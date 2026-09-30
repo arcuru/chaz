@@ -157,3 +157,7 @@ the runtime `ToolRegistry` from that list. Per-session active-set filtering
 hides tools whose owning extension is disabled for the session; policy
 overrides in `security.tool_policies` apply on top of the tool's
 `default_policy()`.
+
+## Agent-job submission
+
+`spawn_agent` prepares a child session DB and its initial Directive before publishing the ID in the existing watched catalog. A client can submit and observe the handle but cannot admit or run it; the executor validates and claims that same DB. Status is `Pending` until acceptance or `Rejected` on refusal. There is no parent request key for automatic deduplication: an uncertain creation response requires catalog inspection before another submission.

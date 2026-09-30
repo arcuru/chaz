@@ -10,7 +10,7 @@ Chaz is an AI agent orchestrator for [Matrix](https://matrix.org). It connects t
 - **Persistent, syncable sessions** backed by [eidetica](https://github.com/arcuru/eidetica). Named sessions; share via ticket URLs.
 - **MCP external tools** with auto-restart, policy enforcement, and presentation modes.
 - **TUI, Matrix, and single-shot CLI** bridges over the same session model.
-- **Scheduled, agent-owned wakes** via a cron-driven routine engine (no broadcast directives).
+- **Scheduled, agent-owned wakes** via a cron, fixed-delay interval, and one-shot routine engine (no broadcast directives).
 - **Security controls** — leak detection, SSRF protection, shell allow/deny lists, tool rate limiting, and explicit approval gates.
 
 ## Quick Start

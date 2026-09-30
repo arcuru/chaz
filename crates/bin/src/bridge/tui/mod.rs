@@ -28,12 +28,12 @@ use crossterm::event::{
 use crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen};
 use ratatui::Terminal;
 use std::collections::HashSet;
-use std::collections::VecDeque;
+use std::future::Future;
 use std::io;
 use std::sync::Arc;
-use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicBool, Ordering};
-use tokio::sync::mpsc;
+use tokio::sync::{Semaphore, mpsc};
+use tokio::task::JoinSet;
 use tokio_stream::StreamExt;
 
 mod bridge_impl;
@@ -86,20 +86,31 @@ enum Action {
     /// A background catalog fetch finished. `Ok` carries the live model
     /// list (already merged with cache); `Err` carries a display message.
     ModelsFetched(Result<Vec<ModelInfo>, String>),
-    /// One session row finished loading in the async picker fill. Carries the
-    /// fully-loaded `SessionInfo`; the handler patches the matching
-    /// placeholder row in `session_list` by `session_db_id`.
-    SessionRowReady(SessionInfo),
+    SessionLoad(SessionLoad),
 }
 
-/// Handle to an in-flight async session-picker fill. The background worker
-/// pops indices off `queue` (a shared priority deque the main loop reorders
-/// on scroll), opens each session DB, and streams the loaded row back as
-/// `Action::SessionRowReady`. Setting `cancel` stops the worker at the next
-/// checkpoint — the main loop does this whenever the picker closes so we
-/// don't keep opening DBs the user isn't looking at.
+enum SessionLoad {
+    Catalog {
+        generation: u64,
+        result: Result<Vec<SessionIndex>, String>,
+    },
+    Row {
+        generation: u64,
+        info: SessionInfo,
+    },
+}
+
+enum CatalogLoadOutcome {
+    Ignored,
+    Loaded { fresh_default: bool },
+    Failed,
+}
+
+/// Handle to in-flight picker work. Metadata reads are demand-driven and
+/// bounded to the visible window; cancellation plus generation checks keep
+/// obsolete results from mutating a later picker.
 pub(super) struct SessionFill {
-    queue: Arc<StdMutex<VecDeque<SessionIndex>>>,
+    generation: u64,
     cancel: Arc<AtomicBool>,
 }
 
@@ -463,7 +474,7 @@ pub(super) struct Tab {
     pub entries: Vec<SessionEntry>,
     pub scroll_offset: u16,
     pub pending_approval: Option<ApprovalExchange>,
-    pub waiting: bool,
+    pub active_turns: usize,
     pub current_agent: String,
     pub session_name: Option<String>,
     /// The model the runtime would actually use for this session's next
@@ -596,23 +607,18 @@ pub(super) struct App {
     /// Toggled by Ctrl+T or `/expand`.
     pub(super) expand_all: bool,
     pub(super) session_list: Vec<SessionInfo>,
-    /// Lazy cache of `session_list`. The cold-list walk
-    /// (`Command::ListSessions`) opens every session DB and folds entries —
-    /// fine on a session with 7 catalogs, less so at scale. Set to `true`
-    /// after a fresh fetch and patched-in-place when a watched session
-    /// fires `on_write`; invalidated wholesale when a session is created.
-    /// Sessions not in tabs are assumed stable from this process's
-    /// perspective; remote sync writes won't invalidate the cache and the
-    /// user can re-open the picker to refresh.
+    /// Whether the current catalog snapshot is reusable on the next open.
     pub(super) session_list_fresh: bool,
-    /// Handle to the background fill that streams loaded rows into
-    /// `session_list` while the picker is open. `None` when no fill is
-    /// running (cache was warm, or the fill finished / was cancelled).
+    /// Catalog rows retained by id so visible metadata requests never need to
+    /// re-list the catalog.
+    pub(super) session_indices: HashMap<String, SessionIndex>,
     pub(super) session_fill: Option<SessionFill>,
-    /// Count of placeholder rows still awaiting their loaded `SessionInfo`.
-    /// Decremented on each `Action::SessionRowReady`; when it reaches zero the
-    /// list is fully loaded and `session_list_fresh` flips to `true`.
-    pub(super) session_fill_remaining: usize,
+    pub(super) session_generation: u64,
+    pub(super) session_catalog_loading: bool,
+    pub(super) session_picker_auto_open: bool,
+    pub(super) session_picker_error: Option<String>,
+    pub(super) session_rows_loading: HashSet<String>,
+    pub(super) session_metadata_limit: Arc<Semaphore>,
     pub(super) picker_index: usize,
     /// Sorted snapshot of the model picker's contents — favorites
     /// (YAML-configured) followed by the live OpenRouter catalog when
@@ -770,8 +776,14 @@ impl App {
             expand_all: false,
             session_list: Vec::new(),
             session_list_fresh: false,
+            session_indices: HashMap::new(),
             session_fill: None,
-            session_fill_remaining: 0,
+            session_generation: 0,
+            session_catalog_loading: false,
+            session_picker_auto_open: false,
+            session_picker_error: None,
+            session_rows_loading: HashSet::new(),
+            session_metadata_limit: Arc::new(Semaphore::new(4)),
             picker_index: 0,
             model_list: Vec::new(),
             session_catalog: None,
@@ -875,55 +887,36 @@ impl App {
         self.session_list.len() + 1
     }
 
-    /// Cancel any in-flight async picker fill. Signals the worker to stop at
-    /// its next checkpoint and drops the handle. Idempotent — safe to call
-    /// every loop iteration the picker isn't open. Rows already patched into
-    /// `session_list` stay; the ones that never loaded remain placeholders
-    /// and a re-open restarts the fill for them.
+    /// Cancel picker work and invalidate any result already queued for the UI.
     pub(super) fn cancel_session_fill(&mut self) {
         if let Some(fill) = self.session_fill.take() {
             fill.cancel.store(true, Ordering::Relaxed);
         }
+        self.session_rows_loading.clear();
+        self.session_catalog_loading = false;
+        self.session_generation = self.session_generation.wrapping_add(1);
     }
 
-    /// Re-order the fill work queue so the rows in the visible window around
-    /// the cursor jump to the front. Called as the user scrolls the picker so
-    /// whatever they're looking at loads first. No-op when no fill is running.
-    pub(super) fn reprioritize_session_fill(&self) {
-        let Some(fill) = &self.session_fill else {
-            return;
-        };
-        // Cursor maps to session_list index `picker_index - 1` (row 0 is the
-        // virtual "New session" row). Build the id set for the window.
+    fn requested_session_indices(&mut self) -> Vec<SessionIndex> {
         let cur = self.picker_index.saturating_sub(1);
         let lo = cur.saturating_sub(SESSION_FILL_WINDOW);
         let hi = cur + SESSION_FILL_WINDOW;
-        let window: HashSet<&str> = self
+        let ids: Vec<String> = self
             .session_list
             .iter()
             .enumerate()
-            .filter(|(i, _)| *i >= lo && *i <= hi)
-            .map(|(_, s)| s.session_db_id.as_str())
+            .filter(|(i, row)| {
+                *i >= lo
+                    && *i <= hi
+                    && !row.loaded
+                    && !self.session_rows_loading.contains(&row.session_db_id)
+            })
+            .map(|(_, row)| row.session_db_id.clone())
             .collect();
-        if window.is_empty() {
-            return;
-        }
-        let Ok(mut q) = fill.queue.lock() else {
-            return;
-        };
-        // Stable partition: visible ids first (preserving queue order), then
-        // the remainder. Cheap — the queue only holds not-yet-loaded rows.
-        let mut front = VecDeque::with_capacity(q.len());
-        let mut back = VecDeque::with_capacity(q.len());
-        for ix in q.drain(..) {
-            if window.contains(ix.session_db_id.as_str()) {
-                front.push_back(ix);
-            } else {
-                back.push_back(ix);
-            }
-        }
-        front.extend(back);
-        *q = front;
+        self.session_rows_loading.extend(ids.iter().cloned());
+        ids.into_iter()
+            .filter_map(|id| self.session_indices.get(&id).cloned())
+            .collect()
     }
 
     /// Resolve the highlighted picker row to a dispatch token: the
@@ -1142,21 +1135,28 @@ async fn setup_session(
 ) -> anyhow::Result<()> {
     let session_db_id = session_db.root_id().to_string();
 
-    // Per-session raw approval channel → tagged forward to shared channel.
-    let (raw_tx, mut raw_rx) = mpsc::channel::<ApprovalExchange>(8);
-    let forwarder_id = session_db_id.clone();
-    let forwarder_tx = approval_tx.clone();
-    tokio::spawn(async move {
-        while let Some(ex) = raw_rx.recv().await {
-            if forwarder_tx.send((forwarder_id.clone(), ex)).await.is_err() {
-                break;
-            }
-        }
-    });
+    server.load_session_entities(session_db).await?;
 
-    server
-        .register_session(session_db, backend, None, Some(raw_tx))
-        .await?;
+    if server.is_executor_authorized() {
+        // Per-session raw approval channel → tagged forward to shared channel.
+        let (raw_tx, mut raw_rx) = mpsc::channel::<ApprovalExchange>(8);
+        let forwarder_id = session_db_id.clone();
+        let forwarder_tx = approval_tx.clone();
+        tokio::spawn(async move {
+            while let Some(ex) = raw_rx.recv().await {
+                if forwarder_tx.send((forwarder_id.clone(), ex)).await.is_err() {
+                    break;
+                }
+            }
+        });
+        server
+            .register_session(session_db, backend, None, Some(raw_tx))
+            .await?;
+    } else {
+        server
+            .watch_session(session_db, backend, None, None)
+            .await?;
+    }
 
     let notify_id = session_db_id;
     session_db
@@ -1273,122 +1273,181 @@ fn spawn_catalog_load(
     });
 }
 
-/// Open the session picker with async fill. Does the cheap catalog walk (one
-/// registry transaction, no per-session DB opens), seeds `session_list` with
-/// placeholder rows in final display order, flips into `SessionPicker` mode
-/// immediately, then spawns a background worker to load each row's real
-/// entry-count / cost / name and stream them back as `Action::SessionRowReady`.
-///
-/// Honors the warm cache: when `session_list_fresh` and the list is non-empty,
-/// the fully-loaded rows from a prior open are reused instantly with no walk.
-/// Returns `false` when the catalog walk failed (caller can surface an error);
-/// `true` otherwise (picker opened, whether from cache or a fresh fill).
-async fn open_session_picker(
+/// Enter the picker synchronously, then fetch catalog metadata in the
+/// background. The event loop remains free to render and cancel while the
+/// registry transaction is delayed.
+fn open_session_picker(
     app: &mut App,
     server: &Arc<Server>,
-    session_rows_tx: &mpsc::Sender<SessionInfo>,
-) -> bool {
-    // Warm-cache short-circuit: a completed prior fill left every row loaded,
-    // Action::SessionChanged patches in-tab rows in place, and NewSession
-    // invalidates wholesale — so a fresh-flagged cache mirrors a cold walk.
-    if app.session_list_fresh && !app.session_list.is_empty() {
-        app.cancel_session_fill();
-        app.picker_index = 0;
-        app.mode = TuiMode::SessionPicker;
-        return true;
-    }
-
-    let indices = match server.registry().list_sessions().await {
-        Ok(ix) => ix,
-        Err(_) => return false,
-    };
-
-    // Preserve any rows a prior (interrupted) fill already loaded so a re-open
-    // restarts only the unfinished ones — the picker was closed mid-walk, but
-    // the rows we did load are still valid this process lifetime.
-    let mut loaded_rows: HashMap<String, SessionInfo> = std::mem::take(&mut app.session_list)
-        .into_iter()
-        .filter(|s| s.loaded)
-        .map(|s| (s.session_db_id.clone(), s))
-        .collect();
-
-    // Build the display rows: reuse a loaded row when we have one, else a
-    // placeholder. Placeholders carry the cheap catalog metadata; sort into
-    // final display order so the async fill patches rows in place (by id)
-    // without ever reordering under the cursor.
-    let mut by_id: HashMap<String, SessionIndex> = indices
-        .iter()
-        .map(|ix| (ix.session_db_id.clone(), ix.clone()))
-        .collect();
-    let mut rows: Vec<SessionInfo> = indices
-        .iter()
-        .map(|ix| {
-            loaded_rows
-                .remove(&ix.session_db_id)
-                .unwrap_or_else(|| SessionInfo::placeholder(ix))
-        })
-        .collect();
-    commands::sort_session_infos(&mut rows);
-
-    // Work queue: only the still-unloaded rows, in display order so the top
-    // (initially visible) placeholders load first.
-    let ordered: VecDeque<SessionIndex> = rows
-        .iter()
-        .filter(|r| !r.loaded)
-        .filter_map(|r| by_id.remove(&r.session_db_id))
-        .collect();
-
-    app.session_fill_remaining = ordered.len();
-    app.session_list = rows;
-    app.session_list_fresh = false;
+    session_rows_tx: &mpsc::Sender<SessionLoad>,
+    auto_open: bool,
+) {
+    app.cancel_session_fill();
     app.picker_index = 0;
     app.mode = TuiMode::SessionPicker;
+    app.session_picker_error = None;
+    app.session_picker_auto_open = auto_open;
 
-    spawn_session_fill(app, server, ordered, session_rows_tx.clone());
+    if app.session_list_fresh && !app.session_list.is_empty() {
+        request_session_metadata(app, server, session_rows_tx);
+        return;
+    }
+
+    app.session_list.clear();
+    app.session_indices.clear();
+    app.session_catalog_loading = true;
+    let registry = server.registry_arc();
+    spawn_session_catalog_load(app, session_rows_tx.clone(), async move {
+        registry
+            .list_sessions()
+            .await
+            .map_err(|error| error.to_string())
+    });
+}
+
+fn spawn_session_catalog_load<F>(app: &mut App, tx: mpsc::Sender<SessionLoad>, load: F)
+where
+    F: Future<Output = Result<Vec<SessionIndex>, String>> + Send + 'static,
+{
+    let generation = app.session_generation;
+    let cancel = Arc::new(AtomicBool::new(false));
+    let worker_cancel = cancel.clone();
+    tokio::spawn(async move {
+        let result = load.await;
+        if !worker_cancel.load(Ordering::Relaxed) {
+            let _ = tx.send(SessionLoad::Catalog { generation, result }).await;
+        }
+    });
+    app.session_fill = Some(SessionFill { generation, cancel });
+}
+
+fn apply_session_catalog(app: &mut App, indices: Vec<SessionIndex>) {
+    let mut cached: HashMap<String, SessionInfo> = std::mem::take(&mut app.session_list)
+        .into_iter()
+        .filter(|row| row.loaded)
+        .map(|row| (row.session_db_id.clone(), row))
+        .collect();
+    app.session_indices = indices
+        .iter()
+        .map(|index| (index.session_db_id.clone(), index.clone()))
+        .collect();
+    app.session_list = indices
+        .iter()
+        .map(|index| {
+            cached
+                .remove(&index.session_db_id)
+                .unwrap_or_else(|| SessionInfo::placeholder(index))
+        })
+        .collect();
+    commands::sort_session_infos(&mut app.session_list);
+    app.session_list_fresh = true;
+    app.session_catalog_loading = false;
+}
+
+fn apply_session_catalog_result(
+    app: &mut App,
+    generation: u64,
+    result: Result<Vec<SessionIndex>, String>,
+) -> CatalogLoadOutcome {
+    if generation != app.session_generation || !matches!(app.mode, TuiMode::SessionPicker) {
+        return CatalogLoadOutcome::Ignored;
+    }
+    match result {
+        Ok(indices) => {
+            let fresh_default = app.session_picker_auto_open
+                && indices.len() <= 1
+                && app.active().entries.is_empty();
+            apply_session_catalog(app, indices);
+            CatalogLoadOutcome::Loaded { fresh_default }
+        }
+        Err(error) => {
+            app.session_catalog_loading = false;
+            app.session_picker_error = Some(error);
+            CatalogLoadOutcome::Failed
+        }
+    }
+}
+
+fn apply_session_row(app: &mut App, generation: u64, info: SessionInfo) -> bool {
+    if generation != app.session_generation || !matches!(app.mode, TuiMode::SessionPicker) {
+        return false;
+    }
+    app.session_rows_loading.remove(&info.session_db_id);
+    if let Some(row) = app
+        .session_list
+        .iter_mut()
+        .find(|row| row.session_db_id == info.session_db_id)
+    {
+        *row = info;
+    }
     true
 }
 
-/// Spawn the background worker that drains `queue`, loads each session's full
-/// `SessionInfo`, and streams it back over `session_rows_tx`. Cancels any
-/// prior fill first. The worker checks the shared cancel flag before every DB
-/// open and before every send, so closing the picker stops it promptly.
-fn spawn_session_fill(
+fn request_session_metadata(
     app: &mut App,
     server: &Arc<Server>,
-    queue: VecDeque<SessionIndex>,
-    session_rows_tx: mpsc::Sender<SessionInfo>,
+    session_rows_tx: &mpsc::Sender<SessionLoad>,
 ) {
-    app.cancel_session_fill();
-    if queue.is_empty() {
-        // Nothing to load — treat the (empty) list as fully fresh so a
-        // re-open short-circuits instead of re-walking.
-        app.session_list_fresh = true;
+    let requested = app.requested_session_indices();
+    if requested.is_empty() {
         return;
     }
-    let queue = Arc::new(StdMutex::new(queue));
-    let cancel = Arc::new(AtomicBool::new(false));
     let registry = server.registry_arc();
-    let worker_queue = queue.clone();
+    spawn_session_metadata_load(app, requested, session_rows_tx.clone(), move |index| {
+        let registry = registry.clone();
+        async move { commands::load_session_metadata(&registry, index).await }
+    });
+}
+
+fn spawn_session_metadata_load<F, Fut>(
+    app: &mut App,
+    requested: Vec<SessionIndex>,
+    tx: mpsc::Sender<SessionLoad>,
+    load: F,
+) where
+    F: Fn(SessionIndex) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = SessionInfo> + Send + 'static,
+{
+    let generation = app.session_generation;
+    let limit = app.session_metadata_limit.clone();
+    let cancel = app
+        .session_fill
+        .as_ref()
+        .filter(|fill| fill.generation == generation)
+        .map(|fill| fill.cancel.clone())
+        .unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
     let worker_cancel = cancel.clone();
     tokio::spawn(async move {
-        loop {
-            if worker_cancel.load(Ordering::Relaxed) {
-                break;
-            }
-            let next = worker_queue.lock().ok().and_then(|mut q| q.pop_front());
-            let Some(index) = next else {
-                break;
-            };
-            let info = commands::load_single_session_info(&registry, index).await;
-            if worker_cancel.load(Ordering::Relaxed) {
-                break;
-            }
-            if session_rows_tx.send(info).await.is_err() {
+        let load = Arc::new(load);
+        let mut rows = JoinSet::new();
+        for index in requested {
+            let limit = limit.clone();
+            let load = load.clone();
+            let worker_cancel = worker_cancel.clone();
+            rows.spawn(async move {
+                if worker_cancel.load(Ordering::Relaxed) {
+                    return None;
+                }
+                let _permit = limit.acquire_owned().await.ok()?;
+                if worker_cancel.load(Ordering::Relaxed) {
+                    return None;
+                }
+                let info = load(index).await;
+                (!worker_cancel.load(Ordering::Relaxed)).then_some(info)
+            });
+        }
+
+        while let Some(Ok(Some(info))) = rows.join_next().await {
+            if tx
+                .send(SessionLoad::Row { generation, info })
+                .await
+                .is_err()
+            {
                 break;
             }
         }
     });
-    app.session_fill = Some(SessionFill { queue, cancel });
+    app.session_fill = Some(SessionFill { generation, cancel });
 }
 
 /// Build a `Tab` for an already-registered session DB.
@@ -1418,13 +1477,17 @@ async fn build_tab(
     let context_budget =
         server.effective_context_budget(&effective_model, agent.max_context_tokens);
     let entries = session.entries().to_vec();
+    let active_turns = Session::active_turn_attempts(&session_db)
+        .await
+        .unwrap_or_default()
+        .len();
     Tab {
         session_db_id,
         session_db,
         entries,
         scroll_offset: 0,
         pending_approval: None,
-        waiting: false,
+        active_turns,
         current_agent: agent.name.clone(),
         session_name,
         effective_model,
@@ -1432,6 +1495,12 @@ async fn build_tab(
         context_budget,
         expanded_entries: HashSet::new(),
     }
+}
+
+/// Refresh live activity independently of historical transcript entries.
+async fn refresh_tab_activity(tab: &mut Tab) -> anyhow::Result<()> {
+    tab.active_turns = Session::active_turn_attempts(&tab.session_db).await?.len();
+    Ok(())
 }
 
 /// Shift the active tab by `delta` (wraps around).
@@ -1471,7 +1540,7 @@ async fn handle_chat_action(
     approval_tx: &mpsc::Sender<TaggedApproval>,
     notify_tx: &mpsc::Sender<String>,
     models_tx: &mpsc::Sender<Result<Vec<ModelInfo>, String>>,
-    session_rows_tx: &mpsc::Sender<SessionInfo>,
+    session_rows_tx: &mpsc::Sender<SessionLoad>,
 ) {
     match action {
         ChatAction::SendMessage(text) => {
@@ -1493,7 +1562,7 @@ async fn handle_chat_action(
                 })
                 .await
             {
-                Ok(()) => tab.waiting = true,
+                Ok(_) => {}
                 Err(e) => tracing::error!("Failed to send message: {e}"),
             }
         }
@@ -1562,12 +1631,7 @@ async fn handle_chat_action(
             app.settings_focus = SettingsFocus::Detail;
         }
         ChatAction::OpenPicker => {
-            // Async fill: opens the picker immediately with placeholder rows
-            // and streams the loaded rows in off-thread. Honors the warm
-            // cache internally (skips the walk when the list is still fresh).
-            if !open_session_picker(app, server, session_rows_tx).await {
-                show_error(app, "Failed to list sessions".to_string());
-            }
+            open_session_picker(app, server, session_rows_tx, false);
         }
         ChatAction::Dispatch(cmd) => {
             // Commands that mutate the catalog membership invalidate the
@@ -1603,12 +1667,9 @@ async fn handle_chat_action(
 /// rename targets `session_db_id` directly, which may or may not be the
 /// active tab — that's why it bypasses the `/name` Command path (which keys
 /// off the active session).
-#[allow(clippy::too_many_arguments)]
 async fn apply_picker_rename(
     app: &mut App,
     server: &Arc<Server>,
-    backend: &BackendManager,
-    secrets: &SecretStore,
     session_db_id: String,
     name: Option<String>,
 ) {
@@ -1634,29 +1695,14 @@ async fn apply_picker_rename(
         app.tabs[idx].session_name = name.clone();
     }
 
-    // Refresh the picker list so the row reflects the new alias and the
-    // selection stays anchored on the renamed session.
-    let tab = app.active();
-    let active_db_id = tab.session_db_id.clone();
-    let active_db = tab.session_db.clone();
-    let current_agent = tab.current_agent.clone();
-    let active_name = tab.session_name.clone();
-    let ctx = CommandContext {
-        server,
-        secrets,
-        backend,
-        session_db_id: &active_db_id,
-        session_db: &active_db,
-        current_agent: &current_agent,
-        session_name: active_name.as_deref(),
-    };
-    if let CommandOutcome::SessionsList(list) =
-        commands::dispatch(Command::ListSessions, &ctx).await
+    if let Some(row) = app
+        .session_list
+        .iter_mut()
+        .find(|row| row.session_db_id == session_db_id)
     {
-        app.session_list = list;
-        app.session_list_fresh = true;
-        app.focus_picker_on(&session_db_id);
+        row.name = name;
     }
+    app.focus_picker_on(&session_db_id);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1782,7 +1828,7 @@ async fn handle_settings_outcome(
     approval_tx: &mpsc::Sender<TaggedApproval>,
     notify_tx: &mpsc::Sender<String>,
     models_tx: &mpsc::Sender<Result<Vec<ModelInfo>, String>>,
-    session_rows_tx: &mpsc::Sender<SessionInfo>,
+    session_rows_tx: &mpsc::Sender<SessionLoad>,
 ) {
     match outcome {
         input::SettingsKey::None => {}
@@ -2075,23 +2121,14 @@ async fn render_outcome(
                         .created_at
                         .map(|t| t.format("%Y-%m-%d").to_string())
                         .unwrap_or_else(|| "—".to_string());
-                    let cost = if info.cost_reported {
-                        format!(", ${:.4}", info.total_cost_usd)
-                    } else {
-                        String::new()
-                    };
                     msg.push_str(&format!(
-                        "\n  {}{} [{}] ({}, {} entries, {}{cost})",
+                        "\n  {}{} [{}] ({}, {})",
                         info.session_db_id,
                         name,
                         info.bridge.as_str(),
                         agent,
-                        info.entry_count,
                         age
                     ));
-                    if let Some(preview) = &info.last_message {
-                        msg.push_str(&format!("\n    {preview}"));
-                    }
                 }
                 show_system_msg(app, msg);
             }
@@ -2123,6 +2160,10 @@ async fn render_outcome(
             }
             let session = Session::new(conv_id, db.clone()).await;
             let entries = session.entries().to_vec();
+            let active_turns = Session::active_turn_attempts(&db)
+                .await
+                .unwrap_or_default()
+                .len();
             // Mirror `build_tab` — resolve through the backend so the status
             // bar reflects what the runtime would actually use.
             let agent = server.agents().get(&agent_name);
@@ -2137,7 +2178,7 @@ async fn render_outcome(
                 entries,
                 scroll_offset: 0,
                 pending_approval: None,
-                waiting: false,
+                active_turns,
                 current_agent: agent_name,
                 session_name,
                 effective_model,
@@ -2173,4 +2214,246 @@ pub(super) fn show_error(app: &mut App, content: String) {
         metadata: None,
         routing: None,
     });
+}
+
+#[cfg(test)]
+mod session_picker_tests {
+    use super::*;
+    use chaz_core::session::{BridgeKind, SessionStatus};
+    use eidetica::backend::database::InMemory;
+    use eidetica::{Instance, NewUser};
+
+    async fn test_tab() -> Tab {
+        let (_instance, mut user) = Instance::create_backend(
+            Box::new(InMemory::new()),
+            NewUser::passwordless("lazy-picker"),
+        )
+        .await
+        .unwrap();
+        let key = user.get_default_key().unwrap();
+        let db = user
+            .create_database(eidetica::crdt::Doc::new(), &key)
+            .await
+            .unwrap();
+        Tab {
+            session_db_id: db.root_id().to_string(),
+            session_db: db,
+            entries: Vec::new(),
+            scroll_offset: 0,
+            pending_approval: None,
+            active_turns: 0,
+            current_agent: "chaz".into(),
+            session_name: None,
+            effective_model: String::new(),
+            roster: Vec::new(),
+            context_budget: 0,
+            expanded_entries: HashSet::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn tab_activity_follows_persisted_claim_not_old_ack() {
+        // Keep the backend alive: the picker fixture normally drops it because
+        // picker tests only inspect tab metadata, not session DB writes.
+        let (_instance, mut user) =
+            Instance::create_backend(Box::new(InMemory::new()), NewUser::passwordless("live-tab"))
+                .await
+                .unwrap();
+        let key = user.get_default_key().unwrap();
+        let db = user
+            .create_database(eidetica::crdt::Doc::new(), &key)
+            .await
+            .unwrap();
+        let mut tab = test_tab().await;
+        tab.session_db_id = db.root_id().to_string();
+        tab.session_db = db;
+        let mut session = Session::new(
+            chaz_core::types::ConversationId(tab.session_db_id.clone()),
+            tab.session_db.clone(),
+        )
+        .await;
+        let attempt = session
+            .start_turn_attempt(chaz_core::session::TurnRequestId::parse("tui-message"))
+            .await
+            .unwrap();
+        refresh_tab_activity(&mut tab).await.unwrap();
+        assert_eq!(tab.active_turns, 1);
+        assert!(view::turn_activity_line(tab.active_turns).is_some());
+        session.complete_turn_attempt(&attempt, None).await.unwrap();
+        session
+            .add_entry(SessionEntry {
+                sender: "chaz".into(),
+                content: String::new(),
+                timestamp: chrono::Utc::now(),
+                entry_type: EntryType::Ack,
+                metadata: None,
+                routing: None,
+            })
+            .await
+            .unwrap();
+        refresh_tab_activity(&mut tab).await.unwrap();
+        assert_eq!(tab.active_turns, 0);
+        assert!(view::turn_activity_line(tab.active_turns).is_none());
+    }
+
+    #[tokio::test]
+    async fn chat_composer_edits_graphemes_and_multiline() {
+        let mut app = App::new(HashSet::new(), test_tab().await);
+        for c in "a界e\u{301}👍🏽z".chars() {
+            input::handle_chat_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE),
+            )
+            .await;
+        }
+        assert_eq!(app.cursor, app.input.len());
+        input::handle_chat_key(&mut app, KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)).await;
+        input::handle_chat_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
+        )
+        .await;
+        assert_eq!(app.input, "a界e\u{301}z");
+        assert_eq!(app.cursor, "a界e\u{301}".len());
+        input::handle_chat_key(&mut app, KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)).await;
+        assert_eq!(app.cursor, "a界".len());
+        input::handle_chat_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT)).await;
+        assert_eq!(app.input, "a界\ne\u{301}z");
+        assert_eq!(app.cursor, "a界\n".len());
+        // Alt+Enter is the break that legacy terminals can actually deliver —
+        // bare Shift+Enter reaches us as an unmodified Enter (i.e. send).
+        input::handle_chat_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT)).await;
+        assert_eq!(app.input, "a界\n\ne\u{301}z");
+        assert_eq!(app.cursor, "a界\n\n".len());
+    }
+
+    /// An unmodified Enter still submits rather than inserting a break: the
+    /// draft is taken and the cursor resets.
+    #[tokio::test]
+    async fn chat_composer_plain_enter_still_submits() {
+        let mut app = App::new(HashSet::new(), test_tab().await);
+        input::handle_chat_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE),
+        )
+        .await;
+        input::handle_chat_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)).await;
+        assert!(app.input.is_empty());
+        assert_eq!(app.cursor, 0);
+    }
+
+    fn index(n: usize) -> SessionIndex {
+        SessionIndex {
+            session_db_id: format!("session-{n}"),
+            source: Some("tui".into()),
+            bridge: BridgeKind::Tui,
+            created_at: None,
+            status: SessionStatus::Active,
+            name: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn visible_metadata_requests_are_bounded_and_cancel_invalidates_results() {
+        let mut app = App::new(HashSet::new(), test_tab().await);
+        let indices: Vec<_> = (0..100).map(index).collect();
+        apply_session_catalog(&mut app, indices);
+        app.mode = TuiMode::SessionPicker;
+
+        let first = app.requested_session_indices();
+        assert!(first.len() <= SESSION_FILL_WINDOW + 1);
+        assert!(first.iter().all(|row| row.session_db_id != "session-99"));
+
+        app.picker_index = 100;
+        let scrolled = app.requested_session_indices();
+        assert!(scrolled.len() <= SESSION_FILL_WINDOW + 1);
+        assert!(scrolled.iter().any(|row| row.session_db_id == "session-99"));
+
+        let generation = app.session_generation;
+        app.session_fill = Some(SessionFill {
+            generation,
+            cancel: Arc::new(AtomicBool::new(false)),
+        });
+        app.cancel_session_fill();
+        assert_ne!(app.session_generation, generation);
+        assert!(app.session_rows_loading.is_empty());
+
+        let mut stale = SessionInfo::placeholder(&index(0));
+        stale.agent_name = Some("stale".into());
+        stale.loaded = true;
+        assert!(!apply_session_row(&mut app, generation, stale));
+        assert!(app.session_list[0].agent_name.is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn delayed_catalog_keeps_picker_responsive_and_stale_results_are_ignored() {
+        let mut app = App::new(HashSet::new(), test_tab().await);
+        app.mode = TuiMode::SessionPicker;
+        app.session_catalog_loading = true;
+        let (tx, mut rx) = mpsc::channel(1);
+        spawn_session_catalog_load(&mut app, tx, async {
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            Ok(vec![index(1)])
+        });
+
+        assert_eq!(app.picker_index, 0);
+        input::handle_picker_key(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(matches!(app.mode, TuiMode::Chat));
+        app.cancel_session_fill();
+        assert!(rx.try_recv().is_err());
+
+        tokio::time::advance(std::time::Duration::from_secs(30)).await;
+        tokio::task::yield_now().await;
+        assert!(rx.try_recv().is_err(), "cancelled load emitted a result");
+
+        app.mode = TuiMode::SessionPicker;
+        let current = app.session_generation;
+        assert!(matches!(
+            apply_session_catalog_result(&mut app, current.wrapping_sub(1), Ok(vec![index(9)])),
+            CatalogLoadOutcome::Ignored
+        ));
+        assert!(app.session_list.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn delayed_row_load_is_bounded_and_cancel_stops_further_opens() {
+        let mut app = App::new(HashSet::new(), test_tab().await);
+        let indices: Vec<_> = (0..100).map(index).collect();
+        apply_session_catalog(&mut app, indices);
+        app.mode = TuiMode::SessionPicker;
+        let requested = app.requested_session_indices();
+        assert!(requested.len() < app.session_list.len());
+
+        let opens = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let max_active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = opens.clone();
+        let observed_active = active.clone();
+        let observed_max = max_active.clone();
+        let (tx, mut rx) = mpsc::channel(32);
+        spawn_session_metadata_load(&mut app, requested, tx, move |index| {
+            let observed = observed.clone();
+            let active = observed_active.clone();
+            let max_active = observed_max.clone();
+            async move {
+                observed.fetch_add(1, Ordering::Relaxed);
+                let now_active = active.fetch_add(1, Ordering::Relaxed) + 1;
+                max_active.fetch_max(now_active, Ordering::Relaxed);
+                tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                active.fetch_sub(1, Ordering::Relaxed);
+                let mut row = SessionInfo::placeholder(&index);
+                row.loaded = true;
+                row
+            }
+        });
+
+        tokio::task::yield_now().await;
+        assert_eq!(opens.load(Ordering::Relaxed), 4);
+        assert_eq!(max_active.load(Ordering::Relaxed), 4);
+        app.cancel_session_fill();
+        tokio::time::advance(std::time::Duration::from_secs(10)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(opens.load(Ordering::Relaxed), 4);
+        assert!(rx.try_recv().is_err());
+    }
 }

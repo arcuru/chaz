@@ -16,6 +16,9 @@ pub(super) async fn resolve_agent_ref(
     agent_ref: &str,
     ctx: &CommandContext<'_>,
 ) -> Result<crate::hosted_index::DbEntry, String> {
+    if let Err(e) = ctx.server.ensure_hosted_indices_complete().await {
+        return Err(format!("Failed to load hosted agents: {e}"));
+    }
     let index = ctx.server.agent_index();
     if let Some(entry) = index.find_by_name(agent_ref) {
         return Ok(entry);
@@ -556,6 +559,9 @@ pub(super) async fn agent_import(
 }
 
 pub(super) async fn agent_hosted(ctx: &CommandContext<'_>) -> CommandOutcome {
+    if let Err(e) = ctx.server.ensure_hosted_indices_complete().await {
+        return CommandOutcome::Error(format!("Failed to load hosted agents: {e}"));
+    }
     let entries = ctx.server.agent_index().list();
     if entries.is_empty() {
         return CommandOutcome::Text("No Living Agents hosted on this peer.".to_string());

@@ -51,6 +51,24 @@ impl CommandBridge {
             session_name,
         }
     }
+
+    /// Run a command that needs only the session registry. Main calls this
+    /// before constructing a Server so catalog reads avoid secret hydration,
+    /// extensions, tools, callbacks, and shutdown work.
+    pub(crate) async fn run_session_independent(
+        command: shared_commands::Command,
+        registry: &chaz_core::session::SessionRegistry,
+    ) -> anyhow::Result<()> {
+        match command {
+            shared_commands::Command::ListSessions => {
+                let list = shared_commands::collect_session_infos(registry).await?;
+                print!("{}", render_sessions(&list));
+                Ok(())
+            }
+            shared_commands::Command::Quit => Ok(()),
+            _ => anyhow::bail!("command requires a current session"),
+        }
+    }
 }
 
 /// Render a `SessionsList` outcome as one line per session. The interactive
@@ -64,8 +82,8 @@ fn render_sessions(list: &[SessionInfo]) -> String {
         let name = info.name.as_deref().unwrap_or("-");
         let agent = info.agent_name.as_deref().unwrap_or("default");
         out.push_str(&format!(
-            "{}\t{}\t{}\t{:?}\t{} entries\n",
-            info.session_db_id, name, agent, info.bridge, info.entry_count
+            "{}\t{}\t{}\t{:?}\n",
+            info.session_db_id, name, agent, info.bridge
         ));
     }
     out
@@ -85,8 +103,13 @@ impl Bridge for CommandBridge {
             ),
         };
 
+        if shared_commands::is_session_independent(&cmd) {
+            return Self::run_session_independent(cmd, server.registry()).await;
+        }
+
         let (_conv_id, session_db) =
             super::cli::resolve_cli_session(&server, self.session_name.as_deref()).await?;
+        server.load_session_entities(&session_db).await?;
         let session_db_id = session_db.root_id().to_string();
 
         let backend = BackendManager::new(&self.config.backends, self.secrets.clone());
@@ -134,6 +157,7 @@ impl Bridge for CommandBridge {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chaz_core::commands::Command;
     use chaz_core::session::{BridgeKind, SessionStatus};
 
     fn info(name: Option<&str>, agent: Option<&str>) -> SessionInfo {
@@ -141,14 +165,9 @@ mod tests {
             session_db_id: "bafyabc".to_string(),
             agent_name: agent.map(str::to_string),
             name: name.map(str::to_string),
-            entry_count: 3,
-            last_message: None,
             bridge: BridgeKind::Cli,
             created_at: None,
             status: SessionStatus::default(),
-            total_cost_usd: 0.0,
-            cost_reported: false,
-            llm_call_count: 0,
             loaded: true,
         }
     }
@@ -173,6 +192,17 @@ mod tests {
     fn every_row_has_the_same_field_count() {
         let out = render_sessions(&[info(Some("a"), Some("b")), info(None, None)]);
         let counts: Vec<usize> = out.lines().map(|l| l.matches('\t').count()).collect();
-        assert_eq!(counts, vec![4, 4]);
+        assert_eq!(counts, vec![3, 3]);
+    }
+
+    #[test]
+    fn only_catalog_commands_bypass_session_resolution() {
+        assert!(shared_commands::is_session_independent(
+            &Command::ListSessions
+        ));
+        assert!(shared_commands::is_session_independent(&Command::Quit));
+        assert!(!shared_commands::is_session_independent(
+            &Command::AgentsList
+        ));
     }
 }

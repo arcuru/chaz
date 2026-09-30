@@ -16,14 +16,16 @@
 
 ## Summary
 
-A schedule is an **agent-owned** object: it belongs to an agent (e.g. `chaz`),
-not to a session. chaz is the runtime — it hosts one or more agents, and on
-boot it loads each hosted agent and registers that agent's schedules. When a
-schedule fires, chaz loads the owning agent, resolves the schedule's **target**
-(an existing pinned session, or a fresh session created per fire), builds
-context _as that agent_, feeds the wake-prompt as private invocation input,
-and runs the agent's loop. The agent may reply, may act only through tools,
-or may do nothing.
+A schedule belongs to an Agent, not to a session. Chaz hosts one or more
+Agents and loads their schedules at boot. The Agent's home daemon is the only
+executor: Fresh schedules use the Agent-level home, while Pinned schedules use
+the Agent's home for the target session. Other daemons may hold the synced
+schedule row, but they skip its fires.
+
+When a schedule fires, the home daemon loads the owner, resolves its target
+(an existing pinned session or a new session for this fire), builds context as
+that Agent, passes the wake prompt as private invocation input, and runs the
+Agent's loop. The Agent may reply, use tools without replying, or do nothing.
 
 Routing is intrinsic: the schedule names its owner, so there is no
 "resolve who responds" step. This replaces the current model where a
@@ -57,7 +59,7 @@ across peers, exactly like its config.
 ```text
 Schedule {
     id:       String,
-    schedule: Cron(expr) | OneShot(fire_at),
+    schedule: Cron(expr) | Interval(period) | OneShot(fire_at),
     prompt:   String,                 // the wake-prompt
     target:   Pinned(session_db_id)   // fire into this existing session
             | Fresh,                  // create a new session per fire
@@ -80,7 +82,7 @@ The `target` choice is made at create time and recorded in the schedule.
 
 ### Lifecycle bounds (Gap 4)
 
-A `Cron` schedule is infinite by default; `OneShot` retires itself. Two
+A `Cron` or fixed-delay `Interval` schedule is infinite by default; `OneShot` retires itself. An interval first fires one period after creation and then one period after each successful handler dispatch; its persisted dispatch anchor preserves that timing across restarts. Agent turns run asynchronously, so intervals do not imply non-overlap. Two
 optional bounds make _finite recurring_ work expressible without a third
 trigger type:
 
@@ -119,7 +121,7 @@ sequenceDiagram
 
     B->>AX: enumerate hosted agents
     AX->>E: register each agent's Schedules (from Agent DB)
-    Note over E: schedule by Cron / OneShot
+    Note over E: schedule by Cron / Interval / OneShot
     T->>E: due
     E->>AG: load owning agent
     AG->>S: resolve target — open Pinned(id) OR create Fresh
@@ -129,9 +131,11 @@ sequenceDiagram
 
 The engine's discovery inverts: it enumerates **hosted agents** and reads
 their schedule registries, rather than scanning session DBs for routine rows.
-The existing "does this peer host the target agent?" check
-(`heartbeat.rs:169`, today only multi-peer dedup) becomes _the_ dispatch
-gate — the ownership boundary falls out naturally.
+The dispatch path checks both hosting and home ownership. A daemon that does
+not host the Agent skips immediately. A co-owner also skips unless its local
+key matches the Agent-level home for Fresh work or the session-level home for
+Pinned work. These gates assume one configured home daemon; there is no
+distributed lock or automatic failover.
 
 ### Intrinsic routing & private wake-prompt
 
@@ -211,13 +215,13 @@ rows, `sweep_for_agent`): the check moves from "clean up on detach" to
 
 ## Failure Modes & Mitigations
 
-| Failure                                            | Mitigation                                                                                                                                                            |
-| -------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Schedule fires for an agent this peer doesn't host | Host check is the dispatch gate — silently skip (owning peer fires it)                                                                                                |
-| Pinned target session deleted / agent detached     | Membership/existence checked at fire → self-skip + log                                                                                                                |
-| Fresh fires accumulate sessions unbounded          | Fresh sessions are normal sessions subject to existing lifecycle/retention; cron cadence is author-chosen                                                             |
-| Self-scheduled tight cron self-sustains activity   | Bounded by cron cadence + per-agent `max_iterations`; **not** the chat-room burst budget (a schedule is a deliberate cadence). Revisit a min-interval guard if abused |
-| Woken agent forced to speak                        | Conditional terminal `Message` — silence produces no entry                                                                                                            |
+| Failure                                                      | Mitigation                                                                                                                                                              |
+| ------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Schedule fires for an agent this peer doesn't host           | Host check is the dispatch gate — silently skip (owning peer fires it)                                                                                                  |
+| Pinned target session deleted / agent detached               | Membership/existence checked at fire → self-skip + log                                                                                                                  |
+| Fresh fires accumulate sessions unbounded                    | Fresh sessions are normal sessions subject to existing lifecycle/retention; cron cadence is author-chosen                                                               |
+| Self-scheduled tight cron or interval self-sustains activity | Bounded by chosen cadence + per-agent `max_iterations`; **not** the chat-room burst budget (a schedule is a deliberate cadence). Revisit a min-interval guard if abused |
+| Woken agent forced to speak                                  | Conditional terminal `Message` — silence produces no entry                                                                                                              |
 
 ## Migration
 

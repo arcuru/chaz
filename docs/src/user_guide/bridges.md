@@ -3,17 +3,20 @@
 A **bridge** connects chaz to a chat transport — Matrix or Discord — translating
 messages between a transport's rooms/channels and chaz session databases.
 
-Each bridge is a **standalone binary and its own eidetica peer**: `chaz-matrix`
-and `chaz-discord` are separate processes from the `chaz` daemon, each with its
-own key and its own database. They are pure transport I/O — they do **not** run
-agents. The `chaz` daemon runs the agents; a bridge only carries messages in and
-replies out. The two communicate over eidetica sync.
+Each bridge is a **standalone binary**: `chaz-matrix` and `chaz-discord` are
+separate processes from the `chaz` daemon. They are transport I/O — they carry
+messages in and replies out — and the configured executor runs the agents.
+Like every Chaz process, a bridge connects to Eidetica through explicit
+settings (see [Connection settings](#connection-settings)): as a **direct
+owner** it is its own Eidetica peer with its own key and database, reaching the
+executor's agent over eidetica sync; as a **service client** it shares the
+Eidetica daemon's login with the executor and needs no sync setup of its own.
 
 This page covers the architecture and the one-time setup/approval flow common to
 both bridges. For transport-specific configuration see [Matrix Bot](matrix.md)
 and [Discord Bot](discord.md).
 
-## Why bridges are separate peers
+## Why bridges are separate processes
 
 Earlier versions ran the Matrix bridge inside the `chaz` process and read its
 credentials (`homeserver_url`, `username`, `password`) from the central config.
@@ -21,14 +24,19 @@ That coupling is gone. Now:
 
 - **A login belongs to exactly one agent.** A bridge's job is to route one
   transport account's traffic to one owning agent's sessions.
-- **Credentials never sit in the daemon's config or database.** Each bridge owns
-  an encrypted settings database (a `PasswordStore`) holding its own
-  homeserver/token/allow-list, unlocked by a password the daemon never sees. The
-  daemon stores only a non-secret pointer (a `LoginRef`) in the agent's database
-  saying "a login of this kind exists, managed by this bridge DB."
-- **The daemon owns no transport config at all.** It runs agents, the TUI, and
-  the CLI. Bridges are independently deployable — a different host, a separate
-  `systemd` unit, its own restart lifecycle.
+- **Transport secrets stay out of the agent's config and DB.** Each bridge
+  stores credentials in an encrypted settings database (`PasswordStore`),
+  unlocked by a password held by that bridge process. A service-client bridge
+  stores this encrypted DB on the shared Eidetica backend; a direct owner uses
+  its own backend. The agent DB holds only a non-secret `LoginRef` pointer.
+- **The daemon runs no transport.** It runs agents, the TUI, and the CLI.
+  Bridges have their own restart lifecycle. Direct-owner bridges can run on a
+  different host; service clients need access to the same Unix service.
+
+The following diagram shows **direct-owner** bridges. Service clients instead
+share the Eidetica daemon login and use its Unix socket, without tickets or
+peer-to-peer sync. Both layouts keep transport processes separate from the
+agent executor.
 
 ```mermaid
 graph LR
@@ -50,10 +58,82 @@ graph LR
     DB2 -.->|Discord| Chan[Discord channels]
 ```
 
-Three peers, three separate backend files, syncing over eidetica's iroh
-transport. No process opens another's database directly — access to an agent's
-DB is granted with a ticket (see below), exactly the way one chaz peer shares an
-agent with another in [Sharing & Sync](session_sharing.md).
+In this direct-owner layout, three peers have separate backend files and sync
+over iroh. Access to an agent DB is granted with a ticket (see below), as in
+[Sharing & Sync](session_sharing.md). Service clients connect to one daemon
+backend through Eidetica instead; they do not use this ticket flow.
+
+## Connection settings
+
+A bridge's config file carries the same `execution:` and `eidetica:` keys as
+every other entry point ([Configuration](configuration.md#eidetica-connection-and-execution-role)).
+The execution role is explicit: a bridge deployment is normally `client`, and
+nothing about the binary forces or assumes that.
+
+As its own Eidetica peer (the layout the setup below describes):
+
+```yaml
+execution: client
+eidetica:
+  connection: "sqlite:///var/lib/chaz-matrix/eidetica.db"
+  login: { username: chaz-matrix, passwordless: true }
+  sync:
+    iroh: true # and/or http_listen for the loopback transport
+```
+
+An existing bridge store from an earlier release lives at
+`<state_dir>/eidetica.db` under the login `chaz-matrix` / `chaz-discord`, so the
+example above opens it unchanged. A direct owner must configure `sync:` — ticket
+bootstrap and the executor's replies both travel over it. Nothing is created
+implicitly: a new store is provisioned with the Eidetica CLI first, and a
+missing `eidetica:` or `execution:` block stops the bridge with this exact
+example for its own state directory.
+
+Sharing the Eidetica daemon's login with the executor:
+
+```yaml
+execution: client
+eidetica:
+  connection: "unix:///run/eidetica/service.sock"
+  login: { username: chaz, passwordless: true }
+```
+
+A service client holds the agent databases already, so the `ticket:` field on
+its logins is an owner-only control and must be omitted; the bridge refuses to
+start otherwise and names the owner-side command. It publishes a login pointer
+without sync addresses, needs no approval, and monitors the connection the way
+the daemon does: a transient Eidetica daemon restart tears the bridge's runtime
+and transport connections down completely, then reconnects with bounded
+backoff, re-logs in, reopens the databases, reinstalls its hooks, and
+reconciles delivery progress. Bad credentials or invalid configuration fail
+immediately.
+
+## Fresh-state service rehearsal (no automatic migration)
+
+1. Back up the old Chaz config and Eidetica/bridge state together; keep an
+   untouched, **compatible** copy for rollback. An older binary may not safely
+   reopen state written by the new version.
+2. On disposable storage, stop all old direct owners. Provision the Eidetica
+   daemon's store and login explicitly using Eidetica's CLI; start the service.
+   Configure exactly one Chaz `execution: executor` process against its
+   `unix://` endpoint, with the same login as the clients. Check its startup
+   log and ensure no second executor is running for those sessions.
+3. Configure CLI/TUI and each Matrix/Discord bridge with `execution: client`,
+   the same service endpoint and login, and **no** `eidetica.sync` or login
+   `ticket`. Provision fresh bridge settings/identities deliberately; old
+   bridge databases, identities, delivery progress and channel bindings are
+   **not** imported into this layout. Reattach channels and verify an inbound
+   message and one reply on a disposable Matrix room before any live cutover.
+4. Test a client and bridge restart while the executor stays up, then an
+   executor restart. Check committed replies arrive and already acknowledged
+   chunks do not resend. Roll back by stopping the new processes and restoring
+   the preserved compatible copy with its old config and binaries, not by
+   pointing an old binary at the newly written store.
+
+This is a rehearsal, not a data move or production cutover. Service selection
+never searches for or silently shadows old direct-owner state. Delivery remains
+at-least-once across the transport-acknowledgement window (see
+[Delivery guarantees](#delivery-guarantees)).
 
 ## The bridge config file
 
@@ -62,10 +142,10 @@ A bridge reads its own YAML file — `chaz-matrix` defaults to
 `discord-bridge.yaml` — or pass `--config <path>`. The same file carries two
 kinds of keys, parsed independently:
 
-- **chaz runtime keys** the bridge's embedded server needs: `backends:`,
-  `agents:` (just the identities the bridge serves), `security:`, optionally
-  `sync_listen:` and `state_dir:`. These are the ordinary [config](configuration.md)
-  keys.
+- **chaz runtime keys** the bridge's embedded server needs: `execution:`,
+  `eidetica:`, `backends:`, `agents:` (just the identities the bridge serves),
+  `security:`, and optionally `state_dir:`. These are the ordinary
+  [config](configuration.md) keys.
 - **bridge-only keys**: `unlock_password:`, an optional `label:`, and a
   `logins:` list.
 
@@ -78,11 +158,16 @@ label: matrix # names the bridge's settings DB (default per transport)
 
 logins:
   - agent: chaz # the owning agent (its DB receives the LoginRef pointer)
-    ticket: "eidetica:?db=...&pr=..." # access ticket for that agent's DB (see Setup)
+    ticket: "eidetica:?db=...&pr=..." # direct owners only: access ticket for that agent's DB (see Setup)
     # ...transport-specific credential fields (see Matrix / Discord pages)
 
 # chaz runtime keys the embedded server needs
 state_dir: /var/lib/chaz-matrix
+execution: client
+eidetica:
+  connection: "sqlite:///var/lib/chaz-matrix/eidetica.db"
+  login: { username: chaz-matrix, passwordless: true }
+  sync: { iroh: true }
 backends:
   - name: openai
     api_key: ${OPENAI_API_KEY}
@@ -98,8 +183,12 @@ on every boot, so editing the config and restarting is how you rotate them.
 
 ## Setup
 
-A bridge needs **Write** access to each agent DB it serves, and the daemon must
-approve that access once. It uses that access sparingly: its login pointer still
+This is the flow for a bridge running as its own Eidetica peer. A service
+client sharing the daemon's login skips it entirely: it holds the agent DB
+through that login, so there is no ticket, no key to invite, and no approval.
+
+A direct-owner bridge needs **Write** access to each agent DB it serves, and the
+daemon must approve that access once. It uses that access sparingly: its login pointer still
 travels as metadata on the access request and is registered by the daemon at
 approval, so you see the claim in `/sharing requests` before granting it. The
 write authority is for **session exposure** — every new channel adds an entry to
@@ -176,6 +265,30 @@ written into the per-channel session DBs (which sync to the daemon), the daemon'
 agents respond, and the replies sync back for the bridge to deliver. Day-to-day
 commands (`!chaz …`) are documented on the per-transport pages.
 
+## Delivery guarantees
+
+Replies are delivered **at least once**, never exactly once. The bridge keeps
+delivery progress for every channel it serves — per transport, login, channel,
+and session — in its peer-local state, and records a chunk as delivered only
+after the transport acknowledged it. A bridge that restarts, or reconnects to
+the Eidetica daemon, resumes from that record: a reply the executor committed
+while the bridge was down goes out on startup, a long reply interrupted between
+chunks resumes at the failed chunk, and nothing already acknowledged is sent
+again. Two bridges sharing one Eidetica login keep separate progress. A failed
+send is retried with bounded backoff (one second doubling to a minute) without
+waiting for new activity in the session.
+
+On the first start after upgrading a channel that has no delivery-progress
+record yet, existing agent messages can be repeated. The bridge treats them as
+unacknowledged rather than risk dropping a reply committed during the upgrade.
+
+The one window that can repeat a message is a crash between the transport
+accepting a chunk and the bridge recording it. Each chunk carries a stable
+idempotency key — a Matrix transaction ID, an enforced Discord nonce — so the
+transport collapses a repeat it still remembers; a repeat outside that window
+appears twice in the room. Delivery to the room is not tied to the TUI's own
+history view, which reads the session directly.
+
 The bridge runs no agent of its own — it only carries messages. The daemon
 discovers each channel's session (the bridge marks it _exposed_ in the agent DB's
 synced session registry), runs the agent, and writes the reply back. The full
@@ -248,10 +361,17 @@ pending approval (or none are configured). Approve them on the daemon and
 restart.
 
 **The bridge can't reach the daemon.** Bootstrap and sync need network
-reachability between the two peers. With the default iroh transport this works
-across NATs, but both must be online; check the daemon's startup log for its sync
-address. The optional `sync_listen:` HTTP bind is for environments where iroh
+reachability between the two peers. With the iroh transport this works across
+NATs, but both must be online; check the daemon's startup log for its sync
+address. The `eidetica.sync.http_listen` bind is for environments where iroh
 can't connect.
+
+**The bridge exits naming `execution` and `eidetica`.** The connector settings
+are required; the message carries the exact block for this bridge's existing
+store. See [Connection settings](#connection-settings).
+
+**A service-client bridge exits over `ticket`.** Tickets are owner-only. Remove
+the field from that login; the shared login already holds the agent DB.
 
 **Credential reads fail after a restart.** The `unlock_password` changed or isn't
 set in the environment. It must match what the store was first sealed with; if

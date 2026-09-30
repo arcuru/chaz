@@ -20,6 +20,7 @@
 pub mod bridge;
 pub mod config;
 pub mod credentials;
+pub mod rooms;
 
 pub use bridge::MatrixBridge;
 pub use config::{MatrixBridgeConfig, MatrixLoginConfig};

@@ -1,8 +1,8 @@
 # Session Messaging Primitive
 
-> **Status: Implemented**
+> **Status: Historical design.** As of 2026-09-27, `spawn_agent` submits a local durable Agent job and immediately returns a session DB handle; `job_status`/`job_wait` observe it. The synchronous completion flow below is historical, not the current tool contract. See [Agent jobs](../architecture/sessions.md#agent-jobs-and-worker-children).
 >
-> **Status update (2026-05-27):** the two "Future:" sections at the bottom have both shipped. Scheduled runs took a different shape than the one sketched here — agent-owned schedules run through `Server::fire_agent_schedule` on a standalone path that does **not** write a `Directive` entry into the session (the wake-prompt is invocation-scoped input, not a broadcast entry). See [Agent-Owned Schedules](./agent_schedules.md). Inter-agent communication shipped as mention-gated chat-room turns; see [Autonomous Agents in Shared Sessions](./autonomous_agents.md). The rest of the doc (entry types, server processing logic, `spawn_agent` flow, `OnceLock` wiring, `SpawnContext`, `RuntimeEventSink`) still matches the code.
+> **Status update (2026-05-27):** the two "Future:" sections at the bottom have both shipped. Scheduled runs took a different shape than the one sketched here — agent-owned schedules run through `Server::fire_agent_schedule` on a standalone path that does **not** write a `Directive` entry into the session (the wake-prompt is invocation-scoped input, not a broadcast entry). See [Agent-Owned Schedules](./agent_schedules.md). Inter-agent communication shipped as mention-gated chat-room turns; see [Autonomous Agents in Shared Sessions](./autonomous_agents.md). Request selection is durable reconciliation rather than a latest-entry check; see [Durable turn recovery](../architecture/sessions.md#durable-turn-recovery). The `spawn_agent` sequence and completion signal below are historical.
 
 ## Summary
 
@@ -16,7 +16,7 @@ Originally, `spawn_agent` called `runtime::execute` directly, bypassing the serv
 
 1. **Single invocation path**: All agent execution goes through `Server::process_session`
 2. **Rich entry types**: Sessions record not just chat messages but also directives, tool calls, and acknowledgments
-3. **Observable**: The full ReAct loop is visible in the session database for debugging and audit
+3. **Observable**: Completed ReAct model messages and tool results are durable in the session database for debugging and audit
 4. **Extensible**: New invocation sources (scheduler, inter-agent messages) use the same mechanism
 
 ## Entry Types
@@ -53,13 +53,18 @@ graph LR
 
 ## Server Processing Logic
 
-The server's `process_session` decides whether to act on an entry:
+The server reconciles durable requests rather than deciding from only the
+latest entry. A non-agent `Message` and a `Directive` are processable requests;
+agent-authored messages use the mention path described in [Autonomous Agents in
+Shared Sessions](./autonomous_agents.md). The executor selects the next queued
+request, records an attempt before model or tool work, and commits completion
+with its final entry. See [Durable turn recovery](../architecture/sessions.md#durable-turn-recovery).
 
 ```text
-match latest.entry_type {
-    Message  if sender is NOT a known agent  => spawn agent task
-    Directive                                 => spawn agent task
-    _                                         => ignore
+next request in session order {
+    non-agent Message => start an attempt, then spawn agent task
+    Directive         => start an attempt, then spawn agent task
+    completed or interrupted request => do not run automatically
 }
 ```
 
@@ -82,10 +87,10 @@ sequenceDiagram
     CS-->>SV: on_write callback
     SV->>CA: spawn agent task
     CA->>CS: write Ack
-    CA->>CS: write ToolCall / ToolResult (via event sink)
-    CA->>CS: write Message (response)
+    CA->>CS: commit model/tool transcript records and display entries
+    CA->>CS: commit terminal model record, Message, and completion
     CA-->>SA: completion_tx.send(())
-    SA->>CS: read latest entry
+    SA->>CS: read the completed request response
     SA-->>P: return response
 ```
 
@@ -107,9 +112,11 @@ Spawn-specific metadata is bundled in `SpawnContext`:
 - `parent_tools` — the parent's `ScopedTools` for transitive narrowing
 - `completion_tx` — signals the parent when the child finishes
 
-## RuntimeEventSink
+## Runtime persistence
 
-The runtime accepts an optional `mpsc::Sender<RuntimeEvent>`:
+Executor-backed turns use an awaited recorder rather than a concurrent best-effort event writer. A model response carrying tool calls commits before execution, and its full correlated result commits before the next model call. Display entries are projections of those successful commits and may truncate results; the structured transcript does not.
+
+Standalone scheduled turns keep a compatibility `mpsc::Sender<RuntimeEvent>` adapter because that path has no durable request attempt:
 
 ```text
 enum RuntimeEvent {
@@ -118,9 +125,7 @@ enum RuntimeEvent {
 }
 ```
 
-The server spawns an event writer task that consumes events and writes `ToolCall`/`ToolResult` entries to the session database. This runs concurrently with the ReAct loop.
-
-When `runtime::execute` returns, the event sender is dropped, the writer drains remaining events and exits.
+These scheduled audit writes remain outside the turn-attempt recovery protocol.
 
 ## Future: Scheduled Runs
 

@@ -17,7 +17,7 @@ agents:
       - ~/AGENTS.md # Tilde expands to $HOME
     system_prompt: |
       Stay terse on Matrix.
-    max_iterations: 10 # Max ReAct loop iterations before forced summary
+    max_iterations: 10 # Legacy name: max nested spawn depth. Tool calls are not capped.
     tools: null # null = all tools, or list specific tools
     # Worker templates this Agent can invoke via `spawn_worker(name=…)`.
     # Workers have no identity of their own; entries written during a
@@ -93,7 +93,7 @@ Each Agent DB contains the following well-known stores:
 | `meta`           | DocStore                     | `AgentMeta`: display_name, description, capabilities, avatar, agent-level `home_pubkey`             |
 | `history`        | `Table<SessionHistoryEntry>` | Sessions this agent has participated in (appended on attach)                                        |
 | `memory_banks`   | `Table<MemoryBankRef>`       | Refs to shared memory banks this agent has been granted access to (name, db_id, permission)         |
-| `schedules`      | `Table<Schedule>`            | Agent-owned cron/one-shot wakes — see [Schedules](#schedules) below                                 |
+| `schedules`      | `Table<Schedule>`            | Agent-owned cron, interval, and one-shot wakes — see [Schedules](#schedules) below                  |
 | `schedule_fires` | `Table<...>`                 | Per-fire records (cost, errors) for schedules — used by the standalone fire path for attribution    |
 | `skills`         | `Table<Skill>`               | Agent-local skills (prompt fragments) attached as private context                                   |
 | `skill_banks`    | `Table<SkillBankRef>`        | Refs to shared skill banks this agent has been granted access to                                    |
@@ -271,9 +271,9 @@ Revoked ed25519:PK_B... from agent 'alpha'. They retain read access to history b
 WARNING: revoked key was the home peer for 2 session(s): s_001, s_002. Their next turn will be silent until you run `/agent rehost alpha` from a surviving peer.
 ```
 
-### Cross-peer `spawn_agent`
+### Agent-job placement
 
-Works without special handling. The spawning peer is the one that calls `attach_agent_to_session` on the child session, so the per-session home defaults to that peer — and the spawning peer runs the child turn. If a co-owner later syncs the child session, their gate skips it.
+`spawn_agent` submits only to an Agent hosted on the local executor with the same Agent/home identity. It does not delegate to another peer or provide automatic failover. Same-login local clients with session DB access can submit and observe a job by its handle; client-role Chaz cannot admit or run one.
 
 ### Migrating pre-existing co-owned setups
 
@@ -315,19 +315,22 @@ pointer that silently re-routes turns.
 
 ## Schedules
 
-A schedule is a time-driven, **agent-owned** wake. It lives in the owning agent's DB `schedules` store (so it syncs and travels with the agent, exactly like its config), not in any session. The chaz `RoutineEngine` (one per peer) sleeps until the next due fire across every hosted agent's schedules, then runs the **standalone fire path**: it loads the owning agent, resolves the schedule's target, and runs that agent's turn directly. The schedule's `prompt` is invocation-scoped input for that turn — it is **not** written as a broadcast `Directive` entry, and there is no "resolve who responds" step (the schedule names its owner). A peer that doesn't host the owning agent silently skips, so multi-peer setups don't double-fire.
+A schedule belongs to an Agent and lives in that Agent's DB, not in a session. It syncs with the Agent's other state. Only the Agent's home daemon executes it: Fresh schedules use the Agent-level home, while Pinned schedules use that Agent's home for the target session. Other daemons may load the same synced row, but the home-peer check makes them skip it. There is no distributed lock or automatic failover; use `/agent rehost --agent` for Fresh schedules or `/agent rehost` in the pinned session when the home daemon changes.
 
-Each schedule has a **target**: `Pinned` (fire into a specific existing session) or `Fresh` (create a new session per fire — an autonomous recurring task). Two trigger shapes:
+The home daemon's `RoutineEngine` sleeps until a schedule is due, then runs the owning Agent directly. The schedule prompt is private input for that turn. It is not written as a broadcast `Directive`, and the normal "which Agent responds?" routing step does not run because the schedule already names its owner.
 
-- **Cron triggers** fire on a recurring schedule (`cron: "0 */5 * * * *"`). Each peer hosting the owning agent fires independently.
+Each schedule has a **target**: `Pinned` (fire into a specific existing session) or `Fresh` (create a new session per fire — an autonomous recurring task). Three trigger shapes:
+
+- **Cron triggers** fire on a calendar schedule (`cron: "0 */5 * * * *"`).
+- **Interval triggers** fire first after their period, then after the same fixed delay from each successful dispatch (`interval_seconds: 300`). The agent turn continues asynchronously, so overlapping turns remain possible. Zero and durations chrono cannot represent are rejected.
 - **One-shot triggers** fire once at an absolute `fire_at`, then the engine drops the schedule. These back the `schedule_once` tool described in [Tools](./tools.md).
 
-**Lifecycle bounds.** A cron schedule is infinite by default. Two optional bounds make finite recurring work expressible without inventing a new trigger type:
+**Lifecycle bounds.** Cron and interval schedules are infinite by default. Two optional bounds make finite recurring work expressible without inventing a new trigger type:
 
 - `max_fires` — retire after N fires. `cron` hourly + `max_fires: 8` = "wake hourly for 8 hours".
 - `expires_at` — an RFC 3339 instant after which it stops.
 
-Whichever is hit first retires the schedule: the fire path (the authoritative chokepoint, which holds the agent DB) persists `enabled = false` and the per-fire `fire_count`, so `max_fires` survives restarts and a retired schedule is **not** re-seeded on reload. A retired schedule is kept (disabled) rather than deleted so its history stays auditable — `schedule_list` shows the bounds and a `[fired N×]` counter. (Implementation note: the in-memory routine keeps its cron slot until the next reload/restart, but every post-bound tick early-returns at the fire path without running the agent — correctness is at the chokepoint, not the heap.)
+Whichever is hit first retires the schedule. The fire path writes `enabled = false` and `fire_count` to the Agent DB, so the count survives restarts and reloads do not revive a retired row. It reserves a `max_fires` slot before the turn starts; overlapping turns therefore cannot exceed the cap. A failed turn refunds its slot, so the count records successful fires rather than attempts. Retired schedules stay in the DB as disabled rows, and `schedule_list` shows their bounds and `[fired N×]` count.
 
 A schedule whose `Pinned` session is gone, or whose owning agent is no longer a member, self-skips at fire time (logged, not errored) — there is no detach/delete sweep.
 
@@ -337,27 +340,30 @@ Fire timing is sleep-until-next, capped at a 5-minute idle wake so a wall-clock 
 
 Routines are created two ways, both compiling to the same `Routine` rows fired by the one engine:
 
-- **Interactive** — the `/schedule add|remove|list` command and the `schedule_add|modify|remove|list` / `schedule_once` tools (this section and [Tools](./tools.md)). This is the only interactive surface; there is no separate `/schedule` command.
+- **Interactive** — `/schedule add|modify|remove|list` and the `schedule_add|modify|remove|list` / `schedule_once` tools (this section and [Tools](./tools.md)).
 - **Static config** — the `schedules:` block in the chaz config ([Configuration](./configuration.md)), translated into session-scoped routines at startup.
 
 ### When rules fire
 
 Firing is **server-side and independent of any UI**. A rule fires whenever chaz is running and the session is registered — you do _not_ need the session open or focused in the TUI, and for Matrix no one needs to be in the room. The agent turn runs on the server regardless; a bridge only affects when you _see_ the result. (Agent-owned schedules use the standalone fire path described above — no `Directive` entry is written, the schedule's `prompt` is passed as invocation-scoped input. Static-config session routines still write a `Directive` into their target session.)
 
-- **chaz must be running.** The engine is one per-process task, not a system cron. While chaz is down nothing fires, and a missed cron tick is skipped, not backfilled (`last_fired` just anchors the next fire after restart). A one-shot whose `fire_at` passed while down fires once on the next start.
+- **chaz must be running.** The engine is one per-process task, not a system cron. While chaz is down nothing fires. A missed cron tick is skipped; an interval resumes from its last successful-dispatch anchor, so if its period elapsed during downtime it fires immediately on restart. A one-shot whose `fire_at` passed while down fires once on the next start.
 - **The session must still be registered.** Closing/deregistering a session prunes its routines from the engine, so a closed session stops firing.
-- **The target agent must be hosted on this peer** — otherwise the handler silently skips (the multi-peer dedupe above).
+- **The home daemon must be running and host the Agent.** A non-home daemon skips the fire. Rehost the Agent or pinned session explicitly if ownership moves.
 - **Changes are live.** `/schedule add|remove`, `schedule_modify`, and `schedule_once` take effect on the running engine immediately — no restart needed.
 
 ### `/schedule` commands
 
-Cron uses 6 fields: `sec min hour day_of_month month day_of_week`.
+Cron uses 6 fields: `sec min hour day_of_month month day_of_week`. Intervals use whole seconds and are fixed-delay from successful dispatch; they do not wait for the asynchronous agent turn to finish.
 
-| Command                                                                       | What                                                                                                                        |
-| ----------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------- |
-| `/schedule list` (or bare `/schedule`)                                        | List rules on the current session. One-shot rules are rendered with an `@YYYY-MM-DD HH:MM:SSZ` marker in place of the cron. |
-| `/schedule add <id> <sec> <min> <hour> <dom> <mon> <dow> <agent_ref> <task…>` | Upsert a cron rule keyed by `<id>`. Task may contain `@mentions`.                                                           |
-| `/schedule remove <id>`                                                       | Remove a rule by id (cron or one-shot).                                                                                     |
+| Command                                                                       | What                                                                                                                               |
+| ----------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------- |
+| `/schedule list` (or bare `/schedule`)                                        | List rules on the current session. Interval rules render as `every 300s`; one-shots render with an `@YYYY-MM-DD HH:MM:SSZ` marker. |
+| `/schedule add <id> <sec> <min> <hour> <dom> <mon> <dow> <agent_ref> <task…>` | Add a cron rule. Duplicate IDs are rejected; use `modify` or remove the old rule first. Task may contain `@mentions`.              |
+| `/schedule add interval <id> <seconds> <agent_ref> <task…>`                   | Add a fixed-delay interval rule. Duplicate IDs are rejected.                                                                       |
+| `/schedule modify <id> cron <6 fields> [agent_ref]`                           | Replace a rule's trigger with a cron expression.                                                                                   |
+| `/schedule modify <id> interval <seconds> [agent_ref]`                        | Replace a rule's trigger with a fixed-delay interval.                                                                              |
+| `/schedule remove <id>`                                                       | Remove a rule by id.                                                                                                               |
 
 To create a one-shot rule from the TUI, agents call the `schedule_once` tool. There's no slash-command form yet.
 
@@ -367,14 +373,123 @@ Example — make `researcher` post a morning briefing to the current session wee
 /schedule add brief 0 0 9 * * Mon-Fri researcher Summarize overnight activity and surface anything urgent.
 ```
 
+Example — make `researcher` check the current session five minutes after each successful handler dispatch:
+
+```text
+/schedule add interval check-in 300 researcher Check for updates and report only actionable changes.
+```
+
+### Walkthrough: interval wake, failure, and recovery
+
+This example uses a 60-second Fresh interval owned by `watcher`, capped at
+three successful fires. It starts with the `schedule_add` tool.
+
+1. **Happy path — create and first fire.** The agent calls `schedule_add`:
+
+   ```json
+   {
+     "id": "watcher",
+     "interval_seconds": 60,
+     "target": "fresh",
+     "max_fires": 3,
+     "task": "Check the deploy queue and report only actionable changes"
+   }
+   ```
+
+   Tool result:
+
+   ```text
+   Added schedule 'watcher' on agent 'watcher': every 60s → fresh session (max 3 fires) — Check the deploy queue and report only actionable changes
+   ```
+
+   Sixty seconds later the engine fires: a Fresh session is created, the
+   owner's turn runs with the prompt as invocation-scoped input, and the
+   listing advances:
+
+   ```text
+   Schedules on 'watcher':
+   - **watcher** [every 60s] (max 3 fires) [fired 1×] → fresh — Check the deploy queue and report only actionable changes
+   ```
+
+2. **Failure and retry.** If the backend is unavailable, the failed turn is
+   recorded without usage metadata. Its `max_fires` slot is refunded, so the
+   count stays at one and the interval tries again after the next period:
+
+   ```text
+   Schedules on 'watcher':
+   - **watcher** [every 60s] (max 3 fires) [fired 1×] → fresh — Check the deploy queue and report only actionable changes
+   ```
+
+   A prompt or target edit can also invalidate a detached fire before its
+   turn starts. In that case chaz closes the newly created Fresh session and
+   runs the edited schedule on its next due fire.
+
+3. **Retirement and recovery — the cap is reached.** Fires 2 and 3
+   succeed. The third admission spends the last slot, so the row retires
+   on the spot (`Schedule retired after fire (reached max_fires (3))` in
+   the server log):
+
+   ```text
+   Schedules on 'watcher':
+   - **watcher** [every 60s] (disabled) (max 3 fires) [fired 3×] → fresh — Check the deploy queue and report only actionable changes
+   ```
+
+   The retired row is kept for audit, not deleted. To put the watcher
+   back on duty with a fresh budget, raise the bound and re-enable it —
+   changes take effect on the running engine immediately:
+
+   ```json
+   { "id": "watcher", "max_fires": 6, "enabled": true }
+   ```
+
+   ```text
+   Modified schedule 'watcher' on 'watcher': enabled=true max_fires=6
+   ```
+
+4. **Disable or remove it.** Disable a schedule without deleting its row,
+   or remove it completely:
+
+   ```json
+   { "id": "watcher", "enabled": false }
+   ```
+
+   ```text
+   Modified schedule 'watcher' on 'watcher': enabled=false
+   ```
+
+   ```json
+   { "id": "watcher" }
+   ```
+
+   The second call uses `schedule_remove` and returns:
+
+   ```text
+   Removed schedule 'watcher' from agent 'watcher'
+   ```
+
+To retire at a time instead of a count, pass an RFC 3339 timestamp such as
+`"expires_at": "2026-06-01T09:00:00Z"`. You may set both bounds; the first
+one reached wins. `schedule_list` is the show surface: there is no separate
+`schedule_show` tool or `/schedule show` command.
+
+The slash command can replace a trigger without changing the prompt or target:
+
+```text
+/schedule modify check-in interval 600 researcher
+```
+
+It cannot edit bounds, targets, prompts, or enabled state. Use
+`schedule_modify` for those fields. Slash-command schedules are always Pinned;
+use the tool when you need a Fresh target.
+
 ## Tool Narrowing
 
 Tool access is controlled at two levels:
 
 1. **Agent / Worker definition**: the `tools:` field restricts which tools an Agent (or a Worker template under it) can see. Supports exact names and glob patterns (`"filesystem__*"` matches all tools from that MCP server namespace — the `__` separator matches the namespacing chaz uses for discovered MCP tools). `tools: null` (or omitted) means "inherit from parent" on a Worker; on an Agent it means "all tools".
-2. **Transitive narrowing**: When an Agent spawns a child — a peer Agent (`spawn_agent`) or a Worker (`spawn_worker`) — the child's resolved tools are the _intersection_ of the parent's tools and the child's `tools:` list.
+2. **Transitive narrowing**: An Agent job pins the parent's effective tool/grant ceiling at admission and intersects it with the target Agent's scope at execution. `spawn_worker` keeps its own synchronous Worker-template scoping.
 
-A child can never have more tools than its parent, even if its definition allows them.
+A child cannot widen its parent's tool authority. Agent jobs exclude `spawn_worker` from their inherited tools.
 
 ## Spawn Permissions
 
@@ -383,7 +498,21 @@ Worker scoping replaces the previous cross-Agent `can_spawn` permission system:
 - A Worker is invocable iff it's declared under the calling Agent's `workers:` list. There is no global Worker registry.
 - A peer Agent is invocable via `spawn_agent` iff it's hosted on the local peer's agent index. There is no `allowed_callers` gate any more.
 
-Spawn depth is bounded by the call-depth cap (a hard recursion limit). The top-level Agent's `max_iterations` seeds a shared iteration budget — a single atomic counter that descends through `spawn_worker` invocations. Each ReAct turn in the Agent or in any nested Worker consumes one unit; when the pool reaches zero, force-summary kicks in at whichever level drained it. Worker `max_iterations` overrides are ignored once a parent budget is in scope: nested Workers share, they don't reset. Delegating to a peer Agent via `spawn_agent` is the opposite — that target gets its own freshly-seeded budget because it's running on its own identity.
+Spawn depth is bounded by the call-depth cap (a hard recursion limit). The field that sets it is still named `max_iterations` (default 10): an Agent's value is the depth ceiling for its sessions, and a Worker's resolved `max_iterations` (template → preset → inline override) is the ceiling for that Worker's child session. `spawn_agent` targets are further limited by the lower of the caller's and target's ceilings. None of these values limit how many tool calls a turn makes; see [How a turn ends](#how-a-turn-ends).
+
+## How a turn ends
+
+A turn keeps calling tools for as long as the model asks for them, the same way Pi's agent loop does. Every model request in the turn offers the Agent's tools, and the turn ends only when:
+
+- the model returns a response with no native tool calls — that response is the reply;
+- a model request fails after the backend's bounded retries (`max_retries`) — the turn fails with that error, and nothing is retried without tools;
+- the executor stops (shutdown or crash) — the turn is interrupted and shows up in `/interrupted` for an explicit `/retry`.
+
+There is no iteration cap, no "you are stuck in a loop" prompt, and no forced no-tools summary. Those fallbacks made models that still wanted a tool print their tool call as plain text instead of calling it. Repeated identical calls simply run again and return their own results.
+
+What still bounds a turn is per call, not per turn: tool approval (`Deny` and approval timeouts come back to the model as tool results), per-tool `rate_limit`, per-tool timeouts, grants, and the spawn-depth ceiling above. Tool errors are also returned to the model as results, so it can recover or stop. To limit a noisy tool, set a `rate_limit` or require approval for it; see [Tool Rate Limiting](security.md#tool-rate-limiting) and [Tool Approval](security.md#tool-approval).
+
+`max_iterations` remains accepted in YAML, `/agent set`, presets, and `spawn_worker` for compatibility, but only as the spawn-depth ceiling.
 
 ## Presets
 
@@ -398,34 +527,31 @@ presets:
     role_suffix: "Be thorough and explore multiple angles."
 ```
 
-The calling agent can request a preset via the `spawn_agent` tool:
+Presets are available to Worker templates; `spawn_agent` does not accept a per-call preset or model override.
+
+## Agent jobs: submit and observe
+
+`spawn_agent` creates a child session DB with one Directive, then returns its ID after catalog publication. The executor validates and accepts that same DB later. It accepts a locally hosted `agent_ref` (display name or DB ID), `task`, and optional `context`; the legacy `agent` name is also accepted. It does not accept `async`, preset, model, workspace, narrow, or private options. Broad local scope is required; this is not an OS sandbox. Same-login clients are trusted, not isolated from one another.
 
 ```json
-{ "agent": "researcher", "task": "...", "preset": "deep" }
+{
+  "agent_ref": "researcher",
+  "task": "Find the canonical reference",
+  "context": "Check the latest revision"
+}
 ```
 
-## Synchronous vs Asynchronous Spawn
+The result is `{"session_db_id":"<child DB ID>","state":"pending"}`. Keep that handle. `job_status({"session_db_id":"<child DB ID>"})` reads the state; `job_wait({"session_db_id":"<child DB ID>","timeout_seconds":30})` waits up to 30 seconds, then returns the current state without canceling the job (1–240 seconds; default 30). The status is typed: `Pending` before executor acceptance, `Rejected { message }` on refusal, `Queued`, `Running { attempt_id }`, `StartedUnknown { attempt_id, activity_recent }` for a client that cannot tell whether a start is still active, `Interrupted { attempt_id }` for an executor observing an abandoned attempt, `Succeeded { text }`, or `Failed { message }`. A failed job is not a successful answer. Check the state rather than treating a wait timeout as completion.
 
-By default, `spawn_agent` waits for the child agent to complete and returns the result. With `"async": true`, it returns immediately and the child runs in the background:
+A queued job can be adopted after executor restart. An attempt that started but has no completion is **not** automatically replayed: model or tool effects may already have happened. Inspect its status and transcript, open the child session, and use `/interrupted` to find the request ID before deciding whether `/retry <request_id>` is safe; do not submit a new task to guess whether the old one ran. If creation or publication returns an uncertain outcome, inspect the session catalog for the published job before submitting again. There is no stable parent request key or automatic submission retry; an unpublished prepared DB is inert and may require manual inspection. Same-Agent/home last-writer-wins claims are not fencing: concurrent executors can overlap and effects are not exactly-once.
 
-```json
-{ "agent": "researcher", "task": "...", "async": true }
-```
+For example:
 
-Async spawns return the child session ID, which can be found via `/sessions` in the TUI.
+1. Submit `{"agent_ref":"researcher","task":"Find the canonical reference"}`. The response is `{"session_db_id":"<child DB ID>","state":"pending"}`, not the research answer.
+2. Call `job_wait` with `{"session_db_id":"<child DB ID>","timeout_seconds":1}`. If capacity is full, it can return `{"session_db_id":"<child DB ID>","state":"Queued"}`. Keep the handle and check again; the timeout did not cancel the job.
+3. If an executor stops after starting, a client may instead see `{"session_db_id":"<child DB ID>","state":{"StartedUnknown":{"attempt_id":"<attempt ID>","activity_recent":false}}}`. Check the child session's `/interrupted` and transcript before an explicit retry. Do not treat a stale start as a failed result.
 
-## How Spawn Works Internally
-
-When an agent calls `spawn_agent`:
-
-1. A new session database is created via the server's `register_child_session`.
-2. A `Directive` entry is written to the child session.
-3. The server's `on_write` callback detects the directive and spawns an agent task.
-4. The agent runs the ReAct loop, writing Ack, ToolCall, ToolResult, and response entries.
-5. A completion signal notifies the parent (for synchronous spawns).
-6. The parent reads the response from the child session.
-
-This routes through the same server processing path as user messages, unifying all agent invocation.
+`spawn_worker` is separate: it invokes a Worker template under the calling Agent and waits by default. Its optional `async` mode is not a durable Agent job; Workers have no Agent identity or Agent-job status handle.
 
 ## Lifecycle Overview
 
@@ -513,51 +639,13 @@ Unmentioned messages fall through: host agent → first attached → default.
 
 ### 5. Delegate via `spawn_agent` or `spawn_worker`
 
-Two delegation paths from inside an Agent's ReAct loop:
-
-- `spawn_agent` — invoke a peer Agent (with its own keys and persistent memory). The target must be hosted on this peer.
-- `spawn_worker` — invoke a Worker template declared under the calling Agent's `workers:` list. No identity, no keys; entries are signed by the parent Agent.
-
-Worker invocation (most common case for delegated work):
+For a locally hosted Agent with its own keys and persistent memory, submit a job:
 
 ```json
-{
-  "name": "researcher",
-  "task": "find the canonical reference",
-  "preset": "deep"
-}
+{ "agent_ref": "researcher", "task": "Find the canonical reference" }
 ```
 
-Peer-Agent invocation:
-
-```json
-{
-  "agent": "chaz",
-  "task": "context-check this rewrite",
-  "preset": "deep"
-}
-```
-
-The parent blocks on completion (sync) or gets a child session ID back (`async: true`) and continues.
-
-```mermaid
-sequenceDiagram
-    participant U as User
-    participant S as Session DB
-    participant C as coder (ReAct)
-    participant CS as Child session DB
-    participant R as researcher (ReAct)
-
-    U->>S: Message "@coder …"
-    S-->>C: on_write → dispatch
-    C->>C: spawn_agent(researcher, task)
-    C->>CS: register_child_session + Directive
-    CS-->>R: on_write → dispatch
-    R->>CS: Ack → ToolCall/ToolResult… → response
-    CS-->>C: completion signal
-    C->>S: final response
-    S-->>U: rendered reply
-```
+The immediate response contains `session_db_id`, not the answer. Observe it with `job_status` or `job_wait` as described in [Agent jobs: submit and observe](#agent-jobs-submit-and-observe). For a one-shot Worker-template call declared under this Agent's `workers:` list, use `spawn_worker` instead; it waits by default and Workers have no separate Agent identity.
 
 ### 6. Schedules
 

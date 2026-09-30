@@ -33,7 +33,7 @@ mod sharing;
 
 pub use extensions::{ExtensionsAction, split_ext_scope};
 pub use parse::{Parsed, parse};
-pub use session::{load_single_session_info, sort_session_infos};
+pub use session::{collect_session_infos, load_session_metadata, sort_session_infos};
 
 /// User-visible permission level for co-ownership grants on an Agent DB.
 /// Stays separate from eidetica's `Permission` so the CLI grammar is
@@ -102,6 +102,11 @@ pub enum Command {
     Print,
     /// Aggregate LLM usage and cost across all sessions.
     ListCosts,
+    /// Show interrupted turns in the current session. These are never replayed
+    /// automatically because a model or tool effect may already have happened.
+    Interrupted,
+    /// Explicitly start a new attempt for an interrupted request.
+    RetryInterrupted(String),
 
     // --- Matrix channel management ---
     /// List Matrix rooms currently attached to the current session.
@@ -273,6 +278,8 @@ pub const BUILTIN_COMMAND_NAMES: &[&str] = &[
     "schedules",
     "info",
     "costs",
+    "interrupted",
+    "retry",
     "print",
     "backends",
     "new",
@@ -293,53 +300,33 @@ pub const BUILTIN_COMMAND_NAMES: &[&str] = &[
     "switch",
 ];
 
-/// Data about a session, used to render a picker (TUI) or a listing (Matrix).
+/// Metadata about a session, used to render a picker or command listing.
+#[derive(Debug, Clone)]
 pub struct SessionInfo {
     pub session_db_id: String,
     pub agent_name: Option<String>,
     pub name: Option<String>,
-    pub entry_count: usize,
-    pub last_message: Option<String>,
     /// Normalized bridge-of-origin from the session catalog.
     pub bridge: crate::session::BridgeKind,
     /// Catalog creation timestamp. `None` for sessions that predate the
     /// catalog (legacy rows in the routing index).
     pub created_at: Option<chrono::DateTime<chrono::Utc>>,
     pub status: crate::session::SessionStatus,
-    /// Sum of `cost_usd` across every assistant entry with `ResponseMetadata`.
-    /// `cost_reported` distinguishes "$0.00 because no calls had cost data"
-    /// from "$0.00 because every call was free".
-    pub total_cost_usd: f64,
-    pub cost_reported: bool,
-    /// Number of assistant messages with recorded metadata. Useful for
-    /// distinguishing "no LLM activity" from "LLM activity but uncosted".
-    pub llm_call_count: u32,
-    /// `false` for a placeholder row emitted before its session DB has been
-    /// opened — the async picker fill shows these with `…` markers and
-    /// patches them to `true` once `load_single_session_info` completes.
-    /// The synchronous `list_sessions` path always produces `true` rows.
+    /// `false` while mutable per-session metadata is still loading.
     pub loaded: bool,
 }
 
 impl SessionInfo {
-    /// A not-yet-loaded row carrying only the cheap catalog metadata (id,
-    /// bridge, created_at, status). The DB-derived fields (entry_count,
-    /// name, agent, last_message, cost) are left blank and `loaded` is
-    /// `false` so the bridge can render `…` placeholders and patch the row
-    /// in place when the async fill emits the real `SessionInfo`.
+    /// A row carrying catalog and peer-local name-index metadata. Agent data
+    /// remains unloaded until a frontend asks for that row.
     pub fn placeholder(index: &crate::session::SessionIndex) -> Self {
         SessionInfo {
             session_db_id: index.session_db_id.clone(),
             agent_name: None,
-            name: None,
-            entry_count: 0,
-            last_message: None,
+            name: index.name.clone(),
             bridge: index.bridge,
             created_at: index.created_at,
             status: index.status,
-            total_cost_usd: 0.0,
-            cost_reported: false,
-            llm_call_count: 0,
             loaded: false,
         }
     }
@@ -374,6 +361,21 @@ pub enum CommandOutcome {
 }
 
 pub async fn dispatch(cmd: Command, ctx: &CommandContext<'_>) -> CommandOutcome {
+    if (service_owner_only(&cmd) || extension_service_owner_only(&cmd))
+        && ctx
+            .server
+            .registry()
+            .instance()
+            .remote_connection()
+            .is_some()
+    {
+        return CommandOutcome::Error(owner_redirect(&cmd));
+    }
+    if command_needs_complete_hosted_indices(&cmd)
+        && let Err(e) = ctx.server.ensure_hosted_indices_complete().await
+    {
+        return CommandOutcome::Error(format!("Failed to load hosted entities: {e}"));
+    }
     match cmd {
         Command::ListSessions => session::list_sessions(ctx).await,
         Command::NewSession(group) => session::new_session(group.as_deref(), ctx).await,
@@ -381,6 +383,8 @@ pub async fn dispatch(cmd: Command, ctx: &CommandContext<'_>) -> CommandOutcome 
         Command::SwitchSession(id) => session::switch_session(&id, ctx).await,
         Command::Info => session::info(ctx).await,
         Command::ListCosts => session::list_costs(ctx).await,
+        Command::Interrupted => session::interrupted(ctx).await,
+        Command::RetryInterrupted(request) => session::retry_interrupted(&request, ctx).await,
         Command::NameSession(name) => session::name_session(&name, ctx).await,
         Command::ClearSessionName => session::clear_session_name(ctx).await,
         Command::Share => session::share(ctx).await,
@@ -442,6 +446,90 @@ pub async fn dispatch(cmd: Command, ctx: &CommandContext<'_>) -> CommandOutcome 
     }
 }
 
+fn command_needs_complete_hosted_indices(command: &Command) -> bool {
+    match command {
+        Command::AgentHosted
+        | Command::AgentHomeStatus(None)
+        | Command::SharingRequests
+        | Command::SharingStatus => true,
+        Command::Extension { name, .. } => matches!(name.as_str(), "memory" | "skills"),
+        _ => false,
+    }
+}
+
+/// Commands whose result is independent of the current session. Frontends may
+/// dispatch these before resolving a session, avoiding an otherwise unused
+/// create/attach cycle.
+pub fn is_session_independent(command: &Command) -> bool {
+    matches!(command, Command::ListSessions | Command::Quit)
+}
+
+fn service_owner_only(command: &Command) -> bool {
+    matches!(
+        command,
+        Command::Share
+            | Command::Sync(_)
+            | Command::AgentShare(_)
+            | Command::AgentImport { .. }
+            | Command::SharingRequests
+            | Command::SharingApprove(_)
+            | Command::SharingReject(_)
+            | Command::SharingStatus
+    )
+}
+
+fn extension_service_owner_only(command: &Command) -> bool {
+    let Command::Extension { name, args } = command else {
+        return false;
+    };
+    if !matches!(name.as_str(), "memory" | "skills") {
+        return false;
+    }
+    let mut words = args.split_whitespace();
+    match words.next() {
+        Some("share" | "unshare" | "import") => true,
+        Some("attach") => words
+            .next()
+            .is_some_and(|arg| arg.parse::<eidetica::sync::DatabaseTicket>().is_ok()),
+        _ => false,
+    }
+}
+
+fn owner_redirect(command: &Command) -> String {
+    let action = match command {
+        Command::Share => "create the session ticket",
+        Command::Sync(_) => "bootstrap the session ticket",
+        Command::AgentShare(_) => "create the agent ticket",
+        Command::AgentImport { .. } => "bootstrap the agent ticket",
+        Command::SharingRequests => "inspect bootstrap requests",
+        Command::SharingApprove(_) => "approve the bootstrap request",
+        Command::SharingReject(_) => "reject the bootstrap request",
+        Command::SharingStatus => "inspect daemon sync state",
+        Command::Extension { name, args } => match args.split_whitespace().next() {
+            Some("share") => {
+                return format!(
+                    "This command controls daemon-owned Eidetica sync. Run it on the Eidetica owner to create the {name} bank ticket; this service client made no changes."
+                );
+            }
+            Some("unshare") => {
+                return format!(
+                    "This command controls daemon-owned Eidetica sync. Run it on the Eidetica owner to disable {name} bank sync; this service client made no changes."
+                );
+            }
+            Some("import" | "attach") => {
+                return format!(
+                    "This command controls daemon-owned Eidetica sync. Run it on the Eidetica owner to bootstrap the {name} bank ticket; this service client made no changes."
+                );
+            }
+            _ => unreachable!("redirect called for service-capable extension command"),
+        },
+        _ => unreachable!("redirect called for service-capable command"),
+    };
+    format!(
+        "This command controls daemon-owned Eidetica sync. Run it on the Eidetica owner to {action}; this service client made no changes."
+    )
+}
+
 async fn dispatch_extension(name: &str, args: &str, ctx: &CommandContext<'_>) -> CommandOutcome {
     use crate::extension::{ExtensionCommandOutcome, HookContext};
     use crate::session::Session;
@@ -485,5 +573,72 @@ async fn dispatch_extension(name: &str, args: &str, ctx: &CommandContext<'_>) ->
         Some(ExtensionCommandOutcome::Text(s)) => CommandOutcome::Text(s),
         Some(ExtensionCommandOutcome::Error(s)) => CommandOutcome::Error(s),
         None => CommandOutcome::Error(format!("Unknown command: /{name}")),
+    }
+}
+
+#[cfg(test)]
+mod capability_tests {
+    use super::*;
+
+    #[test]
+    fn service_owner_commands_are_classified_before_dispatch() {
+        for command in [
+            Command::Share,
+            Command::Sync("ticket".into()),
+            Command::AgentShare("chaz".into()),
+            Command::AgentImport {
+                ticket: "ticket".into(),
+                permission: CoOwnerPermission::Write,
+            },
+            Command::SharingRequests,
+            Command::SharingApprove("request".into()),
+            Command::SharingReject("request".into()),
+            Command::SharingStatus,
+        ] {
+            assert!(service_owner_only(&command));
+            let message = owner_redirect(&command);
+            assert!(message.contains("Eidetica owner"));
+            assert!(message.contains("made no changes"));
+        }
+        assert!(!service_owner_only(&Command::ListSessions));
+        assert!(!service_owner_only(&Command::SessionUnshare));
+        assert!(!service_owner_only(&Command::AgentInvite {
+            agent_ref: "chaz".into(),
+            pubkey: "key".into(),
+            permission: CoOwnerPermission::Write,
+        }));
+        for command in [
+            Command::Extension {
+                name: "memory".into(),
+                args: "share bank".into(),
+            },
+            Command::Extension {
+                name: "memory".into(),
+                args: "unshare bank".into(),
+            },
+            Command::Extension {
+                name: "memory".into(),
+                args: "import not-a-ticket".into(),
+            },
+            Command::Extension {
+                name: "skills".into(),
+                args: "share bank".into(),
+            },
+            Command::Extension {
+                name: "skills".into(),
+                args: "unshare bank".into(),
+            },
+            Command::Extension {
+                name: "skills".into(),
+                args: "import not-a-ticket".into(),
+            },
+        ] {
+            assert!(extension_service_owner_only(&command));
+            assert!(owner_redirect(&command).contains("made no changes"));
+        }
+        assert!(!extension_service_owner_only(&Command::Extension {
+            name: "memory".into(),
+            args: "attach existing-bank".into(),
+        }));
     }
 }

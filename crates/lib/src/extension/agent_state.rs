@@ -1,7 +1,5 @@
-//! Scoped `AgentStateAdmin` implementation — the hub's factory for
-//! building per-extension agent-state handles from the raw infra handles
-//! (`HostedIndex` + `SessionRegistry`) narrowed to the operator's
-//! configured agent allowlist.
+//! Scoped `AgentStateAdmin` access built from an extension's
+//! `agent_state_allowlist` entry.
 //!
 //! This is a **guardrail, not a sandbox** — the scope check is a
 //! defensive check against poorly behaved tools, not a security boundary
@@ -16,11 +14,10 @@ use crate::hosted_index::{DbEntry, HostedIndex};
 use crate::session::SessionRegistry;
 
 /// An `AgentStateAdmin` whose `resolve_agent` and `open_agent_db` reject
-/// agents outside an operator-configured allowlist.
+/// agents outside its configured allowlist.
 ///
-/// The hub constructs one per extension that declares `AgentStateAdmin`
-/// in its manifest, scoped to the set of agent names the operator allows
-/// for that extension in `tool_policy`.
+/// Extensions construct this during instantiation from
+/// `PeerHandles.agent_state_allowlist`.
 pub struct ScopedAgentStateAdmin {
     registry: Arc<SessionRegistry>,
     index: HostedIndex,
@@ -31,11 +28,8 @@ pub struct ScopedAgentStateAdmin {
 }
 
 impl ScopedAgentStateAdmin {
-    /// Build a scoped handle for the given agent allowlist. When
-    /// `allowlist` is `None`, all hosted agents are visible (the
-    /// operator hasn't applied a narrowing yet). When `allowlist` is
-    /// `Some(empty)`, every operation returns `Err` — the cap was
-    /// effectively denied.
+    /// Build a scoped handle. No entry allows all hosted agents; an
+    /// empty entry allows none.
     pub fn new(
         registry: Arc<SessionRegistry>,
         index: HostedIndex,
@@ -49,9 +43,7 @@ impl ScopedAgentStateAdmin {
         }
     }
 
-    /// `true` when `allowlist` was `None` — the operator didn't apply
-    /// any agent-level scoping. Useful for diagnostics
-    /// (`/extensions list -v`).
+    /// Returns whether the operator left this extension unrestricted.
     #[allow(dead_code)]
     pub fn is_unrestricted(&self) -> bool {
         self.allowed.is_none()
@@ -59,14 +51,9 @@ impl ScopedAgentStateAdmin {
 
     /// `true` when `display_name` is within this handle's scope.
     ///
-    /// Scope denial is deliberately **not** distinguished from
-    /// non-existence at this boundary: a scoped-out agent looks exactly
-    /// like an unknown agent (same not-found error in callers). That
-    /// collapses the old "two errors for one concept" wart (Gap 3) and
-    /// avoids leaking the existence of out-of-scope agents to extension
-    /// tools. The operator-facing diagnostic for an empty (deny-all)
-    /// allowlist is emitted once at startup in
-    /// `ExtensionHub::build_agent_state_admin`, not here.
+    /// A scoped-out agent looks like an unknown agent. This avoids
+    /// exposing agents outside the extension's scope. An empty list is
+    /// reported at startup by [`deny_all_warning`].
     fn in_scope(&self, display_name: &str) -> bool {
         match &self.allowed {
             None => true,                            // unrestricted
@@ -75,11 +62,26 @@ impl ScopedAgentStateAdmin {
     }
 }
 
-/// The uniform "no such agent" error — identical whether the agent
-/// truly doesn't exist or is merely scoped out. Mirrors the wording
-/// `/agent` uses for an unresolved ref.
+/// Report missing and out-of-scope agents the same way.
 fn not_found(name: &str) -> String {
     format!("No hosted agent matches '{name}'")
+}
+
+/// Returns a startup warning for an empty agent allowlist.
+///
+/// Empty lists make every lookup look like a missing agent, so the
+/// extension logs this warning when it starts. Missing and non-empty
+/// entries need no warning.
+pub fn deny_all_warning(extension: &str, allowlist: Option<&[String]>) -> Option<String> {
+    if matches!(allowlist, Some(list) if list.is_empty()) {
+        Some(format!(
+            "extension '{extension}' has an empty `agent_state_allowlist.{extension}` list; \
+             it cannot access any agent state. Remove the list to allow all agents, or \
+             add the agents it should access"
+        ))
+    } else {
+        None
+    }
 }
 
 impl AgentStateAdmin for ScopedAgentStateAdmin {
@@ -98,8 +100,7 @@ impl AgentStateAdmin for ScopedAgentStateAdmin {
             return Err(not_found(name));
         };
 
-        // Scope check: a scoped-out agent is reported as not-found,
-        // identical to a genuinely missing one (see `in_scope`).
+        // Do not reveal agents outside the extension's scope.
         if !self.in_scope(&entry.display_name) {
             return Err(not_found(name));
         }
@@ -108,9 +109,7 @@ impl AgentStateAdmin for ScopedAgentStateAdmin {
 
     fn open_agent_db<'a>(&'a self, entry: &'a DbEntry) -> CapFuture<'a, AgentDb> {
         Box::pin(async move {
-            // Defense in depth — the entry should have come through
-            // `resolve_agent`, but verify the scope anyway. Same
-            // not-found masking as the resolve path.
+            // Callers should resolve first, but keep the scope check here too.
             if !self.in_scope(&entry.display_name) {
                 return Err(anyhow::anyhow!(not_found(&entry.display_name)));
             }
@@ -256,5 +255,24 @@ mod tests {
         // diagnostic is the startup warn, not this error.
         let err = scope.resolve_agent("alpha").unwrap_err();
         assert_eq!(err, "No hosted agent matches 'alpha'");
+    }
+
+    #[test]
+    fn deny_all_warning_names_extension_and_config_key() {
+        let msg = deny_all_warning("schedule", Some(&[])).unwrap();
+        assert!(msg.contains("'schedule'"), "extension not named: {msg}");
+        assert!(
+            msg.contains("agent_state_allowlist.schedule"),
+            "config key not named: {msg}"
+        );
+    }
+
+    #[test]
+    fn deny_all_warning_silent_for_healthy_shapes() {
+        // Unrestricted — the common case, must stay silent.
+        assert!(deny_all_warning("schedule", None).is_none());
+        // A real (non-empty) list — scoped, not broken.
+        let scoped: Vec<String> = vec!["alpha".into()];
+        assert!(deny_all_warning("schedule", Some(&scoped)).is_none());
     }
 }

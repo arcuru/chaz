@@ -3,29 +3,30 @@
 //!
 //! The routine engine fires agent-owned schedules and dispatches them to
 //! this extension's routine handler. Unlike the legacy session-routine path, which
-//! write a Directive entry and let `process_session` handle the turn,
+//! writes a Directive entry and lets `process_session` handle the turn,
 //! agent schedules use a **standalone execution path**: load the agent,
 //! build context, run the ReAct loop directly via
 //! [`crate::runtime::execute`], write results, and attribute cost to
 //! the agent's `schedule_fires` store.
 //!
-//! The handler spawns a `tokio` task for the actual agent turn so the
-//! engine's fire loop isn't blocked on LLM latency.
+//! The handler acknowledges dispatch after spawning a `tokio` task, so the
+//! engine's fire loop isn't blocked on LLM latency. Recurrence is therefore
+//! anchored after successful handler completion (dispatch), not agent-turn
+//! completion.
 
 use crate::extension::handler::{HandlerFuture, RoutineHandler};
 use crate::extension::instance::{ExtensionInstance, InstantiateFuture, ScopeCtx};
 use crate::extension::manifest::ExtensionManifest;
 use crate::extension::{Extension, ExtensionRef, HookKind};
-use crate::server::Server;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 pub struct AgentScheduleExtension {
-    server_cell: Arc<OnceLock<Arc<Server>>>,
+    server_slot: crate::instance::ServerSlot,
 }
 
 impl AgentScheduleExtension {
-    pub fn new(server_cell: Arc<OnceLock<Arc<Server>>>) -> Self {
-        Self { server_cell }
+    pub fn new(server_slot: crate::instance::ServerSlot) -> Self {
+        Self { server_slot }
     }
 }
 
@@ -51,11 +52,11 @@ impl Extension for AgentScheduleExtension {
 
     fn instantiate<'a>(&'a self, _scope_ctx: ScopeCtx<'a>) -> InstantiateFuture<'a> {
         let manifest = self.manifest();
-        let server_cell = self.server_cell.clone();
+        let server_slot = self.server_slot.clone();
         Box::pin(async move {
             Ok(Arc::new(AgentScheduleInstance {
                 manifest,
-                server_cell,
+                server_slot,
             }) as Arc<dyn ExtensionInstance>)
         })
     }
@@ -63,7 +64,7 @@ impl Extension for AgentScheduleExtension {
 
 struct AgentScheduleInstance {
     manifest: ExtensionManifest,
-    server_cell: Arc<OnceLock<Arc<Server>>>,
+    server_slot: crate::instance::ServerSlot,
 }
 
 impl ExtensionInstance for AgentScheduleInstance {
@@ -73,13 +74,13 @@ impl ExtensionInstance for AgentScheduleInstance {
 
     fn routine_handler(&self) -> Option<Arc<dyn RoutineHandler>> {
         Some(Arc::new(AgentScheduleRoutineHandler {
-            server_cell: self.server_cell.clone(),
+            server_slot: self.server_slot.clone(),
         }))
     }
 }
 
 struct AgentScheduleRoutineHandler {
-    server_cell: Arc<OnceLock<Arc<Server>>>,
+    server_slot: crate::instance::ServerSlot,
 }
 
 impl RoutineHandler for AgentScheduleRoutineHandler {
@@ -89,17 +90,17 @@ impl RoutineHandler for AgentScheduleRoutineHandler {
                 .map_err(|e| anyhow::anyhow!("invalid agent_schedule payload: {e}"))?;
 
             let server = self
-                .server_cell
+                .server_slot
                 .get()
-                .ok_or_else(|| anyhow::anyhow!("agent_schedule fired before server initialized"))?
-                .clone();
+                .ok_or_else(|| anyhow::anyhow!("agent_schedule fired before server initialized"))?;
 
             // Spawn the actual agent turn — don't block the engine's fire loop.
-            tokio::spawn(async move {
-                if let Err(e) = server.fire_agent_schedule(payload).await {
+            let task_server = server.clone();
+            server.track_task(tokio::spawn(async move {
+                if let Err(e) = task_server.fire_agent_schedule(payload).await {
                     tracing::error!(error = %e, "agent_schedule fire failed");
                 }
-            });
+            }));
 
             Ok(())
         })

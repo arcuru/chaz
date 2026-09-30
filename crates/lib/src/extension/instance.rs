@@ -81,12 +81,9 @@ pub struct PeerHandles {
     pub skill_bank_index: crate::hosted_index::HostedIndex,
     pub embedder: Option<Arc<dyn crate::embedding::Embedder>>,
     pub secrets: Option<Arc<crate::security::SecretStore>>,
-    /// Server cell — set by main.rs after `Server::new`. Empty until
-    /// then. Instances that need a back-reference to the running server
-    /// (today: the schedule and agent_schedule extensions, which spawn
-    /// sessions / fire agent turns) close over the `Arc<OnceLock>` and
-    /// dereference at fire time.
-    pub server_cell: Arc<std::sync::OnceLock<Arc<crate::server::Server>>>,
+    /// Replaceable server slot. Cleared during teardown before a service
+    /// reconnect installs a fresh application runtime.
+    pub server_slot: crate::instance::ServerSlot,
     /// Per-process directory of started MCP servers. Populated by
     /// [`crate::extensions::mcp::McpExtension::instantiate`] at
     /// install time and exposed to readers (TUI Peer→MCP settings)

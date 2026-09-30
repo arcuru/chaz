@@ -1,6 +1,6 @@
 # ReAct Runtime
 
-The ReAct (Reason + Act) loop is the core agent execution model. The runtime takes a conversation context, calls an LLM, executes any requested tool calls, and feeds results back until the LLM produces a text response.
+The ReAct (Reason + Act) loop is the core agent execution model. The runtime takes a conversation context, calls an LLM, executes any requested tool calls, and feeds results back until the LLM produces a text response. The server records a durable turn attempt before entering this loop, awaits structured transcript commits at completed model/tool boundaries, and commits the terminal model response and final entry with completion; request recovery and explicit retry are described in [Session Model](sessions.md#durable-turn-recovery).
 
 ## Loop Flow
 
@@ -19,10 +19,9 @@ graph TD
     SCAN --> INJECT[Scan for injection]
     INJECT --> FEED[Feed results to LLM]
     FEED --> CALL
-    EXEC --> CAP{Max iterations?}
-    CAP -->|Yes| FORCE[Force summary]
-    FORCE --> DONE
 ```
+
+There is no iteration cap. The loop ends when the model returns a response without native tool calls, when a model request fails after its bounded retries, or when the executor stops the task. Repeated identical calls are executed like any others; each gets its own result.
 
 ## Security Gates
 
@@ -46,21 +45,18 @@ kind and is active on the session.
 
 The `before_agent_start` and `agent_end` hooks bracket the whole turn (used today for skill prompt injection at the start and any cleanup the extension wants on completion).
 
-## Event Sink
+## Runtime recorder
 
-The runtime accepts an optional `RuntimeEventSink` (an `mpsc::Sender<RuntimeEvent>`). When provided, it emits events during the loop:
+Executor-backed turns pass an awaited `RuntimeRecorder` into the loop. It persists each completed model response before the runtime acts on tool calls, then persists each complete tool result before the next model request. Errors from this interface stop progression rather than becoming best-effort audit warnings.
 
-- `RuntimeEvent::ToolCall` -- before executing a tool
-- `RuntimeEvent::ToolResult` -- after a tool returns
-
-The server consumes these events and writes `ToolCall` and `ToolResult` entries to the session DB for audit trail and TUI display.
+Scheduled turns currently retain the compatibility `RuntimeEvent` adapter because they do not have a durable turn-attempt record. That adapter projects tool-call and tool-result events to ordinary session entries.
 
 ## Fallback Behavior
 
-- If the backend doesn't support tool calling, the runtime falls back to a single-shot LLM call.
-- If the first tool-aware call fails after retries, it retries once without tools (covers models/providers that advertise tools but reject the schema).
-- A `LoopDetector` fingerprints each tool-call set (name + canonical args); when the same fingerprint repeats `LOOP_DETECTION_THRESHOLD` times the runtime pushes a "you're stuck in a loop" `User` message and breaks out.
-- If `MAX_TOOL_ITERATIONS` (10) is reached, a forced no-tools summary call is made so the agent always returns a text response.
+- If the scoped tool set is empty, or the backend does not support tool calling, the runtime makes a single-shot call without tool definitions.
+- Otherwise every model request in the turn offers the same tool definitions. The runtime never withholds tools to force a final answer: withholding them lets a model that still wants a tool print its call as plain text.
+- A retryable provider error (rate limit, 5xx, timeout, network) is retried with backoff up to the backend's `max_retries`. When retries are exhausted, or the error is not retryable, the turn fails with that error. It is not retried without tools.
+- If the model returns an empty response after tool calls, the last tool result becomes the reply.
 
 ## Context Assembly
 
@@ -77,7 +73,7 @@ RuntimeMessage::ToolResult(result)
 ...
 ```
 
-`AssistantToolCalls` and `ToolResult` messages are maintained in the runtime's local message vector (not written to the session during the loop -- the event sink handles that separately).
+`AssistantToolCalls` and `ToolResult` messages are maintained in the runtime's local message vector for the active continuation. Completed structured forms are persisted. Later turns can reconstruct complete prior call/result groups from completed attempts inside the conversation budget, but interrupted attempts are never resumed automatically.
 
 ## Concurrency
 

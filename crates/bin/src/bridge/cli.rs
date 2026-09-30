@@ -88,13 +88,20 @@ impl Bridge for CliBridge {
     async fn run(self, server: Arc<Server>) -> anyhow::Result<()> {
         let (conv_id, session_db) =
             resolve_cli_session(&server, self.session_name.as_deref()).await?;
+        server.load_session_entities(&session_db).await?;
 
         let backend = BackendManager::new(&self.config.backends, self.secrets.clone());
 
-        // Approval channel = None → auto-deny any tool needing approval.
-        server
-            .register_session(&session_db, backend, None, None)
-            .await?;
+        if server.is_executor_authorized() {
+            // Approval channel = None → auto-deny any tool needing approval.
+            server
+                .register_session(&session_db, backend, None, None)
+                .await?;
+        } else {
+            server
+                .watch_session(&session_db, backend, None, None)
+                .await?;
+        }
 
         // Watch for the agent's response via on_write. The server already
         // installed its own callback during register_session; this is an additional

@@ -64,7 +64,11 @@ impl MatrixClient {
     ///
     /// `state_dir` resolves like headjack: an explicit path (tilde-expanded) or,
     /// when `None`, `$XDG_STATE_HOME/{name}`. The `session` file under it holds
-    /// the persisted credentials + sync token.
+    /// the persisted credentials + sync token. On a fresh login `name` is also
+    /// the client's initial device display name, so callers can tell their
+    /// device apart in the account's session list: the bridge signs in as
+    /// `chaz`, while the `rooms` maintenance command's throwaway device shows
+    /// as `chaz-matrix-rooms`.
     pub async fn login(login: &Login, state_dir: Option<&str>, name: &str) -> anyhow::Result<Self> {
         let state_dir = match state_dir {
             Some(s) => PathBuf::from(expand_tilde(s)),
@@ -77,7 +81,7 @@ impl MatrixClient {
         let (client, sync_token) = if session_file.exists() {
             restore_session(&session_file).await?
         } else {
-            (do_login(&session_file, login).await?, None)
+            (do_login(&session_file, login, name).await?, None)
         };
 
         Ok(Self {
@@ -241,7 +245,11 @@ async fn restore_session(session_file: &Path) -> anyhow::Result<(Client, Option<
 }
 
 /// Password-login a fresh device and persist the session.
-async fn do_login(session_file: &Path, login: &Login) -> anyhow::Result<Client> {
+///
+/// `device_name` is the Matrix initial device display name: it identifies this
+/// device in the account's session list, and is the caller's `name` from
+/// [`MatrixClient::login`].
+async fn do_login(session_file: &Path, login: &Login, device_name: &str) -> anyhow::Result<Client> {
     info!("No previous session found, logging in…");
     let client = Client::builder()
         .homeserver_url(&login.homeserver_url)
@@ -255,7 +263,7 @@ async fn do_login(session_file: &Path, login: &Login) -> anyhow::Result<Client> 
     };
     matrix_auth
         .login_username(&login.username, &password)
-        .initial_device_display_name("chaz")
+        .initial_device_display_name(device_name)
         .await?;
     info!("Logged in as {}", login.username);
 

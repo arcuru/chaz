@@ -6,8 +6,8 @@
 //! registry built, per-agent DBs bootstrapped, the secret store + extension hub
 //! assembled, the [`Server`] constructed with the spawn-tool cell wired, agent
 //! configs reconciled, YAML schedules materialized, and the routine engine
-//! spawned. That sequence is load-bearing (notably the `spawn_server_cell`
-//! `OnceLock` must be set *after* `Server::new`, and the extension hub must be
+//! spawned. That sequence is load-bearing (notably the replaceable server slot
+//! must be populated after `Server::new`, and the extension hub must be
 //! `install_all`'d before it) and historically lived inline in the `chaz`
 //! binary's `main`. [`build`] is the single shared implementation so external
 //! bridge binaries don't copy-paste it.
@@ -38,18 +38,14 @@ pub struct BuildOptions {
     /// Path the config was loaded from; recorded on the server so `/agent
     /// reload` (and config reconcile) can re-read it.
     pub config_path: PathBuf,
-    /// Enable eidetica P2P sync (iroh transport + optional HTTP bind from
-    /// `config.sync_listen`). A one-shot CLI invocation leaves this off — the
-    /// engine and public endpoint would outlive the single ReAct loop.
-    pub enable_sync: bool,
     /// Spawn the routine engine (heartbeats + schedulers) and register every
     /// hosted session/agent with it. Off for one-shot CLI runs.
     pub run_routine_engine: bool,
     /// Materialize an eidetica AgentDb per config-declared agent (minting one
     /// locally on this peer). True for the chaz daemon, which owns its agents.
     /// A standalone bridge sets this **false**: it owns no agents — it
-    /// ticket-bootstraps each agent DB from the daemon before calling `build`,
-    /// and the hosted index then discovers those synced DBs. Minting locally
+    /// either ticket-bootstraps agent DBs as a direct owner or opens them
+    /// through the shared service. Minting locally
     /// here would fork a second, divergent agent DB against the daemon's.
     pub bootstrap_agents_from_config: bool,
     /// Spawn the agent-running `processing_loop`. True for the chaz daemon,
@@ -66,6 +62,176 @@ pub struct BuildOptions {
     /// Whether a turn may run before the configured MCP servers have
     /// finished starting. See [`McpReadiness`].
     pub mcp_readiness: McpReadiness,
+    /// Limit hosted-index loading to the agents referenced by this session, or
+    /// to configured defaults when the session will be created by the gateway.
+    /// Used only by service-client TUI and one-shot paths.
+    pub targeted_session: Option<String>,
+}
+
+impl BuildOptions {
+    /// Options for a long-lived local executable (daemon or TUI). The mode may
+    /// reduce what an executor starts, but can never grant work the connector
+    /// capability denied.
+    pub fn local(
+        config_path: PathBuf,
+        capabilities: crate::instance::InstanceCapabilities,
+        extra_auto_approved_tools: Vec<String>,
+        mcp_readiness: McpReadiness,
+    ) -> Self {
+        let executor = capabilities.runs_agents();
+        Self {
+            config_path,
+            run_routine_engine: executor,
+            bootstrap_agents_from_config: executor,
+            run_agent_loop: executor,
+            extra_auto_approved_tools,
+            mcp_readiness,
+            targeted_session: (capabilities.ownership()
+                == crate::instance::InstanceOwnership::Service
+                && !executor)
+                .then_some(String::new()),
+        }
+    }
+
+    /// Options for one-shot local entry points. `--print` needs one agent
+    /// turn and may perform first-boot agent setup; `cmd` must never start
+    /// queued turns or autonomous work. A direct owner may still bootstrap
+    /// its config-declared agents for first-boot administration, while a
+    /// service client must not.
+    pub fn local_oneshot(
+        config_path: PathBuf,
+        capabilities: crate::instance::InstanceCapabilities,
+        run_agent_loop: bool,
+        bootstrap_agents_from_config: bool,
+        extra_auto_approved_tools: Vec<String>,
+        mcp_readiness: McpReadiness,
+    ) -> Self {
+        let executor = capabilities.runs_agents();
+        Self {
+            config_path,
+            run_routine_engine: false,
+            bootstrap_agents_from_config: executor && bootstrap_agents_from_config,
+            run_agent_loop: executor && run_agent_loop,
+            extra_auto_approved_tools,
+            mcp_readiness,
+            targeted_session: (capabilities.ownership()
+                == crate::instance::InstanceOwnership::Service
+                && !executor)
+                .then_some(String::new()),
+        }
+    }
+}
+
+#[cfg(test)]
+mod build_options_tests {
+    use super::*;
+    use crate::config::{EideticaConfig, EideticaLoginConfig, ExecutionRole};
+
+    fn capabilities(role: ExecutionRole) -> crate::instance::InstanceCapabilities {
+        let config = EideticaConfig {
+            connection: "unix:///tmp/chaz-test.sock".into(),
+            login: EideticaLoginConfig {
+                username: "chaz".into(),
+                password: None,
+                passwordless: true,
+            },
+            sync: None,
+        };
+        crate::instance::capabilities_for_test(&config, role)
+    }
+
+    #[tokio::test]
+    async fn missing_role_cannot_reach_runtime_build() {
+        use eidetica::NewUser;
+        use eidetica::backend::database::InMemory;
+
+        let (instance, user) = eidetica::Instance::create_backend(
+            Box::new(InMemory::new()),
+            NewUser::passwordless("fixture"),
+        )
+        .await
+        .unwrap();
+        let mut config = Config {
+            eidetica: Some(EideticaConfig {
+                connection: "memory://fixture".into(),
+                login: EideticaLoginConfig {
+                    username: "fixture".into(),
+                    password: None,
+                    passwordless: true,
+                },
+                sync: None,
+            }),
+            ..Default::default()
+        };
+        let opts = BuildOptions::local(
+            PathBuf::from("config.yaml"),
+            capabilities(ExecutionRole::Executor),
+            Vec::new(),
+            McpReadiness::Deferred,
+        );
+        let error = build(&mut config, instance, user, opts)
+            .await
+            .err()
+            .expect("runtime build must reject an absent role before bootstrapping agents");
+        assert!(
+            error.to_string().contains("missing required `execution:"),
+            "unexpected build error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn command_mode_never_installs_execution_work() {
+        let options = BuildOptions::local_oneshot(
+            PathBuf::from("config.yaml"),
+            capabilities(ExecutionRole::Executor),
+            false,
+            false,
+            Vec::new(),
+            McpReadiness::Deferred,
+        );
+        assert!(!options.run_agent_loop);
+        assert!(!options.run_routine_engine);
+        assert!(!options.bootstrap_agents_from_config);
+    }
+
+    #[test]
+    fn direct_owner_command_mode_may_bootstrap_without_running_turns() {
+        let config = EideticaConfig {
+            connection: "sqlite:///tmp/chaz-test.db".into(),
+            login: EideticaLoginConfig {
+                username: "chaz".into(),
+                password: None,
+                passwordless: true,
+            },
+            sync: None,
+        };
+        let options = BuildOptions::local_oneshot(
+            PathBuf::from("config.yaml"),
+            crate::instance::capabilities_for_test(&config, ExecutionRole::Executor),
+            false,
+            true,
+            Vec::new(),
+            McpReadiness::Deferred,
+        );
+        assert!(!options.run_agent_loop);
+        assert!(!options.run_routine_engine);
+        assert!(options.bootstrap_agents_from_config);
+    }
+
+    #[test]
+    fn client_mode_cannot_gain_execution_from_print_mode() {
+        let options = BuildOptions::local_oneshot(
+            PathBuf::from("config.yaml"),
+            capabilities(ExecutionRole::Client),
+            true,
+            true,
+            Vec::new(),
+            McpReadiness::AwaitReady,
+        );
+        assert!(!options.run_agent_loop);
+        assert!(!options.run_routine_engine);
+        assert!(!options.bootstrap_agents_from_config);
+    }
 }
 
 /// When MCP tools have to exist, relative to the first turn.
@@ -94,6 +260,29 @@ pub struct BuiltServer {
     pub server: Arc<Server>,
     pub registry: Arc<session::SessionRegistry>,
     pub secret_store: security::SecretStore,
+    tasks: Vec<tokio::task::JoinHandle<()>>,
+    server_slot: crate::instance::ServerSlot,
+}
+
+impl BuiltServer {
+    /// Stop every task owned by this application runtime, then release all
+    /// hooks/subscriptions by dropping the server and its Instance graph.
+    /// Call this to completion before replacing a service connection.
+    pub async fn shutdown(mut self) {
+        self.server_slot.clear();
+        let sessions = self.server.registered_session_ids().await;
+        for session in sessions {
+            self.server.deregister_session(&session).await;
+        }
+        self.server.shutdown().await;
+        self.server.mcp_registry().shutdown().await;
+        for task in &self.tasks {
+            task.abort();
+        }
+        for task in self.tasks.drain(..) {
+            let _ = task.await;
+        }
+    }
 }
 
 /// Assemble a fully-wired [`Server`] from `config` and an opened eidetica
@@ -108,59 +297,19 @@ pub async fn build(
     mut user: eidetica::user::User,
     opts: BuildOptions,
 ) -> anyhow::Result<BuiltServer> {
+    let mut tasks = Vec::new();
+    let execution = crate::instance::required_settings(config)?.1;
+    if execution != crate::config::ExecutionRole::Executor
+        && (opts.run_agent_loop || opts.run_routine_engine || opts.bootstrap_agents_from_config)
+    {
+        anyhow::bail!(
+            "execution role and runtime options disagree: clients cannot run agents, tools, routines, schedules, or agent bootstrap"
+        );
+    }
     // Wall-clock instrumentation for the critical-path build. Individual
     // heavy steps log their own `elapsed_ms`; this bounds the whole
     // gateway-blocking prefix so regressions are visible in the log.
     let build_start = Instant::now();
-
-    // Enable eidetica sync for session sharing. Register iroh P2P transport
-    // by default (stable peer identity, no address config needed). If
-    // sync_listen is configured, also bind HTTP for traditional access.
-    if opts.enable_sync {
-        instance.enable_sync().await?;
-        if let Some(sync) = instance.sync() {
-            // Registering a transport under a name that already has one
-            // *replaces* it: the endpoint that was serving is dropped and a
-            // fresh one is minted under a different address. A caller that set
-            // sync up before calling build — the bridges do, because access
-            // bootstrap needs a live Sync handle — would therefore change its
-            // own address partway through startup, and every peer holding the
-            // old one would be left dialing an endpoint nobody is listening on.
-            // Nothing reports that: the peer is registered, the address is
-            // recorded, and requests simply go unanswered.
-            //
-            // So each transport is registered only if it is not already
-            // serving, which is what callers passing `enable_sync` on an
-            // already-synced instance have always assumed this does.
-            let mut registered_any = false;
-
-            if sync.get_server_address_for("iroh").await.is_err() {
-                use eidetica::sync::transports::iroh::IrohTransport;
-                sync.register_transport("iroh", IrohTransport::builder())
-                    .await?;
-                registered_any = true;
-            }
-
-            if let Some(ref addr) = config.sync_listen
-                && sync.get_server_address_for("http").await.is_err()
-            {
-                use eidetica::sync::transports::http::HttpTransport;
-                sync.register_transport("http", HttpTransport::builder().bind(addr))
-                    .await?;
-                info!("Sync HTTP transport listening on {addr}");
-                registered_any = true;
-            }
-
-            if registered_any {
-                sync.accept_connections().await?;
-                if let Ok(addr) = sync.get_server_address().await {
-                    info!("Eidetica sync address: {addr}");
-                }
-            } else {
-                info!("Sync already accepting connections; keeping the existing address");
-            }
-        }
-    }
 
     let agent_registry = std::sync::Arc::new(agent::AgentRegistry::from_config(config));
     if agent_registry.is_empty() {
@@ -174,9 +323,9 @@ pub async fn build(
     // Materialize an eidetica DB per yaml-declared agent. Idempotent on
     // re-runs (yaml is a first-boot template; AgentDb is the source of
     // truth afterwards). Skipped for a standalone bridge, which owns no
-    // agents and instead ticket-bootstraps the daemon's agent DBs (minting
-    // here would fork a divergent copy); the hosted index below discovers
-    // those already-synced DBs.
+    // agents: it either ticket-bootstraps (direct owner) or shares the
+    // service login. Minting here could fork a divergent agent DB; the
+    // hosted index below discovers the existing DBs.
     if opts.bootstrap_agents_from_config {
         let t = Instant::now();
         let bootstrapped = agent_db::bootstrap_from_config(&mut user, config).await?;
@@ -211,9 +360,48 @@ pub async fn build(
     // walking eidetica's tracked-DBs list. Each entry's `meta.kind` marker
     // classifies it. `/agent new`, `/memory new`, `/agent delete`, etc.
     // mutate these caches at runtime.
+    let targeted_agents = if let Some(identifier) = opts
+        .targeted_session
+        .as_deref()
+        .filter(|identifier| !identifier.is_empty())
+    {
+        let session_db_id = registry.find_by_name(identifier).await?.or_else(|| {
+            eidetica::entry::ID::parse(identifier)
+                .ok()
+                .map(|id| id.to_string())
+        });
+        if let Some(session_db_id) = session_db_id {
+            let (_, db) = registry.open_session(&session_db_id).await?;
+            let meta = session::read_meta_from_db(&db).await;
+            meta.agents
+                .into_iter()
+                .filter_map(|agent| {
+                    eidetica::entry::ID::parse(&agent.db_id)
+                        .ok()
+                        .map(|id| (id, agent.display_name))
+                })
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        }
+    } else {
+        Vec::new()
+    };
+    let peer_default_agents = registry.load_peer_default_agents().await;
+    let configured_defaults = peer_default_agents
+        .clone()
+        .or_else(|| config.default_agents.clone())
+        .filter(|names| !names.is_empty())
+        .unwrap_or_else(|| vec![agent_registry.default_agent().name]);
     let (agent_index_store, memory_bank_index_store, skill_bank_index_store) = {
         let user = registry.user_lock().await;
-        hosted_index::build_from_user(&user).await?
+        if opts.targeted_session.is_some() {
+            let (agents, memory_banks, skill_banks, _) =
+                hosted_index::build_targeted(&user, &targeted_agents, &configured_defaults).await?;
+            (agents, memory_banks, skill_banks)
+        } else {
+            hosted_index::build_from_user(&user).await?
+        }
     };
 
     // NOTE: the co-owned home_pubkey migration warnings used to run here.
@@ -224,7 +412,9 @@ pub async fn build(
     // already-attached banks are skipped (grant_on_memory_bank is idempotent,
     // and attach_memory_bank overwrites by name). Missing banks/agents are
     // logged at warn and skipped so a typo in config doesn't fail startup.
-    if let Some(agent_configs) = &config.agents {
+    if opts.bootstrap_agents_from_config
+        && let Some(agent_configs) = &config.agents
+    {
         for ac in agent_configs {
             if let Some(banks) = &ac.default_memory_banks {
                 for bank_name in banks {
@@ -384,7 +574,7 @@ pub async fn build(
     // SpawnAgent / SpawnWorker route through the server — a single OnceLock
     // is shared; it's set once after Server::new below. The core extension
     // takes ownership of the cell and constructs the spawn tools.
-    let spawn_server_cell = std::sync::Arc::new(std::sync::OnceLock::new());
+    let server_slot = crate::instance::ServerSlot::default();
 
     // Shared MCP server directory — populated by McpExtension::instantiate
     // below, exposed to readers (TUI Peer→MCP settings) via Server.
@@ -412,16 +602,21 @@ pub async fn build(
         skill_bank_index: skill_bank_index_store.clone(),
         embedder: embedder.clone(),
         secrets: Some(Arc::new(secret_store.clone())),
-        server_cell: spawn_server_cell.clone(),
+        server_slot: server_slot.clone(),
         mcp_registry: mcp_registry.clone(),
         agent_state_allowlist: config.agent_state_allowlist.clone(),
         tool_registry: tool_registry.clone(),
     }));
 
     // Collect MCP server configs from inline config + directory scanning.
-    let mut mcp_configs: Vec<config::McpServerConfig> =
-        config.mcp_servers.clone().unwrap_or_default();
-    if let Some(dir) = &config.mcp_server_dir {
+    let mut mcp_configs: Vec<config::McpServerConfig> = if opts.run_agent_loop {
+        config.mcp_servers.clone().unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    if opts.run_agent_loop
+        && let Some(dir) = &config.mcp_server_dir
+    {
         let dir_path = std::path::Path::new(dir);
         let dir_configs = mcp::load_server_configs_from_dir(dir_path);
         if !dir_configs.is_empty() {
@@ -445,11 +640,11 @@ pub async fn build(
         session_registry: registry.clone(),
         embedder: embedder.clone(),
         web_search_backends,
-        spawn_server_cell: spawn_server_cell.clone(),
+        server_slot: server_slot.clone(),
         backend_manager: default_backend.clone(),
         security: security_ctx.clone(),
     });
-    if !mcp_configs.is_empty() {
+    if opts.run_agent_loop && !mcp_configs.is_empty() {
         for config in &mcp_configs {
             extensions.push(Arc::new(extensions::mcp::McpExtension::new(config.clone())));
         }
@@ -501,6 +696,11 @@ pub async fn build(
     let tool_host = std::sync::Arc::new(tool_host::NativeToolHost::new())
         as std::sync::Arc<dyn tool_host::ToolHost>;
 
+    let executor = if opts.run_agent_loop {
+        Some(crate::instance::executor_for_role(execution)?)
+    } else {
+        None
+    };
     let server = Server::new(
         registry.clone(),
         agent_registry,
@@ -516,12 +716,16 @@ pub async fn build(
         extension_hub,
         default_backend.clone(),
         mcp_registry.clone(),
-        opts.run_agent_loop,
+        executor,
     );
-    assert!(
-        spawn_server_cell.set(server.clone()).is_ok(),
-        "Spawn tool server cell already set"
-    );
+    if opts.targeted_session.is_none() {
+        server.mark_hosted_indices_complete();
+    }
+    // Close the processing gate before the first await below can schedule the
+    // resident session-adoption watcher. On restart that watcher scans durable
+    // queued turns immediately; none may run until agent config is reconciled.
+    server.mark_startup_pending();
+    server_slot.set(server.clone());
 
     // Apply operator multi-agent tuning before the bridge starts
     // delivering messages (set_agent_burst_budget is read by
@@ -548,8 +752,7 @@ pub async fn build(
     // Precedence: peer-DB override (Settings → Defaults) beats yaml so
     // runtime edits survive restart. Falling back to yaml when the DB
     // hasn't been written keeps fresh installs honouring config.
-    let db_defaults = server.registry().load_peer_default_agents().await;
-    if let Some(default_agents) = db_defaults {
+    if let Some(default_agents) = peer_default_agents {
         info!(
             agents = ?default_agents,
             "Applied default_agents (peer DB override) — these will auto-attach to new sessions"
@@ -611,29 +814,30 @@ pub async fn build(
         critical_path_ms = build_start.elapsed().as_millis() as u64,
         "Critical-path build complete; deferring at-startup work to background"
     );
-    server.mark_startup_pending();
     {
         let server = server.clone();
         let registry = registry.clone();
         let default_backend = default_backend.clone();
         let deferred_config = config.clone();
+        let reconcile_agents_from_config = opts.bootstrap_agents_from_config;
         let run_routine_engine = opts.run_routine_engine;
         let run_agent_loop = opts.run_agent_loop;
         let mcp_readiness = opts.mcp_readiness;
         let mcp_registry = mcp_registry.clone();
-        tokio::spawn(async move {
+        tasks.push(tokio::spawn(async move {
             run_deferred_startup(
                 server,
                 registry,
                 deferred_config,
                 default_backend,
+                reconcile_agents_from_config,
                 run_routine_engine,
                 run_agent_loop,
                 mcp_readiness,
                 mcp_registry,
             )
             .await;
-        });
+        }));
     }
 
     // Sync every tracked database under the key it was actually granted, which
@@ -641,12 +845,16 @@ pub async fn build(
     // key). Without this, any database this peer reached by bootstrapping with a
     // named user key — every bridge's agent DB — is refused on every pull.
     // Delete this call with the module when eidetica signs with the tracked key.
-    keyed_sync::spawn(registry.clone());
+    if let Some(task) = keyed_sync::spawn(registry.clone()) {
+        tasks.push(task);
+    }
 
     Ok(BuiltServer {
         server,
         registry,
         secret_store,
+        tasks,
+        server_slot,
     })
 }
 
@@ -675,6 +883,7 @@ async fn run_deferred_startup(
     registry: Arc<session::SessionRegistry>,
     config: Config,
     default_backend: backends::BackendManager,
+    reconcile_agents_from_config: bool,
     run_routine_engine: bool,
     run_agent_loop: bool,
     mcp_readiness: McpReadiness,
@@ -693,12 +902,14 @@ async fn run_deferred_startup(
 
     // 2. Reconcile each agent's DB config from yaml, then open the gate.
     //    `/agent reload` runs this same path on demand.
-    let t = Instant::now();
-    server.reconcile_agents_from_config(&config).await;
-    info!(
-        elapsed_ms = t.elapsed().as_millis() as u64,
-        "Deferred: reconciled agents from config"
-    );
+    if reconcile_agents_from_config {
+        let t = Instant::now();
+        server.reconcile_agents_from_config(&config).await;
+        info!(
+            elapsed_ms = t.elapsed().as_millis() as u64,
+            "Deferred: reconciled agents from config"
+        );
+    }
     // 2b. A one-shot run gets a single turn, so it must not start that turn
     //     against a half-loaded tool list. Reuse the turn gate rather than
     //     adding a second one: `process_session` already parks here, so the
@@ -910,9 +1121,9 @@ async fn run_deferred_startup(
         }
 
         let engine_clone = engine.clone();
-        tokio::spawn(async move {
+        server.track_task(tokio::spawn(async move {
             engine_clone.run().await;
-        });
+        }));
     }
 
     // 4. Watch each hosted agent DB's session registry so the daemon runs the
@@ -931,11 +1142,12 @@ async fn run_deferred_startup(
 
 /// Run the agent on sessions that a dumb bridge created and exposed.
 ///
-/// A bridge (a separate peer) creates a session DB, attaches a daemon-owned
+/// A bridge (direct peer or service client) creates a session DB, attaches a daemon-owned
 /// agent to it (granting the agent Write + delegating session auth to the agent
-/// DB), and records a [`agent_db::SessionRef`] in the agent DB's synced session
-/// registry with the bridge in `exposed_on`. That registry write syncs to the
-/// daemon. This installs an `on_write` on each hosted agent DB and, on every
+/// DB), and records a [`agent_db::SessionRef`] in the agent DB's session
+/// registry with the bridge in `exposed_on`. That write reaches the daemon
+/// through sync or the shared service. This installs an `on_write` on each hosted
+/// agent DB and, on every
 /// write (local *or* remote/synced — eidetica's `on_write` fires for both),
 /// re-scans the registry and `register_session`s any exposed session not yet
 /// watched, so the daemon's ReAct loop answers it.
@@ -1190,12 +1402,16 @@ async fn register_one_exposed_session(
             // Proxy tool approvals over the session DB: the runtime
             // blocks on this channel, the proxy writes a request entry,
             // and the exposing bridge renders it + writes the decision.
-            let approval_tx = super::approval_proxy::spawn_session_db_approval_proxy(
-                sdb.clone(),
-                entry.display_name.clone(),
-                server.approval_timeout(),
-            )
-            .await;
+            let (approval_tx, approval_tasks) =
+                super::approval_proxy::spawn_session_db_approval_proxy(
+                    sdb.clone(),
+                    entry.display_name.clone(),
+                    server.approval_timeout(),
+                )
+                .await;
+            for task in approval_tasks {
+                server.track_task(task);
+            }
             if let Err(e) = server
                 .register_session(&sdb, default_backend.clone(), None, Some(approval_tx))
                 .await

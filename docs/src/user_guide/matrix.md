@@ -1,10 +1,35 @@
 # Matrix Bot
 
 Chaz connects to Matrix as a bot, responding to messages in rooms it's invited
-to. The Matrix bridge runs as its own process and eidetica peer (`chaz-matrix`),
-separate from the `chaz` daemon — read [Transport Bridges](bridges.md) first for
-the architecture and the one-time approval flow. This page covers Matrix-specific
+to. The Matrix bridge runs as its own process (`chaz-matrix`), separate from
+the `chaz` daemon — read [Transport Bridges](bridges.md) first for the
+architecture, the connection settings, and the one-time approval flow. This page covers Matrix-specific
 configuration and behavior.
+
+## Live typing during a turn
+
+| Signal                    | Starts                                                                | Ends                                                                    |
+| ------------------------- | --------------------------------------------------------------------- | ----------------------------------------------------------------------- |
+| Matrix room typing notice | The bridge sees a fresh executor per-turn start in the shared session | Completion, error, silent release, or a heartbeat older than 45 seconds |
+
+The bridge only observes the per-turn claim; it does not run the agent or infer
+activity from a room binding, an old acknowledgement, or session runtime
+ownership. Typing is renewed every three seconds while the claim remains
+fresh, with a ten-second server timeout, avoiding gaps if a renewal is delayed. On release it sends
+a cancellation. A missing executor heartbeat times out instead of showing
+permanent typing after a crash; network or sync lag can delay observation.
+Discord does not publish this signal.
+
+Example with a shared room:
+
+1. Send `@chaz:example summarize this` in the room. When the executor starts,
+   the Matrix client displays `chaz is typing` while the turn runs.
+2. On a reply, error, or silent completion, the typing indicator stops even if
+   the bridge remains connected to the room. A second message starts a new turn.
+3. If the executor crashes, the typing notice expires and the bridge stops
+   renewing it when the last heartbeat ages out (within 45 seconds plus sync
+   and polling delay). The turn is interrupted; inspect `/interrupted` from a
+   client and use `/retry <request_id>` only after checking for external effects.
 
 ## Setup
 
@@ -37,6 +62,11 @@ configuration and behavior.
 
    # chaz runtime keys the embedded server needs:
    state_dir: /var/lib/chaz-matrix
+   execution: client
+   eidetica:
+     connection: "sqlite:///var/lib/chaz-matrix/eidetica.db"
+     login: { username: chaz-matrix, passwordless: true }
+     sync: { iroh: true }
    backends:
      - name: openai
        api_key: ${OPENAI_API_KEY}
@@ -44,6 +74,9 @@ configuration and behavior.
      - name: chaz
    ```
 
+   `execution:` and `eidetica:` are the connector settings every Chaz process
+   carries — see [Connection settings](bridges.md#connection-settings) for the
+   direct-owner and shared-login forms and what each one needs.
    `homeserver_url`, `username`, and `password` are the bot's login; `password`
    (and `unlock_password`) accept `${ENV}` references so no secret has to live in
    the file. `allow_list` / `room_size_limit` may be set per-login or as global
@@ -60,6 +93,13 @@ configuration and behavior.
    [Transport Bridges → Setup](bridges.md#setup).
 
 The bot then logs in, accepts invites from allowed users, and starts responding.
+
+On joining a room, the bridge creates or reuses its session and imports only
+messages before the bot's join as context; that history never triggers an agent
+turn. On rejoin it imports only messages from the time the bot was away.
+`!chaz clear` stops the historical import at that marker. Restarting or
+attaching a room to an existing session does not replay history as live input.
+A new addressed message is handled once.
 
 ### Scripted bring-up
 
@@ -91,9 +131,47 @@ Two things worth knowing:
   revises what was already recorded, so a pasted iroh address outlives the run
   that published it. Sync tries every recorded address, and each dead one costs
   a full timeout on every pass. A `pr=http:` hint pointing at the daemon's
-  `sync_listen` is what actually connects host-local.
+  `eidetica.sync.http_listen` is what actually connects host-local.
 - **`/agent share` also writes the ticket to `$XDG_CONFIG_HOME/chaz/shares/`.**
   Point `XDG_CONFIG_HOME` somewhere disposable if you do not want that.
+
+## Maintenance: listing and leaving rooms
+
+`chaz-matrix rooms` provides separate list and reset commands. `rooms list`
+enumerates every room a login is joined to. `rooms leave-all` previews the same
+set without changing membership; add `--execute` to leave every listed room:
+
+```bash
+chaz-matrix --config matrix-bridge.yaml rooms list
+chaz-matrix --config matrix-bridge.yaml rooms leave-all            # preview
+chaz-matrix --config matrix-bridge.yaml rooms leave-all --execute  # leave all
+```
+
+With a single `logins:` entry the login is implicit; with several, name one by
+MXID with `--login` on either command:
+
+```bash
+chaz-matrix --config matrix-bridge.yaml rooms leave-all \
+  --login @chaz:example --execute
+```
+
+`--retries` and `--delay-ms` tune only `leave-all`; listing has no leave policy
+to tune.
+
+Exit codes: `0` for a successful run, an empty room list, or a dry-run; `1`
+when one or more rooms failed to leave; `2` for a setup failure — no or
+ambiguous login, an unresolved password, a failed login, or an authenticated
+account that does not match the configured username.
+
+Safety notes:
+
+- Each run signs in with a **fresh throwaway device** that is logged out at the
+  end, so it never disturbs the bridge's own persisted session or device.
+- **Pending invitations are untouched** — only rooms the account is already
+  joined to are enumerated and left.
+- Run it **with the bridge stopped** for a quiescent reset: a running bridge
+  auto-joins allowed invitations it sees, so a room it re-joins mid-run is not
+  part of the enumeration.
 
 ## Message Handling
 
@@ -161,9 +239,9 @@ Commands are sent as Matrix messages. Session ops go through the same transport-
 
 ## Session Attachment
 
-A Matrix room is connected to a session through an explicit _channel_ record (`room_id → session_db_id`). The first time you talk to the bot in a new room it auto-creates a session and attaches the room to it.
+A Matrix room is connected to a session through an explicit _channel_ record (`room_id → session_db_id`). Joining a new room creates the session and attaches the room before an addressed message arrives.
 
-Use `!chaz attach <session>` to rebind the room to a different session (e.g., to resume a synced session, or to route a scheduled-task session into a specific room). Multiple rooms can attach to the same session — responses fan out to every attached room. `!chaz detach` removes the binding; the next message in the room creates a fresh session.
+Use `!chaz attach <session>` to rebind the room to a different session (e.g., to resume a synced session, or to route a scheduled-task session into a specific room). Multiple rooms can attach to the same session — responses fan out to every attached room. `!chaz detach` removes the binding; the next addressed message in the room creates a fresh session.
 
 At bridge startup, the bot re-installs response-delivery callbacks for every persisted channel whose room it's joined to. This is what makes scheduled-task responses reach a Matrix room even when no user is currently active there.
 

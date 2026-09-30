@@ -18,15 +18,18 @@ enum EntryType {
 }
 ```
 
-Each entry has a sender (participant name), content, timestamp, and type.
+Each entry has a sender (participant name), content, timestamp, and type. Its
+Eidetica `Table` row key is also the stable identity of a processable turn
+request. The key travels with session sync, so two otherwise identical rows
+remain distinct requests.
 
 ### What Enters the LLM Context
 
-Only `Message`, `Directive`, and `Summary` entries enter the conversation portion of the LLM context. The context builder maps senders to roles: entries from the current agent become `assistant` messages, all others become `user` messages.
+Only `Message`, `Directive`, and `Summary` entries enter the conversation portion of the LLM context as ordinary messages. The context builder maps senders to roles: entries from the current agent become `assistant` messages, all others become `user` messages.
 
-The **system prompt is assembled fresh every turn** from the agent's `system_prompt` + `system_prompt_files` (resolved at agent construction) plus `PromptAugmentation` contributions from the extension hub (skills, memory recall, …) and the optional multi-agent room note. There is no per-session persona snapshot — the previous `PersonaSnapshot` entry type was deleted along with `persona.rs` / `role.rs` (see [Skills & Prompts](../design/skills_and_prompts.md)). To change an agent's prompt, edit `system_prompt` / `system_prompt_files` via `/agent set <ref> <field> <value>` (or restart against an edited config file).
+The **system prompt is assembled fresh every turn** from the agent's `system_prompt` + `system_prompt_files` (resolved at agent construction) plus `PromptAugmentation` contributions from the extension hub (skills) and the optional multi-agent room note. There is no per-session persona snapshot — the previous `PersonaSnapshot` entry type was deleted along with `persona.rs` / `role.rs` (see [Skills & Prompts](../design/skills_and_prompts.md)). To change an agent's prompt, edit `system_prompt` / `system_prompt_files` via `/agent set <ref> <field> <value>` (or restart against an edited config file).
 
-`ToolCall`, `ToolResult`, `Ack`, and `Error` entries are excluded from the LLM context. The runtime maintains its own in-memory tool call history for the ReAct loop. Session-level tool entries exist for audit trail and TUI display only.
+`ToolCall`, `ToolResult`, `Ack`, and `Error` entries are excluded from the LLM context. The runtime maintains its active ReAct history in memory. Structured completed model responses and tool results are also written to the attempt's `turn_transcript` store. On a later turn, the context builder joins visible request row IDs to their selected completed attempt at one Eidetica snapshot. It replays only complete native assistant-call/result groups, in request and attempt order, after the triggering request message. An interrupted attempt is not resumed or replayed, and older retry attempts are never included. Session-level tool entries remain display projections, never input for reconstruction.
 
 `ApprovalRequest` and `ApprovalDecision` are **control entries** for the tool-approval protocol a dumb bridge relays over the session DB — also excluded from the LLM context, from bridge message delivery, and from waking an agent turn. See [Dumb Transport Bridges → Tool approvals over the session DB](../design/transport_bridges.md#tool-approvals-over-the-session-db).
 
@@ -47,14 +50,128 @@ sequenceDiagram
 
     U->>S: write Message entry
     S-->>SV: on_write callback
-    SV->>SV: check latest entry
+    SV->>SV: reconcile persisted requests
+    SV->>S: record attempt start
     SV->>A: spawn agent task
     A->>S: write Ack entry
-    A->>S: write ToolCall entry
-    A->>S: write ToolResult entry
-    A->>S: write Message entry (response)
+    A->>S: commit model response + ToolCall display entries
+    A->>A: execute approved tool
+    A->>S: commit full ToolResult + display entry
+    A->>S: commit terminal model response, final entry, and completion
     S-->>U: on_write callback
 ```
+
+### Durable turn recovery
+
+The server treats a non-agent `Message` and a `Directive` as a durable turn
+request. It reconciles the request rows rather than acting only on the latest
+entry. A queued second request stays pending while the first request runs and
+is selected after that attempt finishes.
+
+`turn_attempts` is an append-only table in the session database. A
+`TurnAttempt` records the request row key, an attempt ID, a durable generation,
+and whether the attempt started or completed. The executor writes the started
+record before it can call a model or a tool. It commits a completed record in
+the same transaction as the final response or error entry. A silent turn has
+no final message, but still records completion.
+
+Clients read started attempts and completions from the session DB to show
+per-turn activity. A separate `turn_activity` timestamp store is refreshed
+by the executor every ten seconds while an agent turn is alive, including
+semaphore waits and tool approval. Clients treat a start as visible only for
+45 seconds after its last heartbeat (or its original start), and completion
+wins even over a late synced heartbeat. Matrix renews its ten-second typing
+lease on a three-second timer; the TUI refreshes every five seconds. This
+bounded presentation lease is not the session-wide `claim_runtime` lease and
+has no effect on reconciliation or retry safety.
+
+Attempt generations establish lifecycle precedence; the start and completion
+timestamps are audit data, not the ordering authority. This avoids treating
+clock movement across processes or restarts as a newer attempt.
+
+Each completed model response and tool result is stored in `turn_transcript` with the request row key, attempt ID, a monotonic attempt-local sequence, and a timestamp. Model records retain optional text, normalized response metadata, opaque provider continuation fields, and ordered tool calls with their provider IDs, names, and full argument strings. Result records retain the model sequence, call index, call ID, tool name, full output, and a structured outcome.
+
+The recorder is awaited. A tool-call response commits before approval or execution begins, and every tool result commits before another model request. A persistence failure stops the turn. If the tool already caused an external effect, the unmatched attempt remains interrupted and is not replayed automatically. The visible final response and terminal model record commit in the same transaction as completion. Provider retries that have not produced a completed response and streamed tokens do not create records.
+
+The full arguments and results live in the transcript store. `ToolCall` and `ToolResult` session entries are presentation records created by the same successful transaction; result display remains truncated and bridge delivery continues to exclude tool entries. This does not widen approval prompts or bridge exposure of tool secrets.
+
+For each request, reconciliation exposes one of four states:
+
+- **Queued** has no attempt and may run.
+- **In flight** has a started attempt owned by the current process.
+- **Interrupted** has a durable start without a completion but is not owned by
+  the current process.
+- **Completed** has a completion and never runs again automatically.
+
+On registration, the server captures a session snapshot, installs its
+write callback from that snapshot, and reconciles the snapshot for queued
+requests. The callback covers commits after the snapshot; the catch-up read
+covers work already present before registration. Repeated callbacks are safe:
+the persisted request and attempt state decides whether there is work to run.
+
+When a local service client creates a session, the resident executor treats the
+peer-local session index as a durable adoption queue. It proves that the shared
+user's default key has write authority on the new session, binds that signing
+identity, claims the runtime, and registers the ordinary watch/catch-up path.
+The executor scans existing rows on startup and rescans after index writes, so
+a queued turn survives notification loss and executor restart. This path does
+not add transport exposure metadata; bridge-created sessions continue through
+the agent registry's `exposed_on` adoption path.
+
+An interrupted attempt is deliberately not replayed. Model and tool work may
+already have caused an external effect before the process stopped. The public
+library API exposes `Server::interrupted_turns()` to inspect that state and
+`Server::retry_interrupted_turn()` to request an explicit retry. The retry is
+submitted as a typed row in the session's `session_commands` store. The real
+executor accepts it only if its expected interrupted-attempt ID still matches,
+then atomically completes the command and writes the new target attempt.
+`/interrupted` and `/retry <request_id>` expose this path to TUI and command
+clients without granting those clients model or tool authority.
+
+### Durable session commands
+
+`/compact` and `/retry` are typed client-written requests. Their command IDs
+are generated before the write and may be reused after an uncertain write;
+reusing an ID with a different payload is rejected. They share the session
+watch/catch-up callback, per-session processing slot, and `turn_attempts`
+lifecycle with ordinary turns. A command start without a completion is
+interrupted and never replays automatically. Terminal status and output live
+in `session_command_results`, keyed by command ID, so command clients observe
+the executor's durable result rather than a local return value.
+
+Retry requests carry both the target turn row ID and the interrupted attempt
+ID the client observed. After one retry advances the target generation, a
+second command naming the old attempt is rejected as stale. This is durable
+deduplication under the documented one-executor assumption, not distributed
+fencing or exactly-once external effects.
+
+#### Legacy sessions
+
+New sessions write a turn-schema marker before their first request. When an
+executor first registers an older session, it atomically records a baseline of
+the rows visible at that point. Those existing transcript rows are consumed;
+the server does not infer that they completed, and it does not replay them.
+Rows committed concurrently after that baseline are not included and remain
+queued. Bridge history backfill is likewise marked consumed rather than made
+into new work.
+
+#### Execution boundary and limits
+
+`Server::register_session()` and retry require executor authority. A
+client-role server can observe the synced session state, but cannot register
+execution, drive agents or models, create execution child sessions, or run
+routines and schedules. Build-time validation also rejects runtime options
+that would give a client those responsibilities. A future tool fulfiller may
+receive separate permission to satisfy selected durable tool requests without
+receiving agent/model-driving authority; no such routing, claim, or permission
+path exists here, and current tool execution remains local to the executor.
+
+This protocol assumes one executor for a session. The in-process processing
+and live-attempt sets serialize that executor's work, but they are not
+distributed fencing. The protocol does not provide exactly-once external
+effects. Tests cover both a shared Eidetica service with separate client and
+executor connections and direct peers syncing a session over HTTP; neither
+topology adds multi-executor election or fencing.
 
 ## Session Registry
 
@@ -91,16 +208,27 @@ Sessions can be given human-friendly names via `set_session_name()` (TUI: `/name
 `ContextBuilder` (in `context.rs`) assembles the LLM context within a token budget:
 
 1. Account for system prompt and tool definition tokens first
-2. Find the most recent `Summary` entry (context boundary — older entries excluded)
+2. Resolve a successful `/compact` snapshot boundary, or the most recent legacy `Summary`
 3. Filter for `Message`, `Directive`, and `Summary` entries
 4. Fill from newest messages backward until the token budget is exhausted
-5. Map senders to roles: current agent name = `assistant`, everything else = `user`
+5. Spend only remaining budget on complete native call/result groups; preview oversized results or skip the group
+6. Map senders to roles: current agent name = `assistant`, everything else = `user`
+
+Historical tool results use the same escaped `<tool_output>` boundary as live results. Outputs are leak-scanned before persistence and capped at 100 KB, including native/custom tools; legacy larger records are capped on replay. Authorized session peers sync the bounded transcript. A compact snapshot excludes covered requests and their tool exchanges; legacy summaries also bound both. Missing or malformed records supply no tool history.
 
 Token estimation uses tiktoken (`cl100k_base` BPE tokenizer) for accurate counting. The budget is `max_context_tokens - reserved_output_tokens`, configurable globally and per-agent.
 
 ### Compaction
 
-The `compact` tool and `/compact` TUI command write a `Summary` entry to the session. The `ContextBuilder` treats the most recent `Summary` as the conversation start boundary, effectively replacing older messages with the summary.
+The `compact` tool retains the legacy behavior of writing a `Summary` entry.
+`/compact` captures an Eidetica `Snapshot`, then the executor reads that native
+historical view and writes a typed compact result. Context assembly uses the
+snapshot's parent history as the coverage boundary: the persisted summary is
+followed by every current context entry outside that snapshot. A message
+committed while summarization is running therefore remains visible, even when
+its timestamp sorts before command completion. Successive compactions read the
+prior virtual boundary through the same snapshot-backed context path. No
+covered-entry list or parallel Chaz ancestry graph is stored.
 
 ## Eidetica Sync
 
@@ -129,16 +257,14 @@ Failover is **explicit and operator-driven** in v1. If the home peer's chaz proc
 
 `/agent revoke-peer` emits a soft warning when the revoked key was the home for any sessions or agent-level state, listing what needs rehosting; it does not block the revoke.
 
-Cross-peer `spawn_agent` works without special handling. The spawner is the attacher, so `attach_agent_to_session` on the child session defaults `home_pubkey` to the spawning peer's key — that peer runs the child turn. If a co-owner later syncs the child session, their gate skips it.
+Agent jobs are admitted only for Agents hosted by the local executor. Their child sessions pin the target Agent/home identity; the home gate is not a cross-peer delegation mechanism or an exactly-once execution fence.
 
-## Child Sessions (spawn_agent / spawn_worker)
+## Agent jobs and Worker children
 
-When an Agent spawns a child — either a peer Agent (`spawn_agent`) or a Worker template (`spawn_worker`):
+`spawn_agent` submits one durable Agent job, not a workflow graph. The submitter prepares one child session DB with parent delegation, a request record and exactly one Directive before publishing its ID to the existing watched catalog. An unpublished child is inert; a published child is `Pending` until an executor checks its parent, hosted target/home and broad scope, then pins inherited per-tool grants, capability and depth ceilings and records acceptance in the **same** DB. Invalid requests become `Rejected` without running. Submission returns the DB ID after publication, not after acceptance or execution. A lost creation response requires inspecting the indexed jobs before another submission; there is no stable parent request key or automatic submission retry. Same-login local clients can create and observe jobs but cannot admit or execute them. Narrow, workspace and private scopes are rejected in v1.
 
-1. The server creates a new session DB via `register_child_session`
-2. The parent writes a `Directive` entry to the child session
-3. The server detects the directive and runs the child agent
-4. The child writes its response, completion is signaled to the parent
-5. The parent reads the response from the child session
+After `Pending` admission or `Rejected` refusal, job status comes from the accepted Directive's attempt and typed terminal receipt: queued, running, started-unknown (a client cannot prove liveness), interrupted (executor sees a start without completion), succeeded, or failed. At most ten Agent-job runs hold runtime permits; accepted jobs wait **queued before starting an attempt** when capacity is full. After restart, queued jobs are adopted; a started attempt without completion is not replayed automatically. Inspect it and explicitly retry if appropriate, since effects may already have occurred. `job_wait` only observes and a timeout does not cancel.
 
-Child sessions are full session DBs -- they appear in `/sessions` and can be inspected.
+Unlike the ordinary session protocol's single-executor assumption, an Agent job has a session-DB last-writer-wins owner claim for the same Agent/home identity. A contender losing the claim stops and records an interrupted/claim-loss marker while retaining the transcript. This is not fencing: delayed observations can overlap model or tool effects, and neither exactly-once effects nor cross-peer failover are promised. The pinned child authority cannot exceed the parent's admitted ceiling; `spawn_worker` is excluded from Agent-job delegation.
+
+`spawn_worker` is a separate Worker-template invocation, synchronous by default, with no durable Agent-job handle or Agent identity. Its child session must not be treated as an accepted Agent job.

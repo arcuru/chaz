@@ -46,7 +46,11 @@ pub async fn spawn_session_db_approval_proxy(
     session_db: Database,
     agent_name: String,
     timeout: Duration,
-) -> mpsc::Sender<ApprovalExchange> {
+) -> (
+    mpsc::Sender<ApprovalExchange>,
+    Vec<tokio::task::JoinHandle<()>>,
+) {
+    let mut tasks = Vec::new();
     let (tx, mut rx) = mpsc::channel::<ApprovalExchange>(8);
     let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
     let sid = session_db.root_id().to_string();
@@ -79,7 +83,7 @@ pub async fn spawn_session_db_approval_proxy(
         let pending = pending.clone();
         let db = session_db.clone();
         let sid = sid.clone();
-        tokio::spawn(async move {
+        tasks.push(tokio::spawn(async move {
             while ping_rx.recv().await.is_some() {
                 while ping_rx.try_recv().is_ok() {} // debounce a burst
                 let session = Session::new(ConversationId(sid.clone()), db.clone()).await;
@@ -95,13 +99,13 @@ pub async fn spawn_session_db_approval_proxy(
                     }
                 }
             }
-        });
+        }));
     }
 
     // Requester: write a request entry per exchange and track it as pending.
     {
         let db = session_db;
-        tokio::spawn(async move {
+        tasks.push(tokio::spawn(async move {
             while let Some(exchange) = rx.recv().await {
                 let (request_id, entry) =
                     approval_request_entry(&agent_name, &exchange.info, timeout);
@@ -155,10 +159,10 @@ pub async fn spawn_session_db_approval_proxy(
                     }
                 });
             }
-        });
+        }));
     }
 
-    tx
+    (tx, tasks)
 }
 
 #[cfg(test)]
@@ -207,7 +211,7 @@ mod tests {
     #[tokio::test]
     async fn an_unanswered_request_expires_into_a_timeout() {
         let (_inst, _user, db) = test_session_db().await;
-        let tx =
+        let (tx, _tasks) =
             spawn_session_db_approval_proxy(db, "chaz".to_string(), Duration::from_millis(250))
                 .await;
 
@@ -225,7 +229,7 @@ mod tests {
     #[tokio::test]
     async fn an_expiry_is_recorded_in_the_session() {
         let (_inst, _user, db) = test_session_db().await;
-        let tx = spawn_session_db_approval_proxy(
+        let (tx, _tasks) = spawn_session_db_approval_proxy(
             db.clone(),
             "chaz".to_string(),
             Duration::from_millis(250),
@@ -260,7 +264,7 @@ mod tests {
     #[tokio::test]
     async fn a_request_carries_its_own_ceiling() {
         let (_inst, _user, db) = test_session_db().await;
-        let tx = spawn_session_db_approval_proxy(
+        let (tx, _tasks) = spawn_session_db_approval_proxy(
             db.clone(),
             "chaz".to_string(),
             Duration::from_secs(1234),
@@ -286,7 +290,7 @@ mod tests {
     #[tokio::test]
     async fn an_answer_after_the_expiry_does_not_resolve_the_request() {
         let (_inst, _user, db) = test_session_db().await;
-        let tx = spawn_session_db_approval_proxy(
+        let (tx, _tasks) = spawn_session_db_approval_proxy(
             db.clone(),
             "chaz".to_string(),
             Duration::from_millis(250),
@@ -327,7 +331,7 @@ mod tests {
     #[tokio::test]
     async fn a_decision_written_in_time_resolves_the_request() {
         let (_inst, _user, db) = test_session_db().await;
-        let tx = spawn_session_db_approval_proxy(
+        let (tx, _tasks) = spawn_session_db_approval_proxy(
             db.clone(),
             "chaz".to_string(),
             Duration::from_secs(60),
@@ -366,7 +370,7 @@ mod tests {
         let unwritable = eidetica::Database::open(&instance, db.root_id())
             .await
             .unwrap();
-        let tx = spawn_session_db_approval_proxy(
+        let (tx, _tasks) = spawn_session_db_approval_proxy(
             unwritable,
             "chaz".to_string(),
             Duration::from_secs(60),

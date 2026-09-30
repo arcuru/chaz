@@ -6,7 +6,6 @@ use std::collections::HashMap;
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::AtomicU32;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -258,6 +257,10 @@ fn strip_param_descriptions(params: &Value) -> Value {
 pub struct ToolContext {
     /// Name of the agent currently executing
     pub agent_name: String,
+    // Persisted parent request identity; absent on non-turn callers.
+    pub turn_request_id: Option<crate::session::TurnRequestId>,
+    // Stable model-response call site, set by the runtime before dispatch.
+    pub tool_call_key: Option<String>,
     /// Current spawn depth (0 = root agent from bridge)
     pub call_depth: usize,
     /// Maximum allowed spawn depth
@@ -293,14 +296,6 @@ pub struct ToolContext {
     /// Tools go through the host for system access (shell, HTTP, filesystem)
     /// rather than calling OS APIs directly. Defaults to [`NativeToolHost`].
     pub host: Arc<dyn ToolHost>,
-    /// Shared ReAct iteration budget. Seeded by the top-level Agent's
-    /// `max_iterations` and inherited by descendant Workers via
-    /// `spawn_worker` so nested work draws from the same pool rather than
-    /// each level getting a fresh allotment. `None` = no shared budget;
-    /// the runtime falls back to its built-in cap (used by tests and
-    /// direct `runtime::execute` callers that don't go through the
-    /// spawn machinery).
-    pub iteration_budget: Option<Arc<AtomicU32>>,
     /// Handle to the running `RoutineEngine`, threaded from `Server` at
     /// context construction. Tools that mutate schedules resync the live
     /// heap through this after a committed write. `None` under `--print`
@@ -325,6 +320,27 @@ impl ToolContext {
             .attenuate(Some(&self.session_capabilities))
             .attenuate(Some(&self.agent_capabilities))
             .attenuate(self.agent_grants.get(tool_name))
+    }
+
+    /// Bound a durable child to the parent's current per-tool policy and grants.
+    // spawn_worker has no restartable authority record in v1; exclude it.
+    pub fn delegable_tool_ceilings(
+        &self,
+        policies: &ToolPolicyRegistry,
+    ) -> std::collections::BTreeMap<String, Grants> {
+        self.tools
+            .permitted_names()
+            .into_iter()
+            .filter(|name| name != "spawn_worker")
+            .filter_map(|name| {
+                let tool = self.tools.get(&name)?;
+                let policy = policies.resolve(tool.as_ref());
+                Some((
+                    name.clone(),
+                    self.resolve_call_grants(&policy.grants, &name),
+                ))
+            })
+            .collect()
     }
 
     /// Access the execution host for sandboxed capability requests.
@@ -851,6 +867,19 @@ impl ScopedTools {
             allowed: narrowed,
             active_extensions: self.active_extensions.clone(),
         }
+    }
+
+    // Pin a concrete name set for a durable child. New MCP tools and newly
+    // activated extensions must not appear merely because the executor restarted.
+    pub fn permitted_names(&self) -> Vec<String> {
+        let mut names: Vec<_> = self
+            .definitions(&ToolProfile::default())
+            .into_iter()
+            .map(|definition| definition.name)
+            .collect();
+        names.sort();
+        names.dedup();
+        names
     }
 
     pub fn is_empty(&self) -> bool {

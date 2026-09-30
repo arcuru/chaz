@@ -1,10 +1,12 @@
 mod bridge;
 
 use chaz_core::bridge::Bridge;
+use chaz_core::commands::{self, Parsed};
 use chaz_core::config::Config;
-use chaz_core::{agent, config, server, session};
+use chaz_core::{agent, config, instance, server, session};
 
 use clap::Parser;
+use std::sync::Arc;
 use std::time::Instant;
 use std::{fs::File, io::Read, path::PathBuf};
 use tracing::{error, info, warn};
@@ -141,6 +143,11 @@ async fn main() -> anyhow::Result<()> {
 
     let mut config: Config = serde_yaml::from_str(&contents)?;
 
+    // Validate the connector contract before even creating log/state
+    // directories. A missing or mixed migration config must be a read-only
+    // failure, not the first mutation of a replacement layout.
+    instance::required_settings(&config)?;
+
     // Warn about unrecognised YAML keys before proceeding.
     let unknown = config::check_unknown_config_keys(&contents);
     if !unknown.is_empty() {
@@ -152,7 +159,8 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
-    // Resolve state directory for persistence
+    // Resolve state directory for logs and other Chaz-local files. Eidetica
+    // storage is selected only by the explicit connector configuration.
     let state_dir = resolve_state_dir(&config);
     if let Some(dir) = &state_dir {
         std::fs::create_dir_all(dir)?;
@@ -176,15 +184,11 @@ async fn main() -> anyhow::Result<()> {
                     .with_env_filter(filter)
                     .with_writer(std::io::stderr)
                     .init();
-                return run_usage_subcommand(usage_args, &config, state_dir.as_deref()).await;
+                return run_usage_subcommand(usage_args, &config).await;
             }
             Subcommand::Cmd(a) => cmd_args = Some(a),
         }
     }
-
-    // Both one-shot modes reserve stdout for their result, so neither can log
-    // to it.
-    let headless_oneshot = args.print || cmd_args.is_some();
 
     // Init tracing. Honour RUST_LOG; default to info when unset.
     //
@@ -245,26 +249,29 @@ async fn main() -> anyhow::Result<()> {
     // Whole-startup wall clock: time from here to the gateway taking over.
     let startup_start = Instant::now();
 
-    // Initialize eidetica with SQLite backend for persistent storage
-    let eidetica_db_path = state_dir
-        .as_ref()
-        .map(|d| d.join("eidetica.db"))
-        .unwrap_or_else(|| PathBuf::from("eidetica.db"));
     let t = Instant::now();
-    let backend = eidetica::backend::database::SqlxBackend::open_sqlite(&eidetica_db_path).await?;
-    let (instance, maybe_user) = eidetica::Instance::connect_or_create_backend(
-        Box::new(backend),
-        eidetica::NewUser::passwordless("chaz"),
-    )
-    .await?;
-    let user = match maybe_user {
-        Some(u) => u,
-        None => instance.login_user("chaz", None).await?,
-    };
+    let connected = instance::connect(&config).await?;
+    let capabilities = connected.capabilities;
     info!(
         elapsed_ms = t.elapsed().as_millis() as u64,
         "eidetica opened"
     );
+
+    if let Some(command) = cmd_args
+        .as_ref()
+        .and_then(|args| match commands::parse(&args.command) {
+            Parsed::Command(command) if commands::is_session_independent(&command) => Some(command),
+            _ => None,
+        })
+    {
+        let agents = std::sync::Arc::new(agent::AgentRegistry::from_config(&config));
+        if agents.is_empty() {
+            agents.register_default_chaz(&config)?;
+        }
+        let registry =
+            session::SessionRegistry::new(connected.instance, connected.user, agents).await?;
+        return bridge::cmd::CommandBridge::run_session_independent(command, &registry).await;
+    }
 
     // In non-interactive --print mode there is no approval UI; pass the
     // configured (or default) CLI auto-approved tools so shell/write_file work
@@ -280,44 +287,54 @@ async fn main() -> anyhow::Result<()> {
         Vec::new()
     };
 
-    // Assemble the fully-wired server (registry, agent DBs, secret store,
-    // extension hub, schedules, routine engine) from the opened eidetica
-    // instance. Sync and the routine engine are long-lived and skipped for a
-    // one-shot CLI run. See `chaz_core::server::build`.
+    // Assemble the fully-wired server. The explicit role is the authority
+    // ceiling; one-shot command mode further suppresses all execution work.
     let t = Instant::now();
-    let server::BuiltServer {
-        server,
-        secret_store,
-        ..
-    } = server::build(
-        &mut config,
-        instance,
-        user,
-        server::BuildOptions {
-            config_path: config_path.clone(),
-            // Command mode needs sync even though it is one-shot: `/agent
-            // share` mints a ticket out of the sync layer and refuses outright
-            // without it, and minting tickets is most of the point.
-            enable_sync: cmd_args.is_some() || !args.print,
-            run_routine_engine: !headless_oneshot,
-            // The chaz daemon owns its agents — mint their DBs from config.
-            bootstrap_agents_from_config: true,
-            // Command mode administers the peer; it never runs a turn, and
-            // starting the loop would risk billing one as a side effect.
-            run_agent_loop: cmd_args.is_none(),
+    let build_options = if cmd_args.is_some() || args.print {
+        let bootstrap_agents = args.print
+            || (cmd_args.is_some()
+                && capabilities.ownership() == instance::InstanceOwnership::Direct);
+        let mut options = server::BuildOptions::local_oneshot(
+            config_path.clone(),
+            capabilities,
+            args.print,
+            bootstrap_agents,
             extra_auto_approved_tools,
-            // `--print` runs exactly one turn, so its tool list has to be
-            // complete before that turn starts. Long-lived modes take the
-            // tools whenever they land. `chaz cmd` runs no turn at all and
-            // so never reaches the gate either way.
-            mcp_readiness: if args.print {
+            if args.print {
                 server::McpReadiness::AwaitReady
             } else {
                 server::McpReadiness::Deferred
             },
-        },
-    )
-    .await?;
+        );
+        options.targeted_session = args
+            .session
+            .clone()
+            .or_else(|| cmd_args.as_ref().and_then(|args| args.session.clone()))
+            .or(options.targeted_session);
+        options
+    } else {
+        let mut options = server::BuildOptions::local(
+            config_path.clone(),
+            capabilities,
+            extra_auto_approved_tools,
+            server::McpReadiness::Deferred,
+        );
+        if options.targeted_session.is_some() && !daemon_mode {
+            options.targeted_session = Some("tui".to_string());
+        }
+        options
+    };
+    let mut built = Some(
+        server::build(
+            &mut config,
+            connected.instance,
+            connected.user,
+            build_options,
+        )
+        .await?,
+    );
+    let server = built.as_ref().unwrap().server.clone();
+    let secret_store = built.as_ref().unwrap().secret_store.clone();
     info!(
         build_ms = t.elapsed().as_millis() as u64,
         time_to_gateway_ms = startup_start.elapsed().as_millis() as u64,
@@ -347,7 +364,12 @@ async fn main() -> anyhow::Result<()> {
         // work continues, and let the runtime shut down through the same
         // `Drop` path any other mode uses.
         info!("chaz daemon ready; waiting for shutdown signal");
-        wait_for_shutdown().await;
+        if capabilities.ownership() == instance::InstanceOwnership::Service {
+            supervise_daemon_service(config.clone(), config_path.clone(), built.take().unwrap())
+                .await?;
+            return Ok(());
+        }
+        instance::wait_for_shutdown().await;
         info!("Shutdown signal received; stopping");
         Ok(())
     } else if let Some(a) = cmd_args {
@@ -373,44 +395,54 @@ async fn main() -> anyhow::Result<()> {
         return Err(e);
     }
 
+    if let Some(built) = built {
+        built.shutdown().await;
+    }
     Ok(())
 }
 
-/// Block until the process is asked to stop. Ctrl-C covers foreground and
-/// container use; SIGTERM is what systemd and a test harness's teardown send,
-/// and without it a stop degrades into the kill that follows the timeout.
-async fn wait_for_shutdown() {
-    #[cfg(unix)]
-    {
-        use tokio::signal::unix::{SignalKind, signal};
-        let mut term = match signal(SignalKind::terminate()) {
-            Ok(s) => s,
-            Err(e) => {
-                error!("Failed to install SIGTERM handler, Ctrl-C only: {e}");
-                let _ = tokio::signal::ctrl_c().await;
-                return;
+async fn supervise_daemon_service(
+    config: Config,
+    config_path: PathBuf,
+    built: server::BuiltServer,
+) -> anyhow::Result<()> {
+    let config = Arc::new(config);
+    instance::supervise_service(
+        built,
+        move || {
+            let config = config.clone();
+            let config_path = config_path.clone();
+            async move {
+                let connected = instance::connect(&config).await?;
+                // A rebuild applies the same first-boot reconcile to a fresh
+                // copy of the parsed configuration; nothing here mutates the
+                // file or the previous generation's view of it.
+                let mut config = (*config).clone();
+                let replacement = server::build(
+                    &mut config,
+                    connected.instance,
+                    connected.user,
+                    server::BuildOptions::local(
+                        config_path,
+                        connected.capabilities,
+                        Vec::new(),
+                        server::McpReadiness::Deferred,
+                    ),
+                )
+                .await?;
+                Ok(replacement)
             }
-        };
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => {}
-            _ = term.recv() => {}
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = tokio::signal::ctrl_c().await;
-    }
+        },
+        instance::wait_for_shutdown,
+    )
+    .await
 }
 
 /// `chaz usage` — open the eidetica DB read-only, walk the user-central
 /// session catalog, aggregate per-message `ResponseMetadata`, print either
 /// human-readable text or JSON, then exit. Skips all bridge/sync/scheduler
 /// setup since we never serve a session here.
-async fn run_usage_subcommand(
-    args: UsageArgs,
-    config: &Config,
-    state_dir: Option<&std::path::Path>,
-) -> anyhow::Result<()> {
+async fn run_usage_subcommand(args: UsageArgs, config: &Config) -> anyhow::Result<()> {
     let bridge_filter = match args.bridge.as_deref() {
         Some(s) => Some(session::BridgeKind::from_filter_str(s).ok_or_else(|| {
             anyhow::anyhow!(
@@ -420,25 +452,14 @@ async fn run_usage_subcommand(
         None => None,
     };
 
-    let eidetica_db_path = state_dir
-        .map(|d| d.join("eidetica.db"))
-        .unwrap_or_else(|| PathBuf::from("eidetica.db"));
-    let backend = eidetica::backend::database::SqlxBackend::open_sqlite(&eidetica_db_path).await?;
-    let (instance, maybe_user) = eidetica::Instance::connect_or_create_backend(
-        Box::new(backend),
-        eidetica::NewUser::passwordless("chaz"),
-    )
-    .await?;
-    let user = match maybe_user {
-        Some(u) => u,
-        None => instance.login_user("chaz", None).await?,
-    };
+    let connected = instance::connect(config).await?;
 
     let agent_registry = std::sync::Arc::new(agent::AgentRegistry::from_config(config));
     if agent_registry.is_empty() {
         agent_registry.register_default_chaz(config)?;
     }
-    let registry = session::SessionRegistry::new(instance, user, agent_registry).await?;
+    let registry =
+        session::SessionRegistry::new(connected.instance, connected.user, agent_registry).await?;
 
     let filter = session::usage::UsageFilter {
         since: None,
@@ -511,5 +532,16 @@ mod tests {
             resolve_state_dir(&config),
             dirs::state_dir().map(|dir| dir.join("chaz"))
         );
+    }
+
+    #[test]
+    fn invalid_connector_config_is_rejected_before_state_directory_creation() {
+        let state = tempfile::tempdir().unwrap().path().join("must-not-exist");
+        let config = Config {
+            state_dir: Some(state.display().to_string()),
+            ..Default::default()
+        };
+        assert!(chaz_core::instance::required_settings(&config).is_err());
+        assert!(!state.exists());
     }
 }

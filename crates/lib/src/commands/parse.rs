@@ -76,6 +76,7 @@ pub fn parse(input: &str) -> Parsed {
         "/compact" => return Parsed::Command(Command::Compact),
         "/info" => return Parsed::Command(Command::Info),
         "/costs" => return Parsed::Command(Command::ListCosts),
+        "/interrupted" => return Parsed::Command(Command::Interrupted),
         "/print" => return Parsed::Command(Command::Print),
         "/backends" => return Parsed::Command(Command::ListBackends),
         "/new" => return Parsed::Command(Command::NewSession(None)),
@@ -88,6 +89,15 @@ pub fn parse(input: &str) -> Parsed {
         "/agents" => return Parsed::Command(Command::AgentsList),
         "/pubkey" => return Parsed::Command(Command::Pubkey),
         _ => {}
+    }
+
+    if let Some(arg) = text.strip_prefix("/retry ") {
+        let request = arg.trim();
+        return if request.is_empty() {
+            Parsed::Usage("Usage: /retry <request_id>".to_string())
+        } else {
+            Parsed::Command(Command::RetryInterrupted(request.to_string()))
+        };
     }
 
     // --- Living Agents: per-session participation + lifecycle ---
@@ -688,6 +698,19 @@ mod tests {
             Command::Extensions(ExtensionsAction::List)
         ));
         assert!(usage("/extensions add ").starts_with("Usage: /extensions add"));
+    }
+
+    #[test]
+    fn interrupted_turn_commands_use_stable_request_ids() {
+        assert!(matches!(
+            parse("/interrupted"),
+            Parsed::Command(Command::Interrupted)
+        ));
+        match parse("/retry request-123") {
+            Parsed::Command(Command::RetryInterrupted(id)) => assert_eq!(id, "request-123"),
+            _ => panic!("expected retry command"),
+        }
+        assert!(matches!(parse("/retry "), Parsed::Usage(_)));
     }
 
     #[test]

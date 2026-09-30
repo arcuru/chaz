@@ -2,6 +2,62 @@
 
 Chaz is configured via a YAML file passed with `--config`.
 
+## Eidetica connection and execution role
+
+Every local entry point (`chaz`, `daemon`, `--print`, `cmd`, and `usage`)
+requires an explicit Eidetica connection, existing login, and execution role.
+`executor` may call models and tools and runs routines/scheduled agents;
+`client` can observe, submit messages, approve requests, and use ordinary data
+commands without executing agent work.
+
+Direct ownership keeps Eidetica in this process:
+
+```yaml
+execution: executor
+eidetica:
+  connection: "sqlite:///var/lib/chaz/eidetica.db"
+  login: { username: chaz, passwordless: true }
+  sync:
+    iroh: true
+    http_listen: 127.0.0.1:8765
+```
+
+A service client uses the daemon-owned instance. It must not include `sync:`;
+the Eidetica daemon owns transports, peers, tickets, and bootstrap:
+
+```yaml
+execution: client
+eidetica:
+  connection: "unix:///run/eidetica/service.sock"
+  login: { username: chaz, passwordless: true }
+```
+
+The connector never creates a store or user and never falls back from a failed
+service connection to SQLite. To keep using an existing direct-owner configuration with its
+old data, set `connection` to its resolved `<state_dir>/eidetica.db` and retain
+the existing `chaz` login. Switching to a service connection does not import
+that data; see the [fresh-state rehearsal](bridges.md#fresh-state-service-rehearsal-no-automatic-migration). Provisioning a new Eidetica store/user is a separate,
+explicit operation.
+
+CLI and TUI clients may create sessions and queue turns through that service
+connection. The resident executor adopts those sessions from the durable local
+index and runs them; the client process remains an observer and never calls the
+model or tools. This local handoff does not mark the session as exposed on a
+Matrix or Discord login.
+
+Long-running service-mode daemons monitor the connection. A transient daemon
+restart tears down the old Chaz runtime before bounded-backoff reconnect,
+re-login, database reopen, hook installation, and persisted-state
+reconciliation. Bad credentials or invalid configuration fail immediately.
+Interrupted turns are displayed by `/interrupted` and run only after an
+explicit `/retry <request_id>`; Chaz never automatically replays a possibly
+completed model/tool effect.
+
+Ticket/bootstrap and daemon sync administration commands fail on a service
+client before mutation and direct the operator to run them on the Eidetica
+owner. Ordinary session, agent, approval, and user-level sync-preference data
+operations continue through the service API.
+
 ## Full Example
 
 ```yaml
@@ -14,7 +70,15 @@ allow_list: "@user:matrix.org|@other:matrix.org" # Regex matched against the sen
 # room_size_limit: 100         # Optional: refuse to respond in rooms with more than N members (Matrix only)
 # chat_summary_model: "gpt-4o-mini"  # Optional: separate model for chat summarization
 
-# Persistence
+# Process authority and Eidetica connection (required by chaz/TUI/CLI/daemon)
+execution: executor # or client
+eidetica:
+  connection: "sqlite:///path/to/state/eidetica.db"
+  login:
+    username: chaz
+    passwordless: true
+
+# Logs and other Chaz-local files (does not select the Eidetica database)
 state_dir: "/path/to/state" # Default: $XDG_STATE_HOME/chaz
 
 # LLM backends (OpenAI-compatible)
@@ -25,6 +89,9 @@ backends:
     api_base: https://openrouter.ai/api/v1
     models:
       - name: anthropic/claude-sonnet-4
+        # How hard this model should think. Omit to use the
+        # backend or provider default.
+        # reasoning: { effort: none }
       - name: google/gemini-2.5-pro
   - name: local
     type: openaicompatible
@@ -121,7 +188,9 @@ mcp_servers:
 
 # Scheduled tasks — imported at startup as agent-owned schedules in the
 # owning agent's DB (Pinned to the resolved session), fired by the same
-# RoutineEngine as the /schedule command. Cron is 6 fields:
+# RoutineEngine as the /schedule command. Bootstrap YAML schedules are
+# cron-only; runtime /schedule commands and schedule tools also support
+# fixed-delay intervals. Cron is 6 fields:
 # sec min hour day-of-month month day-of-week. Idempotent by `name`
 # within the owning agent.
 schedules:
@@ -280,26 +349,44 @@ All LLM HTTP requests are wrapped in a configurable timeout and retried on trans
 
 Retries use exponential backoff (1s, 2s, 4s, … capped at 30s). Rate-limit responses (HTTP 429) with a `Retry-After` header are honored as the minimum delay. Non-retryable errors (401, 403, 400) fail immediately.
 
+### Per-model reasoning
+
+Some models think before they answer, spending extra tokens working through the question. That helps on hard problems but slows down simple ones. You can set how much effort each model puts in:
+
+```yaml
+backends:
+  - name: proxy
+    type: openaicompatible
+    api_base: http://127.0.0.1:18081/v1
+    models:
+      - name: example/model
+        reasoning: { effort: none }
+```
+
+Available levels, from least to most thinking: `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`. Setting `none` turns the extra thinking off, which keeps small prompts fast. Anything else is passed straight through to the provider, so only use levels your provider supports.
+
+When present, Chaz includes `reasoning` in the `/v1/chat/completions` request body, so this explicit choice takes precedence over a backend or provider default. Omit `reasoning` to leave that default unchanged. The setting applies only to the named model; models on the same backend may use different levels.
+
 ## Agents
 
 Each `agents:` entry seeds an Agent DB on first boot; subsequent edits live in the DB, not the YAML. See [Agents](agents.md) for the runtime model and live-edit commands. Per-agent fields:
 
-| Field                  | Type                   | Notes                                                                                                  |
-| ---------------------- | ---------------------- | ------------------------------------------------------------------------------------------------------ |
-| `name`                 | string                 | Required. Display name; also the lookup key for `default_agents`, `/agent add`, schedules.             |
-| `system_prompt`        | string                 | Inline system prompt. Appended after `system_prompt_files` content when both are set.                  |
-| `system_prompt_files`  | list of paths          | File contents concatenated into the system prompt. `~` expansion supported.                            |
-| `model`                | string                 | Default model (e.g. `openrouter:anthropic/claude-sonnet-4`). Backend prefix required when ambiguous.   |
-| `tools`                | list of tool names     | Whitelist. `null` (omitted) means "all tools". Supports `namespace__*` globs for MCP tools.            |
-| `workers`              | list of WorkerConfig   | Per-Agent Worker templates invocable via `spawn_worker`. See "Worker fields" below.                    |
-| `max_iterations`       | int                    | ReAct loop cap. Default 10.                                                                            |
-| `autonomous`           | bool                   | Allow firing without an inbound human message (scheduler wakes). Default `false`.                      |
-| `max_context_tokens`   | int                    | Per-agent override of `context.max_context_tokens`.                                                    |
-| `tool_profile`         | string                 | References a key in top-level `tool_profiles`.                                                         |
-| `grants`               | map<tool, Grants>      | Per-tool grant overrides (shell allow/deny, network endpoints, fs paths). Merged per-kind over policy. |
-| `default_memory_banks` | list of bank names     | Auto-attached at first boot. Missing banks are auto-created.                                           |
-| `default_skill_banks`  | list of bank names     | Auto-attached at first boot. Missing banks are warned and skipped.                                     |
-| `presets`              | map<name, AgentPreset> | Named override bundles selectable at spawn time (model / iters / tools / role suffix / tool_profile).  |
+| Field                  | Type                   | Notes                                                                                                                                  |
+| ---------------------- | ---------------------- | -------------------------------------------------------------------------------------------------------------------------------------- |
+| `name`                 | string                 | Required. Display name; also the lookup key for `default_agents`, `/agent add`, schedules.                                             |
+| `system_prompt`        | string                 | Inline system prompt. Appended after `system_prompt_files` content when both are set.                                                  |
+| `system_prompt_files`  | list of paths          | File contents concatenated into the system prompt. `~` expansion supported.                                                            |
+| `model`                | string                 | Default model (e.g. `openrouter:anthropic/claude-sonnet-4`). Backend prefix required when ambiguous.                                   |
+| `tools`                | list of tool names     | Whitelist. `null` (omitted) means "all tools". Supports `namespace__*` globs for MCP tools.                                            |
+| `workers`              | list of WorkerConfig   | Per-Agent Worker templates invocable via `spawn_worker`. See "Worker fields" below.                                                    |
+| `max_iterations`       | int                    | Legacy name for the maximum nested spawn depth. Default 10. Does not cap tool calls; see [How a turn ends](agents.md#how-a-turn-ends). |
+| `autonomous`           | bool                   | Allow firing without an inbound human message (scheduler wakes). Default `false`.                                                      |
+| `max_context_tokens`   | int                    | Per-agent override of `context.max_context_tokens`.                                                                                    |
+| `tool_profile`         | string                 | References a key in top-level `tool_profiles`.                                                                                         |
+| `grants`               | map<tool, Grants>      | Per-tool grant overrides (shell allow/deny, network endpoints, fs paths). Merged per-kind over policy.                                 |
+| `default_memory_banks` | list of bank names     | Auto-attached at first boot. Missing banks are auto-created.                                                                           |
+| `default_skill_banks`  | list of bank names     | Auto-attached at first boot. Missing banks are warned and skipped.                                                                     |
+| `presets`              | map<name, AgentPreset> | Named override bundles for Worker templates (model / iters / tools / role suffix / tool_profile); not a `spawn_agent` argument.        |
 
 ### Worker fields
 
@@ -309,15 +396,15 @@ state of their own — entries written during a Worker invocation are
 signed by the parent Agent's key. Lookup is per-Agent; Chaz's
 `researcher` is distinct from Scout's `researcher`.
 
-| Field                 | Type                   | Notes                                                                                                                                                                                                                                                                                                        |
-| --------------------- | ---------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `name`                | string                 | Required. Unique within the parent Agent's `workers:` list. Used as `spawn_worker(name=…)`.                                                                                                                                                                                                                  |
-| `system_prompt`       | string                 | Worker's system prompt. Falls back to (inherits) the parent Agent's prompt when omitted.                                                                                                                                                                                                                     |
-| `system_prompt_files` | list of paths          | Concatenated into the Worker prompt. `~` expansion supported.                                                                                                                                                                                                                                                |
-| `model`               | string                 | Override the model. Falls back to the parent Agent's `model`.                                                                                                                                                                                                                                                |
-| `tools`               | list of tool names     | Narrows the parent Agent's tool list. May include other Worker names; recursion bounded by depth.                                                                                                                                                                                                            |
-| `max_iterations`      | int                    | Configured per-Worker for completeness, but **ignored when invoked under a parent Agent's iteration budget** — nested Workers share the top-level Agent's pool rather than getting a fresh quota. The field still applies when a Worker is invoked outside a running budget (rare; primarily testing paths). |
-| `presets`             | map<name, AgentPreset> | Selectable via the `preset` arg of `spawn_worker`.                                                                                                                                                                                                                                                           |
+| Field                 | Type                   | Notes                                                                                                                                                        |
+| --------------------- | ---------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `name`                | string                 | Required. Unique within the parent Agent's `workers:` list. Used as `spawn_worker(name=…)`.                                                                  |
+| `system_prompt`       | string                 | Worker's system prompt. Falls back to (inherits) the parent Agent's prompt when omitted.                                                                     |
+| `system_prompt_files` | list of paths          | Concatenated into the Worker prompt. `~` expansion supported.                                                                                                |
+| `model`               | string                 | Override the model. Falls back to the parent Agent's `model`.                                                                                                |
+| `tools`               | list of tool names     | Narrows the parent Agent's tool list. May include other Worker names; recursion bounded by depth.                                                            |
+| `max_iterations`      | int                    | Legacy name for the maximum nested spawn depth of this Worker's child session. Falls back to the parent Agent's value. Does not cap the Worker's tool calls. |
+| `presets`             | map<name, AgentPreset> | Selectable via the `preset` arg of `spawn_worker`.                                                                                                           |
 
 ### `default_agents`
 

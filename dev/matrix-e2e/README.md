@@ -102,6 +102,14 @@ stranger, and the agent all joined:
   addressing gate, so `allow_list` is the only thing left that can produce
   silence. A bare message here would prove nothing Case 1a does not.
 
+### Room reset
+
+The `chaz-matrix rooms` maintenance command runs last, against the same
+throwaway homeserver: `rooms list` lists every room the agent is joined to,
+`rooms leave-all` previews the reset, `rooms leave-all --execute` leaves them
+all, and a final list reports nothing to do — the reset is idempotent, and the
+agent's password never appears in the command's output.
+
 ## Transport
 
 The harness supports two transport modes for eidetica sync between the daemon

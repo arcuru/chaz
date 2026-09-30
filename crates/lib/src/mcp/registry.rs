@@ -213,6 +213,26 @@ impl McpRegistry {
             handle.abort();
         }
     }
+
+    /// Drain running entries and await any owned stdio subprocesses.
+    pub async fn shutdown(&self) {
+        self.abort_pending_tasks();
+        let servers = {
+            let Ok(mut entries) = self.entries.write() else {
+                return;
+            };
+            entries
+                .drain()
+                .filter_map(|(_, entry)| match entry.status {
+                    McpServerStatus::Running { server, .. } => Some(server),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        for server in servers {
+            server.shutdown().await;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -227,6 +247,36 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(1), registry.wait_ready())
             .await
             .expect("wait_ready must not block on an empty registry");
+    }
+
+    #[tokio::test]
+    async fn shutdown_waits_for_running_stdio_child_exit() {
+        let script = r#"
+import json, sys
+for line in sys.stdin:
+    msg = json.loads(line)
+    method = msg.get("method", "")
+    if method == "initialize":
+        result = {"serverInfo":{"name":"sentinel"},"protocolVersion":"2025-11-25","capabilities":{}}
+        print(json.dumps({"jsonrpc":"2.0","id":msg["id"],"result":result}), flush=True)
+"#;
+        let config = crate::config::McpServerConfig {
+            name: "sentinel".into(),
+            command: "python3".into(),
+            args: Some(vec!["-u".into(), "-c".into(), script.into()]),
+            env: None,
+            url: None,
+            default_policy: None,
+            startup_timeout_secs: crate::config::default_mcp_startup_timeout_secs(),
+        };
+        let registry = McpRegistry::new();
+        let server = Arc::new(McpServer::start(&config).await.unwrap());
+        let pid = server.process_id().await.unwrap();
+        assert!(std::path::Path::new(&format!("/proc/{pid}")).exists());
+        registry.insert_running("sentinel".into(), server, None);
+        registry.shutdown().await;
+        assert!(!std::path::Path::new(&format!("/proc/{pid}")).exists());
+        assert!(registry.snapshot().is_empty());
     }
 
     #[tokio::test]

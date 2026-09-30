@@ -48,7 +48,7 @@ At the default level you'll see:
 
 - **Startup**: config loaded, agent count, tool registry ready, bridge mode, eidetica sync address
 - **Sessions**: new session creation, backfill, bridge callback registration
-- **Agent lifecycle**: ReAct loop completion, max iterations reached, tool-aware fallback
+- **Agent lifecycle**: ReAct loop completion and tool-iteration count
 - **Tool execution**: shell commands run, files written, web fetches initiated
 - **Security**: approval decisions (approve/deny/approve-all), MCP server restarts
 - **Scheduling**: schedule fires, manual triggers

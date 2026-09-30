@@ -139,6 +139,24 @@ impl Transport {
             s.restart_attempts.store(0, Ordering::Relaxed);
         }
     }
+
+    /// Stop a running stdio child and wait for process exit. HTTP transports
+    /// have no local process to tear down.
+    pub(super) async fn shutdown(&self) {
+        if let Transport::Stdio(transport) = self {
+            let mut child = transport._child.lock().await;
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) async fn process_id(&self) -> Option<u32> {
+        match self {
+            Transport::Stdio(transport) => transport._child.lock().await.id(),
+            Transport::Http(_) => None,
+        }
+    }
 }
 
 impl StdioTransport {

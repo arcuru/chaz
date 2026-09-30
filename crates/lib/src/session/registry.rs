@@ -8,8 +8,10 @@ use chrono::{DateTime, Utc};
 
 use eidetica::Database;
 use eidetica::auth::types::{DelegatedTreeRef, Permission, PermissionBounds, TreeReference};
-use eidetica::store::DocStore;
+use eidetica::store::{DocStore, Table};
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::{Mutex, mpsc};
 use tracing::{info, warn};
 
@@ -54,6 +56,15 @@ pub struct SessionRegistry {
     pub agents: Arc<AgentRegistry>,
     pub(super) new_session_tx: mpsc::Sender<NewSessionEvent>,
     new_session_rx: Mutex<Option<mpsc::Receiver<NewSessionEvent>>>,
+    /// Sessions created by a local service client may predate the daemon's
+    /// in-memory per-DB key mapping. Keep the already-keyed daemon handle so
+    /// later opens use the same signing identity.
+    pub(super) local_client_sessions: Mutex<std::collections::HashMap<String, Database>>,
+    /// Sessions created through this registry already have an explicit owner
+    /// path (frontend watch, schedule, child registration, or test setup).
+    /// The generic resident watcher only adopts sessions created through a
+    /// different service client.
+    locally_created_sessions: Mutex<std::collections::HashSet<String>>,
     /// Per-`(transport, login_id, channel)` locks serializing get-or-create in
     /// [`super::transport`], so two concurrent inbound messages on a brand-new
     /// channel can't both miss the registry walk and both create a session.
@@ -69,6 +80,22 @@ pub(super) const STORE_SESSION_NAMES: &str = "session_names";
 /// per-session metadata (bridge, created_at, status) as JSON.
 pub(super) const STORE_SESSION_CATALOG: &str = "session_catalog";
 
+const JOB_REQUEST_STORE: &str = "job_request";
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub(crate) struct JobRequest {
+    pub parent_id: String,
+    pub target: String,
+    pub task: String,
+}
+
+/// Only this completed setup handle can publish the child to the catalog.
+#[allow(dead_code)]
+pub(crate) struct PreparedAgentJob {
+    pub(crate) db: Database,
+    source: String,
+}
+
 /// Peer-runtime overrides that survive restart. v1 holds one key
 /// (`default_agents`) edited by the Peer Settings page; the slot is
 /// shared with future peer-scoped configuration overrides. Stored on
@@ -82,14 +109,28 @@ impl SessionRegistry {
         mut user: eidetica::user::User,
         agents: Arc<AgentRegistry>,
     ) -> anyhow::Result<Self> {
+        let started = Instant::now();
+        let stage = Instant::now();
         let chaz_group = find_or_create_db(&mut user, "chaz_group").await?;
+        info!(
+            elapsed_ms = stage.elapsed().as_millis() as u64,
+            total_elapsed_ms = started.elapsed().as_millis() as u64,
+            "Session registry chaz_group ready"
+        );
+        let stage = Instant::now();
         let chaz_peer = find_or_create_db(&mut user, "chaz_peer").await?;
+        info!(
+            elapsed_ms = stage.elapsed().as_millis() as u64,
+            total_elapsed_ms = started.elapsed().as_millis() as u64,
+            "Session registry chaz_peer ready"
+        );
         let (new_session_tx, new_session_rx) = mpsc::channel(64);
 
         // Watch the chaz_group for writes (including remote sync).
         // On each write, re-scan the sessions index and fire events for each known session.
         // Consumers dedupe via their own `seen` set.
         let sync_tx = new_session_tx.clone();
+        let stage = Instant::now();
         chaz_group
             .on_write(move |event, db| {
                 tracing::debug!(
@@ -116,6 +157,11 @@ impl SessionRegistry {
             })
             .await?
             .detach();
+        info!(
+            elapsed_ms = stage.elapsed().as_millis() as u64,
+            total_elapsed_ms = started.elapsed().as_millis() as u64,
+            "Session registry callback installed"
+        );
 
         Ok(Self {
             instance,
@@ -125,6 +171,8 @@ impl SessionRegistry {
             agents,
             new_session_tx,
             new_session_rx: Mutex::new(Some(new_session_rx)),
+            local_client_sessions: Mutex::new(std::collections::HashMap::new()),
+            locally_created_sessions: Mutex::new(std::collections::HashSet::new()),
             channel_create_locks: Mutex::new(std::collections::HashMap::new()),
         })
     }
@@ -166,6 +214,130 @@ impl SessionRegistry {
 
     // -------------------------------------------------------------------------
     // Session creation & opening
+    // Unindexed job setup and publication.
+
+    /// Prepare a delegated child without adding it to either discoverable index.
+    pub(crate) async fn prepare_agent_job(
+        &self,
+        parent_id: &str,
+        target: &str,
+        task: &str,
+    ) -> anyhow::Result<PreparedAgentJob> {
+        anyhow::ensure!(
+            !target.is_empty() && !task.is_empty(),
+            "job target and task are required"
+        );
+        let parent_root = eidetica::entry::ID::parse(parent_id)?;
+        let (parent, db) = {
+            let mut user = self.user.lock().await;
+            let parent = user.open_database(&parent_root).await?;
+            let mut settings = eidetica::crdt::Doc::new();
+            settings.set("name", "session:job-stage:submitter");
+            let key = user.get_default_key()?;
+            let db = user.create_database(settings, &key).await?;
+            (parent, db)
+        };
+        let source = format!("job-stage:submitter:{}", db.root_id());
+        // Eidetica commits separately per DB; none of these writes makes the
+        // child discoverable through the watched catalog.
+        super::Session::initialize_turn_schema(&db).await?;
+        crate::db_kind::write_marker(&db, crate::db_kind::KIND_SESSION, &source).await?;
+        let txn = db.new_transaction().await?;
+        txn.get_settings()?
+            .add_delegated_tree(DelegatedTreeRef {
+                permission_bounds: PermissionBounds {
+                    max: Permission::Admin(0),
+                    min: None,
+                },
+                tree: TreeReference {
+                    root: parent_root,
+                    tips: parent.snapshot().await?.into_tips(),
+                },
+            })
+            .await?;
+        txn.get_store::<DocStore>(JOB_REQUEST_STORE)
+            .await?
+            .set_string(
+                "v1",
+                serde_json::to_string(&JobRequest {
+                    parent_id: parent_id.to_string(),
+                    target: target.to_string(),
+                    task: task.to_string(),
+                })?,
+            )
+            .await?;
+        txn.get_store::<Table<super::SessionEntry>>("entries")
+            .await?
+            .insert(super::SessionEntry {
+                sender: "submitter".into(),
+                content: task.to_string(),
+                timestamp: Utc::now(),
+                entry_type: super::EntryType::Directive,
+                metadata: None,
+                routing: None,
+            })
+            .await?;
+        txn.commit().await?;
+        Ok(PreparedAgentJob { db, source })
+    }
+
+    /// Read the request as untrusted data. Admission checks the catalog, parent,
+    /// delegation and the one prewritten Directive before using its fields.
+    pub(crate) async fn read_job_request(db: &Database) -> anyhow::Result<JobRequest> {
+        let txn = db.new_transaction().await?;
+        let doc = txn
+            .get_store::<DocStore>(JOB_REQUEST_STORE)
+            .await?
+            .get_all()
+            .await?;
+        anyhow::ensure!(
+            doc.len() == 1,
+            "invalid published job: requires exactly one request record"
+        );
+        let json: String = doc
+            .get("v1")
+            .ok_or_else(|| anyhow::anyhow!("invalid published job: request is missing"))?
+            .try_into()?;
+        serde_json::from_str(&json)
+            .map_err(|error| anyhow::anyhow!("invalid published job: malformed request: {error}"))
+    }
+
+    /// Publish only a fully prepared handle to both existing catalog stores.
+    pub(crate) async fn publish_agent_job(
+        &self,
+        prepared: PreparedAgentJob,
+    ) -> anyhow::Result<ConversationId> {
+        let id = prepared.db.root_id().to_string();
+        let txn = self.chaz_group.new_transaction().await?;
+        txn.get_store::<DocStore>(STORE_SESSIONS)
+            .await?
+            .set_string(&id, &prepared.source)
+            .await?;
+        txn.get_store::<DocStore>(STORE_SESSION_CATALOG)
+            .await?
+            .set_string(
+                &id,
+                serde_json::to_string(&SessionCatalogEntry {
+                    session_db_id: id.clone(),
+                    source: Some(prepared.source.clone()),
+                    bridge: BridgeKind::from_source(Some(&prepared.source)),
+                    created_at: Utc::now(),
+                    status: SessionStatus::Active,
+                })?,
+            )
+            .await?;
+        txn.commit().await?;
+        self.locally_created_sessions
+            .lock()
+            .await
+            .insert(id.clone());
+        let _ = self.new_session_tx.try_send(NewSessionEvent {
+            session_db_id: id.clone(),
+            source: Some(prepared.source),
+        });
+        Ok(ConversationId(id))
+    }
+
     // -------------------------------------------------------------------------
 
     /// Create a new session database and register it in the sessions index.
@@ -186,7 +358,12 @@ impl SessionRegistry {
 
         let session_db_id = db.root_id().to_string();
         let conv_id = ConversationId(session_db_id.clone());
+        self.locally_created_sessions
+            .lock()
+            .await
+            .insert(session_db_id.clone());
 
+        super::Session::initialize_turn_schema(&db).await?;
         crate::db_kind::write_marker(&db, crate::db_kind::KIND_SESSION, source.unwrap_or("new"))
             .await?;
 
@@ -223,6 +400,14 @@ impl SessionRegistry {
         });
 
         Ok((conv_id, db))
+    }
+
+    /// Whether this registry itself created the session during this process.
+    pub async fn created_session_locally(&self, session_db_id: &str) -> bool {
+        self.locally_created_sessions
+            .lock()
+            .await
+            .contains(session_db_id)
     }
 
     /// Create a child session and wire a `DelegatedTreeRef { max: Admin(0) }`
@@ -285,8 +470,58 @@ impl SessionRegistry {
     ) -> anyhow::Result<(ConversationId, Database)> {
         let root_id = eidetica::entry::ID::parse(session_db_id)
             .map_err(|e| anyhow::anyhow!("Invalid session DB ID '{session_db_id}': {e}"))?;
+        if let Some(db) = self
+            .local_client_sessions
+            .lock()
+            .await
+            .get(session_db_id)
+            .cloned()
+        {
+            return Ok((ConversationId(session_db_id.to_string()), db));
+        }
         let user = self.user.lock().await;
         let db = user.open_database(&root_id).await?;
+        Ok((ConversationId(session_db_id.to_string()), db))
+    }
+
+    /// Open a session created through this daemon's local Eidetica service.
+    ///
+    /// The client records the new per-database key mapping in its own `User`
+    /// handle, so the daemon's older handle cannot use `User::open_database`.
+    /// Local client sessions use the shared user's default key; resolve that
+    /// key against the session's auth settings and bind the proven identity.
+    /// This refuses bridge-owned sessions whose trees do not authorize that
+    /// key, leaving them on the existing bridge-adoption path.
+    pub async fn open_local_client_session(
+        &self,
+        session_db_id: &str,
+    ) -> anyhow::Result<(ConversationId, Database)> {
+        let root_id = eidetica::entry::ID::parse(session_db_id)
+            .map_err(|e| anyhow::anyhow!("Invalid session DB ID '{session_db_id}': {e}"))?;
+        let user = self.user.lock().await;
+        let default_key = user.get_default_key()?;
+        let (identity, permission) = Database::find_sigkeys(&self.instance, &root_id, &default_key)
+            .await?
+            .into_iter()
+            .next()
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Session {session_db_id} does not authorize this peer's default key"
+                )
+            })?;
+        if !permission.can_write() {
+            anyhow::bail!(
+                "Session {session_db_id} grants this peer's default key {permission:?}, which cannot run a turn"
+            );
+        }
+        let signing_key = user.get_signing_key(&default_key)?;
+        let db = Database::open(&self.instance, &root_id).await?.with_key(
+            eidetica::database::DatabaseKey::with_identity(signing_key, identity),
+        );
+        self.local_client_sessions
+            .lock()
+            .await
+            .insert(session_db_id.to_string(), db.clone());
         Ok((ConversationId(session_db_id.to_string()), db))
     }
 
@@ -304,8 +539,18 @@ impl SessionRegistry {
         let txn = self.chaz_group.new_transaction().await?;
         let sessions = txn.get_store::<DocStore>(STORE_SESSIONS).await?;
         let catalog = txn.get_store::<DocStore>(STORE_SESSION_CATALOG).await?;
+        let names = txn.get_store::<DocStore>(STORE_SESSION_NAMES).await?;
         let routing_doc = sessions.get_all().await?;
         let catalog_doc = catalog.get_all().await?;
+        let names_doc = names.get_all().await?;
+
+        let names_by_id: std::collections::HashMap<String, String> = names_doc
+            .iter()
+            .filter_map(|(name, value)| {
+                let session_db_id: String = value.try_into().ok()?;
+                Some((session_db_id, name.clone()))
+            })
+            .collect();
 
         let mut out: Vec<SessionIndex> = Vec::with_capacity(routing_doc.iter().count());
         for (key, value) in routing_doc.iter() {
@@ -339,6 +584,7 @@ impl SessionRegistry {
                 bridge,
                 created_at,
                 status,
+                name: names_by_id.get(key).cloned(),
             });
         }
         Ok(out)
@@ -635,6 +881,7 @@ mod tests {
         assert_eq!(cli.bridge, BridgeKind::Cli);
         assert_eq!(cli.source.as_deref(), Some("cli"));
         assert_eq!(cli.status, SessionStatus::Active);
+        assert_eq!(cli.name, None);
         let cli_created = cli.created_at.expect("cli session should have created_at");
         assert!(cli_created >= before && cli_created <= after);
 
@@ -646,6 +893,50 @@ mod tests {
         assert_eq!(bare.bridge, BridgeKind::Other);
         assert_eq!(bare.source, None);
         assert!(bare.created_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn list_sessions_joins_names_without_opening_session_databases() {
+        let (instance, registry) = make_registry().await;
+        let (conv, db) = registry.create_session(Some("cli")).await.unwrap();
+        let id = db.root_id().to_string();
+        registry
+            .set_session_name(&id, "named-session".into())
+            .await
+            .unwrap();
+
+        let mut session = super::super::Session::new(conv, db).await;
+        for n in 0..32 {
+            session
+                .add_entry(super::super::SessionEntry {
+                    sender: "user".into(),
+                    content: format!("message {n}"),
+                    timestamp: chrono::Utc::now(),
+                    entry_type: super::super::EntryType::Message,
+                    metadata: None,
+                    routing: None,
+                })
+                .await
+                .unwrap();
+        }
+
+        let engine = instance.backend().local_engine().unwrap();
+        let memory = engine
+            .as_any()
+            .downcast_ref::<eidetica::backend::database::InMemory>()
+            .unwrap();
+        instance
+            .backend()
+            .clear_derived_store_state()
+            .await
+            .unwrap();
+        let root = eidetica::entry::ID::parse(&id).unwrap();
+        assert_eq!(memory.store_state_record_count(&root, "entries"), 0);
+        let rows = registry.list_sessions().await.unwrap();
+
+        let row = rows.iter().find(|row| row.session_db_id == id).unwrap();
+        assert_eq!(row.name.as_deref(), Some("named-session"));
+        assert_eq!(memory.store_state_record_count(&root, "entries"), 0);
     }
 
     /// Adoption re-runs on every rescan and every daemon restart. It used to
@@ -819,6 +1110,135 @@ mod tests {
             peers_after.is_empty(),
             "tree sync relationships should be removed after close, got {peers_after:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn client_prepares_then_publishes_one_inert_child_on_shared_service() {
+        use eidetica::backend::database::InMemory;
+        use eidetica::instance::{Instance, NewUser};
+        use eidetica::service::ServiceServer;
+        use tokio::sync::watch;
+
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("job.sock");
+        let (owner, _) =
+            Instance::create_backend(Box::new(InMemory::new()), NewUser::passwordless("job-test"))
+                .await
+                .unwrap();
+        let service = ServiceServer::bind(owner, &socket).await.unwrap();
+        let (shutdown, receiver) = watch::channel(());
+        let task = tokio::spawn(service.run(receiver));
+        let settings = crate::config::EideticaConfig {
+            connection: format!("unix://{}", socket.display()),
+            login: crate::config::EideticaLoginConfig {
+                username: "job-test".into(),
+                password: None,
+                passwordless: true,
+            },
+            sync: None,
+        };
+        let agents = Arc::new(AgentRegistry::with_default_agent());
+        let client = crate::instance::connect_with(&settings, crate::config::ExecutionRole::Client)
+            .await
+            .unwrap();
+        let submitter = SessionRegistry::new(client.instance, client.user, agents.clone())
+            .await
+            .unwrap();
+        let (_, parent) = submitter.create_session(Some("cli")).await.unwrap();
+        let parent_id = parent.root_id().to_string();
+        let orphan = submitter
+            .prepare_agent_job(&parent_id, "default", "orphan task")
+            .await
+            .unwrap();
+        let orphan_id = orphan.db.root_id().to_string();
+        let prepared = submitter
+            .prepare_agent_job(&parent_id, "default", "requested task")
+            .await
+            .unwrap();
+        let id = prepared.db.root_id().to_string();
+        let resident =
+            crate::instance::connect_with(&settings, crate::config::ExecutionRole::Executor)
+                .await
+                .unwrap();
+        let observer = SessionRegistry::new(resident.instance, resident.user, agents)
+            .await
+            .unwrap();
+        let rows = observer.list_sessions().await.unwrap();
+        assert!(
+            !rows
+                .iter()
+                .any(|row| row.session_db_id == id || row.session_db_id == orphan_id)
+        );
+        assert!(observer.open_job_session(&id).await.is_err());
+        assert!(observer.open_job_session(&orphan_id).await.is_err());
+        drop(orphan);
+
+        assert_eq!(submitter.publish_agent_job(prepared).await.unwrap().0, id);
+        let rows = observer.list_sessions().await.unwrap();
+        assert_eq!(rows.iter().filter(|row| row.session_db_id == id).count(), 1);
+        assert!(!rows.iter().any(|row| row.session_db_id == orphan_id));
+        assert!(
+            rows.iter()
+                .find(|row| row.session_db_id == id)
+                .unwrap()
+                .source
+                .as_deref()
+                .unwrap()
+                .starts_with("job-stage:")
+        );
+        let txn = observer.chaz_group.new_transaction().await.unwrap();
+        for store in [STORE_SESSIONS, STORE_SESSION_CATALOG] {
+            assert!(
+                txn.get_store::<DocStore>(store)
+                    .await
+                    .unwrap()
+                    .get_all()
+                    .await
+                    .unwrap()
+                    .get(&id)
+                    .is_some()
+            );
+        }
+        // This is the delegated-job open path, not find_sigkeys on a remote service.
+        let (_, child) = observer.open_job_session(&id).await.unwrap();
+        assert!(read_delegation(&child, parent.root_id()).await.is_some());
+        assert!(crate::session::jobs::is_job_session(&child).await);
+        assert!(
+            crate::session::jobs::read_accepted_job(&child)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let txn = child.new_transaction().await.unwrap();
+        let doc = txn
+            .get_store::<DocStore>(JOB_REQUEST_STORE)
+            .await
+            .unwrap()
+            .get_all()
+            .await
+            .unwrap();
+        let request: String = doc.get("v1").unwrap().try_into().unwrap();
+        assert_eq!(
+            serde_json::from_str::<JobRequest>(&request).unwrap(),
+            JobRequest {
+                parent_id,
+                target: "default".into(),
+                task: "requested task".into(),
+            }
+        );
+        let entries = txn
+            .get_store::<Table<super::super::SessionEntry>>("entries")
+            .await
+            .unwrap()
+            .search(|_| true)
+            .await
+            .unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].1.entry_type, super::super::EntryType::Directive);
+        assert_eq!(entries[0].1.content, "requested task");
+        assert!(observer.open_job_session(&orphan_id).await.is_err());
+        shutdown.send(()).unwrap();
+        task.await.unwrap().unwrap();
     }
 
     #[tokio::test]

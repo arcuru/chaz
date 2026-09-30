@@ -9,18 +9,23 @@
 //! [`chaz_core::bridge::inbound_user_entry`]. The bridge never runs the agent;
 //! the daemon, watching the exposed session, does.
 //!
-//! Outbound: [`chaz_core::bridge::attach_reconciler`] installs an `on_write`
-//! callback that converges the channel to DB state; the only Discord-specific
-//! part is the `send` closure (`ChannelId::say`). The reconcile rule, the
-//! delivered-set, and the `[guest]` prefixing all live in the lib — the same
-//! code the Matrix bridge runs.
+//! Outbound: [`chaz_core::bridge::delivery`] installs a durable reconciler
+//! that converges the channel to DB state; the only Discord-specific part is
+//! the `send` closure (`ChannelId::send_message` with an enforced nonce). The
+//! reconcile rule, persisted per-channel progress, retry schedule, and the
+//! `[guest]` prefixing all live in the lib — the same code the Matrix bridge
+//! runs.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use chaz_core::backends::BackendManager;
-use chaz_core::bridge::{ApprovalDecision, Bridge, attach_reconciler, inbound_user_entry};
+use chaz_core::bridge::delivery::{DeliveryBinding, DeliveryReconciler, DeliveryStore};
+use chaz_core::bridge::outbound::{
+    chunk_message_chars, is_transient_outbound_status, retry_outbound_chunk,
+};
+use chaz_core::bridge::{ApprovalDecision, Bridge, inbound_user_entry};
 use chaz_core::commands::{self, CommandContext, CommandOutcome, Parsed};
 use chaz_core::config::Config;
 use chaz_core::hosted_index::DbEntry;
@@ -30,13 +35,14 @@ use chaz_core::session::Session;
 use chaz_core::types::ConversationId;
 
 use serenity::async_trait;
+use serenity::builder::CreateMessage;
 use serenity::http::Http;
-use serenity::model::channel::{Message, Reaction, ReactionType};
+use serenity::model::channel::{Message, Nonce, Reaction, ReactionType};
 use serenity::model::gateway::Ready;
 use serenity::model::id::{ChannelId, MessageId, UserId};
 use serenity::prelude::*;
 
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 use tracing::{error, info};
 
 use crate::credentials::DiscordCredentials;
@@ -50,6 +56,9 @@ pub struct DiscordBridge {
     pub creds: DiscordCredentials,
     pub config: Config,
     pub secrets: SecretStore,
+    /// Cooperative shutdown signal: when notified, the gateway connection is
+    /// closed and `run` returns `Ok(())`.
+    pub shutdown: Arc<Notify>,
 }
 
 impl DiscordBridge {
@@ -59,6 +68,7 @@ impl DiscordBridge {
         creds: DiscordCredentials,
         config: Config,
         secrets: SecretStore,
+        shutdown: Arc<Notify>,
     ) -> Self {
         Self {
             login_id,
@@ -66,6 +76,7 @@ impl DiscordBridge {
             creds,
             config,
             secrets,
+            shutdown,
         }
     }
 }
@@ -89,7 +100,7 @@ impl Bridge for DiscordBridge {
             secrets: self.secrets.clone(),
             config: self.config.clone(),
             allowed_users: self.creds.allowed_users.clone(),
-            attached: Arc::new(Mutex::new(HashSet::new())),
+            attached: Arc::new(Mutex::new(HashMap::new())),
             seen_messages: Arc::new(Mutex::new(HashSet::new())),
             message_counts: Arc::new(Mutex::new(HashMap::new())),
             // No timeout here: the daemon owns the clock and stamps each
@@ -109,10 +120,26 @@ impl Bridge for DiscordBridge {
             agent = %self.owning_agent,
             "Starting Discord bridge"
         );
-        client.start().await?;
-        Ok(())
+        let shard_manager = client.shard_manager.clone();
+        tokio::select! {
+            biased;
+            _ = self.shutdown.notified() => {
+                info!("Discord bridge received shutdown signal");
+                shard_manager.shutdown_all().await;
+                Ok(())
+            }
+            result = client.start() => {
+                result?;
+                Ok(())
+            }
+        }
     }
 }
+
+/// Channels with outbound delivery installed, keyed by
+/// `(channel, session_db_id)` — the binding delivery progress is persisted
+/// under — and the reconciler owning each one's progress.
+type AttachedChannels = Arc<Mutex<HashMap<(String, String), Arc<DeliveryReconciler>>>>;
 
 /// All shared state the serenity event loop needs. serenity gives each handler
 /// method an owned `Context` (with `ctx.http` for sends) but no per-callback
@@ -124,9 +151,7 @@ struct Handler {
     secrets: SecretStore,
     config: Config,
     allowed_users: HashSet<u64>,
-    /// Session db ids that already have a reconciler installed — guards the
-    /// `on_write` callback against double-install on later messages.
-    attached: Arc<Mutex<HashSet<String>>>,
+    attached: AttachedChannels,
     /// Message ids already ingested this process. The gateway replays messages
     /// when the connection is resumed, and a replay must not write the inbound
     /// entry a second time or re-run a `!chaz approve` against a later prompt.
@@ -255,9 +280,12 @@ impl Handler {
         Ok(())
     }
 
-    /// Install the outbound reconciler for a channel exactly once, guarded by
-    /// the `attached` set. The reconcile rule lives in `chaz_core`; the only
-    /// Discord-specific part is the `ChannelId::say` send closure.
+    /// Install durable outbound delivery for `(channel, session)` exactly once
+    /// per process. The reconcile rule and persisted progress live in
+    /// `chaz_core`; the only Discord-specific part is the send closure, which
+    /// posts each chunk under its stable nonce with enforcement on, so Discord
+    /// collapses a chunk repeated after a lost acknowledgement within its
+    /// deduplication window.
     async fn attach_once(
         &self,
         http: Arc<Http>,
@@ -265,35 +293,45 @@ impl Handler {
         session_db: &eidetica::Database,
         session_db_id: &str,
     ) -> anyhow::Result<()> {
+        let key = (channel_id.get().to_string(), session_db_id.to_string());
         let mut attached = self.attached.lock().await;
-        if !attached.insert(session_db_id.to_string()) {
+        if attached.contains_key(&key) {
             return Ok(());
         }
-        drop(attached);
         // Same session DB, two watchers: deliver agent replies, and surface
         // tool-approval prompts the daemon proxied here.
         attach_approval_watcher(session_db, http.clone(), channel_id, self.pending.clone()).await?;
-        attach_reconciler(
-            session_db,
+        let binding = DeliveryBinding::new("discord", &self.login_id, &key.0, session_db_id);
+        let reconciler = DeliveryReconciler::attach(
+            session_db.clone(),
+            DeliveryStore::new(self.server.registry().chaz_peer().clone()),
+            binding,
             self.server.agents_arc(),
             self.owning_agent.clone(),
-            move |body| {
+            |body| chunk_message_chars(body, DISCORD_MESSAGE_LIMIT),
+            move |chunk| {
                 let http = http.clone();
-                async move {
-                    info!("→ Discord({channel_id}): {}", body.replace('\n', " "));
-                    // Discord rejects any message over DISCORD_MESSAGE_LIMIT
-                    // characters, so a long agent reply goes out as several
-                    // messages split on natural boundaries. A body that already
-                    // fits produces a single chunk (and an empty body, none).
-                    for piece in chunk_message(&body, DISCORD_MESSAGE_LIMIT) {
-                        channel_id.say(&http, piece).await?;
-                    }
+                Box::pin(async move {
+                    info!("→ Discord({channel_id}): {}", chunk.body.replace('\n', " "));
+                    retry_outbound_chunk(
+                        || {
+                            let message = CreateMessage::new()
+                                .content(chunk.body.clone())
+                                .nonce(Nonce::String(chunk.idempotency_key.clone()))
+                                .enforce_nonce(true);
+                            let http = http.clone();
+                            async move { channel_id.send_message(&http, message).await.map(|_| ()) }
+                        },
+                        is_transient_discord_send_error,
+                    )
+                    .await?;
                     Ok(())
-                }
+                })
             },
         )
         .await?;
-        info!(session_db_id, "Discord reconciler installed");
+        attached.insert(key, reconciler);
+        info!(session_db_id, "Discord outbound delivery installed");
         Ok(())
     }
 
@@ -457,13 +495,7 @@ impl Handler {
                             .as_deref()
                             .map(|n| format!(" \"{n}\""))
                             .unwrap_or_default();
-                        s.push_str(&format!(
-                            "\n  {}{} ({}, {} entries)",
-                            info.session_db_id, name, agent, info.entry_count
-                        ));
-                        if let Some(preview) = &info.last_message {
-                            s.push_str(&format!("\n    {preview}"));
-                        }
+                        s.push_str(&format!("\n  {}{} ({})", info.session_db_id, name, agent));
                     }
                     s
                 }
@@ -476,6 +508,18 @@ impl Handler {
         if let Err(e) = msg_say(ctx, channel_id, text).await {
             error!("Failed to send command response: {e}");
         }
+    }
+}
+
+fn is_transient_discord_send_error(error: &serenity::Error) -> bool {
+    match error {
+        serenity::Error::Http(http) => match http {
+            serenity::http::HttpError::Request(error) => error.is_connect(),
+            _ => http
+                .status_code()
+                .is_some_and(|status| is_transient_outbound_status(status.as_u16())),
+        },
+        _ => false,
     }
 }
 
@@ -815,101 +859,6 @@ async fn handle_approval_reaction(
 /// scalar values, not bytes). Outbound bodies are split to fit this ceiling.
 const DISCORD_MESSAGE_LIMIT: usize = 2000;
 
-/// Split `body` into pieces that each fit within `limit` characters, for
-/// delivery as one Discord message apiece.
-///
-/// Splitting prefers the least disruptive boundary: first newlines, then
-/// spaces within an over-long line, and only as a last resort a hard cut
-/// through a single oversized token (a URL, a base64 blob). Lengths are
-/// measured in `char`s — Discord counts Unicode scalar values — and cuts never
-/// fall inside a multi-byte char. A body that already fits yields one chunk; an
-/// empty body yields none (nothing to send).
-///
-/// Pure, so it is unit-testable without a live transport.
-fn chunk_message(body: &str, limit: usize) -> Vec<String> {
-    pack_parts(body.split('\n'), "\n", limit, |line, lim| {
-        pack_parts(line.split(' '), " ", lim, hard_split)
-    })
-}
-
-/// Greedily pack `parts` (rejoined with `sep`) into chunks of at most `limit`
-/// chars. A single part that exceeds `limit` on its own is broken up by
-/// `break_part`, whose last piece is left open so following parts can still
-/// pack onto it — this avoids stranding a long token's tail on its own line.
-fn pack_parts<'a, I, B>(parts: I, sep: &str, limit: usize, break_part: B) -> Vec<String>
-where
-    I: Iterator<Item = &'a str>,
-    B: Fn(&str, usize) -> Vec<String>,
-{
-    let sep_len = sep.chars().count();
-    let mut chunks: Vec<String> = Vec::new();
-    let mut cur = String::new();
-    let mut cur_len = 0usize;
-
-    for part in parts {
-        let plen = part.chars().count();
-        let need = if cur.is_empty() {
-            plen
-        } else {
-            cur_len + sep_len + plen
-        };
-        if need <= limit {
-            if !cur.is_empty() {
-                cur.push_str(sep);
-                cur_len += sep_len;
-            }
-            cur.push_str(part);
-            cur_len += plen;
-            continue;
-        }
-
-        // The part won't pack onto the current chunk: flush it first.
-        if !cur.is_empty() {
-            chunks.push(std::mem::take(&mut cur));
-            cur_len = 0;
-        }
-        if plen <= limit {
-            // Fits on its own — start a fresh chunk with it.
-            cur.push_str(part);
-            cur_len = plen;
-        } else {
-            // Too long even alone: break it, emitting all but the last piece
-            // and leaving that last piece open for the next part to join.
-            let mut pieces = break_part(part, limit);
-            if let Some(last) = pieces.pop() {
-                chunks.extend(pieces);
-                cur_len = last.chars().count();
-                cur = last;
-            }
-        }
-    }
-    if !cur.is_empty() {
-        chunks.push(cur);
-    }
-    chunks
-}
-
-/// Last-resort split of a single token that exceeds `limit`: cut it into
-/// consecutive `limit`-char pieces on char boundaries. Joining the result back
-/// reproduces the input exactly (no separator is inserted or dropped).
-fn hard_split(token: &str, limit: usize) -> Vec<String> {
-    let mut pieces = Vec::new();
-    let mut cur = String::new();
-    let mut n = 0usize;
-    for ch in token.chars() {
-        if n == limit {
-            pieces.push(std::mem::take(&mut cur));
-            n = 0;
-        }
-        cur.push(ch);
-        n += 1;
-    }
-    if !cur.is_empty() {
-        pieces.push(cur);
-    }
-    pieces
-}
-
 #[async_trait]
 impl EventHandler for Handler {
     async fn message(&self, ctx: Context, msg: Message) {
@@ -939,10 +888,29 @@ impl EventHandler for Handler {
 
 #[cfg(test)]
 mod tests {
-    use super::{charge_message_quota, chunk_message, first_delivery, hard_split};
+    use super::{charge_message_quota, first_delivery, is_transient_discord_send_error};
+
+    use reqwest::{Method, StatusCode};
+    use serenity::http::{ErrorResponse, HttpError as SerenityHttpError};
     use serenity::model::id::MessageId;
     use std::collections::{HashMap, HashSet};
     use tokio::sync::Mutex;
+
+    /// Build a `serenity::Error` shaped as the SDK surfaces a failed send:
+    /// `Http(UnsuccessfulRequest(ErrorResponse))` carrying the given status.
+    /// `ErrorResponse` is `#[non_exhaustive]` with an async-only constructor, so
+    /// this goes through `from_response` on a synthesized `reqwest::Response`
+    /// (converted from an `http::Response`; reqwest supplies a placeholder URL).
+    async fn discord_http_error(status: StatusCode) -> serenity::Error {
+        let body = r#"{"code": 0, "message": "synthesized", "errors": []}"#;
+        let http_response = http::Response::builder()
+            .status(status)
+            .body(body.to_owned())
+            .expect("static response parts");
+        let response: reqwest::Response = http_response.into();
+        let error_response = ErrorResponse::from_response(response, Method::POST).await;
+        serenity::Error::Http(SerenityHttpError::UnsuccessfulRequest(error_response))
+    }
 
     #[tokio::test]
     async fn a_user_spends_their_message_quota_and_is_then_refused() {
@@ -979,119 +947,46 @@ mod tests {
         assert!(!first_delivery(&seen, MessageId::new(43)).await);
     }
 
-    /// Every chunk must respect the char ceiling — the whole point of the split.
-    fn assert_within_limit(chunks: &[String], limit: usize) {
-        for c in chunks {
+    #[test]
+    fn a_generic_io_error_is_permanent() {
+        // A local I/O failure (disk, pipe, …) says nothing about the Discord
+        // transport: retrying it would burn attempts on a problem retries
+        // cannot fix, so it must surface as permanent.
+        let error = serenity::Error::Io(std::io::Error::other("local I/O hiccup"));
+        assert!(!is_transient_discord_send_error(&error));
+    }
+
+    #[tokio::test]
+    async fn rate_limit_and_server_overload_statuses_are_transient() {
+        for status in [429, 503, 504] {
+            let error =
+                discord_http_error(StatusCode::from_u16(status).expect("valid status")).await;
             assert!(
-                c.chars().count() <= limit,
-                "chunk exceeds limit {limit}: {} chars",
-                c.chars().count()
+                is_transient_discord_send_error(&error),
+                "status {status} should be transient"
             );
         }
     }
 
-    #[test]
-    fn short_body_is_one_chunk_unchanged() {
-        assert_eq!(chunk_message("hello world", 2000), vec!["hello world"]);
-    }
-
-    #[test]
-    fn body_at_exactly_the_limit_is_not_split() {
-        let body = "x".repeat(2000);
-        let chunks = chunk_message(&body, 2000);
-        assert_eq!(chunks, vec![body]);
-    }
-
-    #[test]
-    fn empty_body_sends_nothing() {
-        assert!(chunk_message("", 2000).is_empty());
-    }
-
-    #[test]
-    fn splits_on_newline_boundaries() {
-        // Three 40-char lines, limit 100: two lines pack, the third spills over.
-        let line = "a".repeat(40);
-        let body = format!("{line}\n{line}\n{line}");
-        let chunks = chunk_message(&body, 100);
-        assert_within_limit(&chunks, 100);
-        // First chunk packs two lines joined by the newline; never a torn line.
-        assert_eq!(chunks, vec![format!("{line}\n{line}"), line]);
-    }
-
-    #[test]
-    fn splits_long_line_on_spaces_without_breaking_words() {
-        // One line of 10 six-char words ("word00".."word09") = 69 chars.
-        let words: Vec<String> = (0..10).map(|i| format!("word{i:02}")).collect();
-        let body = words.join(" ");
-        let chunks = chunk_message(&body, 20);
-        assert_within_limit(&chunks, 20);
-        // No word is ever split: every whitespace-delimited token in every chunk
-        // is one of the originals.
-        for chunk in &chunks {
-            for tok in chunk.split(' ') {
-                assert!(words.contains(&tok.to_string()), "torn word: {tok:?}");
-            }
+    #[tokio::test]
+    async fn permanent_http_statuses_are_not_transient() {
+        for status in [400, 401, 403, 404, 500, 502] {
+            let error =
+                discord_http_error(StatusCode::from_u16(status).expect("valid status")).await;
+            assert!(
+                !is_transient_discord_send_error(&error),
+                "status {status} should be permanent"
+            );
         }
-        // And nothing is lost: flatten the chunks back to the original words.
-        let recovered: Vec<String> = chunks
-            .iter()
-            .flat_map(|c| c.split(' ').map(str::to_string))
-            .collect();
-        assert_eq!(recovered, words);
     }
 
-    #[test]
-    fn hard_splits_a_single_oversized_token() {
-        // A 4500-char URL-like blob with no spaces: only a hard cut fits it.
-        let blob = "h".repeat(4500);
-        let chunks = chunk_message(&blob, 2000);
-        assert_within_limit(&chunks, 2000);
-        assert_eq!(chunks.len(), 3); // 2000 + 2000 + 500
-        assert_eq!(chunks.concat(), blob); // no character lost or duplicated
-    }
-
-    #[test]
-    fn oversized_token_tail_packs_with_following_words() {
-        // A 25-char token then a short word, limit 10: the token hard-splits to
-        // [10, 10, 5] and the trailing "hi" packs onto the open 5-char tail
-        // rather than stranding on its own message.
-        let body = format!("{} hi", "z".repeat(25));
-        let chunks = chunk_message(&body, 10);
-        assert_within_limit(&chunks, 10);
-        assert_eq!(chunks, vec!["zzzzzzzzzz", "zzzzzzzzzz", "zzzzz hi"]);
-    }
-
-    #[test]
-    fn cuts_never_fall_inside_a_multibyte_char() {
-        // Each char is multi-byte; a byte-indexed split would panic or corrupt.
-        let body = "áéíóú".repeat(3); // 15 chars, 30 bytes
-        let chunks = chunk_message(&body, 4);
-        assert_within_limit(&chunks, 4);
-        assert_eq!(chunks.concat(), body); // round-trips intact
-        // Sanity: a 4-byte emoji is one char, so it packs four-per-chunk.
-        let crabs = "🦀".repeat(9);
-        let chunks = chunk_message(&crabs, 4);
-        assert_within_limit(&chunks, 4);
-        assert_eq!(chunks.concat(), crabs);
-    }
-
-    #[test]
-    fn hard_split_is_exact_and_lossless() {
-        assert_eq!(hard_split("abcdefg", 3), vec!["abc", "def", "g"]);
-        assert_eq!(hard_split("ab", 3), vec!["ab"]);
-        assert!(hard_split("", 3).is_empty());
-    }
-
-    #[test]
-    fn mixed_body_every_chunk_within_limit() {
-        // Newlines, normal words, a giant token, and blank lines together.
-        let body = format!(
-            "intro line here\n\n{}\nshort tail\n{}",
-            "tok ".repeat(200).trim(),
-            "Q".repeat(3000)
-        );
-        let chunks = chunk_message(&body, 2000);
-        assert_within_limit(&chunks, 2000);
-        assert!(!chunks.is_empty());
+    #[tokio::test]
+    async fn a_reqwest_connect_error_is_transient() {
+        // `reqwest::Error` has no public constructor, so the connect arm can
+        // only be pinned with a real failed request; nothing listens on port 1
+        // and the refusal is immediate even inside the Nix sandbox.
+        let error = reqwest::get("http://127.0.0.1:1/").await.unwrap_err();
+        let error = serenity::Error::Http(SerenityHttpError::Request(error));
+        assert!(is_transient_discord_send_error(&error));
     }
 }

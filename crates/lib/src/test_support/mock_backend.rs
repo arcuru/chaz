@@ -27,6 +27,41 @@ pub(crate) struct RecordedCall {
 struct State {
     script: std::collections::VecDeque<Result<LLMResponse, LlmError>>,
     calls: Vec<RecordedCall>,
+    simple_script: std::collections::VecDeque<Result<String, LlmError>>,
+    simple_calls: Vec<Vec<crate::backends::Message>>,
+}
+
+struct CallGate {
+    started: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+    stopped: tokio::sync::Notify,
+}
+
+struct CallGateWait(std::sync::Arc<CallGate>);
+
+impl Drop for CallGateWait {
+    fn drop(&mut self) {
+        self.0.stopped.notify_one();
+    }
+}
+
+/// Handle for pausing exactly one scripted call after it is recorded.
+pub(crate) struct MockCallGate {
+    gate: std::sync::Arc<CallGate>,
+}
+
+impl MockCallGate {
+    pub async fn wait_started(&self) {
+        self.gate.started.notified().await;
+    }
+
+    pub fn release(&self) {
+        self.gate.release.notify_one();
+    }
+
+    pub async fn wait_stopped(&self) {
+        self.gate.stopped.notified().await;
+    }
 }
 
 /// Recording mock LLM backend with a FIFO response queue.
@@ -34,6 +69,7 @@ pub(crate) struct MockBackend {
     state: Mutex<State>,
     default_model: String,
     supports_tools: bool,
+    next_call_gate: Mutex<Option<std::sync::Arc<CallGate>>>,
 }
 
 impl MockBackend {
@@ -42,11 +78,12 @@ impl MockBackend {
             state: Mutex::new(State::default()),
             default_model: "mock-model".to_string(),
             supports_tools: true,
+            next_call_gate: Mutex::new(None),
         }
     }
 
     /// Configure whether `BackendDispatch::supports_tools` reports true.
-    /// Use `false` to drive the runtime's no-tools fallback.
+    /// Use `false` to drive the runtime's no-tools fast path.
     pub fn with_supports_tools(mut self, value: bool) -> Self {
         self.supports_tools = value;
         self
@@ -103,6 +140,18 @@ impl MockBackend {
         self.state.lock().unwrap().script.push_back(Err(err));
     }
 
+    pub fn push_simple_text(&self, content: impl Into<String>) {
+        self.state
+            .lock()
+            .unwrap()
+            .simple_script
+            .push_back(Ok(content.into()));
+    }
+
+    pub fn simple_call_count(&self) -> usize {
+        self.state.lock().unwrap().simple_calls.len()
+    }
+
     /// Queue an arbitrary response. Use when the `push_text` /
     /// `push_tool_calls` convenience constructors don't expose enough
     /// control over the response (e.g., to set custom `ResponseMetadata`).
@@ -119,9 +168,34 @@ impl MockBackend {
     pub fn pending(&self) -> usize {
         self.state.lock().unwrap().script.len()
     }
+
+    pub fn block_next_call(&self) -> MockCallGate {
+        let gate = std::sync::Arc::new(CallGate {
+            started: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+            stopped: tokio::sync::Notify::new(),
+        });
+        *self.next_call_gate.lock().unwrap() = Some(gate.clone());
+        MockCallGate { gate }
+    }
 }
 
 impl BackendDispatch for MockBackend {
+    fn execute<'a>(
+        &'a self,
+        context: &'a crate::backends::ChatContext,
+    ) -> Pin<Box<dyn Future<Output = Result<String, LlmError>> + Send + 'a>> {
+        Box::pin(async move {
+            let mut state = self.state.lock().unwrap();
+            state.simple_calls.push(context.messages.clone());
+            state.simple_script.pop_front().unwrap_or_else(|| {
+                Err(LlmError::Configuration {
+                    message: "MockBackend: execute called with empty script".into(),
+                })
+            })
+        })
+    }
+
     fn supports_tools(&self) -> bool {
         self.supports_tools
     }
@@ -133,17 +207,26 @@ impl BackendDispatch for MockBackend {
         model: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<LLMResponse, LlmError>> + Send + 'a>> {
         Box::pin(async move {
-            let mut state = self.state.lock().unwrap();
-            state.calls.push(RecordedCall {
-                messages: messages.to_vec(),
-                tools: tools.to_vec(),
-                model: model.to_string(),
-            });
-            state.script.pop_front().unwrap_or_else(|| {
-                Err(LlmError::Configuration {
-                    message: "MockBackend: chat_with_tools called with empty script".into(),
+            let response = {
+                let mut state = self.state.lock().unwrap();
+                state.calls.push(RecordedCall {
+                    messages: messages.to_vec(),
+                    tools: tools.to_vec(),
+                    model: model.to_string(),
+                });
+                state.script.pop_front().unwrap_or_else(|| {
+                    Err(LlmError::Configuration {
+                        message: "MockBackend: chat_with_tools called with empty script".into(),
+                    })
                 })
-            })
+            };
+            let gate = self.next_call_gate.lock().unwrap().take();
+            if let Some(gate) = gate {
+                gate.started.notify_one();
+                let _wait = CallGateWait(gate.clone());
+                gate.release.notified().await;
+            }
+            response
         })
     }
 }

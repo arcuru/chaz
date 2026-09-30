@@ -211,13 +211,17 @@ log "workspace: $WORKSPACE"
 log "synapse :$SYNAPSE_PORT  stub-llm :$STUB_PORT  daemon-sync :$DAEMON_SYNC_PORT  bridge-sync :$BRIDGE_SYNC_PORT"
 log "transport: $TRANSPORT"
 
+# Both peers are direct Eidetica owners with explicit connector settings. In
+# http mode the bridge binds only loopback HTTP, so the run stays hermetic; in
+# iroh mode both peers register the P2P transport and nothing else.
 if [[ $TRANSPORT == "http" ]]; then
-	SYNC_LISTEN_DAEMON="sync_listen: \"127.0.0.1:$DAEMON_SYNC_PORT\""
-	SYNC_LISTEN_BRIDGE="sync_listen: \"127.0.0.1:$BRIDGE_SYNC_PORT\""
+	EIDETICA_SYNC_DAEMON="  sync:\n    iroh: true\n    http_listen: \"127.0.0.1:$DAEMON_SYNC_PORT\""
+	EIDETICA_SYNC_BRIDGE="  sync:\n    http_listen: \"127.0.0.1:$BRIDGE_SYNC_PORT\""
 else
-	SYNC_LISTEN_DAEMON=""
-	SYNC_LISTEN_BRIDGE=""
+	EIDETICA_SYNC_DAEMON="  sync:\n    iroh: true"
+	EIDETICA_SYNC_BRIDGE="  sync:\n    iroh: true"
 fi
+EIDETICA_BIN="git+https://github.com/arcuru/eidetica?rev=40b4a1e568bdba7438cb7af1c1eee74e2c38cf04"
 
 # ---------------------------------------------------------------- stub LLM ---
 log "starting stub LLM"
@@ -329,7 +333,13 @@ BRIDGE_CONFIG="$WORKSPACE/bridge.yaml"
 
 cat >"$DAEMON_CONFIG" <<EOF
 state_dir: "$WORKSPACE/state-daemon"
-$SYNC_LISTEN_DAEMON
+execution: executor
+eidetica:
+  connection: "sqlite://$WORKSPACE/state-daemon/eidetica.db"
+  login:
+    username: chaz
+    passwordless: true
+$(printf '%b' "$EIDETICA_SYNC_DAEMON")
 
 backends:
   - name: stub
@@ -348,6 +358,26 @@ agents:
 default_agents: [chaz]
 EOF
 
+mkdir -p "$WORKSPACE/state-daemon" "$WORKSPACE/state-bridge"
+nix run "$EIDETICA_BIN" -- \
+	daemon --data-dir "$WORKSPACE/state-daemon" init --username chaz --passwordless \
+	>>"$WORKSPACE/bringup.log" 2>&1 || fail "could not initialise daemon Eidetica store (see $WORKSPACE/bringup.log)"
+# The bridge's store is provisioned the same explicit way: the connector
+# never creates one, and the legacy `chaz-matrix` login is what its config
+# names.
+nix run "$EIDETICA_BIN" -- \
+	daemon --data-dir "$WORKSPACE/state-bridge" init --username chaz-matrix --passwordless \
+	>>"$WORKSPACE/bringup.log" 2>&1 || fail "could not initialise bridge Eidetica store (see $WORKSPACE/bringup.log)"
+
+# The bridge's connector block, shared by both renderings of its config.
+BRIDGE_EIDETICA="execution: client
+eidetica:
+  connection: \"sqlite://$WORKSPACE/state-bridge/eidetica.db\"
+  login:
+    username: chaz-matrix
+    passwordless: true
+$(printf '%b' "$EIDETICA_SYNC_BRIDGE")"
+
 # ------------------------------------------------------------- bring-up ------
 # The sequence that removes the human: ask the bridge which key to trust,
 # pre-authorize it, and hand over a ticket. Pre-authorized access bootstraps
@@ -357,7 +387,7 @@ cat >"$BRIDGE_CONFIG" <<EOF
 unlock_password: e2e-bridge-unlock
 label: e2e-matrix
 state_dir: "$WORKSPACE/state-bridge"
-$SYNC_LISTEN_BRIDGE
+$BRIDGE_EIDETICA
 logins: []
 agents:
   - name: chaz
@@ -372,7 +402,7 @@ log "pre-authorizing the bridge on the daemon"
 	>>"$WORKSPACE/bringup.log" 2>&1 || fail "/agent invite failed (see $WORKSPACE/bringup.log)"
 
 log "minting the access ticket"
-TICKET="$("$CHAZ_BIN" --config "$DAEMON_CONFIG" cmd '/agent share chaz' 2>>"$WORKSPACE/bringup.log" |
+TICKET="$({ "$CHAZ_BIN" --config "$DAEMON_CONFIG" cmd '/agent share chaz' 2>>"$WORKSPACE/bringup.log" || true; } |
 	grep -o 'eidetica:[^[:space:]]*' | head -1)"
 [[ -n $TICKET ]] || fail "/agent share produced no ticket (see $WORKSPACE/bringup.log)"
 
@@ -397,10 +427,10 @@ if [[ $TRANSPORT == "http" ]]; then
 	*) fail "ticket carries no loopback address hint: $TICKET" ;;
 	esac
 else
-	# Assert the run is actually on the P2P path. Today the daemon only binds
-	# an http sync listener when `sync_listen` is set, which this mode leaves
-	# empty — but a future default that reintroduces a bind would turn this
-	# mode back into the http mode under a different name, silently.
+	# Assert the run is actually on the P2P path. The daemon only binds an
+	# http sync listener when `eidetica.sync.http_listen` is set, which this
+	# mode leaves out — but a future default that reintroduces a bind would
+	# turn this mode back into the http mode under a different name, silently.
 	case "$TICKET" in
 	*"pr=iroh:"*) ;;
 	*) fail "ticket carries no iroh address hint: $TICKET" ;;
@@ -414,7 +444,7 @@ cat >"$BRIDGE_CONFIG" <<EOF
 unlock_password: e2e-bridge-unlock
 label: e2e-matrix
 state_dir: "$WORKSPACE/state-bridge"
-$SYNC_LISTEN_BRIDGE
+$BRIDGE_EIDETICA
 
 logins:
   - agent: chaz
@@ -654,10 +684,24 @@ group_member_joined() {
 }
 wait_for "the stranger to join the group room" 90 group_member_joined "$STRANGER_MXID"
 
+# A pre-join message is imported as context, never as a model request.
+PRECLEAR_BODY="history before the clear marker"
+TXN="e2e-$(date +%s%N)"
+mx PUT "/_matrix/client/v3/rooms/$GROUP_URI/send/m.room.message/$TXN" \
+    "$PUPPET_TOKEN" "$(jq -nc --arg b "$PRECLEAR_BODY" '{msgtype:"m.text",body:$b}')" >/dev/null
+TXN="e2e-$(date +%s%N)"
+mx PUT "/_matrix/client/v3/rooms/$GROUP_URI/send/m.room.message/$TXN" \
+    "$PUPPET_TOKEN" '{"msgtype":"m.text","body":"!chaz clear"}' >/dev/null
+PREJOIN_BODY="history before the agent joined"
+TXN="e2e-$(date +%s%N)"
+mx PUT "/_matrix/client/v3/rooms/$GROUP_URI/send/m.room.message/$TXN" \
+    "$PUPPET_TOKEN" "$(jq -nc --arg b "$PREJOIN_BODY" '{msgtype:"m.text",body:$b}')" >/dev/null
+
 # The bridge auto-joins when invited by a user in its allow_list.
 mx POST "/_matrix/client/v3/rooms/$GROUP_URI/invite" "$PUPPET_TOKEN" \
 	"$(jq -nc --arg a "$AGENT_MXID" '{user_id:$a}')" >/dev/null
 wait_for "the agent to join the group room" 90 group_member_joined "$AGENT_MXID"
+wait_for "join-time room history backfill" 90 grep -q "Backfilled 1 entries" "$BRIDGE_LOG"
 
 # Count what the agent actually said in the group room. Restricted to
 # `m.room.message`: /messages returns state events too, and the agent's own
@@ -703,11 +747,10 @@ BACKENDS_MARKER="Known Models"
 HELP_MARKER="chaz commands"
 
 MENTION_BODY="mentioning the agent"
+BARE_BODY="bare message with no prefix and no mention"
 
-# How many turns the model has been asked to run. The bridge backfills room
-# history into the session, so the text of an ignored message still shows up in
-# a later turn's context — the count of requests is what says whether it became
-# a turn of its own.
+# How many turns the model has been asked to run. Join-time history is
+# context only; messages after join that aren't addressed are ignored.
 stub_requests() { grep -c "^stub_llm: request:" "$WORKSPACE/stub-llm.log" || true; }
 
 # The bridge writes a line for every message it drops for not being addressed
@@ -733,7 +776,7 @@ log "Case 1a: bare message in the group room (must be ignored)"
 TURNS_BEFORE="$(stub_requests)"
 DROPS_BEFORE="$(gate_drops)"
 group_send "$PUPPET_TOKEN" \
-	"$(jq -nc '{msgtype:"m.text",body:"bare message with no prefix and no mention"}')"
+	"$(jq -nc --arg b "$BARE_BODY" '{msgtype:"m.text",body:$b}')"
 wait_for "the bridge to drop the bare group message as unaddressed" 60 \
 	gate_dropped_more_than "$DROPS_BEFORE"
 
@@ -746,9 +789,18 @@ mention_reached_the_model() {
 }
 wait_for "the mention to reach the model" "$REPLY_TIMEOUT" mention_reached_the_model
 
-TURNS_AFTER="$(stub_requests)"
-if [[ $((TURNS_AFTER - TURNS_BEFORE)) -ne 1 ]]; then
-	fail "bridge ran $((TURNS_AFTER - TURNS_BEFORE)) turns for the group room, expected 1 — a bare message was answered"
+GROUP_TURNS="$(grep '^stub_llm: request:' "$WORKSPACE/stub-llm.log" |
+	grep -cF "$BARE_BODY" || true)"
+PREJOIN_TURNS="$(grep '^stub_llm: request:' "$WORKSPACE/stub-llm.log" |
+    grep -cF "$PREJOIN_BODY" || true)"
+[[ $PREJOIN_TURNS -eq 1 ]] || fail "pre-join history did not appear exactly once in the mention turn (found $PREJOIN_TURNS)"
+if grep '^stub_llm: request:' "$WORKSPACE/stub-llm.log" | grep -qF "$PRECLEAR_BODY"; then
+    fail "history before !chaz clear reached the model"
+fi
+[[ "$(stub_requests)" -eq $((TURNS_BEFORE + 1)) ]] || fail "history triggered an extra model turn"
+
+if [[ $GROUP_TURNS -ne 0 ]]; then
+    fail "bridge included an unaddressed post-join message in $GROUP_TURNS model turn(s)"
 fi
 
 wait_for "the mention reply in the group room" "$REPLY_TIMEOUT" \
@@ -791,10 +843,97 @@ TXN="e2e-$(date +%s%N)"
 mx PUT "/_matrix/client/v3/rooms/$(jq -rn --arg r "$ROOM_ID" '$r|@uri')/send/m.room.message/$TXN" \
 	"$PUPPET_TOKEN" "$(jq -nc '{msgtype:"m.text",body:"react test"}')" >/dev/null
 
+wait_for "ReAct tool result" "$REPLY_TIMEOUT" \
+	grep -q "detected tool result" "$WORKSPACE/stub-llm.log"
 wait_for "sixth reply (ReAct cycle)" "$REPLY_TIMEOUT" replies_at_least 6
 
-if ! grep -q "detected tool result" "$WORKSPACE/stub-llm.log"; then
-	fail "ReAct loop did not complete: stub never received a tool result in a follow-up request"
-fi
-
 printf '\033[1;32mPASS\033[0m — ReAct case passed (tool-call cycle completed)\n' >&2
+
+# ----------------------------------------------------------- room reset ---
+# The `chaz-matrix rooms` maintenance command, run against the same throwaway
+# homeserver and bridge config. It signs in with a fresh throwaway device —
+# never the bridge's own session — so leaving rooms here is harmless to the
+# still-running bridge, whose sync merely observes the membership changes. This
+# phase runs last: every message case above is already done, and the bridge's
+# auto-join only fires on a new invite, so nothing re-joins behind it.
+
+log "room reset: dry-run"
+"$CHAZ_MATRIX_BIN" --config "$BRIDGE_CONFIG" rooms leave-all >"$WORKSPACE/rooms-dryrun.log" 2>&1 ||
+	fail "rooms dry-run failed (see $WORKSPACE/rooms-dryrun.log)"
+grep -q "dry-run" "$WORKSPACE/rooms-dryrun.log" ||
+	fail "rooms dry-run did not report dry-run mode (see $WORKSPACE/rooms-dryrun.log)"
+grep -qF "$ROOM_ID" "$WORKSPACE/rooms-dryrun.log" ||
+	fail "rooms dry-run did not list the DM room (see $WORKSPACE/rooms-dryrun.log)"
+grep -qF "$GROUP_ROOM_ID" "$WORKSPACE/rooms-dryrun.log" ||
+	fail "rooms dry-run did not list the group room (see $WORKSPACE/rooms-dryrun.log)"
+! grep -qE "^left " "$WORKSPACE/rooms-dryrun.log" ||
+	fail "rooms dry-run left a room (see $WORKSPACE/rooms-dryrun.log)"
+
+log "room reset: execute"
+"$CHAZ_MATRIX_BIN" --config "$BRIDGE_CONFIG" rooms leave-all --execute >"$WORKSPACE/rooms-execute.log" 2>&1 ||
+	fail "rooms --execute failed (see $WORKSPACE/rooms-execute.log)"
+grep -qF "left $ROOM_ID" "$WORKSPACE/rooms-execute.log" ||
+	fail "rooms --execute did not leave the DM room (see $WORKSPACE/rooms-execute.log)"
+grep -qF "left $GROUP_ROOM_ID" "$WORKSPACE/rooms-execute.log" ||
+	fail "rooms --execute did not leave the group room (see $WORKSPACE/rooms-execute.log)"
+grep -q "failed 0" "$WORKSPACE/rooms-execute.log" ||
+	fail "rooms --execute summary did not report 0 failed (see $WORKSPACE/rooms-execute.log)"
+
+log "room reset: dry-run after execute (idempotence)"
+"$CHAZ_MATRIX_BIN" --config "$BRIDGE_CONFIG" rooms list >"$WORKSPACE/rooms-dryrun2.log" 2>&1 ||
+	fail "rooms dry-run (after execute) failed (see $WORKSPACE/rooms-dryrun2.log)"
+grep -q "nothing to do" "$WORKSPACE/rooms-dryrun2.log" ||
+	fail "rooms dry-run after execute did not report nothing to do (see $WORKSPACE/rooms-dryrun2.log)"
+! grep -qF "$ROOM_ID" "$WORKSPACE/rooms-dryrun2.log" ||
+	fail "rooms dry-run after execute still listed the DM room (see $WORKSPACE/rooms-dryrun2.log)"
+! grep -qF "$GROUP_ROOM_ID" "$WORKSPACE/rooms-dryrun2.log" ||
+	fail "rooms dry-run after execute still listed the group room (see $WORKSPACE/rooms-dryrun2.log)"
+
+# The agent's password must never appear in any of the three outputs, even
+# though the bridge config that resolves it carries the literal value.
+for out in rooms-dryrun rooms-execute rooms-dryrun2; do
+	grep -qF "$AGENT_PASSWORD" "$WORKSPACE/$out.log" &&
+		fail "agent password leaked into rooms output ($WORKSPACE/$out.log)"
+done
+
+printf '\033[1;32mPASS\033[0m — room reset passed (dry-run lists, --execute leaves, re-run idempotent, no secret leaked)\n' >&2
+
+# Rejoining the same room imports only messages between joins. In particular,
+# the old live prompts and bot replies must not be backfilled a second time.
+log "rejoin: inviting the bridge back into the DM"
+sleep 3 # Let the running bridge observe the leave before posting absent-period history.
+ROOM_URI="$(jq -rn --arg r "$ROOM_ID" '$r|@uri')"
+REJOIN_CLEARED="older history during the absence"
+TXN="e2e-$(date +%s%N)"
+mx PUT "/_matrix/client/v3/rooms/$ROOM_URI/send/m.room.message/$TXN" \
+    "$PUPPET_TOKEN" "$(jq -nc --arg b "$REJOIN_CLEARED" '{msgtype:"m.text",body:$b}')" >/dev/null
+TXN="e2e-$(date +%s%N)"
+mx PUT "/_matrix/client/v3/rooms/$ROOM_URI/send/m.room.message/$TXN" \
+    "$PUPPET_TOKEN" '{"msgtype":"m.text","body":"!chaz clear"}' >/dev/null
+REJOIN_HISTORY="history while the bridge was absent"
+TXN="e2e-$(date +%s%N)"
+mx PUT "/_matrix/client/v3/rooms/$ROOM_URI/send/m.room.message/$TXN" \
+    "$PUPPET_TOKEN" "$(jq -nc --arg b "$REJOIN_HISTORY" '{msgtype:"m.text",body:$b}')" >/dev/null
+TURNS_BEFORE_REJOIN="$(stub_requests)"
+BACKFILLS_BEFORE="$(grep -c 'Backfilled 1 entries' "$BRIDGE_LOG" || true)"
+mx POST "/_matrix/client/v3/rooms/$ROOM_URI/invite" "$PUPPET_TOKEN" \
+    "$(jq -nc --arg a "$AGENT_MXID" '{user_id:$a}')" >/dev/null
+wait_for "bridge to rejoin the DM" 90 agent_joined
+rejoin_backfilled() {
+    [[ "$(grep -c 'Backfilled 1 entries' "$BRIDGE_LOG" || true)" -gt "$BACKFILLS_BEFORE" ]]
+}
+wait_for "rejoin history backfill" 90 rejoin_backfilled
+REJOIN_PROMPT="addressed after rejoin"
+TXN="e2e-$(date +%s%N)"
+mx PUT "/_matrix/client/v3/rooms/$ROOM_URI/send/m.room.message/$TXN" \
+    "$PUPPET_TOKEN" "$(jq -nc --arg b "$REJOIN_PROMPT" '{msgtype:"m.text",body:$b}')" >/dev/null
+wait_for "rejoin prompt to reach the model" "$REPLY_TIMEOUT" \
+    grep -qF "$REJOIN_PROMPT" "$WORKSPACE/stub-llm.log"
+wait_for "seventh reply after rejoin" "$REPLY_TIMEOUT" replies_at_least 7
+[[ "$(stub_requests)" -eq $((TURNS_BEFORE_REJOIN + 1)) ]] ||
+    fail "rejoin history triggered a model turn"
+REJOIN_CONTEXT="$(grep '^stub_llm: request:' "$WORKSPACE/stub-llm.log" | grep -F "$REJOIN_PROMPT")"
+[[ "$REJOIN_CONTEXT" == *"$REJOIN_HISTORY"* ]] || fail "rejoin history missing from context"
+[[ "$REJOIN_CONTEXT" != *"$REJOIN_CLEARED"* ]] || fail "history before clear was imported on rejoin"
+[[ "$REJOIN_CONTEXT" != *"second turn"* ]] || fail "previous live room events were reimported on rejoin"
+printf '\033[1;32mPASS\033[0m — rejoin imported absent-period context without replaying old turns\n' >&2

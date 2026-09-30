@@ -13,7 +13,8 @@
 //! ```text
 //! /memory config show
 //! /memory config set auto_recall_enabled false
-//! /memory config set max_entries 5
+//! /memory config set auto_recall_max_entries 5
+//! /memory config set auto_recall_max_chars 200
 //! /memory config reset
 //! ```
 
@@ -48,8 +49,12 @@ struct AutoRecallConfig {
     #[serde(default = "default_true")]
     auto_recall_enabled: bool,
     /// Max entries to surface from own memory + each bank.
-    #[serde(default = "default_max_entries")]
-    max_entries: usize,
+    #[serde(default = "default_auto_recall_max_entries")]
+    auto_recall_max_entries: usize,
+    /// Max characters per entry surfaced in the context tail; longer
+    /// values are truncated with an elision marker.
+    #[serde(default = "default_auto_recall_max_chars")]
+    auto_recall_max_chars: usize,
     /// Which banks participate in auto-recall. `None` = all attached banks.
     #[serde(default)]
     auto_recall_banks: Option<Vec<String>>,
@@ -58,14 +63,18 @@ struct AutoRecallConfig {
 fn default_true() -> bool {
     true
 }
-fn default_max_entries() -> usize {
+fn default_auto_recall_max_entries() -> usize {
     3
+}
+fn default_auto_recall_max_chars() -> usize {
+    200
 }
 impl Default for AutoRecallConfig {
     fn default() -> Self {
         Self {
             auto_recall_enabled: true,
-            max_entries: 3,
+            auto_recall_max_entries: 3,
+            auto_recall_max_chars: 200,
             auto_recall_banks: None,
         }
     }
@@ -344,7 +353,8 @@ impl ContextTail for MemoryContextTail {
                 return Ok(None);
             }
 
-            let max_entries = config.max_entries;
+            let max_entries = config.auto_recall_max_entries;
+            let entry_cap = Some(config.auto_recall_max_chars);
 
             // Search own memory
             let own_results = search_memory(
@@ -353,6 +363,7 @@ impl ContextTail for MemoryContextTail {
                 &query,
                 &[],
                 max_entries,
+                entry_cap,
                 self.embedder.as_deref(),
             )
             .await
@@ -404,6 +415,7 @@ impl ContextTail for MemoryContextTail {
                     &query,
                     &[],
                     max_entries,
+                    entry_cap,
                     self.embedder.as_deref(),
                 )
                 .await
@@ -610,14 +622,28 @@ impl ExtensionCommand for MemoryCommand {
             if let Some(bank_name) = args.strip_prefix("detach ") {
                 return detach_cmd(bank_name.trim(), ctx).await;
             }
-            if args == "config" || args == "config show" {
-                return config_show_cmd(ctx, &self.registry, &self.agent_index).await;
-            }
-            if let Some(rest) = args.strip_prefix("config set ") {
-                return config_set_cmd(rest.trim(), ctx, &self.registry, &self.agent_index).await;
-            }
-            if args == "config reset" {
-                return config_reset_cmd(ctx, &self.registry, &self.agent_index).await;
+            if args == "config" || args.starts_with("config ") {
+                let (command, target) = match parse_config_target(args) {
+                    Ok(parsed) => parsed,
+                    Err(e) => return ExtensionCommandOutcome::Error(e),
+                };
+                if command == "config" || command == "config show" {
+                    return config_show_cmd(ctx, &self.registry, &self.agent_index, target).await;
+                }
+                if let Some(rest) = command.strip_prefix("config set ") {
+                    return config_set_cmd(
+                        rest.trim(),
+                        ctx,
+                        &self.registry,
+                        &self.agent_index,
+                        target,
+                    )
+                    .await;
+                }
+                if command == "config reset" {
+                    return config_reset_cmd(ctx, &self.registry, &self.agent_index, target).await;
+                }
+                return ExtensionCommandOutcome::Error("Usage: /memory config [show|set <key> <value>|reset] [--agent <hosted-name-or-id>]".into());
             }
             ExtensionCommandOutcome::Error(format!(
                 "Unknown memory sub-command: '{args}'. Use: list | new <name> [desc] | \
@@ -1188,13 +1214,37 @@ async fn detach_cmd(bank_name: &str, ctx: &HookContext) -> ExtensionCommandOutco
 
 // ── Config sub-commands ────────────────────────────────────────────────
 
+fn parse_config_target(args: &str) -> Result<(String, Option<&str>), String> {
+    let words: Vec<_> = args.split_whitespace().collect();
+    let flag = words.iter().position(|w| w.starts_with("--"));
+    let (command, target) = match flag {
+        None => (words.as_slice(), None),
+        Some(i)
+            if words[i] == "--agent" && i + 2 == words.len() && !words[i + 1].starts_with("--") =>
+        {
+            (&words[..i], Some(words[i + 1]))
+        }
+        _ => {
+            return Err(
+                "Usage: trailing --agent <hosted-name-or-id> required; unknown or misplaced flag"
+                    .into(),
+            );
+        }
+    };
+    if command.is_empty() || command.iter().any(|w| w.starts_with("--")) {
+        return Err("Invalid /memory config command or target".into());
+    }
+    Ok((command.join(" "), target))
+}
+
 async fn config_show_cmd(
     ctx: &HookContext,
     registry: &SessionRegistry,
     agent_index: &HostedIndex,
+    target: Option<&str>,
 ) -> ExtensionCommandOutcome {
-    let db = match open_agent_db_for_cmd(ctx, registry, agent_index).await {
-        Ok(db) => db,
+    let (db, agent) = match open_agent_db_for_cmd(ctx, registry, agent_index, target).await {
+        Ok(result) => result,
         Err(e) => return e,
     };
     let config = load_auto_recall_config(&db).await;
@@ -1204,15 +1254,19 @@ async fn config_show_cmd(
         None => "(all attached)".to_string(),
     };
     ExtensionCommandOutcome::Text(format!(
-        "Auto-recall config:\n\
+        "Auto-recall config for {agent}:\n\
          ───────────────────────\n\
-         auto_recall_enabled = {}\n\
-         max_entries         = {}\n\
-         auto_recall_banks   = {}\n\
+         auto_recall_enabled     = {}\n\
+         auto_recall_max_entries = {}\n\
+         auto_recall_max_chars   = {}\n\
+         auto_recall_banks       = {}\n\
          ───────────────────────\n\
          /memory config set <key> <value>  to change\n\
          /memory config reset              to revert to defaults",
-        config.auto_recall_enabled, config.max_entries, banks_str,
+        config.auto_recall_enabled,
+        config.auto_recall_max_entries,
+        config.auto_recall_max_chars,
+        banks_str,
     ))
 }
 
@@ -1221,20 +1275,22 @@ async fn config_set_cmd(
     ctx: &HookContext,
     registry: &SessionRegistry,
     agent_index: &HostedIndex,
+    target: Option<&str>,
 ) -> ExtensionCommandOutcome {
     let (key, value) = match rest.split_once(' ') {
         Some((k, v)) => (k.trim(), v.trim()),
         None => {
             return ExtensionCommandOutcome::Error(
                 "Usage: /memory config set <key> <value>\n\
-                 Keys: auto_recall_enabled (true|false), max_entries (1-20), auto_recall_banks (comma-separated names)"
+                 Keys: auto_recall_enabled (true|false), auto_recall_max_entries (1-20), \
+                 auto_recall_max_chars (1-2000), auto_recall_banks (comma-separated names)"
                     .into(),
             );
         }
     };
 
-    let db = match open_agent_db_for_cmd(ctx, registry, agent_index).await {
-        Ok(db) => db,
+    let (db, agent) = match open_agent_db_for_cmd(ctx, registry, agent_index, target).await {
+        Ok(result) => result,
         Err(e) => return e,
     };
     let mut config = load_auto_recall_config(&db).await;
@@ -1249,11 +1305,19 @@ async fn config_set_cmd(
                 ));
             }
         },
-        "max_entries" => match value.parse::<usize>() {
-            Ok(n) if (1..=20).contains(&n) => config.max_entries = n,
+        "auto_recall_max_entries" => match value.parse::<usize>() {
+            Ok(n) if (1..=20).contains(&n) => config.auto_recall_max_entries = n,
             _ => {
                 return ExtensionCommandOutcome::Error(format!(
                     "Invalid value '{value}'. Must be 1–20."
+                ));
+            }
+        },
+        "auto_recall_max_chars" => match value.parse::<usize>() {
+            Ok(n) if (1..=2000).contains(&n) => config.auto_recall_max_chars = n,
+            _ => {
+                return ExtensionCommandOutcome::Error(format!(
+                    "Invalid value '{value}'. Must be 1–2000."
                 ));
             }
         },
@@ -1267,14 +1331,14 @@ async fn config_set_cmd(
         }
         _ => {
             return ExtensionCommandOutcome::Error(format!(
-                "Unknown key '{key}'. Valid keys: auto_recall_enabled, max_entries, auto_recall_banks"
+                "Unknown key '{key}'. Valid keys: auto_recall_enabled, auto_recall_max_entries, auto_recall_max_chars, auto_recall_banks"
             ));
         }
     }
 
     match save_auto_recall_config(&db, &config).await {
         Ok(()) => ExtensionCommandOutcome::Text(format!(
-            "Set {key} = {value}. Changes take effect next turn."
+            "Set {key} = {value} for {agent}. Changes take effect next turn."
         )),
         Err(e) => ExtensionCommandOutcome::Error(format!("Failed to save config: {e}")),
     }
@@ -1284,9 +1348,10 @@ async fn config_reset_cmd(
     ctx: &HookContext,
     registry: &SessionRegistry,
     agent_index: &HostedIndex,
+    target: Option<&str>,
 ) -> ExtensionCommandOutcome {
-    let db = match open_agent_db_for_cmd(ctx, registry, agent_index).await {
-        Ok(db) => db,
+    let (db, agent) = match open_agent_db_for_cmd(ctx, registry, agent_index, target).await {
+        Ok(result) => result,
         Err(e) => return e,
     };
     // Delete the key from meta — next load returns defaults
@@ -1299,10 +1364,12 @@ async fn config_reset_cmd(
         Err(e) => return ExtensionCommandOutcome::Error(format!("Failed to open meta: {e}")),
     };
     match store.delete(AUTO_RECALL_CONFIG_KEY).await {
-        Ok(_) => {
-            let _ = txn.commit().await;
-            ExtensionCommandOutcome::Text("Auto-recall config reset to defaults.".into())
-        }
+        Ok(_) => match txn.commit().await {
+            Ok(_) => ExtensionCommandOutcome::Text(format!(
+                "Auto-recall config for {agent} reset to defaults."
+            )),
+            Err(e) => ExtensionCommandOutcome::Error(format!("Failed to commit reset: {e}")),
+        },
         Err(e) => ExtensionCommandOutcome::Error(format!("Failed to reset: {e}")),
     }
 }
@@ -1311,13 +1378,41 @@ async fn open_agent_db_for_cmd(
     ctx: &HookContext,
     registry: &SessionRegistry,
     agent_index: &HostedIndex,
-) -> Result<Database, ExtensionCommandOutcome> {
-    let entry = agent_index.find_by_name(&ctx.agent_name).ok_or_else(|| {
-        ExtensionCommandOutcome::Error(format!(
-            "Agent '{}' has no Living Agent DB on this peer.",
-            ctx.agent_name
-        ))
-    })?;
+    target: Option<&str>,
+) -> Result<(Database, String), ExtensionCommandOutcome> {
+    let session = ctx.session.lock().await;
+    let authorized = registry
+        .authorized_hosted_agents(session.database(), agent_index)
+        .await
+        .map_err(|e| {
+            ExtensionCommandOutcome::Error(format!("Cannot read session agent authorization: {e}"))
+        })?;
+    let entry = if let Some(target) = target {
+        agent_index
+            .find_by_name(target)
+            .or_else(|| {
+                eidetica::entry::ID::parse(target)
+                    .ok()
+                    .and_then(|id| agent_index.find_by_id(&id))
+            })
+            .ok_or_else(|| {
+                ExtensionCommandOutcome::Error(format!("No hosted agent matches '{target}'"))
+            })?
+    } else {
+        if authorized.len() > 1 {
+            return Err(ExtensionCommandOutcome::Error(
+                "Multiple agents authorized on this session; specify --agent <hosted-name-or-id>"
+                    .into(),
+            ));
+        }
+        agent_index.find_by_name(&ctx.agent_name).ok_or_else(|| {
+            ExtensionCommandOutcome::Error(format!(
+                "Agent '{}' has no Living Agent DB on this peer.",
+                ctx.agent_name
+            ))
+        })?
+    };
+    drop(session);
     let agent_db = registry
         .open_agent_db(&entry.db_id, Some(&entry.pubkey))
         .await
@@ -1328,7 +1423,7 @@ async fn open_agent_db_for_cmd(
                 ctx.agent_name, entry.db_id
             ))
         })?;
-    Ok(agent_db.database().clone())
+    Ok((agent_db.database().clone(), entry.display_name))
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────
@@ -1841,5 +1936,169 @@ mod tests {
             }
             ExtensionCommandOutcome::Error(e) => panic!("unexpected: {e}"),
         }
+    }
+
+    // ── /memory config: auto_recall_max_chars ────────────────────────────────
+
+    // ── /memory config set: unknown-key warning ────────────────────────────
+
+    async fn config_set_via_cmd(cmd: &MemoryCommand, rest: &str) -> ExtensionCommandOutcome {
+        // config_set_cmd needs a session-bound HookContext for the
+        // agent-DB lookup, like attach_via_dispatcher above.
+        use crate::session::Session;
+        use crate::types::ConversationId;
+        use std::sync::Arc;
+        use tokio::sync::Mutex as TokioMutex;
+        let (_conv, session_db) = cmd.registry.create_session(Some("test")).await.unwrap();
+        let session = Arc::new(TokioMutex::new(
+            Session::new(ConversationId(session_db.root_id().to_string()), session_db).await,
+        ));
+        let ctx = HookContext {
+            agent_name: "alpha".to_string(),
+            model: None,
+            call_depth: 0,
+            session,
+            active_extensions: std::collections::HashSet::new(),
+            routine_engine: None,
+        };
+        config_set_cmd(rest, &ctx, &cmd.registry, &cmd.agent_index, None).await
+    }
+
+    #[tokio::test]
+    async fn config_set_unknown_key_lists_valid_keys() {
+        let (_i, registry, cmd) = fixture().await;
+        seed_agent(&registry, &cmd, "alpha").await;
+        // Pre-rename keys are no longer recognized and must hit the
+        // unknown-key warning, which lists the new key names.
+        for old in ["max_entries 5", "max_entry_chars 200", "bogus 1"] {
+            match config_set_via_cmd(&cmd, old).await {
+                ExtensionCommandOutcome::Error(msg) => {
+                    assert!(msg.contains("Unknown key"), "missing warning: {msg}");
+                    assert!(
+                        msg.contains("auto_recall_max_entries")
+                            && msg.contains("auto_recall_max_chars"),
+                        "warning must list new key names: {msg}"
+                    );
+                }
+                ExtensionCommandOutcome::Text(s) => panic!("expected error, got: {s}"),
+            }
+        }
+        // The renamed keys are still accepted.
+        assert_text(
+            config_set_via_cmd(&cmd, "auto_recall_max_entries 5").await,
+            "Set auto_recall_max_entries = 5",
+        );
+    }
+
+    #[test]
+    fn config_target_parser_rejects_misplaced_and_invalid_flags() {
+        assert_eq!(
+            parse_config_target("config show --agent alpha").unwrap(),
+            ("config show".into(), Some("alpha"))
+        );
+        for input in [
+            "config show --agent",
+            "config --bogus alpha",
+            "config show --agent alpha extra",
+            "config set --agent alpha auto_recall_enabled false",
+            "config show --agent --bogus",
+        ] {
+            assert!(parse_config_target(input).is_err(), "accepted {input}");
+        }
+    }
+
+    #[tokio::test]
+    async fn config_targeting_uses_auth_roster_and_separate_agent_dbs() {
+        use crate::session::Session;
+        use crate::types::ConversationId;
+        use tokio::sync::Mutex as TokioMutex;
+        let (_i, registry, cmd) = fixture().await;
+        seed_agent(&registry, &cmd, "alpha").await;
+        seed_agent(&registry, &cmd, "beta").await;
+        let (_conv, db) = registry.create_session(Some("test")).await.unwrap();
+        let session_id = db.root_id().to_string();
+        let session = Arc::new(TokioMutex::new(
+            Session::new(ConversationId(session_id.clone()), db).await,
+        ));
+        let ctx = HookContext {
+            agent_name: "alpha".into(),
+            model: None,
+            call_depth: 0,
+            session,
+            active_extensions: std::collections::HashSet::new(),
+            routine_engine: None,
+        };
+        let run = |args: &'static str| cmd.invoke(args, &ctx);
+        assert_text(run("config show").await, "for alpha");
+        let alpha = cmd.agent_index.find_by_name("alpha").unwrap();
+        let beta = cmd.agent_index.find_by_name("beta").unwrap();
+        registry
+            .attach_agent_to_session(&session_id, &alpha)
+            .await
+            .unwrap();
+        assert_text(
+            run("config set auto_recall_max_entries 4").await,
+            "for alpha",
+        );
+        registry
+            .attach_agent_to_session(&session_id, &beta)
+            .await
+            .unwrap();
+        // A stale readable roster must not hide beta's authoritative Write key.
+        {
+            let session = ctx.session.lock().await;
+            session
+                .update_meta(|meta| meta.agents.clear())
+                .await
+                .unwrap();
+        }
+        for args in [
+            "config",
+            "config show",
+            "config reset",
+            "config set auto_recall_max_entries 9",
+        ] {
+            assert_error(run(args).await, "specify --agent");
+        }
+        assert_error(run("config show --agent ghost").await, "No hosted agent");
+        assert_error(
+            run("config reset --agent beta extra").await,
+            "trailing --agent",
+        );
+        assert_text(
+            run("config set auto_recall_max_entries 8 --agent beta").await,
+            "for beta",
+        );
+        let beta_show = format!("config show --agent {}", beta.db_id);
+        assert_text(
+            cmd.invoke(&beta_show, &ctx).await,
+            "auto_recall_max_entries = 8",
+        );
+        assert_text(
+            run("config show --agent alpha").await,
+            "auto_recall_max_entries = 4",
+        );
+        assert_text(run("config reset --agent beta").await, "for beta");
+        assert_text(
+            run("config show --agent beta").await,
+            "auto_recall_max_entries = 3",
+        );
+        assert_text(
+            run("config show --agent alpha").await,
+            "auto_recall_max_entries = 4",
+        );
+    }
+
+    #[test]
+    fn auto_recall_config_defaults_to_200_char_cap() {
+        let cfg = AutoRecallConfig::default();
+        assert_eq!(cfg.auto_recall_max_chars, 200);
+        // Configs stored before the cap existed deserialize with the
+        // default rather than zero.
+        let parsed: AutoRecallConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(parsed.auto_recall_max_chars, 200);
+        let roundtrip: AutoRecallConfig =
+            serde_json::from_str(&serde_json::to_string(&cfg).unwrap()).unwrap();
+        assert_eq!(roundtrip.auto_recall_max_chars, 200);
     }
 }

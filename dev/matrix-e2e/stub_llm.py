@@ -37,9 +37,8 @@ REPLY = sys.argv[2]
 # cold-boot turn, and leaves the ReAct case asserting on a log line written
 # minutes earlier.
 #
-# The phrase stays in the room's history once sent, so every later turn in that
-# same room repeats the cycle. Send it from a room whose remaining turns are
-# meant to exercise tool calls too — in the harness that means last.
+# Only the latest actual user message triggers a tool call; otherwise an
+# earlier ReAct prompt in the same room's context would trigger every turn.
 TOOL_CALL_TRIGGER = "react test"
 
 
@@ -75,6 +74,17 @@ class Handler(BaseHTTPRequestHandler):
                     part.get("text", "") for part in content if isinstance(part, dict)
                 )
         return " | ".join(parts).replace("\n", " ")
+
+    @staticmethod
+    def _react_requested(messages):
+        for msg in reversed(messages):
+            if not isinstance(msg, dict) or msg.get("role") != "user":
+                continue
+            content = msg.get("content")
+            if not isinstance(content, str) or content.startswith("## Relevant Memories"):
+                continue
+            return TOOL_CALL_TRIGGER in content
+        return False
 
     def do_GET(self):
         # Some clients probe the model list before their first completion.
@@ -138,7 +148,7 @@ class Handler(BaseHTTPRequestHandler):
                     },
                 }
             )
-        elif TOOL_CALL_TRIGGER in user_text:
+        elif self._react_requested(messages):
             sys.stderr.write("stub_llm: returning a tool call\n")
             self._send(
                 {

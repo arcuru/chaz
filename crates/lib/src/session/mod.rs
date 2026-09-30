@@ -20,15 +20,17 @@
 use crate::types::ConversationId;
 
 use chrono::{DateTime, Utc};
-use eidetica::Database;
 use eidetica::store::{DocStore, Table};
+use eidetica::{Database, Snapshot};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use tracing::{error, info, warn};
 
 mod agents;
+pub mod jobs;
 mod keys;
 mod registry;
+pub(crate) use registry::JobRequest;
 mod transport;
 pub mod usage;
 
@@ -99,6 +101,116 @@ pub struct SessionEntry {
     /// None` and future routing fields add zero per-site churn.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub routing: Option<EntryRouting>,
+}
+
+/// Stable identity of a persisted entry that may require an agent turn.
+///
+/// This is the primary key of the entry's Eidetica `Table` row. Row keys are
+/// preserved by sync and distinguish two rows containing identical values.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct TurnRequestId(String);
+
+impl TurnRequestId {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Build an id from its persisted text form.
+    pub fn parse(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+}
+
+impl std::fmt::Display for TurnRequestId {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+/// Durable lifecycle state for one agent-turn attempt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TurnAttemptStatus {
+    Started,
+    Completed,
+}
+
+/// Append-only attempt record stored alongside session entries.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TurnAttempt {
+    pub attempt_id: String,
+    pub request_id: TurnRequestId,
+    pub started_at: DateTime<Utc>,
+    /// Durable causal order for attempts of one request. Timestamps are audit
+    /// data only and may move backwards across restarts.
+    #[serde(default)]
+    pub generation: u64,
+    pub status: TurnAttemptStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<DateTime<Utc>>,
+}
+
+/// Reconciliation result surfaced to frontends and explicit retry callers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TurnRequestState {
+    Queued,
+    InFlight { attempt_id: String },
+    Interrupted { attempt_id: String },
+    Completed { attempt_id: String },
+}
+
+/// A processable persisted entry paired with its stable identity and state.
+#[derive(Debug, Clone)]
+pub struct TurnRequest {
+    pub id: TurnRequestId,
+    pub entry: SessionEntry,
+    pub state: TurnRequestState,
+}
+
+/// The two frontend commands that require executor authority.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub enum SessionCommand {
+    /// Summarize the context visible at this immutable database snapshot.
+    Compact { source_snapshot: Snapshot },
+    /// Retry one specifically observed interrupted turn attempt.
+    Retry {
+        target_request_id: TurnRequestId,
+        expected_interrupted_attempt_id: String,
+    },
+}
+
+/// A typed command request written by any session client.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionCommandRequest {
+    pub command_id: TurnRequestId,
+    pub sender: String,
+    pub created_at: DateTime<Utc>,
+    pub command: SessionCommand,
+}
+
+/// Terminal executor-owned command outcome.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SessionCommandOutcome {
+    Compact { summary: String },
+    RetryAccepted { target_attempt_id: String },
+    Rejected { message: String },
+    Failed { message: String },
+}
+
+/// Durable result observed by the client that submitted a command.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionCommandResult {
+    pub command_id: TurnRequestId,
+    pub attempt_id: String,
+    pub completed_at: DateTime<Utc>,
+    pub outcome: SessionCommandOutcome,
+}
+
+/// A persisted command paired with its attempt-derived lifecycle state.
+#[derive(Debug, Clone)]
+pub struct SessionCommandWork {
+    pub request: SessionCommandRequest,
+    pub state: TurnRequestState,
 }
 
 /// Transport routing metadata for a [`SessionEntry`].
@@ -246,6 +358,9 @@ pub struct SessionIndex {
     pub bridge: BridgeKind,
     pub created_at: Option<DateTime<Utc>>,
     pub status: SessionStatus,
+    /// Human-friendly alias from the peer-local name index. Unlike
+    /// per-session metadata, this is available without opening the session DB.
+    pub name: Option<String>,
 }
 
 /// Normalized bridge-of-origin derived from the session's `source` tag.
@@ -307,9 +422,8 @@ pub enum SessionStatus {
 ///
 /// Stored in `chaz_group`'s `session_catalog` DocStore (one entry per session
 /// ever created on this peer). Caches only fields that don't drift after
-/// creation — `name` and `agent_name` are intentionally NOT cached here, since
-/// they live canonically in `SessionMeta` inside each session's own DB and
-/// would require an update hook at every meta-write site.
+/// creation. Mutable names come from the companion `session_names` index;
+/// agent metadata remains canonical in each session DB and is loaded on demand.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionCatalogEntry {
     pub session_db_id: String,
@@ -328,11 +442,86 @@ pub struct Session {
     pub conversation_id: ConversationId,
     database: Database,
     entries: Vec<SessionEntry>,
+    entry_ids: Vec<TurnRequestId>,
     /// Store name — "entries" for regular, "entries:{id}" for ephemeral
     store_name: String,
 }
 
 const META_STORE: &str = "meta";
+const TURN_ATTEMPTS_STORE: &str = "turn_attempts";
+const TURN_ACTIVITY_STORE: &str = "turn_activity";
+/// A lost executor heartbeat expires visible activity even after a crash.
+pub const TURN_ACTIVITY_TIMEOUT: chrono::Duration = chrono::Duration::seconds(45);
+
+fn fresh_activity(at: DateTime<Utc>, now: DateTime<Utc>) -> bool {
+    let age = now.signed_duration_since(at);
+    age >= chrono::Duration::zero() && age < TURN_ACTIVITY_TIMEOUT
+}
+
+fn visible_attempts(
+    attempts: Vec<TurnAttempt>,
+    heartbeats: &HashMap<String, DateTime<Utc>>,
+    now: DateTime<Utc>,
+) -> Vec<String> {
+    // A late heartbeat cannot resurrect a completed attempt.
+    let completed: HashSet<_> = attempts
+        .iter()
+        .filter(|a| a.status == TurnAttemptStatus::Completed)
+        .map(|a| a.attempt_id.clone())
+        .collect();
+    attempts
+        .into_iter()
+        .filter(|a| {
+            a.status == TurnAttemptStatus::Started && !completed.contains(a.attempt_id.as_str())
+        })
+        .filter(|a| {
+            fresh_activity(
+                heartbeats
+                    .get(&a.attempt_id)
+                    .copied()
+                    .unwrap_or(a.started_at),
+                now,
+            )
+        })
+        .map(|a| a.attempt_id)
+        .collect()
+}
+
+const TURN_TRANSCRIPT_STORE: &str = "turn_transcript";
+const SESSION_COMMANDS_STORE: &str = "session_commands";
+const SESSION_COMMAND_RESULTS_STORE: &str = "session_command_results";
+const TURN_SCHEMA_KEY: &str = "turn_request_schema";
+const TURN_BASELINE_KEY: &str = "turn_request_baseline";
+const TURN_SCHEMA_VERSION: &str = "1";
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TurnTranscriptRecord {
+    pub request_id: TurnRequestId,
+    pub attempt_id: String,
+    pub sequence: u64,
+    pub timestamp: DateTime<Utc>,
+    pub message: TurnTranscriptMessage,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum TurnTranscriptMessage {
+    ModelResponse {
+        model_sequence: u64,
+        content: Option<String>,
+        tool_calls: Vec<crate::runtime::ToolCallRequest>,
+        provider_extra: serde_json::Map<String, serde_json::Value>,
+        metadata: Option<crate::runtime::ResponseMetadata>,
+        terminal: bool,
+    },
+    ToolResult {
+        model_sequence: u64,
+        call_index: usize,
+        call_id: String,
+        name: String,
+        output: String,
+        outcome: crate::runtime::ToolResultOutcome,
+    },
+}
 
 impl Session {
     /// Open a session, loading existing entries from its database.
@@ -341,6 +530,7 @@ impl Session {
             conversation_id,
             database,
             entries: Vec::new(),
+            entry_ids: Vec::new(),
             store_name: "entries".to_string(),
         };
 
@@ -356,14 +546,201 @@ impl Session {
         if let Ok(store) = txn.get_store::<Table<SessionEntry>>(&self.store_name).await {
             match store.search(|_| true).await {
                 Ok(records) => {
-                    let mut entries: Vec<SessionEntry> =
-                        records.into_iter().map(|(_, entry)| entry).collect();
-                    entries.sort_by_key(|e| e.timestamp);
+                    let (ids, entries) = sort_persisted_entries(records);
+                    self.entry_ids = ids;
                     self.entries = entries;
                 }
                 Err(e) => error!("Failed to load session entries from eidetica: {e}"),
             }
         }
+    }
+
+    async fn load_entries_at(
+        database: &Database,
+        store_name: &str,
+        snapshot: &eidetica::Snapshot,
+    ) -> anyhow::Result<(Vec<TurnRequestId>, Vec<SessionEntry>)> {
+        let txn = database.new_transaction_at(snapshot).await?;
+        let store = txn.get_store::<Table<SessionEntry>>(store_name).await?;
+        Ok(sort_persisted_entries(store.search(|_| true).await?))
+    }
+
+    /// Load the typed transcript view at an immutable Eidetica snapshot.
+    pub async fn entries_at_snapshot(
+        database: &Database,
+        snapshot: &Snapshot,
+    ) -> anyhow::Result<Vec<SessionEntry>> {
+        Ok(Self::load_entries_at(database, "entries", snapshot)
+            .await?
+            .1)
+    }
+
+    /// Check whether this database contains any queued durable work at a
+    /// pinned snapshot. Used by reconnect reconciliation.
+    pub async fn has_queued_work_at(
+        &self,
+        snapshot: Snapshot,
+        is_agent: impl Fn(&str) -> bool,
+        live_attempts: &HashSet<String>,
+    ) -> anyhow::Result<bool> {
+        Ok(self
+            .turn_requests_at(snapshot.clone(), is_agent, live_attempts)
+            .await?
+            .into_iter()
+            .any(|request| request.state == TurnRequestState::Queued)
+            || self
+                .command_requests_at(&snapshot, live_attempts)
+                .await?
+                .into_iter()
+                .any(|request| request.state == TurnRequestState::Queued))
+    }
+
+    /// Load the transcript rows with their stable row identities at an
+    /// immutable Eidetica snapshot. Row identity survives sync and rebase,
+    /// which makes it the key durable consumers (transport delivery progress)
+    /// track instead of timestamps or content.
+    pub async fn entries_with_ids_at_snapshot(
+        database: &Database,
+        snapshot: &Snapshot,
+    ) -> anyhow::Result<Vec<(TurnRequestId, SessionEntry)>> {
+        let (ids, entries) = Self::load_entries_at(database, "entries", snapshot).await?;
+        Ok(ids.into_iter().zip(entries).collect())
+    }
+
+    /// Assemble the transcript view using snapshot-backed compact results.
+    /// Coverage is derived from native historical table views; no entry-id
+    /// ancestry is stored alongside the summary.
+    pub async fn context_entries(&self) -> anyhow::Result<Vec<SessionEntry>> {
+        let snapshot = self.database.snapshot().await?;
+        Self::context_entries_at(self.database.clone(), snapshot).await
+    }
+
+    pub async fn context_entries_at(
+        database: Database,
+        snapshot: Snapshot,
+    ) -> anyhow::Result<Vec<SessionEntry>> {
+        Ok(Self::context_entries_with_ids_at(database, snapshot)
+            .await?
+            .into_iter()
+            .map(|(_, entry)| entry)
+            .collect())
+    }
+
+    async fn context_entries_with_ids_at(
+        database: Database,
+        snapshot: Snapshot,
+    ) -> anyhow::Result<Vec<(Option<TurnRequestId>, SessionEntry)>> {
+        let txn = database.new_transaction_at(&snapshot).await?;
+        let results = txn
+            .get_store::<Table<SessionCommandResult>>(SESSION_COMMAND_RESULTS_STORE)
+            .await?
+            .search(|result| matches!(result.outcome, SessionCommandOutcome::Compact { .. }))
+            .await?;
+        let mut candidates = Vec::new();
+        let commands = txn
+            .get_store::<Table<SessionCommandRequest>>(SESSION_COMMANDS_STORE)
+            .await?;
+        for (id, result) in results {
+            let SessionCommandOutcome::Compact { summary } = result.outcome else {
+                continue;
+            };
+            let request = commands.get(&id).await?;
+            let SessionCommand::Compact { source_snapshot } = request.command else {
+                continue;
+            };
+            candidates.push((id, result.completed_at, source_snapshot, summary));
+        }
+        let Some(mut selected) = candidates.pop() else {
+            return Ok(Self::entries_with_ids_at_snapshot(&database, &snapshot)
+                .await?
+                .into_iter()
+                .map(|(id, entry)| (Some(id), entry))
+                .collect());
+        };
+        for candidate in candidates {
+            let selected_to_candidate = database.ids_added(&selected.2, &candidate.2).await?;
+            let candidate_to_selected = database.ids_added(&candidate.2, &selected.2).await?;
+            let candidate_covers_more =
+                !selected_to_candidate.is_empty() && candidate_to_selected.is_empty();
+            let incomparable_or_equal =
+                selected_to_candidate.is_empty() == candidate_to_selected.is_empty();
+            if candidate_covers_more
+                || (incomparable_or_equal
+                    && (candidate.1, &candidate.0) > (selected.1, &selected.0))
+            {
+                selected = candidate;
+            }
+        }
+
+        let source_entries = Self::entries_with_ids_at_snapshot(&database, &selected.2).await?;
+        let covered_ids: HashSet<_> = source_entries.iter().map(|(id, _)| id.clone()).collect();
+        let mut entries = vec![(
+            None,
+            SessionEntry {
+                sender: "system".into(),
+                content: selected.3,
+                timestamp: selected.1,
+                entry_type: EntryType::Summary,
+                metadata: None,
+                routing: None,
+            },
+        )];
+        entries.extend(
+            Self::entries_with_ids_at_snapshot(&database, &snapshot)
+                .await?
+                .into_iter()
+                .filter(|(id, _)| !covered_ids.contains(id))
+                .map(|(id, entry)| (Some(id), entry)),
+        );
+        Ok(entries)
+    }
+
+    /// One immutable view of compacted entries and selected completed attempts.
+    pub async fn context_with_tool_history(
+        &self,
+    ) -> anyhow::Result<(Vec<SessionEntry>, Vec<Vec<TurnTranscriptRecord>>)> {
+        let snapshot = self.database.snapshot().await?;
+        let rows =
+            Self::context_entries_with_ids_at(self.database.clone(), snapshot.clone()).await?;
+        let txn = self.database.new_transaction_at(&snapshot).await?;
+        let attempts = txn
+            .get_store::<Table<TurnAttempt>>(TURN_ATTEMPTS_STORE)
+            .await?
+            .search(|_| true)
+            .await?;
+        let states = index_attempt_states(attempts, &HashSet::new());
+        let selected: HashMap<_, _> = states
+            .into_iter()
+            .filter_map(|(id, state)| {
+                if let TurnRequestState::Completed { attempt_id } = state {
+                    Some((id, attempt_id))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let mut records: HashMap<TurnRequestId, Vec<TurnTranscriptRecord>> = HashMap::new();
+        for (_, record) in txn
+            .get_store::<Table<TurnTranscriptRecord>>(TURN_TRANSCRIPT_STORE)
+            .await?
+            .search(|_| true)
+            .await?
+        {
+            if selected.get(&record.request_id) == Some(&record.attempt_id) {
+                records
+                    .entry(record.request_id.clone())
+                    .or_default()
+                    .push(record);
+            }
+        }
+        let (entries, history) = rows
+            .into_iter()
+            .map(|(id, entry)| {
+                let history = id.and_then(|id| records.remove(&id)).unwrap_or_default();
+                (entry, history)
+            })
+            .unzip();
+        Ok((entries, history))
     }
 
     /// Add an entry to the session, persisting it before it becomes visible
@@ -373,7 +750,7 @@ impl Session {
     /// an entry landing (tool approvals above all) must learn immediately that
     /// it never will, and the in-memory history must not claim a row the
     /// database does not hold.
-    pub async fn add_entry(&mut self, entry: SessionEntry) -> anyhow::Result<()> {
+    pub async fn add_entry(&mut self, entry: SessionEntry) -> anyhow::Result<TurnRequestId> {
         let txn = self
             .database
             .new_transaction()
@@ -383,7 +760,7 @@ impl Session {
             .get_store::<Table<SessionEntry>>(&self.store_name)
             .await
             .map_err(|e| anyhow::anyhow!("failed to open eidetica store: {e}"))?;
-        store
+        let row_id = store
             .insert(entry.clone())
             .await
             .map_err(|e| anyhow::anyhow!("failed to persist entry to eidetica: {e}"))?;
@@ -391,42 +768,711 @@ impl Session {
             .await
             .map_err(|e| anyhow::anyhow!("failed to commit to eidetica: {e}"))?;
 
+        let request_id = TurnRequestId::parse(row_id);
         self.entries.push(entry);
+        self.entry_ids.push(request_id.clone());
+        Ok(request_id)
+    }
+
+    /// Mark a new session as using durable turn requests.
+    ///
+    /// Creation records this before any request is appended. Older sessions
+    /// have no marker and the first executor records their baseline.
+    pub async fn initialize_turn_schema(database: &Database) -> anyhow::Result<()> {
+        let txn = database.new_transaction().await?;
+        let meta = txn.get_store::<DocStore>(META_STORE).await?;
+        meta.set_string(TURN_SCHEMA_KEY, TURN_SCHEMA_VERSION)
+            .await?;
+        meta.set_string(TURN_BASELINE_KEY, "[]").await?;
+        txn.commit().await?;
         Ok(())
     }
 
-    /// Merge backfill history from a bridge (e.g., Matrix room history).
-    /// Only inserts entries that are older than our earliest entry or fill gaps.
-    /// Deduplicates by timestamp+content.
-    pub async fn backfill(&mut self, history: Vec<SessionEntry>) {
-        if history.is_empty() {
-            return;
+    /// Record the compatibility boundary for an older session.
+    ///
+    /// This transaction writes the marker and the visible entry row ids
+    /// together. An entry from a concurrent branch is not in the baseline and
+    /// remains queued after the branches merge.
+    pub async fn ensure_turn_schema_baseline(&self) -> anyhow::Result<()> {
+        let txn = self.database.new_transaction().await?;
+        let meta = txn.get_store::<DocStore>(META_STORE).await?;
+        if meta
+            .get_string(TURN_SCHEMA_KEY)
+            .await
+            .is_ok_and(|version| version == TURN_SCHEMA_VERSION)
+        {
+            return Ok(());
         }
+        let rows = txn
+            .get_store::<Table<SessionEntry>>(&self.store_name)
+            .await?
+            .search(|_| true)
+            .await?;
+        let baseline: Vec<String> = rows.into_iter().map(|(id, _)| id).collect();
+        meta.set_string(TURN_BASELINE_KEY, serde_json::to_string(&baseline)?)
+            .await?;
+        meta.set_string(TURN_SCHEMA_KEY, TURN_SCHEMA_VERSION)
+            .await?;
+        txn.commit().await?;
+        Ok(())
+    }
 
-        let mut new_count = 0;
-        for entry in history {
-            let already_exists = self.entries.iter().any(|existing| {
-                existing.timestamp == entry.timestamp && existing.content == entry.content
-            });
-            if !already_exists {
-                if let Ok(txn) = self.database.new_transaction().await
-                    && let Ok(store) = txn.get_store::<Table<SessionEntry>>(&self.store_name).await
-                    && store.insert(entry.clone()).await.is_ok()
-                {
-                    let _ = txn.commit().await;
+    /// Reconcile durable turn requests in session order.
+    ///
+    /// A started attempt is `InFlight` only when it belongs to this process.
+    /// Any other unmatched start is interrupted. It may have caused external
+    /// effects, so it is never returned as queued work.
+    pub async fn turn_requests(
+        &self,
+        is_agent: impl Fn(&str) -> bool,
+        live_attempts: &std::collections::HashSet<String>,
+    ) -> anyhow::Result<Vec<TurnRequest>> {
+        let attempts = self.read_turn_attempts().await?;
+        let baseline = self.read_turn_baseline().await?;
+        self.turn_requests_with_attempts(is_agent, live_attempts, attempts, baseline)
+    }
+
+    fn turn_requests_with_attempts(
+        &self,
+        is_agent: impl Fn(&str) -> bool,
+        live_attempts: &std::collections::HashSet<String>,
+        attempts: Vec<(String, TurnAttempt)>,
+        baseline: HashSet<String>,
+    ) -> anyhow::Result<Vec<TurnRequest>> {
+        let states = index_attempt_states(attempts, live_attempts);
+        Ok(self
+            .entries
+            .iter()
+            .zip(&self.entry_ids)
+            .filter(|entry| {
+                entry.0.entry_type == EntryType::Directive
+                    || (entry.0.entry_type == EntryType::Message && !is_agent(&entry.0.sender))
+            })
+            .filter(|(_, id)| !baseline.contains(id.as_str()))
+            .map(|(entry, id)| {
+                let entry = entry.clone();
+                let id = id.clone();
+                let state = states.get(&id).cloned().unwrap_or(TurnRequestState::Queued);
+                TurnRequest { id, entry, state }
+            })
+            .collect())
+    }
+
+    /// Reconcile requests against one immutable database snapshot.
+    ///
+    /// This snapshot covers the state present before `on_write_at_tips` was
+    /// registered. The callback handles later commits.
+    pub async fn turn_requests_at(
+        &self,
+        snapshot: eidetica::Snapshot,
+        is_agent: impl Fn(&str) -> bool,
+        live_attempts: &std::collections::HashSet<String>,
+    ) -> anyhow::Result<Vec<TurnRequest>> {
+        let (entry_ids, entries) =
+            Self::load_entries_at(&self.database, &self.store_name, &snapshot).await?;
+        let historical = Session {
+            conversation_id: self.conversation_id.clone(),
+            entries,
+            entry_ids,
+            database: self.database.clone(),
+            store_name: self.store_name.clone(),
+        };
+        let attempts = historical.read_turn_attempts_at(&snapshot).await?;
+        let baseline = historical.read_turn_baseline_at(&snapshot).await?;
+        historical.turn_requests_with_attempts(is_agent, live_attempts, attempts, baseline)
+    }
+
+    /// Select the oldest durable request that may run on this process.
+    ///
+    /// Queued work runs normally. An in-flight request is selectable only when
+    /// its attempt id is in `live_attempts`; explicit retry adds it there.
+    /// Completed and interrupted requests never run automatically.
+    pub async fn next_turn_request(
+        &self,
+        is_agent: impl Fn(&str) -> bool,
+        live_attempts: &std::collections::HashSet<String>,
+    ) -> anyhow::Result<Option<(TurnRequest, Option<String>)>> {
+        let requests = self.turn_requests(is_agent, live_attempts).await?;
+        Ok(requests
+            .iter()
+            .find_map(|request| match &request.state {
+                TurnRequestState::InFlight { attempt_id } => {
+                    Some((request.clone(), Some(attempt_id.clone())))
                 }
-                self.entries.push(entry);
-                new_count += 1;
-            }
-        }
+                _ => None,
+            })
+            .or_else(|| {
+                requests
+                    .into_iter()
+                    .find(|request| request.state == TurnRequestState::Queued)
+                    .map(|request| (request, None))
+            }))
+    }
 
-        if new_count > 0 {
-            self.entries.sort_by_key(|e| e.timestamp);
-            info!(
-                "Backfilled {} entries for {}",
-                new_count, self.conversation_id
-            );
+    /// Find a processable request by stable id, independent of lifecycle.
+    pub async fn turn_request(
+        &self,
+        request_id: &TurnRequestId,
+        is_agent: impl Fn(&str) -> bool,
+        live_attempts: &std::collections::HashSet<String>,
+    ) -> anyhow::Result<Option<TurnRequest>> {
+        Ok(self
+            .turn_requests(is_agent, live_attempts)
+            .await?
+            .into_iter()
+            .find(|request| &request.id == request_id))
+    }
+
+    /// Submit an executor-owned command under a caller-generated stable id.
+    /// Repeating the same id with an identical payload is idempotent; changing
+    /// the payload under that id is rejected.
+    pub async fn submit_command(&self, request: SessionCommandRequest) -> anyhow::Result<()> {
+        let txn = self.database.new_transaction().await?;
+        let store = txn
+            .get_store::<Table<SessionCommandRequest>>(SESSION_COMMANDS_STORE)
+            .await?;
+        match store.get(request.command_id.as_str()).await {
+            Ok(existing) if existing == request => return Ok(()),
+            Ok(_) => anyhow::bail!(
+                "command {} already exists with a different payload",
+                request.command_id
+            ),
+            Err(error) if error.is_not_found() => {}
+            Err(error) => return Err(error.into()),
         }
+        let command_id = request.command_id.to_string();
+        store.set(command_id, request).await?;
+        txn.commit().await?;
+        Ok(())
+    }
+
+    /// Return command requests in stable session order with derived states.
+    pub async fn command_requests(
+        &self,
+        live_attempts: &HashSet<String>,
+    ) -> anyhow::Result<Vec<SessionCommandWork>> {
+        let txn = self.database.new_transaction().await?;
+        let mut requests = txn
+            .get_store::<Table<SessionCommandRequest>>(SESSION_COMMANDS_STORE)
+            .await?
+            .search(|_| true)
+            .await?;
+        requests.sort_by(|(left_id, left), (right_id, right)| {
+            left.created_at
+                .cmp(&right.created_at)
+                .then_with(|| left_id.cmp(right_id))
+        });
+        let states = index_attempt_states(self.read_turn_attempts().await?, live_attempts);
+        Ok(requests
+            .into_iter()
+            .map(|(_, request)| SessionCommandWork {
+                state: states
+                    .get(&request.command_id)
+                    .cloned()
+                    .unwrap_or(TurnRequestState::Queued),
+                request,
+            })
+            .collect())
+    }
+
+    pub async fn command_requests_at(
+        &self,
+        snapshot: &Snapshot,
+        live_attempts: &HashSet<String>,
+    ) -> anyhow::Result<Vec<SessionCommandWork>> {
+        let txn = self.database.new_transaction_at(snapshot).await?;
+        let mut requests = txn
+            .get_store::<Table<SessionCommandRequest>>(SESSION_COMMANDS_STORE)
+            .await?
+            .search(|_| true)
+            .await?;
+        requests.sort_by(|(left_id, left), (right_id, right)| {
+            left.created_at
+                .cmp(&right.created_at)
+                .then_with(|| left_id.cmp(right_id))
+        });
+        let states =
+            index_attempt_states(self.read_turn_attempts_at(snapshot).await?, live_attempts);
+        Ok(requests
+            .into_iter()
+            .map(|(_, request)| SessionCommandWork {
+                state: states
+                    .get(&request.command_id)
+                    .cloned()
+                    .unwrap_or(TurnRequestState::Queued),
+                request,
+            })
+            .collect())
+    }
+
+    pub async fn next_command_request(
+        &self,
+        live_attempts: &HashSet<String>,
+    ) -> anyhow::Result<Option<(SessionCommandWork, Option<String>)>> {
+        let requests = self.command_requests(live_attempts).await?;
+        Ok(requests
+            .iter()
+            .find_map(|request| match &request.state {
+                TurnRequestState::InFlight { attempt_id } => {
+                    Some((request.clone(), Some(attempt_id.clone())))
+                }
+                _ => None,
+            })
+            .or_else(|| {
+                requests
+                    .into_iter()
+                    .find(|request| request.state == TurnRequestState::Queued)
+                    .map(|request| (request, None))
+            }))
+    }
+
+    pub async fn command_result(
+        &self,
+        command_id: &TurnRequestId,
+    ) -> anyhow::Result<Option<SessionCommandResult>> {
+        let txn = self.database.new_transaction().await?;
+        let store = txn
+            .get_store::<Table<SessionCommandResult>>(SESSION_COMMAND_RESULTS_STORE)
+            .await?;
+        match store.get(command_id.as_str()).await {
+            Ok(result) => Ok(Some(result)),
+            Err(error) if error.is_not_found() => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// Complete a command atomically with its typed result.
+    pub async fn complete_command_attempt(
+        &self,
+        attempt: &TurnAttempt,
+        outcome: SessionCommandOutcome,
+    ) -> anyhow::Result<SessionCommandResult> {
+        let completed_at = Utc::now();
+        let completed = TurnAttempt {
+            status: TurnAttemptStatus::Completed,
+            completed_at: Some(completed_at),
+            ..attempt.clone()
+        };
+        let result = SessionCommandResult {
+            command_id: attempt.request_id.clone(),
+            attempt_id: attempt.attempt_id.clone(),
+            completed_at,
+            outcome,
+        };
+        let txn = self.database.new_transaction().await?;
+        let completed_attempt_id = completed.attempt_id.clone();
+        txn.get_store::<Table<TurnAttempt>>(TURN_ATTEMPTS_STORE)
+            .await?
+            .set(completed_attempt_id, completed)
+            .await?;
+        txn.get_store::<Table<SessionCommandResult>>(SESSION_COMMAND_RESULTS_STORE)
+            .await?
+            .set(result.command_id.as_str(), result.clone())
+            .await?;
+        txn.commit().await?;
+        Ok(result)
+    }
+
+    /// Atomically accept a retry command and start the target turn attempt.
+    pub async fn accept_retry_command(
+        &self,
+        command_attempt: &TurnAttempt,
+        target_request_id: TurnRequestId,
+    ) -> anyhow::Result<TurnAttempt> {
+        let generation = self
+            .read_turn_attempts()
+            .await?
+            .into_iter()
+            .filter(|(_, attempt)| attempt.request_id == target_request_id)
+            .map(|(_, attempt)| attempt.generation)
+            .max()
+            .unwrap_or(0)
+            + 1;
+        let target_attempt = TurnAttempt {
+            attempt_id: uuid::Uuid::new_v4().to_string(),
+            request_id: target_request_id,
+            started_at: Utc::now(),
+            generation,
+            status: TurnAttemptStatus::Started,
+            completed_at: None,
+        };
+        let completed_at = Utc::now();
+        let completed_command = TurnAttempt {
+            status: TurnAttemptStatus::Completed,
+            completed_at: Some(completed_at),
+            ..command_attempt.clone()
+        };
+        let result = SessionCommandResult {
+            command_id: command_attempt.request_id.clone(),
+            attempt_id: command_attempt.attempt_id.clone(),
+            completed_at,
+            outcome: SessionCommandOutcome::RetryAccepted {
+                target_attempt_id: target_attempt.attempt_id.clone(),
+            },
+        };
+        let txn = self.database.new_transaction().await?;
+        let attempts = txn
+            .get_store::<Table<TurnAttempt>>(TURN_ATTEMPTS_STORE)
+            .await?;
+        attempts
+            .set(&target_attempt.attempt_id, target_attempt.clone())
+            .await?;
+        let completed_command_id = completed_command.attempt_id.clone();
+        attempts
+            .set(completed_command_id, completed_command)
+            .await?;
+        let command_id = result.command_id.to_string();
+        txn.get_store::<Table<SessionCommandResult>>(SESSION_COMMAND_RESULTS_STORE)
+            .await?
+            .set(command_id, result)
+            .await?;
+        txn.commit().await?;
+        Ok(target_attempt)
+    }
+
+    /// Re-read and validate the retry precondition immediately before the
+    /// serialized executor accepts it.
+    pub async fn accept_retry_command_if_interrupted(
+        &self,
+        command_attempt: &TurnAttempt,
+        target_request_id: TurnRequestId,
+        expected_interrupted_attempt_id: &str,
+        live_attempts: &HashSet<String>,
+    ) -> anyhow::Result<Option<TurnAttempt>> {
+        let attempts = self.read_turn_attempts().await?;
+        let state = index_attempt_states(attempts, live_attempts)
+            .remove(&target_request_id)
+            .unwrap_or(TurnRequestState::Queued);
+        if !matches!(
+            state,
+            TurnRequestState::Interrupted { ref attempt_id }
+                if attempt_id == expected_interrupted_attempt_id
+        ) {
+            return Ok(None);
+        }
+        self.accept_retry_command(command_attempt, target_request_id)
+            .await
+            .map(Some)
+    }
+
+    /// Read lifecycle state for an arbitrary processable entry.
+    ///
+    /// Agent mentions use this without joining the ordinary human/directive
+    /// queue. They keep the existing latest-message routing and gain crash
+    /// recovery.
+    pub async fn turn_state_for_entry(
+        &self,
+        entry_id: &TurnRequestId,
+        live_attempts: &std::collections::HashSet<String>,
+    ) -> anyhow::Result<TurnRequestState> {
+        let attempts = self.read_turn_attempts().await?;
+        Ok(index_attempt_states(attempts, live_attempts)
+            .remove(entry_id)
+            .unwrap_or(TurnRequestState::Queued))
+    }
+
+    /// Persist attempt start before model or tool execution.
+    pub async fn start_turn_attempt(
+        &self,
+        request_id: TurnRequestId,
+    ) -> anyhow::Result<TurnAttempt> {
+        let generation = self
+            .read_turn_attempts()
+            .await?
+            .into_iter()
+            .filter(|(_, attempt)| attempt.request_id == request_id)
+            .map(|(_, attempt)| attempt.generation)
+            .max()
+            .unwrap_or(0)
+            + 1;
+        let attempt = TurnAttempt {
+            attempt_id: uuid::Uuid::new_v4().to_string(),
+            request_id,
+            started_at: Utc::now(),
+            generation,
+            status: TurnAttemptStatus::Started,
+            completed_at: None,
+        };
+        self.write_turn_attempt(&attempt).await?;
+        Ok(attempt)
+    }
+
+    /// Mark an attempt complete in the same transaction as its final entry.
+    pub async fn complete_turn_attempt(
+        &mut self,
+        attempt: &TurnAttempt,
+        final_entry: Option<SessionEntry>,
+    ) -> anyhow::Result<()> {
+        self.complete_turn_attempt_with_transcript(attempt, final_entry, None)
+            .await
+    }
+
+    /// Commit the final visible entry, terminal model record, and completion
+    /// as one fact.
+    pub async fn complete_turn_attempt_with_transcript(
+        &mut self,
+        attempt: &TurnAttempt,
+        final_entry: Option<SessionEntry>,
+        transcript: Option<TurnTranscriptRecord>,
+    ) -> anyhow::Result<()> {
+        let completed = TurnAttempt {
+            status: TurnAttemptStatus::Completed,
+            completed_at: Some(Utc::now()),
+            ..attempt.clone()
+        };
+        let txn = self.database.new_transaction().await?;
+        let final_entry_id = if let Some(entry) = final_entry.as_ref() {
+            Some(
+                txn.get_store::<Table<SessionEntry>>(&self.store_name)
+                    .await?
+                    .insert(entry.clone())
+                    .await?,
+            )
+        } else {
+            None
+        };
+        let attempt_id = completed.attempt_id.clone();
+        txn.get_store::<Table<TurnAttempt>>(TURN_ATTEMPTS_STORE)
+            .await?
+            .set(attempt_id, completed)
+            .await?;
+        if let Some(record) = transcript {
+            let key = format!("{:020}:{}", record.sequence, uuid::Uuid::new_v4());
+            txn.get_store::<Table<TurnTranscriptRecord>>(TURN_TRANSCRIPT_STORE)
+                .await?
+                .set(key, record)
+                .await?;
+        }
+        if let Some(accepted) = crate::session::jobs::read_accepted_job(&self.database).await?
+            && accepted.directive_id == attempt.request_id.as_str()
+        {
+            let terminal = match final_entry.as_ref() {
+                Some(entry) if entry.entry_type == EntryType::Message => {
+                    crate::session::jobs::JobTerminal::Success {
+                        text: Some(entry.content.clone()),
+                    }
+                }
+                Some(entry) if entry.entry_type == EntryType::Error => {
+                    crate::session::jobs::JobTerminal::Failure {
+                        message: entry.content.clone(),
+                    }
+                }
+                None => crate::session::jobs::JobTerminal::Success { text: None },
+                Some(_) => anyhow::bail!("job completion has an invalid terminal entry"),
+            };
+            crate::session::jobs::write_job_result_in_txn(
+                &txn,
+                &crate::session::jobs::JobResult {
+                    attempt_id: attempt.attempt_id.clone(),
+                    terminal,
+                },
+            )
+            .await?;
+        }
+        txn.commit().await?;
+        if let Some(entry) = final_entry {
+            self.entries.push(entry);
+            self.entry_ids.push(TurnRequestId::parse(
+                final_entry_id.expect("entry id exists"),
+            ));
+        }
+        Ok(())
+    }
+
+    pub async fn append_turn_transcript(
+        &self,
+        record: TurnTranscriptRecord,
+        display_entries: Vec<SessionEntry>,
+    ) -> anyhow::Result<()> {
+        let txn = self.database.new_transaction().await?;
+        let key = format!("{:020}:{}", record.sequence, uuid::Uuid::new_v4());
+        txn.get_store::<Table<TurnTranscriptRecord>>(TURN_TRANSCRIPT_STORE)
+            .await?
+            .set(key, record)
+            .await?;
+        let entries = txn
+            .get_store::<Table<SessionEntry>>(&self.store_name)
+            .await?;
+        for entry in display_entries {
+            entries.insert(entry).await?;
+        }
+        txn.commit().await?;
+        Ok(())
+    }
+
+    pub async fn turn_transcript(
+        &self,
+        attempt_id: &str,
+    ) -> anyhow::Result<Vec<TurnTranscriptRecord>> {
+        let txn = self.database.new_transaction().await?;
+        let mut records: Vec<_> = txn
+            .get_store::<Table<TurnTranscriptRecord>>(TURN_TRANSCRIPT_STORE)
+            .await?
+            .search(|record| record.attempt_id == attempt_id)
+            .await?
+            .into_iter()
+            .map(|(_, record)| record)
+            .collect();
+        records.sort_by_key(|record| record.sequence);
+        Ok(records)
+    }
+
+    /// Visible, unexpired per-turn claims. Never infer activity from Ack or
+    /// session-level runtime ownership. Clients re-read this on sync and timer.
+    pub async fn active_turn_attempts(database: &Database) -> anyhow::Result<Vec<String>> {
+        let txn = database.new_transaction().await?;
+        let attempts = txn
+            .get_store::<Table<TurnAttempt>>(TURN_ATTEMPTS_STORE)
+            .await?
+            .search(|_| true)
+            .await?
+            .into_iter()
+            .map(|(_, a)| a)
+            .collect();
+        let heartbeats = txn
+            .get_store::<Table<DateTime<Utc>>>(TURN_ACTIVITY_STORE)
+            .await?
+            .search(|_| true)
+            .await?
+            .into_iter()
+            .collect();
+        Ok(visible_attempts(attempts, &heartbeats, Utc::now()))
+    }
+
+    /// Renew only the activity timestamp; the original started_at remains an
+    /// audit fact. Completion lives in a separate store from these writes.
+    pub async fn renew_turn_activity(database: &Database, attempt_id: &str) -> anyhow::Result<()> {
+        let txn = database.new_transaction().await?;
+        txn.get_store::<Table<DateTime<Utc>>>(TURN_ACTIVITY_STORE)
+            .await?
+            .set(attempt_id, Utc::now())
+            .await?;
+        txn.commit().await?;
+        Ok(())
+    }
+
+    async fn read_turn_attempts(&self) -> anyhow::Result<Vec<(String, TurnAttempt)>> {
+        let txn = self.database.new_transaction().await?;
+        Ok(txn
+            .get_store::<Table<TurnAttempt>>(TURN_ATTEMPTS_STORE)
+            .await?
+            .search(|_| true)
+            .await?)
+    }
+
+    pub(crate) async fn read_turn_attempt(
+        &self,
+        attempt_id: &str,
+    ) -> anyhow::Result<Option<TurnAttempt>> {
+        let txn = self.database.new_transaction().await?;
+        let store = txn
+            .get_store::<Table<TurnAttempt>>(TURN_ATTEMPTS_STORE)
+            .await?;
+        match store.get(attempt_id).await {
+            Ok(attempt) => Ok(Some(attempt)),
+            Err(e) if e.is_not_found() => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    async fn read_turn_attempts_at(
+        &self,
+        snapshot: &eidetica::Snapshot,
+    ) -> anyhow::Result<Vec<(String, TurnAttempt)>> {
+        let txn = self.database.new_transaction_at(snapshot).await?;
+        Ok(txn
+            .get_store::<Table<TurnAttempt>>(TURN_ATTEMPTS_STORE)
+            .await?
+            .search(|_| true)
+            .await?)
+    }
+
+    async fn read_turn_baseline(&self) -> anyhow::Result<HashSet<String>> {
+        let txn = self.database.new_transaction().await?;
+        read_turn_baseline_from(&txn.get_store::<DocStore>(META_STORE).await?).await
+    }
+
+    async fn read_turn_baseline_at(
+        &self,
+        snapshot: &eidetica::Snapshot,
+    ) -> anyhow::Result<HashSet<String>> {
+        let txn = self.database.new_transaction_at(snapshot).await?;
+        read_turn_baseline_from(&txn.get_store::<DocStore>(META_STORE).await?).await
+    }
+
+    async fn write_turn_attempt(&self, attempt: &TurnAttempt) -> anyhow::Result<()> {
+        let txn = self.database.new_transaction().await?;
+        txn.get_store::<Table<TurnAttempt>>(TURN_ATTEMPTS_STORE)
+            .await?
+            .set(&attempt.attempt_id, attempt.clone())
+            .await?;
+        txn.commit().await?;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn attempts_for_test(&self) -> Vec<TurnAttempt> {
+        self.read_turn_attempts()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|(_, attempt)| attempt)
+            .collect()
+    }
+
+    /// The last join event whose history was imported for this room.
+    pub async fn last_backfilled_join(&self, room_id: &str) -> anyhow::Result<Option<String>> {
+        let txn = self.database.new_transaction().await?;
+        let meta = txn.get_store::<DocStore>(META_STORE).await?;
+        Ok(meta
+            .get_string(&format!("matrix_join:{room_id}"))
+            .await
+            .ok())
+    }
+
+    /// Merge historical context and its consumed-turn baseline in one commit.
+    /// A daemon snapshot can never observe a historical row as a live request.
+    pub async fn backfill(
+        &mut self,
+        history: Vec<SessionEntry>,
+        join_marker: (&str, &str),
+    ) -> anyhow::Result<()> {
+        let txn = self.database.new_transaction().await?;
+        let store = txn
+            .get_store::<Table<SessionEntry>>(&self.store_name)
+            .await?;
+        let meta = txn.get_store::<DocStore>(META_STORE).await?;
+        let mut baseline = read_turn_baseline_from(&meta).await?;
+        let mut new_entries = Vec::new();
+        for entry in history {
+            if self
+                .entries
+                .iter()
+                .chain(new_entries.iter().map(|(_, entry)| entry))
+                .any(|existing: &SessionEntry| {
+                    existing.timestamp == entry.timestamp && existing.content == entry.content
+                })
+            {
+                continue;
+            }
+            let row_id = store.insert(entry.clone()).await?;
+            baseline.insert(row_id.clone());
+            new_entries.push((row_id, entry));
+        }
+        if !new_entries.is_empty() {
+            meta.set_string(
+                TURN_BASELINE_KEY,
+                serde_json::to_string(&baseline.into_iter().collect::<Vec<_>>())?,
+            )
+            .await?;
+        }
+        meta.set_string(&format!("matrix_join:{}", join_marker.0), join_marker.1)
+            .await?;
+        txn.commit().await?;
+        let count = new_entries.len();
+        self.load_from_db().await;
+        info!("Backfilled {} entries for {}", count, self.conversation_id);
+        Ok(())
     }
 
     /// Get the most recent entry, if any
@@ -434,9 +1480,18 @@ impl Session {
         self.entries.last()
     }
 
+    pub(crate) fn latest_entry_with_id(&self) -> Option<(&TurnRequestId, &SessionEntry)> {
+        self.entry_ids.last().zip(self.entries.last())
+    }
+
     /// Get all entries in the session
     pub fn entries(&self) -> &[SessionEntry] {
         &self.entries
+    }
+
+    /// Every loaded entry paired with its stable row identity, in transcript order.
+    pub fn entries_with_ids(&self) -> impl Iterator<Item = (&TurnRequestId, &SessionEntry)> {
+        self.entry_ids.iter().zip(self.entries.iter())
     }
 
     /// Get the underlying eidetica Database handle (for sharing with tools)
@@ -458,6 +1513,70 @@ impl Session {
     {
         update_meta_on_db(&self.database, mutator).await
     }
+}
+
+fn sort_persisted_entries(
+    mut rows: Vec<(String, SessionEntry)>,
+) -> (Vec<TurnRequestId>, Vec<SessionEntry>) {
+    rows.sort_by(|(left_id, left), (right_id, right)| {
+        left.timestamp
+            .cmp(&right.timestamp)
+            .then_with(|| left_id.cmp(right_id))
+    });
+    rows.into_iter()
+        .map(|(id, entry)| (TurnRequestId::parse(id), entry))
+        .unzip()
+}
+
+async fn read_turn_baseline_from(store: &DocStore) -> anyhow::Result<HashSet<String>> {
+    match store.get_string(TURN_BASELINE_KEY).await {
+        Ok(value) => Ok(serde_json::from_str(&value)?),
+        Err(_) => Ok(HashSet::new()),
+    }
+}
+
+fn index_attempt_states(
+    attempts: Vec<(String, TurnAttempt)>,
+    live_attempts: &HashSet<String>,
+) -> HashMap<TurnRequestId, TurnRequestState> {
+    #[derive(Default)]
+    struct Facts {
+        completed: Option<(u64, String)>,
+        live: Option<(u64, String)>,
+        started: Option<(u64, String)>,
+    }
+
+    let mut facts: HashMap<TurnRequestId, Facts> = HashMap::new();
+    for (_, attempt) in attempts {
+        let request = facts.entry(attempt.request_id).or_default();
+        let target = match attempt.status {
+            TurnAttemptStatus::Completed => &mut request.completed,
+            TurnAttemptStatus::Started if live_attempts.contains(&attempt.attempt_id) => {
+                &mut request.live
+            }
+            TurnAttemptStatus::Started => &mut request.started,
+        };
+        let candidate = (attempt.generation, attempt.attempt_id);
+        if target.as_ref().is_none_or(|current| candidate > *current) {
+            *target = Some(candidate);
+        }
+    }
+
+    facts
+        .into_iter()
+        .map(|(id, facts)| {
+            let state = if let Some((_, attempt_id)) = facts.completed {
+                TurnRequestState::Completed { attempt_id }
+            } else if let Some((_, attempt_id)) = facts.live {
+                TurnRequestState::InFlight { attempt_id }
+            } else if let Some((_, attempt_id)) = facts.started {
+                TurnRequestState::Interrupted { attempt_id }
+            } else {
+                TurnRequestState::Queued
+            };
+            (id, state)
+        })
+        .collect()
 }
 
 /// Read the meta DocStore of a session DB. Returns default on any error.
@@ -591,27 +1710,6 @@ async fn write_field(store: &DocStore, key: &str, value: Option<&str>) -> anyhow
     Ok(())
 }
 
-/// Find the most recent `Message` entry and produce a short single-line
-/// preview ("sender: first line of content…") suitable for session listings.
-/// Returns `None` if no `Message` entry exists. Shared between the
-/// `list_sessions()` cold path and the TUI picker's row-patch warm path so
-/// both code paths produce identical previews.
-pub fn summarize_last_message(entries: &[SessionEntry]) -> Option<String> {
-    entries
-        .iter()
-        .rev()
-        .find(|e| e.entry_type == EntryType::Message)
-        .map(|e| {
-            let preview = e.content.lines().next().unwrap_or("");
-            let truncated = crate::util::truncate_chars(preview, 60);
-            if truncated.len() < preview.len() {
-                format!("{}: {truncated}…", e.sender)
-            } else {
-                format!("{}: {preview}", e.sender)
-            }
-        })
-}
-
 /// What a session's own entries say about where it began: the timestamp of
 /// its earliest entry, and the `"{transport}:{channel}"` source tag of the
 /// first entry that arrived over a bridge.
@@ -633,29 +1731,6 @@ pub fn session_origin(entries: &[SessionEntry]) -> (Option<DateTime<Utc>>, Optio
         .find_map(|e| e.routing.as_ref()?.source.as_ref())
         .map(|s| format!("{}:{}", s.transport, s.channel));
     (started_at, source)
-}
-
-/// Sum `ResponseMetadata.usage.cost_usd` across an in-memory entry slice.
-/// Returns `(total_cost_usd, cost_reported, llm_call_count)`.
-///
-/// Shared between `list_sessions()` (which walks every session's entries on
-/// catalog open) and the TUI's per-row cache-patch path (which recomputes
-/// just one row's totals when a watched session DB fires `on_write`). Both
-/// see the same in-memory entries, so the cache stays in lock-step with
-/// what `list_sessions()` would have produced from a cold read.
-pub fn sum_session_cost(entries: &[SessionEntry]) -> (f64, bool, u32) {
-    let mut total = 0.0_f64;
-    let mut reported = false;
-    let mut calls = 0u32;
-    for entry in entries {
-        let Some(m) = &entry.metadata else { continue };
-        calls += 1;
-        if let Some(c) = m.usage.cost_usd {
-            total += c;
-            reported = true;
-        }
-    }
-    (total, reported, calls)
 }
 
 /// Extract `@<token>` mentions from free-form text. Returns the tokens
@@ -732,6 +1807,70 @@ async fn find_or_create_db(
 mod tests {
     use super::test_helpers::*;
     use super::*;
+
+    #[tokio::test]
+    async fn client_activity_tracks_claim_heartbeat_completion_and_orphan_expiry() {
+        let (_instance, _user, db) = test_session_db().await;
+        let mut session = Session::new(ConversationId(db.root_id().to_string()), db).await;
+        assert!(
+            Session::active_turn_attempts(session.database())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let attempt = session
+            .start_turn_attempt(TurnRequestId::parse("request"))
+            .await
+            .unwrap();
+        assert_eq!(
+            Session::active_turn_attempts(session.database())
+                .await
+                .unwrap(),
+            vec![attempt.attempt_id.clone()]
+        );
+        Session::renew_turn_activity(session.database(), &attempt.attempt_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            Session::active_turn_attempts(session.database())
+                .await
+                .unwrap(),
+            vec![attempt.attempt_id.clone()]
+        );
+        session.complete_turn_attempt(&attempt, None).await.unwrap();
+        assert!(
+            Session::active_turn_attempts(session.database())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        let now = Utc::now();
+        let orphan = TurnAttempt {
+            attempt_id: "orphan".into(),
+            started_at: now - TURN_ACTIVITY_TIMEOUT,
+            ..attempt.clone()
+        };
+        assert!(visible_attempts(vec![orphan.clone()], &HashMap::new(), now).is_empty());
+        let heartbeats = HashMap::from([(orphan.attempt_id.clone(), now)]);
+        assert_eq!(
+            visible_attempts(vec![orphan.clone()], &heartbeats, now),
+            vec!["orphan"]
+        );
+        let terminal = TurnAttempt {
+            status: TurnAttemptStatus::Completed,
+            ..orphan.clone()
+        };
+        assert!(visible_attempts(vec![orphan, terminal], &heartbeats, now).is_empty());
+        assert!(
+            visible_attempts(
+                vec![attempt],
+                &HashMap::new(),
+                now + chrono::Duration::hours(1)
+            )
+            .is_empty()
+        );
+    }
 
     /// A concurrent write from two peers, resolved by the CRDT — the case the
     /// approval protocol has to survive.
@@ -870,6 +2009,206 @@ mod tests {
         assert_eq!(session.entries().len(), 1);
         let reread = Session::new(ConversationId("c1".to_string()), db).await;
         assert_eq!(reread.entries().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn backfill_is_context_only_and_live_entry_is_single_request() {
+        let (_instance, _user, db) = test_session_db().await;
+        Session::initialize_turn_schema(&db).await.unwrap();
+        let mut session = Session::new(ConversationId("matrix".into()), db.clone()).await;
+        let older = entry_at("user", 3, None);
+        let newer = entry_at("user", 2, None);
+        session
+            .backfill(vec![older.clone(), newer.clone()], ("!room", "$join"))
+            .await
+            .unwrap();
+        // Read from storage, not the in-memory session; a daemon may observe
+        // this commit immediately after the bridge makes it visible.
+        let mut reopened = Session::new(ConversationId("matrix".into()), db.clone()).await;
+        assert_eq!(reopened.entries().len(), 2);
+        assert_eq!(
+            reopened
+                .last_backfilled_join("!room")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("$join")
+        );
+        assert!(
+            reopened
+                .turn_requests(|_| false, &HashSet::new())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        reopened
+            .backfill(vec![older, newer], ("!room", "$join"))
+            .await
+            .unwrap();
+        assert_eq!(
+            reopened.entries().len(),
+            2,
+            "restart/rejoin must deduplicate"
+        );
+        let live = reopened.add_entry(entry_at("user", 0, None)).await.unwrap();
+        let after_live = Session::new(ConversationId("matrix".into()), db).await;
+        let requests = after_live
+            .turn_requests(|_| false, &HashSet::new())
+            .await
+            .unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].id, live);
+    }
+
+    #[tokio::test]
+    async fn backfill_on_an_attached_existing_session_keeps_live_requests() {
+        let (_instance, _user, db) = test_session_db().await;
+        Session::initialize_turn_schema(&db).await.unwrap();
+        let mut session = Session::new(ConversationId("attached".into()), db.clone()).await;
+        let live = session.add_entry(entry_at("user", 0, None)).await.unwrap();
+        session
+            .backfill(vec![entry_at("user", 5, None)], ("!room", "$join"))
+            .await
+            .unwrap();
+        let reopened = Session::new(ConversationId("attached".into()), db).await;
+        assert_eq!(reopened.entries().len(), 2);
+        let requests = reopened
+            .turn_requests(|_| false, &HashSet::new())
+            .await
+            .unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].id, live);
+    }
+
+    #[tokio::test]
+    async fn failed_backfill_does_not_claim_uncommitted_history() {
+        let (instance, _user, db) = test_session_db().await;
+        Session::initialize_turn_schema(&db).await.unwrap();
+        let unwritable = Database::open(&instance, db.root_id()).await.unwrap();
+        let mut session = Session::new(ConversationId("matrix".into()), unwritable).await;
+        assert!(
+            session
+                .backfill(vec![entry_at("user", 1, None)], ("!room", "$join"))
+                .await
+                .is_err()
+        );
+        assert!(session.entries().is_empty());
+        let reopened = Session::new(ConversationId("matrix".into()), db).await;
+        assert!(reopened.entries().is_empty());
+        assert!(
+            reopened
+                .last_backfilled_join("!room")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn distinct_identical_rows_have_distinct_request_ids() {
+        let (_instance, _user, db) = test_session_db().await;
+        Session::initialize_turn_schema(&db).await.unwrap();
+        let entry = entry_at("user", 0, None);
+        let txn = db.new_transaction().await.unwrap();
+        let store = txn
+            .get_store::<Table<SessionEntry>>("entries")
+            .await
+            .unwrap();
+        let first = store.insert(entry.clone()).await.unwrap();
+        let second = store.insert(entry).await.unwrap();
+        txn.commit().await.unwrap();
+
+        let session = Session::new(ConversationId("c1".into()), db).await;
+        let requests = session
+            .turn_requests(|_| false, &HashSet::new())
+            .await
+            .unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_ne!(requests[0].id, requests[1].id);
+        assert_eq!(
+            HashSet::from([first, second]),
+            requests
+                .into_iter()
+                .map(|request| request.id.to_string())
+                .collect()
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_baseline_excludes_history_but_not_later_rows() {
+        let (_instance, _user, db) = test_session_db().await;
+        let mut legacy = Session::new(ConversationId("legacy".into()), db.clone()).await;
+        legacy
+            .add_entry(entry_at("retired-agent", 2, None))
+            .await
+            .unwrap();
+        legacy.add_entry(entry_at("user", 1, None)).await.unwrap();
+
+        legacy.ensure_turn_schema_baseline().await.unwrap();
+        assert!(
+            legacy
+                .turn_requests(|_| false, &HashSet::new())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        let new_id = legacy.add_entry(entry_at("user", 0, None)).await.unwrap();
+        let requests = legacy
+            .turn_requests(|_| false, &HashSet::new())
+            .await
+            .unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].id, new_id);
+    }
+
+    #[tokio::test]
+    async fn attempt_state_uses_causal_generation_not_wall_clock() {
+        let request_id = TurnRequestId::parse("request");
+        let old = TurnAttempt {
+            attempt_id: "old".into(),
+            request_id: request_id.clone(),
+            started_at: Utc::now() + chrono::Duration::hours(1),
+            generation: 1,
+            status: TurnAttemptStatus::Started,
+            completed_at: None,
+        };
+        let retry = TurnAttempt {
+            attempt_id: "retry".into(),
+            request_id: request_id.clone(),
+            started_at: old.started_at - chrono::Duration::hours(2),
+            generation: 2,
+            status: TurnAttemptStatus::Started,
+            completed_at: None,
+        };
+        let live = HashSet::from([retry.attempt_id.clone()]);
+        let state = index_attempt_states(
+            vec![
+                (old.attempt_id.clone(), old),
+                (retry.attempt_id.clone(), retry),
+            ],
+            &live,
+        );
+        assert_eq!(
+            state.get(&request_id),
+            Some(&TurnRequestState::InFlight {
+                attempt_id: "retry".into()
+            })
+        );
+
+        let completed = TurnAttempt {
+            attempt_id: "done".into(),
+            request_id: request_id.clone(),
+            started_at: Utc::now() - chrono::Duration::days(1),
+            generation: 2,
+            status: TurnAttemptStatus::Completed,
+            completed_at: Some(Utc::now()),
+        };
+        let state = index_attempt_states(vec![("done".into(), completed)], &HashSet::new());
+        assert!(matches!(
+            state.get(&request_id),
+            Some(TurnRequestState::Completed { attempt_id }) if attempt_id == "done"
+        ));
     }
 
     fn matrix_source(room: &str) -> EntryRouting {

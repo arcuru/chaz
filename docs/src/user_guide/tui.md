@@ -46,7 +46,7 @@ The TUI has four main pieces:
    running token totals and cost (`<prompt>/<completion> tok • <cached>% cached
 • $<cost>`), summed across **all** agents. `DEBUG` / `EXP` indicators append
    when those modes are on.
-4. **Input box** — type messages and commands. Slash commands open an inline completion popup with grouped categories; arrow keys move the highlight.
+4. **Input box** — type messages and commands. Slash commands open an inline completion popup with grouped categories; arrow keys move the highlight. The input wraps at the terminal edge and grows with the draft, capped so it never takes the whole frame (a long draft squeezes the transcript instead); past that cap the box scrolls to keep the cursor visible. Use `Alt+Enter` for a new line, `Enter` to send, and `Left`/`Right` to move by a visible character (including combined Unicode characters).
 
 When prior sessions exist, the TUI opens straight into the session picker on launch so you choose which one to resume (or pick the "New session" row). A truly fresh state directory drops directly into the default `tui` session.
 
@@ -68,10 +68,12 @@ The TUI catalogs every built-in slash command in its inline completion popup —
 | `/name`           | Clear the session alias                                                |
 | `/info`           | Show current session details (name, DB ID, entry counts)               |
 | `/costs`          | Aggregate LLM usage and cost across all sessions ([details](usage.md)) |
+| `/interrupted`    | List turns that require an explicit retry decision                     |
+| `/retry <id>`     | Ask the executor to retry the currently observed interrupted attempt   |
 | `/channels`       | List Matrix rooms currently attached to this session                   |
 | `/share`          | Generate a shareable ticket URL for the current session                |
 | `/sync <ticket>`  | Sync a remote session via a ticket URL                                 |
-| `/compact`        | Summarize and compact conversation history                             |
+| `/compact`        | Ask the executor to compact the current immutable session snapshot     |
 | `/print`          | Dump the transcript                                                    |
 
 ### Living Agents
@@ -127,11 +129,14 @@ See [Memory](memory.md).
 
 See [Agents — Schedules](agents.md#schedules).
 
-| Command                                       | Description                                               |
-| --------------------------------------------- | --------------------------------------------------------- |
-| `/schedule list`                              | List an agent's schedules                                 |
-| `/schedule add <id> <cron> <agent> <task...>` | Add a schedule (6-field cron: `sec min hour dom mon dow`) |
-| `/schedule remove <id>`                       | Remove a schedule by id                                   |
+| Command                                                   | Description                                               |
+| --------------------------------------------------------- | --------------------------------------------------------- |
+| `/schedule list`                                          | List an agent's schedules                                 |
+| `/schedule add <id> <cron> <agent> <task...>`             | Add a schedule (6-field cron: `sec min hour dom mon dow`) |
+| `/schedule add interval <id> <seconds> <agent> <task...>` | Add a fixed-delay interval schedule                       |
+| `/schedule modify <id> cron <6 fields> [agent]`           | Replace a schedule trigger with cron                      |
+| `/schedule modify <id> interval <seconds> [agent]`        | Replace a schedule trigger with an interval               |
+| `/schedule remove <id>`                                   | Remove a schedule by id                                   |
 
 ### Extensions
 
@@ -187,6 +192,7 @@ Unknown `/<name>` commands route to extension dispatch — see the error you get
 | `Up` / `Down`                   | Move completion selection if popup is open; else scroll history (3) |
 | `PageUp` / `PageDown`           | Fast scroll history (20 lines)                                      |
 | `Home` / `End`                  | Move cursor to start / end of input                                 |
+| `Alt+Enter`                     | Insert a line break in the draft instead of sending                 |
 | `Esc`                           | First press: dismiss completion popup. Second (no popup): quit      |
 | `F1`                            | Open the help overlay                                               |
 | `Ctrl+P`                        | Toggle the session picker                                           |
@@ -220,21 +226,18 @@ Open with `/sessions` or `/s`:
 ```text
 +--[ Sessions ]---------------------------------------+
 |                                                     |
-| > sha256:abc… "tui" * (default, 15 entries)         |
-|     user: What's the current time?                  |
+| > sha256:abc… "tui" * [tui] default • 2h ago       |
 |                                                     |
-|   sha256:def… (default, 42 entries)                 |
-|     user: Tell me about quantum computing           |
+|   sha256:def… [matrix] default • 1d ago             |
 |                                                     |
-|   sha256:xyz… (researcher, 3 entries)               |
-|     default: Research the latest AI papers          |
+|   sha256:xyz… [spawn] researcher • 4d ago           |
 |                                                     |
 +-----------------------------------------------------+
 | [Up/Down] navigate | [Enter] select | [n] new | ... |
 +-----------------------------------------------------+
 ```
 
-Sessions are listed by their eidetica DB root ID; any attached Matrix rooms or human-friendly names appear alongside. The picker shows every session the registry knows about: TUI, Matrix-attached, `spawn_agent` / `spawn_worker` children, and anything synced from remote peers. The current session is marked with `*`. Press `Enter` to switch, `n` to create a new session, or `Esc` to cancel.
+Sessions are listed from registry metadata: eidetica DB root ID, human-friendly name, bridge, agent, age, and status. The picker does not scan transcripts for entry counts, previews, or costs; selecting a session loads that conversation on demand, while `/costs` explicitly scans usage data. Catalog loading happens in the background, and agent metadata is fetched only for rows around the cursor, so navigation and cancel remain available while storage is slow. The picker shows every session the registry knows about: TUI, Matrix-attached, `spawn_agent` / `spawn_worker` children, and anything synced from remote peers. The current session is marked with `*`. Press `Enter` to switch, `n` to create a new session, or `Esc` to cancel.
 
 ## Named Sessions
 
@@ -306,7 +309,32 @@ Typing in the search box does fzf-style fuzzy matching across model ids and capa
 | `Ctrl+U`              | Clear the search query                              |
 | `Esc`                 | Dismiss without changing anything; return to Models |
 
-There is no global key binding for `/models` — terminals without the keyboard-enhancement protocol can't distinguish `Ctrl+M` from `Enter`, which made any natural binding unreliable through `tmux + ssh`. Type `/models` to open.
+There is no global key binding for `/models` — terminals without the keyboard-enhancement protocol can't distinguish `Ctrl+M` from `Enter`, which made any natural binding unreliable through `tmux + ssh`. Type `/models` to open. The same limitation is why a draft line break is bound to `Alt+Enter` rather than `Shift+Enter`: only terminals that negotiate the enhanced protocol report the `Shift`, which is also accepted where it arrives.
+
+## Live turn activity
+
+| Display                            | Source                            | Clears when                                                                       |
+| ---------------------------------- | --------------------------------- | --------------------------------------------------------------------------------- |
+| `thinking...` in the messages area | Unexpired executor per-turn start | The attempt completes (including errors or silent turns) or its heartbeat expires |
+| `_agent_ acknowledged turn`        | Historical Ack entry              | Never a live indicator; remains in history                                        |
+
+The TUI watches the shared session database, not its own submitted-message state.
+A remote executor's start and completion arrive through sync, so a tab opened
+mid-turn shows the same indicator. A crashed executor cannot leave it visible
+forever: without a heartbeat, the TUI clears it within 45 seconds, checked
+on its five-second refresh. The runtime's ownership of the session is not a
+turn claim; an idle session shows no activity. An interrupted turn requires
+`/interrupted` and an explicit `/retry` before another attempt can start.
+
+For example, after sending `@chaz:example` a question in a shared Matrix room:
+
+1. Open that session in the TUI. During the executor's turn, the bottom of the
+   messages area shows `thinking...` even though the prompt was not typed here.
+2. After the reply, `thinking...` disappears; an older `chaz acknowledged turn`
+   line may remain as history. On a silent turn or error it also disappears.
+3. If the executor exits before completion, `thinking...` clears after the
+   heartbeat expires. `/interrupted` then lists the interrupted request;
+   `/retry <request_id>` starts a new claim after you decide retrying is safe.
 
 ## Entry Types
 
@@ -316,7 +344,7 @@ The TUI renders different entry types with distinct styles:
 | ---------- | -------------------------------------- | -------------------------------------------------------------- |
 | Message    | **Bold colored sender** + content      | Chat messages from users and agents                            |
 | Directive  | **Bold sender (directive):** + content | Task instructions (from spawn_agent / spawn_worker, scheduler) |
-| Ack        | Dimmed "_agent_ thinking..."           | Agent is processing                                            |
+| Ack        | Dimmed "_agent_ acknowledged turn"     | Historical audit entry; not live activity                      |
 | ToolCall   | Dimmed `> tool_name(args)`             | Agent invoked a tool                                           |
 | ToolResult | Dimmed `< tool_name: output`           | Tool returned a result                                         |
 | Error      | Red `ERROR sender: message`            | An error occurred                                              |

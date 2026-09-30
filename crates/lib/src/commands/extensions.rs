@@ -360,7 +360,7 @@ mod tests {
     use crate::tool_host::NativeToolHost;
     use eidetica::backend::database::InMemory;
     use eidetica::{Instance, NewUser};
-    use std::sync::{Arc, OnceLock};
+    use std::sync::Arc;
 
     /// Full-fat fixture: Server with every built-in extension registered,
     /// a fresh session, and the dependencies needed to drive
@@ -438,7 +438,7 @@ mod tests {
         hub.set_session_registry(registry.clone());
         hub.set_hosted_index(agent_index.clone());
         let skill_bank_index = crate::hosted_index::HostedIndex::empty("skill_bank");
-        let spawn_cell = Arc::new(OnceLock::new());
+        let spawn_slot = crate::instance::ServerSlot::default();
         // Wire peer_handles so migrated extensions instantiate during
         // `install_all` — without this the global drain path is skipped
         // and tool-only / hook-only extensions silently register nothing.
@@ -449,7 +449,7 @@ mod tests {
             skill_bank_index: skill_bank_index.clone(),
             embedder: None,
             secrets: None,
-            server_cell: spawn_cell.clone(),
+            server_slot: spawn_slot.clone(),
             mcp_registry: Arc::new(crate::mcp::McpRegistry::new()),
             agent_state_allowlist: Default::default(),
             tool_registry: Arc::new(ToolRegistry::new()),
@@ -463,7 +463,7 @@ mod tests {
             session_registry: registry.clone(),
             embedder: None,
             web_search_backends: Vec::new(),
-            spawn_server_cell: spawn_cell.clone(),
+            server_slot: spawn_slot.clone(),
             backend_manager: backend_mgr.clone(),
             security: security.clone(),
         });
@@ -491,9 +491,9 @@ mod tests {
             hub,
             backend_mgr.clone(),
             Arc::new(crate::mcp::McpRegistry::new()),
-            true,
+            Some(crate::instance::ExecutorCapability::for_test()),
         );
-        let _ = spawn_cell.set(server.clone());
+        spawn_slot.set(server.clone());
 
         let (_conv, session_db) = registry.create_session(Some("test")).await.unwrap();
         let session_db_id = session_db.root_id().to_string();
@@ -573,6 +573,24 @@ mod tests {
         ) -> crate::extension::instance::InstantiateFuture<'a> {
             let name = self.name;
             Box::pin(async move { Err(anyhow::anyhow!("boom from {name}")) })
+        }
+    }
+
+    #[tokio::test]
+    async fn builtin_tools_expose_agent_jobs_without_workflow() {
+        let f = fixture().await;
+        let names = visible_tool_names(&scoped_for(&f).await);
+        assert!(
+            !names.contains("workflow"),
+            "workflow must not be registered"
+        );
+        for name in ["spawn_agent", "job_status", "job_wait"] {
+            assert!(names.contains(name), "missing built-in {name}");
+        }
+        for name in ["job_status", "job_wait"] {
+            let description = f.tool_registry.get(name).unwrap().descriptor().description;
+            assert!(description.contains("Agent job"));
+            assert!(!description.contains("workflow"));
         }
     }
 

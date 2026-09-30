@@ -15,6 +15,12 @@ pub struct Config {
     pub room_size_limit: Option<usize>,
     /// Set the state directory for chaz
     pub state_dir: Option<String>,
+    /// Connection and login settings for this process's Eidetica instance.
+    /// Startup callers opt into the shared connector explicitly; legacy
+    /// callers continue to use `state_dir` until their migration slice.
+    pub eidetica: Option<EideticaConfig>,
+    /// Whether this process may execute agents or acts only as a client.
+    pub execution: Option<ExecutionRole>,
     /// Model to use for summarizing chats
     pub chat_summary_model: Option<String>,
     /// Backend configuration
@@ -83,6 +89,90 @@ pub struct Config {
     /// [`RuntimeMode::Auto`]. A standalone transport bridge effectively runs
     /// as [`RuntimeMode::Never`] (it owns no runtime; the daemon does).
     pub runtime: Option<RuntimeMode>,
+}
+
+/// The process's authority to run agent and routine work.
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ExecutionRole {
+    /// Install and run agent execution and autonomous routines.
+    Executor,
+    /// Observe and mutate application state without executing agents.
+    Client,
+}
+
+/// Eidetica connection settings shared by every Chaz executable.
+#[derive(Deserialize, Clone)]
+pub struct EideticaConfig {
+    /// Native Eidetica connection URL (`sqlite:`, `postgres:`, `memory:`, or
+    /// `unix:`). Eidetica validates the scheme and compiled feature support.
+    pub connection: String,
+    /// Existing Eidetica user to log in as. Connecting never provisions it.
+    pub login: EideticaLoginConfig,
+    /// Direct-owner sync setup. Service clients must omit this block because
+    /// the daemon owns transports, peers, and bootstrap.
+    pub sync: Option<EideticaSyncConfig>,
+}
+
+impl std::fmt::Debug for EideticaConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EideticaConfig")
+            .field("connection", &redact_connection_url(&self.connection))
+            .field("login", &self.login)
+            .field("sync", &self.sync)
+            .finish()
+    }
+}
+
+fn redact_connection_url(connection: &str) -> String {
+    let Some((scheme, rest)) = connection.split_once("://") else {
+        return connection.to_string();
+    };
+    // Split at the last `@`: passwords may legally contain `@`, and splitting
+    // at the first would leave a password fragment in the endpoint.
+    let Some((userinfo, endpoint)) = rest.rsplit_once('@') else {
+        return connection.to_string();
+    };
+    if userinfo.contains(':') {
+        format!("{scheme}://<redacted>@{endpoint}")
+    } else {
+        connection.to_string()
+    }
+}
+
+/// Login credentials for an existing Eidetica user.
+#[derive(Deserialize, Clone)]
+pub struct EideticaLoginConfig {
+    pub username: String,
+    /// Plain native password. Secret-reference infrastructure is deliberately
+    /// outside this connector slice.
+    pub password: Option<String>,
+    /// Explicit opt-in to a passwordless Eidetica login.
+    #[serde(default)]
+    pub passwordless: bool,
+}
+
+impl std::fmt::Debug for EideticaLoginConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EideticaLoginConfig")
+            .field("username", &self.username)
+            .field("password", &self.password.as_ref().map(|_| "<redacted>"))
+            .field("passwordless", &self.passwordless)
+            .finish()
+    }
+}
+
+/// Native sync concepts configured on an embedded Eidetica owner.
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct EideticaSyncConfig {
+    /// Register the persisted native Iroh transport.
+    #[serde(default)]
+    pub iroh: bool,
+    /// Register an HTTP transport listening on this address.
+    pub http_listen: Option<String>,
+    /// Native Eidetica database tickets to reconcile at startup.
+    #[serde(default)]
+    pub tickets: Vec<String>,
 }
 
 /// Who claims the right to *run* the agent for a session.
@@ -390,7 +480,8 @@ pub struct AgentConfig {
     /// `researcher`. A Worker is a configured one-shot LLM call with no
     /// identity of its own; entries it writes are signed by this Agent's key.
     pub workers: Option<Vec<WorkerConfig>>,
-    /// Maximum ReAct loop iterations (default: 10)
+    /// Maximum nested spawn depth (legacy name; default: 10). Does not
+    /// bound the ReAct loop, which runs until the model stops calling tools.
     pub max_iterations: Option<u32>,
     /// Whether this agent can run without user input (scheduled/schedule)
     #[serde(default)]
@@ -452,13 +543,10 @@ pub struct WorkerConfig {
     pub model: Option<String>,
     /// Tool names this Worker may use. Narrows the parent Agent's tool
     /// list (intersection). May include other Workers; recursion is
-    /// bounded by depth + budget propagation on the calling Agent.
+    /// bounded by the spawn-depth ceiling.
     pub tools: Option<Vec<String>>,
-    /// Configured for completeness, but ignored when this Worker is
-    /// invoked under a parent Agent's iteration budget — nested Workers
-    /// share the top-level Agent's pool rather than getting a fresh
-    /// quota. Effective only when there is no parent budget (rare;
-    /// primarily test paths).
+    /// Maximum nested spawn depth for this Worker's child session
+    /// (legacy name). Does not bound the Worker's ReAct loop.
     pub max_iterations: Option<u32>,
     /// Named override bundles selectable at spawn time via the `preset`
     /// argument of `spawn_worker`.
@@ -470,7 +558,7 @@ pub struct WorkerConfig {
 pub struct AgentPreset {
     /// Override the model
     pub model: Option<String>,
-    /// Override max iterations
+    /// Override the maximum nested spawn depth (legacy name)
     pub max_iterations: Option<u32>,
     /// Restrict tools (must be subset of agent definition's tools)
     pub tools: Option<Vec<String>>,
@@ -580,6 +668,9 @@ impl Backend {
 pub struct Model {
     /// The name of the model
     pub name: String,
+    /// OpenAI-compatible reasoning mode for requests to this model. Omit to
+    /// leave the provider's default unchanged.
+    pub reasoning: Option<ReasoningConfig>,
     /// Input token price in USD per million tokens, if known. Surfaced in
     /// the TUI model picker; optional because backends typically don't
     /// publish pricing in a standard machine-readable form. Populate
@@ -601,6 +692,33 @@ pub struct Model {
     /// of the global `max_context_tokens` default.
     #[serde(default)]
     pub context_window: Option<u32>,
+}
+
+/// OpenAI-compatible reasoning settings for one configured model.
+///
+/// This is deliberately model-scoped: one backend commonly serves models
+/// with different reasoning defaults. The configured value applies to every
+/// request for the named model; there is no per-request override.
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
+pub struct ReasoningConfig {
+    /// How hard the provider should think for this model. `none` pins
+    /// reasoning off.
+    pub effort: ReasoningEffort,
+}
+
+/// Reasoning effort levels accepted by OpenRouter and OpenAI-compatible
+/// APIs. `none` turns reasoning off; anything else selects how much the
+/// model thinks before answering. Unknown strings fail config parsing.
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ReasoningEffort {
+    None,
+    Minimal,
+    Low,
+    Medium,
+    High,
+    XHigh,
+    Max,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -888,6 +1006,8 @@ fn known_config_keys() -> HashSet<&'static str> {
     // ── backends[].models[] ──
     for k in [
         "backends[].models[].name",
+        "backends[].models[].reasoning",
+        "backends[].models[].reasoning.effort",
         "backends[].models[].price_input",
         "backends[].models[].price_output",
         "backends[].models[].price_cache_read",
@@ -1034,6 +1154,23 @@ fn known_config_keys() -> HashSet<&'static str> {
 
     // ── cli ──
     keys.insert("cli.auto_approved_tools");
+
+    // ── eidetica ──
+    for k in [
+        "eidetica",
+        "eidetica.connection",
+        "eidetica.login",
+        "eidetica.login.username",
+        "eidetica.login.password",
+        "eidetica.login.passwordless",
+        "eidetica.sync",
+        "eidetica.sync.iroh",
+        "eidetica.sync.http_listen",
+        "eidetica.sync.tickets",
+    ] {
+        keys.insert(k);
+    }
+    keys.insert("execution");
 
     // ── agent_state_allowlist.<extension_name> ── (dynamic keys)
     keys.insert("agent_state_allowlist.");
@@ -1292,6 +1429,8 @@ backends:
     api_key: "${OPENROUTER_KEY}"
     models:
       - name: "gpt-4"
+        reasoning:
+          effort: none
       - name: "claude-3"
     request_timeout: 60
     max_retries: 5
@@ -1306,8 +1445,29 @@ backends:
         assert_eq!(b.request_timeout().as_secs(), 60);
         assert_eq!(b.max_retries(), 5);
         assert_eq!(b.models.as_ref().unwrap().len(), 2);
+        assert_eq!(
+            b.models.as_ref().unwrap()[0].reasoning,
+            Some(ReasoningConfig {
+                effort: ReasoningEffort::None
+            })
+        );
         // secret_key scopes to backend name
         assert_eq!(b.secret_key(), "backend:openrouter");
+    }
+
+    #[test]
+    fn invalid_reasoning_effort_is_rejected() {
+        let yaml = r#"
+backends:
+  - type: openaicompatible
+    name: openrouter
+    api_base: "https://openrouter.ai/api/v1"
+    models:
+      - name: "gpt-4"
+        reasoning:
+          effort: turbo
+"#;
+        assert!(serde_yaml::from_str::<Config>(yaml).is_err());
     }
 
     #[test]
@@ -1773,5 +1933,43 @@ agents:
         let unknown = check_unknown_config_keys(yaml);
         // `bogus` appears in two agent entries but should be reported once.
         assert_eq!(unknown, vec!["agents[].bogus"]);
+    }
+
+    #[test]
+    fn eidetica_block_is_known() {
+        let yaml = r#"
+execution: executor
+eidetica:
+  connection: memory://
+  login:
+    username: chaz
+    passwordless: true
+  sync:
+    iroh: true
+    http_listen: 127.0.0.1:8765
+    tickets: []
+"#;
+        assert!(
+            check_unknown_config_keys(yaml).is_empty(),
+            "valid eidetica block must not warn"
+        );
+    }
+
+    #[test]
+    fn connection_redaction_splits_at_last_at() {
+        let rendered = format!(
+            "{:?}",
+            EideticaConfig {
+                connection: "postgres://user:p@ss@db/chaz".into(),
+                login: EideticaLoginConfig {
+                    username: "u".into(),
+                    password: None,
+                    passwordless: true,
+                },
+                sync: None,
+            }
+        );
+        assert!(!rendered.contains("p@ss"), "password fragment leaked");
+        assert!(rendered.contains("<redacted>"));
     }
 }

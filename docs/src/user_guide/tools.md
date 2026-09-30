@@ -12,7 +12,9 @@ Every built-in is owned by an [extension](extensions.md); disabling an extension
 | `calculate`         | `system`   | Low    | Never              | Evaluates math expressions (via meval)                                 |
 | `describe_tool`     | `system`   | Low    | Never              | Returns full description/schema for a tool (discovery)                 |
 | `compact`           | `core`     | Low    | Never              | Summarize and compact conversation context                             |
-| `spawn_agent`       | `core`     | Medium | UnlessAutoApproved | Delegates to a named peer Agent (persistent identity, own keys)        |
+| `spawn_agent`       | `core`     | Medium | UnlessAutoApproved | Submits a durable Agent job and returns its DB handle immediately      |
+| `job_status`        | `core`     | Low    | Never              | Reads the durable state and typed result of an Agent job               |
+| `job_wait`          | `core`     | Low    | Never              | Waits up to a deadline for a job; timeout returns its current status   |
 | `spawn_worker`      | `core`     | Medium | UnlessAutoApproved | Invokes a Worker template declared under the calling Agent (no keys)   |
 | `shell`             | `core`     | High   | Always             | Executes a shell command                                               |
 | `read_file`         | `fs`       | Low    | Never              | Reads file contents from disk                                          |
@@ -26,13 +28,13 @@ Every built-in is owned by an [extension](extensions.md); disabling an extension
 | `skill_list`        | `skills`   | Low    | Never              | List the skills available to this agent (progressive disclosure)       |
 | `skill_search`      | `skills`   | Low    | Never              | Search the skill catalog by keyword                                    |
 | `skill_show`        | `skills`   | Low    | Never              | Fetch a skill's body — the "activation" half of progressive disclosure |
-| `schedule_add`      | `schedule` | Low    | Never              | Add a recurring agent-owned schedule (cron)                            |
+| `schedule_add`      | `schedule` | Low    | Never              | Add a recurring agent-owned cron or interval schedule                  |
 | `schedule_modify`   | `schedule` | Low    | Never              | Partial update of an existing schedule                                 |
 | `schedule_remove`   | `schedule` | Low    | Never              | Delete a schedule by id                                                |
 | `schedule_list`     | `schedule` | Low    | Never              | List an agent's schedules                                              |
 | `schedule_once`     | `schedule` | Low    | Never              | Add a one-shot schedule firing after N seconds                         |
 
-That's 23 tools across 7 extensions today. External tools from [MCP servers](mcp.md) plug in under the same policy layer and show up here too, namespaced as `<server>__<tool>` (matches the Anthropic Agent SDK / Claude Code `mcp__server__tool` convention so OpenAI-compatible providers, which reject dots in function names, accept them).
+Built-in tools are grouped by extension. External tools from [MCP servers](mcp.md) plug in under the same policy layer and show up here too, namespaced as `<server>__<tool>` (matches the Anthropic Agent SDK / Claude Code `mcp__server__tool` convention so OpenAI-compatible providers, which reject dots in function names, accept them).
 
 ## Risk Levels
 
@@ -154,19 +156,30 @@ Returns the full description and JSON Schema for any registered tool. Useful whe
 
 ### compact
 
-Summarizes the conversation history via an LLM call and writes a `Summary` entry. The context builder treats the most recent Summary as the conversation start boundary, effectively compacting older messages.
+Summarizes the conversation history via an LLM call and writes a `Summary` entry. The context builder treats the most recent Summary as the conversation start boundary, including for earlier tool calls.
 
 ### spawn_agent
 
-Delegates a task to another agent in a child session. The named agent's persistent identity and memory are used — pick this when the work needs continuity. See [Agents](agents.md).
+Creates one child session DB with its Directive, publishes its ID to the watched catalog, and returns that handle before the executor accepts or runs it; use `job_status` or `job_wait` to observe completion. See [Agents](agents.md).
 
 ```json
 {
-  "agent": "researcher",
+  "agent_ref": "researcher",
   "task": "Find the latest papers on CRDT synchronization",
-  "async": false
+  "context": "Optional background"
 }
 ```
+
+### job_status / job_wait
+
+Use the `session_db_id` returned by `spawn_agent` to check a job, or wait for a bounded observation window:
+
+```json
+{"session_db_id":"<child DB ID>"}
+{"session_db_id":"<child DB ID>","timeout_seconds":30}
+```
+
+The first object is for `job_status`; the second is for `job_wait` (`timeout_seconds` is an integer from 1 to 240, default 30). Both return `session_db_id` and a typed `state`: `Pending`, `Rejected`, `Queued`, `Running`, `StartedUnknown`, `Interrupted`, `Succeeded`, or `Failed` (with attempt ID, recent-activity hint, text, or error as applicable). A timed-out wait returns current status; it does not cancel work. A start with no completion may already have caused effects: inspect and explicitly retry an interrupted request, never assume automatic replay. If creation returns an uncertain outcome, inspect the catalog before submitting another job; there is no stable request key or automatic submission retry. The handle does not grant session DB access.
 
 ### spawn_worker
 
@@ -183,7 +196,7 @@ Worker templates are per-Agent (Chaz's `researcher` is distinct from Scout's `re
 }
 ```
 
-`name` is required and selects the Worker template. `tools` narrows the resolved scope for this invocation (must be a subset of what the Worker template + parent Agent allow). `model` and `preset` are optional overrides. Unset fields on a Worker template fall back to the parent Agent's defaults. `max_iterations` is accepted for compatibility but does **not** carve out a separate ReAct budget — every Worker invocation shares the calling Agent's iteration pool, so a nested Worker draws from whatever budget remains rather than starting fresh. See [Spawn Permissions](agents.md#spawn-permissions) for the budget semantics.
+`name` is required and selects the Worker template. `tools` narrows the resolved scope for this invocation (must be a subset of what the Worker template + parent Agent allow). `model` and `preset` are optional overrides. Unset fields on a Worker template fall back to the parent Agent's defaults. `max_iterations` is a legacy name for the Worker's nested spawn-depth ceiling; it does not limit tool calls. A Worker, like an Agent, keeps calling tools until the model replies without one. See [Spawn Permissions](agents.md#spawn-permissions) and [How a turn ends](agents.md#how-a-turn-ends).
 
 ### skill_list / skill_search / skill_show
 
@@ -198,7 +211,9 @@ Skills come from three sources merged at session start: disk skills shipped on t
 
 ### schedule_add / schedule_modify / schedule_remove / schedule_list
 
-Agent-facing CRUD over agent-owned schedules, mirroring the `/schedule` slash commands described in [Agents — Schedules](agents.md#schedules). Schedules live in the owning agent's DB (not the session) and are fired by chaz's `RoutineEngine`, which sleeps until the next due fire instead of polling. `schedule_add` targets the current session (Pinned) by default, or a fresh session per fire. Cron uses 6 fields: `sec min hour day_of_month month day_of_week`.
+Agent-facing CRUD over agent-owned schedules, mirroring the `/schedule` slash commands described in [Agents — Schedules](agents.md#schedules). Schedules live in the owning agent's DB (not the session) and are fired by chaz's `RoutineEngine`, which sleeps until the next due fire instead of polling. `schedule_add` targets the current session (Pinned) by default, or a fresh session per fire. Pass exactly one trigger: `cron` uses 6 fields (`sec min hour day_of_month month day_of_week`), while `interval_seconds` is a fixed delay after each successful dispatch. The agent turn runs asynchronously, so an interval does not prevent overlapping turns.
+
+`target` accepts only `"pinned"` or `"fresh"`. Pinned reuses the current session; Fresh creates a session for each fire. `schedule_add` rejects an existing ID. Use `schedule_modify` to change that row, or `schedule_remove` before adding a replacement.
 
 ```json
 {
@@ -208,6 +223,28 @@ Agent-facing CRUD over agent-owned schedules, mirroring the `/schedule` slash co
 }
 ```
 
+For a five-minute fixed-delay check instead:
+
+```json
+{
+  "id": "check-in",
+  "interval_seconds": 300,
+  "task": "Check for actionable updates"
+}
+```
+
+`schedule_modify` accepts the same mutually exclusive `cron` and `interval_seconds` fields, plus `task`, `target`, `enabled`, `max_fires`, and `expires_at`. For example, this changes the period and pauses the schedule:
+
+```json
+{
+  "id": "check-in",
+  "interval_seconds": 600,
+  "enabled": false
+}
+```
+
+Intervals first fire after one period. A task-only or target-only edit keeps the current due time; changing the trigger or re-enabling the schedule starts a full new period. The dispatch anchor is saved across reloads and restarts. If chaz was down longer than the period, the interval fires as soon as it starts again. Missed cron ticks are skipped. Zero, chrono-unrepresentable, and overflowed-first-fire periods are rejected.
+
 The `agent` field is optional — omit it to target yourself, or pass a display name / DB id to target another agent on this peer.
 
 **Lifecycle bounds.** A recurring schedule can be retired automatically:
@@ -216,6 +253,18 @@ The `agent` field is optional — omit it to target yourself, or pass a display 
 - `expires_at` — RFC 3339 timestamp after which it stops firing.
 
 Whichever bound is hit first wins; both are optional (omit = unbounded). `fire_count` is tracked authoritatively in the agent DB so `max_fires` survives restarts. When a bound is reached the schedule is persisted as disabled (it shows in `schedule_list` as `(disabled)` with its `[fired N×]` count rather than being deleted, so the history stays auditable). `schedule_modify` can set/replace `max_fires`/`expires_at`; re-enabling a schedule that already passed a bound will simply retire again on its next fire.
+
+```json
+{
+  "id": "check-in",
+  "max_fires": 8,
+  "expires_at": "2026-06-01T09:00:00Z"
+}
+```
+
+Use `schedule_list` to inspect a schedule. There is no separate show tool. A failed turn does not consume a `max_fires` slot; chaz refunds the reservation and tries the interval again after its next period. To recover a schedule that reached a bound, raise or replace the bound and set `enabled` to `true` in the same `schedule_modify` call.
+
+Schedules belong to one Agent. Only that Agent's home daemon executes them: Fresh schedules use the Agent-level home, and Pinned schedules use the Agent's home for that session. Other daemons skip the fire. Ownership changes are explicit through `/agent rehost`; this is not a distributed-locking or automatic-failover scheme.
 
 ### schedule_once
 
@@ -315,6 +364,16 @@ The legacy `security.shell_allowlist` / `security.shell_denylist` / `security.al
 ### Leak detection
 
 All tool outputs are scanned for secret patterns (API keys, tokens, etc.) before entering the LLM context. The leak detector supports 12 patterns and can either redact or block the output.
+
+### Tool history on later turns
+
+Completed tool calls and their results can appear as paired native tool messages in later model context. The call ID and tool-result boundary remain intact, and the latest user message and assistant replies take priority over older tool output. Results are leak-scanned and capped at 100 KB before storage, including custom tools. A large previous result may appear only as a marked preview or be omitted when the context is tight. An interrupted turn, a missing result, or a call covered by `/compact` is not replayed.
+
+For example, in one session:
+
+1. Ask: `Search for the release notes.` The assistant calls `kagi__search` and replies: `I found the release notes.`
+2. Ask: `What did that search return?` The next model request includes the earlier assistant call and matching result, alongside the prior reply. It can refer to the search instead of claiming no search happened.
+3. If the tool turn was interrupted before completion, the next request has no fabricated result. Use `/interrupted` and explicitly retry with `/retry <request_id>` if appropriate; a completed retry becomes the single replay source. After `/compact`, covered calls are replaced by the summary.
 
 ### Output safety
 

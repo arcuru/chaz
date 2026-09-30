@@ -2,6 +2,15 @@
 
 Chaz is structured as a layered system: bridges handle transport concerns, the server coordinates agent execution, and the runtime runs the ReAct loop.
 
+Each process obtains its Eidetica `Instance` from the shared connector. A
+direct connection owns its backend; a `unix://` connection logs into an
+independent Eidetica daemon. That ownership axis is separate from the explicit
+`execution: executor | client` role: only executors install model/tool and
+routine-driving runtime, while clients retain observation, submission,
+approval, discovery, and native data operations. Long-lived service executors
+replace a failed connection only after tearing down the complete prior Chaz
+runtime, then rebuild hooks and reconcile durable request state.
+
 ## System Diagram
 
 ```mermaid
@@ -64,7 +73,7 @@ Bridges are transport-specific but the server is transport-agnostic. Adding a ne
 
 **Design stance — a bridge is a transport, not a CLI mode.** Matrix in particular is "expose this session to a room," not "run chaz in matrix mode." That framing has two consequences:
 
-- The CLI surface picks how this process is driven, and nothing else. `chaz` opens the TUI; `-p` runs one turn and exits; `cmd` runs one `/command` and exits; `daemon` runs the peer with no user interface at all, for systemd, containers, and tests that cannot supply the TTY the TUI's raw mode needs. Transport bridges are not modes here — they are separate binaries (`chaz-matrix`, `chaz-discord`) running as their own peers, each holding its own key and reaching an agent's database through an access ticket. A bridge and a TUI can be up at once, driving the same hosted session, because they are peers syncing the same databases rather than threads sharing one process. One bridge process serves each login, and a login belongs to exactly one agent, declared in that agent's `type`-tagged `logins:` list.
+- The CLI surface picks how this process is driven, and nothing else. `chaz` opens the TUI; `-p` runs one turn and exits; `cmd` runs one `/command` and exits; `daemon` runs the peer with no user interface at all, for systemd, containers, and tests that cannot supply the TTY the TUI's raw mode needs. Transport bridges are not modes here — they are separate binaries (`chaz-matrix`, `chaz-discord`) running independently. Direct-owner bridges hold their own keys and reach an agent's database through an access ticket; service-client bridges share the Eidetica daemon's login and do not use tickets. A bridge and a TUI can be up at once, driving the same hosted session through sync or the shared service. One bridge process serves each login, and a login belongs to exactly one agent, declared in that agent's `type`-tagged `logins:` list.
 - Future bridges (HTTP, Slack, …) follow the same rule: their presence in config means "this session is reachable via that transport," not "chaz runs in _that_ mode." `chaz` the binary is always a TUI on a terminal first.
 
 **Multi-agent rooms under the login model (interim).** A login is one agent's real Matrix account, so a room is owned by exactly one login/agent. When other agents participate in that room (e.g. a human `@mention`s one, or the host routes to a guest), their messages egress through the owning agent's single MXID, prefixed `[AgentName]` so readers can tell speakers apart; the owning agent speaks plain. This is the best a normal login can do — one account can only present as itself. It has two known sharp edges: (1) `/agent host` can point the default responder at a non-owner agent, which then answers `[prefixed]` through the owner's MXID — keep host = owner to avoid the confusing mismatch; (2) joining two chaz logins into the _same_ room gives each its own per-`(login_id, room)` session, i.e. parallel conversations — don't; use one login per room plus `@mention` for guests. The clean fix is native per-agent identity via a Matrix **application-service / puppeting gateway** (one connection, a `@chaz_*` ghost user per agent, no prefix hack, no split-brain). That requires a homeserver you administer and a from-scratch AS integration (ruma appservice API + inbound transaction endpoint), so it lands later as its own bridge type — not a change to the login bridge.
@@ -73,16 +82,24 @@ Bridges are transport-specific but the server is transport-agnostic. Adding a ne
 
 ### Server
 
-The callback-driven server watches session databases and spawns agent tasks:
+The callback-driven server watches session databases and reconciles durable
+turn requests:
 
-1. Bridges call `register_session` to set up `on_write` callbacks
-2. When a callback fires, the processing loop checks the latest entry
-3. If it's a `Message` from a non-agent or a `Directive`, the server spawns an agent task
-4. The agent writes its response to the session DB, triggering bridge callbacks
+1. An executor server calls `register_session` to set up `on_write` callbacks;
+   a transport-only client can watch a session without claiming execution
+2. Registration pairs a snapshot catch-up with the callback, so requests that
+   arrived before the observer attached are considered too
+3. A non-agent `Message` or `Directive` is selected from the queued request
+   rows, then the executor records an attempt before spawning an agent task
+4. The agent commits its final response or error entry with attempt completion;
+   a queued later request is then eligible to run
 
-Per-session serialization ensures only one agent task runs per session at a time, preventing duplicate responses from concurrent writes.
+Per-session serialization ensures one local executor task runs at a time. The
+durable attempt relation prevents a completed request from running again after
+restart, but it is not distributed fencing or an exactly-once guarantee for
+external effects. See [Session Model](sessions.md#durable-turn-recovery).
 
-The server also handles child session registration for `spawn_agent`, propagating call depth, tool scope, and completion signals.
+`spawn_agent` prepares a delegated child session with one Directive before publishing its DB ID to the watched catalog. The executor then validates parent authority, pins inherited limits and accepts that same child before running it; `spawn_worker` remains a separate Worker-template path (synchronous by default).
 
 **Source**: `crates/lib/src/server.rs`
 
@@ -93,8 +110,7 @@ The ReAct loop (`runtime::execute`) drives agent reasoning:
 1. Build context from session history
 2. Call LLM with tool definitions
 3. If the LLM returns tool calls: check approval, execute with timeout, scan for leaks, feed results back
-4. If the LLM returns text: return as the agent's response
-5. After max iterations: force a summary
+4. If the LLM returns text: return as the agent's response; otherwise repeat from step 2 (there is no iteration cap)
 
 The runtime emits `RuntimeEvent`s (ToolCall, ToolResult) via an optional event sink for audit trail logging.
 
@@ -141,7 +157,7 @@ crates/lib/src/
   openai.rs            OpenAI-compatible backend (async-openai byot)
   embedding.rs         Embedder trait + OpenAiEmbedder (for memory/skill semantic search)
   defaults.rs          Built-in default config and built-in agents (chaz, chazmina, bash, fish, zsh, nu)
-  routine/             RoutineEngine — sleep-until-next driver for cron + one-shot Routines
+  routine/             RoutineEngine — sleep-until-next driver for cron, interval + one-shot Routines
     mod.rs             Module root + re-exports
     engine.rs          Engine — register/reload/deregister, fire_due, dispatch through ExtensionHub
     types.rs           Routine, RoutineId, RoutineScope (Global/Session/Agent), AgentSchedulePayload
@@ -169,7 +185,7 @@ crates/lib/src/
     hooks.rs           Per-kind hook trait definitions + HookKind
   extensions/          Built-in extensions (each declares scopes + caps + endpoints)
     mod.rs             all_builtins, BuiltinDeps
-    core.rs            shell, compact, spawn_agent, spawn_worker
+    core.rs            shell, compact, spawn_agent, job_status, job_wait, spawn_worker
     fs.rs              read_file, write_file, edit_file
     system.rs          get_time, calculate, describe_tool
     web.rs             web_fetch, web_search (Tavily/Brave/Serper/SearxNG/Kagi + DuckDuckGo fallback)
@@ -181,7 +197,8 @@ crates/lib/src/
     path_normalizer.rs tool_call hook stripping trailing `/` from path args
     security_warnings.rs tool_result hook scanning for prompt-injection patterns
   tools/               Built-in tool impls (referenced from extensions/* above)
-    agent.rs           spawn_agent (delegate to a peer Living Agent)
+    agent.rs           spawn_agent (submit a hosted Agent job)
+    jobs.rs            job_status, job_wait (observe an Agent job)
     worker.rs          spawn_worker (invoke a per-Agent Worker template — no keys, no identity)
     shell.rs           shell execution with allowlist/denylist
     file.rs            read_file, write_file

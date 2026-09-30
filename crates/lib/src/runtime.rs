@@ -18,15 +18,15 @@ use crate::extension::{ExtensionHub, HookContext, ToolCallDecision};
 use crate::security::SecurityContext;
 use crate::tool::{RateLimiter, ToolApprovalInfo, ToolContext, ToolPolicyRegistry};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use std::hash::{DefaultHasher, Hash, Hasher};
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
-/// Events emitted during the ReAct loop for audit trail / observability.
+/// Compatibility event stream for standalone runtime callers such as
+/// scheduled turns, which do not have a durable turn attempt.
 pub enum RuntimeEvent {
     ToolCall {
         id: String,
@@ -41,70 +41,44 @@ pub enum RuntimeEvent {
     },
 }
 
-/// Fallback per-call ReAct cap used when `ToolContext::iteration_budget`
-/// is `None` (direct `runtime::execute` callers without the spawn
-/// machinery; primarily tests). Top-level Agent calls populate the
-/// budget so this value is unused under normal operation.
-const MAX_TOOL_ITERATIONS: usize = 10;
-
-/// Atomically consume one unit from a shared iteration budget.
-/// Returns `true` if a unit was claimed; `false` when the budget is
-/// already at zero (exhaustion).
-fn consume_budget(budget: &Arc<AtomicU32>) -> bool {
-    let mut current = budget.load(Ordering::SeqCst);
-    loop {
-        if current == 0 {
-            return false;
-        }
-        match budget.compare_exchange_weak(current, current - 1, Ordering::SeqCst, Ordering::SeqCst)
-        {
-            Ok(_) => return true,
-            Err(actual) => current = actual,
-        }
-    }
+/// Awaited persistence boundary for completed runtime messages.
+pub trait RuntimeRecorder: Send + Sync {
+    fn record<'a>(
+        &'a self,
+        message: RuntimeRecord,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
 }
 
-/// Number of times a tool call fingerprint can repeat before loop detection triggers.
-const LOOP_DETECTION_THRESHOLD: u32 = 3;
-
-/// Detects repetitive tool call patterns that indicate the agent is stuck in a loop.
-///
-/// Fingerprints each set of tool calls per iteration (sorted hash of name + arguments).
-/// When the same fingerprint appears `LOOP_DETECTION_THRESHOLD` times, the loop is
-/// considered stuck and should be broken.
-struct LoopDetector {
-    /// Maps iteration fingerprints to their occurrence count.
-    fingerprints: HashMap<u64, u32>,
+#[derive(Clone, Debug)]
+pub enum RuntimeRecord {
+    ModelResponse {
+        model_sequence: u64,
+        content: Option<String>,
+        tool_calls: Vec<ToolCallRequest>,
+        provider_extra: serde_json::Map<String, serde_json::Value>,
+        metadata: Option<ResponseMetadata>,
+        terminal: bool,
+    },
+    ToolResult {
+        model_sequence: u64,
+        call_index: usize,
+        call_id: String,
+        name: String,
+        output: String,
+        outcome: ToolResultOutcome,
+    },
 }
 
-impl LoopDetector {
-    fn new() -> Self {
-        Self {
-            fingerprints: HashMap::new(),
-        }
-    }
-
-    /// Record a set of tool calls for one iteration and check for loops.
-    /// Returns `true` if a loop is detected.
-    fn record_and_check(&mut self, tool_calls: &[ToolCallRequest]) -> bool {
-        let fingerprint = Self::fingerprint(tool_calls);
-        let count = self.fingerprints.entry(fingerprint).or_insert(0);
-        *count += 1;
-        *count >= LOOP_DETECTION_THRESHOLD
-    }
-
-    /// Compute a fingerprint for a set of tool calls.
-    /// Sorts by name to be order-independent within a single iteration.
-    fn fingerprint(tool_calls: &[ToolCallRequest]) -> u64 {
-        let mut hasher = DefaultHasher::new();
-        let mut pairs: Vec<(&str, &str)> = tool_calls
-            .iter()
-            .map(|tc| (tc.name.as_str(), tc.arguments.as_str()))
-            .collect();
-        pairs.sort();
-        pairs.hash(&mut hasher);
-        hasher.finish()
-    }
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ToolResultOutcome {
+    Success,
+    Error,
+    Denied,
+    ApprovalTimedOut,
+    RateLimited,
+    Blocked,
+    TimedOut,
+    Unavailable,
 }
 
 // === Message types for the ReAct loop ===
@@ -133,7 +107,7 @@ pub enum RuntimeMessage {
 }
 
 /// A tool call requested by the LLM
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ToolCallRequest {
     pub id: String,
     pub name: String,
@@ -163,7 +137,7 @@ pub enum LLMResponse {
 /// Provenance + cost metadata for a single LLM call, normalized across
 /// backends. Backends populate whatever fields their wire format exposes —
 /// missing fields surface as `None`/`0` rather than failing.
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ResponseMetadata {
     /// The model that actually answered. May differ from the requested model
     /// when the backend (e.g. OpenRouter) falls back or routes elsewhere.
@@ -204,7 +178,7 @@ pub struct ResponseMetadata {
 /// - `cost_usd`: backend-reported cost in USD. Only populated when the
 ///   backend returns it (e.g. OpenRouter with `usage.include = true`); we do
 ///   not compute cost locally.
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct TokenUsage {
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
@@ -422,10 +396,36 @@ pub async fn execute(
     event_sink: Option<mpsc::Sender<RuntimeEvent>>,
     hub: Option<&ExtensionHub>,
 ) -> Result<RuntimeOutcome, String> {
+    let recorder = event_sink.map(|sink| Arc::new(EventRecorder(sink)) as Arc<dyn RuntimeRecorder>);
+    execute_with_recorder(
+        model,
+        initial_messages,
+        backend,
+        security,
+        tool_ctx,
+        policies,
+        recorder,
+        hub,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn execute_with_recorder(
+    model: Option<&str>,
+    initial_messages: Vec<RuntimeMessage>,
+    backend: &BackendManager,
+    security: &SecurityContext,
+    tool_ctx: &ToolContext,
+    policies: &ToolPolicyRegistry,
+    recorder: Option<Arc<dyn RuntimeRecorder>>,
+    hub: Option<&ExtensionHub>,
+) -> Result<RuntimeOutcome, String> {
     let tools = &tool_ctx.tools;
     let resolved_model = backend.resolve_model_name(model);
     let max_retries = backend.max_retries_for_model(model);
     let mut acc = MetadataAccumulator::default();
+    let mut model_sequence = 0;
 
     let hook_ctx = hub.map(|_| HookContext {
         agent_name: tool_ctx.agent_name.clone(),
@@ -449,6 +449,18 @@ pub async fn execute(
         .await
         {
             Ok(LLMResponse::Text { content, metadata }) => {
+                record_runtime(
+                    &recorder,
+                    RuntimeRecord::ModelResponse {
+                        model_sequence,
+                        content: Some(content.clone()),
+                        tool_calls: Vec::new(),
+                        provider_extra: Default::default(),
+                        metadata: metadata.clone(),
+                        terminal: true,
+                    },
+                )
+                .await?;
                 if let Some(m) = metadata {
                     acc.record(m);
                 }
@@ -486,22 +498,9 @@ pub async fn execute(
 
     let mut approve_all = false; // tracks if user chose "approve all" this turn
     let mut rate_limiter = RateLimiter::new();
-    let mut loop_detector = LoopDetector::new();
 
     let mut iteration: usize = 0;
     loop {
-        // Budget gate: top-level Agents and inherited Workers share a
-        // single `Arc<AtomicU32>` so nested invocations draw from one
-        // pool. When no budget is plumbed in (test contexts), fall back
-        // to the built-in cap.
-        let budget_exhausted = match tool_ctx.iteration_budget.as_ref() {
-            Some(budget) => !consume_budget(budget),
-            None => iteration >= MAX_TOOL_ITERATIONS,
-        };
-        if budget_exhausted {
-            break;
-        }
-
         let response = match llm_call_with_retry(
             backend,
             model,
@@ -513,41 +512,6 @@ pub async fn execute(
         .await
         {
             Ok(resp) => resp,
-            Err(ref e) if e.is_retryable() && iteration == 0 => {
-                // All retries exhausted on first call with tools — try without tools
-                // in case this model/provider doesn't support function calling.
-                info!(
-                    error = %e,
-                    "Tool-aware call failed after retries, falling back to no-tools execution"
-                );
-                return match llm_call_with_retry(
-                    backend,
-                    model,
-                    &messages,
-                    &[],
-                    &resolved_model,
-                    max_retries,
-                )
-                .await
-                {
-                    Ok(LLMResponse::Text { content, metadata }) => {
-                        if let Some(m) = metadata {
-                            acc.record(m);
-                        }
-                        Ok(finalize_outcome(
-                            hub,
-                            hook_ctx.as_ref(),
-                            RuntimeOutcome {
-                                body: content,
-                                metadata: acc.finalize(),
-                            },
-                        )
-                        .await)
-                    }
-                    Ok(_) => Err("Unexpected response in no-tools fallback".to_string()),
-                    Err(e) => Err(e.to_string()),
-                };
-            }
             Err(e) => {
                 // All retries exhausted or non-retryable — stop
                 warn!(
@@ -563,6 +527,18 @@ pub async fn execute(
 
         match response {
             LLMResponse::Text { content, metadata } if !content.is_empty() => {
+                record_runtime(
+                    &recorder,
+                    RuntimeRecord::ModelResponse {
+                        model_sequence,
+                        content: Some(content.clone()),
+                        tool_calls: Vec::new(),
+                        provider_extra: Default::default(),
+                        metadata: metadata.clone(),
+                        terminal: true,
+                    },
+                )
+                .await?;
                 if let Some(m) = metadata {
                     acc.record(m);
                 }
@@ -580,6 +556,18 @@ pub async fn execute(
                 .await);
             }
             LLMResponse::Text { metadata, .. } if iteration > 0 => {
+                record_runtime(
+                    &recorder,
+                    RuntimeRecord::ModelResponse {
+                        model_sequence,
+                        content: Some(String::new()),
+                        tool_calls: Vec::new(),
+                        provider_extra: Default::default(),
+                        metadata: metadata.clone(),
+                        terminal: true,
+                    },
+                )
+                .await?;
                 if let Some(m) = metadata {
                     acc.record(m);
                 }
@@ -600,6 +588,18 @@ pub async fn execute(
                 return Err("Model returned empty response after tool execution".to_string());
             }
             LLMResponse::Text { content, metadata } => {
+                record_runtime(
+                    &recorder,
+                    RuntimeRecord::ModelResponse {
+                        model_sequence,
+                        content: Some(content.clone()),
+                        tool_calls: Vec::new(),
+                        provider_extra: Default::default(),
+                        metadata: metadata.clone(),
+                        terminal: true,
+                    },
+                )
+                .await?;
                 if let Some(m) = metadata {
                     acc.record(m);
                 }
@@ -619,6 +619,18 @@ pub async fn execute(
                 provider_extra,
                 metadata,
             } => {
+                record_runtime(
+                    &recorder,
+                    RuntimeRecord::ModelResponse {
+                        model_sequence,
+                        content: content.clone(),
+                        tool_calls: tool_calls.clone(),
+                        provider_extra: provider_extra.clone(),
+                        metadata: metadata.clone(),
+                        terminal: false,
+                    },
+                )
+                .await?;
                 if let Some(m) = metadata {
                     acc.record(m);
                 }
@@ -626,20 +638,6 @@ pub async fn execute(
                     "Tool calls requested: {:?}",
                     tool_calls.iter().map(|tc| &tc.name).collect::<Vec<_>>()
                 );
-
-                // --- Loop detection: check if the agent is repeating the same calls ---
-                if loop_detector.record_and_check(&tool_calls) {
-                    warn!(
-                        iteration,
-                        threshold = LOOP_DETECTION_THRESHOLD,
-                        tools = ?tool_calls.iter().map(|tc| &tc.name).collect::<Vec<_>>(),
-                        "Loop detected: agent is repeating the same tool calls"
-                    );
-                    messages.push(RuntimeMessage::User(
-                        "You are stuck in a loop — you have made the same tool calls multiple times with the same arguments. Stop using tools and provide your best response based on the information you already have.".to_string(),
-                    ));
-                    break;
-                }
 
                 // Record the assistant's tool call request
                 messages.push(RuntimeMessage::AssistantToolCalls {
@@ -649,18 +647,7 @@ pub async fn execute(
                 });
 
                 // Execute each tool with security checks
-                for call in &tool_calls {
-                    // Emit tool call event
-                    if let Some(ref sink) = event_sink {
-                        let _ = sink
-                            .send(RuntimeEvent::ToolCall {
-                                id: call.id.clone(),
-                                name: call.name.clone(),
-                                arguments: call.arguments.clone(),
-                            })
-                            .await;
-                    }
-
+                for (call_index, call) in tool_calls.iter().enumerate() {
                     let result = match tools.get(&call.name) {
                         Some(tool) => {
                             let tool: &dyn crate::tool::Tool = &*tool;
@@ -673,9 +660,19 @@ pub async fn execute(
                                 && let Err(msg) = rate_limiter.check(&call.name, limit)
                             {
                                 warn!(tool = %call.name, "Rate limited");
+                                let result = msg;
+                                record_tool_result(
+                                    &recorder,
+                                    model_sequence,
+                                    call_index,
+                                    call,
+                                    &result,
+                                    ToolResultOutcome::RateLimited,
+                                )
+                                .await?;
                                 messages.push(RuntimeMessage::ToolResult {
                                     call_id: call.id.clone(),
-                                    content: wrap_tool_output(&call.name, &msg),
+                                    content: wrap_tool_output(&call.name, &result),
                                 });
                                 continue;
                             }
@@ -701,9 +698,19 @@ pub async fn execute(
                                         approve_all = true; // skip approval for rest of turn
                                     }
                                     ApprovalDecision::Deny => {
+                                        let result = "Tool execution denied by user".to_string();
+                                        record_tool_result(
+                                            &recorder,
+                                            model_sequence,
+                                            call_index,
+                                            call,
+                                            &result,
+                                            ToolResultOutcome::Denied,
+                                        )
+                                        .await?;
                                         messages.push(RuntimeMessage::ToolResult {
                                             call_id: call.id.clone(),
-                                            content: "Tool execution denied by user".to_string(),
+                                            content: result,
                                         });
                                         continue;
                                     }
@@ -711,10 +718,20 @@ pub async fn execute(
                                         // Tell the model nobody answered rather
                                         // than that it was refused: the two
                                         // warrant different next moves.
+                                        let result =
+                                            "Tool execution was not approved in time".to_string();
+                                        record_tool_result(
+                                            &recorder,
+                                            model_sequence,
+                                            call_index,
+                                            call,
+                                            &result,
+                                            ToolResultOutcome::ApprovalTimedOut,
+                                        )
+                                        .await?;
                                         messages.push(RuntimeMessage::ToolResult {
                                             call_id: call.id.clone(),
-                                            content: "Tool execution was not approved in time"
-                                                .to_string(),
+                                            content: result,
                                         });
                                         continue;
                                     }
@@ -732,16 +749,15 @@ pub async fn execute(
                                     "Tool call blocked by extension"
                                 );
                                 let blocked_msg = format!("Tool blocked by extension: {reason}");
-                                if let Some(ref sink) = event_sink {
-                                    let _ = sink
-                                        .send(RuntimeEvent::ToolResult {
-                                            id: call.id.clone(),
-                                            name: call.name.clone(),
-                                            output: blocked_msg.clone(),
-                                            is_error: true,
-                                        })
-                                        .await;
-                                }
+                                record_tool_result(
+                                    &recorder,
+                                    model_sequence,
+                                    call_index,
+                                    call,
+                                    &blocked_msg,
+                                    ToolResultOutcome::Blocked,
+                                )
+                                .await?;
                                 messages.push(RuntimeMessage::ToolResult {
                                     call_id: call.id.clone(),
                                     content: wrap_tool_output(&call.name, &blocked_msg),
@@ -757,6 +773,8 @@ pub async fn execute(
                             let call_grants =
                                 tool_ctx.resolve_call_grants(&policy.grants, &call.name);
                             let mut call_ctx = tool_ctx.clone();
+                            call_ctx.tool_call_key =
+                                Some(format!("{model_sequence}:{call_index}:{}", call.id));
                             call_ctx.grants = call_grants;
                             let exec_result =
                                 execute_with_retry(tool, args, &call_ctx, timeout, &call.name)
@@ -768,7 +786,7 @@ pub async fn execute(
                                         tool = %call.name,
                                         len = output.len(),
                                         "Tool returned: {}",
-                                        &output[..output.len().min(200)]
+                                        crate::util::truncate_chars(&output, 200)
                                     );
 
                                     // --- Extension hook: tool_result ---
@@ -832,25 +850,35 @@ pub async fn execute(
                         },
                     };
 
-                    // Emit tool result event
-                    if let Some(ref sink) = event_sink {
-                        let is_error = result.starts_with("Tool error:")
-                            || result.starts_with("Tool timed out");
-                        let _ = sink
-                            .send(RuntimeEvent::ToolResult {
-                                id: call.id.clone(),
-                                name: call.name.clone(),
-                                output: result.clone(),
-                                is_error,
-                            })
-                            .await;
-                    }
+                    let outcome = if result.starts_with("Tool error:") {
+                        ToolResultOutcome::Error
+                    } else if result.starts_with("Tool timed out") {
+                        ToolResultOutcome::TimedOut
+                    } else if result.starts_with("Unknown tool:")
+                        || result.contains(" is not available yet:")
+                    {
+                        ToolResultOutcome::Unavailable
+                    } else {
+                        ToolResultOutcome::Success
+                    };
+                    // A shared session syncs full results to its authorized peers.
+                    // Bound native/custom tools just as MCP tools are bounded.
+                    let result = bound_tool_output(&result);
+                    record_tool_result(
+                        &recorder,
+                        model_sequence,
+                        call_index,
+                        call,
+                        &result,
+                        outcome,
+                    )
+                    .await?;
 
                     debug!(
                         call_id = %call.id,
                         tool = %call.name,
                         "Tool result: {}",
-                        &result[..result.len().min(200)]
+                        crate::util::truncate_chars(&result, 200)
                     );
                     // Wrap tool output in XML delimiters to prevent injection
                     let wrapped = wrap_tool_output(&call.name, &result);
@@ -862,59 +890,109 @@ pub async fn execute(
             }
         }
 
+        model_sequence += 1;
         iteration += 1;
-    }
-
-    // Hit the cap or loop detected — make one final call without tools to force a text summary
-    info!("Forcing final response (max iterations or loop detected)");
-    // Only add summary prompt if the last message isn't already a loop-break prompt
-    if !matches!(messages.last(), Some(RuntimeMessage::User(msg)) if msg.contains("stuck in a loop"))
-    {
-        messages.push(RuntimeMessage::User(
-            "Please summarize what you found so far and respond to the user.".to_string(),
-        ));
-    }
-    match llm_call_with_retry(backend, model, &messages, &[], &resolved_model, max_retries).await {
-        Ok(LLMResponse::Text { content, metadata }) if !content.is_empty() => {
-            if let Some(m) = metadata {
-                acc.record(m);
-            }
-            Ok(finalize_outcome(
-                hub,
-                hook_ctx.as_ref(),
-                RuntimeOutcome {
-                    body: content,
-                    metadata: acc.finalize(),
-                },
-            )
-            .await)
-        }
-        Ok(_) | Err(_) => {
-            // Last resort: return the last tool result
-            for msg in messages.iter().rev() {
-                if let RuntimeMessage::ToolResult { content, .. } = msg {
-                    return Ok(finalize_outcome(
-                        hub,
-                        hook_ctx.as_ref(),
-                        RuntimeOutcome {
-                            body: content.clone(),
-                            metadata: acc.finalize(),
-                        },
-                    )
-                    .await);
-                }
-            }
-            Err("Agent reached maximum tool iterations without a final response".to_string())
-        }
     }
 }
 
+struct EventRecorder(mpsc::Sender<RuntimeEvent>);
+
+impl RuntimeRecorder for EventRecorder {
+    fn record<'a>(
+        &'a self,
+        message: RuntimeRecord,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(async move {
+            match message {
+                RuntimeRecord::ModelResponse { tool_calls, .. } => {
+                    for call in tool_calls {
+                        self.0
+                            .send(RuntimeEvent::ToolCall {
+                                id: call.id,
+                                name: call.name,
+                                arguments: call.arguments,
+                            })
+                            .await
+                            .map_err(|_| "runtime event receiver closed".to_string())?;
+                    }
+                }
+                RuntimeRecord::ToolResult {
+                    model_sequence: _,
+                    call_index: _,
+                    call_id,
+                    name,
+                    output,
+                    outcome,
+                } => {
+                    self.0
+                        .send(RuntimeEvent::ToolResult {
+                            id: call_id,
+                            name,
+                            output,
+                            is_error: outcome != ToolResultOutcome::Success,
+                        })
+                        .await
+                        .map_err(|_| "runtime event receiver closed".to_string())?;
+                }
+            }
+            Ok(())
+        })
+    }
+}
+
+async fn record_runtime(
+    recorder: &Option<Arc<dyn RuntimeRecorder>>,
+    record: RuntimeRecord,
+) -> Result<(), String> {
+    if let Some(recorder) = recorder {
+        recorder
+            .record(record)
+            .await
+            .map_err(|error| format!("runtime persistence failed: {error}"))?;
+    }
+    Ok(())
+}
+
+async fn record_tool_result(
+    recorder: &Option<Arc<dyn RuntimeRecorder>>,
+    model_sequence: u64,
+    call_index: usize,
+    call: &ToolCallRequest,
+    output: &str,
+    outcome: ToolResultOutcome,
+) -> Result<(), String> {
+    record_runtime(
+        recorder,
+        RuntimeRecord::ToolResult {
+            model_sequence,
+            call_index,
+            call_id: call.id.clone(),
+            name: call.name.clone(),
+            output: output.to_string(),
+            outcome,
+        },
+    )
+    .await
+}
+
+/// Cap synced native/custom results as strictly as MCP output, including
+/// the truncation marker. Old unbounded records receive the same cap on replay.
+pub(crate) fn bound_tool_output(output: &str) -> String {
+    const LIMIT: usize = 100 * 1024;
+    const MARKER: &str = "\n[tool output truncated at 100 KB]";
+    if output.len() <= LIMIT {
+        return output.to_owned();
+    }
+    let mut end = LIMIT - MARKER.len();
+    while !output.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}{}", &output[..end], MARKER)
+}
+
 /// Wrap tool output in XML delimiters for injection defense.
-///
-/// Escapes angle brackets in the tool output so injected content can't close
-/// the delimiter and inject instructions. The LLM sees clearly-bounded tool
-/// output that can't be confused with system-level markup.
-fn wrap_tool_output(tool_name: &str, output: &str) -> String {
+/// Escapes angle brackets so content cannot close the delimiter.
+pub(crate) fn wrap_tool_output(tool_name: &str, output: &str) -> String {
     // Escape < and > in tool output to prevent delimiter breakout
     let escaped = output.replace('<', "&lt;").replace('>', "&gt;");
     format!("<tool_output tool=\"{tool_name}\">\n{escaped}\n</tool_output>")
@@ -1087,101 +1165,6 @@ mod tests {
         );
     }
 
-    fn make_tool_call(name: &str, args: &str) -> ToolCallRequest {
-        ToolCallRequest {
-            id: "call_1".to_string(),
-            name: name.to_string(),
-            arguments: args.to_string(),
-        }
-    }
-
-    #[test]
-    fn test_loop_detector_no_loop() {
-        let mut detector = LoopDetector::new();
-        // Different tool calls each time — no loop
-        assert!(!detector.record_and_check(&[make_tool_call("shell", r#"{"cmd":"ls"}"#)]));
-        assert!(!detector.record_and_check(&[make_tool_call("shell", r#"{"cmd":"pwd"}"#)]));
-        assert!(!detector.record_and_check(&[make_tool_call("read_file", r#"{"path":"a.txt"}"#)]));
-    }
-
-    #[test]
-    fn test_loop_detector_triggers_on_repetition() {
-        let mut detector = LoopDetector::new();
-        let calls = vec![make_tool_call("shell", r#"{"cmd":"ls"}"#)];
-        assert!(!detector.record_and_check(&calls)); // 1st
-        assert!(!detector.record_and_check(&calls)); // 2nd
-        assert!(detector.record_and_check(&calls)); // 3rd — loop detected
-    }
-
-    #[test]
-    fn test_loop_detector_order_independent() {
-        let mut detector = LoopDetector::new();
-        let calls_a = vec![
-            make_tool_call("shell", r#"{"cmd":"ls"}"#),
-            make_tool_call("read_file", r#"{"path":"a.txt"}"#),
-        ];
-        let calls_b = vec![
-            make_tool_call("read_file", r#"{"path":"a.txt"}"#),
-            make_tool_call("shell", r#"{"cmd":"ls"}"#),
-        ];
-        assert!(!detector.record_and_check(&calls_a));
-        assert!(!detector.record_and_check(&calls_b)); // same tools, different order
-        assert!(detector.record_and_check(&calls_a)); // 3rd — loop detected
-    }
-
-    #[test]
-    fn test_loop_detector_different_args_no_loop() {
-        let mut detector = LoopDetector::new();
-        // Same tool, different arguments each time — not a loop
-        assert!(!detector.record_and_check(&[make_tool_call("shell", r#"{"cmd":"ls -l"}"#)]));
-        assert!(!detector.record_and_check(&[make_tool_call("shell", r#"{"cmd":"ls -a"}"#)]));
-        assert!(!detector.record_and_check(&[make_tool_call("shell", r#"{"cmd":"ls -la"}"#)]));
-    }
-
-    #[test]
-    fn test_loop_detector_fingerprint_deterministic() {
-        let calls = vec![make_tool_call("a", "1"), make_tool_call("b", "2")];
-        let fp1 = LoopDetector::fingerprint(&calls);
-        let fp2 = LoopDetector::fingerprint(&calls);
-        assert_eq!(fp1, fp2);
-    }
-
-    // ================================================================
-    // iteration budget
-    // ================================================================
-
-    #[test]
-    fn consume_budget_decrements_and_signals_exhaustion() {
-        let budget = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(3));
-        assert!(consume_budget(&budget));
-        assert!(consume_budget(&budget));
-        assert!(consume_budget(&budget));
-        // 4th attempt — pool drained.
-        assert!(!consume_budget(&budget));
-        // Still drained on subsequent attempts (doesn't underflow).
-        assert!(!consume_budget(&budget));
-        assert_eq!(budget.load(std::sync::atomic::Ordering::SeqCst), 0);
-    }
-
-    #[test]
-    fn consume_budget_starting_at_zero_is_immediately_exhausted() {
-        let budget = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
-        assert!(!consume_budget(&budget));
-    }
-
-    #[test]
-    fn consume_budget_is_shared_across_clones() {
-        // Two clones of the same Arc see the same underlying counter —
-        // the property that lets nested Worker invocations drain the
-        // top-level Agent's pool rather than each getting a fresh one.
-        let budget = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(5));
-        let alias = budget.clone();
-        assert!(consume_budget(&budget));
-        assert!(consume_budget(&alias));
-        assert!(consume_budget(&budget));
-        assert_eq!(alias.load(std::sync::atomic::Ordering::SeqCst), 2);
-    }
-
     // ================================================================
     // execute_with_retry
     // ================================================================
@@ -1276,6 +1259,8 @@ mod tests {
         ));
         ToolContext {
             agent_name: "t".into(),
+            turn_request_id: None,
+            tool_call_key: None,
             call_depth: 0,
             max_call_depth: 5,
             tools: ScopedTools::new(Arc::new(ToolRegistry::new()), None),
@@ -1287,7 +1272,6 @@ mod tests {
             agent_grants: Default::default(),
             host: Arc::new(crate::tool_host::NativeToolHost::new()),
             active_extensions: std::collections::HashSet::new(),
-            iteration_budget: None,
             routine_engine: None,
         }
     }
@@ -1358,5 +1342,17 @@ mod tests {
         .expect("did not time out");
         assert!(matches!(result, Err(ToolError::Timeout { .. })));
         assert_eq!(calls.load(Ordering::Relaxed), 1);
+    }
+}
+
+#[cfg(test)]
+mod tool_output_bound_tests {
+    #[test]
+    fn caps_utf8_results_including_marker() {
+        let text = "é".repeat(60_000);
+        let bounded = super::bound_tool_output(&text);
+        assert!(bounded.len() <= 100 * 1024);
+        assert!(bounded.ends_with("[tool output truncated at 100 KB]"));
+        assert_eq!(super::bound_tool_output("small"), "small");
     }
 }

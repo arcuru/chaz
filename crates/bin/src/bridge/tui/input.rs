@@ -6,6 +6,7 @@ use chaz_core::bridge::ApprovalDecision;
 use chaz_core::commands::Parsed;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+use unicode_segmentation::UnicodeSegmentation;
 
 use super::{
     AgentDiffMode, App, ChatAction, ClickTarget, Completion, ModelPickerScope, Overlay,
@@ -38,6 +39,8 @@ pub(super) fn command_catalog() -> Vec<(&'static str, &'static str)> {
         ("/rename ", "alias for /name"),
         ("/info", "show current session info"),
         ("/costs", "aggregate LLM usage + cost across all sessions"),
+        ("/interrupted", "list turns requiring an explicit retry"),
+        ("/retry ", "retry one interrupted request by stable id"),
         ("/channels", "list Matrix rooms attached to this session"),
         ("/share", "generate shareable ticket for current session"),
         ("/sync ", "sync a remote session via ticket"),
@@ -106,7 +109,14 @@ pub(super) fn command_catalog() -> Vec<(&'static str, &'static str)> {
         ("/memory unshare ", "stop sharing a memory bank"),
         ("# Schedule", ""),
         ("/schedule list", "list an agent's schedules"),
-        ("/schedule add ", "<id> <cron 6 fields> <agent> <task...>"),
+        (
+            "/schedule add ",
+            "<id> <cron 6 fields> <agent> <task...> | interval <id> <seconds> <agent> <task...>",
+        ),
+        (
+            "/schedule modify ",
+            "<id> cron <6 fields> [agent] | interval <seconds> [agent]",
+        ),
         ("/schedule remove ", "remove a schedule by id"),
         ("# LLM config", ""),
         ("/models", "open the Models settings page"),
@@ -512,6 +522,22 @@ pub(super) async fn handle_chat_key(app: &mut App, key: KeyEvent) -> Option<Chat
     }
 
     match key.code {
+        // Hard line break. `Alt+Enter` is the portable binding: without the
+        // keyboard-enhancement protocol a terminal sends bare `\r` for
+        // `Shift+Enter`, so it is indistinguishable from send (same reason
+        // there's no `Ctrl+M` binding). `Alt+Enter` arrives as `ESC \r`, which
+        // does carry a modifier. `Shift+Enter` is still accepted for terminals
+        // that do negotiate the enhanced protocol.
+        KeyCode::Enter
+            if key
+                .modifiers
+                .intersects(KeyModifiers::ALT | KeyModifiers::SHIFT) =>
+        {
+            app.input.insert(app.cursor, '\n');
+            app.cursor += 1;
+            app.completion_dismissed = false;
+            recompute_completion(app);
+        }
         KeyCode::Enter => {
             // With the popup open, Enter completes the highlighted command
             // while there's still more of it to type. Once it's fully typed
@@ -561,7 +587,7 @@ pub(super) async fn handle_chat_key(app: &mut App, key: KeyEvent) -> Option<Chat
         KeyCode::Backspace => {
             if app.cursor > 0 {
                 let prev = app.input[..app.cursor]
-                    .char_indices()
+                    .grapheme_indices(true)
                     .next_back()
                     .map(|(i, _)| i)
                     .unwrap_or(0);
@@ -574,7 +600,7 @@ pub(super) async fn handle_chat_key(app: &mut App, key: KeyEvent) -> Option<Chat
         KeyCode::Left => {
             if app.cursor > 0 {
                 app.cursor = app.input[..app.cursor]
-                    .char_indices()
+                    .grapheme_indices(true)
                     .next_back()
                     .map(|(i, _)| i)
                     .unwrap_or(0);
@@ -583,7 +609,7 @@ pub(super) async fn handle_chat_key(app: &mut App, key: KeyEvent) -> Option<Chat
         KeyCode::Right => {
             if app.cursor < app.input.len() {
                 app.cursor = app.input[app.cursor..]
-                    .char_indices()
+                    .grapheme_indices(true)
                     .nth(1)
                     .map(|(i, _)| app.cursor + i)
                     .unwrap_or(app.input.len());

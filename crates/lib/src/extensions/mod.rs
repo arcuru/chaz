@@ -22,10 +22,9 @@ use crate::backends::BackendManager;
 use crate::embedding::Embedder;
 use crate::hosted_index::HostedIndex;
 use crate::security::SecurityContext;
-use crate::server::Server;
 use crate::session::SessionRegistry;
 use crate::tools::SearchBackend;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 /// Shared deps that several built-in extensions need at construction time.
 /// Bundled into a struct so the `register_builtins` signature stays stable
@@ -41,7 +40,7 @@ pub struct BuiltinDeps {
     pub session_registry: Arc<SessionRegistry>,
     pub embedder: Option<Arc<dyn Embedder>>,
     pub web_search_backends: Vec<SearchBackend>,
-    pub spawn_server_cell: Arc<OnceLock<Arc<Server>>>,
+    pub server_slot: crate::instance::ServerSlot,
     pub backend_manager: BackendManager,
     pub security: SecurityContext,
 }
@@ -49,11 +48,11 @@ pub struct BuiltinDeps {
 /// Build the full built-in extension set as a vector. Consumed by
 /// `ExtensionHub::install_all` (cap-based install path).
 pub fn all_builtins(deps: BuiltinDeps) -> Vec<Arc<dyn crate::extension::Extension>> {
-    let spawn_cell = deps.spawn_server_cell;
+    let server_slot = deps.server_slot;
     let session_registry = deps.session_registry;
     vec![
         Arc::new(core::CoreExtension::new(
-            spawn_cell.clone(),
+            server_slot.clone(),
             deps.backend_manager,
             deps.security,
         )),
@@ -74,6 +73,6 @@ pub fn all_builtins(deps: BuiltinDeps) -> Vec<Arc<dyn crate::extension::Extensio
             deps.agent_index.clone(),
             deps.skill_bank_index.clone(),
         )),
-        Arc::new(agent_schedule::AgentScheduleExtension::new(spawn_cell)),
+        Arc::new(agent_schedule::AgentScheduleExtension::new(server_slot)),
     ]
 }

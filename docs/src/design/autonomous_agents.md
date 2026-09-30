@@ -21,19 +21,21 @@ in `@beta`; `@beta` answers).
 All invocation flows through the session-messaging primitive (see
 [Session Messaging](./session_messaging.md)). The relevant constraints:
 
-- **Loop guard** (`server.rs`, `process_session`):
+- **Request and mention gate** (`server.rs`, `process_session`):
 
   ```text
-  match latest.entry_type {
-      Message  if sender is NOT a known agent  => spawn agent task
-      Directive                                 => spawn agent task
-      _                                         => ignore
+  queued non-agent Message or Directive => process in request order
+  latest agent Message                   => process only when mention-gated
+  completed or interrupted request       => do not run automatically
   }
   ```
 
-  Any `Message` authored by a known agent — including the agent's own reply
-  and any other agent's — is ignored. This is the hard wall preventing
-  agent↔agent loops, and it is exactly what blocks the chat-room model.
+  Human messages and directives are durable requests, not only the latest
+  entry. An agent-authored message can enter the mention path only when it is
+  the latest entry. Its own reply without a qualifying mention does not wake a
+  turn. Durable attempt state prevents completed or interrupted requests from
+  running again automatically; [Durable turn recovery](../architecture/sessions.md#durable-turn-recovery)
+  describes that lifecycle.
 
 - **Single speaker**: `resolve_agent_for_entry` (`session/agents.rs`)
   returns _one_ agent by precedence: explicit override → first `@mention`
@@ -75,11 +77,12 @@ real.
 ### The seam stays where it is
 
 No fan-out evaluator is needed. The existing `notify → process_session`
-loop already re-fires whenever a new entry is written. When an agent writes
-its reply `Message`, that write re-triggers `process_session` on the latest
-entry. So the only changes are to **(a)** what `process_session` decides to
-act on and **(b)** which agent it resolves — recursion falls out of the
-existing callback chain, naturally serialized by the per-session lock.
+loop re-fires whenever a new entry is written. Durable reconciliation drains
+ordinary queued requests in order. When an agent writes its reply `Message`,
+the latest-entry mention path can select an addressed attached agent. So the
+only changes are to **(a)** the mention condition and **(b)** which agent it
+resolves — recursion falls out of the existing callback chain, naturally
+serialized by the per-session lock.
 
 ```mermaid
 sequenceDiagram

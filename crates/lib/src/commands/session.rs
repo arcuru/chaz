@@ -4,11 +4,9 @@
 //! switch, info, name, share/sync, compact, print, channel listing,
 //! scheduler pointers, and per-session LLM config (model/role/backend).
 
-use crate::backends::{ChatContext, Message, MessageRole};
-use crate::session::{EntryType, Session, SessionEntry, SessionIndex, SessionRegistry};
+use crate::session::{EntryType, Session, SessionIndex, SessionRegistry};
 use crate::types::ConversationId;
-
-use eidetica::store::Table;
+use futures::{StreamExt, stream};
 
 use super::{CommandContext, CommandOutcome, SessionInfo, SessionSwitch};
 
@@ -17,78 +15,53 @@ use super::{CommandContext, CommandOutcome, SessionInfo, SessionSwitch};
 // -----------------------------------------------------------------------------
 
 pub(super) async fn list_sessions(ctx: &CommandContext<'_>) -> CommandOutcome {
-    let indices = match ctx.server.registry().list_sessions().await {
-        Ok(b) => b,
-        Err(e) => return CommandOutcome::Error(format!("Failed to list sessions: {e}")),
-    };
-
-    let registry = ctx.server.registry();
-    let mut sessions = Vec::with_capacity(indices.len());
-    for index in indices {
-        sessions.push(load_single_session_info(registry, index).await);
+    match collect_session_infos(ctx.server.registry()).await {
+        Ok(sessions) => CommandOutcome::SessionsList(sessions),
+        Err(e) => CommandOutcome::Error(format!("Failed to list sessions: {e}")),
     }
+}
+
+/// Build the complete session listing without requiring a current session.
+/// One-shot `/sessions` uses this so a read-only catalog command does not
+/// manufacture and attach a throwaway CLI session first.
+pub async fn collect_session_infos(registry: &SessionRegistry) -> anyhow::Result<Vec<SessionInfo>> {
+    let indices = registry.list_sessions().await?;
+    let mut sessions: Vec<_> = stream::iter(indices)
+        .map(|index| load_session_metadata(registry, index))
+        .buffer_unordered(8)
+        .collect()
+        .await;
 
     sort_session_infos(&mut sessions);
 
-    CommandOutcome::SessionsList(sessions)
+    Ok(sessions)
 }
 
-/// Load the full per-session `SessionInfo` for one catalog index. Opens the
-/// session DB and folds its entries to compute entry_count, last_message,
-/// cost rollup, and reads meta for name/agent. This is the expensive part of
-/// listing — one DB open + entry fold per session.
-///
-/// Factored out of `list_sessions` so a bridge can fill picker rows one at a
-/// time (async fill): the synchronous `list_sessions` is now a thin loop over
-/// this helper, and the TUI walks the catalog off-thread calling it per row.
-/// A failed open yields a zeroed-but-`loaded` row rather than dropping the
-/// session, matching the pre-refactor behavior.
-pub async fn load_single_session_info(
-    registry: &SessionRegistry,
-    index: SessionIndex,
-) -> SessionInfo {
-    let (entry_count, last_message, meta_name, meta_agent, cost_total, cost_reported, calls) =
-        match registry.open_session(&index.session_db_id).await {
-            Ok((conv_id, db)) => {
-                let session = Session::new(conv_id, db).await;
-                let meta = session.read_meta().await;
-                let entries = session.entries();
-                let count = entries.len();
-                let last = crate::session::summarize_last_message(entries);
-                let (cost_total, cost_reported, calls) = crate::session::sum_session_cost(entries);
-                (
-                    count,
-                    last,
-                    meta.name,
-                    meta.agent_name,
-                    cost_total,
-                    cost_reported,
-                    calls,
-                )
-            }
-            Err(_) => (0, None, None, None, 0.0, false, 0),
-        };
+/// Load mutable metadata for one picker row without constructing a `Session`
+/// or reading its transcript. A failed open leaves the catalog row usable.
+pub async fn load_session_metadata(registry: &SessionRegistry, index: SessionIndex) -> SessionInfo {
+    let (agent_name, meta_name) = match registry.open_session(&index.session_db_id).await {
+        Ok((_conv_id, db)) => {
+            let meta = crate::session::read_meta_from_db(&db).await;
+            (meta.agent_name, meta.name)
+        }
+        Err(_) => (None, None),
+    };
     SessionInfo {
         session_db_id: index.session_db_id,
-        agent_name: meta_agent,
-        name: meta_name,
-        entry_count,
-        last_message,
+        agent_name,
+        name: meta_name.or(index.name),
         bridge: index.bridge,
         created_at: index.created_at,
         status: index.status,
-        total_cost_usd: cost_total,
-        cost_reported,
-        llm_call_count: calls,
         loaded: true,
     }
 }
 
 /// Order sessions for display: most-recently created first, with legacy
 /// (`created_at = None`) sessions sorted to the end so fresh sessions are
-/// always near the top. Shared by the synchronous `list_sessions` and the
-/// TUI's async fill so placeholder rows and loaded rows land in the same
-/// stable order (rows patch in place by id, not by position).
+/// always near the top. Rows patch in place by id and never reorder as lazy
+/// metadata arrives.
 pub fn sort_session_infos(sessions: &mut [SessionInfo]) {
     sessions.sort_by(|a, b| match (a.created_at, b.created_at) {
         (Some(x), Some(y)) => y.cmp(&x),
@@ -344,6 +317,54 @@ pub(super) async fn share(ctx: &CommandContext<'_>) -> CommandOutcome {
     ))
 }
 
+pub(super) async fn interrupted(ctx: &CommandContext<'_>) -> CommandOutcome {
+    match ctx.server.interrupted_turns(ctx.session_db_id).await {
+        Ok(turns) if turns.is_empty() => CommandOutcome::Text("No interrupted turns.".into()),
+        Ok(turns) => CommandOutcome::Text(
+            turns
+                .into_iter()
+                .map(|turn| {
+                    format!(
+                        "{}\tattempt {}\tinterrupted; retry explicitly with `/retry {}`",
+                        turn.request_id, turn.attempt_id, turn.request_id
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+        ),
+        Err(error) => {
+            CommandOutcome::Error(format!("Failed to inspect interrupted turns: {error}"))
+        }
+    }
+}
+
+pub(super) async fn retry_interrupted(
+    raw_request_id: &str,
+    ctx: &CommandContext<'_>,
+) -> CommandOutcome {
+    let request_id = crate::session::TurnRequestId::parse(raw_request_id);
+    let interrupted = match ctx.server.interrupted_turns(ctx.session_db_id).await {
+        Ok(turns) => turns,
+        Err(error) => return CommandOutcome::Error(format!("Retry refused: {error}")),
+    };
+    let Some(target) = interrupted
+        .into_iter()
+        .find(|turn| turn.request_id == request_id)
+    else {
+        return CommandOutcome::Error(format!(
+            "Retry refused: turn request {request_id} is not interrupted"
+        ));
+    };
+    submit_command(
+        crate::session::SessionCommand::Retry {
+            target_request_id: request_id,
+            expected_interrupted_attempt_id: target.attempt_id,
+        },
+        ctx,
+    )
+    .await
+}
+
 /// Disable sync on the current session so this peer stops serving it.
 pub(super) async fn unshare(ctx: &CommandContext<'_>) -> CommandOutcome {
     let db_id = ctx.session_db.root_id().clone();
@@ -391,88 +412,74 @@ pub(super) async fn sync_ticket(ticket_str: &str, ctx: &CommandContext<'_>) -> C
 }
 
 pub(super) async fn compact(ctx: &CommandContext<'_>) -> CommandOutcome {
+    let source_snapshot = match ctx.session_db.snapshot().await {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            return CommandOutcome::Error(format!("Failed to snapshot session: {error}"));
+        }
+    };
+    submit_command(
+        crate::session::SessionCommand::Compact { source_snapshot },
+        ctx,
+    )
+    .await
+}
+
+async fn submit_command(
+    command: crate::session::SessionCommand,
+    ctx: &CommandContext<'_>,
+) -> CommandOutcome {
+    let command_id = crate::session::TurnRequestId::parse(uuid::Uuid::new_v4().to_string());
+    let request = crate::session::SessionCommandRequest {
+        command_id: command_id.clone(),
+        sender: ctx.current_agent.to_string(),
+        created_at: chrono::Utc::now(),
+        command,
+    };
+    let observer = match ctx.server.observe_session_command(ctx.session_db_id).await {
+        Ok(observer) => observer,
+        Err(error) => {
+            return CommandOutcome::Error(format!(
+                "Command {command_id} was not submitted: {error}"
+            ));
+        }
+    };
     let session = Session::new(
         ConversationId(ctx.session_db_id.to_string()),
         ctx.session_db.clone(),
     )
     .await;
-    let entries: Vec<&SessionEntry> = session
-        .entries()
-        .iter()
-        .filter(|e| {
-            matches!(
-                e.entry_type,
-                EntryType::Message | EntryType::Directive | EntryType::Summary
-            )
-        })
-        .collect();
-    if entries.len() < 3 {
-        return CommandOutcome::Error(
-            "Not enough messages to compact (need at least 3)".to_string(),
-        );
+    if let Err(error) = session.submit_command(request).await {
+        return CommandOutcome::Error(format!("Command {command_id} was not submitted: {error}"));
     }
-
-    let mut transcript = String::new();
-    for entry in &entries {
-        let role_label = if entry.sender == ctx.current_agent {
-            "assistant"
-        } else {
-            &entry.sender
-        };
-        let type_label = match entry.entry_type {
-            EntryType::Summary => " [previous summary]",
-            EntryType::Directive => " [directive]",
-            _ => "",
-        };
-        transcript.push_str(&format!("{role_label}{type_label}: {}\n\n", entry.content));
+    let waited = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        observer.wait(&command_id),
+    )
+    .await;
+    match waited {
+        Ok(Ok(result)) => match result.outcome {
+            crate::session::SessionCommandOutcome::Compact { summary } => {
+                CommandOutcome::Text(format!(
+                    "Session compacted by command {command_id}. Summary ({} chars) persisted.",
+                    summary.len()
+                ))
+            }
+            crate::session::SessionCommandOutcome::RetryAccepted { target_attempt_id } => {
+                CommandOutcome::Text(format!(
+                    "Retry command {command_id} accepted as attempt {target_attempt_id}."
+                ))
+            }
+            crate::session::SessionCommandOutcome::Rejected { message }
+            | crate::session::SessionCommandOutcome::Failed { message } => {
+                CommandOutcome::Error(format!("Command {command_id} failed: {message}"))
+            }
+        },
+        Ok(Err(error)) => CommandOutcome::Error(format!("Command {command_id}: {error}")),
+        Err(_) => CommandOutcome::Error(format!(
+            "Command {command_id} remains durable but did not finish within 30 seconds"
+        )),
     }
-
-    let system_prompt = "You are a conversation summarizer. Produce a thorough, structured summary of the conversation below. Include: key topics discussed, decisions made, tasks completed or in progress, important facts and state, and any open questions. The summary replaces older messages in the context window, so it must be complete enough for the assistant to continue working without the original messages.".to_string();
-
-    let chat_ctx = ChatContext {
-        messages: vec![
-            Message::new(MessageRole::System, system_prompt),
-            Message::new(
-                MessageRole::User,
-                format!(
-                    "Summarize this conversation:\n\n{transcript}\n\n\
-                     Produce a structured summary that captures everything needed to continue the conversation."
-                ),
-            ),
-        ],
-        model: None,
-        system_prompt: None,
-    };
-
-    let summary = match ctx.backend.execute(&chat_ctx).await {
-        Ok(s) => s,
-        Err(e) => return CommandOutcome::Error(format!("LLM summarization failed: {e}")),
-    };
-
-    let entry = SessionEntry {
-        sender: "system".to_string(),
-        content: summary.clone(),
-        timestamp: chrono::Utc::now(),
-        entry_type: EntryType::Summary,
-        metadata: None,
-        routing: None,
-    };
-
-    let write = async {
-        let txn = ctx.session_db.new_transaction().await?;
-        let store = txn.get_store::<Table<SessionEntry>>("entries").await?;
-        store.insert(entry).await?;
-        txn.commit().await?;
-        Ok::<_, anyhow::Error>(())
-    };
-    if let Err(e) = write.await {
-        return CommandOutcome::Error(format!("Failed to write summary: {e}"));
-    }
-
-    CommandOutcome::Text(format!(
-        "Session compacted. Summary ({} chars) written.",
-        summary.len()
-    ))
 }
 
 pub(super) async fn print_transcript(ctx: &CommandContext<'_>) -> CommandOutcome {
@@ -768,4 +775,81 @@ pub(super) async fn list_backends(ctx: &CommandContext<'_>) -> CommandOutcome {
         ctx.backend.list_known_models().join("\n")
     );
     CommandOutcome::Text(msg)
+}
+
+#[cfg(test)]
+mod listing_tests {
+    use super::*;
+    use crate::session::{EntryType, Session, SessionEntry};
+    use crate::test_support::fresh_session_registry;
+
+    #[tokio::test]
+    async fn listing_is_metadata_only_regardless_of_transcript_size() {
+        let (instance, registry) = fresh_session_registry().await;
+        let (conv, db) = registry.create_session(Some("cli")).await.unwrap();
+        let id = db.root_id().to_string();
+        registry
+            .set_session_name(&id, "large-session".into())
+            .await
+            .unwrap();
+
+        let mut session = Session::new(conv, db).await;
+        for n in 0..128 {
+            session
+                .add_entry(SessionEntry {
+                    sender: "user".into(),
+                    content: format!("transcript payload {n}"),
+                    timestamp: chrono::Utc::now(),
+                    entry_type: EntryType::Message,
+                    metadata: None,
+                    routing: None,
+                })
+                .await
+                .unwrap();
+        }
+
+        let engine = instance.backend().local_engine().unwrap();
+        let memory = engine
+            .as_any()
+            .downcast_ref::<eidetica::backend::database::InMemory>()
+            .unwrap();
+        let root = eidetica::entry::ID::parse(&id).unwrap();
+        instance
+            .backend()
+            .clear_derived_store_state()
+            .await
+            .unwrap();
+        assert_eq!(memory.store_state_record_count(&root, "entries"), 0);
+
+        let mut stale_index = registry
+            .list_sessions()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|row| row.session_db_id == id)
+            .unwrap();
+        stale_index.name = Some("stale-alias".into());
+        let canonical = load_session_metadata(&registry, stale_index).await;
+        assert_eq!(canonical.name.as_deref(), Some("large-session"));
+        assert_eq!(memory.store_state_record_count(&root, "entries"), 0);
+
+        let rows = collect_session_infos(&registry).await.unwrap();
+
+        let row = rows.iter().find(|row| row.session_db_id == id).unwrap();
+        assert_eq!(row.name.as_deref(), Some("large-session"));
+        assert_eq!(
+            memory.store_state_record_count(&root, "entries"),
+            0,
+            "listing must not materialize transcript rows"
+        );
+
+        let (_conv, db) = registry.open_session(&id).await.unwrap();
+        let loaded = Session::new(crate::types::ConversationId(id), db).await;
+        assert_eq!(loaded.entries().len(), 128);
+        assert_eq!(
+            memory.store_state_record_count(loaded.database().root_id(), "entries"),
+            128,
+            "negative control: constructing Session materializes transcript rows"
+        );
+    }
 }

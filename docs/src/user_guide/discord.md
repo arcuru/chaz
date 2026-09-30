@@ -42,6 +42,11 @@ Discord-specific configuration and behavior.
 
    # chaz runtime keys the embedded server needs:
    state_dir: /var/lib/chaz-discord
+   execution: client
+   eidetica:
+     connection: "sqlite:///var/lib/chaz-discord/eidetica.db"
+     login: { username: chaz-discord, passwordless: true }
+     sync: { iroh: true }
    backends:
      - name: openai
        api_key: ${OPENAI_API_KEY}

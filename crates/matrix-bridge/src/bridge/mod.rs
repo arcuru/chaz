@@ -2,6 +2,10 @@ mod client;
 mod commands;
 mod history;
 
+use chaz_core::bridge::delivery::{DeliveryBinding, DeliveryReconciler, DeliveryStore};
+use chaz_core::bridge::outbound::{
+    chunk_message_bytes, is_transient_outbound_status, retry_outbound_chunk,
+};
 use chaz_core::bridge::{ApprovalDecision, Bridge};
 use chaz_core::commands::{
     self as shared_commands, Command, CommandContext, CommandOutcome, Parsed,
@@ -14,11 +18,17 @@ use chaz_core::session::{Session, bind_transport, transport_bindings, unbind_tra
 
 use crate::credentials::MatrixCredentials;
 
-use matrix_sdk::ruma::OwnedEventId;
+use matrix_sdk::ruma::api::client::state::get_state_events::v3::Request as RoomStateRequest;
+use matrix_sdk::ruma::api::client::typing::create_typing_event::v3::{
+    Request as TypingRequest, Typing, TypingInfo,
+};
 use matrix_sdk::ruma::events::reaction::OriginalSyncReactionEvent;
+use matrix_sdk::ruma::events::room::member::MembershipState;
+use matrix_sdk::ruma::events::room::member::OriginalSyncRoomMemberEvent;
 use matrix_sdk::ruma::events::room::message::{
     MessageType, OriginalSyncRoomMessageEvent, RoomMessageEventContent,
 };
+use matrix_sdk::ruma::{OwnedEventId, OwnedTransactionId};
 use matrix_sdk::{Room, RoomState};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -26,7 +36,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::{Mutex, Notify};
 use tracing::{error, info};
 
-use client::{Login, MatrixClient, is_allowed};
+use client::is_allowed;
+pub(crate) use client::{Login, MatrixClient};
 use commands::{get_backend, rate_limit};
 use history::read_room_history;
 
@@ -99,39 +110,284 @@ fn owning_agent_entry(server: &Server, owning_agent: &str) -> Option<DbEntry> {
     server.agent_index().find_by_name(owning_agent)
 }
 
-/// Install the reconciling response callback for a Matrix room.
+struct BackfilledRoom {
+    join_id: String,
+    prejoin_ids: HashSet<String>,
+}
+
+/// Bootstrap a joined room before any live event is written. The per-room lock
+/// serializes join handling with concurrent inbound sync events. Retry after a
+/// failed fetch; never mark a partial import complete.
+async fn backfill_joined_room(
+    room: &Room,
+    server: &Server,
+    login_id: &str,
+    owning_agent: &str,
+    backfilled: &Mutex<HashMap<String, BackfilledRoom>>,
+) -> anyhow::Result<()> {
+    if room.state() != RoomState::Joined {
+        return Ok(());
+    }
+    let room_id = room.room_id().to_string();
+    let mut done = backfilled.lock().await;
+    let agent = owning_agent_entry(server, owning_agent)
+        .ok_or_else(|| anyhow::anyhow!("owning agent {owning_agent} not hosted"))?;
+    let client = room.client();
+    let user_id = client
+        .user_id()
+        .ok_or_else(|| anyhow::anyhow!("not logged in"))?;
+    // The SDK's local state cache can lack our own member event after a
+    // restored login. Read current state from the homeserver instead.
+    let state = client
+        .send(RoomStateRequest::new(room.room_id().to_owned()))
+        .await?;
+    let join_id = state
+        .room_state
+        .iter()
+        .find(|raw| {
+            raw.get_field::<String>("state_key")
+                .ok()
+                .flatten()
+                .as_deref()
+                == Some(user_id.as_str())
+                && raw.get_field::<String>("type").ok().flatten().as_deref()
+                    == Some("m.room.member")
+        })
+        .ok_or_else(|| anyhow::anyhow!("own membership state missing"))?;
+    anyhow::ensure!(
+        join_id
+            .get_field::<serde_json::Value>("content")?
+            .and_then(|content| content.get("membership")?.as_str().map(str::to_owned))
+            .as_deref()
+            == Some("join"),
+        "own membership state is not a joined event"
+    );
+    let join_id = join_id
+        .get_field::<String>("event_id")?
+        .ok_or_else(|| anyhow::anyhow!("join event has no ID"))?;
+    if done
+        .get(&room_id)
+        .is_some_and(|value| value.join_id == join_id)
+    {
+        return Ok(());
+    }
+    // The session is published with no newly imported entries. A transaction
+    // below makes the history, consumed baseline and join checkpoint visible
+    // together, even if this is a rejoin after a previous run.
+    let (conv, db) = server
+        .registry()
+        .get_or_create_channel_session(&agent, login_id, "matrix", login_id, &room_id)
+        .await?;
+    let mut session = Session::new(conv, db).await;
+    let previous = session.last_backfilled_join(&room_id).await?;
+    // Reconstruct the cutoff even after restart: the checkpoint alone cannot
+    // distinguish a delayed pre-join command or a message before !chaz clear.
+    let already_imported = previous.as_deref() == Some(join_id.as_str());
+    let (history, prejoin_ids) = read_room_history(
+        room,
+        &join_id,
+        if already_imported {
+            None
+        } else {
+            previous.as_deref()
+        },
+        user_id.as_str(),
+        login_id,
+    )
+    .await?;
+    if !already_imported {
+        session.backfill(history, (&room_id, &join_id)).await?;
+    }
+    done.insert(
+        room_id,
+        BackfilledRoom {
+            join_id,
+            prejoin_ids,
+        },
+    );
+    Ok(())
+}
+
+/// Channels this login has outbound delivery installed for, keyed by
+/// `(room_id, session_db_id)` — the binding delivery progress is persisted
+/// under. A session bound to several rooms gets one reconciler per room, each
+/// with its own progress.
+type AttachedChannels = Arc<Mutex<HashMap<(String, String), Arc<DeliveryReconciler>>>>;
+
+/// Install durable outbound delivery and the approval watcher for a Matrix
+/// room.
 ///
-/// Thin transport adapter over [`chaz_core::bridge::attach_reconciler`]: the
-/// reconcile rule (delta scan, delivered-set, `[guest]` prefixing) lives in
-/// the lib; this only supplies the Matrix `send` closure — render markdown and
-/// hand it to `room.send`. This is the bridge's whole outbound path: the
-/// daemon writes the agent's reply into the (synced) session DB, the callback
-/// fires here, and the reply lands in the room.
+/// Thin transport adapter over [`chaz_core::bridge::delivery`]: the
+/// reconcile rule, persisted progress, retry schedule, and `[guest]`
+/// prefixing live in the lib; this only supplies the Matrix `send` closure —
+/// render markdown and hand it to `room.send` under the chunk's stable
+/// transaction ID, which lets the homeserver collapse a chunk repeated after
+/// a lost acknowledgement. This is the bridge's whole outbound path: the
+/// executor writes the agent's reply into the session DB, the callback fires
+/// here, and the reply lands in the room.
 async fn attach_response_callback(
     session_db: &eidetica::Database,
     room: Room,
-    agents: Arc<chaz_core::agent::AgentRegistry>,
+    server: &Server,
+    login_id: &str,
     owning_agent: String,
     pending: PendingApprovals,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Arc<DeliveryReconciler>> {
+    attach_typing_watcher(session_db, room.clone()).await?;
     // Same session DB, two watchers: deliver agent replies, and surface tool
     // approval prompts the daemon proxied here.
     attach_approval_watcher(session_db, room.clone(), pending).await?;
-    chaz_core::bridge::attach_reconciler(session_db, agents, owning_agent, move |body| {
-        let room = room.clone();
-        async move {
-            info!(
-                room_id = %room.room_id(),
-                body_bytes = body.len(),
-                "Delivering Matrix response"
-            );
-            let content = RoomMessageEventContent::text_markdown(&body);
-            room.send(content).await?;
-            Ok(())
-        }
-    })
+    let binding = DeliveryBinding::new(
+        "matrix",
+        login_id,
+        room.room_id().as_str(),
+        session_db.root_id().to_string(),
+    );
+    DeliveryReconciler::attach(
+        session_db.clone(),
+        DeliveryStore::new(server.registry().chaz_peer().clone()),
+        binding,
+        server.agents_arc(),
+        owning_agent,
+        |body| chunk_message_bytes(body, MATRIX_MESSAGE_LIMIT),
+        move |chunk| {
+            let room = room.clone();
+            Box::pin(async move {
+                info!(
+                    room_id = %room.room_id(),
+                    body_bytes = chunk.body.len(),
+                    "Delivering Matrix response"
+                );
+                let content = RoomMessageEventContent::text_markdown(&chunk.body);
+                // Stable across in-call retries, durable retries, and
+                // restarts, so the homeserver deduplicates every repeat of
+                // this chunk it still remembers.
+                let txn_id = OwnedTransactionId::from(chunk.idempotency_key);
+                retry_outbound_chunk(
+                    || {
+                        let room = room.clone();
+                        let content = content.clone();
+                        let txn_id = txn_id.clone();
+                        async move {
+                            room.send(content)
+                                .with_transaction_id(txn_id)
+                                .await
+                                .map(|_| ())
+                        }
+                    },
+                    is_transient_matrix_send_error,
+                )
+                .await?;
+                Ok(())
+            })
+        },
+    )
     .await
 }
+
+// Give the server ample time beyond the renewal interval; the SDK typing_notice
+// helper uses a four-second timeout and suppresses sends within three seconds.
+const TYPING_LEASE: std::time::Duration = std::time::Duration::from_secs(10);
+const TYPING_RENEWAL: std::time::Duration = std::time::Duration::from_secs(3);
+
+fn turn_typing(active: bool) -> Typing {
+    if active {
+        Typing::Yes(TypingInfo::new(TYPING_LEASE))
+    } else {
+        Typing::No
+    }
+}
+
+async fn send_turn_typing(room: &Room, active: bool) -> matrix_sdk::Result<()> {
+    room.client()
+        .send(TypingRequest::new(
+            room.own_user_id().to_owned(),
+            room.room_id().to_owned(),
+            turn_typing(active),
+        ))
+        .await
+        .map(|_| ())
+        .map_err(Into::into)
+}
+
+/// Observe the executor's per-turn claim through session sync. Timer reads
+/// both renew Matrix's short typing timeout and expire orphaned starts if a
+/// remote executor dies without a final write.
+async fn update_typing<E, F, Fut>(typing: &mut bool, active: bool, send: F) -> Result<(), E>
+where
+    F: FnOnce(bool) -> Fut,
+    Fut: std::future::Future<Output = Result<(), E>>,
+{
+    // True is renewed on every timer pass; false is sent once on release.
+    if active || *typing {
+        send(active).await?;
+        *typing = active;
+    }
+    Ok(())
+}
+
+async fn attach_typing_watcher(session_db: &eidetica::Database, room: Room) -> anyhow::Result<()> {
+    let db = session_db.clone();
+    let changed = Arc::new(Notify::new());
+    let wake = changed.clone();
+    session_db
+        .on_write(move |_, _| {
+            let wake = wake.clone();
+            Box::pin(async move {
+                wake.notify_one();
+                Ok(())
+            })
+        })
+        .await?
+        .detach();
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(TYPING_RENEWAL);
+        let mut typing = false;
+        loop {
+            tokio::select! {
+                _ = tick.tick() => {},
+                _ = changed.notified() => {},
+            }
+            if room.state() != RoomState::Joined {
+                break;
+            }
+            let active = match Session::active_turn_attempts(&db).await {
+                Ok(attempts) => !attempts.is_empty(),
+                Err(error) => {
+                    error!(%error, "Could not read Matrix turn activity");
+                    continue;
+                }
+            };
+            if let Err(error) =
+                update_typing(&mut typing, active, |state| send_turn_typing(&room, state)).await
+            {
+                error!(%error, "Could not update Matrix typing notice");
+            }
+        }
+        if typing {
+            let _ = send_turn_typing(&room, false).await;
+        }
+    });
+    Ok(())
+}
+
+fn is_transient_matrix_send_error(error: &matrix_sdk::Error) -> bool {
+    match error {
+        matrix_sdk::Error::Http(http) => match http.as_ref() {
+            matrix_sdk::HttpError::Reqwest(error) => error.is_connect(),
+            matrix_sdk::HttpError::Api(_) => http
+                .as_client_api_error()
+                .is_some_and(|error| is_transient_outbound_status(error.status_code.as_u16())),
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+/// Matrix homeservers limit event content, so outbound reply bodies must be
+/// delivered as separate events. Markdown carries both plain and formatted
+/// bodies; this byte ceiling leaves room for both fields and the event envelope.
+const MATRIX_MESSAGE_LIMIT: usize = 8_000;
 
 /// Dispatch a shared command in the context of a Matrix room.
 async fn dispatch_in_room(
@@ -190,13 +446,7 @@ async fn render_outcome_to_room(room: &Room, outcome: CommandOutcome) {
                         .as_deref()
                         .map(|n| format!(" \"{n}\""))
                         .unwrap_or_default();
-                    s.push_str(&format!(
-                        "\n  {}{} ({}, {} entries)",
-                        info.session_db_id, name, agent, info.entry_count
-                    ));
-                    if let Some(preview) = &info.last_message {
-                        s.push_str(&format!("\n    {preview}"));
-                    }
+                    s.push_str(&format!("\n  {}{} ({})", info.session_db_id, name, agent));
                 }
                 s
             }
@@ -236,7 +486,7 @@ fn help_text() -> String {
 
 /// `!chaz attach <session>` — bind this room to a specific session and install
 /// the response callback so future writes reach the room. Bridge-local because
-/// it touches the live `attached_sessions` set and matrix `Room`.
+/// it touches the live attached-channel map and matrix `Room`.
 #[allow(clippy::too_many_arguments)]
 async fn handle_attach(
     arg: &str,
@@ -244,7 +494,7 @@ async fn handle_attach(
     server: Arc<Server>,
     login_id: &str,
     owning_agent: &str,
-    attached_sessions: Arc<Mutex<HashSet<String>>>,
+    attached_channels: AttachedChannels,
     pending: PendingApprovals,
 ) {
     let arg = arg.trim();
@@ -294,22 +544,20 @@ async fn handle_attach(
         }
     }
 
-    // Install the response callback on the newly-attached session so future
+    // Install outbound delivery on the newly-attached session so future
     // writes (the daemon's replies, scheduler fires) reach this room.
-    let mut attached = attached_sessions.lock().await;
-    if attached.insert(target_sid.clone()) {
-        drop(attached);
-        if let Err(e) = attach_response_callback(
-            &target_db,
-            room.clone(),
-            server.agents_arc(),
-            owning_agent.to_string(),
-            pending.clone(),
-        )
-        .await
-        {
-            error!("Failed to attach response callback: {e}");
-        }
+    if let Err(e) = attach_once(
+        &attached_channels,
+        &target_db,
+        room.clone(),
+        &server,
+        login_id,
+        owning_agent,
+        pending.clone(),
+    )
+    .await
+    {
+        error!("Failed to attach response callback: {e}");
     }
 
     let _ = room
@@ -402,12 +650,56 @@ impl Bridge for MatrixBridge {
         // installed, so room history is not replayed through them on startup.
         mc.initial_sync().await;
 
+        let backfilled_rooms: Arc<Mutex<HashMap<String, BackfilledRoom>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        for room in mc.client().joined_rooms() {
+            if let Err(e) =
+                backfill_joined_room(&room, &server, &login_id, &owning_agent, &backfilled_rooms)
+                    .await
+            {
+                error!(room_id = %room.room_id(), "Join history backfill failed: {e}");
+            }
+        }
+
+        // Subsequent joins (including invite auto-joins) bootstrap at join,
+        // not when the room first addresses the agent.
+        {
+            let server = server.clone();
+            let login_id = login_id.clone();
+            let owning_agent = owning_agent.clone();
+            let backfilled_rooms = backfilled_rooms.clone();
+            mc.client()
+                .add_event_handler(move |event: OriginalSyncRoomMemberEvent, room: Room| {
+                    let server = server.clone();
+                    let login_id = login_id.clone();
+                    let owning_agent = owning_agent.clone();
+                    let backfilled_rooms = backfilled_rooms.clone();
+                    async move {
+                        if room.client().user_id() != Some(event.state_key.as_ref())
+                            || event.content.membership != MembershipState::Join
+                        {
+                            return;
+                        }
+                        if let Err(e) = backfill_joined_room(
+                            &room,
+                            &server,
+                            &login_id,
+                            &owning_agent,
+                            &backfilled_rooms,
+                        )
+                        .await
+                        {
+                            error!(room_id = %room.room_id(), "Join history backfill failed: {e}");
+                        }
+                    }
+                });
+        }
+
         info!("The client is ready! Listening to new messages…");
 
-        // Track which session DBs have the Matrix response callback installed.
-        // Keyed by session_db_id because a single session may be attached to
-        // multiple rooms (fan-out delivery).
-        let attached_sessions: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+        // Rooms with outbound delivery installed, and the reconciler that
+        // owns each one's persisted progress.
+        let attached_channels: AttachedChannels = Arc::new(Mutex::new(HashMap::new()));
 
         // Posted tool-approval prompts awaiting a reaction/command, keyed by the
         // prompt's event id. Shared across the startup attach, the message
@@ -427,7 +719,7 @@ impl Bridge for MatrixBridge {
         {
             let server = server.clone();
             let client = mc.client().clone();
-            let attached_sessions = attached_sessions.clone();
+            let attached_channels = attached_channels.clone();
             let login_id = login_id.clone();
             let owning_agent = owning_agent.clone();
             let pending_approvals = pending_approvals.clone();
@@ -464,7 +756,8 @@ impl Bridge for MatrixBridge {
                         attach_existing_channel(
                             &server,
                             &client,
-                            &attached_sessions,
+                            &attached_channels,
+                            &login_id,
                             &owning_agent,
                             &room_id,
                             &r.session_db_id,
@@ -493,11 +786,9 @@ impl Bridge for MatrixBridge {
             let login_id = login_id.clone();
             let owning_agent = owning_agent.clone();
             let allow_list = allow_list.clone();
-            let attached_sessions = attached_sessions.clone();
+            let attached_channels = attached_channels.clone();
             let message_counts: Arc<Mutex<HashMap<String, u64>>> =
                 Arc::new(Mutex::new(HashMap::new()));
-            let backfilled_rooms: Arc<Mutex<HashSet<String>>> =
-                Arc::new(Mutex::new(HashSet::new()));
             let seen_events: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
             let pending_approvals = pending_approvals.clone();
 
@@ -509,7 +800,7 @@ impl Bridge for MatrixBridge {
                     let login_id = login_id.clone();
                     let owning_agent = owning_agent.clone();
                     let allow_list = allow_list.clone();
-                    let attached_sessions = attached_sessions.clone();
+                    let attached_channels = attached_channels.clone();
                     let message_counts = message_counts.clone();
                     let backfilled_rooms = backfilled_rooms.clone();
                     let seen_events = seen_events.clone();
@@ -521,13 +812,6 @@ impl Bridge for MatrixBridge {
                         let MessageType::Text(text_content) = &event.content.msgtype else {
                             return;
                         };
-                        // Dedupe: the sync loop can redeliver on reconnect.
-                        {
-                            let mut seen = seen_events.lock().await;
-                            if !seen.insert(event.event_id.to_string()) {
-                                return;
-                            }
-                        }
                         let Some(bot_uid) = room.client().user_id().map(|u| u.to_string()) else {
                             return;
                         };
@@ -535,6 +819,28 @@ impl Bridge for MatrixBridge {
                             return;
                         }
 
+                        // Apply the join cutoff before commands or address checks:
+                        // delayed history must not execute an old command either.
+                        let room_id = room.room_id().to_string();
+                        if let Err(e) = backfill_joined_room(
+                            &room, &server, &login_id, &owning_agent, &backfilled_rooms,
+                        ).await {
+                            error!(room_id, "Join history backfill failed: {e}");
+                            return;
+                        }
+                        if backfilled_rooms.lock().await.get(&room_id).is_some_and(
+                            |value| value.prejoin_ids.contains(event.event_id.as_str()),
+                        ) {
+                            return;
+                        }
+                        // Dedupe after successful bootstrap, so a failed fetch
+                        // does not consume the event on a later sync retry.
+                        {
+                            let mut seen = seen_events.lock().await;
+                            if !seen.insert(event.event_id.to_string()) {
+                                return;
+                            }
+                        }
                         let raw = text_content.body.trim_start();
 
                         // Command channel: `!chaz` optionally followed by args.
@@ -615,7 +921,7 @@ impl Bridge for MatrixBridge {
                                         server.clone(),
                                         &login_id,
                                         &owning_agent,
-                                        attached_sessions.clone(),
+                                        attached_channels.clone(),
                                         pending_approvals.clone(),
                                     )
                                     .await;
@@ -694,8 +1000,6 @@ impl Bridge for MatrixBridge {
                             return;
                         }
 
-                        let room_id = room.room_id().to_string();
-
                         // Resolve (or create) the session bound to this room.
                         // On create this binds the room into the session DB,
                         // attaches the owning agent as host (delegating session
@@ -726,45 +1030,20 @@ impl Bridge for MatrixBridge {
                         };
                         let session_db_id = session_db.root_id().to_string();
 
-                        // Install response callback if we haven't already, so
+                        // Install outbound delivery if we haven't already, so
                         // the daemon's reply reaches this room.
+                        if let Err(e) = attach_once(
+                            &attached_channels,
+                            &session_db,
+                            room.clone(),
+                            &server,
+                            &login_id,
+                            &owning_agent,
+                            pending_approvals.clone(),
+                        )
+                        .await
                         {
-                            let mut attached = attached_sessions.lock().await;
-                            if attached.insert(session_db_id.clone()) {
-                                drop(attached);
-                                if let Err(e) = attach_response_callback(
-                                    &session_db,
-                                    room.clone(),
-                                    server.agents_arc(),
-                                    owning_agent.clone(),
-                                    pending_approvals.clone(),
-                                )
-                                .await
-                                {
-                                    error!("Failed to register response callback: {e}");
-                                } else {
-                                    info!(
-                                        session_db_id = %session_db_id,
-                                        room_id = %room_id,
-                                        "Matrix response callback installed"
-                                    );
-                                }
-                            }
-                        }
-
-                        // Backfill room history on first message per room.
-                        {
-                            let mut backfilled = backfilled_rooms.lock().await;
-                            if backfilled.insert(room_id.clone()) {
-                                info!("Backfilling history for room {room_id}");
-                                let history = read_room_history(&room).await;
-                                let mut session = Session::new(
-                                    chaz_core::types::ConversationId(session_db_id.clone()),
-                                    session_db.clone(),
-                                )
-                                .await;
-                                session.backfill(history).await;
-                            }
+                            error!("Failed to register response callback: {e}");
                         }
 
                         // Write the user entry to the session DB. This is the
@@ -776,6 +1055,17 @@ impl Bridge for MatrixBridge {
                             session_db,
                         )
                         .await;
+                        // A sync after rejoining can deliver pre-join timeline
+                        // events as if they were live. Backfilled event IDs are
+                        // context-only, never another inbound request.
+                        if session.entries().iter().any(|entry| {
+                            entry.routing.as_ref()
+                                .and_then(|routing| routing.source.as_ref())
+                                .and_then(|source| source.message_id.as_deref())
+                                == Some(event.event_id.as_str())
+                        }) {
+                            return;
+                        }
                         // Stamp transport provenance so an agent's reply can
                         // be routed back to this room on this login.
                         if let Err(e) = session
@@ -853,16 +1143,54 @@ impl Bridge for MatrixBridge {
     }
 }
 
-/// Install the response-delivery callback for a persisted channel at startup.
-/// Skips rooms the bot isn't joined to, or sessions that fail to open. The
-/// bridge does not register the session for processing — the daemon does that
-/// when it sees the session exposed in the agent registry — so this only wires
-/// up outbound delivery.
+/// Install outbound delivery for `(room, session)` exactly once per process.
+/// A second call for the same binding is a no-op; the persisted progress is
+/// what makes a repeat install after a restart resume rather than replay.
+#[allow(clippy::too_many_arguments)]
+async fn attach_once(
+    attached: &AttachedChannels,
+    session_db: &eidetica::Database,
+    room: Room,
+    server: &Arc<Server>,
+    login_id: &str,
+    owning_agent: &str,
+    pending: PendingApprovals,
+) -> anyhow::Result<()> {
+    let key = (room.room_id().to_string(), session_db.root_id().to_string());
+    let mut attached = attached.lock().await;
+    if attached.contains_key(&key) {
+        return Ok(());
+    }
+    let reconciler = attach_response_callback(
+        session_db,
+        room,
+        server,
+        login_id,
+        owning_agent.to_string(),
+        pending,
+    )
+    .await?;
+    info!(
+        session_db_id = %key.1,
+        room_id = %key.0,
+        "Matrix outbound delivery installed"
+    );
+    attached.insert(key, reconciler);
+    Ok(())
+}
+
+/// Install outbound delivery for a persisted channel at startup. Skips rooms
+/// the bot isn't joined to, or sessions that fail to open. The bridge does not
+/// register the session for processing — the executor does that when it sees
+/// the session exposed in the agent registry — so this only wires up outbound
+/// delivery, and the first pass delivers whatever was committed while this
+/// bridge was down.
 #[allow(clippy::too_many_arguments)]
 async fn attach_existing_channel(
     server: &Arc<Server>,
     client: &matrix_sdk::Client,
-    attached_sessions: &Arc<Mutex<HashSet<String>>>,
+    attached: &AttachedChannels,
+    login_id: &str,
     owning_agent: &str,
     room_id: &str,
     session_db_id: &str,
@@ -881,28 +1209,18 @@ async fn attach_existing_channel(
         return;
     };
 
-    {
-        let mut attached = attached_sessions.lock().await;
-        if !attached.insert(session_db_id.to_string()) {
-            return;
-        }
-    }
-
-    if let Err(e) = attach_response_callback(
+    if let Err(e) = attach_once(
+        attached,
         &session_db,
         room,
-        server.agents_arc(),
-        owning_agent.to_string(),
+        server,
+        login_id,
+        owning_agent,
         pending,
     )
     .await
     {
         error!("Failed to attach response callback at startup: {e}");
-    } else {
-        info!(
-            session_db_id,
-            room_id, "Matrix channel response callback installed at startup"
-        );
     }
 }
 
@@ -1177,4 +1495,218 @@ async fn resolve_pending_approval(
     let _ = room
         .send(RoomMessageEventContent::notice_plain(label))
         .await;
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn matrix_typing_wire_lease_exceeds_renewal() {
+        assert!(super::TYPING_LEASE > super::TYPING_RENEWAL * 2);
+        assert_eq!(
+            serde_json::to_value(super::turn_typing(true)).unwrap(),
+            serde_json::json!({"typing": true, "timeout": 10000})
+        );
+        assert_eq!(
+            serde_json::to_value(super::turn_typing(false)).unwrap(),
+            serde_json::json!({"typing": false})
+        );
+    }
+
+    #[tokio::test]
+    async fn matrix_typing_renews_and_cancels_when_claim_released() {
+        use chaz_core::session::{Session, TurnRequestId};
+        use chaz_core::types::ConversationId;
+        use eidetica::backend::database::InMemory;
+        use eidetica::{Instance, NewUser};
+
+        let (_instance, mut user) = Instance::create_backend(
+            Box::new(InMemory::new()),
+            NewUser::passwordless("typing-test"),
+        )
+        .await
+        .unwrap();
+        let key = user.get_default_key().unwrap();
+        let db = user
+            .create_database(eidetica::crdt::Doc::new(), &key)
+            .await
+            .unwrap();
+        let mut session = Session::new(ConversationId(db.root_id().to_string()), db).await;
+        let mut sent = Vec::new();
+        let mut typing = false;
+        let attempt = session
+            .start_turn_attempt(TurnRequestId::parse("message"))
+            .await
+            .unwrap();
+        for _ in 0..2 {
+            let active = !Session::active_turn_attempts(session.database())
+                .await
+                .unwrap()
+                .is_empty();
+            super::update_typing(&mut typing, active, |state| {
+                sent.push(state);
+                async { Ok::<(), ()>(()) }
+            })
+            .await
+            .unwrap();
+        }
+        session.complete_turn_attempt(&attempt, None).await.unwrap();
+        let active = !Session::active_turn_attempts(session.database())
+            .await
+            .unwrap()
+            .is_empty();
+        super::update_typing(&mut typing, active, |state| {
+            sent.push(state);
+            async { Ok::<(), ()>(()) }
+        })
+        .await
+        .unwrap();
+        assert_eq!(sent, [true, true, false]);
+        assert!(!typing);
+        let result = super::update_typing(&mut typing, true, |_| async { Err::<(), _>(()) }).await;
+        assert!(result.is_err());
+        assert!(
+            !typing,
+            "a failed Matrix request must be retried on the next tick"
+        );
+    }
+    use super::{MATRIX_MESSAGE_LIMIT, is_transient_matrix_send_error};
+    use chaz_core::bridge::outbound::chunk_message_bytes as chunk_message;
+    use matrix_sdk::{Error as MatrixSdkError, HttpError};
+    use ruma::api::{
+        client::uiaa::UiaaResponse,
+        error::{
+            Error as RumaApiError, ErrorBody, ErrorKind, FromHttpResponseError, StandardErrorBody,
+        },
+    };
+    use ruma::events::room::message::{MessageFormat, MessageType, RoomMessageEventContent};
+
+    /// Build a `matrix_sdk::Error` shaped exactly as the SDK surfaces a
+    /// homeserver error response: `Http(Api(Server(MatrixError)))` carrying the
+    /// given status. Built from real ruma types so an SDK upgrade that reshapes
+    /// these enums breaks this suite instead of silently un-pinning the retry
+    /// classification.
+    fn matrix_api_error(status: reqwest::StatusCode) -> MatrixSdkError {
+        let ruma_error = RumaApiError::new(
+            status,
+            ErrorBody::Standard(StandardErrorBody::new(
+                ErrorKind::Unknown,
+                "synthesized homeserver error".to_owned(),
+            )),
+        );
+        MatrixSdkError::Http(Box::new(HttpError::Api(Box::new(
+            FromHttpResponseError::Server(UiaaResponse::MatrixError(ruma_error)),
+        ))))
+    }
+
+    #[test]
+    fn matrix_chunks_are_transport_sized_and_lossless() {
+        let body = "🦀".repeat(MATRIX_MESSAGE_LIMIT / 4 + 1);
+        let chunks = chunk_message(&body, MATRIX_MESSAGE_LIMIT);
+        assert_eq!(chunks.len(), 2);
+        assert!(
+            chunks
+                .iter()
+                .all(|chunk| chunk.len() <= MATRIX_MESSAGE_LIMIT)
+        );
+        assert_eq!(chunks.concat(), body);
+    }
+
+    #[test]
+    fn markdown_spans_crossing_chunks_render_independently() {
+        let body = format!(
+            "```rust\n{}\n```",
+            "x".repeat(MATRIX_MESSAGE_LIMIT - "```rust\n".len())
+        );
+        let chunks = chunk_message(&body, MATRIX_MESSAGE_LIMIT);
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks.concat(), body);
+
+        // Matrix receives separate events, so its Markdown parser sees an
+        // unclosed fence in the first event and its close in the second.
+        let rendered: Vec<_> = chunks
+            .iter()
+            .map(RoomMessageEventContent::text_markdown)
+            .collect();
+        match &rendered[0].msgtype {
+            MessageType::Text(text) => {
+                assert_eq!(text.body, chunks[0]);
+                let formatted = text
+                    .formatted
+                    .as_ref()
+                    .expect("unclosed fence opener renders as HTML");
+                assert_eq!(formatted.format, MessageFormat::Html);
+                assert_eq!(
+                    formatted.body,
+                    "<pre><code class=\"language-rust\"></code></pre>\n"
+                );
+            }
+            _ => panic!("text_markdown must produce a text event"),
+        }
+        match &rendered[1].msgtype {
+            MessageType::Text(text) => {
+                assert_eq!(text.body, chunks[1]);
+                // The stray closing fence does not extend chunk 1's code
+                // block; the x's render as a paragraph and the fence as an
+                // empty code block. Pinned to current ruma output.
+                let formatted = text
+                    .formatted
+                    .as_ref()
+                    .expect("stray closing fence renders as HTML");
+                assert_eq!(formatted.format, MessageFormat::Html);
+                assert_eq!(
+                    formatted.body,
+                    format!(
+                        "<p>{}</p>\n<pre><code></code></pre>\n",
+                        "x".repeat(MATRIX_MESSAGE_LIMIT - "```rust\n".len())
+                    )
+                );
+            }
+            _ => panic!("text_markdown must produce a text event"),
+        }
+    }
+
+    #[test]
+    fn homeserver_overload_statuses_are_transient() {
+        for status in [429, 503, 504] {
+            assert!(
+                is_transient_matrix_send_error(&matrix_api_error(
+                    reqwest::StatusCode::from_u16(status).expect("valid status"),
+                )),
+                "status {status} should be transient"
+            );
+        }
+    }
+
+    #[test]
+    fn permanent_http_statuses_are_not_transient() {
+        for status in [400, 401, 403, 404, 500, 502] {
+            assert!(
+                !is_transient_matrix_send_error(&matrix_api_error(
+                    reqwest::StatusCode::from_u16(status).expect("valid status"),
+                )),
+                "status {status} should be permanent"
+            );
+        }
+    }
+
+    #[test]
+    fn an_error_outside_the_http_layer_is_permanent() {
+        assert!(!is_transient_matrix_send_error(
+            &MatrixSdkError::AuthenticationRequired
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_reqwest_connect_error_is_transient() {
+        // `reqwest::Error` has no public constructor, so the connect arm can
+        // only be pinned with a real failed request; nothing listens on port 1
+        // and the refusal is immediate even inside the Nix sandbox.
+        let client = reqwest::Client::builder()
+            .danger_accept_invalid_certs(true)
+            .build()
+            .expect("test client");
+        let error = client.get("http://127.0.0.1:1/").send().await.unwrap_err();
+        let error = MatrixSdkError::Http(Box::new(HttpError::Reqwest(error)));
+        assert!(is_transient_matrix_send_error(&error));
+    }
 }

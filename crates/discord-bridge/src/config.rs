@@ -66,10 +66,14 @@ pub struct DiscordLoginConfig {
     /// the public `LoginRef` pointer gets registered.
     pub agent: String,
 
-    /// Access ticket for this agent's DB — produced by the chaz daemon's
-    /// `/agent share`. The bridge bootstraps Write access through it and
-    /// registers the login pointer on the agent DB it points at.
-    pub ticket: String,
+    /// Access ticket for this agent's DB — produced by the executor's
+    /// `/agent share`. A direct Eidetica owner requires it: the bridge
+    /// bootstraps Write access through it and registers the login pointer on
+    /// the agent DB it points at. A service client shares the daemon's login
+    /// and already holds the agent DB, so the ticket is owner-only there and
+    /// must be omitted.
+    #[serde(default)]
+    pub ticket: Option<String>,
 
     /// Routing id stamped into every inbound entry's `TransportRef::login_id`
     /// and matched when delivering replies. Defaults to `"discord"`.
@@ -184,8 +188,8 @@ logins:
         let entry = &cfg.logins[0];
         assert_eq!(entry.agent, "chaz");
         assert_eq!(
-            entry.ticket,
-            "eidetica:?db=sha256:agentdbid&pr=iroh:peeraddr"
+            entry.ticket.as_deref(),
+            Some("eidetica:?db=sha256:agentdbid&pr=iroh:peeraddr")
         );
         assert_eq!(entry.login_id, "discord");
         assert_eq!(entry.allowed_users.len(), 2);
