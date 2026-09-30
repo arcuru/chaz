@@ -92,6 +92,8 @@
           buildArgs
           // {
             nativeBuildInputs = buildArgs.nativeBuildInputs or [] ++ [pkgs.python3];
+            # matrix-sdk builds a TLS client even for loopback HTTP mock tests.
+            SSL_CERT_FILE = "${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt";
             preCheck = ''
               export HOME=$TMPDIR
             '';
