@@ -7321,3 +7321,493 @@ async fn unknown_commands_and_outcomes_do_not_execute() {
     ));
     server.shutdown().await;
 }
+
+/// An effectful same-batch tool must run only after the parent reacquires.
+struct PermitProbe {
+    semaphore: Arc<Semaphore>,
+    calls: Arc<AtomicUsize>,
+}
+
+impl crate::tool::Tool for PermitProbe {
+    fn descriptor(&self) -> crate::tool::ToolDescriptor {
+        crate::tool::ToolDescriptor {
+            name: "permit_probe".into(),
+            description: "Check execution capacity".into(),
+            parameters: serde_json::json!({"type": "object", "properties": {}}),
+        }
+    }
+
+    fn execute<'a>(
+        &'a self,
+        _: serde_json::Value,
+        _: &'a ToolContext,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<String, crate::tool::ToolError>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            assert!(
+                self.semaphore.available_permits() < MAX_CONCURRENT_LLM_CALLS,
+                "effectful tool must hold execution capacity"
+            );
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok("capacity held".into())
+        })
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ten_job_wait_parents_yield_capacity_and_reacquire_before_continuing() {
+    use crate::session::jobs::JobState;
+    use eidetica::service::ServiceServer;
+    use std::time::Duration;
+    use tokio::sync::watch;
+
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("wait-capacity.sock");
+    let (owner, mut user) = Instance::create_backend(
+        Box::new(InMemory::new()),
+        NewUser::passwordless("wait-capacity"),
+    )
+    .await
+    .unwrap();
+    let (agent_db, pubkey) = create_agent_db(
+        &mut user,
+        "default",
+        &AgentDbConfig::default(),
+        &AgentMeta {
+            display_name: Some("default".into()),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let agent = DbEntry {
+        db_id: agent_db.id(),
+        display_name: "default".into(),
+        pubkey,
+    };
+    let service = ServiceServer::bind(owner, &socket).await.unwrap();
+    let (shutdown, receiver) = watch::channel(());
+    let service_task = tokio::spawn(service.run(receiver));
+    let settings = crate::config::EideticaConfig {
+        connection: format!("unix://{}", socket.display()),
+        login: crate::config::EideticaLoginConfig {
+            username: "wait-capacity".into(),
+            password: None,
+            passwordless: true,
+        },
+        sync: None,
+    };
+    let (executor, child_mock) = published_executor_with_mock(
+        &settings,
+        Arc::new(AgentRegistry::with_default_agent()),
+        agent.clone(),
+    )
+    .await;
+    let registry = executor.registry.clone();
+    let client = client_server_fixture_from_registry(registry.clone()).await;
+    let secrets = crate::security::SecretStore::new(registry.chaz_peer().clone()).await;
+    let slot = crate::instance::ServerSlot::default();
+    slot.set(executor.clone());
+    executor.tools.register(crate::tools::JobWaitTool {
+        server: slot.clone(),
+    });
+    let probe_calls = Arc::new(AtomicUsize::new(0));
+    executor.tools.register(PermitProbe {
+        semaphore: executor.semaphore.clone(),
+        calls: probe_calls.clone(),
+    });
+    let mut parents = Vec::new();
+    let mut children = Vec::new();
+    let mut child_gates = Vec::new();
+    for n in 0..MAX_CONCURRENT_LLM_CALLS {
+        let (sid, db) = registry.create_session(Some("wait-parent")).await.unwrap();
+        registry
+            .attach_agent_to_session(&sid.0, &agent)
+            .await
+            .unwrap();
+        let child = registry
+            .prepare_agent_job(&sid.0, "default", &format!("child-{n}"))
+            .await
+            .unwrap();
+        let child_id = child.db.root_id().to_string();
+        children.push((child_id.clone(), child));
+        if n > 0 {
+            child_mock.push_text("finished");
+        }
+        child_gates.push(child_mock.block_next_call());
+        let mock = Arc::new(crate::test_support::MockBackend::new());
+        mock.push_tool_calls([
+            (
+                format!("wait-{n}"),
+                "job_wait".into(),
+                serde_json::json!({
+                    "session_db_id": child_id, "timeout_seconds": 240,
+                })
+                .to_string(),
+            ),
+            (format!("probe-{n}"), "permit_probe".into(), "{}".into()),
+        ]);
+        mock.push_text("parent finished");
+        let first = mock.block_next_call();
+        let final_call = mock.block_next_call();
+        executor
+            .register_session(
+                &db,
+                crate::backends::BackendManager::with_mock(mock.clone(), secrets.clone()),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        Session::new(sid.clone(), db)
+            .await
+            .add_entry(SessionEntry {
+                sender: "user".into(),
+                content: "observe child".into(),
+                timestamp: Utc::now(),
+                entry_type: EntryType::Directive,
+                metadata: None,
+                routing: None,
+            })
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(10), first.wait_started())
+            .await
+            .unwrap();
+        parents.push((sid, mock, first, final_call));
+    }
+    assert_eq!(executor.semaphore.available_permits(), 0);
+    for (_, child) in &children {
+        // Publish below by value; here the prepared DBs remain inert.
+        assert!(
+            crate::session::jobs::read_accepted_job(&child.db)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+    let mut child_ids = Vec::new();
+    for (id, child) in children {
+        registry.publish_agent_job(child).await.unwrap();
+        child_ids.push(id);
+    }
+    tokio::time::timeout(Duration::from_secs(120), async {
+        loop {
+            let processing = executor.processing.lock().await.clone();
+            if child_ids.iter().all(|id| processing.contains(id)) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("children must queue before parents yield");
+    for id in &child_ids {
+        assert_eq!(client.job_status(id).await.unwrap().state, JobState::Queued);
+    }
+    assert!(child_mock.recorded_calls().is_empty());
+    for (_, _, first, _) in &parents {
+        first.release();
+    }
+    let children_started = tokio::time::timeout(Duration::from_secs(120), async {
+        for gate in &child_gates {
+            gate.wait_started().await;
+        }
+    })
+    .await;
+    assert!(
+        children_started.is_ok(),
+        "ten observing parents must not starve their children: permits={}, child calls={}, probe calls={}, parent calls={:?}",
+        executor.semaphore.available_permits(),
+        child_mock.recorded_calls().len(),
+        probe_calls.load(Ordering::SeqCst),
+        parents
+            .iter()
+            .map(|(_, mock, _, _)| mock.recorded_calls().len())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(child_mock.recorded_calls().len(), MAX_CONCURRENT_LLM_CALLS);
+    assert_eq!(executor.semaphore.available_permits(), 0);
+    assert_eq!(probe_calls.load(Ordering::SeqCst), 0);
+    for gate in &child_gates {
+        gate.release();
+    }
+    tokio::time::timeout(Duration::from_secs(120), async {
+        for (_, _, _, final_call) in &parents {
+            final_call.wait_started().await;
+        }
+    })
+    .await
+    .expect("parents must reacquire before the next model call");
+    assert_eq!(
+        executor.semaphore.available_permits(),
+        0,
+        "ten resumed parent models must each own capacity"
+    );
+    assert_eq!(probe_calls.load(Ordering::SeqCst), MAX_CONCURRENT_LLM_CALLS);
+    for id in &child_ids {
+        assert_eq!(
+            client.job_status(id).await.unwrap().state,
+            JobState::Succeeded {
+                text: Some("finished".into())
+            }
+        );
+    }
+    // Even after observation, ten resumed model calls exclude an eleventh
+    // job. It must remain queued without a Started attempt.
+    child_mock.push_text("extra finished");
+    let extra = client
+        .submit_agent_job(&parents[0].0.0, "default", "extra")
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(120), async {
+        while !executor.processing.lock().await.contains(&extra) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        client.job_status(&extra).await.unwrap().state,
+        JobState::Queued
+    );
+    assert_eq!(child_mock.recorded_calls().len(), MAX_CONCURRENT_LLM_CALLS);
+    let (_, extra_db) = registry.open_session(&extra).await.unwrap();
+    assert!(
+        extra_db
+            .new_transaction()
+            .await
+            .unwrap()
+            .get_store::<eidetica::store::Table<TurnAttempt>>("turn_attempts")
+            .await
+            .unwrap()
+            .search(|_| true)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    for (_, mock, _, final_call) in &parents {
+        let calls = mock.recorded_calls();
+        assert_eq!(calls.len(), 2);
+        assert!(calls[1].messages.iter().any(|msg| matches!(msg,
+            runtime::RuntimeMessage::ToolResult { content, .. } if content.contains("Succeeded"))));
+        final_call.release();
+    }
+    tokio::time::timeout(Duration::from_secs(120), async {
+        while executor.semaphore.available_permits() != MAX_CONCURRENT_LLM_CALLS {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("all permits must return after parents complete");
+    assert_eq!(
+        client
+            .wait_job(&extra, Duration::from_secs(10))
+            .await
+            .unwrap()
+            .state,
+        JobState::Succeeded {
+            text: Some("extra finished".into())
+        }
+    );
+    executor.shutdown().await;
+    slot.clear();
+    client.shutdown().await;
+    drop(shutdown);
+    service_task.await.unwrap().unwrap();
+}
+
+struct StoppableWait {
+    entered: Arc<tokio::sync::Notify>,
+    finish: Arc<tokio::sync::Notify>,
+}
+
+impl crate::tool::Tool for StoppableWait {
+    fn descriptor(&self) -> crate::tool::ToolDescriptor {
+        crate::tool::ToolDescriptor {
+            name: "job_wait".into(),
+            description: "test observation".into(),
+            parameters: serde_json::json!({"type": "object", "properties": {}}),
+        }
+    }
+
+    fn execute<'a>(
+        &'a self,
+        _: serde_json::Value,
+        _: &'a ToolContext,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<String, crate::tool::ToolError>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            self.entered.notify_one();
+            self.finish.notified().await;
+            Ok("observed".into())
+        })
+    }
+}
+
+#[tokio::test]
+async fn job_wait_executor_shutdown_and_claim_loss_stop_observation_or_reacquisition() {
+    use std::time::Duration;
+    for claim_loss in [false, true] {
+        for reacquiring in [false, true] {
+            let (_instance, server, registry) = server_fixture().await;
+            let (sid, db) = registry
+                .create_session(Some("stoppable-wait"))
+                .await
+                .unwrap();
+            let entered = Arc::new(tokio::sync::Notify::new());
+            let finish = Arc::new(tokio::sync::Notify::new());
+            server.tools.register(StoppableWait {
+                entered: entered.clone(),
+                finish: finish.clone(),
+            });
+            let effects = Arc::new(AtomicUsize::new(0));
+            server.tools.register(PermitProbe {
+                semaphore: server.semaphore.clone(),
+                calls: effects.clone(),
+            });
+            let mock = Arc::new(crate::test_support::MockBackend::new());
+            mock.push_tool_calls([
+                ("wait".into(), "job_wait".into(), "{}".into()),
+                ("effect".into(), "permit_probe".into(), "{}".into()),
+            ]);
+            mock.push_text("must not continue");
+            let backend = crate::backends::BackendManager::with_mock(
+                mock.clone(),
+                crate::security::SecretStore::new(registry.chaz_peer().clone()).await,
+            );
+            let mut session = Session::new(sid.clone(), db.clone()).await;
+            let request_id = session
+                .add_entry(SessionEntry {
+                    sender: "user".into(),
+                    content: "observe".into(),
+                    timestamp: Utc::now(),
+                    entry_type: EntryType::Directive,
+                    metadata: None,
+                    routing: None,
+                })
+                .await
+                .unwrap();
+            let attempt = session
+                .start_turn_attempt(request_id.clone())
+                .await
+                .unwrap();
+            server
+                .live_attempts
+                .lock()
+                .await
+                .insert(attempt.attempt_id.clone());
+            server.processing.lock().await.insert(sid.0.clone());
+            let token = claim_loss.then(|| "owner".to_string());
+            if claim_loss {
+                assert!(
+                    crate::session::jobs::claim_job(&db, "peer", "agent", "owner")
+                        .await
+                        .unwrap()
+                );
+            }
+            let (completion_tx, mut completion_rx) = mpsc::channel(1);
+            let permit = server.semaphore.clone().acquire_owned().await.unwrap();
+            server
+                .spawn_agent_task(
+                    sid.0.clone(),
+                    session,
+                    server.agents.default_agent().clone(),
+                    None,
+                    backend,
+                    attempt.clone(),
+                    SpawnContext {
+                        job_incarnation: token,
+                        job_authority: None,
+                        call_depth: 0,
+                        max_call_depth: 10,
+                        parent_tools: None,
+                        completion_tx: Some(completion_tx),
+                        processing: server.processing.clone(),
+                    },
+                    Some(permit),
+                )
+                .await;
+            tokio::time::timeout(Duration::from_secs(5), entered.notified())
+                .await
+                .unwrap();
+            let all = tokio::time::timeout(
+                Duration::from_secs(5),
+                server
+                    .semaphore
+                    .clone()
+                    .acquire_many_owned(MAX_CONCURRENT_LLM_CALLS as u32),
+            )
+            .await
+            .expect("observer must release capacity")
+            .unwrap();
+            if reacquiring {
+                finish.notify_one();
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            assert_eq!(mock.recorded_calls().len(), 1);
+            assert_eq!(effects.load(Ordering::SeqCst), 0);
+            if claim_loss {
+                use eidetica::store::DocStore;
+                let txn = db.new_transaction().await.unwrap();
+                let mut owner = crate::session::jobs::read_job_owner(&db)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                owner.incarnation = "rival".into();
+                txn.get_store::<DocStore>("job_owner")
+                    .await
+                    .unwrap()
+                    .set_string("v1", serde_json::to_string(&owner).unwrap())
+                    .await
+                    .unwrap();
+                txn.commit().await.unwrap();
+                tokio::time::timeout(Duration::from_secs(5), completion_rx.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(crate::session::jobs::job_stop_count(&db).await.unwrap(), 1);
+                assert!(
+                    !server
+                        .live_attempts
+                        .lock()
+                        .await
+                        .contains(&attempt.attempt_id)
+                );
+            }
+            tokio::time::timeout(Duration::from_secs(5), server.shutdown())
+                .await
+                .unwrap();
+            drop(all);
+            assert_eq!(
+                server.semaphore.available_permits(),
+                MAX_CONCURRENT_LLM_CALLS
+            );
+            assert_eq!(
+                mock.recorded_calls().len(),
+                1,
+                "stopped wait cannot reach a new model call"
+            );
+            assert_eq!(
+                effects.load(Ordering::SeqCst),
+                0,
+                "stopped wait cannot reach a same-batch effect"
+            );
+            assert!(
+                matches!(
+                    Session::new(sid, db)
+                        .await
+                        .turn_request(&request_id, |_| false, &Default::default())
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .state,
+                    TurnRequestState::Interrupted { .. }
+                ),
+                "stopped parent must not settle or auto-replay"
+            );
+        }
+    }
+}

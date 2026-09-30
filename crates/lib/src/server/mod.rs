@@ -3265,9 +3265,9 @@ impl Server {
                 }
             });
             let _heartbeat = ActivityHeartbeat(heartbeat);
-            let _permit = match reserved_permit {
+            let permit = match reserved_permit {
                 Some(permit) => permit,
-                None => semaphore.acquire_owned().await.expect("semaphore closed"),
+                None => semaphore.clone().acquire_owned().await.expect("semaphore closed"),
             };
             if shutting_down.load(Ordering::Acquire) {
                 return;
@@ -3423,14 +3423,17 @@ impl Server {
                 &policies,
                 Some(recorder.clone()),
                 Some(spawn_extensions.as_ref()),
+                Some(runtime::ExecutionCapacity::new(
+                    semaphore,
+                    permit,
+                    incarnation.clone().map(|token| (claim_db.clone(), token)),
+                )),
             )
             .await;
 
             if shutting_down.load(Ordering::Acquire) {
                 return;
             }
-
-            drop(_permit);
 
             let mut s = session.lock().await;
             let persistence_failed =
