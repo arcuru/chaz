@@ -526,37 +526,12 @@ impl AgentDb {
         &self.database
     }
 
-    /// Read the config. A record written before the spawn-depth rename is
-    /// read with its depths under the new key (see
-    /// [`upgrade_spawn_depth_keys`]); it is stored in the new shape on the
-    /// next write.
     pub async fn read_config(&self) -> anyhow::Result<AgentDbConfig> {
-        let mut value: serde_json::Value = read_blob(&self.database, CONFIG_STORE).await?;
-        if value.is_null() {
-            return Ok(AgentDbConfig::default());
-        }
-        upgrade_spawn_depth_keys(&mut value);
-        Ok(serde_json::from_value(value)?)
+        read_blob(&self.database, CONFIG_STORE).await
     }
 
     pub async fn write_config(&self, cfg: &AgentDbConfig) -> anyhow::Result<()> {
         write_blob(&self.database, CONFIG_STORE, cfg).await
-    }
-
-    /// Test-only: store a config record exactly as given, e.g. in the shape
-    /// an older build wrote it.
-    #[cfg(test)]
-    pub(crate) async fn write_raw_config_for_tests(
-        &self,
-        value: &serde_json::Value,
-    ) -> anyhow::Result<()> {
-        write_blob(&self.database, CONFIG_STORE, value).await
-    }
-
-    /// Test-only: the stored config record, without upgrading it.
-    #[cfg(test)]
-    pub(crate) async fn read_raw_config_for_tests(&self) -> anyhow::Result<serde_json::Value> {
-        read_blob(&self.database, CONFIG_STORE).await
     }
 
     pub async fn read_meta(&self) -> anyhow::Result<AgentMeta> {
@@ -995,76 +970,6 @@ where
     Ok(())
 }
 
-/// Key the spawn-depth ceiling was persisted under before it was renamed to
-/// `max_spawn_depth`. Only the AgentDb record decoder and the reconcile gate
-/// migration read it; config YAML, `/agent set`, and `spawn_worker` reject it.
-const LEGACY_SPAWN_DEPTH_KEY: &str = "max_iterations";
-/// Current key for the spawn-depth ceiling.
-const SPAWN_DEPTH_KEY: &str = "max_spawn_depth";
-
-/// Apply `f` to every object in a serialized [`AgentDbConfig`] that carries a
-/// spawn-depth key: the Agent itself, its presets, each Worker template, and
-/// each Worker's presets.
-fn for_each_spawn_depth_object(
-    value: &mut serde_json::Value,
-    f: &mut impl FnMut(&mut serde_json::Map<String, serde_json::Value>),
-) {
-    fn with_presets(
-        obj: &mut serde_json::Map<String, serde_json::Value>,
-        f: &mut impl FnMut(&mut serde_json::Map<String, serde_json::Value>),
-    ) {
-        f(obj);
-        if let Some(serde_json::Value::Object(presets)) = obj.get_mut("presets") {
-            for preset in presets.values_mut() {
-                if let serde_json::Value::Object(p) = preset {
-                    f(p);
-                }
-            }
-        }
-    }
-    let serde_json::Value::Object(agent) = value else {
-        return;
-    };
-    with_presets(agent, f);
-    if let Some(serde_json::Value::Array(workers)) = agent.get_mut("workers") {
-        for worker in workers {
-            if let serde_json::Value::Object(w) = worker {
-                with_presets(w, f);
-            }
-        }
-    }
-}
-
-/// Rename the pre-rename spawn-depth key to [`SPAWN_DEPTH_KEY`] throughout a
-/// serialized [`AgentDbConfig`], keeping its value. When both keys are
-/// present a non-null current value wins. Returns `true` when any legacy key
-/// was found, so the caller knows the stored record predates the rename.
-pub(crate) fn upgrade_spawn_depth_keys(value: &mut serde_json::Value) -> bool {
-    let mut found = false;
-    for_each_spawn_depth_object(value, &mut |obj| {
-        let Some(legacy) = obj.remove(LEGACY_SPAWN_DEPTH_KEY) else {
-            return;
-        };
-        found = true;
-        let current_is_set = obj.get(SPAWN_DEPTH_KEY).is_some_and(|v| !v.is_null());
-        if !current_is_set {
-            obj.insert(SPAWN_DEPTH_KEY.to_string(), legacy);
-        }
-    });
-    found
-}
-
-/// Inverse of [`upgrade_spawn_depth_keys`]: the serialized shape the same
-/// config had before the rename. Used only to recognise reconcile-gate hashes
-/// computed by a pre-rename build, so upgrading does not look like a yaml edit.
-pub(crate) fn downgrade_spawn_depth_keys(value: &mut serde_json::Value) {
-    for_each_spawn_depth_object(value, &mut |obj| {
-        if let Some(v) = obj.remove(SPAWN_DEPTH_KEY) {
-            obj.insert(LEGACY_SPAWN_DEPTH_KEY.to_string(), v);
-        }
-    });
-}
-
 /// DB name used in eidetica settings — `find_database` idempotency key.
 pub fn agent_db_name(display_name: &str) -> String {
     format!("agent:{display_name}")
@@ -1291,6 +1196,35 @@ mod tests {
         assert_eq!(db.read_meta().await.unwrap(), meta);
         // Returned pubkey is an actual key the user holds for this DB.
         assert_eq!(user.find_key(&db.id()).unwrap(), Some(pubkey));
+    }
+
+    #[tokio::test]
+    async fn config_ignores_unknown_settings() {
+        let mut user = test_peer_user().await;
+        let (db, _) = create_agent_db(
+            &mut user,
+            "chaz",
+            &AgentDbConfig::default(),
+            &AgentMeta::default(),
+        )
+        .await
+        .unwrap();
+        let raw = serde_json::json!({
+            "max_iterations": 30,
+            "future_setting": true,
+            "presets": {"deep": {"max_iterations": 30}},
+            "workers": [{
+                "name": "researcher",
+                "max_iterations": 30,
+                "presets": {"deep": {"max_iterations": 30}}
+            }]
+        });
+        write_blob(db.database(), CONFIG_STORE, &raw).await.unwrap();
+        let cfg = db.read_config().await.unwrap();
+        assert_eq!(cfg.max_spawn_depth, None);
+        assert_eq!(cfg.presets["deep"].max_spawn_depth, None);
+        assert_eq!(cfg.workers[0].max_spawn_depth, None);
+        assert_eq!(cfg.workers[0].presets["deep"].max_spawn_depth, None);
     }
 
     #[tokio::test]
@@ -1881,104 +1815,5 @@ mod tests {
         assert!(db.find_session_ref("sha256:sess").await.unwrap().is_some());
         assert!(db.deregister_session_ref("sha256:sess").await.unwrap());
         assert!(db.list_session_refs().await.unwrap().is_empty());
-    }
-
-    /// A config record as a build from before the spawn-depth rename wrote
-    /// it: `max_iterations` on the Agent, a preset, a Worker template (the
-    /// live researcher shape, 30), and a Worker preset.
-    fn pre_rename_record() -> serde_json::Value {
-        serde_json::json!({
-            "system_prompt": "",
-            "system_prompt_files": [],
-            "applied_config_hash": "old-hash",
-            "model": null,
-            "tools": null,
-            "workers": [{
-                "name": "researcher",
-                "system_prompt": "",
-                "system_prompt_files": [],
-                "model": "m",
-                "tools": null,
-                "max_iterations": 30,
-                "presets": {"deep": {"model": null, "max_iterations": 7, "tools": null,
-                                     "role_suffix": null, "tool_profile": null}}
-            }, {
-                "name": "unset",
-                "system_prompt": "",
-                "system_prompt_files": [],
-                "model": null,
-                "tools": null,
-                "max_iterations": null,
-                "presets": {}
-            }],
-            "max_iterations": 15,
-            "autonomous": false,
-            "presets": {"quick": {"model": null, "max_iterations": 5, "tools": null,
-                                  "role_suffix": null, "tool_profile": null}},
-            "tool_profile": null,
-            "max_context_tokens": null,
-            "capabilities": {},
-            "grants": {},
-            "default_memory_banks": [],
-            "default_skill_banks": []
-        })
-    }
-
-    #[tokio::test]
-    async fn pre_rename_config_record_keeps_every_spawn_depth() {
-        let mut user = test_peer_user().await;
-        let (db, _) = create_agent_db(
-            &mut user,
-            "chaz",
-            &AgentDbConfig::default(),
-            &AgentMeta::default(),
-        )
-        .await
-        .unwrap();
-        db.write_raw_config_for_tests(&pre_rename_record())
-            .await
-            .unwrap();
-
-        let cfg = db.read_config().await.unwrap();
-        assert_eq!(cfg.max_spawn_depth, Some(15));
-        assert_eq!(cfg.presets["quick"].max_spawn_depth, Some(5));
-        assert_eq!(cfg.workers[0].max_spawn_depth, Some(30));
-        assert_eq!(cfg.workers[0].presets["deep"].max_spawn_depth, Some(7));
-        assert_eq!(cfg.workers[1].max_spawn_depth, None);
-        assert_eq!(cfg.applied_config_hash.as_deref(), Some("old-hash"));
-
-        // The runtime view carries the same ceilings (no reset to 10).
-        let registry = crate::agent::AgentRegistry::with_default_agent();
-        let agent = registry.build_from_db_config("chaz", &cfg);
-        assert_eq!(agent.max_spawn_depth, 15);
-        assert_eq!(agent.workers["researcher"].max_spawn_depth, Some(30));
-
-        // Reading does not rewrite; writing persists only the new key.
-        assert!(db.read_raw_config_for_tests().await.unwrap()["max_iterations"] == 15);
-        db.write_config(&cfg).await.unwrap();
-        let raw = db.read_raw_config_for_tests().await.unwrap();
-        assert!(!raw.to_string().contains("max_iterations"), "{raw}");
-        assert_eq!(raw["workers"][0]["max_spawn_depth"], 30);
-        assert_eq!(db.read_config().await.unwrap(), cfg);
-    }
-
-    #[test]
-    fn spawn_depth_key_upgrade_prefers_a_set_current_value() {
-        let mut both = serde_json::json!({"max_iterations": 4, "max_spawn_depth": 9});
-        assert!(upgrade_spawn_depth_keys(&mut both));
-        assert_eq!(both, serde_json::json!({"max_spawn_depth": 9}));
-
-        let mut null_current = serde_json::json!({"max_iterations": 4, "max_spawn_depth": null});
-        assert!(upgrade_spawn_depth_keys(&mut null_current));
-        assert_eq!(null_current, serde_json::json!({"max_spawn_depth": 4}));
-
-        let mut current = serde_json::json!({"max_spawn_depth": 4});
-        assert!(!upgrade_spawn_depth_keys(&mut current));
-
-        // Downgrade is the exact inverse on a full record.
-        let mut record = pre_rename_record();
-        assert!(upgrade_spawn_depth_keys(&mut record));
-        downgrade_spawn_depth_keys(&mut record);
-        assert_eq!(record, pre_rename_record());
     }
 }

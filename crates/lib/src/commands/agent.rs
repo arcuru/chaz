@@ -292,13 +292,6 @@ pub(super) fn apply_agent_field(
                     .map_err(|e| format!("Invalid max_spawn_depth '{value}': {e}"))?,
             );
         }
-        "max_iterations" => {
-            return Err(
-                "max_iterations was renamed to max_spawn_depth (it sets the nested spawn-depth \
-                 ceiling). Use: max_spawn_depth"
-                    .to_string(),
-            );
-        }
         "tool_profile" => cfg.tool_profile = Some(value.to_string()),
         "max_context_tokens" => {
             cfg.max_context_tokens = Some(
