@@ -262,6 +262,49 @@ impl MetadataAccumulator {
     }
 }
 
+/// Executor capacity owned by one running turn. Only job observation yields
+/// it; cancellation drops the turn (and any held permit) as usual.
+pub struct ExecutionCapacity {
+    semaphore: Arc<tokio::sync::Semaphore>,
+    permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    job_claim: Option<(eidetica::Database, String)>,
+}
+
+impl ExecutionCapacity {
+    pub fn new(
+        semaphore: Arc<tokio::sync::Semaphore>,
+        permit: tokio::sync::OwnedSemaphorePermit,
+        job_claim: Option<(eidetica::Database, String)>,
+    ) -> Self {
+        Self {
+            semaphore,
+            permit: Some(permit),
+            job_claim,
+        }
+    }
+
+    async fn reacquire(&mut self) -> Result<(), String> {
+        self.permit = Some(
+            self.semaphore
+                .clone()
+                .acquire_owned()
+                .await
+                .map_err(|_| "executor capacity closed".to_string())?,
+        );
+        // The existing executor claim-loss watcher also covers the wait and
+        // acquisition. Recheck here before any resumed model/tool effects;
+        // the LWW claim remains an observation, not a fencing token.
+        if let Some((db, incarnation)) = &self.job_claim {
+            match crate::session::jobs::owns_job(db, incarnation).await {
+                Ok(true) => {}
+                Ok(false) => return Err("job lost claim while observing".into()),
+                Err(error) => return Err(format!("job claim recheck failed: {error}")),
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Outcome of a single agent turn: the visible reply plus aggregated
 /// token/cost metadata across every LLM call made in the ReAct loop.
 pub struct RuntimeOutcome {
@@ -406,6 +449,7 @@ pub async fn execute(
         policies,
         recorder,
         hub,
+        None,
     )
     .await
 }
@@ -420,6 +464,7 @@ pub async fn execute_with_recorder(
     policies: &ToolPolicyRegistry,
     recorder: Option<Arc<dyn RuntimeRecorder>>,
     hub: Option<&ExtensionHub>,
+    mut capacity: Option<ExecutionCapacity>,
 ) -> Result<RuntimeOutcome, String> {
     let tools = &tool_ctx.tools;
     let resolved_model = backend.resolve_model_name(model);
@@ -776,9 +821,22 @@ pub async fn execute_with_recorder(
                             call_ctx.tool_call_key =
                                 Some(format!("{model_sequence}:{call_index}:{}", call.id));
                             call_ctx.grants = call_grants;
+                            if call.name == "job_wait"
+                                && let Some(capacity) = capacity.as_mut()
+                            {
+                                capacity.permit.take();
+                            }
                             let exec_result =
                                 execute_with_retry(tool, args, &call_ctx, timeout, &call.name)
                                     .await;
+                            // Outside the tool timeout: success, error and timeout
+                            // all regain capacity before hooks, another tool in
+                            // this batch, or the next model request can execute.
+                            if call.name == "job_wait"
+                                && let Some(capacity) = capacity.as_mut()
+                            {
+                                capacity.reacquire().await?;
+                            }
 
                             match exec_result {
                                 Ok(Ok(output)) => {
@@ -1020,6 +1078,10 @@ fn redact_sensitive_params(arguments_json: &str, sensitive: &[&str]) -> String {
         arguments_json.to_string()
     }
 }
+
+#[cfg(test)]
+#[path = "runtime/capacity_tests.rs"]
+mod capacity_tests;
 
 #[cfg(test)]
 mod tests {
