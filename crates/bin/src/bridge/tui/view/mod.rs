@@ -42,6 +42,8 @@ use theme::TOOL as COLOR_TOOL;
 use theme::USER as COLOR_USER;
 
 mod composer;
+#[cfg(test)]
+mod list_tests;
 mod settings;
 
 /// Last `/`-separated segment of a model id (`anthropic/claude-opus-4-7` →
@@ -1298,7 +1300,7 @@ fn humanize_age(created_at: Option<DateTime<Utc>>, now: DateTime<Utc>) -> String
     format!("{weeks}w ago")
 }
 
-fn ui_picker(f: &mut ratatui::Frame, app: &mut App) {
+pub(super) fn ui_picker(f: &mut ratatui::Frame, app: &mut App) {
     let chunks = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(f.area());
 
     let list_area = chunks[0];
@@ -1363,6 +1365,14 @@ fn ui_picker(f: &mut ratatui::Frame, app: &mut App) {
         app.scroll.picker,
     );
     app.scroll.picker = window.offset;
+    // Include a partially visible row, but never the window's forced row when
+    // no session line fits below the pinned New session row.
+    let visible_count = if inner_w == 0 {
+        0
+    } else {
+        inner_h.saturating_sub(rows_y0).div_ceil(row_h) as usize
+    };
+    app.picker_visible_rows = window.first..window.end.min(window.first + visible_count);
 
     if app.session_list.is_empty() {
         let message = if app.session_catalog_loading {
@@ -1400,7 +1410,7 @@ fn ui_picker(f: &mut ratatui::Frame, app: &mut App) {
             };
 
             // Name is available from the peer-local index. Agent metadata is
-            // loaded only for rows around the cursor.
+            // loaded only for rows visible in the picker viewport.
             let header = if info.loaded {
                 format!(
                     "{marker}{title}{current_marker} [{bridge}] {agent_str} • {age}{closed_suffix}"
@@ -1840,7 +1850,47 @@ mod chat_frame_tests {
             .unwrap();
         assert!(screen[selected.y as usize].contains("item-24"));
         assert!(app.click_regions.iter().all(|r| r.y + r.h <= 11));
-        app.picker_index = 0;
+        for hit in &app.click_regions {
+            if let ClickTarget::PickerSelect(i) = hit.target {
+                assert!(
+                    screen[hit.y as usize].contains(&format!("item-{i}")),
+                    "{screen:?}"
+                );
+            }
+        }
+        let hit = *app
+            .click_regions
+            .iter()
+            .find(|r| matches!(r.target, ClickTarget::PickerSelect(i) if i != 24))
+            .unwrap();
+        let ClickTarget::PickerSelect(clicked) = hit.target else {
+            unreachable!()
+        };
+        super::super::input::handle_mouse(
+            &mut app,
+            crossterm::event::MouseEvent {
+                kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                column: hit.x,
+                row: hit.y,
+                modifiers: crossterm::event::KeyModifiers::NONE,
+            },
+        );
+        assert_eq!(app.picker_index, clicked + 1);
+        let new = *app
+            .click_regions
+            .iter()
+            .find(|r| matches!(r.target, ClickTarget::PickerNew))
+            .unwrap();
+        super::super::input::handle_mouse(
+            &mut app,
+            crossterm::event::MouseEvent {
+                kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                column: new.x,
+                row: new.y,
+                modifiers: crossterm::event::KeyModifiers::NONE,
+            },
+        );
+        assert_eq!(app.picker_index, 0);
         terminal
             .draw(|f| {
                 app.click_regions.clear();
