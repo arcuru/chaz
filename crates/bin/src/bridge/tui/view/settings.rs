@@ -6,6 +6,15 @@
 
 use super::*;
 
+/// Reserve hints where feasible, but give the selected row precedence when
+/// the post-header space cannot hold both. An oversized row may still clip.
+fn list_row_budget(height: u16, header: usize, footer: usize, selected_height: usize) -> usize {
+    let available = (height as usize).saturating_sub(header);
+    available
+        .saturating_sub(footer)
+        .max(available.min(selected_height))
+}
+
 /// Stage 1+ Settings page — sidebar of categories + per-category detail.
 /// Composition style A (pure functions over the shared widget primitives).
 /// Each category routes to its own renderer; categories that haven't been
@@ -199,7 +208,7 @@ fn render_peer_defaults(f: &mut ratatui::Frame, area: Rect, app: &mut App, serve
         defaults_count,
         1,
         Some(cursor),
-        area.height.saturating_sub(4) as usize,
+        list_row_budget(area.height, 4, 3, 1),
         app.scroll.peer_defaults,
     );
     app.scroll.peer_defaults = window.offset;
@@ -1172,7 +1181,7 @@ fn render_session_agents(
         agent_count,
         1,
         Some(cursor),
-        area.height.saturating_sub(4) as usize,
+        list_row_budget(area.height, 4, 2, 1),
         app.scroll.session_agents,
     );
     app.scroll.session_agents = window.offset;
@@ -1374,7 +1383,7 @@ pub(super) fn render_session_models(
     let heights: Vec<usize> = (0..total_rows)
         .map(|i| {
             if i == 0 {
-                3
+                3 + usize::from(snapshot.agents.is_empty())
             } else if i == 1 {
                 2
             } else {
@@ -1385,7 +1394,7 @@ pub(super) fn render_session_models(
     let window = ListWindow::new(
         &heights,
         Some(cursor),
-        area.height.saturating_sub(4) as usize,
+        list_row_budget(area.height, 4, 2, heights[cursor]),
         app.scroll.session_models,
     );
     app.scroll.session_models = window.offset;
@@ -1423,7 +1432,7 @@ pub(super) fn render_session_models(
             Style::default().fg(theme::DIM),
         )]));
     } else {
-        if window.first <= 1 {
+        if window.first <= 1 && window.end > 1 {
             lines.push(Line::from(vec![Span::styled(
                 "  Per-agent overrides",
                 Style::default().fg(theme::DIM),
