@@ -88,14 +88,6 @@ impl Tool for SpawnWorker {
         ctx: &'a ToolContext,
     ) -> Pin<Box<dyn Future<Output = Result<String, crate::tool::ToolError>> + Send + 'a>> {
         Box::pin(async move {
-            if arguments.get("max_iterations").is_some() {
-                return Err(
-                    "'max_iterations' was renamed to 'max_spawn_depth' (the Worker's \
-                     nested spawn-depth ceiling; it never limited tool calls)"
-                        .to_string()
-                        .into(),
-                );
-            }
             let server = self
                 .server
                 .get()
@@ -367,22 +359,5 @@ mod tests {
             msg.contains("server") || msg.contains("depth"),
             "got: {msg}"
         );
-    }
-
-    #[tokio::test]
-    async fn renamed_max_iterations_argument_is_refused() {
-        let tool = worker_tool().await;
-        let (_instance, session) = fresh_session().await;
-        let ctx = tool_context(session, Arc::new(ToolRegistry::new()));
-        let err = tool
-            .execute(
-                serde_json::json!({ "name": "any", "task": "x", "max_iterations": 30 }),
-                &ctx,
-            )
-            .await
-            .unwrap_err();
-        assert!(format!("{err}").contains("max_spawn_depth"), "got: {err}");
-        let schema = tool.descriptor().parameters.to_string();
-        assert!(schema.contains("max_spawn_depth") && !schema.contains("max_iterations"));
     }
 }

@@ -1198,74 +1198,6 @@ fn known_config_keys() -> HashSet<&'static str> {
     keys
 }
 
-/// Parse a config file, first refusing keys that were renamed without an
-/// alias. Use this rather than `serde_yaml::from_str` for any config a user
-/// wrote: a renamed key would otherwise parse as unknown, warn, and reset its
-/// setting to the default.
-pub fn parse_config(yaml: &str) -> anyhow::Result<Config> {
-    let renamed = renamed_config_keys(yaml);
-    if !renamed.is_empty() {
-        anyhow::bail!(
-            "config uses `max_iterations`, which was renamed to `max_spawn_depth` \
-             (it sets the nested spawn-depth ceiling and never capped tool calls). \
-             Rename the key and keep its value at: {}",
-            renamed.join(", ")
-        );
-    }
-    Ok(serde_yaml::from_str(yaml)?)
-}
-
-/// Paths in `yaml` that still use the pre-rename spawn-depth key: on an Agent,
-/// a Worker template, or a preset of either. Named by entry (`agents[chaz]
-/// .workers[researcher].max_iterations`) so each one is easy to find. Empty
-/// when the document doesn't parse; the real parse reports that.
-fn renamed_config_keys(yaml: &str) -> Vec<String> {
-    const LEGACY: &str = "max_iterations";
-    fn check(map: &serde_yaml::Mapping, path: &str, out: &mut Vec<String>) {
-        if map.contains_key(LEGACY) {
-            out.push(format!("{path}.{LEGACY}"));
-        }
-        if let Some(serde_yaml::Value::Mapping(presets)) = map.get("presets") {
-            for (name, preset) in presets {
-                if let serde_yaml::Value::Mapping(p) = preset
-                    && p.contains_key(LEGACY)
-                {
-                    let name = name.as_str().unwrap_or("?");
-                    out.push(format!("{path}.presets.{name}.{LEGACY}"));
-                }
-            }
-        }
-    }
-    fn label(map: &serde_yaml::Mapping, index: usize) -> String {
-        map.get("name")
-            .and_then(|n| n.as_str())
-            .map_or_else(|| index.to_string(), str::to_string)
-    }
-    let Ok(value) = serde_yaml::from_str::<serde_yaml::Value>(yaml) else {
-        return Vec::new();
-    };
-    let mut out = Vec::new();
-    let Some(serde_yaml::Value::Sequence(agents)) = value.get("agents") else {
-        return out;
-    };
-    for (i, agent) in agents.iter().enumerate() {
-        let serde_yaml::Value::Mapping(agent) = agent else {
-            continue;
-        };
-        let agent_path = format!("agents[{}]", label(agent, i));
-        check(agent, &agent_path, &mut out);
-        if let Some(serde_yaml::Value::Sequence(workers)) = agent.get("workers") {
-            for (j, worker) in workers.iter().enumerate() {
-                if let serde_yaml::Value::Mapping(w) = worker {
-                    let path = format!("{agent_path}.workers[{}]", label(w, j));
-                    check(w, &path, &mut out);
-                }
-            }
-        }
-    }
-    out
-}
-
 /// Compare the YAML document's key paths against the known registry and
 /// return unrecognised paths as a sorted, deduplicated list.  Empty when
 /// every key is recognised or the document can't be parsed as YAML.
@@ -1419,6 +1351,47 @@ agents:
         assert_eq!(agents[0].tools.as_ref().unwrap().len(), 2);
         // `autonomous` defaults to false when unset
         assert!(!agents[1].autonomous);
+    }
+
+    #[test]
+    fn spawn_depth_and_unknown_settings() {
+        let yaml = r#"
+agents:
+  - name: chaz
+    max_spawn_depth: 30
+    presets:
+      deep: { max_spawn_depth: 30 }
+    workers:
+      - name: researcher
+        max_spawn_depth: 30
+        presets:
+          deep: { max_spawn_depth: 30 }
+"#;
+        for key in ["max_spawn_depth", "max_iterations", "future_setting"] {
+            let yaml = yaml.replace("max_spawn_depth", key);
+            let cfg: Config = serde_yaml::from_str(&yaml).unwrap();
+            let agent = &cfg.agents.as_ref().unwrap()[0];
+            let worker = &agent.workers.as_ref().unwrap()[0];
+            let known = key == "max_spawn_depth";
+            let expected = known.then_some(30);
+            assert_eq!(agent.max_spawn_depth, expected);
+            assert_eq!(worker.max_spawn_depth, expected);
+            assert_eq!(
+                agent.presets.as_ref().unwrap()["deep"].max_spawn_depth,
+                expected
+            );
+            assert_eq!(
+                worker.presets.as_ref().unwrap()["deep"].max_spawn_depth,
+                expected
+            );
+            let unknown = check_unknown_config_keys(&yaml);
+            if known {
+                assert!(unknown.is_empty(), "{unknown:?}");
+            } else {
+                assert!(unknown.contains(&format!("agents[].{key}")));
+                assert!(unknown.contains(&format!("agents[].workers[].{key}")));
+            }
+        }
     }
 
     #[test]
@@ -2039,64 +2012,5 @@ eidetica:
         );
         assert!(!rendered.contains("p@ss"), "password fragment leaked");
         assert!(rendered.contains("<redacted>"));
-    }
-
-    #[test]
-    fn parse_config_reads_max_spawn_depth() {
-        let yaml = r#"
-agents:
-  - name: chaz
-    max_spawn_depth: 12
-    presets:
-      quick: { max_spawn_depth: 2 }
-    workers:
-      - name: researcher
-        max_spawn_depth: 30
-"#;
-        let cfg = parse_config(yaml).unwrap();
-        let chaz = &cfg.agents.as_ref().unwrap()[0];
-        assert_eq!(chaz.max_spawn_depth, Some(12));
-        assert_eq!(
-            chaz.presets.as_ref().unwrap()["quick"].max_spawn_depth,
-            Some(2)
-        );
-        assert_eq!(chaz.workers.as_ref().unwrap()[0].max_spawn_depth, Some(30));
-        assert!(check_unknown_config_keys(yaml).is_empty());
-    }
-
-    #[test]
-    fn parse_config_refuses_the_renamed_key_instead_of_resetting_it() {
-        // The live researcher Worker shape: dropping this as an unknown key
-        // would silently reset its ceiling from 30 to the default 10.
-        let yaml = r#"
-agents:
-  - name: chaz
-    max_iterations: 12
-    presets:
-      quick: { max_iterations: 2 }
-    workers:
-      - name: researcher
-        max_iterations: 30
-        presets:
-          deep: { max_iterations: 7 }
-      - model: unnamed
-        max_iterations: 4
-"#;
-        let err = parse_config(yaml).unwrap_err().to_string();
-        for path in [
-            "agents[chaz].max_iterations",
-            "agents[chaz].presets.quick.max_iterations",
-            "agents[chaz].workers[researcher].max_iterations",
-            "agents[chaz].workers[researcher].presets.deep.max_iterations",
-            "agents[chaz].workers[1].max_iterations",
-        ] {
-            assert!(err.contains(path), "missing {path} in: {err}");
-        }
-        assert!(err.contains("max_spawn_depth"), "{err}");
-        // Still flagged as unknown for tools that only warn.
-        assert!(check_unknown_config_keys(yaml).contains(&"agents[].max_iterations".to_string()));
-        // Other syntax problems still come from the real parse.
-        assert!(parse_config("agents: [").is_err());
-        assert!(renamed_config_keys("agents: [").is_empty());
     }
 }

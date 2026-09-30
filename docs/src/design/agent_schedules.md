@@ -215,13 +215,13 @@ rows, `sweep_for_agent`): the check moves from "clean up on detach" to
 
 ## Failure Modes & Mitigations
 
-| Failure                                                      | Mitigation                                                                                                                                                              |
-| ------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Schedule fires for an agent this peer doesn't host           | Host check is the dispatch gate — silently skip (owning peer fires it)                                                                                                  |
-| Pinned target session deleted / agent detached               | Membership/existence checked at fire → self-skip + log                                                                                                                  |
-| Fresh fires accumulate sessions unbounded                    | Fresh sessions are normal sessions subject to existing lifecycle/retention; cron cadence is author-chosen                                                               |
-| Self-scheduled tight cron or interval self-sustains activity | Bounded by chosen cadence + per-agent `max_iterations`; **not** the chat-room burst budget (a schedule is a deliberate cadence). Revisit a min-interval guard if abused |
-| Woken agent forced to speak                                  | Conditional terminal `Message` — silence produces no entry                                                                                                              |
+| Failure                                                      | Mitigation                                                                                                                                                          |
+| ------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Schedule fires for an agent this peer doesn't host           | Host check is the dispatch gate — silently skip (owning peer fires it)                                                                                              |
+| Pinned target session deleted / agent detached               | Membership/existence checked at fire → self-skip + log                                                                                                              |
+| Fresh fires accumulate sessions unbounded                    | Fresh sessions are normal sessions subject to existing lifecycle/retention; cron cadence is author-chosen                                                           |
+| Self-scheduled tight cron or interval self-sustains activity | Controlled by chosen cadence; **not** the chat-room burst budget or `max_spawn_depth` (which only limits nested delegation). Revisit a min-interval guard if abused |
+| Woken agent forced to speak                                  | Conditional terminal `Message` — silence produces no entry                                                                                                          |
 
 ## Migration
 

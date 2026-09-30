@@ -512,57 +512,7 @@ There is no iteration cap, no "you are stuck in a loop" prompt, and no forced no
 
 What still bounds a turn is per call, not per turn: tool approval (`Deny` and approval timeouts come back to the model as tool results), per-tool `rate_limit`, per-tool timeouts, grants, and the spawn-depth ceiling above. Tool errors are also returned to the model as results, so it can recover or stop. To limit a noisy tool, set a `rate_limit` or require approval for it; see [Tool Rate Limiting](security.md#tool-rate-limiting) and [Tool Approval](security.md#tool-approval).
 
-This setting was called `max_iterations` before it was renamed; see [Upgrading from `max_iterations`](#upgrading-from-max_iterations).
-
-## Upgrading from `max_iterations`
-
-`max_spawn_depth` used to be called `max_iterations`. The old name suggested a cap on tool calls, which it has not been since turns became unbounded, so it was renamed with no alias. What you touch and what happens by itself:
-
-| Where the value lives                                      | What happens on upgrade                                                                                                                                                           |
-| ---------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Config yaml (Agent, Worker, and preset entries)            | **You rename the key.** Chaz refuses to start (and `/agent reload` fails) while any `max_iterations` remains, and names each place it found one.                                  |
-| AgentDb `config` record                                    | Automatic. The stored value is read under its new name, so every Agent, Worker template, and preset keeps its depth. The record is rewritten under the new key on its next write. |
-| Reconcile gate (`applied_config_hash`)                     | Automatic. A gate stamped by an older build is still recognized when the yaml block is unchanged apart from the rename, so live `/agent set` edits survive the upgrade restart.   |
-| `/agent set`, `/agent new`, `spawn_worker` argument        | Use `max_spawn_depth`. The old name is rejected with a pointer to the new one.                                                                                                    |
-| Accepted Agent jobs (`max_call_depth` in their acceptance) | Unchanged. The depth frozen at admission stays as recorded, and in-flight jobs keep validating after the restart because the Agents' depths did not change.                       |
-
-Refusing the old yaml key is deliberate. Ignoring it would drop the value and let reconcile write the default depth of 10 over the stored one, which quietly changes behavior and makes in-flight jobs fail validation, because each restart re-checks their frozen depth against the Agents' current depths.
-
-Upgrade every peer that co-owns an Agent together. An older build reading a record rewritten under the new key does not recognize it and falls back to the default depth.
-
-### Walkthrough: upgrading a Worker with a depth of 30
-
-1. Before upgrading, the yaml gives the `researcher` Worker a depth of 30:
-
-   ```yaml
-   agents:
-     - name: chaz
-       workers:
-         - name: researcher
-           max_iterations: 30
-   ```
-
-2. Start the new build without editing the yaml. It stops before touching any state:
-
-   ```text
-   Error: config uses `max_iterations`, which was renamed to `max_spawn_depth` (it sets the nested spawn-depth ceiling and never capped tool calls). Rename the key and keep its value at: agents[chaz].workers[researcher].max_iterations
-   ```
-
-3. Rename the key, keeping the value:
-
-   ```yaml
-   - name: researcher
-     max_spawn_depth: 30
-   ```
-
-4. Start again. The startup reconcile sees an unchanged yaml block, keeps the AgentDb values (including any live `/agent set` edits), and logs `migrated agent config to max_spawn_depth; yaml unchanged, DB values kept`. The Peer → Agents settings page shows `spawn depth 30` for the Worker.
-
-5. Old muscle memory is caught too:
-
-   ```text
-   /agent set chaz max_iterations 12
-   max_iterations was renamed to max_spawn_depth (it sets the nested spawn-depth ceiling). Use: max_spawn_depth
-   ```
+Use `max_spawn_depth` in YAML, `/agent set`, presets, and `spawn_worker`. The old `max_iterations` setting is ignored like any unknown config field; it is not migrated or aliased. Set `max_spawn_depth` explicitly if you need a non-default ceiling.
 
 ## Presets
 

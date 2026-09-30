@@ -196,7 +196,7 @@ Worker templates are per-Agent (Chaz's `researcher` is distinct from Scout's `re
 }
 ```
 
-`name` is required and selects the Worker template. `tools` narrows the resolved scope for this invocation (must be a subset of what the Worker template + parent Agent allow). `model` and `preset` are optional overrides. Unset fields on a Worker template fall back to the parent Agent's defaults. `max_spawn_depth` overrides the Worker's nested spawn-depth ceiling; it does not limit tool calls (the old `max_iterations` argument is rejected). A Worker, like an Agent, keeps calling tools until the model replies without one. See [Spawn Permissions](agents.md#spawn-permissions) and [How a turn ends](agents.md#how-a-turn-ends).
+`name` is required and selects the Worker template. `tools` narrows the resolved scope for this invocation (must be a subset of what the Worker template + parent Agent allow). `model` and `preset` are optional overrides. Unset fields on a Worker template fall back to the parent Agent's defaults. `max_spawn_depth` overrides the Worker's nested spawn-depth ceiling; it does not limit tool calls. A Worker, like an Agent, keeps calling tools until the model replies without one. See [Spawn Permissions](agents.md#spawn-permissions) and [How a turn ends](agents.md#how-a-turn-ends).
 
 ### skill_list / skill_search / skill_show
 

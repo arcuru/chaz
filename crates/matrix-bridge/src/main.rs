@@ -194,7 +194,7 @@ async fn main() -> anyhow::Result<()> {
     // Parse the same bytes twice: once as the full chaz config (backends,
     // agents, security) the runtime needs, and once for the bridge's own
     // section (label, unlock_password, logins).
-    let mut config: Config = chaz_core::config::parse_config(&contents)?;
+    let mut config: Config = serde_yaml::from_str(&contents)?;
     let bridge_cfg: MatrixBridgeConfig = serde_yaml::from_str(&contents)?;
 
     // Warn about unrecognised YAML keys — the known set is the union of

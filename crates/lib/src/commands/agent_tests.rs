@@ -146,19 +146,6 @@ async fn agent_new_rejects_unknown_override() {
     assert!(server.agents().get("alpha").is_none());
 }
 
-#[test]
-fn agent_field_max_iterations_points_to_the_new_name() {
-    let mut cfg = crate::agent_db::AgentDbConfig {
-        max_spawn_depth: Some(30),
-        ..Default::default()
-    };
-    let err = super::apply_agent_field(&mut cfg, "max_iterations", "5").unwrap_err();
-    assert!(err.contains("max_spawn_depth"), "got {err}");
-    assert_eq!(cfg.max_spawn_depth, Some(30), "old name must not write");
-    super::apply_agent_field(&mut cfg, "max_spawn_depth", "5").unwrap();
-    assert_eq!(cfg.max_spawn_depth, Some(5));
-}
-
 #[tokio::test]
 async fn agent_hosted_lists_registered_agents() {
     let (_i, server, _r, secrets, backend, sid, sdb) = fixture().await;

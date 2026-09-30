@@ -28,15 +28,9 @@ All notable changes to this project will be documented in this file.
   provider failure after bounded retries now fails the turn. `max_iterations`
   is kept only as the nested spawn-depth ceiling (default 10), and the TUI
   agent settings page now labels it "spawn depth".
-- `max_iterations` is renamed to `max_spawn_depth` everywhere: config yaml
-  (Agents, Worker templates, presets), `/agent set` and `/agent new`, and the
-  `spawn_worker` argument. There is no alias: chaz refuses to start while the
-  yaml still uses `max_iterations` and names each occurrence, rather than
-  dropping it and resetting the depth to 10. Rename the key and keep the
-  value. Existing AgentDb records and reconcile gates are migrated
-  automatically, so stored depths and live `/agent set` edits survive the
-  upgrade, and accepted in-flight jobs stay valid. Upgrade co-owning peers
-  together.
+- Renamed `max_iterations` to `max_spawn_depth` in config, commands, and
+  `spawn_worker`. The old config field is ignored, with no alias or migration;
+  set `max_spawn_depth` explicitly to retain a non-default ceiling.
 
 ## [0.3.0](https://github.com/arcuru/chaz/compare/v0.2.0...v0.3.0) - 2024-10-25
 
