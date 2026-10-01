@@ -82,7 +82,7 @@ class Proxy(http.server.BaseHTTPRequestHandler):
             pass  # A killed SDK client is the intentional crash control.
         connection.close()
 
-    do_GET = do_POST = do_PUT = forward
+    do_GET = do_POST = do_PUT = do_DELETE = forward
 
 
 server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Proxy)
