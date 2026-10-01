@@ -747,8 +747,16 @@ pub struct ScheduleConfig {
     pub agent: Option<String>,
     /// Task instructions handed to the agent as the wake prompt
     pub task: String,
-    /// Cron expression (e.g., "0 9 * * *")
-    pub cron: String,
+    /// Six-field cron expression. Mutually exclusive with interval_seconds.
+    #[serde(default)]
+    pub cron: Option<String>,
+    /// Fixed delay in seconds. Mutually exclusive with cron.
+    #[serde(default)]
+    pub interval_seconds: Option<u64>,
+    /// Fulfill this schedule even when its Pinned session is not watched.
+    /// Only this operator-config surface can create permanent schedules.
+    #[serde(default)]
+    pub permanent: bool,
     /// Whether this schedule is active (default: true)
     #[serde(default = "default_enabled")]
     pub enabled: bool,
@@ -763,6 +771,25 @@ pub struct ScheduleConfig {
 
 fn default_enabled() -> bool {
     true
+}
+
+impl ScheduleConfig {
+    pub fn trigger(&self) -> anyhow::Result<crate::routine::Trigger> {
+        use crate::routine::Trigger;
+        let trigger = match (&self.cron, self.interval_seconds) {
+            (Some(expr), None) => {
+                use std::str::FromStr;
+                cron::Schedule::from_str(expr)?;
+                Trigger::Cron { expr: expr.clone() }
+            }
+            (None, Some(seconds)) => Trigger::Interval {
+                period: std::time::Duration::from_secs(seconds),
+            },
+            _ => anyhow::bail!("schedule requires exactly one of cron or interval_seconds"),
+        };
+        crate::routine::engine::validate_trigger(&trigger)?;
+        Ok(trigger)
+    }
 }
 
 /// Security configuration
@@ -1093,6 +1120,8 @@ fn known_config_keys() -> HashSet<&'static str> {
         "schedules[].agent",
         "schedules[].task",
         "schedules[].cron",
+        "schedules[].interval_seconds",
+        "schedules[].permanent",
         "schedules[].enabled",
         "schedules[].max_fires",
         "schedules[].expires_at",
@@ -1534,6 +1563,35 @@ schedules:
         assert_eq!(schedules[0].name, "daily_report");
         // enabled defaults to true
         assert!(schedules[0].enabled);
+        assert!(!schedules[0].permanent);
+        assert!(schedules[0].trigger().is_ok());
+    }
+
+    #[test]
+    fn permanent_interval_config_validates_trigger_and_known_keys() {
+        let yaml = "schedules:\n  - name: poll\n    session: target\n    task: check\n    interval_seconds: 300\n    permanent: true\n";
+        let cfg: Config = serde_yaml::from_str(yaml).unwrap();
+        let schedule = &cfg.schedules.unwrap()[0];
+        assert!(schedule.permanent);
+        assert_eq!(
+            schedule.trigger().unwrap(),
+            crate::routine::Trigger::Interval {
+                period: std::time::Duration::from_secs(300),
+            }
+        );
+        assert!(schedule.max_fires.is_none());
+        assert!(schedule.expires_at.is_none());
+        assert!(check_unknown_config_keys(yaml).is_empty());
+        for invalid in [
+            yaml.replace("300", "0"),
+            yaml.replace("300", &u64::MAX.to_string()),
+            yaml.replace("    interval_seconds: 300\n", ""),
+            format!("{yaml}    cron: '0 * * * * *'\n"),
+            yaml.replace("    interval_seconds: 300", "    cron: 'invalid'"),
+        ] {
+            let cfg: Config = serde_yaml::from_str(&invalid).unwrap();
+            assert!(cfg.schedules.unwrap()[0].trigger().is_err(), "{invalid}");
+        }
     }
 
     #[test]

@@ -882,7 +882,7 @@ pub async fn build(
 /// Errors are logged, not propagated: the gateway is already live, so a
 /// failure here degrades a feature rather than aborting the process.
 #[allow(clippy::too_many_arguments)]
-async fn run_deferred_startup(
+pub(super) async fn run_deferred_startup(
     server: Arc<Server>,
     registry: Arc<session::SessionRegistry>,
     config: Config,
@@ -939,7 +939,7 @@ async fn run_deferred_startup(
     );
 
     // 3a. Translate YAML `schedules:` into agent-owned Schedules. Each
-    //     ScheduleConfig becomes one cron Schedule in the owning agent's
+    //     ScheduleConfig becomes one cron/interval Schedule in the owning agent's
     //     DB, Pinned to the resolved session. Idempotent by schedule id ==
     //     schedule name within the owning agent.
     if let Some(schedules) = config.schedules.clone() {
@@ -948,6 +948,13 @@ async fn run_deferred_startup(
                 info!(schedule = %cfg.name, "Schedule disabled, skipping");
                 continue;
             }
+            let trigger = match cfg.trigger() {
+                Ok(trigger) => trigger,
+                Err(e) => {
+                    error!(schedule = %cfg.name, "Invalid schedule trigger: {e}");
+                    continue;
+                }
+            };
             // Owning agent: explicit `agent:` else the peer's default.
             let owner_ref = cfg
                 .agent
@@ -1014,14 +1021,13 @@ async fn run_deferred_startup(
             }
             let mut schedule = agent_db::Schedule::new(
                 cfg.name.clone(),
-                routine::Trigger::Cron {
-                    expr: cfg.cron.clone(),
-                },
+                trigger,
                 cfg.task.clone(),
                 agent_db::ScheduleTarget::Pinned { session_db_id },
             );
             schedule.max_fires = cfg.max_fires;
             schedule.expires_at = cfg.expires_at;
+            schedule.permanent = cfg.permanent;
             if let Err(e) = adb.upsert_schedule(schedule).await {
                 error!(schedule = %cfg.name, "Failed to save schedule: {e}");
             } else {
@@ -1029,7 +1035,7 @@ async fn run_deferred_startup(
                     schedule = %cfg.name,
                     agent = %entry.display_name,
                     session = %cfg.session,
-                    cron = %cfg.cron,
+                    permanent = cfg.permanent,
                     "Schedule registered as agent-owned schedule"
                 );
             }
@@ -1085,7 +1091,9 @@ async fn run_deferred_startup(
         // Schedules). The agent is the unit of ownership; chaz is the
         // runtime that loads it and fires the callback. Schedules persist
         // in the agent's DB, so this picks up whatever synced/created
-        // since last boot.
+        // since last boot. Permanent Pinned schedules are seeded even when
+        // their target has no client exposure or SessionRuntime; their
+        // standalone fire path opens the target without taking over routing.
         for entry in server.agent_index().list() {
             let opened = {
                 let user = registry.user_lock().await;

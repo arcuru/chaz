@@ -27,6 +27,7 @@ use std::sync::Arc;
 
 mod agent;
 mod extensions;
+mod jobs;
 mod parse;
 mod session;
 mod sharing;
@@ -102,6 +103,8 @@ pub enum Command {
     Print,
     /// Aggregate LLM usage and cost across all sessions.
     ListCosts,
+    /// Daemon-wide schedule inventory across global, session, and agent scopes.
+    Jobs,
     /// Show interrupted turns in the current session. These are never replayed
     /// automatically because a model or tool effect may already have happened.
     Interrupted,
@@ -278,6 +281,7 @@ pub const BUILTIN_COMMAND_NAMES: &[&str] = &[
     "schedules",
     "info",
     "costs",
+    "jobs",
     "interrupted",
     "retry",
     "print",
@@ -383,6 +387,7 @@ pub async fn dispatch(cmd: Command, ctx: &CommandContext<'_>) -> CommandOutcome 
         Command::SwitchSession(id) => session::switch_session(&id, ctx).await,
         Command::Info => session::info(ctx).await,
         Command::ListCosts => session::list_costs(ctx).await,
+        Command::Jobs => jobs::list(ctx).await,
         Command::Interrupted => session::interrupted(ctx).await,
         Command::RetryInterrupted(request) => session::retry_interrupted(&request, ctx).await,
         Command::NameSession(name) => session::name_session(&name, ctx).await,

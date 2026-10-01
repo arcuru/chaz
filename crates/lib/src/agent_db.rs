@@ -415,6 +415,10 @@ pub struct Schedule {
     pub target: ScheduleTarget,
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// Operator-created work that may fire into an unwatched Pinned session.
+    /// This does not bypass home ownership, authorization, or lifecycle bounds.
+    #[serde(default)]
+    pub permanent: bool,
     #[serde(default)]
     pub consecutive_failures: u32,
     #[serde(default = "default_schedule_max_failures")]
@@ -453,6 +457,7 @@ impl Schedule {
             prompt: prompt.into(),
             target,
             enabled: true,
+            permanent: false,
             consecutive_failures: 0,
             max_failures: 3,
             last_error: None,

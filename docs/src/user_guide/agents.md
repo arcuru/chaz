@@ -338,17 +338,17 @@ Fire timing is sleep-until-next, capped at a 5-minute idle wake so a wall-clock 
 
 ### Entry points
 
-Routines are created two ways, both compiling to the same `Routine` rows fired by the one engine:
+Schedules are created two ways, both stored in the Agent DB and compiled into `Routine` entries fired by the one engine:
 
 - **Interactive** — `/schedule add|modify|remove|list` and the `schedule_add|modify|remove|list` / `schedule_once` tools (this section and [Tools](./tools.md)).
-- **Static config** — the `schedules:` block in the chaz config ([Configuration](./configuration.md)), translated into session-scoped routines at startup.
+- **Static config** — the `schedules:` block in the chaz config ([Configuration](./configuration.md)), imported into the owning Agent's DB at startup. This is the only creation surface for the permanent marker.
 
 ### When rules fire
 
-Firing is **server-side and independent of any UI**. A rule fires whenever chaz is running and the session is registered — you do _not_ need the session open or focused in the TUI, and for Matrix no one needs to be in the room. The agent turn runs on the server regardless; a bridge only affects when you _see_ the result. (Agent-owned schedules use the standalone fire path described above — no `Directive` entry is written, the schedule's `prompt` is passed as invocation-scoped input. Static-config session routines still write a `Directive` into their target session.)
+Firing is server-side: the session need not be focused in the TUI, and no human needs to be in a Matrix room. Ordinary Pinned schedules are **best-effort while watched by the daemon**. They self-disable when a fire finds no registered target runtime; durable storage alone does not promise continued execution. A permanent Pinned schedule does not require that runtime or any client presence. Both use the standalone Agent turn path, including schedules imported from config; no `Directive` is written.
 
 - **chaz must be running.** The engine is one per-process task, not a system cron. While chaz is down nothing fires. A missed cron tick is skipped; an interval resumes from its last successful-dispatch anchor, so if its period elapsed during downtime it fires immediately on restart. A one-shot whose `fire_at` passed while down fires once on the next start.
-- **The session must still be registered.** Closing/deregistering a session prunes its routines from the engine, so a closed session stops firing.
+- **Ordinary Pinned targets must still be watched.** A fire into an unregistered target disables the ordinary schedule. Permanent schedules open their target directly without changing interactive routing. This does not add session-close detection or propagate catalog Closed status into the engine.
 - **The home daemon must be running and host the Agent.** A non-home daemon skips the fire. Rehost the Agent or pinned session explicitly if ownership moves.
 - **Changes are live.** `/schedule add|remove`, `schedule_modify`, and `schedule_once` take effect on the running engine immediately — no restart needed.
 
@@ -356,14 +356,15 @@ Firing is **server-side and independent of any UI**. A rule fires whenever chaz 
 
 Cron uses 6 fields: `sec min hour day_of_month month day_of_week`. Intervals use whole seconds and are fixed-delay from successful dispatch; they do not wait for the asynchronous agent turn to finish.
 
-| Command                                                                       | What                                                                                                                               |
-| ----------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------- |
-| `/schedule list` (or bare `/schedule`)                                        | List rules on the current session. Interval rules render as `every 300s`; one-shots render with an `@YYYY-MM-DD HH:MM:SSZ` marker. |
-| `/schedule add <id> <sec> <min> <hour> <dom> <mon> <dow> <agent_ref> <task…>` | Add a cron rule. Duplicate IDs are rejected; use `modify` or remove the old rule first. Task may contain `@mentions`.              |
-| `/schedule add interval <id> <seconds> <agent_ref> <task…>`                   | Add a fixed-delay interval rule. Duplicate IDs are rejected.                                                                       |
-| `/schedule modify <id> cron <6 fields> [agent_ref]`                           | Replace a rule's trigger with a cron expression.                                                                                   |
-| `/schedule modify <id> interval <seconds> [agent_ref]`                        | Replace a rule's trigger with a fixed-delay interval.                                                                              |
-| `/schedule remove <id>`                                                       | Remove a rule by id.                                                                                                               |
+| Command                                                                       | What                                                                                                                                                     |
+| ----------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `/schedule list` (or bare `/schedule`)                                        | List rules on the current session. Interval rules render as `every 300s`; one-shots render with an `@YYYY-MM-DD HH:MM:SSZ` marker.                       |
+| `/schedule add <id> <sec> <min> <hour> <dom> <mon> <dow> <agent_ref> <task…>` | Add a cron rule. Duplicate IDs are rejected; use `modify` or remove the old rule first. Task may contain `@mentions`.                                    |
+| `/schedule add interval <id> <seconds> <agent_ref> <task…>`                   | Add a fixed-delay interval rule. Duplicate IDs are rejected.                                                                                             |
+| `/schedule modify <id> cron <6 fields> [agent_ref]`                           | Replace a rule's trigger with a cron expression.                                                                                                         |
+| `/schedule modify <id> interval <seconds> [agent_ref]`                        | Replace a rule's trigger with a fixed-delay interval.                                                                                                    |
+| `/schedule remove <id>`                                                       | Remove a rule by id.                                                                                                                                     |
+| `/jobs`                                                                       | Read-only inventory from this executor's `list_routines`: global, session, and Agent scopes, with IDs, target, loaded enabled state, and permanent flag. |
 
 To create a one-shot rule from the TUI, agents call the `schedule_once` tool. There's no slash-command form yet.
 
@@ -481,6 +482,76 @@ The slash command can replace a trigger without changing the prompt or target:
 It cannot edit bounds, targets, prompts, or enabled state. Use
 `schedule_modify` for those fields. Slash-command schedules are always Pinned;
 use the tool when you need a Fresh target.
+
+## Permanent schedules
+
+`permanent: true` is an operator commitment to continue a scheduled wake when nobody has its target open.
+The marker lives on the Schedule in the Agent DB, syncs with it, and is copied into the engine's routine inventory.
+At boot the daemon seeds the schedule from that DB whether or not a bridge exposes the target.
+At fire time it reads the durable marker and opens the Pinned target directly, without taking over that session's interactive routing.
+The home-peer, key authorization, busy-session, failure, expiry, and fire-count checks still apply.
+While the daemon is stopped nothing runs; restart resumes interval timing from the last successful dispatch, not by replaying an uncertain prior turn.
+
+Only the YAML `schedules:` creation path accepts the marker.
+Neither `/schedule` nor a schedule tool can set it; an explicit `permanent` tool argument is rejected.
+Existing disable/remove operations remain available, and schedule listings label permanent rows.
+Fresh schedules keep their existing autonomous behavior, with `expires_at` and `max_fires` optional.
+No client heartbeat or read-then-trigger loop is involved; connected client-pull remains deferred because bridges cannot universally perform that loop.
+
+### Auditing scheduled jobs
+
+`/jobs` displays every routine currently loaded by this process's engine, across all scopes, including inert disabled rows.
+Each line carries the engine ID, owning scope, trigger, extension, target, `enabled`, and `permanent`.
+This is a loaded-definition snapshot, not proof of execution or liveness; use `/schedule list <agent>` for the authoritative Agent DB state and fire count.
+The view is available in an executor TUI after schedule startup, not a service client or one-shot `chaz cmd` process, neither of which runs an engine.
+Use that TUI **instead of** a headless executor on the same state, not alongside a second executor.
+It does not fetch another daemon's inventory or replace the separate Agent-job status tools.
+
+### Walkthrough: keep a wake running, then revoke it
+
+1. Create a named `ops` session and attach `watcher`, then add this entry to the executor's config and restart it:
+
+   ```yaml
+   schedules:
+     - name: unattended-check
+       agent: watcher
+       session: ops
+       interval_seconds: 300
+       task: Check for actionable updates
+       permanent: true
+   ```
+
+   With no bounds, this interval keeps running until disabled or removed.
+   In an executor TUI, `/schedule list watcher` shows:
+
+   ```text
+   watcher:
+     unattended-check [every 300s] (permanent) → pinned — Check for actionable updates
+   ```
+
+   `/jobs` also shows `permanent=true`, the Agent DB scope, and the Pinned session ID.
+   Close the target UI; the home daemon still fires it.
+   Restart the daemon; it loads the same DB row without a connected client.
+
+2. A chat attempt to grant permanence is rejected. A `schedule_modify` call with `{"id":"unattended-check","permanent":true}` returns:
+
+   ```text
+   permanent is config-only; use schedules[].permanent in the operator config
+   ```
+
+   If a permanent Pinned fire is instead skipped on a surviving non-home daemon, inspect `/agent home-status watcher` and explicitly `/agent rehost watcher` in `ops` to move its session home.
+   The next due fire uses that ownership; permanence does not provide automatic failover.
+
+3. To revoke the wake, remove its config entry **and** its persisted Schedule:
+
+   ```text
+   /schedule remove unattended-check watcher
+   Removed schedule 'unattended-check'
+   ```
+
+   The live engine drops it immediately.
+   If you leave the config entry in place, the next daemon boot creates it again.
+   To replace a mistaken trigger or marker, remove the row, correct the config, and restart to import the replacement; changing YAML alone leaves an existing row untouched.
 
 ## Tool Narrowing
 

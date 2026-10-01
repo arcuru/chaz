@@ -62,6 +62,15 @@ fn opt_bool(arguments: &Value, name: &str) -> Option<bool> {
     arguments.get(name).and_then(|v| v.as_bool())
 }
 
+fn reject_permanent_argument(arguments: &Value) -> Result<(), ToolError> {
+    if arguments.get("permanent").is_some() {
+        return Err(
+            "permanent is config-only; use schedules[].permanent in the operator config".into(),
+        );
+    }
+    Ok(())
+}
+
 /// Parse the optional `expires_at` arg (RFC 3339 / ISO 8601, e.g.
 /// `2026-06-01T09:00:00Z`). `Ok(None)` if absent; `Err` if present but
 /// unparseable.
@@ -204,6 +213,7 @@ impl Tool for ScheduleAdd {
         ctx: &'a ToolContext,
     ) -> Pin<Box<dyn Future<Output = Result<String, ToolError>> + Send + 'a>> {
         Box::pin(async move {
+            reject_permanent_argument(&arguments)?;
             let user_id = str_arg(&arguments, "id")?;
             let task = str_arg(&arguments, "task")?;
             let cron = opt_str(&arguments, "cron");
@@ -339,6 +349,7 @@ impl Tool for ScheduleModify {
         ctx: &'a ToolContext,
     ) -> Pin<Box<dyn Future<Output = Result<String, ToolError>> + Send + 'a>> {
         Box::pin(async move {
+            reject_permanent_argument(&arguments)?;
             let id = str_arg(&arguments, "id")?;
             let new_cron = opt_str(&arguments, "cron");
             let new_interval = interval_trigger(&arguments)?;
@@ -593,6 +604,7 @@ impl Tool for ScheduleList {
             lines.push(format!("Schedules on '{}':", entry.display_name));
             for t in &schedules {
                 let state = if t.enabled { "" } else { " (disabled)" };
+                let permanent = if t.permanent { " (permanent)" } else { "" };
                 let schedule = match &t.trigger {
                     Trigger::Cron { expr } => expr.clone(),
                     Trigger::Interval { period } => format!("every {period:?}"),
@@ -611,7 +623,7 @@ impl Tool for ScheduleList {
                     String::new()
                 };
                 lines.push(format!(
-                    "- **{}** [{schedule}]{state}{bounds}{fired} → {target_label} — {}",
+                    "- **{}** [{schedule}]{state}{permanent}{bounds}{fired} → {target_label} — {}",
                     t.id, t.prompt
                 ));
             }
@@ -683,6 +695,7 @@ impl Tool for ScheduleOnce {
         ctx: &'a ToolContext,
     ) -> Pin<Box<dyn Future<Output = Result<String, ToolError>> + Send + 'a>> {
         Box::pin(async move {
+            reject_permanent_argument(&arguments)?;
             let after = arguments
                 .get("after_seconds")
                 .and_then(|v| v.as_u64())
@@ -827,6 +840,46 @@ mod tests {
             active_extensions: std::collections::HashSet::new(),
             routine_engine: None,
         }
+    }
+
+    #[tokio::test]
+    async fn chat_tools_cannot_create_or_modify_permanent_marker() {
+        let (_instance, registry, index, session) = fixture("alpha").await;
+        let cap = scoped(registry, index);
+        let ctx = make_ctx("alpha", session);
+        let add = ScheduleAdd::new(cap.clone());
+        let modify = ScheduleModify::new(cap.clone());
+        let once = ScheduleOnce::new(cap.clone());
+        for tool in [&add as &dyn Tool, &modify as &dyn Tool, &once as &dyn Tool] {
+            assert!(
+                tool.descriptor().parameters["properties"]
+                    .get("permanent")
+                    .is_none()
+            );
+            let result = tool.execute(serde_json::json!({"id": "poll", "task": "check", "interval_seconds": 300, "after_seconds": 60, "enabled": true, "permanent": true}), &ctx).await;
+            assert!(result.unwrap_err().to_string().contains("config-only"));
+        }
+        let entry = cap.resolve_agent("alpha").unwrap();
+        let adb = cap.open_agent_db(&entry).await.unwrap();
+        assert!(adb.list_schedules().await.unwrap().is_empty());
+        add.execute(
+            serde_json::json!({"id": "poll", "task": "check", "interval_seconds": 300}),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(!adb.find_schedule("poll").await.unwrap().unwrap().permanent);
+        let mut schedule = adb.find_schedule("poll").await.unwrap().unwrap();
+        schedule.permanent = true;
+        adb.upsert_schedule(schedule).await.unwrap();
+        // Existing revocation stays available without granting the marker.
+        modify
+            .execute(serde_json::json!({"id": "poll", "enabled": false}), &ctx)
+            .await
+            .unwrap();
+        let schedule = adb.find_schedule("poll").await.unwrap().unwrap();
+        assert!(schedule.permanent);
+        assert!(!schedule.enabled);
     }
 
     async fn save_anchor(peer: &eidetica::Database, id: &str) {

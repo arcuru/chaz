@@ -88,6 +88,11 @@ impl Server {
             .open_agent_db_for_schedule(&agent_entry)
             .await
             .ok_or_else(|| anyhow::anyhow!("cannot open owning agent DB for schedule fire"))?;
+        // Read the durable operator marker, not a caller-supplied payload.
+        let permanent = adb
+            .find_schedule(&payload.schedule_id)
+            .await?
+            .is_some_and(|schedule| schedule.permanent);
 
         // 2. Resolve and check the target before lifecycle admission. A
         // non-home daemon must not consume a max_fires slot for work it will
@@ -111,7 +116,7 @@ impl Server {
                 }
             }
             ScheduleTarget::Pinned { session_db_id } => {
-                if !self.is_session_open(session_db_id).await {
+                if !permanent && !self.is_session_open(session_db_id).await {
                     if let Err(e) = self.disable_schedule(&adb, &payload.schedule_id).await {
                         tracing::error!(
                             agent = %agent_name,
