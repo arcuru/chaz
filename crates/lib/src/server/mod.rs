@@ -228,6 +228,7 @@ async fn bridge_reply_for_turn(
 /// Revalidate a selected request after acquiring the per-session processing
 /// slot; selection can be older than another turn's completed commit.
 async fn fresh_attempt_for_request(
+    server: &Server,
     session: &Session,
     request: &crate::session::TurnRequest,
     live_attempts: &std::collections::HashSet<String>,
@@ -252,8 +253,8 @@ async fn fresh_attempt_for_request(
     {
         return Ok(None);
     }
-    session
-        .start_turn_attempt(request.id.clone())
+    server
+        .start_live_attempt(session, request.id.clone())
         .await
         .map(Some)
 }
@@ -2862,7 +2863,9 @@ impl Server {
             _ => false,
         };
         let attempt =
-            match fresh_attempt_for_request(&session, &request, &live_now, pending_retry).await {
+            match fresh_attempt_for_request(self, &session, &request, &live_now, pending_retry)
+                .await
+            {
                 Ok(Some(attempt)) => {
                     if pending_retry {
                         self.pending_retry_attempts
@@ -2948,11 +2951,7 @@ impl Server {
         {
             return Ok(false);
         }
-        let attempt = fresh.start_turn_attempt(request_id).await?;
-        self.live_attempts
-            .lock()
-            .await
-            .insert(attempt.attempt_id.clone());
+        let attempt = self.start_live_attempt(&fresh, request_id).await?;
         self.spawn_agent_task(
             sid,
             fresh,
@@ -2965,6 +2964,26 @@ impl Server {
         )
         .await;
         Ok(true)
+    }
+
+    /// Mark the attempt live before its Started record is written. Status
+    /// readers snapshot live attempts before reading the DB, so the reverse
+    /// order lets a write-triggered observer (e.g. `job_wait`) report a
+    /// just-started attempt as Interrupted.
+    async fn start_live_attempt(
+        &self,
+        session: &Session,
+        request_id: TurnRequestId,
+    ) -> anyhow::Result<TurnAttempt> {
+        let attempt_id = uuid::Uuid::new_v4().to_string();
+        self.live_attempts.lock().await.insert(attempt_id.clone());
+        let started = session
+            .start_turn_attempt_as(request_id, attempt_id.clone())
+            .await;
+        if started.is_err() {
+            self.live_attempts.lock().await.remove(&attempt_id);
+        }
+        started
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3021,14 +3040,8 @@ impl Server {
                 .await?
                 .ok_or_else(|| anyhow::anyhow!("live command attempt {attempt_id} disappeared"))?,
             None => {
-                let attempt = session
-                    .start_turn_attempt(request.command_id.clone())
-                    .await?;
-                self.live_attempts
-                    .lock()
-                    .await
-                    .insert(attempt.attempt_id.clone());
-                attempt
+                self.start_live_attempt(&session, request.command_id.clone())
+                    .await?
             }
         };
         let attempt_id = attempt.attempt_id.clone();

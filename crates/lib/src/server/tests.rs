@@ -617,7 +617,8 @@ async fn observed_matrix_input_is_context_not_a_turn_request() {
 
 #[tokio::test]
 async fn completed_attempt_cannot_be_reused_from_a_stale_in_flight_selection() {
-    let (_instance, _user, db) = crate::session::test_helpers::test_session_db().await;
+    let (_instance, server, registry) = server_fixture().await;
+    let (_, db) = registry.create_session(None).await.unwrap();
     let mut session = Session::new(ConversationId(db.root_id().to_string()), db).await;
     let request_id = session
         .add_entry(SessionEntry {
@@ -644,12 +645,62 @@ async fn completed_attempt_cannot_be_reused_from_a_stale_in_flight_selection() {
     session.complete_turn_attempt(&first, None).await.unwrap();
     let live = std::collections::HashSet::from([first.attempt_id.clone()]);
     assert!(
-        fresh_attempt_for_request(&session, &stale, &live, true)
+        fresh_attempt_for_request(&server, &session, &stale, &live, true)
             .await
             .unwrap()
             .is_none(),
         "a stale live-attempt selection must not re-run an already completed tool turn"
     );
+}
+
+#[tokio::test]
+async fn fresh_queued_attempt_is_live_and_completed_selection_cannot_restart() {
+    let (_instance, server, registry) = server_fixture().await;
+    let (_, db) = registry.create_session(None).await.unwrap();
+    let mut session = Session::new(ConversationId(db.root_id().to_string()), db).await;
+    let request_id = session
+        .add_entry(SessionEntry {
+            sender: "visitor".into(),
+            content: "one queued request".into(),
+            timestamp: Utc::now(),
+            entry_type: EntryType::Message,
+            metadata: None,
+            routing: None,
+        })
+        .await
+        .unwrap();
+    let request = crate::session::TurnRequest {
+        id: request_id,
+        entry: session.entries()[0].clone(),
+        state: TurnRequestState::Queued,
+    };
+    let attempt =
+        fresh_attempt_for_request(&server, &session, &request, &Default::default(), false)
+            .await
+            .unwrap()
+            .unwrap();
+    let live = server.live_attempts.lock().await.clone();
+    assert!(
+        live.contains(&attempt.attempt_id),
+        "fresh queued attempts must be registered live by the start helper"
+    );
+    assert!(matches!(
+        session.turn_state_for_entry(&request.id, &live).await.unwrap(),
+        TurnRequestState::InFlight { attempt_id } if attempt_id == attempt.attempt_id
+    ));
+    session.complete_turn_attempt(&attempt, None).await.unwrap();
+    assert!(
+        fresh_attempt_for_request(&server, &session, &request, &live, false)
+            .await
+            .unwrap()
+            .is_none(),
+        "fresh validation must reject a completed request selected earlier as queued"
+    );
+    assert!(matches!(
+        session.turn_state_for_entry(&request.id, &live).await.unwrap(),
+        TurnRequestState::Completed { attempt_id } if attempt_id == attempt.attempt_id
+    ));
+    server.shutdown().await;
 }
 
 #[tokio::test]
@@ -7355,6 +7406,12 @@ impl crate::tool::Tool for PermitProbe {
     }
 }
 
+// Unoptimized builds can stretch a child's claim refresh past the claim TTL
+// under this load, so settlement is skipped. The Nix test gate runs it.
+#[cfg_attr(
+    debug_assertions,
+    ignore = "claim refresh lags past the TTL in unoptimized builds"
+)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn ten_job_wait_parents_yield_capacity_and_reacquire_before_continuing() {
     use crate::session::jobs::JobState;
