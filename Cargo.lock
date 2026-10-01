@@ -2007,7 +2007,7 @@ dependencies = [
 [[package]]
 name = "eidetica"
 version = "0.2.0"
-source = "git+https://github.com/arcuru/eidetica?rev=94c2624c7793c798847240c3287ff06280420eed#94c2624c7793c798847240c3287ff06280420eed"
+source = "git+https://github.com/arcuru/eidetica?rev=548243300faafebd07421a7f388cd2358f862d41#548243300faafebd07421a7f388cd2358f862d41"
 dependencies = [
  "aes-gcm",
  "argon2",
