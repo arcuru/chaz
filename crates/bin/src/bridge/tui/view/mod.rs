@@ -42,6 +42,8 @@ use theme::TOOL as COLOR_TOOL;
 use theme::USER as COLOR_USER;
 
 mod composer;
+#[cfg(test)]
+mod list_tests;
 mod settings;
 
 /// Last `/`-separated segment of a model id (`anthropic/claude-opus-4-7` →
@@ -98,6 +100,119 @@ fn ellipsize(s: &str, n: usize) -> String {
         format!("{t}…")
     } else {
         t.to_string()
+    }
+}
+
+/// Visible slice of a cursor-driven list.
+///
+/// These lists render as one `Paragraph` of lines, so keeping the selection on
+/// screen means choosing which rows to build at all. Building every row and
+/// letting the pane clip them is what let a cursor walk off the bottom edge
+/// while the list itself never moved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct ListWindow {
+    /// First row to build.
+    pub first: usize,
+    /// One past the last row to build.
+    pub end: usize,
+    /// Offset to persist in `App::scroll` for this list.
+    pub offset: usize,
+}
+
+impl ListWindow {
+    /// `heights[i]` is row `i`'s line count and `budget` the lines available
+    /// for rows, both excluding the list's fixed header and footer.
+    pub(super) fn new(
+        heights: &[usize],
+        cursor: Option<usize>,
+        budget: usize,
+        offset: usize,
+    ) -> Self {
+        Self::fit(heights.len(), |i| heights[i], cursor, budget, offset)
+    }
+
+    /// [`ListWindow::new`] for the common case where every row is `height`
+    /// lines tall. The session picker holds the whole session catalog, so it
+    /// takes this path rather than materializing a `heights` vector per frame.
+    pub(super) fn uniform(
+        len: usize,
+        height: usize,
+        cursor: Option<usize>,
+        budget: usize,
+        offset: usize,
+    ) -> Self {
+        Self::fit(len, |_| height, cursor, budget, offset)
+    }
+
+    /// The window follows the cursor rather than recentering, so navigating
+    /// inside it doesn't jitter the list. It always contains the cursor's row,
+    /// even when that row alone is taller than the budget — that row then
+    /// renders clipped rather than vanishing.
+    ///
+    /// `cursor` is `None` when this list's cursor currently sits outside it.
+    /// The session picker's pinned "New session" row is the only such case: a
+    /// `Some` there would be a lie, and reading it as row 0 would snap the
+    /// window back to the top whenever the user selected that row.
+    fn fit(
+        len: usize,
+        height: impl Fn(usize) -> usize,
+        cursor: Option<usize>,
+        budget: usize,
+        offset: usize,
+    ) -> Self {
+        if len == 0 {
+            return Self {
+                first: 0,
+                end: 0,
+                offset: 0,
+            };
+        }
+        // Everything fits: park at the top rather than honoring an offset left
+        // over from when the list was longer.
+        if (0..len).map(&height).sum::<usize>() <= budget {
+            return Self {
+                first: 0,
+                end: len,
+                offset: 0,
+            };
+        }
+        let cursor = cursor.map(|c| c.min(len - 1));
+        // Never leave the window past the last row — a list that shrank
+        // self-corrects here, with no explicit offset reset — and never below
+        // a cursor that has walked back above it.
+        let mut first = offset.min(len - 1);
+        if let Some(c) = cursor {
+            first = first.min(c);
+        }
+        // Scroll down while the rows from `first` through the cursor overflow.
+        if let Some(c) = cursor {
+            let mut through_cursor: usize = (first..=c).map(&height).sum();
+            while first < c && through_cursor > budget {
+                through_cursor -= height(first);
+                first += 1;
+            }
+        }
+        // Fill whatever budget is left with the rows below.
+        let mut end = first;
+        let mut used = 0usize;
+        while end < len && used + height(end) <= budget {
+            used += height(end);
+            end += 1;
+        }
+        // Always build at least one row, and always the cursor's — the second
+        // is what keeps a row taller than the budget on screen, clipped.
+        let floor = first + 1;
+        let floor = cursor.map_or(floor, |c| floor.max(c + 1));
+        Self {
+            first,
+            end: end.max(floor).min(len),
+            offset: first,
+        }
+    }
+
+    /// Row indices to build, in order.
+    pub(super) fn rows(&self) -> std::ops::Range<usize> {
+        self.first..self.end
     }
 }
 
@@ -1185,7 +1300,7 @@ fn humanize_age(created_at: Option<DateTime<Utc>>, now: DateTime<Utc>) -> String
     format!("{weeks}w ago")
 }
 
-fn ui_picker(f: &mut ratatui::Frame, app: &mut App) {
+pub(super) fn ui_picker(f: &mut ratatui::Frame, app: &mut App) {
     let chunks = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(f.area());
 
     let list_area = chunks[0];
@@ -1235,6 +1350,30 @@ fn ui_picker(f: &mut ratatui::Frame, app: &mut App) {
         y_off = y_off.saturating_add(2);
     }
 
+    // Session rows below the pinned row are windowed, so a cursor moving past
+    // the fold scrolls the list instead of walking off the bottom edge — which
+    // is exactly what happened when every row was built and the pane clipped
+    // them. `y_off` is now the first line below the pinned row, which is
+    // where the first windowed row draws.
+    let rows_y0 = y_off;
+    let row_h: u16 = 2;
+    let window = ListWindow::uniform(
+        app.session_list.len(),
+        row_h as usize,
+        app.picker_index.checked_sub(1),
+        inner_h.saturating_sub(rows_y0) as usize,
+        app.scroll.picker,
+    );
+    app.scroll.picker = window.offset;
+    // Include a partially visible row, but never the window's forced row when
+    // no session line fits below the pinned New session row.
+    let visible_count = if inner_w == 0 {
+        0
+    } else {
+        inner_h.saturating_sub(rows_y0).div_ceil(row_h) as usize
+    };
+    app.picker_visible_rows = window.first..window.end.min(window.first + visible_count);
+
     if app.session_list.is_empty() {
         let message = if app.session_catalog_loading {
             "  Loading sessions…"
@@ -1250,7 +1389,8 @@ fn ui_picker(f: &mut ratatui::Frame, app: &mut App) {
     } else {
         let current_session_db_id = app.active().session_db_id.clone();
         let now = Utc::now();
-        for (i, info) in app.session_list.iter().enumerate() {
+        for i in window.rows() {
+            let info = &app.session_list[i];
             let is_selected = i + 1 == app.picker_index;
             let is_current = info.session_db_id == current_session_db_id;
 
@@ -1270,7 +1410,7 @@ fn ui_picker(f: &mut ratatui::Frame, app: &mut App) {
             };
 
             // Name is available from the peer-local index. Agent metadata is
-            // loaded only for rows around the cursor.
+            // loaded only for rows visible in the picker viewport.
             let header = if info.loaded {
                 format!(
                     "{marker}{title}{current_marker} [{bridge}] {agent_str} • {age}{closed_suffix}"
@@ -1295,13 +1435,15 @@ fn ui_picker(f: &mut ratatui::Frame, app: &mut App) {
                 Style::default().fg(COLOR_USER)
             };
 
-            let row_h: u16 = 2;
-            if y_off < inner_h {
-                let clipped_h = row_h.min(inner_h - y_off);
+            // Screen row of this row inside the pane, rebased on the window
+            // so a scrolled list still hit-tests where it actually drew.
+            let row_y = rows_y0 + (i - window.first) as u16 * row_h;
+            if row_y < inner_h {
+                let clipped_h = row_h.min(inner_h - row_y);
                 if clipped_h > 0 {
                     app.click_regions.push(ClickRegion {
                         x: inner_x,
-                        y: inner_y + y_off,
+                        y: inner_y + row_y,
                         w: inner_w,
                         h: clipped_h,
                         target: ClickTarget::PickerSelect(i),
@@ -1312,16 +1454,18 @@ fn ui_picker(f: &mut ratatui::Frame, app: &mut App) {
             lines.push(Line::from(vec![Span::styled(header, style)]));
 
             lines.push(Line::from(""));
-            y_off = y_off.saturating_add(row_h);
         }
     }
 
-    let list = Paragraph::new(lines).wrap(Wrap { trim: false }).block(
+    let list = Paragraph::new(lines).block(
         Block::bordered()
             .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(COLOR_DIM))
             .title(Span::styled(
-                " Sessions ",
+                format!(
+                    " Sessions{} ",
+                    scroll_indicator(window.first, window.end, app.session_list.len())
+                ),
                 Style::default().fg(COLOR_ACCENT),
             )),
     );
@@ -1666,6 +1810,226 @@ mod chat_frame_tests {
             })
             .collect();
         (rows, (cursor.x, cursor.y))
+    }
+
+    #[tokio::test]
+    async fn picker_scroll_keeps_selected_row_visible_and_rebases_click_targets() {
+        use super::super::{ClickTarget, TuiMode};
+        use chaz_core::commands::SessionInfo;
+        use chaz_core::session::{BridgeKind, SessionIndex, SessionStatus};
+        let mut app = test_app("", 0).await;
+        app.mode = TuiMode::SessionPicker;
+        app.session_list = (0..30)
+            .map(|i| {
+                SessionInfo::placeholder(&SessionIndex {
+                    session_db_id: format!("session-{i}"),
+                    source: None,
+                    bridge: BridgeKind::Tui,
+                    created_at: None,
+                    status: SessionStatus::Active,
+                    name: Some(format!("item-{i}-a-very-long-session-name")),
+                })
+            })
+            .collect();
+        app.picker_index = 25;
+        let mut terminal = Terminal::new(TestBackend::new(32, 12)).unwrap();
+        terminal.draw(|f| super::ui_picker(f, &mut app)).unwrap();
+        let screen = (0..12)
+            .map(|y| {
+                (0..32)
+                    .map(|x| terminal.backend().buffer()[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+        assert!(screen.iter().any(|r| r.contains("item-24")), "{screen:?}");
+        assert!(screen.iter().any(|r| r.contains("New session")));
+        let selected = app
+            .click_regions
+            .iter()
+            .find(|r| matches!(r.target, ClickTarget::PickerSelect(24)))
+            .unwrap();
+        assert!(screen[selected.y as usize].contains("item-24"));
+        assert!(app.click_regions.iter().all(|r| r.y + r.h <= 11));
+        for hit in &app.click_regions {
+            if let ClickTarget::PickerSelect(i) = hit.target {
+                assert!(
+                    screen[hit.y as usize].contains(&format!("item-{i}")),
+                    "{screen:?}"
+                );
+            }
+        }
+        let hit = *app
+            .click_regions
+            .iter()
+            .find(|r| matches!(r.target, ClickTarget::PickerSelect(i) if i != 24))
+            .unwrap();
+        let ClickTarget::PickerSelect(clicked) = hit.target else {
+            unreachable!()
+        };
+        super::super::input::handle_mouse(
+            &mut app,
+            crossterm::event::MouseEvent {
+                kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                column: hit.x,
+                row: hit.y,
+                modifiers: crossterm::event::KeyModifiers::NONE,
+            },
+        );
+        assert_eq!(app.picker_index, clicked + 1);
+        let new = *app
+            .click_regions
+            .iter()
+            .find(|r| matches!(r.target, ClickTarget::PickerNew))
+            .unwrap();
+        super::super::input::handle_mouse(
+            &mut app,
+            crossterm::event::MouseEvent {
+                kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                column: new.x,
+                row: new.y,
+                modifiers: crossterm::event::KeyModifiers::NONE,
+            },
+        );
+        assert_eq!(app.picker_index, 0);
+        terminal
+            .draw(|f| {
+                app.click_regions.clear();
+                super::ui_picker(f, &mut app)
+            })
+            .unwrap();
+        assert!(
+            app.scroll.picker > 0,
+            "pinned row should not reset session viewport"
+        );
+        app.picker_index = 30;
+        let mut narrow = Terminal::new(TestBackend::new(12, 8)).unwrap();
+        app.click_regions.clear();
+        narrow.draw(|f| super::ui_picker(f, &mut app)).unwrap();
+        assert!(
+            app.click_regions
+                .iter()
+                .all(|r| r.y + r.h <= 7 && r.x + r.w <= 12)
+        );
+        assert!(
+            app.click_regions
+                .iter()
+                .any(|r| matches!(r.target, ClickTarget::PickerSelect(29)))
+        );
+    }
+
+    #[tokio::test]
+    async fn picker_wheel_moves_selection_without_scrolling_chat() {
+        use super::super::{TuiMode, input};
+        use crossterm::event::{KeyModifiers, MouseEvent, MouseEventKind};
+        let mut app = test_app("", 0).await;
+        app.mode = TuiMode::SessionPicker;
+        app.session_list = (0..10)
+            .map(|i| {
+                chaz_core::commands::SessionInfo::placeholder(&chaz_core::session::SessionIndex {
+                    session_db_id: format!("s-{i}"),
+                    source: None,
+                    bridge: chaz_core::session::BridgeKind::Tui,
+                    created_at: None,
+                    status: chaz_core::session::SessionStatus::Active,
+                    name: None,
+                })
+            })
+            .collect();
+        input::handle_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::ScrollDown,
+                column: 2,
+                row: 4,
+                modifiers: KeyModifiers::NONE,
+            },
+        );
+        assert_eq!(app.picker_index, 3);
+        assert_eq!(app.active().scroll_offset, 0);
+    }
+
+    #[tokio::test]
+    async fn settings_wheel_moves_detail_cursor_only_over_detail_pane() {
+        use super::super::input;
+        use super::super::{PeerSettingsCategory, SETTINGS_SIDEBAR_W, SettingsScope, TuiMode};
+        use crossterm::event::{KeyModifiers, MouseEvent, MouseEventKind};
+        let mut app = test_app("", 0).await;
+        app.mode = TuiMode::Settings(SettingsScope::Peer);
+        app.peer_settings_index = PeerSettingsCategory::ALL
+            .iter()
+            .position(|c| *c == PeerSettingsCategory::Defaults)
+            .unwrap();
+        app.peer_defaults = (0..10).map(|i| format!("agent-{i}")).collect();
+        let wheel = |column| MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column,
+            row: 4,
+            modifiers: KeyModifiers::NONE,
+        };
+        input::handle_mouse(&mut app, wheel(SETTINGS_SIDEBAR_W - 1));
+        assert_eq!(app.peer_defaults_cursor, 0, "rail wheel must not move list");
+        input::handle_mouse(&mut app, wheel(SETTINGS_SIDEBAR_W));
+        assert_eq!(app.peer_defaults_cursor, 3);
+        for _ in 0..5 {
+            input::handle_mouse(&mut app, wheel(SETTINGS_SIDEBAR_W + 4));
+        }
+        assert_eq!(app.peer_defaults_cursor, 9, "wheel clamps at the last row");
+        assert_eq!(app.active().scroll_offset, 0);
+    }
+
+    #[tokio::test]
+    async fn settings_models_frame_windows_rows_and_clicks_at_narrow_size() {
+        use super::super::{ClickTarget, SessionMetaSnapshot};
+        use chaz_core::backends::BackendManager;
+        use chaz_core::security::SecretStore;
+        use chaz_core::session::AgentRef;
+        use std::collections::HashMap;
+        let mut app = test_app("", 0).await;
+        let secrets = SecretStore::new(app.active().session_db.clone()).await;
+        let backend = BackendManager::new(&None, secrets);
+        app.session_settings_snapshot = Some(SessionMetaSnapshot {
+            session_db_id: "test".into(),
+            model_pin: None,
+            agent_models: HashMap::new(),
+            agents: (0..25)
+                .map(|i| AgentRef {
+                    db_id: format!("db-{i}"),
+                    display_name: format!("agent-{i}"),
+                    home_pubkey: None,
+                })
+                .collect(),
+            host_agent_db_id: None,
+            created_at: None,
+            entry_count: 0,
+        });
+        app.session_models_cursor = 24;
+        let mut terminal = Terminal::new(TestBackend::new(28, 10)).unwrap();
+        terminal
+            .draw(|f| super::settings::render_session_models(f, f.area(), &mut app, &backend))
+            .unwrap();
+        let rows = (0..10)
+            .map(|y| {
+                (0..28)
+                    .map(|x| terminal.backend().buffer()[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+        let selected = app
+            .click_regions
+            .iter()
+            .find(|r| matches!(r.target, ClickTarget::SettingsDetailRow(24)))
+            .unwrap();
+        assert!(rows[selected.y as usize].contains("agent-23"), "{rows:?}");
+        assert!(!rows.iter().any(|r| r.contains("agent-0")));
+        assert!(app.click_regions.iter().all(|r| r.y + r.h <= 10));
+    }
+
+    #[test]
+    fn variable_height_window_keeps_cursor_visible() {
+        let heights = [1, 6, 1, 1, 1, 1];
+        let window = super::ListWindow::new(&heights, Some(5), 3, 0);
+        assert!(window.rows().contains(&5));
+        assert!(window.first > 1);
     }
 
     /// Composer rows for a frame: the bordered box occupies the bottom rows, so
