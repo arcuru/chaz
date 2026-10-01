@@ -6039,6 +6039,12 @@ impl crate::tool::Tool for PermitProbe {
     }
 }
 
+// Unoptimized builds can stretch a child's claim refresh past the claim TTL
+// under this load, so settlement is skipped. The Nix test gate runs it.
+#[cfg_attr(
+    debug_assertions,
+    ignore = "claim refresh lags past the TTL in unoptimized builds"
+)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn ten_job_wait_parents_yield_capacity_and_reacquire_before_continuing() {
     use crate::session::jobs::JobState;
