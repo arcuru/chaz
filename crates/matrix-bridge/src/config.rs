@@ -80,6 +80,20 @@ pub struct MatrixLoginConfig {
     pub login: LoginConfig,
 }
 
+/// Filesystem-safe per-login state component, shared by runtime and maintenance.
+pub fn sanitize_login_id(login_id: &str) -> String {
+    login_id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
 fn default_label() -> String {
     "matrix".to_string()
 }

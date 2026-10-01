@@ -342,6 +342,7 @@
             curl
             jq
             matrix-synapse
+            uv
             (python3.withPackages (ps: [ps.pyyaml]))
           ];
 

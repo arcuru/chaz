@@ -65,6 +65,8 @@ struct Args {
 enum Command {
     /// Inspect or leave rooms for a bridge login.
     Rooms(RoomsArgs),
+    /// Manage encryption keys with the bridge stopped (no chaz database access).
+    Keys(chaz_matrix_bridge::keys::KeysArgs),
 }
 
 #[derive(clap::Args)]
@@ -147,6 +149,16 @@ struct ReadyLogin {
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
+    if let Some(Command::Keys(keys)) = &args.command {
+        // SDK tracing may include secret-storage progress. Maintenance emits
+        // only its explicit nonsecret diagnostics, regardless of RUST_LOG.
+        let config_path = resolve_config_path(args.config.as_deref())?;
+        let contents = std::fs::read_to_string(config_path)?;
+        let cfg: MatrixBridgeConfig = serde_yaml::from_str(&contents)
+            .map_err(|_| anyhow::anyhow!("cannot parse Matrix maintenance config"))?;
+        return chaz_matrix_bridge::keys::run(&cfg, keys).await;
+    }
+
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
     tracing_subscriber::fmt()
@@ -158,8 +170,7 @@ async fn main() -> anyhow::Result<()> {
 
     // The `rooms` maintenance subcommand runs once and exits; it never starts
     // the bridge or opens the bridge's own backend.
-    if let Some(command) = &args.command {
-        let Command::Rooms(rooms) = command;
+    if let Some(Command::Rooms(rooms)) = &args.command {
         let (login, execute, retries, delay_ms) = match &rooms.command {
             RoomsCommand::List(selection) => (selection.login.as_deref(), false, 3, 250),
             RoomsCommand::LeaveAll(args) => (
@@ -432,16 +443,7 @@ async fn build_generation(
 /// Per-login matrix-client state-dir component: keep it filesystem-safe by
 /// replacing anything outside `[A-Za-z0-9_-]` (MXIDs carry `@` and `:`).
 fn sanitize_login_id(login_id: &str) -> String {
-    login_id
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect()
+    chaz_matrix_bridge::config::sanitize_login_id(login_id)
 }
 
 /// Resolve the bridge config path: explicit `--config`, else
@@ -459,6 +461,46 @@ fn resolve_config_path(explicit: Option<&std::path::Path>) -> anyhow::Result<Pat
 mod tests {
     use super::*;
 
+    #[test]
+    fn key_maintenance_requires_specific_targets_and_has_no_secret_argv_or_autoapproval() {
+        assert!(
+            Args::try_parse_from(["chaz-matrix", "keys", "reset", "--account", "@chaz:example"])
+                .is_ok()
+        );
+        for args in [
+            vec!["chaz-matrix", "keys", "reset"],
+            vec!["chaz-matrix", "keys", "recovery-setup"],
+            vec![
+                "chaz-matrix",
+                "keys",
+                "verify",
+                "--user",
+                "@chaz:example",
+                "--device",
+                "DEV",
+                "--timeout",
+                "0",
+            ],
+            vec![
+                "chaz-matrix",
+                "keys",
+                "reset",
+                "--account",
+                "@chaz:example",
+                "--yes",
+            ],
+            vec![
+                "chaz-matrix",
+                "keys",
+                "recovery-restore",
+                "--key",
+                "secret-not-an-accepted-argument",
+            ],
+        ] {
+            assert!(Args::try_parse_from(args).is_err());
+        }
+    }
+
     /// Parse a `rooms leave-all` invocation through the real clap wiring,
     /// returning `(execute, retries, delay_ms)` or `None` when clap rejects it.
     fn parse_leave_all(args: &[&str]) -> Option<(bool, u32, u64)> {
@@ -467,7 +509,9 @@ mod tests {
             .chain(args.iter().copied())
             .collect::<Vec<_>>();
         let parsed = Args::try_parse_from(argv).ok()?;
-        let Command::Rooms(rooms) = parsed.command?;
+        let Command::Rooms(rooms) = parsed.command? else {
+            return None;
+        };
         match rooms.command {
             RoomsCommand::LeaveAll(args) => Some((args.execute, args.retries, args.delay_ms)),
             RoomsCommand::List(_) => None,

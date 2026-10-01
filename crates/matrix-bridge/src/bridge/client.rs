@@ -36,24 +36,24 @@ pub struct Login {
 /// Data needed to rebuild a client — persisted alongside the user session.
 /// Field set and names match headjack's on-disk format exactly so existing
 /// `session` files deserialize unchanged.
-#[derive(Debug, Serialize, Deserialize)]
-struct ClientSession {
-    homeserver: String,
-    db_path: PathBuf,
-    passphrase: String,
+#[derive(Clone, Serialize, Deserialize)]
+pub(crate) struct ClientSession {
+    pub(crate) homeserver: String,
+    pub(crate) db_path: PathBuf,
+    pub(crate) passphrase: String,
     /// Public device fingerprint, used to detect an empty/replaced crypto DB.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    device_ed25519_key: Option<String>,
+    pub(crate) device_ed25519_key: Option<String>,
 }
 
 /// The full session persisted to `{state_dir}/session` as JSON. Layout is
 /// byte-compatible with headjack's `FullSession`.
-#[derive(Debug, Serialize, Deserialize)]
-struct FullSession {
-    client_session: ClientSession,
-    user_session: MatrixSession,
+#[derive(Clone, Serialize, Deserialize)]
+pub(crate) struct FullSession {
+    pub(crate) client_session: ClientSession,
+    pub(crate) user_session: MatrixSession,
     #[serde(skip_serializing_if = "Option::is_none")]
-    sync_token: Option<String>,
+    pub(crate) sync_token: Option<String>,
 }
 
 /// A connected Matrix client plus the bookkeeping the sync loop needs.
@@ -85,8 +85,32 @@ impl MatrixClient {
                 .expect("no state_dir directory found")
                 .join(name),
         };
-        prepare_private_dir(&state_dir).await?;
+        let mut lease = crate::store_lock::StoreLock::acquire(&state_dir)?;
+        anyhow::ensure!(
+            !lease.root.join("pending-reset.json").exists(),
+            "Matrix identity transition pending; run keys resume with the bridge stopped"
+        );
+        let state_dir = lease.root.clone();
         let session_file = state_dir.join("session");
+        let store = if session_file.exists() {
+            crate::store_lock::no_symlinks(&session_file)?;
+            let full: FullSession = serde_json::from_slice(&std::fs::read(&session_file)?)?;
+            anyhow::ensure!(
+                full.user_session.meta.user_id.as_str() == login.username
+                    && full.client_session.homeserver == login.homeserver_url,
+                "saved Matrix account/homeserver differs from configuration; refusing store access"
+            );
+            if full.client_session.db_path.as_os_str().is_empty() {
+                state_dir.join("store")
+            } else {
+                full.client_session.db_path
+            }
+        } else {
+            state_dir.join("store")
+        };
+        if store.exists() {
+            lease.lock_store(&store)?;
+        }
 
         let (client, sync_token) = if session_file.exists() {
             restore_session(&session_file, &state_dir).await?
@@ -96,6 +120,12 @@ impl MatrixClient {
                 None,
             )
         };
+        if !store.join("ownership.lock").exists() {
+            lease.lock_store(&store)?;
+        }
+        // Context belongs to the SDK client's inner Arc, so raw Client clones
+        // and handler tasks keep the lease until their final store access.
+        client.add_event_handler_context(std::sync::Arc::new(lease));
         Ok(Self {
             client,
             sync_token,
@@ -284,7 +314,7 @@ fn resolve_store(session: &mut ClientSession, state_dir: &Path) -> anyhow::Resul
 /// Recipient policy follows MSC4153: room keys go only to devices their owner
 /// has cross-signed. The bridge also requires cross-signed incoming senders. No interactive verification with the bot is needed.
 /// `auto_enable_cross_signing` stays off; see [`MatrixClient::ensure_cross_signed`].
-fn encrypted_builder(session: &ClientSession) -> ClientBuilder {
+pub(crate) fn encrypted_builder(session: &ClientSession) -> ClientBuilder {
     Client::builder()
         .homeserver_url(&session.homeserver)
         .sqlite_store(&session.db_path, Some(&session.passphrase))
@@ -294,19 +324,12 @@ fn encrypted_builder(session: &ClientSession) -> ClientBuilder {
         })
 }
 
-async fn prepare_private_dir(path: &Path) -> anyhow::Result<()> {
-    fs::create_dir_all(path).await?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).await?;
-    }
-    Ok(())
-}
-
 /// Query the server before any key upload. In particular, a legacy session
 /// must not overwrite encryption keys published by some other client/store.
-async fn check_device_key(client: &Client, expected: Option<&str>) -> anyhow::Result<String> {
+pub(crate) async fn check_device_key(
+    client: &Client,
+    expected: Option<&str>,
+) -> anyhow::Result<String> {
     let local = client
         .encryption()
         .ed25519_key()
@@ -527,21 +550,15 @@ async fn initialize_cross_signing(client: &Client, login: &Login) -> anyhow::Res
 /// Atomically write the session file with owner-only permissions: it holds
 /// the access token and the passphrase to the device's key store, and a torn
 /// write would lose the latter.
-async fn write_session(session_file: &Path, full: &FullSession) -> anyhow::Result<()> {
+pub(crate) async fn write_session(session_file: &Path, full: &FullSession) -> anyhow::Result<()> {
     let serialized = serde_json::to_vec(full)?;
     let path = session_file.to_owned();
     tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
         let dir = path.parent().context("session file has no parent")?;
         std::fs::create_dir_all(dir)?;
-        let tmp = path.with_extension("tmp");
-        let mut options = std::fs::OpenOptions::new();
-        options.write(true).create(true).truncate(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let mut file = options.open(&tmp)?;
+        crate::store_lock::no_symlinks(&path)?;
+        let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
+        let file = tmp.as_file_mut();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -549,7 +566,7 @@ async fn write_session(session_file: &Path, full: &FullSession) -> anyhow::Resul
         }
         file.write_all(&serialized)?;
         file.sync_all()?;
-        std::fs::rename(&tmp, &path)?;
+        tmp.persist(&path)?;
         std::fs::File::open(dir)?.sync_all()?;
         Ok(())
     })
@@ -587,6 +604,24 @@ mod tests {
             passphrase: String::new(),
             device_ed25519_key: None,
         }
+    }
+
+    #[tokio::test]
+    async fn raw_sdk_client_clones_retain_store_ownership() {
+        let dir = tempfile::tempdir().unwrap();
+        let lease = crate::store_lock::StoreLock::acquire(dir.path()).unwrap();
+        let server = wiremock::MockServer::start().await;
+        let client = Client::builder()
+            .homeserver_url(server.uri())
+            .build()
+            .await
+            .unwrap();
+        client.add_event_handler_context(std::sync::Arc::new(lease));
+        let clone = client.clone();
+        drop(client);
+        assert!(crate::store_lock::StoreLock::acquire(dir.path()).is_err());
+        drop(clone);
+        assert!(crate::store_lock::StoreLock::acquire(dir.path()).is_ok());
     }
 
     #[test]
@@ -970,7 +1005,11 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(saved.client_session.passphrase, "p");
         assert_eq!(saved.sync_token.as_deref(), Some("s2"));
-        assert!(!path.with_extension("tmp").exists());
+        // The old predictable temporary name is no longer opened or removed.
+        assert_eq!(
+            std::fs::read(path.with_extension("tmp")).unwrap(),
+            b"interrupted"
+        );
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;

@@ -24,6 +24,8 @@ eidetica.workspace = true
 getrandom.workspace = true
 matrix-sdk.workspace = true
 matrix-sdk-base.workspace = true
+matrix-sdk-sqlite = { version = "0.18", default-features = false, features = ["crypto-store"] }
+libc = "0.2"
 regex.workspace = true
 serde.workspace = true
 serde_json.workspace = true

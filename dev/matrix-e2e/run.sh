@@ -502,6 +502,14 @@ spawn bridge env RUST_LOG="$BRIDGE_RUST_LOG" "$CHAZ_MATRIX_BIN" --config "$BRIDG
 BRIDGE_PID="$SPAWNED_PID"
 wait_for "bridge matrix login" 120 grep -q "The client is ready" "$WORKSPACE/bridge.log"
 
+# The maintenance path must never race the live bridge's encrypted store.
+if "$CHAZ_MATRIX_BIN" --config "$BRIDGE_CONFIG" keys status >"$WORKSPACE/maintenance-contention.log" 2>&1; then
+	fail "maintenance opened a store owned by the running bridge"
+fi
+grep -q 'Matrix store is in use' "$WORKSPACE/maintenance-contention.log" ||
+	fail "maintenance contention did not fail at store ownership"
+printf '\033[1;32mPASS\033[0m — live bridge rejects concurrent key maintenance\n' >&2
+
 if grep -qi "pending owner approval" "$WORKSPACE/bridge.log"; then
 	fail "bridge is waiting on manual approval — pre-authorization did not take (see $WORKSPACE/bridge.log)"
 fi

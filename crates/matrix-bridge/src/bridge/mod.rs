@@ -1,4 +1,4 @@
-mod client;
+pub(crate) mod client;
 mod commands;
 mod history;
 

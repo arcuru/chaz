@@ -46,6 +46,11 @@ e2e *args='':
     cargo build --quiet --bin chaz --bin chaz-matrix --example e2ee_probe
     nix develop .#e2e --command dev/matrix-e2e/run.sh {{ args }}
 
+# Matrix key-maintenance CLI acceptance against disposable Synapse (no models)
+e2e-keys:
+    cargo build --quiet --bin chaz-matrix --example key_management_probe
+    nix develop .#e2e --command dev/matrix-e2e/run-key-management.sh
+
 # =============================================================================
 # Coverage
 # =============================================================================

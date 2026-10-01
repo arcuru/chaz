@@ -394,3 +394,21 @@ The failure message names the step that timed out, and each step waits on a
 specific observable — the daemon's readiness line, the bridge's Matrix login,
 the agent's join, then the reply — so the step that fails is the one that
 broke.
+
+## Key-maintenance acceptance
+
+Run `just e2e-keys` for the actual local `chaz-matrix keys` CLI against a separate
+disposable Synapse. This exercises staged reset UIAA cancellation/rejection,
+process death with real replacement keys, server commit with a lost query
+response, safe resume, fresh-store same-identity/standard-backup restore, wrong
+secrets, private recovery files and own-account SAS with negative controls.
+A test-only Untrusted diagnostic proves imported key material without changing
+the bridge's CrossSigned policy. No model is called.
+
+`CHAZ_MATRIX_BIN` and `KEY_PROBE_BIN` can select previously built binaries.
+`KEY_TEST_WORKSPACE` selects a retained private fixture directory; use a new one
+for each run. Otherwise the harness creates one in the temporary directory.
+Account credentials and recovery material stay in that private fixture tree.
+Only public fingerprints, test names and the final counted summary are output.
+The whole transport suite (`just e2e`) separately verifies that a live bridge
+rejects concurrent key maintenance.

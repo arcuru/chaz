@@ -341,3 +341,159 @@ out of the conversation. It does not keep the conversation out of chaz or the mo
 ## Limitations
 
 - **Text only.** The Matrix bridge currently ingests only text messages. Image, file, and other non-text Matrix events are skipped on both the live path and during history backfill. Multimodal models will not see attached images sent in the room. Restoring multimodal ingestion is tracked as a TODO in `crates/matrix-bridge/src/bridge/commands.rs` and `crates/matrix-bridge/src/bridge/history.rs`.
+
+## Key maintenance: one store, one owner
+
+Stop the bridge before using `chaz-matrix keys`. These commands use the configured
+Matrix login and its encrypted store; they do not open chaz's database, call a
+model, or accept commands from a room. A process lock rejects a second bridge or
+maintenance writer. With several logins, put `--login <login-id>` immediately
+following `keys`.
+
+| Command                                                                    | Purpose                                                                                                                      |
+| -------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------- |
+| `keys status`                                                              | Public device/master fingerprints, private-secret availability, recovery and own-device status                               |
+| `keys init --account <MXID>`                                               | Create an identity only when no identity is published; requires typing `INIT <MXID>`                                         |
+| `keys reset --account <MXID>`                                              | Replace this account's identity explicitly; requires typing `RESET <MXID>` and, for password UIAA, `AUTHORIZE <MXID>`        |
+| `keys resume`                                                              | Resolve a pending reset against the actual published identity; never generates new keys                                      |
+| `keys resume --authorize`                                                  | Explicitly re-authorize uploading the **same** pending identity when the server still has the previous identity              |
+| `keys abort`                                                               | Archive a positively cancelled/rejected transition; refuses an ambiguous or committed outcome                                |
+| `keys recovery-setup --output <file>`                                      | Save a new private recovery passphrase, enable standard Matrix secret storage and encrypted room-key backup                  |
+| `keys recovery-setup --output <new-file> --replace-existing`               | Explicitly replace existing recovery/backup after typing `REPLACE RECOVERY <MXID>`; deletes the previous **server backup**   |
+| `keys recovery-restore --key-file <file>`                                  | Restore the same published identity secrets and standard backup keys; accepts a standard recovery key or recovery passphrase |
+| `keys verify --user <own-MXID> --device <device-id> [--timeout <seconds>]` | Interactive SAS verification of exactly one other device of the configured account                                           |
+
+A missing session is first provisioned as a new persistent device. The command
+reports `New Matrix device saved. Run the maintenance command again against this
+persisted login.` and exits; repeat the intended command. This separates first
+login from a staged snapshot. `status` does not initialize or reset cross-signing.
+Configured passwords (including `${ENV}` references) supply password UIAA. Other
+homeserver authentication flows are refused without printing their parameters or
+credentials. Any failed operation exits nonzero; do not interpret a diagnostic as
+a committed transition.
+
+### Identity replacement is a transaction, not SDK cancellation
+
+Reset changes which identity other clients must trust. It is never a startup
+repair. The SDK writes replacement private keys before password authorization,
+so cancelling its UIAA handle alone is not a rollback.
+
+Maintenance copies the encrypted SQLite store while no client has it open,
+records a durable pending journal, and modifies only the staged generation. It
+commits by atomically changing the saved session's store pointer **only** when a
+fresh server query matches the staged private master fingerprint. The device
+fingerprint stays the same. Previous encrypted generations and archived journals
+remain in the login's private state directory; they are not deleted automatically.
+The session file carries the store passphrase and must stay with these stores.
+
+After interruption, the bridge refuses to open a pending transition. `resume`
+can complete a server-committed transition, including retrying the device
+signature. If the server still has the previous identity after an uncertain
+network outcome, both generations remain pending: this is not proof of rejection.
+Use `resume --authorize` to authorize the same replacement, or wait and query
+again. `abort` accepts only a positively cancelled/rejected operation whose server
+identity is still unchanged. An identity matching neither endpoint requires
+explicit account recovery; keep both stores and the journal intact.
+
+### Recovery saves keys, not authenticated history
+
+Recovery is standard Matrix secret storage plus encrypted homeserver-side key
+backup. The SDK's standard recovery-passphrase support protects identity secrets
+and the backup key. A random, high-entropy passphrase is fsynced to your selected
+file **before** setup contacts the server, so a process death cannot lose the only
+recovery secret. The file contains the passphrase itself, usable in other Matrix
+clients' recovery-passphrase flow. Restore also accepts standard encoded recovery
+keys produced by another client.
+
+The destination directory must already be private (`0700`); files are created
+with `0600`. Existing files, symlinks (including parent symlinks) and public
+output directories are refused. There is no overwrite option. Keys/passphrases
+are never accepted on the command line or printed, and maintenance suppresses SDK
+tracing even with `RUST_LOG=trace`. Save the recovery file separately from the
+bridge state, offline if appropriate. Keep earlier recovery files until you have
+verified the replacement in a fresh store. An interrupted setup retains its
+output file; inspect status and attempt restore with it before replacing recovery.
+
+Restoring into a fresh login recovers the **same** identity, signs that device,
+and downloads/imports actual standard backup keys. It does not replay a room's
+history into chaz. Imported backup keys lack original sender provenance in this
+SDK; the bridge's incoming CrossSigned requirement still rejects such events.
+There is no untrusted-history viewer or production fallback. Pre-cutover Matrix
+history can be retired separately; these commands never delete chaz session or
+agent databases. New post-cutover keys are retained. Accepted **new** messages
+still become plaintext in chaz's session database and configured model, as
+explained in [Where encryption ends](#encrypted-rooms).
+
+### Walkthrough: recover the only login, then verify another device
+
+1. Stop the bridge and inspect `chaz-matrix --config matrix-bridge.yaml keys status`.
+   For a new login repeat the command, then initialize explicitly:
+
+   ```bash
+   chaz-matrix --config matrix-bridge.yaml keys init --account @chaz:example
+   ```
+
+   ```text
+   Type INIT @chaz:example to continue; anything else cancels:
+   Identity transition committed; previous encrypted store retained.
+   ```
+
+   If an identity already exists, init refuses it. Recover its secrets instead;
+   only use reset after deliberately deciding to replace that account's identity.
+
+2. Create a private destination and enable recovery:
+
+   ```bash
+   mkdir -m 700 recovery
+   chaz-matrix --config matrix-bridge.yaml keys recovery-setup --output recovery/account.key
+   ```
+
+   ```text
+   Recovery enabled; private recovery passphrase saved. Standard encrypted backup uploaded.
+   ```
+
+3. For a recovery drill, use an isolated bridge config with the same Matrix
+   account and a **new** state directory. Do not delete the original. With both
+   bridges stopped, provision the fresh login using `keys status`, then restore:
+
+   ```bash
+   chaz-matrix --config fresh-bridge.yaml keys recovery-restore --key-file recovery/account.key
+   ```
+
+   ```text
+   Same identity restored; standard encrypted room keys imported. Imported history is NOT authenticated bridge/model input.
+   ```
+
+   Compare the published/private master fingerprints in `keys status` with the
+   original. The fresh device has its own device fingerprint, stable on restart.
+   Failure/recovery: a wrong file reports `recovery failed; incorrect secret,
+incomplete recovery data or unreachable homeserver; identity was not reset`.
+   Supply the correct private file and retry; never reset as a recovery fallback.
+
+4. Start SAS with another device signed into **the bot's own account**, not a
+   room participant's account:
+
+   ```bash
+   chaz-matrix --config matrix-bridge.yaml keys verify --user @chaz:example --device OTHERDEVICE
+   ```
+
+   ```text
+   SAS account: @chaz:example
+   SAS device: OTHERDEVICE
+   SAS transaction: <transaction>
+   Compare SAS decimals on BOTH devices: <three numbers>
+   Type MATCH @chaz:example OTHERDEVICE <transaction> only if they match; type mismatch or cancel otherwise:
+   ```
+
+   Compare both screens and type the full displayed `MATCH` line only when they
+   agree. The other device must also confirm. A bare `yes` or `match`, a different
+   device/transaction, mismatch, peer rejection/cancellation, EOF or timeout
+   never counts as success. On success: `SAS verified selected own-account device
+after explicit match.` Restart the bridge after maintenance exits. No live
+   control socket or automatic verification approval exists.
+
+5. Interruption recovery: after an authorized reset loses its network response,
+   leave the bridge stopped and run `keys resume`. A confirmed commit reports
+   `Identity transition committed; previous encrypted store retained.` An
+   ambiguous old-server result explicitly says both stores are retained; use
+   `keys resume --authorize` only if you still intend that same replacement.
