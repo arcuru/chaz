@@ -77,6 +77,12 @@ impl StoreLock {
             "Matrix store lies outside this login's private directory; move the session and store together"
         );
         private_dir(&store)?;
+        for entry in std::fs::read_dir(&store)? {
+            ensure!(
+                entry?.file_type()?.is_file(),
+                "nonregular entry in Matrix store; refusing unsafe store access"
+            );
+        }
         let store = store.canonicalize()?;
         if self.stores.contains(&store) {
             return Ok(());
@@ -106,6 +112,17 @@ mod tests {
         lease.lock_store(&store).unwrap();
         lease.lock_store(&store).unwrap();
         assert!(lock(&store.join("ownership.lock")).is_err());
+    }
+    #[test]
+    fn a_symlinked_crypto_database_cannot_bypass_store_ownership() {
+        let dir = tempfile::tempdir().unwrap();
+        let other = dir.path().join("other.sqlite3");
+        std::fs::write(&other, "fixture").unwrap();
+        let store = dir.path().join("store");
+        std::fs::create_dir(&store).unwrap();
+        std::os::unix::fs::symlink(other, store.join("matrix-sdk-crypto.sqlite3")).unwrap();
+        let mut lease = StoreLock::acquire(dir.path()).unwrap();
+        assert!(lease.lock_store(&store).is_err());
     }
     #[test]
     fn rejects_symlink_locks_and_escaping_stores() {

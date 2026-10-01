@@ -52,14 +52,14 @@ enum KeysCommand {
         #[arg(long)]
         authorize: bool,
     },
-    /// Discard a positively cancelled/rejected transition, retaining its store.
+    /// Archive a cancelled/rejected or never-generated transition, retaining keys.
     Abort,
     /// Enable standard Matrix recovery and backup. Save a private recovery
     /// passphrase before contacting the server, so interruptions cannot lose it.
     RecoverySetup {
         #[arg(long)]
         output: PathBuf,
-        /// Explicit permission to replace existing secret storage/backup.
+        /// Replace recovery secret storage explicitly, retaining the backup.
         #[arg(long)]
         replace_existing: bool,
     },
@@ -181,6 +181,18 @@ fn load_session(root: &Path) -> anyhow::Result<FullSession> {
 }
 
 async fn open(full: &FullSession) -> anyhow::Result<Client> {
+    ensure!(
+        !full.client_session.db_path.as_os_str().is_empty()
+            && !full.client_session.passphrase.is_empty(),
+        "incomplete Matrix store metadata; restore the session and encrypted store together"
+    );
+    ensure!(
+        full.client_session
+            .db_path
+            .join("matrix-sdk-crypto.sqlite3")
+            .is_file(),
+        "Matrix crypto store missing; refusing replacement keys; restore the original session and store together"
+    );
     let client = encrypted_builder(&full.client_session)
         .request_config(
             RequestConfig::default()
@@ -259,11 +271,19 @@ enum Phase {
 }
 
 #[derive(Serialize, Deserialize)]
+struct PrivateBaseline {
+    master: Option<String>,
+}
+
+#[derive(Serialize, Deserialize)]
 struct Pending {
     version: u8,
     account: String,
     old_master: Option<String>,
     old_store: PathBuf,
+    // An absent field in an earlier journal cannot prove no generation.
+    #[serde(default)]
+    baseline: Option<PrivateBaseline>,
     staged: FullSession,
     phase: Phase,
 }
@@ -351,6 +371,17 @@ async fn resolve(root: &Path, pending: &mut Pending, client: &Client) -> anyhow:
         return Ok(true);
     }
     if remote == pending.old_master {
+        if pending.phase == Phase::Uncertain
+            && pending
+                .baseline
+                .as_ref()
+                .is_some_and(|baseline| baseline.master == candidate)
+        {
+            println!(
+                "No replacement keys persisted; recorded private baseline and server identity unchanged. Run keys abort."
+            );
+            return Ok(false);
+        }
         match pending.phase {
             Phase::Prepared | Phase::Cancelled | Phase::Rejected => println!(
                 "Server identity unchanged; transition rejected/cancelled. Active keys preserved. Run keys abort."
@@ -395,6 +426,9 @@ async fn transition(
     staged.client_session.db_path = root.join(format!("store-{}", random_secret()?));
     copy_store(&full.client_session.db_path, &staged.client_session.db_path)?;
     lease.lock_store(&staged.client_session.db_path)?;
+    let baseline = Some(PrivateBaseline {
+        master: local_master(&staged).await?,
+    });
     let client = open(&staged).await?;
     client.add_event_handler_context(std::sync::Arc::new(lease));
     let old_master = published(&client).await?;
@@ -407,6 +441,7 @@ async fn transition(
         account: account.to_string(),
         old_master,
         old_store: full.client_session.db_path,
+        baseline,
         staged,
         phase: Phase::Prepared,
     };
@@ -547,7 +582,7 @@ async fn recovery_setup(client: &Client, output: &Path, replace: bool) -> anyhow
     if existing || backup {
         ensure!(
             replace,
-            "recovery/backup already exists; restore it, or explicitly use --replace-existing (deletes the previous server backup)"
+            "recovery/backup already exists; restore it, or explicitly use --replace-existing to reconfigure recovery while retaining the backup"
         );
         confirm(&format!(
             "REPLACE RECOVERY {}",
@@ -555,13 +590,16 @@ async fn recovery_setup(client: &Client, output: &Path, replace: bool) -> anyhow
         ))
         .await?;
     }
+    // Reconfiguration must never delete backup-only keys. A backup we cannot
+    // open is not permission to retire it, even after an identity reset.
+    ensure!(
+        !backup || client.encryption().backups().are_enabled().await,
+        "existing backup key unavailable; restore it before reconfiguring recovery; no backup was deleted"
+    );
     // Native standard Matrix passphrase recovery: publish a durable random
     // passphrase BEFORE SDK setup. Even death mid-upload cannot lose the secret.
     let secret = random_secret()?;
     secret_output(output, &secret)?;
-    if backup && replace {
-        client.encryption().backups().disable_and_delete().await.map_err(|_| anyhow::anyhow!("backup replacement interrupted; recovery file retained; inspect status before retrying"))?;
-    }
     client.encryption().recovery().enable().with_passphrase(&secret).await
         .map_err(|_| anyhow::anyhow!("recovery setup interrupted; saved passphrase retained; use recovery-restore with this file before replacing recovery"))?;
     client.encryption().backups().wait_for_steady_state().await
@@ -801,7 +839,7 @@ pub async fn run(config: &MatrixBridgeConfig, args: &KeysArgs) -> anyhow::Result
     let base = config
         .state_dir
         .as_ref()
-        .map(PathBuf::from)
+        .map(|path| PathBuf::from(crate::bridge::client::expand_tilde(path)))
         .or_else(|| dirs::state_dir().map(|d| d.join("chaz-matrix")))
         .context("no state directory")?;
     let root = base
@@ -861,16 +899,24 @@ pub async fn run(config: &MatrixBridgeConfig, args: &KeysArgs) -> anyhow::Result
         let client = open(&pending.staged).await?;
         client.add_event_handler_context(std::sync::Arc::new(lease));
         if matches!(args.command, KeysCommand::Abort) {
+            let current = local_master(&pending.staged).await?;
+            // SDK reset persists new private keys before any replacement
+            // upload. An unchanged recorded baseline proves no new request.
+            let never_generated = pending
+                .baseline
+                .as_ref()
+                .is_some_and(|baseline| baseline.master == current);
             ensure!(
-                matches!(
+                (matches!(
                     pending.phase,
                     Phase::Prepared | Phase::Cancelled | Phase::Rejected
-                ) && published(&client).await? == pending.old_master,
+                ) || (pending.phase == Phase::Uncertain && never_generated))
+                    && published(&client).await? == pending.old_master,
                 "cannot abort an ambiguous/server-committed transition; use keys resume"
             );
             archive_journal(&root)?;
             println!(
-                "Cancelled/rejected transition archived; active identity unchanged; staged keys retained."
+                "Unchanged transition archived; active identity retained; staged keys retained."
             );
             return Ok(());
         }
@@ -895,11 +941,15 @@ pub async fn run(config: &MatrixBridgeConfig, args: &KeysArgs) -> anyhow::Result
         if matches!(args.command, KeysCommand::Resume { authorize: true })
             && published(&client).await? == pending.old_master
         {
+            let candidate = local_master(&pending.staged).await?;
             ensure!(
-                local_master(&pending.staged)
-                    .await?
-                    .is_some_and(|k| Some(k) != pending.old_master),
-                "no replacement identity was generated; preserve journal and inspect state"
+                candidate.is_some()
+                    && candidate != pending.old_master
+                    && pending
+                        .baseline
+                        .as_ref()
+                        .is_some_and(|baseline| baseline.master != candidate),
+                "no newly staged identity proven; abort a never-generated transition or preserve missing journal evidence for repair"
             );
             confirm(&format!("AUTHORIZE {}", pending.account)).await?;
             pending.phase = Phase::Uncertain;
@@ -981,6 +1031,27 @@ pub async fn run(config: &MatrixBridgeConfig, args: &KeysArgs) -> anyhow::Result
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn missing_baseline_is_not_proof_of_an_empty_private_identity() {
+        let staged: FullSession = serde_json::from_str(r#"{"client_session":{"homeserver":"http://hs","db_path":"/store","passphrase":"fixture"},"user_session":{"user_id":"@test:hs","device_id":"DEV","access_token":"fixture"}}"#).unwrap();
+        let pending = Pending {
+            version: 1,
+            account: "@test:hs".into(),
+            old_master: None,
+            old_store: "/old".into(),
+            baseline: Some(PrivateBaseline { master: None }),
+            staged,
+            phase: Phase::Uncertain,
+        };
+        let mut value = serde_json::to_value(pending).unwrap();
+        assert_eq!(value["baseline"], serde_json::json!({"master":null}));
+        let recorded: Pending = serde_json::from_value(value.clone()).unwrap();
+        assert!(recorded.baseline.is_some_and(|b| b.master.is_none()));
+        value.as_object_mut().unwrap().remove("baseline");
+        let unproven: Pending = serde_json::from_value(value).unwrap();
+        assert!(unproven.baseline.is_none());
+    }
+
     #[test]
     fn private_recovery_files_never_overwrite_or_follow_symlinks() {
         let dir = tempfile::tempdir().unwrap();

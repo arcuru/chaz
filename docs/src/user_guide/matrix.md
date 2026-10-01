@@ -357,9 +357,9 @@ following `keys`.
 | `keys reset --account <MXID>`                                              | Replace this account's identity explicitly; requires typing `RESET <MXID>` and, for password UIAA, `AUTHORIZE <MXID>`        |
 | `keys resume`                                                              | Resolve a pending reset against the actual published identity; never generates new keys                                      |
 | `keys resume --authorize`                                                  | Explicitly re-authorize uploading the **same** pending identity when the server still has the previous identity              |
-| `keys abort`                                                               | Archive a positively cancelled/rejected transition; refuses an ambiguous or committed outcome                                |
+| `keys abort`                                                               | Archive a positively cancelled/rejected or never-generated transition; refuses an ambiguous or committed outcome             |
 | `keys recovery-setup --output <file>`                                      | Save a new private recovery passphrase, enable standard Matrix secret storage and encrypted room-key backup                  |
-| `keys recovery-setup --output <new-file> --replace-existing`               | Explicitly replace existing recovery/backup after typing `REPLACE RECOVERY <MXID>`; deletes the previous **server backup**   |
+| `keys recovery-setup --output <new-file> --replace-existing`               | Reconfigure recovery after typing `REPLACE RECOVERY <MXID>`; retains the existing encrypted backup                           |
 | `keys recovery-restore --key-file <file>`                                  | Restore the same published identity secrets and standard backup keys; accepts a standard recovery key or recovery passphrase |
 | `keys verify --user <own-MXID> --device <device-id> [--timeout <seconds>]` | Interactive SAS verification of exactly one other device of the configured account                                           |
 
@@ -391,8 +391,10 @@ can complete a server-committed transition, including retrying the device
 signature. If the server still has the previous identity after an uncertain
 network outcome, both generations remain pending: this is not proof of rejection.
 Use `resume --authorize` to authorize the same replacement, or wait and query
-again. `abort` accepts only a positively cancelled/rejected operation whose server
-identity is still unchanged. An identity matching neither endpoint requires
+again. `abort` accepts a positively cancelled/rejected operation whose server identity
+is still unchanged. It also handles interruption before generation: the recorded
+private baseline must still match the staged store and the server must still
+have the old identity. Missing baseline evidence cannot authorize this abort. An identity matching neither endpoint requires
 explicit account recovery; keep both stores and the journal intact.
 
 ### Recovery saves keys, not authenticated history
@@ -413,6 +415,10 @@ tracing even with `RUST_LOG=trace`. Save the recovery file separately from the
 bridge state, offline if appropriate. Keep earlier recovery files until you have
 verified the replacement in a fresh store. An interrupted setup retains its
 output file; inspect status and attempt restore with it before replacing recovery.
+Reconfiguration reuses the existing backup and never deletes it. If its private
+backup key is unavailable, restore it first; the command refuses replacement.
+Retiring a confirmed pre-cutover backup is a separate operator cutover action,
+not permission for maintenance to delete post-cutover keys.
 
 Restoring into a fresh login recovers the **same** identity, signs that device,
 and downloads/imports actual standard backup keys. It does not replay a room's

@@ -266,7 +266,7 @@ pub(crate) fn is_allowed(allow_list: Option<&str>, sender: &str, username: &str)
 }
 
 /// Expand a leading `~/` against the home directory.
-fn expand_tilde(path: &str) -> String {
+pub(crate) fn expand_tilde(path: &str) -> String {
     if path.starts_with("~/")
         && let Some(home) = dirs::home_dir()
     {
