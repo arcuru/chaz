@@ -391,7 +391,10 @@ can complete a server-committed transition, including retrying the device
 signature. If the server still has the previous identity after an uncertain
 network outcome, both generations remain pending: this is not proof of rejection.
 Use `resume --authorize` to authorize the same replacement, or wait and query
-again. `abort` accepts a positively cancelled/rejected operation whose server identity
+again. A rejected retry does not settle an earlier timed-out upload: pending
+uncertainty remains, and `abort` still refuses it. Resume requires all three
+staged private identity secrets; it refuses incomplete material rather than
+letting the SDK generate another replacement. `abort` accepts a positively cancelled/rejected operation whose server identity
 is still unchanged. It also handles interruption before generation: the recorded
 private baseline must still match the staged store and the server must still
 have the old identity. Missing baseline evidence cannot authorize this abort. An identity matching neither endpoint requires
@@ -417,6 +420,9 @@ verified the replacement in a fresh store. An interrupted setup retains its
 output file; inspect status and attempt restore with it before replacing recovery.
 Reconfiguration reuses the existing backup and never deletes it. If its private
 backup key is unavailable, restore it first; the command refuses replacement.
+Local backup enablement alone is insufficient: the stored backup version and
+private key must match the current server backup. The private identity must also
+match the published identity before recovery can be configured.
 Retiring a confirmed pre-cutover backup is a separate operator cutover action,
 not permission for maintenance to delete post-cutover keys.
 

@@ -125,6 +125,21 @@ mod tests {
         assert!(lease.lock_store(&store).is_err());
     }
     #[test]
+    fn distinct_roots_cannot_open_the_same_physical_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ancestor = StoreLock::acquire(dir.path()).unwrap();
+        let mut child = StoreLock::acquire(&dir.path().join("login")).unwrap();
+        let store = child.root.join("store");
+        ancestor.lock_store(&store).unwrap();
+        assert!(child.lock_store(&store).is_err());
+        let outside = ancestor.root.join("other-login/store");
+        assert!(child.lock_store(&outside).is_err());
+        assert!(!outside.exists());
+        drop(ancestor);
+        child.lock_store(&store).unwrap();
+    }
+
+    #[test]
     fn rejects_symlink_locks_and_escaping_stores() {
         let dir = tempfile::tempdir().unwrap();
         std::os::unix::fs::symlink("elsewhere", dir.path().join("store.lock")).unwrap();

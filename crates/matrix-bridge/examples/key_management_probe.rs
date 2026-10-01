@@ -65,6 +65,47 @@ async fn run() -> anyhow::Result<()> {
         vec![None, None, None]
     };
     let sessions = crypto.get_inbound_group_sessions().await?;
+    if op == "partial-identity" || op == "repair-identity" {
+        use matrix_sdk_base::crypto::{olm::PrivateCrossSigningIdentity, store::types::Changes};
+        let file = PathBuf::from(args.get(3).context("private fixture pickle")?);
+        let identity = if op == "partial-identity" {
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+            let identity = crypto
+                .load_identity()
+                .await?
+                .context("no private identity")?;
+            let mut output = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(file)?;
+            output.write_all(&serde_json::to_vec(&identity.pickle().await)?)?;
+            let master = identity
+                .export_secret(
+                    &matrix_sdk::ruma::events::secret::request::SecretName::CrossSigningMasterKey,
+                )
+                .await
+                .context("no private master")?;
+            let partial = PrivateCrossSigningIdentity::empty(identity.user_id());
+            partial
+                .import_secrets_unchecked(Some(&master), None, None)
+                .await?;
+            partial
+        } else {
+            PrivateCrossSigningIdentity::from_pickle(serde_json::from_slice(&std::fs::read(
+                file,
+            )?)?)?
+        };
+        crypto
+            .save_changes(Changes {
+                private_identity: Some(identity),
+                ..Default::default()
+            })
+            .await?;
+        println!("PASS disposable private-identity fixture mutation");
+        return Ok(());
+    }
     if op == "inspect" {
         println!(
             "{}",
@@ -87,7 +128,31 @@ async fn run() -> anyhow::Result<()> {
         .await?;
     let session: MatrixSession = serde_json::from_value(saved["user_session"].clone())?;
     client.restore_session(session).await?;
-    if op == "fixture" {
+    if op == "encoded-recovery" {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let passphrase = std::fs::read_to_string(args.get(3).context("private passphrase file")?)?;
+        let store = client
+            .encryption()
+            .secret_storage()
+            .open_secret_store(passphrase.trim())
+            .await?;
+        let mut output = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(args.get(4).context("private encoded key destination")?)?;
+        output.write_all(store.secret_storage_key().as_bytes())?;
+        println!("PASS native encoded recovery key saved to private fixture file");
+    } else if op == "rotate-backup" {
+        client.encryption().backups().create().await?;
+        client
+            .encryption()
+            .backups()
+            .wait_for_steady_state()
+            .await?;
+        println!("PASS disposable separate-device backup rotation");
+    } else if op == "fixture" {
         client
             .sync_once(SyncSettings::default().timeout(Duration::from_secs(1)))
             .await?;

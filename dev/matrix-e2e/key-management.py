@@ -53,6 +53,9 @@ class Proxy(http.server.BaseHTTPRequestHandler):
     block_generation = False
     generation_guard = None
     generation_blocked = threading.Event()
+    hold_authorization = False
+    authorization_held = threading.Event()
+    release_authorization = threading.Event()
 
     def log_message(self, *_):
         pass
@@ -70,6 +73,10 @@ class Proxy(http.server.BaseHTTPRequestHandler):
             self.send_response(503)
             self.end_headers()
             return
+        if "/keys/device_signing/upload" in self.path and body and "auth" in json.loads(body) and Proxy.hold_authorization:
+            Proxy.hold_authorization = False
+            Proxy.authorization_held.set()
+            assert Proxy.release_authorization.wait(timeout=60), "delayed authorization not released"
         connection = http.client.HTTPConnection(HS.removeprefix("http://"), timeout=15)
         headers = {k: v for k, v in self.headers.items() if k.lower() not in ("host", "connection", "content-length")}
         connection.request(self.command, self.path, body, headers)
@@ -231,6 +238,18 @@ check(candidate != master and unchanged(master, device), "process death retains 
 cli("resume", ok=False)
 cli("abort", ok=False)
 check(unchanged(master, device), "ambiguous outcome cannot be silently discarded or treated as rollback")
+# REVIEW partial-identity regression: SDK bootstrap(false) regenerates unless ALL secrets exist.
+private_pickle = WORK / "retained-private-identity.json"
+probe(staged_view, "partial-identity", private_pickle)
+cli("resume", "--authorize", text=f"AUTHORIZE {USER}\n", ok=False)
+check(inspect(staged_view)["master"] == candidate and unchanged(master, device), "incomplete staged secrets cannot silently generate another identity on resume")
+probe(staged_view, "repair-identity", private_pickle)
+# END REVIEW partial-identity
+# REVIEW uncertain-retry regression: rejection of this attempt cannot settle an earlier upload.
+cli("resume", "--authorize", text=f"AUTHORIZE {USER}\n", env=wrong_env, ok=False)
+cli("abort", ok=False)
+check((ROOT / "pending-reset.json").exists() and unchanged(master, device), "rejected reauthorization retains prior ambiguous outcome and both stores")
+# END REVIEW uncertain-retry
 cli("resume", "--authorize", text=f"AUTHORIZE {USER}\n")
 check(inspect()["master"] == candidate and remote() == candidate and fingerprint() == device, "authorized resume commits SAME staged identity after crash")
 master = candidate
@@ -244,6 +263,23 @@ master = inspect()["master"]
 check(remote() == master and fingerprint() == device and not (ROOT / "pending-reset.json").exists(), "fresh process resolves committed server fingerprint and atomically commits staged store")
 cli("status")
 check(unchanged(master, device), "committed replacement survives another process restart")
+
+# A real authorized request outlives the client's HTTP timeout. A different
+# rejected retry must not allow abort while that first request can still commit.
+Proxy.hold_authorization = True
+cli("reset", "--account", USER, text=f"RESET {USER}\nAUTHORIZE {USER}\n", ok=False)
+check(Proxy.authorization_held.is_set() and unchanged(master, device), "delayed real authorization survives client timeout with previous identity active")
+cli("resume", "--authorize", text=f"AUTHORIZE {USER}\n", env=wrong_env, ok=False)
+cli("abort", ok=False)
+check((ROOT / "pending-reset.json").exists() and unchanged(master, device), "rejected retry cannot abort an earlier still-in-flight server authorization")
+Proxy.release_authorization.set()
+until = time.monotonic() + 15
+while remote() == master:
+    assert time.monotonic() < until, "delayed authorization never committed"
+    time.sleep(0.1)
+cli("resume")
+master = inspect()["master"]
+check(unchanged(master, device), "late actual server commit resolves with retained staged private identity")
 
 identity_keys = inspect()["identity_keys"]
 check(all(identity_keys), "replacement has all three real private cross-signing fingerprints")
@@ -291,6 +327,13 @@ fresh = inspect(FRESH)
 check(fresh["master"] == master and fresh["identity_keys"] == identity_keys and fresh["keys"] >= 1 and fresh["imported"] >= 1, "fresh-store CLI restore recovers SAME NEW identity and real standard backup keys")
 probe(FRESH, "diagnose", control)
 check(True, "test-only Untrusted diagnostic decrypts exact fixture; no authenticated history acceptance")
+encoded_key = WORK / "encoded-recovery.key"
+probe(FRESH, "encoded-recovery", key, encoded_key)
+ENCODED_CFG, ENCODED = config("encoded-restore")
+cli("status", cfg=ENCODED_CFG)
+check(inspect(ENCODED)["master"] is None and inspect(ENCODED)["keys"] == 0, "native encoded recovery also starts with no cached identity or room keys")
+cli("recovery-restore", "--key-file", str(encoded_key), cfg=ENCODED_CFG)
+check(inspect(ENCODED)["identity_keys"] == identity_keys and inspect(ENCODED)["imported"] >= 1, "native encoded recovery key restores same three private identity fingerprints and actual backup keys")
 fresh_device = session(FRESH)["client_session"]["device_ed25519_key"]
 cli("status", cfg=FRESH_CFG)
 check(inspect(FRESH)["master"] == master and session(FRESH)["client_session"]["device_ed25519_key"] == fresh_device, "fresh restored store survives restart with stable fingerprints")
@@ -376,6 +419,13 @@ tilde_device = session(TILDE_ROOT)["user_session"]["device_id"]
 tilde_status = cli("status", cfg=TILDE_CFG, env=tilde_env)
 check("Account:" in tilde_status and "New Matrix device" not in tilde_status and session(TILDE_ROOT)["user_session"]["device_id"] == tilde_device, "maintenance resolves tilde state paths exactly like the bridge, without provisioning another login")
 
+# REVIEW stale-backup regression: another device's current backup is not our local version.
+probe(FRESH, "rotate-backup")
+retained_backup = request("/_matrix/client/v3/room_keys/version", token=session()["user_session"]["access_token"])
+stale_output = WORK / "stale-backup-recovery.key"
+cli("recovery-setup", "--output", str(stale_output), "--replace-existing", text=f"REPLACE RECOVERY {USER}\n", ok=False)
+check(not stale_output.exists() and request("/_matrix/client/v3/room_keys/version", token=session()["user_session"]["access_token"])["version"] == retained_backup["version"], "locally enabled stale backup cannot replace recovery for an unavailable current backup key")
+# END REVIEW stale-backup
 KEYLESS_CFG, KEYLESS = config("keyless-backup")
 cli("status", cfg=KEYLESS_CFG)
 cli("reset", "--account", USER, cfg=KEYLESS_CFG, text=f"RESET {USER}\nAUTHORIZE {USER}\n")
@@ -384,9 +434,23 @@ cli("recovery-setup", "--output", str(keyless_output), "--replace-existing", cfg
 protected_backup = request("/_matrix/client/v3/room_keys/version", token=session(KEYLESS)["user_session"]["access_token"])
 check(not keyless_output.exists() and protected_backup["version"] == retained_backup["version"] and protected_backup["count"] >= 1, "unavailable backup key refuses reconfiguration without deleting server-only keys")
 
+stale_identity_output = WORK / "stale-identity-recovery.key"
+cli("recovery-setup", "--output", str(stale_identity_output), "--replace-existing", text=f"REPLACE RECOVERY {USER}\n", ok=False)
+check(not stale_identity_output.exists(), "superseded private identity cannot overwrite current account recovery")
+
+# Invalid metadata can contain secrets in unexpected types; serde diagnostics must not echo them.
+valid_session = (ROOT / "session").read_bytes()
+malformed_secret = secrets.token_hex(32)
+try:
+    (ROOT / "session").write_text(json.dumps({"client_session": malformed_secret}))
+    output = cli("status", ok=False)
+    check(malformed_secret not in output, "malformed secret-bearing session is rejected without echoing its contents")
+finally:
+    (ROOT / "session").write_bytes(valid_session)
+
 # All secret-bearing fixture files are private and all process logs are scanned
 # against actual passwords, recovery secrets, tokens and store passphrases.
-secret_values = [PASSWORD, secret, interrupted_key.read_text(), bad_key.read_text(), wrong_env["KEY_TEST_PASSWORD"]]
+secret_values = [PASSWORD, secret, interrupted_key.read_text(), encoded_key.read_text(), bad_key.read_text(), wrong_env["KEY_TEST_PASSWORD"], malformed_secret]
 for file in WORK.glob("**/session"):
     s = json.loads(file.read_text())
     secret_values += [s["client_session"]["passphrase"], s["user_session"]["access_token"]]

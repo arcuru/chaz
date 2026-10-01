@@ -177,7 +177,9 @@ fn read_secret(path: &Path) -> anyhow::Result<String> {
 fn load_session(root: &Path) -> anyhow::Result<FullSession> {
     let file = root.join("session");
     no_symlinks(&file)?;
-    serde_json::from_slice(&std::fs::read(file)?).context("invalid saved Matrix session")
+    serde_json::from_slice(&std::fs::read(file)?).map_err(sdk_error(
+        "invalid saved Matrix session; contents suppressed",
+    ))
 }
 
 async fn open(full: &FullSession) -> anyhow::Result<Client> {
@@ -251,8 +253,14 @@ async fn local_master(full: &FullSession) -> anyhow::Result<Option<String>> {
         &full.client_session.db_path,
         Some(&full.client_session.passphrase),
     )
-    .await?;
-    let Some(identity) = store.load_identity().await? else {
+    .await
+    .map_err(sdk_error(
+        "cannot open private identity store; preserve it for repair",
+    ))?;
+    let Some(identity) = store.load_identity().await.map_err(sdk_error(
+        "cannot read private identity; preserve store for repair",
+    ))?
+    else {
         return Ok(None);
     };
     Ok(identity
@@ -300,7 +308,9 @@ fn journal(root: &Path, pending: &Pending) -> anyhow::Result<()> {
 fn load_pending(root: &Path) -> anyhow::Result<Pending> {
     let path = root.join("pending-reset.json");
     no_symlinks(&path)?;
-    let pending: Pending = serde_json::from_slice(&std::fs::read(path)?)?;
+    let pending: Pending = serde_json::from_slice(&std::fs::read(path)?).map_err(sdk_error(
+        "invalid transition journal; contents suppressed; preserve it for repair",
+    ))?;
     ensure!(
         pending.version == 1,
         "unsupported transition journal; preserve it for repair"
@@ -558,7 +568,12 @@ async fn status(client: &Client, full: &FullSession) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn recovery_setup(client: &Client, output: &Path, replace: bool) -> anyhow::Result<()> {
+async fn recovery_setup(
+    client: &Client,
+    full: &FullSession,
+    output: &Path,
+    replace: bool,
+) -> anyhow::Result<()> {
     ensure!(
         client
             .encryption()
@@ -566,6 +581,13 @@ async fn recovery_setup(client: &Client, output: &Path, replace: bool) -> anyhow
             .await
             .is_some_and(|s| s.is_complete()),
         "identity secrets missing; restore or initialize explicitly before enabling recovery"
+    );
+    let remote = published(client)
+        .await?
+        .context("no published identity; initialize explicitly")?;
+    ensure!(
+        local_master(full).await?.as_deref() == Some(remote.as_str()),
+        "private identity differs from published identity; restore current secrets before configuring recovery"
     );
     let existing = client
         .encryption()
@@ -596,6 +618,33 @@ async fn recovery_setup(client: &Client, output: &Path, replace: bool) -> anyhow
         !backup || client.encryption().backups().are_enabled().await,
         "existing backup key unavailable; restore it before reconfiguring recovery; no backup was deleted"
     );
+    if backup {
+        let info = client
+            .send(get_latest_backup_info::v3::Request::new())
+            .await
+            .map_err(sdk_error("cannot query current backup; recovery unchanged"))?;
+        let store = SqliteCryptoStore::open(
+            &full.client_session.db_path,
+            Some(&full.client_session.passphrase),
+        )
+        .await
+        .map_err(sdk_error(
+            "cannot read private backup metadata; recovery unchanged",
+        ))?;
+        let keys = store.load_backup_keys().await.map_err(sdk_error(
+            "cannot read private backup keys; recovery unchanged",
+        ))?;
+        let algorithm = info.algorithm.deserialize_as().map_err(sdk_error(
+            "invalid current backup metadata; recovery unchanged",
+        ))?;
+        ensure!(
+            keys.backup_version.as_deref() == Some(info.version.as_str())
+                && keys
+                    .decryption_key
+                    .is_some_and(|key| key.backup_key_matches(&algorithm)),
+            "current server backup key unavailable or differs from local version; restore it before reconfiguring recovery; no backup was deleted"
+        );
+    }
     // Native standard Matrix passphrase recovery: publish a durable random
     // passphrase BEFORE SDK setup. Even death mid-upload cannot lose the secret.
     let secret = random_secret()?;
@@ -662,8 +711,16 @@ async fn recovery_restore(
         &full.client_session.db_path,
         Some(&full.client_session.passphrase),
     )
-    .await?;
-    let imported = crypto.get_inbound_group_sessions().await?;
+    .await
+    .map_err(sdk_error(
+        "cannot open restored key store; preserve it for repair",
+    ))?;
+    let imported = crypto
+        .get_inbound_group_sessions()
+        .await
+        .map_err(sdk_error(
+            "cannot inspect restored room keys; preserve store for repair",
+        ))?;
     for (room, keys) in &response.rooms {
         for id in keys.sessions.keys() {
             ensure!(
@@ -951,6 +1008,16 @@ pub async fn run(config: &MatrixBridgeConfig, args: &KeysArgs) -> anyhow::Result
                         .is_some_and(|baseline| baseline.master != candidate),
                 "no newly staged identity proven; abort a never-generated transition or preserve missing journal evidence for repair"
             );
+            // SDK bootstrap(false) regenerates when ANY private key is missing.
+            // Fingerprinting a surviving master alone cannot authorize that.
+            ensure!(
+                client
+                    .encryption()
+                    .cross_signing_status()
+                    .await
+                    .is_some_and(|s| s.is_complete()),
+                "staged identity secrets incomplete; resume cannot generate replacements; preserve pending state for repair"
+            );
             confirm(&format!("AUTHORIZE {}", pending.account)).await?;
             pending.phase = Phase::Uncertain;
             journal(&root, &pending)?;
@@ -973,16 +1040,12 @@ pub async fn run(config: &MatrixBridgeConfig, args: &KeysArgs) -> anyhow::Result
                         .context("configured password required")?,
                 );
                 auth.session = info.session.clone();
-                if let Err(error) = client
+                // A rejected retry says nothing about an earlier timed-out
+                // upload. Retain uncertainty until the server proves commit.
+                let _ = client
                     .encryption()
                     .bootstrap_cross_signing(Some(uiaa::AuthData::Password(auth)))
-                    .await
-                    && error
-                        .as_uiaa_response()
-                        .is_some_and(|i| i.auth_error.is_some())
-                {
-                    pending.phase = Phase::Rejected;
-                }
+                    .await;
             }
             journal(&root, &pending)?;
         }
@@ -1013,7 +1076,7 @@ pub async fn run(config: &MatrixBridgeConfig, args: &KeysArgs) -> anyhow::Result
                 KeysCommand::RecoverySetup {
                     output,
                     replace_existing,
-                } => recovery_setup(&client, output, *replace_existing).await,
+                } => recovery_setup(&client, &full, output, *replace_existing).await,
                 KeysCommand::RecoveryRestore { key_file } => {
                     recovery_restore(&client, &full, key_file).await
                 }
@@ -1050,6 +1113,24 @@ mod tests {
         value.as_object_mut().unwrap().remove("baseline");
         let unproven: Pending = serde_json::from_value(value).unwrap();
         assert!(unproven.baseline.is_none());
+    }
+
+    #[test]
+    fn malformed_secret_metadata_does_not_echo_contents() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["session", "pending-reset.json"] {
+            std::fs::write(
+                dir.path().join(name),
+                r#"{"client_session":"secret-diagnostic-sentinel"}"#,
+            )
+            .unwrap();
+        }
+        let session_error = load_session(dir.path()).err().unwrap();
+        let pending_error = load_pending(dir.path()).err().unwrap();
+        for error in [session_error, pending_error] {
+            assert!(!format!("{error:?}").contains("secret-diagnostic-sentinel"));
+            assert!(error.to_string().contains("contents suppressed"));
+        }
     }
 
     #[test]
