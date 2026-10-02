@@ -1,7 +1,11 @@
 //! Durable outbound delivery for transport bridges.
 //!
-//! A bridge delivers a session's agent `Message` entries to one transport
-//! channel. Progress is persisted per [`DeliveryBinding`] — the transport,
+//! Reply-capable bridges deliver only addressed `BridgeEvent` outbound rows
+//! for their own login and channel (including already-written `MatrixSend`
+//! rows). Legacy Discord fanout of ordinary agent messages remains until its
+//! adapter migrates, but never publishes a final paired with an outbox event.
+//! After a transport acknowledgement, a generic receipt enters shared history.
+//! Progress is persisted per [`DeliveryBinding`] — the transport,
 //! login, channel, and session a bridge routes on — in the peer-local
 //! `chaz_peer` database. Two frontends sharing one Eidetica login therefore
 //! keep independent progress, and a restarted or reconnected bridge resumes
@@ -39,7 +43,11 @@ use tracing::{debug, error, warn};
 
 use super::render_outbound;
 use crate::agent::AgentRegistry;
-use crate::session::{EntryType, Session, SessionEntry, TurnRequestId};
+use crate::session::{
+    BridgeEventRole, EntryRouting, EntryType, Session, SessionEntry, TurnRequestId,
+};
+#[cfg(test)]
+use chrono::Utc;
 
 /// `chaz_peer` store holding one [`DeliveryProgress`] document per binding.
 const DELIVERY_STORE: &str = "transport_delivery";
@@ -52,8 +60,8 @@ const IDEMPOTENCY_KEY_LEN: usize = 24;
 /// The stable frontend identity delivery progress is scoped to.
 ///
 /// A login belongs to one bridge process, a channel is bound to one session,
-/// and the same session may be bound to several channels (fan-out), so the
-/// full tuple is what makes progress independent per frontend.
+/// and different transports have independent delivery semantics, so the full
+/// tuple scopes progress to one frontend.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct DeliveryBinding {
     pub transport: String,
@@ -301,7 +309,10 @@ impl DeliveryReconciler {
                             source,
                             "Session write; reconciling the transport"
                         );
-                        reconciler.run_pass().await;
+                        // A Matrix confirmation is itself a session write. Run
+                        // reconciliation after callback dispatch, never while
+                        // the confirming commit waits for callbacks to settle.
+                        tokio::spawn(async move { reconciler.run_pass().await });
                     }
                     Ok(())
                 })
@@ -373,22 +384,111 @@ impl DeliveryReconciler {
     /// converged; `Ok(false)` when a send failed and the tail remains.
     async fn reconcile_once(&self) -> anyhow::Result<bool> {
         let mut state = self.state.lock().await;
+        anyhow::ensure!(
+            crate::session::transport_bindings(&self.session_db)
+                .await?
+                .len()
+                <= 1,
+            "session has multiple external bindings; delivery requires explicit migration"
+        );
+        // A detached room or an ambiguous legacy session must never receive a
+        // pending request even if the bridge is still watching its old DB.
+        if self.binding.transport == "matrix"
+            && !crate::session::is_bound(
+                &self.session_db,
+                "matrix",
+                &self.binding.login_id,
+                &self.binding.channel,
+            )
+            .await?
+        {
+            anyhow::bail!("Matrix room is detached");
+        }
         let snapshot = self.session_db.snapshot().await?;
         let rows = Session::entries_with_ids_at_snapshot(&self.session_db, &snapshot).await?;
         let baseline = self.baseline_ids(&mut state).await?;
+        let legacy_fanout = if self.binding.transport == "matrix" {
+            false
+        } else {
+            !crate::session::session_attachment(&self.session_db)
+                .await
+                .ok()
+                .flatten()
+                .is_some_and(|a| {
+                    a.conversational_replies
+                        && a.transport == self.binding.transport
+                        && a.login_id == self.binding.login_id
+                        && a.channel == self.binding.channel
+                })
+        };
 
+        // A future outbound role addressed here is not safely understood by
+        // this reader. Do not fold it into delivered_through: a newer reader
+        // must still be able to act on it after an upgrade.
+        let unsupported_addressed = rows.iter().any(|(id, entry)| {
+            entry.routing.as_ref().is_some_and(|r| {
+                r.destinations.iter().any(|d| {
+                    d.transport == self.binding.transport
+                        && d.login_id == self.binding.login_id
+                        && d.channel == self.binding.channel
+                })
+            }) && entry.bridge_role().is_none()
+                && (entry.entry_type == EntryType::BridgeEvent
+                    || matches!(entry.entry_type, EntryType::Unknown { .. }))
+                && !baseline.contains(id.as_str())
+        });
         let pending: Vec<&(TurnRequestId, SessionEntry)> = rows
             .iter()
             .filter(|(id, entry)| {
-                entry.entry_type == EntryType::Message
-                    && self.agents.get(&entry.sender).is_some()
-                    && !baseline.contains(id.as_str())
+                (if entry.bridge_role() == Some(BridgeEventRole::Outbound) {
+                    entry.sender == self.owning_agent
+                        && self.agents.get(&entry.sender).is_some()
+                        && entry.routing.as_ref().is_some_and(|routing| {
+                            routing.source.is_none()
+                                && routing.destinations.len() == 1
+                                && routing.destinations[0].transport == self.binding.transport
+                                && routing.destinations[0].login_id == self.binding.login_id
+                                && routing.destinations[0].channel == self.binding.channel
+                                && routing.destinations[0]
+                                    .message_id
+                                    .as_deref()
+                                    .is_some_and(|id| !id.is_empty())
+                        })
+                } else {
+                    // Existing Discord sessions still publish normal agent
+                    // messages; other adapters use addressed outbox rows.
+                    legacy_fanout
+                        && entry.entry_type == EntryType::Message
+                        && entry
+                            .routing
+                            .as_ref()
+                            .and_then(|r| r.outbound_id.as_ref())
+                            .is_none()
+                        && self.agents.get(&entry.sender).is_some()
+                }) && !baseline.contains(id.as_str())
                     && state.progress.entries.get(id.as_str()) != Some(&DeliveryMark::Complete)
             })
             .collect();
 
         for (id, entry) in pending {
-            let body = render_outbound(&self.owning_agent, &entry.sender, &entry.content);
+            if entry.bridge_role() == Some(BridgeEventRole::Outbound) {
+                let attachment = crate::session::session_attachment(&self.session_db).await?;
+                anyhow::ensure!(
+                    attachment
+                        .as_ref()
+                        .is_some_and(|a| a.transport == self.binding.transport
+                            && a.login_id == self.binding.login_id
+                            && a.channel == self.binding.channel),
+                    "external attachment changed before delivery"
+                );
+            }
+            let body = if entry.bridge_role() == Some(BridgeEventRole::Outbound) {
+                // Bound destination, owning agent, and supported role were
+                // checked above; never render the JSON envelope as a message.
+                entry.bridge_body().expect("supported outbound has a body")
+            } else {
+                render_outbound(&self.owning_agent, &entry.sender, &entry.content)
+            };
             let chunks = (self.chunk)(&body);
             let start = match state.progress.entries.get(id.as_str()) {
                 Some(DeliveryMark::Chunks(count)) => *count,
@@ -400,6 +500,11 @@ impl DeliveryReconciler {
                     body,
                     idempotency_key: self.binding.idempotency_key(id.as_str(), index),
                 };
+                debug!(entry_id = %id, transport = %self.binding.transport,
+                    outbound_id = ?entry.routing.as_ref().and_then(|r| r.destinations.first())
+                        .and_then(|d| d.message_id.as_deref()),
+                    channel = %self.binding.channel, idempotency_key = %chunk.idempotency_key,
+                    "Delivering addressed row chunk");
                 if let Err(error) = (self.send)(chunk).await {
                     warn!(
                         session_db_id = %self.binding.session_db_id,
@@ -416,6 +521,15 @@ impl DeliveryReconciler {
                 } else {
                     DeliveryMark::Chunks(index + 1)
                 };
+                // Write the shared confirmation before marking the final chunk
+                // complete. If this commit fails the same transport transaction
+                // ID safely retries. A second pass sees the confirmation and
+                // doesn't append another acknowledgement.
+                if mark == DeliveryMark::Complete
+                    && entry.bridge_role() == Some(BridgeEventRole::Outbound)
+                {
+                    self.confirm_bridge_send(entry, &rows).await?;
+                }
                 state.progress.entries.insert(id.as_str().to_string(), mark);
                 self.store.save(&self.binding, &state.progress).await?;
             }
@@ -428,9 +542,12 @@ impl DeliveryReconciler {
             }
         }
 
-        // Everything at `snapshot` is delivered. Fold the marks into the
-        // snapshot so the record stays small; skip the write when there is
-        // nothing to fold.
+        if unsupported_addressed {
+            warn!(session_db_id = %self.binding.session_db_id, "Unsupported addressed event left pending for a newer reader");
+            return Ok(false);
+        }
+        // Everything actionable at `snapshot` is delivered. Fold the marks
+        // into the snapshot so the record stays small.
         if !state.progress.entries.is_empty() {
             state.progress = DeliveryProgress {
                 delivered_through: Some(snapshot.clone()),
@@ -443,6 +560,50 @@ impl DeliveryReconciler {
             ));
         }
         Ok(true)
+    }
+
+    async fn confirm_bridge_send(
+        &self,
+        entry: &SessionEntry,
+        rows: &[(TurnRequestId, SessionEntry)],
+    ) -> anyhow::Result<()> {
+        let id = entry
+            .routing
+            .as_ref()
+            .and_then(|r| r.destinations.first())
+            .and_then(|d| d.message_id.as_deref())
+            .ok_or_else(|| anyhow::anyhow!("bridge outbound missing durable message identity"))?;
+        if rows.iter().any(|(_, row)| {
+            row.bridge_role() == Some(BridgeEventRole::Receipt)
+                && row.routing.as_ref().and_then(|r| r.reply_to.as_deref()) == Some(id)
+        }) {
+            return Ok(());
+        }
+        let mut session = Session::new(
+            crate::types::ConversationId(self.binding.session_db_id.clone()),
+            self.session_db.clone(),
+        )
+        .await;
+        // Re-read after a retry or concurrent peer write; this is an audit
+        // projection, not another request or external send.
+        if session.entries().iter().any(|row| {
+            row.bridge_role() == Some(BridgeEventRole::Receipt)
+                && row.routing.as_ref().and_then(|r| r.reply_to.as_deref()) == Some(id)
+        }) {
+            return Ok(());
+        }
+        session
+            .add_entry(SessionEntry::new_bridge_event(
+                &self.owning_agent,
+                BridgeEventRole::Receipt,
+                "",
+                Some(EntryRouting {
+                    reply_to: Some(id.to_owned()),
+                    ..Default::default()
+                }),
+            ))
+            .await?;
+        Ok(())
     }
 
     async fn baseline_ids(&self, state: &mut ReconcileState) -> anyhow::Result<HashSet<String>> {
@@ -470,7 +631,6 @@ mod tests {
     use super::*;
     use crate::session::EntryType;
     use crate::types::ConversationId;
-    use chrono::Utc;
     use eidetica::backend::database::InMemory;
     use eidetica::crdt::Doc;
     use eidetica::{Instance, NewUser};
@@ -594,6 +754,204 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn matrix_delivers_only_owned_addressed_rows_with_ack_and_restart_dedupe() {
+        let fx = fixture().await;
+        crate::session::bind_transport(&fx.session_db, "matrix", "@default:s", "!room:s")
+            .await
+            .unwrap();
+        let binding = DeliveryBinding::new(
+            "matrix",
+            "@default:s",
+            "!room:s",
+            fx.session_db.root_id().to_string(),
+        );
+        write(&fx.session_db, "default", "local final @friend").await;
+        let mut session = Session::new(
+            ConversationId(fx.session_db.root_id().to_string()),
+            fx.session_db.clone(),
+        )
+        .await;
+        let send = |sender: &str, login: &str, room: &str, id: &str| SessionEntry {
+            sender: sender.into(),
+            content: "addressed".into(),
+            timestamp: Utc::now(),
+            entry_type: EntryType::MatrixSend,
+            metadata: None,
+            routing: Some(EntryRouting {
+                destinations: vec![crate::session::TransportRef {
+                    transport: "matrix".into(),
+                    login_id: login.into(),
+                    channel: room.into(),
+                    sender: None,
+                    sender_display: None,
+                    message_id: Some(id.into()),
+                }],
+                ..Default::default()
+            }),
+        };
+        session
+            .add_entry(send("other", "@default:s", "!room:s", "wrong-agent"))
+            .await
+            .unwrap();
+        session
+            .add_entry(send("default", "@other:s", "!room:s", "wrong-login"))
+            .await
+            .unwrap();
+        session
+            .add_entry(send("default", "@default:s", "!other:s", "wrong-room"))
+            .await
+            .unwrap();
+        session
+            .add_entry(send("default", "@default:s", "!room:s", "the-send"))
+            .await
+            .unwrap();
+        let wire = Arc::new(Transport::default());
+        let attach = || {
+            DeliveryReconciler::attach_with_backoff(
+                fx.session_db.clone(),
+                fx.store.clone(),
+                binding.clone(),
+                fx.agents.clone(),
+                "default".into(),
+                one_chunk,
+                wire.send_fn(),
+                |_| Duration::from_millis(20),
+            )
+        };
+        let first = attach().await.unwrap();
+        assert_eq!(wire.bodies().await, ["addressed"]);
+        let entries = Session::new(
+            ConversationId(fx.session_db.root_id().to_string()),
+            fx.session_db.clone(),
+        )
+        .await;
+        assert_eq!(
+            entries
+                .entries()
+                .iter()
+                .filter(|e| e.bridge_role() == Some(BridgeEventRole::Receipt))
+                .count(),
+            1
+        );
+        assert!(
+            entries
+                .entries()
+                .iter()
+                .any(|e| e.bridge_role() == Some(BridgeEventRole::Receipt)
+                    && e.routing.as_ref().unwrap().reply_to.as_deref() == Some("the-send"))
+        );
+        assert_eq!(
+            fx.store
+                .load(&binding)
+                .await
+                .unwrap()
+                .unwrap()
+                .entries
+                .len(),
+            0
+        );
+        first.stop();
+        drop(first);
+        let restarted = attach().await.unwrap();
+        restarted.run_pass().await;
+        assert_eq!(
+            wire.attempts.load(Ordering::SeqCst),
+            1,
+            "restart must not repeat acknowledged sends"
+        );
+        crate::session::unbind_transport(&fx.session_db, "matrix", "@default:s", "!room:s")
+            .await
+            .unwrap();
+        session
+            .add_entry(send("default", "@default:s", "!room:s", "after-detach"))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert_eq!(
+            wire.attempts.load(Ordering::SeqCst),
+            1,
+            "detached rooms must receive nothing"
+        );
+        restarted.stop();
+    }
+
+    #[tokio::test]
+    async fn generic_test_transport_is_addressed_receipted_and_future_safe() {
+        let fx = fixture().await;
+        crate::session::bind_conversational_transport(&fx.session_db, "test", "login", "room")
+            .await
+            .unwrap();
+        write(&fx.session_db, "default", "local final stays here").await;
+        let mut session = Session::new(
+            ConversationId(fx.session_db.root_id().to_string()),
+            fx.session_db.clone(),
+        )
+        .await;
+        let route = |id: &str| {
+            Some(EntryRouting {
+                destinations: vec![crate::session::TransportRef {
+                    transport: "test".into(),
+                    login_id: "login".into(),
+                    channel: "room".into(),
+                    sender: None,
+                    sender_display: None,
+                    message_id: Some(id.into()),
+                }],
+                ..Default::default()
+            })
+        };
+        session
+            .add_entry(SessionEntry::new_bridge_event(
+                "default",
+                BridgeEventRole::Outbound,
+                "only outbound",
+                route("generic-id"),
+            ))
+            .await
+            .unwrap();
+        let wire = Arc::new(Transport::default());
+        let reconciler = attach(&fx, "room", &wire, one_chunk).await;
+        assert_eq!(wire.bodies().await, ["only outbound"]);
+        let receipt = Session::new(
+            ConversationId(fx.session_db.root_id().to_string()),
+            fx.session_db.clone(),
+        )
+        .await;
+        assert!(receipt.entries().iter().any(|entry| entry.bridge_role()
+            == Some(BridgeEventRole::Receipt)
+            && entry.routing.as_ref().and_then(|r| r.reply_to.as_deref()) == Some("generic-id")));
+        reconciler.stop();
+        let newer = Arc::new(Transport::default());
+        let restarted = attach(&fx, "room", &newer, one_chunk).await;
+        assert!(newer.bodies().await.is_empty());
+        restarted.stop();
+
+        let mut future = SessionEntry::new_bridge_event(
+            "default",
+            BridgeEventRole::Outbound,
+            "future effect",
+            route("future-id"),
+        );
+        future.content = r#"{"version":9,"role":"outbound","body":"future effect"}"#.into();
+        let future_id = session.add_entry(future).await.unwrap();
+        let future_snapshot = fx.session_db.snapshot().await.unwrap();
+        let future_wire = Arc::new(Transport::default());
+        let holding = attach(&fx, "room", &future_wire, one_chunk).await;
+        assert!(future_wire.bodies().await.is_empty());
+        let progress = fx.store.load(holding.binding()).await.unwrap().unwrap();
+        assert_ne!(
+            progress.delivered_through,
+            Some(future_snapshot),
+            "an unsupported addressed event must remain outside the delivered snapshot"
+        );
+        assert!(
+            !progress.entries.contains_key(future_id.as_str()),
+            "an unsupported addressed event must not be marked delivered"
+        );
+        holding.stop();
+    }
+
+    #[tokio::test]
     async fn a_response_committed_while_offline_delivers_on_reattach() {
         let fx = fixture().await;
         write(&fx.session_db, "user", "hello").await;
@@ -629,6 +987,34 @@ mod tests {
         reconciler.stop();
     }
 
+    #[tokio::test]
+    async fn non_matrix_bridge_skips_final_already_addressed_to_matrix() {
+        let fx = fixture().await;
+        write(&fx.session_db, "default", "local reply").await;
+        let mut session = Session::new(
+            ConversationId(fx.session_db.root_id().to_string()),
+            fx.session_db.clone(),
+        )
+        .await;
+        session
+            .add_entry(SessionEntry {
+                sender: "default".into(),
+                content: "Matrix room reply".into(),
+                timestamp: Utc::now(),
+                entry_type: EntryType::Message,
+                metadata: None,
+                routing: Some(EntryRouting {
+                    outbound_id: Some("room-send-id".into()),
+                    ..Default::default()
+                }),
+            })
+            .await
+            .unwrap();
+        let transport = Arc::new(Transport::default());
+        let reconciler = attach(&fx, "other-transport-room", &transport, one_chunk).await;
+        assert_eq!(transport.bodies().await, vec!["local reply"]);
+        reconciler.stop();
+    }
     #[tokio::test]
     async fn a_missing_progress_record_never_discards_existing_responses() {
         let fx = fixture().await;

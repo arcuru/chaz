@@ -67,6 +67,7 @@ struct SessionRuntimeRecorder {
     attempt_id: String,
     sequence: AtomicU32,
     terminal: std::sync::Mutex<Option<TurnTranscriptRecord>>,
+    explicit_bridge_send: AtomicBool,
     agent_name: String,
     #[cfg(test)]
     fail_after: Arc<std::sync::Mutex<Option<usize>>>,
@@ -88,6 +89,14 @@ impl runtime::RuntimeRecorder for SessionRuntimeRecorder {
                     *value -= 1;
                 }
             }
+            let explicit_send = matches!(
+                &message,
+                runtime::RuntimeRecord::ToolResult {
+                    name,
+                    outcome: runtime::ToolResultOutcome::Success,
+                    ..
+                } if name == "matrix__send"
+            );
             let sequence = self.sequence.fetch_add(1, Ordering::SeqCst) as u64;
             let message = match message {
                 runtime::RuntimeRecord::ModelResponse {
@@ -141,9 +150,112 @@ impl runtime::RuntimeRecorder for SessionRuntimeRecorder {
                 .await
                 .append_turn_transcript(record, display_entries)
                 .await
-                .map_err(|error| format!("failed to persist runtime transcript: {error}"))
+                .map_err(|error| format!("failed to persist runtime transcript: {error}"))?;
+            if explicit_send {
+                self.explicit_bridge_send.store(true, Ordering::Release);
+            }
+            Ok(())
         })
     }
+}
+
+/// Only the origin of this exact turn may acquire an external destination.
+/// Revalidate attachment and login ownership before atomically committing
+/// the final and addressed outbox event; the publisher checks again at send.
+async fn bridge_reply_for_turn(
+    session: &Session,
+    registry: &SessionRegistry,
+    attempt: &TurnAttempt,
+    agent_name: &str,
+    attachment: Option<&crate::session::TransportAttachment>,
+    body: &str,
+) -> anyhow::Result<Option<SessionEntry>> {
+    let request = session
+        .entries_with_ids()
+        .find(|(id, _)| *id == &attempt.request_id)
+        .map(|(_, entry)| entry)
+        .ok_or_else(|| anyhow::anyhow!("turn request entry is missing"))?;
+    if request.entry_type != EntryType::Message {
+        return Ok(None);
+    }
+    let Some(source) = request
+        .routing
+        .as_ref()
+        .and_then(|routing| routing.source.as_ref())
+    else {
+        return Ok(None);
+    };
+    let attachment = attachment
+        .ok_or_else(|| anyhow::anyhow!("external-origin turn has no unambiguous attachment"))?;
+    if !attachment.conversational_replies {
+        return Ok(None); // legacy non-conversational adapters retain their delivery path
+    }
+    if source.transport != attachment.transport
+        || source.login_id != attachment.login_id
+        || source.channel != attachment.channel
+    {
+        anyhow::bail!("external-origin turn does not match its current attachment");
+    }
+    if body.trim().is_empty() {
+        anyhow::bail!("external-origin final is empty without no_reply");
+    }
+    let current = crate::session::session_attachment(session.database()).await?;
+    anyhow::ensure!(
+        current.as_ref() == Some(attachment),
+        "turn attachment changed before reply completed"
+    );
+    crate::tools::ensure_agent_owns_login(
+        registry,
+        session,
+        agent_name,
+        &attachment.transport,
+        &attachment.login_id,
+    )
+    .await
+    .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    Ok(Some(
+        crate::tools::addressed_send_entry(
+            agent_name,
+            body,
+            &attachment.transport,
+            &attachment.login_id,
+            &attachment.channel,
+        )
+        .0,
+    ))
+}
+
+/// Revalidate a selected request after acquiring the per-session processing
+/// slot; selection can be older than another turn's completed commit.
+async fn fresh_attempt_for_request(
+    session: &Session,
+    request: &crate::session::TurnRequest,
+    live_attempts: &std::collections::HashSet<String>,
+    pending_retry: bool,
+) -> anyhow::Result<Option<TurnAttempt>> {
+    if pending_retry {
+        if let TurnRequestState::InFlight { attempt_id } = &request.state
+            && matches!(session.turn_state_for_entry(&request.id, live_attempts).await?,
+                TurnRequestState::InFlight { attempt_id: ref current } if current == attempt_id)
+        {
+            return session.read_turn_attempt(attempt_id).await;
+        }
+        return Ok(None);
+    }
+    if !matches!(request.state, TurnRequestState::Queued)
+        || !matches!(
+            session
+                .turn_state_for_entry(&request.id, live_attempts)
+                .await?,
+            TurnRequestState::Queued
+        )
+    {
+        return Ok(None);
+    }
+    session
+        .start_turn_attempt(request.id.clone())
+        .await
+        .map(Some)
 }
 
 fn display_entries_for_record(
@@ -535,6 +647,9 @@ pub struct Server {
     live_attempts: Arc<Mutex<std::collections::HashSet<String>>>,
     /// Unique to this Server generation, even under the same service login.
     job_incarnation: String,
+    /// A retry command durably created these attempts, but no runtime has
+    /// consumed them yet. Consuming one marker is process-local and one-shot.
+    pending_retry_attempts: Arc<Mutex<std::collections::HashSet<String>>>,
     /// Per-schedule accounting locks. Schedule turns deliberately overlap, but
     /// their lifecycle read-modify-write operations must not lose increments:
     /// `max_fires` admission reserves its slot under these locks, so
@@ -679,6 +794,7 @@ impl Server {
             transcript_fail_after: Arc::new(std::sync::Mutex::new(None)),
             live_attempts: Arc::new(Mutex::new(std::collections::HashSet::new())),
             job_incarnation: uuid::Uuid::new_v4().to_string(),
+            pending_retry_attempts: Arc::new(Mutex::new(std::collections::HashSet::new())),
             schedule_accounting: Arc::new(Mutex::new(HashMap::new())),
             skip_counters: Arc::new(Mutex::new(HashMap::new())),
             active_extensions: Arc::new(Mutex::new(HashMap::new())),
@@ -2417,6 +2533,18 @@ impl Server {
             return Ok(None);
         }
         let session = Session::new(conversation_id.clone(), session_db.clone()).await;
+        // Receipt proves the executor observed this generation through session
+        // sync. A bridge never acknowledges enablement on its own write alone.
+        if let Some(policy) = session.read_meta().await.ambient_participation
+            && crate::session::session_attachment(&session_db)
+                .await
+                .ok()
+                .flatten()
+                .is_some_and(|a| policy.matches_source(&a.transport, &a.login_id, &a.channel))
+        {
+            crate::session::acknowledge_ambient_participation(&session_db, &policy.generation)
+                .await?;
+        }
 
         let live_attempts = self.live_attempts.lock().await.clone();
         let command = session.next_command_request(&live_attempts).await?;
@@ -2543,6 +2671,22 @@ impl Server {
         };
         if !should_process {
             return Ok(None);
+        }
+        if let Some(source) = latest.routing.as_ref().and_then(|r| r.source.as_ref()) {
+            let attachment = crate::session::session_attachment(&session_db).await?;
+            if !attachment.is_some_and(|a| {
+                a.transport == source.transport
+                    && a.login_id == source.login_id
+                    && a.channel == source.channel
+            }) || (latest.routing.as_ref().is_some_and(|r| r.ambient_candidate)
+                && !crate::session::ambient_participation_for_entry(&session_db, &latest).await)
+            {
+                warn!(
+                    session_db_id,
+                    "External turn no longer passes attachment or ambient policy gate"
+                );
+                return Ok(None);
+            }
         }
 
         // Fast-start gate: the gateway may already be drawn and accepting
@@ -2697,21 +2841,50 @@ impl Server {
             return Ok(None);
         }
 
-        // Non-job turns and explicit retries keep their existing lifecycle.
-        let attempt = match existing_attempt_id {
-            Some(attempt_id) => session
-                .read_turn_attempt(&attempt_id)
-                .await?
-                .ok_or_else(|| anyhow::anyhow!("live attempt {attempt_id} disappeared"))?,
-            None => {
-                let attempt = session.start_turn_attempt(request.id).await?;
-                self.live_attempts
-                    .lock()
-                    .await
-                    .insert(attempt.attempt_id.clone());
-                attempt
-            }
+        // This is the last check before model or tool side effects. A request
+        // stays queued through startup, runtime, and home-peer checks. Only
+        // the executor about to run it records the attempt start.
+        let live_now = self.live_attempts.lock().await.clone();
+        let pending_retry = match &request.state {
+            TurnRequestState::InFlight { attempt_id } => self
+                .pending_retry_attempts
+                .lock()
+                .await
+                .contains(attempt_id),
+            _ => false,
         };
+        let attempt =
+            match fresh_attempt_for_request(&session, &request, &live_now, pending_retry).await {
+                Ok(Some(attempt)) => {
+                    if pending_retry {
+                        self.pending_retry_attempts
+                            .lock()
+                            .await
+                            .remove(&attempt.attempt_id);
+                    }
+                    attempt
+                }
+                Ok(None) => {
+                    let current = session.turn_state_for_entry(&request.id, &live_now).await;
+                    self.processing.lock().await.remove(session_db_id);
+                    if matches!(current, Ok(TurnRequestState::Completed { .. })) {
+                        let _ = self
+                            .notify_tx
+                            .send(ProcessingCommand::Wake(session_db_id.to_string()))
+                            .await;
+                    }
+                    current?;
+                    return Ok(None);
+                }
+                Err(error) => {
+                    self.processing.lock().await.remove(session_db_id);
+                    return Err(error);
+                }
+            };
+        self.live_attempts
+            .lock()
+            .await
+            .insert(attempt.attempt_id.clone());
 
         let attempt_id = attempt.attempt_id.clone();
         self.spawn_agent_task(
@@ -2886,6 +3059,10 @@ impl Server {
                                 )
                                 .await;
                         };
+                        self.pending_retry_attempts
+                            .lock()
+                            .await
+                            .insert(target_attempt.attempt_id.clone());
                         self.live_attempts
                             .lock()
                             .await
@@ -3034,6 +3211,7 @@ impl Server {
             .unwrap_or_default();
 
         let tools = self.tools.clone();
+        let registry = self.registry.clone();
         let policies = self.policies.clone();
         let security = self.security.clone();
         let semaphore = self.semaphore.clone();
@@ -3117,6 +3295,18 @@ impl Server {
             }
             .with_active_extensions(Some(active_extensions.clone()));
 
+            // Stable for the session, independent of whether this turn came
+            // from Matrix, the TUI, or another locally attached agent.
+            let attachment = {
+                let s = session.lock().await;
+                match crate::session::session_attachment(s.database()).await {
+                    Ok(attachment) => attachment,
+                    Err(error) => {
+                        warn!(%error, "Session has an invalid external attachment; disabling conversational tools");
+                        None
+                    }
+                }
+            };
             let tool_ctx = ToolContext {
                 agent_name: agent_name.clone(),
                 turn_request_id: Some(attempt.request_id.clone()),
@@ -3125,6 +3315,7 @@ impl Server {
                 max_call_depth,
                 tools: scoped_tools,
                 profile,
+                allow_no_reply: attachment.as_ref().is_some_and(|a| a.conversational_replies),
                 session: session.clone(),
                 grants: Default::default(),
                 session_capabilities,
@@ -3135,7 +3326,7 @@ impl Server {
                 routine_engine: routine_engine.clone(),
             };
 
-            let tool_defs = tool_ctx.tools.definitions(&tool_ctx.profile);
+            let tool_defs = tool_ctx.definitions();
             let (session_model, assembled) = {
                 let s = session.lock().await;
                 let meta = s.read_meta().await;
@@ -3173,9 +3364,11 @@ impl Server {
                     budget_model.as_deref(),
                     max_context_tokens,
                 );
-                let assembled =
-                    ContextBuilder::new(&context_entries, &agent_name, &system_prompt, &context_config)
-                        .with_tools(&tool_defs)
+                let mut builder = ContextBuilder::new(&context_entries, &agent_name, &system_prompt, &context_config);
+                if let Some(attachment) = &attachment {
+                    builder = builder.with_attachment(attachment);
+                }
+                let assembled = builder.with_tools(&tool_defs)
                         .with_tool_history(&tool_history)
                         .with_max_tokens_override(max_tokens_override)
                         .with_room_participants(&roster)
@@ -3202,6 +3395,7 @@ impl Server {
                 attempt_id: attempt.attempt_id.clone(),
                 sequence: AtomicU32::new(0),
                 terminal: std::sync::Mutex::new(None),
+                explicit_bridge_send: AtomicBool::new(false),
                 agent_name: agent_name.clone(),
                 #[cfg(test)]
                 fail_after: transcript_fail_after,
@@ -3228,41 +3422,62 @@ impl Server {
             let mut s = session.lock().await;
             let persistence_failed =
                 matches!(&result, Err(error) if error.starts_with("runtime persistence failed:"));
-            let final_entry = match result {
-                Ok(outcome) if outcome.body.trim().is_empty() => {
-                    // Silent turn — the agent acted via tools or chose
-                    // not to speak. Write no Message: keeps the room
-                    // and LLM context uncluttered and doesn't trip the
-                    // multi-agent burst counter. The turn's cost is not
-                    // dropped silently — for autonomous wakes the fire
-                    // path attributes it to the agent's own fire log
-                    // (see agent-owned schedules); session usage stays
-                    // Message-only by design.
-                    debug!(
-                        agent = %agent_name,
-                        session = %session_db_id,
-                        "Agent produced no message (silent turn) — no entry written"
-                    );
-                    None
+            let mut reply_preflight_failed = false;
+            let (final_entry, outbound) = match result {
+                Ok(outcome) if tool_ctx.allow_no_reply && outcome.body.trim().is_empty() => {
+                    // The terminal no_reply was recorded as the turn's model fact.
+                    (None, None)
                 }
-                Ok(outcome) => Some(SessionEntry {
-                    sender: agent_name,
-                    content: outcome.body,
-                    timestamp: Utc::now(),
-                    entry_type: EntryType::Message,
-                    metadata: outcome.metadata,
-                    routing: None,
-                }),
+                Ok(outcome) => {
+                    let outbound = if recorder.explicit_bridge_send.load(Ordering::Acquire) {
+                        None
+                    } else {
+                        match bridge_reply_for_turn(
+                            &s,
+                            &registry,
+                            &attempt,
+                            &agent_name,
+                            attachment.as_ref(),
+                            &outcome.body,
+                        )
+                        .await
+                        {
+                            Ok(outbound) => outbound,
+                            Err(error) => {
+                                error!(%error, "External turn reply failed its attachment or ownership check");
+                                reply_preflight_failed = true;
+                                None
+                            }
+                        }
+                    };
+                    let final_routing = outbound
+                        .as_ref()
+                        .and_then(|entry| entry.routing.as_ref())
+                        .and_then(|routing| routing.destinations.first())
+                        .and_then(|destination| destination.message_id.clone())
+                        .map(|id| crate::session::EntryRouting {
+                            outbound_id: Some(id),
+                            ..Default::default()
+                        });
+                    (Some(SessionEntry {
+                        sender: agent_name,
+                        content: outcome.body,
+                        timestamp: Utc::now(),
+                        entry_type: EntryType::Message,
+                        metadata: outcome.metadata,
+                        routing: final_routing,
+                    }), outbound)
+                }
                 Err(err) => {
                     error!("Agent error for {}: {err}", session_db_id);
-                    Some(SessionEntry {
+                    (Some(SessionEntry {
                         sender: agent_name,
                         content: format!("Error: {err}"),
                         timestamp: Utc::now(),
                         entry_type: EntryType::Error,
                         metadata: None,
                         routing: None,
-                    })
+                    }), None)
                 }
             };
             if let Some(ref token) = incarnation {
@@ -3274,18 +3489,18 @@ impl Server {
                     }
                 }
             }
-            if persistence_failed {
+            if persistence_failed || reply_preflight_failed {
                 error!(
-                    "Runtime transcript persistence stopped turn {} for {session_db_id}",
+                    "Turn {} for {session_db_id} remains interrupted: transcript or external reply preflight failed",
                     attempt.attempt_id
                 );
             } else {
                 let terminal = recorder.terminal.lock().unwrap().take();
-                if let Err(e) = s
-                    .complete_turn_attempt_with_transcript(&attempt, final_entry, terminal)
+                if let Err(error) = s
+                    .complete_turn_attempt_with_outbound(&attempt, final_entry, outbound, terminal)
                     .await
                 {
-                    error!("Failed to complete turn attempt for {session_db_id}: {e}");
+                    error!("Failed to complete turn attempt for {session_db_id}: {error}");
                 }
             }
             drop(s);

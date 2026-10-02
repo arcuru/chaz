@@ -1,16 +1,16 @@
 # Matrix Bot
 
-Chaz connects to Matrix as a bot, responding to messages in rooms it's invited
-to. The Matrix bridge runs as its own process (`chaz-matrix`), separate from
+Chaz connects to Matrix as a bot. It records eligible room messages in a
+session. An invoked Matrix turn normally posts its final to that room; `no_reply({})` ends the turn without a post, and `matrix__send` remains available for explicit or proactive messages. The Matrix bridge runs as its own process (`chaz-matrix`), separate from
 the `chaz` daemon — read [Transport Bridges](bridges.md) first for the
 architecture, the connection settings, and the one-time approval flow. This page covers Matrix-specific
 configuration and behavior.
 
 ## Live typing during a turn
 
-| Signal                    | Starts                                                                | Ends                                                                    |
-| ------------------------- | --------------------------------------------------------------------- | ----------------------------------------------------------------------- |
-| Matrix room typing notice | The bridge sees a fresh executor per-turn start in the shared session | Completion, error, silent release, or a heartbeat older than 45 seconds |
+| Signal                    | Starts                                                                | Ends                                                    |
+| ------------------------- | --------------------------------------------------------------------- | ------------------------------------------------------- |
+| Matrix room typing notice | The bridge sees a fresh executor per-turn start in the shared session | Completion, error, or a heartbeat older than 45 seconds |
 
 The bridge only observes the per-turn claim; it does not run the agent or infer
 activity from a room binding, an old acknowledgement, or session runtime
@@ -24,7 +24,7 @@ Example with a shared room:
 
 1. Send `@chaz:example summarize this` in the room. When the executor starts,
    the Matrix client displays `chaz is typing` while the turn runs.
-2. On a reply, error, or silent completion, the typing indicator stops even if
+2. On a final or error, the typing indicator stops even if
    the bridge remains connected to the room. A second message starts a new turn.
 3. If the executor crashes, the typing notice expires and the bridge stops
    renewing it when the last heartbeat ages out (within 45 seconds plus sync
@@ -176,7 +176,7 @@ Safety notes:
 ## Message Handling
 
 - **DMs**: The bot responds to every message
-- **Group rooms**: The bot responds to messages prefixed with `!chaz` or that mention the bot
+- **Group rooms**: By default, the bot responds to `!chaz` commands or messages that mention it. An explicitly enabled room can invite participation on every eligible text message.
 
 To send a message with room context:
 
@@ -192,19 +192,22 @@ Commands are sent as Matrix messages. Session ops go through the same transport-
 
 ### Session
 
-| Command                  | Description                                          |
-| ------------------------ | ---------------------------------------------------- |
-| `!chaz sessions`         | List every session known to the registry             |
-| `!chaz info`             | Show details for the session attached to this room   |
-| `!chaz name [<alias>]`   | Set (or clear, with no arg) a human-friendly alias   |
-| `!chaz attach <session>` | Bind this room to a specific session (name or DB ID) |
-| `!chaz detach`           | Detach this room from its session                    |
-| `!chaz channels`         | List Matrix rooms currently attached to this session |
-| `!chaz share`            | Generate a shareable ticket URL for this session     |
-| `!chaz unshare`          | Stop sharing the current session                     |
-| `!chaz sync <ticket>`    | Sync a remote session via ticket URL                 |
-| `!chaz compact`          | Summarize and compact conversation history           |
-| `!chaz print`            | Print the current conversation context               |
+| Command                      | Description                                                                   |
+| ---------------------------- | ----------------------------------------------------------------------------- |
+| `!chaz sessions`             | List every session known to the registry                                      |
+| `!chaz info`                 | Show details for the session attached to this room                            |
+| `!chaz name [<alias>]`       | Set (or clear, with no arg) a human-friendly alias                            |
+| `!chaz attach <session>`     | Bind this room to a specific session (name or DB ID)                          |
+| `!chaz detach`               | Detach this room from its session                                             |
+| `!chaz participation on`     | Enable agent-selected replies for this group room after executor confirmation |
+| `!chaz participation status` | Report whether this login and room are confirmed enabled                      |
+| `!chaz participation off`    | Disable participation in this room                                            |
+| `!chaz channels`             | List transport channels attached to this session                              |
+| `!chaz share`                | Generate a shareable ticket URL for this session                              |
+| `!chaz unshare`              | Stop sharing the current session                                              |
+| `!chaz sync <ticket>`        | Sync a remote session via ticket URL                                          |
+| `!chaz compact`              | Summarize and compact conversation history                                    |
+| `!chaz print`                | Print the current conversation context                                        |
 
 ### Living Agents
 
@@ -237,13 +240,128 @@ Commands are sent as Matrix messages. Session ops go through the same transport-
 | `!chaz rename`                 | Rename the Matrix room based on conversation content                        |
 | `!chaz party`                  | 🎉                                                                          |
 
-## Session Attachment
+## Attached rooms and reply routing
 
-A Matrix room is connected to a session through an explicit _channel_ record (`room_id → session_db_id`). Joining a new room creates the session and attaches the room before an addressed message arrives.
+A session can attach **at most one Matrix `(login, room)`**. It is still the
+same session in the TUI; selecting it there does not change the Matrix room or
+make it the TUI's default. `!chaz attach <session>` refuses a second Matrix
+room or login until the existing room is detached. An older session with
+conflicting bindings fails closed: detach or explicitly migrate its bindings,
+not a silent redirect. `!chaz detach` removes this room's binding; the next
+addressed message there creates a fresh session. Non-Matrix transport bindings
+are separate.
 
-Use `!chaz attach <session>` to rebind the room to a different session (e.g., to resume a synced session, or to route a scheduled-task session into a specific room). Multiple rooms can attach to the same session — responses fan out to every attached room. `!chaz detach` removes the binding; the next addressed message in the room creates a fresh session.
+| Action                                     | Effect                                                                                                       |
+| ------------------------------------------ | ------------------------------------------------------------------------------------------------------------ |
+| Addressed Matrix text in a DM or group     | Stored with login, room and sender provenance; wakes the session's agent                                     |
+| Unaddressed text in an attached group room | Stored as observation for later context; **no model turn**                                                   |
+| `!chaz participation on`                   | Authorized, executor-confirmed ambient wake for this room; off by default                                    |
+| `!chaz participation off` / `status`       | Stop ambient wake / show confirmed state; messages remain observable                                         |
+| Normal final on a Matrix-origin turn       | Saved locally and queued to the same bound room under the owning agent's login                               |
+| Normal final on a TUI/local/schedule turn  | Saved locally only, even in a Matrix-bound session                                                           |
+| `no_reply({})` in a Matrix-bound session   | Terminal action: no final message and no room post                                                           |
+| `matrix__send({"body":"text"})`            | Explicit/proactive room send; on a Matrix-origin turn it counts as the reply and the later final stays local |
 
-At bridge startup, the bot re-installs response-delivery callbacks for every persisted channel whose room it's joined to. This is what makes scheduled-task responses reach a Matrix room even when no user is currently active there.
+The daemon commits a Matrix-origin final, its addressed generic `BridgeEvent` outbound row,
+and its completed turn attempt atomically. The bridge delivers only addressed
+outbound events whose single destination still matches its own login and
+the session binding. A missing binding, mismatched identity, or conflicting
+legacy binding fails closed. No other session or joined room can be targeted.
+An acknowledged send appears as
+**sent** in later context and the TUI; until confirmation it remains **pending**.
+The bridge retries pending chunks after an outage with stable Matrix
+transaction IDs; it can repeat a request after a lost acknowledgement, so the
+homeserver's transaction-ID deduplication matters. Detaching before delivery
+prevents an old queued send from being redirected.
+
+Incoming source and outbound status come from entry metadata, not text in the
+message body. The local copy of an auto-posted final carries its paired send
+identity and appears as a `matrix_reply` with pending/sent status in later
+model context; a TUI/local final still appears as a `local_message`. A message
+that imitates a provenance header remains an untrusted body. A Matrix mention
+to another bot is received by that bot's own bridge and
+session; the send event itself does not create a second local agent wake. Only
+a normal **local** agent message that `@mentions` an attached agent invites
+that agent to produce a local final; burst limits still apply. The model-facing
+`no_reply` action is available on every turn of a Matrix-bound session, including
+local turns, to keep the tool list stable; non-Matrix-origin finals never auto-post.
+A model without tool-calling support cannot safely choose `no_reply` and is
+rejected for a Matrix-bound turn rather than silently posting a fallback answer.
+
+## Migration: schedules no longer auto-post finals
+
+Scheduled turns no longer automatically post their final text to Matrix, even
+when their session is attached to a room. Their normal final is saved locally.
+Matrix-origin conversational turns still auto-post normal finals as described
+above; a scheduled wake is not a Matrix-origin turn.
+
+To publish scheduled work, use a **Pinned** schedule targeting the session
+attached to the intended Matrix login and room, and instruct its owning agent
+to call `matrix__send({"body":"…"})`. A Fresh schedule has no attached room.
+The explicit send is the room post; the scheduled turn's later normal final
+stays local and does not produce a duplicate. See [Agent-owned schedules](agents.md#schedules)
+for creation and home-daemon requirements.
+
+1. In the attached session, create a pinned morning briefing:
+
+   ```text
+   /schedule add brief 0 0 9 * * Mon-Fri chaz Summarize overnight activity. Publish the briefing with matrix__send in this attached session; keep your final local.
+   ```
+
+   When it fires, the agent calls, for example:
+
+   ```json
+   { "body": "Morning briefing: no urgent changes." }
+   ```
+
+   through `matrix__send`. The room receives that explicit post once, not the
+   later local final.
+
+2. If an existing schedule only says “summarize overnight activity”, its final
+   now appears in the session, **not** in Matrix. Replace its task with an
+   explicit-send instruction (remove and re-add the rule if using commands).
+3. If the pinned session is not attached, `matrix__send` is unavailable; a
+   normal final cannot substitute for it. Attach the intended room with
+   `!chaz attach <session>` before the next fire. If another room already owns
+   the binding, attach refuses it; detach the old room explicitly before moving
+   it. Never change a schedule to Fresh as a workaround for a missing binding.
+
+## Choosing when to wake in a group
+
+Group ambient participation is **off by default**. Only a sender matching
+this bridge login's explicit nonempty `allow_list` can set
+`!chaz participation on`. The bridge waits for the executor to acknowledge a
+fresh setting for this exact login and room; an old participation policy from
+before the session-local send contract is deliberately inert until explicitly
+re-enabled. `status` and `off` require the same allowlist. Commands, own-bot
+messages, pre-join history, duplicate events and unauthorized senders do not
+wake the agent. The per-sender rate limit and the pilot ceiling of 20 ambient
+turns per room per bridge process apply; excess eligible messages are still
+observations, not extra turns. DMs remain addressed by default.
+
+Example in an allowlisted group room:
+
+1. `@you:example` sends `!chaz participation status` and sees
+   `Matrix participation: off`. An unaddressed message is recorded but does
+   not spend a model call. A mention of `@chaz:example` does start a turn;
+   its ordinary final appears in both the session and the Matrix room.
+2. If the agent instead calls `matrix__send({"body":"The answer is 42"})`,
+   the room receives that explicit post from its Matrix login, while the
+   session shows the addressed event as pending, then sent. A later normal
+   final on that turn remains **local** and does not produce a second room post.
+3. A second room tries `!chaz attach <session>` and receives
+   `!chaz Error: failed to bind room: session has a different or conflicting external attachment; detach or migrate explicitly`.
+   Detach the old room first if moving the handle is intentional; an old
+   queued send is not rerouted to the new room.
+4. `@you:example` sends `!chaz participation on` and sees
+   `Matrix participation: on` only after executor confirmation. A bare
+   message now wakes the model. A normal final replies in the room, while
+   `no_reply({})` as a sole terminal action leaves it silent. If the executor is unavailable,
+   the response is
+   `!chaz Error: executor did not confirm participation; mode is off`;
+   restore it and explicitly enable again.
+5. `!chaz participation off` reports `Matrix participation: off`. Bare
+   messages return to observation-only; mentions still start turns.
 
 ## Per-Session Settings
 

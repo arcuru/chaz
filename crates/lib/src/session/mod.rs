@@ -1,10 +1,11 @@
 //! Per-conversation state (`Session`) and the central registry
 //! (`SessionRegistry`).
 //!
-//! A session is one conversation. Each owns a dedicated eidetica Database
-//! with two stores:
-//! - `entries` (Table<SessionEntry>) — message/directive/tool-call history
-//! - `meta`    (DocStore)            — session configuration (name, agent, model, ...)
+//! A session is one conversation in a dedicated eidetica Database.
+//! `entries` is the ordered Table<SessionEntry> transcript; `meta` and
+//! `transport_bindings` hold synced configuration, while `turn_attempts`,
+//! `turn_transcript`, and the command/activity stores hold durable execution
+//! state. Bridge delivery progress is peer-local, outside this database.
 //!
 //! The registry (inside `chaz_group`) holds only indices: `sessions`,
 //! `session_names`. Canonical per-session config lives in each session's own
@@ -22,11 +23,13 @@ use crate::types::ConversationId;
 use chrono::{DateTime, Utc};
 use eidetica::store::{DocStore, Table};
 use eidetica::{Database, Snapshot};
-use serde::{Deserialize, Serialize};
+use serde::de::Error as _;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::{HashMap, HashSet};
 use tracing::{error, info, warn};
 
 mod agents;
+mod bridge_event;
 pub mod jobs;
 mod keys;
 mod registry;
@@ -34,19 +37,31 @@ pub(crate) use registry::JobRequest;
 mod transport;
 pub mod usage;
 
+pub use bridge_event::{BridgeEvent, BridgeEventRole};
 pub use keys::BootstrapOutcome;
 #[cfg(test)]
 pub(crate) mod test_helpers;
 
 pub use registry::SessionRegistry;
-pub use transport::{bind_transport, is_bound, transport_bindings, unbind_transport};
+pub use transport::{
+    TransportAttachment, bind_conversational_transport, bind_transport, is_bound,
+    session_attachment, transport_bindings, unbind_transport,
+};
 
 /// Type of session entry. Participants (users and agents alike) write entries
 /// to a session. There is no user/agent distinction at the protocol level.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum EntryType {
     /// A chat message (from any participant)
     Message,
+    /// Versioned, core-owned transport observation, outbound request, or receipt.
+    BridgeEvent,
+    /// Legacy Matrix observation; retained only for reading existing history.
+    MatrixObserved,
+    /// Explicit durable outbound request from matrix__send; never a local chat wake.
+    MatrixSend,
+    /// Bridge acknowledgement of an outbound Matrix request; audit only.
+    MatrixSent,
     /// A task/instruction from a non-user source (spawn_agent, scheduler, system).
     /// Included in LLM context as a user message.
     Directive,
@@ -73,6 +88,81 @@ pub enum EntryType {
     /// matches it back to the blocked request by `request_id`. Same exclusions
     /// as `ApprovalRequest`.
     ApprovalDecision,
+    /// A later version's entry, preserved in storage and inert in this reader.
+    Unknown {
+        kind: String,
+        raw: serde_json::Value,
+    },
+}
+
+impl EntryType {
+    fn wire_name(&self) -> &str {
+        match self {
+            Self::Message => "Message",
+            Self::BridgeEvent => "BridgeEvent",
+            Self::MatrixObserved => "MatrixObserved",
+            Self::MatrixSend => "MatrixSend",
+            Self::MatrixSent => "MatrixSent",
+            Self::Directive => "Directive",
+            Self::ToolCall => "ToolCall",
+            Self::ToolResult => "ToolResult",
+            Self::Ack => "Ack",
+            Self::Error => "Error",
+            Self::Summary => "Summary",
+            Self::ApprovalRequest => "ApprovalRequest",
+            Self::ApprovalDecision => "ApprovalDecision",
+            Self::Unknown { kind, .. } => kind,
+        }
+    }
+}
+
+impl Serialize for EntryType {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Unknown { raw, .. } => raw.serialize(serializer),
+            _ => serializer.serialize_str(self.wire_name()),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for EntryType {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = serde_json::Value::deserialize(deserializer)?;
+        let name = match &raw {
+            serde_json::Value::String(name) => name.clone(),
+            serde_json::Value::Object(fields) if fields.len() == 1 => {
+                fields.keys().next().expect("one field").clone()
+            }
+            _ => {
+                return Err(D::Error::custom(
+                    "entry type must be a string or one named object",
+                ));
+            }
+        };
+        let known = match name.as_str() {
+            "Message" => Some(Self::Message),
+            "BridgeEvent" => Some(Self::BridgeEvent),
+            "MatrixObserved" => Some(Self::MatrixObserved),
+            "MatrixSend" => Some(Self::MatrixSend),
+            "MatrixSent" => Some(Self::MatrixSent),
+            "Directive" => Some(Self::Directive),
+            "ToolCall" => Some(Self::ToolCall),
+            "ToolResult" => Some(Self::ToolResult),
+            "Ack" => Some(Self::Ack),
+            "Error" => Some(Self::Error),
+            "Summary" => Some(Self::Summary),
+            "ApprovalRequest" => Some(Self::ApprovalRequest),
+            "ApprovalDecision" => Some(Self::ApprovalDecision),
+            _ => None,
+        };
+        match (known, &raw) {
+            (Some(kind), serde_json::Value::String(_)) => Ok(kind),
+            (Some(_), _) => Err(D::Error::custom(
+                "known session entry kind has malformed payload",
+            )),
+            (None, _) => Ok(Self::Unknown { kind: name, raw }),
+        }
+    }
 }
 
 /// An entry in a session. Participants (human users and AI agents) are
@@ -225,17 +315,33 @@ pub struct EntryRouting {
     /// transport/login/channel this entry arrived on, and from whom.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<TransportRef>,
-    /// Default-reply pointer: the transport `message_id` of the inbound
-    /// entry this is a reply to. The publisher resolves the destination by
-    /// finding the referenced entry and reading its `source`. Lets the
-    /// runtime stay transport-agnostic for the chat-in → chat-out case.
+    /// Adapter-supplied ambient candidate; the core verifies current policy.
+    #[serde(
+        default,
+        alias = "matrix_participation",
+        skip_serializing_if = "is_false"
+    )]
+    pub ambient_candidate: bool,
+    /// Default-reply pointer for legacy transports and correlated receipts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reply_to: Option<String>,
+    /// The paired durable outbound request committed with an external-origin
+    /// final; old Matrix rows used the `matrix_send_id` wire name.
+    #[serde(
+        default,
+        alias = "matrix_send_id",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub outbound_id: Option<String>,
     /// Explicit destinations for proactive / cross-transport sends. Each
     /// publisher sends the entries whose destination matches its own
     /// `(transport, login_id)`. Empty for the implicit reply-to-source path.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub destinations: Vec<TransportRef>,
+}
+
+fn is_false(value: &bool) -> bool {
+    !value
 }
 
 /// A transport-scoped address: where a message came from or should go.
@@ -323,6 +429,9 @@ pub struct SessionMeta {
     /// Per-session agent→agent burst budget override. `Some(n)` replaces
     /// the global `multi_agent.burst_budget`; `None` falls back to it.
     pub burst_budget_override: Option<usize>,
+    /// Fresh ambient opt-in, scoped to one login and room. Legacy participation
+    /// policy is intentionally not read; upgrading must not reactivate it.
+    pub ambient_participation: Option<AmbientParticipation>,
     /// Session-wide capability ceiling. Attenuates every tool call by every
     /// agent in this session — the outermost tier, above the agent-wide cap
     /// and per-tool grants. "This is a private, no-network session" lives
@@ -330,6 +439,48 @@ pub struct SessionMeta {
     #[serde(default)]
     pub capabilities: crate::grants::Grants,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AmbientParticipation {
+    #[serde(default = "default_matrix_transport")]
+    pub transport: String,
+    pub login_id: String,
+    #[serde(alias = "room_id")]
+    pub channel: String,
+    /// Fresh per enable operation; the executor echoes this after sync.
+    pub generation: String,
+}
+
+fn default_matrix_transport() -> String {
+    "matrix".into()
+}
+
+impl AmbientParticipation {
+    pub fn new_for(transport: &str, login_id: &str, channel: &str) -> Self {
+        Self {
+            transport: transport.into(),
+            login_id: login_id.into(),
+            channel: channel.into(),
+            generation: uuid::Uuid::new_v4().to_string(),
+        }
+    }
+
+    /// Compatibility helper for tests and bridge code written for the pilot.
+    pub fn new(login_id: &str, room_id: &str) -> Self {
+        Self::new_for("matrix", login_id, room_id)
+    }
+
+    pub fn matches_source(&self, transport: &str, login_id: &str, channel: &str) -> bool {
+        self.transport == transport && self.login_id == login_id && self.channel == channel
+    }
+
+    pub fn matches(&self, login_id: &str, room_id: &str) -> bool {
+        self.matches_source("matrix", login_id, room_id)
+    }
+}
+
+/// Already-live Matrix policy records are read through the generic policy.
+pub type MatrixParticipation = AmbientParticipation;
 
 impl SessionMeta {
     /// Resolve which model should run for `agent_name`. Order:
@@ -743,13 +894,53 @@ impl Session {
         Ok((entries, history))
     }
 
+    /// Bridge ingress is a core decision: adapter facts request a wake, but
+    /// only the current, unambiguous attachment and synced ambient policy can
+    /// authorize it. A suppressed request is still an observed context row.
+    pub async fn add_bridge_input(
+        &mut self,
+        mut entry: SessionEntry,
+        wake_requested: bool,
+    ) -> anyhow::Result<TurnRequestId> {
+        anyhow::ensure!(
+            entry.entry_type == EntryType::Message,
+            "bridge ingress requires a user message"
+        );
+        let source = entry
+            .routing
+            .as_ref()
+            .and_then(|r| r.source.as_ref())
+            .ok_or_else(|| {
+                anyhow::anyhow!("bridge ingress requires authenticated source provenance")
+            })?;
+        let attachment = session_attachment(&self.database)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("bridge ingress requires an external attachment"))?;
+        anyhow::ensure!(
+            attachment.transport == source.transport
+                && attachment.login_id == source.login_id
+                && attachment.channel == source.channel,
+            "bridge ingress source does not match the session attachment"
+        );
+        let allowed = wake_requested
+            && (!entry.routing.as_ref().is_some_and(|r| r.ambient_candidate)
+                || ambient_participation_for_entry(&self.database, &entry).await);
+        if !allowed {
+            let timestamp = entry.timestamp;
+            entry = SessionEntry::new_bridge_event(
+                entry.sender,
+                BridgeEventRole::Observation,
+                entry.content,
+                entry.routing,
+            );
+            entry.timestamp = timestamp;
+        }
+        self.add_entry(entry).await
+    }
+
     /// Add an entry to the session, persisting it before it becomes visible
-    /// in memory.
-    ///
-    /// A write failure is returned rather than logged: callers that block on
-    /// an entry landing (tool approvals above all) must learn immediately that
-    /// it never will, and the in-memory history must not claim a row the
-    /// database does not hold.
+    /// in memory. A write failure is returned rather than logged: callers
+    /// awaiting it (tool approvals above all) must know it did not land.
     pub async fn add_entry(&mut self, entry: SessionEntry) -> anyhow::Result<TurnRequestId> {
         let txn = self
             .database
@@ -1208,41 +1399,69 @@ impl Session {
     }
 
     /// Commit the final visible entry, terminal model record, and completion
-    /// as one fact.
+    /// as one fact. Callers without an outbound room reply retain this API.
     pub async fn complete_turn_attempt_with_transcript(
         &mut self,
         attempt: &TurnAttempt,
         final_entry: Option<SessionEntry>,
         transcript: Option<TurnTranscriptRecord>,
     ) -> anyhow::Result<()> {
+        self.complete_turn_attempt_with_outbound(attempt, final_entry, None, transcript)
+            .await
+    }
+
+    /// An external-origin reply has a local final and an addressed outbox row.
+    /// Neither may commit without the other or without the completed attempt.
+    pub async fn complete_turn_attempt_with_outbound(
+        &mut self,
+        attempt: &TurnAttempt,
+        final_entry: Option<SessionEntry>,
+        outbound: Option<SessionEntry>,
+        transcript: Option<TurnTranscriptRecord>,
+    ) -> anyhow::Result<()> {
+        if let Some(send) = outbound.as_ref() {
+            if send.bridge_role() != Some(BridgeEventRole::Outbound) {
+                anyhow::bail!("turn outbound must be a supported bridge outbound event");
+            }
+            let final_entry = final_entry.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("turn outbound requires a local final in the same transaction")
+            })?;
+            let destination = send
+                .routing
+                .as_ref()
+                .filter(|routing| routing.source.is_none() && routing.destinations.len() == 1)
+                .and_then(|routing| routing.destinations.first())
+                .filter(|destination| {
+                    !destination.transport.is_empty()
+                        && !destination.login_id.is_empty()
+                        && !destination.channel.is_empty()
+                })
+                .ok_or_else(|| {
+                    anyhow::anyhow!("turn outbound needs one addressed external destination")
+                })?;
+            let send_id = destination
+                .message_id
+                .as_deref()
+                .filter(|id| !id.is_empty())
+                .ok_or_else(|| anyhow::anyhow!("turn outbound needs a durable send identity"))?;
+            if final_entry.entry_type != EntryType::Message
+                || final_entry.sender != send.sender
+                || send.bridge_body().as_deref() != Some(final_entry.content.as_str())
+                || final_entry
+                    .routing
+                    .as_ref()
+                    .and_then(|routing| routing.outbound_id.as_deref())
+                    != Some(send_id)
+            {
+                anyhow::bail!("turn final and addressed outbox event must match");
+            }
+        }
         let completed = TurnAttempt {
             status: TurnAttemptStatus::Completed,
             completed_at: Some(Utc::now()),
             ..attempt.clone()
         };
         let txn = self.database.new_transaction().await?;
-        let final_entry_id = if let Some(entry) = final_entry.as_ref() {
-            Some(
-                txn.get_store::<Table<SessionEntry>>(&self.store_name)
-                    .await?
-                    .insert(entry.clone())
-                    .await?,
-            )
-        } else {
-            None
-        };
-        let attempt_id = completed.attempt_id.clone();
-        txn.get_store::<Table<TurnAttempt>>(TURN_ATTEMPTS_STORE)
-            .await?
-            .set(attempt_id, completed)
-            .await?;
-        if let Some(record) = transcript {
-            let key = format!("{:020}:{}", record.sequence, uuid::Uuid::new_v4());
-            txn.get_store::<Table<TurnTranscriptRecord>>(TURN_TRANSCRIPT_STORE)
-                .await?
-                .set(key, record)
-                .await?;
-        }
         if let Some(accepted) = crate::session::jobs::read_accepted_job(&self.database).await?
             && accepted.directive_id == attempt.request_id.as_str()
         {
@@ -1269,12 +1488,31 @@ impl Session {
             )
             .await?;
         }
+        let mut committed_entries = Vec::new();
+        if final_entry.is_some() || outbound.is_some() {
+            let entries = txn
+                .get_store::<Table<SessionEntry>>(&self.store_name)
+                .await?;
+            for entry in final_entry.into_iter().chain(outbound) {
+                let id = entries.insert(entry.clone()).await?;
+                committed_entries.push((TurnRequestId::parse(id), entry));
+            }
+        }
+        txn.get_store::<Table<TurnAttempt>>(TURN_ATTEMPTS_STORE)
+            .await?
+            .set(completed.attempt_id.clone(), completed)
+            .await?;
+        if let Some(record) = transcript {
+            let key = format!("{:020}:{}", record.sequence, uuid::Uuid::new_v4());
+            txn.get_store::<Table<TurnTranscriptRecord>>(TURN_TRANSCRIPT_STORE)
+                .await?
+                .set(key, record)
+                .await?;
+        }
         txn.commit().await?;
-        if let Some(entry) = final_entry {
+        for (id, entry) in committed_entries {
             self.entries.push(entry);
-            self.entry_ids.push(TurnRequestId::parse(
-                final_entry_id.expect("entry id exists"),
-            ));
+            self.entry_ids.push(id);
         }
         Ok(())
     }
@@ -1524,7 +1762,26 @@ fn sort_persisted_entries(
             .then_with(|| left_id.cmp(right_id))
     });
     rows.into_iter()
-        .map(|(id, entry)| (TurnRequestId::parse(id), entry))
+        .map(|(id, entry)| {
+            match &entry.entry_type {
+                EntryType::Unknown { kind, .. } => {
+                    warn!(entry_id = %id, kind = %crate::util::truncate_chars(kind, 80),
+                    "Ignoring unknown session entry kind")
+                }
+                EntryType::BridgeEvent if entry.bridge_role().is_none() => {
+                    let detail = entry.bridge_event().map(|event| {
+                        format!(
+                            "version={} role={}",
+                            event.version,
+                            crate::util::truncate_chars(&event.role, 80)
+                        )
+                    });
+                    warn!(entry_id = %id, detail = ?detail, "Ignoring unsupported bridge event");
+                }
+                _ => {}
+            }
+            (TurnRequestId::parse(id), entry)
+        })
         .unzip()
 }
 
@@ -1618,7 +1875,14 @@ pub async fn read_meta_from_db(database: &Database) -> SessionMeta {
         Err(_) => Default::default(),
     };
 
+    let ambient_raw = match store.get_string("bridge_ambient_v1").await {
+        Ok(value) => Some(value),
+        Err(_) => store.get_string("matrix_ambient_v1").await.ok(),
+    };
+    let ambient_participation = ambient_raw.and_then(|json| serde_json::from_str(&json).ok());
+
     SessionMeta {
+        ambient_participation,
         name: store.get_string("name").await.ok(),
         agent_name: store.get_string("agent_name").await.ok(),
         agents,
@@ -1667,6 +1931,14 @@ where
         let json = serde_json::to_string(&current.agent_models)?;
         store.set_string("agent_models", json).await?;
     }
+    let participation = current
+        .ambient_participation
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()?;
+    write_field(&store, "bridge_ambient_v1", participation.as_deref()).await?;
+    // A disabled policy must not revive from the pre-upgrade Matrix key.
+    let _ = store.delete("matrix_ambient_v1").await;
     write_field(&store, "role_name", current.role_name.as_deref()).await?;
     write_field(&store, "role_prompt", current.role_prompt.as_deref()).await?;
     write_field(&store, "backend_name", current.backend_name.as_deref()).await?;
@@ -1693,6 +1965,69 @@ where
         store.set_string("capabilities", json).await?;
     }
 
+    txn.commit().await?;
+    Ok(())
+}
+
+/// No action can opt in without both the bridge's per-entry mark and a
+/// current matching, still-bound session policy on the executor.
+pub async fn ambient_participation_for_entry(database: &Database, entry: &SessionEntry) -> bool {
+    let Some(source) = entry
+        .routing
+        .as_ref()
+        .filter(|routing| routing.ambient_candidate)
+        .and_then(|routing| routing.source.as_ref())
+    else {
+        return false;
+    };
+    if entry.entry_type != EntryType::Message {
+        return false;
+    }
+    let Some(policy) = read_meta_from_db(database).await.ambient_participation else {
+        return false;
+    };
+    policy.matches_source(&source.transport, &source.login_id, &source.channel)
+        && session_attachment(database)
+            .await
+            .ok()
+            .flatten()
+            .is_some_and(|a| {
+                a.transport == source.transport
+                    && a.login_id == source.login_id
+                    && a.channel == source.channel
+            })
+}
+
+/// Executor receipt for an enable operation. A separate store avoids rewriting
+/// the bridge-owned policy from a concurrently synced metadata snapshot.
+pub async fn ambient_participation_receipt(database: &Database) -> anyhow::Result<Option<String>> {
+    let txn = database.new_transaction().await?;
+    let store = txn
+        .get_store::<DocStore>("bridge_ambient_v1_receipt")
+        .await?;
+    if let Ok(value) = store.get_string("generation").await {
+        return Ok(Some(value));
+    }
+    Ok(txn
+        .get_store::<DocStore>("matrix_ambient_v1_receipt")
+        .await?
+        .get_string("generation")
+        .await
+        .ok())
+}
+
+pub async fn acknowledge_ambient_participation(
+    database: &Database,
+    generation: &str,
+) -> anyhow::Result<()> {
+    if ambient_participation_receipt(database).await?.as_deref() == Some(generation) {
+        return Ok(());
+    }
+    let txn = database.new_transaction().await?;
+    let store = txn
+        .get_store::<DocStore>("bridge_ambient_v1_receipt")
+        .await?;
+    store.set_string("generation", generation).await?;
     txn.commit().await?;
     Ok(())
 }
@@ -2276,6 +2611,141 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn legacy_matrix_participation_never_reactivates_on_upgrade() {
+        let (_instance, _user, db) = test_session_db().await;
+        bind_transport(&db, "matrix", "@bot:example.com", "!room:example.com")
+            .await
+            .unwrap();
+        let old = MatrixParticipation::new("@bot:example.com", "!room:example.com");
+        let txn = db.new_transaction().await.unwrap();
+        txn.get_store::<DocStore>(META_STORE)
+            .await
+            .unwrap()
+            .set_string("matrix_participation", serde_json::to_string(&old).unwrap())
+            .await
+            .unwrap();
+        txn.commit().await.unwrap();
+        let mut entry = crate::bridge::inbound_user_entry(
+            "matrix",
+            "@bot:example.com",
+            "!room:example.com",
+            "@user:example.com",
+            None,
+            "hi",
+            None,
+        );
+        entry.routing.as_mut().unwrap().ambient_candidate = true;
+        assert!(read_meta_from_db(&db).await.ambient_participation.is_none());
+        assert!(
+            !ambient_participation_for_entry(&db, &entry).await,
+            "a formerly enabled session must require explicit new opt-in"
+        );
+    }
+
+    #[tokio::test]
+    async fn matrix_participation_is_persisted_bound_and_fail_closed() {
+        let (_instance, _user, db) = test_session_db().await;
+        let mut entry = crate::bridge::inbound_user_entry(
+            "matrix",
+            "@bot:test",
+            "!one:test",
+            "@human:test",
+            None,
+            "hi",
+            None,
+        );
+        assert!(read_meta_from_db(&db).await.ambient_participation.is_none());
+        bind_transport(&db, "matrix", "@bot:test", "!one:test")
+            .await
+            .unwrap();
+        let policy = MatrixParticipation::new("@bot:test", "!one:test");
+        update_meta_on_db(&db, |meta| {
+            meta.ambient_participation = Some(policy.clone())
+        })
+        .await
+        .unwrap();
+        // An existing addressed message is never retroactively opted in.
+        assert!(!ambient_participation_for_entry(&db, &entry).await);
+        entry.routing.as_mut().unwrap().ambient_candidate = true;
+        assert!(ambient_participation_for_entry(&db, &entry).await);
+        let roundtrip: SessionEntry =
+            serde_json::from_str(&serde_json::to_string(&entry).unwrap()).unwrap();
+        assert!(ambient_participation_for_entry(&db, &roundtrip).await);
+        assert_eq!(
+            read_meta_from_db(&db).await.ambient_participation,
+            Some(policy.clone())
+        );
+        assert!(ambient_participation_receipt(&db).await.unwrap().is_none());
+        acknowledge_ambient_participation(&db, &policy.generation)
+            .await
+            .unwrap();
+        assert_eq!(
+            ambient_participation_receipt(&db).await.unwrap(),
+            Some(policy.generation.clone())
+        );
+
+        // Attaching a second room does not inherit the first room's setting.
+        assert!(
+            bind_transport(&db, "matrix", "@bot:test", "!two:test")
+                .await
+                .is_err(),
+            "another Matrix room must never silently attach"
+        );
+        entry
+            .routing
+            .as_mut()
+            .unwrap()
+            .source
+            .as_mut()
+            .unwrap()
+            .channel = "!two:test".into();
+        assert!(!ambient_participation_for_entry(&db, &entry).await);
+        entry
+            .routing
+            .as_mut()
+            .unwrap()
+            .source
+            .as_mut()
+            .unwrap()
+            .channel = "!one:test".into();
+        unbind_transport(&db, "matrix", "@bot:test", "!one:test")
+            .await
+            .unwrap();
+        assert!(!ambient_participation_for_entry(&db, &entry).await);
+        bind_transport(&db, "matrix", "@bot:test", "!one:test")
+            .await
+            .unwrap();
+        entry
+            .routing
+            .as_mut()
+            .unwrap()
+            .source
+            .as_mut()
+            .unwrap()
+            .login_id = "@other:test".into();
+        assert!(!ambient_participation_for_entry(&db, &entry).await);
+        entry
+            .routing
+            .as_mut()
+            .unwrap()
+            .source
+            .as_mut()
+            .unwrap()
+            .login_id = "@bot:test".into();
+        update_meta_on_db(&db, |meta| meta.ambient_participation = None)
+            .await
+            .unwrap();
+        assert!(!ambient_participation_for_entry(&db, &entry).await);
+        assert!(read_meta_from_db(&db).await.ambient_participation.is_none());
+        // A receipt from the previous generation cannot confirm a new enable.
+        let next = MatrixParticipation::new("@bot:test", "!one:test");
+        assert_ne!(
+            ambient_participation_receipt(&db).await.unwrap().as_deref(),
+            Some(next.generation.as_str())
+        );
+    }
+
+    #[tokio::test]
     async fn session_meta_agents_round_trip() {
         let (_instance, _user, db) = test_session_db().await;
 
@@ -2589,7 +3059,9 @@ mod tests {
                     message_id: Some("$evt".to_string()),
                 }),
                 reply_to: None,
+                outbound_id: None,
                 destinations: Vec::new(),
+                ambient_candidate: false,
             }),
         };
         let json = serde_json::to_string(&entry).unwrap();
@@ -2599,5 +3071,111 @@ mod tests {
         assert_eq!(src.login_id, "@bot:example.com");
         assert_eq!(src.channel, "!room:example.com");
         assert_eq!(src.message_id.as_deref(), Some("$evt"));
+    }
+    #[tokio::test]
+    async fn matrix_reply_completion_atomically_commits_final_and_outbox() {
+        let (_instance, _user, db) = test_session_db().await;
+        let mut session = Session::new(ConversationId(db.root_id().to_string()), db.clone()).await;
+        let request = session
+            .add_entry(SessionEntry {
+                sender: "@human:example".into(),
+                content: "question".into(),
+                timestamp: Utc::now(),
+                entry_type: EntryType::Message,
+                metadata: None,
+                routing: None,
+            })
+            .await
+            .unwrap();
+        let attempt = session.start_turn_attempt(request).await.unwrap();
+        let outbound = SessionEntry {
+            sender: "agent".into(),
+            content: "answer".into(),
+            timestamp: Utc::now(),
+            entry_type: EntryType::MatrixSend,
+            metadata: None,
+            routing: Some(EntryRouting {
+                destinations: vec![TransportRef {
+                    transport: "matrix".into(),
+                    login_id: "@bot:example".into(),
+                    channel: "!room:example".into(),
+                    sender: None,
+                    sender_display: None,
+                    message_id: Some("outbound-id".into()),
+                }],
+                ..Default::default()
+            }),
+        };
+        let final_entry = SessionEntry {
+            sender: "agent".into(),
+            content: "answer".into(),
+            timestamp: Utc::now(),
+            entry_type: EntryType::Message,
+            metadata: None,
+            routing: Some(EntryRouting {
+                outbound_id: Some("outbound-id".into()),
+                ..Default::default()
+            }),
+        };
+        assert!(
+            session
+                .complete_turn_attempt_with_outbound(&attempt, None, Some(outbound.clone()), None)
+                .await
+                .is_err()
+        );
+        assert_eq!(session.entries().len(), 1);
+        assert!(
+            session
+                .read_turn_attempts()
+                .await
+                .unwrap()
+                .iter()
+                .all(|(_, row)| row.status == TurnAttemptStatus::Started)
+        );
+
+        let mut mismatched = final_entry.clone();
+        mismatched.content = "different answer".into();
+        assert!(
+            session
+                .complete_turn_attempt_with_outbound(
+                    &attempt,
+                    Some(mismatched),
+                    Some(outbound.clone()),
+                    None,
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(session.entries().len(), 1);
+        session
+            .complete_turn_attempt_with_outbound(&attempt, Some(final_entry), Some(outbound), None)
+            .await
+            .unwrap();
+        let reloaded = Session::new(ConversationId(db.root_id().to_string()), db).await;
+        assert_eq!(reloaded.entries().len(), 3);
+        assert_eq!(
+            reloaded
+                .entries()
+                .iter()
+                .filter(|e| e.entry_type == EntryType::Message)
+                .count(),
+            2
+        );
+        assert_eq!(
+            reloaded
+                .entries()
+                .iter()
+                .filter(|e| e.entry_type == EntryType::MatrixSend)
+                .count(),
+            1
+        );
+        assert!(
+            reloaded
+                .read_turn_attempts()
+                .await
+                .unwrap()
+                .iter()
+                .any(|(_, row)| row.status == TurnAttemptStatus::Completed)
+        );
     }
 }

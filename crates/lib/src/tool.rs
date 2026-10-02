@@ -252,6 +252,9 @@ fn strip_param_descriptions(params: &Value) -> Value {
     result
 }
 
+/// Reserved terminal action; the runtime handles it without executing a tool.
+pub const NO_REPLY_TOOL: &str = "no_reply";
+
 /// Context provided by the runtime to tools during execution.
 #[derive(Clone)]
 pub struct ToolContext {
@@ -269,6 +272,8 @@ pub struct ToolContext {
     pub tools: ScopedTools,
     /// Controls how tool definitions are presented to the LLM
     pub profile: ToolProfile,
+    /// Stable for every turn in a session attached to Matrix.
+    pub allow_no_reply: bool,
     /// Handle to the current session (for tools that need to write entries, e.g. compact)
     pub session: std::sync::Arc<tokio::sync::Mutex<crate::session::Session>>,
     /// Per-session active-extension set, used by `HookContext` to filter
@@ -304,6 +309,20 @@ pub struct ToolContext {
 }
 
 impl ToolContext {
+    /// Mirror the terminal action into context budgeting and the model request.
+    pub fn definitions(&self) -> Vec<ToolDefinition> {
+        let mut defs = self.tools.definitions(&self.profile);
+        if self.allow_no_reply {
+            defs.push(ToolDefinition {
+                name: NO_REPLY_TOOL.into(),
+                description: "End this turn without a final message. A normal final from a Matrix-origin turn reaches the room; a local-origin final stays local. Call only as a sole action with {} when you have nothing useful to add.".into(),
+                parameters: serde_json::json!({"type": "object", "properties": {}, "additionalProperties": false}),
+                strict: false,
+            });
+        }
+        defs
+    }
+
     /// Read the resolved capability grants for the currently-executing tool.
     pub fn grants(&self) -> &Grants {
         &self.grants
