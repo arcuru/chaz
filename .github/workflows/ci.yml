@@ -76,7 +76,7 @@ jobs:
       # harness step so a slow cold compile does not eat the harness budget.
       - name: Build binaries
         run: |
-          nix develop .# --command cargo build --bin chaz --bin chaz-matrix
+          nix develop .# --command cargo build --bin chaz --bin chaz-matrix --example e2ee_probe
         timeout-minutes: 20
 
       # Every wait inside run.sh is bounded, so a passing run finishes in about a

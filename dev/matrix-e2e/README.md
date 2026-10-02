@@ -102,6 +102,23 @@ stranger, and the agent all joined:
   addressing gate, so `allow_list` is the only thing left that can produce
   silence. A bare message here would prove nothing Case 1a does not.
 
+### Encrypted rooms
+
+A cross-signed puppet device opens an encrypted DM with the agent. A second,
+unsigned puppet device shares the room:
+
+- **E1/E2** — a plain message and a `!chaz` command are decrypted and answered,
+  and the probe decrypts the replies.
+- **E3** — the unsigned device receives the same reply as undecryptable, with
+  the key withheld as `m.unverified`. That proves the bridge knew about the
+  device and withheld the key on purpose, rather than missing it.
+- **E4** — a message from the unsigned device is logged as undecryptable and
+  gets no answer. A later message from the signed device is the barrier.
+- **E5** — after a bridge restart the device id and device key are unchanged,
+  no new cross-signing identity is created, and the room still works.
+- **E6** — the server's copy of the room holds only `m.room.encrypted` events
+  from the agent, never a plaintext `m.room.message`.
+
 ### Room reset
 
 The `chaz-matrix rooms` maintenance command runs last, against the same
@@ -117,7 +134,7 @@ and bridge peers.
 
 | Flag               | Behavior                                                                                                                                                                                                                                                                                                                   |
 | ------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `--transport http` | **Default.** Both peers listen on loopback HTTP. The daemon's `sync_listen` is set and iroh hints are stripped from the ticket. Fast, reliable, good for CI iteration.                                                                                                                                                     |
+| `--transport http` | **Default.** Both peers set `eidetica.sync.http_listen` to loopback. Neither registers an Iroh endpoint, so sync stays local.                                                                                                                                                                                              |
 | `--transport iroh` | Neither peer binds a sync port. They discover each other through iroh's DHT/relay mechanism instead. Expected to be slower and less reliable — that's the point, it exercises the production transport path that unit tests and the default http mode can't reach. If it doesn't reliably connect, that's actionable data. |
 
 `--transport iroh` is the one mode that is **not hermetic**: iroh discovery
@@ -169,16 +186,19 @@ sequence exists to protect.
 
 ## Notes
 
-- **The room is unencrypted, and it has to be.** chaz builds `matrix-sdk`
-  without the `e2e-encryption` feature, so an encrypted room is one the bridge
-  cannot read. The puppet is plain HTTP against the client-server API for the
-  same reason — no Olm, no client library, nothing to keep in sync with the
-  bridge's capabilities.
-- **The ticket's `iroh:` hints are stripped** (in `--transport http` mode only;
-  `--transport iroh` keeps them). The daemon mints a fresh iroh
-  endpoint on every start, so a recorded address is stale as soon as it is
-  written, and sync pays a full timeout per dead address. Both processes are on
-  loopback, where the `http:` hint is what connects.
+- **The main rooms are unencrypted; one room is encrypted.** The plaintext
+  cases use plain HTTP against the client-server API, with no client library.
+  Encryption needs a real Olm/Megolm device, so the encrypted cases drive
+  `e2ee_probe` (`crates/matrix-bridge/examples/e2ee_probe.rs`), a small
+  matrix-sdk client that keeps each device's store in the workspace. `just e2e`
+  builds it; override its path with `E2EE_PROBE_BIN`.
+- **The bridge starts from a pre-encryption session.** The harness logs the
+  agent in over HTTP and writes a session file with no crypto store, like every
+  bridge deployed before encryption support. The first start must upgrade that
+  device in place. Creating a fresh device would pass the other cases and miss
+  the path a real upgrade takes.
+- **HTTP mode registers only loopback transports.** It also strips any
+  `iroh:` ticket hints defensively; `--transport iroh` keeps them.
 - **`XDG_CONFIG_HOME` is redirected into the workspace**, because
   `/agent share` writes a copy of every ticket under the config directory.
 - **Ports are requested from the kernel**, not hardcoded, so a run does not
@@ -186,6 +206,82 @@ sequence exists to protect.
 - **Every `curl` carries `--max-time`.** A poll loop is only bounded if each
   attempt is, and a server that accepts a connection and then stops answering
   is otherwise an attempt that never returns.
+
+## Unpublished dependency: local acceptance only
+
+The E2EE dependency pin is Eidetica
+`94c2624c7793c798847240c3287ff06280420eed` (sqlx 0.9). It is not yet
+published at the public Git URL. The manifest and lock name that final revision;
+**a fresh public checkout cannot build until it is published**. Do not substitute
+the old pin with a sqlx backport: that tests a different API and source tree.
+
+With a local Git repository containing that exact commit, create an immutable
+copy and a disposable consumer snapshot. Only the snapshot's dependency URL is
+rewritten; no path patch or file URL belongs in the committed consumer:
+
+```bash
+# Run from a committed Chaz checkout; set this to the local Eidetica repository.
+EIDETICA_REPO=/path/to/eidetica
+REV=94c2624c7793c798847240c3287ff06280420eed
+WORK=$(mktemp -d -p /tmp)
+git clone --no-hardlinks "$EIDETICA_REPO" "$WORK/eidetica"
+git -C "$WORK/eidetica" checkout --detach "$REV"
+test "$(git -C "$WORK/eidetica" rev-parse HEAD)" = "$REV"
+test -z "$(git -C "$WORK/eidetica" status --porcelain)"
+chmod -R a-w "$WORK/eidetica"
+mkdir "$WORK/chaz"
+git archive HEAD | tar -x -C "$WORK/chaz"
+sed -i "s|https://github.com/arcuru/eidetica|file://$WORK/eidetica|g" \
+    "$WORK/chaz/Cargo.toml" "$WORK/chaz/Cargo.lock"
+cd "$WORK/chaz"
+export CARGO_TARGET_DIR="$WORK/target"
+export CHAZ_BIN="$CARGO_TARGET_DIR/debug/chaz"
+export CHAZ_MATRIX_BIN="$CARGO_TARGET_DIR/debug/chaz-matrix"
+export E2EE_PROBE_BIN="$CARGO_TARGET_DIR/debug/examples/e2ee_probe"
+export EIDETICA_FLAKE="git+file://$WORK/eidetica?rev=$REV"
+CI=1 nix develop .# -c just nix full
+nix develop .# -c just e2e --keep --timeout 60
+```
+
+`EIDETICA_FLAKE` controls the CLI that provisions both disposable peer stores;
+it must point to the same revision as the consumer. Without the override the
+harness derives the public pin from `Cargo.toml`. Keep the logs and both source
+revisions when reporting results. An overlay pass establishes local integration,
+not publication, deployment, or compatibility of an existing production database.
+
+When upgrading an existing Eidetica database across verification-rule changes,
+follow Eidetica's [offline trust-reset procedure](https://github.com/arcuru/eidetica/blob/main/docs/src/design/verification.md#explicit-trust-reset-on-verification-rule-upgrades)
+with every owner stopped and a backup retained. This is an operator step, not
+an automatic startup reset. The fixture uses fresh Eidetica databases and upgrades
+only the legacy Matrix session/device state.
+
+### Supervised live smoke test without production state
+
+A local pass does not establish live-homeserver compatibility or a safe upgrade of
+existing Eidetica verification labels. Keep those as separate operator gates:
+
+1. With operator approval, create disposable bot and sender accounts on the target
+   homeserver. Use a new, isolated Chaz daemon/bridge configuration, fresh Eidetica
+   databases, separate Matrix stores, and the local stub model. Do not copy production
+   tokens, databases, login directories, or account cross-signing secrets into them.
+2. Cross-sign the sender's device, then test an encrypted DM: ordinary text and
+   `!chaz help` must get decryptable replies. Inspect raw room history for
+   `m.room.encrypted`, not only the client's decrypted display. No manual trust
+   ceremony with the bot should be required for these fresh identities.
+3. Add an unsigned sender device. Confirm deliberate reply-key withholding and
+   ignored incoming messages; also check an unencrypted room and allow-list rejection.
+   Do not weaken policy or reset an identity to make a failing case work.
+4. Stop and restart only the isolated bridge, keeping its session and store together.
+   Confirm unchanged device/key fingerprints, no replacement identity, and another
+   encrypted reply. Retain redacted logs and revision/binary fingerprints, then stop
+   the test processes and retire the disposable accounts with operator approval.
+5. Before a later production upgrade, separately assess the old Eidetica revision's
+   verification rules and inventory all owners. Rehearse the documented offline
+   trust reset and re-verification on an isolated backup copy with network sync
+   disabled. Reset only disposable local verification labels, not Matrix identities
+   or immutable Entries. A successful fresh-state smoke test is not migration proof;
+   do not start the new version against production data until the operator approves
+   the backup, offline procedure, and rollback plan.
 
 ## Writing a new case
 
@@ -298,3 +394,21 @@ The failure message names the step that timed out, and each step waits on a
 specific observable — the daemon's readiness line, the bridge's Matrix login,
 the agent's join, then the reply — so the step that fails is the one that
 broke.
+
+## Key-maintenance acceptance
+
+Run `just e2e-keys` for the actual local `chaz-matrix keys` CLI against a separate
+disposable Synapse. This exercises staged reset UIAA cancellation/rejection,
+process death with real replacement keys, server commit with a lost query
+response, safe resume, fresh-store same-identity/standard-backup restore, wrong
+secrets, private recovery files and own-account SAS with negative controls.
+A test-only Untrusted diagnostic proves imported key material without changing
+the bridge's CrossSigned policy. No model is called.
+
+`CHAZ_MATRIX_BIN` and `KEY_PROBE_BIN` can select previously built binaries.
+`KEY_TEST_WORKSPACE` selects a retained private fixture directory; use a new one
+for each run. Otherwise the harness creates one in the temporary directory.
+Account credentials and recovery material stay in that private fixture tree.
+Only public fingerprints, test names and the final counted summary are output.
+The whole transport suite (`just e2e`) separately verifies that a live bridge
+rejects concurrent key maintenance.
