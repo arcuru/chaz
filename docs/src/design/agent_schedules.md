@@ -217,7 +217,7 @@ rows, `sweep_for_agent`): the check moves from "clean up on detach" to
 | Pinned target session deleted / agent detached               | Membership/existence checked at fire → self-skip + log                                                                                                              |
 | Fresh fires accumulate sessions unbounded                    | Fresh sessions are normal sessions subject to existing lifecycle/retention; cron cadence is author-chosen                                                           |
 | Self-scheduled tight cron or interval self-sustains activity | Controlled by chosen cadence; **not** the chat-room burst budget or `max_spawn_depth` (which only limits nested delegation). Revisit a min-interval guard if abused |
-| Empty model final | Runtime reports an error instead of silently dropping the turn |
+| Empty model final                                            | Runtime reports an error instead of silently dropping the turn                                                                                                      |
 
 ## Migration
 

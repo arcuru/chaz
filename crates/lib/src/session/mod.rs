@@ -29,8 +29,8 @@ use std::collections::{HashMap, HashSet};
 use tracing::{error, info, warn};
 
 mod agents;
-pub mod jobs;
 mod bridge_event;
+pub mod jobs;
 mod keys;
 mod registry;
 pub(crate) use registry::JobRequest;
@@ -1462,27 +1462,6 @@ impl Session {
             ..attempt.clone()
         };
         let txn = self.database.new_transaction().await?;
-        let mut committed_entries = Vec::new();
-        if final_entry.is_some() || outbound.is_some() {
-            let entries = txn
-                .get_store::<Table<SessionEntry>>(&self.store_name)
-                .await?;
-            for entry in final_entry.into_iter().chain(outbound) {
-                let id = entries.insert(entry.clone()).await?;
-                committed_entries.push((TurnRequestId::parse(id), entry));
-            }
-        }
-        txn.get_store::<Table<TurnAttempt>>(TURN_ATTEMPTS_STORE)
-            .await?
-            .set(completed.attempt_id.clone(), completed)
-            .await?;
-        if let Some(record) = transcript {
-            let key = format!("{:020}:{}", record.sequence, uuid::Uuid::new_v4());
-            txn.get_store::<Table<TurnTranscriptRecord>>(TURN_TRANSCRIPT_STORE)
-                .await?
-                .set(key, record)
-                .await?;
-        }
         if let Some(accepted) = crate::session::jobs::read_accepted_job(&self.database).await?
             && accepted.directive_id == attempt.request_id.as_str()
         {
@@ -1508,6 +1487,27 @@ impl Session {
                 },
             )
             .await?;
+        }
+        let mut committed_entries = Vec::new();
+        if final_entry.is_some() || outbound.is_some() {
+            let entries = txn
+                .get_store::<Table<SessionEntry>>(&self.store_name)
+                .await?;
+            for entry in final_entry.into_iter().chain(outbound) {
+                let id = entries.insert(entry.clone()).await?;
+                committed_entries.push((TurnRequestId::parse(id), entry));
+            }
+        }
+        txn.get_store::<Table<TurnAttempt>>(TURN_ATTEMPTS_STORE)
+            .await?
+            .set(completed.attempt_id.clone(), completed)
+            .await?;
+        if let Some(record) = transcript {
+            let key = format!("{:020}:{}", record.sequence, uuid::Uuid::new_v4());
+            txn.get_store::<Table<TurnTranscriptRecord>>(TURN_TRANSCRIPT_STORE)
+                .await?
+                .set(key, record)
+                .await?;
         }
         txn.commit().await?;
         for (id, entry) in committed_entries {
