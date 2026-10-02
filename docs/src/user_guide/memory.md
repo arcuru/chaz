@@ -187,6 +187,8 @@ An unknown agent or misplaced/unknown flag is rejected. If a session unexpectedl
 | `auto_recall_max_chars`   | `200`   | 1–2000     | Max characters per auto-recalled entry (truncated)     |
 | `auto_recall_banks`       | _(all)_ | names      | Which banks participate; comma-separated, empty = none |
 
+The pre-rename keys `max_entries` / `max_entry_chars` are still honored as aliases, both in stored per-agent configs and on `/memory config set` (which saves them under the canonical names). A stored config that sets both spellings of one setting is invalid: chaz logs a warning and uses the defaults.
+
 Disabling auto-recall stops the `## Relevant Memories` block but leaves the `remember`/`recall` tools fully functional. Auto-recall only searches banks listed in `auto_recall_banks` (or all attached banks when unset).
 
 When `auto_recall_banks` is set, only the named banks are searched by auto-recall. Other attached banks remain available for explicit `recall bank="..."` — they're just excluded from the automatic `## Relevant Memories` block.
