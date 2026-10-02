@@ -319,9 +319,6 @@ async fn explicit_matrix_send_counts_as_reply_and_no_reply_cannot_retract_it() {
     let (_instance, server, registry) = server_fixture().await;
     let (alpha, adb) = seed_agent(&server, &registry, "alpha").await;
     register_alpha_agent_runtime(&server);
-    let mut agent = server.agents().get("alpha").unwrap();
-    agent.max_iterations = 4;
-    server.agents().upsert(agent);
     server.tools.register(crate::tools::MatrixSend {
         registry: registry.clone(),
     });

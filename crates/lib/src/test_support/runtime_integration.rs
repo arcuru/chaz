@@ -480,7 +480,7 @@ async fn opted_in_tool_failure_never_retries_without_tools() {
     assert!(
         result
             .as_ref()
-            .is_err_and(|e| e.contains("tool-aware call failed"))
+            .is_err_and(|e| e.contains("Request timed out"))
     );
     let calls = mock.recorded_calls();
     assert_eq!(
@@ -532,17 +532,26 @@ async fn no_reply_rejects_mixed_final_text() {
 }
 
 #[tokio::test]
-async fn opted_in_iteration_exhaustion_does_not_force_an_unstructured_reply() {
-    use std::sync::atomic::AtomicU32;
+async fn no_reply_remains_available_after_repeated_tools_past_ten_rounds() {
     let (_instance, session) = fresh_session().await;
     let secrets = empty_secrets().await;
-    let mut ctx = tool_context(session, Arc::new(ToolRegistry::new()));
+    let echo = EchoTool::new();
+    let call_counter = echo.calls.clone();
+    let registry = ToolRegistry::new();
+    registry.register(echo);
+    let mut ctx = tool_context(session, Arc::new(registry));
     ctx.allow_no_reply = true;
-    ctx.iteration_budget = Some(Arc::new(AtomicU32::new(0)));
     let mock = Arc::new(MockBackend::new());
-    mock.push_text("unsafe forced summary");
+    for i in 0..12 {
+        mock.push_tool_calls(vec![(
+            format!("c{i}"),
+            "echo".into(),
+            json!({"text": "same request"}).to_string(),
+        )]);
+    }
+    mock.push_tool_calls(vec![("stop".into(), "no_reply".into(), "{}".into())]);
     let backend = BackendManager::with_mock(mock.clone(), secrets);
-    let result = runtime::execute(
+    let outcome = runtime::execute(
         Some("mock-model"),
         vec![RuntimeMessage::User("hi".into())],
         &backend,
@@ -552,9 +561,18 @@ async fn opted_in_iteration_exhaustion_does_not_force_an_unstructured_reply() {
         None,
         None,
     )
-    .await;
-    assert!(result.as_ref().is_err_and(|e| e.contains("exhausted")));
-    assert!(mock.recorded_calls().is_empty());
+    .await
+    .expect("native tools must remain available until terminal no_reply");
+    assert!(outcome.body.is_empty());
+    assert_eq!(call_counter.load(Ordering::SeqCst), 12);
+    let calls = mock.recorded_calls();
+    assert_eq!(calls.len(), 13);
+    let names = |i: usize| calls[i].tools.iter().map(|t| &t.name).collect::<Vec<_>>();
+    assert!(names(0).iter().any(|name| name.as_str() == "no_reply"));
+    for i in 1..calls.len() {
+        assert_eq!(names(i), names(0));
+    }
+    assert_eq!(mock.pending(), 0);
 }
 
 #[tokio::test]
