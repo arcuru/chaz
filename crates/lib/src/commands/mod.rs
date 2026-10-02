@@ -376,73 +376,92 @@ pub async fn dispatch(cmd: Command, ctx: &CommandContext<'_>) -> CommandOutcome 
     {
         return CommandOutcome::Error(format!("Failed to load hosted entities: {e}"));
     }
+    // Keep command futures boxed: their combined unoptimized poll temporaries
+    // otherwise overflow a default worker stack when nested in bridge sync.
     match cmd {
-        Command::ListSessions => session::list_sessions(ctx).await,
-        Command::NewSession(group) => session::new_session(group.as_deref(), ctx).await,
-        Command::ListAgentGroups => session::list_agent_groups(ctx).await,
-        Command::SwitchSession(id) => session::switch_session(&id, ctx).await,
-        Command::Info => session::info(ctx).await,
-        Command::ListCosts => session::list_costs(ctx).await,
-        Command::Interrupted => session::interrupted(ctx).await,
-        Command::RetryInterrupted(request) => session::retry_interrupted(&request, ctx).await,
-        Command::NameSession(name) => session::name_session(&name, ctx).await,
-        Command::ClearSessionName => session::clear_session_name(ctx).await,
-        Command::Share => session::share(ctx).await,
-        Command::SessionUnshare => session::unshare(ctx).await,
-        Command::Sync(ticket) => session::sync_ticket(&ticket, ctx).await,
-        Command::Compact => session::compact(ctx).await,
-        Command::Print => session::print_transcript(ctx).await,
-        Command::ListChannels => session::list_channels(ctx).await,
-        Command::AgentAdd(r) => agent::agent_add(&r, ctx).await,
-        Command::AgentRemove(r) => agent::agent_remove(&r, ctx).await,
-        Command::AgentsList => agent::agents_list(ctx).await,
-        Command::AgentRoom => agent::agent_room(ctx).await,
-        Command::AgentSetHost(arg) => agent::agent_set_host(arg.as_deref(), ctx).await,
-        Command::AgentSetBurst(n) => agent::agent_set_burst(n, ctx).await,
-        Command::AgentNew { name, overrides } => agent::agent_new(&name, &overrides, ctx).await,
-        Command::AgentShare(r) => agent::agent_share(&r, ctx).await,
-        Command::AgentUnshare(r) => agent::agent_unshare(&r, ctx).await,
-        Command::AgentImport { ticket, permission } => {
-            agent::agent_import(&ticket, permission, ctx).await
+        Command::ListSessions => Box::pin(session::list_sessions(ctx)).await,
+        Command::NewSession(group) => Box::pin(session::new_session(group.as_deref(), ctx)).await,
+        Command::ListAgentGroups => Box::pin(session::list_agent_groups(ctx)).await,
+        Command::SwitchSession(id) => Box::pin(session::switch_session(&id, ctx)).await,
+        Command::Info => Box::pin(session::info(ctx)).await,
+        Command::ListCosts => Box::pin(session::list_costs(ctx)).await,
+        Command::Interrupted => Box::pin(session::interrupted(ctx)).await,
+        Command::RetryInterrupted(request) => {
+            Box::pin(session::retry_interrupted(&request, ctx)).await
         }
-        Command::AgentHosted => agent::agent_hosted(ctx).await,
-        Command::AgentDelete(r) => agent::agent_delete(&r, ctx).await,
+        Command::NameSession(name) => Box::pin(session::name_session(&name, ctx)).await,
+        Command::ClearSessionName => Box::pin(session::clear_session_name(ctx)).await,
+        Command::Share => Box::pin(session::share(ctx)).await,
+        Command::SessionUnshare => Box::pin(session::unshare(ctx)).await,
+        Command::Sync(ticket) => Box::pin(session::sync_ticket(&ticket, ctx)).await,
+        Command::Compact => Box::pin(session::compact(ctx)).await,
+        Command::Print => Box::pin(session::print_transcript(ctx)).await,
+        Command::ListChannels => Box::pin(session::list_channels(ctx)).await,
+        Command::AgentAdd(r) => Box::pin(agent::agent_add(&r, ctx)).await,
+        Command::AgentRemove(r) => Box::pin(agent::agent_remove(&r, ctx)).await,
+        Command::AgentsList => Box::pin(agent::agents_list(ctx)).await,
+        Command::AgentRoom => Box::pin(agent::agent_room(ctx)).await,
+        Command::AgentSetHost(arg) => Box::pin(agent::agent_set_host(arg.as_deref(), ctx)).await,
+        Command::AgentSetBurst(n) => Box::pin(agent::agent_set_burst(n, ctx)).await,
+        Command::AgentNew { name, overrides } => {
+            Box::pin(agent::agent_new(&name, &overrides, ctx)).await
+        }
+        Command::AgentShare(r) => Box::pin(agent::agent_share(&r, ctx)).await,
+        Command::AgentUnshare(r) => Box::pin(agent::agent_unshare(&r, ctx)).await,
+        Command::AgentImport { ticket, permission } => {
+            Box::pin(agent::agent_import(&ticket, permission, ctx)).await
+        }
+        Command::AgentHosted => Box::pin(agent::agent_hosted(ctx)).await,
+        Command::AgentDelete(r) => Box::pin(agent::agent_delete(&r, ctx)).await,
         Command::AgentSet {
             agent_ref,
             field,
             value,
-        } => agent::agent_set(&agent_ref, &field, &value, ctx).await,
-        Command::AgentReload(agent_ref) => agent::agent_reload(agent_ref.as_deref(), ctx).await,
-        Command::Pubkey => agent::pubkey(ctx).await,
+        } => Box::pin(agent::agent_set(&agent_ref, &field, &value, ctx)).await,
+        Command::AgentReload(agent_ref) => {
+            Box::pin(agent::agent_reload(agent_ref.as_deref(), ctx)).await
+        }
+        Command::Pubkey => Box::pin(agent::pubkey(ctx)).await,
         Command::AgentInvite {
             agent_ref,
             pubkey,
             permission,
-        } => agent::agent_invite(&agent_ref, &pubkey, permission, ctx).await,
+        } => Box::pin(agent::agent_invite(&agent_ref, &pubkey, permission, ctx)).await,
         Command::AgentRevokePeer { agent_ref, pubkey } => {
-            agent::agent_revoke_peer(&agent_ref, &pubkey, ctx).await
+            Box::pin(agent::agent_revoke_peer(&agent_ref, &pubkey, ctx)).await
         }
         Command::AgentRehost {
             agent_ref,
             pubkey,
             scope,
             clear,
-        } => agent::agent_rehost(&agent_ref, pubkey.as_deref(), scope, clear, ctx).await,
-        Command::AgentHomeStatus(r) => agent::agent_home_status(r.as_deref(), ctx).await,
-        Command::SharingRequests => sharing::sharing_requests(ctx).await,
-        Command::SharingApprove(id) => sharing::sharing_approve(&id, ctx).await,
-        Command::SharingReject(id) => sharing::sharing_reject(&id, ctx).await,
-        Command::SharingStatus => sharing::sharing_status(ctx).await,
-        Command::Extensions(action) => extensions::dispatch(action, ctx).await,
-        Command::Model(arg) => session::model(arg, ctx).await,
-        Command::AgentModel { agent, model } => session::agent_model(&agent, model, ctx).await,
-        Command::Role(arg) => session::role(arg, ctx).await,
-        Command::SetBackend { name, url, api_key } => {
-            session::set_backend(&name, &url, &api_key, ctx).await
+        } => {
+            Box::pin(agent::agent_rehost(
+                &agent_ref,
+                pubkey.as_deref(),
+                scope,
+                clear,
+                ctx,
+            ))
+            .await
         }
-        Command::ListBackends => session::list_backends(ctx).await,
+        Command::AgentHomeStatus(r) => Box::pin(agent::agent_home_status(r.as_deref(), ctx)).await,
+        Command::SharingRequests => Box::pin(sharing::sharing_requests(ctx)).await,
+        Command::SharingApprove(id) => Box::pin(sharing::sharing_approve(&id, ctx)).await,
+        Command::SharingReject(id) => Box::pin(sharing::sharing_reject(&id, ctx)).await,
+        Command::SharingStatus => Box::pin(sharing::sharing_status(ctx)).await,
+        Command::Extensions(action) => Box::pin(extensions::dispatch(action, ctx)).await,
+        Command::Model(arg) => Box::pin(session::model(arg, ctx)).await,
+        Command::AgentModel { agent, model } => {
+            Box::pin(session::agent_model(&agent, model, ctx)).await
+        }
+        Command::Role(arg) => Box::pin(session::role(arg, ctx)).await,
+        Command::SetBackend { name, url, api_key } => {
+            Box::pin(session::set_backend(&name, &url, &api_key, ctx)).await
+        }
+        Command::ListBackends => Box::pin(session::list_backends(ctx)).await,
         Command::Quit => CommandOutcome::Quit,
-        Command::Extension { name, args } => dispatch_extension(&name, &args, ctx).await,
+        Command::Extension { name, args } => Box::pin(dispatch_extension(&name, &args, ctx)).await,
     }
 }
 
