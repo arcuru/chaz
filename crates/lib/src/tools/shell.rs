@@ -209,32 +209,15 @@ fn preview_stream(s: &str, budget: usize) -> String {
     // assembled preview stays within `budget`.
     let notice_fixed = "\n[… ".len() + " bytes omitted …]\n".len();
     let reserved = notice_fixed + s.len().to_string().len();
-    if budget <= reserved {
-        // Pathologically small budget (unreachable from this tool's call
-        // sites): keep whatever head fits and disclose the rest.
-        let head_len = floor_char_boundary(s, budget / 2);
-        return format!(
-            "{}[… {} bytes omitted …]",
-            &s[..head_len],
-            s.len() - head_len
-        );
-    }
+    // The caller gives each clipped stream roughly 5 KB or more, so the
+    // notice always fits, even with the widest possible byte count.
     let tail_budget = (budget - reserved) / 2;
-    let tail_start = floor_char_boundary(s, s.len() - tail_budget);
+    let tail_start = s.floor_char_boundary(s.len() - tail_budget);
     let tail = &s[tail_start..];
-    let head_len = floor_char_boundary(s, budget - reserved - tail.len());
+    let head_len = s.floor_char_boundary(budget - reserved - tail.len());
     let head = &s[..head_len];
     let omitted = s.len() - head.len() - tail.len();
     format!("{head}\n[… {omitted} bytes omitted …]\n{tail}")
-}
-
-/// Largest index ≤ `index` that is a UTF-8 character boundary of `s`.
-fn floor_char_boundary(s: &str, index: usize) -> usize {
-    let mut index = index.min(s.len());
-    while index > 0 && !s.is_char_boundary(index) {
-        index -= 1;
-    }
-    index
 }
 
 #[cfg(test)]
@@ -418,7 +401,9 @@ mod tests {
     #[tokio::test]
     async fn long_stdout_and_stderr_are_labeled_and_bounded() {
         let host = Arc::new(MockHost::new());
-        host.push_shell(&"o".repeat(30_000), &"e".repeat(30_000), 1);
+        let stdout = format!("stdout head\n{}\nstdout tail", "o".repeat(30_000));
+        let stderr = format!("stderr head\n{}\nstderr tail", "e".repeat(30_000));
+        host.push_shell(&stdout, &stderr, 1);
         let (_i, c) = ctx_with(host).await;
         let out = ShellExec
             .execute(serde_json::json!({ "command": "x" }), &c)
@@ -426,7 +411,10 @@ mod tests {
             .unwrap();
         assert!(out.contains("[stdout]"), "stdout unlabeled: {out}");
         assert!(out.contains("[stderr]"), "stderr unlabeled: {out}");
-        assert!(out.contains("[exit code 1]"), "verdict lost: {out}");
+        assert!(out.ends_with("[exit code 1]"), "verdict lost: {out}");
+        for retained in ["stdout head", "stdout tail", "stderr head", "stderr tail"] {
+            assert!(out.contains(retained), "missing {retained}: {out}");
+        }
         assert_eq!(
             out.matches("bytes omitted").count(),
             2,
@@ -496,10 +484,48 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn exact_cap_is_returned_untouched() {
+        let cases = [
+            (format!("{}é", "a".repeat(OUTPUT_LIMIT - 2)), "", 0),
+            (
+                "a".repeat(OUTPUT_LIMIT - "\n[stderr] err\n[exit code 7]".len()),
+                "err",
+                7,
+            ),
+        ];
+        for (stdout, stderr, code) in cases {
+            let expected = if stderr.is_empty() {
+                stdout.clone()
+            } else {
+                format!("{stdout}\n[stderr] {stderr}\n[exit code {code}]")
+            };
+            assert_eq!(expected.len(), OUTPUT_LIMIT);
+            let host = Arc::new(MockHost::new());
+            host.push_shell(&stdout, stderr, code);
+            let (_i, c) = ctx_with(host).await;
+            let out = ShellExec
+                .execute(serde_json::json!({ "command": "x" }), &c)
+                .await
+                .unwrap();
+            assert_eq!(out, expected);
+        }
+    }
+
     #[test]
-    fn exact_cap_is_returned_untouched() {
-        let stdout = "a".repeat(OUTPUT_LIMIT);
-        assert_eq!(format_shell_output(&stdout, "", 0), stdout);
+    fn stream_preview_counts_omitted_utf8_bytes() {
+        let input = "aé日🦀\n".repeat(4_000);
+        for budget in [4_970, 4_971, 4_972, 4_973] {
+            let out = preview_stream(&input, budget);
+            let (head, rest) = out.split_once("\n[… ").expect("omission notice");
+            let (count, tail) = rest.split_once(" bytes omitted …]\n").unwrap();
+            let omitted: usize = count.parse().unwrap();
+            assert!(input.starts_with(head));
+            assert!(input.ends_with(tail));
+            assert!(!head.is_empty() && !tail.is_empty());
+            assert_eq!(head.len() + omitted + tail.len(), input.len());
+            assert!(out.len() <= budget, "bound exceeded: {}", out.len());
+        }
     }
 
     #[test]

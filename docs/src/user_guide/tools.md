@@ -124,7 +124,7 @@ Executes a shell command. Subject to command allowlist/denylist filtering.
 { "command": "ls -la /tmp" }
 ```
 
-**Output shape.** A short result (≤ 10 KB total) is returned verbatim: stdout, then a `[stderr] …` line when anything was written to stderr, then an `[exit code N]` line for a nonzero exit, or `[no output]` when the command produced nothing. A longer result is projected into a bounded preview instead of being cut at an arbitrary byte: each stream is labeled (`[stdout]` / `[stderr]`), keeps a head and a tail excerpt with a `[… N bytes omitted …]` notice naming how many bytes were dropped, a long stdout cannot crowd stderr out of the preview, and the `[exit code N]` verdict always survives — noisy output can no longer hide a failed command. The whole result stays within the 10 KB ceiling.
+**Output shape.** Results stay within 10,000 bytes, including labels, omission notices and exit status. Short results keep the existing format: stdout, then `[stderr] …` when stderr is present, then `[exit code N]` for a nonzero exit. A successful command with no output returns `[no output]`; a silent failure returns its exit-code line. Longer results label each present stream (`[stdout]` / `[stderr]`) and keep head and tail excerpts of clipped streams around a `[… N bytes omitted …]` notice. Cuts respect UTF-8 boundaries. Both streams receive preview space, with unused space going to the other stream, and the nonzero-exit verdict remains outside the clipped output.
 
 ### remember / recall
 
