@@ -124,6 +124,8 @@ Executes a shell command. Subject to command allowlist/denylist filtering.
 { "command": "ls -la /tmp" }
 ```
 
+**Output shape.** A short result (≤ 10 KB total) is returned verbatim: stdout, then a `[stderr] …` line when anything was written to stderr, then an `[exit code N]` line for a nonzero exit, or `[no output]` when the command produced nothing. A longer result is projected into a bounded preview instead of being cut at an arbitrary byte: each stream is labeled (`[stdout]` / `[stderr]`), keeps a head and a tail excerpt with a `[… N bytes omitted …]` notice naming how many bytes were dropped, a long stdout cannot crowd stderr out of the preview, and the `[exit code N]` verdict always survives — noisy output can no longer hide a failed command. The whole result stays within the 10 KB ceiling.
+
 ### remember / recall
 
 Persistent key-value memory. By default writes to the agent's own memory (its own Living Agent DB's `memory` subtree), which travels with the agent through eidetica sync and is naturally isolated from other agents.
