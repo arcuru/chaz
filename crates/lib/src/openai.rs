@@ -573,6 +573,21 @@ impl OpenAI {
             message: format!("decode /models response: {e}"),
         })?;
 
+        Ok(payload.into_model_infos())
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct ModelsResponse {
+    data: Vec<ModelEntry>,
+}
+
+impl ModelsResponse {
+    /// Map the decoded catalog onto [`ModelInfo`](crate::backends::ModelInfo)
+    /// rows for the model picker and the context-window overlay. Decoding and
+    /// window normalization live here (not in the fetch) so every consumer of
+    /// a `/models` catalog sees the same recognized window.
+    fn into_model_infos(self) -> Vec<crate::backends::ModelInfo> {
         // OpenRouter quotes prices as $/token (decimal string). ModelInfo
         // carries $/Mtok so the picker can display "$2.50".
         fn parse_per_mtok(s: Option<String>) -> Option<f64> {
@@ -580,18 +595,12 @@ impl OpenAI {
                 .map(|per_token| per_token * 1_000_000.0)
         }
 
-        Ok(payload
-            .data
+        self.data
             .into_iter()
             .map(|m| {
+                let context_window = m.resolved_context_window();
                 let pricing = m.pricing.unwrap_or_default();
                 let arch = m.architecture.unwrap_or_default();
-                // The routed provider's cap is the operative limit; fall back
-                // to the model's headline window when it isn't reported.
-                let context_window = m
-                    .top_provider
-                    .and_then(|tp| tp.context_length)
-                    .or(m.context_length);
                 crate::backends::ModelInfo {
                     id: m.id,
                     price_input: parse_per_mtok(pricing.prompt),
@@ -602,13 +611,8 @@ impl OpenAI {
                     context_window,
                 }
             })
-            .collect())
+            .collect()
     }
-}
-
-#[derive(Debug, Deserialize)]
-struct ModelsResponse {
-    data: Vec<ModelEntry>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -625,6 +629,35 @@ struct ModelEntry {
     /// the headline `context_length`; prefer this when present.
     #[serde(default)]
     top_provider: Option<TopProvider>,
+    /// The model's advertised context window in the camelCase form served by
+    /// OpenAI-compatible gateways such as rig-proxy (`contextWindow`). Those
+    /// same gateways serve `maxTokens` for the *output-token* ceiling; that
+    /// field is deliberately not decoded here because it is never a context
+    /// window.
+    #[serde(default, alias = "contextWindow")]
+    context_window: Option<u32>,
+}
+
+impl ModelEntry {
+    /// The model's context window, normalized across the formats
+    /// OpenAI-compatible `/models` catalogs use, in precedence order:
+    ///
+    /// 1. `top_provider.context_length` — OpenRouter's routed-provider cap,
+    ///    the operative limit when the provider reports one;
+    /// 2. `context_length` — OpenRouter's headline window;
+    /// 3. `contextWindow` — the camelCase field gateways such as rig-proxy
+    ///    serve when they carry none of the OpenRouter fields.
+    ///
+    /// Each catalog serves one shape or the other, so in practice the chain
+    /// is unambiguous; if a catalog served several at once, the OpenRouter
+    /// forms keep their existing precedence.
+    fn resolved_context_window(&self) -> Option<u32> {
+        self.top_provider
+            .as_ref()
+            .and_then(|tp| tp.context_length)
+            .or(self.context_length)
+            .or(self.context_window)
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -923,6 +956,136 @@ fn convert_chat_context(
 mod tests {
     use super::*;
     use crate::config::ReasoningEffort;
+
+    // --- /models catalog decode ---
+
+    #[test]
+    fn model_entry_recognizes_camelcase_context_window() {
+        // rig-proxy serves an OpenAI-compatible catalog with camelCase
+        // `contextWindow` (the input window) alongside `maxTokens` (the
+        // output ceiling). The window must come from `contextWindow` —
+        // reading `maxTokens` as a window would budget Sol at 128k instead
+        // of its advertised 1.05M.
+        let entry: ModelEntry = serde_json::from_value(serde_json::json!({
+            "id": "gpt-sol-latest",
+            "contextWindow": 1_050_000,
+            "maxTokens": 128_000
+        }))
+        .unwrap();
+        assert_eq!(entry.resolved_context_window(), Some(1_050_000));
+    }
+
+    #[test]
+    fn model_entry_never_reads_max_tokens_as_a_window() {
+        // An entry reporting only an output ceiling stays window-unknown:
+        // callers keep falling back to the configured budget.
+        let entry: ModelEntry = serde_json::from_value(serde_json::json!({
+            "id": "output-cap-only",
+            "maxTokens": 128_000
+        }))
+        .unwrap();
+        assert_eq!(entry.resolved_context_window(), None);
+    }
+
+    #[test]
+    fn model_entry_prefers_routed_provider_window() {
+        // OpenRouter precedence is unchanged: the routed provider's cap is
+        // the operative limit, even when the headline window is larger.
+        let entry: ModelEntry = serde_json::from_value(serde_json::json!({
+            "id": "deepseek/deepseek-v4",
+            "context_length": 1_000_000,
+            "top_provider": { "context_length": 128_000 }
+        }))
+        .unwrap();
+        assert_eq!(entry.resolved_context_window(), Some(128_000));
+    }
+
+    #[test]
+    fn model_entry_reads_legacy_headline_window() {
+        let entry: ModelEntry = serde_json::from_value(serde_json::json!({
+            "id": "deepseek/deepseek-v4",
+            "context_length": 163_840
+        }))
+        .unwrap();
+        assert_eq!(entry.resolved_context_window(), Some(163_840));
+    }
+
+    #[test]
+    fn model_entry_without_window_fields_stays_unknown() {
+        // No window advertised in any format → None, so budgeting falls back
+        // to the configured `max_context_tokens`.
+        let entry: ModelEntry = serde_json::from_value(serde_json::json!({
+            "id": "opaque-model",
+            "pricing": { "prompt": "0.000001", "completion": "0.000002" }
+        }))
+        .unwrap();
+        assert_eq!(entry.resolved_context_window(), None);
+    }
+
+    #[tokio::test]
+    async fn decoded_rig_proxy_window_reaches_backend_overlay() {
+        // The chain the runtime uses on first use of a model: decode the
+        // live catalog, slot the window into the manager's overlay (as the
+        // background first-use fetch does), and `context_window` — the
+        // resolver window-aware budgeting and the TUI footer share — reports
+        // the full 1.05M window instead of the 128k fallback.
+        let payload: ModelsResponse = serde_json::from_value(serde_json::json!({
+            "object": "list",
+            "data": [{
+                // Verbatim shape of a live rig-proxy entry (extra fields such
+                // as `cost`, `compat` and `thinkingLevelMap` must be ignored
+                // by the decode, not break it).
+                "id": "gpt-5.6-sol",
+                "object": "model",
+                "owned_by": "rigproxy",
+                "name": "GPT-5.6 Sol",
+                "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
+                "contextWindow": 1_050_000,
+                "maxTokens": 128_000,
+                "reasoning": true,
+                "input": ["text"],
+                "compat": { "supportsDeveloperRole": true, "supportsReasoningEffort": true },
+                "thinkingLevelMap": { "xhigh": "xhigh", "max": null }
+            }]
+        }))
+        .unwrap();
+        let infos = payload.into_model_infos();
+        assert_eq!(infos.len(), 1);
+
+        let secrets = {
+            let (_instance, mut user) = eidetica::Instance::create_backend(
+                Box::new(eidetica::backend::database::InMemory::new()),
+                eidetica::NewUser::passwordless("t"),
+            )
+            .await
+            .unwrap();
+            let key = user.get_default_key().unwrap();
+            let mut doc = eidetica::crdt::Doc::new();
+            doc.set("name", "test");
+            crate::security::SecretStore::new(user.create_database(doc, &key).await.unwrap()).await
+        };
+        let mut backend = crate::config::Backend::new(crate::config::BackendType::OpenAICompatible);
+        backend.name = Some("proxy".to_string());
+        backend.models = Some(vec![crate::config::Model {
+            name: "gpt-5.6-sol".into(),
+            reasoning: None,
+            price_input: None,
+            price_output: None,
+            price_cache_read: None,
+            context_window: None,
+        }]);
+        let mgr = crate::backends::BackendManager::new(&Some(vec![backend]), secrets);
+
+        // Before the fetch lands: unknown window (the bug's symptom).
+        assert_eq!(mgr.context_window("gpt-5.6-sol"), None);
+        // The background fetch's write: overlay gets the decoded window.
+        for info in &infos {
+            if let Some(w) = info.context_window {
+                mgr.insert_model_window(info.id.clone(), w);
+            }
+        }
+        assert_eq!(mgr.context_window("gpt-5.6-sol"), Some(1_050_000));
+    }
 
     #[test]
     fn usage_normalizes_openai_style_cached_tokens() {
