@@ -347,6 +347,11 @@ A schedule whose `Pinned` session is gone, or whose owning agent is no longer a 
 
 Fire timing is sleep-until-next, capped at a 5-minute idle wake so a wall-clock jump can't strand a routine. The engine fires due rules within seconds of their scheduled time rather than waiting for a poll interval.
 
+**Matrix migration.** Scheduled finals no longer automatically post to Matrix.
+To publish, use a Pinned schedule targeting an attached session and instruct
+its owner to call `matrix__send`; its normal final remains local. Fresh
+schedules have no room binding. See the [migration walkthrough](matrix.md#migration-schedules-no-longer-auto-post-finals).
+
 ### Entry points
 
 Routines are created two ways, both compiling to the same `Routine` rows fired by the one engine:

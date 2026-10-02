@@ -1071,6 +1071,59 @@ ENCRYPTED_REPLIES="$(probe --dir "$SIGNED_DIR" wire --room "$E2EE_ROOM" --sender
 
 printf '\033[1;32mPASS\033[0m — encrypted cases passed (plain message, command, withheld unsigned device, ignored unsigned sender, restart, on-wire encryption)\n' >&2
 
+# --------------------------------------------- pinned scheduled E2EE turns ---
+# Keep E1–E6 and the plaintext DM counts unchanged. The agent creates real
+# bounded schedules in this already-attached encrypted session via schedule_add.
+# The retired pinned row plus the persisted terminal Message proves execution
+# reached its final write; a later distinguishable encrypted reply is a barrier.
+scheduled_completed() {
+    local mode="$1"
+    sqlite3 "$WORKSPACE/state-daemon/eidetica.db" \
+    "select count(distinct e.record_key)
+     from store_state_namespaces fn join store_state_records f on fn.namespace_id=f.namespace_id
+     join store_state_namespaces en on en.database_id=json_extract(cast(f.record_value as text),'\$.target.session_db_id')
+     join store_state_records e on en.namespace_id=e.namespace_id
+     where fn.store_name='schedules' and en.store_name='entries'
+     and json_extract(cast(f.record_value as text),'\$.id')='e2ee-$mode'
+     and json_extract(cast(f.record_value as text),'\$.target.kind')='pinned'
+     and json_extract(cast(f.record_value as text),'\$.prompt')='$MARKER-scheduled-$mode'
+     and json_extract(cast(f.record_value as text),'\$.enabled')=0
+     and json_extract(cast(f.record_value as text),'\$.fire_count')=1
+     and json_extract(cast(e.record_value as text),'\$.entry_type')='Message'
+     and json_extract(cast(e.record_value as text),'\$.sender')='chaz'
+     and json_extract(cast(e.record_value as text),'\$.routing') is null
+     and json_extract(cast(e.record_value as text),'\$.content')='$MARKER-scheduled-$mode-final';" |
+        grep -qx 1
+}
+for mode in send silent; do
+    log "scheduled E2EE: pinned $mode turn"
+    probe --dir "$SIGNED_DIR" send --room "$E2EE_ROOM" \
+        --body "create pinned schedule $mode" >/dev/null
+    probe --dir "$SIGNED_DIR" expect --room "$E2EE_ROOM" --sender "$AGENT_MXID" \
+        --contains "$MARKER-schedule-$mode-created" --timeout "$REPLY_TIMEOUT" >/dev/null ||
+        fail "pinned $mode schedule was not created"
+    if [[ $mode == send ]]; then
+        probe --dir "$SIGNED_DIR" expect --room "$E2EE_ROOM" --sender "$AGENT_MXID" \
+            --contains "$MARKER-scheduled-post" --timeout "$REPLY_TIMEOUT" >/dev/null ||
+            fail "scheduled explicit send did not arrive as a decryptable encrypted post"
+    fi
+    wait_for "successful pinned $mode fire and persisted local final" "$REPLY_TIMEOUT" \
+        scheduled_completed "$mode"
+    probe --dir "$SIGNED_DIR" send --room "$E2EE_ROOM" --body "!chaz backends" >/dev/null
+    probe --dir "$SIGNED_DIR" expect --room "$E2EE_ROOM" --sender "$AGENT_MXID" \
+        --contains "$BACKENDS_MARKER" --timeout "$REPLY_TIMEOUT" >/dev/null ||
+        fail "encrypted barrier after scheduled $mode turn never arrived"
+    # Baseline 5 from E6, then creation + explicit send + barrier; the silent
+    # schedule adds only its creation reply and barrier, never its normal final.
+    expected=8
+    [[ $mode == silent ]] && expected=10
+    actual="$(probe --dir "$SIGNED_DIR" wire --room "$E2EE_ROOM" --sender "$AGENT_MXID")" ||
+        fail "scheduled $mode phase leaked plaintext"
+    [[ $actual -eq $expected ]] ||
+        fail "scheduled $mode phase expected $expected encrypted posts, found $actual"
+done
+printf '\033[1;32mPASS\033[0m — pinned scheduled E2EE: explicit send posts exactly once; both normal finals local; no-send zero posts after completion/barrier\n' >&2
+
 # ----------------------------------------------------------- room reset ---
 # The `chaz-matrix rooms` maintenance command, run against the same throwaway
 # homeserver and bridge config. It signs in with a fresh throwaway device —

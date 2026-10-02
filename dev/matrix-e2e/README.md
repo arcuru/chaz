@@ -374,6 +374,21 @@ became a turn at all. The bridge backfills room history into the session, so an
 ignored message still appears in a later turn's context; the count of `request:`
 lines is what distinguishes context from a turn.
 
+### Pinned schedules in an encrypted room
+
+After E1–E6 (whose exact counts remain unchanged), the agent calls `schedule_add`
+to create two real pinned intervals capped at one fire each. One scheduled
+turn explicitly calls `matrix__send`; the other returns only a normal final.
+The signed probe decrypts the explicit post and requires ciphertext on the
+wire. The harness waits for each retired pinned row and persisted terminal
+Message, then observes a distinguishable encrypted command-reply barrier.
+Exact wire counts prove one explicit scheduled post, no duplicate final, and
+zero posts from the no-send scheduled final. Plaintext DM counts are unchanged.
+
+The stub matches the scheduler's private first System message, not old user
+text. Current ReAct results are recognized by their call ID at the request's
+end, so history cannot re-create a schedule or substitute a stale send result.
+
 ### Keep the stub boring
 
 The stub exists so a failure is never ambiguous. If a case starts needing the
