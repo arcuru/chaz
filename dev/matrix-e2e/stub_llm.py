@@ -86,6 +86,69 @@ class Handler(BaseHTTPRequestHandler):
             return TOOL_CALL_TRIGGER in content
         return False
 
+    def _fixture_reply(self, *, content=None, name=None, arguments=None, call_id=None):
+        message = {"role": "assistant", "content": content}
+        if name:
+            message["tool_calls"] = [{
+                "id": call_id, "type": "function", "function": {
+                    "name": name, "arguments": json.dumps(arguments),
+                },
+            }]
+        self._send({
+            "id": "chatcmpl-e2e", "object": "chat.completion", "created": 0,
+            "model": "stub", "choices": [{"index": 0, "message": message,
+                "finish_reason": "tool_calls" if name else "stop"}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+        })
+
+    def _schedule_fixture(self, messages, tools):
+        # The scheduler prepends private System input. Historical user prompts
+        # and tool results are not a new schedule invocation or ReAct result.
+        task = messages[0].get("content") if messages and isinstance(messages[0], dict) \
+            and messages[0].get("role") == "system" else None
+        for mode in ("send", "silent"):
+            if task != f"{REPLY}-scheduled-{mode}":
+                continue
+            call_id = f"scheduled-{mode}-send"
+            current_result = messages[-1].get("role") == "tool" \
+                and messages[-1].get("tool_call_id") == call_id
+            if mode == "send" and not current_result:
+                if "matrix__send" not in tools:
+                    self._send({"error": "scheduled matrix__send unavailable"}, status=400)
+                    return True
+                sys.stderr.write("stub_llm: scheduled explicit matrix__send\n")
+                self._fixture_reply(name="matrix__send", call_id=call_id,
+                                    arguments={"body": f"{REPLY}-scheduled-post"})
+            else:
+                sys.stderr.write(f"stub_llm: scheduled {mode} local final\n")
+                self._fixture_reply(content=f"{REPLY}-scheduled-{mode}-final")
+            return True
+
+        latest_user = next((msg.get("content", "") for msg in reversed(messages)
+                            if isinstance(msg, dict) and msg.get("role") == "user"
+                            and isinstance(msg.get("content"), str)
+                            and not msg["content"].startswith("## Relevant Memories")), "")
+        for mode in ("send", "silent"):
+            if f"create pinned schedule {mode}" not in latest_user:
+                continue
+            call_id = f"create-schedule-{mode}"
+            if messages[-1].get("role") == "tool" \
+                    and messages[-1].get("tool_call_id") == call_id:
+                if "Added schedule" not in str(messages[-1].get("content")):
+                    self._send({"error": "schedule fixture creation failed"}, status=400)
+                    return True
+                self._fixture_reply(content=f"{REPLY}-schedule-{mode}-created")
+            else:
+                if "schedule_add" not in tools:
+                    self._send({"error": "schedule_add unavailable"}, status=400)
+                    return True
+                self._fixture_reply(name="schedule_add", call_id=call_id, arguments={
+                    "id": f"e2ee-{mode}", "interval_seconds": 5, "target": "pinned",
+                    "max_fires": 1, "task": f"{REPLY}-scheduled-{mode}",
+                })
+            return True
+        return False
+
     def do_GET(self):
         # Some clients probe the model list before their first completion.
         if self.path.rstrip("/").endswith("/models"):
@@ -140,6 +203,8 @@ class Handler(BaseHTTPRequestHandler):
                             if isinstance(msg, dict) and msg.get("role") == "user"
                             and isinstance(msg.get("content"), str)
                             and not msg["content"].startswith("## Relevant Memories")), "")
+        if self._schedule_fixture(messages, tools):
+            return
         if "participation after restart" in latest_user:
             if not any('"kind":"matrix_reply"' in str(msg.get("content", ""))
                        for msg in messages if isinstance(msg, dict)):

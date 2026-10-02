@@ -288,6 +288,44 @@ local turns, to keep the tool list stable; non-Matrix-origin finals never auto-p
 A model without tool-calling support cannot safely choose `no_reply` and is
 rejected for a Matrix-bound turn rather than silently posting a fallback answer.
 
+## Migration: schedules no longer auto-post finals
+
+Scheduled turns no longer automatically post their final text to Matrix, even
+when their session is attached to a room. Their normal final is saved locally.
+Matrix-origin conversational turns still auto-post normal finals as described
+above; a scheduled wake is not a Matrix-origin turn.
+
+To publish scheduled work, use a **Pinned** schedule targeting the session
+attached to the intended Matrix login and room, and instruct its owning agent
+to call `matrix__send({"body":"…"})`. A Fresh schedule has no attached room.
+The explicit send is the room post; the scheduled turn's later normal final
+stays local and does not produce a duplicate. See [Agent-owned schedules](agents.md#schedules)
+for creation and home-daemon requirements.
+
+1. In the attached session, create a pinned morning briefing:
+
+   ```text
+   /schedule add brief 0 0 9 * * Mon-Fri chaz Summarize overnight activity. Publish the briefing with matrix__send in this attached session; keep your final local.
+   ```
+
+   When it fires, the agent calls, for example:
+
+   ```json
+   { "body": "Morning briefing: no urgent changes." }
+   ```
+
+   through `matrix__send`. The room receives that explicit post once, not the
+   later local final.
+
+2. If an existing schedule only says “summarize overnight activity”, its final
+   now appears in the session, **not** in Matrix. Replace its task with an
+   explicit-send instruction (remove and re-add the rule if using commands).
+3. If the pinned session is not attached, `matrix__send` is unavailable; a
+   normal final cannot substitute for it. Attach the intended room with
+   `!chaz attach <session>` before the next fire. If another room already owns
+   the binding, attach refuses it; detach the old room explicitly before moving
+   it. Never change a schedule to Fresh as a workaround for a missing binding.
+
 ## Choosing when to wake in a group
 
 Group ambient participation is **off by default**. Only a sender matching
