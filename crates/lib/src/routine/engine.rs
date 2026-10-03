@@ -1348,11 +1348,35 @@ mod tests {
         .await
         .unwrap();
 
+        let mut disabled = Routine::interval(
+            RoutineId::new("disabled-session"),
+            "disabled",
+            std::time::Duration::from_secs(1),
+            target("heartbeat"),
+        );
+        disabled.enabled = false;
+        disabled.permanent = true;
+        upsert_routine(&sess, SESSION_ROUTINES_STORE, &disabled)
+            .await
+            .unwrap();
+
         let engine = RoutineEngine::new(peer, None).await.unwrap();
         engine.register_session("sess-1", &sess).await.unwrap();
         let listed = engine.list_routines().await;
-        assert_eq!(listed.len(), 1);
-        assert!(matches!(listed[0].0, RoutineScope::Session(ref s) if s == "sess-1"));
+        assert_eq!(listed.len(), 2);
+        assert!(
+            listed
+                .iter()
+                .all(|(scope, _)| matches!(scope, RoutineScope::Session(s) if s == "sess-1"))
+        );
+        assert_eq!(listed[0].1, disabled);
+        assert_eq!(engine.state.lock().await.heap.len(), 1);
+        let restarted = RoutineEngine::new(engine.chaz_peer.clone(), None)
+            .await
+            .unwrap();
+        restarted.register_session("sess-1", &sess).await.unwrap();
+        assert_eq!(restarted.list_routines().await, listed);
+        assert_eq!(restarted.state.lock().await.heap.len(), 1);
     }
 
     #[tokio::test]
