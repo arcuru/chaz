@@ -390,7 +390,7 @@ fn replay_turn(records: &[TurnTranscriptRecord], budget: usize) -> Option<Vec<Ru
     let mut i = 0;
     while i < sorted.len() {
         let record = &sorted[i];
-        if previous.is_some_and(|p| record.sequence != p + 1)
+        if record.sequence != previous.map_or(0, |p| p + 1)
             || record.attempt_id != sorted[0].attempt_id
             || record.request_id != sorted[0].request_id
         {
@@ -408,7 +408,7 @@ fn replay_turn(records: &[TurnTranscriptRecord], budget: usize) -> Option<Vec<Ru
         else {
             return None;
         };
-        if model_sequence.is_some_and(|p| *seq != p + 1) {
+        if *seq != model_sequence.map_or(0, |p| p + 1) {
             return None;
         }
         model_sequence = Some(*seq);
@@ -669,6 +669,44 @@ mod tests {
         assert!(replay_turn(&retry, 1000).is_none());
         assert!(replay_turn(&valid[..2], 1000).is_none());
         assert!(replay_turn(&[], 1000).is_none());
+    }
+
+    #[test]
+    fn missing_first_tool_exchange_never_replays() {
+        let mut complete = records("first");
+        complete.pop();
+        let mut suffix = records("second");
+        for record in &mut suffix {
+            record.sequence += 2;
+            match &mut record.message {
+                TurnTranscriptMessage::ModelResponse { model_sequence, .. }
+                | TurnTranscriptMessage::ToolResult { model_sequence, .. } => *model_sequence += 1,
+            }
+        }
+        complete.extend(suffix);
+        assert_eq!(replay_turn(&complete, 1000).unwrap().len(), 4);
+        // The remaining exchange is paired and terminal, but its front is missing.
+        assert!(replay_turn(&complete[2..], 1000).is_none());
+    }
+
+    #[test]
+    fn replay_requires_each_front_anchor() {
+        for (sequence_offset, model_offset) in [(2, 0), (0, 1)] {
+            let mut partial = records("ok");
+            for record in &mut partial {
+                record.sequence += sequence_offset;
+                match &mut record.message {
+                    TurnTranscriptMessage::ModelResponse { model_sequence, .. }
+                    | TurnTranscriptMessage::ToolResult { model_sequence, .. } => {
+                        *model_sequence += model_offset;
+                    }
+                }
+            }
+            assert!(
+                replay_turn(&partial, 1000).is_none(),
+                "replayed with sequence offset {sequence_offset} and model offset {model_offset}"
+            );
+        }
     }
 
     #[tokio::test]
