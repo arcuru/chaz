@@ -18,7 +18,7 @@ Every built-in is owned by an [extension](extensions.md); disabling an extension
 | `job_wait`          | `core`     | Low    | Never              | Waits up to a deadline for a job; timeout returns its current status   |
 | `spawn_worker`      | `core`     | Medium | UnlessAutoApproved | Invokes a Worker template declared under the calling Agent (no keys)   |
 | `shell`             | `core`     | High   | Always             | Executes a shell command                                               |
-| `read_file`         | `fs`       | Low    | Never              | Reads file contents from disk                                          |
+| `read_file`         | `fs`       | Low    | Never              | Reads a text file from disk, one bounded page of lines at a time       |
 | `write_file`        | `fs`       | Medium | UnlessAutoApproved | Writes content to a file                                               |
 | `edit_file`         | `fs`       | Medium | UnlessAutoApproved | Replace exact text in a file (single or atomic-multi-edit)             |
 | `web_fetch`         | `web`      | Medium | UnlessAutoApproved | HTTP GET or POST requests                                              |
@@ -165,6 +165,68 @@ Read or write files on the host filesystem. Both go through the host's `FileRead
 ```json
 {"path": "/tmp/notes.txt"}
 {"path": "/tmp/output.txt", "content": "Hello, world!"}
+```
+
+`read_file` arguments:
+
+| Argument | Type              | Default           | Meaning                                              |
+| -------- | ----------------- | ----------------- | ---------------------------------------------------- |
+| `path`   | string            | (required)        | File to read                                         |
+| `offset` | integer or `null` | `1`               | 1-based line number to start from; must be 1 or more |
+| `limit`  | integer or `null` | fill the page cap | Most lines to return; must be 1 or more              |
+
+The schema stays strict-mode: `offset` and `limit` are listed as required but nullable, so a strict provider sends `null` for "use the default". Older path-only calls are still accepted.
+
+#### Paged reads
+
+A single `read_file` result is capped at **2,000 lines and 51,200 bytes, notices included**. The cap bounds what the model sees, not what the host reads: the host still reads the whole file through `FileRead` under the same grants, and paging slices the decoded text (invalid UTF-8 becomes U+FFFD, as before).
+
+- **Short file from the start** (`offset` 1, no `limit` cutting it short, within both caps) comes back verbatim — exactly the bytes of the file, with no notice.
+- **Anything else** is a _page_: whole lines, each with its original terminator (`\n` or `\r\n`), then one blank line and one `[bracketed]` notice. The notice gives the range shown, the file's total line count, and either `end of file` or why the page stopped (`the requested limit`, `the 2000-line output ceiling`, `the 51200-byte output ceiling`) plus `Use offset=N to continue`. Because the notice takes two lines, a page holds at most 1,998 file lines.
+- Pages end only on line boundaries, so a multibyte character is never cut. Concatenating the pages' content reproduces the file. Only the file's last line can lack a newline; when it does, the final notice says `the last line has no final newline`.
+- **An oversized line** (one line over the byte budget) is never cut or silently skipped. The page before it stops early; asking for it returns only a notice giving its size, a bounded shell recipe, and the offset after it.
+- **Errors**: an `offset` past the last line, or an `offset`/`limit` that is zero, negative, fractional, or not a number, is rejected before the host is called. Grant denials and I/O failures from the host come back unchanged.
+
+Paging through a 5,000-line file:
+
+```text
+→ {"path": "/var/log/app.log"}
+00001 starting
+…
+01998 request 1997 ok
+
+[Lines 1-1998 of 5000; stopped at the 2000-line output ceiling. Use offset=1999 to continue.]
+
+→ {"path": "/var/log/app.log", "offset": 4999}
+04999 request 4998 ok
+05000 shutdown
+
+[Lines 4999-5000 of 5000; end of file.]
+
+→ {"path": "/var/log/app.log", "offset": 20, "limit": 2}
+00020 request 19 ok
+00021 request 20 ok
+
+[Lines 20-21 of 5000; stopped at the requested limit. Use offset=22 to continue.]
+```
+
+Edge cases and failures:
+
+```text
+→ {"path": "/tmp/empty.txt"}
+[Empty file: 0 lines.]
+
+→ {"path": "/tmp/notes.txt", "offset": 99}
+Tool error: invalid argument: offset 99 is beyond the end of the file (12 lines)
+
+→ {"path": "/tmp/notes.txt", "limit": 0}
+Tool error: invalid argument: 'limit' must be a positive integer (1 or more), got 0
+
+→ {"path": "/data/min.js", "offset": 2}
+[Line 2 of 3 is 80001 bytes, over the 51200-byte output ceiling, so it was not returned. Read a bounded slice of it with the shell tool (for example: sed -n '2p' FILE | head -c 50000), or use offset=3 to skip it.]
+
+→ {"path": "/etc/shadow"}
+Tool error: Filesystem read of '/etc/shadow' is outside the allowed paths
 ```
 
 ### edit_file
