@@ -1306,3 +1306,6 @@ mod tests {
         assert_eq!(json["function"]["strict"], serde_json::Value::Bool(true));
     }
 }
+
+#[cfg(test)]
+mod request_reload_tests;
