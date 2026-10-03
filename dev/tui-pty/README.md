@@ -10,7 +10,10 @@ The recipe builds the actual `chaz` binary and a test-only store provisioner.
 Python's standard-library PTY facilities drive a 40×16 terminal, submit a
 Unicode prompt (`café`, a wide character, and a combining accent), check that
 the existing loopback model stub received it and that its final reply rendered,
-resize to 72×24, then submit another prompt and check another reply.
+resize to 72×24, wait for the wide redraw, then submit another prompt and
+check another reply. Typing must wait for that redraw: crossterm's
+edge-triggered poll can strand input that arrives together with `SIGWINCH`
+until the next keystroke.
 No production database, credentials, provider endpoint, or Matrix login is used.
 Each run has a disposable HOME/XDG tree, SQLite store, and kernel-assigned port;
 the child environment excludes provider keys and replaces model CLIs with
@@ -29,6 +32,6 @@ stub listener. Run the recipe repeatedly to exercise fresh-state cleanup.
 
 On lifecycle failure, `target/tui-pty-failures/<timestamp>/` contains `pty.raw`,
 `checkpoints.json` (command, executable SHA-256, PID, geometry and observed text),
-and `requests.json`. Inspect the original unittest traceback first; artifact
+`requests.json`, and the run's `chaz-tui` log. Inspect the original unittest traceback first; artifact
 write errors are reported separately and do not replace it. Negative-control
 artifacts are checked inside disposable directories and then deleted.

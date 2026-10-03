@@ -62,10 +62,10 @@ class PtyProcess:
             raise
 
     def resize(self, columns, rows):
+        # The kernel delivers SIGWINCH to the foreground process group; a
+        # second, explicit signal could arrive after the redraw being awaited.
         fcntl.ioctl(self.slave, termios.TIOCSWINSZ, struct.pack("HHHH", rows, columns, 0, 0))
         self.checkpoints.append({"resize": [columns, rows], "time": time.monotonic()})
-        if hasattr(self, "child"):
-            os.kill(self.child.pid, signal.SIGWINCH)
 
     def send(self, text):
         os.write(self.master, text.encode("utf-8"))
@@ -89,6 +89,18 @@ class PtyProcess:
                 raise AssertionError(f"child exited {self.child.returncode} before {text!r}")
             if time.monotonic() >= deadline:
                 raise AssertionError(f"deadline waiting for {text!r}")
+
+    def request(self, received, timeout=20):
+        # Keep reading the PTY so failure artifacts show what the TUI drew.
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                return received.get_nowait()
+            except queue.Empty:
+                pass
+            if time.monotonic() >= deadline:
+                raise AssertionError("deadline waiting for a stub request")
+            self.drain(min(0.05, max(0, deadline - time.monotonic())))
 
     def close(self):
         try:
@@ -220,14 +232,19 @@ default_agents: [chaz]
                 process.expect(" > ")
                 prompt = "pty-café-界-e\u0301"
                 process.send(prompt + "\r")
-                self.assertIn(prompt, [m.get("content") for m in received.get(timeout=20)
+                self.assertIn(prompt, [m.get("content") for m in process.request(received)
                                        if m.get("role") == "user"])
                 process.expect(server.reply)
+                offset = len(process.raw)
                 process.resize(72, 24)
+                # Wait for the wide-layout redraw before typing. crossterm's
+                # edge-triggered poll returns Resize and drops tty readiness
+                # in the same batch, stranding input until the next byte.
+                process.expect("Ctrl+PgUp", offset=offset)
                 server.reply = "pty-resized-ok"
                 offset = len(process.raw)
                 process.send("pty-after-resize\r")
-                self.assertIn("pty-after-resize", [m.get("content") for m in received.get(timeout=20)
+                self.assertIn("pty-after-resize", [m.get("content") for m in process.request(received)
                                                    if m.get("role") == "user"])
                 process.expect(server.reply, offset=offset)
                 process.send("\x03")
@@ -239,11 +256,17 @@ default_agents: [chaz]
             except BaseException:
                 if process:
                     artifact = ROOT / "target/tui-pty-failures" / str(time.time_ns())
+                    try:
+                        process.drain(0.2)
+                    except Exception as error:
+                        print(f"final PTY drain failed: {error}", file=sys.stderr)
                     process.capture(artifact)
                     try:
                         (artifact / "requests.json").write_text(json.dumps(requests, indent=2))
+                        for log in (home / "state").glob("chaz-tui*.log*"):
+                            (artifact / log.name).write_bytes(log.read_bytes())
                     except Exception as error:
-                        print(f"request artifact failed: {error}", file=sys.stderr)
+                        print(f"request/log artifact failed: {error}", file=sys.stderr)
                 raise
             finally:
                 try:
