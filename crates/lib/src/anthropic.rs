@@ -287,15 +287,17 @@ impl Anthropic {
             tools,
             model,
             &crate::extensions::context::default_cache_options(),
+            None,
         )
         .await
     }
-    async fn chat_with_cache_impl(
+    pub(crate) async fn chat_with_cache_impl(
         &self,
         messages: &[RuntimeMessage],
         tools: &[ToolDefinition],
         model: &str,
         cache: &CacheOptions,
+        max_output_tokens: Option<u32>,
     ) -> Result<LLMResponse, LlmError> {
         cache
             .validate(messages)
@@ -310,7 +312,7 @@ impl Anthropic {
         apply_cache_options(&mut system, &mut req_messages, &mut req_tools, cache);
 
         let url = format!("{}/messages", self.api_base().trim_end_matches('/'));
-        let mut max_tokens = self.backend.max_output_tokens();
+        let mut max_tokens = max_output_tokens.unwrap_or_else(|| self.backend.max_output_tokens());
         let initial_max_tokens = max_tokens;
         let mut raise_attempts: u32 = 0;
         // Lazily-discovered model output ceiling. Fetched once, on the first
@@ -383,7 +385,8 @@ impl Anthropic {
             // max_tokens (the documented recovery), then surface truncation if
             // the raise budget is exhausted.
             if response.is_truncated() {
-                let can_raise = response.stop_reason.as_deref() == Some("max_tokens")
+                let can_raise = max_output_tokens.is_none()
+                    && response.stop_reason.as_deref() == Some("max_tokens")
                     && response.has_tool_use()
                     && raise_attempts < MAX_MAX_TOKENS_RAISES;
                 if can_raise {
@@ -603,7 +606,7 @@ impl LLMBackend for Anthropic {
         model: &str,
         cache: &CacheOptions,
     ) -> Result<LLMResponse, LlmError> {
-        self.chat_with_cache_impl(messages, tools, model, cache)
+        self.chat_with_cache_impl(messages, tools, model, cache, None)
             .await
     }
     async fn chat_with_tools(

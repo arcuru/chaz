@@ -647,14 +647,19 @@ async fn llm_call_with_retry(
     }))
 }
 
-/// Fire `agent_end` for all registered hooks and return the outcome unchanged.
-/// Centralizes the hook fire across every exit site of `execute`.
+/// Notify successful-turn observers and end hooks without changing the outcome.
 async fn finalize_outcome(
     hub: Option<&ExtensionHub>,
     ctx: Option<&HookContext>,
     outcome: RuntimeOutcome,
+    request: (&[RuntimeMessage], &[ToolDefinition]),
+    backend: &BackendManager,
+    security: &SecurityContext,
 ) -> RuntimeOutcome {
     if let (Some(hub), Some(ctx)) = (hub, ctx) {
+        let public = crate::extension::turn::public_messages(request.0, &outcome.body);
+        hub.fire_turn_complete(ctx, &public, request.1, backend, security)
+            .await;
         hub.fire_agent_end(ctx).await;
     }
     outcome
@@ -784,6 +789,8 @@ struct RoundProjector<'a> {
     /// `(first message index, model sequence)` of each current-attempt
     /// exchange, in order.
     rounds: Vec<(usize, u64)>,
+    // Retain the accepted request, not the unprojected durable baseline.
+    last_request: Option<ProjectedRequest>,
 }
 
 impl<'a> RoundProjector<'a> {
@@ -817,6 +824,7 @@ impl<'a> RoundProjector<'a> {
             session_db,
             base_sources,
             rounds: Vec::new(),
+            last_request: None,
         }
     }
 
@@ -1004,7 +1012,7 @@ impl<'a> RoundProjector<'a> {
     /// provider's.
     #[allow(clippy::too_many_arguments)]
     async fn call_model(
-        &self,
+        &mut self,
         backend: &BackendManager,
         model: Option<&str>,
         messages: &[RuntimeMessage],
@@ -1067,7 +1075,19 @@ impl<'a> RoundProjector<'a> {
                 recorder.observe_call(observation).await?;
             }
         }
+        self.last_request = projected;
         Ok(response)
+    }
+
+    fn last_request<'b>(
+        &'b self,
+        messages: &'b [RuntimeMessage],
+        tools: &'b [ToolDefinition],
+    ) -> (&'b [RuntimeMessage], &'b [ToolDefinition]) {
+        match &self.last_request {
+            Some(request) => (&request.messages, &request.tools),
+            None => (messages, tools),
+        }
     }
 }
 
@@ -1344,6 +1364,9 @@ async fn run_turn(
                             body: content,
                             metadata: acc.finalize(),
                         },
+                        projector.last_request(&messages, &[]),
+                        backend,
+                        security,
                     )
                     .await);
                 }
@@ -1557,6 +1580,9 @@ async fn run_turn(
                         body: content,
                         metadata: acc.finalize(),
                     },
+                    projector.last_request(&messages, &tool_defs),
+                    backend,
+                    security,
                 )
                 .await);
             }
@@ -1597,6 +1623,9 @@ async fn run_turn(
                             body: content.clone(),
                             metadata: acc.finalize(),
                         },
+                        projector.last_request(&messages, &tool_defs),
+                        backend,
+                        security,
                     )
                     .await);
                 }
@@ -1689,6 +1718,9 @@ async fn run_turn(
                             body: String::new(),
                             metadata: acc.finalize(),
                         },
+                        projector.last_request(&messages, &tool_defs),
+                        backend,
+                        security,
                     )
                     .await);
                 }

@@ -256,6 +256,9 @@ pub trait ExtensionInstance: Send + Sync + 'static {
     fn agent_end_hook(&self) -> Option<Arc<dyn HookHandlerAgentEnd>> {
         None
     }
+    fn turn_complete_hook(&self) -> Option<Arc<dyn super::turn::TurnComplete>> {
+        None
+    }
     fn session_start_hook(&self) -> Option<Arc<dyn HookHandlerSessionStart>> {
         None
     }

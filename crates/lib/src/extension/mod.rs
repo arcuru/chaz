@@ -28,6 +28,7 @@ pub mod hooks;
 pub mod instance;
 pub mod manifest;
 pub mod projection;
+pub mod turn;
 
 #[allow(unused_imports)]
 pub use instance::{CapResolver, ExtensionInstance, PeerHandles, Scope, ScopeCtx, TurnCtx};
@@ -79,6 +80,8 @@ pub enum HookKind {
     ToolCall,
     ToolResult,
     AgentEnd,
+    /// Read-only final model context with scoped host operations.
+    TurnComplete,
     SessionStart,
     SessionShutdown,
     /// Extension provides one or more named tools (via
@@ -1587,6 +1590,76 @@ impl ExtensionHub {
         acc
     }
 
+    /// Read-only successful-turn endpoint. Uses the same active set as the
+    /// runtime, and never hands an extension an unscoped registry/backend.
+    pub async fn fire_turn_complete(
+        &self,
+        ctx: &HookContext,
+        messages: &[RuntimeMessage],
+        tools: &[crate::tool::ToolDefinition],
+        backend: &crate::backends::BackendManager,
+        security: &crate::security::SecurityContext,
+    ) {
+        let Some(registry) = self.session_registry.as_ref() else {
+            return;
+        };
+        let db = ctx.session.lock().await.database().clone();
+        let id = db.root_id().to_string();
+        // The caller must hold a session this peer can open with its keys.
+        if registry.open_session(&id).await.is_err() {
+            return;
+        }
+        let mut instances: Vec<_> = self
+            .scoped_instances(&ctx.agent_name, Some(&db))
+            .await
+            .into_iter()
+            .collect();
+        let active = self
+            .active_extensions_for_call(&ctx.agent_name, Some(&db), &ctx.active_extensions)
+            .await;
+        instances.sort_by(|a, b| a.0.cmp(&b.0));
+        for (name, instance) in instances {
+            if !active.contains(&name)
+                || !instance
+                    .manifest()
+                    .supported_hooks
+                    .contains(&HookKind::TurnComplete)
+            {
+                continue;
+            }
+            let Some(endpoint) = instance.turn_complete_hook() else {
+                continue;
+            };
+            let turn = turn::TurnCompleteContext {
+                agent_name: &ctx.agent_name,
+                model: ctx.model.as_deref(),
+                call_depth: ctx.call_depth,
+                messages,
+                tools,
+                extension: &name,
+                db: &db,
+                registry,
+                backend,
+                security,
+                completion_used: std::sync::atomic::AtomicBool::new(false),
+            };
+            let fut = AssertUnwindSafe(endpoint.on_turn_complete(&turn));
+            match tokio::time::timeout(std::time::Duration::from_secs(15), fut.catch_unwind()).await
+            {
+                Ok(Ok(Ok(()))) => {}
+                Ok(Ok(Err(error))) => {
+                    warn!(extension = %name, %error, "Turn-complete extension failed; preserving user turn")
+                }
+                Ok(Err(_)) => {
+                    warn!(extension = %name, "Turn-complete extension panicked; preserving user turn")
+                }
+                Err(_) => {
+                    warn!(extension = %name, "Turn-complete extension timed out; preserving user turn")
+                }
+            }
+        }
+    }
+
     pub async fn fire_agent_end(&self, ctx: &HookContext) {
         for reg in &self.agent_end {
             if !ctx.active_extensions.contains(reg.owner) {
@@ -1797,6 +1870,14 @@ impl ExtensionHub {
             self.register_command_attributed_arc(owner, name, handler);
         }
         let owner_static = self.intern_name(owner);
+        if inst.turn_complete_hook().is_some()
+            && inst
+                .manifest()
+                .supported_hooks
+                .contains(&HookKind::TurnComplete)
+        {
+            self.note_hook(owner_static, HookKind::TurnComplete);
+        }
         if let Some(h) = inst.before_agent_start_hook() {
             self.hooks_by_extension
                 .entry(owner_static)

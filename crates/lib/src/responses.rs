@@ -261,6 +261,18 @@ impl Responses {
         model: &str,
         prompt_cache_key: Option<&str>,
     ) -> Result<LLMResponse, LlmError> {
+        self.chat_with_tools_bounded(messages, tools, model, prompt_cache_key, None)
+            .await
+    }
+
+    pub(crate) async fn chat_with_tools_bounded(
+        &self,
+        messages: &[RuntimeMessage],
+        tools: &[ToolDefinition],
+        model: &str,
+        prompt_cache_key: Option<&str>,
+        max_output_tokens: Option<u32>,
+    ) -> Result<LLMResponse, LlmError> {
         let api_key = self
             .backend
             .api_key_ref
@@ -277,8 +289,11 @@ impl Responses {
             ModelApi::Responses,
             Some(&api_key),
         );
-        let request =
+        let mut request =
             self.request_with_origin(messages, tools, model, prompt_cache_key, &origin)?;
+        if let Some(limit) = max_output_tokens {
+            request.max_output_tokens = Some(limit);
+        }
         let api_base = self
             .backend
             .api_base

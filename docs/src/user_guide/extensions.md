@@ -30,6 +30,7 @@ others are runtime hooks that fire around each agent turn.
 | `agent_schedule`    | _(routine handler)_          | Standalone fire path for agent-owned schedules. Not directly toggled by users; no tools or commands.                                                 |
 | `mcp-<server>`      | Tool                         | One extension per configured [MCP server](mcp.md), named `mcp-<server_name>`. Wraps the server and registers its tools under the server's namespace. |
 | `path_normalizer`   | ToolCall                     | Strips trailing slashes from `path` arguments on filesystem tools before they execute.                                                               |
+| `session_naming`    | TurnComplete                 | Opt-in, one-shot model-assisted naming of an unnamed session. See [Model-assisted session names](#model-assisted-session-names).                     |
 | `security_warnings` | ToolResult                   | Scans tool output for prompt-injection patterns and logs warnings (warning-only — output is unmodified).                                             |
 
 Disabling an extension hides its tools from the LLM, stops its hooks
@@ -637,3 +638,97 @@ the remaining chain and final budget check still run.
    baseline budgeting. An over-budget final request is refused before provider
    dispatch. Set `enabled true` again to reconstruct pointers, or remove the
    optional projection grant to stop projection everywhere on this peer.
+
+## Model-assisted session names
+
+`session_naming` is a built-in extension. It adds no tool to the main model.
+It is active by default but **makes no model calls until you enable it on a session**:
+
+```
+/extensions set session_naming enabled true
+```
+
+| Setting / command                     | Default | Effect                                                                                                                                   |
+| ------------------------------------- | ------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
+| `enabled`                             | `false` | Attempt naming after a successful, nonempty top-level reply.                                                                             |
+| `model`                               | `null`  | Use the effective turn model; a string selects a model through the usual configured backend routing, including `backend:model` prefixes. |
+| `attempted`                           | `false` | Written before inference; set to `false` explicitly to permit one retry.                                                                 |
+| `/extensions settings session_naming` | —       | Inspect settings, `status`, and `last_usage`.                                                                                            |
+| `/extensions remove session_naming`   | —       | Stop the endpoint on this session; agent opt-outs work too.                                                                              |
+| `/name <text>`                        | —       | Set an explicit name; the extension never replaces it.                                                                                   |
+| `/name`                               | —       | Clear the name; does not reset the naming attempt.                                                                                       |
+
+The first eligible turn spends at most one auxiliary completion: 128 output tokens and a 10-second deadline, without tools or retries.
+The naming call runs before that turn's reply is returned, so the first eligible reply can be delayed by up to the naming deadline; later turns only read the persisted marker.
+The attempt marker persists with the session, so restarting the daemon, clearing the name, or removing/re-adding the extension does not repeat inference.
+There is no periodic renaming and no replacement policy: **every existing name is preserved**, including manual names and names generated earlier.
+An explicit rename made while inference is in flight is rechecked before applying the result.
+Child-agent turns and silent replies do not trigger naming.
+Settings changes take effect on the next eligible turn; they do not start inference by themselves.
+
+### What the naming model sees
+
+The extension receives the public context of the final model request plus the final reply: assembled system content (including skills, memory and room notes), selected session messages and summaries, historical tool exchanges, and this turn's tool calls/results.
+It observes the accepted request after context projection, so extension edits and revocations match what the main model saw rather than an earlier baseline.
+The tool definitions available to the main model are included as reference data, not executable tools.
+This is **not** a short last-message excerpt or a second read of the session's entire history.
+Existing summary boundaries, context projection, context-budget truncation and tool-result truncation/wrappers remain in force.
+Opaque provider continuation fields (including hidden reasoning), opaque response metadata extras, excluded audit entries and other sessions are deliberately not exposed.
+A known smaller naming-model window causes a failed attempt rather than silently shortening the context.
+Selecting another model sends this same public context to that model's configured backend; choose it with the same care as the session model.
+
+Names must be nonempty, one line, at most 80 characters, and pass the runtime's secret-leak scan.
+An unavailable model, timeout, tool-call response, invalid name or name already taken by another session leaves the user reply intact and consumes the attempt.
+`status` is `attempting`, `named`, `preserved` (a name appeared during inference), or `failed`.
+A crash or endpoint deadline can leave `attempting`; it still prevents automatic retries.
+Failures are logged, not inserted as user-visible conversation errors.
+
+Auxiliary usage metadata returned with a text response is stored separately in `last_usage` under this extension's settings, even if the resulting name cannot be applied.
+It does not replace the main reply's cost or context-occupancy metadata and is not included in `/costs` or the main turn's usage totals.
+Failed/truncated requests and rejected tool-call responses have no retained auxiliary usage; their provider-side cost can be unknown, **not zero**.
+The configured backend/proxy still sees the request.
+The selected model's API is preserved: Chat Completions, Anthropic Messages, or Responses, with a native output limit on each.
+Naming does not invoke context projectors again or replay opaque provider continuation items.
+Names use the existing session metadata and peer-local name index, so session lists and open TUI tabs update through the normal session-write notification.
+As with `/name`, a name collision is an error, not a reason to take over another session's alias.
+
+### Walkthrough: name a troubleshooting session and retry a failed attempt
+
+1. Open an unnamed session with `/new`, then enable naming:
+
+   ```text
+   /extensions set session_naming enabled true
+   Set session_naming.enabled = true
+   ```
+
+2. Ask the agent to diagnose a migration problem.
+   It replies normally once the naming completion finishes or fails; the reply text is never changed by naming.
+   If it returns `Migration diagnosis`, the open tab and session picker show `Migration diagnosis`, and `/join Migration diagnosis` resolves through the same alias index as `/name`.
+   `/extensions settings session_naming` now includes `"status": "named"` and `"attempted": true`.
+   Further turns do not rename it or spend another naming call.
+
+3. In another unnamed session, enable naming and let a turn succeed while the backend fails the subsequent auxiliary request.
+   The naming failure does not change the main reply.
+   With no explicit naming-model override and a failed auxiliary request, inspection shows:
+
+   ```text
+   /extensions settings session_naming
+   Settings for 'session_naming' on this session:
+   {
+     "attempted": true,
+     "enabled": true,
+     "last_usage": null,
+     "status": "failed"
+   }
+   ```
+
+4. Restore the backend, then explicitly allow one retry:
+
+   ```text
+   /extensions set session_naming attempted false
+   Set session_naming.attempted = false
+   ```
+
+   Send the next user prompt; its successful reply triggers one fresh naming attempt.
+   Alternatively, use `/name Migration investigation` for a manual name with no naming-model call.
+   If you want to regenerate an existing name, both `/name` (clear it) and the explicit attempt reset are required.

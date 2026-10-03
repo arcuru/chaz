@@ -197,6 +197,15 @@ pub trait BackendDispatch: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = Result<LLMResponse, LlmError>> + Send + 'a>> {
         self.chat_with_tools(messages, tools, model)
     }
+    /// Test seam for a bounded, tool-free auxiliary completion.
+    fn complete_bounded<'a>(
+        &'a self,
+        messages: &'a [RuntimeMessage],
+        model: &'a str,
+        _max_output_tokens: u32,
+    ) -> Pin<Box<dyn Future<Output = Result<LLMResponse, LlmError>> + Send + 'a>> {
+        self.chat_with_tools(messages, &[], model)
+    }
     fn chat_with_tools<'a>(
         &'a self,
         messages: &'a [RuntimeMessage],
@@ -701,6 +710,39 @@ impl BackendManager {
         self.select_backend_for_model(model).max_retries()
     }
 
+    /// One tool-free auxiliary call through the configured model route.
+    /// No runtime hooks, tools, retries, or Anthropic output-budget raises.
+    pub(crate) async fn complete_bounded(
+        &self,
+        model: Option<&str>,
+        messages: &[RuntimeMessage],
+        max_output_tokens: u32,
+    ) -> Result<LLMResponse, LlmError> {
+        if let Some(model) = model {
+            self.validate_model(model)
+                .map_err(|message| LlmError::Configuration { message })?;
+        }
+        if let Some(mock) = &self.mock {
+            return mock
+                .complete_bounded(messages, model.unwrap_or(""), max_output_tokens)
+                .await;
+        }
+        if self.backends.is_empty() {
+            return Err(LlmError::Configuration {
+                message: "No backends configured".into(),
+            });
+        }
+        let resolved = self.resolve_model_name(model);
+        let backend = self.select_backend_for_model(model);
+        let client = BackendClient::for_model(backend, &self.secrets, &resolved)?;
+        let cache = crate::extensions::context::default_cache_options();
+        let limit = Some(max_output_tokens);
+        with_backend!(client,
+            b => b.chat_with_cache_impl(messages, &[], &resolved, &cache, limit).await,
+            responses => b.chat_with_tools_bounded(messages, &[], &resolved, None, limit).await
+        )
+    }
+
     /// Execute a single LLM call with tool definitions (for ReAct loop).
     pub async fn chat_with_tools_for_model(
         &self,
@@ -1093,6 +1135,123 @@ mod tests {
         };
         let err = mgr.execute(&ctx).await.unwrap_err();
         assert!(matches!(err, LlmError::Configuration { .. }));
+    }
+
+    #[tokio::test]
+    async fn bounded_completion_sends_native_limits_without_tools_or_policy_override() {
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{method, path},
+        };
+        for api in [
+            ModelApi::ChatCompletions,
+            ModelApi::AnthropicMessages,
+            ModelApi::Responses,
+        ] {
+            let kind = if api == ModelApi::AnthropicMessages {
+                BackendType::Anthropic
+            } else {
+                BackendType::OpenAICompatible
+            };
+            let server = MockServer::start().await;
+            let response = match api {
+                ModelApi::ChatCompletions => {
+                    serde_json::json!({"choices": [{"message": {"role": "assistant", "content": "Title"}, "finish_reason": "stop"}], "model": "test-model", "usage": {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12}})
+                }
+                ModelApi::AnthropicMessages => {
+                    serde_json::json!({"content": [{"type": "text", "text": "Title"}], "model": "test-model", "stop_reason": "end_turn", "usage": {"input_tokens": 10, "output_tokens": 2}})
+                }
+                ModelApi::Responses => {
+                    serde_json::json!({"status":"completed", "model":"test-model", "output":[{"type":"message", "content":[{"type":"output_text", "text":"Title"}]}], "usage":{"input_tokens":10,"output_tokens":2,"total_tokens":12}})
+                }
+            };
+            let endpoint = match api {
+                ModelApi::AnthropicMessages => "/v1/messages",
+                ModelApi::ChatCompletions => "/v1/chat/completions",
+                ModelApi::Responses => "/v1/responses",
+            };
+            Mock::given(method("POST"))
+                .and(path(endpoint))
+                .respond_with(ResponseTemplate::new(200).set_body_json(response))
+                .expect(2)
+                .mount(&server)
+                .await;
+            let mut config = Backend::new(kind.clone());
+            config.name = Some("route".into());
+            config.api_base = Some(format!("{}/v1", server.uri()));
+            config.api_key = Some("test-key".into());
+            config.models = Some(vec![Model {
+                name: "test-model".into(),
+                api: Some(api),
+                reasoning: Some(crate::config::ReasoningConfig {
+                    effort: crate::config::ReasoningEffort::High,
+                }),
+                price_input: None,
+                price_output: None,
+                price_cache_read: None,
+                context_window: None,
+            }]);
+            let manager = BackendManager::new(&Some(vec![config]), empty_secrets().await);
+            let messages = vec![RuntimeMessage::User("context".into())];
+            let response = manager
+                .complete_bounded(Some("route:test-model"), &messages, 128)
+                .await
+                .unwrap();
+            assert!(
+                matches!(response, LLMResponse::Text { ref content, .. } if content == "Title")
+            );
+            manager
+                .chat_with_tools_for_model(Some("route:test-model"), &messages, &[], "test-model")
+                .await
+                .unwrap();
+            let requests = server.received_requests().await.unwrap();
+            assert_eq!(requests.len(), 2);
+            let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+            let normal: serde_json::Value = serde_json::from_slice(&requests[1].body).unwrap();
+            assert_eq!(body["model"], "test-model");
+            assert!(body.get("tools").is_none());
+            if api == ModelApi::AnthropicMessages {
+                assert_eq!(body["max_tokens"], 128);
+                assert_eq!(normal["max_tokens"], 8192);
+            } else if api == ModelApi::Responses {
+                assert_eq!(body["max_output_tokens"], 128);
+                assert_eq!(body["reasoning"]["effort"], "high");
+                assert!(normal.get("max_output_tokens").is_none());
+            } else {
+                assert_eq!(body["max_completion_tokens"], 128);
+                assert_eq!(body["reasoning"]["effort"], "high");
+                assert!(normal.get("max_completion_tokens").is_none());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn bounded_anthropic_completion_never_raises_budget_or_retries_tool_use() {
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{method, path},
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("POST")).and(path("/messages")).respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"stop_reason": "max_tokens", "content": [{"type": "tool_use", "id": "call", "name": "tool", "input": {}}]}))).expect(1).mount(&server).await;
+        let mut config = Backend::new(BackendType::Anthropic);
+        config.api_base = Some(server.uri());
+        config.api_key = Some("test-key".into());
+        let manager = BackendManager::new(&Some(vec![config]), empty_secrets().await);
+        assert!(matches!(
+            manager
+                .complete_bounded(
+                    Some("test-model"),
+                    &[RuntimeMessage::User("context".into())],
+                    128
+                )
+                .await,
+            Err(LlmError::TruncatedOutput { .. })
+        ));
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            1,
+            "no model-catalog lookup or output-budget raise"
+        );
     }
 
     #[tokio::test]

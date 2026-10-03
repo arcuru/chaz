@@ -252,11 +252,36 @@ async fn launch_creates_or_reopens_exactly_the_requested_session() {
     assert_eq!(reopened.root_id().to_string(), tui_id);
     assert_eq!(session_ids(&server).await, with_tui);
 
-    // A name that resolves but cannot open is an error, not a replacement.
-    let _ = server
+    // Failed authorization must not publish an alias. Construct a legacy stale
+    // index entry directly to check that launch refuses to replace it.
+    assert!(
+        server
+            .registry()
+            .set_session_name("not-a-session", "ghost".into())
+            .await
+            .is_err()
+    );
+    assert!(
+        server
+            .registry()
+            .find_by_name("ghost")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let txn = server
         .registry()
-        .set_session_name("not-a-session", "ghost".into())
-        .await;
+        .chaz_group()
+        .new_transaction()
+        .await
+        .unwrap();
+    txn.get_store::<eidetica::store::DocStore>("session_names")
+        .await
+        .unwrap()
+        .set_string("ghost", "not-a-session")
+        .await
+        .unwrap();
+    txn.commit().await.unwrap();
     let error = launch_session(&server, Some("ghost"), true)
         .await
         .unwrap_err();
