@@ -6005,3 +6005,183 @@ async fn client_submission_publishes_one_child_then_executor_runs_it() {
     drop(shutdown);
     task.await.unwrap().unwrap();
 }
+
+#[tokio::test]
+async fn chaz_query_reports_persisted_agent_job_tool_ceilings() {
+    use crate::runtime::RuntimeMessage;
+    use crate::test_support::MockBackend;
+    let (_instance, fixture, registry) = server_fixture().await;
+    let mock = Arc::new(MockBackend::new());
+    mock.push_tool_calls(vec![(
+        "query-tools".into(),
+        "chaz".into(),
+        serde_json::json!({"query": "tools", "period": null}).to_string(),
+    )]);
+    mock.push_text("done");
+    let policies = Arc::new(crate::tool::ToolPolicyRegistry::empty());
+    let tools = Arc::new(ToolRegistry::new());
+    tools.register(crate::tools::ChazTool {
+        policies: policies.clone(),
+    });
+    tools.register(crate::tools::Calculate);
+    tools.register(crate::tools::GetTime);
+    let host = Arc::new(crate::test_support::MockHost::new());
+    let backend = BackendManager::with_mock(
+        mock.clone(),
+        crate::security::SecretStore::new(registry.chaz_peer().clone()).await,
+    );
+    let server = Server::new(
+        registry.clone(),
+        fixture.agents.clone(),
+        fixture.agent_index.clone(),
+        HostedIndex::empty("bank"),
+        HostedIndex::empty("skill_bank"),
+        tools,
+        policies,
+        crate::test_support::permissive_security(),
+        HashMap::new(),
+        Default::default(),
+        host.clone(),
+        Arc::new(crate::extension::ExtensionHub::new()),
+        backend,
+        Arc::new(crate::mcp::McpRegistry::new()),
+        Some(crate::instance::ExecutorCapability::for_test()),
+    );
+    fixture.shutdown().await;
+    let (parent, parent_db) = seed_agent(&server, &registry, "parent").await;
+    let mut parent_cfg = parent_db.read_config().await.unwrap();
+    parent_cfg.tools = Some(vec!["calculate".into(), "chaz".into()]);
+    parent_cfg.grants.insert("calculate".into(), serde_json::from_value(serde_json::json!({
+        "shell": {"allow": []}, "network": {"endpoints": []}, "fs": {"allow_read": [], "allow_write": []}
+    })).unwrap());
+    parent_db.write_config(&parent_cfg).await.unwrap();
+    let parent_agent = registry.agents.build_from_db_config("parent", &parent_cfg);
+    registry.agents.upsert(parent_agent);
+    let (_target, target_db) = seed_agent(&server, &registry, "child").await;
+    let target_cfg = target_db.read_config().await.unwrap();
+    assert!(target_cfg.grants.is_empty(), "target itself is permissive");
+    registry
+        .agents
+        .upsert(registry.agents.build_from_db_config("child", &target_cfg));
+    let (parent_id, _) = registry.create_session(Some("cli")).await.unwrap();
+    registry
+        .attach_agent_to_session(&parent_id.0, &parent)
+        .await
+        .unwrap();
+    let id = server
+        .submit_agent_job(&parent_id.0, "child", "inspect your own tools")
+        .await
+        .unwrap();
+    let status = server
+        .wait_job(&id, std::time::Duration::from_secs(15))
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            status.state,
+            crate::session::jobs::JobState::Succeeded { .. }
+        ),
+        "{status:?}"
+    );
+    let (_, db) = registry.open_session(&id).await.unwrap();
+    let accepted = crate::session::jobs::read_accepted_job(&db)
+        .await
+        .unwrap()
+        .unwrap();
+    let calls = mock.recorded_calls();
+    assert_eq!(calls.len(), 2);
+    let content = calls[1]
+        .messages
+        .iter()
+        .find_map(|m| match m {
+            RuntimeMessage::ToolResult { content, .. } => Some(content),
+            _ => None,
+        })
+        .unwrap();
+    // Runtime wraps successful JSON output as untrusted data.
+    let begin = content.find('{').unwrap();
+    let end = content.rfind('}').unwrap();
+    let output: serde_json::Value = serde_json::from_str(&content[begin..=end]).unwrap();
+    let rows = output["tools"].as_array().unwrap();
+    assert_eq!(
+        rows.iter()
+            .map(|r| r["name"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["calculate", "chaz"]
+    );
+    assert_eq!(
+        rows[0]["effective_grants"],
+        serde_json::to_value(&accepted.definition.tool_ceilings["calculate"]).unwrap()
+    );
+    assert_eq!(
+        rows[0]["effective_grants"]["shell"]["allow"],
+        serde_json::json!([])
+    );
+    assert_eq!(
+        rows[0]["effective_grants"]["network"]["endpoints"],
+        serde_json::json!([])
+    );
+    assert_eq!(
+        rows[0]["effective_grants"]["fs"]["allow_read"],
+        serde_json::json!([])
+    );
+    assert!(host.recorded_calls().is_empty());
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn costs_command_preserves_operator_text_contract() {
+    let (_instance, server, registry) = server_fixture().await;
+    let (id, db) = registry.create_session(Some("cli")).await.unwrap();
+    let mut session = Session::new(id.clone(), db.clone()).await;
+    session
+        .update_meta(|m| m.name = Some("fixture".into()))
+        .await
+        .unwrap();
+    session
+        .add_entry(SessionEntry {
+            sender: "agent".into(),
+            content: "message".into(),
+            timestamp: Utc::now(),
+            entry_type: EntryType::Message,
+            metadata: Some(crate::runtime::ResponseMetadata {
+                model: "model".into(),
+                usage: crate::runtime::TokenUsage {
+                    prompt_tokens: 100,
+                    completion_tokens: 50,
+                    cached_tokens: Some(10),
+                    cost_usd: Some(0.25),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+            routing: None,
+        })
+        .await
+        .unwrap();
+    let secrets = crate::security::SecretStore::new(registry.chaz_peer().clone()).await;
+    let ctx = crate::commands::CommandContext {
+        server: &server,
+        secrets: &secrets,
+        backend: &server.default_backend,
+        session_db_id: &id.0,
+        session_db: &db,
+        current_agent: "agent",
+        session_name: Some("fixture"),
+    };
+    let crate::commands::CommandOutcome::Text(text) =
+        crate::commands::dispatch(crate::commands::Command::ListCosts, &ctx).await
+    else {
+        panic!("costs must return text")
+    };
+    assert_eq!(
+        text,
+        concat!(
+            "LLM usage\n  Sessions: 1 scanned, 1 with recorded usage\n",
+            "  Total: 1 call | 100 prompt + 50 completion (10 cached) | $0.2500\n",
+            "\nBy model:\n  model                                       1 call  $0.2500\n",
+            "\nTop sessions:\n  fixture                          [cli   ]    1 call  $0.2500\n"
+        )
+    );
+    server.shutdown().await;
+}
