@@ -545,11 +545,16 @@ The result is `{"session_db_id":"<child DB ID>","state":"pending"}`. Keep that h
 
 A queued job can be adopted after executor restart. An attempt that started but has no completion is **not** automatically replayed: model or tool effects may already have happened. Inspect its status and transcript, open the child session, and use `/interrupted` to find the request ID before deciding whether `/retry <request_id>` is safe; do not submit a new task to guess whether the old one ran. If creation or publication returns an uncertain outcome, inspect the session catalog for the published job before submitting again. There is no stable parent request key or automatic submission retry; an unpublished prepared DB is inert and may require manual inspection. Same-Agent/home last-writer-wins claims are not fencing: concurrent executors can overlap and effects are not exactly-once.
 
+### Waiting without holding a slot
+
+The executor allows ten turns to execute at once. An Agent calling `job_wait` releases its slot while observing, so ten waiting parents cannot block their own queued children. The parent keeps its attempt and claim; waiting does not complete, retry, or restart the turn. It reacquires a slot before running another tool, an extension result hook, or a model request. This capacity wait can delay continuation beyond the observation deadline. Tool errors and policy timeouts also require reacquisition; executor shutdown or observed claim loss stops the turn instead. No wait continuation is replayed after restart.
+
 For example:
 
 1. Submit `{"agent_ref":"researcher","task":"Find the canonical reference"}`. The response is `{"session_db_id":"<child DB ID>","state":"pending"}`, not the research answer.
-2. Call `job_wait` with `{"session_db_id":"<child DB ID>","timeout_seconds":1}`. If capacity is full, it can return `{"session_db_id":"<child DB ID>","state":"Queued"}`. Keep the handle and check again; the timeout did not cancel the job.
-3. If an executor stops after starting, a client may instead see `{"session_db_id":"<child DB ID>","state":{"StartedUnknown":{"attempt_id":"<attempt ID>","activity_recent":false}}}`. Check the child session's `/interrupted` and transcript before an explicit retry. Do not treat a stale start as a failed result.
+2. Call `job_wait` with `{"session_db_id":"<child DB ID>","timeout_seconds":30}`. The parent yields its slot. If the child finishes, the response can be `{"session_db_id":"<child DB ID>","state":{"Succeeded":{"text":"Canonical reference found"}}}`. The parent regains a slot before its next tool or model call.
+3. If all slots remain busy or the child is still running, a shorter wait such as `{"session_db_id":"<child DB ID>","timeout_seconds":1}` can return `{"session_db_id":"<child DB ID>","state":"Queued"}`. Keep the handle and check again; the timeout did not cancel the job.
+4. If an executor stops after starting, a client may instead see `{"session_db_id":"<child DB ID>","state":{"StartedUnknown":{"attempt_id":"<attempt ID>","activity_recent":false}}}`. Check the child session's `/interrupted` and transcript before an explicit retry. Do not treat a stale start as a failed result.
 
 `spawn_worker` is separate: it invokes a Worker template under the calling Agent and waits by default. Its optional `async` mode is not a durable Agent job; Workers have no Agent identity or Agent-job status handle.
 

@@ -1176,6 +1176,17 @@ impl Session {
         &self,
         request_id: TurnRequestId,
     ) -> anyhow::Result<TurnAttempt> {
+        self.start_turn_attempt_as(request_id, uuid::Uuid::new_v4().to_string())
+            .await
+    }
+
+    /// Start an attempt under a caller-chosen ID, so an executor can mark it
+    /// live before the Started record becomes visible to observers.
+    pub async fn start_turn_attempt_as(
+        &self,
+        request_id: TurnRequestId,
+        attempt_id: String,
+    ) -> anyhow::Result<TurnAttempt> {
         let generation = self
             .read_turn_attempts()
             .await?
@@ -1186,7 +1197,7 @@ impl Session {
             .unwrap_or(0)
             + 1;
         let attempt = TurnAttempt {
-            attempt_id: uuid::Uuid::new_v4().to_string(),
+            attempt_id,
             request_id,
             started_at: Utc::now(),
             generation,

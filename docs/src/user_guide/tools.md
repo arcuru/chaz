@@ -14,7 +14,7 @@ Every built-in is owned by an [extension](extensions.md); disabling an extension
 | `compact`           | `core`     | Low    | Never              | Summarize and compact conversation context                             |
 | `spawn_agent`       | `core`     | Medium | UnlessAutoApproved | Submits a durable Agent job and returns its DB handle immediately      |
 | `job_status`        | `core`     | Low    | Never              | Reads the durable state and typed result of an Agent job               |
-| `job_wait`          | `core`     | Low    | Never              | Waits up to a deadline for a job; timeout returns its current status   |
+| `job_wait`          | `core`     | Low    | Never              | Observes a job with a deadline, yielding the Agent's execution slot    |
 | `spawn_worker`      | `core`     | Medium | UnlessAutoApproved | Invokes a Worker template declared under the calling Agent (no keys)   |
 | `shell`             | `core`     | High   | Always             | Executes a shell command                                               |
 | `read_file`         | `fs`       | Low    | Never              | Reads file contents from disk                                          |
@@ -179,7 +179,7 @@ Use the `session_db_id` returned by `spawn_agent` to check a job, or wait for a 
 {"session_db_id":"<child DB ID>","timeout_seconds":30}
 ```
 
-The first object is for `job_status`; the second is for `job_wait` (`timeout_seconds` is an integer from 1 to 240, default 30). Both return `session_db_id` and a typed `state`: `Pending`, `Rejected`, `Queued`, `Running`, `StartedUnknown`, `Interrupted`, `Succeeded`, or `Failed` (with attempt ID, recent-activity hint, text, or error as applicable). A timed-out wait returns current status; it does not cancel work. A start with no completion may already have caused effects: inspect and explicitly retry an interrupted request, never assume automatic replay. If creation returns an uncertain outcome, inspect the catalog before submitting another job; there is no stable request key or automatic submission retry. The handle does not grant session DB access.
+The first object is for `job_status`; the second is for `job_wait` (`timeout_seconds` is an integer from 1 to 240, default 30). Both return `session_db_id` and a typed `state`: `Pending`, `Rejected`, `Queued`, `Running`, `StartedUnknown`, `Interrupted`, `Succeeded`, or `Failed` (with attempt ID, recent-activity hint, text, or error as applicable). A timed-out wait returns current status; it does not cancel work. A start with no completion may already have caused effects: inspect and explicitly retry an interrupted request, never assume automatic replay. If creation returns an uncertain outcome, inspect the catalog before submitting another job; there is no stable request key or automatic submission retry. The handle does not grant session DB access. During an in-Agent wait, the parent yields its execution slot so queued children can run, then reacquires a slot before continuing. The observation deadline does not bound this subsequent capacity wait; see [Waiting without holding a slot](agents.md#waiting-without-holding-a-slot).
 
 ### spawn_worker
 
