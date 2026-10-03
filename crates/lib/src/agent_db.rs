@@ -958,7 +958,11 @@ where
     }
 }
 
-async fn write_blob<T>(database: &Database, store_name: &str, value: &T) -> anyhow::Result<()>
+pub(crate) async fn write_blob<T>(
+    database: &Database,
+    store_name: &str,
+    value: &T,
+) -> anyhow::Result<()>
 where
     T: serde::Serialize,
 {
@@ -1196,6 +1200,105 @@ mod tests {
         assert_eq!(db.read_meta().await.unwrap(), meta);
         // Returned pubkey is an actual key the user holds for this DB.
         assert_eq!(user.find_key(&db.id()).unwrap(), Some(pubkey));
+    }
+
+    #[tokio::test]
+    async fn blob_reads_default_only_when_missing() {
+        use crate::memory_bank_db::{MemoryBankDb, MemoryBankMeta};
+        use crate::skill_bank_db::{SkillBankDb, SkillBankMeta};
+
+        let mut user = test_peer_user().await;
+        let key = user.get_default_key().unwrap();
+        let database = user.create_database(Doc::new(), &key).await.unwrap();
+        let agent = AgentDb::from_database(database.clone());
+        let memory = MemoryBankDb::from_database(database.clone());
+        let skills = SkillBankDb::from_database(database.clone());
+
+        assert_eq!(agent.read_config().await.unwrap(), AgentDbConfig::default());
+        assert_eq!(agent.read_meta().await.unwrap(), AgentMeta::default());
+        assert_eq!(memory.read_meta().await.unwrap(), MemoryBankMeta::default());
+        assert_eq!(skills.read_meta().await.unwrap(), SkillBankMeta::default());
+
+        let txn = database.new_transaction().await.unwrap();
+        for name in ["config", "meta"] {
+            let store = txn.get_store::<DocStore>(name).await.unwrap();
+            store.set("value", 42i64).await.unwrap();
+        }
+        txn.commit().await.unwrap();
+
+        // A present non-string value is a storage error, not a missing blob.
+        for error in [
+            agent.read_config().await.unwrap_err(),
+            agent.read_meta().await.unwrap_err(),
+            memory.read_meta().await.unwrap_err(),
+            skills.read_meta().await.unwrap_err(),
+        ] {
+            assert!(
+                !error
+                    .downcast_ref::<eidetica::Error>()
+                    .unwrap()
+                    .is_not_found()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn blob_reads_propagate_json_errors() {
+        use crate::memory_bank_db::MemoryBankDb;
+        use crate::skill_bank_db::SkillBankDb;
+
+        let (_user, agent) = peer_with_agent_db().await;
+        let memory = MemoryBankDb::from_database(agent.database().clone());
+        let skills = SkillBankDb::from_database(agent.database().clone());
+
+        // Both malformed JSON and valid JSON with incompatible field types.
+        for json in ["{", r#"{"system_prompt":42,"display_name":42}"#] {
+            let txn = agent.database().new_transaction().await.unwrap();
+            for name in ["config", "meta"] {
+                let store = txn.get_store::<DocStore>(name).await.unwrap();
+                store.set_string("value", json).await.unwrap();
+            }
+            txn.commit().await.unwrap();
+
+            for error in [
+                agent.read_config().await.unwrap_err(),
+                agent.read_meta().await.unwrap_err(),
+                memory.read_meta().await.unwrap_err(),
+                skills.read_meta().await.unwrap_err(),
+            ] {
+                assert!(error.is::<serde_json::Error>());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn blob_write_preserves_key_store_and_single_commit() {
+        let (_user, agent) = peer_with_agent_db().await;
+        let database = agent.database();
+        let value = serde_json::json!({"nested": {"list": [1, "two"], "enabled": true}});
+
+        for (name, other) in [("config", "meta"), ("meta", "config")] {
+            let txn = database.new_transaction().await.unwrap();
+            let other_store = txn.get_store::<DocStore>(other).await.unwrap();
+            let other_before = other_store.get_string("value").await.unwrap();
+            let before = database.snapshot().await.unwrap();
+
+            write_blob(database, name, &value).await.unwrap();
+
+            let after = database.snapshot().await.unwrap();
+            assert_eq!(after.tips().len(), 1);
+            let entry = database.get_entry(after.tips()[0].clone()).await.unwrap();
+            assert_eq!(entry.parents().unwrap(), before.into_tips());
+
+            let txn = database.new_transaction().await.unwrap();
+            let store = txn.get_store::<DocStore>(name).await.unwrap();
+            assert_eq!(
+                store.get_string("value").await.unwrap(),
+                serde_json::to_string(&value).unwrap()
+            );
+            let other_store = txn.get_store::<DocStore>(other).await.unwrap();
+            assert_eq!(other_store.get_string("value").await.unwrap(), other_before);
+        }
     }
 
     #[tokio::test]
