@@ -466,6 +466,7 @@ mod tests {
             server_slot: spawn_slot.clone(),
             backend_manager: backend_mgr.clone(),
             security: security.clone(),
+            tool_policies: policies.clone(),
         });
         installed_extensions.extend(extra);
         hub.install_all(installed_extensions).await.unwrap();
@@ -584,9 +585,11 @@ mod tests {
             !names.contains("workflow"),
             "workflow must not be registered"
         );
-        for name in ["spawn_agent", "job_status", "job_wait"] {
+        for name in ["chaz", "spawn_agent", "job_status", "job_wait"] {
             assert!(names.contains(name), "missing built-in {name}");
         }
+        assert_eq!(f.tool_registry.owner_of("chaz"), Some("core"));
+        assert!(f.tool_registry.get("chaz").unwrap().strict_schema());
         for name in ["job_status", "job_wait"] {
             let description = f.tool_registry.get(name).unwrap().descriptor().description;
             assert!(description.contains("Agent job"));

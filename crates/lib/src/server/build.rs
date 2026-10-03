@@ -649,6 +649,7 @@ pub async fn build(
         server_slot: server_slot.clone(),
         backend_manager: default_backend.clone(),
         security: security_ctx.clone(),
+        tool_policies: policies.clone(),
     });
     if opts.run_agent_loop && !mcp_configs.is_empty() {
         for config in &mcp_configs {
