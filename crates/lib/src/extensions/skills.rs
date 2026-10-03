@@ -6,6 +6,10 @@
 //! 1. `.chaz/skills/` — project-local (relative to cwd)
 //! 2. `~/.config/chaz/skills/` — user-global
 //!
+//! Within each directory, `*.md` files are parsed in lexical path order,
+//! so when two files in one directory declare the same `name`, the file
+//! whose path sorts first wins.
+//!
 //! SKILL.md format: YAML frontmatter + Markdown body.
 
 use crate::extension::caps::{CapabilityKind, CapabilityRequest, PromptAugmentation};
@@ -56,20 +60,21 @@ impl SkillRegistry {
     /// [`scan`], but with caller-provided paths. Used by tests; `scan` is the
     /// production entry point.
     fn scan_paths(&mut self, dirs: &[PathBuf]) {
+        self.load_listings(dirs.iter().map(list_dir));
+    }
+
+    /// Parse and dedupe directory listings, one listing per source
+    /// directory, in source priority order. A listing may arrive in any
+    /// order (`read_dir` makes no ordering promise); its `.md` files are
+    /// sorted lexically by path before parsing, so the first file in path
+    /// order wins a name shared by two files in the same directory, and
+    /// the resulting catalog is identical however the filesystem
+    /// enumerates entries.
+    fn load_listings(&mut self, listings: impl IntoIterator<Item = Vec<PathBuf>>) {
         let mut seen: HashMap<String, usize> = HashMap::new();
 
-        for dir in dirs {
-            if !dir.is_dir() {
-                continue;
-            }
-            let Ok(entries) = std::fs::read_dir(dir) else {
-                continue;
-            };
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.extension().is_none_or(|e| e != "md") {
-                    continue;
-                }
+        for listing in listings {
+            for path in skill_files(listing) {
                 match parse_skill_md(&path) {
                     Ok(skill) => {
                         if seen.contains_key(&skill.name) {
@@ -106,6 +111,28 @@ impl SkillRegistry {
             })
             .collect()
     }
+}
+
+/// Every entry of `dir`, in whatever order the filesystem yields them.
+/// A missing or unreadable directory lists as empty.
+fn list_dir(dir: &PathBuf) -> Vec<PathBuf> {
+    if !dir.is_dir() {
+        return Vec::new();
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    entries.flatten().map(|entry| entry.path()).collect()
+}
+
+/// The `.md` entries of one directory listing, sorted lexically by path.
+fn skill_files(listing: Vec<PathBuf>) -> Vec<PathBuf> {
+    let mut files: Vec<PathBuf> = listing
+        .into_iter()
+        .filter(|path| path.extension().is_some_and(|e| e == "md"))
+        .collect();
+    files.sort();
+    files
 }
 
 fn dirs_fallback() -> PathBuf {
@@ -2056,6 +2083,326 @@ mod tests {
         assert!(out.starts_with("## Available skills\n"));
         assert!(out.contains("- **nix** — Nix tips"));
         assert!(out.contains("- **rust** — Rust building"));
+    }
+
+    // ── Disk discovery order (6) ─────────────────────────────────────
+
+    /// Write `files` into a fresh temp dir, in the given order or reversed,
+    /// so two fixtures can hold identical contents created in opposite
+    /// orders.
+    fn write_fixture(files: &[(&str, &str)], reversed: bool) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let mut order: Vec<&(&str, &str)> = files.iter().collect();
+        if reversed {
+            order.reverse();
+        }
+        for (filename, contents) in order {
+            write_skill(dir.path(), filename, contents);
+        }
+        dir
+    }
+
+    /// Load `dirs` through `load_listings` with every listing handed over
+    /// in ascending or descending path order — standing in for filesystems
+    /// whose `read_dir` order differs, which a single test filesystem can't
+    /// reproduce on demand.
+    fn load_enumerated(dirs: &[&std::path::Path], descending: bool) -> SkillRegistry {
+        let mut r = SkillRegistry::new();
+        r.load_listings(dirs.iter().map(|dir| {
+            let mut listing = list_dir(&dir.to_path_buf());
+            listing.sort();
+            if descending {
+                listing.reverse();
+            }
+            listing
+        }));
+        r
+    }
+
+    /// The catalog block the system prompt would carry for `disk` alone.
+    async fn render_disk_catalog(disk: SkillRegistry, tools: &[&str]) -> Option<String> {
+        let (_i, registry) = fresh_session_registry().await;
+        let disk = Arc::new(std::sync::RwLock::new(disk));
+        let aug = SkillsPromptAugmentation {
+            inputs: Arc::new(session_skills_with_disk(disk, registry)),
+        };
+        let tools: Vec<String> = tools.iter().map(|t| (*t).to_string()).collect();
+        aug.augment_system_prompt("test-agent", &[], &tools)
+            .await
+            .expect("cap call succeeds")
+    }
+
+    /// Render `dirs` via the real `scan_paths` and via both adversarial
+    /// enumeration orders; assert all three are byte-identical and return
+    /// the shared text.
+    async fn render_every_enumeration(dirs: &[&std::path::Path], tools: &[&str]) -> String {
+        let mut scanned = SkillRegistry::new();
+        scanned.scan_paths(&dirs.iter().map(|d| d.to_path_buf()).collect::<Vec<_>>());
+        let scanned = render_disk_catalog(scanned, tools).await.unwrap();
+        let ascending = render_disk_catalog(load_enumerated(dirs, false), tools)
+            .await
+            .unwrap();
+        let descending = render_disk_catalog(load_enumerated(dirs, true), tools)
+            .await
+            .unwrap();
+        assert_eq!(
+            ascending, descending,
+            "enumeration order changed the catalog"
+        );
+        assert_eq!(scanned, ascending, "scan_paths disagrees with sorted load");
+        scanned
+    }
+
+    fn catalog_lines(out: &str) -> Vec<&str> {
+        out.lines().filter(|l| l.starts_with("- **")).collect()
+    }
+
+    #[tokio::test]
+    async fn disk_catalog_is_byte_identical_across_creation_and_enumeration_order() {
+        let files = [
+            ("alpha.md", skill_md("alpha", "first", &[], "a")),
+            ("bravo.md", skill_md("bravo", "second", &[], "b")),
+            ("charlie.md", skill_md("charlie", "third", &[], "c")),
+            ("dup-1.md", skill_md("dup", "dup from 1", &[], "1")),
+            ("dup-2.md", skill_md("dup", "dup from 2", &[], "2")),
+        ];
+        let files: Vec<(&str, &str)> = files.iter().map(|(f, c)| (*f, c.as_str())).collect();
+        let forward = write_fixture(&files, false);
+        let backward = write_fixture(&files, true);
+
+        let forward_text = render_every_enumeration(&[forward.path()], &[]).await;
+        let backward_text = render_every_enumeration(&[backward.path()], &[]).await;
+        assert_eq!(forward_text, backward_text);
+    }
+
+    #[tokio::test]
+    async fn disk_catalog_unique_names_follow_lexical_path_order() {
+        // Path order (a, b, c) deliberately differs from name order.
+        let dir = tempfile::tempdir().unwrap();
+        write_skill(dir.path(), "c.md", &skill_md("zulu", "Z", &[], "z"));
+        write_skill(dir.path(), "a.md", &skill_md("mike", "M", &[], "m"));
+        write_skill(dir.path(), "b.md", &skill_md("alpha", "A", &[], "a"));
+
+        let out = render_every_enumeration(&[dir.path()], &[]).await;
+        assert_eq!(
+            catalog_lines(&out),
+            ["- **mike** — M", "- **alpha** — A", "- **zulu** — Z"]
+        );
+    }
+
+    #[tokio::test]
+    async fn disk_duplicate_name_in_one_directory_resolves_to_first_path() {
+        let dir = tempfile::tempdir().unwrap();
+        write_skill(
+            dir.path(),
+            "20-deploy.md",
+            &skill_md("deploy", "later", &[], "2"),
+        );
+        write_skill(
+            dir.path(),
+            "10-deploy.md",
+            &skill_md("deploy", "earlier", &[], "1"),
+        );
+
+        let out = render_every_enumeration(&[dir.path()], &[]).await;
+        assert_eq!(catalog_lines(&out), ["- **deploy** — earlier"]);
+    }
+
+    #[tokio::test]
+    async fn disk_malformed_and_non_markdown_files_do_not_perturb_order() {
+        let skills = [
+            ("b.md", skill_md("bravo", "B", &[], "b")),
+            ("d.md", skill_md("delta", "D", &[], "d")),
+        ];
+        let clean = tempfile::tempdir().unwrap();
+        let noisy = tempfile::tempdir().unwrap();
+        for (filename, contents) in &skills {
+            write_skill(clean.path(), filename, contents);
+            write_skill(noisy.path(), filename, contents);
+        }
+        // Interleaved with the real skills in path order.
+        write_skill(noisy.path(), "a.md", "no frontmatter\n");
+        write_skill(noisy.path(), "c.md", "---\nname: unclosed\n");
+        write_skill(noisy.path(), "a.txt", &skill_md("text", "T", &[], "t"));
+        write_skill(noisy.path(), "e", &skill_md("bare", "E", &[], "e"));
+
+        let clean_text = render_every_enumeration(&[clean.path()], &[]).await;
+        let noisy_text = render_every_enumeration(&[noisy.path()], &[]).await;
+        assert_eq!(clean_text, noisy_text);
+        assert_eq!(
+            catalog_lines(&noisy_text),
+            ["- **bravo** — B", "- **delta** — D"]
+        );
+    }
+
+    #[tokio::test]
+    async fn disk_requires_tools_filtering_is_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        write_skill(dir.path(), "a.md", &skill_md("plain", "P", &[], "p"));
+        write_skill(
+            dir.path(),
+            "b.md",
+            "---\nname: needs-shell\ndescription: S\nrequires_tools: [shell]\n---\nbody\n",
+        );
+        write_skill(dir.path(), "c.md", &skill_md("tail", "T", &[], "t"));
+
+        let without = render_every_enumeration(&[dir.path()], &[]).await;
+        assert_eq!(
+            catalog_lines(&without),
+            ["- **plain** — P", "- **tail** — T"]
+        );
+        let with = render_every_enumeration(&[dir.path()], &["shell"]).await;
+        assert_eq!(
+            catalog_lines(&with),
+            ["- **plain** — P", "- **needs-shell** — S", "- **tail** — T"]
+        );
+    }
+
+    async fn insert_skill_row(db: &eidetica::Database, name: &str, description: &str) {
+        use eidetica::store::Table;
+        let txn = db.new_transaction().await.unwrap();
+        let store = txn
+            .get_store::<Table<crate::agent_db::Skill>>(crate::agent_db::SKILLS_STORE)
+            .await
+            .unwrap();
+        store
+            .insert(crate::agent_db::Skill {
+                name: name.into(),
+                description: description.into(),
+                body: "body".into(),
+                timestamp: chrono::Utc::now(),
+                tags: vec![],
+            })
+            .await
+            .unwrap();
+        txn.commit().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn disk_source_and_layer_precedence_is_unchanged() {
+        // Project dir before global dir; disk before agent before granted
+        // bank before session-attached bank.
+        let project = tempfile::tempdir().unwrap();
+        let global = tempfile::tempdir().unwrap();
+        write_skill(
+            project.path(),
+            "z.md",
+            &skill_md("project-only", "P", &[], "p"),
+        );
+        write_skill(
+            project.path(),
+            "shared.md",
+            &skill_md("shared", "project", &[], "p"),
+        );
+        write_skill(
+            global.path(),
+            "a.md",
+            &skill_md("global-only", "G", &[], "g"),
+        );
+        write_skill(
+            global.path(),
+            "shared.md",
+            &skill_md("shared", "global", &[], "g"),
+        );
+        write_skill(
+            global.path(),
+            "layer.md",
+            &skill_md("layer", "disk", &[], "g"),
+        );
+
+        let (_i, registry) = fresh_session_registry().await;
+        let agent_index = crate::hosted_index::HostedIndex::empty("agent");
+        let skill_bank_index = crate::hosted_index::HostedIndex::empty("skill_bank");
+
+        let (agent_db, agent_pubkey) = registry
+            .create_new_agent_db(
+                "test-agent",
+                &crate::agent_db::AgentDbConfig::default(),
+                &crate::agent_db::AgentMeta {
+                    display_name: Some("test-agent".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        agent_index.register(crate::hosted_index::DbEntry {
+            db_id: agent_db.id(),
+            display_name: "test-agent".into(),
+            pubkey: agent_pubkey,
+        });
+        insert_skill_row(agent_db.database(), "layer", "agent").await;
+        insert_skill_row(agent_db.database(), "agent-vs-bank", "agent").await;
+
+        for bank_name in ["granted", "attached"] {
+            let (bank, pubkey) = registry
+                .create_new_skill_bank(
+                    bank_name,
+                    &crate::skill_bank_db::SkillBankMeta {
+                        display_name: Some(bank_name.into()),
+                        description: None,
+                    },
+                )
+                .await
+                .unwrap();
+            skill_bank_index.register(crate::hosted_index::DbEntry {
+                db_id: bank.id(),
+                display_name: bank_name.into(),
+                pubkey,
+            });
+            insert_skill_row(bank.database(), "layer", bank_name).await;
+            insert_skill_row(bank.database(), "agent-vs-bank", bank_name).await;
+            insert_skill_row(bank.database(), "bank-vs-session", bank_name).await;
+            if bank_name == "granted" {
+                agent_db
+                    .attach_skill_bank(crate::agent_db::SkillBankRef {
+                        name: bank_name.into(),
+                        db_id: bank.id().to_string(),
+                        permission: crate::agent_db::BankPermission::Read,
+                    })
+                    .await
+                    .unwrap();
+            }
+        }
+
+        let mut rendered = Vec::new();
+        for descending in [false, true] {
+            let disk = load_enumerated(&[project.path(), global.path()], descending);
+            let inputs = Arc::new(SessionSkills {
+                disk: Arc::new(std::sync::RwLock::new(disk)),
+                registry: registry.clone(),
+                agent_index: agent_index.clone(),
+                skill_bank_index: skill_bank_index.clone(),
+                session_attached_banks: vec!["attached".into()],
+            });
+            let entries = inputs.catalog_for("test-agent").await;
+            let winner = |name: &str| entries.iter().find(|e| e.name == name).unwrap();
+            let shared = winner("shared");
+            assert_eq!(shared.description, "project");
+            assert!(matches!(shared.source, SkillSource::Disk));
+            let layer = winner("layer");
+            assert_eq!(layer.description, "disk");
+            assert!(matches!(layer.source, SkillSource::Disk));
+            let agent_vs_bank = winner("agent-vs-bank");
+            assert_eq!(agent_vs_bank.description, "agent");
+            assert!(matches!(agent_vs_bank.source, SkillSource::Agent));
+            let bank_vs_session = winner("bank-vs-session");
+            assert_eq!(bank_vs_session.description, "granted");
+            assert!(
+                matches!(&bank_vs_session.source, SkillSource::Bank { name } if name == "granted")
+            );
+            let out = format_catalog(&entries, &[]).unwrap();
+            assert_eq!(
+                catalog_lines(&out)[..4],
+                [
+                    "- **shared** — project",
+                    "- **project-only** — P",
+                    "- **global-only** — G",
+                    "- **layer** — disk",
+                ]
+            );
+            rendered.push(out);
+        }
+        assert_eq!(rendered[0], rendered[1]);
     }
 
     // ── Extension trait surface (3) ──────────────────────────────────
