@@ -164,7 +164,7 @@ fn page(text: &str, offset: usize, limit: Option<usize>) -> Result<String, crate
     }
 
     if end == start {
-        // The first requested line alone exceeds the ceiling. Say so rather
+        // The first requested line alone exceeds the content budget. Say so rather
         // than returning a cut line or silently skipping it.
         let size = lines[start].len();
         let skip = if offset < total {
@@ -173,8 +173,9 @@ fn page(text: &str, offset: usize, limit: Option<usize>) -> Result<String, crate
             "; it is the last line".to_string()
         };
         return Ok(format!(
-            "[Line {offset} of {total} is {size} bytes, over the {READ_MAX_BYTES}-byte \
-             output ceiling, so it was not returned. Read a bounded slice of it with the \
+            "[Line {offset} of {total} is {size} bytes, over the {byte_budget}-byte \
+             page content budget (the {READ_MAX_BYTES}-byte output ceiling includes the \
+             notice), so it was not returned. Read a bounded slice of it with the \
              shell tool (for example: sed -n '{offset}p' FILE | head -c 50000){skip}.]"
         ));
     }
@@ -576,8 +577,8 @@ mod tests {
 
     #[tokio::test]
     async fn read_file_consecutive_pages_reconstruct_large_file_exactly() {
-        // 5,000 numbered lines (~ 79 KB): exceeds both ceilings, so the
-        // default page stops at the line ceiling and continues cleanly.
+        // 5,000 numbered lines (~ 250 KB): exceeds both ceilings, so the
+        // default page stops at the byte ceiling and continues cleanly.
         let body: String = (1..=5000)
             .map(|i| format!("{i:05} the quick brown fox jumps over the lazy dog\n"))
             .collect();
@@ -698,6 +699,64 @@ mod tests {
         assert!(out.starts_with("[Line 1 of 1 is 51201 bytes"), "{out}");
         assert!(out.contains("it is the last line"), "{out}");
         assert!(!out.contains("offset="), "{out}");
+    }
+
+    #[tokio::test]
+    async fn read_file_content_budget_boundary_is_reported_honestly() {
+        let budget = READ_MAX_BYTES - NOTICE_RESERVE;
+        for size in [budget, budget + 1, READ_MAX_BYTES] {
+            let line = format!("{}\n", "x".repeat(size - 1));
+            let body = format!("before\n{line}after\n");
+            let out = read(
+                body.as_bytes(),
+                serde_json::json!({ "path": "/f", "offset": 2 }),
+            )
+            .await
+            .unwrap();
+            assert_within_caps(&out);
+            if size == budget {
+                let (content, notice) = split_notice(&out);
+                assert_eq!(content, line);
+                assert!(notice.contains("offset=3"), "{notice}");
+            } else {
+                assert!(
+                    out.starts_with(&format!("[Line 2 of 3 is {size} bytes")),
+                    "{out}"
+                );
+                assert!(
+                    out.contains(&format!("over the {budget}-byte page content budget")),
+                    "{out}"
+                );
+                assert!(
+                    out.contains("not returned") && out.contains("offset=3"),
+                    "{out}"
+                );
+                assert!(!out.contains("over the 51200-byte output ceiling"), "{out}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn read_file_paging_keeps_lossy_utf8_decoding_policy() {
+        let body = b"a\xff\r\nb";
+        let out = read(body, serde_json::json!({ "path": "/f", "limit": 1 }))
+            .await
+            .unwrap();
+        assert_eq!(
+            out,
+            "a\u{fffd}\r\n\n[Lines 1-1 of 2; stopped at the requested limit. Use offset=2 to continue.]"
+        );
+        let out = read(body, serde_json::json!({ "path": "/f", "offset": 2 }))
+            .await
+            .unwrap();
+        assert_eq!(
+            out,
+            "b\n\n[Lines 2-2 of 2; end of file (the last line has no final newline).]"
+        );
+        let out = read(body, serde_json::json!({ "path": "/f" }))
+            .await
+            .unwrap();
+        assert_eq!(out, "a\u{fffd}\r\nb");
     }
 
     #[tokio::test]
