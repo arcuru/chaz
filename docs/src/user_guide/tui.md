@@ -364,3 +364,15 @@ When an agent calls a tool that requires approval, the TUI shows an inline promp
 ```
 
 Press `y` to approve, `n` to deny, or `a` to approve all remaining tool calls for this turn.
+
+## Testing the terminal lifecycle
+
+Contributors can run `nix develop .# -c just tui-pty` on Linux with `uv` available.
+This drives the real TUI under a narrow PTY with a disposable database and a
+loopback stub backend: Unicode input, final reply rendering, resize, and idle
+Ctrl+C quit with terminal restoration.
+It also checks that missing output fails on both early exit and timeout, and
+that children are reaped.
+This complements the fast widget snapshots; it does not test in-flight job
+cancellation.
+See `dev/tui-pty/README.md` for isolation details and failure artifact locations.
