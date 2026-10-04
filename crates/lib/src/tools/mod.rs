@@ -1,5 +1,6 @@
 mod agent;
 mod calculate;
+mod chaz;
 mod compact;
 mod describe;
 mod edit;
@@ -15,6 +16,7 @@ mod worker;
 
 pub use agent::SpawnAgent;
 pub use calculate::Calculate;
+pub use chaz::ChazTool;
 pub use compact::Compact;
 pub use describe::DescribeTool;
 pub use edit::EditFile;

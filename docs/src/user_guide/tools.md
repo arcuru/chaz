@@ -11,6 +11,7 @@ Every built-in is owned by an [extension](extensions.md); disabling an extension
 | `get_time`          | `system`   | Low    | Never              | Returns the current UTC time                                           |
 | `calculate`         | `system`   | Low    | Never              | Evaluates math expressions (via meval)                                 |
 | `describe_tool`     | `system`   | Low    | Never              | Returns full description/schema for a tool (discovery)                 |
+| `chaz`              | `core`     | Low    | Never              | Query this runtime's session, identity, callable tools, or usage       |
 | `compact`           | `core`     | Low    | Never              | Summarize and compact conversation context                             |
 | `spawn_agent`       | `core`     | Medium | UnlessAutoApproved | Submits a durable Agent job and returns its DB handle immediately      |
 | `job_status`        | `core`     | Low    | Never              | Reads the durable state and typed result of an Agent job               |
@@ -35,6 +36,99 @@ Every built-in is owned by an [extension](extensions.md); disabling an extension
 | `schedule_once`     | `schedule` | Low    | Never              | Add a one-shot schedule firing after N seconds                         |
 
 Built-in tools are grouped by extension. External tools from [MCP servers](mcp.md) plug in under the same policy layer and show up here too, namespaced as `<server>__<tool>` (matches the Anthropic Agent SDK / Claude Code `mcp__server__tool` convention so OpenAI-compatible providers, which reject dots in function names, accept them).
+
+## Your runtime-local view
+
+The builtin `chaz` tool is a read-only mirror of the calling runtime, not a peer-wide catalog.
+It can answer where you are, who is calling, which tools are callable, and what usage is recorded in this session.
+It cannot look up other sessions or agents, inspect full configuration or memory, or change anything.
+The `core` extension publishes the whole bundle under one tool name; a restrictive `allowed_tools` list must include `chaz` to permit any of its queries.
+Normal policy overrides, approval, timeout, rate limiting, and output safety processing still apply.
+No shell, filesystem, or network capability is needed for these self-only reads.
+
+Both `query` and `period` are required, and no other arguments are accepted.
+For `session`, `agent`, and `tools`, `period` must be JSON `null`.
+For `usage`, it must be `all`, `today`, `week`, or `month`.
+
+| Query     | Result fields                                            | Meaning                                                                                                                     |
+| --------- | -------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------- |
+| `session` | `session_db_id`, `name`                                  | Only the current session; `name` is null if no name is available.                                                           |
+| `agent`   | `name`, `call_depth`, `max_call_depth`                   | Runtime caller identity and nested spawn depth, not a ReAct iteration limit. A Worker inherits its owning Agent's identity. |
+| `tools`   | `tools`                                                  | Callable tools sorted by name, within this runtime's narrowed scope and active extensions.                                  |
+| `usage`   | `session_db_id`, `period`, `since`, `total`, `per_model` | Recorded Message metadata in the loaded current session; `since` is a UTC RFC3339 boundary or null for `all`.               |
+
+Each tool row contains only `name`, `presentation`, `risk`, `approval`, `timeout_seconds`, `rate_limit`, and `effective_grants`.
+Enums use their normal lowercase encodings: presentation is `full`, `brief`, `summary`, or `hidden`.
+`effective_grants` has the existing shell/network/filesystem grant shape, attenuated by the session, caller, and per-tool ceilings, including persisted Agent-job ceilings.
+`rate_limit` is the configured calls-per-minute limit or null, not remaining quota.
+`approval` reports the resolved requirement, not a guarantee that a future call will execute automatically.
+A Hidden tool is still callable and appears here as `hidden`; removing it from `allowed_tools` revokes access, while disabling its extension also removes it from this view.
+Use `describe_tool` (when permitted) for full descriptions and schemas.
+
+Usage periods are the current **UTC calendar** day, Monday-start week, or month, not rolling windows or local time.
+Entries exactly at the boundary are included.
+`total` contains `calls`, `prompt_tokens`, `completion_tokens`, `cached_tokens`, `cache_creation_tokens`, `reasoning_tokens`, `cost_usd`, and `cost_reported`.
+Each `per_model` row contains only `calls`, `prompt_tokens`, `completion_tokens`, `cost_usd`, and `cost_reported`.
+`calls` counts Message metadata records, not individual backend requests.
+Usage includes all qualifying participants in this session, but excludes other sessions and the current turn's final message until it is committed.
+Missing costs are not estimated; `cost_reported: true` means at least one cost was reported, not complete coverage.
+With no qualifying metadata, totals are zero, `cost_reported` is false, and `per_model` is empty.
+For the operator's peer-wide view, use the unchanged [usage CLI or `/costs`](usage.md).
+
+### Walkthrough: inspect yourself, not a neighboring session
+
+1. In a session named `planning`, let the model call:
+
+   ```json
+   { "query": "session", "period": null }
+   ```
+
+   The tool result JSON (before the runtime's safety wrapper) is:
+
+   ```json
+   { "session_db_id": "<current session DB ID>", "name": "planning" }
+   ```
+
+2. Ask who is calling with `{"query":"agent","period":null}`.
+   A root Chaz runtime with a spawn ceiling of three returns:
+
+   ```json
+   { "name": "chaz", "call_depth": 0, "max_call_depth": 3 }
+   ```
+
+   Then call `{"query":"tools","period":null}` to see the current callable names and effective constraints.
+   A child may see fewer tools and narrower grants than its parent; there is no option to request the parent's view.
+
+3. Check recorded usage with `{"query":"usage","period":"all"}`.
+   In a session with no Message metadata yet, the result is:
+
+   ```json
+   {
+     "session_db_id": "<current session DB ID>",
+     "period": "all",
+     "since": null,
+     "total": {
+       "calls": 0,
+       "prompt_tokens": 0,
+       "completion_tokens": 0,
+       "cached_tokens": 0,
+       "cache_creation_tokens": 0,
+       "reasoning_tokens": 0,
+       "cost_usd": 0.0,
+       "cost_reported": false
+     },
+     "per_model": {}
+   }
+   ```
+
+4. Trying `{"query":"session","period":null,"session_db_id":"<another DB ID>"}` fails before any state is read:
+
+   ```text
+   invalid argument: Expected exactly query (session, agent, tools, usage) and period (all, today, week, month for usage; null otherwise)
+   ```
+
+   Recover by dropping the target selector and repeating the first call.
+   A known foreign DB ID is not authorization, and rename/attach/configuration queries are not supported.
 
 ## Risk Levels
 
