@@ -28,9 +28,6 @@ import json
 import sys
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-PORT = int(sys.argv[1])
-REPLY = sys.argv[2]
-
 # The phrase that asks for a tool call. Branching on the request content rather
 # than on a request counter keeps the tool call attached to the turn that asked
 # for it: a counter hands it to whichever turn arrives first, which is the
@@ -137,7 +134,7 @@ class Handler(BaseHTTPRequestHandler):
                     "choices": [
                         {
                             "index": 0,
-                            "message": {"role": "assistant", "content": REPLY},
+                            "message": {"role": "assistant", "content": self.server.reply},
                             "finish_reason": "stop",
                         }
                     ],
@@ -193,7 +190,7 @@ class Handler(BaseHTTPRequestHandler):
                     "choices": [
                         {
                             "index": 0,
-                            "message": {"role": "assistant", "content": REPLY},
+                            "message": {"role": "assistant", "content": self.server.reply},
                             "finish_reason": "stop",
                         }
                     ],
@@ -211,4 +208,6 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    HTTPServer(("127.0.0.1", PORT), Handler).serve_forever()
+    server = HTTPServer(("127.0.0.1", int(sys.argv[1])), Handler)
+    server.reply = sys.argv[2]
+    server.serve_forever()

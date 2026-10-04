@@ -41,6 +41,11 @@ build mode='debug':
 test *args='':
     cargo test {{ args }}
 
+# Hermetic Linux PTY lifecycle test of the real TUI (stdlib Python via uv)
+tui-pty:
+    cargo build --quiet --bin chaz --example tui_fixture
+    uv run --no-project dev/tui-pty/test_lifecycle.py
+
 # Matrix bridge end-to-end test against a throwaway homeserver
 e2e *args='':
     cargo build --quiet --bin chaz --bin chaz-matrix --example e2ee_probe
