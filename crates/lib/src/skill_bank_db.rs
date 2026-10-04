@@ -19,7 +19,7 @@
 
 #![allow(dead_code)]
 
-use crate::agent_db::Skill;
+use crate::agent_db::{Skill, read_blob, write_blob};
 use eidetica::Database;
 use eidetica::auth::crypto::PublicKey;
 use eidetica::crdt::Doc;
@@ -31,8 +31,6 @@ use tracing::info;
 
 pub const SKILLS_STORE: &str = "skills";
 pub const META_STORE: &str = "meta";
-
-const BLOB_KEY: &str = "value";
 
 /// Display metadata for a skill bank. Read by `/skills list` and by the
 /// dynamic descriptor that tells the LLM which banks are available.
@@ -78,31 +76,6 @@ impl SkillBankDb {
         txn.commit().await?;
         Ok(())
     }
-}
-
-async fn read_blob<T>(database: &Database, store_name: &str) -> anyhow::Result<T>
-where
-    T: serde::de::DeserializeOwned + Default,
-{
-    let txn = database.new_transaction().await?;
-    let store = txn.get_store::<DocStore>(store_name).await?;
-    match store.get_string(BLOB_KEY).await {
-        Ok(json) => Ok(serde_json::from_str(&json)?),
-        Err(e) if e.is_not_found() => Ok(T::default()),
-        Err(e) => Err(e.into()),
-    }
-}
-
-async fn write_blob<T>(database: &Database, store_name: &str, value: &T) -> anyhow::Result<()>
-where
-    T: serde::Serialize,
-{
-    let json = serde_json::to_string(value)?;
-    let txn = database.new_transaction().await?;
-    let store = txn.get_store::<DocStore>(store_name).await?;
-    store.set_string(BLOB_KEY, json).await?;
-    txn.commit().await?;
-    Ok(())
 }
 
 /// DB name used in eidetica settings — idempotency key for
