@@ -65,8 +65,10 @@ impl SkillRegistry {
             let Ok(entries) = std::fs::read_dir(dir) else {
                 continue;
             };
-            for entry in entries.flatten() {
-                let path = entry.path();
+            let mut paths: Vec<_> = entries.flatten().map(|entry| entry.path()).collect();
+            // Stabilize catalog order and first-wins deduplication within this source.
+            paths.sort();
+            for path in paths {
                 if path.extension().is_none_or(|e| e != "md") {
                     continue;
                 }
@@ -1627,7 +1629,7 @@ mod tests {
         assert_eq!(s.body, "body only");
     }
 
-    // ── SkillRegistry (3) ────────────────────────────────────────────
+    // ── SkillRegistry (5) ────────────────────────────────────────────
 
     #[test]
     fn new_registry_is_empty() {
@@ -1702,6 +1704,42 @@ mod tests {
         // First-wins dedupe: dir_a's "shared" should win over dir_b's.
         let shared = r.list().iter().find(|s| s.name == "shared").unwrap();
         assert_eq!(shared.description, "from A");
+    }
+
+    #[test]
+    fn disk_catalog_follows_path_order() {
+        // Skill names deliberately differ from filename order.
+        let files = [("c.md", "zulu"), ("a.md", "mike"), ("b.md", "alpha")];
+        for order in [files, [files[2], files[1], files[0]]] {
+            let dir = tempfile::tempdir().unwrap();
+            for (filename, name) in order {
+                write_skill(dir.path(), filename, &skill_md(name, "", &[], ""));
+            }
+            let mut r = SkillRegistry::new();
+            r.scan_paths(&[dir.path().to_path_buf()]);
+            let names: Vec<_> = r.list().iter().map(|s| s.name.as_str()).collect();
+            assert_eq!(names, ["mike", "alpha", "zulu"]);
+        }
+    }
+
+    #[test]
+    fn disk_duplicates_use_source_priority_then_path_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("z-project");
+        let global = dir.path().join("a-global");
+        std::fs::create_dir(&project).unwrap();
+        std::fs::create_dir(&global).unwrap();
+        for (source, filename, body) in [
+            (&project, "20-deploy.md", "later project"),
+            (&project, "10-deploy.md", "first project"),
+            (&global, "00-deploy.md", "global"),
+        ] {
+            write_skill(source, filename, &skill_md("deploy", "", &[], body));
+        }
+        let mut r = SkillRegistry::new();
+        r.scan_paths(&[project, global]);
+        assert_eq!(r.list().len(), 1);
+        assert_eq!(r.list()[0].body, "first project");
     }
 
     // ── format_catalog (4) ───────────────────────────────────────────
