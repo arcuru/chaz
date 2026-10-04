@@ -69,6 +69,9 @@ impl Server {
             .agents
             .get(parent_name)
             .ok_or_else(|| anyhow::anyhow!("parent Agent not hosted"))?;
+        // Admission and restart validation precede per-turn hydration. Use the
+        // Living Agent config here too, rather than a YAML-built snapshot.
+        let parent_agent = Box::pin(self.hydrate_agent_from_db(parent_agent)).await;
         let parent_host = self
             .agent_index
             .find_by_name(parent_name)
@@ -103,6 +106,7 @@ impl Server {
             .agents
             .get(&target_name)
             .ok_or_else(|| anyhow::anyhow!("target Agent runtime unavailable"))?;
+        let target_agent = Box::pin(self.hydrate_agent_from_db(target_agent)).await;
         let parent_active = self
             .active_extensions_for_agent(parent_id, parent_name)
             .await;

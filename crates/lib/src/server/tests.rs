@@ -5640,6 +5640,211 @@ async fn published_job_is_adopted_without_creating_another_child() {
 }
 
 #[tokio::test]
+async fn accepted_job_restart_uses_agent_db_depth_not_yaml() {
+    use crate::commands::{Command, CommandContext, CommandOutcome, dispatch};
+    use crate::session::jobs::{JobState, read_accepted_job};
+    use eidetica::service::ServiceServer;
+    use tokio::sync::watch;
+
+    let dir = tempfile::tempdir().unwrap();
+    Box::pin(async {
+        let socket = dir.path().join("job-depth.sock");
+        let (owner, mut user) = Instance::create_backend(
+            Box::new(InMemory::new()),
+            NewUser::passwordless("job-depth"),
+        )
+        .await
+        .unwrap();
+        let config: crate::config::Config = serde_yaml::from_str(concat!(
+            "agents:\n  - name: default\n    max_spawn_depth: 2\n",
+            "  - name: target\n    max_spawn_depth: 2\n",
+        ))
+        .unwrap();
+        let mut entries = Vec::new();
+        for cfg in config.agents.as_ref().unwrap() {
+            let (db, pubkey) = create_agent_db(
+                &mut user,
+                &cfg.name,
+                &AgentDbConfig::from_agent_config(cfg),
+                &AgentMeta {
+                    display_name: Some(cfg.name.clone()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            entries.push(DbEntry {
+                db_id: db.id(),
+                display_name: cfg.name.clone(),
+                pubkey,
+            });
+        }
+        let service = ServiceServer::bind(owner, &socket).await.unwrap();
+        let (shutdown, receiver) = watch::channel(());
+        let task = tokio::spawn(service.run(receiver));
+        let settings = crate::config::EideticaConfig {
+            connection: format!("unix://{}", socket.display()),
+            login: crate::config::EideticaLoginConfig {
+                username: "job-depth".into(),
+                password: None,
+                passwordless: true,
+            },
+            sync: None,
+        };
+        let (executor, mock) = published_executor_with_mock(
+            &settings,
+            Arc::new(AgentRegistry::from_config(&config)),
+            entries[0].clone(),
+        )
+        .await;
+        executor.agent_index().register(entries[1].clone());
+        let permits = executor
+            .semaphore
+            .clone()
+            .try_acquire_many_owned(MAX_CONCURRENT_LLM_CALLS as u32)
+            .unwrap();
+        let registry = executor.registry();
+        let (parent_id, parent_db) = registry.create_session(Some("cli")).await.unwrap();
+        registry
+            .attach_agent_to_session(&parent_id.0, &entries[0])
+            .await
+            .unwrap();
+        let secrets = crate::security::SecretStore::new(registry.chaz_peer().clone()).await;
+        let ctx = CommandContext {
+            server: &executor,
+            secrets: &secrets,
+            backend: &executor.default_backend,
+            session_db_id: &parent_id.0,
+            session_db: &parent_db,
+            current_agent: "default",
+            session_name: None,
+        };
+        for (name, depth) in [("default", "4"), ("target", "3")] {
+            match dispatch(
+                Command::AgentSet {
+                    agent_ref: name.into(),
+                    field: "max_spawn_depth".into(),
+                    value: depth.into(),
+                },
+                &ctx,
+            )
+            .await
+            {
+                CommandOutcome::Text(_) => {}
+                CommandOutcome::Error(error) => panic!("/agent set failed: {error}"),
+                _ => panic!("unexpected /agent set outcome"),
+            }
+        }
+        let id = executor
+            .submit_agent_job(&parent_id.0, "target", "held across restart")
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !executor.processing.lock().await.contains(&id) {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("accepted job must be queued for capacity");
+        let (_, child) = registry.open_session(&id).await.unwrap();
+        let accepted = read_accepted_job(&child).await.unwrap().unwrap();
+        assert_eq!(accepted.definition.max_call_depth, 3);
+        assert_eq!(
+            executor.job_status(&id).await.unwrap().state,
+            JobState::Queued
+        );
+        assert!(mock.recorded_calls().is_empty());
+        executor.shutdown().await;
+        drop(permits);
+
+        // A new executor rebuilds the registry from unchanged YAML, not the old
+        // process's /agent set-updated runtime entries. The service retains the DBs.
+        let fresh_agents = Arc::new(AgentRegistry::from_config(&config));
+        assert_eq!(fresh_agents.get("default").unwrap().max_spawn_depth, 2);
+        assert_eq!(fresh_agents.get("target").unwrap().max_spawn_depth, 2);
+        let (restarted, next_mock) =
+            published_executor_with_mock(&settings, fresh_agents, entries[0].clone()).await;
+        restarted.agent_index().register(entries[1].clone());
+        let _permits = restarted
+            .semaphore
+            .clone()
+            .try_acquire_many_owned(MAX_CONCURRENT_LLM_CALLS as u32)
+            .unwrap();
+        assert_eq!(
+            restarted
+                .validate_accepted_job(&child)
+                .await
+                .expect("restart must validate against persisted AgentDb depths"),
+            Some(accepted.clone())
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !restarted.is_watching_session(&id).await {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("restart must adopt the original queued child");
+        assert_eq!(
+            restarted.job_status(&id).await.unwrap().state,
+            JobState::Queued
+        );
+        assert!(next_mock.recorded_calls().is_empty());
+        assert_eq!(
+            read_accepted_job(&child).await.unwrap(),
+            Some(accepted.clone())
+        );
+
+        // Hydration is not permission to rewrite an accepted ceiling. A real DB
+        // policy change must still fail depth/authority validation, in either direction.
+        let target_db = restarted
+            .registry()
+            .open_agent_db(&entries[1].db_id, Some(&entries[1].pubkey))
+            .await
+            .unwrap()
+            .unwrap();
+        let mut cfg = target_db.read_config().await.unwrap();
+        for (depth, error) in [
+            (0, "spawn depth exceeds Agent ceiling"),
+            (5, "accepted job authority differs from parent"),
+        ] {
+            cfg.max_spawn_depth = Some(depth);
+            target_db.write_config(&cfg).await.unwrap();
+            let refused = restarted.validate_accepted_job(&child).await.unwrap_err();
+            assert!(refused.to_string().contains(error), "{refused}");
+            assert_eq!(
+                read_accepted_job(&child).await.unwrap(),
+                Some(accepted.clone())
+            );
+        }
+        cfg.max_spawn_depth = Some(3);
+        target_db.write_config(&cfg).await.unwrap();
+        assert_eq!(
+            restarted.validate_accepted_job(&child).await.unwrap(),
+            Some(accepted)
+        );
+        assert_eq!(
+            restarted
+                .registry()
+                .list_sessions()
+                .await
+                .unwrap()
+                .iter()
+                .filter(|row| row
+                    .source
+                    .as_deref()
+                    .is_some_and(|s| s.starts_with("job-stage:")))
+                .count(),
+            1,
+            "restart must not create a replacement child"
+        );
+        restarted.shutdown().await;
+        drop(shutdown);
+        task.await.unwrap().unwrap();
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn client_submission_publishes_one_child_then_executor_runs_it() {
     use eidetica::service::ServiceServer;
     use tokio::sync::watch;
