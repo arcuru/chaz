@@ -190,6 +190,36 @@ pub(super) fn ui_settings(
         });
     }
 
+    // Approval keys must never act on an unseen request. Reuse the chat panel
+    // over the bottom rows without discarding the underlying reader or draft.
+    if let Some(exchange) = app.active().pending_approval.as_ref() {
+        let info = exchange.info.clone();
+        let frame = f.area();
+        let panel = Rect {
+            y: frame.bottom().saturating_sub(frame.height.min(4)),
+            height: frame.height.min(4),
+            ..frame
+        };
+        f.render_widget(Clear, panel);
+        super::render_approval_panel(
+            f,
+            &mut app.click_regions,
+            panel,
+            &info.name,
+            &info.risk_level.to_string(),
+            &info.arguments_display,
+        );
+        app.click_regions.retain(|r| {
+            r.w > 0
+                && r.h > 0
+                && r.x >= panel.x
+                && r.y >= panel.y
+                && r.x.saturating_add(r.w) <= panel.right()
+                && r.y.saturating_add(r.h) <= panel.bottom()
+        });
+        return;
+    }
+
     // Bottom strip is normally the status hints; an inline prompt
     // takes over while typing, and a one-shot status message wins over
     // hints when set (until the next nav keypress clears it). When a

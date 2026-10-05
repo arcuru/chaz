@@ -652,6 +652,115 @@ async fn settings_modals_keep_reader_position_and_own_background_input() {
 }
 
 #[tokio::test]
+async fn settings_approval_is_visible_and_denial_preserves_reader_and_draft() {
+    let (_instance, server, backend, mut app) = fixture().await;
+    agent(&server, "agent-00", 20, true);
+    open(&mut app, SettingsScope::Peer, 0);
+    app.settings_focus = SettingsFocus::Content;
+    for (width, height) in [(80, 24), (120, 40)] {
+        for by_mouse in [false, true] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            draw(&mut terminal, &mut app, &server, &backend);
+            key(&mut app, KeyCode::End);
+            let offset = app.settings_reader.offset;
+            let list = app.settings_list_area.unwrap();
+            app.settings_prompt = Some(SettingsPrompt {
+                label: "add".into(),
+                input: "retained draft".into(),
+                cursor: 14,
+                intent: SettingsPromptIntent::AddPeerDefault,
+            });
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            app.active_mut().pending_approval = Some(chaz_core::bridge::ApprovalExchange {
+                info: chaz_core::tool::ToolApprovalInfo {
+                    name: "review_tool".into(),
+                    arguments_display: "fixture arguments".into(),
+                    risk_level: chaz_core::tool::RiskLevel::High,
+                },
+                decision_tx: tx,
+            });
+            let rows = draw(&mut terminal, &mut app, &server, &backend);
+            for text in [
+                "Tool approval",
+                "review_tool",
+                "fixture arguments",
+                "[n] deny",
+            ] {
+                assert!(
+                    contains(&rows, text),
+                    "missing visible approval {text}: {rows:?}"
+                );
+            }
+            assert_regions(&app, width, height);
+            assert!(app.settings_list_area.is_none() && app.settings_reader.viewport.is_none());
+            key(&mut app, KeyCode::Home);
+            input::handle_mouse(&mut app, mouse(MouseEventKind::ScrollDown, list.x, list.y));
+            input::handle_mouse(
+                &mut app,
+                mouse(MouseEventKind::Down(MouseButton::Left), list.x, list.y),
+            );
+            assert!(app.active().pending_approval.is_some());
+            if by_mouse {
+                let deny = *app
+                    .click_regions
+                    .iter()
+                    .find(|r| matches!(r.target, ClickTarget::ApprovalDeny))
+                    .unwrap();
+                input::handle_mouse(
+                    &mut app,
+                    mouse(MouseEventKind::Down(MouseButton::Left), deny.x, deny.y),
+                );
+            } else {
+                key(&mut app, KeyCode::Char('n'));
+            }
+            assert!(matches!(
+                tokio::time::timeout(std::time::Duration::from_secs(1), rx)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                chaz_core::bridge::ApprovalDecision::Deny
+            ));
+            assert_eq!(
+                app.settings_prompt.as_ref().unwrap().input,
+                "retained draft"
+            );
+            assert_eq!(app.settings_reader.offset, offset);
+            assert_eq!(app.settings_focus, SettingsFocus::Content);
+            assert_eq!(app.peer_agents_cursor, 0);
+            assert_eq!(app.mode, TuiMode::Settings(SettingsScope::Peer));
+            key(&mut app, KeyCode::Esc);
+            draw(&mut terminal, &mut app, &server, &backend);
+            assert!(app.settings_reader.viewport.is_some());
+            assert_eq!(app.settings_reader.offset, offset);
+        }
+    }
+    let (tx, _rx) = tokio::sync::oneshot::channel();
+    app.active_mut().pending_approval = Some(chaz_core::bridge::ApprovalExchange {
+        info: chaz_core::tool::ToolApprovalInfo {
+            name: "review_tool".into(),
+            arguments_display: "fixture arguments".into(),
+            risk_level: chaz_core::tool::RiskLevel::High,
+        },
+        decision_tx: tx,
+    });
+    for (width, height) in [
+        (0, 0),
+        (1, 1),
+        (15, 7),
+        (16, 8),
+        (17, 13),
+        (40, 8),
+        (64, 14),
+    ] {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        draw(&mut terminal, &mut app, &server, &backend);
+        assert_regions(&app, width, height);
+    }
+    key(&mut app, KeyCode::Char('n'));
+    server.shutdown().await;
+}
+
+#[tokio::test]
 async fn settings_static_empty_and_degenerate_frames_have_safe_regions() {
     let (_instance, server, backend, mut app) = fixture().await;
     // Missing snapshots use the same read-only placeholder path.

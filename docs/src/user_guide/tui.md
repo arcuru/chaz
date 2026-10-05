@@ -266,8 +266,10 @@ stays on the left and the current page stays on the right.
 
 Action letters such as `a`, `d`, and `r`, and Defaults' `Ctrl+Up`/`Ctrl+Down`
 reordering keep their existing selected-row targets. Prompts, pickers, diffs,
-and approval input take precedence over the reader. Wheeling or clicking a
-covered Settings list cannot move its selection or the hidden chat.
+and approval input take precedence over the reader. A pending tool approval
+shows the same request and buttons as chat, preserving any Settings draft and
+reading position until it is answered. Wheeling or clicking a covered Settings
+list cannot move its selection or the hidden chat.
 
 ### Selection is not reading position
 

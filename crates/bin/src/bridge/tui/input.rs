@@ -407,16 +407,6 @@ pub(super) fn handle_mouse(app: &mut App, m: MouseEvent) -> Option<MouseOutcome>
         _ => return None,
     }
 
-    if matches!(app.mode, TuiMode::Settings(_))
-        && app.overlay.is_none()
-        && (app.agent_diff.is_some()
-            || app.settings_prompt.is_some()
-            || app.settings_picker.is_some()
-            || app.active().pending_approval.is_some())
-    {
-        return None;
-    }
-
     // Left-click — find the innermost hit region. `click_regions` is pushed in
     // outer-to-inner order during render (overlay backdrop first, rows next),
     // so iterate in reverse to prefer the most specific hit.
@@ -428,6 +418,22 @@ pub(super) fn handle_mouse(app: &mut App, m: MouseEvent) -> Option<MouseOutcome>
         .copied()
         .find(|r| r.hit(col, row));
     let hit = hit?;
+    if matches!(app.mode, TuiMode::Settings(_))
+        && app.overlay.is_none()
+        && (app.agent_diff.is_some()
+            || app.settings_prompt.is_some()
+            || app.settings_picker.is_some()
+            || app.active().pending_approval.is_some())
+        && !(app.active().pending_approval.is_some()
+            && matches!(
+                hit.target,
+                ClickTarget::ApprovalApprove
+                    | ClickTarget::ApprovalDeny
+                    | ClickTarget::ApprovalApproveAll
+            ))
+    {
+        return None;
+    }
     match hit.target {
         ClickTarget::OverlayDismiss => {
             app.overlay = None;
