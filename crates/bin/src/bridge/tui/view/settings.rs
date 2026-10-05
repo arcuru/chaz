@@ -1324,7 +1324,10 @@ fn render_session_agents(
     // If a picker is open, carve the bottom of the detail area for it.
     // The agents list renders into the top region.
     let (list_area, picker_area) = if app.settings_picker.is_some() {
-        let picker_h = 8u16.min(area.height.saturating_sub(1)).max(3);
+        let picker_h = 8u16
+            .min(area.height.saturating_sub(1))
+            .max(3)
+            .min(area.height);
         let list_h = area.height.saturating_sub(picker_h);
         (
             Rect {
@@ -1461,8 +1464,8 @@ fn render_session_agents(
 /// Session→Agents detail area. Sources the visible candidate slice from
 /// the live filter so the displayed list always matches what Enter would
 /// commit.
-fn render_session_agents_picker(f: &mut ratatui::Frame, area: Rect, app: &App) {
-    let Some(picker) = app.settings_picker.as_ref() else {
+fn render_session_agents_picker(f: &mut ratatui::Frame, area: Rect, app: &mut App) {
+    let Some(picker) = app.settings_picker.as_mut() else {
         return;
     };
     let filtered_indices = picker.filtered();
@@ -1470,7 +1473,8 @@ fn render_session_agents_picker(f: &mut ratatui::Frame, area: Rect, app: &App) {
         .iter()
         .filter_map(|i| picker.candidates.get(*i).map(|s| s.as_str()))
         .collect();
-    widgets::picker(
+    picker.selected = picker.selected.min(items.len().saturating_sub(1));
+    picker.viewport = widgets::picker(
         f,
         area,
         &picker.label,

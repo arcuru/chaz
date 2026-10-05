@@ -1,0 +1,28 @@
+---
+source: crates/bin/src/bridge/tui/view/list_tests.rs
+expression: "rows.join(\"\\n\")"
+---
+ Session Settings  —  Picker test                                    [Esc back] 
+  Overview                                                                      
+> Agents          Agents    30 attached                                         
+  Models          ─────                                                         
+  Routing                                                                       
+  History       > agent-00        (no model)                                    
+  Sharing         agent-01        (no model)                                    
+                  agent-02        (no model)                                    
+                  agent-03        (no model)                                    
+                  agent-04        (no model)                                    
+                  agent-05        (no model)                                    
+                  agent-06        (no model)                                    
+                  agent-07        (no model)                                    
+                                                                                
+                  [a] add agent · [d] remove selected                           
+                 add agent: ▎                                                   
+                    candidate-24                                                
+                    candidate-25                                                
+                    candidate-26                                                
+                    candidate-27                                                
+                    candidate-28                                                
+                  > candidate-29                                                
+                  ↑↓ select · enter add · esc cancel                            
+ type to filter · ↑↓ select · enter add · esc cancel

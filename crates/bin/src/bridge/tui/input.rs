@@ -363,7 +363,12 @@ pub(super) fn handle_mouse(app: &mut App, m: MouseEvent) -> Option<MouseOutcome>
             } else if app.active().pending_approval.is_some() {
                 // Approval owns input; no wheel reaches the background.
             } else if let Some(picker) = app.settings_picker.as_mut() {
-                picker.selected = wheel_step(picker.selected, down, picker.filtered().len());
+                if picker
+                    .viewport
+                    .contains(ratatui::layout::Position::new(m.column, m.row))
+                {
+                    picker.selected = wheel_step(picker.selected, down, picker.filtered().len());
+                }
             } else if app.mode == TuiMode::ModelPicker {
                 app.model_picker_index = wheel_step(
                     app.model_picker_index,
@@ -405,6 +410,11 @@ pub(super) fn handle_mouse(app: &mut App, m: MouseEvent) -> Option<MouseOutcome>
         }
         MouseEventKind::Down(MouseButton::Left) => {}
         _ => return None,
+    }
+
+    // The filter picker has keyboard actions, not background list/category hits.
+    if app.overlay.is_none() && app.settings_picker.is_some() {
+        return None;
     }
 
     // Left-click — find the innermost hit region. `click_regions` is pushed in
@@ -1021,6 +1031,7 @@ pub(super) fn handle_settings_key(
                     candidates,
                     selected: 0,
                     intent: SettingsPickerIntent::AddSessionAgent,
+                    viewport: ratatui::layout::Rect::default(),
                 });
                 return SettingsKey::None;
             }
@@ -1402,11 +1413,17 @@ fn handle_settings_picker_key(app: &mut App, key: KeyEvent) -> SettingsKey {
     let Some(picker) = app.settings_picker.as_mut() else {
         return SettingsKey::None;
     };
+    picker.selected = picker
+        .selected
+        .min(picker.filtered().len().saturating_sub(1));
     match key.code {
         KeyCode::Esc => {
             app.settings_picker = None;
         }
         KeyCode::Enter => {
+            if picker.viewport.width <= 4 || picker.viewport.height == 0 {
+                return SettingsKey::None;
+            }
             let chosen = picker.selected_name().map(|s| s.to_string());
             let intent = picker.intent;
             app.settings_picker = None;

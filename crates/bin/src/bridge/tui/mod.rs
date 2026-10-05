@@ -305,6 +305,8 @@ pub(super) struct SettingsPicker {
     pub candidates: Vec<String>,
     pub selected: usize,
     pub intent: SettingsPickerIntent,
+    /// Match-row viewport from the last frame; hidden pickers own no hits.
+    pub viewport: ratatui::layout::Rect,
 }
 
 /// What the active settings picker is collecting. Same shape as

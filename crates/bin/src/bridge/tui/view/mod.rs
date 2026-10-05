@@ -281,6 +281,9 @@ pub(super) fn ui(
     app.click_regions.clear();
     app.settings_list_area = None;
     app.settings_reader.viewport = None;
+    if let Some(picker) = app.settings_picker.as_mut() {
+        picker.viewport = Rect::default();
+    }
 
     // Mirror the fast-start gate so ui_chat (which has no `server` handle)
     // can show the "reconciling agents…" indicator until the deferred

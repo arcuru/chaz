@@ -1,6 +1,9 @@
 //! Frame + input regressions for the cursor lists, including variable-height
 //! rows. All Settings cases draw the real sidebar/detail layout.
-use super::super::{SessionMetaSnapshot, SettingsFocus, Tab, input};
+use super::super::{
+    SessionMetaSnapshot, SettingsFocus, SettingsPicker, SettingsPickerIntent, SettingsPromptIntent,
+    Tab, input,
+};
 use super::*;
 use chaz_core::agent::{Agent, AgentRegistry};
 use chaz_core::agent_db::{AgentDbConfig, WorkerDbConfig};
@@ -449,7 +452,9 @@ async fn wheel_ownership_stays_with_modal_or_visible_list() {
         candidates: (0..10).map(|i| format!("agent-{i}")).collect(),
         selected: 0,
         intent: SettingsPickerIntent::AddSessionAgent,
+        viewport: ratatui::layout::Rect::default(),
     });
+    app.settings_picker.as_mut().unwrap().viewport = ratatui::layout::Rect::new(16, 4, 64, 6);
     input::handle_mouse(&mut app, wheel);
     assert_eq!(app.settings_picker.as_ref().unwrap().selected, 3);
     assert_eq!(app.peer_agents_cursor, 0);
@@ -575,5 +580,188 @@ async fn toolbar_context_reopen_honors_pins_and_refreshes_runtime_budget() {
     let screen = draw(&mut terminal, &mut app, &server, &backend).join("\n");
     assert!(screen.contains("ctx unknown/64k tok"), "{screen}");
     assert_eq!(app.active().effective_model, "small-model");
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn add_agent_picker_last_row_matches_enter_after_resize() {
+    let (_instance, server, backend, mut app) = fixture().await;
+    List::SessionAgents.open(&mut app);
+    app.active_mut().session_name = Some("Picker test".into());
+    app.settings_picker = Some(SettingsPicker {
+        label: "add agent".into(),
+        filter: String::new(),
+        cursor: 0,
+        candidates: (0..30).map(|i| format!("candidate-{i:02}")).collect(),
+        selected: 0,
+        intent: SettingsPickerIntent::AddSessionAgent,
+        viewport: ratatui::layout::Rect::default(),
+    });
+    for _ in 0..40 {
+        input::handle_settings_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+            SettingsScope::Session,
+        );
+    }
+    for (width, height) in [(80, 24), (40, 14), (120, 40)] {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        let rows = draw(&mut terminal, &mut app, &server, &backend);
+        assert!(
+            rows.iter().any(|r| r.contains("> candidate-29")),
+            "{rows:?}"
+        );
+        assert_eq!(
+            app.settings_picker.as_ref().unwrap().selected_name(),
+            Some("candidate-29")
+        );
+        insta::assert_snapshot!(format!("add_agent_last_{width}x{height}"), rows.join("\n"));
+    }
+    match input::handle_settings_key(
+        &mut app,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        SettingsScope::Session,
+    ) {
+        input::SettingsKey::PromptSubmit {
+            intent: SettingsPromptIntent::AddSessionAgent,
+            value,
+        } => assert_eq!(value, "candidate-29"),
+        _ => panic!("Enter must submit the visible agent"),
+    }
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn add_agent_picker_filter_unicode_cancel_and_mouse_ownership() {
+    let (_instance, server, backend, mut app) = fixture().await;
+    List::SessionAgents.open(&mut app);
+    app.active_mut().session_name = Some("Picker test".into());
+    app.input = "chat draft".into();
+    app.settings_picker = Some(SettingsPicker {
+        label: "add agent".into(),
+        filter: String::new(),
+        cursor: 0,
+        candidates: (0..20).map(|i| format!("研究-{i:02}")).collect(),
+        selected: 19,
+        intent: SettingsPickerIntent::AddSessionAgent,
+        viewport: Rect::default(),
+    });
+    let key = |app: &mut App, code| {
+        input::handle_settings_key(
+            app,
+            KeyEvent::new(code, KeyModifiers::NONE),
+            SettingsScope::Session,
+        )
+    };
+    // No drawn row yet: do not accept an invisible action target.
+    assert!(matches!(
+        key(&mut app, KeyCode::Enter),
+        input::SettingsKey::None
+    ));
+    assert!(app.settings_picker.is_some());
+    let mut terminal = Terminal::new(TestBackend::new(40, 14)).unwrap();
+    let rows = draw(&mut terminal, &mut app, &server, &backend);
+    assert!(rows.iter().any(|r| r.contains("> 研 究 -19")), "{rows:?}");
+    let picker_area = app.settings_picker.as_ref().unwrap().viewport;
+    let category = app.settings_index(SettingsScope::Session);
+    for (x, y) in [(1, 1), (16, 2), (39, 13), (80, 40)] {
+        input::handle_mouse(
+            &mut app,
+            mouse(MouseEventKind::Down(MouseButton::Left), x, y),
+        );
+        input::handle_mouse(&mut app, mouse(MouseEventKind::ScrollUp, x, y));
+        assert_eq!(app.settings_picker.as_ref().unwrap().selected, 19);
+        assert_eq!(app.settings_index(SettingsScope::Session), category);
+        assert_eq!(app.session_agents_cursor, 0);
+    }
+    input::handle_mouse(
+        &mut app,
+        mouse(MouseEventKind::ScrollUp, picker_area.x, picker_area.y),
+    );
+    assert_eq!(app.settings_picker.as_ref().unwrap().selected, 16);
+    app.overlay = Some(Overlay::Help { scroll: 0 });
+    input::handle_mouse(
+        &mut app,
+        mouse(MouseEventKind::ScrollDown, picker_area.x, picker_area.y),
+    );
+    assert_eq!(
+        app.settings_picker.as_ref().unwrap().selected,
+        16,
+        "overlay owns wheel"
+    );
+    app.overlay = None;
+    for c in ['1', '9'] {
+        key(&mut app, KeyCode::Char(c));
+    }
+    let rows = draw(&mut terminal, &mut app, &server, &backend);
+    assert_eq!(
+        app.settings_picker.as_ref().unwrap().selected_name(),
+        Some("研究-19")
+    );
+    assert!(rows.iter().any(|r| r.contains("> 研 究 -19")));
+    key(&mut app, KeyCode::Char('無'));
+    let rows = draw(&mut terminal, &mut app, &server, &backend);
+    assert!(rows.iter().any(|r| r.contains("(no matches)")));
+    assert_eq!(app.settings_picker.as_ref().unwrap().selected_name(), None);
+    key(&mut app, KeyCode::Backspace);
+    assert_eq!(app.settings_picker.as_ref().unwrap().filter, "19");
+    // Candidate shrink clamps the stored index, not only the painted highlight.
+    let picker = app.settings_picker.as_mut().unwrap();
+    picker.filter.clear();
+    picker.cursor = 0;
+    picker.selected = 99;
+    picker.candidates.truncate(2);
+    draw(&mut terminal, &mut app, &server, &backend);
+    assert_eq!(app.settings_picker.as_ref().unwrap().selected, 1);
+    assert_eq!(
+        app.settings_picker.as_ref().unwrap().selected_name(),
+        Some("研究-01")
+    );
+    key(&mut app, KeyCode::Esc);
+    assert!(app.settings_picker.is_none());
+    assert_eq!(app.mode, TuiMode::Settings(SettingsScope::Session));
+    assert_eq!(app.input, "chat draft");
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn add_agent_picker_empty_and_hidden_frames_do_not_submit() {
+    let (_instance, server, backend, mut app) = fixture().await;
+    List::SessionAgents.open(&mut app);
+    app.settings_picker = Some(SettingsPicker {
+        label: "add agent".into(),
+        filter: String::new(),
+        cursor: 0,
+        candidates: vec!["last-agent".into()],
+        selected: 0,
+        intent: SettingsPickerIntent::AddSessionAgent,
+        viewport: Rect::default(),
+    });
+    for (width, height) in [(0, 0), (1, 1), (40, 2), (0, 14), (1, 14)] {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        draw(&mut terminal, &mut app, &server, &backend);
+        assert!(matches!(
+            input::handle_settings_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                SettingsScope::Session
+            ),
+            input::SettingsKey::None
+        ));
+        assert!(app.settings_picker.is_some());
+    }
+    app.settings_picker.as_mut().unwrap().candidates.clear();
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    let rows = draw(&mut terminal, &mut app, &server, &backend);
+    assert!(rows.iter().any(|r| r.contains("(no matches)")));
+    assert!(matches!(
+        input::handle_settings_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            SettingsScope::Session
+        ),
+        input::SettingsKey::None
+    ));
+    assert!(app.settings_picker.is_none());
     server.shutdown().await;
 }

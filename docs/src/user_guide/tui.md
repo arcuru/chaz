@@ -495,3 +495,21 @@ that children are reaped.
 This complements the fast widget snapshots; it does not test in-flight job
 cancellation.
 See `dev/tui-pty/README.md` for isolation details and failure artifact locations.
+
+## Adding an agent from Settings
+
+In Session Settings → Agents, press `a` to open the add-agent picker.
+Typing filters candidate names (case-insensitive substring); `↑`/`↓` selects,
+`Enter` adds the highlighted agent, and `Esc` cancels without changing the roster.
+The filtered selection remains the action target even when the list scrolls or
+resizes. The wheel moves three candidates only over the picker's match rows;
+background category/list clicks are ignored while the picker owns input.
+
+For example:
+
+1. With more candidates than visible rows, move down to the final candidate.
+   The list scrolls to show `> candidate-29`; `Enter` adds that candidate,
+   not a row from the previous visible page.
+2. Type a filter with no matches. The picker shows `(no matches)` and `Enter`
+   adds nothing. Reopen with `a`, or remove the filter with `Backspace` before
+   accepting, or press `Esc` to cancel.
