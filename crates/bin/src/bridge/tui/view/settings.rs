@@ -15,6 +15,88 @@ fn list_row_budget(height: u16, header: usize, footer: usize, selected_height: u
         .max(available.min(selected_height))
 }
 
+/// Both painting and input use these row slots, including blank slots.
+fn list_viewport(area: Rect, header: u16, budget: usize) -> Option<Rect> {
+    let height = area.height.saturating_sub(header).min(budget as u16);
+    (area.width > 0 && height > 0).then_some(Rect {
+        y: area.y + header.min(area.height),
+        height,
+        ..area
+    })
+}
+
+/// Preserve fitting decoration. Overflow replaces it with a pinned identity/range
+/// row and reads the existing fields, using identical native wrap measurement.
+fn render_content(
+    f: &mut ratatui::Frame,
+    area: Rect,
+    app: &mut App,
+    label: &str,
+    lines: Vec<Line<'static>>,
+    header: usize,
+) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let paragraph = Paragraph::new(lines.clone()).wrap(Wrap { trim: false });
+    let overflow = paragraph.line_count(area.width) > area.height as usize;
+    let header = header.min(lines.len());
+    let header_rows = if overflow {
+        1
+    } else {
+        Paragraph::new(lines[..header].to_vec())
+            .wrap(Wrap { trim: false })
+            .line_count(area.width)
+    }
+    .min(area.height as usize) as u16;
+    let body_area = Rect {
+        y: area.y + header_rows,
+        height: area.height - header_rows,
+        ..area
+    };
+    let body = Paragraph::new(lines[header..].to_vec()).wrap(Wrap { trim: false });
+    let count = body.line_count(body_area.width);
+    let reader = &mut app.settings_reader;
+    reader.visible_rows = body_area.height;
+    reader.max_offset = count
+        .saturating_sub(body_area.height as usize)
+        .min(u16::MAX as usize) as u16;
+    if !overflow {
+        reader.max_offset = 0;
+    }
+    reader.offset = reader.offset.min(reader.max_offset);
+    reader.viewport = (body_area.height > 0).then_some(body_area);
+    if overflow {
+        let start = reader.offset as usize + 1;
+        let end = (reader.offset as usize + body_area.height as usize).min(count);
+        let focused = app.settings_focus == super::super::SettingsFocus::Content;
+        let cue = Line::from(vec![
+            Span::styled(
+                format!("DETAILS [{start}–{end}/{count}] · "),
+                if focused {
+                    theme::selected()
+                } else {
+                    theme::accent()
+                },
+            ),
+            Span::styled(label.to_string(), theme::accent_bold()),
+        ]);
+        f.render_widget(Paragraph::new(cue), Rect { height: 1, ..area });
+        f.render_widget(body.scroll((reader.offset, 0)), body_area);
+    } else {
+        f.render_widget(paragraph, area);
+    }
+    if let Some(viewport) = reader.viewport {
+        app.click_regions.push(ClickRegion {
+            x: viewport.x,
+            y: viewport.y,
+            w: viewport.width,
+            h: viewport.height,
+            target: ClickTarget::SettingsContent,
+        });
+    }
+}
+
 /// Stage 1+ Settings page — sidebar of categories + per-category detail.
 /// Composition style A (pure functions over the shared widget primitives).
 /// Each category routes to its own renderer; categories that haven't been
@@ -27,6 +109,7 @@ pub(super) fn ui_settings(
     backend: &BackendManager,
     config: &Config,
 ) {
+    app.sync_settings_reader(scope);
     let chunks = Layout::vertical([
         Constraint::Length(1), // header
         Constraint::Min(1),    // sidebar + detail
@@ -54,7 +137,7 @@ pub(super) fn ui_settings(
             .map(|c| c.label())
             .collect(),
     };
-    let sidebar_focused = matches!(app.settings_focus, super::super::SettingsFocus::Sidebar);
+    let sidebar_focused = matches!(app.settings_focus, super::super::SettingsFocus::Category);
     widgets::sidebar(f, sidebar_area, &labels, selected, sidebar_focused);
     // Click regions for each sidebar row so users can mouse-switch
     // categories. One terminal line per item, starting at sidebar_area.y.
@@ -83,6 +166,28 @@ pub(super) fn ui_settings(
                 .unwrap_or(SessionSettingsCategory::Overview);
             render_session_category(f, detail_area, app, category, server, backend);
         }
+    }
+
+    // No background Settings region is actionable while another owner has input.
+    if app.agent_diff.is_some()
+        || app.settings_prompt.is_some()
+        || app.settings_picker.is_some()
+        || app.overlay.is_some()
+        || app.active().pending_approval.is_some()
+    {
+        app.click_regions.clear();
+        app.settings_list_area = None;
+        app.settings_reader.viewport = None;
+    } else {
+        let frame = f.area();
+        app.click_regions.retain(|r| {
+            r.w > 0
+                && r.h > 0
+                && r.x >= frame.x
+                && r.y >= frame.y
+                && r.x.saturating_add(r.w) <= frame.right()
+                && r.y.saturating_add(r.h) <= frame.bottom()
+        });
     }
 
     // Bottom strip is normally the status hints; an inline prompt
@@ -119,7 +224,14 @@ pub(super) fn ui_settings(
 /// by focus so the user sees which keys are live right now.
 fn settings_status_hint(app: &App, scope: SettingsScope) -> &'static str {
     let cur = app.settings_index(scope);
-    let detail = matches!(app.settings_focus, super::super::SettingsFocus::Detail);
+    if app.settings_focus == super::super::SettingsFocus::Content {
+        return if scope == SettingsScope::Peer && cur == 0 {
+            " ↑↓ read · PgUp/Dn · Home/End · Enter model · ← list · Tab category · Esc "
+        } else {
+            " ↑↓ read · PgUp/Dn page · Home/End · ← back · Tab category · Esc back "
+        };
+    }
+    let detail = matches!(app.settings_focus, super::super::SettingsFocus::List);
     match scope {
         SettingsScope::Session => match SessionSettingsCategory::ALL.get(cur) {
             Some(SessionSettingsCategory::Agents) => {
@@ -130,14 +242,18 @@ fn settings_status_hint(app: &App, scope: SettingsScope) -> &'static str {
                 }
             }
             Some(SessionSettingsCategory::Models) => {
-                " ↑↓/Tab category · Enter open picker · Esc back "
+                if detail {
+                    " ↑↓ scope · ← category · Enter model · Tab category · Esc back "
+                } else {
+                    " ↑↓/Tab category · → scopes · Enter open picker · Esc back "
+                }
             }
-            _ => " ↑↓/Tab category · 1-9 jump · Esc back ",
+            _ => " ↑↓/Tab category · → read · 1-9 jump · Esc back ",
         },
         SettingsScope::Peer => match PeerSettingsCategory::ALL.get(cur) {
             Some(PeerSettingsCategory::Agents) => {
                 if detail {
-                    " ↑↓ select · ← back · Enter model · [r] reload yaml · Esc back "
+                    " ↑↓ select · → read · ← category · Enter model · [r] reload · Esc back "
                 } else {
                     " ↑↓/Tab category · → list · [r] reload yaml · Esc back "
                 }
@@ -149,7 +265,14 @@ fn settings_status_hint(app: &App, scope: SettingsScope) -> &'static str {
                     " ↑↓/Tab category · → list · [a]/[d] · Ctrl+↑↓ reorder · Esc back "
                 }
             }
-            _ => " ↑↓/Tab category · 1-9 jump · Esc back ",
+            Some(PeerSettingsCategory::Mcp) => {
+                if detail {
+                    " ↑↓ select · → read · ← category · Tab category · Esc back "
+                } else {
+                    " ↑↓/Tab category · → list · 1-9 jump · Esc back "
+                }
+            }
+            _ => " ↑↓/Tab category · → read · 1-9 jump · Esc back ",
         },
     }
 }
@@ -167,13 +290,13 @@ fn render_peer_category(
     config: &Config,
 ) {
     match category {
-        PeerSettingsCategory::About => render_peer_about(f, area, server, backend, config),
+        PeerSettingsCategory::About => render_peer_about(f, area, app, server, backend, config),
         PeerSettingsCategory::Agents => render_peer_agents(f, area, app, server, backend),
-        PeerSettingsCategory::Backends => render_peer_backends(f, area, backend, config),
-        PeerSettingsCategory::Bridges => render_peer_bridges(f, area, config),
+        PeerSettingsCategory::Backends => render_peer_backends(f, area, app, backend, config),
+        PeerSettingsCategory::Bridges => render_peer_bridges(f, area, app, config),
         PeerSettingsCategory::Defaults => render_peer_defaults(f, area, app, server),
         PeerSettingsCategory::Mcp => render_peer_mcp(f, area, app),
-        _ => render_settings_detail_placeholder(f, area, category.label()),
+        _ => render_settings_detail_placeholder(f, area, app, category.label()),
     }
 }
 
@@ -212,6 +335,9 @@ fn render_peer_defaults(f: &mut ratatui::Frame, area: Rect, app: &mut App, serve
         app.scroll.peer_defaults,
     );
     app.scroll.peer_defaults = window.offset;
+    if defaults_count > 0 {
+        app.settings_list_area = list_viewport(area, 4, window.rows().len());
+    }
     if app.peer_defaults.is_empty() {
         lines.push(Line::from(vec![Span::styled(
             "  (none — falls back to first registered agent on new sessions)",
@@ -253,7 +379,11 @@ fn render_peer_defaults(f: &mut ratatui::Frame, area: Rect, app: &mut App, serve
         Style::default().fg(theme::DIM),
     )]));
 
-    f.render_widget(Paragraph::new(lines), area);
+    if defaults_count == 0 {
+        render_content(f, area, app, "Default agents", lines, 4);
+    } else {
+        f.render_widget(Paragraph::new(lines), area);
+    }
 
     // Per-row click regions. Header is 4 lines (blank, title, dashes,
     // blank); each default is one line after that.
@@ -278,6 +408,7 @@ fn render_peer_defaults(f: &mut ratatui::Frame, area: Rect, app: &mut App, serve
 fn render_peer_backends(
     f: &mut ratatui::Frame,
     area: Rect,
+    app: &mut App,
     backend: &BackendManager,
     config: &Config,
 ) {
@@ -345,13 +476,13 @@ fn render_peer_backends(
         Style::default().fg(theme::DIM),
     )]));
 
-    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+    render_content(f, area, app, "Backends", lines, 4);
 }
 
 /// Peer → Bridges (read-only). v1: tui + cli are always-on, in-process.
 /// Matrix and Discord are their own standalone peer binaries (`chaz-matrix`,
 /// `chaz-discord`), external to this process, so they show as external.
-fn render_peer_bridges(f: &mut ratatui::Frame, area: Rect, _config: &Config) {
+fn render_peer_bridges(f: &mut ratatui::Frame, area: Rect, app: &mut App, _config: &Config) {
     let lines = vec![
         Line::from(""),
         Line::from(vec![Span::styled("  Bridges", theme::accent_bold())]),
@@ -370,7 +501,7 @@ fn render_peer_bridges(f: &mut ratatui::Frame, area: Rect, _config: &Config) {
             Style::default().fg(theme::DIM),
         )]),
     ];
-    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+    render_content(f, area, app, "Bridges", lines, 4);
 }
 
 /// One row in the bridges list: name in accent, status in white.
@@ -434,16 +565,16 @@ fn render_peer_agents(
     // worker nesting.
     let mut agent_line_offsets: Vec<u16> = Vec::with_capacity(names.len());
 
+    let budget = chunks[0].height.saturating_sub(3) as usize;
+    app.settings_list_area = list_viewport(chunks[0], 3, budget);
     let heights: Vec<usize> = names
         .iter()
-        .map(|n| server.agents().get(n).map_or(1, |a| 1 + a.workers.len()))
+        .map(|n| {
+            let height = server.agents().get(n).map_or(1, |a| 1 + a.workers.len());
+            if height > budget { 1 } else { height }
+        })
         .collect();
-    let window = ListWindow::new(
-        &heights,
-        Some(cursor),
-        chunks[0].height.saturating_sub(3) as usize,
-        app.scroll.peer_agents,
-    );
+    let window = ListWindow::new(&heights, Some(cursor), budget, app.scroll.peer_agents);
     app.scroll.peer_agents = window.offset;
     if names.is_empty() {
         lines.push(Line::from(vec![Span::styled(
@@ -473,17 +604,33 @@ fn render_peer_agents(
             let worker_count = agent.as_ref().map(|a| a.workers.len()).unwrap_or(0);
             let worker_badge = if worker_count == 0 {
                 String::new()
+            } else if 1 + worker_count > budget {
+                format!("[{worker_count} workers → details]")
             } else {
                 format!("  [{worker_count} workers]")
             };
             agent_line_offsets.push(lines.len() as u16);
             lines.push(Line::from(vec![Span::styled(
-                format!("{marker}{name:<14}  {model_label}{worker_badge}"),
+                if worker_count > 0 && 1 + worker_count > budget {
+                    // The overflow cue wins space over the model or a long name.
+                    format!(
+                        "{marker}{worker_badge} {}",
+                        ellipsize(
+                            name,
+                            chunks[0]
+                                .width
+                                .saturating_sub(worker_badge.len() as u16 + 3)
+                                as usize
+                        )
+                    )
+                } else {
+                    format!("{marker}{name:<14}  {model_label}{worker_badge}")
+                },
                 style,
             )]));
             // Render Workers as nested decorative rows. Cursor still indexes
             // Agents only — these don't move the selection.
-            if let Some(agent) = agent {
+            if let Some(agent) = agent.filter(|a| a.workers.len() < budget) {
                 let mut worker_names: Vec<&str> =
                     agent.workers.keys().map(String::as_str).collect();
                 worker_names.sort_unstable();
@@ -533,7 +680,14 @@ fn render_peer_agents(
         "  Enter — set default model · [r] reload from yaml",
         Style::default().fg(theme::DIM),
     )]));
-    f.render_widget(Paragraph::new(detail).wrap(Wrap { trim: false }), chunks[1]);
+    render_content(
+        f,
+        chunks[1],
+        app,
+        names.get(cursor).map(String::as_str).unwrap_or("Agents"),
+        detail,
+        if names.is_empty() { 0 } else { 3 },
+    );
 }
 
 /// Per-agent detail block — Agent fields then a nested sub-block for each
@@ -835,6 +989,8 @@ fn render_peer_mcp(f: &mut ratatui::Frame, area: Rect, app: &mut App) {
         app.scroll.peer_mcp,
     );
     app.scroll.peer_mcp = window.offset;
+    app.settings_list_area =
+        list_viewport(chunks[0], 3, chunks[0].height.saturating_sub(3) as usize);
     if servers.is_empty() {
         lines.push(Line::from(vec![Span::styled(
             "  (no MCP servers configured)",
@@ -905,7 +1061,17 @@ fn render_peer_mcp(f: &mut ratatui::Frame, area: Rect, app: &mut App) {
         "  (view-only in v1)",
         Style::default().fg(theme::DIM),
     )]));
-    f.render_widget(Paragraph::new(detail).wrap(Wrap { trim: false }), chunks[1]);
+    render_content(
+        f,
+        chunks[1],
+        app,
+        servers
+            .get(cursor)
+            .map(|e| e.name.as_str())
+            .unwrap_or("MCP"),
+        detail,
+        if servers.is_empty() { 1 } else { 3 },
+    );
 }
 
 /// One-line capability summary for a running server's list row.
@@ -1024,6 +1190,7 @@ fn mcp_detail_lines(entry: &McpRegistryEntry) -> Vec<Line<'static>> {
 fn render_peer_about(
     f: &mut ratatui::Frame,
     area: Rect,
+    app: &mut App,
     server: &Arc<Server>,
     backend: &BackendManager,
     config: &Config,
@@ -1083,7 +1250,7 @@ fn render_peer_about(
         about_kv("  default agents", &default_agents),
         about_kv("  agent groups", &agent_groups),
     ];
-    f.render_widget(Paragraph::new(lines), area);
+    render_content(f, area, app, "About", lines, 4);
 }
 
 /// Single labelled row used by the About / agent-detail panes. Owns its
@@ -1112,7 +1279,7 @@ fn render_session_category(
         SessionSettingsCategory::Overview => render_session_overview(f, area, app),
         SessionSettingsCategory::Models => render_session_models(f, area, app, backend),
         SessionSettingsCategory::Agents => render_session_agents(f, area, app, backend),
-        _ => render_settings_detail_placeholder(f, area, category.label()),
+        _ => render_settings_detail_placeholder(f, area, app, category.label()),
     }
 }
 
@@ -1151,7 +1318,7 @@ fn render_session_agents(
     let snapshot = match app.session_settings_snapshot.as_ref() {
         Some(s) => s,
         None => {
-            render_settings_detail_placeholder(f, area, "Agents");
+            render_settings_detail_placeholder(f, area, app, "Agents");
             if let Some(p_area) = picker_area {
                 render_session_agents_picker(f, p_area, app);
             }
@@ -1185,6 +1352,9 @@ fn render_session_agents(
         app.scroll.session_agents,
     );
     app.scroll.session_agents = window.offset;
+    if agent_count > 0 {
+        app.settings_list_area = list_viewport(area, 4, window.rows().len());
+    }
     if snapshot.agents.is_empty() {
         lines.push(Line::from(vec![Span::styled(
             "  (no agents attached — press [a] to add)",
@@ -1229,7 +1399,11 @@ fn render_session_agents(
         Style::default().fg(theme::DIM),
     )]));
 
-    f.render_widget(Paragraph::new(lines), area);
+    if agent_count == 0 {
+        render_content(f, area, app, "Agents", lines, 4);
+    } else {
+        f.render_widget(Paragraph::new(lines), area);
+    }
 
     // One click region per agent row (header is 4 lines: blank, title,
     // dashes, blank). Click focuses the detail pane and moves the cursor.
@@ -1280,7 +1454,7 @@ fn render_session_agents_picker(f: &mut ratatui::Frame, area: Rect, app: &App) {
 /// Static snapshot of the active session — name, id, created_at, message
 /// count, attached agents, current agent + effective model. All values
 /// come from the per-tab `Tab` plus the seeded session meta snapshot.
-fn render_session_overview(f: &mut ratatui::Frame, area: Rect, app: &App) {
+fn render_session_overview(f: &mut ratatui::Frame, area: Rect, app: &mut App) {
     let tab = app.active();
     let snapshot = app.session_settings_snapshot.as_ref();
 
@@ -1330,7 +1504,7 @@ fn render_session_overview(f: &mut ratatui::Frame, area: Rect, app: &App) {
         about_kv("  effective model", &effective_model),
         about_kv("  host agent", &host_agent),
     ];
-    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+    render_content(f, area, app, "Overview", lines, 4);
 }
 
 /// Session pin + per-agent overrides. Press Enter (handled upstream) to
@@ -1349,7 +1523,7 @@ pub(super) fn render_session_models(
     let snapshot = match app.session_settings_snapshot.as_ref() {
         Some(s) => s,
         None => {
-            render_settings_detail_placeholder(f, area, "Models");
+            render_settings_detail_placeholder(f, area, app, "Models");
             return;
         }
     };
@@ -1398,6 +1572,7 @@ pub(super) fn render_session_models(
         app.scroll.session_models,
     );
     app.scroll.session_models = window.offset;
+    app.settings_list_area = list_viewport(area, 4, window.rows().map(|i| heights[i]).sum());
     let mut row_offsets = Vec::new();
     // Row 0 — Session pin. Selection marker + resolved-to suffix so the
     // user sees what the pin maps to without flipping to /agents.
@@ -1486,7 +1661,12 @@ pub(super) fn render_session_models(
 /// Placeholder right-pane: shows the active category's name and a
 /// `(coming soon)` line. Replaced category-by-category in subsequent
 /// stages.
-fn render_settings_detail_placeholder(f: &mut ratatui::Frame, area: Rect, category: &str) {
+fn render_settings_detail_placeholder(
+    f: &mut ratatui::Frame,
+    area: Rect,
+    app: &mut App,
+    category: &str,
+) {
     let lines = vec![
         Line::from(""),
         Line::from(vec![Span::styled(
@@ -1503,5 +1683,5 @@ fn render_settings_detail_placeholder(f: &mut ratatui::Frame, area: Rect, catego
             Style::default().fg(theme::DIM),
         )]),
     ];
-    f.render_widget(Paragraph::new(lines), area);
+    render_content(f, area, app, category, lines, 4);
 }

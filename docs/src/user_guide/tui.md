@@ -240,7 +240,89 @@ Approval prompts hijack the keyboard while open: `y` approve, `n` deny, `a` appr
 
 ### Mouse
 
-Mouse capture is enabled. Click on completion rows, help-overlay command rows, approval buttons, picker rows, tab titles, or tab close `[x]` widgets to act on them. The scroll wheel scrolls the help overlay when it is open; in the session picker, model picker, and Settings lists it moves the selection three rows (over the Settings detail pane, not its category rail), and the list scrolls to keep the selection visible; other overlays swallow it; otherwise it scrolls history.
+Mouse capture is enabled. Click on completion rows, help-overlay command rows, approval buttons, picker rows, tab titles, or tab close `[x]` widgets to act on them. The scroll wheel scrolls the help overlay when it is open; in the session and model pickers it moves the selection three rows. In Settings, it selects over the visible list rows and reads over the visible content body (see [Reading Settings details](#reading-settings-details)); headers, the category rail, and the status strip swallow it. Other overlays swallow it; otherwise it scrolls history.
+
+## Reading Settings details
+
+Open Peer Settings with `s` in the session picker (`Ctrl+P`), or Session
+Settings with `/settings` in chat. At normal terminal sizes, the category rail
+stays on the left and the current page stays on the right.
+
+### Keys and pointer
+
+| Input                        | Category focus                                                                                        | List focus                                                                                  | Content focus                                          |
+| ---------------------------- | ----------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------- | ------------------------------------------------------ |
+| `Up` / `Down`                | Cycle categories                                                                                      | Select an entity or model scope; wraps                                                      | Read one wrapped line; clamps                          |
+| `Right`                      | Enter a nonempty list, otherwise Content                                                              | Enter the body on Peer Agents/MCP; otherwise no-op                                          | No-op                                                  |
+| `Left`                       | No-op                                                                                                 | Return to Category                                                                          | Return to the list, or Category on a static/empty page |
+| `PageUp` / `PageDown`        | No-op                                                                                                 | No-op                                                                                       | Read a page, with one line of overlap                  |
+| `Home` / `End`               | First/last category                                                                                   | First/last category                                                                         | Beginning/end of the body                              |
+| `Tab` / `Shift+Tab`, `1`–`9` | Cycle/jump categories                                                                                 | Same, returning to Category                                                                 | Same, returning to Category                            |
+| `Enter`                      | Enter a list/static body; Session Models opens its picker                                             | Peer Agents sets the selected agent's default model; Session Models opens its scoped picker | Peer Agents keeps that model action; otherwise no-op   |
+| `Esc`                        | Return to the caller                                                                                  | Same                                                                                        | Same; use Left to leave only the reader                |
+| Click an entity row          | Select it and focus List                                                                              | Same                                                                                        | Same                                                   |
+| Click the body               | Focus Content without moving selection or reading position                                            | Same                                                                                        | Same                                                   |
+| Wheel over list/body         | List: select three entities, clamped. Body: read three wrapped lines, clamped. Focus does not change. | Same                                                                                        | Same                                                   |
+
+Action letters such as `a`, `d`, and `r`, and Defaults' `Ctrl+Up`/`Ctrl+Down`
+reordering keep their existing selected-row targets. Prompts, pickers, diffs,
+and approval input take precedence over the reader. Wheeling or clicking a
+covered Settings list cannot move its selection or the hidden chat.
+
+### Selection is not reading position
+
+An agent's workers are decorative list rows, not selectable agents. If the
+whole agent-and-workers group fits the list's current row budget, it stays
+expanded. Otherwise its agent row shows `[20 workers → details]` (with the
+actual count). The existing body still contains every worker's fields.
+
+When a body overflows, a pinned row identifies the selected entity and shows
+its visible wrapped-line range, such as `DETAILS [1–14/131] · alpha`.
+`DETAILS` is highlighted while Content owns the keys. Scrolling this body
+never changes the selected agent/server or a model action's scope.
+System prompts remain deliberately abbreviated previews, not full-prompt viewers.
+
+There is one reading position. Changing the category or selected entity,
+including a catalog replacement at the same index, resets it to the beginning;
+leaving Settings resets it too. Focus changes and opening/canceling a model
+picker or diff preserve it. Resizing rewraps the body and clamps the numeric
+wrapped-line offset. It does not preserve a semantic text anchor or remember
+separate positions for previously visited entities. A body that fits again
+returns to its ordinary, unscrolled layout.
+
+### Read an overflowing worker group
+
+1. In an 80×24 terminal, open Peer Settings → Agents and select an agent
+   `alpha` with twenty worker templates. Its row shows:
+
+   ```text
+   > [20 workers → details] alpha
+   ```
+
+   Shorter groups that fit still show their nested `└` rows.
+
+2. Press Right to focus List, then Right again for Content. For short field
+   values, the pinned row reads:
+
+   ```text
+   DETAILS [1–14/131] · alpha
+   ```
+
+   Use Down or PageDown to read. End exposes the final workers' model,
+   spawn-depth, tools and prompt-preview fields; `alpha` remains selected:
+
+   ```text
+   DETAILS [118–131/131] · alpha
+   ```
+
+3. If the wheel seems inactive over the pinned row or a list header, move it
+   into the body below the pinned row. Headers swallow wheel events; blank
+   body cells still scroll. Move over the list only when you intend to select
+   a different agent, which resets reading to Home.
+4. Resize to 120×40. The same agent and focus remain selected; the visible
+   range is remeasured and the offset clamps to the new last page if needed.
+   Use Home to return to the first fields. Left returns to List; Esc returns
+   to the session picker. Reading itself writes no settings.
 
 ## Debug Mode
 

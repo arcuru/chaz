@@ -47,6 +47,8 @@ mod composer;
 #[cfg(test)]
 mod list_tests;
 mod settings;
+#[cfg(test)]
+mod settings_tests;
 
 /// Last `/`-separated segment of a model id (`anthropic/claude-opus-4-7` →
 /// `claude-opus-4-7`). Bare ids without `/` are returned as-is. Used for the
@@ -277,6 +279,8 @@ pub(super) fn ui(
     // Click regions are rebuilt from scratch each frame so coordinates match
     // what the user is currently seeing.
     app.click_regions.clear();
+    app.settings_list_area = None;
+    app.settings_reader.viewport = None;
 
     // Mirror the fast-start gate so ui_chat (which has no `server` handle)
     // can show the "reconciling agents…" indicator until the deferred
@@ -2140,35 +2144,6 @@ mod chat_frame_tests {
             },
         );
         assert_eq!(app.picker_index, 3);
-        assert_eq!(app.active().scroll_offset, 0);
-    }
-
-    #[tokio::test]
-    async fn settings_wheel_moves_detail_cursor_only_over_detail_pane() {
-        use super::super::input;
-        use super::super::{PeerSettingsCategory, SETTINGS_SIDEBAR_W, SettingsScope, TuiMode};
-        use crossterm::event::{KeyModifiers, MouseEvent, MouseEventKind};
-        let mut app = test_app("", 0).await;
-        app.mode = TuiMode::Settings(SettingsScope::Peer);
-        app.peer_settings_index = PeerSettingsCategory::ALL
-            .iter()
-            .position(|c| *c == PeerSettingsCategory::Defaults)
-            .unwrap();
-        app.peer_defaults = (0..10).map(|i| format!("agent-{i}")).collect();
-        let wheel = |column| MouseEvent {
-            kind: MouseEventKind::ScrollDown,
-            column,
-            row: 4,
-            modifiers: KeyModifiers::NONE,
-        };
-        input::handle_mouse(&mut app, wheel(SETTINGS_SIDEBAR_W - 1));
-        assert_eq!(app.peer_defaults_cursor, 0, "rail wheel must not move list");
-        input::handle_mouse(&mut app, wheel(SETTINGS_SIDEBAR_W));
-        assert_eq!(app.peer_defaults_cursor, 3);
-        for _ in 0..5 {
-            input::handle_mouse(&mut app, wheel(SETTINGS_SIDEBAR_W + 4));
-        }
-        assert_eq!(app.peer_defaults_cursor, 9, "wheel clamps at the last row");
         assert_eq!(app.active().scroll_offset, 0);
     }
 

@@ -12,7 +12,7 @@ use eidetica::{Instance, NewUser, backend::database::InMemory};
 use ratatui::{Terminal, backend::TestBackend};
 use std::collections::{HashMap, HashSet};
 
-async fn fixture() -> (Instance, Arc<Server>, BackendManager, App) {
+pub(super) async fn fixture() -> (Instance, Arc<Server>, BackendManager, App) {
     fixture_with_backends(None).await
 }
 
@@ -112,7 +112,7 @@ async fn fixture_with_backends(
     (instance, server, backend, app)
 }
 
-fn draw(
+pub(super) fn draw(
     terminal: &mut Terminal<TestBackend>,
     app: &mut App,
     server: &Arc<Server>,
@@ -131,7 +131,7 @@ fn draw(
         .collect()
 }
 
-fn mouse(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
+pub(super) fn mouse(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
     MouseEvent {
         kind,
         column,
@@ -189,7 +189,7 @@ impl List {
         };
         app.mode = TuiMode::Settings(scope);
         app.set_settings_index(scope, category);
-        app.settings_focus = SettingsFocus::Detail;
+        app.settings_focus = SettingsFocus::List;
     }
     fn cursor(self, app: &App) -> usize {
         match self {
@@ -246,14 +246,8 @@ async fn scrolling_case(list: List) {
         draw(&mut terminal, &mut app, &server, &backend);
         for _ in 0..8 {
             let before = list.cursor(&app);
-            input::handle_mouse(
-                &mut app,
-                mouse(
-                    MouseEventKind::ScrollDown,
-                    super::super::SETTINGS_SIDEBAR_W,
-                    4,
-                ),
-            );
+            let area = app.settings_list_area.unwrap();
+            input::handle_mouse(&mut app, mouse(MouseEventKind::ScrollDown, area.x, area.y));
             assert_eq!(
                 list.cursor(&app),
                 (before + 3).min(if matches!(list, List::Models) { 30 } else { 29 })
@@ -371,6 +365,12 @@ async fn footer_frames_reserve_hints_without_starving_rows() {
             let mut terminal = Terminal::new(TestBackend::new(80, height)).unwrap();
             let rows = draw(&mut terminal, &mut app, &server, &backend);
             assert_rows(list, &app, &rows, 80);
+            if let Some(y) = rows[..rows.len() - 1].iter().position(|r| r.contains(hint)) {
+                assert!(
+                    app.settings_list_area.unwrap().bottom() <= y as u16,
+                    "footer is not a list wheel target: {list:?}: {rows:?}"
+                );
+            }
             if height
                 >= if matches!(list, List::Models) {
                     11
@@ -388,14 +388,8 @@ async fn footer_frames_reserve_hints_without_starving_rows() {
         }
         // Overflow still leaves both the cursor and footer visible.
         for _ in 0..8 {
-            input::handle_mouse(
-                &mut app,
-                mouse(
-                    MouseEventKind::ScrollDown,
-                    super::super::SETTINGS_SIDEBAR_W,
-                    4,
-                ),
-            );
+            let area = app.settings_list_area.unwrap();
+            input::handle_mouse(&mut app, mouse(MouseEventKind::ScrollDown, area.x, area.y));
         }
         let mut terminal = Terminal::new(TestBackend::new(80, 14)).unwrap();
         let rows = draw(&mut terminal, &mut app, &server, &backend);

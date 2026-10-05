@@ -360,6 +360,8 @@ pub(super) fn handle_mouse(app: &mut App, m: MouseEvent) -> Option<MouseOutcome>
                 };
             } else if app.overlay.is_some() {
                 // Modal overlays own the wheel even when they have no scroll.
+            } else if app.active().pending_approval.is_some() {
+                // Approval owns input; no wheel reaches the background.
             } else if let Some(picker) = app.settings_picker.as_mut() {
                 picker.selected = wheel_step(picker.selected, down, picker.filtered().len());
             } else if app.mode == TuiMode::ModelPicker {
@@ -371,16 +373,25 @@ pub(super) fn handle_mouse(app: &mut App, m: MouseEvent) -> Option<MouseOutcome>
             } else if app.mode == TuiMode::SessionPicker {
                 app.picker_index = wheel_step(app.picker_index, down, app.picker_len());
             } else if let TuiMode::Settings(scope) = app.mode {
-                // The left rail has no scrollable rows, and the agent diff
-                // modal hides the list, so only a visible detail list moves.
-                if m.column < super::SETTINGS_SIDEBAR_W || app.agent_diff.is_some() {
+                if app.agent_diff.is_some() || app.settings_prompt.is_some() {
                     return None;
                 }
-                let cat = app.settings_index(scope);
-                if let Some(len) = settings_inner_list_len(app, scope, cat)
-                    && let Some(cursor) = inner_cursor_mut(app, scope, cat)
+                app.sync_settings_reader(scope);
+                let point = ratatui::layout::Position::new(m.column, m.row);
+                if app
+                    .settings_reader
+                    .viewport
+                    .is_some_and(|r| r.contains(point))
                 {
-                    *cursor = wheel_step(*cursor, down, len);
+                    app.settings_reader.scroll(down, 3);
+                } else if app.settings_list_area.is_some_and(|r| r.contains(point)) {
+                    let cat = app.settings_index(scope);
+                    if let Some(len) = settings_inner_list_len(app, scope, cat)
+                        && let Some(cursor) = inner_cursor_mut(app, scope, cat)
+                    {
+                        *cursor = wheel_step(*cursor, down, len);
+                    }
+                    app.sync_settings_reader(scope);
                 }
             } else {
                 let off = &mut app.active_mut().scroll_offset;
@@ -394,6 +405,16 @@ pub(super) fn handle_mouse(app: &mut App, m: MouseEvent) -> Option<MouseOutcome>
         }
         MouseEventKind::Down(MouseButton::Left) => {}
         _ => return None,
+    }
+
+    if matches!(app.mode, TuiMode::Settings(_))
+        && app.overlay.is_none()
+        && (app.agent_diff.is_some()
+            || app.settings_prompt.is_some()
+            || app.settings_picker.is_some()
+            || app.active().pending_approval.is_some())
+    {
+        return None;
     }
 
     // Left-click — find the innermost hit region. `click_regions` is pushed in
@@ -476,9 +497,15 @@ pub(super) fn handle_mouse(app: &mut App, m: MouseEvent) -> Option<MouseOutcome>
                 let n = app.settings_category_count(scope);
                 if i < n {
                     app.set_settings_index(scope, i);
-                    app.settings_focus = SettingsFocus::Sidebar;
+                    app.settings_focus = SettingsFocus::Category;
                     app.settings_status = None;
                 }
+            }
+        }
+        ClickTarget::SettingsContent => {
+            if matches!(app.mode, TuiMode::Settings(_)) && app.settings_reader.viewport.is_some() {
+                app.settings_focus = SettingsFocus::Content;
+                app.settings_status = None;
             }
         }
         ClickTarget::SettingsDetailRow(i) => {
@@ -487,7 +514,8 @@ pub(super) fn handle_mouse(app: &mut App, m: MouseEvent) -> Option<MouseOutcome>
             if let TuiMode::Settings(scope) = app.mode {
                 let cat = app.settings_index(scope);
                 set_settings_detail_cursor(app, scope, cat, i);
-                app.settings_focus = SettingsFocus::Detail;
+                app.settings_focus = SettingsFocus::List;
+                app.sync_settings_reader(scope);
                 app.settings_status = None;
             }
         }
@@ -545,7 +573,7 @@ fn apply_approval(app: &mut App, decision: ApprovalDecision) {
     }
 }
 
-pub(super) async fn handle_chat_key(app: &mut App, key: KeyEvent) -> Option<ChatAction> {
+fn handle_approval_key(app: &mut App, key: KeyEvent) -> bool {
     if let Some(exchange) = app.active_mut().pending_approval.take() {
         let decision = match key.code {
             KeyCode::Char('y') => Some(ApprovalDecision::Approve),
@@ -553,12 +581,20 @@ pub(super) async fn handle_chat_key(app: &mut App, key: KeyEvent) -> Option<Chat
             KeyCode::Char('a') => Some(ApprovalDecision::ApproveAll),
             _ => {
                 app.active_mut().pending_approval = Some(exchange);
-                return None;
+                return true;
             }
         };
         if let Some(decision) = decision {
             let _ = exchange.decision_tx.send(decision);
         }
+        return true;
+    }
+
+    false
+}
+
+pub(super) async fn handle_chat_key(app: &mut App, key: KeyEvent) -> Option<ChatAction> {
+    if handle_approval_key(app, key) {
         return None;
     }
 
@@ -911,20 +947,17 @@ pub(super) enum SettingsKey {
     WritePeerDefaults(Vec<String>),
 }
 
-/// Key handler for `TuiMode::Settings`. Navigation is focus-aware:
-///   - Sidebar focus (default): `↑`/`↓` cycle categories, `→` / `Enter`
-///     dive into the active category's inner list (only when it owns one),
-///     `Esc` exits Settings.
-///   - Detail focus: `↑`/`↓` move the inner cursor, `←` returns focus to
-///     the sidebar, `Esc` exits Settings.
-///
-/// `Tab`/`BackTab` always cycle categories and snap focus back to the
-/// sidebar — a stable escape hatch from any inner-list state.
+/// Category/List/Content navigation. Content reads wrapped lines without
+/// changing the selected entity; Tab / BackTab always return to Category.
 pub(super) fn handle_settings_key(
     app: &mut App,
     key: KeyEvent,
     scope: SettingsScope,
 ) -> SettingsKey {
+    if app.overlay.is_some() || handle_approval_key(app, key) {
+        return SettingsKey::None;
+    }
+    app.sync_settings_reader(scope);
     // The agent diff/merge modal owns all keys while open — arrows move its
     // row cursor, Esc closes it (not Settings), and r/R/a drive the merge.
     if app.agent_diff.is_some() {
@@ -1069,6 +1102,8 @@ pub(super) fn handle_settings_key(
             | KeyCode::Right
             | KeyCode::Home
             | KeyCode::End
+            | KeyCode::PageUp
+            | KeyCode::PageDown
             | KeyCode::Enter
             | KeyCode::Esc
             | KeyCode::Char(_)
@@ -1088,63 +1123,91 @@ pub(super) fn handle_settings_key(
         // which pane currently owns arrow keys.
         KeyCode::Tab => {
             app.set_settings_index(scope, (cur + 1) % n);
-            app.settings_focus = SettingsFocus::Sidebar;
+            app.settings_focus = SettingsFocus::Category;
             SettingsKey::None
         }
         KeyCode::BackTab => {
             app.set_settings_index(scope, (cur + n - 1) % n);
-            app.settings_focus = SettingsFocus::Sidebar;
+            app.settings_focus = SettingsFocus::Category;
             SettingsKey::None
         }
         KeyCode::Down => match focus {
-            SettingsFocus::Sidebar => {
+            SettingsFocus::Category => {
                 app.set_settings_index(scope, (cur + 1) % n);
                 SettingsKey::None
             }
-            SettingsFocus::Detail => {
+            SettingsFocus::List => {
                 if let Some(len) = inner_list_len {
                     bump_inner_cursor(app, scope, cur, 1, len);
+                    app.sync_settings_reader(scope);
                 }
+                SettingsKey::None
+            }
+            SettingsFocus::Content => {
+                app.settings_reader.scroll(true, 1);
                 SettingsKey::None
             }
         },
         KeyCode::Up => match focus {
-            SettingsFocus::Sidebar => {
+            SettingsFocus::Category => {
                 app.set_settings_index(scope, (cur + n - 1) % n);
                 SettingsKey::None
             }
-            SettingsFocus::Detail => {
+            SettingsFocus::List => {
                 if let Some(len) = inner_list_len {
                     bump_inner_cursor(app, scope, cur, -1, len);
+                    app.sync_settings_reader(scope);
                 }
                 SettingsKey::None
             }
+            SettingsFocus::Content => {
+                app.settings_reader.scroll(false, 1);
+                SettingsKey::None
+            }
         },
-        // Right enters the detail pane when the active category owns an
-        // inner list with at least one row. No-op otherwise — there's
-        // nothing for arrows to land on.
         KeyCode::Right => {
-            if matches!(focus, SettingsFocus::Sidebar) && inner_list_len.is_some_and(|len| len > 0)
-            {
-                app.settings_focus = SettingsFocus::Detail;
+            match focus {
+                SettingsFocus::Category => {
+                    app.settings_focus = if inner_list_len.is_some_and(|len| len > 0) {
+                        SettingsFocus::List
+                    } else {
+                        SettingsFocus::Content
+                    };
+                }
+                SettingsFocus::List if settings_has_content(scope, cur, inner_list_len) => {
+                    app.settings_focus = SettingsFocus::Content;
+                }
+                _ => {}
             }
             SettingsKey::None
         }
-        // Left pops focus back to the sidebar from the detail pane.
         KeyCode::Left => {
-            if matches!(focus, SettingsFocus::Detail) {
-                app.settings_focus = SettingsFocus::Sidebar;
-            }
+            app.settings_focus = match focus {
+                SettingsFocus::Content if inner_list_len.is_some_and(|len| len > 0) => {
+                    SettingsFocus::List
+                }
+                _ => SettingsFocus::Category,
+            };
             SettingsKey::None
         }
-        KeyCode::Home => {
-            app.set_settings_index(scope, 0);
-            app.settings_focus = SettingsFocus::Sidebar;
+        KeyCode::Home | KeyCode::End if focus == SettingsFocus::Content => {
+            app.settings_reader.offset = if key.code == KeyCode::Home {
+                0
+            } else {
+                app.settings_reader.max_offset
+            };
             SettingsKey::None
         }
-        KeyCode::End => {
-            app.set_settings_index(scope, n - 1);
-            app.settings_focus = SettingsFocus::Sidebar;
+        KeyCode::PageUp | KeyCode::PageDown if focus == SettingsFocus::Content => {
+            app.settings_reader.scroll(
+                key.code == KeyCode::PageDown,
+                app.settings_reader.visible_rows.saturating_sub(1).max(1),
+            );
+            SettingsKey::None
+        }
+        KeyCode::Home | KeyCode::End => {
+            app.set_settings_index(scope, if key.code == KeyCode::Home { 0 } else { n - 1 });
+            app.settings_focus = SettingsFocus::Category;
             SettingsKey::None
         }
         // Number keys 1..=9 jump straight to that category (only when the
@@ -1155,7 +1218,7 @@ pub(super) fn handle_settings_key(
             let idx = (c as usize) - ('1' as usize);
             if idx < n {
                 app.set_settings_index(scope, idx);
-                app.settings_focus = SettingsFocus::Sidebar;
+                app.settings_focus = SettingsFocus::Category;
             }
             SettingsKey::None
         }
@@ -1167,26 +1230,29 @@ pub(super) fn handle_settings_key(
                     super::SessionSettingsCategory::ALL.get(cur),
                     Some(super::SessionSettingsCategory::Models)
                 )
+                && focus != SettingsFocus::Content
             {
                 return SettingsKey::OpenModelPicker(None);
             }
-            // Peer→Agents in detail focus: Enter opens the picker for
+            // Peer→Agents in List/Content focus: Enter opens the picker for
             // agent-global model (DB-level `AgentDbConfig.model`).
             if matches!(scope, SettingsScope::Peer)
                 && matches!(
                     super::PeerSettingsCategory::ALL.get(cur),
                     Some(super::PeerSettingsCategory::Agents)
                 )
-                && matches!(focus, SettingsFocus::Detail)
+                && matches!(focus, SettingsFocus::List | SettingsFocus::Content)
                 && let Some(name) = app.peer_agents_names.get(app.peer_agents_cursor).cloned()
             {
                 return SettingsKey::OpenModelPicker(Some(ModelPickerScope::AgentGlobal(name)));
             }
-            // Otherwise Enter on the sidebar dives into the detail pane
-            // when one exists — same effect as Right.
-            if matches!(focus, SettingsFocus::Sidebar) && inner_list_len.is_some_and(|len| len > 0)
-            {
-                app.settings_focus = SettingsFocus::Detail;
+            // Otherwise Enter on Category has the same effect as Right.
+            if matches!(focus, SettingsFocus::Category) {
+                app.settings_focus = if inner_list_len.is_some_and(|len| len > 0) {
+                    SettingsFocus::List
+                } else {
+                    SettingsFocus::Content
+                };
             }
             SettingsKey::None
         }
@@ -1482,6 +1548,16 @@ fn settings_inner_list_len(app: &App, scope: SettingsScope, category_idx: usize)
             _ => None,
         },
     }
+}
+
+/// Nonempty list-only pages have no second body; empty pages read their message.
+fn settings_has_content(scope: SettingsScope, category: usize, len: Option<usize>) -> bool {
+    len.is_none_or(|n| n == 0)
+        || (scope == SettingsScope::Peer
+            && matches!(
+                super::PeerSettingsCategory::ALL.get(category),
+                Some(super::PeerSettingsCategory::Agents | super::PeerSettingsCategory::Mcp)
+            ))
 }
 
 fn peer_agent_count(app: &App) -> usize {
