@@ -391,7 +391,7 @@ These tables list every category in sidebar order. Read-only pages are inspector
 
 | Session category | Current behavior                                                                                                                               |
 | ---------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
-| Overview         | Read-only active-session identity, creation time, entry count, roster/host, current agent, and effective model.                                |
+| Overview         | Read-only active-session identity, creation time, entry count, attached-agent count and host, current agent, and effective model.              |
 | Agents           | Inspect the attached roster. `a` opens a filtered picker of hosted agents not already attached (`Enter` adds); `d` removes the selected agent. |
 | Models           | Edit the session-wide pin or a per-agent session override via the [model picker](#model-picker).                                               |
 | Routing          | **Coming soon.**                                                                                                                               |
