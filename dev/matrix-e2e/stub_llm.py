@@ -107,7 +107,7 @@ class Handler(BaseHTTPRequestHandler):
         task = messages[0].get("content") if messages and isinstance(messages[0], dict) \
             and messages[0].get("role") == "system" else None
         for mode in ("send", "silent"):
-            if task != f"{REPLY}-scheduled-{mode}":
+            if task != f"{self.server.reply}-scheduled-{mode}":
                 continue
             call_id = f"scheduled-{mode}-send"
             current_result = messages[-1].get("role") == "tool" \
@@ -118,10 +118,10 @@ class Handler(BaseHTTPRequestHandler):
                     return True
                 sys.stderr.write("stub_llm: scheduled explicit matrix__send\n")
                 self._fixture_reply(name="matrix__send", call_id=call_id,
-                                    arguments={"body": f"{REPLY}-scheduled-post"})
+                                    arguments={"body": f"{self.server.reply}-scheduled-post"})
             else:
                 sys.stderr.write(f"stub_llm: scheduled {mode} local final\n")
-                self._fixture_reply(content=f"{REPLY}-scheduled-{mode}-final")
+                self._fixture_reply(content=f"{self.server.reply}-scheduled-{mode}-final")
             return True
 
         latest_user = next((msg.get("content", "") for msg in reversed(messages)
@@ -137,14 +137,14 @@ class Handler(BaseHTTPRequestHandler):
                 if "Added schedule" not in str(messages[-1].get("content")):
                     self._send({"error": "schedule fixture creation failed"}, status=400)
                     return True
-                self._fixture_reply(content=f"{REPLY}-schedule-{mode}-created")
+                self._fixture_reply(content=f"{self.server.reply}-schedule-{mode}-created")
             else:
                 if "schedule_add" not in tools:
                     self._send({"error": "schedule_add unavailable"}, status=400)
                     return True
                 self._fixture_reply(name="schedule_add", call_id=call_id, arguments={
                     "id": f"e2ee-{mode}", "interval_seconds": 5, "target": "pinned",
-                    "max_fires": 1, "task": f"{REPLY}-scheduled-{mode}",
+                    "max_fires": 1, "task": f"{self.server.reply}-scheduled-{mode}",
                 })
             return True
         return False
@@ -309,6 +309,9 @@ class Handler(BaseHTTPRequestHandler):
                 "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
             })
         else:
+            if not self.server.matrix_sends:
+                self._fixture_reply(content=self.server.reply)
+                return
             if "matrix__send" not in tools:
                 self._send({"error": "matrix__send unavailable"}, status=400)
                 return
@@ -332,4 +335,5 @@ class Handler(BaseHTTPRequestHandler):
 if __name__ == "__main__":
     server = HTTPServer(("127.0.0.1", int(sys.argv[1])), Handler)
     server.reply = sys.argv[2]
+    server.matrix_sends = True
     server.serve_forever()
