@@ -61,6 +61,7 @@ pub struct MatrixClient {
     client: Client,
     sync_token: Option<String>,
     session_file: PathBuf,
+    autojoin: std::sync::Arc<std::sync::Mutex<tokio::task::JoinSet<()>>>,
 }
 
 impl MatrixClient {
@@ -143,6 +144,7 @@ impl MatrixClient {
             client,
             sync_token,
             session_file,
+            autojoin: Default::default(),
         })
     }
 
@@ -162,48 +164,63 @@ impl MatrixClient {
     /// rooms exceeding the limit. Mirrors headjack's `join_rooms`.
     pub fn install_autojoin(&self, allow_list: Option<String>, room_size_limit: Option<usize>) {
         let username = self.full_name();
+        let autojoin = std::sync::Arc::downgrade(&self.autojoin);
         self.client.add_event_handler(
-            move |room_member: StrippedRoomMemberEvent, client: Client, room: Room| async move {
-                if room_member.state_key != client.user_id().unwrap() {
-                    return;
-                }
-                if !is_allowed(
-                    allow_list.as_deref(),
-                    room_member.sender.as_str(),
-                    &username,
-                ) {
-                    return;
-                }
-                info!("Received stripped room member event: {room_member:?}");
-                tokio::spawn(async move {
-                    info!("Autojoining room {}", room.room_id());
-                    let mut delay = 2;
-                    while let Err(err) = room.join().await {
-                        warn!(
-                            "Failed to join room {} ({err:?}), retrying in {delay}s",
-                            room.room_id()
-                        );
-                        sleep(Duration::from_secs(delay)).await;
-                        delay *= 2;
-                        if delay > 3600 {
-                            error!("Can't join room {} ({err:?})", room.room_id());
-                            break;
-                        }
-                    }
-                    if is_room_too_large(&room, room_size_limit).await {
-                        warn!(
-                            "Room {} has too many members, refusing to join",
-                            room.room_id()
-                        );
-                        if let Err(e) = room.leave().await {
-                            error!("Error leaving room: {e:?}");
-                        }
+            move |room_member: StrippedRoomMemberEvent, client: Client, room: Room| {
+                let autojoin = autojoin.upgrade();
+                async move {
+                    let Some(autojoin) = autojoin else {
+                        return;
+                    };
+                    if room_member.state_key != client.user_id().unwrap() {
                         return;
                     }
-                    info!("Successfully joined room {}", room.room_id());
-                });
+                    if !is_allowed(
+                        allow_list.as_deref(),
+                        room_member.sender.as_str(),
+                        &username,
+                    ) {
+                        return;
+                    }
+                    info!("Received stripped room member event: {room_member:?}");
+                    let mut tasks = autojoin.lock().unwrap();
+                    while tasks.try_join_next().is_some() {}
+                    tasks.spawn(async move {
+                        info!("Autojoining room {}", room.room_id());
+                        let mut delay = 2;
+                        while let Err(err) = room.join().await {
+                            warn!(
+                                "Failed to join room {} ({err:?}), retrying in {delay}s",
+                                room.room_id()
+                            );
+                            sleep(Duration::from_secs(delay)).await;
+                            delay *= 2;
+                            if delay > 3600 {
+                                error!("Can't join room {} ({err:?})", room.room_id());
+                                break;
+                            }
+                        }
+                        if is_room_too_large(&room, room_size_limit).await {
+                            warn!(
+                                "Room {} has too many members, refusing to join",
+                                room.room_id()
+                            );
+                            if let Err(e) = room.leave().await {
+                                error!("Error leaving room: {e:?}");
+                            }
+                            return;
+                        }
+                        info!("Successfully joined room {}", room.room_id());
+                    });
+                }
             },
         );
+    }
+
+    /// Called after sync stops, so no handler can start more autojoin work.
+    pub async fn shutdown(&self) {
+        let mut tasks = std::mem::take(&mut *self.autojoin.lock().unwrap());
+        tasks.shutdown().await;
     }
 
     /// Block until the first sync against the homeserver succeeds, retrying on
