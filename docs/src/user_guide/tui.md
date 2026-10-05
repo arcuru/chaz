@@ -213,6 +213,7 @@ See [Extensions](extensions.md). Extensions can also register their own slash co
 | ---------------------- | ------------------------------------------------------------- |
 | `/clear`               | Clear the display (entries remain in the database)            |
 | `/raw`                 | Dump raw entry data (index, timestamp, type, sender, content) |
+| `/settings`            | Open [Session Settings](#settings) (also `Ctrl+,` in chat)    |
 | `/debug`               | Toggle debug mode (also `Ctrl+D`)                             |
 | `/quit`, `/q`, `/exit` | Exit                                                          |
 
@@ -358,6 +359,51 @@ Open with `/sessions` or `/s`:
 
 Sessions are listed from registry metadata: eidetica DB root ID, human-friendly name, bridge, agent, age, and status. The picker does not scan transcripts for entry counts, previews, or costs; selecting a session loads that conversation on demand, while `/costs` explicitly scans usage data. Catalog loading happens in the background, and agent metadata is fetched only for rows visible in the picker viewport, so navigation and cancel remain available while storage is slow. Loaded metadata stays cached while the TUI is open. The "New session" row stays pinned above the scrolling list; selecting it retains the list's viewport and continues loading those visible rows. The picker shows every session the registry knows about: TUI, Matrix-attached, `spawn_agent` / `spawn_worker` children, and anything synced from remote peers. The current session is marked with `*`. Press `Enter` to switch, `n` to create a new session, or `Esc` to cancel.
 
+## Settings
+
+Settings has two separate scopes: **Peer** covers this process's hosted agents and configuration; **Session** covers the active conversation's roster and model overrides. A per-agent Session model override does not change that agent's DB default. Peer → Agents can change the DB default, which applies wherever a session override does not win.
+
+| Entry path                            | Opens                                                  |
+| ------------------------------------- | ------------------------------------------------------ |
+| `Ctrl+,` in chat or `/settings`       | Session Settings                                       |
+| `/models` in chat                     | Session Settings → Models, with the scope list focused |
+| `Ctrl+,` or `s` in the session picker | Peer Settings                                          |
+
+`Ctrl+,` does nothing while Settings or the model picker is already open. Settings remembers its caller: `Esc` returns to chat or the session picker, rather than quitting. Opening Settings normally focuses the category sidebar. `↑` / `↓` select categories; `Tab` / `Shift+Tab` cycle them from either pane and return focus to the sidebar. Number keys jump to categories in the order below (`1`–`9` for Peer, `1`–`6` for Session).
+
+For categories with a selectable list, `→` or `Enter` moves focus into that list, `↑` / `↓` select rows, and `←` returns to the sidebar. On Session → Models, `Enter` opens the model picker for the selected scope even from sidebar focus. A model picker returns to its Settings page on selection or `Esc`; `Esc` cancels without writing a model. An open add prompt, add-agent picker, or YAML diff handles `Esc` first, so cancel it before pressing `Esc` again to leave Settings. Exiting Settings does not undo edits already applied.
+
+### Shipped pages and controls
+
+These tables list every category in sidebar order. Read-only pages are inspectors, not editors waiting for an apply key. The six **coming soon** pages are placeholders and have no settings controls.
+
+| Peer category | Current behavior                                                                                                                                                                                                                                                                         |
+| ------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Agents        | Inspect hosted agents and selected-agent details. In list focus, `Enter` picks the agent's DB-default model. `r` opens a YAML diff: `r` applies the additive drift merge, `R` requests a full reseed with confirmation, and `a` lets you pick fields (`Space` toggles, `Enter` applies). |
+| Backends      | Read-only backend names, API base URLs, and configured/known model counts; no credential editor.                                                                                                                                                                                         |
+| Defaults      | Edit the ordered agents attached to new sessions; the first is the routing host. `a` opens an add prompt, `d` removes the selected row, and `Ctrl+↑` / `Ctrl+↓` reorder it. Changes persist in the peer DB, not YAML, and do not change existing session rosters.                        |
+| Bridges       | Read-only status: TUI active, CLI available, Matrix/Discord external binaries.                                                                                                                                                                                                           |
+| Extensions    | **Coming soon.**                                                                                                                                                                                                                                                                         |
+| MCP           | Read-only server list and selected-server status, tools, and failure details.                                                                                                                                                                                                            |
+| Groups        | **Coming soon.**                                                                                                                                                                                                                                                                         |
+| Identity      | **Coming soon.**                                                                                                                                                                                                                                                                         |
+| About         | Read-only version, state directory, in-process bridges, and configuration/count summary.                                                                                                                                                                                                 |
+
+| Session category | Current behavior                                                                                                                               |
+| ---------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
+| Overview         | Read-only active-session identity, creation time, entry count, roster/host, current agent, and effective model.                                |
+| Agents           | Inspect the attached roster. `a` opens a filtered picker of hosted agents not already attached (`Enter` adds); `d` removes the selected agent. |
+| Models           | Edit the session-wide pin or a per-agent session override via the [model picker](#model-picker).                                               |
+| Routing          | **Coming soon.**                                                                                                                               |
+| History          | **Coming soon.**                                                                                                                               |
+| Sharing          | **Coming soon.**                                                                                                                               |
+
+### Example: session override, then peer inspection
+
+1. In chat, type `/models`. The Models page opens with `Session` selected. Press `↓` to select an attached agent's row, then `Enter`; the picker title names that agent's scope.
+2. Type to filter models and press `Enter` to apply one. You return to Models with a per-agent override for **this session only**. To back out instead, press `Esc` in the picker: you return to Models with no model change. Press `Esc` on Models to return to chat.
+3. Open the session picker with `Ctrl+P`, then press `s` (or `Ctrl+,`). This opens **Peer**, not the highlighted session's Settings. Select Backends (key `2`) to inspect configured backends without editing them. Press `Esc` to return to the session picker, then `Esc` to return to chat. Merely browsing either scope does not write settings.
+
 ## Named Sessions
 
 Give sessions human-friendly names instead of opaque IDs:
@@ -468,7 +514,7 @@ The TUI renders different entry types with distinct styles:
 | ToolResult | Dimmed `< tool_name: output`           | Tool returned a result                                         |
 | Error      | Red `ERROR sender: message`            | An error occurred                                              |
 
-Senders are color-coded: agents in green, users in cyan, system in yellow.
+Senders are color-coded: agents in magenta, users in cyan, system in yellow. Green is the UI accent, not the agent sender color.
 
 ## Tool Approval
 
