@@ -45,6 +45,68 @@ volumes:
   chaz-state:
 ```
 
+## Filtered tests from a compiled archive
+
+Run these commands from the root of the Chaz checkout you are editing.
+
+| Command                                                       | Purpose                                                        |
+| ------------------------------------------------------------- | -------------------------------------------------------------- |
+| `nix run .#test -- -E 'test(test_error_size)'`                | Run matching tests from the current source's compiled archive. |
+| `nix run .#test -- -E 'binary(service_client_targeted)' -j 2` | Select a test binary and limit concurrent tests.               |
+| `nix run .#test -- --help`                                    | Show nextest's filter, output, and execution options.          |
+| `nix build .#test.archive`                                    | Realize the archive without running tests.                     |
+| `nix build .#test.default`                                    | Run the full Cargo test check, including doctests.             |
+
+### Compile once, filter many times
+
+The first invocation realizes a nextest archive for this tree, compiling the workspace's tests with the existing Nix toolchain, default features, and Cargo profile.
+It reuses Crane's dependency artifacts where available.
+Changing only the filter reuses that immutable archive: nextest extracts and runs binaries without invoking Cargo or rebuilding the project.
+Changes to Rust sources, Cargo inputs, or snapshot fixtures invalidate the archive; a new invocation builds the changed tree.
+New files must be tracked with `git add` before Nix can see them.
+
+Use `.#test` in the actual worktree, not a pinned remote flake or a runner saved from another revision.
+The runner remaps source paths and snapshot lookup to the current workspace, supplies Python, TLS certificates, and the OpenSSL library path, and uses a disposable writable home directory.
+The CLI integration test uses nextest's relocated binary path when running from an archive.
+No writable Cargo target is shared between worktrees, and this app does not seed the dev shell's target directory.
+
+The archive runs unit and integration tests, not doctests.
+The full Cargo check reuses its compiled artifacts and still runs doctests.
+Filtered runs do **not** replace the final gates:
+
+```bash
+nix develop .# -c just fix
+nix develop .# -c just nix full
+```
+
+### A filtered iteration
+
+1. From the workspace root, select a known test:
+
+   ```bash
+   nix run .#test -- -E 'test(=error::tests::test_error_size)' --show-progress=none
+   ```
+
+   After the initial build and extraction, nextest reports `1 test run: 1 passed` (plus skipped tests).
+
+2. Run another filter without editing source:
+
+   ```bash
+   nix run .#test -- -E 'test(=error::tests::test_display_formatting)' -j 1 --show-progress=none
+   ```
+
+   This extracts the same archive and reports `1 test run: 1 passed`, with no compilation.
+   Edit source and repeat either command to test the newly compiled version instead.
+
+3. A misspelled filter is a failure, not a successful test run:
+
+   ```bash
+   nix run .#test -- -E 'test(=archive_runner_no_such_test)' --show-progress=none
+   ```
+
+   Nextest reports `0 tests run: 0 passed` and `error: no tests to run`, exiting non-zero.
+   Correct the name or broaden the filter, then check that tests actually ran.
+
 ## Minimal Configuration
 
 Create a `config.yaml`:

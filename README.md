@@ -334,6 +334,11 @@ just fmt            # treefmt
 just ci             # all checks
 ```
 
+For repeated filtered tests without rebuilding unchanged source, use
+`nix run .#test -- -E 'test(test_error_size)'` from the workspace root.
+See [compiled archive tests](docs/src/user_guide/getting_started.md#filtered-tests-from-a-compiled-archive)
+for reuse, source invalidation, and the required full final gates.
+
 ## Repository
 
 **Mirrored on [GitHub](https://github.com/arcuru/chaz) and [Codeberg](https://codeberg.org/arcuru/chaz). GitHub is the official repo, but use either repo to contribute.**

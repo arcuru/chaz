@@ -162,6 +162,49 @@
 
         chaz-doc = craneLib.cargoDoc buildArgs;
 
+        # Compile once for filtered local runs and the full cargo test check.
+        # Keep Crane's existing Cargo profile and default workspace features.
+        chaz-test-archive = craneLib.mkCargoDerivation (buildArgs
+          // {
+            pnameSuffix = "-test-archive";
+            nativeBuildInputs = buildArgs.nativeBuildInputs or [] ++ [pkgs.cargo-nextest];
+            buildPhaseCargoCommand = ''
+              cargo nextest archive --locked --workspace \
+                ''${CARGO_PROFILE:+--cargo-profile "$CARGO_PROFILE"} \
+                --archive-file archive.tar.zst
+            '';
+            installPhaseCommand = ''
+              mkdir -p $out
+              cp archive.tar.zst $out/
+            '';
+          });
+
+        # Still cargo test, including doctests; only the compiled artifacts change.
+        chaz-test = craneLib.cargoTest (testArgs // {cargoArtifacts = chaz-test-archive;});
+
+        chaz-test-runner = pkgs.writeShellApplication {
+          name = "chaz-test-runner";
+          runtimeInputs = [pkgs.cargo-nextest pkgs.python3 pkgs.coreutils];
+          text = ''
+            if [[ ! -f ./Cargo.toml ]]; then
+              echo "Run nix run .#test from the Chaz workspace root." >&2
+              exit 1
+            fi
+            # Match the check's writable HOME without touching the developer's home.
+            test_home=$(mktemp -d)
+            trap 'rm -rf "$test_home"' EXIT
+            export HOME="$test_home"
+            export LD_LIBRARY_PATH="${commonArgs.LD_LIBRARY_PATH}''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+            export SSL_CERT_FILE="${testArgs.SSL_CERT_FILE}"
+            export INSTA_WORKSPACE_ROOT="$PWD"
+            cargo-nextest nextest run \
+              --archive-file ${chaz-test-archive}/archive.tar.zst \
+              --workspace-remap "$PWD" \
+              --no-fail-fast \
+              "$@"
+          '';
+        };
+
         # Pre-built instrumented deps for coverage (separate cache: different RUSTFLAGS than buildArgs).
         coverageArtifacts = craneLib.mkCargoDerivation (commonArgs
           // {
@@ -223,7 +266,8 @@
 
           # Test group
           test = {
-            default = craneLib.cargoTest testArgs;
+            default = chaz-test;
+            archive = chaz-test-archive;
           };
 
           # Doc group
@@ -263,7 +307,7 @@
         # CI checks — run during `nix flake check`
         checks = {
           build = chaz-unwrapped;
-          test = craneLib.cargoTest testArgs;
+          test = chaz-test;
           lint = mkAggregate "lint" lintDefaults;
           doc = chaz-doc;
         };
@@ -279,6 +323,10 @@
         };
 
         apps = {
+          test = {
+            type = "app";
+            program = "${chaz-test-runner}/bin/chaz-test-runner";
+          };
           default = {
             type = "app";
             program = "${chaz}/bin/chaz";
