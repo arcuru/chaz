@@ -180,7 +180,12 @@
           });
 
         # Still cargo test, including doctests; only the compiled artifacts change.
-        chaz-test = craneLib.cargoTest (testArgs // {cargoArtifacts = chaz-test-archive;});
+        chaz-test = craneLib.cargoTest (testArgs
+          // {
+            cargoArtifacts = chaz-test-archive;
+            # The archive owns reusable artifacts; this check has no consumers.
+            doInstallCargoArtifacts = false;
+          });
 
         chaz-test-runner = pkgs.writeShellApplication {
           name = "chaz-test-runner";
