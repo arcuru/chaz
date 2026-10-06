@@ -90,7 +90,7 @@ async fn fixture_with_backends(
         effective_model: String::new(),
         roster: Vec::new(),
         context_budget: 0,
-        context_model: String::new(),
+        model_pin: None,
         expanded_entries: HashSet::new(),
     };
     let mut app = App::new(HashSet::new(), tab);
@@ -505,7 +505,7 @@ async fn toolbar_context_reopen_honors_pins_and_refreshes_runtime_budget() {
     let tab = super::super::build_tab(&server, &backend, db.clone(), id.clone()).await;
     assert_eq!(tab.effective_model, "large-model");
     assert_eq!(tab.context_budget, 1_050_000);
-    assert_eq!(tab.context_model, "secondary:large-model");
+    assert_eq!(tab.model_pin.as_deref(), Some("secondary:large-model"));
     app.tabs[0] = tab;
     // No session write: a learned-window update must reach the very next frame.
     server
@@ -546,7 +546,40 @@ async fn toolbar_context_reopen_honors_pins_and_refreshes_runtime_budget() {
     server
         .agents()
         .upsert(Agent::from_db_config("agent-00", &AgentDbConfig::default()));
-    let tab = super::super::build_tab(&server, &backend, db, id).await;
+    let tab = super::super::build_tab(&server, &backend, db.clone(), id.clone()).await;
     assert_eq!(tab.effective_model, "small-model");
     assert_eq!(tab.context_budget, 64_000);
+    app.tabs[0] = tab;
+    server.agents().upsert(Agent::from_db_config(
+        "agent-00",
+        &AgentDbConfig {
+            model: Some("secondary:large-model".into()),
+            ..Default::default()
+        },
+    ));
+    let screen = draw(&mut terminal, &mut app, &server, &backend).join("\n");
+    assert!(screen.contains("ctx unknown/64000 tok"), "{screen}");
+    // Without session pins, a live agent-default edit must also reach the next
+    // frame. AgentSet updates the registry, not the session DB's on_write hook.
+    session
+        .update_meta(|meta| {
+            meta.model = None;
+            meta.agent_models.clear();
+        })
+        .await
+        .unwrap();
+    app.tabs[0] = super::super::build_tab(&server, &backend, db, id).await;
+    let screen = draw(&mut terminal, &mut app, &server, &backend).join("\n");
+    assert!(screen.contains("ctx unknown/2000000 tok"), "{screen}");
+    server.agents().upsert(Agent::from_db_config(
+        "agent-00",
+        &AgentDbConfig {
+            model: Some("primary:small-model".into()),
+            ..Default::default()
+        },
+    ));
+    let screen = draw(&mut terminal, &mut app, &server, &backend).join("\n");
+    assert!(screen.contains("ctx unknown/64000 tok"), "{screen}");
+    assert_eq!(app.active().effective_model, "small-model");
+    server.shutdown().await;
 }

@@ -160,8 +160,8 @@ pub struct ResponseMetadata {
     /// **final** LLM call in the turn — i.e. how full the window was when the
     /// turn ended. Unlike `usage.prompt_tokens` (which the accumulator *sums*
     /// across ReAct iterations, so a multi-tool-call turn far exceeds the real
-    /// window), this is a point-in-time high-water mark suitable for a "ctx
-    /// N%" gauge. Set by [`MetadataAccumulator::finalize`]; `None` on raw
+    /// window), this is a point-in-time input size suitable for the TUI's
+    /// estimated context occupancy. Set by [`MetadataAccumulator::finalize`]; `None` on raw
     /// per-call metadata that hasn't been through the accumulator.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_tokens: Option<u32>,

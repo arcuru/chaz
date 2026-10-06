@@ -473,18 +473,15 @@ pub(super) struct Tab {
     pub current_agent: String,
     pub session_name: Option<String>,
     /// The model the runtime would actually use for this session's next
-    /// turn, as resolved by `BackendManager::resolve_model_name` from the
-    /// agent's `default_model`. Empty string when no backends are configured.
-    /// Resolved at tab construction; if the agent or backend default
-    /// changes mid-session the displayed value goes stale until the next
-    /// tab open.
+    /// turn, as resolved from session pins and the current agent/backend default.
+    /// Refreshed on every draw; empty when no backends are configured.
     pub effective_model: String,
     /// Full roster of agents attached to this session, each with its
     /// resolved effective model and whether it is the designated host.
     /// Drives the multi-agent status-bar segment; for a single-agent
     /// session the bar falls back to `current_agent`/`effective_model` so
-    /// its rendering stays byte-identical. Refreshed wherever
-    /// `effective_model` is.
+    /// its rendering stays byte-identical. Refreshed on session changes;
+    /// the current agent's model also refreshes on draw.
     pub roster: Vec<RosterAgent>,
     /// The per-turn context budget (tokens) the runtime would target for the
     /// current agent's effective model — the model's resolved window, lowered
@@ -492,8 +489,9 @@ pub(super) struct Tab {
     /// unknown. Denominator for the status bar's numeric context pair. Refreshed on
     /// every draw from the runtime overlay and current agent cap.
     pub context_budget: usize,
-    /// Budgeting/catalog id, retaining the backend prefix that display strips.
-    pub context_model: String,
+    /// Session/per-agent pin, retaining any backend prefix. Kept separate from
+    /// defaults so live agent edits can re-resolve unpinned models on draw.
+    pub model_pin: Option<String>,
     /// Per-entry expand override (entry index → "opposite of `App::expand_all`").
     /// Empty by default; click on an entry's icon toggles its presence here.
     pub expanded_entries: HashSet<usize>,
@@ -1516,7 +1514,9 @@ async fn build_tab(
         effective_model,
         roster,
         context_budget,
-        context_model,
+        model_pin: meta
+            .resolve_model_for_agent(&agent.name)
+            .map(str::to_string),
         expanded_entries: HashSet::new(),
     }
 }
@@ -2211,12 +2211,14 @@ async fn render_outcome(
                 scroll_offset: 0,
                 pending_approval: None,
                 active_turns,
+                model_pin: meta
+                    .resolve_model_for_agent(&agent_name)
+                    .map(str::to_string),
                 current_agent: agent_name,
                 session_name,
                 effective_model,
                 roster,
                 context_budget,
-                context_model,
                 expanded_entries: HashSet::new(),
             });
             app.active_tab = app.tabs.len() - 1;
@@ -2280,7 +2282,7 @@ mod session_picker_tests {
             effective_model: String::new(),
             roster: Vec::new(),
             context_budget: 0,
-            context_model: String::new(),
+            model_pin: None,
             expanded_entries: HashSet::new(),
         }
     }

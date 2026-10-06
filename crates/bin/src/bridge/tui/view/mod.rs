@@ -9,6 +9,8 @@ use chaz_core::session::EntryType;
 use chaz_core::util::truncate_chars;
 
 use std::sync::Arc;
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 use chrono::{DateTime, Utc};
 
@@ -268,14 +270,26 @@ pub(super) fn ui(
     // can show the "reconciling agents…" indicator until the deferred
     // at-startup work releases it.
     app.startup_ready = server.is_startup_ready();
-    // First-use catalog discovery can update the overlay without a session
-    // write. Read the runtime budget every frame, including agent-cap changes.
+    // Catalog discovery and agent-default edits need not write the session DB.
+    // Resolve pins against live defaults, windows and caps on every draw.
     let tab = app.active_mut();
-    let cap = server
-        .agents()
-        .get(&tab.current_agent)
-        .and_then(|a| a.max_context_tokens);
-    tab.context_budget = server.effective_context_budget(&tab.context_model, cap);
+    let agent = server.agents().get(&tab.current_agent);
+    let requested_model = tab
+        .model_pin
+        .as_deref()
+        .or_else(|| agent.as_ref().and_then(|a| a.default_model.as_deref()));
+    tab.effective_model = backend.resolve_model_name(requested_model);
+    let context_model = requested_model
+        .map(str::to_string)
+        .or_else(|| backend.default_model())
+        .unwrap_or_default();
+    let cap = agent.and_then(|a| a.max_context_tokens);
+    tab.context_budget = server.effective_context_budget(&context_model, cap);
+    for row in &mut tab.roster {
+        if row.name == tab.current_agent {
+            row.model.clone_from(&tab.effective_model);
+        }
+    }
 
     // Refresh peer-side caches whenever any Settings page is up. The Peer
     // Settings views index into these directly for action keys ([r]
@@ -963,6 +977,25 @@ fn ui_chat(f: &mut ratatui::Frame, app: &mut App, ext_segments: &[String]) {
         format!(" | agent: {current_agent}{model_segment}")
     };
 
+    // A normal-width toolbar must keep the numeric pair visible even when a
+    // session has a long name. Clip only the label, using terminal-cell widths.
+    let label_width = (chunks[4].width as usize).saturating_sub(ctx_segment.width() + 1);
+    let session_label = if session_label.width() > label_width {
+        let mut cells = 0;
+        let mut label: String = session_label
+            .graphemes(true)
+            .take_while(|g| {
+                cells += g.width();
+                cells <= label_width.saturating_sub(1)
+            })
+            .collect();
+        if label_width > 0 {
+            label.push('…');
+        }
+        label
+    } else {
+        session_label
+    };
     let make_status = |agent_segment: &str| {
         format!(
             " {session_label}{ctx_segment}{agent_segment}{usage_segment}{debug_indicator}{expand_indicator}{startup_indicator}"
@@ -1840,7 +1873,7 @@ mod chat_frame_tests {
             effective_model: String::new(),
             roster: Vec::new(),
             context_budget: 0,
-            context_model: String::new(),
+            model_pin: None,
             expanded_entries: HashSet::new(),
         };
         let mut app = App::new(HashSet::new(), tab);
@@ -1933,6 +1966,17 @@ mod chat_frame_tests {
         app.active_mut().context_budget = 1_050_000;
         let screen = draw(&mut app, 80, 16).0.join("\n");
         assert!(screen.contains("ctx unknown/1050000 tok"), "{screen}");
+    }
+
+    #[tokio::test]
+    async fn toolbar_context_remains_visible_with_long_session_names() {
+        let mut app = test_app("", 0).await;
+        app.active_mut().context_budget = 1_050_000;
+        for name in ["long session name ".repeat(8), "界e\u{301}".repeat(40)] {
+            app.active_mut().session_name = Some(name);
+            let screen = draw(&mut app, 80, 16).0.join("\n");
+            assert!(screen.contains("ctx unknown/1050000 tok"), "{screen}");
+        }
     }
 
     #[tokio::test]

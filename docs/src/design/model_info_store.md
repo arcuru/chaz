@@ -86,15 +86,17 @@ ever required in config.
 - The clamp lives in `server::clamp_budget_to_window`: a known window is the
   budget ceiling a model-blind static default must not cap, while an explicit
   per-agent cap may still lower it.
-- The same budget surfaces in the TUI status bar as `ctx N%`.
+- The same budget surfaces in the TUI status bar as the denominator of
+  `ctx ~<used>/<max> tok`.
   `Server::effective_context_budget` returns the concrete denominator and
   resolves windows through the server's **own** `default_backend` (the one that
   gets warmed and updated) — not a caller's freshly-built manager, whose overlay
   would be empty.
 
-### The `ctx N%` gauge
+### The numeric context pair
 
-The status bar shows context occupancy as `ctx N%`. Two subtleties make it
+The status bar shows estimated context occupancy as `ctx ~<used>/<max> tok`
+(see [Context usage](../user_guide/tui.md#context-usage)). Two subtleties make it
 honest:
 
 - **Numerator is a point-in-time high-water mark, not a running sum.** It uses
@@ -102,12 +104,13 @@ honest:
   _final_ LLM call — set by `MetadataAccumulator` (it overwrites this per call
   while it _sums_ `usage.prompt_tokens` across ReAct iterations). Dividing the
   summed `prompt_tokens` would overshoot the window badly on multi-tool-call
-  turns; `context_tokens` is how full the window actually was. Entries written
-  before this field existed simply lack it, so the gauge hides until the next
-  turn.
+  turns; `context_tokens` is how full the window actually was. `~` marks that
+  the last input size is only an estimate of current occupancy. Missing/zero
+  usage, including entries written before this field existed, shows `unknown`;
+  so does a last response from a different model.
 - **Scoped to the primary (host) agent.** Both the numerator (the host's most
   recent turn) and the denominator (`tab.context_budget`, the host's window)
-  belong to the same agent, so the percentage is coherent even in a multi-agent
+  belong to the same agent, so the pair is coherent even in a multi-agent
   room where other agents run different-window models. The status bar's
   token/cost totals are the opposite — summed across _all_ agents in the
   session — because that's a session-wide cost figure, not a per-window gauge.

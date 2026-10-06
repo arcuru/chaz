@@ -358,7 +358,7 @@ impl Bridge for TuiBridge {
                         tab.session_name = meta.name.clone();
                         tab.effective_model = effective_model;
                         tab.context_budget = context_budget;
-                        tab.context_model = context_model;
+                        tab.model_pin = session_model;
                         tab.roster = roster;
                         refresh_tab_activity(tab).await?;
 

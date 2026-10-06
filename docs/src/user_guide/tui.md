@@ -66,7 +66,8 @@ The denominator is the runtime's effective **input** context budget, not the
 output-token cap. Configured model windows take precedence over discovered
 windows; an explicit agent cap can lower the budget. When the model window is
 unknown, the configured input-budget fallback still applies. A zero budget is
-shown as `unknown`. The bar refreshes learned windows and caps on redraw.
+shown as `unknown`. The bar refreshes model defaults, learned windows and caps
+on redraw. Long session names are clipped to keep the pair visible.
 
 For example:
 
