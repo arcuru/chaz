@@ -108,6 +108,10 @@ pub(super) fn command_catalog() -> Vec<(&'static str, &'static str)> {
         ("/agent unshare ", "stop sharing an agent DB"),
         ("/memory unshare ", "stop sharing a memory bank"),
         ("# Schedule", ""),
+        (
+            "/jobs",
+            "daemon-wide schedules with scope, target, and permanent flag",
+        ),
         ("/schedule list", "list an agent's schedules"),
         (
             "/schedule add ",

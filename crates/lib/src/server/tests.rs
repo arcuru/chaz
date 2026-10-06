@@ -6211,6 +6211,304 @@ async fn client_submission_publishes_one_child_then_executor_runs_it() {
     task.await.unwrap().unwrap();
 }
 
+// Exercise the production boot/handler path, replacing only the LLM backend.
+async fn start_schedule_test_daemon(
+    registry: Arc<crate::session::SessionRegistry>,
+    entry: DbEntry,
+    config: crate::config::Config,
+) -> (
+    Arc<Server>,
+    Arc<crate::test_support::MockBackend>,
+    crate::instance::ServerSlot,
+) {
+    let index = HostedIndex::empty("agent");
+    index.register(entry);
+    let tools = Arc::new(ToolRegistry::new());
+    let mcp_registry = Arc::new(crate::mcp::McpRegistry::new());
+    let mock = Arc::new(crate::test_support::MockBackend::new());
+    mock.push_text("scheduled check completed");
+    let slot = crate::instance::ServerSlot::default();
+    let mut hub = crate::extension::ExtensionHub::new();
+    hub.set_peer_handles(Arc::new(crate::extension::PeerHandles {
+        registry: registry.clone(),
+        agent_index: index.clone(),
+        memory_bank_index: HostedIndex::empty("bank"),
+        skill_bank_index: HostedIndex::empty("skill_bank"),
+        embedder: None,
+        secrets: None,
+        server_slot: slot.clone(),
+        mcp_registry: mcp_registry.clone(),
+        agent_state_allowlist: Default::default(),
+        tool_registry: tools.clone(),
+    }));
+    hub.install_all(vec![Arc::new(
+        crate::extensions::agent_schedule::AgentScheduleExtension::new(slot.clone()),
+    )])
+    .await
+    .unwrap();
+    let secrets = crate::security::SecretStore::new(registry.chaz_peer().clone()).await;
+    let backend = crate::backends::BackendManager::with_mock(mock.clone(), secrets);
+    let server = Server::new(
+        registry.clone(),
+        registry.agents.clone(),
+        index,
+        HostedIndex::empty("bank"),
+        HostedIndex::empty("skill_bank"),
+        tools,
+        Arc::new(crate::tool::ToolPolicyRegistry::empty()),
+        crate::test_support::permissive_security(),
+        HashMap::new(),
+        Default::default(),
+        Arc::new(crate::tool_host::NativeToolHost::new()),
+        Arc::new(hub),
+        backend.clone(),
+        mcp_registry,
+        Some(crate::instance::ExecutorCapability::for_test()),
+    );
+    slot.set(server.clone());
+    super::build::run_deferred_startup(
+        server.clone(),
+        registry,
+        config,
+        backend,
+        false,
+        true,
+        false,
+        super::build::McpReadiness::Deferred,
+        server.mcp_registry().clone(),
+    )
+    .await;
+    (server, mock, slot)
+}
+
+#[tokio::test]
+async fn permanent_interval_fires_unwatched_across_daemon_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let url = format!(
+        "sqlite://{}?mode=rwc",
+        dir.path().join("eidetica.db").display()
+    );
+    let backend = eidetica::backend::database::Sqlite::connect(&url)
+        .await
+        .unwrap();
+    let (instance, user) =
+        Instance::create_backend(Box::new(backend), NewUser::passwordless("test"))
+            .await
+            .unwrap();
+    let registry = Arc::new(
+        crate::session::SessionRegistry::new(
+            instance.clone(),
+            user,
+            Arc::new(AgentRegistry::with_default_agent()),
+        )
+        .await
+        .unwrap(),
+    );
+    let (_, setup, _) = server_fixture_from_registry(registry.clone()).await;
+    let (entry, adb) = seed_agent(&setup, &registry, "alpha").await;
+    // A completed child session is not adopted as a resident client session
+    // on restart. Only the permanent schedule may reopen it for a turn.
+    let (conv, db) = registry
+        .create_session(Some("spawn:completed-worker"))
+        .await
+        .unwrap();
+    let sid = conv.0;
+    registry
+        .attach_agent_to_session(&sid, &entry)
+        .await
+        .unwrap();
+    registry
+        .set_session_name(&sid, "target".to_string())
+        .await
+        .unwrap();
+    let yaml = "schedules:\n  - name: permanent-poll\n    agent: alpha\n    session: target\n    task: check\n    interval_seconds: 1\n    permanent: true\n    max_fires: 2\n  - name: ordinary-poll\n    agent: alpha\n    session: target\n    task: best effort\n    interval_seconds: 1\n";
+    let config: crate::config::Config = serde_yaml::from_str(yaml).unwrap();
+    let (first, first_mock, first_slot) =
+        start_schedule_test_daemon(registry.clone(), entry.clone(), config.clone()).await;
+    assert!(
+        !first.is_session_open(&sid).await,
+        "no client or runtime attached"
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            if adb.list_schedule_fires().await.unwrap().len() == 1
+                && !adb
+                    .find_schedule("ordinary-poll")
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .enabled
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("permanent fire and ordinary self-retirement");
+    assert_eq!(first_mock.recorded_calls().len(), 1);
+    assert!(
+        !first.is_session_open(&sid).await,
+        "standalone turn does not hijack routing"
+    );
+    let row = adb.find_schedule("permanent-poll").await.unwrap().unwrap();
+    assert!(row.permanent && row.enabled);
+    assert_eq!(row.fire_count, 1);
+    let secrets = crate::security::SecretStore::new(registry.chaz_peer().clone()).await;
+    let ctx = crate::commands::CommandContext {
+        server: &first,
+        secrets: &secrets,
+        backend: &first.default_backend,
+        session_db_id: &sid,
+        session_db: &db,
+        current_agent: "alpha",
+        session_name: None,
+    };
+    let crate::commands::CommandOutcome::Text(view) =
+        crate::commands::dispatch(crate::commands::Command::Jobs, &ctx).await
+    else {
+        panic!("/jobs must show the engine");
+    };
+    assert!(
+        view.contains("permanent=true") && view.contains("permanent-poll"),
+        "{view}"
+    );
+    assert!(
+        view.contains(&format!("scope=agent:{}", entry.db_id)),
+        "{view}"
+    );
+    assert!(view.contains(&format!("target=pinned:{sid}")), "{view}");
+    first.shutdown().await;
+    first_slot.clear();
+    setup.shutdown().await;
+    drop(first);
+    drop(secrets);
+    drop(db);
+    drop(adb);
+    drop(registry);
+    drop(setup);
+    drop(instance);
+
+    // Reopen SQLite: no instance, login, registry, server, or engine survives.
+    let instance = Instance::connect(&url).await.unwrap();
+    let user = instance.login_user("test", None).await.unwrap();
+    let registry = Arc::new(
+        crate::session::SessionRegistry::new(
+            instance,
+            user,
+            Arc::new(AgentRegistry::with_default_agent()),
+        )
+        .await
+        .unwrap(),
+    );
+    let (second, second_mock, second_slot) =
+        start_schedule_test_daemon(registry.clone(), entry.clone(), config).await;
+    let adb = second.open_agent_db_by_name("alpha").await.unwrap();
+    assert!(!second.is_session_open(&sid).await);
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while adb.list_schedule_fires().await.unwrap().len() != 2 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("restart must seed and fire permanent interval without a client");
+    assert_eq!(
+        second_mock.recorded_calls().len(),
+        1,
+        "{:?}",
+        second_mock.recorded_calls()
+    );
+    let row = adb.find_schedule("permanent-poll").await.unwrap().unwrap();
+    assert!(row.permanent);
+    assert!(!row.enabled, "permanent must still honor max_fires");
+    assert_eq!(row.fire_count, 2);
+    assert!(
+        adb.list_schedule_fires()
+            .await
+            .unwrap()
+            .iter()
+            .all(|fire| fire.schedule_id == "permanent-poll"
+                && fire.session_db_id == sid
+                && fire.usage.is_some())
+    );
+    let session = Session::new(
+        ConversationId(sid.clone()),
+        registry.open_session(&sid).await.unwrap().1,
+    )
+    .await;
+    assert_eq!(
+        session
+            .entries()
+            .iter()
+            .filter(|entry| entry.entry_type == EntryType::Message
+                && entry.content == "scheduled check completed")
+            .count(),
+        2
+    );
+    second.shutdown().await;
+    second_slot.clear();
+}
+
+#[tokio::test]
+async fn permanent_schedule_still_skips_foreign_home() {
+    let (_instance, server, registry) = server_fixture().await;
+    let (entry, adb) = seed_agent(&server, &registry, "alpha").await;
+    let (conv, db) = registry.create_session(Some("unwatched")).await.unwrap();
+    registry
+        .attach_agent_to_session(&conv.0, &entry)
+        .await
+        .unwrap();
+    let foreign = registry.new_ephemeral_key("foreign").await.unwrap();
+    crate::session::update_meta_on_db(&db, |meta| {
+        meta.agents[0].home_pubkey = Some(foreign.to_string())
+    })
+    .await
+    .unwrap();
+    let mut schedule = Schedule::new(
+        "poll",
+        Trigger::Interval {
+            period: std::time::Duration::from_secs(300),
+        },
+        "check",
+        crate::agent_db::ScheduleTarget::Pinned {
+            session_db_id: conv.0.clone(),
+        },
+    );
+    schedule.permanent = true;
+    adb.upsert_schedule(schedule).await.unwrap();
+    let mut payload = pinned_schedule_payload(&entry.db_id.to_string(), "poll", "check", &conv.0);
+    payload.one_shot = false;
+    server.fire_agent_schedule(payload).await.unwrap();
+    let row = adb.find_schedule("poll").await.unwrap().unwrap();
+    assert!(row.enabled && row.permanent);
+    assert_eq!(row.fire_count, 0);
+    assert!(adb.list_schedule_fires().await.unwrap().is_empty());
+    assert!(!server.is_session_open(&conv.0).await);
+}
+
+#[tokio::test]
+async fn jobs_view_reports_unavailable_without_an_engine() {
+    let (_instance, server, registry) = server_fixture().await;
+    let (conv, db) = registry.create_session(Some("view")).await.unwrap();
+    let secrets = crate::security::SecretStore::new(registry.chaz_peer().clone()).await;
+    let ctx = crate::commands::CommandContext {
+        server: &server,
+        secrets: &secrets,
+        backend: &server.default_backend,
+        session_db_id: &conv.0,
+        session_db: &db,
+        current_agent: "alpha",
+        session_name: None,
+    };
+    let crate::commands::CommandOutcome::Error(message) =
+        crate::commands::dispatch(crate::commands::Command::Jobs, &ctx).await
+    else {
+        panic!("missing engine must not claim an empty healthy inventory");
+    };
+    assert!(message.contains("Schedule engine unavailable"));
+    server.shutdown().await;
+}
+
 #[tokio::test]
 async fn chaz_query_reports_persisted_agent_job_tool_ceilings() {
     use crate::runtime::RuntimeMessage;

@@ -76,6 +76,7 @@ pub fn parse(input: &str) -> Parsed {
         "/compact" => return Parsed::Command(Command::Compact),
         "/info" => return Parsed::Command(Command::Info),
         "/costs" => return Parsed::Command(Command::ListCosts),
+        "/jobs" => return Parsed::Command(Command::Jobs),
         "/interrupted" => return Parsed::Command(Command::Interrupted),
         "/print" => return Parsed::Command(Command::Print),
         "/backends" => return Parsed::Command(Command::ListBackends),

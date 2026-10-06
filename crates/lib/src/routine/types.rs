@@ -104,6 +104,8 @@ pub struct Routine {
     pub target: RoutineTarget,
     #[serde(default = "default_enabled")]
     pub enabled: bool,
+    #[serde(default)]
+    pub permanent: bool,
     #[serde(default = "default_max_failures")]
     pub max_failures: u32,
     #[serde(default)]
@@ -126,6 +128,7 @@ impl Routine {
             trigger: Trigger::Cron { expr: expr.into() },
             target,
             enabled: true,
+            permanent: false,
             max_failures: 3,
             consecutive_failures: 0,
             last_error: None,
@@ -145,6 +148,7 @@ impl Routine {
             trigger: Trigger::Interval { period },
             target,
             enabled: true,
+            permanent: false,
             max_failures: 3,
             consecutive_failures: 0,
             last_error: None,
@@ -164,6 +168,7 @@ impl Routine {
             trigger: Trigger::OneShot { fire_at },
             target,
             enabled: true,
+            permanent: false,
             max_failures: 3,
             consecutive_failures: 0,
             last_error: None,
@@ -326,6 +331,52 @@ mod tests {
     fn generate_id_uses_prefix() {
         let id = generate_id("wakeup");
         assert!(id.as_str().starts_with("wakeup-"));
+    }
+
+    #[test]
+    fn permanent_defaults_false_on_old_schedule_and_routine_rows() {
+        let mut schedule = crate::agent_db::Schedule::new(
+            "poll",
+            Trigger::Interval {
+                period: Duration::from_secs(300),
+            },
+            "check",
+            crate::agent_db::ScheduleTarget::Fresh,
+        );
+        assert!(!schedule.permanent);
+        let mut old = serde_json::to_value(&schedule).unwrap();
+        old.as_object_mut().unwrap().remove("permanent");
+        assert!(
+            !serde_json::from_value::<crate::agent_db::Schedule>(old)
+                .unwrap()
+                .permanent
+        );
+        schedule.permanent = true;
+        assert!(
+            serde_json::from_value::<crate::agent_db::Schedule>(
+                serde_json::to_value(schedule).unwrap()
+            )
+            .unwrap()
+            .permanent
+        );
+        let mut routine = Routine::interval(
+            RoutineId::new("poll"),
+            "poll",
+            Duration::from_secs(300),
+            RoutineTarget {
+                extension: "agent_schedule".into(),
+                payload: serde_json::Value::Null,
+            },
+        );
+        let mut old = serde_json::to_value(&routine).unwrap();
+        old.as_object_mut().unwrap().remove("permanent");
+        assert!(!serde_json::from_value::<Routine>(old).unwrap().permanent);
+        routine.permanent = true;
+        assert!(
+            serde_json::from_value::<Routine>(serde_json::to_value(routine).unwrap())
+                .unwrap()
+                .permanent
+        );
     }
 
     #[test]

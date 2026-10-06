@@ -200,6 +200,7 @@ schedules:
     task: "Run the daily status check" # Wake prompt handed to the agent
     cron: "0 0 9 * * *" # 09:00:00 every day
     enabled: true
+    permanent: false # Best-effort while the target session is watched (default)
 
 # Context window management
 context:
@@ -489,9 +490,18 @@ External tools via the Model Context Protocol. See [MCP External Tools](mcp.md) 
 
 ## Schedules
 
-Cron-driven agent wakes. Each entry is imported at startup as an **agent-owned schedule** (see [Agents — Schedules](agents.md#schedules)) in the owning agent's DB, Pinned to the resolved session. On fire, the owning agent's turn runs directly with `task` as the wake prompt — no `Directive` is written to the session. `agent:` names the owner (display name or DB id); omit it to use the peer's default agent. `session:` is referenced by name or eidetica DB root ID. Responses are delivered to every Matrix room attached to that session (see [Matrix: channel attachment](matrix.md#session-attachment)).
+Cron or interval agent wakes. Each entry is imported at startup as an **agent-owned schedule** (see [Agents — Schedules](agents.md#schedules)) in the owning agent's DB, Pinned to the resolved session. On fire, the owning agent's turn runs directly with `task` as the wake prompt — no `Directive` is written to the session. `agent:` names the owner (display name or DB id); omit it to use the peer's default agent. `session:` is referenced by name or eidetica DB root ID. Responses are delivered to every Matrix room attached to that session (see [Matrix: channel attachment](matrix.md#session-attachment)).
 
-Optional lifecycle bounds mirror the `schedule_add` tool: `max_fires:` (retire after N fires) and `expires_at:` (RFC 3339 instant after which it stops). Whichever is hit first retires the schedule; omit both for an unbounded cron. Example — wake hourly for a day then stop:
+| Field                      | Default | Meaning                                                                                                            |
+| -------------------------- | ------- | ------------------------------------------------------------------------------------------------------------------ |
+| `cron`                     | absent  | Six-field calendar trigger; set exactly one of this or `interval_seconds`.                                         |
+| `interval_seconds`         | absent  | Positive whole-second fixed delay from successful dispatch.                                                        |
+| `permanent`                | `false` | Permit the home daemon to fire into an unwatched target, including after restart. Config-only; chat cannot set it. |
+| `max_fires` / `expires_at` | absent  | Optional lifecycle bounds; apply to permanent schedules too.                                                       |
+
+Import is **create-only**, keyed by schedule name within the Agent: existing DB rows are left alone, even if YAML changes or disappears. To replace a schedule, remove its DB row with `/schedule remove <name> <agent>`, then restart with the replacement config. Deleting a YAML entry does not revoke permanent work. See [Permanent schedules](agents.md#permanent-schedules) for the model, audit view, and recovery walkthrough.
+
+Optional lifecycle bounds mirror the `schedule_add` tool: `max_fires:` (retire after N fires) and `expires_at:` (RFC 3339 instant after which it stops). Whichever is hit first retires the schedule; omit both for an unbounded cron or interval. Example — wake hourly for a day then stop:
 
 ```yaml
 schedules:
