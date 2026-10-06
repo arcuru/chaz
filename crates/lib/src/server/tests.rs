@@ -847,6 +847,12 @@ use eidetica::{Instance, NewUser};
 
 /// Build a Server with the minimum wiring needed to exercise hydration.
 async fn server_fixture() -> (Instance, Arc<Server>, Arc<crate::session::SessionRegistry>) {
+    server_fixture_with_host(Arc::new(crate::tool_host::NativeToolHost::new())).await
+}
+
+async fn server_fixture_with_host(
+    host: Arc<dyn ToolHost>,
+) -> (Instance, Arc<Server>, Arc<crate::session::SessionRegistry>) {
     let backend = InMemory::new();
     let (instance, user) =
         Instance::create_backend(Box::new(backend), NewUser::passwordless("test"))
@@ -880,7 +886,7 @@ async fn server_fixture() -> (Instance, Arc<Server>, Arc<crate::session::Session
         security,
         HashMap::new(),
         Default::default(),
-        Arc::new(crate::tool_host::NativeToolHost::new()),
+        host,
         Arc::new(crate::extension::ExtensionHub::new()),
         default_backend,
         Arc::new(crate::mcp::McpRegistry::new()),
@@ -5370,7 +5376,7 @@ async fn service_restart_reopens_and_reconciles_persisted_work() {
 }
 
 #[tokio::test]
-async fn direct_peer_sync_preserves_request_identity_and_completion() {
+async fn direct_peer_sync_preserves_request_identity_and_completion_with_unknown_records() {
     use eidetica::auth::Permission;
     use eidetica::auth::types::AuthKey;
     use eidetica::crdt::Doc;
@@ -5457,6 +5463,7 @@ async fn direct_peer_sync_preserves_request_identity_and_completion() {
         .await
         .unwrap();
 
+    crate::session::compatibility_tests::install_writer_rows(&peer_db).await;
     let mut peer_session = Session::new(ConversationId("peer".into()), peer_db.clone()).await;
     let request_id = peer_session
         .add_entry(SessionEntry {
@@ -5492,6 +5499,40 @@ async fn direct_peer_sync_preserves_request_identity_and_completion() {
         .unwrap();
 
     let peer_session = Session::new(ConversationId("peer".into()), peer_db).await;
+    assert!(
+        peer_session
+            .entries()
+            .iter()
+            .any(|entry| matches!(&entry.entry_type,
+        EntryType::Unknown { kind, .. } if kind == "Cancel"))
+    );
+    assert_eq!(
+        peer_session
+            .turn_transcript("attempt-supported")
+            .await
+            .unwrap()
+            .len(),
+        3
+    );
+    assert!(
+        matches!(&peer_session.turn_transcript("attempt-cancelled").await.unwrap()[2].message,
+        TurnTranscriptMessage::Unknown { kind, .. } if kind == "Cancelled")
+    );
+    let (entries, history) = peer_session.context_with_tool_history().await.unwrap();
+    let messages = crate::context::ContextBuilder::new(&entries, "agent", "", &Default::default())
+        .with_tool_history(&history)
+        .build()
+        .await
+        .messages;
+    let tool_ids: Vec<_> = messages
+        .iter()
+        .filter_map(|m| match m {
+            runtime::RuntimeMessage::ToolResult { call_id, .. } => Some(call_id.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(tool_ids, ["call-supported"]);
+    assert_eq!(mock.recorded_calls().len(), 1);
     let request = peer_session
         .turn_requests(|name| name == "agent", &Default::default())
         .await
@@ -7160,4 +7201,192 @@ async fn costs_command_preserves_operator_text_contract() {
         )
     );
     server.shutdown().await;
+}
+
+#[tokio::test]
+async fn precursor_unknown_records_do_not_execute_and_known_commands_still_work() {
+    use crate::session::compatibility_tests::install_writer_rows;
+    use crate::test_support::{MockBackend, MockHost};
+    use serde_json::json;
+
+    let host = Arc::new(MockHost::new());
+    let (_instance, server, registry) = server_fixture_with_host(host.clone()).await;
+    let (_conv, db) = registry
+        .create_session(Some("reader-compatibility"))
+        .await
+        .unwrap();
+    let sid = db.root_id().to_string();
+    install_writer_rows(&db).await;
+    let session = Session::new(ConversationId(sid.clone()), db.clone()).await;
+    let unknown = SessionCommandRequest {
+        command_id: TurnRequestId::parse("future-command"),
+        sender: "user".into(),
+        created_at: Utc::now(),
+        command: serde_json::from_value(
+            json!({"FutureCommand":{"compact":true,"retry":"request-supported"}}),
+        )
+        .unwrap(),
+    };
+    session.submit_command(unknown.clone()).await.unwrap();
+    let known_with_unknown_result = SessionCommandRequest {
+        command_id: TurnRequestId::parse("future-result"),
+        sender: "user".into(),
+        created_at: Utc::now(),
+        command: SessionCommand::Compact {
+            source_snapshot: db.snapshot().await.unwrap(),
+        },
+    };
+    session
+        .submit_command(known_with_unknown_result.clone())
+        .await
+        .unwrap();
+    let txn = db.new_transaction().await.unwrap();
+    txn.get_store::<eidetica::store::Table<SessionCommandResult>>("session_command_results")
+        .await
+        .unwrap()
+        .set(
+            "future-result",
+            SessionCommandResult {
+                command_id: known_with_unknown_result.command_id.clone(),
+                attempt_id: "future-attempt".into(),
+                completed_at: Utc::now(),
+                outcome: serde_json::from_value(
+                    json!({"FutureOutcome":{"summary":"not a success"}}),
+                )
+                .unwrap(),
+            },
+        )
+        .await
+        .unwrap();
+    txn.commit().await.unwrap();
+    let mock = Arc::new(MockBackend::new());
+    let backend = BackendManager::with_mock(
+        mock.clone(),
+        crate::security::SecretStore::new(registry.chaz_peer().clone()).await,
+    );
+    server
+        .register_session(&db, backend, Some("default".into()), None)
+        .await
+        .unwrap();
+    assert!(server.process_session(&sid).await.unwrap().is_none());
+    assert!(mock.recorded_calls().is_empty());
+    assert_eq!(mock.simple_call_count(), 0);
+    assert!(host.recorded_calls().is_empty());
+    assert_eq!(
+        session.attempts_for_test().await.len(),
+        2,
+        "unsupported records must not start attempts"
+    );
+    assert!(
+        session
+            .command_result(&unknown.command_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        server
+            .process_session_command(
+                &sid,
+                Session::new(ConversationId(sid.clone()), db.clone()).await,
+                unknown,
+                None
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(session.attempts_for_test().await.len(), 2);
+    for record in session
+        .turn_transcript("attempt-cancelled")
+        .await
+        .unwrap()
+        .iter()
+        .skip(1)
+    {
+        assert!(display_entries_for_record("agent", record).is_empty());
+    }
+    // Supported retry still returns an honest rejection without calling models.
+    let result = server
+        .submit_session_command(
+            &sid,
+            SessionCommandRequest {
+                command_id: TurnRequestId::parse("known-retry"),
+                sender: "user".into(),
+                created_at: Utc::now(),
+                command: SessionCommand::Retry {
+                    target_request_id: TurnRequestId::parse("missing-request"),
+                    expected_interrupted_attempt_id: "missing-attempt".into(),
+                },
+            },
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        result.outcome,
+        SessionCommandOutcome::Rejected { .. }
+    ));
+    assert_eq!(mock.simple_call_count(), 0);
+    // Compaction needs three ordinary entries, not a control row counted as
+    // conversation. Add an agent message that cannot create queued work.
+    let mut conversation = Session::new(ConversationId(sid.clone()), db.clone()).await;
+    conversation
+        .add_entry(SessionEntry {
+            sender: "default".into(),
+            content: "known ordinary answer".into(),
+            timestamp: Utc::now(),
+            entry_type: EntryType::Message,
+            metadata: None,
+            routing: None,
+        })
+        .await
+        .unwrap();
+    // Compaction and ordinary turns still use only their scripted model calls.
+    mock.push_simple_text("compatible compact summary");
+    let result = server
+        .submit_session_command(
+            &sid,
+            SessionCommandRequest {
+                command_id: TurnRequestId::parse("known-compact"),
+                sender: "user".into(),
+                created_at: Utc::now(),
+                command: SessionCommand::Compact {
+                    source_snapshot: db.snapshot().await.unwrap(),
+                },
+            },
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        result.outcome,
+        SessionCommandOutcome::Compact { .. }
+    ));
+    assert_eq!(mock.simple_call_count(), 1);
+    mock.push_text("ordinary next answer");
+    write_user_message_with_content(&db, &sid, "ordinary next question").await;
+    await_call_count(&mock, 1).await;
+    await_no_processing(&server, &sid).await;
+    assert_eq!(mock.recorded_calls().len(), 1);
+    assert!(host.recorded_calls().is_empty());
+    let after = Session::new(ConversationId(sid), db).await;
+    assert!(
+        after
+            .entries()
+            .iter()
+            .any(|e| e.content == "ordinary next answer")
+    );
+    assert!(
+        after
+            .entries()
+            .iter()
+            .any(|e| matches!(&e.entry_type, EntryType::Unknown { kind, .. } if kind == "Cancel"))
+    );
+    assert!(matches!(
+        after
+            .command_result(&known_with_unknown_result.command_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .outcome,
+        SessionCommandOutcome::Unknown { .. }
+    ));
 }

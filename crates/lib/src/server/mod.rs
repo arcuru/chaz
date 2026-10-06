@@ -263,6 +263,11 @@ fn display_entries_for_record(
     record: &TurnTranscriptRecord,
 ) -> Vec<SessionEntry> {
     match &record.message {
+        TurnTranscriptMessage::Unknown { .. }
+        | TurnTranscriptMessage::ToolResult {
+            outcome: runtime::ToolResultOutcome::Unknown { .. },
+            ..
+        } => Vec::new(),
         TurnTranscriptMessage::ModelResponse { tool_calls, .. } => tool_calls
             .iter()
             .map(|call| SessionEntry {
@@ -2095,6 +2100,9 @@ impl Server {
             SessionCommandOutcome::Compact { .. } => {
                 anyhow::bail!("retry command returned a compact result")
             }
+            SessionCommandOutcome::Unknown { kind, .. } => {
+                anyhow::bail!("unsupported session command outcome: {kind}")
+            }
         }
     }
 
@@ -3000,6 +3008,10 @@ impl Server {
         request: SessionCommandRequest,
         existing_attempt_id: Option<String>,
     ) -> anyhow::Result<String> {
+        anyhow::ensure!(
+            !matches!(request.command, SessionCommand::Unknown { .. }),
+            "unsupported session command cannot execute"
+        );
         if !self.is_startup_ready() {
             self.await_startup_ready().await;
         }
@@ -3021,6 +3033,7 @@ impl Server {
         };
         let attempt_id = attempt.attempt_id.clone();
         let outcome = match request.command {
+            SessionCommand::Unknown { .. } => unreachable!("checked before attempt start"),
             SessionCommand::Compact { source_snapshot } => {
                 self.execute_compact_command(session_db_id, &session, &source_snapshot)
                     .await

@@ -69,16 +69,18 @@ pub enum RuntimeRecord {
     },
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ToolResultOutcome {
-    Success,
-    Error,
-    Denied,
-    ApprovalTimedOut,
-    RateLimited,
-    Blocked,
-    TimedOut,
-    Unavailable,
+crate::session::wire::session_wire_enum! {
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub enum ToolResultOutcome {
+        Success,
+        Error,
+        Denied,
+        ApprovalTimedOut,
+        RateLimited,
+        Blocked,
+        TimedOut,
+        Unavailable,
+    }
 }
 
 fn no_reply_arguments_empty(arguments: &str) -> bool {
