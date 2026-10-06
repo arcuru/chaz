@@ -335,9 +335,12 @@ impl Bridge for TuiBridge {
                             .as_deref()
                             .and_then(|name| meta.resolve_model_for_agent(name))
                             .map(str::to_string);
-                        let effective_model = backend.resolve_model_name(
-                            session_model.as_deref().or(agent_default.as_deref()),
-                        );
+                        let requested_model = session_model.as_deref().or(agent_default.as_deref());
+                        let effective_model = backend.resolve_model_name(requested_model);
+                        let context_model = requested_model
+                            .map(str::to_string)
+                            .or_else(|| backend.default_model())
+                            .unwrap_or_default();
                         // Re-resolve the budget too: a `/model` change can move
                         // the effective model to one with a different window.
                         let agent_cap = current_agent
@@ -345,7 +348,7 @@ impl Bridge for TuiBridge {
                             .and_then(|name| server.agents().get(name))
                             .and_then(|a| a.max_context_tokens);
                         let context_budget =
-                            server.effective_context_budget(&effective_model, agent_cap);
+                            server.effective_context_budget(&context_model, agent_cap);
                         // Refresh the full roster too: attach/detach, host
                         // changes, and per-agent model pins all move here.
                         let roster = build_roster(&server, &backend, &meta);
@@ -355,6 +358,7 @@ impl Bridge for TuiBridge {
                         tab.session_name = meta.name.clone();
                         tab.effective_model = effective_model;
                         tab.context_budget = context_budget;
+                        tab.context_model = context_model;
                         tab.roster = roster;
                         refresh_tab_activity(tab).await?;
 

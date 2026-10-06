@@ -489,9 +489,11 @@ pub(super) struct Tab {
     /// The per-turn context budget (tokens) the runtime would target for the
     /// current agent's effective model — the model's resolved window, lowered
     /// by any per-agent cap, or the configured default when the window is
-    /// unknown. Denominator for the status bar's `ctx N%`. Resolved at tab
-    /// construction alongside `effective_model`; goes stale the same way.
+    /// unknown. Denominator for the status bar's numeric context pair. Refreshed on
+    /// every draw from the runtime overlay and current agent cap.
     pub context_budget: usize,
+    /// Budgeting/catalog id, retaining the backend prefix that display strips.
+    pub context_model: String,
     /// Per-entry expand override (entry index → "opposite of `App::expand_all`").
     /// Empty by default; click on an entry's icon toggles its presence here.
     pub expanded_entries: HashSet<usize>,
@@ -1486,14 +1488,17 @@ async fn build_tab(
     .await;
     let meta = session.read_meta().await;
     let roster = build_roster(server, backend, &meta);
-    let session_name = meta.name;
-    // Mirror the runtime's resolution: the live turn passes
-    // `agent.default_model` into `runtime::execute`, which calls
-    // `BackendManager::resolve_model_name` to strip the backend prefix
-    // and fall back to the backend default when None.
-    let effective_model = backend.resolve_model_name(agent.default_model.as_deref());
-    let context_budget =
-        server.effective_context_budget(&effective_model, agent.max_context_tokens);
+    let session_name = meta.name.clone();
+    // Reopening a session must honor persisted pins just like a live refresh.
+    let requested_model = meta
+        .resolve_model_for_agent(&agent.name)
+        .or(agent.default_model.as_deref());
+    let effective_model = backend.resolve_model_name(requested_model);
+    let context_model = requested_model
+        .map(str::to_string)
+        .or_else(|| backend.default_model())
+        .unwrap_or_default();
+    let context_budget = server.effective_context_budget(&context_model, agent.max_context_tokens);
     let entries = session.entries().to_vec();
     let active_turns = Session::active_turn_attempts(&session_db)
         .await
@@ -1511,6 +1516,7 @@ async fn build_tab(
         effective_model,
         roster,
         context_budget,
+        context_model,
         expanded_entries: HashSet::new(),
     }
 }
@@ -2187,9 +2193,17 @@ async fn render_outcome(
             let agent = server.agents().get(&agent_name);
             let agent_default_model = agent.as_ref().and_then(|a| a.default_model.clone());
             let agent_cap = agent.as_ref().and_then(|a| a.max_context_tokens);
-            let effective_model = backend.resolve_model_name(agent_default_model.as_deref());
-            let context_budget = server.effective_context_budget(&effective_model, agent_cap);
-            let roster = build_roster(server, backend, &session.read_meta().await);
+            let meta = session.read_meta().await;
+            let requested_model = meta
+                .resolve_model_for_agent(&agent_name)
+                .or(agent_default_model.as_deref());
+            let effective_model = backend.resolve_model_name(requested_model);
+            let context_model = requested_model
+                .map(str::to_string)
+                .or_else(|| backend.default_model())
+                .unwrap_or_default();
+            let context_budget = server.effective_context_budget(&context_model, agent_cap);
+            let roster = build_roster(server, backend, &meta);
             app.tabs.push(Tab {
                 session_db_id,
                 session_db: db,
@@ -2202,6 +2216,7 @@ async fn render_outcome(
                 effective_model,
                 roster,
                 context_budget,
+                context_model,
                 expanded_entries: HashSet::new(),
             });
             app.active_tab = app.tabs.len() - 1;
@@ -2265,6 +2280,7 @@ mod session_picker_tests {
             effective_model: String::new(),
             roster: Vec::new(),
             context_budget: 0,
+            context_model: String::new(),
             expanded_entries: HashSet::new(),
         }
     }

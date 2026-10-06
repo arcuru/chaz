@@ -53,16 +53,26 @@ fn model_slug(model: &str) -> &str {
     model.rsplit('/').next().unwrap_or(model)
 }
 
-/// Percent of the context budget occupied by the latest turn's prompt, for
-/// the `ctx N%` status segment. `None` when the budget is unknown (zero) so
-/// the caller hides the segment rather than dividing by zero. Can exceed 100
-/// if a turn was packed past a later-lowered budget — reported honestly, not
-/// clamped, so an over-budget session is visible.
-fn ctx_pct(prompt_tokens: u32, budget: usize) -> Option<u64> {
-    if budget == 0 {
-        return None;
-    }
-    Some((prompt_tokens as f64 / budget as f64 * 100.0).round() as u64)
+/// Last reported input size is an estimate of current occupancy, not a fresh
+/// tokenization of the transcript. Zero can also mean missing provider usage.
+fn context_segment(tab: &super::Tab) -> String {
+    let last = tab
+        .entries
+        .iter()
+        .rev()
+        .find(|e| e.sender == tab.current_agent && e.entry_type == EntryType::Message);
+    let used = last
+        .and_then(|e| e.metadata.as_ref())
+        .filter(|m| m.model == tab.effective_model)
+        .and_then(|m| m.context_tokens)
+        .filter(|&n| n > 0)
+        .map_or_else(|| "unknown".to_string(), |n| format!("~{n}"));
+    let max = if tab.context_budget == 0 {
+        "unknown".to_string()
+    } else {
+        tab.context_budget.to_string()
+    };
+    format!(" | ctx {used}/{max} tok")
 }
 
 /// One-line preview of a ToolCall entry's content. Server writes ToolCall
@@ -258,6 +268,14 @@ pub(super) fn ui(
     // can show the "reconciling agents…" indicator until the deferred
     // at-startup work releases it.
     app.startup_ready = server.is_startup_ready();
+    // First-use catalog discovery can update the overlay without a session
+    // write. Read the runtime budget every frame, including agent-cap changes.
+    let tab = app.active_mut();
+    let cap = server
+        .agents()
+        .get(&tab.current_agent)
+        .and_then(|a| a.max_context_tokens);
+    tab.context_budget = server.effective_context_budget(&tab.context_model, cap);
 
     // Refresh peer-side caches whenever any Settings page is up. The Peer
     // Settings views index into these directly for action keys ([r]
@@ -832,26 +850,9 @@ fn ui_chat(f: &mut ratatui::Frame, app: &mut App, ext_segments: &[String]) {
             )
         }
     };
-    // Context occupancy for the *primary* (host) agent only — `tab.context_budget`
-    // is the host's window, and in a multi-agent room another agent's turn may
-    // run a different model/window, so mixing them would be incoherent. The
-    // `usage_segment` above is unaffected: cost/tokens still sum the whole
-    // session. Numerator is the host's most recent turn's `context_tokens` (the
-    // input size of that turn's final LLM call = how full the window was), NOT
-    // `usage.prompt_tokens`, which sums every ReAct iteration and overshoots.
-    // Hidden until the host has taken such a turn, or when no budget is known.
-    let ctx_segment = {
-        let last_ctx = tab
-            .entries
-            .iter()
-            .rev()
-            .filter(|e| e.sender == current_agent)
-            .find_map(|e| e.metadata.as_ref().and_then(|m| m.context_tokens));
-        match last_ctx.and_then(|p| ctx_pct(p, tab.context_budget)) {
-            Some(pct) => format!(" | ctx {pct}%"),
-            None => String::new(),
-        }
-    };
+    // Only the host's latest message belongs with its effective input budget;
+    // aggregate prompt usage sums ReAct calls and is not context occupancy.
+    let ctx_segment = context_segment(tab);
     let approval_info = tab.pending_approval.as_ref().map(|ex| {
         (
             ex.info.name.clone(),
@@ -964,7 +965,7 @@ fn ui_chat(f: &mut ratatui::Frame, app: &mut App, ext_segments: &[String]) {
 
     let make_status = |agent_segment: &str| {
         format!(
-            " {session_label}{agent_segment}{ctx_segment}{usage_segment}{debug_indicator}{expand_indicator}{startup_indicator}"
+            " {session_label}{ctx_segment}{agent_segment}{usage_segment}{debug_indicator}{expand_indicator}{startup_indicator}"
         )
     };
     let mut status_text = make_status(&agent_segment);
@@ -1839,6 +1840,7 @@ mod chat_frame_tests {
             effective_model: String::new(),
             roster: Vec::new(),
             context_budget: 0,
+            context_model: String::new(),
             expanded_entries: HashSet::new(),
         };
         let mut app = App::new(HashSet::new(), tab);
@@ -1863,6 +1865,74 @@ mod chat_frame_tests {
             })
             .collect();
         (rows, (cursor.x, cursor.y))
+    }
+
+    #[tokio::test]
+    async fn toolbar_context_uses_last_host_call_and_current_model_budget() {
+        use chaz_core::runtime::{ResponseMetadata, TokenUsage};
+        use chaz_core::session::{EntryType, SessionEntry};
+        let mut app = test_app("", 0).await;
+        let tab = app.active_mut();
+        tab.effective_model = "large-model".into();
+        tab.context_budget = 1_050_000;
+        let entry = SessionEntry {
+            sender: "chaz".into(),
+            content: "fixture reply".into(),
+            timestamp: chrono::Utc::now(),
+            entry_type: EntryType::Message,
+            metadata: Some(ResponseMetadata {
+                model: "large-model".into(),
+                provider: None,
+                response_id: None,
+                usage: TokenUsage {
+                    prompt_tokens: 9_999_999,
+                    ..Default::default()
+                },
+                context_tokens: Some(12_345),
+                extra: Default::default(),
+            }),
+            routing: None,
+        };
+        tab.entries.push(entry.clone());
+        let mut other = entry.clone();
+        other.sender = "guest".into();
+        other.metadata.as_mut().unwrap().context_tokens = Some(900_000);
+        tab.entries.push(other);
+        let screen = draw(&mut app, 100, 16).0.join("\n");
+        assert!(screen.contains("ctx ~12345/1050000 tok"), "{screen}");
+
+        // New model, same session: don't pair its budget with an old count.
+        app.active_mut().effective_model = "small-model".into();
+        app.active_mut().context_budget = 32_000;
+        let screen = draw(&mut app, 80, 16).0.join("\n");
+        assert!(screen.contains("ctx unknown/32000 tok"), "{screen}");
+        // A new response restores usage; a cap changes only the denominator.
+        let mut latest = entry;
+        latest.metadata.as_mut().unwrap().model = "small-model".into();
+        latest.metadata.as_mut().unwrap().context_tokens = Some(20_001);
+        app.active_mut().entries.push(latest);
+        app.active_mut().context_budget = 16_000;
+        let screen = draw(&mut app, 80, 16).0.join("\n");
+        assert!(screen.contains("ctx ~20001/16000 tok"), "{screen}");
+        // Missing/zero usage on the latest message must not resurrect older data.
+        app.active_mut()
+            .entries
+            .last_mut()
+            .unwrap()
+            .metadata
+            .as_mut()
+            .unwrap()
+            .context_tokens = Some(0);
+        let screen = draw(&mut app, 80, 16).0.join("\n");
+        assert!(screen.contains("ctx unknown/16000 tok"), "{screen}");
+        app.active_mut().entries.last_mut().unwrap().metadata = None;
+        app.active_mut().context_budget = 0;
+        let screen = draw(&mut app, 80, 16).0.join("\n");
+        assert!(screen.contains("ctx unknown/unknown tok"), "{screen}");
+        app.active_mut().entries.clear();
+        app.active_mut().context_budget = 1_050_000;
+        let screen = draw(&mut app, 80, 16).0.join("\n");
+        assert!(screen.contains("ctx unknown/1050000 tok"), "{screen}");
     }
 
     #[tokio::test]
@@ -2241,27 +2311,6 @@ mod tests {
             model_slug("provider/family/qwen-2.5-coder:free"),
             "qwen-2.5-coder:free"
         );
-    }
-
-    #[test]
-    fn ctx_pct_basic_and_rounding() {
-        assert_eq!(ctx_pct(64_000, 128_000), Some(50));
-        // Rounds to nearest.
-        assert_eq!(ctx_pct(1, 3), Some(33));
-        assert_eq!(ctx_pct(2, 3), Some(67));
-    }
-
-    #[test]
-    fn ctx_pct_unknown_budget_is_hidden() {
-        // Zero budget -> None so the segment is omitted, never a divide-by-zero.
-        assert_eq!(ctx_pct(1000, 0), None);
-        assert_eq!(ctx_pct(0, 0), None);
-    }
-
-    #[test]
-    fn ctx_pct_reports_over_budget_unclamped() {
-        // A turn packed past a later-lowered budget shows >100, not a clamp.
-        assert_eq!(ctx_pct(200_000, 128_000), Some(156));
     }
 
     #[test]
