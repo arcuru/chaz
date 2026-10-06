@@ -349,9 +349,14 @@ async fn context_augmentation_order_is_stable_and_filtered() {
     let mut extensions: Vec<Arc<dyn Extension>> = names
         .iter()
         .map(|&name| {
+            let scopes = if name == "echo" {
+                vec![instance::Scope::PerAgent, instance::Scope::PerSession]
+            } else {
+                vec![instance::Scope::PerSession]
+            };
             Arc::new(
                 TestExt::new(name)
-                    .scopes(vec![instance::Scope::PerSession])
+                    .scopes(scopes)
                     .prompt_augmentation(Arc::new(FixedAug(name)))
                     .context_tail(Arc::new(FixedAug(name))),
             ) as Arc<dyn Extension>
@@ -362,9 +367,71 @@ async fn context_augmentation_order_is_stable_and_filtered() {
             .prompt_augmentation(Arc::new(FixedAug("GLOBAL")))
             .context_tail(Arc::new(FixedAug("GLOBAL"))),
     ));
+    extensions.push(Arc::new(
+        TestExt::new("foxtrot")
+            .scopes(vec![instance::Scope::PerAgent])
+            .prompt_augmentation(Arc::new(FixedAug("foxtrot")))
+            .context_tail(Arc::new(FixedAug("foxtrot"))),
+    ));
     hub.install_all(extensions).await.unwrap();
+
+    // Wire the real agent-name lookup, then seed distinguishable cached
+    // agent output for the same-named session provider to override.
+    let peer = hub.peer_handles.as_ref().unwrap().clone();
+    let registry = peer.registry.clone();
+    let agent = crate::agent_db::ensure_agent_db(&mut *registry.user_for_tests().await, "chaz")
+        .await
+        .unwrap();
+    peer.agent_index.register(crate::hosted_index::DbEntry {
+        db_id: agent.db.id(),
+        display_name: "chaz".into(),
+        pubkey: agent.pubkey,
+    });
+    hub.ensure_agent_instances("chaz", agent.db.database())
+        .await;
+    hub.agent_instances.write().await.insert(
+        (agent.db.id(), "echo".into()),
+        Arc::new(TestInstance {
+            manifest: TestExt::new("echo").manifest(),
+            parts: TestParts {
+                prompt_augmentation: Some(Arc::new(FixedAug("AGENT-ECHO"))),
+                context_tail: Some(Arc::new(FixedAug("AGENT-ECHO"))),
+                ..Default::default()
+            },
+        }),
+    );
+    let hub = Arc::new(hub);
+    let secrets = crate::security::SecretStore::new(registry.chaz_peer().clone()).await;
+    let server = crate::server::Server::new(
+        registry.clone(),
+        registry.agents.clone(),
+        peer.agent_index.clone(),
+        peer.memory_bank_index.clone(),
+        peer.skill_bank_index.clone(),
+        peer.tool_registry.clone(),
+        Arc::new(crate::tool::ToolPolicyRegistry::empty()),
+        crate::test_support::permissive_security(),
+        Default::default(),
+        Default::default(),
+        Arc::new(crate::tool_host::NativeToolHost::new()),
+        hub.clone(),
+        crate::backends::BackendManager::new(&None, secrets),
+        peer.mcp_registry.clone(),
+        None,
+    );
+    peer.server_slot.set(server.clone());
+    assert_eq!(
+        hub.augment_system_prompt("chaz", &[], &[], None, None)
+            .await,
+        "AGENT-ECHO\n\nfoxtrot"
+    );
+    assert_eq!(
+        hub.context_tails("chaz", &[], None, None).await,
+        "AGENT-ECHO\n\nfoxtrot"
+    );
+
     let (_instance, db) = make_session_db().await;
-    let expected = "alpha\n\nbravo\n\ncharlie\n\ndelta\n\necho\n\nzulu";
+    let expected = "alpha\n\nbravo\n\ncharlie\n\ndelta\n\necho\n\nfoxtrot\n\nzulu";
 
     // Each collection builds a fresh name map; cache hits must preserve the
     // same model-facing bytes as the initial lazy instantiation.
@@ -390,6 +457,8 @@ async fn context_augmentation_order_is_stable_and_filtered() {
             .await,
         "bravo\n\nzulu"
     );
+    peer.server_slot.clear();
+    server.shutdown().await;
 }
 
 struct FixedStatus(&'static str, &'static str);
