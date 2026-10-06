@@ -1,4 +1,4 @@
-//! Core-tool bundle — `shell`, `compact`, `spawn_agent`, `spawn_worker`.
+//! Core-tool bundle — self queries, shell, compaction, and spawning.
 //!
 //! These are too tightly coupled to the server to live in main.rs as
 //! direct registrations now that everything else flows through extensions
@@ -17,7 +17,10 @@ use crate::extension::manifest::ExtensionManifest;
 use crate::extension::{Extension, ExtensionRef, HookKind};
 use crate::mcp::McpServerStatus;
 use crate::security::SecurityContext;
-use crate::tools::{Compact, JobStatusTool, JobWaitTool, ShellExec, SpawnAgent, SpawnWorker};
+use crate::tool::ToolPolicyRegistry;
+use crate::tools::{
+    ChazTool, Compact, JobStatusTool, JobWaitTool, ShellExec, SpawnAgent, SpawnWorker,
+};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -25,6 +28,7 @@ pub struct CoreExtension {
     pub server_slot: crate::instance::ServerSlot,
     pub backend: BackendManager,
     pub security: SecurityContext,
+    pub tool_policies: Arc<ToolPolicyRegistry>,
 }
 
 impl CoreExtension {
@@ -32,11 +36,13 @@ impl CoreExtension {
         server_slot: crate::instance::ServerSlot,
         backend: BackendManager,
         security: SecurityContext,
+        tool_policies: Arc<ToolPolicyRegistry>,
     ) -> Self {
         Self {
             server_slot,
             backend,
             security,
+            tool_policies,
         }
     }
 }
@@ -66,12 +72,14 @@ impl Extension for CoreExtension {
         let server_slot = self.server_slot.clone();
         let backend = self.backend.clone();
         let security = self.security.clone();
+        let tool_policies = self.tool_policies.clone();
         Box::pin(async move {
             Ok(Arc::new(CoreInstance {
                 manifest,
                 server_slot,
                 backend,
                 security,
+                tool_policies,
             }) as Arc<dyn ExtensionInstance>)
         })
     }
@@ -82,6 +90,7 @@ struct CoreInstance {
     server_slot: crate::instance::ServerSlot,
     backend: BackendManager,
     security: SecurityContext,
+    tool_policies: Arc<ToolPolicyRegistry>,
 }
 
 impl ExtensionInstance for CoreInstance {
@@ -91,6 +100,9 @@ impl ExtensionInstance for CoreInstance {
 
     fn tools(&self) -> Vec<Arc<dyn crate::tool::Tool>> {
         vec![
+            Arc::new(ChazTool {
+                policies: self.tool_policies.clone(),
+            }),
             Arc::new(ShellExec),
             Arc::new(Compact),
             Arc::new(SpawnAgent {

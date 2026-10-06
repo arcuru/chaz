@@ -235,7 +235,7 @@ agents:
     workers:
       - name: researcher
         system_prompt: "You are a focused research assistant. Use web_fetch and calculate to answer questions concisely."
-        max_iterations: 20
+        max_spawn_depth: 20
         tools: ["web_fetch", "calculate", "get_time"]
 
 # Security settings
@@ -333,6 +333,11 @@ just lint           # clippy + lints
 just fmt            # treefmt
 just ci             # all checks
 ```
+
+For repeated filtered tests without rebuilding unchanged source, use
+`nix run .#test -- -E 'test(test_error_size)'` from the workspace root.
+See [compiled archive tests](docs/src/user_guide/getting_started.md#filtered-tests-from-a-compiled-archive)
+for reuse, source invalidation, and the required full final gates.
 
 ## Repository
 

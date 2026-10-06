@@ -49,11 +49,11 @@ struct AutoRecallConfig {
     #[serde(default = "default_true")]
     auto_recall_enabled: bool,
     /// Max entries to surface from own memory + each bank.
-    #[serde(default = "default_auto_recall_max_entries")]
+    #[serde(default = "default_auto_recall_max_entries", alias = "max_entries")]
     auto_recall_max_entries: usize,
     /// Max characters per entry surfaced in the context tail; longer
     /// values are truncated with an elision marker.
-    #[serde(default = "default_auto_recall_max_chars")]
+    #[serde(default = "default_auto_recall_max_chars", alias = "max_entry_chars")]
     auto_recall_max_chars: usize,
     /// Which banks participate in auto-recall. `None` = all attached banks.
     #[serde(default)]
@@ -90,7 +90,10 @@ async fn load_auto_recall_config(db: &Database) -> AutoRecallConfig {
         Err(_) => return AutoRecallConfig::default(),
     };
     match meta.get_string(AUTO_RECALL_CONFIG_KEY).await {
-        Ok(s) => serde_json::from_str(&s).unwrap_or_default(),
+        Ok(s) => serde_json::from_str(&s).unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "invalid stored auto-recall config; using defaults");
+            AutoRecallConfig::default()
+        }),
         Err(_) => AutoRecallConfig::default(),
     }
 }
@@ -1295,6 +1298,12 @@ async fn config_set_cmd(
     };
     let mut config = load_auto_recall_config(&db).await;
 
+    // Pre-rename spellings are stored and reported under the canonical key.
+    let key = match key {
+        "max_entries" => "auto_recall_max_entries",
+        "max_entry_chars" => "auto_recall_max_chars",
+        other => other,
+    };
     match key {
         "auto_recall_enabled" => match value.to_lowercase().as_str() {
             "true" | "1" | "yes" | "on" => config.auto_recall_enabled = true,
@@ -1968,22 +1977,28 @@ mod tests {
     async fn config_set_unknown_key_lists_valid_keys() {
         let (_i, registry, cmd) = fixture().await;
         seed_agent(&registry, &cmd, "alpha").await;
-        // Pre-rename keys are no longer recognized and must hit the
-        // unknown-key warning, which lists the new key names.
-        for old in ["max_entries 5", "max_entry_chars 200", "bogus 1"] {
-            match config_set_via_cmd(&cmd, old).await {
-                ExtensionCommandOutcome::Error(msg) => {
-                    assert!(msg.contains("Unknown key"), "missing warning: {msg}");
-                    assert!(
-                        msg.contains("auto_recall_max_entries")
-                            && msg.contains("auto_recall_max_chars"),
-                        "warning must list new key names: {msg}"
-                    );
-                }
-                ExtensionCommandOutcome::Text(s) => panic!("expected error, got: {s}"),
-            }
+        // Old aliases remain accepted and are stored under their canonical names.
+        for (old, expected) in [
+            ("max_entries 5", "Set auto_recall_max_entries = 5"),
+            ("max_entry_chars 200", "Set auto_recall_max_chars = 200"),
+        ] {
+            assert_text(config_set_via_cmd(&cmd, old).await, expected);
         }
-        // The renamed keys are still accepted.
+
+        // Genuine unknown keys still warn and list the canonical names.
+        match config_set_via_cmd(&cmd, "bogus 1").await {
+            ExtensionCommandOutcome::Error(msg) => {
+                assert!(msg.contains("Unknown key"), "missing warning: {msg}");
+                assert!(
+                    msg.contains("auto_recall_max_entries")
+                        && msg.contains("auto_recall_max_chars"),
+                    "warning must list new key names: {msg}"
+                );
+            }
+            ExtensionCommandOutcome::Text(s) => panic!("expected error, got: {s}"),
+        }
+
+        // The canonical names remain accepted.
         assert_text(
             config_set_via_cmd(&cmd, "auto_recall_max_entries 5").await,
             "Set auto_recall_max_entries = 5",
@@ -2100,5 +2115,24 @@ mod tests {
         let roundtrip: AutoRecallConfig =
             serde_json::from_str(&serde_json::to_string(&cfg).unwrap()).unwrap();
         assert_eq!(roundtrip.auto_recall_max_chars, 200);
+    }
+
+    #[test]
+    fn auto_recall_config_deserializes_legacy_keys() {
+        let config: AutoRecallConfig =
+            serde_json::from_str(r#"{"max_entries": 7, "max_entry_chars": 400}"#).unwrap();
+        assert_eq!(config.auto_recall_max_entries, 7);
+        assert_eq!(config.auto_recall_max_chars, 400);
+    }
+
+    #[test]
+    fn auto_recall_config_rejects_legacy_and_canonical_key_duplicates() {
+        for json in [
+            r#"{"max_entries": 7, "auto_recall_max_entries": 5}"#,
+            r#"{"max_entry_chars": 400, "auto_recall_max_chars": 200}"#,
+        ] {
+            let error = serde_json::from_str::<AutoRecallConfig>(json).unwrap_err();
+            assert!(error.to_string().contains("duplicate field"), "{error}");
+        }
     }
 }

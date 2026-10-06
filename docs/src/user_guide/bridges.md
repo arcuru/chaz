@@ -16,6 +16,36 @@ This page covers the architecture and the one-time setup/approval flow common to
 both bridges. For transport-specific configuration see [Matrix Bot](matrix.md)
 and [Discord Bot](discord.md).
 
+## What an attached session publishes
+
+| Event                                                      | Shared-session behavior                                                                                  |
+| ---------------------------------------------------------- | -------------------------------------------------------------------------------------------------------- |
+| Addressed external message                                 | The attached adapter supplies source facts; core checks the binding and lets a `Message` wake the agent. |
+| Unaddressed observation                                    | Recorded for later context; it does not start a turn.                                                    |
+| Normal final for an external turn                          | If the adapter declares conversational replies, saved locally and queued to that same source.            |
+| Normal final for a TUI, CLI, schedule, or local-agent turn | Remains local even though the session has an external attachment.                                        |
+| `no_reply({})`                                             | Completes without a final or external post on a reply-capable attached session.                          |
+| Explicit `matrix__send`                                    | Queues a deliberate addressed message; its later final does not post twice.                              |
+
+One session has at most one external publishable `(transport, login, channel)`
+attachment; local clients can still use it.
+New bindings reject a second external channel instead of guessing where a reply
+belongs, and ambiguous older sessions need an explicit detach or migration.
+The shared session stores a versioned, transport-neutral `BridgeEvent` for
+observations, outbound requests, and receipts.
+A reader preserves unsupported future kinds with a warning but does not act
+on them; existing Matrix-specific rows remain readable without a history
+rewrite.
+The bridge and the daemon must be upgraded together: an old binary cannot
+safely reopen sessions containing the new kind.
+
+Example: attach a Matrix room and ask a question there; the final posts to
+that room, and the TUI shows both the local final and the delivery receipt.
+Ask a second question from the TUI in the same session; its final stays local.
+If the room is detached before a queued reply is sent, the bridge leaves it
+pending rather than publishing it to a different room; reattach deliberately
+and inspect the interrupted or undelivered work before retrying.
+
 ## Why bridges are separate processes
 
 Earlier versions ran the Matrix bridge inside the `chaz` process and read its
@@ -123,7 +153,7 @@ immediately.
    `ticket`. Provision fresh bridge settings/identities deliberately; old
    bridge databases, identities, delivery progress and channel bindings are
    **not** imported into this layout. Reattach channels and verify an inbound
-   message and one reply on a disposable Matrix room before any live cutover.
+   ordinary final, terminal `no_reply({})`, and one explicit `matrix__send` on a disposable Matrix room before any live cutover.
 4. Test a client and bridge restart while the executor stays up, then an
    executor restart. Check committed replies arrive and already acknowledged
    chunks do not resend. Roll back by stopping the new processes and restoring

@@ -111,9 +111,12 @@ async fn repeated_catalog_commands_do_not_create_sessions_and_agents_stay_sessio
     )
     .unwrap();
 
+    // Nextest archives relocate the binary away from Cargo's compiled-in path.
+    let chaz_binary = std::env::var_os("NEXTEST_BIN_EXE_chaz")
+        .unwrap_or_else(|| env!("CARGO_BIN_EXE_chaz").into());
     let run = |args: &[&str]| {
         let started = std::time::Instant::now();
-        Command::new(env!("CARGO_BIN_EXE_chaz"))
+        Command::new(&chaz_binary)
             .arg("--config")
             .arg(&config_path)
             .args(args)

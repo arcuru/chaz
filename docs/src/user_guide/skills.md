@@ -18,6 +18,8 @@ Skills are composed at turn time from four sources, in priority order. The first
 | 4     | **Granted skill bank**    | `SkillBankDb` granted to the agent via `/skills grant`             | Persistent grant; agent carries the ref in its DB |
 | 5     | **Session-attached bank** | `SkillBankDb` attached to the current session via `/skills attach` | Transient; lasts only as long as the session      |
 
+Within one disk directory, `*.md` files are read in lexical path order, so the catalog lists them in that order and, if two files in the same directory declare the same `name`, the file whose path sorts first wins (`10-deploy.md` beats `20-deploy.md`). Files that fail to parse and non-`.md` files are skipped without affecting the rest.
+
 Disk paths are scanned at extension install time (process startup). DB-backed sources are read at every turn — write a new skill to a granted bank from another peer, sync settles, the next turn sees it.
 
 ## The SKILL.md format

@@ -108,7 +108,7 @@ pub struct AgentDbConfig {
     /// Mirrors [`AgentConfig::workers`].
     #[serde(default)]
     pub workers: Vec<WorkerDbConfig>,
-    pub max_iterations: Option<u32>,
+    pub max_spawn_depth: Option<u32>,
     #[serde(default)]
     pub autonomous: bool,
     #[serde(default)]
@@ -143,7 +143,7 @@ pub struct WorkerDbConfig {
     pub system_prompt_files: Vec<String>,
     pub model: Option<String>,
     pub tools: Option<Vec<String>>,
-    pub max_iterations: Option<u32>,
+    pub max_spawn_depth: Option<u32>,
     #[serde(default)]
     pub presets: HashMap<String, AgentPreset>,
 }
@@ -156,7 +156,7 @@ impl WorkerDbConfig {
             system_prompt_files: cfg.system_prompt_files.clone().unwrap_or_default(),
             model: cfg.model.clone(),
             tools: cfg.tools.clone(),
-            max_iterations: cfg.max_iterations,
+            max_spawn_depth: cfg.max_spawn_depth,
             presets: cfg.presets.clone().unwrap_or_default(),
         }
     }
@@ -282,7 +282,7 @@ impl AgentDbConfig {
                 .as_ref()
                 .map(|ws| ws.iter().map(WorkerDbConfig::from_worker_config).collect())
                 .unwrap_or_default(),
-            max_iterations: cfg.max_iterations,
+            max_spawn_depth: cfg.max_spawn_depth,
             autonomous: cfg.autonomous,
             presets: cfg.presets.clone().unwrap_or_default(),
             tool_profile: cfg.tool_profile.clone(),
@@ -958,7 +958,11 @@ where
     }
 }
 
-async fn write_blob<T>(database: &Database, store_name: &str, value: &T) -> anyhow::Result<()>
+pub(crate) async fn write_blob<T>(
+    database: &Database,
+    store_name: &str,
+    value: &T,
+) -> anyhow::Result<()>
 where
     T: serde::Serialize,
 {
@@ -1150,7 +1154,7 @@ mod tests {
             model: Some("sonnet".to_string()),
             tools: Some(vec!["get_time".into(), "calculate".into()]),
             workers: None,
-            max_iterations: Some(15),
+            max_spawn_depth: Some(15),
             autonomous: false,
             presets: None,
             tool_profile: None,
@@ -1171,7 +1175,7 @@ mod tests {
             model: Some("opus".to_string()),
             tools: Some(vec!["web_fetch".into()]),
             workers: vec![],
-            max_iterations: Some(40),
+            max_spawn_depth: Some(40),
             autonomous: true,
             presets: HashMap::new(),
             tool_profile: Some("deep".to_string()),
@@ -1196,6 +1200,134 @@ mod tests {
         assert_eq!(db.read_meta().await.unwrap(), meta);
         // Returned pubkey is an actual key the user holds for this DB.
         assert_eq!(user.find_key(&db.id()).unwrap(), Some(pubkey));
+    }
+
+    #[tokio::test]
+    async fn blob_reads_default_only_when_missing() {
+        use crate::memory_bank_db::{MemoryBankDb, MemoryBankMeta};
+        use crate::skill_bank_db::{SkillBankDb, SkillBankMeta};
+
+        let mut user = test_peer_user().await;
+        let key = user.get_default_key().unwrap();
+        let database = user.create_database(Doc::new(), &key).await.unwrap();
+        let agent = AgentDb::from_database(database.clone());
+        let memory = MemoryBankDb::from_database(database.clone());
+        let skills = SkillBankDb::from_database(database.clone());
+
+        assert_eq!(agent.read_config().await.unwrap(), AgentDbConfig::default());
+        assert_eq!(agent.read_meta().await.unwrap(), AgentMeta::default());
+        assert_eq!(memory.read_meta().await.unwrap(), MemoryBankMeta::default());
+        assert_eq!(skills.read_meta().await.unwrap(), SkillBankMeta::default());
+
+        let txn = database.new_transaction().await.unwrap();
+        for name in ["config", "meta"] {
+            let store = txn.get_store::<DocStore>(name).await.unwrap();
+            store.set("value", 42i64).await.unwrap();
+        }
+        txn.commit().await.unwrap();
+
+        // A present non-string value is a storage error, not a missing blob.
+        for error in [
+            agent.read_config().await.unwrap_err(),
+            agent.read_meta().await.unwrap_err(),
+            memory.read_meta().await.unwrap_err(),
+            skills.read_meta().await.unwrap_err(),
+        ] {
+            assert!(
+                !error
+                    .downcast_ref::<eidetica::Error>()
+                    .unwrap()
+                    .is_not_found()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn blob_reads_propagate_json_errors() {
+        use crate::memory_bank_db::MemoryBankDb;
+        use crate::skill_bank_db::SkillBankDb;
+
+        let (_user, agent) = peer_with_agent_db().await;
+        let memory = MemoryBankDb::from_database(agent.database().clone());
+        let skills = SkillBankDb::from_database(agent.database().clone());
+
+        // Both malformed JSON and valid JSON with incompatible field types.
+        for json in ["{", r#"{"system_prompt":42,"display_name":42}"#] {
+            let txn = agent.database().new_transaction().await.unwrap();
+            for name in ["config", "meta"] {
+                let store = txn.get_store::<DocStore>(name).await.unwrap();
+                store.set_string("value", json).await.unwrap();
+            }
+            txn.commit().await.unwrap();
+
+            for error in [
+                agent.read_config().await.unwrap_err(),
+                agent.read_meta().await.unwrap_err(),
+                memory.read_meta().await.unwrap_err(),
+                skills.read_meta().await.unwrap_err(),
+            ] {
+                assert!(error.is::<serde_json::Error>());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn blob_write_preserves_key_store_and_single_commit() {
+        let (_user, agent) = peer_with_agent_db().await;
+        let database = agent.database();
+        let value = serde_json::json!({"nested": {"list": [1, "two"], "enabled": true}});
+
+        for (name, other) in [("config", "meta"), ("meta", "config")] {
+            let txn = database.new_transaction().await.unwrap();
+            let other_store = txn.get_store::<DocStore>(other).await.unwrap();
+            let other_before = other_store.get_string("value").await.unwrap();
+            let before = database.snapshot().await.unwrap();
+
+            write_blob(database, name, &value).await.unwrap();
+
+            let after = database.snapshot().await.unwrap();
+            assert_eq!(after.tips().len(), 1);
+            let entry = database.get_entry(after.tips()[0].clone()).await.unwrap();
+            assert_eq!(entry.parents().unwrap(), before.into_tips());
+
+            let txn = database.new_transaction().await.unwrap();
+            let store = txn.get_store::<DocStore>(name).await.unwrap();
+            assert_eq!(
+                store.get_string("value").await.unwrap(),
+                serde_json::to_string(&value).unwrap()
+            );
+            let other_store = txn.get_store::<DocStore>(other).await.unwrap();
+            assert_eq!(other_store.get_string("value").await.unwrap(), other_before);
+        }
+    }
+
+    #[tokio::test]
+    async fn config_ignores_unknown_settings() {
+        let mut user = test_peer_user().await;
+        let (db, _) = create_agent_db(
+            &mut user,
+            "chaz",
+            &AgentDbConfig::default(),
+            &AgentMeta::default(),
+        )
+        .await
+        .unwrap();
+        let raw = serde_json::json!({
+            "max_iterations": 30,
+            "future_setting": true,
+            "presets": {"deep": {"max_iterations": 30}},
+            "workers": [{
+                "name": "researcher",
+                "max_iterations": 30,
+                "presets": {"deep": {"max_iterations": 30}}
+            }]
+        });
+        write_blob(db.database(), CONFIG_STORE, &raw).await.unwrap();
+        let cfg = db.read_config().await.unwrap();
+        assert_eq!(cfg.max_spawn_depth, None);
+        assert_eq!(cfg.presets["deep"].max_spawn_depth, None);
+        assert_eq!(cfg.workers[0].max_spawn_depth, None);
+        assert_eq!(cfg.workers[0].presets["deep"].max_spawn_depth, None);
     }
 
     #[tokio::test]
@@ -1264,7 +1396,7 @@ mod tests {
         // need to survive restarts.
         let mut user = test_peer_user().await;
         let mut cfg = agent_cfg("chatter");
-        cfg.max_iterations = Some(5);
+        cfg.max_spawn_depth = Some(5);
         let config = empty_config_with_agents(vec![cfg]);
         let dbs = bootstrap_from_config(&mut user, &config).await.unwrap();
         let id = dbs["chatter"].db.id();
@@ -1274,15 +1406,15 @@ mod tests {
                 .read_config()
                 .await
                 .unwrap()
-                .max_iterations,
+                .max_spawn_depth,
             Some(5)
         );
 
-        // Simulate a `/agent set` edit that bumps max_iterations past yaml.
+        // Simulate a `/agent set` edit that bumps max_spawn_depth past yaml.
         dbs["chatter"]
             .db
             .write_config(&AgentDbConfig {
-                max_iterations: Some(77),
+                max_spawn_depth: Some(77),
                 ..dbs["chatter"].db.read_config().await.unwrap()
             })
             .await
@@ -1290,7 +1422,7 @@ mod tests {
 
         // yaml changes to something else entirely; re-bootstrap must not clobber.
         let mut cfg2 = agent_cfg("chatter");
-        cfg2.max_iterations = Some(99);
+        cfg2.max_spawn_depth = Some(99);
         let config2 = empty_config_with_agents(vec![cfg2]);
         let dbs2 = bootstrap_from_config(&mut user, &config2).await.unwrap();
 
@@ -1301,7 +1433,7 @@ mod tests {
                 .read_config()
                 .await
                 .unwrap()
-                .max_iterations,
+                .max_spawn_depth,
             Some(77),
             "yaml should not overwrite existing DB config"
         );

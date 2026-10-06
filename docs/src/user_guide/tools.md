@@ -11,13 +11,14 @@ Every built-in is owned by an [extension](extensions.md); disabling an extension
 | `get_time`          | `system`   | Low    | Never              | Returns the current UTC time                                           |
 | `calculate`         | `system`   | Low    | Never              | Evaluates math expressions (via meval)                                 |
 | `describe_tool`     | `system`   | Low    | Never              | Returns full description/schema for a tool (discovery)                 |
+| `chaz`              | `core`     | Low    | Never              | Query this runtime's session, identity, callable tools, or usage       |
 | `compact`           | `core`     | Low    | Never              | Summarize and compact conversation context                             |
 | `spawn_agent`       | `core`     | Medium | UnlessAutoApproved | Submits a durable Agent job and returns its DB handle immediately      |
 | `job_status`        | `core`     | Low    | Never              | Reads the durable state and typed result of an Agent job               |
 | `job_wait`          | `core`     | Low    | Never              | Waits up to a deadline for a job; timeout returns its current status   |
 | `spawn_worker`      | `core`     | Medium | UnlessAutoApproved | Invokes a Worker template declared under the calling Agent (no keys)   |
 | `shell`             | `core`     | High   | Always             | Executes a shell command                                               |
-| `read_file`         | `fs`       | Low    | Never              | Reads file contents from disk                                          |
+| `read_file`         | `fs`       | Low    | Never              | Reads a text file from disk, one bounded page of lines at a time       |
 | `write_file`        | `fs`       | Medium | UnlessAutoApproved | Writes content to a file                                               |
 | `edit_file`         | `fs`       | Medium | UnlessAutoApproved | Replace exact text in a file (single or atomic-multi-edit)             |
 | `web_fetch`         | `web`      | Medium | UnlessAutoApproved | HTTP GET or POST requests                                              |
@@ -35,6 +36,99 @@ Every built-in is owned by an [extension](extensions.md); disabling an extension
 | `schedule_once`     | `schedule` | Low    | Never              | Add a one-shot schedule firing after N seconds                         |
 
 Built-in tools are grouped by extension. External tools from [MCP servers](mcp.md) plug in under the same policy layer and show up here too, namespaced as `<server>__<tool>` (matches the Anthropic Agent SDK / Claude Code `mcp__server__tool` convention so OpenAI-compatible providers, which reject dots in function names, accept them).
+
+## Your runtime-local view
+
+The builtin `chaz` tool is a read-only mirror of the calling runtime, not a peer-wide catalog.
+It can answer where you are, who is calling, which tools are callable, and what usage is recorded in this session.
+It cannot look up other sessions or agents, inspect full configuration or memory, or change anything.
+The `core` extension publishes the whole bundle under one tool name; a restrictive `allowed_tools` list must include `chaz` to permit any of its queries.
+Normal policy overrides, approval, timeout, rate limiting, and output safety processing still apply.
+No shell, filesystem, or network capability is needed for these self-only reads.
+
+Both `query` and `period` are required, and no other arguments are accepted.
+For `session`, `agent`, and `tools`, `period` must be JSON `null`.
+For `usage`, it must be `all`, `today`, `week`, or `month`.
+
+| Query     | Result fields                                            | Meaning                                                                                                                     |
+| --------- | -------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------- |
+| `session` | `session_db_id`, `name`                                  | Only the current session; `name` is null if no name is available.                                                           |
+| `agent`   | `name`, `call_depth`, `max_call_depth`                   | Runtime caller identity and nested spawn depth, not a ReAct iteration limit. A Worker inherits its owning Agent's identity. |
+| `tools`   | `tools`                                                  | Callable tools sorted by name, within this runtime's narrowed scope and active extensions.                                  |
+| `usage`   | `session_db_id`, `period`, `since`, `total`, `per_model` | Recorded Message metadata in the loaded current session; `since` is a UTC RFC3339 boundary or null for `all`.               |
+
+Each tool row contains only `name`, `presentation`, `risk`, `approval`, `timeout_seconds`, `rate_limit`, and `effective_grants`.
+Enums use their normal lowercase encodings: presentation is `full`, `brief`, `summary`, or `hidden`.
+`effective_grants` has the existing shell/network/filesystem grant shape, attenuated by the session, caller, and per-tool ceilings, including persisted Agent-job ceilings.
+`rate_limit` is the configured calls-per-minute limit or null, not remaining quota.
+`approval` reports the resolved requirement, not a guarantee that a future call will execute automatically.
+A Hidden tool is still callable and appears here as `hidden`; removing it from `allowed_tools` revokes access, while disabling its extension also removes it from this view.
+Use `describe_tool` (when permitted) for full descriptions and schemas.
+
+Usage periods are the current **UTC calendar** day, Monday-start week, or month, not rolling windows or local time.
+Entries exactly at the boundary are included.
+`total` contains `calls`, `prompt_tokens`, `completion_tokens`, `cached_tokens`, `cache_creation_tokens`, `reasoning_tokens`, `cost_usd`, and `cost_reported`.
+Each `per_model` row contains only `calls`, `prompt_tokens`, `completion_tokens`, `cost_usd`, and `cost_reported`.
+`calls` counts Message metadata records, not individual backend requests.
+Usage includes all qualifying participants in this session, but excludes other sessions and the current turn's final message until it is committed.
+Missing costs are not estimated; `cost_reported: true` means at least one cost was reported, not complete coverage.
+With no qualifying metadata, totals are zero, `cost_reported` is false, and `per_model` is empty.
+For the operator's peer-wide view, use the unchanged [usage CLI or `/costs`](usage.md).
+
+### Walkthrough: inspect yourself, not a neighboring session
+
+1. In a session named `planning`, let the model call:
+
+   ```json
+   { "query": "session", "period": null }
+   ```
+
+   The tool result JSON (before the runtime's safety wrapper) is:
+
+   ```json
+   { "session_db_id": "<current session DB ID>", "name": "planning" }
+   ```
+
+2. Ask who is calling with `{"query":"agent","period":null}`.
+   A root Chaz runtime with a spawn ceiling of three returns:
+
+   ```json
+   { "name": "chaz", "call_depth": 0, "max_call_depth": 3 }
+   ```
+
+   Then call `{"query":"tools","period":null}` to see the current callable names and effective constraints.
+   A child may see fewer tools and narrower grants than its parent; there is no option to request the parent's view.
+
+3. Check recorded usage with `{"query":"usage","period":"all"}`.
+   In a session with no Message metadata yet, the result is:
+
+   ```json
+   {
+     "session_db_id": "<current session DB ID>",
+     "period": "all",
+     "since": null,
+     "total": {
+       "calls": 0,
+       "prompt_tokens": 0,
+       "completion_tokens": 0,
+       "cached_tokens": 0,
+       "cache_creation_tokens": 0,
+       "reasoning_tokens": 0,
+       "cost_usd": 0.0,
+       "cost_reported": false
+     },
+     "per_model": {}
+   }
+   ```
+
+4. Trying `{"query":"session","period":null,"session_db_id":"<another DB ID>"}` fails before any state is read:
+
+   ```text
+   invalid argument: Expected exactly query (session, agent, tools, usage) and period (all, today, week, month for usage; null otherwise)
+   ```
+
+   Recover by dropping the target selector and repeating the first call.
+   A known foreign DB ID is not authorization, and rename/attach/configuration queries are not supported.
 
 ## Risk Levels
 
@@ -72,6 +166,18 @@ Read or write files on the host filesystem. Both go through the host's `FileRead
 {"path": "/tmp/notes.txt"}
 {"path": "/tmp/output.txt", "content": "Hello, world!"}
 ```
+
+`read_file` arguments:
+
+| Argument | Type              | Default           | Meaning                                              |
+| -------- | ----------------- | ----------------- | ---------------------------------------------------- |
+| `path`   | string            | (required)        | File to read                                         |
+| `offset` | integer or `null` | `1`               | 1-based line number to start from; must be 1 or more |
+| `limit`  | integer or `null` | fill the page cap | Most lines to return; must be 1 or more              |
+
+The schema stays strict-mode: `offset` and `limit` are listed as required but nullable, so a strict provider sends `null` for "use the default". Older path-only calls are still accepted.
+
+For the output model and examples, see [Paged file reads](#paged-file-reads).
 
 ### edit_file
 
@@ -123,6 +229,8 @@ Executes a shell command. Subject to command allowlist/denylist filtering.
 ```json
 { "command": "ls -la /tmp" }
 ```
+
+**Output shape.** Results stay within 10,000 bytes, including labels, omission notices and exit status. Short results keep the existing format: stdout, then `[stderr] …` when stderr is present, then `[exit code N]` for a nonzero exit. A successful command with no output returns `[no output]`; a silent failure returns its exit-code line. Longer results label each present stream (`[stdout]` / `[stderr]`) and keep head and tail excerpts of clipped streams around a `[… N bytes omitted …]` notice. Cuts respect UTF-8 boundaries. Both streams receive preview space, with unused space going to the other stream, and the nonzero-exit verdict remains outside the clipped output.
 
 ### remember / recall
 
@@ -196,7 +304,7 @@ Worker templates are per-Agent (Chaz's `researcher` is distinct from Scout's `re
 }
 ```
 
-`name` is required and selects the Worker template. `tools` narrows the resolved scope for this invocation (must be a subset of what the Worker template + parent Agent allow). `model` and `preset` are optional overrides. Unset fields on a Worker template fall back to the parent Agent's defaults. `max_iterations` is a legacy name for the Worker's nested spawn-depth ceiling; it does not limit tool calls. A Worker, like an Agent, keeps calling tools until the model replies without one. See [Spawn Permissions](agents.md#spawn-permissions) and [How a turn ends](agents.md#how-a-turn-ends).
+`name` is required and selects the Worker template. `tools` narrows the resolved scope for this invocation (must be a subset of what the Worker template + parent Agent allow). `model` and `preset` are optional overrides. Unset fields on a Worker template fall back to the parent Agent's defaults. `max_spawn_depth` overrides the Worker's nested spawn-depth ceiling; it does not limit tool calls. A Worker, like an Agent, keeps calling tools until the model replies without one. See [Spawn Permissions](agents.md#spawn-permissions) and [How a turn ends](agents.md#how-a-turn-ends).
 
 ### skill_list / skill_search / skill_show
 
@@ -280,6 +388,80 @@ One-shot wakeup that fires a directive into this session after a delay, then del
 - `after_seconds` is bounded to `[30, 2_592_000]` (30 seconds to 30 days).
 - The wakeup time has up to 30 s of jitter past the requested delay (poll interval).
 - Generated rule id has the form `wakeup-<epoch_ms>`; it surfaces in `/schedule list` and `schedule_list` with an `@YYYY-MM-DD HH:MM:SSZ` marker in place of a cron expression.
+
+## Paged file reads
+
+A single `read_file` result is capped at **2,000 lines and 51,200 bytes, notices included**. The cap bounds what the model sees, not what the host reads: the host still reads the whole file through `FileRead` under the same grants, and paging slices the decoded text (invalid UTF-8 becomes U+FFFD, as before).
+
+- **Short file from the start** (`offset` 1, no `limit` cutting it short, within both caps) comes back verbatim — exactly the decoded text, with no notice.
+- **Anything else** is a _page_: whole lines, each with its original terminator (`\n` or `\r\n`), then one blank line and one `[bracketed]` notice. The notice gives the range shown, the file's total line count, and either `end of file` or why the page stopped (`the requested limit`, `the 2000-line output ceiling`, `the 51200-byte output ceiling`) plus `Use offset=N to continue`. A page reserves two lines and 512 bytes for the separator and notice, leaving at most 1,998 file lines and 50,688 content bytes.
+- Pages end only on line boundaries, so a multibyte character is never cut. Concatenating the pages' content reproduces the decoded text, except for the separator newline added when the last file line has no final newline. The final notice identifies that case; remove that one added newline when reconstructing the text. A trailing file newline does not count as an extra empty line.
+- **An oversized line** (one line over the 50,688-byte page content budget) is never cut or silently skipped. The page before it stops early; asking for it returns only a notice giving its size, a bounded shell recipe, and the offset after it (or says it is the last line).
+- **Errors**: an `offset`/`limit` that is zero, negative, fractional, or not a number is rejected before the host is called. An `offset` past the last line is rejected after the authorized read determines the total. Grant denials and I/O failures from the host come back unchanged.
+
+### Paging walkthrough
+
+**1. Read the first page** of a 5,000-line file with short lines:
+
+```text
+→ {"path": "/var/log/app.log"}
+00001 starting
+…
+01998 request 1997 ok
+
+[Lines 1-1998 of 5000; stopped at the 2000-line output ceiling. Use offset=1999 to continue.]
+
+```
+
+**2. Pass back the notice's offset** until the notice says `end of file`:
+
+```text
+→ {"path": "/var/log/app.log", "offset": 1999}
+01999 request 1998 ok
+…
+03996 request 3995 ok
+
+[Lines 1999-3996 of 5000; stopped at the 2000-line output ceiling. Use offset=3997 to continue.]
+
+→ {"path": "/var/log/app.log", "offset": 3997}
+03997 request 3996 ok
+…
+05000 shutdown
+
+[Lines 3997-5000 of 5000; end of file.]
+```
+
+**3. Recover from a bad offset** by requesting a range inside the file. Use `limit` when you only need a small window:
+
+```text
+→ {"path": "/var/log/app.log", "offset": 5001}
+Tool error: invalid argument: offset 5001 is beyond the end of the file (5000 lines)
+
+→ {"path": "/var/log/app.log", "offset": 20, "limit": 2}
+00020 request 19 ok
+00021 request 20 ok
+
+[Lines 20-21 of 5000; stopped at the requested limit. Use offset=22 to continue.]
+```
+
+### Edge cases and failures
+
+```text
+→ {"path": "/tmp/empty.txt"}
+[Empty file: 0 lines.]
+
+→ {"path": "/tmp/notes.txt", "offset": 99}
+Tool error: invalid argument: offset 99 is beyond the end of the file (12 lines)
+
+→ {"path": "/tmp/notes.txt", "limit": 0}
+Tool error: invalid argument: 'limit' must be a positive integer (1 or more), got 0
+
+→ {"path": "/data/min.js", "offset": 2}
+[Line 2 of 3 is 80001 bytes, over the 50688-byte page content budget (the 51200-byte output ceiling includes the notice), so it was not returned. Read a bounded slice of it with the shell tool (for example: sed -n '2p' FILE | head -c 50000), or use offset=3 to skip it.]
+
+→ {"path": "/etc/shadow"}
+Tool error: Filesystem read of '/etc/shadow' is outside the allowed paths
+```
 
 ## External Tools (MCP)
 

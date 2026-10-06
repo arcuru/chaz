@@ -480,9 +480,9 @@ pub struct AgentConfig {
     /// `researcher`. A Worker is a configured one-shot LLM call with no
     /// identity of its own; entries it writes are signed by this Agent's key.
     pub workers: Option<Vec<WorkerConfig>>,
-    /// Maximum nested spawn depth (legacy name; default: 10). Does not
+    /// Maximum nested spawn depth (default: 10). Does not
     /// bound the ReAct loop, which runs until the model stops calling tools.
-    pub max_iterations: Option<u32>,
+    pub max_spawn_depth: Option<u32>,
     /// Whether this agent can run without user input (scheduled/schedule)
     #[serde(default)]
     pub autonomous: bool,
@@ -545,9 +545,9 @@ pub struct WorkerConfig {
     /// list (intersection). May include other Workers; recursion is
     /// bounded by the spawn-depth ceiling.
     pub tools: Option<Vec<String>>,
-    /// Maximum nested spawn depth for this Worker's child session
-    /// (legacy name). Does not bound the Worker's ReAct loop.
-    pub max_iterations: Option<u32>,
+    /// Maximum nested spawn depth for this Worker's child session.
+    /// Does not bound the Worker's ReAct loop.
+    pub max_spawn_depth: Option<u32>,
     /// Named override bundles selectable at spawn time via the `preset`
     /// argument of `spawn_worker`.
     pub presets: Option<HashMap<String, AgentPreset>>,
@@ -558,8 +558,8 @@ pub struct WorkerConfig {
 pub struct AgentPreset {
     /// Override the model
     pub model: Option<String>,
-    /// Override the maximum nested spawn depth (legacy name)
-    pub max_iterations: Option<u32>,
+    /// Override the maximum nested spawn depth
+    pub max_spawn_depth: Option<u32>,
     /// Restrict tools (must be subset of agent definition's tools)
     pub tools: Option<Vec<String>>,
     /// Appended to the base system prompt
@@ -1024,7 +1024,7 @@ fn known_config_keys() -> HashSet<&'static str> {
         "agents[].model",
         "agents[].tools",
         "agents[].workers",
-        "agents[].max_iterations",
+        "agents[].max_spawn_depth",
         "agents[].autonomous",
         "agents[].presets",
         "agents[].tool_profile",
@@ -1044,7 +1044,7 @@ fn known_config_keys() -> HashSet<&'static str> {
         "agents[].workers[].system_prompt_files",
         "agents[].workers[].model",
         "agents[].workers[].tools",
-        "agents[].workers[].max_iterations",
+        "agents[].workers[].max_spawn_depth",
         "agents[].workers[].presets",
     ] {
         keys.insert(k);
@@ -1332,10 +1332,10 @@ agents:
     system_prompt: "You are a research analyst."
     model: gpt-4
     tools: [web_fetch, calculate]
-    max_iterations: 20
+    max_spawn_depth: 20
     autonomous: true
   - name: default
-    max_iterations: 5
+    max_spawn_depth: 5
 "#;
         let cfg: Config = serde_yaml::from_str(yaml).unwrap();
         let agents = cfg.agents.unwrap();
@@ -1346,11 +1346,52 @@ agents:
             Some("You are a research analyst.")
         );
         assert_eq!(agents[0].model.as_deref(), Some("gpt-4"));
-        assert_eq!(agents[0].max_iterations, Some(20));
+        assert_eq!(agents[0].max_spawn_depth, Some(20));
         assert!(agents[0].autonomous);
         assert_eq!(agents[0].tools.as_ref().unwrap().len(), 2);
         // `autonomous` defaults to false when unset
         assert!(!agents[1].autonomous);
+    }
+
+    #[test]
+    fn spawn_depth_and_unknown_settings() {
+        let yaml = r#"
+agents:
+  - name: chaz
+    max_spawn_depth: 30
+    presets:
+      deep: { max_spawn_depth: 30 }
+    workers:
+      - name: researcher
+        max_spawn_depth: 30
+        presets:
+          deep: { max_spawn_depth: 30 }
+"#;
+        for key in ["max_spawn_depth", "max_iterations", "future_setting"] {
+            let yaml = yaml.replace("max_spawn_depth", key);
+            let cfg: Config = serde_yaml::from_str(&yaml).unwrap();
+            let agent = &cfg.agents.as_ref().unwrap()[0];
+            let worker = &agent.workers.as_ref().unwrap()[0];
+            let known = key == "max_spawn_depth";
+            let expected = known.then_some(30);
+            assert_eq!(agent.max_spawn_depth, expected);
+            assert_eq!(worker.max_spawn_depth, expected);
+            assert_eq!(
+                agent.presets.as_ref().unwrap()["deep"].max_spawn_depth,
+                expected
+            );
+            assert_eq!(
+                worker.presets.as_ref().unwrap()["deep"].max_spawn_depth,
+                expected
+            );
+            let unknown = check_unknown_config_keys(&yaml);
+            if known {
+                assert!(unknown.is_empty(), "{unknown:?}");
+            } else {
+                assert!(unknown.contains(&format!("agents[].{key}")));
+                assert!(unknown.contains(&format!("agents[].workers[].{key}")));
+            }
+        }
     }
 
     #[test]
@@ -1367,7 +1408,7 @@ agents:
     workers:
       - name: researcher
         system_prompt: "Cite primary sources."
-        max_iterations: 20
+        max_spawn_depth: 20
       - name: librarian
         system_prompt: "Locate references."
         model: gpt-4
@@ -1390,7 +1431,7 @@ agents:
             researcher.system_prompt.as_deref(),
             Some("Cite primary sources.")
         );
-        assert_eq!(researcher.max_iterations, Some(20));
+        assert_eq!(researcher.max_spawn_depth, Some(20));
         // Model + tools fall back to the parent Agent's defaults when unset.
         assert!(researcher.model.is_none());
         assert!(researcher.tools.is_none());
@@ -1617,7 +1658,7 @@ embedding:
         // AgentPreset is the only config type with Serialize (for storage).
         let preset = AgentPreset {
             model: Some("gpt-4".into()),
-            max_iterations: Some(10),
+            max_spawn_depth: Some(10),
             tools: Some(vec!["shell".into()]),
             role_suffix: Some("be concise".into()),
             tool_profile: Some("brief".into()),
@@ -1631,7 +1672,7 @@ embedding:
     fn agent_preset_defaults_all_none() {
         let preset = AgentPreset::default();
         assert!(preset.model.is_none());
-        assert!(preset.max_iterations.is_none());
+        assert!(preset.max_spawn_depth.is_none());
         assert!(preset.tools.is_none());
     }
 

@@ -68,6 +68,10 @@ impl Bridge for TuiBridge {
         let mut activity_tick = tokio::time::interval(std::time::Duration::from_secs(5));
         loop {
             terminal.draw(|f| view::ui(f, &mut app, &server, &backend, &self.config))?;
+            // Use this frame's viewport, not the previous frame's cursor or size.
+            if matches!(app.mode, TuiMode::SessionPicker) {
+                request_session_metadata(&mut app, &server, &session_rows_tx);
+            }
 
             let action = tokio::select! {
                 Some(Ok(event)) = events.next() => {
@@ -217,8 +221,6 @@ impl Bridge for TuiBridge {
                                         &notify_tx,
                                     )
                                     .await;
-                                } else {
-                                    request_session_metadata(&mut app, &server, &session_rows_tx);
                                 }
                             }
                             TuiMode::ModelPicker => {
@@ -306,9 +308,6 @@ impl Bridge for TuiBridge {
                                 }
                             }
                         }
-                    }
-                    if matches!(app.mode, TuiMode::SessionPicker) {
-                        request_session_metadata(&mut app, &server, &session_rows_tx);
                     }
                 }
                 Action::SessionChanged(id) => {
@@ -417,9 +416,7 @@ impl Bridge for TuiBridge {
                                 app.mode = TuiMode::Chat;
                                 app.cancel_session_fill();
                             }
-                            CatalogLoadOutcome::Loaded { .. } => {
-                                request_session_metadata(&mut app, &server, &session_rows_tx)
-                            }
+                            CatalogLoadOutcome::Loaded { .. } => {}
                             CatalogLoadOutcome::Ignored | CatalogLoadOutcome::Failed => {}
                         }
                     }

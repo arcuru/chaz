@@ -432,14 +432,13 @@ impl SessionRegistry {
     /// produces a valid-looking ticket but the source peer refuses to serve,
     /// and imported DBs go stale after the initial fetch.
     ///
-    /// Idempotent — eidetica's `User::enable_sync` short-circuits if the bit
-    /// is already on, and errors with `DatabaseNotTracked` for DBs this user
-    /// doesn't track (i.e. doesn't hold a key for).
+    /// Reuses the recorded signing key and errors with `DatabaseNotTracked`
+    /// for DBs this user doesn't track.
     pub async fn enable_sync_for(&self, db_id: &eidetica::entry::ID) -> anyhow::Result<()> {
         use eidetica::user::types::SyncSettings;
         let mut user = self.user.lock().await;
         // Push on every commit, not just the periodic interval, so cross-process
-        // peers (the standalone bridges) see writes immediately — `enable_sync`
+        // peers (the standalone bridges) see writes immediately — `share`
         // alone only flips `sync_enabled` and leaves `sync_on_commit` false, so
         // inbound messages / agent replies would sit until the 300s tick.
         // `track_database` upserts the settings; reuse the key already recorded.
@@ -470,17 +469,27 @@ impl SessionRegistry {
         Ok(())
     }
 
-    /// Atomically enable sync for `db_id` and build a `DatabaseTicket` with
-    /// this peer's transport addresses populated. Wraps eidetica's
-    /// `User::share`, which combines `enable_sync` + `Sync::create_ticket`
-    /// so the track → enable → ticket-build sequence stays in one place.
+    /// Enable this user's sharing preference and return a point-in-time locator.
+    /// Validate the transport before changing preferences, so a failed ticket
+    /// build does not silently enable sharing. The signed preference write is
+    /// separate from the locator and does not guarantee peer reachability.
     ///
     /// Used by `/agent share`, `/memory share`, and `/session share` to
     /// produce a ticket the holder can paste into the corresponding import
     /// command on another peer.
     pub async fn share_for(&self, db_id: &eidetica::entry::ID) -> anyhow::Result<DatabaseTicket> {
-        let mut user = self.user.lock().await;
-        let ticket = user.share(db_id).await?;
+        let user = self.user.lock().await;
+        let key = user.database(db_id).await?.key_id;
+        let db = user.open_database_with_key(db_id, &key).await?;
+        let sync = self
+            .instance
+            .sync()
+            .ok_or_else(|| anyhow::anyhow!("Sync not enabled"))?;
+        let ticket = sync.create_ticket(db_id).await?;
+        if ticket.addresses().is_empty() {
+            anyhow::bail!("No sync transport is listening; cannot share a reachable ticket");
+        }
+        db.share().await?;
         info!(db_id = %db_id, "Shared DB (sync enabled, ticket built)");
         Ok(ticket)
     }
@@ -488,8 +497,12 @@ impl SessionRegistry {
     /// Inverse of `enable_sync_for`. Used by future "stop sharing this DB"
     /// flows. Idempotent — eidetica short-circuits if already off.
     pub async fn disable_sync_for(&self, db_id: &eidetica::entry::ID) -> anyhow::Result<()> {
-        let mut user = self.user.lock().await;
-        user.disable_sync(db_id).await?;
+        let user = self.user.lock().await;
+        let key = user.database(db_id).await?.key_id;
+        user.open_database_with_key(db_id, &key)
+            .await?
+            .stop_sharing()
+            .await?;
         info!(db_id = %db_id, "Disabled sync for DB");
         Ok(())
     }
@@ -522,8 +535,15 @@ impl SessionRegistry {
             .ok_or_else(|| anyhow::anyhow!("Sync not enabled"))?;
         let mut user = self.user.lock().await;
         let key_id = user.get_default_key()?;
+        // The old API preserved preferences on a repeat import and disabled
+        // sync on a new one; callers still enable it after local registration.
+        let sync_settings = user
+            .database(ticket.database_id())
+            .await
+            .map(|tracked| tracked.sync_settings)
+            .unwrap_or_default();
         match user
-            .request_database_access(&sync, ticket, &key_id, permission, None)
+            .request_database_access(&sync, ticket, &key_id, permission, sync_settings, None)
             .await
         {
             Ok(()) => Ok(BootstrapOutcome::Approved),
@@ -887,6 +907,177 @@ mod tests {
             err.to_string().contains("not tracked")
                 || err.to_string().to_lowercase().contains("not tracked"),
             "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn sharing_preserves_preferences_and_requires_a_transport() {
+        use eidetica::sync::transports::http::HttpTransport;
+        use eidetica::user::types::SyncSettings;
+
+        let (instance, registry) = make_registry_with_sync().await;
+        let (_, db) = registry.create_session(Some("sharing")).await.unwrap();
+        let id = db.root_id();
+        let key = registry.default_pubkey().await.unwrap();
+        let mut preferences = SyncSettings::on_commit().with_interval(17);
+        preferences.sync_enabled = false;
+        preferences
+            .properties
+            .insert("test".into(), "retained".into());
+        registry
+            .user
+            .lock()
+            .await
+            .track_database(id.clone(), &key, preferences)
+            .await
+            .unwrap();
+
+        assert!(registry.share_for(id).await.is_err());
+        assert!(
+            !registry.is_sync_enabled_for(id).await.unwrap(),
+            "ticket failure must not enable sharing"
+        );
+
+        let sync = instance.sync().unwrap();
+        sync.register_transport("http", HttpTransport::builder().bind("127.0.0.1:0"))
+            .await
+            .unwrap();
+        sync.accept_connections().await.unwrap();
+        let ticket = registry.share_for(id).await.unwrap();
+        assert_eq!(ticket.database_id(), id);
+        assert!(!ticket.addresses().is_empty());
+        assert!(registry.is_sync_enabled_for(id).await.unwrap());
+        registry.disable_sync_for(id).await.unwrap();
+        registry.disable_sync_for(id).await.unwrap();
+        let settings = registry
+            .user
+            .lock()
+            .await
+            .database(id)
+            .await
+            .unwrap()
+            .sync_settings;
+        assert!(!settings.sync_enabled);
+        assert!(settings.sync_on_commit);
+        assert_eq!(settings.interval_seconds, Some(17));
+        assert_eq!(
+            settings.properties.get("test").map(String::as_str),
+            Some("retained")
+        );
+        assert_eq!(registry.find_key_for_db(id).await.unwrap(), Some(key));
+        assert!(
+            db.new_transaction().await.is_ok(),
+            "unshare must not revoke write access"
+        );
+    }
+
+    #[tokio::test]
+    async fn bootstrap_requires_approval_and_preserves_retry_preferences() {
+        use eidetica::sync::transports::http::HttpTransport;
+        use eidetica::user::types::SyncSettings;
+
+        let (owner, source) = make_registry_with_sync().await;
+        let (receiver, target) = make_registry_with_sync().await;
+        let (_, db) = source.create_session(Some("private")).await.unwrap();
+        let id = db.root_id();
+        let owner_sync = owner.sync().unwrap();
+        owner_sync
+            .register_transport("http", HttpTransport::builder().bind("127.0.0.1:0"))
+            .await
+            .unwrap();
+        owner_sync.accept_connections().await.unwrap();
+        receiver
+            .sync()
+            .unwrap()
+            .register_transport("http", HttpTransport::builder())
+            .await
+            .unwrap();
+        let ticket = source.share_for(id).await.unwrap();
+        let requester = target.default_pubkey().await.unwrap();
+        let outcome = target
+            .request_db_access(&ticket, Permission::Write(10))
+            .await
+            .unwrap();
+        let BootstrapOutcome::Pending { request_id, .. } = outcome else {
+            panic!("a ticket must not grant access without approval");
+        };
+        assert_eq!(source.pending_bootstrap_requests().await.unwrap().len(), 1);
+        assert!(target.user.lock().await.open_database(id).await.is_err());
+        assert!(
+            db.get_settings()
+                .await
+                .unwrap()
+                .get_auth_key(&requester)
+                .await
+                .is_err()
+        );
+        assert!(!target.is_sync_enabled_for(id).await.unwrap());
+
+        source.approve_bootstrap_request(&request_id).await.unwrap();
+        assert!(matches!(
+            target
+                .request_db_access(&ticket, Permission::Write(10))
+                .await
+                .unwrap(),
+            BootstrapOutcome::Approved
+        ));
+        assert!(
+            !target.is_sync_enabled_for(id).await.unwrap(),
+            "new imports stay disabled"
+        );
+        let imported = target.user.lock().await.open_database(id).await.unwrap();
+        assert_eq!(
+            imported.current_permission().await.unwrap(),
+            Permission::Write(10)
+        );
+        let txn = imported.new_transaction().await.unwrap();
+        txn.get_store::<eidetica::store::DocStore>("probe")
+            .await
+            .unwrap()
+            .set("signed", "receiver")
+            .await
+            .unwrap();
+        txn.commit().await.unwrap();
+
+        let mut preferences = SyncSettings::on_commit().with_interval(23);
+        preferences
+            .properties
+            .insert("test".into(), "retained".into());
+        target
+            .user
+            .lock()
+            .await
+            .track_database(id.clone(), &requester, preferences)
+            .await
+            .unwrap();
+        assert!(matches!(
+            target
+                .request_db_access(&ticket, Permission::Write(10))
+                .await
+                .unwrap(),
+            BootstrapOutcome::Approved
+        ));
+        let settings = target
+            .user
+            .lock()
+            .await
+            .database(id)
+            .await
+            .unwrap()
+            .sync_settings;
+        assert!(settings.sync_enabled && settings.sync_on_commit);
+        assert_eq!(settings.interval_seconds, Some(23));
+        assert_eq!(
+            settings.properties.get("test").map(String::as_str),
+            Some("retained")
+        );
+        assert_eq!(target.find_key_for_db(id).await.unwrap(), Some(requester));
+        assert!(
+            source
+                .pending_bootstrap_requests()
+                .await
+                .unwrap()
+                .is_empty()
         );
     }
 

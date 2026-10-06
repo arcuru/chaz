@@ -2,6 +2,778 @@
 
 use super::*;
 
+#[tokio::test]
+async fn mentioned_agent_writes_local_final_and_unmentioned_agent_does_not_wake() {
+    use crate::test_support::MockBackend;
+
+    let (_instance, server, registry) = server_fixture().await;
+    let (alpha, _alpha_db) = seed_agent(&server, &registry, "alpha").await;
+    let (beta, _beta_db) = seed_agent(&server, &registry, "beta").await;
+    register_alpha_agent_runtime(&server);
+    let mut beta_runtime = server.agents().get("alpha").unwrap();
+    beta_runtime.name = "beta".into();
+    server.agents().upsert(beta_runtime);
+
+    let (_conv, db) = registry.create_session(Some("room")).await.unwrap();
+    let sid = db.root_id().to_string();
+    registry
+        .attach_agent_to_session(&sid, &alpha)
+        .await
+        .unwrap();
+    registry.attach_agent_to_session(&sid, &beta).await.unwrap();
+    let mock = Arc::new(MockBackend::new());
+    mock.push_text("beta local reply");
+    mock.push_text("human reply");
+    let backend = BackendManager::with_mock(
+        mock.clone(),
+        crate::security::SecretStore::new(registry.chaz_peer().clone()).await,
+    );
+    server
+        .register_session(&db, backend, None, None)
+        .await
+        .unwrap();
+
+    let mut session = Session::new(ConversationId(sid.clone()), db.clone()).await;
+    session
+        .add_entry(SessionEntry {
+            sender: "alpha".into(),
+            content: "@beta, anything to add?".into(),
+            timestamp: Utc::now(),
+            entry_type: EntryType::Message,
+            metadata: None,
+            routing: None,
+        })
+        .await
+        .unwrap();
+    await_call_count(&mock, 1).await;
+    await_no_processing(&server, &sid).await;
+    assert!(mock.recorded_calls()[0].messages.iter().any(|m| matches!(m,
+        crate::runtime::RuntimeMessage::System(text) if text.contains("normal local reply"))));
+    let after_mention = Session::new(ConversationId(sid.clone()), db.clone()).await;
+    assert!(
+        after_mention
+            .entries()
+            .iter()
+            .any(|e| e.content == "beta local reply" && e.entry_type == EntryType::Message)
+    );
+    assert_eq!(
+        after_mention.attempts_for_test().await[0].status,
+        crate::session::TurnAttemptStatus::Completed
+    );
+
+    session
+        .add_entry(SessionEntry {
+            sender: "alpha".into(),
+            content: "Just a note for the room.".into(),
+            timestamp: Utc::now(),
+            entry_type: EntryType::Message,
+            metadata: None,
+            routing: None,
+        })
+        .await
+        .unwrap();
+    assert!(server.process_session(&sid).await.unwrap().is_none());
+    assert_eq!(
+        mock.recorded_calls().len(),
+        1,
+        "unmentioned agent message must not wake"
+    );
+
+    write_user_message_with_content(&db, &sid, "please answer").await;
+    await_call_count(&mock, 2).await;
+    await_no_processing(&server, &sid).await;
+    let final_session = Session::new(ConversationId(sid), db).await;
+    assert!(
+        final_session
+            .entries()
+            .iter()
+            .any(|e| e.content == "human reply")
+    );
+}
+
+#[tokio::test]
+async fn matrix_origin_final_queues_room_reply_but_local_final_and_no_reply_do_not() {
+    use crate::agent_db::LoginRef;
+    use crate::test_support::MockBackend;
+
+    let (_instance, server, registry) = server_fixture().await;
+    let (alpha, adb) = seed_agent(&server, &registry, "alpha").await;
+    register_alpha_agent_runtime(&server);
+    let (_cv, db) = registry.create_session(Some("room")).await.unwrap();
+    let sid = db.root_id().to_string();
+    registry
+        .attach_agent_to_session(&sid, &alpha)
+        .await
+        .unwrap();
+    adb.register_login(LoginRef {
+        kind: "matrix".into(),
+        identifier: "@alpha:s".into(),
+        bridge_db_id: sid.clone(),
+        peer_pubkey: None,
+        agent_pubkey: None,
+        sync_addresses: Vec::new(),
+    })
+    .await
+    .unwrap();
+    crate::session::bind_transport(&db, "matrix", "@alpha:s", "!room:s")
+        .await
+        .unwrap();
+
+    let mock = Arc::new(MockBackend::new());
+    mock.push_text("room answer");
+    mock.push_text("local answer");
+    mock.push_tool_calls(vec![("stop".into(), "no_reply".into(), "{}".into())]);
+    mock.push_tool_calls(vec![("stop-local".into(), "no_reply".into(), "{}".into())]);
+    server
+        .register_session(
+            &db,
+            BackendManager::with_mock(
+                mock.clone(),
+                crate::security::SecretStore::new(registry.chaz_peer().clone()).await,
+            ),
+            Some("alpha".into()),
+            None,
+        )
+        .await
+        .unwrap();
+    let mut session = Session::new(ConversationId(sid.clone()), db.clone()).await;
+    let inbound = |body: &str, id: &str| {
+        crate::bridge::inbound_user_entry(
+            "matrix",
+            "@alpha:s",
+            "!room:s",
+            "@human:s",
+            None,
+            body,
+            Some(id.into()),
+        )
+    };
+
+    session
+        .add_entry(inbound("answer this", "$one"))
+        .await
+        .unwrap();
+    await_call_count(&mock, 1).await;
+    await_no_processing(&server, &sid).await;
+    let answered = Session::new(ConversationId(sid.clone()), db.clone()).await;
+    assert!(answered.entries().iter().any(|entry| {
+        entry.entry_type == EntryType::Message
+            && entry.sender == "alpha"
+            && entry.content == "room answer"
+    }));
+    let outbound: Vec<_> = answered
+        .entries()
+        .iter()
+        .filter(|entry| entry.bridge_role() == Some(crate::session::BridgeEventRole::Outbound))
+        .collect();
+    assert_eq!(outbound.len(), 1);
+    assert_eq!(outbound[0].bridge_body().as_deref(), Some("room answer"));
+    let reply = answered
+        .entries()
+        .iter()
+        .find(|entry| entry.entry_type == EntryType::Message && entry.content == "room answer")
+        .unwrap();
+    assert_eq!(
+        reply.routing.as_ref().unwrap().outbound_id,
+        outbound[0].routing.as_ref().unwrap().destinations[0].message_id,
+    );
+    assert_eq!(
+        outbound[0].routing.as_ref().unwrap().destinations[0].channel,
+        "!room:s"
+    );
+    assert!(
+        mock.recorded_calls()[0]
+            .tools
+            .iter()
+            .any(|tool| tool.name == "no_reply")
+    );
+
+    session
+        .add_entry(SessionEntry {
+            sender: "human".into(),
+            content: "local question".into(),
+            timestamp: Utc::now(),
+            entry_type: EntryType::Message,
+            metadata: None,
+            routing: None,
+        })
+        .await
+        .unwrap();
+    await_call_count(&mock, 2).await;
+    await_no_processing(&server, &sid).await;
+    let local = Session::new(ConversationId(sid.clone()), db.clone()).await;
+    let local_final = local
+        .entries()
+        .iter()
+        .find(|entry| entry.content == "local answer")
+        .unwrap();
+    assert!(
+        local_final
+            .routing
+            .as_ref()
+            .and_then(|routing| routing.outbound_id.as_ref())
+            .is_none()
+    );
+    assert_eq!(
+        local
+            .entries()
+            .iter()
+            .filter(|entry| entry.bridge_role() == Some(crate::session::BridgeEventRole::Outbound))
+            .count(),
+        1
+    );
+    let tool_names = |index: usize| {
+        mock.recorded_calls()[index]
+            .tools
+            .iter()
+            .map(|t| t.name.clone())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        tool_names(0),
+        tool_names(1),
+        "Matrix binding must keep the model tool prefix stable across wake sources"
+    );
+
+    session
+        .add_entry(inbound("nothing useful", "$two"))
+        .await
+        .unwrap();
+    await_call_count(&mock, 3).await;
+    await_no_processing(&server, &sid).await;
+    let silent = Session::new(ConversationId(sid.clone()), db.clone()).await;
+    assert_eq!(
+        silent
+            .entries()
+            .iter()
+            .filter(|entry| entry.bridge_role() == Some(crate::session::BridgeEventRole::Outbound))
+            .count(),
+        1
+    );
+    assert_eq!(
+        silent
+            .entries()
+            .iter()
+            .filter(|entry| entry.entry_type == EntryType::Message && entry.sender == "alpha")
+            .count(),
+        2
+    );
+    assert_eq!(
+        silent
+            .attempts_for_test()
+            .await
+            .iter()
+            .filter(|attempt| attempt.status == crate::session::TurnAttemptStatus::Completed)
+            .count(),
+        3
+    );
+    assert_eq!(tool_names(0), tool_names(2));
+
+    session
+        .add_entry(SessionEntry {
+            sender: "human".into(),
+            content: "local turn may abstain".into(),
+            timestamp: Utc::now(),
+            entry_type: EntryType::Message,
+            metadata: None,
+            routing: None,
+        })
+        .await
+        .unwrap();
+    await_call_count(&mock, 4).await;
+    await_no_processing(&server, &sid).await;
+    let local_silent = Session::new(ConversationId(sid.clone()), db).await;
+    assert_eq!(
+        local_silent
+            .entries()
+            .iter()
+            .filter(|entry| entry.entry_type == EntryType::Message && entry.sender == "alpha")
+            .count(),
+        2
+    );
+    assert_eq!(
+        local_silent
+            .entries()
+            .iter()
+            .filter(|entry| entry.bridge_role() == Some(crate::session::BridgeEventRole::Outbound))
+            .count(),
+        1
+    );
+    assert_eq!(
+        local_silent
+            .attempts_for_test()
+            .await
+            .iter()
+            .filter(|attempt| attempt.status == crate::session::TurnAttemptStatus::Completed)
+            .count(),
+        4
+    );
+    assert_eq!(tool_names(0), tool_names(3));
+}
+
+#[tokio::test]
+async fn explicit_matrix_send_counts_as_reply_and_no_reply_cannot_retract_it() {
+    use crate::agent_db::LoginRef;
+    use crate::test_support::MockBackend;
+
+    let (_instance, server, registry) = server_fixture().await;
+    let (alpha, adb) = seed_agent(&server, &registry, "alpha").await;
+    register_alpha_agent_runtime(&server);
+    server.tools.register(crate::tools::MatrixSend {
+        registry: registry.clone(),
+    });
+    let (_cv, db) = registry.create_session(Some("room")).await.unwrap();
+    let sid = db.root_id().to_string();
+    registry
+        .attach_agent_to_session(&sid, &alpha)
+        .await
+        .unwrap();
+    adb.register_login(LoginRef {
+        kind: "matrix".into(),
+        identifier: "@alpha:s".into(),
+        bridge_db_id: sid.clone(),
+        peer_pubkey: None,
+        agent_pubkey: None,
+        sync_addresses: Vec::new(),
+    })
+    .await
+    .unwrap();
+    crate::session::bind_transport(&db, "matrix", "@alpha:s", "!room:s")
+        .await
+        .unwrap();
+    let mock = Arc::new(MockBackend::new());
+    mock.push_tool_calls(vec![(
+        "send-one".into(),
+        "matrix__send".into(),
+        r#"{"body":"explicit reply"}"#.into(),
+    )]);
+    mock.push_text("local ack");
+    mock.push_tool_calls(vec![(
+        "send-two".into(),
+        "matrix__send".into(),
+        r#"{"body":"already sent"}"#.into(),
+    )]);
+    mock.push_tool_calls(vec![("stop".into(), "no_reply".into(), "{}".into())]);
+    server
+        .register_session(
+            &db,
+            BackendManager::with_mock(
+                mock.clone(),
+                crate::security::SecretStore::new(registry.chaz_peer().clone()).await,
+            ),
+            Some("alpha".into()),
+            None,
+        )
+        .await
+        .unwrap();
+    let mut session = Session::new(ConversationId(sid.clone()), db.clone()).await;
+    let inbound = |body: &str, id: &str| {
+        crate::bridge::inbound_user_entry(
+            "matrix",
+            "@alpha:s",
+            "!room:s",
+            "@human:s",
+            None,
+            body,
+            Some(id.into()),
+        )
+    };
+    session
+        .add_entry(inbound("question", "$one"))
+        .await
+        .unwrap();
+    await_call_count(&mock, 2).await;
+    await_no_processing(&server, &sid).await;
+    let replied = Session::new(ConversationId(sid.clone()), db.clone()).await;
+    let outbox: Vec<_> = replied
+        .entries()
+        .iter()
+        .filter(|entry| entry.bridge_role() == Some(crate::session::BridgeEventRole::Outbound))
+        .collect();
+    assert_eq!(
+        outbox.len(),
+        1,
+        "explicit send must suppress auto-final room post"
+    );
+    assert_eq!(outbox[0].bridge_body().as_deref(), Some("explicit reply"));
+    assert!(
+        replied
+            .entries()
+            .iter()
+            .any(|entry| entry.entry_type == EntryType::Message && entry.content == "local ack")
+    );
+
+    session
+        .add_entry(inbound("second question", "$two"))
+        .await
+        .unwrap();
+    await_call_count(&mock, 4).await;
+    await_no_processing(&server, &sid).await;
+    let failed = Session::new(ConversationId(sid), db).await;
+    assert_eq!(
+        failed
+            .entries()
+            .iter()
+            .filter(|entry| entry.bridge_role() == Some(crate::session::BridgeEventRole::Outbound))
+            .count(),
+        2
+    );
+    assert!(failed.entries().iter().any(|entry| {
+        entry.entry_type == EntryType::Error
+            && entry
+                .content
+                .contains("no_reply cannot retract a queued Matrix send")
+    }));
+    assert!(
+        !failed
+            .entries()
+            .iter()
+            .any(|entry| entry.entry_type == EntryType::Message && entry.content == "already sent")
+    );
+}
+#[tokio::test]
+async fn matrix_origin_reply_requires_owner_and_current_single_room_binding() {
+    use crate::agent_db::LoginRef;
+    use crate::session::test_helpers::{make_agent_entry, make_registry};
+
+    let (_instance, registry) = make_registry().await;
+    let agent = make_agent_entry(&registry, "alpha").await;
+    let (_cv, db) = registry.create_session(Some("room")).await.unwrap();
+    let sid = db.root_id().to_string();
+    registry
+        .attach_agent_to_session(&sid, &agent)
+        .await
+        .unwrap();
+    crate::session::bind_transport(&db, "matrix", "@alpha:s", "!room:s")
+        .await
+        .unwrap();
+    let mut session = Session::new(ConversationId(sid), db.clone()).await;
+    let request = session
+        .add_entry(crate::bridge::inbound_user_entry(
+            "matrix",
+            "@alpha:s",
+            "!room:s",
+            "@human:s",
+            None,
+            "question",
+            Some("$one".into()),
+        ))
+        .await
+        .unwrap();
+    let attempt = session.start_turn_attempt(request).await.unwrap();
+    let binding = crate::session::TransportAttachment {
+        transport: "matrix".into(),
+        login_id: "@alpha:s".into(),
+        channel: "!room:s".into(),
+        conversational_replies: true,
+    };
+    assert!(
+        bridge_reply_for_turn(
+            &session,
+            &registry,
+            &attempt,
+            "alpha",
+            Some(&binding),
+            "answer"
+        )
+        .await
+        .is_err(),
+        "an unregistered login cannot send"
+    );
+    let adb = registry
+        .open_agent_db(&agent.db_id, None)
+        .await
+        .unwrap()
+        .unwrap();
+    adb.register_login(LoginRef {
+        kind: "matrix".into(),
+        identifier: "@alpha:s".into(),
+        bridge_db_id: db.root_id().to_string(),
+        peer_pubkey: None,
+        agent_pubkey: None,
+        sync_addresses: Vec::new(),
+    })
+    .await
+    .unwrap();
+    let outbound = bridge_reply_for_turn(
+        &session,
+        &registry,
+        &attempt,
+        "alpha",
+        Some(&binding),
+        "answer",
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        outbound.bridge_role(),
+        Some(crate::session::BridgeEventRole::Outbound)
+    );
+    assert_eq!(
+        outbound.routing.as_ref().unwrap().destinations[0].channel,
+        "!room:s"
+    );
+    assert!(
+        bridge_reply_for_turn(&session, &registry, &attempt, "alpha", None, "answer")
+            .await
+            .is_err(),
+        "ambiguous bindings must not choose a room"
+    );
+    let wrong = crate::session::TransportAttachment {
+        channel: "!wrong:s".into(),
+        ..binding.clone()
+    };
+    assert!(
+        bridge_reply_for_turn(
+            &session,
+            &registry,
+            &attempt,
+            "alpha",
+            Some(&wrong),
+            "answer"
+        )
+        .await
+        .is_err()
+    );
+    crate::session::unbind_transport(&db, "matrix", "@alpha:s", "!room:s")
+        .await
+        .unwrap();
+    assert!(
+        bridge_reply_for_turn(
+            &session,
+            &registry,
+            &attempt,
+            "alpha",
+            Some(&binding),
+            "answer"
+        )
+        .await
+        .is_err()
+    );
+}
+#[tokio::test]
+async fn observed_matrix_input_is_context_not_a_turn_request() {
+    use crate::test_support::MockBackend;
+    let (_instance, server, registry) = server_fixture().await;
+    let alpha = seed_agent(&server, &registry, "alpha").await.0;
+    register_alpha_agent_runtime(&server);
+    let (_cv, db) = registry.create_session(Some("local")).await.unwrap();
+    let sid = db.root_id().to_string();
+    registry
+        .attach_agent_to_session(&sid, &alpha)
+        .await
+        .unwrap();
+    crate::session::bind_transport(&db, "matrix", "@alpha:s", "!room:s")
+        .await
+        .unwrap();
+    let mock = Arc::new(MockBackend::new());
+    mock.push_text("local result");
+    server
+        .register_session(
+            &db,
+            BackendManager::with_mock(
+                mock.clone(),
+                crate::security::SecretStore::new(registry.chaz_peer().clone()).await,
+            ),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let mut session = Session::new(ConversationId(sid.clone()), db.clone()).await;
+    let mut observed = crate::bridge::inbound_user_entry(
+        "matrix",
+        "@alpha:s",
+        "!room:s",
+        "@human:s",
+        None,
+        "watching",
+        Some("event".into()),
+    );
+    observed = SessionEntry::new_bridge_event(
+        observed.sender,
+        crate::session::BridgeEventRole::Observation,
+        observed.content,
+        observed.routing,
+    );
+    session.add_entry(observed).await.unwrap();
+    assert!(
+        session
+            .next_turn_request(|name| name == "alpha", &Default::default())
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(server.process_session(&sid).await.unwrap().is_none());
+    assert_eq!(mock.recorded_calls().len(), 0);
+    write_user_message_with_content(&db, &sid, "from TUI").await;
+    await_call_count(&mock, 1).await;
+    assert!(mock.recorded_calls()[0].messages.iter().any(|m| matches!(m,
+        crate::runtime::RuntimeMessage::User(s) if s.contains("bridge_observation") && s.contains("watching"))));
+    await_no_processing(&server, &sid).await;
+    assert_eq!(mock.recorded_calls().len(), 1);
+}
+
+#[tokio::test]
+async fn completed_attempt_cannot_be_reused_from_a_stale_in_flight_selection() {
+    let (_instance, _user, db) = crate::session::test_helpers::test_session_db().await;
+    let mut session = Session::new(ConversationId(db.root_id().to_string()), db).await;
+    let request_id = session
+        .add_entry(SessionEntry {
+            sender: "visitor".into(),
+            content: "one request".into(),
+            timestamp: Utc::now(),
+            entry_type: EntryType::Message,
+            metadata: None,
+            routing: None,
+        })
+        .await
+        .unwrap();
+    let first = session
+        .start_turn_attempt(request_id.clone())
+        .await
+        .unwrap();
+    let stale = crate::session::TurnRequest {
+        id: request_id,
+        entry: session.entries()[0].clone(),
+        state: TurnRequestState::InFlight {
+            attempt_id: first.attempt_id.clone(),
+        },
+    };
+    session.complete_turn_attempt(&first, None).await.unwrap();
+    let live = std::collections::HashSet::from([first.attempt_id.clone()]);
+    assert!(
+        fresh_attempt_for_request(&session, &stale, &live, true)
+            .await
+            .unwrap()
+            .is_none(),
+        "a stale live-attempt selection must not re-run an already completed tool turn"
+    );
+}
+
+#[tokio::test]
+async fn neutral_test_adapter_replies_to_source_only_and_no_reply_stays_silent() {
+    use crate::agent_db::LoginRef;
+    use crate::session::{BridgeEventRole, bind_conversational_transport};
+    use crate::test_support::MockBackend;
+
+    let (_instance, server, registry) = server_fixture().await;
+    let (agent, adb) = seed_agent(&server, &registry, "alpha").await;
+    register_alpha_agent_runtime(&server);
+    let (_conv, db) = registry.create_session(Some("test:room")).await.unwrap();
+    let sid = db.root_id().to_string();
+    registry
+        .attach_agent_to_session(&sid, &agent)
+        .await
+        .unwrap();
+    adb.register_login(LoginRef {
+        kind: "test".into(),
+        identifier: "test-login".into(),
+        bridge_db_id: sid.clone(),
+        peer_pubkey: None,
+        agent_pubkey: None,
+        sync_addresses: Vec::new(),
+    })
+    .await
+    .unwrap();
+    bind_conversational_transport(&db, "test", "test-login", "room")
+        .await
+        .unwrap();
+    let model = Arc::new(MockBackend::new());
+    model.push_text("external answer");
+    model.push_text("local answer");
+    model.push_tool_calls(vec![("quiet".into(), "no_reply".into(), "{}".into())]);
+    server
+        .register_session(
+            &db,
+            BackendManager::with_mock(
+                model.clone(),
+                crate::security::SecretStore::new(registry.chaz_peer().clone()).await,
+            ),
+            Some("alpha".into()),
+            None,
+        )
+        .await
+        .unwrap();
+    let mut session = Session::new(ConversationId(sid.clone()), db.clone()).await;
+    let external = |content: &str| {
+        crate::bridge::inbound_user_entry(
+            "test",
+            "test-login",
+            "room",
+            "visitor",
+            None,
+            content,
+            None,
+        )
+    };
+    session
+        .add_bridge_input(external("ask"), true)
+        .await
+        .unwrap();
+    await_call_count(&model, 1).await;
+    await_no_processing(&server, &sid).await;
+    let answered = Session::new(ConversationId(sid.clone()), db.clone()).await;
+    let outbound: Vec<_> = answered
+        .entries()
+        .iter()
+        .filter(|e| e.bridge_role() == Some(BridgeEventRole::Outbound))
+        .collect();
+    assert_eq!(outbound.len(), 1);
+    assert_eq!(
+        outbound[0].bridge_body().as_deref(),
+        Some("external answer")
+    );
+    assert_eq!(
+        outbound[0].routing.as_ref().unwrap().destinations[0].transport,
+        "test"
+    );
+    assert!(
+        model.recorded_calls()[0]
+            .tools
+            .iter()
+            .any(|t| t.name == "no_reply")
+    );
+
+    session
+        .add_entry(SessionEntry {
+            sender: "visitor".into(),
+            content: "local question".into(),
+            timestamp: Utc::now(),
+            entry_type: EntryType::Message,
+            metadata: None,
+            routing: None,
+        })
+        .await
+        .unwrap();
+    await_call_count(&model, 2).await;
+    await_no_processing(&server, &sid).await;
+    session
+        .add_bridge_input(external("silent"), true)
+        .await
+        .unwrap();
+    await_call_count(&model, 3).await;
+    await_no_processing(&server, &sid).await;
+    let final_session = Session::new(ConversationId(sid), db).await;
+    assert_eq!(
+        final_session
+            .entries()
+            .iter()
+            .filter(|e| e.bridge_role() == Some(BridgeEventRole::Outbound))
+            .count(),
+        1
+    );
+    assert!(
+        final_session
+            .entries()
+            .iter()
+            .any(|e| e.entry_type == EntryType::Message
+                && e.content == "local answer"
+                && e.routing.is_none())
+    );
+}
+
 #[test]
 fn budget_clamps_to_model_window() {
     // Known window drives the budget — no static default caps it. A small
@@ -240,7 +1012,7 @@ async fn hydrate_picks_up_db_config_edits() {
             "alpha",
             &AgentDbConfig {
                 model: Some("haiku".to_string()),
-                max_iterations: Some(5),
+                max_spawn_depth: Some(5),
                 ..Default::default()
             },
             &AgentMeta {
@@ -267,7 +1039,7 @@ async fn hydrate_picks_up_db_config_edits() {
         default_model: Some("opus".to_string()),
         allowed_tools: None,
         workers: HashMap::new(),
-        max_iterations: 999,
+        max_spawn_depth: 999,
         autonomous: false,
         presets: HashMap::new(),
         tool_profile: None,
@@ -281,7 +1053,7 @@ async fn hydrate_picks_up_db_config_edits() {
     let input = stale.clone();
     let hydrated = server.hydrate_agent_from_db(input).await;
     assert_eq!(hydrated.default_model.as_deref(), Some("haiku"));
-    assert_eq!(hydrated.max_iterations, 5);
+    assert_eq!(hydrated.max_spawn_depth, 5);
     // And the registry reflects the live state too.
     assert_eq!(
         server
@@ -296,7 +1068,7 @@ async fn hydrate_picks_up_db_config_edits() {
     // Write V2 to the DB.
     db.write_config(&AgentDbConfig {
         model: Some("sonnet".to_string()),
-        max_iterations: Some(42),
+        max_spawn_depth: Some(42),
         ..Default::default()
     })
     .await
@@ -305,7 +1077,7 @@ async fn hydrate_picks_up_db_config_edits() {
     stale.default_model = Some("opus".to_string()); // re-enter with stale snapshot
     let hydrated_v2 = server.hydrate_agent_from_db(stale).await;
     assert_eq!(hydrated_v2.default_model.as_deref(), Some("sonnet"));
-    assert_eq!(hydrated_v2.max_iterations, 42);
+    assert_eq!(hydrated_v2.max_spawn_depth, 42);
     assert_eq!(
         server
             .agents()
@@ -329,7 +1101,7 @@ async fn hydrate_returns_input_when_agent_not_in_index() {
         default_model: Some("ghost".to_string()),
         allowed_tools: None,
         workers: HashMap::new(),
-        max_iterations: 7,
+        max_spawn_depth: 7,
         autonomous: false,
         presets: HashMap::new(),
         tool_profile: None,
@@ -340,7 +1112,7 @@ async fn hydrate_returns_input_when_agent_not_in_index() {
     let result = server.hydrate_agent_from_db(input.clone()).await;
     assert_eq!(result.name, "phantom");
     assert_eq!(result.default_model.as_deref(), Some("ghost"));
-    assert_eq!(result.max_iterations, 7);
+    assert_eq!(result.max_spawn_depth, 7);
 }
 
 #[tokio::test]
@@ -394,7 +1166,7 @@ async fn reconcile_resolves_prompt_into_blob_and_is_gated() {
         default_model: None,
         allowed_tools: None,
         workers: HashMap::new(),
-        max_iterations: 10,
+        max_spawn_depth: 10,
         autonomous: false,
         presets: HashMap::new(),
         tool_profile: None,
@@ -490,7 +1262,7 @@ async fn reload_config_for_rereads_yaml_from_disk() {
         default_model: None,
         allowed_tools: None,
         workers: HashMap::new(),
-        max_iterations: 10,
+        max_spawn_depth: 10,
         autonomous: false,
         presets: HashMap::new(),
         tool_profile: None,
@@ -1526,7 +2298,7 @@ fn register_alpha_agent_runtime(server: &Server) {
         default_model: Some("test-model".to_string()),
         allowed_tools: None,
         workers: HashMap::new(),
-        max_iterations: 1,
+        max_spawn_depth: 1,
         autonomous: false,
         presets: HashMap::new(),
         tool_profile: None,
@@ -3343,7 +4115,7 @@ async fn transcript_commits_full_tool_exchange_before_progression() {
 
 #[tokio::test]
 async fn executor_turn_keeps_tools_past_former_iteration_cap() {
-    // A live executor turn is not capped by the Agent's `max_iterations`
+    // A live executor turn is not capped by the Agent's `max_spawn_depth`
     // (1 here, and the former default of 10 is also exceeded): every model
     // request offers tools until the model replies without a tool call.
     use crate::test_support::MockBackend;
@@ -4694,7 +5466,7 @@ async fn direct_peer_sync_preserves_request_identity_and_completion() {
         .await
         .unwrap();
     txn.commit().await.unwrap();
-    owner_user.enable_sync(owner_db.root_id()).await.unwrap();
+    owner_db.share().await.unwrap();
     let owner_sync = owner.sync().unwrap();
     owner_sync
         .register_transport("http", HttpTransport::builder().bind("127.0.0.1:0"))
@@ -5018,8 +5790,7 @@ async fn shared_login_transport_and_observer_frontends_keep_independent_progress
         "one login resolves one daemon-local chaz_peer"
     );
     let store = DeliveryStore::new(transport_registry.chaz_peer().clone());
-    let binding =
-        DeliveryBinding::new("matrix", "@chaz:example", "!room:example", root.to_string());
+    let binding = DeliveryBinding::new("test", "@chaz:example", "!room:example", root.to_string());
     let room = Arc::new(tokio::sync::Mutex::new(Vec::<String>::new()));
     let attach_transport = |db, binding, room: Arc<tokio::sync::Mutex<Vec<String>>>| {
         let store = store.clone();
@@ -5315,7 +6086,7 @@ async fn published_job_is_adopted_without_creating_another_child() {
         };
         let mut agent_config = AgentDbConfig::default();
         agent_config.grants.insert("calculate".into(), restricted);
-        agent_config.max_iterations = Some(2);
+        agent_config.max_spawn_depth = Some(2);
         let (agent_db, pubkey) = create_agent_db(
             &mut user,
             "default",
@@ -5346,7 +6117,7 @@ async fn published_job_is_adopted_without_creating_another_child() {
         };
         let agents = Arc::new(AgentRegistry::with_default_agent());
         let mut configured = agents.get("default").unwrap();
-        configured.max_iterations = 2;
+        configured.max_spawn_depth = 2;
         configured.grants.insert(
             "calculate".into(),
             crate::grants::Grants {
@@ -5704,6 +6475,211 @@ async fn published_job_is_adopted_without_creating_another_child() {
             server.shutdown().await;
         }
         client_server.shutdown().await;
+        drop(shutdown);
+        task.await.unwrap().unwrap();
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn accepted_job_restart_uses_agent_db_depth_not_yaml() {
+    use crate::commands::{Command, CommandContext, CommandOutcome, dispatch};
+    use crate::session::jobs::{JobState, read_accepted_job};
+    use eidetica::service::ServiceServer;
+    use tokio::sync::watch;
+
+    let dir = tempfile::tempdir().unwrap();
+    Box::pin(async {
+        let socket = dir.path().join("job-depth.sock");
+        let (owner, mut user) = Instance::create_backend(
+            Box::new(InMemory::new()),
+            NewUser::passwordless("job-depth"),
+        )
+        .await
+        .unwrap();
+        let config: crate::config::Config = serde_yaml::from_str(concat!(
+            "agents:\n  - name: default\n    max_spawn_depth: 2\n",
+            "  - name: target\n    max_spawn_depth: 2\n",
+        ))
+        .unwrap();
+        let mut entries = Vec::new();
+        for cfg in config.agents.as_ref().unwrap() {
+            let (db, pubkey) = create_agent_db(
+                &mut user,
+                &cfg.name,
+                &AgentDbConfig::from_agent_config(cfg),
+                &AgentMeta {
+                    display_name: Some(cfg.name.clone()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            entries.push(DbEntry {
+                db_id: db.id(),
+                display_name: cfg.name.clone(),
+                pubkey,
+            });
+        }
+        let service = ServiceServer::bind(owner, &socket).await.unwrap();
+        let (shutdown, receiver) = watch::channel(());
+        let task = tokio::spawn(service.run(receiver));
+        let settings = crate::config::EideticaConfig {
+            connection: format!("unix://{}", socket.display()),
+            login: crate::config::EideticaLoginConfig {
+                username: "job-depth".into(),
+                password: None,
+                passwordless: true,
+            },
+            sync: None,
+        };
+        let (executor, mock) = published_executor_with_mock(
+            &settings,
+            Arc::new(AgentRegistry::from_config(&config)),
+            entries[0].clone(),
+        )
+        .await;
+        executor.agent_index().register(entries[1].clone());
+        let permits = executor
+            .semaphore
+            .clone()
+            .try_acquire_many_owned(MAX_CONCURRENT_LLM_CALLS as u32)
+            .unwrap();
+        let registry = executor.registry();
+        let (parent_id, parent_db) = registry.create_session(Some("cli")).await.unwrap();
+        registry
+            .attach_agent_to_session(&parent_id.0, &entries[0])
+            .await
+            .unwrap();
+        let secrets = crate::security::SecretStore::new(registry.chaz_peer().clone()).await;
+        let ctx = CommandContext {
+            server: &executor,
+            secrets: &secrets,
+            backend: &executor.default_backend,
+            session_db_id: &parent_id.0,
+            session_db: &parent_db,
+            current_agent: "default",
+            session_name: None,
+        };
+        for (name, depth) in [("default", "4"), ("target", "3")] {
+            match dispatch(
+                Command::AgentSet {
+                    agent_ref: name.into(),
+                    field: "max_spawn_depth".into(),
+                    value: depth.into(),
+                },
+                &ctx,
+            )
+            .await
+            {
+                CommandOutcome::Text(_) => {}
+                CommandOutcome::Error(error) => panic!("/agent set failed: {error}"),
+                _ => panic!("unexpected /agent set outcome"),
+            }
+        }
+        let id = executor
+            .submit_agent_job(&parent_id.0, "target", "held across restart")
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !executor.processing.lock().await.contains(&id) {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("accepted job must be queued for capacity");
+        let (_, child) = registry.open_session(&id).await.unwrap();
+        let accepted = read_accepted_job(&child).await.unwrap().unwrap();
+        assert_eq!(accepted.definition.max_call_depth, 3);
+        assert_eq!(
+            executor.job_status(&id).await.unwrap().state,
+            JobState::Queued
+        );
+        assert!(mock.recorded_calls().is_empty());
+        executor.shutdown().await;
+        drop(permits);
+
+        // A new executor rebuilds the registry from unchanged YAML, not the old
+        // process's /agent set-updated runtime entries. The service retains the DBs.
+        let fresh_agents = Arc::new(AgentRegistry::from_config(&config));
+        assert_eq!(fresh_agents.get("default").unwrap().max_spawn_depth, 2);
+        assert_eq!(fresh_agents.get("target").unwrap().max_spawn_depth, 2);
+        let (restarted, next_mock) =
+            published_executor_with_mock(&settings, fresh_agents, entries[0].clone()).await;
+        restarted.agent_index().register(entries[1].clone());
+        let _permits = restarted
+            .semaphore
+            .clone()
+            .try_acquire_many_owned(MAX_CONCURRENT_LLM_CALLS as u32)
+            .unwrap();
+        assert_eq!(
+            restarted
+                .validate_accepted_job(&child)
+                .await
+                .expect("restart must validate against persisted AgentDb depths"),
+            Some(accepted.clone())
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !restarted.is_watching_session(&id).await {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("restart must adopt the original queued child");
+        assert_eq!(
+            restarted.job_status(&id).await.unwrap().state,
+            JobState::Queued
+        );
+        assert!(next_mock.recorded_calls().is_empty());
+        assert_eq!(
+            read_accepted_job(&child).await.unwrap(),
+            Some(accepted.clone())
+        );
+
+        // Hydration is not permission to rewrite an accepted ceiling. A real DB
+        // policy change must still fail depth/authority validation, in either direction.
+        let target_db = restarted
+            .registry()
+            .open_agent_db(&entries[1].db_id, Some(&entries[1].pubkey))
+            .await
+            .unwrap()
+            .unwrap();
+        let mut cfg = target_db.read_config().await.unwrap();
+        for (depth, error) in [
+            (0, "spawn depth exceeds Agent ceiling"),
+            (5, "accepted job authority differs from parent"),
+        ] {
+            cfg.max_spawn_depth = Some(depth);
+            target_db.write_config(&cfg).await.unwrap();
+            let refused = restarted.validate_accepted_job(&child).await.unwrap_err();
+            assert!(refused.to_string().contains(error), "{refused}");
+            assert_eq!(
+                read_accepted_job(&child).await.unwrap(),
+                Some(accepted.clone())
+            );
+        }
+        cfg.max_spawn_depth = Some(3);
+        target_db.write_config(&cfg).await.unwrap();
+        assert_eq!(
+            restarted.validate_accepted_job(&child).await.unwrap(),
+            Some(accepted)
+        );
+        assert_eq!(
+            restarted
+                .registry()
+                .list_sessions()
+                .await
+                .unwrap()
+                .iter()
+                .filter(|row| row
+                    .source
+                    .as_deref()
+                    .is_some_and(|s| s.starts_with("job-stage:")))
+                .count(),
+            1,
+            "restart must not create a replacement child"
+        );
+        restarted.shutdown().await;
         drop(shutdown);
         task.await.unwrap().unwrap();
     })
@@ -6075,4 +7051,184 @@ async fn client_submission_publishes_one_child_then_executor_runs_it() {
     client.shutdown().await;
     drop(shutdown);
     task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn chaz_query_reports_persisted_agent_job_tool_ceilings() {
+    use crate::runtime::RuntimeMessage;
+    use crate::test_support::MockBackend;
+    let (_instance, fixture, registry) = server_fixture().await;
+    let mock = Arc::new(MockBackend::new());
+    mock.push_tool_calls(vec![(
+        "query-tools".into(),
+        "chaz".into(),
+        serde_json::json!({"query": "tools", "period": null}).to_string(),
+    )]);
+    mock.push_text("done");
+    let policies = Arc::new(crate::tool::ToolPolicyRegistry::empty());
+    let tools = Arc::new(ToolRegistry::new());
+    tools.register(crate::tools::ChazTool {
+        policies: policies.clone(),
+    });
+    tools.register(crate::tools::Calculate);
+    tools.register(crate::tools::GetTime);
+    let host = Arc::new(crate::test_support::MockHost::new());
+    let backend = BackendManager::with_mock(
+        mock.clone(),
+        crate::security::SecretStore::new(registry.chaz_peer().clone()).await,
+    );
+    let server = Server::new(
+        registry.clone(),
+        fixture.agents.clone(),
+        fixture.agent_index.clone(),
+        HostedIndex::empty("bank"),
+        HostedIndex::empty("skill_bank"),
+        tools,
+        policies,
+        crate::test_support::permissive_security(),
+        HashMap::new(),
+        Default::default(),
+        host.clone(),
+        Arc::new(crate::extension::ExtensionHub::new()),
+        backend,
+        Arc::new(crate::mcp::McpRegistry::new()),
+        Some(crate::instance::ExecutorCapability::for_test()),
+    );
+    fixture.shutdown().await;
+    let (parent, parent_db) = seed_agent(&server, &registry, "parent").await;
+    let mut parent_cfg = parent_db.read_config().await.unwrap();
+    parent_cfg.tools = Some(vec!["calculate".into(), "chaz".into()]);
+    parent_cfg.grants.insert("calculate".into(), serde_json::from_value(serde_json::json!({
+        "shell": {"allow": []}, "network": {"endpoints": []}, "fs": {"allow_read": [], "allow_write": []}
+    })).unwrap());
+    parent_db.write_config(&parent_cfg).await.unwrap();
+    let parent_agent = registry.agents.build_from_db_config("parent", &parent_cfg);
+    registry.agents.upsert(parent_agent);
+    let (_target, target_db) = seed_agent(&server, &registry, "child").await;
+    let target_cfg = target_db.read_config().await.unwrap();
+    assert!(target_cfg.grants.is_empty(), "target itself is permissive");
+    registry
+        .agents
+        .upsert(registry.agents.build_from_db_config("child", &target_cfg));
+    let (parent_id, _) = registry.create_session(Some("cli")).await.unwrap();
+    registry
+        .attach_agent_to_session(&parent_id.0, &parent)
+        .await
+        .unwrap();
+    let id = server
+        .submit_agent_job(&parent_id.0, "child", "inspect your own tools")
+        .await
+        .unwrap();
+    let status = server
+        .wait_job(&id, std::time::Duration::from_secs(15))
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            status.state,
+            crate::session::jobs::JobState::Succeeded { .. }
+        ),
+        "{status:?}"
+    );
+    let (_, db) = registry.open_session(&id).await.unwrap();
+    let accepted = crate::session::jobs::read_accepted_job(&db)
+        .await
+        .unwrap()
+        .unwrap();
+    let calls = mock.recorded_calls();
+    assert_eq!(calls.len(), 2);
+    let content = calls[1]
+        .messages
+        .iter()
+        .find_map(|m| match m {
+            RuntimeMessage::ToolResult { content, .. } => Some(content),
+            _ => None,
+        })
+        .unwrap();
+    // Runtime wraps successful JSON output as untrusted data.
+    let begin = content.find('{').unwrap();
+    let end = content.rfind('}').unwrap();
+    let output: serde_json::Value = serde_json::from_str(&content[begin..=end]).unwrap();
+    let rows = output["tools"].as_array().unwrap();
+    assert_eq!(
+        rows.iter()
+            .map(|r| r["name"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["calculate", "chaz"]
+    );
+    assert_eq!(
+        rows[0]["effective_grants"],
+        serde_json::to_value(&accepted.definition.tool_ceilings["calculate"]).unwrap()
+    );
+    assert_eq!(
+        rows[0]["effective_grants"]["shell"]["allow"],
+        serde_json::json!([])
+    );
+    assert_eq!(
+        rows[0]["effective_grants"]["network"]["endpoints"],
+        serde_json::json!([])
+    );
+    assert_eq!(
+        rows[0]["effective_grants"]["fs"]["allow_read"],
+        serde_json::json!([])
+    );
+    assert!(host.recorded_calls().is_empty());
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn costs_command_preserves_operator_text_contract() {
+    let (_instance, server, registry) = server_fixture().await;
+    let (id, db) = registry.create_session(Some("cli")).await.unwrap();
+    let mut session = Session::new(id.clone(), db.clone()).await;
+    session
+        .update_meta(|m| m.name = Some("fixture".into()))
+        .await
+        .unwrap();
+    session
+        .add_entry(SessionEntry {
+            sender: "agent".into(),
+            content: "message".into(),
+            timestamp: Utc::now(),
+            entry_type: EntryType::Message,
+            metadata: Some(crate::runtime::ResponseMetadata {
+                model: "model".into(),
+                usage: crate::runtime::TokenUsage {
+                    prompt_tokens: 100,
+                    completion_tokens: 50,
+                    cached_tokens: Some(10),
+                    cost_usd: Some(0.25),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+            routing: None,
+        })
+        .await
+        .unwrap();
+    let secrets = crate::security::SecretStore::new(registry.chaz_peer().clone()).await;
+    let ctx = crate::commands::CommandContext {
+        server: &server,
+        secrets: &secrets,
+        backend: &server.default_backend,
+        session_db_id: &id.0,
+        session_db: &db,
+        current_agent: "agent",
+        session_name: Some("fixture"),
+    };
+    let crate::commands::CommandOutcome::Text(text) =
+        crate::commands::dispatch(crate::commands::Command::ListCosts, &ctx).await
+    else {
+        panic!("costs must return text")
+    };
+    assert_eq!(
+        text,
+        concat!(
+            "LLM usage\n  Sessions: 1 scanned, 1 with recorded usage\n",
+            "  Total: 1 call | 100 prompt + 50 completion (10 cached) | $0.2500\n",
+            "\nBy model:\n  model                                       1 call  $0.2500\n",
+            "\nTop sessions:\n  fixture                          [cli   ]    1 call  $0.2500\n"
+        )
+    );
+    server.shutdown().await;
 }

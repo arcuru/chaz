@@ -7,6 +7,7 @@ Sessions are the core data model in chaz. Every conversation -- whether from a M
 ```rust,ignore
 enum EntryType {
     Message,    // Chat message (from any participant)
+    BridgeEvent, // Versioned external observation, outbox request, or receipt
     Directive,  // Task instruction (from spawn_agent, scheduler, system)
     ToolCall,   // Record of a tool invocation (audit trail)
     ToolResult, // Record of a tool result (audit trail)
@@ -30,6 +31,14 @@ Only `Message`, `Directive`, and `Summary` entries enter the conversation portio
 The **system prompt is assembled fresh every turn** from the agent's `system_prompt` + `system_prompt_files` (resolved at agent construction) plus `PromptAugmentation` contributions from the extension hub (skills) and the optional multi-agent room note. There is no per-session persona snapshot — the previous `PersonaSnapshot` entry type was deleted along with `persona.rs` / `role.rs` (see [Skills & Prompts](../design/skills_and_prompts.md)). To change an agent's prompt, edit `system_prompt` / `system_prompt_files` via `/agent set <ref> <field> <value>` (or restart against an edited config file).
 
 `ToolCall`, `ToolResult`, `Ack`, and `Error` entries are excluded from the LLM context. The runtime maintains its active ReAct history in memory. Structured completed model responses and tool results are also written to the attempt's `turn_transcript` store. On a later turn, the context builder joins visible request row IDs to their selected completed attempt at one Eidetica snapshot. It replays only complete native assistant-call/result groups, in request and attempt order, after the triggering request message. An interrupted attempt is not resumed or replayed, and older retry attempts are never included. Session-level tool entries remain display projections, never input for reconstruction.
+
+A context-only external observation or a pending addressed send is a known
+`BridgeEvent` with provenance and an inert role for turn scheduling.
+Receipts are audit-only.
+Unknown entry kinds (including future payload-carrying variants) are preserved
+and warned about, but excluded from context, wake, and delivery.
+Readers still accept existing Matrix-specific event kinds without rewriting
+shared history.
 
 `ApprovalRequest` and `ApprovalDecision` are **control entries** for the tool-approval protocol a dumb bridge relays over the session DB — also excluded from the LLM context, from bridge message delivery, and from waking an agent turn. See [Dumb Transport Bridges → Tool approvals over the session DB](../design/transport_bridges.md#tool-approvals-over-the-session-db).
 
@@ -72,8 +81,8 @@ is selected after that attempt finishes.
 `TurnAttempt` records the request row key, an attempt ID, a durable generation,
 and whether the attempt started or completed. The executor writes the started
 record before it can call a model or a tool. It commits a completed record in
-the same transaction as the final response or error entry. A silent turn has
-no final message, but still records completion.
+the same transaction as the final local response or error entry. Empty model
+output is an error, not an intentional message-free completion.
 
 Clients read started attempts and completions from the session DB to show
 per-turn activity. A separate `turn_activity` timestamp store is refreshed
@@ -175,29 +184,31 @@ topology adds multi-executor election or fencing.
 
 ## Session Registry
 
-A session is identified solely by the root ID of its own eidetica `Database`. The `SessionRegistry` holds three index stores inside the peer-local `chaz_group` DB — nothing load-bearing about a session lives here:
+A session is identified solely by the root ID of its own eidetica `Database`. The `SessionRegistry` holds two index stores inside the peer-local `chaz_group` DB — nothing load-bearing about a session lives here:
 
 - **`sessions`**: every known `session_db_id` → origin tag (for debugging/listing)
-- **`matrix_channels`**: Matrix `room_id` → `session_db_id` (fan-out supported — one session may receive responses on many rooms)
 - **`session_names`**: human-friendly `name` → `session_db_id`
 
 The canonical per-session configuration (name, agent, model, role, backend) lives in each session's own DB under a `meta` DocStore as a `SessionMeta`. Because it lives in the session, it syncs with the session via eidetica — sharing a session also shares its config.
 
 ```mermaid
 graph LR
-    ROOM["Matrix room !r:ex.org"] -->|matrix_channels| SID1["session_db_id A"]
-    SID1 --> DB1[(Session DB A<br/>entries + meta)]
-    ROOM2["Matrix room !q:ex.org"] -->|matrix_channels| SID1
-    NAME["name 'daily-standup'"] -->|session_names| SID1
+    ROOM["Matrix room !r:ex.org"] -->|one binding| DB1[(Session DB A<br/>entries + meta + binding)]
+    NAME["name 'daily-standup'"] -->|session_names| DB1
     SID2["spawn:abc-123"] --> DB2[(Session DB B)]
-    REG[(Registry<br/>indices only)] -.-> ROOM
-    REG -.-> ROOM2
-    REG -.-> NAME
+    REG[(Registry<br/>sessions + names only)] -.-> NAME
 ```
 
 ### Matrix channels
 
-A Matrix channel is an explicit `(room_id → session_db_id)` attachment. A room's first message auto-creates a session and a channel. `!chaz attach <session>` rebinds a room to a different session; `!chaz detach` removes the binding; `!chaz channels` lists rooms attached to the current session. At Matrix bridge startup, every persisted channel for a joined room receives both server-processing and response-delivery callbacks — this is how scheduled-session responses reach Matrix even when no user is active in the room.
+An external attachment is an explicit `(transport, login_id, channel)` record in the session DB, with a reply capability for conversational adapters.
+There is at most one publishable external attachment per session; TUI/CLI remain local clients, not extra attachments.
+An addressed Matrix message in a new room creates and attaches a session, while unaddressed messages in an already-attached room become context-only `BridgeEvent` observations.
+`!chaz attach <session>` rejects another external binding until explicit detach or migration, and `!chaz channels` lists bindings.
+The bridge delivers only generic addressed outbound events for its own login and room, then records a generic receipt.
+A Matrix-origin final enters that outbox atomically with its local copy; TUI, schedule, and local-agent finals never enter it.
+Startup reconciliation and per-binding progress retry queued sends even when the agent is offline.
+See [Matrix Bot](../user_guide/matrix.md#attached-rooms-and-reply-routing).
 
 ### Named Sessions
 

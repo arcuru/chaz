@@ -51,7 +51,7 @@ pub enum AgentField {
     SystemPromptFiles,
     Model,
     Tools,
-    MaxIterations,
+    MaxSpawnDepth,
     Autonomous,
     Presets,
     ToolProfile,
@@ -67,7 +67,7 @@ impl AgentField {
         Self::SystemPromptFiles,
         Self::Model,
         Self::Tools,
-        Self::MaxIterations,
+        Self::MaxSpawnDepth,
         Self::Autonomous,
         Self::Presets,
         Self::ToolProfile,
@@ -83,7 +83,7 @@ impl AgentField {
             Self::SystemPromptFiles => "system_prompt_files",
             Self::Model => "default_model",
             Self::Tools => "allowed_tools",
-            Self::MaxIterations => "max_iterations",
+            Self::MaxSpawnDepth => "max_spawn_depth",
             Self::Autonomous => "autonomous",
             Self::Presets => "presets",
             Self::ToolProfile => "tool_profile",
@@ -109,7 +109,7 @@ impl AgentField {
             Self::SystemPromptFiles => a.system_prompt_files == b.system_prompt_files,
             Self::Model => a.model == b.model,
             Self::Tools => a.tools == b.tools,
-            Self::MaxIterations => a.max_iterations == b.max_iterations,
+            Self::MaxSpawnDepth => a.max_spawn_depth == b.max_spawn_depth,
             Self::Autonomous => a.autonomous == b.autonomous,
             Self::Presets => a.presets == b.presets,
             Self::ToolProfile => a.tool_profile == b.tool_profile,
@@ -133,8 +133,8 @@ impl AgentField {
             }
             Self::Model => opt_str(cfg.model.as_deref()),
             Self::Tools => render_tools(cfg.tools.as_deref()),
-            Self::MaxIterations => cfg
-                .max_iterations
+            Self::MaxSpawnDepth => cfg
+                .max_spawn_depth
                 .map(|n| n.to_string())
                 .unwrap_or_else(|| "(default 10)".to_string()),
             Self::Autonomous => if cfg.autonomous { "yes" } else { "no" }.to_string(),
@@ -177,7 +177,7 @@ impl AgentField {
             Self::SystemPromptFiles => into.system_prompt_files = from.system_prompt_files.clone(),
             Self::Model => into.model = from.model.clone(),
             Self::Tools => into.tools = from.tools.clone(),
-            Self::MaxIterations => into.max_iterations = from.max_iterations,
+            Self::MaxSpawnDepth => into.max_spawn_depth = from.max_spawn_depth,
             Self::Autonomous => into.autonomous = from.autonomous,
             Self::Presets => into.presets = from.presets.clone(),
             Self::ToolProfile => into.tool_profile = from.tool_profile.clone(),
@@ -414,25 +414,25 @@ mod tests {
     #[test]
     fn changed_when_both_set_differently() {
         let mut yaml = cfg();
-        yaml.max_iterations = Some(10);
+        yaml.max_spawn_depth = Some(10);
         let mut db = cfg();
-        db.max_iterations = Some(40);
+        db.max_spawn_depth = Some(40);
         let diff = diff_agent(&yaml, &db);
         let row = diff
             .rows
             .iter()
-            .find(|r| r.field == AgentField::MaxIterations)
+            .find(|r| r.field == AgentField::MaxSpawnDepth)
             .unwrap();
         assert_eq!(row.status, FieldStatus::Changed);
     }
 
     #[test]
     fn drift_preserves_explicit_db_edits_overwrites_defaults() {
-        // yaml declares model + max_iterations; DB has a user-set model
-        // (explicit) but default max_iterations (never set).
+        // yaml declares model + max_spawn_depth; DB has a user-set model
+        // (explicit) but default max_spawn_depth (never set).
         let mut yaml = cfg();
         yaml.model = Some("opus".into());
-        yaml.max_iterations = Some(20);
+        yaml.max_spawn_depth = Some(20);
 
         let mut db = cfg();
         db.model = Some("haiku".into()); // explicit /agent set edit
@@ -440,23 +440,23 @@ mod tests {
         let merged = apply_merge(&db, &yaml, &AgentMergeMode::Drift);
         // model was explicitly set in DB → preserved.
         assert_eq!(merged.model.as_deref(), Some("haiku"));
-        // max_iterations was default in DB → taken from yaml.
-        assert_eq!(merged.max_iterations, Some(20));
+        // max_spawn_depth was default in DB → taken from yaml.
+        assert_eq!(merged.max_spawn_depth, Some(20));
     }
 
     #[test]
     fn reseed_overwrites_everything_from_yaml() {
         let mut yaml = cfg();
         yaml.model = Some("opus".into());
-        yaml.max_iterations = Some(20);
+        yaml.max_spawn_depth = Some(20);
 
         let mut db = cfg();
         db.model = Some("haiku".into());
-        db.max_iterations = Some(99);
+        db.max_spawn_depth = Some(99);
 
         let merged = apply_merge(&db, &yaml, &AgentMergeMode::Reseed);
         assert_eq!(merged.model.as_deref(), Some("opus"));
-        assert_eq!(merged.max_iterations, Some(20));
+        assert_eq!(merged.max_spawn_depth, Some(20));
     }
 
     #[test]

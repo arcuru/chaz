@@ -114,11 +114,6 @@ pub(super) struct SessionFill {
     cancel: Arc<AtomicBool>,
 }
 
-/// How many rows on each side of the cursor count as "visible" for fill
-/// prioritization. A generous window so a page of scrolling still lands on
-/// already-prioritized rows.
-const SESSION_FILL_WINDOW: usize = 12;
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum TuiMode {
     Chat,
@@ -580,6 +575,32 @@ pub(super) async fn refresh_status_segments(app: &mut App) {
         .collect();
 }
 
+/// Width of the Settings category rail; the detail pane starts right of it.
+pub(super) const SETTINGS_SIDEBAR_W: u16 = 16;
+
+/// First visible row of each cursor-driven list in the TUI.
+///
+/// Held here rather than derived from the cursor so a list keeps its place
+/// while the cursor moves inside the window — deriving it would snap the
+/// window to the cursor on every keypress. Each list clamps its own entry to
+/// the row count it just drew, so a list that shrinks self-corrects without an
+/// explicit reset.
+#[derive(Debug, Default, Clone, Copy)]
+pub(super) struct ListScroll {
+    /// Row index into `App::picker_len()`; 0 is the virtual "New session" row.
+    pub(super) picker: usize,
+    /// Peer → Defaults agent list.
+    pub(super) peer_defaults: usize,
+    /// Peer → Agents list.
+    pub(super) peer_agents: usize,
+    /// Peer → MCP server list.
+    pub(super) peer_mcp: usize,
+    /// Session → Agents list.
+    pub(super) session_agents: usize,
+    /// Session → Models scope list.
+    pub(super) session_models: usize,
+}
+
 pub(super) struct App {
     pub(super) mode: TuiMode,
     pub(super) overlay: Option<Overlay>,
@@ -620,6 +641,11 @@ pub(super) struct App {
     pub(super) session_rows_loading: HashSet<String>,
     pub(super) session_metadata_limit: Arc<Semaphore>,
     pub(super) picker_index: usize,
+    /// Session rows actually visible in the last drawn picker frame. Requests
+    /// run after drawing so input, catalog updates and resizes cannot use stale geometry.
+    pub(super) picker_visible_rows: std::ops::Range<usize>,
+    /// Scroll offsets for the cursor-driven lists — see [`ListScroll`].
+    pub(super) scroll: ListScroll,
     /// Sorted snapshot of the model picker's contents — favorites
     /// (YAML-configured) followed by the live OpenRouter catalog when
     /// available. Repopulated when the picker opens. Sort order: current
@@ -785,6 +811,8 @@ impl App {
             session_rows_loading: HashSet::new(),
             session_metadata_limit: Arc::new(Semaphore::new(4)),
             picker_index: 0,
+            picker_visible_rows: 0..0,
+            scroll: ListScroll::default(),
             model_list: Vec::new(),
             session_catalog: None,
             model_picker_index: 0,
@@ -898,25 +926,16 @@ impl App {
     }
 
     fn requested_session_indices(&mut self) -> Vec<SessionIndex> {
-        let cur = self.picker_index.saturating_sub(1);
-        let lo = cur.saturating_sub(SESSION_FILL_WINDOW);
-        let hi = cur + SESSION_FILL_WINDOW;
-        let ids: Vec<String> = self
-            .session_list
-            .iter()
-            .enumerate()
-            .filter(|(i, row)| {
-                *i >= lo
-                    && *i <= hi
-                    && !row.loaded
-                    && !self.session_rows_loading.contains(&row.session_db_id)
-            })
-            .map(|(_, row)| row.session_db_id.clone())
+        let requested: Vec<_> = self
+            .picker_visible_rows
+            .clone()
+            .filter_map(|i| self.session_list.get(i))
+            .filter(|row| !row.loaded && !self.session_rows_loading.contains(&row.session_db_id))
+            .filter_map(|row| self.session_indices.get(&row.session_db_id).cloned())
             .collect();
-        self.session_rows_loading.extend(ids.iter().cloned());
-        ids.into_iter()
-            .filter_map(|id| self.session_indices.get(&id).cloned())
-            .collect()
+        self.session_rows_loading
+            .extend(requested.iter().map(|index| index.session_db_id.clone()));
+        requested
     }
 
     /// Resolve the highlighted picker row to a dispatch token: the
@@ -1289,7 +1308,6 @@ fn open_session_picker(
     app.session_picker_auto_open = auto_open;
 
     if app.session_list_fresh && !app.session_list.is_empty() {
-        request_session_metadata(app, server, session_rows_tx);
         return;
     }
 
@@ -2353,6 +2371,177 @@ mod session_picker_tests {
         }
     }
 
+    fn draw_picker(app: &mut App, width: u16, height: u16) -> Vec<String> {
+        let mut terminal =
+            Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+        app.click_regions.clear();
+        terminal.draw(|f| view::ui_picker(f, app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        (0..height)
+            .map(|y| (0..width).map(|x| buffer[(x, y)].symbol()).collect())
+            .collect()
+    }
+
+    fn visible_ids(app: &App) -> HashSet<String> {
+        app.click_regions
+            .iter()
+            .filter_map(|r| match r.target {
+                ClickTarget::PickerSelect(i) => Some(app.session_list[i].session_db_id.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn retained_picker_viewport_loads_visible_metadata_with_new_selected() {
+        let mut app = App::new(HashSet::new(), test_tab().await);
+        apply_session_catalog(&mut app, (0..100).map(index).collect());
+        app.mode = TuiMode::SessionPicker;
+        app.scroll.picker = 60;
+        // New session is selected, but the retained viewport is nowhere near row 0.
+        let before = draw_picker(&mut app, 100, 13);
+        assert_eq!(app.scroll.picker, 60);
+        assert!(before.iter().any(|r| r.contains("> + New session")));
+        let visible = visible_ids(&app);
+        assert_eq!(visible.len(), 3, "only rows actually built in the viewport");
+        let requested = app.requested_session_indices();
+        assert_eq!(
+            requested
+                .iter()
+                .map(|i| i.session_db_id.clone())
+                .collect::<HashSet<_>>(),
+            visible
+        );
+        assert!(
+            app.requested_session_indices().is_empty(),
+            "no duplicate in-flight requests"
+        );
+        let count = requested.len();
+        let (tx, mut rx) = mpsc::channel(8);
+        spawn_session_metadata_load(&mut app, requested, tx, |index| async move {
+            let mut info = SessionInfo::placeholder(&index);
+            info.agent_name = Some("visible-agent".into());
+            info.loaded = true;
+            info
+        });
+        for _ in 0..count {
+            let SessionLoad::Row { generation, info } =
+                tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+                    .await
+                    .unwrap()
+                    .unwrap()
+            else {
+                panic!("expected metadata row")
+            };
+            assert!(apply_session_row(&mut app, generation, info));
+        }
+        let after = draw_picker(&mut app, 100, 13);
+        for hit in &app.click_regions {
+            if let ClickTarget::PickerSelect(i) = hit.target {
+                assert!(after[hit.y as usize].contains("visible-agent"), "{after:?}");
+                assert!(app.session_list[i].loaded);
+            }
+        }
+        assert_eq!(
+            app.session_list.iter().filter(|row| row.loaded).count(),
+            count
+        );
+        assert!(app.session_list[..60].iter().all(|row| !row.loaded));
+        assert!(
+            app.requested_session_indices().is_empty(),
+            "loaded rows stay cached"
+        );
+    }
+
+    #[tokio::test]
+    async fn picker_metadata_requests_follow_fresh_resize_and_input_frames() {
+        use crossterm::event::{MouseButton, MouseEventKind};
+        let mut app = App::new(HashSet::new(), test_tab().await);
+        apply_session_catalog(&mut app, (0..100).map(index).collect());
+        app.mode = TuiMode::SessionPicker;
+        app.scroll.picker = 50;
+        assert!(
+            app.requested_session_indices().is_empty(),
+            "no viewport before first draw"
+        );
+        draw_picker(&mut app, 100, 12);
+        let small = visible_ids(&app);
+        let requested = app.requested_session_indices();
+        assert_eq!(
+            requested
+                .iter()
+                .map(|i| i.session_db_id.clone())
+                .collect::<HashSet<_>>(),
+            small
+        );
+        draw_picker(&mut app, 100, 22);
+        let large = visible_ids(&app);
+        assert!(large.len() > small.len());
+        let extra = app.requested_session_indices();
+        assert_eq!(
+            extra
+                .iter()
+                .map(|i| i.session_db_id.clone())
+                .collect::<HashSet<_>>(),
+            large.difference(&small).cloned().collect()
+        );
+        // A click on the pinned row retains the viewport, while Down then wheel
+        // changes the cursor; the next draw must update requests before dispatch.
+        app.picker_index = 53;
+        let new = *app
+            .click_regions
+            .iter()
+            .find(|r| matches!(r.target, ClickTarget::PickerNew))
+            .unwrap();
+        input::handle_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: new.x,
+                row: new.y,
+                modifiers: KeyModifiers::NONE,
+            },
+        );
+        assert_eq!(app.picker_index, 0);
+        draw_picker(&mut app, 100, 12);
+        assert_eq!(visible_ids(&app), small);
+        input::handle_picker_key(&mut app, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        input::handle_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::ScrollDown,
+                column: 2,
+                row: 4,
+                modifiers: KeyModifiers::NONE,
+            },
+        );
+        assert_eq!(app.picker_index, 4);
+        draw_picker(&mut app, 100, 12);
+        let moved = visible_ids(&app);
+        assert!(moved.is_disjoint(&large));
+        assert_eq!(
+            app.requested_session_indices()
+                .iter()
+                .map(|i| i.session_db_id.clone())
+                .collect::<HashSet<_>>(),
+            moved
+        );
+        app.session_rows_loading.clear();
+        draw_picker(&mut app, 100, 7);
+        assert_eq!(
+            visible_ids(&app).len(),
+            1,
+            "a clipped row's header is still visible"
+        );
+        assert_eq!(app.requested_session_indices().len(), 1);
+        draw_picker(&mut app, 100, 6);
+        assert!(visible_ids(&app).is_empty());
+        assert!(
+            app.requested_session_indices().is_empty(),
+            "no rows fit below pinned header"
+        );
+    }
+
     #[tokio::test]
     async fn visible_metadata_requests_are_bounded_and_cancel_invalidates_results() {
         let mut app = App::new(HashSet::new(), test_tab().await);
@@ -2360,13 +2549,15 @@ mod session_picker_tests {
         apply_session_catalog(&mut app, indices);
         app.mode = TuiMode::SessionPicker;
 
+        draw_picker(&mut app, 100, 12);
         let first = app.requested_session_indices();
-        assert!(first.len() <= SESSION_FILL_WINDOW + 1);
+        assert_eq!(first.len(), 3);
         assert!(first.iter().all(|row| row.session_db_id != "session-99"));
 
         app.picker_index = 100;
+        draw_picker(&mut app, 100, 12);
         let scrolled = app.requested_session_indices();
-        assert!(scrolled.len() <= SESSION_FILL_WINDOW + 1);
+        assert_eq!(scrolled.len(), 3);
         assert!(scrolled.iter().any(|row| row.session_db_id == "session-99"));
 
         let generation = app.session_generation;
@@ -2421,6 +2612,7 @@ mod session_picker_tests {
         let indices: Vec<_> = (0..100).map(index).collect();
         apply_session_catalog(&mut app, indices);
         app.mode = TuiMode::SessionPicker;
+        draw_picker(&mut app, 100, 20);
         let requested = app.requested_session_indices();
         assert!(requested.len() < app.session_list.len());
 

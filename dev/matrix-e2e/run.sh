@@ -82,14 +82,15 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 HERE="$REPO_ROOT/dev/matrix-e2e"
 CHAZ_BIN="${CHAZ_BIN:-$REPO_ROOT/target/debug/chaz}"
 CHAZ_MATRIX_BIN="${CHAZ_MATRIX_BIN:-$REPO_ROOT/target/debug/chaz-matrix}"
+E2EE_PROBE_BIN="${E2EE_PROBE_BIN:-$REPO_ROOT/target/debug/examples/e2ee_probe}"
 
-for bin in "$CHAZ_BIN" "$CHAZ_MATRIX_BIN"; do
+for bin in "$CHAZ_BIN" "$CHAZ_MATRIX_BIN" "$E2EE_PROBE_BIN"; do
 	if [[ ! -x $bin ]]; then
-		echo "missing binary: $bin (run 'just build', or set CHAZ_BIN / CHAZ_MATRIX_BIN)" >&2
+		echo "missing binary: $bin (run 'just e2e', or set CHAZ_BIN / CHAZ_MATRIX_BIN / E2EE_PROBE_BIN)" >&2
 		exit 2
 	fi
 done
-for tool in synapse_homeserver register_new_matrix_user curl jq python3; do
+for tool in synapse_homeserver register_new_matrix_user curl jq sqlite3 python3; do
 	command -v "$tool" >/dev/null || {
 		echo "missing tool: $tool (try 'just e2e', which provides them)" >&2
 		exit 2
@@ -126,7 +127,7 @@ cleanup() {
 	fi
 	exit $status
 }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT INT TERM HUP
 
 # Ask the kernel for a port nobody is using. Racy in principle; the alternative
 # is hardcoded ports that collide with a developer's running daemon, which is
@@ -154,6 +155,33 @@ wait_for() {
 	fail "timed out after ${timeout}s waiting for $what"
 }
 
+# Exec a command with the kernel primed to TERM it when this harness dies.
+# `cleanup` runs from a trap, and no trap runs after SIGKILL, so a hard-killed
+# harness would otherwise strand every process it started — which is the leak
+# that put stray daemons on developer machines. PR_SET_PDEATHSIG is Linux-only;
+# elsewhere this is a plain exec and abrupt death leaks as it always did.
+#
+# Must be backgrounded by the caller. It `exec`s, so the wrapper does not linger
+# as an extra process and `$!` names the command itself.
+with_pdeathsig() {
+	exec python3 -c '
+import ctypes, os, signal, sys
+
+PR_SET_PDEATHSIG = 1
+parent = int(sys.argv[1])
+if sys.platform == "linux":
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.prctl(PR_SET_PDEATHSIG, signal.SIGTERM, 0, 0, 0) != 0:
+        raise OSError(ctypes.get_errno(), "prctl(PR_SET_PDEATHSIG)")
+    # The signal only fires for a death after the prctl call. The harness may
+    # already be gone, and then nothing would ever reap what we are about to
+    # exec, so check before committing.
+    if os.getppid() != parent:
+        sys.exit("harness exited before child startup")
+os.execvp(sys.argv[2], sys.argv[2:])
+' "$$" "$@"
+}
+
 # Start a process, log it into the workspace, and register it for cleanup. The
 # pid lands in SPAWNED_PID rather than on stdout: a command substitution would
 # run this in a subshell, where the PIDS append is discarded and the process
@@ -162,7 +190,7 @@ SPAWNED_PID=""
 spawn() {
 	local name="$1"
 	shift
-	"$@" >"$WORKSPACE/$name.log" 2>&1 &
+	with_pdeathsig "$@" >"$WORKSPACE/$name.log" 2>&1 &
 	SPAWNED_PID=$!
 	PIDS+=("$SPAWNED_PID")
 	if [[ $VERBOSE -eq 1 ]]; then
@@ -171,7 +199,10 @@ spawn() {
 		# would kill the prefixer and leave `tail -f` alive, still holding
 		# this step's stderr. A CI step does not finish while a background
 		# process holds its output pipe.
-		tail -f "$WORKSPACE/$name.log" > >(sed "s/^/[$name] /" >&2) 2>/dev/null &
+		#
+		# `tail -f` never ends on its own, so it needs the death signal as much
+		# as the component does; `sed` then exits on EOF by itself.
+		with_pdeathsig tail -f "$WORKSPACE/$name.log" > >(sed "s/^/[$name] /" >&2) 2>/dev/null &
 		PIDS+=($!)
 	fi
 }
@@ -215,13 +246,15 @@ log "transport: $TRANSPORT"
 # http mode the bridge binds only loopback HTTP, so the run stays hermetic; in
 # iroh mode both peers register the P2P transport and nothing else.
 if [[ $TRANSPORT == "http" ]]; then
-	EIDETICA_SYNC_DAEMON="  sync:\n    iroh: true\n    http_listen: \"127.0.0.1:$DAEMON_SYNC_PORT\""
+	EIDETICA_SYNC_DAEMON="  sync:\n    http_listen: \"127.0.0.1:$DAEMON_SYNC_PORT\""
 	EIDETICA_SYNC_BRIDGE="  sync:\n    http_listen: \"127.0.0.1:$BRIDGE_SYNC_PORT\""
 else
 	EIDETICA_SYNC_DAEMON="  sync:\n    iroh: true"
 	EIDETICA_SYNC_BRIDGE="  sync:\n    iroh: true"
 fi
-EIDETICA_BIN="git+https://github.com/arcuru/eidetica?rev=40b4a1e568bdba7438cb7af1c1eee74e2c38cf04"
+# Keep provisioning on the same dependency as the consumer. A local immutable
+# flake override is allowed while that revision is not published.
+EIDETICA_FLAKE="${EIDETICA_FLAKE:-git+https://github.com/arcuru/eidetica?rev=$(sed -n 's/^eidetica = .*rev = "\([^"]*\)".*/\1/p' "$REPO_ROOT/Cargo.toml")}"
 
 # ---------------------------------------------------------------- stub LLM ---
 log "starting stub LLM"
@@ -359,13 +392,13 @@ default_agents: [chaz]
 EOF
 
 mkdir -p "$WORKSPACE/state-daemon" "$WORKSPACE/state-bridge"
-nix run "$EIDETICA_BIN" -- \
+nix run "$EIDETICA_FLAKE" -- \
 	daemon --data-dir "$WORKSPACE/state-daemon" init --username chaz --passwordless \
 	>>"$WORKSPACE/bringup.log" 2>&1 || fail "could not initialise daemon Eidetica store (see $WORKSPACE/bringup.log)"
 # The bridge's store is provisioned the same explicit way: the connector
 # never creates one, and the legacy `chaz-matrix` login is what its config
 # names.
-nix run "$EIDETICA_BIN" -- \
+nix run "$EIDETICA_FLAKE" -- \
 	daemon --data-dir "$WORKSPACE/state-bridge" init --username chaz-matrix --passwordless \
 	>>"$WORKSPACE/bringup.log" 2>&1 || fail "could not initialise bridge Eidetica store (see $WORKSPACE/bringup.log)"
 
@@ -476,14 +509,51 @@ BRIDGE_RUST_LOG="info,chaz_matrix_bridge=debug,chaz_core::session::transport=deb
 # under a second name, and the group-room cases run after that.
 BRIDGE_LOG="$WORKSPACE/bridge.log"
 
+# Every bridge deployed before encryption support holds a session file with an
+# empty crypto store path and passphrase, for a device that never uploaded
+# keys. Start this run from one, so the first bridge start takes the upgrade
+# path a real deployment takes rather than the fresh-login path.
+LOGIN_STATE_DIR="$WORKSPACE/state-bridge/matrix/_agent_e2e_test"
+log "seeding a pre-encryption bridge session"
+LEGACY_LOGIN="$(curl -sS --max-time "$CURL_MAX_TIME" -X POST -H 'Content-Type: application/json' \
+	-d "$(jq -nc --arg p "$AGENT_PASSWORD" \
+		'{type:"m.login.password",identifier:{type:"m.id.user",user:"agent"},password:$p,initial_device_display_name:"chaz"}')" \
+	"$HOMESERVER/_matrix/client/v3/login")"
+LEGACY_DEVICE="$(jq -r '.device_id // empty' <<<"$LEGACY_LOGIN")"
+[[ -n $LEGACY_DEVICE ]] || fail "could not log the agent in to seed a legacy session"
+mkdir -p "$LOGIN_STATE_DIR"
+jq -c --arg hs "$HOMESERVER" '{
+	client_session: {homeserver: $hs, db_path: "", passphrase: ""},
+	user_session: {user_id: .user_id, device_id: .device_id, access_token: .access_token}
+}' <<<"$LEGACY_LOGIN" >"$LOGIN_STATE_DIR/session"
+
 log "starting bridge"
 spawn bridge env RUST_LOG="$BRIDGE_RUST_LOG" "$CHAZ_MATRIX_BIN" --config "$BRIDGE_CONFIG"
 BRIDGE_PID="$SPAWNED_PID"
 wait_for "bridge matrix login" 120 grep -q "The client is ready" "$WORKSPACE/bridge.log"
 
+# The maintenance path must never race the live bridge's encrypted store.
+if "$CHAZ_MATRIX_BIN" --config "$BRIDGE_CONFIG" keys status >"$WORKSPACE/maintenance-contention.log" 2>&1; then
+	fail "maintenance opened a store owned by the running bridge"
+fi
+grep -q 'Matrix store is in use' "$WORKSPACE/maintenance-contention.log" ||
+	fail "maintenance contention did not fail at store ownership"
+printf '\033[1;32mPASS\033[0m — live bridge rejects concurrent key maintenance\n' >&2
+
 if grep -qi "pending owner approval" "$WORKSPACE/bridge.log"; then
 	fail "bridge is waiting on manual approval — pre-authorization did not take (see $WORKSPACE/bridge.log)"
 fi
+
+grep -q "Upgrading pre-encryption Matrix session" "$WORKSPACE/bridge.log" ||
+	fail "bridge did not upgrade the pre-encryption session (see $WORKSPACE/bridge.log)"
+[[ $(jq -r '.user_session.device_id' "$LOGIN_STATE_DIR/session") == "$LEGACY_DEVICE" ]] ||
+	fail "bridge replaced the pre-encryption device instead of upgrading it"
+[[ -n $(jq -r '.client_session.passphrase' "$LOGIN_STATE_DIR/session") ]] ||
+	fail "upgraded session has no crypto store passphrase"
+[[ $(stat -c %a "$LOGIN_STATE_DIR/session") == 600 && $(stat -c %a "$LOGIN_STATE_DIR") == 700 ]] ||
+	fail "session file or login state dir is readable by others"
+AGENT_DEVICE_KEY="$(jq -r '.client_session.device_ed25519_key // empty' "$LOGIN_STATE_DIR/session")"
+[[ -n $AGENT_DEVICE_KEY ]] || fail "upgraded session did not record the device key"
 
 # Preserve the daemon's pre-conversation state. Restoring it below models the
 # observed failure: the daemon's copied state knows the agent and bridge but
@@ -517,9 +587,8 @@ PUPPET_TOKEN="$(mx POST /_matrix/client/v3/login "" "$(jq -nc \
 [[ -n $PUPPET_TOKEN ]] || fail "puppet could not log in"
 
 log "creating the room"
-# Unencrypted on purpose, and not a limitation of the harness: chaz builds
-# matrix-sdk without the e2e-encryption feature, so an encrypted room is one
-# the bridge could not read at all.
+# Unencrypted, so these cases keep covering plaintext rooms. The encrypted
+# cases have their own room further down.
 ROOM_ID="$(mx POST /_matrix/client/v3/createRoom "$PUPPET_TOKEN" "$(jq -nc \
 	--arg agent "$AGENT_MXID" \
 	'{preset:"trusted_private_chat",is_direct:true,invite:[$agent]}')" |
@@ -638,12 +707,12 @@ wait_for "fifth reply" "$REPLY_TIMEOUT" replies_at_least 5
 printf '\033[1;32mPASS\033[0m — all restart cases passed (bridge + daemon)\n' >&2
 
 # -------------------------------------------------------- group-room cases ---
-# Case 1a — a bare message in a group room is ignored
+# Case 1a — a bare message in a group room is observed, not executed
 # Case 2  — an @-mention in a group room is answered
 # Case 1b — the `!chaz` prefix is answered without a mention
 # Case 3  — a sender outside allow_list is ignored even with the `!chaz` prefix
 #
-# Each "must be ignored" case is asserted with a barrier rather than a fixed
+# Each no-wake case is asserted with a barrier rather than a fixed
 # wait: send the message that must not be answered, then one that must be, and
 # wait for the second to be answered before requiring the first produced
 # nothing. Both travel the same path in that order, so the second answer is
@@ -751,16 +820,16 @@ BARE_BODY="bare message with no prefix and no mention"
 
 # How many turns the model has been asked to run. Join-time history is
 # context only; messages after join that aren't addressed are ignored.
-stub_requests() { grep -c "^stub_llm: request:" "$WORKSPACE/stub-llm.log" || true; }
+stub_requests() { grep -c "^stub_llm: turn:" "$WORKSPACE/stub-llm.log" || true; }
 
 # The bridge writes a line for every message it drops for not being addressed
-# to it. That line is the observable for a message that must be ignored: the
+# to it. That line is the observable for a message that must not wake: the
 # absence of a reply is not, because absence is also what a reply that has not
 # arrived yet looks like, and it stays true with the gate deleted.
-gate_drops() { grep -c "not addressed to the bot" "$BRIDGE_LOG" || true; }
+gate_drops() { grep -Ec "Unbound Matrix room observation ignored|Recorded unaddressed Matrix observation" "$BRIDGE_LOG" || true; }
 gate_dropped_more_than() { [[ "$(gate_drops)" -gt "$1" ]]; }
 
-# Case 1a + Case 2 — the bare message must be ignored, the mention answered.
+# Case 1a + Case 2 — the bare message must not wake; the mention does.
 #
 # The bare message is asserted on the bridge's drop line, and waiting for it
 # also orders the pair: the mention is not sent until the bridge has finished
@@ -772,7 +841,7 @@ gate_dropped_more_than() { [[ "$(gate_drops)" -gt "$1" ]]; }
 # that is logged but not performed. Counting requests rather than replies in
 # the room is deliberate: every reply this stub sends is the same string, so a
 # wrongly sent first reply reads exactly like the mention's.
-log "Case 1a: bare message in the group room (must be ignored)"
+log "Case 1a: bare message in the group room (no wake)"
 TURNS_BEFORE="$(stub_requests)"
 DROPS_BEFORE="$(gate_drops)"
 group_send "$PUPPET_TOKEN" \
@@ -789,22 +858,48 @@ mention_reached_the_model() {
 }
 wait_for "the mention to reach the model" "$REPLY_TIMEOUT" mention_reached_the_model
 
-GROUP_TURNS="$(grep '^stub_llm: request:' "$WORKSPACE/stub-llm.log" |
+GROUP_TURNS="$(grep '^stub_llm: turn:' "$WORKSPACE/stub-llm.log" |
 	grep -cF "$BARE_BODY" || true)"
-PREJOIN_TURNS="$(grep '^stub_llm: request:' "$WORKSPACE/stub-llm.log" |
+PREJOIN_TURNS="$(grep '^stub_llm: turn:' "$WORKSPACE/stub-llm.log" |
     grep -cF "$PREJOIN_BODY" || true)"
 [[ $PREJOIN_TURNS -eq 1 ]] || fail "pre-join history did not appear exactly once in the mention turn (found $PREJOIN_TURNS)"
-if grep '^stub_llm: request:' "$WORKSPACE/stub-llm.log" | grep -qF "$PRECLEAR_BODY"; then
+if grep '^stub_llm: turn:' "$WORKSPACE/stub-llm.log" | grep -qF "$PRECLEAR_BODY"; then
     fail "history before !chaz clear reached the model"
 fi
 [[ "$(stub_requests)" -eq $((TURNS_BEFORE + 1)) ]] || fail "history triggered an extra model turn"
 
-if [[ $GROUP_TURNS -ne 0 ]]; then
-    fail "bridge included an unaddressed post-join message in $GROUP_TURNS model turn(s)"
-fi
+[[ $GROUP_TURNS -eq 1 ]] || fail "unaddressed observation missing from the mention context (found $GROUP_TURNS)"
 
 wait_for "the mention reply in the group room" "$REPLY_TIMEOUT" \
 	group_said_at_least "$MARKER" 1
+
+# This room is now attached. Unaddressed speech becomes shared context but
+# must not wake a model. A later mention is its causal barrier.
+TURNS_BEFORE="$(stub_requests)"
+DROPS_BEFORE="$(gate_drops)"
+group_send "$PUPPET_TOKEN" '{"msgtype":"m.text","body":"observed after attachment"}'
+wait_for "bare message recorded without wake" 60 gate_dropped_more_than "$DROPS_BEFORE"
+[[ "$(stub_requests)" -eq "$TURNS_BEFORE" ]] || fail "observation started a model turn"
+group_send "$PUPPET_TOKEN" "$(jq -nc --arg a "$AGENT_MXID" \
+    '{msgtype:"m.text",body:"observation barrier"} + {"m.mentions":{user_ids:[$a]}}')"
+wait_for "observation visible in next turn" "$REPLY_TIMEOUT" \
+    sh -c "grep '^stub_llm: turn:' '$WORKSPACE/stub-llm.log' | grep -qF 'observed after attachment'"
+[[ "$(stub_requests)" -eq $((TURNS_BEFORE + 1)) ]] || fail "observation triggered extra turns"
+wait_for "second explicit send" "$REPLY_TIMEOUT" group_said_at_least "$MARKER" 2
+
+# A normal Matrix-origin final is now the room reply; the next turn uses the
+# explicit send tool and its later final must not produce a duplicate post.
+GROUP_BEFORE="$(group_agent_said "$MARKER")"
+group_send "$PUPPET_TOKEN" "$(jq -nc --arg a "$AGENT_MXID" \
+    '{msgtype:"m.text",body:"local final test"} + {"m.mentions":{user_ids:[$a]}}')"
+wait_for "normal final posted to Matrix" "$REPLY_TIMEOUT" \
+    group_said_at_least "$MARKER" "$((GROUP_BEFORE + 1))"
+group_said_count_is "$MARKER" "$((GROUP_BEFORE + 1))" "normal final posted twice"
+group_send "$PUPPET_TOKEN" "$(jq -nc --arg a "$AGENT_MXID" \
+    '{msgtype:"m.text",body:"barrier after local final"} + {"m.mentions":{user_ids:[$a]}}')"
+wait_for "explicit send after normal final" "$REPLY_TIMEOUT" \
+    group_said_at_least "$MARKER" "$((GROUP_BEFORE + 2))"
+group_said_count_is "$MARKER" "$((GROUP_BEFORE + 2))" "explicit send final posted twice"
 
 # Case 1b — the `!chaz` prefix is answered without a mention.
 log "Case 1b: !chaz command in the group room (must be answered)"
@@ -813,8 +908,8 @@ wait_for "the !chaz reply in the group room" "$REPLY_TIMEOUT" \
 	group_said_at_least "$BACKENDS_MARKER" 1
 
 # Case 3 — allow_list rejection. The stranger uses the `!chaz` prefix on
-# purpose: the prefix clears the "only engage when addressed" gate that Case 1a
-# already covers, which leaves allow_list as the only thing that can produce
+# purpose: the prefix takes the command path rather than Case 1a's
+# observation-only path, leaving allow_list as the only thing that can produce
 # silence. A bare message here would be dropped by the addressing gate, and the
 # case would still pass with allow_list deleted entirely.
 log "Case 3: stranger sends !chaz (must be ignored — not in allow_list)"
@@ -825,7 +920,57 @@ wait_for "the !chaz help reply in the group room" "$REPLY_TIMEOUT" \
 group_said_count_is "$BACKENDS_MARKER" 1 \
 	"bridge answered a sender outside allow_list"
 
-printf '\033[1;32mPASS\033[0m — group room cases passed (bare ignored, !chaz prefix, @-mention, allow_list rejection)\n' >&2
+printf '\033[1;32mPASS\033[0m — group room cases passed (bare observed without wake, !chaz prefix, @-mention, allow_list rejection)\n' >&2
+
+# An unauthorized sender cannot enable the new mode; a valid sender waits for
+# the daemon's synced receipt. The local-only case is followed by an addressed
+# reply barrier so no outbound event can hide behind an arbitrary sleep.
+log "participation: reject unauthorized toggle"
+group_send "$STRANGER_TOKEN" '{"msgtype":"m.text","body":"!chaz participation on"}'
+group_send "$PUPPET_TOKEN" '{"msgtype":"m.text","body":"!chaz participation status"}'
+wait_for "default-off participation status" 60 group_said_at_least "Matrix participation: off" 1
+group_said_count_is "Matrix participation: on" 0 "unauthorized toggle enabled participation"
+log "participation: enable with executor receipt"
+group_send "$PUPPET_TOKEN" '{"msgtype":"m.text","body":"!chaz participation on"}'
+wait_for "executor-confirmed participation" 90 group_said_at_least "Matrix participation: on" 1
+PARTICIPATION_TURNS="$(stub_requests)"
+PARTICIPATION_REPLIES="$(group_agent_said "$MARKER")"
+PARTICIPATION_OUTBOUND="$(group_agent_said "")"
+group_send "$PUPPET_TOKEN" '{"msgtype":"m.text","body":"participation local-only test"}'
+wait_for "ambient terminal no_reply reached model" "$REPLY_TIMEOUT" \
+    grep -q "stub_llm: participation terminal no_reply" "$WORKSPACE/stub-llm.log"
+# The following explicit send is a barrier: the daemon serializes turns per session.
+group_send "$PUPPET_TOKEN" '{"msgtype":"m.text","body":"participation reply test"}'
+wait_for "participating explicit send" "$REPLY_TIMEOUT" \
+    group_said_at_least "$MARKER" "$((PARTICIPATION_REPLIES + 1))"
+[[ "$(stub_requests)" -eq $((PARTICIPATION_TURNS + 2)) ]] || fail "participation did not produce exactly two model requests"
+group_said_count_is "$MARKER" "$((PARTICIPATION_REPLIES + 1))" "terminal no_reply emitted a room reply"
+group_said_count_is "" "$((PARTICIPATION_OUTBOUND + 1))" "terminal no_reply or tool audit leaked an outbound event"
+# No tool call: the ordinary final itself must be queued for room delivery.
+group_send "$PUPPET_TOKEN" '{"msgtype":"m.text","body":"participation auto-final test"}'
+wait_for "ambient ordinary final posted" "$REPLY_TIMEOUT" \
+    group_said_at_least "$MARKER" "$((PARTICIPATION_REPLIES + 2))"
+[[ "$(stub_requests)" -eq $((PARTICIPATION_TURNS + 3)) ]] || fail "ambient ordinary final triggered extra model turns"
+group_said_count_is "$MARKER" "$((PARTICIPATION_REPLIES + 2))" "ambient ordinary final posted twice"
+group_said_count_is "" "$((PARTICIPATION_OUTBOUND + 2))" "ambient ordinary final leaked another outbound event"
+log "participation: restart executor and confirm synced policy persists"
+kill -TERM "$DAEMON_PID"
+wait_for "daemon exit with participation enabled" 30 sh -c "! kill -0 $DAEMON_PID 2>/dev/null"
+retire_pid "$DAEMON_PID"
+spawn daemon-participation "$CHAZ_BIN" --config "$DAEMON_CONFIG" daemon
+DAEMON_PID="$SPAWNED_PID"
+wait_for "daemon restart with participation enabled" 120 grep -q "daemon ready" "$WORKSPACE/daemon-participation.log"
+group_send "$PUPPET_TOKEN" '{"msgtype":"m.text","body":"participation after restart"}'
+wait_for "reply with persisted participation after restart" "$REPLY_TIMEOUT" \
+    group_said_at_least "$MARKER" "$((PARTICIPATION_REPLIES + 3))"
+[[ "$(stub_requests)" -eq $((PARTICIPATION_TURNS + 4)) ]] || fail "restart participation request count changed"
+group_said_count_is "$MARKER" "$((PARTICIPATION_REPLIES + 3))" "restart turn posted twice"
+group_send "$PUPPET_TOKEN" '{"msgtype":"m.text","body":"!chaz participation off"}'
+wait_for "participation disabled" 60 group_said_at_least "Matrix participation: off" 2
+DROPS_BEFORE="$(gate_drops)"
+group_send "$PUPPET_TOKEN" '{"msgtype":"m.text","body":"bare again after participation off"}'
+wait_for "default address gate restored" 60 gate_dropped_more_than "$DROPS_BEFORE"
+printf '\033[1;32mPASS\033[0m — opt-in group participation: terminal no_reply, ordinary final reply, explicit send without duplicate, authorization and off\n' >&2
 
 # -------------------------------------------------------- ReAct case ---
 # The stub answers a request whose user messages ask for a tool call with a
@@ -845,9 +990,169 @@ mx PUT "/_matrix/client/v3/rooms/$(jq -rn --arg r "$ROOM_ID" '$r|@uri')/send/m.r
 
 wait_for "ReAct tool result" "$REPLY_TIMEOUT" \
 	grep -q "detected tool result" "$WORKSPACE/stub-llm.log"
-wait_for "sixth reply (ReAct cycle)" "$REPLY_TIMEOUT" replies_at_least 6
+# A ReAct tool result ends with a local final; it must not be delivered to Matrix.
+if replies_at_least 6 >/dev/null; then
+    fail "ReAct local final leaked to the Matrix room"
+fi
 
 printf '\033[1;32mPASS\033[0m — ReAct case passed (tool-call cycle completed)\n' >&2
+
+# ------------------------------------------------------ encrypted cases ---
+# An encrypted DM driven by e2ee_probe, a real Olm/Megolm client. The puppet's
+# probe device is cross-signed, like a device verified in Element. A second
+# puppet device is left unsigned: the bridge must withhold room keys from it
+# and must not act on what it sends. Each probe device keeps its own store.
+#
+# Case E1 — a plain message is decrypted, answered, and the answer is encrypted
+# Case E2 — a `!chaz` command in the encrypted room is answered
+# Case E3 — the unsigned device gets the reply's key withheld as unverified
+# Case E4 — a message from the unsigned device is not decrypted or answered
+# Case E5 — after a bridge restart the device and keys are unchanged, and the
+#           encrypted room still works
+# Case E6 — the server never saw a plaintext message from the bridge there
+probe() { "$E2EE_PROBE_BIN" "$@" 2>>"$WORKSPACE/probe.log"; }
+SIGNED_DIR="$WORKSPACE/probe-signed"
+UNSIGNED_DIR="$WORKSPACE/probe-unsigned"
+
+log "encrypted: logging in a cross-signed puppet device"
+probe --dir "$SIGNED_DIR" login --homeserver "$HOMESERVER" --user puppet \
+	--password "$PUPPET_PASSWORD" >/dev/null ||
+	fail "cross-signed probe login failed (see $WORKSPACE/probe.log)"
+E2EE_ROOM="$(probe --dir "$SIGNED_DIR" create-dm --invite "$AGENT_MXID")" ||
+	fail "could not create the encrypted room (see $WORKSPACE/probe.log)"
+log "encrypted room: $E2EE_ROOM"
+probe --dir "$SIGNED_DIR" wait-joined --room "$E2EE_ROOM" --user "$AGENT_MXID" --timeout 90 ||
+	fail "the agent did not join the encrypted room"
+
+# The first message in a room's session is always answered when the room is a
+# DM, so it has to be the one carrying the prompt.
+log "Case E1: plain message in the encrypted room"
+probe --dir "$SIGNED_DIR" send --room "$E2EE_ROOM" --body "encrypted ping" >/dev/null ||
+	fail "could not send the encrypted message (see $WORKSPACE/probe.log)"
+probe --dir "$SIGNED_DIR" expect --room "$E2EE_ROOM" --sender "$AGENT_MXID" \
+	--contains "$MARKER" --timeout "$REPLY_TIMEOUT" >/dev/null ||
+	fail "no decryptable encrypted reply to the plain message (see $WORKSPACE/probe.log, $BRIDGE_LOG)"
+
+log "Case E2: !chaz command in the encrypted room"
+probe --dir "$SIGNED_DIR" send --room "$E2EE_ROOM" --body "!chaz backends" >/dev/null ||
+	fail "could not send the encrypted command"
+probe --dir "$SIGNED_DIR" expect --room "$E2EE_ROOM" --sender "$AGENT_MXID" \
+	--contains "$BACKENDS_MARKER" --timeout "$REPLY_TIMEOUT" >/dev/null ||
+	fail "no decryptable encrypted reply to the command (see $WORKSPACE/probe.log)"
+
+log "Case E3: an unsigned puppet device is refused the reply's key"
+probe --dir "$UNSIGNED_DIR" login --homeserver "$HOMESERVER" --user puppet \
+	--password "$PUPPET_PASSWORD" --unsigned >/dev/null ||
+	fail "unsigned probe login failed (see $WORKSPACE/probe.log)"
+probe --dir "$SIGNED_DIR" send --room "$E2EE_ROOM" --body "!chaz help" >/dev/null ||
+	fail "could not send the encrypted help command"
+SIGNED_SAW="$(probe --dir "$SIGNED_DIR" expect --room "$E2EE_ROOM" --sender "$AGENT_MXID" \
+	--contains "$HELP_MARKER" --timeout "$REPLY_TIMEOUT")" ||
+	fail "the cross-signed device could not read the reply (see $WORKSPACE/probe.log)"
+UNSIGNED_SAW="$(probe --dir "$UNSIGNED_DIR" expect --room "$E2EE_ROOM" --sender "$AGENT_MXID" \
+	--withheld --timeout "$REPLY_TIMEOUT")" ||
+	fail "the unsigned device was not refused the reply's key (see $WORKSPACE/probe.log)"
+[[ $SIGNED_SAW == "$UNSIGNED_SAW" ]] ||
+	fail "the devices judged different replies ($SIGNED_SAW vs $UNSIGNED_SAW)"
+
+log "Case E4: a message from the unsigned device is not acted on"
+UNSIGNED_EVENT="$(probe --dir "$UNSIGNED_DIR" send --room "$E2EE_ROOM" --body "!chaz backends")" ||
+	fail "the unsigned device could not send"
+# The log is coloured, so match the event id as a fixed string on the line.
+reported_undecryptable() {
+	grep "Could not decrypt a message" "$BRIDGE_LOG" | grep -qF "$UNSIGNED_EVENT"
+}
+wait_for "the bridge to report the undecryptable message" "$REPLY_TIMEOUT" reported_undecryptable
+# Barrier: a later message from the signed device is answered, so the unsigned
+# one had its chance first. The reply must be to this message, not a stray
+# `backends` reply to the unsigned one.
+probe --dir "$SIGNED_DIR" send --room "$E2EE_ROOM" --body "!chaz help" >/dev/null
+probe --dir "$SIGNED_DIR" expect --room "$E2EE_ROOM" --sender "$AGENT_MXID" \
+	--contains "$HELP_MARKER" --timeout "$REPLY_TIMEOUT" >/dev/null ||
+	fail "barrier reply after the unsigned message never arrived"
+[[ $(probe --dir "$SIGNED_DIR" wire --room "$E2EE_ROOM" --sender "$AGENT_MXID") -eq 4 ]] ||
+	fail "the bridge answered the unsigned device's message (expected exactly 4 replies)"
+
+log "Case E5: bridge restart keeps the encrypted device"
+DEVICE_BEFORE="$(jq -r '.user_session.device_id' "$LOGIN_STATE_DIR/session")"
+kill -TERM "$BRIDGE_PID"
+wait_for "bridge to exit" 30 sh -c "! kill -0 $BRIDGE_PID 2>/dev/null"
+retire_pid "$BRIDGE_PID"
+spawn bridge-encrypted-restart env RUST_LOG="$BRIDGE_RUST_LOG" "$CHAZ_MATRIX_BIN" --config "$BRIDGE_CONFIG"
+BRIDGE_PID="$SPAWNED_PID"
+BRIDGE_LOG="$WORKSPACE/bridge-encrypted-restart.log"
+wait_for "bridge to come back online" 120 grep -q "The client is ready" "$BRIDGE_LOG"
+[[ $(jq -r '.user_session.device_id' "$LOGIN_STATE_DIR/session") == "$DEVICE_BEFORE" ]] ||
+	fail "the bridge came back as a different device"
+[[ $(jq -r '.client_session.device_ed25519_key' "$LOGIN_STATE_DIR/session") == "$AGENT_DEVICE_KEY" ]] ||
+	fail "the bridge's device key changed across restart"
+! grep -q "Creating a cross-signing identity" "$BRIDGE_LOG" ||
+	fail "the bridge re-created its cross-signing identity on restart"
+probe --dir "$SIGNED_DIR" send --room "$E2EE_ROOM" --body "encrypted after restart" >/dev/null
+probe --dir "$SIGNED_DIR" expect --room "$E2EE_ROOM" --sender "$AGENT_MXID" \
+	--contains "$MARKER" --timeout "$REPLY_TIMEOUT" >/dev/null ||
+	fail "no decryptable reply after the bridge restart (see $WORKSPACE/probe.log, $BRIDGE_LOG)"
+
+log "Case E6: nothing from the bridge reached the server in plaintext"
+ENCRYPTED_REPLIES="$(probe --dir "$SIGNED_DIR" wire --room "$E2EE_ROOM" --sender "$AGENT_MXID")" ||
+	fail "the bridge sent a plaintext message into the encrypted room (see $WORKSPACE/probe.log)"
+[[ $ENCRYPTED_REPLIES -eq 5 ]] ||
+	fail "expected 5 encrypted replies from the bridge, found $ENCRYPTED_REPLIES"
+
+printf '\033[1;32mPASS\033[0m — encrypted cases passed (plain message, command, withheld unsigned device, ignored unsigned sender, restart, on-wire encryption)\n' >&2
+
+# --------------------------------------------- pinned scheduled E2EE turns ---
+# Keep E1–E6 and the plaintext DM counts unchanged. The agent creates real
+# bounded schedules in this already-attached encrypted session via schedule_add.
+# The retired pinned row plus the persisted terminal Message proves execution
+# reached its final write; a later distinguishable encrypted reply is a barrier.
+scheduled_completed() {
+    local mode="$1"
+    sqlite3 "$WORKSPACE/state-daemon/eidetica.db" \
+    "select count(distinct e.record_key)
+     from store_state_namespaces fn join store_state_records f on fn.namespace_id=f.namespace_id
+     join store_state_namespaces en on en.database_id=json_extract(cast(f.record_value as text),'\$.target.session_db_id')
+     join store_state_records e on en.namespace_id=e.namespace_id
+     where fn.store_name='schedules' and en.store_name='entries'
+     and json_extract(cast(f.record_value as text),'\$.id')='e2ee-$mode'
+     and json_extract(cast(f.record_value as text),'\$.target.kind')='pinned'
+     and json_extract(cast(f.record_value as text),'\$.prompt')='$MARKER-scheduled-$mode'
+     and json_extract(cast(f.record_value as text),'\$.enabled')=0
+     and json_extract(cast(f.record_value as text),'\$.fire_count')=1
+     and json_extract(cast(e.record_value as text),'\$.entry_type')='Message'
+     and json_extract(cast(e.record_value as text),'\$.sender')='chaz'
+     and json_extract(cast(e.record_value as text),'\$.routing') is null
+     and json_extract(cast(e.record_value as text),'\$.content')='$MARKER-scheduled-$mode-final';" |
+        grep -qx 1
+}
+for mode in send silent; do
+    log "scheduled E2EE: pinned $mode turn"
+    probe --dir "$SIGNED_DIR" send --room "$E2EE_ROOM" \
+        --body "create pinned schedule $mode" >/dev/null
+    probe --dir "$SIGNED_DIR" expect --room "$E2EE_ROOM" --sender "$AGENT_MXID" \
+        --contains "$MARKER-schedule-$mode-created" --timeout "$REPLY_TIMEOUT" >/dev/null ||
+        fail "pinned $mode schedule was not created"
+    if [[ $mode == send ]]; then
+        probe --dir "$SIGNED_DIR" expect --room "$E2EE_ROOM" --sender "$AGENT_MXID" \
+            --contains "$MARKER-scheduled-post" --timeout "$REPLY_TIMEOUT" >/dev/null ||
+            fail "scheduled explicit send did not arrive as a decryptable encrypted post"
+    fi
+    wait_for "successful pinned $mode fire and persisted local final" "$REPLY_TIMEOUT" \
+        scheduled_completed "$mode"
+    probe --dir "$SIGNED_DIR" send --room "$E2EE_ROOM" --body "!chaz backends" >/dev/null
+    probe --dir "$SIGNED_DIR" expect --room "$E2EE_ROOM" --sender "$AGENT_MXID" \
+        --contains "$BACKENDS_MARKER" --timeout "$REPLY_TIMEOUT" >/dev/null ||
+        fail "encrypted barrier after scheduled $mode turn never arrived"
+    # Baseline 5 from E6, then creation + explicit send + barrier; the silent
+    # schedule adds only its creation reply and barrier, never its normal final.
+    expected=8
+    [[ $mode == silent ]] && expected=10
+    actual="$(probe --dir "$SIGNED_DIR" wire --room "$E2EE_ROOM" --sender "$AGENT_MXID")" ||
+        fail "scheduled $mode phase leaked plaintext"
+    [[ $actual -eq $expected ]] ||
+        fail "scheduled $mode phase expected $expected encrypted posts, found $actual"
+done
+printf '\033[1;32mPASS\033[0m — pinned scheduled E2EE: explicit send posts exactly once; both normal finals local; no-send zero posts after completion/barrier\n' >&2
 
 # ----------------------------------------------------------- room reset ---
 # The `chaz-matrix rooms` maintenance command, run against the same throwaway
@@ -929,11 +1234,34 @@ mx PUT "/_matrix/client/v3/rooms/$ROOM_URI/send/m.room.message/$TXN" \
     "$PUPPET_TOKEN" "$(jq -nc --arg b "$REJOIN_PROMPT" '{msgtype:"m.text",body:$b}')" >/dev/null
 wait_for "rejoin prompt to reach the model" "$REPLY_TIMEOUT" \
     grep -qF "$REJOIN_PROMPT" "$WORKSPACE/stub-llm.log"
-wait_for "seventh reply after rejoin" "$REPLY_TIMEOUT" replies_at_least 7
+wait_for "sixth explicit send after rejoin" "$REPLY_TIMEOUT" replies_at_least 6
 [[ "$(stub_requests)" -eq $((TURNS_BEFORE_REJOIN + 1)) ]] ||
     fail "rejoin history triggered a model turn"
-REJOIN_CONTEXT="$(grep '^stub_llm: request:' "$WORKSPACE/stub-llm.log" | grep -F "$REJOIN_PROMPT")"
+REJOIN_CONTEXT="$(grep '^stub_llm: turn:' "$WORKSPACE/stub-llm.log" | grep -F "$REJOIN_PROMPT")"
 [[ "$REJOIN_CONTEXT" == *"$REJOIN_HISTORY"* ]] || fail "rejoin history missing from context"
 [[ "$REJOIN_CONTEXT" != *"$REJOIN_CLEARED"* ]] || fail "history before clear was imported on rejoin"
 [[ "$REJOIN_CONTEXT" != *"second turn"* ]] || fail "previous live room events were reimported on rejoin"
-printf '\033[1;32mPASS\033[0m — rejoin imported absent-period context without replaying old turns\n' >&2
+# Count real Matrix messages, not model finals or bridge progress rows.
+DM_OUTBOUND="$(mx GET "/_matrix/client/v3/rooms/$ROOM_URI/messages?dir=b&limit=200" \
+    "$PUPPET_TOKEN" | jq --arg a "$AGENT_MXID" --arg m "$MARKER" \
+    '[.chunk[] | select(.type == "m.room.message" and .sender == $a) | select(.content.body // "" | contains($m))] | length')"
+[[ "$DM_OUTBOUND" == 6 ]] || fail "expected six explicit Matrix sends across the DM lifecycle; found $DM_OUTBOUND"
+
+# The daemon's disposable SQLite store-state projection retains Completed
+# attempt records. Query only this room's DB; the original first turn is
+# restored from the bridge on the copied-state recovery path.
+DM_SESSION_ID="$(sed -E $'s/\x1B\[[0-9;]*[[:alpha:]]//g' "$WORKSPACE/bridge.log" | \
+    sed -nE '/Channel bound to session/s/.*session_db_id=([^ ]+).*/\1/p' | head -1)"
+[[ "$DM_SESSION_ID" =~ ^[a-z0-9]+$ ]] || fail "could not identify disposable DM session ID"
+completed_attempts() {
+    sqlite3 "$WORKSPACE/state-daemon/eidetica.db" \
+    "select count(distinct json_extract(cast(r.record_value as text),'\$.attempt_id'))
+     from store_state_namespaces n join store_state_records r on n.namespace_id=r.namespace_id
+     where n.database_id='$DM_SESSION_ID' and n.store_name='turn_attempts'
+     and json_extract(cast(r.record_value as text),'\$.status')='Completed'"
+}
+seven_completed_attempts() { [[ "$(completed_attempts)" -ge 7 ]]; }
+wait_for "seven durable completed DM attempts" 60 seven_completed_attempts
+COMPLETED="$(completed_attempts)"
+printf '\033[1;32mPASS\033[0m — rejoin and durable delivery: %s DM sends, %s completed attempts\n' \
+    "$DM_OUTBOUND" "$COMPLETED" >&2

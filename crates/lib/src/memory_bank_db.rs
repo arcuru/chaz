@@ -18,7 +18,7 @@
 
 #![allow(dead_code)]
 
-use crate::agent_db::MemoryEntry;
+use crate::agent_db::{MemoryEntry, read_blob, write_blob};
 use eidetica::Database;
 use eidetica::auth::crypto::PublicKey;
 use eidetica::crdt::Doc;
@@ -30,8 +30,6 @@ use tracing::info;
 
 pub const MEMORY_STORE: &str = "memory";
 pub const META_STORE: &str = "meta";
-
-const BLOB_KEY: &str = "value";
 
 /// Display metadata for a memory bank. Read by `/memory list` and by the
 /// dynamic tool descriptor that tells the LLM which banks it can query.
@@ -77,31 +75,6 @@ impl MemoryBankDb {
         txn.commit().await?;
         Ok(())
     }
-}
-
-async fn read_blob<T>(database: &Database, store_name: &str) -> anyhow::Result<T>
-where
-    T: serde::de::DeserializeOwned + Default,
-{
-    let txn = database.new_transaction().await?;
-    let store = txn.get_store::<DocStore>(store_name).await?;
-    match store.get_string(BLOB_KEY).await {
-        Ok(json) => Ok(serde_json::from_str(&json)?),
-        Err(e) if e.is_not_found() => Ok(T::default()),
-        Err(e) => Err(e.into()),
-    }
-}
-
-async fn write_blob<T>(database: &Database, store_name: &str, value: &T) -> anyhow::Result<()>
-where
-    T: serde::Serialize,
-{
-    let json = serde_json::to_string(value)?;
-    let txn = database.new_transaction().await?;
-    let store = txn.get_store::<DocStore>(store_name).await?;
-    store.set_string(BLOB_KEY, json).await?;
-    txn.commit().await?;
-    Ok(())
 }
 
 /// DB name used in eidetica settings — the idempotency key for

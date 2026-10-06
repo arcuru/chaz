@@ -205,7 +205,7 @@ Approval prompts hijack the keyboard while open: `y` approve, `n` deny, `a` appr
 
 ### Mouse
 
-Mouse capture is enabled. Click on completion rows, help-overlay command rows, approval buttons, picker rows, tab titles, or tab close `[x]` widgets to act on them. The scroll wheel scrolls history (or the active overlay when one is open).
+Mouse capture is enabled. Click on completion rows, help-overlay command rows, approval buttons, picker rows, tab titles, or tab close `[x]` widgets to act on them. The scroll wheel scrolls the help overlay when it is open; in the session picker, model picker, and Settings lists it moves the selection three rows (over the Settings detail pane, not its category rail), and the list scrolls to keep the selection visible; other overlays swallow it; otherwise it scrolls history.
 
 ## Debug Mode
 
@@ -237,7 +237,7 @@ Open with `/sessions` or `/s`:
 +-----------------------------------------------------+
 ```
 
-Sessions are listed from registry metadata: eidetica DB root ID, human-friendly name, bridge, agent, age, and status. The picker does not scan transcripts for entry counts, previews, or costs; selecting a session loads that conversation on demand, while `/costs` explicitly scans usage data. Catalog loading happens in the background, and agent metadata is fetched only for rows around the cursor, so navigation and cancel remain available while storage is slow. The picker shows every session the registry knows about: TUI, Matrix-attached, `spawn_agent` / `spawn_worker` children, and anything synced from remote peers. The current session is marked with `*`. Press `Enter` to switch, `n` to create a new session, or `Esc` to cancel.
+Sessions are listed from registry metadata: eidetica DB root ID, human-friendly name, bridge, agent, age, and status. The picker does not scan transcripts for entry counts, previews, or costs; selecting a session loads that conversation on demand, while `/costs` explicitly scans usage data. Catalog loading happens in the background, and agent metadata is fetched only for rows visible in the picker viewport, so navigation and cancel remain available while storage is slow. Loaded metadata stays cached while the TUI is open. The "New session" row stays pinned above the scrolling list; selecting it retains the list's viewport and continues loading those visible rows. The picker shows every session the registry knows about: TUI, Matrix-attached, `spawn_agent` / `spawn_worker` children, and anything synced from remote peers. The current session is marked with `*`. Press `Enter` to switch, `n` to create a new session, or `Esc` to cancel.
 
 ## Named Sessions
 
@@ -276,7 +276,7 @@ Pick a model for a specific scope — the whole session, or one agent in this se
 - **`Session`** (row 0) — the session-wide pin (`SessionMeta.model`, what `/model <id>` writes). Every agent uses this unless its own row sets an override.
 - **`<agent>`** — per-agent override for that agent (`SessionMeta.agent_models[name]`, what `/model <agent> <id>` writes). Falls back to the session pin when unset.
 
-`↑` / `↓` (or click) selects a row. `Enter` opens the picker locked to that row's scope:
+`↑` / `↓` (or click) selects a row. Overflowing Settings lists keep the selected row visible. Defaults, Session Agents, and Models reserve room for their footer hints when space permits; in a short pane, selectable rows take precedence over hints. `Enter` opens the picker locked to that row's scope:
 
 ```text
 +--[ Search models (143) ]----------------------------------------+
@@ -313,10 +313,10 @@ There is no global key binding for `/models` — terminals without the keyboard-
 
 ## Live turn activity
 
-| Display                            | Source                            | Clears when                                                                       |
-| ---------------------------------- | --------------------------------- | --------------------------------------------------------------------------------- |
-| `thinking...` in the messages area | Unexpired executor per-turn start | The attempt completes (including errors or silent turns) or its heartbeat expires |
-| `_agent_ acknowledged turn`        | Historical Ack entry              | Never a live indicator; remains in history                                        |
+| Display                            | Source                            | Clears when                                                       |
+| ---------------------------------- | --------------------------------- | ----------------------------------------------------------------- |
+| `thinking...` in the messages area | Unexpired executor per-turn start | The attempt completes (including errors) or its heartbeat expires |
+| `_agent_ acknowledged turn`        | Historical Ack entry              | Never a live indicator; remains in history                        |
 
 The TUI watches the shared session database, not its own submitted-message state.
 A remote executor's start and completion arrive through sync, so a tab opened
@@ -331,7 +331,7 @@ For example, after sending `@chaz:example` a question in a shared Matrix room:
 1. Open that session in the TUI. During the executor's turn, the bottom of the
    messages area shows `thinking...` even though the prompt was not typed here.
 2. After the reply, `thinking...` disappears; an older `chaz acknowledged turn`
-   line may remain as history. On a silent turn or error it also disappears.
+   line may remain as history. On an error it also disappears.
 3. If the executor exits before completion, `thinking...` clears after the
    heartbeat expires. `/interrupted` then lists the interrupted request;
    `/retry <request_id>` starts a new claim after you decide retrying is safe.
@@ -364,3 +364,15 @@ When an agent calls a tool that requires approval, the TUI shows an inline promp
 ```
 
 Press `y` to approve, `n` to deny, or `a` to approve all remaining tool calls for this turn.
+
+## Testing the terminal lifecycle
+
+Contributors can run `nix develop .# -c just tui-pty` on Linux with `uv` available.
+This drives the real TUI under a narrow PTY with a disposable database and a
+loopback stub backend: Unicode input, final reply rendering, resize, and idle
+Ctrl+C quit with terminal restoration.
+It also checks that missing output fails on both early exit and timeout, and
+that children are reaped.
+This complements the fast widget snapshots; it does not test in-flight job
+cancellation.
+See `dev/tui-pty/README.md` for isolation details and failure artifact locations.

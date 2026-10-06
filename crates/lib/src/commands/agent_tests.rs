@@ -103,7 +103,7 @@ async fn agent_new_writes_overrides_into_db_and_registers() {
         name: "alpha".to_string(),
         overrides: vec![
             ("model".into(), "opus".into()),
-            ("max_iterations".into(), "42".into()),
+            ("max_spawn_depth".into(), "42".into()),
             ("tools".into(), "get_time,calculate".into()),
         ],
     };
@@ -115,7 +115,7 @@ async fn agent_new_writes_overrides_into_db_and_registers() {
     // Runtime registry reflects the overrides.
     let agent = server.agents().get("alpha").expect("agent registered");
     assert_eq!(agent.default_model.as_deref(), Some("opus"));
-    assert_eq!(agent.max_iterations, 42);
+    assert_eq!(agent.max_spawn_depth, 42);
     assert_eq!(
         agent.allowed_tools.as_deref(),
         Some(&["get_time".to_string(), "calculate".to_string()][..])
@@ -127,7 +127,7 @@ async fn agent_new_writes_overrides_into_db_and_registers() {
     drop(user);
     let cfg = db.read_config().await.unwrap();
     assert_eq!(cfg.model.as_deref(), Some("opus"));
-    assert_eq!(cfg.max_iterations, Some(42));
+    assert_eq!(cfg.max_spawn_depth, Some(42));
 }
 
 #[tokio::test]
@@ -371,7 +371,7 @@ async fn agent_set_system_prompt_refreshes_blob_ref_and_hydrates() {
         default_model: None,
         allowed_tools: None,
         workers: std::collections::HashMap::new(),
-        max_iterations: 10,
+        max_spawn_depth: 10,
         autonomous: false,
         presets: std::collections::HashMap::new(),
         tool_profile: None,

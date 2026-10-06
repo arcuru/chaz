@@ -1,6 +1,6 @@
 # Autonomous Agents in Shared Sessions
 
-> **Status: Implemented (v1)** — mention-only agent→agent, pure-heuristic gate, burst budget 6, room-note injection.
+> **Status: Implemented** — mention-only agent→agent, normal local finals, pure-heuristic gate, burst budget 6, room-note injection.
 
 ## Summary
 
@@ -9,8 +9,9 @@ which replies, and processing stops. This design turns a session into a
 **chat room**: multiple agents are members, and an agent's message can wake
 another agent. v1 keeps this deliberately small and safe — an agent only
 wakes another agent when it **explicitly `@mentions`** an attached agent,
-and the decision to respond uses **no extra LLM call**. Runaway loops are
-bounded by a **per-burst turn budget** derived from the session log.
+and the decision to wake uses **no extra LLM call**. The mentioned agent completes with a normal local final; Matrix participation
+is not needed for local agent-to-agent turns. Runaway loops are bounded by
+a **per-burst turn budget** derived from the session log.
 
 The human→agent path is unchanged. The only new behavior is mention-chained
 agent→agent hand-off (e.g. a human asks `@alpha`; `@alpha` answers and pulls

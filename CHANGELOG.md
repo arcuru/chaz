@@ -28,6 +28,9 @@ All notable changes to this project will be documented in this file.
   provider failure after bounded retries now fails the turn. `max_iterations`
   is kept only as the nested spawn-depth ceiling (default 10), and the TUI
   agent settings page now labels it "spawn depth".
+- Renamed `max_iterations` to `max_spawn_depth` in config, commands, and
+  `spawn_worker`. The old config field is ignored, with no alias or migration;
+  set `max_spawn_depth` explicitly to retain a non-default ceiling.
 
 ## [0.3.0](https://github.com/arcuru/chaz/compare/v0.2.0...v0.3.0) - 2024-10-25
 

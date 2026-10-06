@@ -72,9 +72,9 @@ pub struct Agent {
     /// Worker name (unique within the Agent). Lookup is scoped — Workers
     /// are NOT in a global registry; each Agent sees only its own.
     pub workers: HashMap<String, Worker>,
-    /// Maximum nested spawn depth (legacy name). The ReAct loop itself
+    /// Maximum nested spawn depth. The ReAct loop itself
     /// is unbounded: it runs until the model replies without tool calls.
-    pub max_iterations: u32,
+    pub max_spawn_depth: u32,
     /// Whether this agent can run without user input.
     pub autonomous: bool,
     /// Named override bundles for spawn-time configuration.
@@ -112,10 +112,10 @@ pub struct Worker {
     /// allowed_tools. When set, narrowed against the parent's list at
     /// spawn time (intersection).
     pub allowed_tools: Option<Vec<String>>,
-    /// Legacy-named maximum nested spawn depth for this Worker's child
+    /// Maximum nested spawn depth for this Worker's child
     /// session. It does not bound the ReAct loop: a turn keeps calling
     /// tools until the model returns a response without tool calls.
-    pub max_iterations: Option<u32>,
+    pub max_spawn_depth: Option<u32>,
     /// Named override bundles selectable via the `preset` arg of `spawn_worker`.
     pub presets: HashMap<String, AgentPreset>,
 }
@@ -138,7 +138,7 @@ impl Worker {
             system_prompt_files,
             default_model: cfg.model.clone(),
             allowed_tools: cfg.tools.clone(),
-            max_iterations: cfg.max_iterations,
+            max_spawn_depth: cfg.max_spawn_depth,
             presets: cfg.presets.clone().unwrap_or_default(),
         }
     }
@@ -156,7 +156,7 @@ impl Worker {
             system_prompt_files,
             default_model: cfg.model.clone(),
             allowed_tools: cfg.tools.clone(),
-            max_iterations: cfg.max_iterations,
+            max_spawn_depth: cfg.max_spawn_depth,
             presets: cfg.presets.clone(),
         }
     }
@@ -166,7 +166,7 @@ impl Worker {
 /// All fields are final values after applying: definition defaults → preset → inline overrides.
 pub struct ResolvedOverrides {
     pub model: Option<String>,
-    pub max_iterations: u32,
+    pub max_spawn_depth: u32,
     pub allowed_tools: Option<Vec<String>>,
     pub role_suffix: Option<String>,
     pub tool_profile: Option<String>,
@@ -198,7 +198,7 @@ impl Agent {
             default_model: agent_config.model.clone(),
             allowed_tools: agent_config.tools.clone(),
             workers,
-            max_iterations: agent_config.max_iterations.unwrap_or(10),
+            max_spawn_depth: agent_config.max_spawn_depth.unwrap_or(10),
             autonomous: agent_config.autonomous,
             presets: agent_config.presets.clone().unwrap_or_default(),
             tool_profile: agent_config.tool_profile.clone(),
@@ -234,7 +234,7 @@ impl Agent {
             default_model: cfg.model.clone(),
             allowed_tools: cfg.tools.clone(),
             workers,
-            max_iterations: cfg.max_iterations.unwrap_or(10),
+            max_spawn_depth: cfg.max_spawn_depth.unwrap_or(10),
             autonomous: cfg.autonomous,
             presets: cfg.presets.clone(),
             tool_profile: cfg.tool_profile.clone(),
@@ -257,11 +257,11 @@ impl Agent {
         &self,
         preset: Option<&str>,
         model_override: Option<&str>,
-        max_iterations_override: Option<u32>,
+        max_spawn_depth_override: Option<u32>,
         tools_override: Option<&[String]>,
     ) -> ResolvedOverrides {
         let mut model = self.default_model.clone();
-        let mut max_iterations = self.max_iterations;
+        let mut max_spawn_depth = self.max_spawn_depth;
         let mut allowed_tools = self.allowed_tools.clone();
         let mut role_suffix = None;
         let mut tool_profile = self.tool_profile.clone();
@@ -273,8 +273,8 @@ impl Agent {
             if let Some(ref m) = p.model {
                 model = Some(m.clone());
             }
-            if let Some(mi) = p.max_iterations {
-                max_iterations = mi;
+            if let Some(mi) = p.max_spawn_depth {
+                max_spawn_depth = mi;
             }
             if let Some(ref t) = p.tools {
                 // Preset tools must be subset of definition's allowed tools
@@ -290,8 +290,8 @@ impl Agent {
         if let Some(m) = model_override {
             model = Some(m.to_string());
         }
-        if let Some(mi) = max_iterations_override {
-            max_iterations = mi;
+        if let Some(mi) = max_spawn_depth_override {
+            max_spawn_depth = mi;
         }
         if let Some(t) = tools_override {
             // Inline tools must be subset of current allowed tools
@@ -300,7 +300,7 @@ impl Agent {
 
         ResolvedOverrides {
             model,
-            max_iterations,
+            max_spawn_depth,
             allowed_tools,
             role_suffix,
             tool_profile,
@@ -367,7 +367,7 @@ impl AgentRegistry {
                 default_model: None,
                 allowed_tools: None,
                 workers: HashMap::new(),
-                max_iterations: 10,
+                max_spawn_depth: 10,
                 autonomous: false,
                 presets: HashMap::new(),
                 tool_profile: None,
@@ -389,7 +389,7 @@ impl AgentRegistry {
             default_model: None,
             allowed_tools: None,
             workers: HashMap::new(),
-            max_iterations: 10,
+            max_spawn_depth: 10,
             autonomous: false,
             presets: HashMap::new(),
             tool_profile: None,
@@ -553,7 +553,7 @@ mod tests {
             default_model: None,
             allowed_tools: None,
             workers: HashMap::new(),
-            max_iterations: 10,
+            max_spawn_depth: 10,
             autonomous: false,
             presets: HashMap::new(),
             tool_profile: None,
@@ -568,7 +568,7 @@ mod tests {
         let agent = make_agent("test");
         let resolved = agent.resolve_overrides(None, None, None, None);
         assert_eq!(resolved.model, None);
-        assert_eq!(resolved.max_iterations, 10);
+        assert_eq!(resolved.max_spawn_depth, 10);
         assert!(resolved.allowed_tools.is_none());
         assert!(resolved.role_suffix.is_none());
     }
@@ -581,7 +581,7 @@ mod tests {
             "deep".to_string(),
             AgentPreset {
                 model: Some("opus".to_string()),
-                max_iterations: Some(40),
+                max_spawn_depth: Some(40),
                 tools: None,
                 role_suffix: Some("Be thorough.".to_string()),
                 tool_profile: None,
@@ -590,7 +590,7 @@ mod tests {
 
         let resolved = agent.resolve_overrides(Some("deep"), None, None, None);
         assert_eq!(resolved.model.as_deref(), Some("opus"));
-        assert_eq!(resolved.max_iterations, 40);
+        assert_eq!(resolved.max_spawn_depth, 40);
         assert_eq!(resolved.role_suffix.as_deref(), Some("Be thorough."));
     }
 
@@ -601,7 +601,7 @@ mod tests {
             "deep".to_string(),
             AgentPreset {
                 model: Some("opus".to_string()),
-                max_iterations: Some(40),
+                max_spawn_depth: Some(40),
                 tools: None,
                 role_suffix: None,
                 tool_profile: None,
@@ -610,7 +610,7 @@ mod tests {
 
         let resolved = agent.resolve_overrides(Some("deep"), Some("haiku"), Some(5), None);
         assert_eq!(resolved.model.as_deref(), Some("haiku"));
-        assert_eq!(resolved.max_iterations, 5);
+        assert_eq!(resolved.max_spawn_depth, 5);
     }
 
     #[test]
@@ -658,7 +658,7 @@ mod tests {
         let cfg = crate::agent_db::AgentDbConfig {
             model: Some("opus".to_string()),
             tools: Some(vec!["get_time".into()]),
-            max_iterations: Some(42),
+            max_spawn_depth: Some(42),
             tool_profile: Some("deep".to_string()),
             max_context_tokens: Some(200_000),
             ..Default::default()
@@ -671,7 +671,7 @@ mod tests {
             agent.allowed_tools.as_deref(),
             Some(&["get_time".to_string()][..])
         );
-        assert_eq!(agent.max_iterations, 42);
+        assert_eq!(agent.max_spawn_depth, 42);
         assert_eq!(agent.tool_profile.as_deref(), Some("deep"));
         assert_eq!(agent.max_context_tokens, Some(200_000));
         assert!(agent.workers.is_empty());
@@ -682,7 +682,7 @@ mod tests {
         let cfg = crate::agent_db::AgentDbConfig::default();
         let agent = Agent::from_db_config("fresh", &cfg);
         assert_eq!(agent.name, "fresh");
-        assert_eq!(agent.max_iterations, 10);
+        assert_eq!(agent.max_spawn_depth, 10);
         assert!(agent.allowed_tools.is_none());
         assert!(agent.workers.is_empty());
     }
@@ -694,7 +694,7 @@ mod tests {
                 crate::agent_db::WorkerDbConfig {
                     name: "researcher".into(),
                     system_prompt: "Cite sources.".into(),
-                    max_iterations: Some(20),
+                    max_spawn_depth: Some(20),
                     ..Default::default()
                 },
                 crate::agent_db::WorkerDbConfig {
@@ -710,7 +710,7 @@ mod tests {
 
         let researcher = agent.find_worker("researcher").expect("researcher");
         assert_eq!(researcher.system_prompt, "Cite sources.");
-        assert_eq!(researcher.max_iterations, Some(20));
+        assert_eq!(researcher.max_spawn_depth, Some(20));
 
         let librarian = agent.find_worker("librarian").expect("librarian");
         assert_eq!(librarian.default_model.as_deref(), Some("gpt-4"));
@@ -756,7 +756,7 @@ mod tests {
 
         let v1 = crate::agent_db::AgentDbConfig {
             model: Some("haiku".to_string()),
-            max_iterations: Some(5),
+            max_spawn_depth: Some(5),
             ..Default::default()
         };
         let built_v1 = registry.build_from_db_config("alpha", &v1);
@@ -765,12 +765,12 @@ mod tests {
             registry.get("alpha").unwrap().default_model.as_deref(),
             Some("haiku")
         );
-        assert_eq!(registry.get("alpha").unwrap().max_iterations, 5);
+        assert_eq!(registry.get("alpha").unwrap().max_spawn_depth, 5);
 
         // Second build after a config edit picks up the new values.
         let v2 = crate::agent_db::AgentDbConfig {
             model: Some("opus".to_string()),
-            max_iterations: Some(99),
+            max_spawn_depth: Some(99),
             ..Default::default()
         };
         let built_v2 = registry.build_from_db_config("alpha", &v2);
@@ -779,6 +779,6 @@ mod tests {
             registry.get("alpha").unwrap().default_model.as_deref(),
             Some("opus")
         );
-        assert_eq!(registry.get("alpha").unwrap().max_iterations, 99);
+        assert_eq!(registry.get("alpha").unwrap().max_spawn_depth, 99);
     }
 }

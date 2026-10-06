@@ -43,6 +43,7 @@ pub struct BuiltinDeps {
     pub server_slot: crate::instance::ServerSlot,
     pub backend_manager: BackendManager,
     pub security: SecurityContext,
+    pub tool_policies: Arc<crate::tool::ToolPolicyRegistry>,
 }
 
 /// Build the full built-in extension set as a vector. Consumed by
@@ -55,6 +56,7 @@ pub fn all_builtins(deps: BuiltinDeps) -> Vec<Arc<dyn crate::extension::Extensio
             server_slot.clone(),
             deps.backend_manager,
             deps.security,
+            deps.tool_policies,
         )),
         Arc::new(path_normalizer::PathNormalizer),
         Arc::new(security_warnings::SecurityWarnings),

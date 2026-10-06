@@ -48,7 +48,7 @@ impl Tool for SpawnWorker {
                     },
                     "preset": {
                         "type": "string",
-                        "description": "Optional preset name on the Worker template that overrides model/max_iterations/tools/role_suffix."
+                        "description": "Optional preset name on the Worker template that overrides model/max_spawn_depth/tools/role_suffix."
                     },
                     "tools": {
                         "type": "array",
@@ -59,9 +59,9 @@ impl Tool for SpawnWorker {
                         "type": "string",
                         "description": "Override the model for this invocation."
                     },
-                    "max_iterations": {
+                    "max_spawn_depth": {
                         "type": "integer",
-                        "description": "Legacy name for the Worker's maximum nested spawn depth. It does not limit tool calls: the Worker keeps calling tools until the model replies without one."
+                        "description": "Override the Worker's maximum nested spawn depth. It does not limit tool calls: the Worker keeps calling tools until the model replies without one."
                     },
                     "async": {
                         "type": "boolean",
@@ -120,8 +120,8 @@ impl Tool for SpawnWorker {
                         .collect()
                 });
             let model_override = arguments.get("model").and_then(|v| v.as_str());
-            let max_iterations_override = arguments
-                .get("max_iterations")
+            let max_spawn_depth_override = arguments
+                .get("max_spawn_depth")
                 .and_then(|v| v.as_u64())
                 .map(|v| v as u32);
             let is_async = arguments
@@ -153,8 +153,9 @@ impl Tool for SpawnWorker {
                 .default_model
                 .clone()
                 .or_else(|| caller_agent.default_model.clone());
-            let mut resolved_max_iterations =
-                worker.max_iterations.unwrap_or(caller_agent.max_iterations);
+            let mut resolved_max_spawn_depth = worker
+                .max_spawn_depth
+                .unwrap_or(caller_agent.max_spawn_depth);
             let mut resolved_tools = worker
                 .allowed_tools
                 .clone()
@@ -167,8 +168,8 @@ impl Tool for SpawnWorker {
                 if let Some(ref m) = p.model {
                     resolved_model = Some(m.clone());
                 }
-                if let Some(mi) = p.max_iterations {
-                    resolved_max_iterations = mi;
+                if let Some(mi) = p.max_spawn_depth {
+                    resolved_max_spawn_depth = mi;
                 }
                 if let Some(ref t) = p.tools {
                     resolved_tools = Some(intersect_tools(&resolved_tools, t));
@@ -179,8 +180,8 @@ impl Tool for SpawnWorker {
             if let Some(m) = model_override {
                 resolved_model = Some(m.to_string());
             }
-            if let Some(mi) = max_iterations_override {
-                resolved_max_iterations = mi;
+            if let Some(mi) = max_spawn_depth_override {
+                resolved_max_spawn_depth = mi;
             }
             if let Some(ref t) = tools_override {
                 resolved_tools = Some(intersect_tools(&resolved_tools, t));
@@ -217,7 +218,7 @@ impl Tool for SpawnWorker {
             // Register child session with parent→child delegation wired in.
             // No ephemeral keypair: entries on the child are signed by the
             // parent Agent's key via the delegation chain. The resolved
-            // `max_iterations` value is the child's spawn-depth ceiling;
+            // `max_spawn_depth` value is the child's spawn-depth ceiling;
             // it does not bound the child's tool-calling loop.
             let (conversation_id, session_db, mut completion_rx) = server
                 .register_child_session(
@@ -225,7 +226,7 @@ impl Tool for SpawnWorker {
                     self.backend.clone(),
                     self.security.approval_callback.clone(),
                     ctx.call_depth + 1,
-                    resolved_max_iterations as usize,
+                    resolved_max_spawn_depth as usize,
                     child_tools,
                     Some(&parent_session_db_id),
                 )

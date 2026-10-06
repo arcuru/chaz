@@ -135,26 +135,7 @@ pub async fn collect_usage(
             Ok((conv_id, db)) => {
                 let session = Session::new(conv_id, db).await;
                 let meta = session.read_meta().await;
-                let mut totals = UsageTotals::default();
-                // Single pass per session: fold each metadata into the
-                // session totals AND the cross-session per-model split.
-                for entry in session.entries() {
-                    if !include_entry(entry, filter) {
-                        continue;
-                    }
-                    let Some(m) = &entry.metadata else { continue };
-                    totals.record(m);
-                    if !m.model.is_empty() {
-                        let row = per_model.entry(m.model.clone()).or_default();
-                        row.calls += 1;
-                        row.prompt_tokens += m.usage.prompt_tokens as u64;
-                        row.completion_tokens += m.usage.completion_tokens as u64;
-                        if let Some(c) = m.usage.cost_usd {
-                            row.cost_usd += c;
-                            row.cost_reported = true;
-                        }
-                    }
-                }
+                let totals = collect_session_usage(session.entries(), filter, &mut per_model);
                 (meta.name, totals)
             }
             Err(e) => {
@@ -216,18 +197,32 @@ pub async fn collect_usage(
     })
 }
 
-#[cfg(test)]
-fn collect_entries(entries: &[SessionEntry], filter: &UsageFilter) -> UsageTotals {
-    let mut t = UsageTotals::default();
+/// Tally recorded Message metadata in entry order. Session selection stays
+/// with the caller; sharing the model accumulator preserves cost arithmetic.
+pub(crate) fn collect_session_usage(
+    entries: &[SessionEntry],
+    filter: &UsageFilter,
+    per_model: &mut BTreeMap<String, ModelUsage>,
+) -> UsageTotals {
+    let mut totals = UsageTotals::default();
     for entry in entries {
         if !include_entry(entry, filter) {
             continue;
         }
-        if let Some(m) = &entry.metadata {
-            t.record(m);
+        let Some(m) = &entry.metadata else { continue };
+        totals.record(m);
+        if !m.model.is_empty() {
+            let row = per_model.entry(m.model.clone()).or_default();
+            row.calls += 1;
+            row.prompt_tokens += m.usage.prompt_tokens as u64;
+            row.completion_tokens += m.usage.completion_tokens as u64;
+            if let Some(c) = m.usage.cost_usd {
+                row.cost_usd += c;
+                row.cost_reported = true;
+            }
         }
     }
-    t
+    totals
 }
 
 fn include_entry(entry: &SessionEntry, filter: &UsageFilter) -> bool {
@@ -383,7 +378,7 @@ mod tests {
     }
 
     #[test]
-    fn collect_entries_sums_metadata_and_filters_by_since() {
+    fn collect_session_usage_sums_metadata_and_filters_by_since() {
         let early = Utc.with_ymd_and_hms(2026, 5, 10, 0, 0, 0).unwrap();
         let late = Utc.with_ymd_and_hms(2026, 5, 13, 0, 0, 0).unwrap();
         let entries = vec![
@@ -392,30 +387,150 @@ mod tests {
             mk_entry(late, "opus", None),
         ];
 
-        let all = collect_entries(&entries, &UsageFilter::default());
+        let all = collect_session_usage(&entries, &UsageFilter::default(), &mut BTreeMap::new());
         assert_eq!(all.calls, 3);
         assert_eq!(all.prompt_tokens, 300);
         assert!((all.cost_usd - 0.003).abs() < 1e-9);
         assert!(all.cost_reported);
 
-        let recent = collect_entries(
+        let recent = collect_session_usage(
             &entries,
             &UsageFilter {
                 since: Some(Utc.with_ymd_and_hms(2026, 5, 12, 0, 0, 0).unwrap()),
                 ..Default::default()
             },
+            &mut BTreeMap::new(),
         );
         assert_eq!(recent.calls, 2, "since-filter drops earlier entries");
     }
 
     #[test]
-    fn collect_entries_skips_non_message_entries() {
+    fn collect_session_usage_skips_non_message_entries() {
         let ts = Utc.with_ymd_and_hms(2026, 5, 13, 0, 0, 0).unwrap();
         let mut tool_entry = mk_entry(ts, "haiku", Some(0.05));
         tool_entry.entry_type = EntryType::ToolCall;
         let entries = vec![tool_entry];
 
-        let t = collect_entries(&entries, &UsageFilter::default());
+        let t = collect_session_usage(&entries, &UsageFilter::default(), &mut BTreeMap::new());
         assert_eq!(t.calls, 0, "only Message entries count");
+    }
+
+    #[test]
+    fn tally_keeps_optional_tokens_cost_coverage_and_inclusive_since() {
+        let since = Utc.with_ymd_and_hms(2026, 10, 1, 0, 0, 0).unwrap();
+        let mut entries = vec![
+            mk_entry(since - chrono::Duration::nanoseconds(1), "old", Some(99.0)),
+            mk_entry(since, "zero", Some(0.0)),
+            mk_entry(since, "missing", None),
+            mk_entry(since, "zero", None),
+            mk_entry(since, "", Some(0.5)),
+        ];
+        let usage = &mut entries[1].metadata.as_mut().unwrap().usage;
+        usage.cache_creation_tokens = Some(7);
+        usage.reasoning_tokens = Some(3);
+        let mut no_metadata = mk_entry(since, "ignored", Some(99.0));
+        no_metadata.metadata = None;
+        entries.push(no_metadata);
+        let mut audit = mk_entry(since, "ignored", Some(99.0));
+        audit.entry_type = EntryType::ToolResult;
+        entries.push(audit);
+        let mut models = BTreeMap::new();
+        let total = collect_session_usage(
+            &entries,
+            &UsageFilter {
+                since: Some(since),
+                ..Default::default()
+            },
+            &mut models,
+        );
+        assert_eq!(
+            serde_json::to_value(total).unwrap(),
+            serde_json::json!({
+                "calls": 4, "prompt_tokens": 400, "completion_tokens": 200,
+                "cached_tokens": 40, "cache_creation_tokens": 7, "reasoning_tokens": 3,
+                "cost_usd": 0.5, "cost_reported": true
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(models).unwrap(),
+            serde_json::json!({
+                "zero": {"calls": 2, "prompt_tokens": 200, "completion_tokens": 100, "cost_usd": 0.0, "cost_reported": true},
+                "missing": {"calls": 1, "prompt_tokens": 100, "completion_tokens": 50, "cost_usd": 0.0, "cost_reported": false}
+            })
+        );
+        let empty = collect_session_usage(&[], &Default::default(), &mut BTreeMap::new());
+        assert_eq!(empty.calls, 0);
+        assert!(!empty.cost_reported);
+    }
+
+    #[test]
+    fn per_model_cost_additions_stay_in_entry_order_across_sessions() {
+        let ts = Utc.with_ymd_and_hms(2026, 10, 1, 0, 0, 0).unwrap();
+        let mut models = BTreeMap::new();
+        collect_session_usage(
+            &[mk_entry(ts, "model", Some(1e16))],
+            &Default::default(),
+            &mut models,
+        );
+        collect_session_usage(
+            &[
+                mk_entry(ts, "model", Some(1.0)),
+                mk_entry(ts, "model", Some(1.0)),
+            ],
+            &Default::default(),
+            &mut models,
+        );
+        // Regrouping the second session into a subtotal would produce 1e16 + 2.
+        assert_eq!(models["model"].cost_usd, (1e16_f64 + 1.0) + 1.0);
+    }
+
+    #[tokio::test]
+    async fn operator_rollup_json_and_text_contract() {
+        let (_instance, registry) = crate::test_support::fresh_session_registry().await;
+        let (id, db) = registry.create_session(Some("cli")).await.unwrap();
+        let mut session = Session::new(id, db).await;
+        session
+            .update_meta(|m| m.name = Some("fixture".into()))
+            .await
+            .unwrap();
+        let ts = Utc.with_ymd_and_hms(2026, 10, 1, 0, 0, 0).unwrap();
+        session
+            .add_entry(mk_entry(ts, "model", Some(0.25)))
+            .await
+            .unwrap();
+        let rollup = collect_usage(&registry, &Default::default()).await.unwrap();
+        assert_eq!(
+            serde_json::to_value(&rollup.per_model["model"]).unwrap(),
+            serde_json::json!({
+                "calls": 1, "prompt_tokens": 100, "completion_tokens": 50,
+                "cost_usd": 0.25, "cost_reported": true
+            })
+        );
+        let mut wire = serde_json::to_value(&rollup).unwrap();
+        // Only the generated DB ID and catalog timestamp are nondeterministic.
+        wire["per_session"][0]["session_db_id"] = serde_json::json!("<session>");
+        wire["per_session"][0]["created_at"] = serde_json::json!("<created>");
+        assert_eq!(
+            wire,
+            serde_json::json!({
+                "sessions_scanned": 1, "sessions_with_usage": 1,
+                "total": {"calls": 1, "prompt_tokens": 100, "completion_tokens": 50, "cached_tokens": 10,
+                    "cache_creation_tokens": 0, "reasoning_tokens": 0, "cost_usd": 0.25, "cost_reported": true},
+                "per_session": [{"session_db_id": "<session>", "name": "fixture", "gateway": "cli", "created_at": "<created>",
+                    "status": "Active", "totals": {"calls": 1, "prompt_tokens": 100, "completion_tokens": 50, "cached_tokens": 10,
+                        "cache_creation_tokens": 0, "reasoning_tokens": 0, "cost_usd": 0.25, "cost_reported": true}}],
+                "per_model": {"model": {"calls": 1, "prompt_tokens": 100, "completion_tokens": 50, "cost_usd": 0.25, "cost_reported": true}},
+                "filter": {"since": null, "gateway": null, "active_only": false}
+            })
+        );
+        assert_eq!(
+            render_text(&rollup),
+            concat!(
+                "LLM usage\n  Sessions: 1 scanned, 1 with recorded usage\n",
+                "  Total: 1 call | 100 prompt + 50 completion (10 cached) | $0.2500\n",
+                "\nBy model:\n  model                                       1 call  $0.2500\n",
+                "\nTop sessions:\n  fixture                          [cli   ]    1 call  $0.2500\n"
+            )
+        );
     }
 }

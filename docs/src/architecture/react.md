@@ -53,10 +53,39 @@ Scheduled turns currently retain the compatibility `RuntimeEvent` adapter becaus
 
 ## Fallback Behavior
 
-- If the scoped tool set is empty, or the backend does not support tool calling, the runtime makes a single-shot call without tool definitions.
+- Unbound sessions without tool support fall back to a single-shot LLM call. A reply-capable attached session requires tool support so `no_reply({})` remains available on every turn.
 - Otherwise every model request in the turn offers the same tool definitions. The runtime never withholds tools to force a final answer: withholding them lets a model that still wants a tool print its call as plain text.
 - A retryable provider error (rate limit, 5xx, timeout, network) is retried with backoff up to the backend's `max_retries`. When retries are exhausted, or the error is not retryable, the turn fails with that error. It is not retried without tools.
-- If the model returns an empty response after tool calls, the last tool result becomes the reply.
+- If the model returns an empty response after tool calls, the last tool result becomes the reply on unbound turns. reply-capable attached turns reject empty text without terminal `no_reply`.
+
+## Turn finals, terminal silence, and addressed bridge sends
+
+A normal final from a conversational external-origin turn is a local session
+`Message` and an addressed, versioned `BridgeEvent` outbound request committed
+with the completed attempt in one transaction.
+The local copy references that outbox identity, so later context can show its
+pending or sent state instead of presenting it as private text.
+A TUI, scheduled, or local-agent final in that session stays local.
+Blank model text is an error, not deliberate silence; `no_reply({})` is a sole
+terminal model action that completes without a final or external post.
+Its definition stays stable across all turns in a conversationally attached
+session to preserve the model-call tool prefix.
+
+The optional `matrix__send` tool checks the executing agent's registered Matrix
+login and the session's singular attachment, then queues the same generic
+outbound event.
+A successful explicit send during a Matrix-origin turn counts as its room
+reply: its later final remains local and cannot create a second post.
+The Matrix bridge sends only addressed outbox events to its bound room, using
+per-binding progress and stable transaction IDs; after acknowledgement it
+records a generic `BridgeEvent` receipt.
+Already-written `MatrixObserved`, `MatrixSend`, and `MatrixSent` entries remain
+readable, but are not produced by new code.
+Local-only finals, tool audit rows, and agent-to-agent wakes cannot leak into
+this addressed Matrix path.
+Other transports can use the same core contract; Discord retains its previous
+fanout path until migrated.
+Source and outbound state come from typed metadata, not mutable body headers.
 
 ## Context Assembly
 

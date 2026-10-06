@@ -348,23 +348,47 @@ pub(super) enum MouseOutcome {
 }
 
 pub(super) fn handle_mouse(app: &mut App, m: MouseEvent) -> Option<MouseOutcome> {
-    // Wheel scrolls the overlay when one is up, otherwise the chat history.
+    // Route the wheel to the visible cursor list; never scroll chat behind it.
     match m.kind {
-        MouseEventKind::ScrollUp => {
+        MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+            let down = m.kind == MouseEventKind::ScrollDown;
             if let Some(Overlay::Help { scroll }) = app.overlay.as_mut() {
-                *scroll = scroll.saturating_sub(3);
+                *scroll = if down {
+                    scroll.saturating_add(3)
+                } else {
+                    scroll.saturating_sub(3)
+                };
+            } else if app.overlay.is_some() {
+                // Modal overlays own the wheel even when they have no scroll.
+            } else if let Some(picker) = app.settings_picker.as_mut() {
+                picker.selected = wheel_step(picker.selected, down, picker.filtered().len());
+            } else if app.mode == TuiMode::ModelPicker {
+                app.model_picker_index = wheel_step(
+                    app.model_picker_index,
+                    down,
+                    app.model_picker_filtered.len(),
+                );
+            } else if app.mode == TuiMode::SessionPicker {
+                app.picker_index = wheel_step(app.picker_index, down, app.picker_len());
+            } else if let TuiMode::Settings(scope) = app.mode {
+                // The left rail has no scrollable rows, and the agent diff
+                // modal hides the list, so only a visible detail list moves.
+                if m.column < super::SETTINGS_SIDEBAR_W || app.agent_diff.is_some() {
+                    return None;
+                }
+                let cat = app.settings_index(scope);
+                if let Some(len) = settings_inner_list_len(app, scope, cat)
+                    && let Some(cursor) = inner_cursor_mut(app, scope, cat)
+                {
+                    *cursor = wheel_step(*cursor, down, len);
+                }
             } else {
                 let off = &mut app.active_mut().scroll_offset;
-                *off = off.saturating_add(3);
-            }
-            return None;
-        }
-        MouseEventKind::ScrollDown => {
-            if let Some(Overlay::Help { scroll }) = app.overlay.as_mut() {
-                *scroll = scroll.saturating_add(3);
-            } else {
-                let off = &mut app.active_mut().scroll_offset;
-                *off = off.saturating_sub(3);
+                *off = if down {
+                    off.saturating_sub(3)
+                } else {
+                    off.saturating_add(3)
+                };
             }
             return None;
         }
@@ -481,20 +505,37 @@ fn set_settings_detail_cursor(app: &mut App, scope: SettingsScope, cat: usize, r
     if len == 0 {
         return;
     }
-    let clamped = row.min(len - 1);
+    if let Some(cursor) = inner_cursor_mut(app, scope, cat) {
+        *cursor = row.min(len - 1);
+    }
+}
+
+/// The inner-list cursor owned by the active category, or `None` when the
+/// category has no cursor list — the one place that maps a category to its
+/// cursor field.
+fn inner_cursor_mut(app: &mut App, scope: SettingsScope, cat: usize) -> Option<&mut usize> {
     use super::{PeerSettingsCategory, SessionSettingsCategory};
     match scope {
-        SettingsScope::Peer => match PeerSettingsCategory::ALL.get(cat) {
-            Some(PeerSettingsCategory::Agents) => app.peer_agents_cursor = clamped,
-            Some(PeerSettingsCategory::Defaults) => app.peer_defaults_cursor = clamped,
-            Some(PeerSettingsCategory::Mcp) => app.peer_mcp_cursor = clamped,
-            _ => {}
+        SettingsScope::Peer => match PeerSettingsCategory::ALL.get(cat)? {
+            PeerSettingsCategory::Agents => Some(&mut app.peer_agents_cursor),
+            PeerSettingsCategory::Defaults => Some(&mut app.peer_defaults_cursor),
+            PeerSettingsCategory::Mcp => Some(&mut app.peer_mcp_cursor),
+            _ => None,
         },
-        SettingsScope::Session => match SessionSettingsCategory::ALL.get(cat) {
-            Some(SessionSettingsCategory::Agents) => app.session_agents_cursor = clamped,
-            Some(SessionSettingsCategory::Models) => app.session_models_cursor = clamped,
-            _ => {}
+        SettingsScope::Session => match SessionSettingsCategory::ALL.get(cat)? {
+            SessionSettingsCategory::Agents => Some(&mut app.session_agents_cursor),
+            SessionSettingsCategory::Models => Some(&mut app.session_models_cursor),
+            _ => None,
         },
+    }
+}
+
+/// One wheel notch moves a list cursor three rows, clamped to `len`.
+fn wheel_step(cursor: usize, down: bool, len: usize) -> usize {
+    if down {
+        cursor.saturating_add(3).min(len.saturating_sub(1))
+    } else {
+        cursor.saturating_sub(3)
     }
 }
 
@@ -1460,19 +1501,8 @@ fn bump_inner_cursor(
     if len == 0 {
         return;
     }
-    use super::{PeerSettingsCategory, SessionSettingsCategory};
-    let cursor_ref: &mut usize = match scope {
-        SettingsScope::Peer => match PeerSettingsCategory::ALL.get(category_idx) {
-            Some(PeerSettingsCategory::Agents) => &mut app.peer_agents_cursor,
-            Some(PeerSettingsCategory::Defaults) => &mut app.peer_defaults_cursor,
-            Some(PeerSettingsCategory::Mcp) => &mut app.peer_mcp_cursor,
-            _ => return,
-        },
-        SettingsScope::Session => match SessionSettingsCategory::ALL.get(category_idx) {
-            Some(SessionSettingsCategory::Agents) => &mut app.session_agents_cursor,
-            Some(SessionSettingsCategory::Models) => &mut app.session_models_cursor,
-            _ => return,
-        },
+    let Some(cursor_ref) = inner_cursor_mut(app, scope, category_idx) else {
+        return;
     };
     let cur = (*cursor_ref).min(len.saturating_sub(1));
     let n = len as i32;
