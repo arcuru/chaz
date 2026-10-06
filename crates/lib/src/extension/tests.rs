@@ -109,6 +109,7 @@ struct TestParts {
     session_shutdown: Option<Arc<dyn handler::HookHandlerSessionShutdown>>,
     routine_handler: Option<Arc<dyn handler::RoutineHandler>>,
     prompt_augmentation: Option<Arc<dyn caps::PromptAugmentation>>,
+    context_tail: Option<Arc<dyn caps::ContextTail>>,
     status_segment: Option<Arc<dyn caps::StatusSegment>>,
     tools: Vec<Arc<dyn Tool>>,
     commands: Vec<(String, Arc<dyn ExtensionCommand>)>,
@@ -161,6 +162,10 @@ impl TestExt {
     }
     fn prompt_augmentation(mut self, p: Arc<dyn caps::PromptAugmentation>) -> Self {
         self.parts.prompt_augmentation = Some(p);
+        self
+    }
+    fn context_tail(mut self, tail: Arc<dyn caps::ContextTail>) -> Self {
+        self.parts.context_tail = Some(tail);
         self
     }
     fn status_segment(mut self, s: Arc<dyn caps::StatusSegment>) -> Self {
@@ -260,6 +265,9 @@ impl instance::ExtensionInstance for TestInstance {
     fn prompt_augmentation(&self) -> Option<Arc<dyn caps::PromptAugmentation>> {
         self.parts.prompt_augmentation.clone()
     }
+    fn context_tail(&self) -> Option<Arc<dyn caps::ContextTail>> {
+        self.parts.context_tail.clone()
+    }
     fn status_segment(&self) -> Option<Arc<dyn caps::StatusSegment>> {
         self.parts.status_segment.clone()
     }
@@ -321,6 +329,67 @@ impl caps::PromptAugmentation for FixedAug {
         let text = self.0.to_string();
         Box::pin(async move { Ok(Some(text)) })
     }
+}
+
+impl caps::ContextTail for FixedAug {
+    fn context_tail<'a>(
+        &'a self,
+        _agent_name: &'a str,
+        _recent: &'a [String],
+    ) -> caps::CapFuture<'a, Option<String>> {
+        let text = self.0.to_string();
+        Box::pin(async move { Ok(Some(text)) })
+    }
+}
+
+#[tokio::test]
+async fn context_augmentation_order_is_stable_and_filtered() {
+    let mut hub = test_hub().await;
+    let names = ["zulu", "echo", "alpha", "delta", "bravo", "charlie"];
+    let mut extensions: Vec<Arc<dyn Extension>> = names
+        .iter()
+        .map(|&name| {
+            Arc::new(
+                TestExt::new(name)
+                    .scopes(vec![instance::Scope::PerSession])
+                    .prompt_augmentation(Arc::new(FixedAug(name)))
+                    .context_tail(Arc::new(FixedAug(name))),
+            ) as Arc<dyn Extension>
+        })
+        .collect();
+    extensions.push(Arc::new(
+        TestExt::new("global")
+            .prompt_augmentation(Arc::new(FixedAug("GLOBAL")))
+            .context_tail(Arc::new(FixedAug("GLOBAL"))),
+    ));
+    hub.install_all(extensions).await.unwrap();
+    let (_instance, db) = make_session_db().await;
+    let expected = "alpha\n\nbravo\n\ncharlie\n\ndelta\n\necho\n\nzulu";
+
+    // Each collection builds a fresh name map; cache hits must preserve the
+    // same model-facing bytes as the initial lazy instantiation.
+    for _ in 0..8 {
+        assert_eq!(
+            hub.augment_system_prompt("chaz", &[], &[], None, Some(&db))
+                .await,
+            expected
+        );
+        assert_eq!(
+            hub.context_tails("chaz", &[], None, Some(&db)).await,
+            expected
+        );
+    }
+    let active = vec!["zulu".to_string(), "bravo".to_string()];
+    assert_eq!(
+        hub.augment_system_prompt("chaz", &[], &[], Some(&active), Some(&db))
+            .await,
+        "bravo\n\nzulu"
+    );
+    assert_eq!(
+        hub.context_tails("chaz", &[], Some(&active), Some(&db))
+            .await,
+        "bravo\n\nzulu"
+    );
 }
 
 struct FixedStatus(&'static str, &'static str);
