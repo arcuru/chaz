@@ -100,6 +100,11 @@ pub enum Command {
     Compact,
     /// Dump the transcript of the current session.
     Print,
+    /// Ask the executor to stop the turn running in the current session, by
+    /// recording an [`EntryType::Cancel`](crate::session::EntryType::Cancel)
+    /// entry. The client captures the active attempt; delayed events never
+    /// affect another attempt.
+    Stop,
     /// Aggregate LLM usage and cost across all sessions.
     ListCosts,
     /// Show interrupted turns in the current session. These are never replayed
@@ -275,6 +280,7 @@ pub const BUILTIN_COMMAND_NAMES: &[&str] = &[
     "share",
     "unshare",
     "compact",
+    "stop",
     "schedules",
     "info",
     "costs",
@@ -396,6 +402,7 @@ pub async fn dispatch(cmd: Command, ctx: &CommandContext<'_>) -> CommandOutcome 
         Command::Sync(ticket) => Box::pin(session::sync_ticket(&ticket, ctx)).await,
         Command::Compact => Box::pin(session::compact(ctx)).await,
         Command::Print => Box::pin(session::print_transcript(ctx)).await,
+        Command::Stop => Box::pin(session::stop(ctx)).await,
         Command::ListChannels => Box::pin(session::list_channels(ctx)).await,
         Command::AgentAdd(r) => Box::pin(agent::agent_add(&r, ctx)).await,
         Command::AgentRemove(r) => Box::pin(agent::agent_remove(&r, ctx)).await,

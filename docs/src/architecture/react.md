@@ -51,6 +51,26 @@ Executor-backed turns pass an awaited `RuntimeRecorder` into the loop. It persis
 
 Scheduled turns currently retain the compatibility `RuntimeEvent` adapter because they do not have a durable turn-attempt record. That adapter projects tool-call and tool-result events to ordinary session entries.
 
+## Cancellation
+
+`execute_cancellable_with_recorder` receives an executor-owned `TurnCancel`, a sticky, idempotent flag with an async wait.
+The server stores it with the durable attempt in a session-keyed running-turn map.
+Before its processing and queue gates, `process_session` scans for a non-agent `Cancel` event whose request ID and attempt ID both match.
+It scans all entries because audit writes can arrive after the control event.
+Registration rereads the session to cover an event written between durable start and signal installation.
+Wall-clock timestamps do not choose the target.
+
+The runtime races cancellation against model requests (including retry backoff), pending approval, and tool execution, and checks it before each tool call.
+It drops the losing work future, but never abandons transcript persistence.
+Every remaining call in a recorded native batch gets an awaited `ToolResultOutcome::Cancelled`, including calls not yet started.
+The runtime fires `agent_end` and returns `TurnError::Cancelled` with completed-call usage.
+The server commits the terminal cancellation record, visible `Error`, and attempt completion together, then releases the processing slot for the next request.
+Complete cancelled exchanges can replay; incomplete persistence leaves an interrupted attempt instead.
+
+On Unix the native shell host places each shell in its own process group and kills that group when its wait is dropped.
+Tokio's `kill_on_drop` cleans up the direct child; no shell-job registry or model-callable cancel tool is added.
+`execute` and `execute_with_recorder` remain non-cancellable wrappers for existing schedule and test callers.
+
 ## Fallback Behavior
 
 - Unbound sessions without tool support fall back to a single-shot LLM call. A reply-capable attached session requires tool support so `no_reply({})` remains available on every turn.

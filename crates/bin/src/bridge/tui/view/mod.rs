@@ -763,6 +763,12 @@ fn ui_chat(f: &mut ratatui::Frame, app: &mut App, ext_segments: &[String]) {
                     dim,
                 )]));
             }
+            EntryType::Cancel => {
+                lines.push(Line::from(vec![Span::styled(
+                    format!("{debug_prefix}  ⏹ stop requested by {}", entry.sender),
+                    dim,
+                )]));
+            }
             EntryType::ApprovalDecision => {
                 let label = chaz_core::bridge::parse_approval_decision(entry)
                     .map(|p| format!("🔓 approval {}", p.decision))
@@ -1141,7 +1147,7 @@ fn render_completion_popup(
 pub(super) fn turn_activity_line(active_turns: usize) -> Option<Line<'static>> {
     (active_turns > 0).then(|| {
         Line::from(Span::styled(
-            "  thinking...",
+            "  thinking... Esc stop · Ctrl+C quit",
             Style::default().fg(COLOR_DIM),
         ))
     })
@@ -2164,7 +2170,7 @@ mod tests {
     #[test]
     fn thinking_indicator_is_drawn_only_for_a_live_claim() {
         use ratatui::{Terminal, backend::TestBackend, widgets::Paragraph};
-        let mut terminal = Terminal::new(TestBackend::new(24, 1)).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(40, 1)).unwrap();
         assert!(super::turn_activity_line(0).is_none());
         terminal
             .draw(|frame| {
@@ -2182,7 +2188,9 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
         assert!(
-            rendered.contains("thinking..."),
+            rendered.contains("thinking...")
+                && rendered.contains("Esc stop")
+                && rendered.contains("Ctrl+C quit"),
             "actual TUI buffer: {rendered}"
         );
     }

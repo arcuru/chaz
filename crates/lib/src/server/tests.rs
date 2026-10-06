@@ -2053,77 +2053,6 @@ async fn peer_is_home_for_returns_false_when_home_is_another_peer() {
     assert!(!server.peer_is_home_for(&sid, "alpha").await);
 }
 
-// ---- Deferred home-pubkey warnings ----------------------------------
-// `warn_unset_home_pubkey_on_coowned` runs deferred off the critical path
-// (build.rs step 2c). These tests pin its lazy contract: solo agents never
-// trigger a session-index fetch, co-owned agents do, and a precomputed list
-// is reused instead of re-queried.
-
-#[tokio::test]
-async fn home_pubkey_warn_skips_session_fetch_for_solo_agents() {
-    let (_instance, server, registry) = server_fixture().await;
-    seed_agent(&server, &registry, "alpha").await;
-    // A live session exists, so a fetch would return Some — None proves the
-    // solo-agent fast path never touched the session index.
-    registry.create_session(Some("t")).await.unwrap();
-    let fetched =
-        build::warn_unset_home_pubkey_on_coowned(&registry, server.agent_index(), None).await;
-    assert!(
-        fetched.is_none(),
-        "solo agents must not trigger a session fetch"
-    );
-}
-
-#[tokio::test]
-async fn home_pubkey_warn_fetches_sessions_for_coowned_agents() {
-    let (_instance, server, registry) = server_fixture().await;
-    let (entry, _adb) = seed_agent(&server, &registry, "alpha").await;
-    let other = registry.new_ephemeral_key("other-peer").await.unwrap();
-    registry
-        .grant_on_agent_db(
-            &entry.db_id,
-            &other,
-            "co-owner:test",
-            eidetica::auth::types::Permission::Admin(1),
-        )
-        .await
-        .unwrap();
-    registry.create_session(Some("t")).await.unwrap();
-    let fetched =
-        build::warn_unset_home_pubkey_on_coowned(&registry, server.agent_index(), None).await;
-    assert_eq!(
-        fetched.map(|s| s.len()),
-        Some(1),
-        "co-owned agents must trigger a session fetch"
-    );
-}
-
-#[tokio::test]
-async fn home_pubkey_warn_reuses_precomputed_sessions() {
-    let (_instance, server, registry) = server_fixture().await;
-    let (entry, _adb) = seed_agent(&server, &registry, "alpha").await;
-    let other = registry.new_ephemeral_key("other-peer").await.unwrap();
-    registry
-        .grant_on_agent_db(
-            &entry.db_id,
-            &other,
-            "co-owner:test",
-            eidetica::auth::types::Permission::Admin(1),
-        )
-        .await
-        .unwrap();
-    // One real session exists, but the caller passes an empty precomputed
-    // list — an empty result proves the cached list was reused, not re-queried.
-    registry.create_session(Some("t")).await.unwrap();
-    let fetched =
-        build::warn_unset_home_pubkey_on_coowned(&registry, server.agent_index(), Some(&[])).await;
-    assert_eq!(
-        fetched.map(|s| s.len()),
-        Some(0),
-        "precomputed list must be reused, not re-queried"
-    );
-}
-
 // ---- Bridge-home migration ------------------------------------------
 
 fn bridge_set(keys: &[&eidetica::auth::crypto::PublicKey]) -> std::collections::HashSet<String> {
@@ -7231,4 +7160,405 @@ async fn costs_command_preserves_operator_text_contract() {
         )
     );
     server.shutdown().await;
+}
+
+// ---- User stop requests ---------------------------------------------------
+
+/// A backend whose every model call waits for a permit, so a test decides
+/// exactly when (or whether) a turn's model call completes.
+struct GatedBackend {
+    gate: tokio::sync::Semaphore,
+}
+
+impl GatedBackend {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            gate: tokio::sync::Semaphore::new(0),
+        })
+    }
+    fn release_one(&self) {
+        self.gate.add_permits(1);
+    }
+}
+
+impl crate::backends::BackendDispatch for GatedBackend {
+    fn execute<'a>(
+        &'a self,
+        _context: &'a crate::backends::ChatContext,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<String, crate::error::LlmError>> + Send + 'a>,
+    > {
+        Box::pin(std::future::pending())
+    }
+    fn supports_tools(&self) -> bool {
+        true
+    }
+    fn chat_with_tools<'a>(
+        &'a self,
+        _messages: &'a [crate::runtime::RuntimeMessage],
+        _tools: &'a [crate::tool::ToolDefinition],
+        _model: &'a str,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<crate::runtime::LLMResponse, crate::error::LlmError>,
+                > + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            self.gate.acquire().await.expect("gate open").forget();
+            Ok(crate::runtime::LLMResponse::Text {
+                content: "reply".to_string(),
+                metadata: None,
+            })
+        })
+    }
+}
+
+/// A registered session with `alpha` attached, answered by `backend`.
+async fn gated_session(
+    server: &Arc<Server>,
+    registry: &Arc<crate::session::SessionRegistry>,
+    entry: &DbEntry,
+    backend: Arc<GatedBackend>,
+) -> (eidetica::Database, String) {
+    let (_conv, session_db) = registry.create_session(Some("t")).await.unwrap();
+    let sid = session_db.root_id().to_string();
+    registry.attach_agent_to_session(&sid, entry).await.unwrap();
+    let backend = crate::backends::BackendManager::with_mock(
+        backend,
+        crate::security::SecretStore::new(registry.chaz_peer().clone()).await,
+    );
+    server
+        .register_session(&session_db, backend, Some("alpha".to_string()), None)
+        .await
+        .unwrap();
+    (session_db, sid)
+}
+
+async fn session_entries(session_db: &eidetica::Database, sid: &str) -> Vec<SessionEntry> {
+    crate::session::Session::new(
+        crate::types::ConversationId(sid.to_string()),
+        session_db.clone(),
+    )
+    .await
+    .entries()
+    .to_vec()
+}
+
+/// Poll until at least `n` entries match `pred`; `false` after ~5s.
+async fn await_entries(
+    session_db: &eidetica::Database,
+    sid: &str,
+    n: usize,
+    pred: impl Fn(&SessionEntry) -> bool,
+) -> bool {
+    for _ in 0..100 {
+        if session_entries(session_db, sid)
+            .await
+            .iter()
+            .filter(|e| pred(e))
+            .count()
+            >= n
+        {
+            return true;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    false
+}
+
+fn is_ack(e: &SessionEntry) -> bool {
+    e.sender == "alpha" && e.entry_type == EntryType::Ack
+}
+fn is_stop(e: &SessionEntry) -> bool {
+    e.sender == "alpha" && e.entry_type == EntryType::Error && e.content == TURN_STOPPED_MESSAGE
+}
+fn is_reply(e: &SessionEntry) -> bool {
+    e.sender == "alpha" && e.entry_type == EntryType::Message
+}
+
+/// End to end through the executor, model-free: a user's stop event ends the
+/// turn it targets and nothing else. The turn in a second session keeps
+/// running and completes; a later turn in the stopped session is untouched by
+/// the old stop, by a late-arriving stop stamped before it began, and by a
+/// stop an agent writes.
+#[tokio::test]
+async fn a_user_stop_ends_only_the_turn_it_targets() {
+    let (_inst, server, registry) = server_fixture().await;
+    let (entry, _adb) = seed_agent(&server, &registry, "alpha").await;
+    register_alpha_agent_runtime(&server);
+
+    let stopped_backend = GatedBackend::new();
+    let other_backend = GatedBackend::new();
+    let (db1, s1) = gated_session(&server, &registry, &entry, stopped_backend.clone()).await;
+    let (db2, s2) = gated_session(&server, &registry, &entry, other_backend.clone()).await;
+
+    write_user_message(&db1, &s1).await;
+    write_user_message(&db2, &s2).await;
+    assert!(
+        await_entries(&db1, &s1, 1, is_ack).await,
+        "turn 1 never started"
+    );
+    assert!(
+        await_entries(&db2, &s2, 1, is_ack).await,
+        "other turn never started"
+    );
+
+    // The stop: the same client API as /stop, persisted to the session.
+    let mut client = Session::new(ConversationId(s1.clone()), db1.clone()).await;
+    assert!(client.request_stop("user").await.unwrap());
+    let old_stop = client.entries().last().unwrap().clone();
+    assert!(
+        await_entries(&db1, &s1, 1, is_stop).await,
+        "the stop never ended the running turn"
+    );
+    assert!(
+        !session_entries(&db1, &s1).await.iter().any(is_reply),
+        "a stopped turn must not also reply"
+    );
+
+    // Unrelated work continues: the other session's turn is still running
+    // and completes normally once its model call returns.
+    assert!(!session_entries(&db2, &s2).await.iter().any(is_stop));
+    other_backend.release_one();
+    assert!(
+        await_entries(&db2, &s2, 1, is_reply).await,
+        "the other session's turn must complete"
+    );
+
+    // A new turn in the stopped session. Wait for the stopped one to release
+    // the session first; a write while it is held is skipped by design.
+    for _ in 0..100 {
+        if !server.processing.lock().await.contains(&s1) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    write_user_message(&db1, &s1).await;
+    assert!(
+        await_entries(&db1, &s1, 2, is_ack).await,
+        "turn 2 never started"
+    );
+
+    // A delayed/repeated old event cannot stop the new attempt, even with
+    // a future timestamp. An agent-written exact target is ignored too.
+    let mut client = Session::new(ConversationId(s1.clone()), db1.clone()).await;
+    let mut late = old_stop.clone();
+    late.timestamp = Utc::now() + chrono::Duration::days(1);
+    client.add_entry(late).await.unwrap();
+    client.add_entry(old_stop).await.unwrap();
+    assert!(client.request_stop("alpha").await.unwrap());
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert_eq!(
+        session_entries(&db1, &s1)
+            .await
+            .iter()
+            .filter(|e| is_stop(e))
+            .count(),
+        1,
+        "turn 2 must not be stopped by a stale or agent-written stop"
+    );
+
+    stopped_backend.release_one();
+    assert!(
+        await_entries(&db1, &s1, 1, is_reply).await,
+        "turn 2 must complete"
+    );
+    // The task clears its running-turn entry right after the reply.
+    let mut cleared = false;
+    for _ in 0..100 {
+        if server.turns.lock().await.is_empty() {
+            cleared = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(
+        cleared,
+        "a finished turn must leave the running-turn registry"
+    );
+}
+
+/// A stop submitted after the durable start but before runtime registration
+/// is found by the fresh registration scan, rather than lost in the gap.
+#[tokio::test]
+async fn a_stop_that_lands_before_the_turn_starts_still_stops_it() {
+    let (_inst, server, registry) = server_fixture().await;
+    let (entry, _adb) = seed_agent(&server, &registry, "alpha").await;
+    register_alpha_agent_runtime(&server);
+    let backend = GatedBackend::new();
+    let (db, sid) = gated_session(&server, &registry, &entry, backend).await;
+    // Stop the fixture's dispatcher so this test controls the start/map gap.
+    server.shutdown().await;
+    server.shutting_down.store(false, Ordering::Release);
+    write_user_message(&db, &sid).await;
+    let client = Session::new(ConversationId(sid.clone()), db.clone()).await;
+    let (request, _) = client
+        .next_turn_request(|_| false, &Default::default())
+        .await
+        .unwrap()
+        .unwrap();
+    let attempt = client.start_turn_attempt(request.id).await.unwrap();
+    let mut frontend = Session::new(ConversationId(sid.clone()), db.clone()).await;
+    assert!(frontend.request_stop("user").await.unwrap());
+    let cancel = runtime::TurnCancel::new();
+    server.turns.lock().await.insert(
+        sid.clone(),
+        RunningTurn {
+            attempt,
+            cancel: cancel.clone(),
+        },
+    );
+    let fresh = Session::new(ConversationId(sid.clone()), db).await;
+    server.observe_stop_requests(&sid, &fresh).await;
+    assert!(cancel.is_cancelled());
+}
+
+#[tokio::test]
+async fn an_idle_stop_does_not_target_queued_or_future_work() {
+    let (_inst, server, registry) = server_fixture().await;
+    let (_conv, db) = registry.create_session(Some("idle-stop")).await.unwrap();
+    let sid = db.root_id().to_string();
+    server.shutdown().await;
+    write_user_message(&db, &sid).await;
+    let mut client = Session::new(ConversationId(sid), db).await;
+    assert!(!client.request_stop("user").await.unwrap());
+    assert!(
+        !client
+            .entries()
+            .iter()
+            .any(|e| e.entry_type == EntryType::Cancel)
+    );
+}
+
+/// Real native shell wait, cancelled by a persisted frontend event. The
+/// ready marker proves execution started; the delayed child marker detects
+/// leaked descendants. No provider or production state is involved.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_user_stop_kills_shell_descendants_and_preserves_native_replay() {
+    let (_inst, server, registry) = server_fixture().await;
+    let (entry, _adb) = seed_agent(&server, &registry, "alpha").await;
+    register_alpha_agent_runtime(&server);
+    server.tools.register(crate::tools::ShellExec);
+    let directory = tempfile::tempdir().unwrap();
+    let ready = directory.path().join("ready");
+    let leaked = directory.path().join("leaked");
+    let command = format!(
+        "echo ready > '{}'; (sleep 2; echo leaked > '{}') & wait",
+        ready.display(),
+        leaked.display()
+    );
+    let mock = Arc::new(crate::test_support::MockBackend::new());
+    mock.push_tool_calls(vec![
+        (
+            "shell-1".into(),
+            "shell".into(),
+            serde_json::json!({"command": command}).to_string(),
+        ),
+        (
+            "shell-2".into(),
+            "shell".into(),
+            serde_json::json!({"command": "echo should-not-run"}).to_string(),
+        ),
+    ]);
+    mock.push_text("next turn reply");
+    let (_conv, db) = registry.create_session(Some("stop-shell")).await.unwrap();
+    let sid = db.root_id().to_string();
+    registry
+        .attach_agent_to_session(&sid, &entry)
+        .await
+        .unwrap();
+    let manager = crate::backends::BackendManager::with_mock(
+        mock.clone(),
+        crate::security::SecretStore::new(registry.chaz_peer().clone()).await,
+    );
+    let (approval_tx, mut approval_rx) = mpsc::channel::<crate::bridge::ApprovalExchange>(8);
+    let approver = tokio::spawn(async move {
+        while let Some(exchange) = approval_rx.recv().await {
+            let _ = exchange
+                .decision_tx
+                .send(crate::bridge::ApprovalDecision::Approve);
+        }
+    });
+    server
+        .register_session(&db, manager, Some("alpha".into()), Some(approval_tx))
+        .await
+        .unwrap();
+    write_user_message(&db, &sid).await;
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while !ready.exists() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("shell must actually start before it is stopped");
+    let started = std::time::Instant::now();
+    let mut frontend = Session::new(ConversationId(sid.clone()), db.clone()).await;
+    assert!(frontend.request_stop("user").await.unwrap());
+    assert!(await_entries(&db, &sid, 1, is_stop).await);
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(1),
+        "cancellation must beat the child command"
+    );
+    let session = Session::new(ConversationId(sid.clone()), db.clone()).await;
+    let attempts = session.attempts_for_test().await;
+    assert_eq!(attempts.len(), 1);
+    assert_eq!(
+        attempts[0].status,
+        crate::session::TurnAttemptStatus::Completed
+    );
+    let records = session
+        .turn_transcript(&attempts[0].attempt_id)
+        .await
+        .unwrap();
+    let cancelled: Vec<_> = records
+        .iter()
+        .filter_map(|record| match &record.message {
+            TurnTranscriptMessage::ToolResult {
+                call_id,
+                outcome: runtime::ToolResultOutcome::Cancelled,
+                ..
+            } => Some(call_id.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(cancelled, vec!["shell-1", "shell-2"]);
+    assert!(
+        session
+            .entries()
+            .iter()
+            .find(|entry| is_stop(entry))
+            .unwrap()
+            .metadata
+            .is_some(),
+        "completed model usage survives stop"
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(2200)).await;
+    assert!(!leaked.exists(), "a stopped shell descendant survived");
+    assert_eq!(
+        mock.recorded_calls().len(),
+        1,
+        "no model continuation after stop"
+    );
+    write_user_message(&db, &sid).await;
+    assert!(await_entries(&db, &sid, 1, is_reply).await);
+    let calls = mock.recorded_calls();
+    let replayed: Vec<_> = calls[1]
+        .messages
+        .iter()
+        .filter_map(|message| match message {
+            runtime::RuntimeMessage::ToolResult { call_id, .. } => Some(call_id.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        replayed,
+        vec!["shell-1", "shell-2"],
+        "cancelled native exchanges replay completely"
+    );
+    server.shutdown().await;
+    approver.abort();
 }

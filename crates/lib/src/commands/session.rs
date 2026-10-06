@@ -482,6 +482,23 @@ async fn submit_command(
     }
 }
 
+/// Record a stop request in the session. The executor that owns the running
+/// turn — this peer or another one — observes the entry and stops the turn;
+/// the command itself touches no runtime state, so it works the same from a
+/// bridge on a separate peer.
+pub(super) async fn stop(ctx: &CommandContext<'_>) -> CommandOutcome {
+    let mut session = Session::new(
+        ConversationId(ctx.session_db_id.to_string()),
+        ctx.session_db.clone(),
+    )
+    .await;
+    match session.request_stop("user").await {
+        Ok(true) => CommandOutcome::Text("Stop requested for the active turn.".to_string()),
+        Ok(false) => CommandOutcome::Text("No running turn to stop.".to_string()),
+        Err(e) => CommandOutcome::Error(format!("Failed to record stop request: {e}")),
+    }
+}
+
 pub(super) async fn print_transcript(ctx: &CommandContext<'_>) -> CommandOutcome {
     let session = Session::new(
         ConversationId(ctx.session_db_id.to_string()),

@@ -503,6 +503,13 @@ fn replay_turn(records: &[TurnTranscriptRecord], budget: usize) -> Option<Vec<Ru
             return None;
         }
         previous = Some(record.sequence);
+        if matches!(record.message, TurnTranscriptMessage::Cancelled) {
+            if i + 1 != sorted.len() {
+                return None;
+            }
+            terminal = true;
+            break;
+        }
         let TurnTranscriptMessage::ModelResponse {
             model_sequence: seq,
             content,
@@ -950,6 +957,7 @@ mod tests {
         for record in &mut suffix {
             record.sequence += 2;
             match &mut record.message {
+                TurnTranscriptMessage::Cancelled => {}
                 TurnTranscriptMessage::ModelResponse { model_sequence, .. }
                 | TurnTranscriptMessage::ToolResult { model_sequence, .. } => *model_sequence += 1,
             }
@@ -967,6 +975,7 @@ mod tests {
             for record in &mut partial {
                 record.sequence += sequence_offset;
                 match &mut record.message {
+                    TurnTranscriptMessage::Cancelled => {}
                     TurnTranscriptMessage::ModelResponse { model_sequence, .. }
                     | TurnTranscriptMessage::ToolResult { model_sequence, .. } => {
                         *model_sequence += model_offset;

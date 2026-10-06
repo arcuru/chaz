@@ -46,6 +46,7 @@ pub(super) fn command_catalog() -> Vec<(&'static str, &'static str)> {
         ("/sync ", "sync a remote session via ticket"),
         ("/compact", "summarize and compact conversation history"),
         ("/print", "dump the transcript"),
+        ("/stop", "stop the running turn (Esc while waiting)"),
         ("# Living Agents", ""),
         ("/agents", "list agents attached to this session"),
         ("/agent add ", "attach an agent (display name or DB ID)"),
@@ -546,20 +547,39 @@ fn apply_approval(app: &mut App, decision: ApprovalDecision) {
 }
 
 pub(super) async fn handle_chat_key(app: &mut App, key: KeyEvent) -> Option<ChatAction> {
-    if let Some(exchange) = app.active_mut().pending_approval.take() {
-        let decision = match key.code {
-            KeyCode::Char('y') => Some(ApprovalDecision::Approve),
-            KeyCode::Char('n') => Some(ApprovalDecision::Deny),
-            KeyCode::Char('a') => Some(ApprovalDecision::ApproveAll),
-            _ => {
-                app.active_mut().pending_approval = Some(exchange);
-                return None;
-            }
-        };
-        if let Some(decision) = decision {
-            let _ = exchange.decision_tx.send(decision);
+    // Stop is a user event even during approval; don't turn Esc into a deny.
+    if key.code == KeyCode::Esc {
+        if app.completion.is_some() {
+            app.completion = None;
+            app.completion_dismissed = true;
+        } else if app.active().active_turns > 0 {
+            return Some(ChatAction::Dispatch(chaz_core::commands::Command::Stop));
+        } else {
+            app.should_quit = true;
         }
         return None;
+    }
+    if let Some(exchange) = app.active_mut().pending_approval.take() {
+        if exchange.decision_tx.is_closed() {
+            // The executor already settled this approval (e.g. user stop).
+        } else if !app.input.is_empty() || key.code == KeyCode::Char('/') {
+            // Slash commands, especially /stop, stay available while waiting.
+            app.active_mut().pending_approval = Some(exchange);
+        } else {
+            let decision = match key.code {
+                KeyCode::Char('y') => Some(ApprovalDecision::Approve),
+                KeyCode::Char('n') => Some(ApprovalDecision::Deny),
+                KeyCode::Char('a') => Some(ApprovalDecision::ApproveAll),
+                _ => {
+                    app.active_mut().pending_approval = Some(exchange);
+                    return None;
+                }
+            };
+            if let Some(decision) = decision {
+                let _ = exchange.decision_tx.send(decision);
+            }
+            return None;
+        }
     }
 
     match key.code {
@@ -693,16 +713,6 @@ pub(super) async fn handle_chat_key(app: &mut App, key: KeyEvent) -> Option<Chat
         KeyCode::PageDown => {
             let off = &mut app.active_mut().scroll_offset;
             *off = off.saturating_sub(20);
-        }
-        KeyCode::Esc => {
-            // Esc first dismisses the completion popup (keeping the typed
-            // text); only a second Esc with no popup quits the TUI.
-            if app.completion.is_some() {
-                app.completion = None;
-                app.completion_dismissed = true;
-            } else {
-                app.should_quit = true;
-            }
         }
         KeyCode::F(1) => {
             app.overlay = Some(Overlay::Help { scroll: 0 });

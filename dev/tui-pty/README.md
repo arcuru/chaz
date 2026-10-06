@@ -19,9 +19,16 @@ Each run has a disposable HOME/XDG tree, SQLite store, and kernel-assigned port;
 the child environment excludes provider keys and replaces model CLIs with
 fail-loud stubs.
 
-The final idle Ctrl+C must exit successfully, leave the alternate screen, and
-restore canonical input and echo. This covers the documented **quit** behavior,
-not in-flight cancellation or the semantics of cancelling a durable job.
+The same test stalls a model request, dismisses help and command completion
+before Esc stops it, and checks `/stop` on another stalled request.
+It stops a pending approval without running its tool, then approves a native
+shell and verifies that stop prevents its descendant's delayed marker.
+Each stop must produce the terminal stopped entry and allow another turn;
+the cancelled native tool exchanges replay without orphan call IDs.
+The final Ctrl+C while busy must exit successfully, leave the alternate screen,
+and restore canonical input and echo.
+This covers user-event cancellation of the active session attempt, not rollback
+of effects or recursive cancellation of durable child jobs.
 Widget snapshots remain the faster rendering tests.
 
 Two negative controls require missing text to fail when a child exits cleanly

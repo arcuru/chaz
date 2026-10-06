@@ -75,6 +75,7 @@ The TUI catalogs every built-in slash command in its inline completion popup —
 | `/sync <ticket>`  | Sync a remote session via a ticket URL                                 |
 | `/compact`        | Ask the executor to compact the current immutable session snapshot     |
 | `/print`          | Dump the transcript                                                    |
+| `/stop`           | Stop the active turn in this session; idle sessions are unchanged      |
 
 ### Living Agents
 
@@ -185,23 +186,23 @@ Unknown `/<name>` commands route to extension dispatch — see the error you get
 
 ## Key Bindings
 
-| Key                             | Action                                                              |
-| ------------------------------- | ------------------------------------------------------------------- |
-| `Enter`                         | Accept highlighted completion (if extending); else send / execute   |
-| `Tab` / `Shift+Tab`             | Open completion popup and cycle highlighted entry                   |
-| `Up` / `Down`                   | Move completion selection if popup is open; else scroll history (3) |
-| `PageUp` / `PageDown`           | Fast scroll history (20 lines)                                      |
-| `Home` / `End`                  | Move cursor to start / end of input                                 |
-| `Alt+Enter`                     | Insert a line break in the draft instead of sending                 |
-| `Esc`                           | First press: dismiss completion popup. Second (no popup): quit      |
-| `F1`                            | Open the help overlay                                               |
-| `Ctrl+P`                        | Toggle the session picker                                           |
-| `Ctrl+D`                        | Toggle debug mode                                                   |
-| `Ctrl+W`                        | Close the active tab (refuses to close the last tab)                |
-| `Ctrl+PageUp` / `Ctrl+PageDown` | Cycle to previous / next tab (wraps)                                |
-| `Ctrl+C`                        | Quit                                                                |
+| Key                             | Action                                                                      |
+| ------------------------------- | --------------------------------------------------------------------------- |
+| `Enter`                         | Accept highlighted completion (if extending); else send / execute           |
+| `Tab` / `Shift+Tab`             | Open completion popup and cycle highlighted entry                           |
+| `Up` / `Down`                   | Move completion selection if popup is open; else scroll history (3)         |
+| `PageUp` / `PageDown`           | Fast scroll history (20 lines)                                              |
+| `Home` / `End`                  | Move cursor to start / end of input                                         |
+| `Alt+Enter`                     | Insert a line break in the draft instead of sending                         |
+| `Esc`                           | Dismiss overlay/completion first; otherwise stop while busy, quit when idle |
+| `F1`                            | Open the help overlay                                                       |
+| `Ctrl+P`                        | Toggle the session picker                                                   |
+| `Ctrl+D`                        | Toggle debug mode                                                           |
+| `Ctrl+W`                        | Close the active tab (refuses to close the last tab)                        |
+| `Ctrl+PageUp` / `Ctrl+PageDown` | Cycle to previous / next tab (wraps)                                        |
+| `Ctrl+C`                        | Quit                                                                        |
 
-Approval prompts hijack the keyboard while open: `y` approve, `n` deny, `a` approve all remaining tool calls for this turn.
+Approval prompts accept `y` to approve, `n` to deny, and `a` to approve all remaining tool calls for this turn. `Esc` and slash commands remain available to stop the turn; `Ctrl+C` still quits.
 
 ### Mouse
 
@@ -347,9 +348,82 @@ The TUI renders different entry types with distinct styles:
 | Ack        | Dimmed "_agent_ acknowledged turn"     | Historical audit entry; not live activity                      |
 | ToolCall   | Dimmed `> tool_name(args)`             | Agent invoked a tool                                           |
 | ToolResult | Dimmed `< tool_name: output`           | Tool returned a result                                         |
-| Error      | Red `ERROR sender: message`            | An error occurred                                              |
+| Error      | Red `ERROR sender: message`            | An error occurred, or a turn was stopped                       |
+| Cancel     | Dimmed `⏹ stop requested by sender`    | A participant asked the running turn to stop                   |
 
 Senders are color-coded: agents in green, users in cyan, system in yellow.
+
+## Stopping a Running Turn
+
+Press `Esc` while a turn is running, or send `/stop`.
+The live activity line shows `thinking... Esc stop · Ctrl+C quit`.
+Overlays and the completion popup dismiss on the first `Esc`; press it again to stop.
+`Ctrl+C` quits, including while the agent is busy.
+
+The frontend writes a `Cancel` event into the session with the active request and attempt IDs.
+The executor observes that event through the ordinary session-write path, then interrupts its model call, approval wait, or tool execution.
+The frontend does not abort the executor task itself.
+A synced client uses the same event path; Matrix exposes it as `!chaz stop`.
+
+The event targets only the attempt visible when you ask to stop.
+Delayed or repeated events cannot stop a later turn, including a retry of the same request.
+When no active attempt is visible, `/stop` returns `No running turn to stop.` without recording an event.
+Queued requests are not cancelled.
+Other sessions and already-started child sessions keep running; stop those from their own session.
+Session write permission is required, and the executor ignores agent-authored or malformed stop events.
+
+Every recorded native tool call gets a result, including calls in the batch that had not started: `Tool execution cancelled by user`.
+The completed attempt has a terminal cancellation record and a visible agent `Error`: `Stopped: the turn was cancelled at the user's request.`
+It retains usage from completed model calls for `/costs`, and does not produce a final reply.
+If transcript persistence fails, the attempt remains interrupted rather than claiming a successful stop.
+
+On Unix, stopping a native shell call kills its process group, including ordinary descendants.
+Completed side effects are not rolled back, partial shell output is not recovered, and descendants that deliberately escape the group are outside this cleanup.
+The executor must have the session registered and receive its synced event before it can stop remote work.
+Matrix acknowledges the command but does not post the local terminal `Error` to the room.
+
+### Walkthrough
+
+1. Ask for slow shell work and approve it with `y`:
+
+   ```text
+   user:
+     run sleep 20, then tell me it finished
+
+     ▸ shell {"command":"sleep 20"}
+     thinking... Esc stop · Ctrl+C quit
+   ```
+
+2. Press `Esc`, or send `/stop`. With a popup open, dismiss it first.
+   The shell stops and the transcript shows:
+
+   ```text
+   system:
+     Stop requested for the active turn.
+     ⏹ stop requested by user
+     ✗ shell Tool execution cancelled by user
+     ERROR chaz: Stopped: the turn was cancelled at the user's request.
+   ```
+
+3. Send another message. The earlier event cannot target this new attempt:
+
+   ```text
+   user:
+     never mind, just say hi
+
+   chaz:
+     Hi!
+   ```
+
+4. If you send `/stop` after the reply, nothing is running to stop:
+
+   ```text
+   system:
+     No running turn to stop.
+   ```
+
+   Send the next message normally; there is no stop event to clear.
+   Bare `Esc` while idle still quits the TUI.
 
 ## Tool Approval
 
@@ -364,15 +438,18 @@ When an agent calls a tool that requires approval, the TUI shows an inline promp
 ```
 
 Press `y` to approve, `n` to deny, or `a` to approve all remaining tool calls for this turn.
+To stop instead, press `Esc` or send `/stop`; a cancelled approval cannot approve a later tool call.
 
 ## Testing the terminal lifecycle
 
 Contributors can run `nix develop .# -c just tui-pty` on Linux with `uv` available.
 This drives the real TUI under a narrow PTY with a disposable database and a
-loopback stub backend: Unicode input, final reply rendering, resize, and idle
-Ctrl+C quit with terminal restoration.
+loopback stub backend: Unicode input, final reply rendering, resize, Esc and
+/stop during a blocked model call, overlay/completion-first dismissal, pending
+approval and native shell cancellation, next-turn recovery, and Ctrl+C quit
+while busy with terminal restoration.
 It also checks that missing output fails on both early exit and timeout, and
 that children are reaped.
-This complements the fast widget snapshots; it does not test in-flight job
-cancellation.
+This complements the fast widget snapshots and executor tests; it does not
+exercise production providers or cross-peer delivery.
 See `dev/tui-pty/README.md` for isolation details and failure artifact locations.
