@@ -22,7 +22,7 @@ graph TD
 
     subgraph Server
         SV[Server<br/>on_write callbacks]
-        SR[SessionRegistry<br/>indices: sessions, matrix_channels, session_names]
+        SR[SessionRegistry<br/>indices: sessions, session_names]
     end
 
     subgraph "Agent Runtime"
@@ -35,7 +35,7 @@ graph TD
         EI[(Per-session DBs<br/>entries + meta)]
         LA[(Living Agent DBs<br/>config, memory, meta, history)]
         MB[(Memory Bank DBs<br/>shared memory)]
-        CG[(chaz_group DB<br/>peer-local: sessions,<br/>matrix_channels, session_names)]
+        CG[(chaz_group DB<br/>peer-local: sessions, session_names)]
         CP[(chaz_peer DB<br/>peer-local: credentials,<br/>routines, schedule_state)]
         HI[HostedIndex<br/>in-memory cache<br/>built from user.databases]
     end
@@ -47,7 +47,7 @@ graph TD
     RT <-->|tool calls| TS
     RT <-->|LLM calls| LLM
     RT -->|write response| EI
-    EI -->|callback| MG
+    EI -->|addressed BridgeEvent| MG
     EI -->|callback| TG
     SV --> SR
     SR --> CG
@@ -57,7 +57,7 @@ graph TD
     HI -.->|classify by meta.kind| MB
 ```
 
-**Three peer-local layers, none synced:** `user.databases()` (eidetica's catalog of every DB this peer holds keys for) is the source of truth for "which DBs do we host"; `HostedIndex` is an in-memory cache derived from it at startup; `chaz_group` holds session/channel/name indices; `chaz_peer` holds credentials and cron/schedule state. Sync-ful state lives in per-session, per-agent, and per-bank DBs.
+**Three peer-local layers, none synced:** `user.databases()` (eidetica's catalog of every DB this peer holds keys for) is the source of truth for "which DBs do we host"; `HostedIndex` is an in-memory cache derived from it at startup; `chaz_group` holds session/name indices; `chaz_peer` holds credentials and cron/schedule state. Sync-ful state lives in per-session, per-agent, and per-bank DBs.
 
 ## Key Components
 
@@ -118,7 +118,7 @@ The runtime emits `RuntimeEvent`s (ToolCall, ToolResult) via an optional event s
 
 ### Session Model
 
-Each conversation is an eidetica `Database` containing a `Table<SessionEntry>` (history) and a `DocStore` called `meta` (session config: name, agent, model, role, backend). Sessions are identified globally by their DB root ID. The `SessionRegistry` holds index stores only: `sessions`, `matrix_channels` (Matrix `room_id` → `session_db_id`, fan-out supported), and `session_names`.
+Each conversation is an eidetica `Database` containing a `Table<SessionEntry>` (history) and a `DocStore` called `meta` (session config: name, agent, model, role, backend). Sessions are identified globally by their DB root ID. The `SessionRegistry` holds index stores only: `sessions` and `session_names`; External attachments live in each session DB and permit one publishable transport/login/channel; TUI stays a local interface.
 
 See [Session Model](sessions.md) for details.
 

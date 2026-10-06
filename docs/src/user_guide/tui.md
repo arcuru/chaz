@@ -313,10 +313,10 @@ There is no global key binding for `/models` — terminals without the keyboard-
 
 ## Live turn activity
 
-| Display                            | Source                            | Clears when                                                                       |
-| ---------------------------------- | --------------------------------- | --------------------------------------------------------------------------------- |
-| `thinking...` in the messages area | Unexpired executor per-turn start | The attempt completes (including errors or silent turns) or its heartbeat expires |
-| `_agent_ acknowledged turn`        | Historical Ack entry              | Never a live indicator; remains in history                                        |
+| Display                            | Source                            | Clears when                                                       |
+| ---------------------------------- | --------------------------------- | ----------------------------------------------------------------- |
+| `thinking...` in the messages area | Unexpired executor per-turn start | The attempt completes (including errors) or its heartbeat expires |
+| `_agent_ acknowledged turn`        | Historical Ack entry              | Never a live indicator; remains in history                        |
 
 The TUI watches the shared session database, not its own submitted-message state.
 A remote executor's start and completion arrive through sync, so a tab opened
@@ -331,7 +331,7 @@ For example, after sending `@chaz:example` a question in a shared Matrix room:
 1. Open that session in the TUI. During the executor's turn, the bottom of the
    messages area shows `thinking...` even though the prompt was not typed here.
 2. After the reply, `thinking...` disappears; an older `chaz acknowledged turn`
-   line may remain as history. On a silent turn or error it also disappears.
+   line may remain as history. On an error it also disappears.
 3. If the executor exits before completion, `thinking...` clears after the
    heartbeat expires. `/interrupted` then lists the interrupted request;
    `/retry <request_id>` starts a new claim after you decide retrying is safe.

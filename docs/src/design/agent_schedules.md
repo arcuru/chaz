@@ -5,14 +5,14 @@
 > Shipped: Agent-DB `Schedule` type + store (Stage 1); engine agent-source
 > discovery + `schedule_fires` audit log (Stage 2); standalone fire path
 > via `Server::fire_agent_schedule` + `agent_schedule` extension (Stage 3);
-> conditional terminal `Message` on silent turns (Stage 4);
+> normal terminal `Message` on invoked turns (Stage 4);
 > `ScheduleFire.usage` cost-on-agent; schedule tools + `/schedule`
 > command repointed to agent-owned schedules, detach-side routine sweep
 > retired, `notify_agent_schedules_changed` engine bridge (Stage 5).
 > 5 integration tests + 11 tool/command tests covering the full
 > plumbing. The live turn in a real session still needs end-to-end
 > integration testing on a dev instance (agent responds, cost
-> attributed, silent turn produces no entry).
+> attributed, normal local final is written).
 
 ## Summary
 
@@ -25,7 +25,7 @@ schedule row, but they skip its fires.
 When a schedule fires, the home daemon loads the owner, resolves its target
 (an existing pinned session or a new session for this fire), builds context as
 that Agent, passes the wake prompt as private invocation input, and runs the
-Agent's loop. The Agent may reply, use tools without replying, or do nothing.
+Agent's loop. The Agent may use tools, then completes with a normal local final.
 
 Routing is intrinsic: the schedule names its owner, so there is no
 "resolve who responds" step. This replaces the current model where a
@@ -46,8 +46,8 @@ agent; `RoutineEngine` discovers work by scanning sessions; the
   across the session DBs it happens to have been used in.
 - The wake-prompt is a broadcast `Directive` entry every participant sees,
   even though it's a private nudge to one agent.
-- A woken agent is _forced_ to emit a terminal `Message` even when it only
-  ran tools or chose to stay silent (`server.rs` always appends one).
+- A woken agent writes a local terminal `Message`; tools can run before
+  that final without creating an external post.
 
 ## Model
 
@@ -177,8 +177,8 @@ The standalone path:
 4. **Run the owner's turn directly** — load + hydrate the owner agent,
    build context _as that agent_ from the session's current entries
    with the wake-prompt as private invocation input, run the ReAct
-   loop, emit `ToolCall`/`ToolResult` and a terminal `Message` _only if
-   non-empty_ (see Optional response). The path **returns the turn
+   loop, emit `ToolCall`/`ToolResult` and a terminal local `Message`.
+   The path **returns the turn
    outcome** to its caller — it is not fire-and-forget — so cost is
    recoverable.
 5. **Attribute cost to the agent** — write `ScheduleFire { …, usage =
@@ -195,15 +195,11 @@ interactive hot path untouched. Some assemble/execute sequence is
 duplicated; that cost is accepted to isolate risk from every
 interactive turn.
 
-### Optional response
+### Local final
 
-The runtime must allow a turn to end **without** a `Message`. Today
-`server.rs` unconditionally appends a terminal `Message` with
-`outcome.body` even when empty. This becomes conditional: skip the
-`Message` entry when the body is empty/whitespace; `ToolCall`/`ToolResult`
-/`Error` entries are still written. (This is also a latent bug for the
-chat-room model — empty Messages clutter the room — so it is worth doing
-independently.)
+An invoked schedule turn writes a normal local final. Empty model output is
+reported as an error, not a valid completion. Tool results remain audit
+entries; neither they nor the local final automatically post to Matrix.
 
 ### Membership at fire time (Pinned only)
 
@@ -221,7 +217,7 @@ rows, `sweep_for_agent`): the check moves from "clean up on detach" to
 | Pinned target session deleted / agent detached               | Membership/existence checked at fire → self-skip + log                                                                                                              |
 | Fresh fires accumulate sessions unbounded                    | Fresh sessions are normal sessions subject to existing lifecycle/retention; cron cadence is author-chosen                                                           |
 | Self-scheduled tight cron or interval self-sustains activity | Controlled by chosen cadence; **not** the chat-room burst budget or `max_spawn_depth` (which only limits nested delegation). Revisit a min-interval guard if abused |
-| Woken agent forced to speak                                  | Conditional terminal `Message` — silence produces no entry                                                                                                          |
+| Empty model final                                            | Runtime reports an error instead of silently dropping the turn                                                                                                      |
 
 ## Migration
 

@@ -594,6 +594,9 @@ pub async fn build(
     // MCP extensions can register tools asynchronously off the critical
     // path via their `PeerHandles::tool_registry` handle.
     let tool_registry = Arc::new(tool::ToolRegistry::new());
+    tool_registry.register(crate::tools::MatrixSend {
+        registry: registry.clone(),
+    });
 
     // Set up extension hub infrastructure before install_all.
     // Tools and commands flow through per-extension caps;

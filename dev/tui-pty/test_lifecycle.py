@@ -180,6 +180,7 @@ class Lifecycle(unittest.TestCase):
         server = HTTPServer(("127.0.0.1", 0), Handler)
         server.timeout = 2
         server.reply = "pty-first-ok"
+        server.matrix_sends = False  # Local TUI turns have no Matrix attachment.
         port = server.server_port
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         process = None
