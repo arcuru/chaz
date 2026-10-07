@@ -20,6 +20,12 @@ async fn service_steering(
         Instance::create_backend(Box::new(InMemory::new()), NewUser::passwordless("monitor"))
             .await
             .unwrap();
+    user.admin()
+        .await
+        .unwrap()
+        .create_user(NewUser::passwordless("monitor-reader"))
+        .await
+        .unwrap();
     let (agent_db, pubkey) = create_agent_db(
         &mut user,
         "default",
@@ -247,10 +253,19 @@ async fn service_steering(
         .is_err(),
         "input cannot carry a widened execution scope"
     );
+    // Keep the reader's mappings in a separate login. Publishing a Read key
+    // into the writer's key map makes the existing implicit session opener
+    // select that key nondeterministically after restart.
+    let mut reader_settings = settings.clone();
+    reader_settings.login.username = "monitor-reader".into();
+    let mut reader_connection =
+        crate::instance::connect_with(&reader_settings, crate::config::ExecutionRole::Client)
+            .await
+            .unwrap();
     // Same service, a genuinely read-only signing identity can inspect but
     // cannot publish; an unentitled identity fails rather than using a row.
     let read_db = {
-        let mut user = registry.user_for_tests().await;
+        let user = &mut reader_connection.user;
         let read_key = user
             .add_private_key(Some("monitor-read-only"))
             .await
@@ -296,6 +311,10 @@ async fn service_steering(
             .await
             .unwrap()
     };
+    assert_eq!(
+        read_db.current_permission().await.unwrap(),
+        eidetica::auth::types::Permission::Read
+    );
     let reader = Session::new(ConversationId(id.clone()), read_db).await;
     assert_eq!(reader.job_inputs().await.unwrap().len(), 1);
     assert!(
