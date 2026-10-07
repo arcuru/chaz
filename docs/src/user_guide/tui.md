@@ -285,8 +285,8 @@ The session hub is the TUI's home: the list of this peer's sessions plus a pinne
 | `n`              | Create a session and open it                                                                    |
 | `r`              | Rename the selected session                                                                     |
 | `s` / `Ctrl+,`   | [Peer Settings](#settings); `Esc` there returns to the hub                                      |
-| `Esc` / `Ctrl+P` | Back to the open conversation; nothing when none is open                                        |
-| `Ctrl+P`         | Reload the list when it failed to load or no conversation is open                               |
+| `Esc`            | Back to the open conversation; stays in the hub when none is open                               |
+| `Ctrl+P`         | Back to the open conversation; reload when the list failed or no conversation is open           |
 | `Ctrl+C`         | Quit                                                                                            |
 
 The footer shows the subset of these keys that fits the terminal, and `Esc back` only when there is a conversation to return to.
@@ -334,7 +334,7 @@ Settings has two separate scopes: **Peer** covers this process's hosted agents a
 | `/models` in chat                  | Session Settings → Models, with the scope list focused |
 | `Ctrl+,` or `s` in the session hub | Peer Settings (no open conversation needed)            |
 
-`Ctrl+,` does nothing while Settings or the model picker is already open. Settings remembers its caller: `Esc` returns to chat or the session hub, rather than quitting. At normal terminal sizes the category rail stays on the left and the current page on the right. Navigation starts at **Category**, then enters **List → Content** (static/empty pages skip List); see [Reading Settings details](#reading-settings-details) for all keys and pointer controls. Number keys follow the sidebar order below (`1`–`9` for Peer, `1`–`6` for Session).
+`Ctrl+,` does nothing while Settings or the model picker is already open. Tab-cycle shortcuts act only in chat, so Settings and pickers retain their conversation caller. Settings remembers its caller: `Esc` returns to chat or the session hub, rather than quitting. At normal terminal sizes the category rail stays on the left and the current page on the right. Navigation starts at **Category**, then enters **List → Content** (static/empty pages skip List); see [Reading Settings details](#reading-settings-details) for all keys and pointer controls. Number keys follow the sidebar order below (`1`–`9` for Peer, `1`–`6` for Session).
 
 A model picker returns to its Settings page on selection or `Esc`; canceling writes no model. Add prompts, add-agent pickers and YAML diffs handle `Esc` first, so cancel them before leaving Settings. Exiting Settings does not undo edits already applied.
 

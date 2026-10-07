@@ -1499,7 +1499,7 @@ fn open_session_picker(
     app.session_picker_error = None;
     app.hub_notice = None;
 
-    if app.session_list_fresh && !app.session_list.is_empty() {
+    if app.session_list_fresh {
         return;
     }
 
@@ -1716,9 +1716,10 @@ async fn refresh_tab_activity(tab: &mut Tab) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Shift the active tab by `delta` (wraps around).
+/// Shift the active tab by `delta` (wraps around), only in the conversation
+/// view. Settings and pickers retain their caller and scoped identity.
 fn cycle_tab(app: &mut App, delta: i32) {
-    if app.tabs.is_empty() {
+    if app.mode != TuiMode::Chat || app.tabs.is_empty() {
         return;
     }
     let n = app.tabs.len() as i32;
@@ -1737,6 +1738,14 @@ fn ensure_view(app: &mut App, server: &Arc<Server>, session_rows_tx: &mpsc::Send
     if app.tabs.is_empty() && needs_conversation {
         app.settings_return = None;
         app.session_settings_snapshot = None;
+        open_session_picker(app, server, session_rows_tx);
+    } else if app.mode == TuiMode::SessionPicker
+        && !app.session_list_fresh
+        && !app.session_catalog_loading
+        && app.session_picker_error.is_none()
+    {
+        // Settings can interrupt the initial catalog load. Resume it when
+        // the hub becomes visible, without rendering an incomplete empty list.
         open_session_picker(app, server, session_rows_tx);
     }
 }

@@ -7,6 +7,7 @@ use super::super::{
 };
 use super::list_tests::{draw, fixture, send_mouse};
 use super::*;
+use chaz_core::backends::ModelInfo;
 use chaz_core::security::SecretStore;
 use chaz_core::session::SessionIndex;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
@@ -33,7 +34,9 @@ async fn session_ids(server: &Server) -> Vec<String> {
 
 fn frame(app: &mut App, server: &Arc<Server>, backend: &BackendManager, w: u16, h: u16) -> String {
     let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
-    draw(&mut terminal, app, server, backend).join("\n")
+    let screen = draw(&mut terminal, app, server, backend).join("\n");
+    println!("{w}x{h} {mode:?}:\n{screen}", mode = app.mode);
+    screen
 }
 
 fn channels() -> (
@@ -87,6 +90,23 @@ async fn hub_launch_creates_nothing_and_is_a_safe_base_view() {
     app.session_picker_error = None;
     let empty = frame(&mut app, &server, &backend, 80, 24);
     assert!(empty.contains("No saved sessions yet"), "{empty}");
+    for (w, h) in [(80, 24), (120, 40), (40, 8)] {
+        for state in ["empty", "loading", "error"] {
+            app.session_catalog_loading = state == "loading";
+            app.session_picker_error = (state == "error").then(|| "store offline".into());
+            let screen = frame(&mut app, &server, &backend, w, h);
+            assert!(screen.contains("New session"), "{w}x{h} {state}: {screen}");
+            let message = match state {
+                "loading" => "Loading sessions…",
+                "error" => "Failed to load sessions:",
+                _ => "No saved sessions yet",
+            };
+            assert!(screen.contains(message), "{w}x{h} {state}: {screen}");
+            assert!(screen.lines().last().unwrap().contains("n new"));
+        }
+    }
+    app.session_catalog_loading = false;
+    app.session_picker_error = None;
 
     // The base hub cannot be dismissed into a nonexistent conversation.
     for code in [KeyCode::Esc, KeyCode::Up, KeyCode::Down] {
@@ -400,4 +420,125 @@ async fn hub_failures_stay_in_the_hub_and_peer_actions_need_no_conversation() {
     );
     assert!(app.tabs.is_empty());
     assert_eq!(session_ids(&server).await, before);
+}
+
+#[tokio::test]
+async fn hub_peer_model_picker_with_models_and_no_pin_needs_no_tab() {
+    let (_instance, server, backend, _) = fixture().await;
+    let mut app = App::hub(HashSet::new());
+    app.open_settings(SettingsScope::Peer, TuiMode::SessionPicker);
+    app.seed_model_picker(
+        &backend,
+        None,
+        ModelPickerScope::AgentGlobal("agent-00".into()),
+    );
+    app.rebuild_model_list(vec![ModelInfo {
+        id: "stub-model".into(),
+        ..Default::default()
+    }]);
+    app.model_picker_caller = app.mode;
+    app.mode = TuiMode::ModelPicker;
+    for (w, h) in [(80, 24), (120, 40), (40, 8)] {
+        let screen = frame(&mut app, &server, &backend, w, h);
+        assert!(
+            screen.contains("Pick model — agent-00"),
+            "{w}x{h}: {screen}"
+        );
+        if w >= 80 {
+            assert!(screen.contains("stub-model"), "{w}x{h}: {screen}");
+        }
+        assert_eq!(app.model_picker_selection().as_deref(), Some("stub-model"));
+        assert!(
+            !screen.contains("(current)"),
+            "no model is pinned: {screen}"
+        );
+    }
+    input::handle_model_picker_key(&mut app, key(KeyCode::Esc));
+    assert_eq!(app.mode, TuiMode::Settings(SettingsScope::Peer));
+    super::list_tests::settings_key(&mut app, KeyCode::Esc);
+    assert_eq!(app.mode, TuiMode::SessionPicker);
+    assert!(app.tabs.is_empty());
+}
+
+#[tokio::test]
+async fn hub_tab_cycle_cannot_change_settings_or_switcher_caller() {
+    let (_instance, server, backend, mut app) = fixture().await;
+    let first = app.active().session_db_id.clone();
+    let (_, db) = server.registry().create_session(Some("tui")).await.unwrap();
+    let id = db.root_id().to_string();
+    let tab = super::super::build_tab(&server, &backend, db, id).await;
+    app.push_tab(tab);
+    app.set_active_tab(0);
+    app.input = "first draft".into();
+    app.cursor = 4;
+    app.active_mut().scroll_offset = 7;
+    for mode in [
+        TuiMode::SessionPicker,
+        TuiMode::Settings(SettingsScope::Session),
+        TuiMode::Settings(SettingsScope::Peer),
+        TuiMode::ModelPicker,
+    ] {
+        app.mode = mode;
+        for direction in [-1, 1] {
+            super::super::cycle_tab(&mut app, direction);
+            assert_eq!(
+                app.active().session_db_id,
+                first,
+                "caller changed in {mode:?}"
+            );
+            assert_eq!((app.input.as_str(), app.cursor), ("first draft", 4));
+            assert_eq!(app.active().scroll_offset, 7);
+        }
+    }
+    app.mode = TuiMode::Chat;
+    super::super::cycle_tab(&mut app, 1);
+    assert_ne!(app.active().session_db_id, first);
+    super::super::cycle_tab(&mut app, -1);
+    assert_eq!(app.active().session_db_id, first);
+    assert_eq!((app.input.as_str(), app.cursor), ("first draft", 4));
+}
+
+#[tokio::test]
+async fn hub_return_from_settings_restarts_cancelled_catalog_discovery() {
+    let (_instance, server, backend, _) = fixture().await;
+    let mut app = App::hub(HashSet::new());
+    let (rows_tx, mut rows_rx) = mpsc::channel(8);
+    open_session_picker(&mut app, &server, &rows_tx);
+    let cancelled_generation = app.session_generation;
+    app.open_settings(SettingsScope::Peer, TuiMode::SessionPicker);
+    // The event loop cancels discovery when the hub is not visible.
+    app.cancel_session_fill();
+    app.close_settings();
+    ensure_view(&mut app, &server, &rows_tx);
+    assert!(
+        app.session_catalog_loading,
+        "return left the catalog unloaded"
+    );
+    let loading = frame(&mut app, &server, &backend, 80, 24);
+    assert!(loading.contains("Loading sessions…"), "{loading}");
+    assert!(!loading.contains("No saved sessions"), "{loading}");
+    assert!(matches!(
+        super::super::apply_session_catalog_result(&mut app, cancelled_generation, Ok(Vec::new())),
+        super::super::CatalogLoadOutcome::Ignored
+    ));
+    let load = tokio::time::timeout(std::time::Duration::from_secs(5), rows_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let SessionLoad::Catalog { generation, result } = load else {
+        panic!("expected catalog")
+    };
+    super::super::apply_session_catalog_result(&mut app, generation, result);
+    assert!(app.session_list_fresh);
+    assert_eq!(app.session_list.len(), session_ids(&server).await.len());
+    assert!(!app.session_list.is_empty(), "fixture has a stored session");
+
+    // A completed empty catalog stays authoritative on a Settings round trip.
+    super::super::apply_session_catalog(&mut app, Vec::new());
+    app.open_settings(SettingsScope::Peer, TuiMode::SessionPicker);
+    app.cancel_session_fill();
+    app.close_settings();
+    ensure_view(&mut app, &server, &rows_tx);
+    assert!(!app.session_catalog_loading);
+    assert!(app.session_list_fresh);
 }

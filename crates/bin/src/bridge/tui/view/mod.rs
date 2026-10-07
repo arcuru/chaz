@@ -1763,7 +1763,8 @@ fn render_model_list_block(f: &mut ratatui::Frame, area: ratatui::layout::Rect, 
     let current = app
         .active_scope_pin()
         .map(str::to_string)
-        .unwrap_or_else(|| app.active().effective_model.clone());
+        .or_else(|| app.current().map(|tab| tab.effective_model.clone()))
+        .unwrap_or_default();
     let end = (scroll + visible_rows).min(app.model_picker_filtered.len());
     // Header occupies y_off=1 (after the top border at 0); rows start at 2.
     let mut y_off: u16 = 2;
