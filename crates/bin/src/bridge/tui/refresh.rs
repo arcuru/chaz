@@ -26,6 +26,15 @@ use super::*;
 pub(super) struct RefreshSlot {
     in_flight: Option<u64>,
     dirty: bool,
+    task: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl Drop for RefreshSlot {
+    fn drop(&mut self) {
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
+    }
 }
 
 impl RefreshSlot {
@@ -49,6 +58,7 @@ impl RefreshSlot {
             return None;
         }
         self.in_flight = None;
+        self.task = None;
         Some(std::mem::take(&mut self.dirty))
     }
 
@@ -177,10 +187,11 @@ pub(super) fn request_with<Fut>(
     }
     let fut = load(ticket);
     let tx = tx.clone();
-    tokio::spawn(async move {
-        // The run loop may have exited; nothing left to update then.
+    // The slot owns the task so closing its tab or exiting the TUI cancels
+    // the read, including one stalled forever on the backend.
+    slot.task = Some(tokio::spawn(async move {
         let _ = tx.send(fut.await).await;
-    });
+    }));
 }
 
 /// Request a background read of `kind` for the tab hosting `session_db_id`
@@ -679,9 +690,10 @@ mod tests {
         let release = request_gated(&mut app, "b", RefreshKind::Session, &tx, |t| {
             snapshot("b", t, vec![message("ghost")], 0)
         });
-        close_tab_at(&mut app, 1);
         release.send(()).unwrap();
+        // A result already queued before close still needs the identity guard.
         let late = rx.recv().await.unwrap();
+        close_tab_at(&mut app, 1);
         assert_eq!(apply(&mut app, late, resolved), Applied::default());
         assert!(app.tabs[0].entries.is_empty());
 
@@ -689,16 +701,41 @@ mod tests {
         let release = request_gated(&mut app, "a", RefreshKind::Session, &tx, |t| {
             snapshot("a", t, vec![message("old tab")], 0)
         });
+        release.send(()).unwrap();
+        let late = rx.recv().await.unwrap();
         let db = app.tabs[0].session_db.clone();
         app.tabs.push(tab("z", db.clone()));
         close_tab_at(&mut app, 0);
         app.tabs.push(tab("a", db));
-        release.send(()).unwrap();
-        let late = rx.recv().await.unwrap();
         assert_eq!(apply(&mut app, late, resolved), Applied::default());
         let reopened = &app.tabs[app.tab_index_for("a").unwrap()];
         assert!(reopened.entries.is_empty());
         assert_eq!(reopened.session_name, None);
+    }
+
+    /// Refresh work belongs to the tab, not the runtime: closing it or
+    /// dropping the app must release even a permanently stalled read.
+    #[tokio::test]
+    async fn closing_tabs_and_exiting_cancel_pending_reads() {
+        let (_instance, mut app) = app_with_tabs(&["a", "b"]).await;
+        let (tx, _rx) = mpsc::channel(8);
+        let closed = request_gated(&mut app, "a", RefreshKind::Session, &tx, |t| {
+            snapshot("a", t, Vec::new(), 0)
+        });
+        let exiting = request_gated(&mut app, "b", RefreshKind::Status, &tx, |t| {
+            status("b", t, "unused")
+        });
+        tokio::task::yield_now().await;
+        assert!(!closed.is_closed() && !exiting.is_closed());
+
+        close_tab_at(&mut app, 0);
+        tokio::task::yield_now().await;
+        assert!(closed.is_closed(), "closed tab left its read running");
+        assert!(!exiting.is_closed(), "another tab's read was cancelled");
+
+        drop(app);
+        tokio::task::yield_now().await;
+        assert!(exiting.is_closed(), "TUI exit left its read running");
     }
 
     /// A slow activity poll that completes after a newer reload must not roll

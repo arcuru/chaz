@@ -20,7 +20,8 @@ impl Bridge for TuiBridge {
         let (models_tx, mut models_rx) = mpsc::channel::<Result<Vec<ModelInfo>, String>>(4);
         let (session_rows_tx, mut session_rows_rx) = mpsc::channel::<SessionLoad>(128);
         // Background tab reads (session reloads, status strip, live-turn
-        // counts). Bounded by `tabs × RefreshKind`, so this never fills.
+        // counts). Tasks are owned by their tab's slots; the channel adds
+        // bounded backpressure when many open tabs finish together.
         let (refresh_tx, mut refresh_rx) = mpsc::channel::<refresh::Refresh>(64);
 
         // Resolve any directly opened conversation before touching the
