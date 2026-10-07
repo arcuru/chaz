@@ -52,7 +52,8 @@ The TUI has four main pieces:
    After the agent/model comes the session's
    running token totals and cost (`<prompt>/<completion> tok • <cached>% cached
 • $<cost>`), summed across **all** agents. `DEBUG` / `EXP` indicators append
-   when those modes are on.
+   when those modes are on, and `⚠ refresh failed` appends while the tab's last
+   background read failed (see [Responsiveness](#responsiveness-and-background-refresh)).
 4. **Input box** — type messages and commands. Slash commands open an inline completion popup with grouped categories; arrow keys move the highlight. The input wraps at the terminal edge and grows with the draft, capped so it never takes the whole frame (a long draft squeezes the transcript instead); past that cap the box scrolls to keep the cursor visible. Use `Alt+Enter` for a new line, `Enter` to send, and `Left`/`Right` to move by a visible character (including combined Unicode characters).
 
 An ordinary launch opens the [session hub](#session-hub) rather than any conversation; there is no built-in default session.
@@ -564,6 +565,33 @@ For example, after sending `@chaz:example` a question in a shared Matrix room:
 3. If the executor exits before completion, `thinking...` clears after the
    heartbeat expires. `/interrupted` then lists the interrupted request;
    `/retry <request_id>` starts a new claim after you decide retrying is safe.
+
+## Responsiveness and background refresh
+
+Typing, scrolling, clicks and tab switches never wait on storage. Each tab
+keeps the last session state it read — transcript, session name and models,
+the extension status strip, and the `thinking...` indicator — and the TUI
+draws that immediately. Reads happen in the background and replace the cached
+state when they finish:
+
+| Trigger                             | Background read                                  |
+| ----------------------------------- | ------------------------------------------------ |
+| A write to an open session          | That tab's transcript and meta; status if active |
+| Switching tabs or opening a session | The newly active tab's extension status strip    |
+| Every five seconds                  | Each tab's live-turn claims (`thinking...`)      |
+
+A burst of writes (a streaming turn, sync catching up) costs at most one read
+in flight plus one follow-up per tab, and a result is applied only to the tab
+that asked for it — a late read for a closed or reopened tab is discarded.
+Pending keypresses and wheel notches are all handled in order, but drawn as one
+frame, and pointer motion is ignored without redrawing. Rendering reuses the
+wrapped transcript until it changes and draws only the visible rows, so typing
+in a long session costs about the same as in a short one.
+
+A slow backend therefore delays when new messages and status appear, not
+your input. If a background read fails, the tab keeps its last good state and
+the status bar shows `⚠ refresh failed` until a later read succeeds; the error
+is logged at `warn`.
 
 ## Entry Types
 

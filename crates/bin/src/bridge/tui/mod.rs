@@ -39,6 +39,7 @@ use tokio_stream::StreamExt;
 mod bridge_impl;
 mod input;
 mod jobs;
+mod refresh;
 mod theme;
 mod view;
 mod widgets;
@@ -93,6 +94,8 @@ enum Action {
     ModelsFetched(Result<Vec<ModelInfo>, String>),
     SessionLoad(SessionLoad),
     JobsLoaded(Result<chaz_core::server::JobMonitor, String>),
+    /// A background tab read finished (see [`refresh`]).
+    Refresh(refresh::Refresh),
 }
 
 enum SessionLoad {
@@ -532,6 +535,9 @@ pub(super) struct Tab {
     /// Per-entry expand override (entry index → "opposite of `App::expand_all`").
     /// Empty by default; click on an entry's icon toggles its presence here.
     pub expanded_entries: HashSet<usize>,
+    /// Backend-derived state refreshed off the input/render path, plus the
+    /// transcript render cache. See [`refresh`].
+    pub(in crate::bridge::tui) live: refresh::TabLive,
 }
 
 /// One attached agent as shown in the multi-agent status bar: its display
@@ -598,21 +604,6 @@ impl Tab {
             None => short_session_id(&self.session_db_id),
         }
     }
-}
-
-/// Refresh `app.status_segments` from the active session's `extension_outputs`
-/// store (the daemon writes it at the turn boundary). Flattens every
-/// extension's status map into render-ready segment values, ordered by
-/// extension name then key. No-op when there's no active tab.
-pub(super) async fn refresh_status_segments(app: &mut App) {
-    let Some(db) = app.tabs.get(app.active_tab).map(|t| t.session_db.clone()) else {
-        return;
-    };
-    let outputs = chaz_core::extension::read_extension_outputs(&db).await;
-    app.status_segments = outputs
-        .into_values()
-        .flat_map(|o| o.status.into_values())
-        .collect();
 }
 
 /// Width of the Settings category rail; the detail pane starts right of it.
@@ -773,11 +764,9 @@ pub(super) struct App {
     /// so the cursor row always points at the same server in both
     /// places.
     pub(super) peer_mcp_servers: Vec<chaz_core::mcp::McpRegistryEntry>,
-    /// Extension status segments flattened for the status strip, refreshed
-    /// by the run loop from the active session's `extension_outputs` store (the
-    /// daemon writes it at the turn boundary). Each entry is one
-    /// ready-to-render segment value, ordered by extension then key.
-    pub(super) status_segments: Vec<String>,
+    /// Monotonic ticket source for background tab refreshes; see
+    /// [`refresh`] for how tickets reject stale results.
+    pub(super) refresh_ticket: u64,
     /// Sub-cursor inside the Session → Models row list (row 0 =
     /// Session pin, rows 1..n = each attached agent). Drives which
     /// scope `Enter` opens the picker for. Clamped to live length
@@ -895,7 +884,7 @@ impl App {
             peer_defaults: Vec::new(),
             peer_defaults_cursor: 0,
             peer_mcp_servers: Vec::new(),
-            status_segments: Vec::new(),
+            refresh_ticket: 0,
             peer_mcp_cursor: 0,
             session_models_cursor: 0,
             session_agents_cursor: 0,
@@ -1722,13 +1711,8 @@ async fn build_tab(
             .resolve_model_for_agent(&agent.name)
             .map(str::to_string),
         expanded_entries: HashSet::new(),
+        live: Default::default(),
     }
-}
-
-/// Refresh live activity independently of historical transcript entries.
-async fn refresh_tab_activity(tab: &mut Tab) -> anyhow::Result<()> {
-    tab.active_turns = Session::active_turn_attempts(&tab.session_db).await?.len();
-    Ok(())
 }
 
 /// Shift the active tab by `delta` (wraps around), only in the conversation
@@ -2464,6 +2448,7 @@ async fn render_outcome(
                 roster,
                 context_budget,
                 expanded_entries: HashSet::new(),
+                live: Default::default(),
             });
             return true;
         }
@@ -2501,6 +2486,7 @@ fn show_local(app: &mut App, content: String, entry_type: EntryType) {
         metadata: None,
         routing: None,
     });
+    tab.touch_transcript();
 }
 
 #[cfg(test)]
@@ -2537,6 +2523,7 @@ mod session_picker_tests {
             context_budget: 0,
             model_pin: None,
             expanded_entries: HashSet::new(),
+            live: Default::default(),
         }
     }
 
@@ -2565,7 +2552,7 @@ mod session_picker_tests {
             .start_turn_attempt(chaz_core::session::TurnRequestId::parse("tui-message"))
             .await
             .unwrap();
-        refresh_tab_activity(&mut tab).await.unwrap();
+        tab.active_turns = refresh::load_active_turns(&tab.session_db).await.unwrap();
         assert_eq!(tab.active_turns, 1);
         assert!(view::turn_activity_line(tab.active_turns).is_some());
         session.complete_turn_attempt(&attempt, None).await.unwrap();
@@ -2580,7 +2567,7 @@ mod session_picker_tests {
             })
             .await
             .unwrap();
-        refresh_tab_activity(&mut tab).await.unwrap();
+        tab.active_turns = refresh::load_active_turns(&tab.session_db).await.unwrap();
         assert_eq!(tab.active_turns, 0);
         assert!(view::turn_activity_line(tab.active_turns).is_none());
     }

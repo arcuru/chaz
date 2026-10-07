@@ -348,6 +348,19 @@ pub(super) enum MouseOutcome {
     ModelPickerOpenSelected,
 }
 
+/// Whether `handle_mouse` can do anything with `m`. The run loop drops every
+/// other report (motion, drags, releases, other buttons) before it costs a
+/// handler pass or a redraw — with mouse capture on, a terminal reports every
+/// pointer move.
+pub(super) fn mouse_is_actionable(m: &MouseEvent) -> bool {
+    matches!(
+        m.kind,
+        MouseEventKind::ScrollUp
+            | MouseEventKind::ScrollDown
+            | MouseEventKind::Down(MouseButton::Left)
+    )
+}
+
 pub(super) fn handle_mouse(app: &mut App, m: MouseEvent) -> Option<MouseOutcome> {
     // Route the wheel to the visible cursor list; never scroll chat behind it.
     match m.kind {
@@ -499,6 +512,7 @@ pub(super) fn handle_mouse(app: &mut App, m: MouseEvent) -> Option<MouseOutcome>
                 if !set.remove(&i) {
                     set.insert(i);
                 }
+                tab.touch_transcript();
             }
         }
         ClickTarget::ModelPickerSelect(i) => {
@@ -793,6 +807,7 @@ fn parse_chat_line(app: &mut App, text: &str) -> Option<ChatAction> {
             tab.entries.clear();
             tab.scroll_offset = 0;
             tab.expanded_entries.clear();
+            tab.touch_transcript();
             return None;
         }
         "/debug" => {
@@ -1664,6 +1679,35 @@ pub(super) fn handle_picker_key(app: &mut App, key: KeyEvent) -> Option<String> 
 mod tests {
     use super::{command_catalog, command_extends, matching_commands};
     use std::collections::HashSet;
+
+    /// Only reports `handle_mouse` acts on survive the run loop's filter;
+    /// pointer motion and drags never reach a handler or a redraw.
+    #[test]
+    fn only_actionable_mouse_reports_pass_the_filter() {
+        use super::{MouseButton, MouseEvent, MouseEventKind, mouse_is_actionable};
+        let at = |kind| MouseEvent {
+            kind,
+            column: 3,
+            row: 4,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        };
+        for kind in [
+            MouseEventKind::ScrollUp,
+            MouseEventKind::ScrollDown,
+            MouseEventKind::Down(MouseButton::Left),
+        ] {
+            assert!(mouse_is_actionable(&at(kind)), "{kind:?}");
+        }
+        for kind in [
+            MouseEventKind::Moved,
+            MouseEventKind::Drag(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+            MouseEventKind::Down(MouseButton::Right),
+            MouseEventKind::ScrollLeft,
+        ] {
+            assert!(!mouse_is_actionable(&at(kind)), "{kind:?}");
+        }
+    }
 
     #[test]
     fn catalog_templates_are_well_formed() {

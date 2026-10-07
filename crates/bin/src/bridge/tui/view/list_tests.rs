@@ -96,6 +96,7 @@ async fn fixture_with_backends(
         context_budget: 0,
         model_pin: None,
         expanded_entries: HashSet::new(),
+        live: Default::default(),
     };
     let mut app = App::new(HashSet::new(), tab);
     app.session_settings_snapshot = Some(SessionMetaSnapshot {
