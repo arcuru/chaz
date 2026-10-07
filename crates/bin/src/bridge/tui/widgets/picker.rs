@@ -11,12 +11,12 @@
 //!
 //! Like `inline_edit_prompt`, this is a pure render function. State
 //! (filter buffer, cursor, selection index) lives on `App`; the caller
-//! pre-filters the candidate list and passes the visible slice in.
+//! pre-filters the candidate list and passes the full filtered slice in.
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Paragraph};
+use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph};
 
 use super::super::theme;
 
@@ -28,7 +28,9 @@ use super::super::theme;
 /// - `cursor` — byte offset into `filter` where the block cursor sits.
 /// - `items` — already-filtered candidate names, in display order.
 /// - `selected` — index into `items` of the highlighted row. Clamped to
-///   the visible range; ignored when `items` is empty.
+///   candidate range; ignored when `items` is empty.
+///
+/// Returns the match-row viewport for input ownership.
 pub(in super::super) fn picker(
     f: &mut Frame,
     area: Rect,
@@ -37,9 +39,9 @@ pub(in super::super) fn picker(
     cursor: usize,
     items: &[&str],
     selected: usize,
-) {
+) -> Rect {
     if area.height == 0 {
-        return;
+        return Rect::default();
     }
 
     // Paint the whole region with the bar background so any padding rows
@@ -67,32 +69,24 @@ pub(in super::super) fn picker(
     f.render_widget(Paragraph::new(filter_line).style(theme::bar()), chunks[0]);
 
     // 2. Match rows
-    let row_capacity = chunks[1].height as usize;
-    let mut rows: Vec<Line> = Vec::with_capacity(row_capacity);
     if items.is_empty() {
-        if row_capacity > 0 {
-            rows.push(Line::from(vec![Span::styled(
-                "  (no matches)",
-                theme::dim_on_bar(),
-            )]));
-        }
+        f.render_widget(
+            Paragraph::new("  (no matches)").style(theme::dim_on_bar()),
+            chunks[1],
+        );
     } else {
-        for (i, name) in items.iter().take(row_capacity).enumerate() {
-            let is_selected = i == selected;
-            let marker = if is_selected { "> " } else { "  " };
-            let style = if is_selected {
+        let selected = selected.min(items.len() - 1);
+        let rows = items.iter().enumerate().map(|(i, name)| {
+            let marker = if i == selected { "> " } else { "  " };
+            let style = if i == selected {
                 theme::selected()
             } else {
                 theme::text_on_bar()
             };
-            rows.push(Line::from(vec![Span::styled(
-                format!("  {marker}{name}"),
-                style,
-            )]));
-        }
-    }
-    if !rows.is_empty() {
-        f.render_widget(Paragraph::new(rows).style(theme::bar()), chunks[1]);
+            ListItem::new(Line::from(Span::styled(format!("  {marker}{name}"), style)))
+        });
+        let mut state = ListState::default().with_selected(Some(selected));
+        f.render_stateful_widget(List::new(rows).style(theme::bar()), chunks[1], &mut state);
     }
 
     // 3. Footer hint
@@ -103,4 +97,5 @@ pub(in super::super) fn picker(
         )]);
         f.render_widget(Paragraph::new(hint).style(theme::bar()), chunks[2]);
     }
+    chunks[1]
 }

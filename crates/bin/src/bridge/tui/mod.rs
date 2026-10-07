@@ -131,16 +131,40 @@ pub(super) enum SettingsScope {
     Session,
 }
 
-/// Which pane in a Settings page currently owns arrow-key input. Sidebar is
-/// the default on entry; Right / Enter / a sidebar click sets it. Detail
-/// takes over after Right / Enter into a category that owns an inner list
-/// (Session→Agents, Peer→Agents, Peer→Defaults) or after a click inside
-/// that list. Tab / BackTab cycle categories regardless of focus and snap
-/// focus back to Sidebar so the user never gets pinned inside the inner list.
+/// Category → List → Content input ownership. Static pages skip List;
+/// Tab / BackTab always return to Category.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum SettingsFocus {
-    Sidebar,
-    Detail,
+    Category,
+    List,
+    Content,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct SettingsReaderIdentity {
+    scope: SettingsScope,
+    category: usize,
+    entity: Option<String>,
+}
+
+/// One reading position, not a cache of positions for previously visited entities.
+#[derive(Default)]
+pub(super) struct SettingsReader {
+    identity: Option<SettingsReaderIdentity>,
+    pub offset: u16,
+    pub max_offset: u16,
+    pub visible_rows: u16,
+    pub viewport: Option<ratatui::layout::Rect>,
+}
+
+impl SettingsReader {
+    pub fn scroll(&mut self, down: bool, lines: u16) {
+        self.offset = if down {
+            self.offset.saturating_add(lines).min(self.max_offset)
+        } else {
+            self.offset.saturating_sub(lines)
+        };
+    }
 }
 
 /// Categories listed in the Peer Settings sidebar. Ordering here is the
@@ -281,6 +305,8 @@ pub(super) struct SettingsPicker {
     pub candidates: Vec<String>,
     pub selected: usize,
     pub intent: SettingsPickerIntent,
+    /// Match-row viewport from the last frame; hidden pickers own no hits.
+    pub viewport: ratatui::layout::Rect,
 }
 
 /// What the active settings picker is collecting. Same shape as
@@ -444,6 +470,8 @@ pub(super) enum ClickTarget {
     /// detail pane and moves the per-category cursor to row `i`. Only
     /// emitted for categories that own an inner list.
     SettingsDetailRow(usize),
+    /// Focus the visible read-only body without changing its selected entity.
+    SettingsContent,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -778,9 +806,12 @@ pub(super) struct App {
     /// Session Settings.
     pub(super) session_settings_index: usize,
     /// Which pane in the active Settings page owns ↑↓ / Enter input.
-    /// Reset to `Sidebar` on `open_settings`; flipped by Right / Enter,
+    /// Reset to `Category` on `open_settings`; flipped by Right / Enter,
     /// Left, or a click that lands inside the corresponding region.
     pub(super) settings_focus: SettingsFocus,
+    pub(super) settings_reader: SettingsReader,
+    /// Actual visible row slots, excluding the list header and footer.
+    pub(super) settings_list_area: Option<ratatui::layout::Rect>,
 }
 
 impl App {
@@ -843,7 +874,9 @@ impl App {
             agent_diff: None,
             settings_status: None,
             model_picker_caller: TuiMode::Chat,
-            settings_focus: SettingsFocus::Sidebar,
+            settings_focus: SettingsFocus::Category,
+            settings_reader: SettingsReader::default(),
+            settings_list_area: None,
         }
     }
 
@@ -854,8 +887,10 @@ impl App {
         if matches!(self.mode, TuiMode::Settings(_)) {
             return;
         }
+        self.settings_reader = SettingsReader::default();
+        self.settings_list_area = None;
         self.settings_return = Some(from);
-        self.settings_focus = SettingsFocus::Sidebar;
+        self.settings_focus = SettingsFocus::Category;
         self.mode = TuiMode::Settings(scope);
     }
 
@@ -866,6 +901,46 @@ impl App {
         self.mode = back;
         // Drop any transient Settings sub-state so re-entry starts clean.
         self.agent_diff = None;
+        self.settings_reader = SettingsReader::default();
+        self.settings_list_area = None;
+        self.click_regions.clear();
+    }
+
+    /// Refresh before rendering/input, including while a submodal covers the body.
+    /// A replacement at the same numeric cursor is still a different reader.
+    pub(super) fn sync_settings_reader(&mut self, scope: SettingsScope) {
+        let category = self.settings_index(scope);
+        let entity = match scope {
+            SettingsScope::Peer => match PeerSettingsCategory::ALL.get(category) {
+                Some(PeerSettingsCategory::Agents) => self
+                    .peer_agents_names
+                    .get(
+                        self.peer_agents_cursor
+                            .min(self.peer_agents_names.len().saturating_sub(1)),
+                    )
+                    .cloned(),
+                Some(PeerSettingsCategory::Mcp) => self
+                    .peer_mcp_servers
+                    .get(
+                        self.peer_mcp_cursor
+                            .min(self.peer_mcp_servers.len().saturating_sub(1)),
+                    )
+                    .map(|e| e.name.clone()),
+                _ => None,
+            },
+            SettingsScope::Session => Some(self.active().session_db_id.clone()),
+        };
+        let identity = SettingsReaderIdentity {
+            scope,
+            category,
+            entity,
+        };
+        if self.settings_reader.identity.as_ref() != Some(&identity) {
+            self.settings_reader = SettingsReader {
+                identity: Some(identity),
+                ..Default::default()
+            };
+        }
     }
 
     pub(super) fn settings_category_count(&self, scope: SettingsScope) -> usize {
@@ -888,6 +963,10 @@ impl App {
             return;
         }
         let clamped = idx.min(n - 1);
+        if self.settings_index(scope) != clamped {
+            self.settings_reader = SettingsReader::default();
+            self.settings_list_area = None;
+        }
         match scope {
             SettingsScope::Peer => self.peer_settings_index = clamped,
             SettingsScope::Session => self.session_settings_index = clamped,
@@ -1652,7 +1731,7 @@ async fn handle_chat_action(
             app.set_settings_index(SettingsScope::Session, models_idx);
             app.session_models_cursor = 0;
             app.open_settings(SettingsScope::Session, TuiMode::Chat);
-            app.settings_focus = SettingsFocus::Detail;
+            app.settings_focus = SettingsFocus::List;
         }
         ChatAction::OpenPicker => {
             open_session_picker(app, server, session_rows_tx, false);

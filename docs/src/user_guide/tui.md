@@ -213,6 +213,7 @@ See [Extensions](extensions.md). Extensions can also register their own slash co
 | ---------------------- | ------------------------------------------------------------- |
 | `/clear`               | Clear the display (entries remain in the database)            |
 | `/raw`                 | Dump raw entry data (index, timestamp, type, sender, content) |
+| `/settings`            | Open [Session Settings](#settings) (also `Ctrl+,` in chat)    |
 | `/debug`               | Toggle debug mode (also `Ctrl+D`)                             |
 | `/quit`, `/q`, `/exit` | Exit                                                          |
 
@@ -240,7 +241,7 @@ Approval prompts hijack the keyboard while open: `y` approve, `n` deny, `a` appr
 
 ### Mouse
 
-Mouse capture is enabled. Click on completion rows, help-overlay command rows, approval buttons, picker rows, tab titles, or tab close `[x]` widgets to act on them. The scroll wheel scrolls the help overlay when it is open; in the session picker, model picker, and Settings lists it moves the selection three rows (over the Settings detail pane, not its category rail), and the list scrolls to keep the selection visible; other overlays swallow it; otherwise it scrolls history.
+Mouse capture is enabled. Click on completion rows, help-overlay command rows, approval buttons, picker rows, tab titles, or tab close `[x]` widgets to act on them. The scroll wheel scrolls the help overlay when it is open; in the session and model pickers it moves the selection three rows. In Settings, it selects over the visible list rows and reads over the visible content body (see [Reading Settings details](#reading-settings-details)); headers, the category rail, and the status strip swallow it. Other overlays swallow it; otherwise it scrolls history.
 
 ## Debug Mode
 
@@ -273,6 +274,149 @@ Open with `/sessions` or `/s`:
 ```
 
 Sessions are listed from registry metadata: eidetica DB root ID, human-friendly name, bridge, agent, age, and status. The picker does not scan transcripts for entry counts, previews, or costs; selecting a session loads that conversation on demand, while `/costs` explicitly scans usage data. Catalog loading happens in the background, and agent metadata is fetched only for rows visible in the picker viewport, so navigation and cancel remain available while storage is slow. Loaded metadata stays cached while the TUI is open. The "New session" row stays pinned above the scrolling list; selecting it retains the list's viewport and continues loading those visible rows. The picker shows every session the registry knows about: TUI, Matrix-attached, `spawn_agent` / `spawn_worker` children, and anything synced from remote peers. The current session is marked with `*`. Press `Enter` to switch, `n` to create a new session, or `Esc` to cancel.
+
+## Settings
+
+Settings has two separate scopes: **Peer** covers this process's hosted agents and configuration; **Session** covers the active conversation's roster and model overrides. A per-agent Session model override does not change that agent's DB default. Peer → Agents can change the DB default, which applies wherever a session override does not win.
+
+| Entry path                            | Opens                                                  |
+| ------------------------------------- | ------------------------------------------------------ |
+| `Ctrl+,` in chat or `/settings`       | Session Settings                                       |
+| `/models` in chat                     | Session Settings → Models, with the scope list focused |
+| `Ctrl+,` or `s` in the session picker | Peer Settings                                          |
+
+`Ctrl+,` does nothing while Settings or the model picker is already open. Settings remembers its caller: `Esc` returns to chat or the session picker, rather than quitting. At normal terminal sizes the category rail stays on the left and the current page on the right. Navigation starts at **Category**, then enters **List → Content** (static/empty pages skip List); see [Reading Settings details](#reading-settings-details) for all keys and pointer controls. Number keys follow the sidebar order below (`1`–`9` for Peer, `1`–`6` for Session).
+
+A model picker returns to its Settings page on selection or `Esc`; canceling writes no model. Add prompts, add-agent pickers and YAML diffs handle `Esc` first, so cancel them before leaving Settings. Exiting Settings does not undo edits already applied.
+
+### Shipped pages and controls
+
+These tables list every category in sidebar order. Read-only pages are inspectors, not editors waiting for an apply key. The six **coming soon** pages are placeholders and have no settings controls.
+
+| Peer category | Current behavior                                                                                                                                                                                                                                                                              |
+| ------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Agents        | Inspect hosted agents and selected-agent details. In List or Content, `Enter` picks the agent's DB-default model. `r` opens a YAML diff: `r` applies the additive drift merge, `R` requests a full reseed with confirmation, and `a` lets you pick fields (`Space` toggles, `Enter` applies). |
+| Backends      | Read-only backend names, API base URLs, and configured/known model counts; no credential editor.                                                                                                                                                                                              |
+| Defaults      | Edit the ordered agents attached to new sessions; the first is the routing host. `a` opens an add prompt, `d` removes the selected row, and `Ctrl+↑` / `Ctrl+↓` reorder it. Changes persist in the peer DB, not YAML, and do not change existing session rosters.                             |
+| Bridges       | Read-only status: TUI active, CLI available, Matrix/Discord external binaries.                                                                                                                                                                                                                |
+| Extensions    | **Coming soon.**                                                                                                                                                                                                                                                                              |
+| MCP           | Read-only server list and selected-server status, tools, and failure details.                                                                                                                                                                                                                 |
+| Groups        | **Coming soon.**                                                                                                                                                                                                                                                                              |
+| Identity      | **Coming soon.**                                                                                                                                                                                                                                                                              |
+| About         | Read-only version, state directory, in-process bridges, and configuration/count summary.                                                                                                                                                                                                      |
+
+| Session category | Current behavior                                                                                                                               |
+| ---------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
+| Overview         | Read-only active-session identity, creation time, entry count, attached-agent count and host, current agent, and effective model.              |
+| Agents           | Inspect the attached roster. `a` opens a filtered picker of hosted agents not already attached (`Enter` adds); `d` removes the selected agent. |
+| Models           | Edit the session-wide pin or a per-agent session override via the [model picker](#model-picker).                                               |
+| Routing          | **Coming soon.**                                                                                                                               |
+| History          | **Coming soon.**                                                                                                                               |
+| Sharing          | **Coming soon.**                                                                                                                               |
+
+### Example: session override, then peer inspection
+
+1. In chat, type `/models`. The Models page opens with `Session` selected. Press `↓` to select an attached agent's row, then `Enter`; the picker title names that agent's scope.
+2. Type to filter models and press `Enter` to apply one. You return to Models with a per-agent override for **this session only**. To back out instead, press `Esc` in the picker: you return to Models with no model change. Press `Esc` on Models to return to chat.
+3. Open the session picker with `Ctrl+P`, then press `s` (or `Ctrl+,`). This opens **Peer**, not the highlighted session's Settings. Select Backends (key `2`) to inspect configured backends without editing them. Press `Esc` to return to the session picker, then `Esc` to return to chat. Merely browsing either scope does not write settings.
+
+### Reading Settings details
+
+#### Keys and pointer
+
+| Input                        | Category focus                                                                                        | List focus                                                                                  | Content focus                                          |
+| ---------------------------- | ----------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------- | ------------------------------------------------------ |
+| `Up` / `Down`                | Cycle categories; wraps                                                                               | Select an entity or model scope; wraps                                                      | Read one wrapped line; clamps                          |
+| `Right`                      | Enter a nonempty list, otherwise Content                                                              | Enter the body on Peer Agents/MCP; otherwise no-op                                          | No-op                                                  |
+| `Left`                       | No-op                                                                                                 | Return to Category                                                                          | Return to the list, or Category on a static/empty page |
+| `PageUp` / `PageDown`        | No-op                                                                                                 | No-op                                                                                       | Read a page, with one line of overlap                  |
+| `Home` / `End`               | First/last category                                                                                   | First/last category                                                                         | Beginning/end of the body                              |
+| `Tab` / `Shift+Tab`, `1`–`9` | Cycle/jump categories                                                                                 | Same, returning to Category                                                                 | Same, returning to Category                            |
+| `Enter`                      | Enter a list/static body; Session Models opens its picker                                             | Peer Agents sets the selected agent's default model; Session Models opens its scoped picker | Peer Agents keeps that model action; otherwise no-op   |
+| `Esc`                        | Return to the caller                                                                                  | Same                                                                                        | Same; use Left to leave only the reader                |
+| Click an entity row          | Select it and focus List                                                                              | Same                                                                                        | Same                                                   |
+| Click the body               | Focus Content without moving selection or reading position                                            | Same                                                                                        | Same                                                   |
+| Wheel over list/body         | List: select three entities, clamped. Body: read three wrapped lines, clamped. Focus does not change. | Same                                                                                        | Same                                                   |
+
+Action letters such as `a`, `d`, and `r`, and Defaults' `Ctrl+Up`/`Ctrl+Down`
+reordering keep their existing selected-row targets. Prompts, pickers, diffs,
+and approval input take precedence over the reader. A pending tool approval
+shows the same request and buttons as chat, preserving any Settings draft and
+reading position until it is answered. Wheeling or clicking a covered Settings
+list cannot move its selection or the hidden chat.
+
+#### Selection is not reading position
+
+An agent's workers are decorative list rows, not selectable agents. If the
+whole agent-and-workers group fits the list's current row budget, it stays
+expanded. Otherwise its agent row shows `[20 workers → details]` (with the
+actual count). The existing body still contains every worker's fields.
+
+When a body overflows, a pinned row identifies the selected entity and shows
+its visible wrapped-line range, such as `DETAILS [1–14/131] · alpha`.
+`DETAILS` is highlighted while Content owns the keys. Scrolling this body
+never changes the selected agent/server or a model action's scope.
+System prompts remain deliberately abbreviated previews, not full-prompt viewers.
+
+There is one reading position. Changing the category or selected entity,
+including a catalog replacement at the same index, resets it to the beginning;
+leaving Settings resets it too. Focus changes and opening/canceling a model
+picker or diff preserve it. Resizing rewraps the body and clamps the numeric
+wrapped-line offset. It does not preserve a semantic text anchor or remember
+separate positions for previously visited entities. A body that fits again
+returns to its ordinary, unscrolled layout.
+
+#### Read an overflowing worker group
+
+1. In an 80×24 terminal, open Peer Settings → Agents and select an agent
+   `alpha` with twenty worker templates. Its row shows:
+
+   ```text
+   > [20 workers → details] alpha
+   ```
+
+   Shorter groups that fit still show their nested `└` rows.
+
+2. Press Right to focus List, then Right again for Content. For short field
+   values, the pinned row reads:
+
+   ```text
+   DETAILS [1–14/131] · alpha
+   ```
+
+   Use Down or PageDown to read. End exposes the final workers' model,
+   spawn-depth, tools and prompt-preview fields; `alpha` remains selected:
+
+   ```text
+   DETAILS [118–131/131] · alpha
+   ```
+
+3. If the wheel seems inactive over the pinned row or a list header, move it
+   into the body below the pinned row. Headers swallow wheel events; blank
+   body cells still scroll. Move over the list only when you intend to select
+   a different agent, which resets reading to Home.
+4. Resize to 120×40. The same agent and focus remain selected; the visible
+   range is remeasured and the offset clamps to the new last page if needed.
+   Use Home to return to the first fields. Left returns to List; Esc returns
+   to the session picker. Reading itself writes no settings.
+
+### Adding an agent from Settings
+
+In Session Settings → Agents, press `a` to open the add-agent picker.
+Typing filters candidate names (case-insensitive substring); `↑`/`↓` selects,
+`Enter` adds the highlighted agent, and `Esc` cancels without changing the roster.
+The filtered selection remains the action target even when the list scrolls or
+resizes. The wheel moves three candidates only over the picker's match rows;
+background category/list clicks are ignored while the picker owns input.
+
+For example:
+
+1. With more candidates than visible rows, move down to the final candidate.
+   The list scrolls to show `> candidate-29`; `Enter` adds that candidate,
+   not a row from the previous visible page.
+2. Type a filter with no matches. The picker shows `(no matches)` and `Enter`
+   adds nothing. Reopen with `a`, or remove the filter with `Backspace` before
+   accepting, or press `Esc` to cancel.
 
 ## Named Sessions
 
@@ -384,7 +528,7 @@ The TUI renders different entry types with distinct styles:
 | ToolResult | Dimmed `< tool_name: output`           | Tool returned a result                                         |
 | Error      | Red `ERROR sender: message`            | An error occurred                                              |
 
-Senders are color-coded: agents in green, users in cyan, system in yellow.
+Senders are color-coded: agents in magenta, users in cyan, system in yellow. Green is the UI accent, not the agent sender color.
 
 ## Tool Approval
 
