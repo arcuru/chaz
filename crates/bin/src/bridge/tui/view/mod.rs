@@ -67,14 +67,26 @@ fn context_segment(tab: &super::Tab) -> String {
         .and_then(|e| e.metadata.as_ref())
         .filter(|m| m.model == tab.effective_model)
         .and_then(|m| m.context_tokens)
-        .filter(|&n| n > 0)
-        .map_or_else(|| "unknown".to_string(), |n| format!("~{n}"));
+        .filter(|&n| n > 0);
+    let percentage = match used {
+        Some(n) if tab.context_budget > 0 => {
+            format!(
+                " ({:.1}%)",
+                f64::from(n) / tab.context_budget as f64 * 100.0
+            )
+        }
+        _ => String::new(),
+    };
+    let used = used.map_or_else(
+        || "unknown".to_string(),
+        |n| format!("~{}", human_tokens(u64::from(n))),
+    );
     let max = if tab.context_budget == 0 {
         "unknown".to_string()
     } else {
-        tab.context_budget.to_string()
+        human_tokens(tab.context_budget as u64)
     };
-    format!(" | ctx {used}/{max} tok")
+    format!(" | ctx {used}/{max}{percentage} tok")
 }
 
 /// One-line preview of a ToolCall entry's content. Server writes ToolCall
@@ -1352,13 +1364,15 @@ fn render_approval_panel(
 
 /// Compact token count for the status bar: `942`, `12.3k`, `1.5M`.
 fn human_tokens(n: u64) -> String {
-    if n < 1000 {
-        n.to_string()
+    let (value, suffix) = if n < 1000 {
+        return n.to_string();
     } else if n < 1_000_000 {
-        format!("{:.1}k", n as f64 / 1000.0)
+        (n as f64 / 1000.0, "k")
     } else {
-        format!("{:.1}M", n as f64 / 1_000_000.0)
-    }
+        (n as f64 / 1_000_000.0, "M")
+    };
+    let value = format!("{value:.1}");
+    format!("{}{suffix}", value.trim_end_matches(".0"))
 }
 
 /// "5m ago", "3h ago", "2d ago", "5w ago" — coarse age for the picker.
@@ -1932,13 +1946,22 @@ mod chat_frame_tests {
         other.metadata.as_mut().unwrap().context_tokens = Some(900_000);
         tab.entries.push(other);
         let screen = draw(&mut app, 100, 16).0.join("\n");
-        assert!(screen.contains("ctx ~12345/1050000 tok"), "{screen}");
+        assert!(screen.contains("ctx ~12.3k/1.1M (1.2%) tok"), "{screen}");
+
+        app.active_mut().entries[0]
+            .metadata
+            .as_mut()
+            .unwrap()
+            .context_tokens = Some(57_000);
+        app.active_mut().context_budget = 1_000_000;
+        let screen = draw(&mut app, 100, 16).0.join("\n");
+        assert!(screen.contains("ctx ~57k/1M (5.7%) tok"), "{screen}");
 
         // New model, same session: don't pair its budget with an old count.
         app.active_mut().effective_model = "small-model".into();
         app.active_mut().context_budget = 32_000;
         let screen = draw(&mut app, 80, 16).0.join("\n");
-        assert!(screen.contains("ctx unknown/32000 tok"), "{screen}");
+        assert!(screen.contains("ctx unknown/32k tok"), "{screen}");
         // A new response restores usage; a cap changes only the denominator.
         let mut latest = entry;
         latest.metadata.as_mut().unwrap().model = "small-model".into();
@@ -1946,7 +1969,12 @@ mod chat_frame_tests {
         app.active_mut().entries.push(latest);
         app.active_mut().context_budget = 16_000;
         let screen = draw(&mut app, 80, 16).0.join("\n");
-        assert!(screen.contains("ctx ~20001/16000 tok"), "{screen}");
+        assert!(screen.contains("ctx ~20k/16k (125.0%) tok"), "{screen}");
+        // A known count without a budget cannot produce a percentage.
+        app.active_mut().context_budget = 0;
+        let screen = draw(&mut app, 80, 16).0.join("\n");
+        assert!(screen.contains("ctx ~20k/unknown tok"), "{screen}");
+        app.active_mut().context_budget = 16_000;
         // Missing/zero usage on the latest message must not resurrect older data.
         app.active_mut()
             .entries
@@ -1957,7 +1985,7 @@ mod chat_frame_tests {
             .unwrap()
             .context_tokens = Some(0);
         let screen = draw(&mut app, 80, 16).0.join("\n");
-        assert!(screen.contains("ctx unknown/16000 tok"), "{screen}");
+        assert!(screen.contains("ctx unknown/16k tok"), "{screen}");
         app.active_mut().entries.last_mut().unwrap().metadata = None;
         app.active_mut().context_budget = 0;
         let screen = draw(&mut app, 80, 16).0.join("\n");
@@ -1965,7 +1993,7 @@ mod chat_frame_tests {
         app.active_mut().entries.clear();
         app.active_mut().context_budget = 1_050_000;
         let screen = draw(&mut app, 80, 16).0.join("\n");
-        assert!(screen.contains("ctx unknown/1050000 tok"), "{screen}");
+        assert!(screen.contains("ctx unknown/1.1M tok"), "{screen}");
     }
 
     #[tokio::test]
@@ -1975,7 +2003,7 @@ mod chat_frame_tests {
         for name in ["long session name ".repeat(8), "界e\u{301}".repeat(40)] {
             app.active_mut().session_name = Some(name);
             let screen = draw(&mut app, 80, 16).0.join("\n");
-            assert!(screen.contains("ctx unknown/1050000 tok"), "{screen}");
+            assert!(screen.contains("ctx unknown/1.1M tok"), "{screen}");
         }
     }
 
@@ -2312,7 +2340,10 @@ mod tests {
     fn human_tokens_scales() {
         assert_eq!(human_tokens(0), "0");
         assert_eq!(human_tokens(942), "942");
+        assert_eq!(human_tokens(1_000), "1k");
         assert_eq!(human_tokens(12_345), "12.3k");
+        assert_eq!(human_tokens(57_000), "57k");
+        assert_eq!(human_tokens(1_000_000), "1M");
         assert_eq!(human_tokens(1_500_000), "1.5M");
     }
 

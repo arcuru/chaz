@@ -27,7 +27,7 @@ chaz --config config.yaml "what's on my plate today?"
 |   The current time is 10:30 AM UTC.                 |
 |                                                     |
 +-----------------------------------------------------+
-| tui | ctx ~7680/128000 tok | agent: default | model: gpt-5 | 1.5k/0.2k tok • 0% cached |
+| tui | ctx ~7.7k/128k (6.0%) tok | agent: default | model: gpt-5 | 1.5k/0.2k tok • 0% cached |
 +--[ > ]----------------------------------------------+
 | type here...                                        |
 +-----------------------------------------------------+
@@ -41,8 +41,8 @@ The TUI has four main pieces:
    session shows `agent: <name> | model: <model>`; a multi-agent session lists
    the whole roster with the host marked `*` and each agent's model
    (`agents: alpha*→opus, beta→haiku`), collapsing to a count if it would
-   overflow. `ctx ~<used>/<max> tok` shows the host's last reported input
-   count and effective input budget (see [Context usage](#context-usage)).
+   overflow. `ctx ~<used>/<max> (<percent>%) tok` shows the host's last reported input
+   count, effective input budget, and occupancy percentage (see [Context usage](#context-usage)).
    After the agent/model comes the session's
    running token totals and cost (`<prompt>/<completion> tok • <cached>% cached
 • $<cost>`), summed across **all** agents. `DEBUG` / `EXP` indicators append
@@ -53,7 +53,7 @@ When prior sessions exist, the TUI opens straight into the session picker on lau
 
 ## Context usage
 
-The status bar's `ctx ~12345/1050000 tok` pair is separate from the running
+The status bar's `ctx ~57k/1M (5.7%) tok` pair is separate from the running
 prompt/completion totals. The numerator is the **host agent's final LLM call's
 reported prompt tokens**, not the sum of every tool-loop call.
 `~` marks an estimate of current occupancy: the last call does not include
@@ -61,6 +61,10 @@ subsequent messages or a freshly rebuilt system prompt.
 Chaz does not manufacture a count from a percentage or locally estimate a
 missing provider count. `unknown` means no usable count is available (including
 missing/zero usage or a last response from a different model).
+
+Counts use rounded `k`/`M` suffixes, omitting a redundant `.0`.
+The percentage is calculated from the unrounded counts and shown only when
+both the count and budget are known; it can exceed 100% after lowering a cap.
 
 The denominator is the runtime's effective **input** context budget, not the
 output-token cap. Configured model windows take precedence over discovered
@@ -72,14 +76,14 @@ on redraw. Long session names are clipped to keep the pair visible.
 For example:
 
 1. Select a model advertising a 1,050,000-token window via `/models` → select a scope → `Enter`.
-   Before a response, the bar shows `ctx unknown/1050000 tok`.
+   Before a response, the bar shows `ctx unknown/1.1M tok`.
 2. Send a message. If the final call reports 12,345 prompt tokens, it shows
-   `ctx ~12345/1050000 tok`, even if the turn's accumulated prompt total is larger.
+   `ctx ~12.3k/1.1M (1.2%) tok`, even if the turn's accumulated prompt total is larger.
 3. Switch to a 32,000-token model. Until that model replies, the old model's
-   count is not reused: `ctx unknown/32000 tok`.
+   count is not reused: `ctx unknown/32k tok`.
 4. If the provider omits usage, it remains `unknown`; a later response with
    usage restores the numerator. An agent cap of 16,000 changes the denominator
-   to `16000`, including after reopening the session.
+   to `16k`, including after reopening the session.
 
 ## Commands
 
