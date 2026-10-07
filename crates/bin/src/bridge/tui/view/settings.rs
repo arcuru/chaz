@@ -54,19 +54,16 @@ fn render_content(
         height: area.height - header_rows,
         ..area
     };
-    let body = Paragraph::new(lines[header..].to_vec()).wrap(Wrap { trim: false });
-    let count = body.line_count(body_area.width);
     let reader = &mut app.settings_reader;
     reader.visible_rows = body_area.height;
-    reader.max_offset = count
-        .saturating_sub(body_area.height as usize)
-        .min(u16::MAX as usize) as u16;
-    if !overflow {
-        reader.max_offset = 0;
-    }
-    reader.offset = reader.offset.min(reader.max_offset);
     reader.viewport = (body_area.height > 0).then_some(body_area);
     if overflow {
+        let body = Paragraph::new(lines[header..].to_vec()).wrap(Wrap { trim: false });
+        let count = body.line_count(body_area.width);
+        reader.max_offset = count
+            .saturating_sub(body_area.height as usize)
+            .min(u16::MAX as usize) as u16;
+        reader.offset = reader.offset.min(reader.max_offset);
         let start = reader.offset as usize + 1;
         let end = (reader.offset as usize + body_area.height as usize).min(count);
         let focused = app.settings_focus == super::super::SettingsFocus::Content;
@@ -84,6 +81,8 @@ fn render_content(
         f.render_widget(Paragraph::new(cue), Rect { height: 1, ..area });
         f.render_widget(body.scroll((reader.offset, 0)), body_area);
     } else {
+        reader.max_offset = 0;
+        reader.offset = 0;
         f.render_widget(paragraph, area);
     }
     if let Some(viewport) = reader.viewport {

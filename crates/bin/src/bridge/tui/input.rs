@@ -1141,50 +1141,28 @@ pub(super) fn handle_settings_key(
         // Tab / BackTab always cycle categories and force focus back to
         // the sidebar, so the user can always get unstuck regardless of
         // which pane currently owns arrow keys.
-        KeyCode::Tab => {
-            app.set_settings_index(scope, (cur + 1) % n);
+        KeyCode::Tab | KeyCode::BackTab => {
+            let step = if key.code == KeyCode::Tab { 1 } else { n - 1 };
+            app.set_settings_index(scope, (cur + step) % n);
             app.settings_focus = SettingsFocus::Category;
             SettingsKey::None
         }
-        KeyCode::BackTab => {
-            app.set_settings_index(scope, (cur + n - 1) % n);
-            app.settings_focus = SettingsFocus::Category;
+        KeyCode::Up | KeyCode::Down => {
+            let down = key.code == KeyCode::Down;
+            match focus {
+                SettingsFocus::Category => {
+                    app.set_settings_index(scope, (cur + if down { 1 } else { n - 1 }) % n);
+                }
+                SettingsFocus::List => {
+                    if let Some(len) = inner_list_len {
+                        bump_inner_cursor(app, scope, cur, if down { 1 } else { -1 }, len);
+                        app.sync_settings_reader(scope);
+                    }
+                }
+                SettingsFocus::Content => app.settings_reader.scroll(down, 1),
+            }
             SettingsKey::None
         }
-        KeyCode::Down => match focus {
-            SettingsFocus::Category => {
-                app.set_settings_index(scope, (cur + 1) % n);
-                SettingsKey::None
-            }
-            SettingsFocus::List => {
-                if let Some(len) = inner_list_len {
-                    bump_inner_cursor(app, scope, cur, 1, len);
-                    app.sync_settings_reader(scope);
-                }
-                SettingsKey::None
-            }
-            SettingsFocus::Content => {
-                app.settings_reader.scroll(true, 1);
-                SettingsKey::None
-            }
-        },
-        KeyCode::Up => match focus {
-            SettingsFocus::Category => {
-                app.set_settings_index(scope, (cur + n - 1) % n);
-                SettingsKey::None
-            }
-            SettingsFocus::List => {
-                if let Some(len) = inner_list_len {
-                    bump_inner_cursor(app, scope, cur, -1, len);
-                    app.sync_settings_reader(scope);
-                }
-                SettingsKey::None
-            }
-            SettingsFocus::Content => {
-                app.settings_reader.scroll(false, 1);
-                SettingsKey::None
-            }
-        },
         KeyCode::Right => {
             match focus {
                 SettingsFocus::Category => {
