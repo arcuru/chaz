@@ -15,19 +15,16 @@ impl Bridge for TuiBridge {
         let (models_tx, mut models_rx) = mpsc::channel::<Result<Vec<ModelInfo>, String>>(4);
         let (session_rows_tx, mut session_rows_rx) = mpsc::channel::<SessionLoad>(128);
 
-        let (_conv_id, session_db) = default_tui_session(&server).await?;
-        let session_db_id = session_db.root_id().to_string();
-
-        let backend = BackendManager::new(&self.config.backends, self.secrets.clone());
-
-        setup_session(
+        // Resolve any directly opened conversation before touching the
+        // terminal, so a bad `--session` surfaces as a plain error.
+        let launch = launch_session(
             &server,
-            &session_db,
-            backend.clone(),
-            approval_tx.clone(),
-            notify_tx.clone(),
+            self.session.as_deref(),
+            self.initial_prompt.is_some(),
         )
         .await?;
+
+        let backend = BackendManager::new(&self.config.backends, self.secrets.clone());
 
         let agent_names: HashSet<String> = server
             .agents()
@@ -36,11 +33,24 @@ impl Bridge for TuiBridge {
             .map(|s| s.to_string())
             .collect();
 
-        let initial_tab = build_tab(&server, &backend, session_db, session_db_id).await;
-        let mut app = App::new(agent_names, initial_tab);
-        if let Some(prompt) = self.initial_prompt.as_ref() {
-            app.input = prompt.clone();
-            app.cursor = app.input.len();
+        let mut app = App::hub(agent_names);
+        if let Some(session_db) = launch {
+            setup_session(
+                &server,
+                &session_db,
+                backend.clone(),
+                approval_tx.clone(),
+                notify_tx.clone(),
+            )
+            .await?;
+            let session_db_id = session_db.root_id().to_string();
+            app.push_tab(build_tab(&server, &backend, session_db, session_db_id).await);
+            app.mode = TuiMode::Chat;
+            // Prefill, never send: the user reviews the prompt first.
+            if let Some(prompt) = self.initial_prompt.as_ref() {
+                app.input = prompt.clone();
+                app.cursor = app.input.len();
+            }
         }
 
         let original_hook = std::panic::take_hook();
@@ -52,17 +62,10 @@ impl Bridge for TuiBridge {
         let mut terminal = init_terminal()?;
         let mut events = EventStream::new();
 
-        // When prior sessions exist, open straight into the picker so the
-        // user picks one (or the New session row) instead of always landing
-        // in the default session. A fresh install — only the just-created
-        // empty default session — still goes directly to chat. Also
-        // skipped when an initial prompt was supplied — the user already
-        // signalled "I want to send something now," not "show me sessions."
-        if self.initial_prompt.is_none() {
-            // Enter a responsive loading state before touching the catalog.
-            // Once it arrives, a truly fresh one-session state falls through
-            // to chat; prior history keeps the picker open.
-            open_session_picker(&mut app, &server, &session_rows_tx, true);
+        // An ordinary launch opens the hub — even on an empty install — and
+        // creates nothing. The catalog loads in the background.
+        if app.tabs.is_empty() {
+            open_session_picker(&mut app, &server, &session_rows_tx);
         }
 
         let mut activity_tick = tokio::time::interval(std::time::Duration::from_secs(5));
@@ -110,7 +113,11 @@ impl Bridge for TuiBridge {
                     } else if key.code == KeyCode::Char('w')
                         && key.modifiers.contains(KeyModifiers::CONTROL)
                     {
-                        close_active_tab(&mut app);
+                        // Closes the focused conversation view only; the
+                        // last one closing lands back on the hub.
+                        if app.mode == TuiMode::Chat {
+                            app.close_tab_at(app.active_tab);
+                        }
                     } else if key.code == KeyCode::Char(',')
                         && key.modifiers.contains(KeyModifiers::CONTROL)
                     {
@@ -142,8 +149,10 @@ impl Bridge for TuiBridge {
                     } else if key.code == KeyCode::Char('p')
                         && key.modifiers.contains(KeyModifiers::CONTROL)
                     {
-                        // Ctrl+P toggles the session picker. In chat mode it
-                        // opens it; in picker mode it dismisses back to chat.
+                        // Ctrl+P toggles the session hub. In chat mode it
+                        // opens it; in the hub it returns to the open
+                        // conversation, or reloads a hub that has none (or
+                        // whose catalog failed to load).
                         match app.mode {
                             TuiMode::Chat => {
                                 handle_chat_action(
@@ -160,7 +169,12 @@ impl Bridge for TuiBridge {
                                 .await;
                             }
                             TuiMode::SessionPicker => {
-                                app.mode = TuiMode::Chat;
+                                if app.tabs.is_empty() || app.session_picker_error.is_some() {
+                                    app.session_list_fresh = false;
+                                    open_session_picker(&mut app, &server, &session_rows_tx);
+                                } else {
+                                    app.mode = TuiMode::Chat;
+                                }
                             }
                             TuiMode::ModelPicker => {
                                 app.mode = app.model_picker_caller;
@@ -216,7 +230,6 @@ impl Bridge for TuiBridge {
                                         &mut app,
                                         &server,
                                         &backend,
-                                        &self.secrets,
                                         &approval_tx,
                                         &notify_tx,
                                     )
@@ -279,19 +292,16 @@ impl Bridge for TuiBridge {
                                     &mut app,
                                     &server,
                                     &backend,
-                                    &self.secrets,
                                     &approval_tx,
                                     &notify_tx,
                                 )
                                 .await;
                             }
                             input::MouseOutcome::TabActivate(i) => {
-                                if i < app.tabs.len() {
-                                    app.active_tab = i;
-                                }
+                                app.set_active_tab(i);
                             }
                             input::MouseOutcome::TabClose(i) => {
-                                close_tab_at(&mut app, i);
+                                app.close_tab_at(i);
                             }
                             input::MouseOutcome::ModelPickerOpenSelected => {
                                 if let Some(model_id) = app.model_picker_selection() {
@@ -415,20 +425,15 @@ impl Bridge for TuiBridge {
                 }
                 Action::SessionLoad(load) => match load {
                     SessionLoad::Catalog { generation, result } => {
-                        match apply_session_catalog_result(&mut app, generation, result) {
-                            CatalogLoadOutcome::Loaded { fresh_default } if fresh_default => {
-                                app.mode = TuiMode::Chat;
-                                app.cancel_session_fill();
-                            }
-                            CatalogLoadOutcome::Loaded { .. } => {}
-                            CatalogLoadOutcome::Ignored | CatalogLoadOutcome::Failed => {}
-                        }
+                        apply_session_catalog_result(&mut app, generation, result);
                     }
                     SessionLoad::Row { generation, info } => {
                         apply_session_row(&mut app, generation, info);
                     }
                 },
             }
+
+            ensure_view(&mut app, &server, &session_rows_tx);
 
             // The picker owns the background fill; the moment we're not in it,
             // stop opening session DBs the user isn't looking at. A re-open

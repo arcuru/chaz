@@ -360,7 +360,7 @@ pub(super) fn handle_mouse(app: &mut App, m: MouseEvent) -> Option<MouseOutcome>
                 };
             } else if app.overlay.is_some() {
                 // Modal overlays own the wheel even when they have no scroll.
-            } else if app.active().pending_approval.is_some() {
+            } else if app.has_pending_approval() {
                 // Approval owns input; no wheel reaches the background.
             } else if let Some(picker) = app.settings_picker.as_mut() {
                 if picker
@@ -398,8 +398,8 @@ pub(super) fn handle_mouse(app: &mut App, m: MouseEvent) -> Option<MouseOutcome>
                     }
                     app.sync_settings_reader(scope);
                 }
-            } else {
-                let off = &mut app.active_mut().scroll_offset;
+            } else if let Some(tab) = app.current_mut() {
+                let off = &mut tab.scroll_offset;
                 *off = if down {
                     off.saturating_sub(3)
                 } else {
@@ -413,10 +413,7 @@ pub(super) fn handle_mouse(app: &mut App, m: MouseEvent) -> Option<MouseOutcome>
     }
 
     // The filter picker has keyboard actions, not background list/category hits.
-    if app.overlay.is_none()
-        && app.settings_picker.is_some()
-        && app.active().pending_approval.is_none()
-    {
+    if app.overlay.is_none() && app.settings_picker.is_some() && !app.has_pending_approval() {
         return None;
     }
 
@@ -436,8 +433,8 @@ pub(super) fn handle_mouse(app: &mut App, m: MouseEvent) -> Option<MouseOutcome>
         && (app.agent_diff.is_some()
             || app.settings_prompt.is_some()
             || app.settings_picker.is_some()
-            || app.active().pending_approval.is_some())
-        && !(app.active().pending_approval.is_some()
+            || app.has_pending_approval())
+        && !(app.has_pending_approval()
             && matches!(
                 hit.target,
                 ClickTarget::ApprovalApprove
@@ -493,9 +490,11 @@ pub(super) fn handle_mouse(app: &mut App, m: MouseEvent) -> Option<MouseOutcome>
         ClickTarget::TabActivate(i) => return Some(MouseOutcome::TabActivate(i)),
         ClickTarget::TabClose(i) => return Some(MouseOutcome::TabClose(i)),
         ClickTarget::ToggleEntryExpanded(i) => {
-            let set = &mut app.active_mut().expanded_entries;
-            if !set.remove(&i) {
-                set.insert(i);
+            if let Some(tab) = app.current_mut() {
+                let set = &mut tab.expanded_entries;
+                if !set.remove(&i) {
+                    set.insert(i);
+                }
             }
         }
         ClickTarget::ModelPickerSelect(i) => {
@@ -587,13 +586,19 @@ fn wheel_step(cursor: usize, down: bool, len: usize) -> usize {
 }
 
 fn apply_approval(app: &mut App, decision: ApprovalDecision) {
-    if let Some(exchange) = app.active_mut().pending_approval.take() {
+    if let Some(exchange) = app
+        .current_mut()
+        .and_then(|tab| tab.pending_approval.take())
+    {
         let _ = exchange.decision_tx.send(decision);
     }
 }
 
 fn handle_approval_key(app: &mut App, key: KeyEvent) -> bool {
-    if let Some(exchange) = app.active_mut().pending_approval.take() {
+    if let Some(exchange) = app
+        .current_mut()
+        .and_then(|tab| tab.pending_approval.take())
+    {
         let decision = match key.code {
             KeyCode::Char('y') => Some(ApprovalDecision::Approve),
             KeyCode::Char('n') => Some(ApprovalDecision::Deny),
@@ -1590,6 +1595,7 @@ fn bump_inner_cursor(
 }
 
 pub(super) fn handle_picker_key(app: &mut App, key: KeyEvent) -> Option<String> {
+    app.hub_notice = None;
     match key.code {
         KeyCode::Up => {
             if app.picker_index > 0 {
@@ -1606,9 +1612,9 @@ pub(super) fn handle_picker_key(app: &mut App, key: KeyEvent) -> Option<String> 
         KeyCode::Enter => Some(app.picker_selection()),
         KeyCode::Char('n') => Some("__new__".to_string()),
         KeyCode::Char('s') => {
-            // `s` opens Peer Settings — the session list view doubles as
-            // the "peer landing page", so its settings surface is the peer
-            // scope. Esc inside Settings returns here.
+            // `s` opens Peer Settings — the hub is the peer landing page,
+            // so its settings surface is the peer scope, with or without an
+            // open conversation. Esc inside Settings returns here.
             app.open_settings(super::SettingsScope::Peer, TuiMode::SessionPicker);
             None
         }
@@ -1638,7 +1644,11 @@ pub(super) fn handle_picker_key(app: &mut App, key: KeyEvent) -> Option<String> 
             None
         }
         KeyCode::Esc => {
-            app.mode = TuiMode::Chat;
+            // The hub is the base view: Esc returns to an open conversation,
+            // and is a no-op when there is none to return to.
+            if !app.tabs.is_empty() {
+                app.mode = TuiMode::Chat;
+            }
             None
         }
         _ => None,

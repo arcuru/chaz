@@ -6,6 +6,14 @@ All notable changes to this project will be documented in this file.
 
 ### Breaking Changes
 
+- The TUI no longer opens or creates a session named `tui` at launch. A plain
+  `chaz` opens the session hub and creates nothing; **New session** creates and
+  opens one. `chaz "PROMPT"` creates one new session with the prompt pre-filled
+  (still unsent), and `--session NAME` now also works without `--print`,
+  reopening or creating that named session. Closing the last conversation view
+  returns to the hub instead of being refused; closing never deletes a session.
+  Existing sessions named `tui` are left as ordinary sessions.
+
 - CLI arguments now follow `claude` / `pi` conventions. The TUI is the default
   when no other mode is selected; `--tui` and `--cli` are removed.
   - `chaz` → TUI (previously launched the Matrix bridge). When the

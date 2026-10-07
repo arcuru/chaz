@@ -152,12 +152,13 @@ The TUI is the default — just run chaz with no other mode flag:
 chaz --config config.yaml
 ```
 
-You'll see a terminal interface with an input bar at the bottom and a status bar showing the current session and agent. Type a message and press Enter to chat.
+It opens on the session hub, a list of your sessions with a pinned **New session** row; launching creates nothing. Press `n` (or select **New session**) to start a conversation, then type a message and press Enter to chat. See [Session Hub](tui.md#session-hub).
 
-You can also pass an initial prompt as a positional argument; it pre-fills the input box so you can review and send it:
+You can also pass an initial prompt as a positional argument; it opens a new conversation with the prompt pre-filled, unsent, so you can review and send it. Add `--session NAME` to open (or create) a named session instead:
 
 ```bash
 chaz --config config.yaml "Summarize the last meeting notes."
+chaz --config config.yaml --session standup "Summarize the last meeting notes."
 ```
 
 Type `/help` to see available commands.

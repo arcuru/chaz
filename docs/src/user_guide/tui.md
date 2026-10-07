@@ -6,11 +6,17 @@ The TUI (Terminal User Interface) is the default surface. It provides a local ch
 chaz --config config.yaml
 ```
 
-You can pre-fill the input box with a starting prompt by passing it as a positional argument:
+| Launch                         | Opens                                                          | Creates a session?       |
+| ------------------------------ | -------------------------------------------------------------- | ------------------------ |
+| `chaz`                         | The [session hub](#session-hub), even when sessions exist      | No                       |
+| `chaz "PROMPT"`                | A new conversation with `PROMPT` in the composer, unsent       | Yes, exactly one         |
+| `chaz --session NAME`          | The session named `NAME`                                       | Only if `NAME` is absent |
+| `chaz --session NAME "PROMPT"` | The session named `NAME` with `PROMPT` in its composer, unsent | Only if `NAME` is absent |
 
-```bash
-chaz --config config.yaml "what's on my plate today?"
-```
+A prompt is never sent for you; review it and press `Enter`. `--session` takes a
+session name, not an ID. If the name exists but its session cannot be opened,
+chaz exits with the error instead of opening or creating another conversation.
+`-p`/`--print` and `cmd` are unchanged.
 
 ## Interface Layout
 
@@ -35,7 +41,7 @@ chaz --config config.yaml "what's on my plate today?"
 
 The TUI has four main pieces:
 
-1. **Tab bar** — one tab per open session. Click to switch, `[x]` to close, or use `Ctrl+PageUp`/`Ctrl+PageDown`. Closing the last tab is refused (the TUI always shows at least one session).
+1. **Tab bar** — one tab per open conversation view. Click to switch, `×` to close, or use `Ctrl+PageUp`/`Ctrl+PageDown`. Closing a view never deletes, detaches, or stops its session; closing the last one returns to the [session hub](#session-hub). The right side lists the keys that fit.
 2. **Messages area** — conversation history with all entry types
 3. **Status bar** — session name, context usage/budget, then the agent and model. A single-agent
    session shows `agent: <name> | model: <model>`; a multi-agent session lists
@@ -49,7 +55,7 @@ The TUI has four main pieces:
    when those modes are on.
 4. **Input box** — type messages and commands. Slash commands open an inline completion popup with grouped categories; arrow keys move the highlight. The input wraps at the terminal edge and grows with the draft, capped so it never takes the whole frame (a long draft squeezes the transcript instead); past that cap the box scrolls to keep the cursor visible. Use `Alt+Enter` for a new line, `Enter` to send, and `Left`/`Right` to move by a visible character (including combined Unicode characters).
 
-When prior sessions exist, the TUI opens straight into the session picker on launch so you choose which one to resume (or pick the "New session" row). A truly fresh state directory drops directly into the default `tui` session.
+An ordinary launch opens the [session hub](#session-hub) rather than any conversation; there is no built-in default session.
 
 ## Context usage
 
@@ -94,7 +100,7 @@ The TUI catalogs every built-in slash command in its inline completion popup —
 | Command           | Description                                                            |
 | ----------------- | ---------------------------------------------------------------------- |
 | `/help`, `/?`     | Open the help overlay (also `F1`)                                      |
-| `/sessions`, `/s` | Open the session picker (also `Ctrl+P`)                                |
+| `/sessions`, `/s` | Open the session hub (also `Ctrl+P`)                                   |
 | `/new`            | Create a new session and switch to it                                  |
 | `/new <group>`    | Create a new session with a named agent group attached                 |
 | `/groups`         | List the configured agent groups                                       |
@@ -231,9 +237,9 @@ Unknown `/<name>` commands route to extension dispatch — see the error you get
 | `Alt+Enter`                     | Insert a line break in the draft instead of sending                 |
 | `Esc`                           | First press: dismiss completion popup. Second (no popup): quit      |
 | `F1`                            | Open the help overlay                                               |
-| `Ctrl+P`                        | Toggle the session picker                                           |
+| `Ctrl+P`                        | Open the session hub (in the hub: back to the open conversation)    |
 | `Ctrl+D`                        | Toggle debug mode                                                   |
-| `Ctrl+W`                        | Close the active tab (refuses to close the last tab)                |
+| `Ctrl+W`                        | Close the active view; the last one returns to the hub              |
 | `Ctrl+PageUp` / `Ctrl+PageDown` | Cycle to previous / next tab (wraps)                                |
 | `Ctrl+C`                        | Quit                                                                |
 
@@ -241,7 +247,7 @@ Approval prompts hijack the keyboard while open: `y` approve, `n` deny, `a` appr
 
 ### Mouse
 
-Mouse capture is enabled. Click on completion rows, help-overlay command rows, approval buttons, picker rows, tab titles, or tab close `[x]` widgets to act on them. The scroll wheel scrolls the help overlay when it is open; in the session and model pickers it moves the selection three rows. In Settings, it selects over the visible list rows and reads over the visible content body (see [Reading Settings details](#reading-settings-details)); headers, the category rail, and the status strip swallow it. Other overlays swallow it; otherwise it scrolls history.
+Mouse capture is enabled. Click on completion rows, help-overlay command rows, approval buttons, hub and picker rows, tab titles, or tab close `×` widgets to act on them. The scroll wheel scrolls the help overlay when it is open; in the session hub and model picker it moves the selection three rows. In Settings, it selects over the visible list rows and reads over the visible content body (see [Reading Settings details](#reading-settings-details)); headers, the category rail, and the status strip swallow it. Other overlays swallow it; otherwise it scrolls history.
 
 ## Debug Mode
 
@@ -255,37 +261,80 @@ This is useful for understanding the session entry flow, correlating with log ou
 
 The `/raw` command provides an even more detailed dump: every entry's index, timestamp, type, sender, and content in a tabular format.
 
-## Session Picker
+## Session Hub
 
-Open with `/sessions` or `/s`:
+The session hub is the TUI's home: the list of this peer's sessions plus a pinned **New session** row.
 
 ```text
-+--[ Sessions ]---------------------------------------+
-|                                                     |
-| > sha256:abc… "tui" * [tui] default • 2h ago       |
-|                                                     |
-|   sha256:def… [matrix] default • 1d ago             |
-|                                                     |
-|   sha256:xyz… [spawn] researcher • 4d ago           |
-|                                                     |
-+-----------------------------------------------------+
-| [Up/Down] navigate | [Enter] select | [n] new | ... |
-+-----------------------------------------------------+
++--[ Sessions ]-------------------------------------------+
+|                                                         |
+| > + New session                                         |
+|                                                         |
+|   "work" * [tui] default • 2h ago                       |
+|                                                         |
+|   …3f9a1c0d [matrix] default • 1d ago                   |
+|                                                         |
++---------------------------------------------------------+
+ ↑↓ select · Enter open · n new · r rename · s peer settings · Ctrl+C quit
 ```
 
-Sessions are listed from registry metadata: eidetica DB root ID, human-friendly name, bridge, agent, age, and status. The picker does not scan transcripts for entry counts, previews, or costs; selecting a session loads that conversation on demand, while `/costs` explicitly scans usage data. Catalog loading happens in the background, and agent metadata is fetched only for rows visible in the picker viewport, so navigation and cancel remain available while storage is slow. Loaded metadata stays cached while the TUI is open. The "New session" row stays pinned above the scrolling list; selecting it retains the list's viewport and continues loading those visible rows. The picker shows every session the registry knows about: TUI, Matrix-attached, `spawn_agent` / `spawn_worker` children, and anything synced from remote peers. The current session is marked with `*`. Press `Enter` to switch, `n` to create a new session, or `Esc` to cancel.
+| Key / action     | In the hub                                                                                      |
+| ---------------- | ----------------------------------------------------------------------------------------------- |
+| `↑` / `↓`, wheel | Move the selection (the wheel moves three rows)                                                 |
+| `Enter`, click   | Open the selected session, or create one on **New session** (click selects, second click opens) |
+| `n`              | Create a session and open it                                                                    |
+| `r`              | Rename the selected session                                                                     |
+| `s` / `Ctrl+,`   | [Peer Settings](#settings); `Esc` there returns to the hub                                      |
+| `Esc` / `Ctrl+P` | Back to the open conversation; nothing when none is open                                        |
+| `Ctrl+P`         | Reload the list when it failed to load or no conversation is open                               |
+| `Ctrl+C`         | Quit                                                                                            |
+
+The footer shows the subset of these keys that fits the terminal, and `Esc back` only when there is a conversation to return to.
+
+### How the hub, sessions and views relate
+
+A **session** is stored data: its transcript, roster and name live in the peer's database whether or not the TUI shows it. A **view** is a tab showing one session in this TUI process. The hub is the base view underneath every tab.
+
+- **Launching creates nothing.** `chaz` opens the hub even on an empty install; you create a session explicitly with **New session** or `n`, which stores it and opens it at once. The launch prompt and `--session` forms in the [launch table](#tui-mode) are the only other ways a launch creates one.
+- **Opening is not creating.** Selecting a session that already has a view focuses that view instead of adding a duplicate.
+- **Closing a view is local.** `Ctrl+W` or `×` removes the view only. The session keeps its history, agents and bridge attachments, and an agent already working in it carries on. Closing the last view returns to the hub; reopen the session from there.
+- **Drafts follow their view.** Unsent text and the cursor stay with each conversation when you switch tabs, visit the hub, or open Settings, as does each view's scroll position. Closing a view discards its draft.
+- **Settings scope is explicit.** From the hub, `s` opens Peer Settings, which needs no open conversation. Session Settings exists only for an open conversation and is titled with its name.
+- **The list is local.** Rows come from this peer's session catalog: TUI sessions, Matrix-attached ones, `spawn_agent` / `spawn_worker` children, and anything synced so far. It is not an inventory of every remote peer. Agent names load only for visible rows; a row shows `…` until then. `*` marks the focused conversation.
+- **A session named `tui` is ordinary.** Earlier versions opened a session named `tui` on every launch. Existing ones stay as they are and appear in the list like any other session.
+
+The list reads registry metadata only: root ID, name, bridge, agent, age and status. It never scans transcripts for counts, previews or costs, and `/costs` scans usage explicitly. The catalog loads in the background, so navigation, New and Peer Settings work while it loads. _Loading sessions…_, _No saved sessions yet_ and _Failed to load sessions: … — Ctrl+P retries._ are distinct states; a failure is never shown as an empty list. A failed open or create stays in the hub with the error in the footer until the next key.
+
+### Walkthrough: from the hub and back
+
+1. On a fresh install, run `chaz --config config.yaml`. The hub shows only **New session**, followed by `No saved sessions yet — select "New session" above.` Nothing has been stored.
+2. Press `n`. A conversation opens with an empty composer. Its tab bar reads ` …3f9a1c0d ×  Ctrl+P sessions · Ctrl+, settings · Ctrl+W close`. Send a message and leave a half-typed reply in the composer.
+3. Press `Ctrl+P`. The hub lists the new session marked `*`. Press `Esc` to return; the half-typed reply and cursor are where you left them.
+4. Press `Ctrl+W`. The view closes and the hub returns, still listing the session; its history is intact. Select it and press `Enter` to reopen it.
+5. Press `s` in the hub, read a Peer Settings page, and press `Esc` to come back to the hub. No conversation needed to be open.
+6. Quit with `Ctrl+C` and run `chaz --config config.yaml --session work "draft the agenda"`. A session named `work` is created and opened, with `draft the agenda` waiting unsent. Run the same command again: `work` reopens, and no second session appears.
+7. Failure: if the session index names `work` but its database can no longer be opened, chaz neither opens another conversation nor creates a replacement:
+
+   ```text
+   Error: Failed to open session 'work'
+
+   Caused by:
+       …
+   ```
+
+   Inside the hub, a stale row that cannot be opened behaves the same way: the footer shows `Failed to switch session: …` and you stay in the hub.
 
 ## Settings
 
 Settings has two separate scopes: **Peer** covers this process's hosted agents and configuration; **Session** covers the active conversation's roster and model overrides. A per-agent Session model override does not change that agent's DB default. Peer → Agents can change the DB default, which applies wherever a session override does not win.
 
-| Entry path                            | Opens                                                  |
-| ------------------------------------- | ------------------------------------------------------ |
-| `Ctrl+,` in chat or `/settings`       | Session Settings                                       |
-| `/models` in chat                     | Session Settings → Models, with the scope list focused |
-| `Ctrl+,` or `s` in the session picker | Peer Settings                                          |
+| Entry path                         | Opens                                                  |
+| ---------------------------------- | ------------------------------------------------------ |
+| `Ctrl+,` in chat or `/settings`    | Session Settings                                       |
+| `/models` in chat                  | Session Settings → Models, with the scope list focused |
+| `Ctrl+,` or `s` in the session hub | Peer Settings (no open conversation needed)            |
 
-`Ctrl+,` does nothing while Settings or the model picker is already open. Settings remembers its caller: `Esc` returns to chat or the session picker, rather than quitting. At normal terminal sizes the category rail stays on the left and the current page on the right. Navigation starts at **Category**, then enters **List → Content** (static/empty pages skip List); see [Reading Settings details](#reading-settings-details) for all keys and pointer controls. Number keys follow the sidebar order below (`1`–`9` for Peer, `1`–`6` for Session).
+`Ctrl+,` does nothing while Settings or the model picker is already open. Settings remembers its caller: `Esc` returns to chat or the session hub, rather than quitting. At normal terminal sizes the category rail stays on the left and the current page on the right. Navigation starts at **Category**, then enters **List → Content** (static/empty pages skip List); see [Reading Settings details](#reading-settings-details) for all keys and pointer controls. Number keys follow the sidebar order below (`1`–`9` for Peer, `1`–`6` for Session).
 
 A model picker returns to its Settings page on selection or `Esc`; canceling writes no model. Add prompts, add-agent pickers and YAML diffs handle `Esc` first, so cancel them before leaving Settings. Exiting Settings does not undo edits already applied.
 
@@ -318,7 +367,7 @@ These tables list every category in sidebar order. Read-only pages are inspector
 
 1. In chat, type `/models`. The Models page opens with `Session` selected. Press `↓` to select an attached agent's row, then `Enter`; the picker title names that agent's scope.
 2. Type to filter models and press `Enter` to apply one. You return to Models with a per-agent override for **this session only**. To back out instead, press `Esc` in the picker: you return to Models with no model change. Press `Esc` on Models to return to chat.
-3. Open the session picker with `Ctrl+P`, then press `s` (or `Ctrl+,`). This opens **Peer**, not the highlighted session's Settings. Select Backends (key `2`) to inspect configured backends without editing them. Press `Esc` to return to the session picker, then `Esc` to return to chat. Merely browsing either scope does not write settings.
+3. Open the session hub with `Ctrl+P`, then press `s` (or `Ctrl+,`). This opens **Peer**, not the highlighted session's Settings. Select Backends (key `2`) to inspect configured backends without editing them. Press `Esc` to return to the session hub, then `Esc` to return to chat. Merely browsing either scope does not write settings.
 
 ### Reading Settings details
 
@@ -398,7 +447,7 @@ returns to its ordinary, unscrolled layout.
 4. Resize to 120×40. The same agent and focus remain selected; the visible
    range is remeasured and the offset clamps to the new last page if needed.
    Use Home to return to the first fields. Left returns to List; Esc returns
-   to the session picker. Reading itself writes no settings.
+   to the session hub. Reading itself writes no settings.
 
 ### Adding an agent from Settings
 
@@ -432,7 +481,7 @@ Named sessions can be referenced anywhere a session identifier is accepted:
 /join daily-standup
 ```
 
-The name appears in the status bar, session picker, and `/info` output. Names must be unique across all sessions. Use `/name` (with no argument) to clear the name.
+The name appears in the status bar, session hub, and `/info` output. Names must be unique across all sessions. Use `/name` (with no argument) to clear the name.
 
 ## Model Picker
 

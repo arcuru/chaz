@@ -16,7 +16,8 @@ use tracing::{error, info, warn};
 struct ChazArgs {
     /// Print the response and exit — non-interactive one-shot. By default
     /// each invocation creates a fresh ephemeral session; pass --session
-    /// NAME to reuse one. Without --print, chaz launches the TUI.
+    /// NAME to reuse one. Without --print, chaz launches the TUI, which
+    /// opens on the session hub unless a prompt or --session is given.
     #[arg(short = 'p', long = "print")]
     print: bool,
 
@@ -26,13 +27,15 @@ struct ChazArgs {
     #[arg(short, long)]
     config: Option<PathBuf>,
 
-    /// Named session to reuse with --print (find-or-create). When omitted,
-    /// --print creates a fresh session per invocation.
-    #[arg(long, requires = "print", value_name = "NAME")]
+    /// Named session to open (find-or-create). With --print the prompt runs
+    /// there; otherwise the TUI opens it directly instead of the session hub.
+    /// When omitted, --print creates a fresh session per invocation.
+    #[arg(long, value_name = "NAME")]
     session: Option<String>,
 
     /// Initial prompt. With --print, sent as the one-shot message
-    /// (required). Without --print, pre-fills the TUI input box on launch.
+    /// (required). Without --print, the TUI pre-fills it, unsent, in the
+    /// --session conversation or in a newly created one.
     #[arg(required_if_eq("print", "true"))]
     prompt: Option<String>,
 
@@ -121,6 +124,17 @@ fn resolve_config_path(explicit: Option<&std::path::Path>) -> anyhow::Result<Pat
     }
 }
 
+/// The top-level `--session` selects the TUI or `--print` conversation. A
+/// subcommand would silently ignore it (`cmd` has its own flag), so refuse it.
+fn validate_session_scope(args: &ChazArgs) -> anyhow::Result<()> {
+    if args.session.is_some() && args.subcommand.is_some() {
+        anyhow::bail!(
+            "--session applies to the TUI and --print; pass `chaz cmd --session NAME` for a command"
+        );
+    }
+    Ok(())
+}
+
 /// Resolve the configured state directory, expanding a leading `~` when set.
 /// Falls back to the platform XDG state directory when it is absent.
 fn resolve_state_dir(config: &Config) -> Option<PathBuf> {
@@ -134,6 +148,7 @@ fn resolve_state_dir(config: &Config) -> Option<PathBuf> {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let mut args = ChazArgs::parse();
+    validate_session_scope(&args)?;
 
     let config_path = resolve_config_path(args.config.as_deref())?;
 
@@ -319,8 +334,10 @@ async fn main() -> anyhow::Result<()> {
             extra_auto_approved_tools,
             server::McpReadiness::Deferred,
         );
+        // A service-client TUI targets the session it will open, if named;
+        // the hub alone needs only the configured defaults.
         if options.targeted_session.is_some() && !daemon_mode {
-            options.targeted_session = Some("tui".to_string());
+            options.targeted_session = Some(args.session.clone().unwrap_or_default());
         }
         options
     };
@@ -384,6 +401,9 @@ async fn main() -> anyhow::Result<()> {
         let mut tui_bridge = bridge::tui::TuiBridge::new(config, secret_store);
         if let Some(prompt) = args.prompt {
             tui_bridge = tui_bridge.with_initial_prompt(prompt);
+        }
+        if let Some(name) = args.session {
+            tui_bridge = tui_bridge.with_session(name);
         }
         tui_bridge.run(server).await
     };
@@ -478,9 +498,35 @@ async fn run_usage_subcommand(args: UsageArgs, config: &Config) -> anyhow::Resul
 
 #[cfg(test)]
 mod tests {
-    use super::{resolve_config_path, resolve_state_dir};
+    use super::{ChazArgs, resolve_config_path, resolve_state_dir, validate_session_scope};
     use chaz_core::config::Config;
+    use clap::Parser;
     use std::path::PathBuf;
+
+    #[test]
+    fn session_flag_reaches_interactive_and_print_but_not_subcommands() {
+        let parse = |argv: &[&str]| ChazArgs::try_parse_from(argv).unwrap();
+        let tui = parse(&["chaz", "--session", "work"]);
+        assert_eq!(tui.session.as_deref(), Some("work"));
+        assert!(!tui.print && tui.prompt.is_none());
+        validate_session_scope(&tui).unwrap();
+
+        let prefilled = parse(&["chaz", "--session", "work", "draft"]);
+        assert_eq!(prefilled.prompt.as_deref(), Some("draft"));
+        validate_session_scope(&prefilled).unwrap();
+
+        let print = parse(&["chaz", "-p", "--session", "work", "hi"]);
+        assert!(print.print);
+        validate_session_scope(&print).unwrap();
+        assert!(
+            ChazArgs::try_parse_from(["chaz", "-p"]).is_err(),
+            "--print needs PROMPT"
+        );
+
+        let cmd = parse(&["chaz", "--session", "work", "cmd", "/info"]);
+        assert!(validate_session_scope(&cmd).is_err());
+        validate_session_scope(&parse(&["chaz", "cmd", "/info", "--session", "work"])).unwrap();
+    }
 
     #[test]
     fn explicit_config_arg_wins() {
