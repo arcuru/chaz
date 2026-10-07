@@ -473,25 +473,25 @@ pub(super) struct Tab {
     pub current_agent: String,
     pub session_name: Option<String>,
     /// The model the runtime would actually use for this session's next
-    /// turn, as resolved by `BackendManager::resolve_model_name` from the
-    /// agent's `default_model`. Empty string when no backends are configured.
-    /// Resolved at tab construction; if the agent or backend default
-    /// changes mid-session the displayed value goes stale until the next
-    /// tab open.
+    /// turn, as resolved from session pins and the current agent/backend default.
+    /// Refreshed on every draw; empty when no backends are configured.
     pub effective_model: String,
     /// Full roster of agents attached to this session, each with its
     /// resolved effective model and whether it is the designated host.
     /// Drives the multi-agent status-bar segment; for a single-agent
     /// session the bar falls back to `current_agent`/`effective_model` so
-    /// its rendering stays byte-identical. Refreshed wherever
-    /// `effective_model` is.
+    /// its rendering stays byte-identical. Refreshed on session changes;
+    /// the current agent's model also refreshes on draw.
     pub roster: Vec<RosterAgent>,
     /// The per-turn context budget (tokens) the runtime would target for the
     /// current agent's effective model — the model's resolved window, lowered
     /// by any per-agent cap, or the configured default when the window is
-    /// unknown. Denominator for the status bar's `ctx N%`. Resolved at tab
-    /// construction alongside `effective_model`; goes stale the same way.
+    /// unknown. Denominator for the status bar's numeric context pair. Refreshed on
+    /// every draw from the runtime overlay and current agent cap.
     pub context_budget: usize,
+    /// Session/per-agent pin, retaining any backend prefix. Kept separate from
+    /// defaults so live agent edits can re-resolve unpinned models on draw.
+    pub model_pin: Option<String>,
     /// Per-entry expand override (entry index → "opposite of `App::expand_all`").
     /// Empty by default; click on an entry's icon toggles its presence here.
     pub expanded_entries: HashSet<usize>,
@@ -1486,14 +1486,17 @@ async fn build_tab(
     .await;
     let meta = session.read_meta().await;
     let roster = build_roster(server, backend, &meta);
-    let session_name = meta.name;
-    // Mirror the runtime's resolution: the live turn passes
-    // `agent.default_model` into `runtime::execute`, which calls
-    // `BackendManager::resolve_model_name` to strip the backend prefix
-    // and fall back to the backend default when None.
-    let effective_model = backend.resolve_model_name(agent.default_model.as_deref());
-    let context_budget =
-        server.effective_context_budget(&effective_model, agent.max_context_tokens);
+    let session_name = meta.name.clone();
+    // Reopening a session must honor persisted pins just like a live refresh.
+    let requested_model = meta
+        .resolve_model_for_agent(&agent.name)
+        .or(agent.default_model.as_deref());
+    let effective_model = backend.resolve_model_name(requested_model);
+    let context_model = requested_model
+        .map(str::to_string)
+        .or_else(|| backend.default_model())
+        .unwrap_or_default();
+    let context_budget = server.effective_context_budget(&context_model, agent.max_context_tokens);
     let entries = session.entries().to_vec();
     let active_turns = Session::active_turn_attempts(&session_db)
         .await
@@ -1511,6 +1514,9 @@ async fn build_tab(
         effective_model,
         roster,
         context_budget,
+        model_pin: meta
+            .resolve_model_for_agent(&agent.name)
+            .map(str::to_string),
         expanded_entries: HashSet::new(),
     }
 }
@@ -2187,9 +2193,17 @@ async fn render_outcome(
             let agent = server.agents().get(&agent_name);
             let agent_default_model = agent.as_ref().and_then(|a| a.default_model.clone());
             let agent_cap = agent.as_ref().and_then(|a| a.max_context_tokens);
-            let effective_model = backend.resolve_model_name(agent_default_model.as_deref());
-            let context_budget = server.effective_context_budget(&effective_model, agent_cap);
-            let roster = build_roster(server, backend, &session.read_meta().await);
+            let meta = session.read_meta().await;
+            let requested_model = meta
+                .resolve_model_for_agent(&agent_name)
+                .or(agent_default_model.as_deref());
+            let effective_model = backend.resolve_model_name(requested_model);
+            let context_model = requested_model
+                .map(str::to_string)
+                .or_else(|| backend.default_model())
+                .unwrap_or_default();
+            let context_budget = server.effective_context_budget(&context_model, agent_cap);
+            let roster = build_roster(server, backend, &meta);
             app.tabs.push(Tab {
                 session_db_id,
                 session_db: db,
@@ -2197,6 +2211,9 @@ async fn render_outcome(
                 scroll_offset: 0,
                 pending_approval: None,
                 active_turns,
+                model_pin: meta
+                    .resolve_model_for_agent(&agent_name)
+                    .map(str::to_string),
                 current_agent: agent_name,
                 session_name,
                 effective_model,
@@ -2265,6 +2282,7 @@ mod session_picker_tests {
             effective_model: String::new(),
             roster: Vec::new(),
             context_budget: 0,
+            model_pin: None,
             expanded_entries: HashSet::new(),
         }
     }

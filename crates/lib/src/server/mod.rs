@@ -1739,7 +1739,7 @@ impl Server {
     /// resolution `run_*_turn` feeds the context builder
     /// ([`resolve_context_max_tokens`]), with the static configured default
     /// applied when neither a window nor a cap narrows it. Surfaced so the
-    /// TUI can render `ctx N%` against the exact denominator the runtime uses.
+    /// TUI can show the same effective maximum in its numeric context pair.
     ///
     /// Resolves windows through the server's own `default_backend`, which is
     /// the manager whose overlay gets warmed at startup and updated by the
