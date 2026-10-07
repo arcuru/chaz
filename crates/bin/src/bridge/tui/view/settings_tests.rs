@@ -580,6 +580,8 @@ async fn settings_modals_keep_reader_position_and_own_background_input() {
                     candidates: (0..10).map(|i| format!("candidate-{i}")).collect(),
                     selected: 0,
                     intent: SettingsPickerIntent::AddSessionAgent,
+                    // Simulate a stale match region from a previously visible picker.
+                    viewport: list,
                 })
             }
             3 => {
@@ -612,7 +614,13 @@ async fn settings_modals_keep_reader_position_and_own_background_input() {
         )));
         input::handle_mouse(&mut app, mouse(MouseEventKind::ScrollDown, list.x, list.y));
         if modal == 2 {
-            assert_eq!(app.settings_picker.as_ref().unwrap().selected, 3);
+            let picker = app.settings_picker.as_ref().unwrap();
+            assert_eq!(
+                picker.viewport,
+                Rect::default(),
+                "off-page picker is hidden"
+            );
+            assert_eq!(picker.selected, 0, "hidden picker cannot receive the wheel");
         }
         key(&mut app, KeyCode::Home);
         input::handle_mouse(
@@ -757,6 +765,89 @@ async fn settings_approval_is_visible_and_denial_preserves_reader_and_draft() {
         assert_regions(&app, width, height);
     }
     key(&mut app, KeyCode::Char('n'));
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn settings_approval_owns_visible_picker_input_and_preserves_filter() {
+    let (_instance, server, backend, mut app) = fixture().await;
+    open(&mut app, SettingsScope::Session, 1);
+    app.settings_focus = SettingsFocus::List;
+    app.input = "chat draft".into();
+    for (width, height) in [(80, 24), (120, 40)] {
+        for by_mouse in [false, true] {
+            app.settings_picker = Some(SettingsPicker {
+                label: "add agent".into(),
+                filter: "candidate".into(),
+                cursor: 9,
+                candidates: (0..30).map(|i| format!("candidate-{i:02}")).collect(),
+                selected: 29,
+                intent: SettingsPickerIntent::AddSessionAgent,
+                viewport: Rect::default(),
+            });
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            let rows = draw(&mut terminal, &mut app, &server, &backend);
+            assert!(contains(&rows, "> candidate-29"), "{rows:?}");
+            let picker_area = app.settings_picker.as_ref().unwrap().viewport;
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            app.active_mut().pending_approval = Some(chaz_core::bridge::ApprovalExchange {
+                info: chaz_core::tool::ToolApprovalInfo {
+                    name: "review_tool".into(),
+                    arguments_display: "fixture arguments".into(),
+                    risk_level: chaz_core::tool::RiskLevel::High,
+                },
+                decision_tx: tx,
+            });
+            let rows = draw(&mut terminal, &mut app, &server, &backend);
+            assert!(contains(&rows, "review_tool") && contains(&rows, "[n] deny"));
+            assert_regions(&app, width, height);
+            key(&mut app, KeyCode::Home);
+            assert!(matches!(
+                key(&mut app, KeyCode::Enter),
+                input::SettingsKey::None
+            ));
+            input::handle_mouse(
+                &mut app,
+                mouse(MouseEventKind::ScrollUp, picker_area.x, picker_area.y),
+            );
+            if by_mouse {
+                let deny = *app
+                    .click_regions
+                    .iter()
+                    .find(|r| matches!(r.target, ClickTarget::ApprovalDeny))
+                    .unwrap();
+                input::handle_mouse(
+                    &mut app,
+                    mouse(MouseEventKind::Down(MouseButton::Left), deny.x, deny.y),
+                );
+            } else {
+                key(&mut app, KeyCode::Char('n'));
+            }
+            assert!(
+                app.active().pending_approval.is_none(),
+                "approval owns picker clicks"
+            );
+            assert!(matches!(
+                tokio::time::timeout(std::time::Duration::from_secs(1), rx)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                chaz_core::bridge::ApprovalDecision::Deny
+            ));
+            let picker = app.settings_picker.as_ref().unwrap();
+            assert_eq!(picker.filter, "candidate");
+            assert_eq!(picker.cursor, 9);
+            assert_eq!(picker.selected, 29);
+            assert_eq!(app.settings_focus, SettingsFocus::List);
+            assert_eq!(app.session_agents_cursor, 0);
+            assert_eq!(app.input, "chat draft");
+            assert_eq!(app.mode, TuiMode::Settings(SettingsScope::Session));
+            let rows = draw(&mut terminal, &mut app, &server, &backend);
+            assert!(contains(&rows, "> candidate-29"), "{rows:?}");
+            key(&mut app, KeyCode::Esc);
+            assert!(app.settings_picker.is_none());
+        }
+    }
     server.shutdown().await;
 }
 

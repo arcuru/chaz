@@ -413,7 +413,10 @@ pub(super) fn handle_mouse(app: &mut App, m: MouseEvent) -> Option<MouseOutcome>
     }
 
     // The filter picker has keyboard actions, not background list/category hits.
-    if app.overlay.is_none() && app.settings_picker.is_some() {
+    if app.overlay.is_none()
+        && app.settings_picker.is_some()
+        && app.active().pending_approval.is_none()
+    {
         return None;
     }
 
