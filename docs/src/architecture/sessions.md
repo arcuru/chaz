@@ -154,6 +154,26 @@ second command naming the old attempt is rejected as stale. This is durable
 deduplication under the documented one-executor assumption, not distributed
 fencing or exactly-once external effects.
 
+#### Reader-first wire compatibility
+
+Upgrade **every reader** sharing a session before enabling writers of new wire
+variants: executors, TUI/CLI clients, transport peers and history/export consumers.
+Entry-kind tolerance alone is insufficient; command, transcript and nested tool
+outcome readers must also preserve unknown variants. This is a manual upgrade
+contract, not peer discovery or version negotiation.
+
+Unknown variants retain their original JSON through serialization and sync.
+Unknown entries are audit-only; unknown commands never start attempts or fabricate
+results. Unknown command outcomes are not success or compaction. Unknown native
+records or tool outcomes exclude the **entire affected attempt** from replay, so
+no orphan call or result reaches the model. Other supported attempts remain readable.
+Malformed **known** payloads still fail validation.
+
+Compatibility-only readers do not implement cancellation. Enable stop/cancel
+writers only after all readers are upgraded, and use the later stop implementation
+for execution. If an older reader fails a history read or shows an empty
+conversation, upgrade it rather than deleting or rewriting preserved records.
+
 #### Legacy sessions
 
 New sessions write a turn-schema marker before their first request. When an
