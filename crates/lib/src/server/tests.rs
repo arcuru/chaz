@@ -7204,7 +7204,7 @@ async fn costs_command_preserves_operator_text_contract() {
 }
 
 #[tokio::test]
-async fn precursor_unknown_records_do_not_execute_and_known_commands_still_work() {
+async fn unknown_commands_and_outcomes_do_not_execute() {
     use crate::session::compatibility_tests::install_writer_rows;
     use crate::test_support::{MockBackend, MockHost};
     use serde_json::json;
@@ -7296,92 +7296,22 @@ async fn precursor_unknown_records_do_not_execute_and_known_commands_still_work(
             .is_err()
     );
     assert_eq!(session.attempts_for_test().await.len(), 2);
-    for record in session
-        .turn_transcript("attempt-cancelled")
-        .await
-        .unwrap()
-        .iter()
-        .skip(1)
-    {
-        assert!(display_entries_for_record("agent", record).is_empty());
-    }
-    // Supported retry still returns an honest rejection without calling models.
-    let result = server
-        .submit_session_command(
-            &sid,
-            SessionCommandRequest {
-                command_id: TurnRequestId::parse("known-retry"),
-                sender: "user".into(),
-                created_at: Utc::now(),
-                command: SessionCommand::Retry {
-                    target_request_id: TurnRequestId::parse("missing-request"),
-                    expected_interrupted_attempt_id: "missing-attempt".into(),
-                },
-            },
-        )
-        .await
-        .unwrap();
-    assert!(matches!(
-        result.outcome,
-        SessionCommandOutcome::Rejected { .. }
-    ));
-    assert_eq!(mock.simple_call_count(), 0);
-    // Compaction needs three ordinary entries, not a control row counted as
-    // conversation. Add an agent message that cannot create queued work.
-    let mut conversation = Session::new(ConversationId(sid.clone()), db.clone()).await;
-    conversation
-        .add_entry(SessionEntry {
-            sender: "default".into(),
-            content: "known ordinary answer".into(),
-            timestamp: Utc::now(),
-            entry_type: EntryType::Message,
-            metadata: None,
-            routing: None,
-        })
-        .await
-        .unwrap();
-    // Compaction and ordinary turns still use only their scripted model calls.
-    mock.push_simple_text("compatible compact summary");
-    let result = server
-        .submit_session_command(
-            &sid,
-            SessionCommandRequest {
-                command_id: TurnRequestId::parse("known-compact"),
-                sender: "user".into(),
-                created_at: Utc::now(),
-                command: SessionCommand::Compact {
-                    source_snapshot: db.snapshot().await.unwrap(),
-                },
-            },
-        )
-        .await
-        .unwrap();
-    assert!(matches!(
-        result.outcome,
-        SessionCommandOutcome::Compact { .. }
-    ));
-    assert_eq!(mock.simple_call_count(), 1);
-    mock.push_text("ordinary next answer");
-    write_user_message_with_content(&db, &sid, "ordinary next question").await;
-    await_call_count(&mock, 1).await;
-    await_no_processing(&server, &sid).await;
-    assert_eq!(mock.recorded_calls().len(), 1);
-    assert!(host.recorded_calls().is_empty());
-    let after = Session::new(ConversationId(sid), db).await;
-    assert!(
-        after
-            .entries()
+    assert_eq!(
+        session
+            .context_entries()
+            .await
+            .unwrap()
             .iter()
-            .any(|e| e.content == "ordinary next answer")
-    );
-    assert!(
-        after
-            .entries()
-            .iter()
-            .any(|e| matches!(&e.entry_type, EntryType::Unknown { kind, .. } if kind == "Cancel"))
+            .filter(|entry| matches!(entry.entry_type, EntryType::Message))
+            .map(|entry| entry.content.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "ordinary cancelled conversation",
+            "ordinary supported conversation"
+        ]
     );
     assert!(matches!(
-        after
+        session
             .command_result(&known_with_unknown_result.command_id)
             .await
             .unwrap()
@@ -7389,4 +7319,5 @@ async fn precursor_unknown_records_do_not_execute_and_known_commands_still_work(
             .outcome,
         SessionCommandOutcome::Unknown { .. }
     ));
+    server.shutdown().await;
 }

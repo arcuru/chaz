@@ -156,59 +156,23 @@ fencing or exactly-once external effects.
 
 #### Reader-first wire compatibility
 
-The reader compatibility update is a separate prerequisite for stop/cancel
-writers. Its minimum source revision is
-`9d1b3ad75d43f25c5e502ab119024d751d1711b0`
-(`fix(session): preserve unknown commands and native records`), or a descendant
-containing that change. No release number is assigned to this prerequisite;
-the version string alone does not establish compatibility. This revision adds
-readers only: it neither emits stop records nor implements cancellation.
+Upgrade **every reader** sharing a session before enabling writers of new wire
+variants: executors, TUI/CLI clients, transport peers and history/export consumers.
+Entry-kind tolerance alone is insufficient; command, transcript and nested tool
+outcome readers must also preserve unknown variants. This is a manual upgrade
+contract, not peer discovery or version negotiation.
 
-| Wire boundary                                   | Unsupported variant behavior                                                                                             |
-| ----------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------ |
-| Entry kind                                      | Preserve the type name and payload; exclude from context, turn requests and transport delivery                           |
-| Session command request                         | Preserve the request; exclude from executable command work, without starting an attempt or fabricating a result          |
-| Session command outcome                         | Preserve and expose the unsupported outcome; do not treat it as success, compaction or permission to execute the command |
-| Native transcript record or nested tool outcome | Preserve raw audit data; exclude the entire affected attempt from native replay, without orphaned calls or results       |
+Unknown variants retain their original JSON through serialization and sync.
+Unknown entries are audit-only; unknown commands never start attempts or fabricate
+results. Unknown command outcomes are not success or compaction. Unknown native
+records or tool outcomes exclude the **entire affected attempt** from replay, so
+no orphan call or result reaches the model. Other supported attempts remain readable.
+Malformed **known** payloads still fail validation.
 
-Unknown variants retain their original JSON value semantically unchanged
-through serialization, reload and sync. Ordinary conversation and other
-complete, supported native attempts remain readable. Unknown records on
-interrupted or superseded attempts do not poison the typed table scan.
-Malformed payloads of **known** variants still fail decoding; this compatibility
-path does not suppress storage, authentication or validation errors.
-
-Roll out in this order:
-
-1. Integrate and make the reader prerequisite available independently of the
-   stop writer update.
-2. Upgrade **every reader** sharing the affected sessions: executors, TUI/CLI
-   clients, transport peers and history/export consumers. Verify their source
-   revision contains the prerequisite before deploying writers that emit new
-   variants.
-3. Only then enable stop/cancel writers. A compatibility-only executor ignores
-   a stop request; it does not cancel the turn or pretend cancellation succeeded.
-   Executing cancellation requires the later stop implementation too.
-
-Readers predating the prerequisite are unsupported for sessions receiving stop
-data. In particular, entry-kind tolerance alone is insufficient: older closed
-transcript and tool-outcome decoders reject `Cancelled`. If an outdated reader
-shows an empty conversation or fails a native-history read, upgrade it rather
-than deleting or rewriting the preserved records. This is a manual rollout
-contract, not peer discovery, version negotiation or an automatic fleet update.
-
-The regression pair is precursor reader
-`9d1b3ad75d43f25c5e502ab119024d751d1711b0` against writer
-`5b199639aa923686d452f343fafeb43b3c877c4b`. The pinned
-`session/fixtures/stop-writer.snap` contains typed-table exports of the writer's
-`Cancel` entry, `Cancelled` terminal and nested `Cancelled` tool outcome beside
-an unaffected complete exchange. Production session/context/command readers
-exercise these rows on disposable data, including HTTP sync, round trips and
-ordinary subsequent work. Frozen closed decoders provide rejecting controls;
-the pre-tolerant reader `7d09ffca4965f3f6a3f34ead817a60f6f027dbd7`
-with Eidetica `5d9a657c1df341ecb6ab291dbf8527488356ac52` also demonstrates
-the failed whole-entry scan after a `Cancel` row. These checks establish the
-reader boundary, not cancellation behavior or a completed rollout.
+Compatibility-only readers do not implement cancellation. Enable stop/cancel
+writers only after all readers are upgraded, and use the later stop implementation
+for execution. If an older reader fails a history read or shows an empty
+conversation, upgrade it rather than deleting or rewriting preserved records.
 
 #### Legacy sessions
 
