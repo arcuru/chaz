@@ -1,5 +1,8 @@
 //! Unit tests for the agent server. Extracted from `mod.rs`.
 
+#[path = "job_monitor_tests.rs"]
+mod job_monitor_tests;
+
 use super::*;
 
 #[tokio::test]
@@ -5949,6 +5952,17 @@ async fn published_executor_with_mock(
     agents: Arc<AgentRegistry>,
     agent: DbEntry,
 ) -> (Arc<Server>, Arc<crate::test_support::MockBackend>) {
+    let mock = Arc::new(crate::test_support::MockBackend::new());
+    mock.push_text("finished");
+    published_executor_using_mock(settings, agents, agent, mock).await
+}
+
+async fn published_executor_using_mock(
+    settings: &crate::config::EideticaConfig,
+    agents: Arc<AgentRegistry>,
+    agent: DbEntry,
+    mock: Arc<crate::test_support::MockBackend>,
+) -> (Arc<Server>, Arc<crate::test_support::MockBackend>) {
     let connection =
         crate::instance::connect_with(settings, crate::config::ExecutionRole::Executor)
             .await
@@ -5960,8 +5974,6 @@ async fn published_executor_with_mock(
     );
     let index = HostedIndex::empty("agent");
     index.register(agent.clone());
-    let mock = Arc::new(crate::test_support::MockBackend::new());
-    mock.push_text("finished");
     let backend = crate::backends::BackendManager::with_mock(
         mock.clone(),
         crate::security::SecretStore::new(registry.chaz_peer().clone()).await,

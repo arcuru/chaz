@@ -212,6 +212,51 @@ impl SessionRegistry {
         &self.instance
     }
 
+    /// Called only after an executor has durably claimed an accepted job.
+    pub(crate) async fn ensure_executor_db(
+        &self,
+        agent_db_id: &eidetica::entry::ID,
+        agent_key: &eidetica::auth::crypto::PublicKey,
+    ) -> anyhow::Result<(Database, eidetica::auth::crypto::PublicKey)> {
+        let mut user = self.user.lock().await;
+        let agent = crate::agent_db::AgentDb::from_database(
+            user.open_database_with_key(agent_db_id, agent_key).await?,
+        );
+        crate::executor_db::ensure(&mut user, &agent, agent_key).await
+    }
+
+    /// Read through the Agent's reference using that Agent's key; no creation.
+    pub async fn agent_executor_queues(
+        &self,
+        agent_db_id: &eidetica::entry::ID,
+        agent_key: &eidetica::auth::crypto::PublicKey,
+    ) -> anyhow::Result<Vec<crate::executor_db::ExecutorQueue>> {
+        let mut user = self.user.lock().await;
+        let agent = crate::agent_db::AgentDb::from_database(
+            user.open_database_with_key(agent_db_id, agent_key).await?,
+        );
+        let mut queues = Vec::new();
+        for reference in agent.list_executors().await? {
+            let rows = async {
+                let db =
+                    crate::executor_db::open_for_agent(&mut user, &agent, &reference, agent_key)
+                        .await?;
+                crate::executor_db::list_jobs(&db).await
+            }
+            .await;
+            let (jobs, unavailable) = match rows {
+                Ok(jobs) => (jobs, None),
+                Err(error) => (Vec::new(), Some(error.to_string())),
+            };
+            queues.push(crate::executor_db::ExecutorQueue {
+                reference,
+                jobs,
+                unavailable,
+            });
+        }
+        Ok(queues)
+    }
+
     // -------------------------------------------------------------------------
     // Session creation & opening
     // Unindexed job setup and publication.
@@ -228,14 +273,15 @@ impl SessionRegistry {
             "job target and task are required"
         );
         let parent_root = eidetica::entry::ID::parse(parent_id)?;
-        let (parent, db) = {
+        // An adopted same-service parent may postdate this User's key-map
+        // snapshot. Reuse its registry-bound, service-validated identity.
+        let (_, parent) = self.open_session(parent_id).await?;
+        let db = {
             let mut user = self.user.lock().await;
-            let parent = user.open_database(&parent_root).await?;
             let mut settings = eidetica::crdt::Doc::new();
             settings.set("name", "session:job-stage:submitter");
             let key = user.get_default_key()?;
-            let db = user.create_database(settings, &key).await?;
-            (parent, db)
+            user.create_database(settings, &key).await?
         };
         let source = format!("job-stage:submitter:{}", db.root_id());
         // Eidetica commits separately per DB; none of these writes makes the

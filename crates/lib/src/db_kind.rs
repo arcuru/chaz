@@ -32,6 +32,7 @@ pub const KIND_BANK: &str = "bank";
 /// Skill bank — peer-hosted, granted to agents for shared skill prompts.
 pub const KIND_SKILL_BANK: &str = "skill_bank";
 pub const KIND_SESSION: &str = "session";
+pub const KIND_EXECUTOR: &str = "executor";
 /// Bridge settings DB — bridge-owned, holds encrypted transport-login
 /// credentials ([`crate::bridge_db`]). The agent DB's `logins` registry
 /// points at one of these by root ID.

@@ -32,6 +32,7 @@ pub(super) fn command_catalog() -> Vec<(&'static str, &'static str)> {
     vec![
         ("# Session", ""),
         ("/sessions", "open session picker"),
+        ("/jobs", "open Jobs ancestry and wait monitor"),
         ("/new", "create a new session [agent group]"),
         ("/groups", "list configured agent groups"),
         ("/join ", "switch to session by name or DB ID"),
@@ -368,6 +369,8 @@ pub(super) fn handle_mouse(app: &mut App, m: MouseEvent) -> Option<MouseOutcome>
                     down,
                     app.model_picker_filtered.len(),
                 );
+            } else if app.mode == TuiMode::Jobs {
+                app.jobs.selected = wheel_step(app.jobs.selected, down, app.jobs.data.nodes.len());
             } else if app.mode == TuiMode::SessionPicker {
                 app.picker_index = wheel_step(app.picker_index, down, app.picker_len());
             } else if let TuiMode::Settings(scope) = app.mode {
@@ -721,6 +724,7 @@ fn parse_chat_line(app: &mut App, text: &str) -> Option<ChatAction> {
     // the TUI only.
     match text {
         "/sessions" | "/s" => return Some(ChatAction::OpenPicker),
+        "/jobs" => return Some(ChatAction::OpenJobs),
         "/models" => return Some(ChatAction::OpenModelsSettings),
         "/settings" => return Some(ChatAction::OpenSettings(SettingsScope::Session)),
         "/clear" => {
@@ -1608,6 +1612,7 @@ mod tests {
         // Verbs `parse_chat_line` handles before reaching the shared grammar.
         const VIEW_LOCAL: &[&str] = &[
             "/sessions",
+            "/jobs",
             "/models",
             "/settings",
             "/clear",

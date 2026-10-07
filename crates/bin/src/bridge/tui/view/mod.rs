@@ -279,6 +279,7 @@ pub(super) fn ui(
     let ext_segments = app.status_segments.clone();
 
     match app.mode {
+        TuiMode::Jobs => super::jobs::draw(f, app),
         TuiMode::Chat => ui_chat(f, app, &ext_segments),
         TuiMode::SessionPicker => ui_picker(f, app),
         TuiMode::ModelPicker => ui_model_picker(f, app),
@@ -859,6 +860,10 @@ fn ui_chat(f: &mut ratatui::Frame, app: &mut App, ext_segments: &[String]) {
             ex.info.arguments_display.clone(),
         )
     });
+    let job_banner = super::jobs::banner(tab);
+    if !job_banner.is_empty() {
+        lines.extend(job_banner.lines().map(|line| Line::from(line.to_string())));
+    }
     let _ = tab;
 
     // Per-line visual heights, accumulated. Used to translate
@@ -1016,7 +1021,14 @@ fn ui_chat(f: &mut ratatui::Frame, app: &mut App, ext_segments: &[String]) {
         Block::bordered()
             .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(COLOR_DIM))
-            .title(Span::styled(" > ", Style::default().fg(COLOR_ACCENT))),
+            .title(Span::styled(
+                if app.active().job.is_some() {
+                    " > next-call input (finished: view-only) "
+                } else {
+                    " > "
+                },
+                Style::default().fg(COLOR_ACCENT),
+            )),
     );
     f.render_widget(input, chunks[5]);
 
@@ -1828,6 +1840,7 @@ mod chat_frame_tests {
             .await
             .unwrap();
         let tab = Tab {
+            job: None,
             session_db_id: db.root_id().to_string(),
             session_db: db,
             entries: Vec::new(),

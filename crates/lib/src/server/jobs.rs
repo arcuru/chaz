@@ -394,6 +394,22 @@ impl Server {
             return Ok(false);
         };
         let session_db_id = child_db.root_id().to_string();
+        if let Some(owner) = crate::session::jobs::read_job_owner(child_db).await?
+            && owner.agent_db_id
+                == self
+                    .agent_index
+                    .find_by_name(&accepted.definition.target)
+                    .ok_or_else(|| anyhow::anyhow!("job target no longer hosted"))?
+                    .db_id
+                    .to_string()
+            && self
+                .peer_is_home_for(&session_db_id, &accepted.definition.target)
+                .await
+        {
+            // A crash may have split the session claim/start/receipt from its
+            // projection. Reconstruct it without replaying an attempt.
+            self.record_claimed_job(child_db, &accepted).await?;
+        }
         if self.watched.lock().await.contains(&session_db_id) {
             return Ok(true);
         }
@@ -698,13 +714,46 @@ impl Server {
             self.validate_accepted_job(db).await?.as_ref() == Some(accepted),
             "job admission authority changed"
         );
-        crate::session::jobs::claim_job(
+        if !crate::session::jobs::claim_job(
             db,
             &target.pubkey.to_string(),
             &target.db_id.to_string(),
             &self.job_incarnation,
         )
-        .await
+        .await?
+        {
+            return Ok(false);
+        }
+        // This write is an execution gate: the persisted session claim alone
+        // must never launch model/tool work without a discoverable queue row.
+        self.record_claimed_job(db, accepted).await?;
+        Ok(true)
+    }
+
+    pub(super) async fn record_claimed_job(
+        &self,
+        session: &eidetica::Database,
+        accepted: &AcceptedAgentJob,
+    ) -> anyhow::Result<(eidetica::Database, String, String)> {
+        let target = self
+            .agent_index
+            .find_by_name(&accepted.definition.target)
+            .ok_or_else(|| anyhow::anyhow!("job target no longer hosted"))?;
+        let (db, peer) = self
+            .registry
+            .ensure_executor_db(&target.db_id, &target.pubkey)
+            .await?;
+        let live = self.live_attempts.lock().await.clone();
+        crate::executor_db::reconcile_job(
+            &db,
+            session,
+            accepted,
+            &target.db_id.to_string(),
+            &peer.to_string(),
+            &live,
+        )
+        .await?;
+        Ok((db, target.db_id.to_string(), peer.to_string()))
     }
 
     /// A registered job keeps its claim fresh and periodically retries stale
@@ -780,5 +829,25 @@ impl Server {
                 }
             }
         }));
+    }
+}
+
+impl Server {
+    /// Observation and input publication never register/adopt this session.
+    pub async fn job_inputs(
+        &self,
+        session_db_id: &str,
+    ) -> anyhow::Result<Vec<crate::session::steering::JobInput>> {
+        let (id, db) = self.registry.open_job_session(session_db_id).await?;
+        Session::new(id, db).await.job_inputs().await
+    }
+
+    pub async fn submit_job_input(
+        &self,
+        session_db_id: &str,
+        request: crate::session::steering::JobInputRequest,
+    ) -> anyhow::Result<crate::session::steering::JobInput> {
+        let (id, db) = self.registry.open_job_session(session_db_id).await?;
+        Session::new(id, db).await.submit_job_input(request).await
     }
 }

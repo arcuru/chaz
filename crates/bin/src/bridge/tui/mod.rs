@@ -38,6 +38,7 @@ use tokio_stream::StreamExt;
 
 mod bridge_impl;
 mod input;
+mod jobs;
 mod theme;
 mod view;
 mod widgets;
@@ -87,6 +88,7 @@ enum Action {
     /// list (already merged with cache); `Err` carries a display message.
     ModelsFetched(Result<Vec<ModelInfo>, String>),
     SessionLoad(SessionLoad),
+    JobsLoaded(Result<chaz_core::server::JobMonitor, String>),
 }
 
 enum SessionLoad {
@@ -116,6 +118,7 @@ pub(super) struct SessionFill {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum TuiMode {
+    Jobs,
     Chat,
     SessionPicker,
     ModelPicker,
@@ -367,6 +370,7 @@ pub(super) struct SessionMetaSnapshot {
 }
 
 pub(super) enum ChatAction {
+    OpenJobs,
     Dispatch(Command),
     OpenPicker,
     /// Open the model picker scoped to `scope`. From `/models` and
@@ -464,6 +468,7 @@ impl ClickRegion {
 /// Per-session state. Each `Tab` wraps one eidetica session database plus the
 /// UI state specific to viewing it (scroll position, pending approval, etc.).
 pub(super) struct Tab {
+    job: Option<jobs::JobTab>,
     pub session_db_id: String,
     pub session_db: eidetica::Database,
     pub entries: Vec<SessionEntry>,
@@ -602,6 +607,7 @@ pub(super) struct ListScroll {
 }
 
 pub(super) struct App {
+    jobs: jobs::JobsView,
     pub(super) mode: TuiMode,
     pub(super) overlay: Option<Overlay>,
     pub(super) click_regions: Vec<ClickRegion>,
@@ -786,6 +792,7 @@ pub(super) struct App {
 impl App {
     fn new(agent_names: HashSet<String>, initial_tab: Tab) -> Self {
         Self {
+            jobs: jobs::JobsView::default(),
             mode: TuiMode::Chat,
             overlay: None,
             click_regions: Vec::new(),
@@ -1154,6 +1161,10 @@ async fn setup_session(
 ) -> anyhow::Result<()> {
     let session_db_id = session_db.root_id().to_string();
 
+    anyhow::ensure!(
+        !chaz_core::session::jobs::is_job_session(session_db).await,
+        "job sessions must be opened as observers"
+    );
     server.load_session_entities(session_db).await?;
 
     if server.is_executor_authorized() {
@@ -1500,6 +1511,7 @@ async fn build_tab(
         .unwrap_or_default()
         .len();
     Tab {
+        job: None,
         session_db_id,
         session_db,
         entries,
@@ -1529,6 +1541,9 @@ fn cycle_tab(app: &mut App, delta: i32) {
     let n = app.tabs.len() as i32;
     let i = (app.active_tab as i32 + delta).rem_euclid(n);
     app.active_tab = i as usize;
+    if app.active().job.is_some() {
+        app.mode = TuiMode::Chat;
+    }
 }
 
 fn close_active_tab(app: &mut App) {
@@ -1560,8 +1575,27 @@ async fn handle_chat_action(
     models_tx: &mpsc::Sender<Result<Vec<ModelInfo>, String>>,
     session_rows_tx: &mpsc::Sender<SessionLoad>,
 ) {
+    if app.active().job.is_some()
+        && !matches!(
+            action,
+            ChatAction::OpenJobs | ChatAction::OpenPicker | ChatAction::SendMessage(_)
+        )
+    {
+        show_error(
+            app,
+            "Job-local commands/settings are unavailable in the observer".into(),
+        );
+        return;
+    }
     match action {
+        ChatAction::OpenJobs => {
+            app.mode = TuiMode::Jobs;
+        }
         ChatAction::SendMessage(text) => {
+            if app.active().job.is_some() {
+                jobs::send(app.active_mut(), text).await;
+                return;
+            }
             let tab = app.active_mut();
             let session_db = tab.session_db.clone();
             let session_db_id = tab.session_db_id.clone();
@@ -2159,6 +2193,14 @@ async fn render_outcome(
                 agent_name,
                 session_name,
             } = *switch;
+            if chaz_core::session::jobs::is_job_session(&db).await {
+                if let Err(error) =
+                    jobs::open(app, server, backend, &session_db_id, notify_tx).await
+                {
+                    show_error(app, format!("Job unavailable: {error}"));
+                }
+                return;
+            }
             // If the session is already open in some tab, switch to it.
             if let Some(idx) = app.tab_index_for(&session_db_id) {
                 app.active_tab = idx;
@@ -2191,6 +2233,7 @@ async fn render_outcome(
             let context_budget = server.effective_context_budget(&effective_model, agent_cap);
             let roster = build_roster(server, backend, &session.read_meta().await);
             app.tabs.push(Tab {
+                job: None,
                 session_db_id,
                 session_db: db,
                 entries,
@@ -2254,6 +2297,7 @@ mod session_picker_tests {
             .await
             .unwrap();
         Tab {
+            job: None,
             session_db_id: db.root_id().to_string(),
             session_db: db,
             entries: Vec::new(),

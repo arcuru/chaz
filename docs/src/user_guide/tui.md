@@ -376,3 +376,76 @@ that children are reaped.
 This complements the fast widget snapshots; it does not test in-flight job
 cancellation.
 See `dev/tui-pty/README.md` for isolation details and failure artifact locations.
+
+## Jobs: observe without taking over
+
+`/jobs` (or `Ctrl+G`) opens the local Jobs monitor. It follows the Agent DB's
+stable per-executor references, then reads the job Session DB for attempt and
+result evidence. A projection row is discovery, not execution authority.
+
+| Control      | Action                                                             |
+| ------------ | ------------------------------------------------------------------ |
+| `↑` / `↓`    | Select an ancestry node and preview its task, activity and result  |
+| `Enter`      | Open a job in an observe-only conversation tab                     |
+| `r`          | Refresh the overview without registering an executor               |
+| `Esc`        | Return from the overview                                           |
+| `Ctrl+G`     | Toggle between chat and Jobs                                       |
+| `Ctrl+W`     | Close the current tab; the resident job continues                  |
+| Job composer | Publish authenticated input for the same attempt's next model call |
+
+The tree shows actual parent identities. Wait arrows come from entered,
+bounded `job_wait` calls, not model intentions. Context conversations and
+referenced pending children are labelled **context/unclaimed**, not counted as
+running jobs. An unfinished wait is recorded activity, not proof that an
+executor is still alive. Snapshot age and unavailable sources stay visible.
+This view does not fetch remote databases or request access automatically.
+
+Opening a job does not start work, adopt a runtime, or append another ordinary
+turn. The tab follows persisted messages and tool activity. Job-local settings,
+retry, cancellation and approval-policy changes are unavailable here.
+Closing a tab or the client does not cancel the job or discard published input.
+
+### Next-call steering and the final boundary
+
+An authorized session writer can send input while a recent started attempt is
+observable. Read-only keys can inspect but cannot publish. The original
+Directive and accepted tool, grant, capability and depth ceilings remain
+unchanged. Input cannot contain scope overrides or start another job.
+
+The executor reads input only between complete model/tool exchanges. It does
+not interrupt a model call, tool or approval wait. Tool-free jobs use the same
+boundary. If input is accepted before closing, a model's final text is
+provisional: the same attempt continues and only its continued terminal result
+becomes available to the parent. Completed jobs are view-only; there is no
+reopen or follow-up action.
+
+Feedback distinguishes `Queued` publication, `Accepted`, `Dispatching` intent
+(with no proof the backend received it), and `Included` after a response to the
+request containing that input is observed. `NotApplied` and `Uncertain` explain
+late publication, failure or interruption. A lost acknowledgement retains the
+request ID: resend the same text to retry that publication, not create a second
+logical input. Different text is refused while that publication is unresolved.
+There is no globally exactly-once effect guarantee. Interrupted input and
+model/tool effects never replay automatically after restart.
+
+### Walkthrough: steer, then inspect
+
+1. Run a client-role TUI against the same configured Eidetica service as a
+   resident executor (`execution: client` on the viewer). Ask the executor's
+   ordinary conversation to submit a local Agent job with `spawn_agent`.
+2. Open `/jobs`, select the claimed job, and press `Enter`. The tab shows the
+   original task and persisted tool activity. Its banner says
+   `JOB observer` and `recorded, not proven liveness`.
+3. While the job is working, send `Use the smaller example first`. Input
+   feedback first shows `Queued`, then `Dispatching { model_sequence: 1 }`
+   and `Included { model_sequence: 1 }` when that call has returned. These
+   sequence numbers are illustrative; the tab displays the actual call number.
+   Close the tab with `Ctrl+W`: the executor still finishes the job.
+4. Reopen the job. Its recorded state is `Succeeded` or `Failed`, with the
+   committed result and input receipts. Sending again displays
+   `Finished job — view-only`; it cannot replace the result or start work.
+5. For a failure path, stop only the disposable viewer's access to its test
+   service. A refresh displays `unavailable` or `refresh timed out` with the
+   retained snapshot labelled stale. Restore access and press `r` to refresh.
+   A stale start is not an invitation to replay: inspect the attempt before
+   using the separate explicit retry workflow outside the job observer.
