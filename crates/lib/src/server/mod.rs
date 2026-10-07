@@ -265,7 +265,12 @@ fn display_entries_for_record(
     record: &TurnTranscriptRecord,
 ) -> Vec<SessionEntry> {
     match &record.message {
-        TurnTranscriptMessage::Cancelled => Vec::new(),
+        TurnTranscriptMessage::Cancelled
+        | TurnTranscriptMessage::Unknown { .. }
+        | TurnTranscriptMessage::ToolResult {
+            outcome: runtime::ToolResultOutcome::Unknown { .. },
+            ..
+        } => Vec::new(),
         TurnTranscriptMessage::ModelResponse { tool_calls, .. } => tool_calls
             .iter()
             .map(|call| SessionEntry {
@@ -1750,7 +1755,7 @@ impl Server {
     /// resolution `run_*_turn` feeds the context builder
     /// ([`resolve_context_max_tokens`]), with the static configured default
     /// applied when neither a window nor a cap narrows it. Surfaced so the
-    /// TUI can render `ctx N%` against the exact denominator the runtime uses.
+    /// TUI can show the same effective maximum in its numeric context pair.
     ///
     /// Resolves windows through the server's own `default_backend`, which is
     /// the manager whose overlay gets warmed at startup and updated by the
@@ -2110,6 +2115,9 @@ impl Server {
             | SessionCommandOutcome::Failed { message } => anyhow::bail!(message),
             SessionCommandOutcome::Compact { .. } => {
                 anyhow::bail!("retry command returned a compact result")
+            }
+            SessionCommandOutcome::Unknown { kind, .. } => {
+                anyhow::bail!("unsupported session command outcome: {kind}")
             }
         }
     }
@@ -3020,6 +3028,10 @@ impl Server {
         request: SessionCommandRequest,
         existing_attempt_id: Option<String>,
     ) -> anyhow::Result<String> {
+        anyhow::ensure!(
+            !matches!(request.command, SessionCommand::Unknown { .. }),
+            "unsupported session command cannot execute"
+        );
         if !self.is_startup_ready() {
             self.await_startup_ready().await;
         }
@@ -3041,6 +3053,7 @@ impl Server {
         };
         let attempt_id = attempt.attempt_id.clone();
         let outcome = match request.command {
+            SessionCommand::Unknown { .. } => unreachable!("checked before attempt start"),
             SessionCommand::Compact { source_snapshot } => {
                 self.execute_compact_command(session_db_id, &session, &source_snapshot)
                     .await

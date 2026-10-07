@@ -552,12 +552,13 @@ fn replay_turn(records: &[TurnTranscriptRecord], budget: usize) -> Option<Vec<Ru
                 call_id,
                 name,
                 output,
-                ..
+                outcome,
             } = &result.message
             else {
                 return None;
             };
-            if result.sequence != previous? + 1
+            if matches!(outcome, crate::runtime::ToolResultOutcome::Unknown { .. })
+                || result.sequence != previous? + 1
                 || result.attempt_id != record.attempt_id
                 || result.request_id != record.request_id
                 || *model_sequence != *seq
@@ -957,7 +958,7 @@ mod tests {
         for record in &mut suffix {
             record.sequence += 2;
             match &mut record.message {
-                TurnTranscriptMessage::Cancelled => {}
+                TurnTranscriptMessage::Cancelled | TurnTranscriptMessage::Unknown { .. } => {}
                 TurnTranscriptMessage::ModelResponse { model_sequence, .. }
                 | TurnTranscriptMessage::ToolResult { model_sequence, .. } => *model_sequence += 1,
             }
@@ -975,7 +976,7 @@ mod tests {
             for record in &mut partial {
                 record.sequence += sequence_offset;
                 match &mut record.message {
-                    TurnTranscriptMessage::Cancelled => {}
+                    TurnTranscriptMessage::Cancelled | TurnTranscriptMessage::Unknown { .. } => {}
                     TurnTranscriptMessage::ModelResponse { model_sequence, .. }
                     | TurnTranscriptMessage::ToolResult { model_sequence, .. } => {
                         *model_sequence += model_offset;

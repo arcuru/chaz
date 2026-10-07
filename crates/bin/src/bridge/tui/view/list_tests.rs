@@ -13,6 +13,12 @@ use ratatui::{Terminal, backend::TestBackend};
 use std::collections::{HashMap, HashSet};
 
 async fn fixture() -> (Instance, Arc<Server>, BackendManager, App) {
+    fixture_with_backends(None).await
+}
+
+async fn fixture_with_backends(
+    backends: Option<Vec<chaz_core::config::Backend>>,
+) -> (Instance, Arc<Server>, BackendManager, App) {
     let (instance, user) = Instance::create_backend(
         Box::new(InMemory::new()),
         NewUser::passwordless("list-frames"),
@@ -42,7 +48,10 @@ async fn fixture() -> (Instance, Arc<Server>, BackendManager, App) {
             .unwrap(),
     );
     let (id, db) = registry.create_session(Some("frame-test")).await.unwrap();
-    let backend = BackendManager::new(&None, SecretStore::new(registry.chaz_peer().clone()).await);
+    let backend = BackendManager::new(
+        &backends,
+        SecretStore::new(registry.chaz_peer().clone()).await,
+    );
     let mcp = Arc::new(chaz_core::mcp::McpRegistry::new());
     for i in 0..30 {
         mcp.insert_starting(format!("mcp-{i:02}"));
@@ -81,6 +90,7 @@ async fn fixture() -> (Instance, Arc<Server>, BackendManager, App) {
         effective_model: String::new(),
         roster: Vec::new(),
         context_budget: 0,
+        model_pin: None,
         expanded_entries: HashSet::new(),
     };
     let mut app = App::new(HashSet::new(), tab);
@@ -453,5 +463,123 @@ async fn wheel_ownership_stays_with_modal_or_visible_list() {
     input::handle_mouse(&mut app, wheel);
     assert_eq!(app.peer_agents_cursor, 3);
     assert_eq!(app.active().scroll_offset, 0);
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn toolbar_context_reopen_honors_pins_and_refreshes_runtime_budget() {
+    use chaz_core::backends::ModelInfo;
+    use chaz_core::config::{Backend, BackendType, Model};
+    use chaz_core::session::Session;
+    let mut configured = Backend::new(BackendType::OpenAICompatible);
+    configured.name = Some("primary".into());
+    configured.models = Some(vec![Model {
+        name: "small-model".into(),
+        reasoning: None,
+        price_input: None,
+        price_output: None,
+        price_cache_read: None,
+        context_window: Some(64_000),
+    }]);
+    let mut secondary = Backend::new(BackendType::OpenAICompatible);
+    secondary.name = Some("secondary".into());
+    let (_instance, server, backend, mut app) =
+        fixture_with_backends(Some(vec![configured, secondary])).await;
+    let db = app.active().session_db.clone();
+    let id = app.active().session_db_id.clone();
+    let session = Session::new(chaz_core::types::ConversationId(id.clone()), db.clone()).await;
+    session
+        .update_meta(|meta| {
+            meta.agent_name = Some("agent-00".into());
+            meta.model = Some("secondary:large-model".into());
+        })
+        .await
+        .unwrap();
+    server
+        .cache_model_info(&ModelInfo {
+            id: "secondary:large-model".into(),
+            context_window: Some(1_050_000),
+            ..Default::default()
+        })
+        .await;
+    let tab = super::super::build_tab(&server, &backend, db.clone(), id.clone()).await;
+    assert_eq!(tab.effective_model, "large-model");
+    assert_eq!(tab.context_budget, 1_050_000);
+    assert_eq!(tab.model_pin.as_deref(), Some("secondary:large-model"));
+    app.tabs[0] = tab;
+    // No session write: a learned-window update must reach the very next frame.
+    server
+        .cache_model_info(&ModelInfo {
+            id: "secondary:large-model".into(),
+            context_window: Some(2_000_000),
+            ..Default::default()
+        })
+        .await;
+    let mut terminal = Terminal::new(TestBackend::new(100, 16)).unwrap();
+    let screen = draw(&mut terminal, &mut app, &server, &backend).join("\n");
+    assert!(screen.contains("ctx unknown/2M tok"), "{screen}");
+    server.agents().upsert(Agent::from_db_config(
+        "agent-00",
+        &AgentDbConfig {
+            max_context_tokens: Some(16_000),
+            ..Default::default()
+        },
+    ));
+    let screen = draw(&mut terminal, &mut app, &server, &backend).join("\n");
+    assert!(screen.contains("ctx unknown/16k tok"), "{screen}");
+    // A per-agent pin wins over the session pin; explicit YAML windows win
+    // over learned windows. Neither source is an output-token limit.
+    session
+        .update_meta(|meta| {
+            meta.agent_models
+                .insert("agent-00".into(), "primary:small-model".into());
+        })
+        .await
+        .unwrap();
+    server
+        .cache_model_info(&ModelInfo {
+            id: "primary:small-model".into(),
+            context_window: Some(1_050_000),
+            ..Default::default()
+        })
+        .await;
+    server
+        .agents()
+        .upsert(Agent::from_db_config("agent-00", &AgentDbConfig::default()));
+    let tab = super::super::build_tab(&server, &backend, db.clone(), id.clone()).await;
+    assert_eq!(tab.effective_model, "small-model");
+    assert_eq!(tab.context_budget, 64_000);
+    app.tabs[0] = tab;
+    server.agents().upsert(Agent::from_db_config(
+        "agent-00",
+        &AgentDbConfig {
+            model: Some("secondary:large-model".into()),
+            ..Default::default()
+        },
+    ));
+    let screen = draw(&mut terminal, &mut app, &server, &backend).join("\n");
+    assert!(screen.contains("ctx unknown/64k tok"), "{screen}");
+    // Without session pins, a live agent-default edit must also reach the next
+    // frame. AgentSet updates the registry, not the session DB's on_write hook.
+    session
+        .update_meta(|meta| {
+            meta.model = None;
+            meta.agent_models.clear();
+        })
+        .await
+        .unwrap();
+    app.tabs[0] = super::super::build_tab(&server, &backend, db, id).await;
+    let screen = draw(&mut terminal, &mut app, &server, &backend).join("\n");
+    assert!(screen.contains("ctx unknown/2M tok"), "{screen}");
+    server.agents().upsert(Agent::from_db_config(
+        "agent-00",
+        &AgentDbConfig {
+            model: Some("primary:small-model".into()),
+            ..Default::default()
+        },
+    ));
+    let screen = draw(&mut terminal, &mut app, &server, &backend).join("\n");
+    assert!(screen.contains("ctx unknown/64k tok"), "{screen}");
+    assert_eq!(app.active().effective_model, "small-model");
     server.shutdown().await;
 }

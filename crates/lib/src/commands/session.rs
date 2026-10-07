@@ -459,6 +459,9 @@ async fn submit_command(
     .await;
     match waited {
         Ok(Ok(result)) => match result.outcome {
+            crate::session::SessionCommandOutcome::Unknown { kind, .. } => CommandOutcome::Error(
+                format!("Command {command_id} has unsupported outcome: {kind}"),
+            ),
             crate::session::SessionCommandOutcome::Compact { summary } => {
                 CommandOutcome::Text(format!(
                     "Session compacted by command {command_id}. Summary ({} chars) persisted.",

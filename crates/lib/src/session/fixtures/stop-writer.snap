@@ -1,0 +1,179 @@
+[
+  {
+    "id": "request-cancelled",
+    "store": "entries",
+    "value": {
+      "content": "ordinary cancelled conversation",
+      "entry_type": "Message",
+      "sender": "user",
+      "timestamp": "2023-11-14T22:13:20Z"
+    }
+  },
+  {
+    "id": "request-supported",
+    "store": "entries",
+    "value": {
+      "content": "ordinary supported conversation",
+      "entry_type": "Message",
+      "sender": "user",
+      "timestamp": "2023-11-14T22:13:20Z"
+    }
+  },
+  {
+    "id": "stop-event",
+    "store": "entries",
+    "value": {
+      "content": "{\"request_id\":\"request-cancelled\",\"attempt_id\":\"attempt-cancelled\"}",
+      "entry_type": "Cancel",
+      "sender": "user",
+      "timestamp": "2023-11-14T22:13:20Z"
+    }
+  },
+  {
+    "id": "attempt-cancelled",
+    "store": "turn_attempts",
+    "value": {
+      "attempt_id": "attempt-cancelled",
+      "completed_at": "2023-11-14T22:13:20Z",
+      "generation": 0,
+      "request_id": "request-cancelled",
+      "started_at": "2023-11-14T22:13:20Z",
+      "status": "Completed"
+    }
+  },
+  {
+    "id": "attempt-supported",
+    "store": "turn_attempts",
+    "value": {
+      "attempt_id": "attempt-supported",
+      "completed_at": "2023-11-14T22:13:20Z",
+      "generation": 0,
+      "request_id": "request-supported",
+      "started_at": "2023-11-14T22:13:20Z",
+      "status": "Completed"
+    }
+  },
+  {
+    "id": "cancelled-0",
+    "store": "turn_transcript",
+    "value": {
+      "attempt_id": "attempt-cancelled",
+      "message": {
+        "ModelResponse": {
+          "content": null,
+          "metadata": null,
+          "model_sequence": 0,
+          "provider_extra": {},
+          "terminal": false,
+          "tool_calls": [
+            {
+              "arguments": "{\"command\":\"must-not-run\"}",
+              "id": "call-cancelled",
+              "name": "shell"
+            }
+          ]
+        }
+      },
+      "request_id": "request-cancelled",
+      "sequence": 0,
+      "timestamp": "2023-11-14T22:13:20Z"
+    }
+  },
+  {
+    "id": "cancelled-1",
+    "store": "turn_transcript",
+    "value": {
+      "attempt_id": "attempt-cancelled",
+      "message": {
+        "ToolResult": {
+          "call_id": "call-cancelled",
+          "call_index": 0,
+          "model_sequence": 0,
+          "name": "shell",
+          "outcome": "Cancelled",
+          "output": "cancelled tool output"
+        }
+      },
+      "request_id": "request-cancelled",
+      "sequence": 1,
+      "timestamp": "2023-11-14T22:13:20Z"
+    }
+  },
+  {
+    "id": "cancelled-2",
+    "store": "turn_transcript",
+    "value": {
+      "attempt_id": "attempt-cancelled",
+      "message": "Cancelled",
+      "request_id": "request-cancelled",
+      "sequence": 2,
+      "timestamp": "2023-11-14T22:13:20Z"
+    }
+  },
+  {
+    "id": "supported-0",
+    "store": "turn_transcript",
+    "value": {
+      "attempt_id": "attempt-supported",
+      "message": {
+        "ModelResponse": {
+          "content": null,
+          "metadata": null,
+          "model_sequence": 0,
+          "provider_extra": {},
+          "terminal": false,
+          "tool_calls": [
+            {
+              "arguments": "{\"command\":\"must-not-run\"}",
+              "id": "call-supported",
+              "name": "shell"
+            }
+          ]
+        }
+      },
+      "request_id": "request-supported",
+      "sequence": 0,
+      "timestamp": "2023-11-14T22:13:20Z"
+    }
+  },
+  {
+    "id": "supported-1",
+    "store": "turn_transcript",
+    "value": {
+      "attempt_id": "attempt-supported",
+      "message": {
+        "ToolResult": {
+          "call_id": "call-supported",
+          "call_index": 0,
+          "model_sequence": 0,
+          "name": "shell",
+          "outcome": "Success",
+          "output": "supported tool output"
+        }
+      },
+      "request_id": "request-supported",
+      "sequence": 1,
+      "timestamp": "2023-11-14T22:13:20Z"
+    }
+  },
+  {
+    "id": "supported-2",
+    "store": "turn_transcript",
+    "value": {
+      "attempt_id": "attempt-supported",
+      "message": {
+        "ModelResponse": {
+          "content": "supported answer",
+          "metadata": null,
+          "model_sequence": 1,
+          "provider_extra": {},
+          "terminal": true,
+          "tool_calls": []
+        }
+      },
+      "request_id": "request-supported",
+      "sequence": 2,
+      "timestamp": "2023-11-14T22:13:20Z"
+    }
+  }
+]
