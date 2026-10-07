@@ -296,6 +296,12 @@ pub(super) fn ui(
         picker.viewport = Rect::default();
     }
 
+    app.settings_layout = super::SettingsLayout::for_size(f.area().width, f.area().height);
+    if app.settings_too_small() {
+        settings::ui_too_small(f, app);
+        return;
+    }
+
     // Mirror the fast-start gate so ui_chat (which has no `server` handle)
     // can show the "reconciling agents…" indicator until the deferred
     // at-startup work releases it.

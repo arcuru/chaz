@@ -294,13 +294,14 @@ for line in sys.stdin:
         format!("{} FINAL_ERROR", "wide界 e\u{301} failure ".repeat(200)),
     );
     open(&mut app, SettingsScope::Peer, 5);
-    for (width, height) in [(80, 24), (120, 40)] {
+    for (width, height) in [(40, 8), (64, 14), (80, 24), (120, 40)] {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         for (cursor, sentinel) in [(0, "FINAL_TOOL_39"), (1, "FINAL_ERROR")] {
             app.peer_mcp_cursor = cursor;
             let rows = draw(&mut terminal, &mut app, &server, &backend);
             assert!(!contains(&rows, sentinel));
             app.settings_focus = SettingsFocus::Content;
+            draw(&mut terminal, &mut app, &server, &backend);
             key(&mut app, KeyCode::End);
             let rows = draw(&mut terminal, &mut app, &server, &backend);
             assert!(contains(&rows, sentinel), "{rows:?}");
@@ -855,6 +856,664 @@ async fn settings_static_empty_and_degenerate_frames_have_safe_regions() {
         key(&mut app, KeyCode::End);
         key(&mut app, KeyCode::Left);
         assert_eq!(app.settings_focus, SettingsFocus::Category);
+    }
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn settings_geometry_boundaries_show_every_category_and_selected_row() {
+    use super::super::SettingsLayout;
+    let (_instance, server, backend, mut app) = fixture().await;
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    let sizes: Vec<_> = [39, 40, 41, 63, 64, 65, 80]
+        .into_iter()
+        .flat_map(|w| [7, 8, 9, 13, 14, 15, 24].map(|h| (w, h)))
+        .chain([
+            (0, 0),
+            (0, 8),
+            (40, 0),
+            (1, 1),
+            (1, 8),
+            (40, 1),
+            (15, 14),
+            (16, 14),
+            (17, 14),
+        ])
+        .collect();
+    for scope in [SettingsScope::Peer, SettingsScope::Session] {
+        for category in 0..app.settings_category_count(scope) {
+            open(&mut app, scope, category);
+            app.peer_agents_cursor = 29;
+            app.peer_defaults_cursor = 29;
+            app.peer_mcp_cursor = 29;
+            app.session_agents_cursor = 29;
+            app.session_models_cursor = 30;
+            let label = match scope {
+                SettingsScope::Peer => PeerSettingsCategory::ALL[category].label(),
+                SettingsScope::Session => SessionSettingsCategory::ALL[category].label(),
+            };
+            for &(width, height) in &sizes {
+                terminal.backend_mut().resize(width, height);
+                terminal.resize(Rect::new(0, 0, width, height)).unwrap();
+                app.settings_focus = SettingsFocus::Category;
+                let rows = draw(&mut terminal, &mut app, &server, &backend);
+                assert_regions(&app, width, height);
+                let expected = if width < 40 || height < 8 {
+                    SettingsLayout::TooSmall
+                } else if width < 64 || height < 14 {
+                    SettingsLayout::Compact
+                } else {
+                    SettingsLayout::Normal
+                };
+                assert_eq!(app.settings_layout, expected, "{width}×{height}");
+                if expected == SettingsLayout::TooSmall {
+                    assert!(app.click_regions.is_empty());
+                    assert!(
+                        app.settings_list_area.is_none() && app.settings_reader.viewport.is_none()
+                    );
+                    continue;
+                }
+                assert!(
+                    contains(&rows, label),
+                    "{scope:?}/{label} {width}×{height}: {rows:?}"
+                );
+                if expected == SettingsLayout::Compact {
+                    assert!(rows[1].contains(&format!(
+                        "{label} {}/{}",
+                        category + 1,
+                        app.settings_category_count(scope)
+                    )));
+                }
+                let list = app.settings_list_area.is_some();
+                if list {
+                    let hit = app.click_regions.iter().find(|r| matches!(r.target,
+                        ClickTarget::SettingsDetailRow(i) if i == if scope == SettingsScope::Session && category == 2 { 30 } else { 29 }
+                    )).expect("selected row is visible");
+                    let name = if scope == SettingsScope::Peer && category == 5 {
+                        "mcp-29"
+                    } else {
+                        "agent-29"
+                    };
+                    assert!(
+                        rows[hit.y as usize].contains(name) && rows[hit.y as usize].contains('>'),
+                        "{rows:?}"
+                    );
+                    key(&mut app, KeyCode::Right);
+                    assert_eq!(app.settings_focus, SettingsFocus::List);
+                    key(&mut app, KeyCode::Right);
+                } else {
+                    key(&mut app, KeyCode::Right);
+                    assert_eq!(app.settings_focus, SettingsFocus::Content);
+                }
+                draw(&mut terminal, &mut app, &server, &backend);
+                if app.settings_focus == SettingsFocus::Content {
+                    assert!(app.settings_reader.visible_rows >= 1);
+                    assert!(app.settings_reader.viewport.is_some());
+                    if expected == SettingsLayout::Compact {
+                        assert!(app.settings_list_area.is_none());
+                        assert!(
+                            !app.click_regions
+                                .iter()
+                                .any(|r| matches!(r.target, ClickTarget::SettingsDetailRow(_)))
+                        );
+                    }
+                }
+                assert_regions(&app, width, height);
+            }
+        }
+    }
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn settings_compact_empty_missing_and_static_pages_use_full_content_slot() {
+    let (_instance, server, backend, mut app) = fixture().await;
+    for name in server.agents().names() {
+        server.agents().unregister(&name);
+    }
+    server.set_default_agents(Vec::new());
+    server.mcp_registry().shutdown().await;
+    for missing in [false, true] {
+        app.session_settings_snapshot = (!missing).then(|| super::super::SessionMetaSnapshot {
+            session_db_id: app.active().session_db_id.clone(),
+            model_pin: None,
+            agent_models: Default::default(),
+            agents: Vec::new(),
+            host_agent_db_id: None,
+            created_at: None,
+            entry_count: 0,
+        });
+        for scope in [SettingsScope::Peer, SettingsScope::Session] {
+            for category in 0..app.settings_category_count(scope) {
+                open(&mut app, scope, category);
+                for (width, height) in [(40, 8), (64, 14), (80, 24)] {
+                    let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+                    draw(&mut terminal, &mut app, &server, &backend);
+                    // The empty Models page still has its editable Session scope.
+                    if scope == SettingsScope::Session && category == 2 && !missing {
+                        let hit = *app
+                            .click_regions
+                            .iter()
+                            .find(|r| matches!(r.target, ClickTarget::SettingsDetailRow(0)))
+                            .unwrap();
+                        assert!(
+                            draw(&mut terminal, &mut app, &server, &backend)[hit.y as usize]
+                                .contains("> Session")
+                        );
+                        continue;
+                    }
+                    key(&mut app, KeyCode::Right);
+                    let rows = draw(&mut terminal, &mut app, &server, &backend);
+                    assert_eq!(app.settings_focus, SettingsFocus::Content);
+                    let body = app.settings_reader.viewport.unwrap();
+                    assert!(body.height >= 1);
+                    if (width, height) == (40, 8) {
+                        assert_eq!(body, Rect::new(0, 3, 40, 4));
+                    }
+                    assert!(
+                        !app.click_regions
+                            .iter()
+                            .any(|r| matches!(r.target, ClickTarget::SettingsDetailRow(_))),
+                        "{rows:?}"
+                    );
+                    key(&mut app, KeyCode::End);
+                    let tail = draw(&mut terminal, &mut app, &server, &backend);
+                    let sentinel = match (scope, category) {
+                        (SettingsScope::Peer, 0) => "yaml",
+                        (SettingsScope::Peer, 2) => "restart.",
+                        (SettingsScope::Peer, 8) => "agent groups",
+                        (SettingsScope::Peer, 1 | 3 | 5) => "view-only in v1",
+                        (SettingsScope::Session, 0) => "agent)",
+                        (SettingsScope::Session, 1) if !missing => "selected",
+                        _ => "coming soon",
+                    };
+                    assert!(
+                        contains(&tail, sentinel),
+                        "missing {sentinel} {scope:?}/{category} {width}×{height}: {tail:?}"
+                    );
+                    assert_eq!(app.settings_reader.offset, app.settings_reader.max_offset);
+                    assert_regions(&app, width, height);
+                    key(&mut app, KeyCode::Left);
+                    assert_eq!(app.settings_focus, SettingsFocus::Category);
+                }
+            }
+        }
+    }
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn settings_compact_breadcrumb_keys_and_pane_wheel_ownership() {
+    let (_instance, server, backend, mut app) = fixture().await;
+    agent(&server, "agent-00", 20, true);
+    let mut terminal = Terminal::new(TestBackend::new(40, 8)).unwrap();
+    for scope in [SettingsScope::Peer, SettingsScope::Session] {
+        open(&mut app, scope, 0);
+        let n = app.settings_category_count(scope);
+        for category in 0..n {
+            let rows = draw(&mut terminal, &mut app, &server, &backend);
+            assert_eq!(app.settings_index(scope), category);
+            assert!(rows[1].contains(&format!(" {}/{} ", category + 1, n)));
+            let next = *app.click_regions.iter().find(|r| matches!(r.target, ClickTarget::SettingsSidebarItem(i) if i == (category + 1) % n)).unwrap();
+            send_mouse(
+                &mut app,
+                MouseEventKind::Down(MouseButton::Left),
+                next.x,
+                next.y,
+            );
+            assert_eq!(app.settings_focus, SettingsFocus::Category);
+        }
+        assert_eq!(app.settings_index(scope), 0);
+        draw(&mut terminal, &mut app, &server, &backend);
+        send_mouse(&mut app, MouseEventKind::Down(MouseButton::Left), 0, 1);
+        assert_eq!(app.settings_index(scope), n - 1);
+        key(&mut app, KeyCode::Tab);
+        assert_eq!(app.settings_index(scope), 0);
+        key(&mut app, KeyCode::BackTab);
+        assert_eq!(app.settings_index(scope), n - 1);
+        key(&mut app, KeyCode::Char('1'));
+        assert_eq!(app.settings_index(scope), 0);
+    }
+    open(&mut app, SettingsScope::Peer, 0);
+    app.active_mut().scroll_offset = 7;
+    let rows = draw(&mut terminal, &mut app, &server, &backend);
+    assert!(contains(&rows, "20 workers → details"));
+    assert!(!contains(&rows, "└ worker-"));
+    let list = app.settings_list_area.unwrap();
+    assert_eq!(list, Rect::new(0, 3, 40, 4));
+    send_mouse(
+        &mut app,
+        MouseEventKind::ScrollDown,
+        list.x,
+        list.bottom() - 1,
+    );
+    assert_eq!(app.peer_agents_cursor, 3);
+    send_mouse(&mut app, MouseEventKind::ScrollUp, list.x, list.y);
+    assert_eq!(app.peer_agents_cursor, 0);
+    key(&mut app, KeyCode::Right);
+    draw(&mut terminal, &mut app, &server, &backend);
+    let window = app.scroll.peer_agents;
+    key(&mut app, KeyCode::Right);
+    draw(&mut terminal, &mut app, &server, &backend);
+    assert_eq!(app.settings_focus, SettingsFocus::Content);
+    assert!(app.settings_list_area.is_none());
+    assert_eq!(app.scroll.peer_agents, window);
+    let body = app.settings_reader.viewport.unwrap();
+    for (x, y) in (0..=40).flat_map(|x| (0..=8).map(move |y| (x, y))) {
+        let before = app.settings_reader.offset;
+        send_mouse(&mut app, MouseEventKind::ScrollDown, x, y);
+        assert_eq!(
+            app.settings_reader.offset,
+            if body.contains(ratatui::layout::Position::new(x, y)) {
+                before.saturating_add(3).min(app.settings_reader.max_offset)
+            } else {
+                before
+            }
+        );
+        assert_eq!(app.peer_agents_cursor, 0);
+    }
+    key(&mut app, KeyCode::Home);
+    send_mouse(
+        &mut app,
+        MouseEventKind::Down(MouseButton::Left),
+        body.x,
+        body.y,
+    );
+    key(&mut app, KeyCode::PageDown);
+    assert_eq!(app.settings_reader.offset, 3);
+    key(&mut app, KeyCode::PageUp);
+    assert_eq!(app.settings_reader.offset, 0);
+    key(&mut app, KeyCode::End);
+    let tail = draw(&mut terminal, &mut app, &server, &backend);
+    assert!(contains(&tail, "FINAL_WORKER_PROMPT"), "{tail:?}");
+    let offset = app.settings_reader.offset;
+    key(&mut app, KeyCode::Left);
+    let rows = draw(&mut terminal, &mut app, &server, &backend);
+    assert!(contains(&rows, "20 workers → details"));
+    assert!(app.settings_reader.viewport.is_none());
+    assert_eq!(app.settings_reader.offset, offset);
+    key(&mut app, KeyCode::Right);
+    draw(&mut terminal, &mut app, &server, &backend);
+    assert_eq!(app.settings_reader.offset, offset);
+    assert_eq!(app.active().scroll_offset, 7);
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn settings_resize_through_too_small_retains_reader_selection_and_recovers_tail() {
+    let (_instance, server, backend, mut app) = fixture().await;
+    agent(&server, "agent-15", 20, true);
+    open(&mut app, SettingsScope::Peer, 0);
+    app.peer_agents_cursor = 15;
+    app.settings_focus = SettingsFocus::Content;
+    app.input = "chat draft".into();
+    app.active_mut().scroll_offset = 12;
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    draw(&mut terminal, &mut app, &server, &backend);
+    key(&mut app, KeyCode::End);
+    for (width, height) in [(40, 8), (39, 7), (120, 40), (80, 24), (0, 0), (64, 14)] {
+        let before = app.settings_reader.offset;
+        let max_before = app.settings_reader.max_offset;
+        terminal.backend_mut().resize(width, height);
+        terminal.resize(Rect::new(0, 0, width, height)).unwrap();
+        draw(&mut terminal, &mut app, &server, &backend);
+        if width < 40 || height < 8 {
+            assert!(app.click_regions.is_empty());
+            assert!(app.settings_reader.viewport.is_none() && app.settings_list_area.is_none());
+            for code in [
+                KeyCode::Enter,
+                KeyCode::Home,
+                KeyCode::End,
+                KeyCode::Down,
+                KeyCode::PageDown,
+                KeyCode::Tab,
+                KeyCode::Char('r'),
+            ] {
+                assert!(matches!(key(&mut app, code), input::SettingsKey::None));
+            }
+            send_mouse(&mut app, MouseEventKind::ScrollDown, 20, 5);
+            send_mouse(&mut app, MouseEventKind::Down(MouseButton::Left), 20, 5);
+            assert_eq!(app.settings_reader.offset, before);
+            assert_eq!(app.settings_reader.max_offset, max_before);
+        } else {
+            assert_eq!(
+                app.settings_reader.offset,
+                before.min(app.settings_reader.max_offset)
+            );
+            key(&mut app, KeyCode::End);
+            let rows = draw(&mut terminal, &mut app, &server, &backend);
+            assert!(contains(&rows, "FINAL_WORKER_PROMPT"), "{rows:?}");
+            assert!(contains(&rows, "agent-15"), "pinned identity: {rows:?}");
+            key(&mut app, KeyCode::Home);
+            assert!(contains(
+                &draw(&mut terminal, &mut app, &server, &backend),
+                "default model"
+            ));
+            key(&mut app, KeyCode::End);
+        }
+        assert_eq!(app.settings_focus, SettingsFocus::Content);
+        assert_eq!(app.peer_agents_cursor, 15);
+        assert_eq!(app.peer_settings_index, 0);
+        assert_eq!(app.input, "chat draft");
+        assert_eq!(app.active().scroll_offset, 12);
+        assert_regions(&app, width, height);
+    }
+    key(&mut app, KeyCode::Tab);
+    assert_eq!(app.settings_reader.offset, 0);
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn settings_too_small_freezes_modals_and_refuses_invisible_submit_or_confirmation() {
+    let (_instance, server, backend, mut app) = fixture().await;
+    agent(&server, "agent-00", 20, true);
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    for modal in 0..7 {
+        open(&mut app, SettingsScope::Peer, 0);
+        app.settings_focus = SettingsFocus::Content;
+        terminal.backend_mut().resize(80, 24);
+        terminal.resize(Rect::new(0, 0, 80, 24)).unwrap();
+        draw(&mut terminal, &mut app, &server, &backend);
+        key(&mut app, KeyCode::End);
+        let mut rx = None;
+        match modal {
+            0 => {
+                app.agent_diff = Some(AgentDiffView {
+                    agent_name: "agent-00".into(),
+                    diff: chaz_core::agent_diff::diff_agent(
+                        &AgentDbConfig::default(),
+                        &AgentDbConfig::default(),
+                    ),
+                    mode: AgentDiffMode::ConfirmReseed,
+                    cursor: 0,
+                    picks: Vec::new(),
+                })
+            }
+            1 => {
+                app.settings_prompt = Some(SettingsPrompt {
+                    label: "add".into(),
+                    input: "draft".into(),
+                    cursor: 5,
+                    intent: SettingsPromptIntent::AddPeerDefault,
+                })
+            }
+            2 => {
+                app.set_settings_index(SettingsScope::Session, 1);
+                app.mode = TuiMode::Settings(SettingsScope::Session);
+                app.settings_picker = Some(settings_picker(
+                    "add",
+                    (0..30).map(|i| format!("candidate-{i:02}")).collect(),
+                    29,
+                ));
+            }
+            3 => {
+                app.overlay = Some(Overlay::RenamePrompt {
+                    session_db_id: "fixture".into(),
+                    title: "Rename".into(),
+                    input: "draft".into(),
+                    cursor: 5,
+                })
+            }
+            4 => app.overlay = Some(Overlay::Help { scroll: 2 }),
+            5 => rx = Some(approval(&mut app)),
+            _ => {
+                app.model_picker_caller = app.mode;
+                app.mode = TuiMode::ModelPicker;
+                app.model_search = "draft".into();
+                app.model_picker_index = 0;
+            }
+        }
+        // Supported compact modals keep ownership; covered Settings cannot scroll.
+        terminal.backend_mut().resize(40, 8);
+        terminal.resize(Rect::new(0, 0, 40, 8)).unwrap();
+        let rows = draw(&mut terminal, &mut app, &server, &backend);
+        assert_regions(&app, 40, 8);
+        assert!(app.settings_list_area.is_none() && app.settings_reader.viewport.is_none());
+        if modal == 2 {
+            assert!(contains(&rows, "> candidate-29"), "{rows:?}");
+            let picker = app.settings_picker.as_ref().unwrap().viewport;
+            send_mouse(&mut app, MouseEventKind::ScrollUp, picker.x, picker.y);
+            assert_eq!(app.settings_picker.as_ref().unwrap().selected, 26);
+        } else if modal == 5 {
+            assert!(
+                contains(&rows, "review_tool") && contains(&rows, "[n] deny"),
+                "{rows:?}"
+            );
+        }
+        let offset = app.settings_reader.offset;
+        let focus = app.settings_focus;
+        let mode = app.mode;
+        let picker_index = app.settings_picker.as_ref().map(|p| p.selected);
+        terminal.backend_mut().resize(39, 7);
+        terminal.resize(Rect::new(0, 0, 39, 7)).unwrap();
+        let rows = draw(&mut terminal, &mut app, &server, &backend);
+        assert!(contains(&rows, "Too small: need 40×8"), "{rows:?}");
+        assert!(app.click_regions.is_empty());
+        assert!(app.settings_list_area.is_none() && app.settings_reader.viewport.is_none());
+        for code in [
+            KeyCode::Enter,
+            KeyCode::Char('y'),
+            KeyCode::Char('n'),
+            KeyCode::Char('r'),
+            KeyCode::Char('R'),
+            KeyCode::Char('a'),
+            KeyCode::Char('d'),
+            KeyCode::Char(' '),
+            KeyCode::Up,
+            KeyCode::Down,
+            KeyCode::PageDown,
+            KeyCode::Home,
+            KeyCode::End,
+            KeyCode::Tab,
+            KeyCode::Backspace,
+        ] {
+            let event = KeyEvent::new(code, KeyModifiers::NONE);
+            match modal {
+                3 | 4 => assert!(matches!(
+                    input::handle_overlay_key(&mut app, event),
+                    input::OverlayKey::Consumed
+                )),
+                6 => assert!(matches!(
+                    input::handle_model_picker_key(&mut app, event),
+                    input::ModelPickerKey::None
+                )),
+                _ => assert!(matches!(key(&mut app, code), input::SettingsKey::None)),
+            }
+        }
+        for kind in [
+            MouseEventKind::ScrollUp,
+            MouseEventKind::ScrollDown,
+            MouseEventKind::Down(MouseButton::Left),
+        ] {
+            for (x, y) in [(0, 0), (20, 5), (38, 6), (40, 8)] {
+                send_mouse(&mut app, kind, x, y);
+            }
+        }
+        assert_eq!(app.settings_reader.offset, offset);
+        assert_eq!(app.settings_focus, focus);
+        assert_eq!(app.mode, mode);
+        assert_eq!(app.peer_agents_cursor, 0);
+        assert_eq!(app.active().scroll_offset, 0);
+        match modal {
+            0 => assert_eq!(
+                app.agent_diff.as_ref().unwrap().mode,
+                AgentDiffMode::ConfirmReseed
+            ),
+            1 => assert_eq!(app.settings_prompt.as_ref().unwrap().input, "draft"),
+            2 => {
+                let picker = app.settings_picker.as_ref().unwrap();
+                assert_eq!(picker.filter, "");
+                assert_eq!(Some(picker.selected), picker_index);
+                assert_eq!(picker.viewport, Rect::default());
+            }
+            3 => assert!(
+                matches!(&app.overlay, Some(Overlay::RenamePrompt { input, cursor: 5, .. }) if input == "draft")
+            ),
+            4 => assert!(matches!(app.overlay, Some(Overlay::Help { scroll: 2 }))),
+            5 => assert!(matches!(
+                rx.as_mut().unwrap().try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+            )),
+            _ => assert_eq!(app.model_search, "draft"),
+        }
+        // Resizing restores the same owner and draft before safe cancellation.
+        terminal.backend_mut().resize(40, 8);
+        terminal.resize(Rect::new(0, 0, 40, 8)).unwrap();
+        draw(&mut terminal, &mut app, &server, &backend);
+        assert_eq!(app.settings_focus, focus);
+        terminal.backend_mut().resize(1, 1);
+        terminal.resize(Rect::new(0, 0, 1, 1)).unwrap();
+        draw(&mut terminal, &mut app, &server, &backend);
+        let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        match modal {
+            3 | 4 => {
+                input::handle_overlay_key(&mut app, esc);
+            }
+            6 => {
+                input::handle_model_picker_key(&mut app, esc);
+            }
+            _ => {
+                key(&mut app, KeyCode::Esc);
+            }
+        }
+        if modal == 0 {
+            assert_eq!(app.agent_diff.as_ref().unwrap().mode, AgentDiffMode::View);
+            key(&mut app, KeyCode::Esc);
+        }
+        if modal == 5 {
+            assert!(matches!(
+                tokio::time::timeout(std::time::Duration::from_secs(1), rx.unwrap())
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                chaz_core::bridge::ApprovalDecision::Deny
+            ));
+        }
+        assert!(
+            app.overlay.is_none()
+                && app.agent_diff.is_none()
+                && app.settings_prompt.is_none()
+                && app.settings_picker.is_none()
+                && app.active().pending_approval.is_none()
+        );
+        assert!(
+            matches!(app.mode, TuiMode::Settings(_)),
+            "Esc cancels owner, not Settings"
+        );
+        key(&mut app, KeyCode::Esc);
+        assert_eq!(app.mode, TuiMode::SessionPicker);
+    }
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn settings_compact_models_keep_selected_action_scopes() {
+    let (_instance, server, backend, mut app) = fixture().await;
+    let mut terminal = Terminal::new(TestBackend::new(40, 8)).unwrap();
+    open(&mut app, SettingsScope::Session, 2);
+    for cursor in [0, 1, 15, 30] {
+        app.session_models_cursor = cursor;
+        let rows = draw(&mut terminal, &mut app, &server, &backend);
+        let hit = *app
+            .click_regions
+            .iter()
+            .find(|r| matches!(r.target, ClickTarget::SettingsDetailRow(i) if i == cursor))
+            .unwrap();
+        let name = if cursor == 0 {
+            "Session".to_string()
+        } else {
+            format!("agent-{:02}", cursor - 1)
+        };
+        assert!(rows[hit.y as usize].contains(&name), "{rows:?}");
+        send_mouse(
+            &mut app,
+            MouseEventKind::Down(MouseButton::Left),
+            hit.x,
+            hit.y,
+        );
+        assert_eq!(app.settings_focus, SettingsFocus::List);
+        assert_eq!(app.session_models_cursor, cursor);
+        assert!(matches!(
+            key(&mut app, KeyCode::Enter),
+            input::SettingsKey::OpenModelPicker(None)
+        ));
+        // This is the same helper the async picker dispatcher uses for None.
+        let scope = super::super::models_scope_from_cursor(&app);
+        if cursor == 0 {
+            assert!(matches!(scope, super::super::ModelPickerScope::Session));
+        } else {
+            assert!(matches!(scope, super::super::ModelPickerScope::Agent(n) if n == name));
+        }
+    }
+    open(&mut app, SettingsScope::Peer, 0);
+    app.peer_agents_cursor = 29;
+    draw(&mut terminal, &mut app, &server, &backend);
+    key(&mut app, KeyCode::Right);
+    key(&mut app, KeyCode::Right);
+    draw(&mut terminal, &mut app, &server, &backend);
+    assert!(
+        matches!(key(&mut app, KeyCode::Enter), input::SettingsKey::OpenModelPicker(Some(super::super::ModelPickerScope::AgentGlobal(n))) if n == "agent-29")
+    );
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn settings_static_populated_unicode_content_reaches_last_fields_after_reflow() {
+    let (_instance, server, backend, mut app) = fixture().await;
+    let mut configured =
+        chaz_core::config::Backend::new(chaz_core::config::BackendType::OpenAICompatible);
+    configured.name = Some("fixture".into());
+    configured.api_base = Some(format!("{} FINAL_URL", "wide界 e\u{301} ".repeat(200)));
+    let config = Config {
+        backends: Some(vec![configured]),
+        state_dir: Some(format!("{} FINAL_PATH", "wide界 e\u{301} ".repeat(200))),
+        agent_groups: Some([("FINAL_GROUP".into(), Vec::new())].into_iter().collect()),
+        ..Default::default()
+    };
+    app.session_settings_snapshot
+        .as_mut()
+        .unwrap()
+        .host_agent_db_id = Some(format!("{} FINAL_HOST", "wide界 e\u{301} ".repeat(200)));
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    for (scope, category, sentinel) in [
+        (SettingsScope::Peer, 1, "FINAL_URL"),
+        (SettingsScope::Peer, 8, "FINAL_GROUP"),
+        (SettingsScope::Session, 0, "FINAL_HOST"),
+    ] {
+        open(&mut app, scope, category);
+        app.settings_focus = SettingsFocus::Content;
+        for (width, height) in [(80, 24), (40, 8), (64, 14), (41, 9), (80, 24)] {
+            terminal.backend_mut().resize(width, height);
+            terminal.resize(Rect::new(0, 0, width, height)).unwrap();
+            terminal
+                .draw(|f| ui(f, &mut app, &server, &backend, &config))
+                .unwrap();
+            assert!(app.settings_reader.visible_rows > 0);
+            assert!(app.settings_reader.max_offset > 0);
+            let page = app.settings_reader.visible_rows.saturating_sub(1).max(1);
+            key(&mut app, KeyCode::Home);
+            let mut found = false;
+            for _ in 0..=app.settings_reader.max_offset / page + 1 {
+                terminal
+                    .draw(|f| ui(f, &mut app, &server, &backend, &config))
+                    .unwrap();
+                let text: String = terminal
+                    .backend()
+                    .buffer()
+                    .content()
+                    .iter()
+                    .map(|c| c.symbol())
+                    .collect();
+                found |= text.contains(sentinel);
+                key(&mut app, KeyCode::PageDown);
+            }
+            assert!(
+                found,
+                "{scope:?}/{category} {width}×{height} lost {sentinel}"
+            );
+            assert_eq!(app.settings_reader.offset, app.settings_reader.max_offset);
+            assert_regions(&app, width, height);
+        }
     }
     server.shutdown().await;
 }

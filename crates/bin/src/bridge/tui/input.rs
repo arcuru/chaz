@@ -254,6 +254,9 @@ pub(super) enum OverlayKey {
 /// `handle_chat_key` / picker handling so overlays intercept input before the
 /// underlying mode sees it.
 pub(super) fn handle_overlay_key(app: &mut App, key: KeyEvent) -> OverlayKey {
+    if app.settings_too_small() && key.code != KeyCode::Esc {
+        return OverlayKey::Consumed;
+    }
     let backend_ready = app.backend_ready();
     let Some(overlay) = app.overlay.as_mut() else {
         return OverlayKey::NotConsumed;
@@ -370,6 +373,9 @@ pub(super) fn mouse_is_actionable(m: &MouseEvent) -> bool {
 }
 
 pub(super) fn handle_mouse(app: &mut App, m: MouseEvent) -> Option<MouseOutcome> {
+    if app.settings_too_small() {
+        return None;
+    }
     // Route the wheel to the visible cursor list; never scroll chat behind it.
     match m.kind {
         MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
@@ -904,6 +910,9 @@ pub(super) enum ModelPickerKey {
 /// ambiguous with Enter on terminals without keyboard-enhancement
 /// support, which makes a key binding unreliable through tmux + ssh).
 pub(super) fn handle_model_picker_key(app: &mut App, key: KeyEvent) -> ModelPickerKey {
+    if app.settings_too_small() && key.code != KeyCode::Esc {
+        return ModelPickerKey::None;
+    }
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let alt = key.modifiers.contains(KeyModifiers::ALT);
 
@@ -1025,6 +1034,15 @@ pub(super) fn handle_settings_key(
     key: KeyEvent,
     scope: SettingsScope,
 ) -> SettingsKey {
+    if app.settings_too_small() {
+        if key.code != KeyCode::Esc {
+            return SettingsKey::None;
+        }
+        if app.active().pending_approval.is_some() && app.overlay.is_none() {
+            apply_approval(app, ApprovalDecision::Deny);
+            return SettingsKey::None;
+        }
+    }
     if app.overlay.is_some() || handle_approval_key(app, key) {
         return SettingsKey::None;
     }

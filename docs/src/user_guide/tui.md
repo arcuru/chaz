@@ -412,15 +412,15 @@ These tables list every category in sidebar order. Read-only pages are inspector
 Action letters such as `a`, `d`, and `r`, and Defaults' `Ctrl+Up`/`Ctrl+Down`
 reordering keep their existing selected-row targets. Prompts, pickers, diffs,
 and approval input take precedence over the reader. A pending tool approval
-shows the same request and buttons as chat, preserving any Settings draft and
+shows the same request and buttons as chat at supported sizes, preserving any Settings draft and
 reading position until it is answered. Wheeling or clicking a covered Settings
 list cannot move its selection or the hidden chat.
 
 #### Selection is not reading position
 
-An agent's workers are decorative list rows, not selectable agents. If the
-whole agent-and-workers group fits the list's current row budget, it stays
-expanded. Otherwise its agent row shows `[20 workers → details]` (with the
+An agent's workers are decorative list rows, not selectable agents. In the
+normal layout, a group that fits the list's row budget stays expanded.
+Compact lists always summarize workers. A summarized agent row shows `[20 workers → details]` (with the
 actual count). The existing body still contains every worker's fields.
 
 When a body overflows, a pinned row identifies the selected entity and shows
@@ -435,7 +435,8 @@ leaving Settings resets it too. Focus changes and opening/canceling a model
 picker or diff preserve it. Resizing rewraps the body and clamps the numeric
 wrapped-line offset. It does not preserve a semantic text anchor or remember
 separate positions for previously visited entities. A body that fits again
-returns to its ordinary, unscrolled layout.
+returns to its ordinary, unscrolled layout in normal Settings. Compact Content
+keeps its pinned identity row. See [Small-terminal Settings](#small-terminal-settings).
 
 #### Read an overflowing worker group
 
@@ -488,6 +489,66 @@ For example:
 2. Type a filter with no matches. The picker shows `(no matches)` and `Enter`
    adds nothing. Reopen with `a`, or remove the filter with `Backspace` before
    accepting, or press `Esc` to cancel.
+
+## Small-terminal Settings
+
+Settings chooses its layout from the terminal's current width and height:
+
+| Size                                                       | Layout                                                                |
+| ---------------------------------------------------------- | --------------------------------------------------------------------- |
+| Width ≥64 **and** height ≥14                               | Normal category rail, with list and body together on Agents/MCP.      |
+| Width ≥40 **and** height ≥8, below either normal threshold | Compact: header, category breadcrumb, one content pane, status strip. |
+| Width <40 **or** height <8                                 | Too-small message; no page or modal actions.                          |
+
+Compact uses the [same navigation and reader](#reading-settings-details), not a
+separate selection. The breadcrumb shows the category, ordinal and focus:
+`‹ Agents 1/9 ›  LIST`. Click `‹` or `›` to cycle categories; click the category
+label to focus Category. Tab, Shift+Tab and number keys still work.
+
+Peer Agents/MCP show the list until Content owns focus. Right replaces it with
+the selected entity's body; Left restores the same list selection and window.
+Only the visible pane receives clicks or wheel events. Breadcrumbs, headers
+and the status strip swallow the wheel. Static and empty pages use the full
+content slot. Lists prioritize selected rows over decoration; Models drops
+explanatory continuation rows without changing the selected model scope.
+
+Resizing preserves focus, selection and drafts. A visible body rewraps and
+clamps its numeric reading offset before drawing. Below 40×8, Settings and its
+open modals are hidden without discarding their state. Typing, navigation,
+scrolling, actions, submissions and confirmations are paused. Esc backs out
+of the current modal (denying an approval), or leaves Settings when no modal
+owns input. Ctrl+C still quits. Resize back to resume before submitting.
+
+### Resize while reading
+
+1. Open Peer Settings → Agents in an 80×24 terminal. Select `alpha`, with
+   twenty workers, then focus List and resize to 40×8. The breadcrumb and
+   summarized row read:
+
+   ```text
+   ‹ Agents 1/9 ›  LIST
+   > [20 workers → details] alpha
+   ```
+
+2. Press Right. The list disappears and the breadcrumb reads
+   `‹ Agents 1/9 ›  READ`. Down/PageDown reads the body; End reaches its
+   final fields. At 40×8, the pinned identity leaves four reading rows,
+   so longer worker blocks take multiple pages. Left returns to `alpha`
+   in the list; it does not change the model action's target.
+3. Resize to 39×7. The page is replaced by:
+
+   ```text
+   Peer Settings
+   Too small: need 40×8
+   Resize or Esc back
+   ```
+
+   Enter and action keys do nothing. If a prompt or picker was open, its
+   draft/filter remains intact; nothing is submitted invisibly.
+
+4. Resize back to 40×8 or 80×24. The same owner and selection return; the
+   visible reader's offset clamps to the new wrapping. Use Home to start
+   reading again, or Esc to cancel/return to the caller.
 
 ## Named Sessions
 

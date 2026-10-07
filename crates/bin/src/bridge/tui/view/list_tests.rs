@@ -273,9 +273,17 @@ fn assert_rows(list: List, app: &App, rows: &[String], width: u16) {
 async fn scrolling_case(list: List) {
     let (_instance, server, backend, mut app) = fixture().await;
     list.open(&mut app);
-    for width in [80, 36] {
+    for width in [80, 40, 36] {
         let mut terminal = Terminal::new(TestBackend::new(width, 30)).unwrap();
         draw(&mut terminal, &mut app, &server, &backend);
+        if width < 40 {
+            let before = list.cursor(&app);
+            assert!(app.click_regions.is_empty() && app.settings_list_area.is_none());
+            send_mouse(&mut app, MouseEventKind::ScrollDown, 16, 4);
+            settings_key(&mut app, KeyCode::Down);
+            assert_eq!(list.cursor(&app), before, "below the supported floor");
+            continue;
+        }
         for _ in 0..8 {
             let before = list.cursor(&app);
             let area = app.settings_list_area.unwrap();
@@ -392,10 +400,14 @@ async fn footer_frames_reserve_hints_without_starving_rows() {
         (List::Models, "Enter — open picker"),
     ] {
         list.open(&mut app);
-        // Full layout consumes two fixed rows; the list has 4 header lines.
+        // Normal keeps its footer budget; compact gives row slots precedence.
         for height in [14, 11, 10, 9, 8, 7] {
             let mut terminal = Terminal::new(TestBackend::new(80, height)).unwrap();
             let rows = draw(&mut terminal, &mut app, &server, &backend);
+            if height < 8 {
+                assert!(app.click_regions.is_empty() && app.settings_list_area.is_none());
+                continue;
+            }
             assert_rows(list, &app, &rows, 80);
             if let Some(y) = rows[..rows.len() - 1].iter().position(|r| r.contains(hint)) {
                 assert!(
@@ -403,27 +415,21 @@ async fn footer_frames_reserve_hints_without_starving_rows() {
                     "footer is not a list wheel target: {list:?}: {rows:?}"
                 );
             }
-            if height
-                >= if matches!(list, List::Models) {
-                    11
-                } else if matches!(list, List::Defaults) {
-                    10
-                } else {
-                    9
-                }
-            {
+            if height >= 14 {
                 assert!(
                     rows[..rows.len() - 1].iter().any(|r| r.contains(hint)),
                     "{list:?}, height {height}: {rows:?}"
                 );
             }
         }
-        // Overflow still leaves both the cursor and footer visible.
+        // Resize back before routing pointer input; use this frame's row slots.
+        let mut terminal = Terminal::new(TestBackend::new(80, 14)).unwrap();
+        draw(&mut terminal, &mut app, &server, &backend);
+        // Normal overflow still leaves both the cursor and footer visible.
         for _ in 0..8 {
             let area = app.settings_list_area.unwrap();
             input::handle_mouse(&mut app, mouse(MouseEventKind::ScrollDown, area.x, area.y));
         }
-        let mut terminal = Terminal::new(TestBackend::new(80, 14)).unwrap();
         let rows = draw(&mut terminal, &mut app, &server, &backend);
         assert_rows(list, &app, &rows, 80);
         assert!(
