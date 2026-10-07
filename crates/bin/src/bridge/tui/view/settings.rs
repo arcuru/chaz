@@ -177,21 +177,11 @@ pub(super) fn ui_settings(
         app.click_regions.clear();
         app.settings_list_area = None;
         app.settings_reader.viewport = None;
-    } else {
-        let frame = f.area();
-        app.click_regions.retain(|r| {
-            r.w > 0
-                && r.h > 0
-                && r.x >= frame.x
-                && r.y >= frame.y
-                && r.x.saturating_add(r.w) <= frame.right()
-                && r.y.saturating_add(r.h) <= frame.bottom()
-        });
     }
 
     // Approval keys must never act on an unseen request. Reuse the chat panel
     // over the bottom rows without discarding the underlying reader or draft.
-    if let Some(exchange) = app.active().pending_approval.as_ref() {
+    let hit_area = if let Some(exchange) = app.active().pending_approval.as_ref() {
         let info = exchange.info.clone();
         let frame = f.area();
         let panel = Rect {
@@ -208,14 +198,19 @@ pub(super) fn ui_settings(
             &info.risk_level.to_string(),
             &info.arguments_display,
         );
-        app.click_regions.retain(|r| {
-            r.w > 0
-                && r.h > 0
-                && r.x >= panel.x
-                && r.y >= panel.y
-                && r.x.saturating_add(r.w) <= panel.right()
-                && r.y.saturating_add(r.h) <= panel.bottom()
-        });
+        panel
+    } else {
+        f.area()
+    };
+    app.click_regions.retain(|r| {
+        r.w > 0
+            && r.h > 0
+            && r.x >= hit_area.x
+            && r.y >= hit_area.y
+            && r.x.saturating_add(r.w) <= hit_area.right()
+            && r.y.saturating_add(r.h) <= hit_area.bottom()
+    });
+    if app.active().pending_approval.is_some() {
         return;
     }
 

@@ -143,6 +143,33 @@ pub(super) fn mouse(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
     }
 }
 
+pub(super) fn settings_key(app: &mut App, code: KeyCode) -> input::SettingsKey {
+    let TuiMode::Settings(scope) = app.mode else {
+        panic!("not Settings")
+    };
+    input::handle_settings_key(app, KeyEvent::new(code, KeyModifiers::NONE), scope)
+}
+
+pub(super) fn send_mouse(app: &mut App, kind: MouseEventKind, x: u16, y: u16) {
+    input::handle_mouse(app, mouse(kind, x, y));
+}
+
+pub(super) fn settings_picker(
+    label: &str,
+    candidates: Vec<String>,
+    selected: usize,
+) -> SettingsPicker {
+    SettingsPicker {
+        label: label.into(),
+        filter: String::new(),
+        cursor: 0,
+        candidates,
+        selected,
+        intent: SettingsPickerIntent::AddSessionAgent,
+        viewport: Rect::default(),
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 enum List {
     Defaults,
@@ -407,7 +434,6 @@ async fn footer_frames_reserve_hints_without_starving_rows() {
 
 #[tokio::test]
 async fn wheel_ownership_stays_with_modal_or_visible_list() {
-    use super::super::{SettingsPicker, SettingsPickerIntent};
     let (_instance, server, backend, mut app) = fixture().await;
     List::PeerAgents.open(&mut app);
     let mut terminal = Terminal::new(TestBackend::new(80, 30)).unwrap();
@@ -445,15 +471,11 @@ async fn wheel_ownership_stays_with_modal_or_visible_list() {
     input::handle_mouse(&mut app, wheel);
     assert_eq!(app.peer_agents_cursor, 0, "diff modal hides the list");
     app.agent_diff = None;
-    app.settings_picker = Some(SettingsPicker {
-        label: "Add".into(),
-        filter: String::new(),
-        cursor: 0,
-        candidates: (0..10).map(|i| format!("agent-{i}")).collect(),
-        selected: 0,
-        intent: SettingsPickerIntent::AddSessionAgent,
-        viewport: ratatui::layout::Rect::default(),
-    });
+    app.settings_picker = Some(settings_picker(
+        "Add",
+        (0..10).map(|i| format!("agent-{i}")).collect(),
+        0,
+    ));
     app.settings_picker.as_mut().unwrap().viewport = ratatui::layout::Rect::new(16, 4, 64, 6);
     input::handle_mouse(&mut app, wheel);
     assert_eq!(app.settings_picker.as_ref().unwrap().selected, 3);
@@ -588,21 +610,13 @@ async fn add_agent_picker_last_row_matches_enter_after_resize() {
     let (_instance, server, backend, mut app) = fixture().await;
     List::SessionAgents.open(&mut app);
     app.active_mut().session_name = Some("Picker test".into());
-    app.settings_picker = Some(SettingsPicker {
-        label: "add agent".into(),
-        filter: String::new(),
-        cursor: 0,
-        candidates: (0..30).map(|i| format!("candidate-{i:02}")).collect(),
-        selected: 0,
-        intent: SettingsPickerIntent::AddSessionAgent,
-        viewport: ratatui::layout::Rect::default(),
-    });
+    app.settings_picker = Some(settings_picker(
+        "add agent",
+        (0..30).map(|i| format!("candidate-{i:02}")).collect(),
+        0,
+    ));
     for _ in 0..40 {
-        input::handle_settings_key(
-            &mut app,
-            KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
-            SettingsScope::Session,
-        );
+        settings_key(&mut app, KeyCode::Down);
     }
     for (width, height) in [(80, 24), (40, 14), (120, 40)] {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
@@ -617,11 +631,7 @@ async fn add_agent_picker_last_row_matches_enter_after_resize() {
         );
         insta::assert_snapshot!(format!("add_agent_last_{width}x{height}"), rows.join("\n"));
     }
-    match input::handle_settings_key(
-        &mut app,
-        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
-        SettingsScope::Session,
-    ) {
+    match settings_key(&mut app, KeyCode::Enter) {
         input::SettingsKey::PromptSubmit {
             intent: SettingsPromptIntent::AddSessionAgent,
             value,
@@ -637,25 +647,14 @@ async fn add_agent_picker_filter_unicode_cancel_and_mouse_ownership() {
     List::SessionAgents.open(&mut app);
     app.active_mut().session_name = Some("Picker test".into());
     app.input = "chat draft".into();
-    app.settings_picker = Some(SettingsPicker {
-        label: "add agent".into(),
-        filter: String::new(),
-        cursor: 0,
-        candidates: (0..20).map(|i| format!("研究-{i:02}")).collect(),
-        selected: 19,
-        intent: SettingsPickerIntent::AddSessionAgent,
-        viewport: Rect::default(),
-    });
-    let key = |app: &mut App, code| {
-        input::handle_settings_key(
-            app,
-            KeyEvent::new(code, KeyModifiers::NONE),
-            SettingsScope::Session,
-        )
-    };
+    app.settings_picker = Some(settings_picker(
+        "add agent",
+        (0..20).map(|i| format!("研究-{i:02}")).collect(),
+        19,
+    ));
     // No drawn row yet: do not accept an invisible action target.
     assert!(matches!(
-        key(&mut app, KeyCode::Enter),
+        settings_key(&mut app, KeyCode::Enter),
         input::SettingsKey::None
     ));
     assert!(app.settings_picker.is_some());
@@ -665,24 +664,25 @@ async fn add_agent_picker_filter_unicode_cancel_and_mouse_ownership() {
     let picker_area = app.settings_picker.as_ref().unwrap().viewport;
     let category = app.settings_index(SettingsScope::Session);
     for (x, y) in [(1, 1), (16, 2), (39, 13), (80, 40)] {
-        input::handle_mouse(
-            &mut app,
-            mouse(MouseEventKind::Down(MouseButton::Left), x, y),
-        );
-        input::handle_mouse(&mut app, mouse(MouseEventKind::ScrollUp, x, y));
+        send_mouse(&mut app, MouseEventKind::Down(MouseButton::Left), x, y);
+        send_mouse(&mut app, MouseEventKind::ScrollUp, x, y);
         assert_eq!(app.settings_picker.as_ref().unwrap().selected, 19);
         assert_eq!(app.settings_index(SettingsScope::Session), category);
         assert_eq!(app.session_agents_cursor, 0);
     }
-    input::handle_mouse(
+    send_mouse(
         &mut app,
-        mouse(MouseEventKind::ScrollUp, picker_area.x, picker_area.y),
+        MouseEventKind::ScrollUp,
+        picker_area.x,
+        picker_area.y,
     );
     assert_eq!(app.settings_picker.as_ref().unwrap().selected, 16);
     app.overlay = Some(Overlay::Help { scroll: 0 });
-    input::handle_mouse(
+    send_mouse(
         &mut app,
-        mouse(MouseEventKind::ScrollDown, picker_area.x, picker_area.y),
+        MouseEventKind::ScrollDown,
+        picker_area.x,
+        picker_area.y,
     );
     assert_eq!(
         app.settings_picker.as_ref().unwrap().selected,
@@ -691,7 +691,7 @@ async fn add_agent_picker_filter_unicode_cancel_and_mouse_ownership() {
     );
     app.overlay = None;
     for c in ['1', '9'] {
-        key(&mut app, KeyCode::Char(c));
+        settings_key(&mut app, KeyCode::Char(c));
     }
     let rows = draw(&mut terminal, &mut app, &server, &backend);
     assert_eq!(
@@ -699,11 +699,11 @@ async fn add_agent_picker_filter_unicode_cancel_and_mouse_ownership() {
         Some("研究-19")
     );
     assert!(rows.iter().any(|r| r.contains("> 研 究 -19")));
-    key(&mut app, KeyCode::Char('無'));
+    settings_key(&mut app, KeyCode::Char('無'));
     let rows = draw(&mut terminal, &mut app, &server, &backend);
     assert!(rows.iter().any(|r| r.contains("(no matches)")));
     assert_eq!(app.settings_picker.as_ref().unwrap().selected_name(), None);
-    key(&mut app, KeyCode::Backspace);
+    settings_key(&mut app, KeyCode::Backspace);
     assert_eq!(app.settings_picker.as_ref().unwrap().filter, "19");
     // Candidate shrink clamps the stored index, not only the painted highlight.
     let picker = app.settings_picker.as_mut().unwrap();
@@ -717,7 +717,7 @@ async fn add_agent_picker_filter_unicode_cancel_and_mouse_ownership() {
         app.settings_picker.as_ref().unwrap().selected_name(),
         Some("研究-01")
     );
-    key(&mut app, KeyCode::Esc);
+    settings_key(&mut app, KeyCode::Esc);
     assert!(app.settings_picker.is_none());
     assert_eq!(app.mode, TuiMode::Settings(SettingsScope::Session));
     assert_eq!(app.input, "chat draft");
@@ -728,24 +728,12 @@ async fn add_agent_picker_filter_unicode_cancel_and_mouse_ownership() {
 async fn add_agent_picker_empty_and_hidden_frames_do_not_submit() {
     let (_instance, server, backend, mut app) = fixture().await;
     List::SessionAgents.open(&mut app);
-    app.settings_picker = Some(SettingsPicker {
-        label: "add agent".into(),
-        filter: String::new(),
-        cursor: 0,
-        candidates: vec!["last-agent".into()],
-        selected: 0,
-        intent: SettingsPickerIntent::AddSessionAgent,
-        viewport: Rect::default(),
-    });
+    app.settings_picker = Some(settings_picker("add agent", vec!["last-agent".into()], 0));
     for (width, height) in [(0, 0), (1, 1), (40, 2), (0, 14), (1, 14)] {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         draw(&mut terminal, &mut app, &server, &backend);
         assert!(matches!(
-            input::handle_settings_key(
-                &mut app,
-                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
-                SettingsScope::Session
-            ),
+            settings_key(&mut app, KeyCode::Enter),
             input::SettingsKey::None
         ));
         assert!(app.settings_picker.is_some());
@@ -755,11 +743,7 @@ async fn add_agent_picker_empty_and_hidden_frames_do_not_submit() {
     let rows = draw(&mut terminal, &mut app, &server, &backend);
     assert!(rows.iter().any(|r| r.contains("(no matches)")));
     assert!(matches!(
-        input::handle_settings_key(
-            &mut app,
-            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
-            SettingsScope::Session
-        ),
+        settings_key(&mut app, KeyCode::Enter),
         input::SettingsKey::None
     ));
     assert!(app.settings_picker.is_none());

@@ -243,90 +243,6 @@ Approval prompts hijack the keyboard while open: `y` approve, `n` deny, `a` appr
 
 Mouse capture is enabled. Click on completion rows, help-overlay command rows, approval buttons, picker rows, tab titles, or tab close `[x]` widgets to act on them. The scroll wheel scrolls the help overlay when it is open; in the session and model pickers it moves the selection three rows. In Settings, it selects over the visible list rows and reads over the visible content body (see [Reading Settings details](#reading-settings-details)); headers, the category rail, and the status strip swallow it. Other overlays swallow it; otherwise it scrolls history.
 
-## Reading Settings details
-
-Open Peer Settings with `s` in the session picker (`Ctrl+P`), or Session
-Settings with `/settings` in chat. At normal terminal sizes, the category rail
-stays on the left and the current page stays on the right.
-
-### Keys and pointer
-
-| Input                        | Category focus                                                                                        | List focus                                                                                  | Content focus                                          |
-| ---------------------------- | ----------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------- | ------------------------------------------------------ |
-| `Up` / `Down`                | Cycle categories                                                                                      | Select an entity or model scope; wraps                                                      | Read one wrapped line; clamps                          |
-| `Right`                      | Enter a nonempty list, otherwise Content                                                              | Enter the body on Peer Agents/MCP; otherwise no-op                                          | No-op                                                  |
-| `Left`                       | No-op                                                                                                 | Return to Category                                                                          | Return to the list, or Category on a static/empty page |
-| `PageUp` / `PageDown`        | No-op                                                                                                 | No-op                                                                                       | Read a page, with one line of overlap                  |
-| `Home` / `End`               | First/last category                                                                                   | First/last category                                                                         | Beginning/end of the body                              |
-| `Tab` / `Shift+Tab`, `1`–`9` | Cycle/jump categories                                                                                 | Same, returning to Category                                                                 | Same, returning to Category                            |
-| `Enter`                      | Enter a list/static body; Session Models opens its picker                                             | Peer Agents sets the selected agent's default model; Session Models opens its scoped picker | Peer Agents keeps that model action; otherwise no-op   |
-| `Esc`                        | Return to the caller                                                                                  | Same                                                                                        | Same; use Left to leave only the reader                |
-| Click an entity row          | Select it and focus List                                                                              | Same                                                                                        | Same                                                   |
-| Click the body               | Focus Content without moving selection or reading position                                            | Same                                                                                        | Same                                                   |
-| Wheel over list/body         | List: select three entities, clamped. Body: read three wrapped lines, clamped. Focus does not change. | Same                                                                                        | Same                                                   |
-
-Action letters such as `a`, `d`, and `r`, and Defaults' `Ctrl+Up`/`Ctrl+Down`
-reordering keep their existing selected-row targets. Prompts, pickers, diffs,
-and approval input take precedence over the reader. A pending tool approval
-shows the same request and buttons as chat, preserving any Settings draft and
-reading position until it is answered. Wheeling or clicking a covered Settings
-list cannot move its selection or the hidden chat.
-
-### Selection is not reading position
-
-An agent's workers are decorative list rows, not selectable agents. If the
-whole agent-and-workers group fits the list's current row budget, it stays
-expanded. Otherwise its agent row shows `[20 workers → details]` (with the
-actual count). The existing body still contains every worker's fields.
-
-When a body overflows, a pinned row identifies the selected entity and shows
-its visible wrapped-line range, such as `DETAILS [1–14/131] · alpha`.
-`DETAILS` is highlighted while Content owns the keys. Scrolling this body
-never changes the selected agent/server or a model action's scope.
-System prompts remain deliberately abbreviated previews, not full-prompt viewers.
-
-There is one reading position. Changing the category or selected entity,
-including a catalog replacement at the same index, resets it to the beginning;
-leaving Settings resets it too. Focus changes and opening/canceling a model
-picker or diff preserve it. Resizing rewraps the body and clamps the numeric
-wrapped-line offset. It does not preserve a semantic text anchor or remember
-separate positions for previously visited entities. A body that fits again
-returns to its ordinary, unscrolled layout.
-
-### Read an overflowing worker group
-
-1. In an 80×24 terminal, open Peer Settings → Agents and select an agent
-   `alpha` with twenty worker templates. Its row shows:
-
-   ```text
-   > [20 workers → details] alpha
-   ```
-
-   Shorter groups that fit still show their nested `└` rows.
-
-2. Press Right to focus List, then Right again for Content. For short field
-   values, the pinned row reads:
-
-   ```text
-   DETAILS [1–14/131] · alpha
-   ```
-
-   Use Down or PageDown to read. End exposes the final workers' model,
-   spawn-depth, tools and prompt-preview fields; `alpha` remains selected:
-
-   ```text
-   DETAILS [118–131/131] · alpha
-   ```
-
-3. If the wheel seems inactive over the pinned row or a list header, move it
-   into the body below the pinned row. Headers swallow wheel events; blank
-   body cells still scroll. Move over the list only when you intend to select
-   a different agent, which resets reading to Home.
-4. Resize to 120×40. The same agent and focus remain selected; the visible
-   range is remeasured and the offset clamps to the new last page if needed.
-   Use Home to return to the first fields. Left returns to List; Esc returns
-   to the session picker. Reading itself writes no settings.
-
 ## Debug Mode
 
 Toggle with `Ctrl+D` or `/debug`. When active:
@@ -369,11 +285,9 @@ Settings has two separate scopes: **Peer** covers this process's hosted agents a
 | `/models` in chat                     | Session Settings → Models, with the scope list focused |
 | `Ctrl+,` or `s` in the session picker | Peer Settings                                          |
 
-`Ctrl+,` does nothing while Settings or the model picker is already open. Settings remembers its caller: `Esc` returns to chat or the session picker, rather than quitting. Navigation has three focus levels: **Category → List → Content**. Opening Settings normally focuses Category. `↑` / `↓` select categories; `Tab` / `Shift+Tab` cycle them from any focus level and return to Category. Number keys jump to categories in the order below (`1`–`9` for Peer, `1`–`6` for Session).
+`Ctrl+,` does nothing while Settings or the model picker is already open. Settings remembers its caller: `Esc` returns to chat or the session picker, rather than quitting. At normal terminal sizes the category rail stays on the left and the current page on the right. Navigation starts at **Category**, then enters **List → Content** (static/empty pages skip List); see [Reading Settings details](#reading-settings-details) for all keys and pointer controls. Number keys follow the sidebar order below (`1`–`9` for Peer, `1`–`6` for Session).
 
-For categories with a nonempty selectable list, `→` or `Enter` moves from Category into List, where `↑` / `↓` select rows. On Peer → Agents or MCP, another `→` enters Content to read the selected entity's details; static or empty pages enter Content directly. In Content, arrows scroll wrapped lines and `PageUp` / `PageDown` scroll pages without changing selection. `←` returns to List, or Category when there is no list. See [Reading Settings details](#reading-settings-details) for the full key and pointer reference.
-
-On Session → Models, `Enter` opens the model picker for the selected scope even from Category. On Peer → Agents, `Enter` in List or Content edits the selected agent's DB-default model. A model picker returns to its Settings page on selection or `Esc`; `Esc` cancels without writing a model. An open add prompt, add-agent picker, or YAML diff handles `Esc` first, so cancel it before pressing `Esc` again to leave Settings. Exiting Settings does not undo edits already applied.
+A model picker returns to its Settings page on selection or `Esc`; canceling writes no model. Add prompts, add-agent pickers and YAML diffs handle `Esc` first, so cancel them before leaving Settings. Exiting Settings does not undo edits already applied.
 
 ### Shipped pages and controls
 
@@ -405,6 +319,104 @@ These tables list every category in sidebar order. Read-only pages are inspector
 1. In chat, type `/models`. The Models page opens with `Session` selected. Press `↓` to select an attached agent's row, then `Enter`; the picker title names that agent's scope.
 2. Type to filter models and press `Enter` to apply one. You return to Models with a per-agent override for **this session only**. To back out instead, press `Esc` in the picker: you return to Models with no model change. Press `Esc` on Models to return to chat.
 3. Open the session picker with `Ctrl+P`, then press `s` (or `Ctrl+,`). This opens **Peer**, not the highlighted session's Settings. Select Backends (key `2`) to inspect configured backends without editing them. Press `Esc` to return to the session picker, then `Esc` to return to chat. Merely browsing either scope does not write settings.
+
+### Reading Settings details
+
+#### Keys and pointer
+
+| Input                        | Category focus                                                                                        | List focus                                                                                  | Content focus                                          |
+| ---------------------------- | ----------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------- | ------------------------------------------------------ |
+| `Up` / `Down`                | Cycle categories; wraps                                                                               | Select an entity or model scope; wraps                                                      | Read one wrapped line; clamps                          |
+| `Right`                      | Enter a nonempty list, otherwise Content                                                              | Enter the body on Peer Agents/MCP; otherwise no-op                                          | No-op                                                  |
+| `Left`                       | No-op                                                                                                 | Return to Category                                                                          | Return to the list, or Category on a static/empty page |
+| `PageUp` / `PageDown`        | No-op                                                                                                 | No-op                                                                                       | Read a page, with one line of overlap                  |
+| `Home` / `End`               | First/last category                                                                                   | First/last category                                                                         | Beginning/end of the body                              |
+| `Tab` / `Shift+Tab`, `1`–`9` | Cycle/jump categories                                                                                 | Same, returning to Category                                                                 | Same, returning to Category                            |
+| `Enter`                      | Enter a list/static body; Session Models opens its picker                                             | Peer Agents sets the selected agent's default model; Session Models opens its scoped picker | Peer Agents keeps that model action; otherwise no-op   |
+| `Esc`                        | Return to the caller                                                                                  | Same                                                                                        | Same; use Left to leave only the reader                |
+| Click an entity row          | Select it and focus List                                                                              | Same                                                                                        | Same                                                   |
+| Click the body               | Focus Content without moving selection or reading position                                            | Same                                                                                        | Same                                                   |
+| Wheel over list/body         | List: select three entities, clamped. Body: read three wrapped lines, clamped. Focus does not change. | Same                                                                                        | Same                                                   |
+
+Action letters such as `a`, `d`, and `r`, and Defaults' `Ctrl+Up`/`Ctrl+Down`
+reordering keep their existing selected-row targets. Prompts, pickers, diffs,
+and approval input take precedence over the reader. A pending tool approval
+shows the same request and buttons as chat, preserving any Settings draft and
+reading position until it is answered. Wheeling or clicking a covered Settings
+list cannot move its selection or the hidden chat.
+
+#### Selection is not reading position
+
+An agent's workers are decorative list rows, not selectable agents. If the
+whole agent-and-workers group fits the list's current row budget, it stays
+expanded. Otherwise its agent row shows `[20 workers → details]` (with the
+actual count). The existing body still contains every worker's fields.
+
+When a body overflows, a pinned row identifies the selected entity and shows
+its visible wrapped-line range, such as `DETAILS [1–14/131] · alpha`.
+`DETAILS` is highlighted while Content owns the keys. Scrolling this body
+never changes the selected agent/server or a model action's scope.
+System prompts remain deliberately abbreviated previews, not full-prompt viewers.
+
+There is one reading position. Changing the category or selected entity,
+including a catalog replacement at the same index, resets it to the beginning;
+leaving Settings resets it too. Focus changes and opening/canceling a model
+picker or diff preserve it. Resizing rewraps the body and clamps the numeric
+wrapped-line offset. It does not preserve a semantic text anchor or remember
+separate positions for previously visited entities. A body that fits again
+returns to its ordinary, unscrolled layout.
+
+#### Read an overflowing worker group
+
+1. In an 80×24 terminal, open Peer Settings → Agents and select an agent
+   `alpha` with twenty worker templates. Its row shows:
+
+   ```text
+   > [20 workers → details] alpha
+   ```
+
+   Shorter groups that fit still show their nested `└` rows.
+
+2. Press Right to focus List, then Right again for Content. For short field
+   values, the pinned row reads:
+
+   ```text
+   DETAILS [1–14/131] · alpha
+   ```
+
+   Use Down or PageDown to read. End exposes the final workers' model,
+   spawn-depth, tools and prompt-preview fields; `alpha` remains selected:
+
+   ```text
+   DETAILS [118–131/131] · alpha
+   ```
+
+3. If the wheel seems inactive over the pinned row or a list header, move it
+   into the body below the pinned row. Headers swallow wheel events; blank
+   body cells still scroll. Move over the list only when you intend to select
+   a different agent, which resets reading to Home.
+4. Resize to 120×40. The same agent and focus remain selected; the visible
+   range is remeasured and the offset clamps to the new last page if needed.
+   Use Home to return to the first fields. Left returns to List; Esc returns
+   to the session picker. Reading itself writes no settings.
+
+### Adding an agent from Settings
+
+In Session Settings → Agents, press `a` to open the add-agent picker.
+Typing filters candidate names (case-insensitive substring); `↑`/`↓` selects,
+`Enter` adds the highlighted agent, and `Esc` cancels without changing the roster.
+The filtered selection remains the action target even when the list scrolls or
+resizes. The wheel moves three candidates only over the picker's match rows;
+background category/list clicks are ignored while the picker owns input.
+
+For example:
+
+1. With more candidates than visible rows, move down to the final candidate.
+   The list scrolls to show `> candidate-29`; `Enter` adds that candidate,
+   not a row from the previous visible page.
+2. Type a filter with no matches. The picker shows `(no matches)` and `Enter`
+   adds nothing. Reopen with `a`, or remove the filter with `Backspace` before
+   accepting, or press `Esc` to cancel.
 
 ## Named Sessions
 
@@ -543,21 +555,3 @@ that children are reaped.
 This complements the fast widget snapshots; it does not test in-flight job
 cancellation.
 See `dev/tui-pty/README.md` for isolation details and failure artifact locations.
-
-## Adding an agent from Settings
-
-In Session Settings → Agents, press `a` to open the add-agent picker.
-Typing filters candidate names (case-insensitive substring); `↑`/`↓` selects,
-`Enter` adds the highlighted agent, and `Esc` cancels without changing the roster.
-The filtered selection remains the action target even when the list scrolls or
-resizes. The wheel moves three candidates only over the picker's match rows;
-background category/list clicks are ignored while the picker owns input.
-
-For example:
-
-1. With more candidates than visible rows, move down to the final candidate.
-   The list scrolls to show `> candidate-29`; `Enter` adds that candidate,
-   not a row from the previous visible page.
-2. Type a filter with no matches. The picker shows `(no matches)` and `Enter`
-   adds nothing. Reopen with `a`, or remove the filter with `Backspace` before
-   accepting, or press `Esc` to cancel.

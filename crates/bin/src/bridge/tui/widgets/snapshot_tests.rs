@@ -181,7 +181,6 @@ fn header_long_wide_subtitle_keeps_escape_hint() {
                 Some("[Esc back]"),
             );
         });
-        println!("header {width}: {s}");
         assert!(s.contains("[Esc back]"), "{s}");
         insta::assert_snapshot!(format!("header_wide_{width}"), s);
     }
