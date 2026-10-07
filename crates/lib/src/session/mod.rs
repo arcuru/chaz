@@ -2209,18 +2209,6 @@ async fn find_or_create_db(
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn stop_event_keeps_the_unit_entry_wire_format() {
-        assert_eq!(
-            serde_json::to_string(&EntryType::Cancel).unwrap(),
-            "\"Cancel\""
-        );
-        assert_eq!(
-            serde_json::from_str::<EntryType>("\"Cancel\"").unwrap(),
-            EntryType::Cancel
-        );
-    }
-
     #[tokio::test]
     async fn stop_requires_session_write_authority() {
         let (instance, _user, db) = test_session_db().await;

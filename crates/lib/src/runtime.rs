@@ -563,34 +563,6 @@ pub async fn execute_with_recorder(
     .map_err(|error| error.to_string())
 }
 
-/// Compatibility event-stream entry point for a stoppable standalone turn.
-#[allow(clippy::too_many_arguments)]
-pub async fn execute_cancellable(
-    model: Option<&str>,
-    initial_messages: Vec<RuntimeMessage>,
-    backend: &BackendManager,
-    security: &SecurityContext,
-    tool_ctx: &ToolContext,
-    policies: &ToolPolicyRegistry,
-    event_sink: Option<mpsc::Sender<RuntimeEvent>>,
-    hub: Option<&ExtensionHub>,
-    cancel: Option<&TurnCancel>,
-) -> Result<RuntimeOutcome, TurnError> {
-    let recorder = event_sink.map(|sink| Arc::new(EventRecorder(sink)) as Arc<dyn RuntimeRecorder>);
-    execute_cancellable_with_recorder(
-        model,
-        initial_messages,
-        backend,
-        security,
-        tool_ctx,
-        policies,
-        recorder,
-        hub,
-        cancel,
-    )
-    .await
-}
-
 /// Run a turn with awaited transcript persistence and an executor-owned stop.
 /// Persistence is never abandoned on stop: every recorded native call is
 /// paired, including calls in the batch that were not started.
@@ -1171,7 +1143,7 @@ pub async fn execute_cancellable_with_recorder(
     }
 }
 
-struct EventRecorder(mpsc::Sender<RuntimeEvent>);
+pub(crate) struct EventRecorder(pub(crate) mpsc::Sender<RuntimeEvent>);
 
 impl RuntimeRecorder for EventRecorder {
     fn record<'a>(

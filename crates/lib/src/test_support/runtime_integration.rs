@@ -1430,6 +1430,30 @@ impl crate::backends::BackendDispatch for StalledBackend {
     }
 }
 
+/// Run one stoppable turn from a single user message.
+async fn run_cancellable(
+    backend: &BackendManager,
+    security: &crate::security::SecurityContext,
+    ctx: &ToolContext,
+    events: Option<tokio::sync::mpsc::Sender<runtime::RuntimeEvent>>,
+    cancel: &runtime::TurnCancel,
+) -> Result<runtime::RuntimeOutcome, runtime::TurnError> {
+    let recorder = events
+        .map(|sink| Arc::new(runtime::EventRecorder(sink)) as Arc<dyn runtime::RuntimeRecorder>);
+    runtime::execute_cancellable_with_recorder(
+        Some("mock-model"),
+        vec![RuntimeMessage::User("go".into())],
+        backend,
+        security,
+        ctx,
+        &ToolPolicyRegistry::empty(),
+        recorder,
+        None,
+        Some(cancel),
+    )
+    .await
+}
+
 /// Collect every event the runtime emitted, once the sink has closed.
 async fn drain_events(
     mut rx: tokio::sync::mpsc::Receiver<runtime::RuntimeEvent>,
@@ -1464,7 +1488,6 @@ async fn a_stop_during_a_long_shell_call_ends_the_turn_promptly() {
     registry.register(crate::tools::ShellExec);
     let ctx = tool_context(session, Arc::new(registry));
     let (security, _approver) = security_with_decision(ApprovalDecision::Approve);
-    let policies = ToolPolicyRegistry::empty();
 
     let mock = Arc::new(MockBackend::new());
     mock.push_tool_calls(vec![(
@@ -1493,17 +1516,7 @@ async fn a_stop_during_a_long_shell_call_ends_the_turn_promptly() {
     let started = std::time::Instant::now();
     let result = tokio::time::timeout(
         std::time::Duration::from_secs(5),
-        runtime::execute_cancellable(
-            Some("mock-model"),
-            vec![RuntimeMessage::User("sleep".into())],
-            &backend,
-            &security,
-            &ctx,
-            &policies,
-            Some(tx),
-            None,
-            Some(&cancel),
-        ),
+        run_cancellable(&backend, &security, &ctx, Some(tx), &cancel),
     )
     .await
     .expect("a stop must end the turn without waiting out the shell command");
@@ -1546,7 +1559,6 @@ async fn a_stop_abandons_a_stalled_model_call() {
     registry.register(EchoTool::new());
     let ctx = tool_context(session, Arc::new(registry));
     let security = permissive_security();
-    let policies = ToolPolicyRegistry::empty();
     let backend = BackendManager::with_mock(Arc::new(StalledBackend), secrets);
 
     let cancel = runtime::TurnCancel::new();
@@ -1558,17 +1570,7 @@ async fn a_stop_abandons_a_stalled_model_call() {
 
     let result = tokio::time::timeout(
         std::time::Duration::from_secs(5),
-        runtime::execute_cancellable(
-            Some("mock-model"),
-            vec![RuntimeMessage::User("hi".into())],
-            &backend,
-            &security,
-            &ctx,
-            &policies,
-            None,
-            None,
-            Some(&cancel),
-        ),
+        run_cancellable(&backend, &security, &ctx, None, &cancel),
     )
     .await
     .expect("a stop must not wait for the model");
@@ -1591,7 +1593,6 @@ async fn a_stop_ends_a_pending_approval_without_running_the_tool() {
         auto_approved_tools: Default::default(),
         approval_callback: Some(approval_tx),
     };
-    let policies = ToolPolicyRegistry::empty();
     let mock = Arc::new(MockBackend::new());
     mock.push_tool_calls(vec![(
         "call_gated".to_string(),
@@ -1609,17 +1610,7 @@ async fn a_stop_ends_a_pending_approval_without_running_the_tool() {
     let (tx, rx) = tokio::sync::mpsc::channel(16);
     let result = tokio::time::timeout(
         std::time::Duration::from_secs(5),
-        runtime::execute_cancellable(
-            Some("mock-model"),
-            vec![RuntimeMessage::User("go".into())],
-            &backend,
-            &security,
-            &ctx,
-            &policies,
-            Some(tx),
-            None,
-            Some(&cancel),
-        ),
+        run_cancellable(&backend, &security, &ctx, Some(tx), &cancel),
     )
     .await
     .expect("a stop must not wait for an approval");
@@ -1677,7 +1668,6 @@ async fn a_stop_between_calls_leaves_the_rest_unstarted() {
     registry.register(echo);
     let ctx = tool_context(session, Arc::new(registry));
     let security = permissive_security();
-    let policies = ToolPolicyRegistry::empty();
     let mock = Arc::new(MockBackend::new());
     mock.push_tool_calls(vec![
         ("c1".to_string(), "stopper".to_string(), "{}".to_string()),
@@ -1691,18 +1681,7 @@ async fn a_stop_between_calls_leaves_the_rest_unstarted() {
     let backend = BackendManager::with_mock(mock.clone(), secrets);
 
     let (tx, mut rx) = tokio::sync::mpsc::channel(16);
-    let result = runtime::execute_cancellable(
-        Some("mock-model"),
-        vec![RuntimeMessage::User("go".into())],
-        &backend,
-        &security,
-        &ctx,
-        &policies,
-        Some(tx),
-        None,
-        Some(&cancel),
-    )
-    .await;
+    let result = run_cancellable(&backend, &security, &ctx, Some(tx), &cancel).await;
 
     match result {
         Err(runtime::TurnError::Cancelled { metadata }) => assert!(

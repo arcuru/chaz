@@ -5376,7 +5376,7 @@ async fn service_restart_reopens_and_reconciles_persisted_work() {
 }
 
 #[tokio::test]
-async fn direct_peer_sync_preserves_request_identity_and_completion_with_unknown_records() {
+async fn direct_peer_sync_preserves_request_identity_and_completion_with_stop_records() {
     use eidetica::auth::Permission;
     use eidetica::auth::types::AuthKey;
     use eidetica::crdt::Doc;
@@ -5503,8 +5503,7 @@ async fn direct_peer_sync_preserves_request_identity_and_completion_with_unknown
         peer_session
             .entries()
             .iter()
-            .any(|entry| matches!(&entry.entry_type,
-        EntryType::Unknown { kind, .. } if kind == "Cancel"))
+            .any(|entry| entry.entry_type == EntryType::Cancel)
     );
     assert_eq!(
         peer_session
@@ -5514,10 +5513,14 @@ async fn direct_peer_sync_preserves_request_identity_and_completion_with_unknown
             .len(),
         3
     );
-    assert!(
-        matches!(&peer_session.turn_transcript("attempt-cancelled").await.unwrap()[2].message,
-        TurnTranscriptMessage::Unknown { kind, .. } if kind == "Cancelled")
-    );
+    assert!(matches!(
+        &peer_session
+            .turn_transcript("attempt-cancelled")
+            .await
+            .unwrap()[2]
+            .message,
+        TurnTranscriptMessage::Cancelled
+    ));
     let (entries, history) = peer_session.context_with_tool_history().await.unwrap();
     let messages = crate::context::ContextBuilder::new(&entries, "agent", "", &Default::default())
         .with_tool_history(&history)
@@ -5531,7 +5534,7 @@ async fn direct_peer_sync_preserves_request_identity_and_completion_with_unknown
             _ => None,
         })
         .collect();
-    assert_eq!(tool_ids, ["call-supported"]);
+    assert_eq!(tool_ids, ["call-cancelled", "call-supported"]);
     assert_eq!(mock.recorded_calls().len(), 1);
     let request = peer_session
         .turn_requests(|name| name == "agent", &Default::default())

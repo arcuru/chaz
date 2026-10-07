@@ -1,6 +1,6 @@
-//! Reader-only regressions: no typed Cancel/Cancelled variants exist here.
-//! stop-writer.snap is exported from typed tables by writer revision
-//! 5b199639aa923686d452f343fafeb43b3c877c4b, not hand-authored stop JSON.
+//! stop-writer.snap holds the persisted shapes this crate writes when a user
+//! stops a turn. The reader-only release before typed Cancel/Cancelled was
+//! verified against these exact rows, so the writer must keep producing them.
 
 use super::*;
 use crate::config::ContextConfig;
@@ -44,6 +44,34 @@ fn native_ids(messages: &[RuntimeMessage]) -> Vec<String> {
         .collect()
 }
 
+#[test]
+fn stop_writer_rows_keep_the_verified_wire_format() {
+    for row in writer_rows() {
+        let raw = &row["value"];
+        let reserialized = match row["store"].as_str().unwrap() {
+            "entries" => {
+                let entry: SessionEntry = serde_json::from_value(raw.clone()).unwrap();
+                assert!(!matches!(entry.entry_type, EntryType::Unknown { .. }));
+                serde_json::to_value(entry).unwrap()
+            }
+            TURN_TRANSCRIPT_STORE => {
+                let record: TurnTranscriptRecord = serde_json::from_value(raw.clone()).unwrap();
+                assert!(!matches!(
+                    record.message,
+                    TurnTranscriptMessage::Unknown { .. }
+                        | TurnTranscriptMessage::ToolResult {
+                            outcome: ToolResultOutcome::Unknown { .. },
+                            ..
+                        }
+                ));
+                serde_json::to_value(record).unwrap()
+            }
+            _ => continue,
+        };
+        assert_eq!(&reserialized, raw, "{}", row["id"]);
+    }
+}
+
 #[tokio::test]
 async fn stop_writer_attempts_replay_only_when_fully_supported() {
     let (_instance, _user, db) = test_helpers::test_session_db().await;
@@ -53,21 +81,10 @@ async fn stop_writer_attempts_replay_only_when_fully_supported() {
     let stop = session
         .entries()
         .iter()
-        .find(|e| {
-            matches!(
-                &e.entry_type, EntryType::Unknown { kind, .. } if kind == "Cancel"
-            )
-        })
+        .find(|e| e.entry_type == EntryType::Cancel)
         .unwrap();
     assert!(stop.bridge_body().is_none());
     assert!(stop.bridge_role().is_none());
-    let cancelled = session.turn_transcript("attempt-cancelled").await.unwrap();
-    assert_eq!(cancelled.len(), 3);
-    assert!(matches!(&cancelled[2].message,
-        TurnTranscriptMessage::Unknown { kind, .. } if kind == "Cancelled"));
-    assert!(matches!(&cancelled[1].message,
-        TurnTranscriptMessage::ToolResult { outcome: ToolResultOutcome::Unknown { kind, .. }, .. }
-        if kind == "Cancelled"));
 
     // Check both sides of replay: never leave an orphan call or result.
     let replay_ids = |messages: &[RuntimeMessage]| {
@@ -82,30 +99,10 @@ async fn stop_writer_attempts_replay_only_when_fully_supported() {
             .collect();
         (calls, native_ids(messages))
     };
-    let supported = vec!["call-supported".to_string()];
-    assert_eq!(
-        replay_ids(&context(&session).await),
-        (supported.clone(), supported)
-    );
+    let both = vec!["call-cancelled".to_string(), "call-supported".to_string()];
+    assert_eq!(replay_ids(&context(&session).await), (both.clone(), both));
 
-    // Isolate the nested unknown outcome from the unknown terminal record.
-    let txn = db.new_transaction().await.unwrap();
-    let store = txn
-        .get_store::<Table<TurnTranscriptRecord>>(TURN_TRANSCRIPT_STORE)
-        .await
-        .unwrap();
-    let mut terminal = store.get("supported-2").await.unwrap();
-    terminal.request_id = TurnRequestId::parse("request-cancelled");
-    terminal.attempt_id = "attempt-cancelled".into();
-    store.set("cancelled-2", terminal).await.unwrap();
-    txn.commit().await.unwrap();
-    let supported = vec!["call-supported".to_string()];
-    assert_eq!(
-        replay_ids(&context(&session).await),
-        (supported.clone(), supported)
-    );
-
-    // Positive control: repairing only the outcome restores the whole pair.
+    // A later writer's nested outcome withholds only its own exchange.
     let txn = db.new_transaction().await.unwrap();
     let store = txn
         .get_store::<Table<TurnTranscriptRecord>>(TURN_TRANSCRIPT_STORE)
@@ -115,11 +112,14 @@ async fn stop_writer_attempts_replay_only_when_fully_supported() {
     let TurnTranscriptMessage::ToolResult { outcome, .. } = &mut result.message else {
         panic!("tool result")
     };
-    *outcome = ToolResultOutcome::Denied;
+    *outcome = serde_json::from_value(json!("Future")).unwrap();
     store.set("cancelled-1", result).await.unwrap();
     txn.commit().await.unwrap();
-    let both = vec!["call-cancelled".to_string(), "call-supported".to_string()];
-    assert_eq!(replay_ids(&context(&session).await), (both.clone(), both));
+    let supported = vec!["call-supported".to_string()];
+    assert_eq!(
+        replay_ids(&context(&session).await),
+        (supported.clone(), supported)
+    );
 }
 
 #[test]
