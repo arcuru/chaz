@@ -1426,6 +1426,7 @@ async fn run_cancellable(
         None,
         Some(cancel),
         None,
+        runtime::ModelCallScope::default(),
     )
     .await
 }

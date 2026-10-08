@@ -23,7 +23,8 @@
 //!   their session structurally through the instance model
 //!   (`ExtensionInstance` endpoints + `ScopeCtx`), not through a cap.
 //! * **Extension-providable** — [`Messenger`], [`MemoryAccess`],
-//!   [`PromptAugmentation`], [`ContextTail`], [`StatusSegment`]. An
+//!   [`PromptAugmentation`], [`ContextTail`], [`StatusSegment`], and the
+//!   operator-granted [`crate::extension::projection::ContextProjector`]. An
 //!   extension publishes an impl from the matching
 //!   [`crate::extension::instance::ExtensionInstance`]
 //!   endpoint; consumers resolve them at turn time through the
@@ -122,6 +123,12 @@ pub enum CapabilityKind {
     /// Extension-providable — pure data, so it crosses the gateway
     /// boundary cleanly. Modeled on pi's `setStatus` tier.
     StatusSegment,
+    /// Reshape the model-facing request before every logical model call.
+    /// Extension-providable, but a declaration alone is inert: the host
+    /// invokes the endpoint only for extensions the operator lists in
+    /// `context_projection`, with the authority that grant names. See
+    /// [`crate::extension::projection`].
+    ContextProjection,
 }
 
 impl CapabilityKind {
@@ -160,6 +167,7 @@ impl CapabilityKind {
             Self::PromptAugmentation => "prompt_augmentation",
             Self::ContextTail => "context_tail",
             Self::StatusSegment => "status_segment",
+            Self::ContextProjection => "context_projection",
         }
     }
 }
@@ -458,6 +466,7 @@ mod tests {
             CapabilityKind::PromptAugmentation,
             CapabilityKind::ContextTail,
             CapabilityKind::StatusSegment,
+            CapabilityKind::ContextProjection,
         ];
         for k in providable {
             assert!(!k.is_host_only(), "{k} should not be host-only");
@@ -479,6 +488,7 @@ mod tests {
             (CapabilityKind::Messenger, "\"messenger\""),
             (CapabilityKind::Memory, "\"memory\""),
             (CapabilityKind::AgentStateAdmin, "\"agent_state_admin\""),
+            (CapabilityKind::ContextProjection, "\"context_projection\""),
         ];
         for (kind, wire) in cases {
             let s = serde_json::to_string(&kind).unwrap();
