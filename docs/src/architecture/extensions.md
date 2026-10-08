@@ -100,6 +100,8 @@ empty / `None`:
 - **Tools** — `tools() -> Vec<Arc<dyn Tool>>`
 - **Commands** — `commands() -> Vec<(String, Arc<dyn ExtensionCommand>)>`
 - **Per-turn context** — `prompt_augmentation()`, `context_tail()`
+- **Per-model-call projection** — `context_projector()`; invoked only for
+  operator-granted extensions (see [Context projection](#context-projection))
 - **Extension-to-extension caps** — `memory_access()`, `messenger()`,
   and the TypeId-keyed escape hatch `extension_cap(type_id)`
 - **Hook handlers** — `before_agent_start_hook()`, `tool_call_hook()`,
@@ -203,10 +205,93 @@ authoritative):
   instance model (`ExtensionInstance` endpoints + `ScopeCtx`), not through
   a cap handle.
 - **Extension-providable** — `Messenger`, `MemoryAccess`,
-  `PromptAugmentation`, `ContextTail`. Published by an instance through
-  its endpoints; `PromptAugmentation`/`ContextTail` are consumed directly
-  by context assembly, `Messenger`/`MemoryAccess` are resolvable through
-  the `CapResolver` (no consumer yet).
+  `PromptAugmentation`, `ContextTail`, `StatusSegment`,
+  `ContextProjection`. Published by an instance through its endpoints;
+  `PromptAugmentation`/`ContextTail` are consumed directly by context
+  assembly, `Messenger`/`MemoryAccess` are resolvable through the
+  `CapResolver` (no consumer yet). `ContextProjection` is the one kind
+  whose declaration the runtime reads: the host invokes
+  `context_projector()` only when the manifest provides it **and** the
+  operator granted the extension.
+
+Required/requested capability declarations remain descriptive: nothing
+refuses to load an extension whose `required_capabilities` are absent,
+and `AgentStateAdmin { agents }` is not the live scope source
+(`agent_state_allowlist` is).
+
+## Context projection
+
+Before **every logical model call** — the first call of a turn, each
+tool-loop continuation, and the no-tools single-shot path — the runtime
+builds a fresh baseline (assembled context, `before_agent_start`
+injections, and the current attempt's completed exchanges) and runs the
+granted projection chain over a copy of it
+(`extension/projection.rs`, `RoundProjector` in `runtime.rs`). The
+accepted result is what the backend receives; transport retries inside
+`llm_call_with_retry` resend exactly that request without projecting
+again. The runtime's own message vector, the recorder stream, and the
+session transcript keep the originals, and the next call projects a new
+baseline rather than the previous output.
+
+```rust,ignore
+trait ContextProjector: Send + Sync {
+    fn project<'a>(&'a self, call: &'a ProjectionCall<'a>,
+                   request: ProjectedRequest) -> CapFuture<'a, ProjectedRequest>;
+}
+struct ProjectedRequest { messages: Vec<RuntimeMessage>, tools: Vec<ToolDefinition> }
+```
+
+`ProjectionCall` is read-only: agent, session DB id, turn request id,
+attempt id, resolved model, model round, the granted authority and
+required flag, the round's baseline, its index-aligned `ContextSource`
+provenance (`Instructions`, `SessionEntry { index, sender, timestamp }`,
+`ReplayedExchange { request_id, attempt_id, model_sequence }`,
+`ContextTail`, `TurnInjection`, `CurrentAttempt { model_sequence }`), and
+the request budget. It carries no database handle or write path.
+
+**Eligibility, checked at each call.** A projector runs when all hold:
+listed in the operator's `context_projection` config; instantiated for
+the agent or session (per-session over per-agent over Global by name —
+the same precedence as other instance lookups); in the turn's active
+set (session set minus agent opt-outs); still active in the session's
+extension log at that call, so `/extensions remove` takes effect at the
+next model call; manifest provides `ContextProjection`; and
+`context_projector()` returns `Some`.
+
+**Order.** Conversation grants run first, then full-context grants;
+within a phase, configured list order. Each step receives the previous
+accepted output.
+
+**Authority.** `conversation` may rewrite, drop, or add conversation
+messages but must return the System messages and tool declarations
+unchanged. `full_context` may also rewrite instructions and the
+model-facing tool declarations, but may only keep, drop, or re-describe
+tools the call already exposes. Neither touches execution: tool calls are
+resolved against the turn's `ScopedTools`, so a hidden tool is still
+executable and an undeclared one is still refused.
+
+**Host validation** (every step, both authorities): non-empty request;
+each tool-call group kept whole (call message, then one result per call,
+in order) or omitted whole; call ids, names, arguments and opaque
+`provider_extra` byte-identical to the baseline; no invented, repeated,
+or reordered groups; exchanges completed by the current attempt kept;
+estimated size of the complete request (messages, call arguments,
+provider data, tool declarations) within the budget (context window minus
+reserved output). Result bodies and other text may change, and whole
+historical exchanges may be dropped.
+
+**Failure.** A required grant that is unavailable, errors, panics, times
+out (30 s), or returns invalid output stops the call before any request
+is sent; the turn ends with that error. An optional step that fails is
+skipped and its validated input — including earlier required edits —
+continues down the chain. Optional grants that are inactive are never
+invoked. Whatever survives must still pass the budget gate; an
+over-budget baseline is not a fallback. With no grants configured the
+runtime does no projection work and every request is byte-identical to
+before.
+
+This is a guardrail for operator-trusted in-process extensions, not a
+sandbox: an instance can still use handles captured at construction.
 
 ## Routine handlers
 
@@ -344,6 +429,7 @@ so it round-trips through eidetica.
 | `crates/lib/src/extension/caps.rs`               | Cap traits (`Messenger`, `MemoryAccess`, `PromptAugmentation`, `ContextTail`, `AgentStateAdmin`) + `CapabilityKind`/`CapabilityRequest` declaration vocab |
 | `crates/lib/src/extension/agent_state.rs`        | `AgentStateAdmin` cap + scoped impl                                                                                                                       |
 | `crates/lib/src/extension/manifest.rs`           | `ExtensionManifest` + per-manifest validation                                                                                                             |
+| `crates/lib/src/extension/projection.rs`         | Per-model-call context projection: grants, `ContextProjector`, chain runner and host validation                                                           |
 | `crates/lib/src/extension/handler.rs`            | Hook-handler traits + `InstalledExtension` (Global drain target)                                                                                          |
 | `crates/lib/src/extension/hook_bridge.rs`        | Adapters bridging instance hook handlers into the fire vecs                                                                                               |
 | `crates/lib/src/extension/hooks.rs`              | Per-kind hook trait definitions + `HookKind`                                                                                                              |
@@ -390,7 +476,8 @@ lifecycle. All built-ins are in the default-active set for new sessions
    - implement `instantiate(ctx)` to return an `ExtensionInstance` that
      overrides the endpoints you contribute — `tools()`, `commands()`,
      the `*_hook()` slots, `prompt_augmentation()` / `context_tail()`,
-     `memory_access()` / `messenger()`, `routine_handler()`.
+     `context_projector()`, `memory_access()` / `messenger()`,
+     `routine_handler()`.
 2. Add the module to `crates/lib/src/extensions/mod.rs` and the constructor to the
    `all_builtins` vec. If it needs shared deps (session registry, agent
    index, embedder, …), add them to `BuiltinDeps` and thread through

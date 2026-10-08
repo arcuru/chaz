@@ -14,6 +14,7 @@
 
 use crate::config::ContextConfig;
 use crate::extension::ExtensionHub;
+use crate::extension::projection::ContextSource;
 use crate::runtime::RuntimeMessage;
 use crate::session::{EntryType, SessionEntry, TurnTranscriptMessage, TurnTranscriptRecord};
 use crate::tool::{NO_REPLY_TOOL, ToolDefinition};
@@ -101,6 +102,11 @@ fn room_note(participants: &[String], agent_name: &str) -> Option<String> {
 /// Assembled context ready for the runtime/backend.
 pub struct AssembledContext {
     pub messages: Vec<RuntimeMessage>,
+    /// Read-only provenance of each entry in `messages`, index-aligned.
+    pub sources: Vec<ContextSource>,
+    /// Estimated-token ceiling for the whole request (window minus the
+    /// reserved output). Context projection gates every model call on it.
+    pub request_budget_tokens: usize,
     /// Estimated total tokens used by this context (messages + system + tools).
     pub estimated_tokens: usize,
     /// Number of session entries that were included.
@@ -393,9 +399,11 @@ impl<'a> ContextBuilder<'a> {
 
         // 7. Assemble RuntimeMessages
         let mut messages = Vec::with_capacity(included_entries.len() + 1);
+        let mut sources = Vec::with_capacity(included_entries.len() + 1);
 
         if !system_prompt.is_empty() {
             messages.push(RuntimeMessage::System(system_prompt));
+            sources.push(ContextSource::Instructions);
         }
 
         // Give visible conversation priority; replay complete native groups from
@@ -423,7 +431,32 @@ impl<'a> ContextBuilder<'a> {
                 RuntimeMessage::User(text)
             };
             messages.push(rm);
-            messages.append(&mut replay[*index]);
+            sources.push(ContextSource::SessionEntry {
+                index: *index,
+                sender: entry.sender.clone(),
+                timestamp: entry.timestamp,
+            });
+            let group = std::mem::take(&mut replay[*index]);
+            if let Some(first) = self
+                .tool_history
+                .and_then(|history| history[*index].iter().min_by_key(|r| r.sequence))
+            {
+                // `replay_turn` accepts only contiguous groups numbered from
+                // model sequence 0, so the k-th call message is sequence k.
+                let mut model_sequence = 0;
+                for (position, message) in group.iter().enumerate() {
+                    if position > 0 && matches!(message, RuntimeMessage::AssistantToolCalls { .. })
+                    {
+                        model_sequence += 1;
+                    }
+                    sources.push(ContextSource::ReplayedExchange {
+                        request_id: first.request_id.as_str().to_string(),
+                        attempt_id: first.attempt_id.clone(),
+                        model_sequence,
+                    });
+                }
+            }
+            messages.extend(group);
         }
 
         // 8. Context tails — memory surfacing, etc. Appended after the
@@ -432,9 +465,12 @@ impl<'a> ContextBuilder<'a> {
         //    message budget.
         if let Some(t) = tail_text {
             messages.push(RuntimeMessage::User(t));
+            sources.push(ContextSource::ContextTail);
         }
         AssembledContext {
             messages,
+            sources,
+            request_budget_tokens: budget,
             estimated_tokens: used_tokens,
             entries_included: included_entries.len(),
             truncated,
@@ -590,6 +626,24 @@ fn replay_turn(records: &[TurnTranscriptRecord], budget: usize) -> Option<Vec<Ru
         }
     }
     (messages.iter().map(message_cost).sum::<usize>() <= budget).then_some(messages)
+}
+
+/// Estimate the whole model-facing request: every message kind, including
+/// call arguments and retained provider data, plus the tool declarations.
+pub(crate) fn estimate_request_tokens(
+    messages: &[RuntimeMessage],
+    tools: &[ToolDefinition],
+) -> usize {
+    let message_tokens: usize = messages
+        .iter()
+        .map(|message| match message {
+            RuntimeMessage::System(text)
+            | RuntimeMessage::User(text)
+            | RuntimeMessage::Assistant(text) => estimate_tokens(text) + MESSAGE_OVERHEAD_TOKENS,
+            other => message_cost(other),
+        })
+        .sum();
+    message_tokens + tools.iter().map(estimate_tool_tokens).sum::<usize>()
 }
 
 fn message_cost(msg: &RuntimeMessage) -> usize {
@@ -841,6 +895,23 @@ mod tests {
             .expect("preview available");
         assert!(tool.contains("[prior tool output truncated for context]"));
         assert!(tool.contains("&lt;malicious&gt;"));
+        // Every message carries its source, replayed exchanges included.
+        assert_eq!(result.sources.len(), result.messages.len());
+        assert!(
+            matches!(&result.sources[0], ContextSource::SessionEntry { index: 0, sender, .. } if sender == "user")
+        );
+        assert!(matches!(
+            &result.sources[1],
+            ContextSource::ReplayedExchange {
+                model_sequence: 0,
+                ..
+            }
+        ));
+        assert!(matches!(
+            result.sources.last(),
+            Some(ContextSource::SessionEntry { index: 2, .. })
+        ));
+        assert_eq!(result.request_budget_tokens, 220);
     }
 
     #[test]

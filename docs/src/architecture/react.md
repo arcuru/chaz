@@ -6,7 +6,8 @@ The ReAct (Reason + Act) loop is the core agent execution model. The runtime tak
 
 ```mermaid
 graph TD
-    START[Build context from session] --> CALL[Call LLM with tool definitions]
+    START[Build context from session] --> PROJECT[Project request for this call]
+    PROJECT --> CALL[Call LLM with tool definitions]
     CALL --> CHECK{Response type?}
     CHECK -->|Text| DONE[Return response]
     CHECK -->|Tool calls| EXEC[Execute tools]
@@ -18,7 +19,7 @@ graph TD
     RUN --> SCAN[Scan for leaks]
     SCAN --> INJECT[Scan for injection]
     INJECT --> FEED[Feed results to LLM]
-    FEED --> CALL
+    FEED --> PROJECT
 ```
 
 There is no iteration cap. The loop ends when the model returns a response without native tool calls, when a model request fails after its bounded retries, or when the executor stops the task. Repeated identical calls are executed like any others; each gets its own result.
@@ -101,6 +102,8 @@ RuntimeMessage::AssistantToolCalls(calls)
 RuntimeMessage::ToolResult(result)
 ...
 ```
+
+Before each model call the runtime runs the operator-granted context projection chain over a copy of this vector plus the current attempt's completed exchanges; see [Context projection](extensions.md#context-projection). The projected request is sent (and resent unchanged on transport retries); the local vector and the recorded transcript keep the originals. With no `context_projection` grants the vector is sent as-is.
 
 `AssistantToolCalls` and `ToolResult` messages are maintained in the runtime's local message vector for the active continuation. Completed structured forms are persisted. Later turns can reconstruct complete prior call/result groups from completed attempts inside the conversation budget, but interrupted attempts are never resumed automatically.
 

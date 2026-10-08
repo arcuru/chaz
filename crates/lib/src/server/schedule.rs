@@ -742,6 +742,9 @@ impl Server {
             0,
             crate::runtime::RuntimeMessage::System(wake_prompt.to_string()),
         );
+        assembled
+            .sources
+            .insert(0, crate::extension::projection::ContextSource::Instructions);
 
         if assembled.truncated {
             tracing::info!(
@@ -820,7 +823,7 @@ impl Server {
             approval_callback: None, // no interactive approval for schedule fires
         };
 
-        let result = crate::runtime::execute(
+        let result = crate::runtime::execute_scoped(
             effective_model.as_deref(),
             assembled.messages,
             &self.default_backend,
@@ -829,6 +832,11 @@ impl Server {
             &self.policies,
             Some(event_tx),
             Some(self.extensions.as_ref()),
+            crate::runtime::ModelCallScope {
+                attempt_id: None,
+                request_budget_tokens: Some(assembled.request_budget_tokens),
+                sources: assembled.sources,
+            },
         )
         .await;
 

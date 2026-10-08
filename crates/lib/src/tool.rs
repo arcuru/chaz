@@ -473,7 +473,7 @@ pub struct ToolApprovalInfo {
 }
 
 /// Serializable tool definition for sending to the LLM
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ToolDefinition {
     pub name: String,
     pub description: String,

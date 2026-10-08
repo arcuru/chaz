@@ -80,6 +80,11 @@ pub struct Config {
     /// An empty entry (`[]`) means the cap is effectively denied.
     #[serde(default)]
     pub agent_state_allowlist: HashMap<String, Vec<String>>,
+    /// Operator grants for per-model-call context projection. Only listed
+    /// extensions may reshape model requests, with the authority each entry
+    /// names. Empty (the default) leaves every request untouched.
+    #[serde(default)]
+    pub context_projection: Vec<crate::extension::projection::ContextProjectionGrant>,
     /// Multi-agent chat-room tuning. Omit to use built-in defaults.
     pub multi_agent: Option<MultiAgentConfig>,
     /// Runtime-ownership mode for this peer: who claims the right to *run*
@@ -976,6 +981,7 @@ fn known_config_keys() -> HashSet<&'static str> {
         "embedding",
         "cli",
         "agent_state_allowlist",
+        "context_projection",
         "multi_agent",
         "runtime",
         // Bridge-only top-level keys (MatrixBridgeConfig + DiscordBridgeConfig).
@@ -1174,6 +1180,15 @@ fn known_config_keys() -> HashSet<&'static str> {
 
     // ── agent_state_allowlist.<extension_name> ── (dynamic keys)
     keys.insert("agent_state_allowlist.");
+
+    // ── context_projection[] ──
+    for k in [
+        "context_projection[].extension",
+        "context_projection[].authority",
+        "context_projection[].required",
+    ] {
+        keys.insert(k);
+    }
 
     // ── multi_agent ──
     keys.insert("multi_agent.burst_budget");

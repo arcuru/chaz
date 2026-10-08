@@ -149,6 +149,7 @@ async fn job_wait_reacquires_after_success_error_and_policy_timeout() {
                 None,
                 None,
                 Some(capacity),
+                ModelCallScope::default(),
             )
             .await
         });

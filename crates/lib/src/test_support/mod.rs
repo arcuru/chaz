@@ -19,4 +19,6 @@ pub(crate) use mock_backend::*;
 pub(crate) use mock_host::*;
 
 #[cfg(test)]
+mod projection_integration;
+#[cfg(test)]
 mod runtime_integration;
