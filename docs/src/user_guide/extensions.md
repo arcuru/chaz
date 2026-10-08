@@ -212,6 +212,9 @@ What is automatic and what you control:
 - **Activation still applies.** A granted projector runs only while the
   extension is active for the session and the responding agent.
   `/extensions remove` stops it from the next model call, even mid-turn.
+  Session removal and agent opt-outs also stop the extension's tools at
+  their next actual execution; changing model-facing declarations does
+  not freeze earlier execution permissions.
 - **Authority is per grant.** `conversation` projectors cannot change the
   system instructions or the tool list the model sees. `full_context`
   projectors can, but they can only hide or re-describe tools the turn

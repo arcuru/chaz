@@ -902,6 +902,7 @@ mod tests {
             RuntimeMessage::System("be helpful".into()),
             RuntimeMessage::User("hi".into()),
             RuntimeMessage::AssistantToolCalls {
+                exchange_id: None,
                 content: None,
                 tool_calls: vec![
                     ToolCallRequest {

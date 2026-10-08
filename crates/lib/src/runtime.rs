@@ -21,7 +21,6 @@ use crate::tool::{
     NO_REPLY_TOOL, RateLimiter, ToolApprovalInfo, ToolContext, ToolDefinition, ToolPolicyRegistry,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, atomic::Ordering};
@@ -116,6 +115,10 @@ pub enum RuntimeMessage {
     User(String),
     Assistant(String),
     AssistantToolCalls {
+        /// Host-assigned baseline message index for this exchange occurrence.
+        /// Request-local only: not persisted or sent to the provider. Projectors
+        /// must retain it even when provider call IDs repeat across responses.
+        exchange_id: Option<usize>,
         content: Option<String>,
         tool_calls: Vec<ToolCallRequest>,
         /// Provider-specific fields from the response that must be echoed
@@ -653,7 +656,6 @@ struct RoundProjector<'a> {
     /// `(first message index, model sequence)` of each current-attempt
     /// exchange, in order.
     rounds: Vec<(usize, u64)>,
-    current_calls: HashSet<String>,
 }
 
 impl<'a> RoundProjector<'a> {
@@ -683,7 +685,6 @@ impl<'a> RoundProjector<'a> {
             session_db,
             base_sources,
             rounds: Vec::new(),
-            current_calls: HashSet::new(),
         }
     }
 
@@ -699,15 +700,13 @@ impl<'a> RoundProjector<'a> {
         input: Vec<RuntimeMessage>,
     ) {
         if !input.is_empty() {
-            self.note_exchange(messages.len(), model_sequence, &[]);
+            self.note_exchange(messages.len(), model_sequence);
             messages.extend(input);
         }
     }
 
-    fn note_exchange(&mut self, index: usize, model_sequence: u64, calls: &[ToolCallRequest]) {
+    fn note_exchange(&mut self, index: usize, model_sequence: u64) {
         self.rounds.push((index, model_sequence));
-        self.current_calls
-            .extend(calls.iter().map(|call| call.id.clone()));
     }
 
     fn sources_for(&self, len: usize) -> Vec<ContextSource> {
@@ -749,11 +748,19 @@ impl<'a> RoundProjector<'a> {
             )
             .await
             .map_err(refused)?;
-        let baseline = ProjectedRequest {
+        let mut baseline = ProjectedRequest {
             messages: messages.to_vec(),
             tools: tools.to_vec(),
         };
+        baseline.identify_exchanges();
         let sources = self.sources_for(messages.len());
+        let current_exchanges = sources
+            .iter()
+            .enumerate()
+            .filter_map(|(index, source)| {
+                matches!(source, ContextSource::CurrentAttempt { .. }).then_some(index)
+            })
+            .collect();
         let inputs = projection::RoundInputs {
             agent_name: &self.tool_ctx.agent_name,
             session_db_id: self.session_db_id.as_deref(),
@@ -762,13 +769,20 @@ impl<'a> RoundProjector<'a> {
             model: self.resolved_model,
             model_round,
             sources: &sources,
-            current_calls: &self.current_calls,
+            current_exchanges: &current_exchanges,
             budget_tokens: self.scope.request_budget_tokens,
         };
-        projection::run_chain(&chain, &baseline, &inputs)
+        let mut accepted = projection::run_chain(&chain, &baseline, &inputs)
             .await
-            .map(Some)
-            .map_err(refused)
+            .map_err(refused)?;
+        // Host coordinates are projection-only. Backend requests and transport
+        // retries remain identical to the ordinary unprojected message shape.
+        for message in &mut accepted.messages {
+            if let RuntimeMessage::AssistantToolCalls { exchange_id, .. } = message {
+                *exchange_id = None;
+            }
+        }
+        Ok(Some(accepted))
     }
 
     /// Project logical model call `model_round` and send it. Transport
@@ -926,7 +940,7 @@ pub async fn execute_cancellable_with_recorder(
                         acc.record(m);
                     }
                     if !pending.is_empty() {
-                        projector.note_exchange(messages.len(), model_sequence, &[]);
+                        projector.note_exchange(messages.len(), model_sequence);
                         messages.push(RuntimeMessage::Assistant(content));
                         projector.append_boundary_input(&mut messages, model_sequence + 1, pending);
                         model_sequence += 1;
@@ -1035,7 +1049,7 @@ pub async fn execute_cancellable_with_recorder(
                     acc.record(m);
                 }
                 if !pending.is_empty() {
-                    projector.note_exchange(messages.len(), model_sequence, &[]);
+                    projector.note_exchange(messages.len(), model_sequence);
                     messages.push(RuntimeMessage::Assistant(content));
                     projector.append_boundary_input(&mut messages, model_sequence + 1, pending);
                     model_sequence += 1;
@@ -1164,8 +1178,9 @@ pub async fn execute_cancellable_with_recorder(
                 );
 
                 // Record the assistant's tool call request
-                projector.note_exchange(messages.len(), model_sequence, &tool_calls);
+                projector.note_exchange(messages.len(), model_sequence);
                 messages.push(RuntimeMessage::AssistantToolCalls {
+                    exchange_id: None,
                     content: content.clone(),
                     tool_calls: tool_calls.clone(),
                     provider_extra: provider_extra.clone(),
@@ -1310,6 +1325,39 @@ pub async fn execute_cancellable_with_recorder(
                                     content: wrap_tool_output(&call.name, &blocked_msg),
                                 });
                                 continue;
+                            }
+
+                            // Recheck extension authority after approval/hooks:
+                            // the turn's scoped filter is a ceiling, not a lease
+                            // to keep executing after a live revocation.
+                            if let (Some(hub), Some(owner)) = (hub, tools.owner_of(&call.name)) {
+                                let db = tool_ctx.session.lock().await.database().clone();
+                                let active = hub
+                                    .active_extensions_for_call(
+                                        &tool_ctx.agent_name,
+                                        Some(&db),
+                                        &tool_ctx.active_extensions,
+                                    )
+                                    .await;
+                                if !active.contains(owner) {
+                                    let result = format!(
+                                        "Tool unavailable: extension '{owner}' is inactive"
+                                    );
+                                    record_tool_result(
+                                        &recorder,
+                                        model_sequence,
+                                        call_index,
+                                        call,
+                                        &result,
+                                        ToolResultOutcome::Unavailable,
+                                    )
+                                    .await?;
+                                    messages.push(RuntimeMessage::ToolResult {
+                                        call_id: call.id.clone(),
+                                        content: wrap_tool_output(&call.name, &result),
+                                    });
+                                    continue;
+                                }
                             }
 
                             // --- Security: execute with timeout ---

@@ -754,6 +754,7 @@ fn convert_runtime_messages(messages: &[RuntimeMessage]) -> Vec<ChatMessage> {
                 content,
                 tool_calls,
                 provider_extra,
+                ..
             } => ChatMessage {
                 role: "assistant".to_string(),
                 content: content.clone().map(MessageContent::Text),
@@ -1323,6 +1324,7 @@ mod tests {
         );
 
         let history = convert_runtime_messages(&[RuntimeMessage::AssistantToolCalls {
+            exchange_id: None,
             content: None,
             tool_calls: vec![ToolCallRequest {
                 id: "call_1".into(),

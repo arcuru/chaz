@@ -576,6 +576,7 @@ fn replay_turn(records: &[TurnTranscriptRecord], budget: usize) -> Option<Vec<Ru
             return None;
         }
         messages.push(RuntimeMessage::AssistantToolCalls {
+            exchange_id: None,
             content: content.clone(),
             tool_calls: tool_calls.clone(),
             provider_extra: provider_extra.clone(),
@@ -659,6 +660,7 @@ fn message_cost(msg: &RuntimeMessage) -> usize {
             content,
             tool_calls,
             provider_extra,
+            ..
         } => {
             format!(
                 "{}{}{}",

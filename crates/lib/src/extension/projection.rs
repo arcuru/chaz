@@ -164,6 +164,18 @@ pub struct ProjectedRequest {
     pub tools: Vec<ToolDefinition>,
 }
 
+impl ProjectedRequest {
+    /// Refresh occurrence identities on a host-created baseline, never on a
+    /// projector's output. Identities stay with their groups through Vec edits.
+    pub(crate) fn identify_exchanges(&mut self) {
+        for (index, message) in self.messages.iter_mut().enumerate() {
+            if let RuntimeMessage::AssistantToolCalls { exchange_id, .. } = message {
+                *exchange_id = Some(index);
+            }
+        }
+    }
+}
+
 /// What a projector sees about the call it is shaping. Everything here is
 /// read-only; the projector's only output is the returned request.
 pub struct ProjectionCall<'a> {
@@ -211,6 +223,8 @@ pub(crate) struct ResolvedProjector {
 pub enum ProjectionViolation {
     #[error("the request has no messages")]
     Empty,
+    #[error("an assistant tool-call message has no calls")]
+    EmptyCallGroup,
     #[error("conversation authority cannot change the instructions")]
     InstructionsChanged,
     #[error("conversation authority cannot change the tool declarations")]
@@ -255,8 +269,9 @@ pub(crate) struct RoundInputs<'a> {
     pub model: &'a str,
     pub model_round: u64,
     pub sources: &'a [ContextSource],
-    /// Call ids completed by the current attempt; their exchanges must stay.
-    pub current_calls: &'a HashSet<String>,
+    /// Baseline message indices belonging to the current attempt. Provider
+    /// call IDs are not occurrence identities and may legally repeat.
+    pub current_exchanges: &'a HashSet<usize>,
     pub budget_tokens: Option<usize>,
 }
 
@@ -301,7 +316,7 @@ pub(crate) async fn run_chain(
                 &current,
                 &candidate,
                 step.authority,
-                inputs.current_calls,
+                inputs.current_exchanges,
                 inputs.budget_tokens,
             )
             .map(|()| candidate)
@@ -353,7 +368,6 @@ fn system_messages(messages: &[RuntimeMessage]) -> Vec<&str> {
 }
 
 struct CallGroup<'a> {
-    order: usize,
     calls: &'a [ToolCallRequest],
     provider_extra: &'a serde_json::Map<String, serde_json::Value>,
 }
@@ -364,7 +378,7 @@ pub(crate) fn validate_step(
     input: &ProjectedRequest,
     candidate: &ProjectedRequest,
     authority: ProjectionAuthority,
-    current_calls: &HashSet<String>,
+    current_exchanges: &HashSet<usize>,
     budget: Option<usize>,
 ) -> Result<(), ProjectionViolation> {
     if candidate.messages.is_empty() {
@@ -394,21 +408,20 @@ pub(crate) fn validate_step(
         }
     }
 
-    // Index the baseline's call groups by their first call id.
-    let mut groups: HashMap<&str, CallGroup<'_>> = HashMap::new();
+    // Index host occurrences, not provider IDs. Equal calls in separate model
+    // responses must remain distinguishable even after their bodies change.
+    let mut groups: HashMap<usize, CallGroup<'_>> = HashMap::new();
     let mut result_ids: HashSet<&str> = HashSet::new();
-    for message in &baseline.messages {
+    for (index, message) in baseline.messages.iter().enumerate() {
         match message {
             RuntimeMessage::AssistantToolCalls {
                 tool_calls,
                 provider_extra,
                 ..
             } if !tool_calls.is_empty() => {
-                let order = groups.len();
                 groups.insert(
-                    tool_calls[0].id.as_str(),
+                    index,
                     CallGroup {
-                        order,
                         calls: tool_calls,
                         provider_extra,
                     },
@@ -421,18 +434,25 @@ pub(crate) fn validate_step(
         }
     }
 
-    let mut seen: HashSet<&str> = HashSet::new();
+    let mut seen: HashSet<usize> = HashSet::new();
     let mut last_order: Option<usize> = None;
     let mut i = 0;
     while i < candidate.messages.len() {
         match &candidate.messages[i] {
+            RuntimeMessage::AssistantToolCalls { tool_calls, .. } if tool_calls.is_empty() => {
+                return Err(ProjectionViolation::EmptyCallGroup);
+            }
             RuntimeMessage::AssistantToolCalls {
+                exchange_id,
                 tool_calls,
                 provider_extra,
                 ..
             } if !tool_calls.is_empty() => {
                 let first = tool_calls[0].id.as_str();
-                let Some(group) = groups.get(first) else {
+                let Some(index) = exchange_id else {
+                    return Err(ProjectionViolation::ForgedCall(first.to_string()));
+                };
+                let Some(group) = groups.get(index) else {
                     return Err(ProjectionViolation::ForgedCall(first.to_string()));
                 };
                 if tool_calls.len() > group.calls.len() {
@@ -454,10 +474,10 @@ pub(crate) fn validate_step(
                 if provider_extra != group.provider_extra {
                     return Err(ProjectionViolation::AlteredProviderEcho(first.to_string()));
                 }
-                if !seen.insert(first) || last_order.is_some_and(|last| group.order <= last) {
+                if !seen.insert(*index) || last_order.is_some_and(|last| *index <= last) {
                     return Err(ProjectionViolation::ReorderedExchange(first.to_string()));
                 }
-                last_order = Some(group.order);
+                last_order = Some(*index);
                 for (offset, call) in group.calls.iter().enumerate() {
                     match candidate.messages.get(i + 1 + offset) {
                         Some(RuntimeMessage::ToolResult { call_id, .. }) if call_id == &call.id => {
@@ -480,21 +500,13 @@ pub(crate) fn validate_step(
         i += 1;
     }
 
-    let mut dropped: Vec<&str> = groups
+    if let Some((_, group)) = groups
         .iter()
-        .filter(|(first, group)| {
-            !seen.contains(*first)
-                && group
-                    .calls
-                    .iter()
-                    .any(|call| current_calls.contains(&call.id))
-        })
-        .map(|(first, _)| *first)
-        .collect();
-    dropped.sort_unstable();
-    if let Some(first) = dropped.first() {
+        .filter(|(index, _)| current_exchanges.contains(index) && !seen.contains(index))
+        .min_by_key(|(index, _)| **index)
+    {
         return Err(ProjectionViolation::DroppedCurrentExchange(
-            first.to_string(),
+            group.calls[0].id.clone(),
         ));
     }
 
@@ -526,6 +538,7 @@ mod tests {
     fn exchange(id: &str, extra: serde_json::Value) -> Vec<RuntimeMessage> {
         vec![
             RuntimeMessage::AssistantToolCalls {
+                exchange_id: None,
                 content: None,
                 tool_calls: vec![call(id)],
                 provider_extra: extra.as_object().cloned().unwrap_or_default(),
@@ -545,10 +558,12 @@ mod tests {
         messages.extend(exchange("old", json!({"reasoning": "kept"})));
         messages.push(RuntimeMessage::User("new question".into()));
         messages.extend(exchange("now", json!({})));
-        ProjectedRequest {
+        let mut request = ProjectedRequest {
             messages,
             tools: vec![tool("echo")],
-        }
+        };
+        request.identify_exchanges();
+        request
     }
 
     fn check(
@@ -556,7 +571,7 @@ mod tests {
         authority: ProjectionAuthority,
     ) -> Result<(), ProjectionViolation> {
         let base = baseline();
-        let current: HashSet<String> = ["now".to_string()].into();
+        let current: HashSet<usize> = [5].into();
         validate_step(&base, &base, candidate, authority, &current, None)
     }
 
@@ -691,6 +706,63 @@ mod tests {
         assert_eq!(
             check(&empty, ProjectionAuthority::FullContext),
             Err(ProjectionViolation::Empty)
+        );
+    }
+
+    #[test]
+    fn repeated_provider_ids_keep_distinct_occurrences_and_current_protection() {
+        let mut base = baseline();
+        // Deliberately identical immutable fields AND result bodies; source
+        // occurrence, not textual similarity, must distinguish these groups.
+        base.messages
+            .splice(5..7, exchange("old", json!({"reasoning": "kept"})));
+        base.identify_exchanges();
+        let current = HashSet::from([5]);
+        let validate = |candidate: &ProjectedRequest| {
+            validate_step(
+                &base,
+                &base,
+                candidate,
+                ProjectionAuthority::FullContext,
+                &current,
+                None,
+            )
+        };
+        validate(&base).unwrap();
+        let mut historical_omitted = base.clone();
+        historical_omitted.messages.drain(2..4);
+        if let RuntimeMessage::ToolResult { content, .. } =
+            historical_omitted.messages.last_mut().unwrap()
+        {
+            *content = "authorized replacement body".into();
+        }
+        validate(&historical_omitted).unwrap();
+        let mut current_omitted = base.clone();
+        current_omitted.messages.truncate(5);
+        assert_eq!(
+            validate(&current_omitted),
+            Err(ProjectionViolation::DroppedCurrentExchange("old".into()))
+        );
+        let mut duplicate = base.clone();
+        duplicate.messages.extend_from_within(5..7);
+        assert_eq!(
+            validate(&duplicate),
+            Err(ProjectionViolation::ReorderedExchange("old".into()))
+        );
+        let mut swapped = base.clone();
+        swapped.messages.swap(2, 5);
+        swapped.messages.swap(3, 6);
+        assert_eq!(
+            validate(&swapped),
+            Err(ProjectionViolation::ReorderedExchange("old".into()))
+        );
+        let mut forged = base.clone();
+        if let RuntimeMessage::AssistantToolCalls { exchange_id, .. } = &mut forged.messages[5] {
+            *exchange_id = Some(99);
+        }
+        assert_eq!(
+            validate(&forged),
+            Err(ProjectionViolation::ForgedCall("old".into()))
         );
     }
 
