@@ -255,8 +255,8 @@ the agent or session (per-session over per-agent over Global by name —
 the same precedence as other instance lookups); in the turn's active
 set (session set minus agent opt-outs); still active in the session's
 extension log at that call, so `/extensions remove` takes effect at the
-next model call; manifest provides `ContextProjection`; and
-`context_projector()` returns `Some`.
+next model call; current agent opt-outs also attenuate the turn set;
+manifest provides `ContextProjection`; and `context_projector()` returns `Some`.
 
 **Order.** Conversation grants run first, then full-context grants;
 within a phase, configured list order. Each step receives the previous
@@ -267,11 +267,15 @@ messages but must return the System messages and tool declarations
 unchanged. `full_context` may also rewrite instructions and the
 model-facing tool declarations, but may only keep, drop, or re-describe
 tools the call already exposes. Neither touches execution: tool calls are
-resolved against the turn's `ScopedTools`, so a hidden tool is still
-executable and an undeclared one is still refused.
+resolved against the turn's `ScopedTools`, so a hidden but granted tool is
+still executable and an out-of-scope one is still refused. The host rechecks
+session/agent extension activation immediately before execution, after
+approval and hooks; revocation therefore stops execution even within a
+batch already returned by the model. Unowned tools retain their existing
+scope/grant checks.
 
 **Host validation** (every step, both authorities): non-empty request;
-each tool-call group kept whole (call message, then one result per call,
+no empty tool-call messages; each tool-call group kept whole (call message, then one result per call,
 in order) or omitted whole; call ids, names, arguments and opaque
 `provider_extra` byte-identical to the baseline; no invented, repeated,
 or reordered groups; exchanges completed by the current attempt kept;

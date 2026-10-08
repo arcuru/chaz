@@ -952,6 +952,11 @@ impl ScopedTools {
         self.registry.get(name)
     }
 
+    /// Extension owning this tool, for live revocation checks at execution.
+    pub(crate) fn owner_of(&self, name: &str) -> Option<&'static str> {
+        self.registry.owner_of(name)
+    }
+
     /// The still-loading source a [`Self::get`] miss would have come from.
     /// Delegates to [`ToolRegistry::pending_source_for`]; the allowlist and
     /// extension filters are deliberately not applied, because a name the

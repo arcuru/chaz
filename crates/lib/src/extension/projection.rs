@@ -211,6 +211,8 @@ pub(crate) struct ResolvedProjector {
 pub enum ProjectionViolation {
     #[error("the request has no messages")]
     Empty,
+    #[error("an assistant tool-call message has no calls")]
+    EmptyCallGroup,
     #[error("conversation authority cannot change the instructions")]
     InstructionsChanged,
     #[error("conversation authority cannot change the tool declarations")]
@@ -426,6 +428,9 @@ pub(crate) fn validate_step(
     let mut i = 0;
     while i < candidate.messages.len() {
         match &candidate.messages[i] {
+            RuntimeMessage::AssistantToolCalls { tool_calls, .. } if tool_calls.is_empty() => {
+                return Err(ProjectionViolation::EmptyCallGroup);
+            }
             RuntimeMessage::AssistantToolCalls {
                 tool_calls,
                 provider_extra,

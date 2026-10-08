@@ -87,11 +87,31 @@ struct ProjectingExt {
     name: &'static str,
     declares: bool,
     projector: Arc<FnProjector>,
+    scopes: Vec<Scope>,
+    tag_scope: bool,
+}
+
+struct ScopedProjector {
+    inner: Arc<FnProjector>,
+    tag: String,
+}
+
+impl ContextProjector for ScopedProjector {
+    fn project<'a>(
+        &'a self,
+        call: &'a ProjectionCall<'a>,
+        mut request: ProjectedRequest,
+    ) -> CapFuture<'a, ProjectedRequest> {
+        request
+            .messages
+            .push(RuntimeMessage::User(self.tag.clone()));
+        self.inner.project(call, request)
+    }
 }
 
 struct ProjectingInstance {
     manifest: ExtensionManifest,
-    projector: Arc<FnProjector>,
+    projector: Arc<dyn ContextProjector>,
 }
 
 impl ExtensionInstance for ProjectingInstance {
@@ -126,16 +146,29 @@ impl Extension for ProjectingExt {
     }
     fn instantiate<'a>(
         &'a self,
-        _scope: ScopeCtx<'a>,
+        scope: ScopeCtx<'a>,
     ) -> crate::extension::instance::InstantiateFuture<'a> {
+        let projector: Arc<dyn ContextProjector> = if self.tag_scope {
+            let tag = match scope {
+                ScopeCtx::Global { .. } => "global".to_string(),
+                ScopeCtx::Agent { agent_name, .. } => format!("agent:{agent_name}"),
+                ScopeCtx::Session { session_db_id, .. } => format!("session:{session_db_id}"),
+            };
+            Arc::new(ScopedProjector {
+                inner: self.projector.clone(),
+                tag,
+            })
+        } else {
+            self.projector.clone()
+        };
         let instance = ProjectingInstance {
             manifest: self.manifest(),
-            projector: self.projector.clone(),
+            projector,
         };
         Box::pin(async move { Ok(Arc::new(instance) as Arc<dyn ExtensionInstance>) })
     }
     fn scopes(&self) -> &[Scope] {
-        &[Scope::Global]
+        &self.scopes
     }
 }
 
@@ -188,6 +221,8 @@ fn probe_declaring(
             name,
             declares,
             projector,
+            scopes: vec![Scope::Global],
+            tag_scope: false,
         }),
     }
 }
@@ -284,17 +319,77 @@ impl Tool for DeactivateTool {
     }
 }
 
-/// Collects every runtime record, standing in for the session transcript.
+/// Records originals, optionally writing through the real session store.
 #[derive(Default)]
-struct CollectingRecorder(Mutex<Vec<RuntimeRecord>>);
+struct CollectingRecorder {
+    records: Mutex<Vec<RuntimeRecord>>,
+    session: Option<Arc<tokio::sync::Mutex<Session>>>,
+}
 
 impl RuntimeRecorder for CollectingRecorder {
     fn record<'a>(
         &'a self,
         message: RuntimeRecord,
     ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
-        self.0.lock().unwrap().push(message);
-        Box::pin(async { Ok(()) })
+        use crate::session::{TurnRequestId, TurnTranscriptMessage, TurnTranscriptRecord};
+        let sequence = {
+            let mut records = self.records.lock().unwrap();
+            let sequence = records.len() as u64;
+            records.push(message.clone());
+            sequence
+        };
+        Box::pin(async move {
+            let Some(session) = &self.session else {
+                return Ok(());
+            };
+            let message = match message {
+                RuntimeRecord::ModelResponse {
+                    model_sequence,
+                    content,
+                    tool_calls,
+                    provider_extra,
+                    metadata,
+                    terminal,
+                } => TurnTranscriptMessage::ModelResponse {
+                    model_sequence,
+                    content,
+                    tool_calls,
+                    provider_extra,
+                    metadata,
+                    terminal,
+                },
+                RuntimeRecord::ToolResult {
+                    model_sequence,
+                    call_index,
+                    call_id,
+                    name,
+                    output,
+                    outcome,
+                } => TurnTranscriptMessage::ToolResult {
+                    model_sequence,
+                    call_index,
+                    call_id,
+                    name,
+                    output,
+                    outcome,
+                },
+            };
+            session
+                .lock()
+                .await
+                .append_turn_transcript(
+                    TurnTranscriptRecord {
+                        request_id: TurnRequestId::parse("projection-test"),
+                        attempt_id: "projection-test".into(),
+                        sequence,
+                        timestamp: chrono::Utc::now(),
+                        message,
+                    },
+                    Vec::new(),
+                )
+                .await
+                .map_err(|e| e.to_string())
+        })
     }
 }
 
@@ -304,7 +399,8 @@ struct Fixture {
     _session_instance: eidetica::Instance,
     _registry_instance: eidetica::Instance,
     session: Arc<tokio::sync::Mutex<Session>>,
-    hub: ExtensionHub,
+    hub: Arc<ExtensionHub>,
+    peer: Arc<PeerHandles>,
     ctx: ToolContext,
     mock: Arc<MockBackend>,
     backend: BackendManager,
@@ -329,7 +425,7 @@ impl Fixture {
         let tools = Arc::new(ToolRegistry::new());
         let mut hub = ExtensionHub::new();
         hub.set_session_registry(registry.clone());
-        hub.set_peer_handles(Arc::new(PeerHandles {
+        let peer = Arc::new(PeerHandles {
             registry,
             agent_index: HostedIndex::empty("agent"),
             memory_bank_index: HostedIndex::empty("bank"),
@@ -340,7 +436,8 @@ impl Fixture {
             mcp_registry: Arc::new(crate::mcp::McpRegistry::new()),
             agent_state_allowlist: Default::default(),
             tool_registry: tools.clone(),
-        }));
+        });
+        hub.set_peer_handles(peer.clone());
         hub.set_context_projection_grants(grants).unwrap();
         hub.install_all(
             probes
@@ -362,7 +459,8 @@ impl Fixture {
             _session_instance: session_instance,
             _registry_instance: registry_instance,
             session,
-            hub,
+            hub: Arc::new(hub),
+            peer,
             ctx,
             mock,
             backend,
@@ -380,7 +478,19 @@ impl Fixture {
         messages: Vec<RuntimeMessage>,
         scope: ModelCallScope,
     ) -> (Result<runtime::RuntimeOutcome, String>, Vec<RuntimeRecord>) {
-        let recorder = Arc::new(CollectingRecorder::default());
+        self.run_recording(messages, scope, false).await
+    }
+
+    async fn run_recording(
+        &self,
+        messages: Vec<RuntimeMessage>,
+        scope: ModelCallScope,
+        persist: bool,
+    ) -> (Result<runtime::RuntimeOutcome, String>, Vec<RuntimeRecord>) {
+        let recorder = Arc::new(CollectingRecorder {
+            session: persist.then(|| self.session.clone()),
+            ..Default::default()
+        });
         let result = runtime::execute_with_recorder(
             Some("mock-model"),
             messages,
@@ -394,7 +504,7 @@ impl Fixture {
             scope,
         )
         .await;
-        let records = recorder.0.lock().unwrap().clone();
+        let records = recorder.records.lock().unwrap().clone();
         (result, records)
     }
 
@@ -1062,8 +1172,48 @@ async fn projection_never_changes_recorded_originals() {
     fx.register(echo_tool(&echo_calls));
     push_call(&fx.mock, "c1", "echo");
     fx.mock.push_text("done");
-    let (result, records) = fx.run(prompt(), ModelCallScope::default()).await;
+    let (result, records) = fx
+        .run_recording(prompt(), ModelCallScope::default(), true)
+        .await;
     result.unwrap();
+    let stored = fx
+        .session
+        .lock()
+        .await
+        .turn_transcript("projection-test")
+        .await
+        .unwrap();
+    assert_eq!(stored.len(), records.len());
+    assert!(stored.iter().any(|r| matches!(&r.message,
+        crate::session::TurnTranscriptMessage::ToolResult { output, .. }
+            if output == "original tool output"
+    )));
+    assert!(!serde_json::to_string(&stored).unwrap().contains("[pruned]"));
+    // Compare the complete stored payloads to an execution without projection,
+    // independently of what the recording model backend received.
+    let plain = Fixture::new(&[], &[], &[]).await;
+    plain.register(echo_tool(&Arc::new(AtomicUsize::new(0))));
+    push_call(&plain.mock, "c1", "echo");
+    plain.mock.push_text("done");
+    plain
+        .run_recording(prompt(), ModelCallScope::default(), true)
+        .await
+        .0
+        .unwrap();
+    let unprojected = plain
+        .session
+        .lock()
+        .await
+        .turn_transcript("projection-test")
+        .await
+        .unwrap();
+    assert_eq!(
+        stored.into_iter().map(|r| r.message).collect::<Vec<_>>(),
+        unprojected
+            .into_iter()
+            .map(|r| r.message)
+            .collect::<Vec<_>>()
+    );
     // The provider saw the projection...
     assert!(fx.calls()[1].messages.iter().any(|m| matches!(
         m,
@@ -1083,4 +1233,207 @@ async fn projection_never_changes_recorded_originals() {
         m,
         RuntimeMessage::ToolResult { content, .. } if content.contains("original tool output")
     )));
+}
+
+#[tokio::test]
+async fn projection_rejects_empty_tool_call_messages() {
+    for required in [false, true] {
+        let p = probe("empty-call", |_, mut request| {
+            request.messages.push(RuntimeMessage::AssistantToolCalls {
+                content: None,
+                tool_calls: Vec::new(),
+                provider_extra: json!({"reasoning": "invented"})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            });
+            Ok(request)
+        });
+        let fx = Fixture::new(
+            &[&p],
+            &[grant(
+                "empty-call",
+                ProjectionAuthority::FullContext,
+                required,
+            )],
+            &["empty-call"],
+        )
+        .await;
+        fx.mock.push_text("ok");
+        let (result, _) = fx.run(prompt(), ModelCallScope::default()).await;
+        if required {
+            assert!(result.is_err(), "empty call message was dispatched");
+            assert!(fx.calls().is_empty());
+        } else {
+            result.unwrap();
+            assert_eq!(fx.calls()[0].messages, prompt());
+        }
+    }
+}
+
+#[tokio::test]
+async fn projection_cannot_preserve_revoked_tool_execution() {
+    // Revocation in the same batch must affect the next actual execution,
+    // regardless of a projected declaration (or no projection at all).
+    for with_projection in [false, true] {
+        let p = probe("revocable", |_, mut request| {
+            request.tools.clear();
+            Ok(request)
+        });
+        let grants = if with_projection {
+            vec![grant("revocable", ProjectionAuthority::FullContext, false)]
+        } else {
+            Vec::new()
+        };
+        let mut fx = Fixture::new(&[&p], &grants, &["revocable"]).await;
+        let echo_calls = Arc::new(AtomicUsize::new(0));
+        fx.tools
+            .register_arc_owned(Arc::new(echo_tool(&echo_calls)), Some("revocable"));
+        fx.ctx.tools = fx
+            .ctx
+            .tools
+            .clone()
+            .with_active_extensions(Some(fx.ctx.active_extensions.clone()));
+        fx.register(DeactivateTool {
+            session: fx.session.clone(),
+            extension: "revocable",
+        });
+        fx.mock.push_tool_calls(vec![
+            ("c1".into(), "deactivate".into(), "{}".into()),
+            ("c2".into(), "echo".into(), "{}".into()),
+        ]);
+        fx.mock.push_text("done");
+        let (result, records) = fx.run(prompt(), ModelCallScope::default()).await;
+        result.unwrap();
+        assert_eq!(
+            echo_calls.load(Ordering::SeqCst),
+            0,
+            "revoked tool executed"
+        );
+        assert!(records.iter().any(|r| matches!(r,
+            RuntimeRecord::ToolResult { name, outcome: ToolResultOutcome::Unavailable, .. } if name == "echo"
+        )));
+    }
+}
+
+#[tokio::test]
+async fn projection_scoped_resolution_and_agent_revocation() {
+    let mut global = probe("global", noop());
+    let mut agent = probe("agent", noop());
+    let mut session = probe("session", noop());
+    for (p, scopes) in [
+        (&mut global, vec![Scope::Global]),
+        (&mut agent, vec![Scope::Global, Scope::PerAgent]),
+        (
+            &mut session,
+            vec![Scope::Global, Scope::PerAgent, Scope::PerSession],
+        ),
+    ] {
+        let ext = Arc::get_mut(&mut p.ext).unwrap();
+        ext.scopes = scopes;
+        ext.tag_scope = true;
+    }
+    let mut fx = Fixture::new(
+        &[&global, &agent, &session],
+        &[
+            grant("global", ProjectionAuthority::Conversation, false),
+            grant("agent", ProjectionAuthority::Conversation, false),
+            grant("session", ProjectionAuthority::Conversation, false),
+        ],
+        &["global", "agent", "session"],
+    )
+    .await;
+    let registry = &fx.peer.registry;
+    let seeded =
+        crate::agent_db::ensure_agent_db(&mut *registry.user_for_tests().await, "test-agent")
+            .await
+            .unwrap();
+    fx.peer.agent_index.register(crate::hosted_index::DbEntry {
+        db_id: seeded.db.id(),
+        display_name: "test-agent".into(),
+        pubkey: seeded.pubkey,
+    });
+    let server = crate::server::Server::new(
+        registry.clone(),
+        registry.agents.clone(),
+        fx.peer.agent_index.clone(),
+        fx.peer.memory_bank_index.clone(),
+        fx.peer.skill_bank_index.clone(),
+        fx.tools.clone(),
+        Arc::new(ToolPolicyRegistry::empty()),
+        permissive_security(),
+        Default::default(),
+        Default::default(),
+        Arc::new(crate::tool_host::NativeToolHost::new()),
+        fx.hub.clone(),
+        BackendManager::with_mock(fx.mock.clone(), empty_secrets().await),
+        fx.peer.mcp_registry.clone(),
+        None,
+    );
+    fx.peer.server_slot.set(server.clone());
+
+    // Cold and cached resolutions choose one endpoint per name, with session
+    // over agent over global precedence. A second session gets its own instance.
+    let (_other_instance, other_session) = fresh_session().await;
+    let original_session = fx.ctx.session.clone();
+    for target in [
+        original_session.clone(),
+        original_session.clone(),
+        other_session,
+    ] {
+        let db = target.lock().await.database().clone();
+        fx.hub.record_active(&db).await.unwrap();
+        fx.ctx.session = target;
+        fx.mock.push_text("ok");
+        fx.run(prompt(), ModelCallScope::default()).await.0.unwrap();
+        assert_eq!(
+            user_texts(fx.calls().last().unwrap()),
+            [
+                "question".to_string(),
+                "global".to_string(),
+                "agent:test-agent".to_string(),
+                format!("session:{}", db.root_id()),
+            ]
+        );
+    }
+    assert_eq!(global.count(), 3);
+    assert_eq!(agent.count(), 3);
+    assert_eq!(session.count(), 3);
+    fx.ctx.agent_name = "not-hosted".into();
+    fx.mock.push_text("ok");
+    fx.run(prompt(), ModelCallScope::default()).await.0.unwrap();
+    assert_eq!(user_texts(fx.calls().last().unwrap())[2], "global");
+
+    // The stale turn set still allows the agent extension, but its fresh
+    // opt-out must stop both projection and independently checked execution.
+    fx.ctx.agent_name = "test-agent".into();
+    fx.ctx.session = original_session;
+    fx.ctx.tools = fx
+        .ctx
+        .tools
+        .clone()
+        .with_active_extensions(Some(fx.ctx.active_extensions.clone()));
+    let echo_calls = Arc::new(AtomicUsize::new(0));
+    fx.tools
+        .register_arc_owned(Arc::new(echo_tool(&echo_calls)), Some("agent"));
+    append_event(
+        seeded.db.database(),
+        ExtensionEvent::Deactivated {
+            name: "agent".into(),
+            timestamp: chrono::Utc::now(),
+        },
+    )
+    .await
+    .unwrap();
+    push_call(&fx.mock, "revoked", "echo");
+    fx.mock.push_text("done");
+    let (result, records) = fx.run(prompt(), ModelCallScope::default()).await;
+    result.unwrap();
+    assert_eq!(agent.count(), 4, "revoked agent projector ran");
+    assert_eq!(echo_calls.load(Ordering::SeqCst), 0);
+    assert!(records.iter().any(|r| matches!(r,
+        RuntimeRecord::ToolResult { name, outcome: ToolResultOutcome::Unavailable, .. } if name == "echo"
+    )));
+    fx.peer.server_slot.clear();
+    server.shutdown().await;
 }

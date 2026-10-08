@@ -1091,7 +1091,8 @@ impl ExtensionHub {
     /// minus agent opt-outs) ∩ still active in the session's extension log
     /// at this call ∩ manifest provides `context_projection` ∩ endpoint
     /// present. A required grant that fails any check refuses the call; an
-    /// optional one is skipped without being invoked.
+    /// optional one is skipped without being invoked. Current agent opt-outs
+    /// also attenuate the turn's active set at this boundary.
     pub(crate) async fn resolve_context_projectors(
         &self,
         agent_name: &str,
@@ -1101,27 +1102,18 @@ impl ExtensionHub {
         if self.context_projection.is_empty() {
             return Ok(Vec::new());
         }
-        // Re-read activation at this call boundary so `/extensions remove`
-        // stops a projector at the next model call, not the next turn.
-        let session_active: Option<HashSet<String>> = match session_db {
-            Some(db) => Some(match read_active(db).await {
-                Ok(refs) => refs.into_iter().map(|r| r.name().to_string()).collect(),
-                Err(error) => {
-                    warn!(%error, "Could not read active extensions; no projector is active");
-                    HashSet::new()
-                }
-            }),
-            None => None,
-        };
+        let active = self
+            .active_extensions_for_call(agent_name, session_db, turn_active)
+            .await;
         let instances = self.scoped_instances(agent_name, session_db).await;
         let mut resolved = Vec::new();
         for grant in &self.context_projection {
             let name = grant.extension.as_str();
-            let active = turn_active.contains(name)
-                && session_active.as_ref().is_none_or(|set| set.contains(name));
             let projector = match instances.get(name) {
                 None => Err("no instance exists for this agent or session"),
-                Some(_) if !active => Err("it is not active for this session and agent"),
+                Some(_) if !active.contains(name) => {
+                    Err("it is not active for this session and agent")
+                }
                 Some(inst)
                     if !inst
                         .manifest()
@@ -1157,6 +1149,40 @@ impl ExtensionHub {
             }
         }
         Ok(resolved)
+    }
+
+    /// Attenuate the turn's active set with current session/agent revocations.
+    /// Used at both model-call and actual tool-execution boundaries; never
+    /// enables an extension that was absent from the turn's authority.
+    pub(crate) async fn active_extensions_for_call(
+        &self,
+        agent_name: &str,
+        session_db: Option<&Database>,
+        turn_active: &HashSet<String>,
+    ) -> HashSet<String> {
+        let mut active = turn_active.clone();
+        if let Some(db) = session_db {
+            match read_active(db).await {
+                Ok(refs) => {
+                    let session_active: HashSet<_> =
+                        refs.into_iter().map(|r| r.name().to_string()).collect();
+                    active.retain(|name| session_active.contains(name));
+                }
+                Err(error) => {
+                    warn!(%error, "Could not read active extensions; no extension is active");
+                    active.clear();
+                }
+            }
+        }
+        if let Some(server) = self
+            .peer_handles
+            .as_ref()
+            .and_then(|peer| peer.server_slot.get())
+        {
+            let disabled = server.agent_disabled_extensions(agent_name).await;
+            active.retain(|name| !disabled.contains(name));
+        }
+        active
     }
 
     /// Every instance reachable for `(agent, session)`, keyed by extension

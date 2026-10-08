@@ -1063,6 +1063,39 @@ pub async fn execute_with_recorder(
                                 continue;
                             }
 
+                            // Recheck extension authority after approval/hooks:
+                            // the turn's scoped filter is a ceiling, not a lease
+                            // to keep executing after a live revocation.
+                            if let (Some(hub), Some(owner)) = (hub, tools.owner_of(&call.name)) {
+                                let db = tool_ctx.session.lock().await.database().clone();
+                                let active = hub
+                                    .active_extensions_for_call(
+                                        &tool_ctx.agent_name,
+                                        Some(&db),
+                                        &tool_ctx.active_extensions,
+                                    )
+                                    .await;
+                                if !active.contains(owner) {
+                                    let result = format!(
+                                        "Tool unavailable: extension '{owner}' is inactive"
+                                    );
+                                    record_tool_result(
+                                        &recorder,
+                                        model_sequence,
+                                        call_index,
+                                        call,
+                                        &result,
+                                        ToolResultOutcome::Unavailable,
+                                    )
+                                    .await?;
+                                    messages.push(RuntimeMessage::ToolResult {
+                                        call_id: call.id.clone(),
+                                        content: wrap_tool_output(&call.name, &result),
+                                    });
+                                    continue;
+                                }
+                            }
+
                             // --- Security: execute with timeout ---
                             let timeout = policy.timeout_duration();
                             // Build per-call grants by attenuating the tool's
