@@ -108,7 +108,7 @@ A session's _authoritative_ participant list is its eidetica AuthSettings. Addin
 
 Freshly-created sessions auto-attach a configured roster so `/agents` and the model picker reflect routing reality on the very first message. The list is `Config.default_agents` (see [`configuration.md`](configuration.md#default_agents)) — typically the same agent(s) you message most often. Without that config, just the first agent in `agents:` is attached.
 
-This runs at session-creation time only (TUI `/new`, the picker's "New session" row, CLI `--session`, TUI startup default). It does **not** mutate existing sessions — those keep whatever participant list they already have. Spawned child sessions (`spawn_agent` / `spawn_worker`) also skip auto-attach since they're agent-driven and inherit context from the parent rather than the default.
+This runs at session-creation time only (TUI `/new`, the hub's "New session" row, a TUI launch prompt, or `--session` creating an absent name). It does **not** mutate existing sessions — those keep whatever participant list they already have. Spawned child sessions (`spawn_agent` / `spawn_worker`) also skip auto-attach since they're agent-driven and inherit context from the parent rather than the default.
 
 Names in `default_agents` that don't have a hosted Agent DB are skipped with a debug log; the rest still attach. Per-agent attach failures are logged but don't unwind the rest. Session creation never fails because of `default_agents`.
 

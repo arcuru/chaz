@@ -4,6 +4,7 @@
 //! switch, info, name, share/sync, compact, print, channel listing,
 //! scheduler pointers, and per-session LLM config (model/role/backend).
 
+use crate::server::Server;
 use crate::session::{EntryType, Session, SessionIndex, SessionRegistry};
 use crate::types::ConversationId;
 use futures::{StreamExt, stream};
@@ -71,29 +72,28 @@ pub fn sort_session_infos(sessions: &mut [SessionInfo]) {
     });
 }
 
-pub(super) async fn new_session(group: Option<&str>, ctx: &CommandContext<'_>) -> CommandOutcome {
+pub(super) async fn new_session(group: Option<&str>, server: &Server) -> CommandOutcome {
     // Resolve the requested group before creating anything — a typo
     // should report the known groups, not strand an empty session.
     if let Some(name) = group
-        && ctx.server.agent_group(name).is_none()
+        && server.agent_group(name).is_none()
     {
         return CommandOutcome::Error(format!(
             "Unknown agent group '{name}'. {}",
-            known_groups_hint(ctx)
+            known_groups_hint(server)
         ));
     }
-    let (conv_id, db) = match ctx.server.registry().create_session(Some("tui")).await {
+    let (conv_id, db) = match server.registry().create_session(Some("tui")).await {
         Ok(r) => r,
         Err(e) => return CommandOutcome::Error(format!("Failed to create session: {e}")),
     };
     let session_db_id = db.root_id().to_string();
     // Mirror routing reality in `meta.agents` so `/agents` and the
     // per-agent model picker reflect the agent that will actually answer.
-    let _ = ctx.server.auto_attach_agents(&session_db_id, group).await;
-    let agent = ctx
-        .server
+    let _ = server.auto_attach_agents(&session_db_id, group).await;
+    let agent = server
         .registry()
-        .resolve_agent(&session_db_id, None, ctx.server.agent_index())
+        .resolve_agent(&session_db_id, None, server.agent_index())
         .await;
     CommandOutcome::SessionSwitched(Box::new(SessionSwitch {
         session_db_id,
@@ -105,8 +105,8 @@ pub(super) async fn new_session(group: Option<&str>, ctx: &CommandContext<'_>) -
 }
 
 /// One-line tail for "unknown group" errors, naming what *is* configured.
-fn known_groups_hint(ctx: &CommandContext<'_>) -> String {
-    let names = ctx.server.agent_group_names();
+fn known_groups_hint(server: &Server) -> String {
+    let names = server.agent_group_names();
     if names.is_empty() {
         "No agent groups are configured (set `agent_groups:` in the config).".to_string()
     } else {
@@ -140,8 +140,8 @@ pub(super) async fn list_agent_groups(ctx: &CommandContext<'_>) -> CommandOutcom
     CommandOutcome::Text(out)
 }
 
-pub(super) async fn switch_session(identifier: &str, ctx: &CommandContext<'_>) -> CommandOutcome {
-    let (conv_id, db) = match ctx.server.registry().resolve_session(identifier).await {
+pub(super) async fn switch_session(identifier: &str, server: &Server) -> CommandOutcome {
+    let (conv_id, db) = match server.registry().resolve_session(identifier).await {
         Ok(r) => r,
         Err(e) => return CommandOutcome::Error(format!("Failed to switch session: {e}")),
     };
@@ -149,10 +149,9 @@ pub(super) async fn switch_session(identifier: &str, ctx: &CommandContext<'_>) -
     let session_db_id = db.root_id().to_string();
     let meta = crate::session::read_meta_from_db(&db).await;
 
-    let agent = ctx
-        .server
+    let agent = server
         .registry()
-        .resolve_agent(&session_db_id, None, ctx.server.agent_index())
+        .resolve_agent(&session_db_id, None, server.agent_index())
         .await;
 
     CommandOutcome::SessionSwitched(Box::new(SessionSwitch {
