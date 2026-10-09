@@ -401,13 +401,7 @@ pub(super) fn apply(
     let redraw = match msg {
         Refresh::Status { segments, .. } => {
             let tab = &mut app.tabs[idx];
-            match segments {
-                Ok(segments) => {
-                    tab.live.status_segments = segments;
-                    record_error(tab, kind, None);
-                }
-                Err(e) => record_error(tab, kind, Some(e)),
-            }
+            replace_status(tab, segments);
             is_active
         }
         Refresh::Activity { active_turns, .. } => {
@@ -464,6 +458,16 @@ pub(super) fn resolve(
     }
 }
 
+pub(super) fn replace_status(tab: &mut Tab, status: Result<Vec<String>, String>) {
+    match status {
+        Ok(status) => {
+            tab.live.status_segments = status;
+            record_error(tab, RefreshKind::Status, None);
+        }
+        Err(error) => record_error(tab, RefreshKind::Status, Some(error)),
+    }
+}
+
 pub(super) fn replace_snapshot(
     app: &mut App,
     idx: usize,
@@ -471,8 +475,7 @@ pub(super) fn replace_snapshot(
     resolve: impl FnOnce(&str, &SessionMeta) -> Resolved,
 ) {
     let ticket = app.next_ticket();
-    app.tabs[idx].live.errors = Default::default();
-    app.tabs[idx].live.error = None;
+    record_error(&mut app.tabs[idx], RefreshKind::Session, None);
     apply_session_snapshot(app, idx, ticket, snapshot, resolve);
 }
 

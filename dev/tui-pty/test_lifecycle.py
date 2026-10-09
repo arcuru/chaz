@@ -583,6 +583,7 @@ eidetica:
                 control("append", "APPENDED")
                 offset = len(process.raw); control("start", "STARTED")
                 process.expect("RECOVERY-VISIBLE", offset=offset, timeout=25)
+                process.expect_screen("RECOVERY-STATUS", timeout=5)
                 process.expect_screen("draft-during-loss-界OFFLINE", timeout=5)
                 self.assertNotIn(b"\x1b[?1049l", process.raw)
                 process.send("\x03")

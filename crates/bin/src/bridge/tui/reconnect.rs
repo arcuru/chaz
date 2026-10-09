@@ -10,7 +10,13 @@ use std::path::PathBuf;
 pub(super) struct Reopened {
     pub id: String,
     pub incarnation: u64,
-    pub result: Result<(eidetica::Database, refresh::SessionSnapshot, Observation), String>,
+    pub result: Result<ReopenedState, String>,
+}
+pub(super) struct ReopenedState {
+    db: eidetica::Database,
+    snapshot: refresh::SessionSnapshot,
+    status: Result<Vec<String>, String>,
+    observation: Observation,
 }
 pub(super) struct Replacement {
     pub built: BuiltServer,
@@ -68,13 +74,19 @@ pub(super) async fn rebuild(
                 .await
                 .map_err(|e| e.to_string())?;
             let snapshot = refresh::load_session_snapshot(&target, db.clone()).await?;
-            Ok((db, snapshot))
+            let status = refresh::load_status_segments(&db).await;
+            Ok((db, snapshot, status))
         })
         .await;
         let result = match result {
-            Ok((db, snapshot)) => {
+            Ok((db, snapshot, status)) => {
                 match setup_session(&server, &db, backend, approval_tx, notify_tx).await {
-                    Ok(observation) => Ok((db, snapshot, observation)),
+                    Ok(observation) => Ok(ReopenedState {
+                        db,
+                        snapshot,
+                        status,
+                        observation,
+                    }),
                     Err(e) => Err(e.to_string()),
                 }
             }
@@ -113,12 +125,18 @@ pub(super) fn apply(app: &mut App, replacement: &mut Replacement, backend: &Back
             continue;
         };
         match reopened.result {
-            Ok((db, snapshot, observation)) => {
+            Ok(ReopenedState {
+                db,
+                snapshot,
+                status,
+                observation,
+            }) => {
                 app.tabs[i].session_db = db;
                 app.tabs[i].live.observation = Some(observation);
                 refresh::replace_snapshot(app, i, snapshot, |agent, meta| {
                     refresh::resolve(&replacement.built.server, backend, agent, meta)
                 });
+                refresh::replace_status(&mut app.tabs[i], status);
             }
             Err(error) => {
                 app.tabs[i].live.error = Some(error);

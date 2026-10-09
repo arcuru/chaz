@@ -96,6 +96,16 @@ async fn main() -> anyhow::Result<()> {
             }
             "append" => {
                 session.add_entry(entry("RECOVERY-VISIBLE")).await?;
+                write_extension_outputs(
+                    &db,
+                    &BTreeMap::from([(
+                        "fixture".into(),
+                        ExtensionOutput {
+                            status: BTreeMap::from([("state".into(), "RECOVERY-STATUS".into())]),
+                        },
+                    )]),
+                )
+                .await?;
                 println!("APPENDED");
             }
             "quit" => break,
