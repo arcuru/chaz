@@ -700,6 +700,22 @@ impl Session {
         session
     }
 
+    /// Open a session without turning storage failures into an empty transcript.
+    pub async fn try_new(
+        conversation_id: ConversationId,
+        database: Database,
+    ) -> anyhow::Result<Self> {
+        let snapshot = database.snapshot().await?;
+        let (entry_ids, entries) = Self::load_entries_at(&database, "entries", &snapshot).await?;
+        Ok(Self {
+            conversation_id,
+            database,
+            entries,
+            entry_ids,
+            store_name: "entries".into(),
+        })
+    }
+
     /// Load entries from eidetica
     async fn load_from_db(&mut self) {
         let Ok(txn) = self.database.new_transaction().await else {
@@ -1757,6 +1773,11 @@ impl Session {
         read_meta_from_db(&self.database).await
     }
 
+    /// Fallible metadata read for clients retaining cached state.
+    pub async fn try_read_meta(&self) -> anyhow::Result<SessionMeta> {
+        try_read_meta_from_db(&self.database).await
+    }
+
     /// Mutate session metadata in the session's own DB.
     /// The closure receives the current meta (default if unset) and may modify it.
     pub async fn update_meta<F>(&self, mutator: F) -> anyhow::Result<()>
@@ -1913,12 +1934,56 @@ pub async fn read_meta_from_db(database: &Database) -> SessionMeta {
     }
 }
 
+/// Read session metadata without confusing absent fields with storage failures.
+/// Presentation clients use this when replacing a last-good cached snapshot.
+pub async fn try_read_meta_from_db(database: &Database) -> anyhow::Result<SessionMeta> {
+    let txn = database.new_transaction().await?;
+    let doc = txn
+        .get_store::<DocStore>(META_STORE)
+        .await?
+        .get_all()
+        .await?;
+    let text = |key: &str| -> anyhow::Result<Option<String>> {
+        doc.get(key)
+            .map(|v| v.try_into().map_err(Into::into))
+            .transpose()
+    };
+    fn json<T: serde::de::DeserializeOwned + Default>(value: Option<String>) -> anyhow::Result<T> {
+        value
+            .map(|v| serde_json::from_str(&v))
+            .transpose()
+            .map(|v| v.unwrap_or_default())
+            .map_err(Into::into)
+    }
+    Ok(SessionMeta {
+        name: text("name")?,
+        agent_name: text("agent_name")?,
+        agents: json(text("agents")?)?,
+        host_agent_db_id: text("host_agent_db_id")?,
+        model: text("model")?,
+        agent_models: json(text("agent_models")?)?,
+        role_name: text("role_name")?,
+        role_prompt: text("role_prompt")?,
+        backend_name: text("backend_name")?,
+        backend_url: text("backend_url")?,
+        backend_key_ref: text("backend_key_ref")?,
+        burst_budget_override: text("burst_budget_override")?
+            .map(|v| v.parse())
+            .transpose()?,
+        capabilities: json(text("capabilities")?)?,
+        ambient_participation: text("bridge_ambient_v1")?
+            .or(text("matrix_ambient_v1")?)
+            .map(|v| serde_json::from_str(&v))
+            .transpose()?,
+    })
+}
+
 /// Apply a mutator to the meta DocStore of a session DB and commit.
 pub async fn update_meta_on_db<F>(database: &Database, mutator: F) -> anyhow::Result<()>
 where
     F: FnOnce(&mut SessionMeta),
 {
-    let mut current = read_meta_from_db(database).await;
+    let mut current = try_read_meta_from_db(database).await?;
     mutator(&mut current);
 
     let txn = database.new_transaction().await?;
@@ -2156,6 +2221,45 @@ async fn find_or_create_db(
 mod tests {
     use super::test_helpers::*;
     use super::*;
+
+    #[tokio::test]
+    async fn fallible_meta_distinguishes_absence_and_rejects_mutation_after_read_failure() {
+        let (_instance, _user, db) = test_helpers::test_session_db().await;
+        assert!(try_read_meta_from_db(&db).await.unwrap().agents.is_empty());
+        update_meta_on_db(&db, |m| m.name = Some("last-good".into()))
+            .await
+            .unwrap();
+        db.with_transaction(|txn| async move {
+            txn.get_store::<DocStore>(META_STORE)
+                .await?
+                .set_string("agents", "not-json")
+                .await
+        })
+        .await
+        .unwrap();
+        let before = db.snapshot().await.unwrap();
+        assert!(try_read_meta_from_db(&db).await.is_err());
+        assert!(
+            update_meta_on_db(&db, |m| m.model = Some("should-not-write".into()))
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            db.snapshot().await.unwrap(),
+            before,
+            "failed read must not overwrite metadata"
+        );
+        let txn = db.new_transaction().await.unwrap();
+        assert_eq!(
+            txn.get_store::<DocStore>(META_STORE)
+                .await
+                .unwrap()
+                .get_string("name")
+                .await
+                .unwrap(),
+            "last-good"
+        );
+    }
 
     #[tokio::test]
     async fn client_activity_tracks_claim_heartbeat_completion_and_orphan_expiry() {

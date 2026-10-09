@@ -568,30 +568,89 @@ For example, after sending `@chaz:example` a question in a shared Matrix room:
 
 ## Responsiveness and background refresh
 
-Typing, scrolling, clicks and tab switches never wait on storage. Each tab
-keeps the last session state it read — transcript, session name and models,
-the extension status strip, and the `thinking...` indicator — and the TUI
-draws that immediately. Reads happen in the background and replace the cached
-state when they finish:
+The TUI draws cached state and handles local input independently of backend
+work. Enter accepts an action into an ordered queue; it does not wait for a
+session read, command, or message write. Settings opens from cached metadata,
+and opening a stored session leaves the hub usable while its data loads.
+Each tab owns its transcript, name/models, extension strip and live-turn count.
+A completion addresses the requesting tab incarnation, never whichever tab
+happens to be focused. Closing and reopening a tab cannot apply its old results.
+A delayed open does not take focus after newer local navigation.
 
-| Trigger                             | Background read                                  |
-| ----------------------------------- | ------------------------------------------------ |
-| A write to an open session          | That tab's transcript and meta; status if active |
-| Switching tabs or opening a session | The newly active tab's extension status strip    |
-| Every five seconds                  | Each tab's live-turn claims (`thinking...`)      |
+| Trigger / display                      | Behavior                                                                |
+| -------------------------------------- | ----------------------------------------------------------------------- |
+| Session write / Settings open          | Coalesced background transcript/meta/status refresh                     |
+| Every five seconds                     | Refresh activity; check service health and retry failed reads           |
+| `⟳ refreshing (cached)`                | A read is pending; displayed data is the last successful read           |
+| `⚠ refresh failed`                     | That read failed; last-good data remains, even if another read succeeds |
+| `action(s) pending`                    | Accepted backend actions execute in order, one at a time                |
+| Queue full or backend disconnected     | New backend actions are not accepted; composer/prompts stay editable    |
+| `Write still pending; outcome unknown` | A deadline warns, but does not cancel, retry or advance past the write  |
+| Ctrl+C with unfinished actions         | Warn first; a second Ctrl+C explicitly exits and abandons queued work   |
 
-A burst of writes (a streaming turn, sync catching up) costs at most one read
-in flight plus one follow-up per tab, and a result is applied only to the tab
-that asked for it — a late read for a closed or reopened tab is discarded.
-Pending keypresses and wheel notches are all handled in order, but drawn as one
-frame, and pointer motion is ignored without redrawing. Rendering reuses the
-wrapped transcript until it changes and draws only the visible rows, so typing
-in a long session costs about the same as in a short one.
+### Cached is not confirmed
 
-A slow backend therefore delays when new messages and status appear, not
-your input. If a background read fails, the tab keeps its last good state and
-the status bar shows `⚠ refresh failed` until a later read succeeds; the error
-is logged at `warn`.
+Reads have a bounded wait and supervised panic/cancellation handling. A failed
+read releases its slot for recovery without clearing cached data or restoring
+an otherwise live terminal. Errors are tracked separately for transcript/meta,
+status and activity; a successful activity poll cannot hide a failed transcript
+read. Catalog failures likewise retain prior rows and mark their metadata stale.
+Errors are logged at `warn`; worker panics are logged at `error`.
+
+Writes are different. A transport failure, timeout or cancellation cannot prove
+that a message or command did not commit. The TUI never automatically retries
+an accepted action. A slow write stays owned and later accepted actions remain
+queued behind it. Errors report an unknown outcome rather than success; check
+persisted state before deciding to resubmit. Unconfirmed accepted input is kept
+and reported after terminal restoration on exit. Queued actions abandoned by
+an explicit exit were not started; a started write may already have effects.
+
+On an actual service disconnect, the TUI keeps the cached view and draft. Once
+accepted actions settle, it tears down the old runtime and reconnects through
+the normal connector using the same configured login and execution role.
+Successful recovery reopens the same session IDs and refreshes their caches;
+it does not replay submitted messages or commands. A slow health read alone
+is not grounds to replace a runtime. Configuration/login errors are displayed,
+not retried indefinitely.
+
+Pending keypresses and wheel notches are handled in order, but can draw as one
+frame. Pointer motion is ignored without redrawing. Rendering reuses wrapped
+transcripts until they change and draws the visible rows rather than rebuilding
+all history for each keystroke.
+
+### Walkthrough: a slow backend, then a lost connection
+
+1. In a conversation, submit a message and keep typing a second draft. The
+   first action may remain pending while the second draft and local scrolling
+   stay usable. Open Settings with Ctrl+S, or the hub with Ctrl+P; browsing cached
+   data does not wait for the first write. If the write remains slow, the status
+   reports:
+
+   ```text
+   Write still pending; outcome unknown. Not cancelled or retried; later actions remain queued
+   ```
+
+2. If a refresh fails, the transcript/name/status do not become empty. The bar
+   shows `⚠ refresh failed`. An actual service disconnect reports:
+
+   ```text
+   Backend disconnected — cached data is stale; reconnecting after accepted actions settle. No writes replayed
+   ```
+
+   New backend submissions are refused while disconnected, but the existing
+   draft remains editable. Do not assume a previously submitted message failed
+   to commit just because the service went away.
+
+3. When the service returns, the same views refresh and the draft survives:
+
+   ```text
+   Backend reconnected; writes were not replayed
+   ```
+
+   Check the transcript or persisted command result before explicitly retrying
+   any unconfirmed action. If you instead exit while work is pending, the first
+   Ctrl+C warns; Ctrl+C again restores the terminal and reports queued versus
+   potentially committed work, including unconfirmed accepted input.
 
 ## Entry Types
 
@@ -630,8 +689,11 @@ loopback stub backend: Unicode input, final reply rendering, resize, and idle
 Ctrl+C quit with terminal restoration.
 It also checks that missing output fails on both early exit and timeout, and
 that children are reaped.
-This complements the fast widget snapshots; it does not test in-flight job
-cancellation.
+It also stops a disposable IPC owner while Enter, Settings and hub actions
+are pending, verifies ordered commands and cache/draft retention across an
+actual service stop/restart, and exercises read timeout/panic under a controlling
+PTY without losing terminal ownership. This complements the widget tests; it
+does not assert rollback of cancelled writes or cancel durable agent turns.
 See `dev/tui-pty/README.md` for isolation details and failure artifact locations.
 
 ## Jobs: observe without taking over

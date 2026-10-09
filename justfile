@@ -43,7 +43,7 @@ test *args='':
 
 # Hermetic Linux PTY lifecycle test of the real TUI (stdlib Python via uv)
 tui-pty:
-    cargo build --quiet --bin chaz --example tui_fixture
+    cargo build --quiet --bin chaz --example tui_fixture --example tui_service_fixture
     uv run --no-project dev/tui-pty/test_lifecycle.py
     uv run --no-project dev/tui-pty/test_jobs.py
 

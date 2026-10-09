@@ -70,7 +70,7 @@ impl RefreshSlot {
 
 /// Backend-derived per-tab state plus its refresh bookkeeping. Grouped so a
 /// `Tab` literal only needs `live: TabLive::default()`.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub(super) struct TabLive {
     /// Full session reload (entries + meta + activity) after a write.
     pub(super) reload: RefreshSlot,
@@ -88,12 +88,40 @@ pub(super) struct TabLive {
     /// successful read. Shown in the status bar so a failed refresh doesn't
     /// pass for fresh data.
     pub(super) error: Option<String>,
+    errors: [Option<String>; 3],
+    pub(super) meta: SessionMeta,
+    /// View-local command/error output is not stored in the session DB.
+    local_entries: Vec<SessionEntry>,
+    pub(super) incarnation: u64,
+    pub(super) observation: Option<Observation>,
     /// Bumped whenever `entries` or `expanded_entries` change, so the
     /// transcript render cache knows when its wrapped lines are stale.
     pub(super) transcript_rev: u64,
     /// Wrapped transcript reused across frames until `transcript_rev`, the
     /// width or a display toggle changes.
     pub(super) render: view::TranscriptCache,
+}
+
+impl TabLive {
+    pub(super) fn cancel_reads(&mut self) {
+        self.reload = RefreshSlot::default();
+        self.status = RefreshSlot::default();
+        self.activity = RefreshSlot::default();
+    }
+    pub(super) fn with_meta(meta: SessionMeta) -> Self {
+        Self {
+            meta,
+            ..Default::default()
+        }
+    }
+    pub(super) fn failed(&self, kind: RefreshKind) -> bool {
+        self.errors[kind as usize].is_some()
+    }
+    pub(super) fn pending(&self) -> bool {
+        self.reload.in_flight.is_some()
+            || self.status.in_flight.is_some()
+            || self.activity.in_flight.is_some()
+    }
 }
 
 /// What a session reload read from storage.
@@ -108,12 +136,12 @@ pub(super) enum Refresh {
     Session {
         session_db_id: String,
         ticket: u64,
-        snapshot: Box<SessionSnapshot>,
+        snapshot: Result<Box<SessionSnapshot>, String>,
     },
     Status {
         session_db_id: String,
         ticket: u64,
-        segments: Vec<String>,
+        segments: Result<Vec<String>, String>,
     },
     Activity {
         session_db_id: String,
@@ -154,8 +182,26 @@ impl Tab {
         self.live.transcript_rev = self.live.transcript_rev.wrapping_add(1);
     }
 
-    pub(super) fn set_entries(&mut self, entries: Vec<SessionEntry>) {
+    pub(super) fn set_entries(&mut self, mut entries: Vec<SessionEntry>) {
+        entries.extend(self.live.local_entries.iter().cloned());
+        // Stable sort preserves backend row order on timestamp ties while
+        // retaining local command output between subsequent persisted rows.
+        entries.sort_by_key(|e| e.timestamp);
         self.entries = entries;
+        self.touch_transcript();
+    }
+
+    pub(super) fn add_local(&mut self, entry: SessionEntry) {
+        self.live.local_entries.push(entry.clone());
+        self.entries.push(entry);
+        self.touch_transcript();
+    }
+
+    pub(super) fn clear_view(&mut self) {
+        self.entries.clear();
+        self.live.local_entries.clear();
+        self.scroll_offset = 0;
+        self.expanded_entries.clear();
         self.touch_transcript();
     }
 }
@@ -168,7 +214,7 @@ pub(super) fn request_with<Fut>(
     session_db_id: &str,
     kind: RefreshKind,
     tx: &mpsc::Sender<Refresh>,
-    load: impl FnOnce(u64) -> Fut,
+    load: impl FnOnce(u64) -> Fut + Send + 'static,
 ) where
     Fut: Future<Output = Refresh> + Send + 'static,
 {
@@ -185,12 +231,29 @@ pub(super) fn request_with<Fut>(
     if !slot.begin(ticket) {
         return;
     }
-    let fut = load(ticket);
     let tx = tx.clone();
-    // The slot owns the task so closing its tab or exiting the TUI cancels
-    // the read, including one stalled forever on the backend.
+    let id = session_db_id.to_owned();
     slot.task = Some(tokio::spawn(async move {
-        let _ = tx.send(fut.await).await;
+        let msg = supervised::read(async move { Ok(load(ticket).await) })
+            .await
+            .unwrap_or_else(|e| match kind {
+                RefreshKind::Session => Refresh::Session {
+                    session_db_id: id,
+                    ticket,
+                    snapshot: Err(e),
+                },
+                RefreshKind::Status => Refresh::Status {
+                    session_db_id: id,
+                    ticket,
+                    segments: Err(e),
+                },
+                RefreshKind::Activity => Refresh::Activity {
+                    session_db_id: id,
+                    ticket,
+                    active_turns: Err(e),
+                },
+            });
+        let _ = tx.send(msg).await;
     }));
 }
 
@@ -210,7 +273,7 @@ pub(super) fn request(
     request_with(app, session_db_id, kind, tx, move |ticket| async move {
         match kind {
             RefreshKind::Session => Refresh::Session {
-                snapshot: Box::new(load_session_snapshot(&id, db).await),
+                snapshot: load_session_snapshot(&id, db).await.map(Box::new),
                 session_db_id: id,
                 ticket,
             },
@@ -228,18 +291,22 @@ pub(super) fn request(
     });
 }
 
-async fn load_session_snapshot(session_db_id: &str, db: eidetica::Database) -> SessionSnapshot {
-    let active_turns = load_active_turns(&db).await;
-    let session = Session::new(
-        chaz_core::types::ConversationId(session_db_id.to_string()),
-        db,
-    )
-    .await;
-    SessionSnapshot {
-        entries: session.entries().to_vec(),
-        meta: session.read_meta().await,
-        active_turns,
+pub(super) async fn load_session_snapshot(
+    _session_db_id: &str,
+    db: eidetica::Database,
+) -> Result<SessionSnapshot, String> {
+    async {
+        let snapshot = db.snapshot().await?;
+        let entries = Session::entries_at_snapshot(&db, &snapshot).await?;
+        let meta = chaz_core::session::try_read_meta_from_db(&db).await?;
+        Ok::<_, anyhow::Error>(SessionSnapshot {
+            entries,
+            meta,
+            active_turns: load_active_turns(&db).await,
+        })
     }
+    .await
+    .map_err(|e| e.to_string())
 }
 
 pub(super) async fn load_active_turns(db: &eidetica::Database) -> Result<usize, String> {
@@ -252,12 +319,24 @@ pub(super) async fn load_active_turns(db: &eidetica::Database) -> Result<usize, 
 /// Flatten every extension's status map from the session's
 /// `extension_outputs` store (written by the daemon at the turn boundary)
 /// into render-ready segments, ordered by extension name then key.
-pub(super) async fn load_status_segments(db: &eidetica::Database) -> Vec<String> {
-    chaz_core::extension::read_extension_outputs(db)
+pub(super) async fn load_status_segments(db: &eidetica::Database) -> Result<Vec<String>, String> {
+    chaz_core::extension::try_read_extension_outputs(db)
         .await
-        .into_values()
-        .flat_map(|o| o.status.into_values())
-        .collect()
+        .map(|outputs| {
+            outputs
+                .into_values()
+                .flat_map(|o| o.status.into_values())
+                .collect()
+        })
+        .map_err(|e| e.to_string())
+}
+
+fn record_error(tab: &mut Tab, kind: RefreshKind, error: Option<String>) {
+    if let Some(e) = &error {
+        tracing::warn!(session = %tab.session_db_id, ?kind, "Refresh failed: {e}");
+    }
+    tab.live.errors[kind as usize] = error;
+    tab.live.error = tab.live.errors.iter().find_map(Clone::clone);
 }
 
 fn apply_active_turns(tab: &mut Tab, ticket: u64, active_turns: Result<usize, String>) -> bool {
@@ -269,12 +348,12 @@ fn apply_active_turns(tab: &mut Tab, ticket: u64, active_turns: Result<usize, St
         Ok(n) => {
             let changed = tab.active_turns != n || tab.live.error.is_some();
             tab.active_turns = n;
-            tab.live.error = None;
+            record_error(tab, RefreshKind::Activity, None);
             changed
         }
         Err(e) => {
             tracing::warn!(session = %tab.session_db_id, "Live turn refresh failed: {e}");
-            tab.live.error = Some(e);
+            record_error(tab, RefreshKind::Activity, Some(e));
             true
         }
     }
@@ -322,15 +401,26 @@ pub(super) fn apply(
     let redraw = match msg {
         Refresh::Status { segments, .. } => {
             let tab = &mut app.tabs[idx];
-            let changed = tab.live.status_segments != segments;
-            tab.live.status_segments = segments;
-            changed && is_active
+            match segments {
+                Ok(segments) => {
+                    tab.live.status_segments = segments;
+                    record_error(tab, kind, None);
+                }
+                Err(e) => record_error(tab, kind, Some(e)),
+            }
+            is_active
         }
         Refresh::Activity { active_turns, .. } => {
             apply_active_turns(&mut app.tabs[idx], ticket, active_turns) && is_active
         }
         Refresh::Session { snapshot, .. } => {
-            apply_session_snapshot(app, idx, ticket, *snapshot, resolve);
+            match snapshot {
+                Ok(snapshot) => {
+                    record_error(&mut app.tabs[idx], kind, None);
+                    apply_session_snapshot(app, idx, ticket, *snapshot, resolve);
+                }
+                Err(e) => record_error(&mut app.tabs[idx], kind, Some(e)),
+            }
             // The tab title and picker rows are visible from every tab.
             true
         }
@@ -374,6 +464,18 @@ pub(super) fn resolve(
     }
 }
 
+pub(super) fn replace_snapshot(
+    app: &mut App,
+    idx: usize,
+    snapshot: SessionSnapshot,
+    resolve: impl FnOnce(&str, &SessionMeta) -> Resolved,
+) {
+    let ticket = app.next_ticket();
+    app.tabs[idx].live.errors = Default::default();
+    app.tabs[idx].live.error = None;
+    apply_session_snapshot(app, idx, ticket, snapshot, resolve);
+}
+
 fn apply_session_snapshot(
     app: &mut App,
     idx: usize,
@@ -395,6 +497,10 @@ fn apply_session_snapshot(
     let tab = &mut app.tabs[idx];
     tab.set_entries(entries);
     tab.session_name = meta.name.clone();
+    tab.model_pin = meta
+        .resolve_model_for_agent(&tab.current_agent)
+        .map(str::to_owned);
+    tab.live.meta = meta.clone();
     tab.effective_model = effective_model;
     tab.context_budget = context_budget;
     tab.roster = roster;
@@ -472,6 +578,7 @@ mod tests {
             pending_approval: None,
             active_turns: 0,
             current_agent: "chaz".into(),
+            model_pin: None,
             session_name: None,
             effective_model: String::new(),
             roster: Vec::new(),
@@ -504,7 +611,7 @@ mod tests {
         Refresh::Status {
             session_db_id: id.into(),
             ticket,
-            segments: vec![segment.into()],
+            segments: Ok(vec![segment.into()]),
         }
     }
 
@@ -512,14 +619,14 @@ mod tests {
         Refresh::Session {
             session_db_id: id.into(),
             ticket,
-            snapshot: Box::new(SessionSnapshot {
+            snapshot: Ok(Box::new(SessionSnapshot {
                 entries,
                 meta: SessionMeta {
                     name: Some("renamed".into()),
                     ..Default::default()
                 },
                 active_turns: Ok(turns),
-            }),
+            })),
         }
     }
 
@@ -576,9 +683,9 @@ mod tests {
 
         let frame = tokio::time::timeout(Duration::from_secs(1), async {
             for c in "hello".chars() {
-                input::handle_chat_key(&mut app, key(KeyCode::Char(c))).await;
+                input::handle_chat_key(&mut app, key(KeyCode::Char(c)));
             }
-            input::handle_chat_key(&mut app, key(KeyCode::PageUp)).await;
+            input::handle_chat_key(&mut app, key(KeyCode::PageUp));
             draw_chat(&mut app, 60, 20)
         })
         .await
@@ -632,6 +739,9 @@ mod tests {
                     snapshot("a", t, vec![message("first")], 0)
                 }
             });
+        }
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
         }
         assert_eq!(spawned.load(Ordering::SeqCst), 1);
         releases.remove(0).send(()).unwrap();
@@ -693,7 +803,7 @@ mod tests {
         release.send(()).unwrap();
         // A result already queued before close still needs the identity guard.
         let late = rx.recv().await.unwrap();
-        close_tab_at(&mut app, 1);
+        app.close_tab_at(1);
         assert_eq!(apply(&mut app, late, resolved), Applied::default());
         assert!(app.tabs[0].entries.is_empty());
 
@@ -705,7 +815,7 @@ mod tests {
         let late = rx.recv().await.unwrap();
         let db = app.tabs[0].session_db.clone();
         app.tabs.push(tab("z", db.clone()));
-        close_tab_at(&mut app, 0);
+        app.close_tab_at(0);
         app.tabs.push(tab("a", db));
         assert_eq!(apply(&mut app, late, resolved), Applied::default());
         let reopened = &app.tabs[app.tab_index_for("a").unwrap()];
@@ -728,7 +838,7 @@ mod tests {
         tokio::task::yield_now().await;
         assert!(!closed.is_closed() && !exiting.is_closed());
 
-        close_tab_at(&mut app, 0);
+        app.close_tab_at(0);
         tokio::task::yield_now().await;
         assert!(closed.is_closed(), "closed tab left its read running");
         assert!(!exiting.is_closed(), "another tab's read was cancelled");
@@ -807,5 +917,277 @@ mod tests {
         cycle_tab(&mut app, 1);
         let frame = draw_chat(&mut app, 80, 10).join("\n");
         assert!(frame.contains("status-of-b") && !frame.contains("status-of-a"));
+    }
+    #[tokio::test(start_paused = true)]
+    async fn stalled_and_panicked_slots_complete_with_errors_and_recover() {
+        let (_instance, mut app) = app_with_tabs(&["a"]).await;
+        app.active_mut().live.status_segments = vec!["last-good".into()];
+        let (tx, mut rx) = mpsc::channel(8);
+        request_with(&mut app, "a", RefreshKind::Status, &tx, |_| {
+            std::future::pending()
+        });
+        let msg = tokio::time::timeout(supervised::READ_TIMEOUT * 2, rx.recv())
+            .await
+            .expect("stalled read stranded its slot")
+            .unwrap(); // paused clock advances to read timeout
+        apply(&mut app, msg, resolved);
+        assert!(!app.active().live.status.is_pending());
+        assert_eq!(app.active().live.status_segments, ["last-good"]);
+        assert!(
+            app.active()
+                .live
+                .error
+                .as_ref()
+                .unwrap()
+                .contains("timed out")
+        );
+        request_with(
+            &mut app,
+            "a",
+            RefreshKind::Status,
+            &tx,
+            |_| -> std::future::Pending<Refresh> { panic!("fixture refresh constructor panic") },
+        );
+        apply(&mut app, rx.recv().await.unwrap(), resolved);
+        assert!(!app.active().live.status.is_pending());
+        assert!(
+            app.active()
+                .live
+                .error
+                .as_ref()
+                .unwrap()
+                .contains("panicked")
+        );
+        request_with(
+            &mut app,
+            "a",
+            RefreshKind::Activity,
+            &tx,
+            |ticket| async move {
+                Refresh::Activity {
+                    session_db_id: "a".into(),
+                    ticket,
+                    active_turns: Ok(0),
+                }
+            },
+        );
+        apply(&mut app, rx.recv().await.unwrap(), resolved);
+        assert!(
+            app.active().live.error.is_some(),
+            "activity cannot clear a failed status read"
+        );
+        request_with(
+            &mut app,
+            "a",
+            RefreshKind::Status,
+            &tx,
+            |ticket| async move { status("a", ticket, "recovered") },
+        );
+        apply(&mut app, rx.recv().await.unwrap(), resolved);
+        assert_eq!(app.active().live.status_segments, ["recovered"]);
+        assert!(app.active().live.error.is_none());
+    }
+
+    #[tokio::test]
+    async fn actual_service_loss_retains_last_good_transcript_meta_status_and_recovers() {
+        use chaz_core::{
+            config::{EideticaConfig, EideticaLoginConfig, ExecutionRole},
+            extension::{ExtensionOutput, write_extension_outputs},
+        };
+        use eidetica::service::ServiceServer;
+        use std::collections::BTreeMap;
+        use tokio::sync::watch;
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("fixture.sock");
+        let (owner, mut user) = Instance::create_backend(
+            Box::new(InMemory::new()),
+            NewUser::passwordless("failure-fixture"),
+        )
+        .await
+        .unwrap();
+        let key = user.get_default_key().unwrap();
+        let db = user
+            .create_database(eidetica::crdt::Doc::new(), &key)
+            .await
+            .unwrap();
+        let id = db.root_id().clone();
+        let mut session =
+            Session::new(chaz_core::types::ConversationId(id.to_string()), db.clone()).await;
+        session
+            .add_entry(message("last-good-transcript"))
+            .await
+            .unwrap();
+        session
+            .update_meta(|m| m.name = Some("last-good-name".into()))
+            .await
+            .unwrap();
+        write_extension_outputs(
+            &db,
+            &BTreeMap::from([(
+                "core".into(),
+                ExtensionOutput {
+                    status: BTreeMap::from([("fixture".into(), "last-good-status".into())]),
+                },
+            )]),
+        )
+        .await
+        .unwrap();
+        let service = ServiceServer::bind(owner.clone(), &socket).await.unwrap();
+        let (shutdown, receiver) = watch::channel(());
+        let task = tokio::spawn(service.run(receiver));
+        let config = EideticaConfig {
+            connection: format!("unix://{}", socket.display()),
+            login: EideticaLoginConfig {
+                username: "failure-fixture".into(),
+                password: None,
+                passwordless: true,
+            },
+            sync: None,
+        };
+        let client = chaz_core::instance::connect_with(&config, ExecutionRole::Client)
+            .await
+            .unwrap();
+        let remote = client.user.open_database(&id).await.unwrap();
+        let mut app = App::new(HashSet::new(), tab(&id.to_string(), remote));
+        let (tx, mut rx) = mpsc::channel(8);
+        for kind in [RefreshKind::Session, RefreshKind::Status] {
+            request(&mut app, &id.to_string(), kind, &tx);
+        }
+        for _ in 0..2 {
+            apply(&mut app, rx.recv().await.unwrap(), resolved);
+        }
+        assert_eq!(app.active().entries.len(), 1);
+        assert_eq!(app.active().session_name.as_deref(), Some("last-good-name"));
+        assert_eq!(app.active().live.status_segments, ["last-good-status"]);
+        println!("CONTROL: service alive -> entries=1 name=last-good-name status_maps=1");
+        drop(shutdown);
+        task.await.unwrap().unwrap();
+        assert!(
+            load_active_turns(&app.active().session_db).await.is_err(),
+            "dead backend positive control"
+        );
+        assert!(
+            Session::try_new(
+                chaz_core::types::ConversationId(id.to_string()),
+                app.active().session_db.clone()
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            chaz_core::session::try_read_meta_from_db(&app.active().session_db)
+                .await
+                .is_err()
+        );
+        assert!(
+            chaz_core::extension::try_read_extension_outputs(&app.active().session_db)
+                .await
+                .is_err()
+        );
+        for kind in [
+            RefreshKind::Session,
+            RefreshKind::Status,
+            RefreshKind::Activity,
+        ] {
+            request(&mut app, &id.to_string(), kind, &tx);
+        }
+        for _ in 0..3 {
+            apply(&mut app, rx.recv().await.unwrap(), resolved);
+        }
+        assert_eq!(app.active().entries[0].content, "last-good-transcript");
+        assert_eq!(app.active().session_name.as_deref(), Some("last-good-name"));
+        assert_eq!(app.active().live.status_segments, ["last-good-status"]);
+        assert!(app.active().live.error.is_some());
+        println!("SERVICE LOST: entries=1 name=last-good-name status_maps=1 refresh_error=true");
+        let service = ServiceServer::bind(owner, &socket).await.unwrap();
+        let (shutdown, receiver) = watch::channel(());
+        let task = tokio::spawn(service.run(receiver));
+        session.add_entry(message("after-recovery")).await.unwrap();
+        // Recovery replaces the complete client generation, not the closed
+        // socket, while preserving this view's composer/scroll/incarnation.
+        app.input = "draft-during-loss-界".into();
+        app.cursor = app.input.len();
+        app.active_mut().scroll_offset = 20;
+        reconnect::disconnect(&mut app);
+        let config = Config {
+            execution: Some(ExecutionRole::Client),
+            eidetica: Some(config),
+            state_dir: Some(dir.path().join("state").display().to_string()),
+            ..Default::default()
+        };
+        let (approval_tx, _approval_rx) = mpsc::channel(8);
+        let (notify_tx, _notify_rx) = mpsc::channel(64);
+        let mut replacement = reconnect::rebuild(
+            None,
+            config,
+            dir.path().join("config.yaml"),
+            vec![(id.to_string(), app.active().live.incarnation)],
+            approval_tx,
+            notify_tx,
+        )
+        .await
+        .map_err(|e| e.0)
+        .unwrap();
+        let backend = BackendManager::new(&None, replacement.built.secret_store.clone());
+        reconnect::apply(&mut app, &mut replacement, &backend);
+        for kind in [
+            RefreshKind::Session,
+            RefreshKind::Status,
+            RefreshKind::Activity,
+        ] {
+            request(&mut app, &id.to_string(), kind, &tx);
+        }
+        for _ in 0..3 {
+            apply(&mut app, rx.recv().await.unwrap(), resolved);
+        }
+        assert_eq!(app.input, "draft-during-loss-界");
+        assert_eq!(app.active().scroll_offset, 20);
+        assert_eq!(
+            app.active().entries.len(),
+            2,
+            "existing tab did not recover: {:?}",
+            app.active().live.error
+        );
+        assert!(app.active().live.error.is_none());
+        println!(
+            "SERVICE RECOVERED: entries=2 name=last-good-name status_maps=1 refresh_error=false"
+        );
+        println!(
+            "REFRESH ERROR CONTRACT: PASS; last-good data retained and existing tab recovered"
+        );
+        replacement.built.shutdown().await;
+        drop(shutdown);
+        task.await.unwrap().unwrap();
+    }
+    #[tokio::test]
+    async fn local_command_results_survive_reload_in_transcript_order() {
+        let (_instance, mut app) = app_with_tabs(&["a"]).await;
+        let first = message("first-backend");
+        let mut local = message("local-界");
+        local.timestamp = first.timestamp + chrono::Duration::seconds(1);
+        let mut second = message("second-backend");
+        second.timestamp = first.timestamp + chrono::Duration::seconds(2);
+        app.active_mut().set_entries(vec![first.clone()]);
+        app.active_mut().add_local(local);
+        app.active_mut()
+            .set_entries(vec![first.clone(), second.clone()]);
+        assert_eq!(
+            app.active()
+                .entries
+                .iter()
+                .map(|e| e.content.as_str())
+                .collect::<Vec<_>>(),
+            ["first-backend", "local-界", "second-backend"]
+        );
+        app.active_mut().set_entries(vec![first, second]);
+        assert_eq!(
+            app.active().entries.len(),
+            3,
+            "local result duplicated or discarded"
+        );
+        app.active_mut().clear_view();
+        assert!(app.active().entries.is_empty());
+        app.active_mut().set_entries(Vec::new());
+        assert!(app.active().entries.is_empty());
     }
 }

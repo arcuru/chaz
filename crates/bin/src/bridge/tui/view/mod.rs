@@ -323,7 +323,9 @@ pub(super) fn ui(
         let mut names = server.agents().names();
         names.sort();
         app.peer_agents_names = names;
-        app.peer_defaults = server.default_agents();
+        if !app.operations.is_pending() {
+            app.peer_defaults = server.default_agents();
+        }
         app.peer_mcp_servers = server.mcp_registry().snapshot();
     }
 
@@ -331,7 +333,10 @@ pub(super) fn ui(
     // line: the active tab's last read of its session's `extension_outputs`
     // store (the daemon writes it at the turn boundary), refreshed in the
     // background. Cloned so `ui_chat` can still take `&mut App`.
-    let ext_segments = app.active().live.status_segments.clone();
+    let ext_segments = app
+        .current()
+        .map(|t| t.live.status_segments.clone())
+        .unwrap_or_default();
 
     match app.mode {
         TuiMode::Jobs => super::jobs::draw(f, app),
@@ -692,9 +697,12 @@ pub(super) fn ui_chat(f: &mut ratatui::Frame, app: &mut App, ext_segments: &[Str
     // rather than letting it pass for fresh.
     let refresh_indicator = if tab.live.error.is_some() {
         " | ⚠ refresh failed"
+    } else if tab.live.pending() {
+        " | ⟳ refreshing (cached)"
     } else {
         ""
     };
+    let operation_indicator = app.operations.indicator();
     let _ = tab;
     app.click_regions.extend(clicks);
 
@@ -780,14 +788,21 @@ pub(super) fn ui_chat(f: &mut ratatui::Frame, app: &mut App, ext_segments: &[Str
     };
     let make_status = |agent_segment: &str| {
         format!(
-            " {session_label}{ctx_segment}{agent_segment}{usage_segment}{debug_indicator}{expand_indicator}{startup_indicator}{refresh_indicator}"
+            " {session_label}{ctx_segment}{agent_segment}{usage_segment}{debug_indicator}{expand_indicator}{startup_indicator}{refresh_indicator}{operation_indicator}"
         )
     };
-    let mut status_text = make_status(&agent_segment);
+    let mut status_text = if let Some(notice) = &app.operations.notice {
+        format!(" ⚠ {notice}{refresh_indicator}")
+    } else {
+        make_status(&agent_segment)
+    };
 
     // If the full roster would overflow the status line, collapse it to a
     // count plus the host, leaving the per-agent detail to the Settings page.
-    if multi_agent && status_text.chars().count() > chunks[4].width as usize {
+    if app.operations.notice.is_none()
+        && multi_agent
+        && status_text.chars().count() > chunks[4].width as usize
+    {
         let collapsed = match roster.iter().find(|r| r.is_host) {
             Some(h) if !h.model.is_empty() => format!(
                 " | agents: {} · host {}→{}",
@@ -1668,12 +1683,16 @@ pub(super) fn ui_picker(f: &mut ratatui::Frame, app: &mut App) {
 
             // Name is available from the peer-local index. Agent metadata is
             // loaded only for rows visible in the picker viewport.
+            let row_error = app.session_row_errors.contains_key(&info.session_db_id);
+            let stale_suffix = if row_error { " ⚠ metadata stale" } else { "" };
             let header = if info.loaded {
                 format!(
-                    "{marker}{title}{current_marker} [{bridge}] {agent_str} • {age}{closed_suffix}"
+                    "{marker}{title}{current_marker} [{bridge}] {agent_str} • {age}{closed_suffix}{stale_suffix}"
                 )
             } else {
-                format!("{marker}{title}{current_marker} [{bridge}] … • {age}{closed_suffix}")
+                format!(
+                    "{marker}{title}{current_marker} [{bridge}] … • {age}{closed_suffix}{stale_suffix}"
+                )
             };
 
             let is_closed = matches!(info.status, chaz_core::session::SessionStatus::Closed);
@@ -1733,7 +1752,19 @@ pub(super) fn ui_picker(f: &mut ratatui::Frame, app: &mut App) {
     let bar = Style::default()
         .bg(Color::Rgb(0x1a, 0x1d, 0x26))
         .fg(Color::White);
-    let footer = if let Some(notice) = &app.hub_notice {
+    let operation = app.operations.indicator();
+    let metadata_error = app
+        .session_row_errors
+        .values()
+        .next()
+        .map(|e| format!("Metadata refresh failed: {e}; cached rows retained"));
+    let footer = if let Some(notice) = app
+        .operations
+        .notice
+        .as_ref()
+        .or(app.hub_notice.as_ref())
+        .or(metadata_error.as_ref())
+    {
         Paragraph::new(format!(" {notice}")).style(bar.fg(COLOR_ERROR))
     } else {
         let back = if app.tabs.is_empty() {
@@ -1752,7 +1783,7 @@ pub(super) fn ui_picker(f: &mut ratatui::Frame, app: &mut App) {
         .into_iter()
         .find(|hint| hint.chars().count() <= width)
         .unwrap_or_else(|| format!(" n new · s settings{back}"));
-        Paragraph::new(hint).style(bar)
+        Paragraph::new(format!("{hint}{operation}")).style(bar)
     };
     f.render_widget(footer, chunks[1]);
 }
@@ -2059,11 +2090,11 @@ mod chat_frame_tests {
             pending_approval: None,
             active_turns: 0,
             current_agent: "chaz".into(),
+            model_pin: None,
             session_name: None,
             effective_model: String::new(),
             roster: Vec::new(),
             context_budget: 0,
-            model_pin: None,
             expanded_entries: HashSet::new(),
             live: Default::default(),
         };
@@ -2715,6 +2746,7 @@ mod transcript_tests {
             pending_approval: None,
             active_turns: 1,
             current_agent: "chaz".into(),
+            model_pin: None,
             session_name: None,
             effective_model: String::new(),
             roster: Vec::new(),

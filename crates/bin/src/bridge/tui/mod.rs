@@ -39,7 +39,10 @@ use tokio_stream::StreamExt;
 mod bridge_impl;
 mod input;
 mod jobs;
+mod operations;
+mod reconnect;
 mod refresh;
+mod supervised;
 mod theme;
 mod view;
 mod widgets;
@@ -55,6 +58,7 @@ pub struct TuiBridge {
     /// `--session NAME`: open that named session (creating it when absent)
     /// instead of the hub.
     session: Option<String>,
+    runtime: Option<(chaz_core::server::BuiltServer, std::path::PathBuf)>,
 }
 
 impl TuiBridge {
@@ -64,7 +68,17 @@ impl TuiBridge {
             secrets,
             initial_prompt: None,
             session: None,
+            runtime: None,
         }
+    }
+
+    pub fn with_runtime(
+        mut self,
+        runtime: chaz_core::server::BuiltServer,
+        path: std::path::PathBuf,
+    ) -> Self {
+        self.runtime = Some((runtime, path));
+        self
     }
 
     pub fn with_initial_prompt(mut self, prompt: String) -> Self {
@@ -80,7 +94,7 @@ impl TuiBridge {
 
 /// Approval routed from the server through a per-tab forwarder, tagged with
 /// the owning session DB ID so the TUI knows which tab to show the prompt on.
-pub(super) type TaggedApproval = (String, ApprovalExchange);
+pub(super) type TaggedApproval = (String, u64, ApprovalExchange);
 
 enum Action {
     Key(KeyEvent),
@@ -96,6 +110,8 @@ enum Action {
     JobsLoaded(Result<chaz_core::server::JobMonitor, String>),
     /// A background tab read finished (see [`refresh`]).
     Refresh(refresh::Refresh),
+    Operation(operations::Completion),
+    Connection(reconnect::ResultMessage),
 }
 
 enum SessionLoad {
@@ -105,7 +121,8 @@ enum SessionLoad {
     },
     Row {
         generation: u64,
-        info: SessionInfo,
+        id: String,
+        result: Result<SessionInfo, String>,
     },
 }
 
@@ -121,6 +138,7 @@ enum CatalogLoadOutcome {
 pub(super) struct SessionFill {
     generation: u64,
     cancel: Arc<AtomicBool>,
+    tasks: Vec<supervised::Task<()>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -638,6 +656,7 @@ pub(super) struct App {
     pub(super) overlay: Option<Overlay>,
     pub(super) click_regions: Vec<ClickRegion>,
     pub(super) input: String,
+    command_input: Option<String>,
     pub(super) cursor: usize,
     /// Active slash-command completion popup, if any. Recomputed on every
     /// input edit (see `input::recompute_completion`).
@@ -649,6 +668,7 @@ pub(super) struct App {
     pub(super) active_tab: usize,
     pub(super) agent_names: HashSet<String>,
     pub(super) should_quit: bool,
+    pub(super) backend_available: bool,
     pub(super) debug_mode: bool,
     /// Mirror of `Server::is_startup_ready`, refreshed each frame in `ui`.
     /// Drives the "⟳ reconciling agents…" status indicator on the fast-start
@@ -676,6 +696,7 @@ pub(super) struct App {
     /// focused. The focused one lives in `input`/`cursor`.
     pub(super) drafts: HashMap<String, (String, usize)>,
     pub(super) session_rows_loading: HashSet<String>,
+    session_row_errors: HashMap<String, String>,
     pub(super) session_metadata_limit: Arc<Semaphore>,
     pub(super) picker_index: usize,
     /// Session rows actually visible in the last drawn picker frame. Requests
@@ -722,6 +743,7 @@ pub(super) struct App {
     /// True while a background `/models` fetch is in flight. Picker shows
     /// a "Loading…" hint and the catalog rows haven't arrived yet.
     pub(super) model_picker_loading: bool,
+    model_catalog_task: Option<supervised::Task<()>>,
     /// Set when the last fetch failed; cleared on a successful retry.
     pub(super) model_picker_error: Option<String>,
     /// Scope the picker is editing. Set at open time from the caller
@@ -767,6 +789,8 @@ pub(super) struct App {
     /// Monotonic ticket source for background tab refreshes; see
     /// [`refresh`] for how tickets reject stale results.
     pub(super) refresh_ticket: u64,
+    pub(super) navigation_generation: u64,
+    pub(in crate::bridge::tui) operations: operations::Operations,
     /// Sub-cursor inside the Session → Models row list (row 0 =
     /// Session pin, rows 1..n = each attached agent). Drives which
     /// scope `Enter` opens the picker for. Clamped to live length
@@ -839,6 +863,7 @@ impl App {
             overlay: None,
             click_regions: Vec::new(),
             input: String::new(),
+            command_input: None,
             cursor: 0,
             completion: None,
             completion_dismissed: false,
@@ -846,6 +871,7 @@ impl App {
             active_tab: 0,
             agent_names,
             should_quit: false,
+            backend_available: true,
             debug_mode: false,
             startup_ready: true,
             expand_all: false,
@@ -859,6 +885,7 @@ impl App {
             hub_notice: None,
             drafts: HashMap::new(),
             session_rows_loading: HashSet::new(),
+            session_row_errors: HashMap::new(),
             session_metadata_limit: Arc::new(Semaphore::new(4)),
             picker_index: 0,
             picker_visible_rows: 0..0,
@@ -872,6 +899,7 @@ impl App {
             model_picker_matcher: nucleo_matcher::Matcher::new(nucleo_matcher::Config::DEFAULT),
             model_picker_favorites: Vec::new(),
             model_picker_loading: false,
+            model_catalog_task: None,
             model_picker_error: None,
             model_picker_scope: ModelPickerScope::Session,
             model_picker_current_pin: None,
@@ -885,6 +913,8 @@ impl App {
             peer_defaults_cursor: 0,
             peer_mcp_servers: Vec::new(),
             refresh_ticket: 0,
+            navigation_generation: 0,
+            operations: operations::Operations::default(),
             peer_mcp_cursor: 0,
             session_models_cursor: 0,
             session_agents_cursor: 0,
@@ -1032,6 +1062,7 @@ impl App {
                 self.drafts.insert(id, draft);
             }
         }
+        self.navigation_generation += 1;
         self.active_tab = i;
         self.restore_draft();
     }
@@ -1050,7 +1081,9 @@ impl App {
     }
 
     /// Open a conversation view and focus it with an empty composer.
-    pub(super) fn push_tab(&mut self, tab: Tab) {
+    pub(super) fn push_tab(&mut self, mut tab: Tab) {
+        self.refresh_ticket += 1;
+        tab.live.incarnation = self.refresh_ticket;
         self.tabs.push(tab);
         self.set_active_tab(self.tabs.len() - 1);
     }
@@ -1061,6 +1094,7 @@ impl App {
         if i >= self.tabs.len() {
             return;
         }
+        self.navigation_generation += 1;
         let closed = self.tabs.remove(i);
         self.drafts.remove(&closed.session_db_id);
         if i == self.active_tab {
@@ -1097,12 +1131,18 @@ impl App {
     }
 
     fn requested_session_indices(&mut self) -> Vec<SessionIndex> {
-        let requested: Vec<_> = self
-            .picker_visible_rows
-            .clone()
+        let mut visible: Vec<_> = self.picker_visible_rows.clone().collect();
+        visible.sort_by_key(|&i| usize::from(Some(i) != self.picker_index.checked_sub(1)));
+        let requested: Vec<_> = visible
+            .into_iter()
             .filter_map(|i| self.session_list.get(i))
-            .filter(|row| !row.loaded && !self.session_rows_loading.contains(&row.session_db_id))
+            .filter(|row| {
+                !row.loaded
+                    && !self.session_rows_loading.contains(&row.session_db_id)
+                    && !self.session_row_errors.contains_key(&row.session_db_id)
+            })
             .filter_map(|row| self.session_indices.get(&row.session_db_id).cloned())
+            .take(4usize.saturating_sub(self.session_rows_loading.len()))
             .collect();
         self.session_rows_loading
             .extend(requested.iter().map(|index| index.session_db_id.clone()));
@@ -1285,18 +1325,6 @@ impl App {
             .and_then(|&i| self.model_list.get(i))
             .map(|m| m.id.clone())
     }
-
-    /// Point the picker cursor at `session_db_id` (offset past the New
-    /// session row). Falls back to the first session, or the New row when
-    /// there are no sessions.
-    pub(super) fn focus_picker_on(&mut self, session_db_id: &str) {
-        self.picker_index = self
-            .session_list
-            .iter()
-            .position(|s| s.session_db_id == session_db_id)
-            .map(|p| p + 1)
-            .unwrap_or(if self.session_list.is_empty() { 0 } else { 1 });
-    }
 }
 
 fn init_terminal() -> anyhow::Result<Terminal<ratatui::backend::CrosstermBackend<io::Stdout>>> {
@@ -1313,6 +1341,20 @@ fn restore_terminal() {
     let _ = crossterm::execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen);
 }
 
+#[derive(Default)]
+pub(super) struct Observation {
+    pub id: u64,
+    callback: Option<eidetica::instance::WriteCallback>,
+    forwarder: Option<tokio::task::JoinHandle<()>>,
+}
+impl Drop for Observation {
+    fn drop(&mut self) {
+        if let Some(task) = self.forwarder.take() {
+            task.abort();
+        }
+    }
+}
+
 /// Register a session DB with the server and wire up per-tab notify and
 /// approval forwarding. The raw approval channel given to the server is
 /// per-session; a spawned forwarder tags each approval with the session_db_id
@@ -1323,7 +1365,7 @@ async fn setup_session(
     backend: BackendManager,
     approval_tx: mpsc::Sender<TaggedApproval>,
     notify_tx: mpsc::Sender<String>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Observation> {
     let session_db_id = session_db.root_id().to_string();
 
     anyhow::ensure!(
@@ -1331,19 +1373,31 @@ async fn setup_session(
         "job sessions must be opened as observers"
     );
     server.load_session_entities(session_db).await?;
+    static NEXT_OBSERVATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let observation_id = NEXT_OBSERVATION.fetch_add(1, Ordering::Relaxed);
+    let mut observation = Observation {
+        id: observation_id,
+        callback: None,
+        forwarder: None,
+    };
 
     if server.is_executor_authorized() {
         // Per-session raw approval channel → tagged forward to shared channel.
         let (raw_tx, mut raw_rx) = mpsc::channel::<ApprovalExchange>(8);
         let forwarder_id = session_db_id.clone();
         let forwarder_tx = approval_tx.clone();
-        tokio::spawn(async move {
+        let forwarder = tokio::spawn(async move {
             while let Some(ex) = raw_rx.recv().await {
-                if forwarder_tx.send((forwarder_id.clone(), ex)).await.is_err() {
+                if forwarder_tx
+                    .send((forwarder_id.clone(), observation_id, ex))
+                    .await
+                    .is_err()
+                {
                     break;
                 }
             }
         });
+        observation.forwarder = Some(forwarder);
         server
             .register_session(session_db, backend, None, Some(raw_tx))
             .await?;
@@ -1354,7 +1408,7 @@ async fn setup_session(
     }
 
     let notify_id = session_db_id;
-    session_db
+    observation.callback = Some(session_db
         .on_write(move |event, _db| {
             // Source-agnostic: a co-owner's message landing over sync should
             // redraw the tab as readily as one typed here.
@@ -1366,10 +1420,9 @@ async fn setup_session(
                 Ok(())
             })
         })
-        .await?
-        .detach();
+        .await?);
 
-    Ok(())
+    Ok(observation)
 }
 
 /// `--session NAME`: reopen the session with that name, or create and name
@@ -1477,15 +1530,21 @@ fn spawn_catalog_load(
     backend: BackendManager,
     models_tx: mpsc::Sender<Result<Vec<ModelInfo>, String>>,
 ) {
+    if app.model_picker_loading {
+        return;
+    }
     app.model_picker_loading = true;
     app.model_picker_error = None;
-    tokio::spawn(async move {
-        let res = backend
-            .fetch_models_with_info()
-            .await
-            .map_err(|e| e.to_string());
+    app.model_catalog_task = Some(supervised::Task(tokio::spawn(async move {
+        let res = supervised::read(async move {
+            backend
+                .fetch_models_with_info()
+                .await
+                .map_err(|e| e.to_string())
+        })
+        .await;
         let _ = models_tx.send(res).await;
-    });
+    })));
 }
 
 /// Enter the picker synchronously, then fetch catalog metadata in the
@@ -1500,14 +1559,14 @@ fn open_session_picker(
     app.picker_index = 0;
     app.mode = TuiMode::SessionPicker;
     app.session_picker_error = None;
+    app.session_row_errors.clear();
     app.hub_notice = None;
 
     if app.session_list_fresh {
         return;
     }
 
-    app.session_list.clear();
-    app.session_indices.clear();
+    // Retain the previous catalog while an explicit retry is pending.
     app.session_catalog_loading = true;
     let registry = server.registry_arc();
     spawn_session_catalog_load(app, session_rows_tx.clone(), async move {
@@ -1525,13 +1584,17 @@ where
     let generation = app.session_generation;
     let cancel = Arc::new(AtomicBool::new(false));
     let worker_cancel = cancel.clone();
-    tokio::spawn(async move {
-        let result = load.await;
+    let task = supervised::Task(tokio::spawn(async move {
+        let result = supervised::read(load).await;
         if !worker_cancel.load(Ordering::Relaxed) {
             let _ = tx.send(SessionLoad::Catalog { generation, result }).await;
         }
+    }));
+    app.session_fill = Some(SessionFill {
+        generation,
+        cancel,
+        tasks: vec![task],
     });
-    app.session_fill = Some(SessionFill { generation, cancel });
 }
 
 fn apply_session_catalog(app: &mut App, indices: Vec<SessionIndex>) {
@@ -1578,17 +1641,29 @@ fn apply_session_catalog_result(
     }
 }
 
-fn apply_session_row(app: &mut App, generation: u64, info: SessionInfo) -> bool {
+fn apply_session_row(
+    app: &mut App,
+    generation: u64,
+    id: String,
+    result: Result<SessionInfo, String>,
+) -> bool {
     if generation != app.session_generation || !matches!(app.mode, TuiMode::SessionPicker) {
         return false;
     }
-    app.session_rows_loading.remove(&info.session_db_id);
-    if let Some(row) = app
-        .session_list
-        .iter_mut()
-        .find(|row| row.session_db_id == info.session_db_id)
-    {
-        *row = info;
+    app.session_rows_loading.remove(&id);
+    match result {
+        Ok(info) => {
+            if let Some(row) = app
+                .session_list
+                .iter_mut()
+                .find(|row| row.session_db_id == id)
+            {
+                *row = info;
+            }
+        }
+        Err(e) => {
+            app.session_row_errors.insert(id, e);
+        }
     }
     true
 }
@@ -1605,7 +1680,11 @@ fn request_session_metadata(
     let registry = server.registry_arc();
     spawn_session_metadata_load(app, requested, session_rows_tx.clone(), move |index| {
         let registry = registry.clone();
-        async move { commands::load_session_metadata(&registry, index).await }
+        async move {
+            commands::try_load_session_metadata(&registry, index)
+                .await
+                .map_err(|e| e.to_string())
+        }
     });
 }
 
@@ -1616,7 +1695,7 @@ fn spawn_session_metadata_load<F, Fut>(
     load: F,
 ) where
     F: Fn(SessionIndex) -> Fut + Send + Sync + 'static,
-    Fut: Future<Output = SessionInfo> + Send + 'static,
+    Fut: Future<Output = Result<SessionInfo, String>> + Send + 'static,
 {
     let generation = app.session_generation;
     let limit = app.session_metadata_limit.clone();
@@ -1627,7 +1706,7 @@ fn spawn_session_metadata_load<F, Fut>(
         .map(|fill| fill.cancel.clone())
         .unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
     let worker_cancel = cancel.clone();
-    tokio::spawn(async move {
+    let task = supervised::Task(tokio::spawn(async move {
         let load = Arc::new(load);
         let mut rows = JoinSet::new();
         for index in requested {
@@ -1635,29 +1714,47 @@ fn spawn_session_metadata_load<F, Fut>(
             let load = load.clone();
             let worker_cancel = worker_cancel.clone();
             rows.spawn(async move {
-                if worker_cancel.load(Ordering::Relaxed) {
-                    return None;
-                }
-                let _permit = limit.acquire_owned().await.ok()?;
-                if worker_cancel.load(Ordering::Relaxed) {
-                    return None;
-                }
-                let info = load(index).await;
-                (!worker_cancel.load(Ordering::Relaxed)).then_some(info)
+                let id = index.session_db_id.clone();
+                let result = supervised::read(async move {
+                    let _permit = limit.acquire_owned().await.map_err(|e| e.to_string())?;
+                    if worker_cancel.load(Ordering::Relaxed) {
+                        return Err("catalog read cancelled".into());
+                    }
+                    load(index).await
+                })
+                .await;
+                (id, result)
             });
         }
-
-        while let Some(Ok(Some(info))) = rows.join_next().await {
-            if tx
-                .send(SessionLoad::Row { generation, info })
-                .await
-                .is_err()
+        while let Some(result) = rows.join_next().await {
+            if let Ok((id, result)) = result
+                && tx
+                    .send(SessionLoad::Row {
+                        generation,
+                        id,
+                        result,
+                    })
+                    .await
+                    .is_err()
             {
                 break;
             }
         }
-    });
-    app.session_fill = Some(SessionFill { generation, cancel });
+    }));
+    if let Some(fill) = app
+        .session_fill
+        .as_mut()
+        .filter(|f| f.generation == generation)
+    {
+        fill.tasks.retain(|t| !t.0.is_finished());
+        fill.tasks.push(task);
+    } else {
+        app.session_fill = Some(SessionFill {
+            generation,
+            cancel,
+            tasks: vec![task],
+        });
+    }
 }
 
 /// Build a `Tab` for an already-registered session DB.
@@ -1666,17 +1763,13 @@ async fn build_tab(
     backend: &BackendManager,
     session_db: eidetica::Database,
     session_db_id: String,
-) -> Tab {
+) -> Result<Tab, String> {
     let agent = server
         .registry()
         .resolve_agent(&session_db_id, None, server.agent_index())
         .await;
-    let session = Session::new(
-        chaz_core::types::ConversationId(session_db_id.clone()),
-        session_db.clone(),
-    )
-    .await;
-    let meta = session.read_meta().await;
+    let snapshot = refresh::load_session_snapshot(&session_db_id, session_db.clone()).await?;
+    let meta = snapshot.meta;
     let roster = build_roster(server, backend, &meta);
     let session_name = meta.name.clone();
     // Reopening a session must honor persisted pins just like a live refresh.
@@ -1689,12 +1782,9 @@ async fn build_tab(
         .or_else(|| backend.default_model())
         .unwrap_or_default();
     let context_budget = server.effective_context_budget(&context_model, agent.max_context_tokens);
-    let entries = session.entries().to_vec();
-    let active_turns = Session::active_turn_attempts(&session_db)
-        .await
-        .unwrap_or_default()
-        .len();
-    Tab {
+    let entries = snapshot.entries;
+    let active_turns = snapshot.active_turns?;
+    Ok(Tab {
         job: None,
         session_db_id,
         session_db,
@@ -1711,8 +1801,8 @@ async fn build_tab(
             .resolve_model_for_agent(&agent.name)
             .map(str::to_string),
         expanded_entries: HashSet::new(),
-        live: Default::default(),
-    }
+        live: refresh::TabLive::with_meta(meta),
+    })
 }
 
 /// Shift the active tab by `delta` (wraps around), only in the conversation
@@ -1749,8 +1839,24 @@ fn ensure_view(app: &mut App, server: &Arc<Server>, session_rows_tx: &mpsc::Send
     }
 }
 
+fn operation_context(
+    server: &Arc<Server>,
+    backend: &BackendManager,
+    secrets: &SecretStore,
+    approval_tx: &mpsc::Sender<TaggedApproval>,
+    notify_tx: &mpsc::Sender<String>,
+) -> operations::Context {
+    operations::Context {
+        server: server.clone(),
+        backend: backend.clone(),
+        secrets: secrets.clone(),
+        approval_tx: approval_tx.clone(),
+        notify_tx: notify_tx.clone(),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
-async fn handle_chat_action(
+fn handle_chat_action(
     action: ChatAction,
     app: &mut App,
     server: &Arc<Server>,
@@ -1778,175 +1884,78 @@ async fn handle_chat_action(
             app.mode = TuiMode::Jobs;
         }
         ChatAction::SendMessage(text) => {
-            if app.active().job.is_some() {
-                jobs::send(app.active_mut(), text).await;
+            let Some(target) = operations::Target::capture(app) else {
                 return;
+            };
+            let ctx = operation_context(server, backend, secrets, approval_tx, notify_tx);
+            operations::submit(app, true, Some(text.clone()), ctx.send(target, text));
+        }
+        ChatAction::Dispatch(Command::Quit) => {
+            app.should_quit = app.operations.request_exit();
+        }
+        ChatAction::Dispatch(cmd) => {
+            if matches!(cmd, Command::NewSession(_)) {
+                app.session_list_fresh = false;
             }
-            let tab = app.active_mut();
-            let session_db = tab.session_db.clone();
-            let session_db_id = tab.session_db_id.clone();
-            let mut session =
-                Session::new(chaz_core::types::ConversationId(session_db_id), session_db).await;
-            // Only wait on a reply the agent can actually see: an unwritten
-            // message never wakes a turn, so the spinner would never stop.
-            match session
-                .add_entry(SessionEntry {
-                    sender: "user".to_string(),
-                    content: text,
-                    timestamp: chrono::Utc::now(),
-                    entry_type: EntryType::Message,
-                    metadata: None,
-                    routing: None,
-                })
-                .await
-            {
-                Ok(_) => {}
-                Err(e) => tracing::error!("Failed to send message: {e}"),
-            }
+            let target = operations::Target::capture(app);
+            let write = !operations::command_is_read(&cmd);
+            let ctx = operation_context(server, backend, secrets, approval_tx, notify_tx);
+            let input = app.command_input.take();
+            operations::submit(app, write, input, ctx.command(cmd, target, None));
         }
         ChatAction::OpenSettings(scope) => {
-            // From a chat-action context the caller mode is always Chat —
-            // the picker doesn't go through ChatAction. `Ctrl+S` from the
-            // picker takes a different path that sets the return-to slot
-            // correctly.
-            if let SettingsScope::Session = scope {
-                seed_session_settings_snapshot(app, server).await;
+            if scope == SettingsScope::Session {
+                seed_session_settings_snapshot(app, server);
             }
             app.open_settings(scope, TuiMode::Chat);
         }
         ChatAction::OpenModelPicker { scope } => {
-            // Read the current pin for the caller-selected scope so we
-            // can show `(current)` in the picker. Session and Agent
-            // scopes read from session meta; AgentGlobal reads from
-            // the in-memory agent registry.
             let current_pin = match &scope {
-                ModelPickerScope::Session | ModelPickerScope::Agent(_) => {
-                    let session_db = app.active().session_db.clone();
-                    let session_db_id = app.active().session_db_id.clone();
-                    let session =
-                        Session::new(chaz_core::types::ConversationId(session_db_id), session_db)
-                            .await;
-                    let meta = session.read_meta().await;
-                    match &scope {
-                        ModelPickerScope::Session => meta.model.clone(),
-                        ModelPickerScope::Agent(name) => meta.agent_models.get(name).cloned(),
-                        _ => unreachable!(),
-                    }
-                }
+                ModelPickerScope::Session => app.current().and_then(|t| t.live.meta.model.clone()),
+                ModelPickerScope::Agent(name) => app
+                    .current()
+                    .and_then(|t| t.live.meta.agent_models.get(name).cloned()),
                 ModelPickerScope::AgentGlobal(name) => server
                     .agents()
                     .get(name)
                     .and_then(|a| a.default_model.clone()),
             };
             app.seed_model_picker(backend, current_pin, scope);
-            // Reuse the session's in-memory catalog if we've already pulled it;
-            // otherwise kick off a live fetch. Browsing never persists — only
-            // the model the user selects does (see `dispatch_model_selection`).
             match app.session_catalog.clone() {
                 Some(catalog) => app.rebuild_model_list(catalog),
                 None => spawn_catalog_load(app, backend.clone(), models_tx.clone()),
             }
-            // Remember which mode opened the picker so Esc / selection
-            // return there instead of dropping back to chat. From chat
-            // this no-ops (caller == Chat); from Settings(Session) it
-            // bounces back into the page where the user pressed Enter.
             app.model_picker_caller = app.mode;
             app.mode = TuiMode::ModelPicker;
         }
         ChatAction::OpenModelsSettings => {
-            // /models lands on the Models page regardless of what was
-            // last open in Session Settings, then leaves the user there
-            // to pick a row (Session or per-agent) and Enter into the
-            // picker.
-            seed_session_settings_snapshot(app, server).await;
-            let models_idx = SessionSettingsCategory::ALL
+            seed_session_settings_snapshot(app, server);
+            let idx = SessionSettingsCategory::ALL
                 .iter()
                 .position(|c| matches!(c, SessionSettingsCategory::Models))
                 .unwrap_or(0);
-            app.set_settings_index(SettingsScope::Session, models_idx);
+            app.set_settings_index(SettingsScope::Session, idx);
             app.session_models_cursor = 0;
             app.open_settings(SettingsScope::Session, TuiMode::Chat);
             app.settings_focus = SettingsFocus::List;
         }
-        ChatAction::OpenPicker => {
-            open_session_picker(app, server, session_rows_tx);
-        }
-        ChatAction::Dispatch(cmd) => {
-            // Commands that mutate the catalog membership invalidate the
-            // picker cache. NameSession / ClearSessionName change a row's
-            // name but Action::SessionChanged patches it in place from the
-            // session DB's on_write fire, so no wholesale invalidation
-            // needed there.
-            if matches!(cmd, Command::NewSession(_)) {
-                app.session_list_fresh = false;
-            }
-            let tab = app.active();
-            let session_db_id = tab.session_db_id.clone();
-            let session_db = tab.session_db.clone();
-            let current_agent = tab.current_agent.clone();
-            let session_name = tab.session_name.clone();
-            let ctx = CommandContext {
-                server,
-                secrets,
-                backend,
-                session_db_id: &session_db_id,
-                session_db: &session_db,
-                current_agent: &current_agent,
-                session_name: session_name.as_deref(),
-            };
-            let outcome = commands::dispatch(cmd, &ctx).await;
-            render_outcome(app, outcome, server, backend, approval_tx, notify_tx).await;
-        }
+        ChatAction::OpenPicker => open_session_picker(app, server, session_rows_tx),
     }
 }
 
-/// Persist a rename initiated from the session picker's [r] keybinding, then
-/// refresh the picker list so the new alias is visible immediately. The
-/// rename targets `session_db_id` directly, which may or may not be the
-/// active tab — that's why it bypasses the `/name` Command path (which keys
-/// off the active session).
-async fn apply_picker_rename(
-    app: &mut App,
-    server: &Arc<Server>,
-    session_db_id: String,
-    name: Option<String>,
-) {
-    let result = match &name {
-        Some(n) => {
-            server
-                .registry()
-                .set_session_name(&session_db_id, n.clone())
-                .await
+fn apply_picker_rename(app: &mut App, server: &Arc<Server>, id: String, name: Option<String>) {
+    let server = server.clone();
+    operations::submit(app, true, None, async move {
+        match &name {
+            Some(n) => server.registry().set_session_name(&id, n.clone()).await,
+            None => server.registry().clear_session_name(&id).await,
         }
-        None => server.registry().clear_session_name(&session_db_id).await,
-    };
-
-    if let Err(e) = result {
-        show_error(app, format!("Rename failed: {e}"));
-        // Stay in the picker so the user can try again.
-        return;
-    }
-
-    // Keep the active tab's cached name in sync so its title and status bar
-    // update without waiting for a session reopen.
-    if let Some(idx) = app.tab_index_for(&session_db_id) {
-        app.tabs[idx].session_name = name.clone();
-    }
-
-    if let Some(row) = app
-        .session_list
-        .iter_mut()
-        .find(|row| row.session_db_id == session_db_id)
-    {
-        row.name = name;
-    }
-    app.focus_picker_on(&session_db_id);
+        .map_err(|e| e.to_string())?;
+        Ok(operations::Effect::Renamed { id, name })
+    });
 }
 
-/// Open the hub's selected row: focus an already-open view, open a stored
-/// session, or create one. Needs no current conversation; a failure stays in
-/// the hub with a notice instead of landing in an unrelated conversation.
-async fn dispatch_picker_selection(
+fn dispatch_picker_selection(
     selected: String,
     app: &mut App,
     server: &Arc<Server>,
@@ -1955,8 +1964,8 @@ async fn dispatch_picker_selection(
     notify_tx: &mpsc::Sender<String>,
 ) {
     app.hub_notice = None;
-    if let Some(idx) = app.tab_index_for(&selected) {
-        app.set_active_tab(idx);
+    if let Some(i) = app.tab_index_for(&selected) {
+        app.set_active_tab(i);
         app.mode = TuiMode::Chat;
         return;
     }
@@ -1965,29 +1974,55 @@ async fn dispatch_picker_selection(
     } else {
         Command::SwitchSession(selected)
     };
-    // Creating a session from the picker grows the catalog, so the warm
-    // cache is now stale — invalidate it (mirrors the `/new` chat path) or
-    // the next `/sessions` would show the cached list without this session.
-    let invalidates_cache = matches!(cmd, Command::NewSession(_));
-    let outcome = match commands::dispatch_without_session(cmd, server).await {
-        Ok(outcome) => outcome,
-        Err(_) => CommandOutcome::Error("Session command needs an open conversation".into()),
-    };
-    if invalidates_cache {
+    // Lookup/hydration are cancellable reads; registration/create can have
+    // effects and are never rolled back by a timeout.
+    let write = !operations::command_is_read(&cmd);
+    if write {
         app.session_list_fresh = false;
     }
-    if render_outcome(app, outcome, server, backend, approval_tx, notify_tx).await {
-        app.mode = TuiMode::Chat;
-    }
+    let server = server.clone();
+    let backend = backend.clone();
+    let approval_tx = approval_tx.clone();
+    let notify_tx = notify_tx.clone();
+    operations::submit(app, write, None, async move {
+        let outcome = if matches!(cmd, Command::SwitchSession(_)) {
+            let server = server.clone();
+            supervised::read(async move {
+                commands::dispatch_without_session(cmd, &server)
+                    .await
+                    .map_err(|_| "Session command needs an open conversation".to_owned())
+            })
+            .await?
+        } else {
+            commands::dispatch_without_session(cmd, &server)
+                .await
+                .map_err(|_| "Session command needs an open conversation".to_owned())?
+        };
+        match outcome {
+            CommandOutcome::SessionSwitched(switch) => {
+                let tab_server = server.clone();
+                let tab_backend = backend.clone();
+                let tab_db = switch.db.clone();
+                let tab_id = switch.session_db_id.clone();
+                let mut tab = supervised::read(async move {
+                    build_tab(&tab_server, &tab_backend, tab_db, tab_id).await
+                })
+                .await?;
+                tab.live.observation = Some(
+                    setup_session(&server, &switch.db, backend, approval_tx, notify_tx)
+                        .await
+                        .map_err(|e| e.to_string())?,
+                );
+                Ok(operations::Effect::Opened(Box::new(tab)))
+            }
+            CommandOutcome::Error(e) => Err(e),
+            outcome => Ok(operations::Effect::Outcome(outcome)),
+        }
+    });
 }
 
-/// Apply the model selected in the model picker. Dispatches either
-/// `Command::Model` (Session scope → `SessionMeta.model`) or
-/// `Command::AgentModel` (agent scope → `SessionMeta.agent_models`). Both
-/// write via `on_write` → `SessionChanged`, which refreshes the
-/// status-bar `effective_model` so display moves in step.
 #[allow(clippy::too_many_arguments)]
-async fn dispatch_model_selection(
+fn dispatch_model_selection(
     model_id: String,
     app: &mut App,
     server: &Arc<Server>,
@@ -1996,66 +2031,32 @@ async fn dispatch_model_selection(
     approval_tx: &mpsc::Sender<TaggedApproval>,
     notify_tx: &mpsc::Sender<String>,
 ) {
-    // Snapshot the picked model's info (pricing/window/modalities, as merged
-    // from the live catalog) before `model_id` is consumed below, so we can
-    // persist it as an in-use model once the selection commits.
+    if !app.backend_available || !app.operations.has_capacity() {
+        app.operations.notice =
+            Some("Backend unavailable or action queue full — model selection not accepted".into());
+        return;
+    }
     let selected_info = app.model_list.iter().find(|m| m.id == model_id).cloned();
-    // Scope was locked when the picker opened; read it back here to
-    // pick between the session-wide Command::Model and per-agent
-    // Command::AgentModel.
-    let scope = app.model_picker_scope.clone();
-    let cmd = match scope {
+    let cmd = match app.model_picker_scope.clone() {
         ModelPickerScope::Session => Command::Model(Some(model_id)),
-        ModelPickerScope::Agent(name) => Command::AgentModel {
-            agent: name,
+        ModelPickerScope::Agent(agent) => Command::AgentModel {
+            agent,
             model: Some(model_id),
         },
-        ModelPickerScope::AgentGlobal(name) => Command::AgentSet {
-            agent_ref: name,
-            field: "model".to_string(),
+        ModelPickerScope::AgentGlobal(agent_ref) => Command::AgentSet {
+            agent_ref,
+            field: "model".into(),
             value: model_id,
         },
     };
-    // Agent-global edits come from Peer Settings, which may have no
-    // conversation open; only session scopes address the focused one.
-    let outcome = match commands::dispatch_without_session(cmd, server).await {
-        Ok(outcome) => outcome,
-        Err(cmd) => match app.current() {
-            Some(tab) => {
-                let session_db_id = tab.session_db_id.clone();
-                let session_db = tab.session_db.clone();
-                let current_agent = tab.current_agent.clone();
-                let session_name = tab.session_name.clone();
-                let ctx = CommandContext {
-                    server,
-                    secrets,
-                    backend,
-                    session_db_id: &session_db_id,
-                    session_db: &session_db,
-                    current_agent: &current_agent,
-                    session_name: session_name.as_deref(),
-                };
-                commands::dispatch(cmd, &ctx).await
-            }
-            None => CommandOutcome::Error("No conversation is open".into()),
-        },
-    };
-    // Record the now-in-use model so the runtime budgets its window (this
-    // turn's overlay + next startup's warm) without anyone editing YAML.
-    if let Some(info) = selected_info {
-        server.cache_model_info(&info).await;
-    }
-    render_outcome(app, outcome, server, backend, approval_tx, notify_tx).await;
-    // Return to whoever opened the picker — chat by default; Session
-    // Settings when the picker was invoked from there.
     app.mode = app.model_picker_caller;
+    let target = operations::Target::capture(app);
+    let ctx = operation_context(server, backend, secrets, approval_tx, notify_tx);
+    operations::submit(app, true, None, ctx.command(cmd, target, selected_info));
 }
 
-/// Route a `SettingsKey` outcome through the right async backend path.
-/// Extracted so the per-mode match arm in `run()` doesn't balloon every
-/// time Settings grows a new action verb.
 #[allow(clippy::too_many_arguments)]
-async fn handle_settings_outcome(
+fn handle_settings_outcome(
     outcome: input::SettingsKey,
     app: &mut App,
     server: &Arc<Server>,
@@ -2068,11 +2069,8 @@ async fn handle_settings_outcome(
 ) {
     match outcome {
         input::SettingsKey::None => {}
-        input::SettingsKey::OpenModelPicker(given_scope) => {
-            // When the caller already knows the scope (e.g. Peer→Agents →
-            // AgentGlobal), use it directly. Otherwise derive from the
-            // cursor (Session→Models path).
-            let scope = given_scope.unwrap_or_else(|| models_scope_from_cursor(app));
+        input::SettingsKey::OpenModelPicker(scope) => {
+            let scope = scope.unwrap_or_else(|| models_scope_from_cursor(app));
             handle_chat_action(
                 ChatAction::OpenModelPicker { scope },
                 app,
@@ -2083,196 +2081,124 @@ async fn handle_settings_outcome(
                 notify_tx,
                 models_tx,
                 session_rows_tx,
-            )
-            .await;
+            );
         }
         input::SettingsKey::DispatchCommand(cmd) => {
-            dispatch_settings_command(cmd, app, server, backend, secrets, approval_tx, notify_tx)
-                .await;
+            let target = operations::Target::capture(app);
+            let ctx = operation_context(server, backend, secrets, approval_tx, notify_tx);
+            operations::submit(
+                app,
+                !operations::command_is_read(&cmd),
+                None,
+                ctx.command(cmd, target, None),
+            );
         }
-        input::SettingsKey::PromptSubmit { intent, value } => match intent {
-            SettingsPromptIntent::AddSessionAgent => {
-                dispatch_settings_command(
-                    Command::AgentAdd(value),
-                    app,
-                    server,
-                    backend,
-                    secrets,
-                    approval_tx,
-                    notify_tx,
-                )
-                .await;
-            }
-            SettingsPromptIntent::AddPeerDefault => {
-                add_peer_default(app, server, value).await;
-            }
-        },
-        input::SettingsKey::OpenAgentDiff { name } => {
-            open_agent_diff(app, server, &name).await;
+        input::SettingsKey::PromptSubmit {
+            intent: SettingsPromptIntent::AddSessionAgent,
+            value,
+        } => {
+            let target = operations::Target::capture(app);
+            let ctx = operation_context(server, backend, secrets, approval_tx, notify_tx);
+            operations::submit(
+                app,
+                true,
+                None,
+                ctx.command(Command::AgentAdd(value), target, None),
+            );
         }
-        input::SettingsKey::ApplyAgentMerge { name, mode } => {
-            apply_agent_merge(app, server, &name, mode).await;
-        }
-        input::SettingsKey::WritePeerDefaults(names) => {
-            write_peer_defaults(app, server, names).await;
-        }
-    }
-}
-
-/// Validate `name` against the live agent registry, append it to the
-/// persisted defaults list, then call through `write_peer_defaults` so
-/// runtime + DB stay in lockstep. Duplicate-name nudges land in
-/// `settings_status` rather than silently failing.
-async fn add_peer_default(app: &mut App, server: &Arc<Server>, name: String) {
-    let name = name.trim().to_string();
-    if name.is_empty() {
-        return;
-    }
-    let known: std::collections::HashSet<String> = server.agents().names().into_iter().collect();
-    if !known.contains(&name) {
-        app.settings_status = Some(format!("No agent named '{name}' — not added"));
-        return;
-    }
-    let mut next = server.default_agents();
-    if next.iter().any(|n| n == &name) {
-        app.settings_status = Some(format!("'{name}' already in defaults"));
-        return;
-    }
-    next.push(name.clone());
-    write_peer_defaults(app, server, next).await;
-    app.settings_status = Some(format!("Added '{name}' to defaults"));
-}
-
-/// Apply a new `default_agents` list — set it on the running Server so
-/// future session creates use it, persist to `chaz_peer` so the
-/// override survives restart. Failures land in `settings_status`; the
-/// in-memory value still applies even if the persist fails (better
-/// debounced UX than silently dropping).
-async fn write_peer_defaults(app: &mut App, server: &Arc<Server>, names: Vec<String>) {
-    server.set_default_agents(names.clone());
-    match server.registry().save_peer_default_agents(&names).await {
-        Ok(()) => {
-            // settings_status set by the caller for context-specific
-            // messages (added, removed, reordered); a generic "Saved"
-            // overrides only if nothing more specific applies.
-            if app.settings_status.is_none() {
-                app.settings_status = Some("Defaults saved".to_string());
-            }
-        }
-        Err(e) => {
-            app.settings_status = Some(format!("Saved in-memory; persist failed: {e}"));
-        }
-    }
-}
-
-/// `[r]` on the Peer→Agents list — open the yaml↔DB diff/merge modal for the
-/// named agent. Computes the field-level diff server-side and seeds
-/// `app.agent_diff`. A `None` diff (no yaml entry, or this peer doesn't host
-/// the agent's DB) lands a one-shot status instead of opening an empty modal.
-async fn open_agent_diff(app: &mut App, server: &Arc<Server>, name: &str) {
-    match server.agent_diff(name).await {
-        Ok(Some(diff)) => {
-            // Seed pick state to the changed rows so an immediate Enter in
-            // pick mode applies the visible drift.
-            let picks = diff
-                .rows
-                .iter()
-                .map(|r| r.status != chaz_core::agent_diff::FieldStatus::Unchanged)
-                .collect();
-            app.agent_diff = Some(AgentDiffView {
-                agent_name: name.to_string(),
-                diff,
-                mode: AgentDiffMode::View,
-                cursor: 0,
-                picks,
+        input::SettingsKey::PromptSubmit {
+            intent: SettingsPromptIntent::AddPeerDefault,
+            value,
+        } => {
+            let server = server.clone();
+            operations::submit(app, true, None, async move {
+                let name = value.trim().to_string();
+                if !server.agents().names().contains(&name) {
+                    return Err(format!("No agent named '{name}' — not added"));
+                }
+                let mut next = server.default_agents();
+                if next.contains(&name) {
+                    return Ok(operations::Effect::Settings(format!(
+                        "'{name}' already in defaults"
+                    )));
+                }
+                next.push(name.clone());
+                server
+                    .registry()
+                    .save_peer_default_agents(&next)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                server.set_default_agents(next);
+                Ok(operations::Effect::Settings(format!(
+                    "Added '{name}' to defaults"
+                )))
             });
         }
-        Ok(None) => {
-            app.settings_status = Some(format!(
-                "No yaml entry for '{name}', or this peer doesn't host it — nothing to diff"
-            ));
+        input::SettingsKey::OpenAgentDiff { name } => {
+            let server = server.clone();
+            operations::submit(app, false, None, async move {
+                match server.agent_diff(&name).await.map_err(|e| e.to_string())? {
+                    Some(diff) => {
+                        let picks = diff
+                            .rows
+                            .iter()
+                            .map(|r| r.status != chaz_core::agent_diff::FieldStatus::Unchanged)
+                            .collect();
+                        Ok(operations::Effect::Diff(AgentDiffView {
+                            agent_name: name,
+                            diff,
+                            mode: AgentDiffMode::View,
+                            cursor: 0,
+                            picks,
+                        }))
+                    }
+                    None => Ok(operations::Effect::Settings(format!(
+                        "No yaml entry for '{name}', or this peer doesn't host it — nothing to diff"
+                    ))),
+                }
+            });
         }
-        Err(e) => {
-            app.settings_status = Some(format!("Diff failed — {e}"));
+        input::SettingsKey::ApplyAgentMerge { name, mode } => {
+            let server = server.clone();
+            operations::submit(app, true, None, async move {
+                let outcome = server
+                    .merge_agent_from_yaml(&name, &mode)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                let text = if !outcome.found_yaml {
+                    format!("No yaml entry for '{name}' — nothing applied")
+                } else if !outcome.found_db {
+                    format!("This peer holds no key for '{name}' — can't merge")
+                } else if !outcome.changed {
+                    format!("{name}: nothing to apply — already in sync")
+                } else {
+                    format!(
+                        "{name}: merged {} (effective next message)",
+                        outcome.applied.join(", ")
+                    )
+                };
+                Ok(operations::Effect::Settings(text))
+            });
+        }
+        input::SettingsKey::WritePeerDefaults(names) => {
+            if !app.backend_available || !app.operations.has_capacity() {
+                return;
+            }
+            // Pending preview, not a persisted-success claim. Later relative
+            // key actions derive from this ordered preview, not old DB state.
+            app.peer_defaults.clone_from(&names);
+            let server = server.clone();
+            operations::submit(app, true, None, async move {
+                server
+                    .registry()
+                    .save_peer_default_agents(&names)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                server.set_default_agents(names);
+                Ok(operations::Effect::Settings("Defaults saved".into()))
+            });
         }
     }
-}
-
-/// Apply a merge mode chosen from inside the diff modal. Delegates to
-/// `Server::merge_agent_from_yaml`, which writes the merged DB config and
-/// upserts the runtime registry; the edit is live on the agent's next message.
-/// Feedback (and the precise "nothing changed" / "not hosted" cases) lands in
-/// `app.settings_status`.
-async fn apply_agent_merge(
-    app: &mut App,
-    server: &Arc<Server>,
-    name: &str,
-    mode: chaz_core::agent_diff::AgentMergeMode,
-) {
-    match server.merge_agent_from_yaml(name, &mode).await {
-        Ok(outcome) if !outcome.found_yaml => {
-            app.settings_status = Some(format!("No yaml entry for '{name}' — nothing applied"));
-        }
-        Ok(outcome) if !outcome.found_db => {
-            app.settings_status =
-                Some(format!("This peer holds no key for '{name}' — can't merge"));
-        }
-        Ok(outcome) if !outcome.changed => {
-            app.settings_status = Some(format!("{name}: nothing to apply — already in sync"));
-        }
-        Ok(outcome) => {
-            app.settings_status = Some(format!(
-                "{name}: merged {} (effective next message)",
-                outcome.applied.join(", ")
-            ));
-        }
-        Err(e) => {
-            app.settings_status = Some(format!("Merge failed — {e}"));
-        }
-    }
-}
-
-/// Dispatch a backend command initiated from the Settings page. Shared
-/// path between `[d]` direct-action keys and submitted prompts. The
-/// command's write fires eidetica's `on_write` callback, which posts
-/// to `notify_rx` and refreshes the snapshot via `Action::SessionChanged`
-/// — same path every other write uses. There's no explicit re-seed
-/// here; the next frame may briefly render stale data before the
-/// callback lands, matching the picker's behavior.
-#[allow(clippy::too_many_arguments)]
-async fn dispatch_settings_command(
-    cmd: Command,
-    app: &mut App,
-    server: &Arc<Server>,
-    backend: &BackendManager,
-    secrets: &SecretStore,
-    approval_tx: &mpsc::Sender<TaggedApproval>,
-    notify_tx: &mpsc::Sender<String>,
-) {
-    // Settings actions that edit a session exist only in Session scope, but
-    // never let a stale action address a view that has since closed.
-    let Some(tab) = app.current() else {
-        app.settings_status = Some("No conversation is open".into());
-        return;
-    };
-    let session_db_id = tab.session_db_id.clone();
-    let session_db = tab.session_db.clone();
-    let current_agent = tab.current_agent.clone();
-    let session_name = tab.session_name.clone();
-    let ctx = CommandContext {
-        server,
-        secrets,
-        backend,
-        session_db_id: &session_db_id,
-        session_db: &session_db,
-        current_agent: &current_agent,
-        session_name: session_name.as_deref(),
-    };
-    let outcome = commands::dispatch(cmd, &ctx).await;
-    // Show errors as system messages — they're surfaced next time the
-    // user leaves Settings and sees the chat. (A future stage may add a
-    // dedicated error strip on the settings page itself.)
-    render_outcome(app, outcome, server, backend, approval_tx, notify_tx).await;
 }
 
 /// Translate the Models page row cursor into the picker scope.
@@ -2293,170 +2219,23 @@ fn models_scope_from_cursor(app: &App) -> ModelPickerScope {
     }
 }
 
-/// Read the active session's meta + index row and stash a frozen snapshot
-/// on `App` for the Session Settings page. Called when Session Settings
-/// opens and when the active tab fires `SessionChanged` while that page is
-/// up. Silent on failure — the snapshot stays whatever it was so the page
-/// still renders something coherent.
-async fn seed_session_settings_snapshot(app: &mut App, server: &Arc<Server>) {
-    let (session_db_id, session_db, entry_count) = {
-        let tab = app.active();
-        (
-            tab.session_db_id.clone(),
-            tab.session_db.clone(),
-            tab.entries.len(),
-        )
-    };
-    let session = Session::new(
-        chaz_core::types::ConversationId(session_db_id.clone()),
-        session_db,
-    )
-    .await;
-    let meta = session.read_meta().await;
-    let created_at = server
-        .registry()
-        .list_sessions()
-        .await
-        .ok()
-        .and_then(|rows| {
-            rows.into_iter()
-                .find(|r| r.session_db_id == session_db_id)
-                .and_then(|r| r.created_at)
-        });
-
+/// Seed Settings immediately from this tab's last-good data. Fresh data arrives
+/// through the normal supervised session refresh, never an input-path read.
+fn seed_session_settings_snapshot(app: &mut App, _server: &Arc<Server>) {
+    let tab = app.active();
+    let meta = &tab.live.meta;
     app.session_settings_snapshot = Some(SessionMetaSnapshot {
-        session_db_id,
+        session_db_id: tab.session_db_id.clone(),
         model_pin: meta.model.clone(),
         agent_models: meta.agent_models.clone(),
         agents: meta.agents.clone(),
         host_agent_db_id: meta.host_agent_db_id.clone(),
-        created_at,
-        entry_count,
+        created_at: app
+            .session_indices
+            .get(&tab.session_db_id)
+            .and_then(|s| s.created_at),
+        entry_count: tab.entries.len(),
     });
-}
-
-/// Apply a command outcome. Returns whether it focused a conversation view.
-async fn render_outcome(
-    app: &mut App,
-    outcome: CommandOutcome,
-    server: &Server,
-    backend: &BackendManager,
-    approval_tx: &mpsc::Sender<TaggedApproval>,
-    notify_tx: &mpsc::Sender<String>,
-) -> bool {
-    match outcome {
-        CommandOutcome::Text(t) => show_system_msg(app, t),
-        CommandOutcome::Error(e) => show_error(app, e),
-        CommandOutcome::SessionsList(list) => {
-            if list.is_empty() {
-                show_system_msg(app, "No sessions found.".to_string());
-            } else {
-                let mut msg = String::from("Sessions:\n");
-                for info in &list {
-                    let agent = info.agent_name.as_deref().unwrap_or("default");
-                    let name = info
-                        .name
-                        .as_deref()
-                        .map(|n| format!(" \"{n}\""))
-                        .unwrap_or_default();
-                    let age = info
-                        .created_at
-                        .map(|t| t.format("%Y-%m-%d").to_string())
-                        .unwrap_or_else(|| "—".to_string());
-                    msg.push_str(&format!(
-                        "\n  {}{} [{}] ({}, {})",
-                        info.session_db_id,
-                        name,
-                        info.bridge.as_str(),
-                        agent,
-                        age
-                    ));
-                }
-                show_system_msg(app, msg);
-            }
-        }
-        CommandOutcome::SessionSwitched(switch) => {
-            let chaz_core::commands::SessionSwitch {
-                session_db_id,
-                conv_id,
-                db,
-                agent_name,
-                session_name,
-            } = *switch;
-            if chaz_core::session::jobs::is_job_session(&db).await {
-                return match jobs::open(app, server, backend, &session_db_id, notify_tx).await {
-                    Ok(()) => true,
-                    Err(error) => {
-                        show_error(app, format!("Job unavailable: {error}"));
-                        false
-                    }
-                };
-            }
-            // If the session is already open in some tab, switch to it.
-            if let Some(idx) = app.tab_index_for(&session_db_id) {
-                app.set_active_tab(idx);
-                return true;
-            }
-            if let Err(e) = setup_session(
-                server,
-                &db,
-                backend.clone(),
-                approval_tx.clone(),
-                notify_tx.clone(),
-            )
-            .await
-            {
-                show_error(app, format!("Failed to register session: {e}"));
-                return false;
-            }
-            let session = Session::new(conv_id, db.clone()).await;
-            let entries = session.entries().to_vec();
-            let active_turns = Session::active_turn_attempts(&db)
-                .await
-                .unwrap_or_default()
-                .len();
-            // Mirror `build_tab` — resolve through the backend so the status
-            // bar reflects what the runtime would actually use.
-            let agent = server.agents().get(&agent_name);
-            let agent_default_model = agent.as_ref().and_then(|a| a.default_model.clone());
-            let agent_cap = agent.as_ref().and_then(|a| a.max_context_tokens);
-            let meta = session.read_meta().await;
-            let requested_model = meta
-                .resolve_model_for_agent(&agent_name)
-                .or(agent_default_model.as_deref());
-            let effective_model = backend.resolve_model_name(requested_model);
-            let context_model = requested_model
-                .map(str::to_string)
-                .or_else(|| backend.default_model())
-                .unwrap_or_default();
-            let context_budget = server.effective_context_budget(&context_model, agent_cap);
-            let roster = build_roster(server, backend, &meta);
-            app.push_tab(Tab {
-                job: None,
-                session_db_id,
-                session_db: db,
-                entries,
-                scroll_offset: 0,
-                pending_approval: None,
-                active_turns,
-                model_pin: meta
-                    .resolve_model_for_agent(&agent_name)
-                    .map(str::to_string),
-                current_agent: agent_name,
-                session_name,
-                effective_model,
-                roster,
-                context_budget,
-                expanded_entries: HashSet::new(),
-                live: Default::default(),
-            });
-            return true;
-        }
-        CommandOutcome::Quit => {
-            app.should_quit = true;
-        }
-    }
-    false
 }
 
 pub(super) fn show_system_msg(app: &mut App, content: String) {
@@ -2478,7 +2257,7 @@ fn show_local(app: &mut App, content: String, entry_type: EntryType) {
         app.settings_status = Some(content);
         return;
     };
-    tab.entries.push(SessionEntry {
+    tab.add_local(SessionEntry {
         sender: "system".to_string(),
         content,
         timestamp: chrono::Utc::now(),
@@ -2486,7 +2265,6 @@ fn show_local(app: &mut App, content: String, entry_type: EntryType) {
         metadata: None,
         routing: None,
     });
-    tab.touch_transcript();
 }
 
 #[cfg(test)]
@@ -2579,26 +2357,24 @@ mod session_picker_tests {
             input::handle_chat_key(
                 &mut app,
                 KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE),
-            )
-            .await;
+            );
         }
         assert_eq!(app.cursor, app.input.len());
-        input::handle_chat_key(&mut app, KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)).await;
+        input::handle_chat_key(&mut app, KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
         input::handle_chat_key(
             &mut app,
             KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
-        )
-        .await;
+        );
         assert_eq!(app.input, "a界e\u{301}z");
         assert_eq!(app.cursor, "a界e\u{301}".len());
-        input::handle_chat_key(&mut app, KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)).await;
+        input::handle_chat_key(&mut app, KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
         assert_eq!(app.cursor, "a界".len());
-        input::handle_chat_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT)).await;
+        input::handle_chat_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT));
         assert_eq!(app.input, "a界\ne\u{301}z");
         assert_eq!(app.cursor, "a界\n".len());
         // Alt+Enter is the break that legacy terminals can actually deliver —
         // bare Shift+Enter reaches us as an unmodified Enter (i.e. send).
-        input::handle_chat_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT)).await;
+        input::handle_chat_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT));
         assert_eq!(app.input, "a界\n\ne\u{301}z");
         assert_eq!(app.cursor, "a界\n\n".len());
     }
@@ -2611,9 +2387,8 @@ mod session_picker_tests {
         input::handle_chat_key(
             &mut app,
             KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE),
-        )
-        .await;
-        input::handle_chat_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)).await;
+        );
+        input::handle_chat_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert!(app.input.is_empty());
         assert_eq!(app.cursor, 0);
     }
@@ -2680,18 +2455,21 @@ mod session_picker_tests {
             let mut info = SessionInfo::placeholder(&index);
             info.agent_name = Some("visible-agent".into());
             info.loaded = true;
-            info
+            Ok(info)
         });
         for _ in 0..count {
-            let SessionLoad::Row { generation, info } =
-                tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
-                    .await
-                    .unwrap()
-                    .unwrap()
+            let SessionLoad::Row {
+                generation,
+                id,
+                result,
+            } = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+                .await
+                .unwrap()
+                .unwrap()
             else {
                 panic!("expected metadata row")
             };
-            assert!(apply_session_row(&mut app, generation, info));
+            assert!(apply_session_row(&mut app, generation, id, result));
         }
         let after = draw_picker(&mut app, 100, 13);
         for hit in &app.click_regions {
@@ -2736,13 +2514,14 @@ mod session_picker_tests {
         let large = visible_ids(&app);
         assert!(large.len() > small.len());
         let extra = app.requested_session_indices();
-        assert_eq!(
+        assert_eq!(extra.len(), 1, "three previous reads still own slots");
+        assert!(
             extra
                 .iter()
-                .map(|i| i.session_db_id.clone())
-                .collect::<HashSet<_>>(),
-            large.difference(&small).cloned().collect()
+                .all(|i| large.contains(&i.session_db_id) && !small.contains(&i.session_db_id))
         );
+        // Model completion of the previous reads before the next viewport move.
+        app.session_rows_loading.clear();
         // A click on the pinned row retains the viewport, while Down then wheel
         // changes the cursor; the next draw must update requests before dispatch.
         app.picker_index = 53;
@@ -2815,13 +2594,14 @@ mod session_picker_tests {
         app.picker_index = 100;
         draw_picker(&mut app, 100, 12);
         let scrolled = app.requested_session_indices();
-        assert_eq!(scrolled.len(), 3);
+        assert_eq!(scrolled.len(), 1, "only one of four slots is available");
         assert!(scrolled.iter().any(|row| row.session_db_id == "session-99"));
 
         let generation = app.session_generation;
         app.session_fill = Some(SessionFill {
             generation,
             cancel: Arc::new(AtomicBool::new(false)),
+            tasks: Vec::new(),
         });
         app.cancel_session_fill();
         assert_ne!(app.session_generation, generation);
@@ -2830,7 +2610,12 @@ mod session_picker_tests {
         let mut stale = SessionInfo::placeholder(&index(0));
         stale.agent_name = Some("stale".into());
         stale.loaded = true;
-        assert!(!apply_session_row(&mut app, generation, stale));
+        assert!(!apply_session_row(
+            &mut app,
+            generation,
+            stale.session_db_id.clone(),
+            Ok(stale)
+        ));
         assert!(app.session_list[0].agent_name.is_none());
     }
 
@@ -2893,16 +2678,20 @@ mod session_picker_tests {
                 active.fetch_sub(1, Ordering::Relaxed);
                 let mut row = SessionInfo::placeholder(&index);
                 row.loaded = true;
-                row
+                Ok(row)
             }
         });
 
-        tokio::task::yield_now().await;
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
         assert_eq!(opens.load(Ordering::Relaxed), 4);
         assert_eq!(max_active.load(Ordering::Relaxed), 4);
         app.cancel_session_fill();
         tokio::time::advance(std::time::Duration::from_secs(10)).await;
-        tokio::task::yield_now().await;
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
         assert_eq!(opens.load(Ordering::Relaxed), 4);
         assert!(rx.try_recv().is_err());
     }

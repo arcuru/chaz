@@ -83,7 +83,10 @@ pub(super) async fn agent_remove(agent_ref: &str, ctx: &CommandContext<'_>) -> C
 }
 
 pub(super) async fn agents_list(ctx: &CommandContext<'_>) -> CommandOutcome {
-    let meta = crate::session::read_meta_from_db(ctx.session_db).await;
+    let meta = match crate::session::try_read_meta_from_db(ctx.session_db).await {
+        Ok(meta) => meta,
+        Err(e) => return CommandOutcome::Error(format!("Failed to read session metadata: {e}")),
+    };
     if meta.agents.is_empty() {
         // Pre-auto-attach session: name what actually routes so the user
         // isn't misled by "none attached" when messages clearly resolve.
@@ -123,7 +126,10 @@ pub(super) async fn agents_list(ctx: &CommandContext<'_>) -> CommandOutcome {
 /// host id if one somehow survives), and the burst-budget state so an
 /// operator can see *why* an agent→agent chain stopped.
 pub(super) async fn agent_room(ctx: &CommandContext<'_>) -> CommandOutcome {
-    let meta = crate::session::read_meta_from_db(ctx.session_db).await;
+    let meta = match crate::session::try_read_meta_from_db(ctx.session_db).await {
+        Ok(meta) => meta,
+        Err(e) => return CommandOutcome::Error(format!("Failed to read session metadata: {e}")),
+    };
 
     let mut out = String::from("Chat-room status for this session:\n");
 
@@ -146,11 +152,15 @@ pub(super) async fn agent_room(ctx: &CommandContext<'_>) -> CommandOutcome {
         },
     }
 
-    let session = Session::new(
+    let session = match Session::try_new(
         ConversationId(ctx.session_db_id.to_string()),
         ctx.session_db.clone(),
     )
-    .await;
+    .await
+    {
+        Ok(session) => session,
+        Err(e) => return CommandOutcome::Error(format!("Failed to read session: {e}")),
+    };
     let budget = meta
         .burst_budget_override
         .unwrap_or_else(|| ctx.server.agent_burst_budget());
@@ -178,11 +188,15 @@ pub(super) async fn agent_room(ctx: &CommandContext<'_>) -> CommandOutcome {
 }
 
 pub(super) async fn agent_set_host(arg: Option<&str>, ctx: &CommandContext<'_>) -> CommandOutcome {
-    let session = Session::new(
+    let session = match Session::try_new(
         ConversationId(ctx.session_db_id.to_string()),
         ctx.session_db.clone(),
     )
-    .await;
+    .await
+    {
+        Ok(session) => session,
+        Err(e) => return CommandOutcome::Error(format!("Failed to read session: {e}")),
+    };
 
     match arg {
         None => {
@@ -198,7 +212,12 @@ pub(super) async fn agent_set_host(arg: Option<&str>, ctx: &CommandContext<'_>) 
             };
 
             // Host must be attached — catch the "set host on un-attached agent" footgun.
-            let meta = crate::session::read_meta_from_db(ctx.session_db).await;
+            let meta = match crate::session::try_read_meta_from_db(ctx.session_db).await {
+                Ok(meta) => meta,
+                Err(e) => {
+                    return CommandOutcome::Error(format!("Failed to read session metadata: {e}"));
+                }
+            };
             let db_id = entry.db_id.to_string();
             if !meta.agents.iter().any(|a| a.db_id == db_id) {
                 return CommandOutcome::Error(format!(
@@ -223,11 +242,15 @@ pub(super) async fn agent_set_host(arg: Option<&str>, ctx: &CommandContext<'_>) 
 /// `Some(n)` stores `n` in `SessionMeta.burst_budget_override` (n ≥ 1);
 /// `None` clears it so the global default applies.
 pub(super) async fn agent_set_burst(n: Option<usize>, ctx: &CommandContext<'_>) -> CommandOutcome {
-    let session = Session::new(
+    let session = match Session::try_new(
         ConversationId(ctx.session_db_id.to_string()),
         ctx.session_db.clone(),
     )
-    .await;
+    .await
+    {
+        Ok(session) => session,
+        Err(e) => return CommandOutcome::Error(format!("Failed to read session: {e}")),
+    };
 
     match n {
         None => {
@@ -601,7 +624,12 @@ pub(super) async fn agent_delete(agent_ref: &str, ctx: &CommandContext<'_>) -> C
             Ok(pair) => pair,
             Err(_) => continue,
         };
-        let meta = crate::session::read_meta_from_db(&sdb).await;
+        let meta = match crate::session::try_read_meta_from_db(&sdb).await {
+            Ok(meta) => meta,
+            Err(e) => {
+                return CommandOutcome::Error(format!("Failed to read session metadata: {e}"));
+            }
+        };
         if meta.agents.iter().any(|a| a.db_id == db_id_str) {
             return CommandOutcome::Error(format!(
                 "Agent '{}' is still attached to session {}. Detach it first (/agent remove {}).",
@@ -849,7 +877,12 @@ pub(super) async fn agent_revoke_peer(
             let Ok((_conv, db)) = ctx.server.registry().open_session(&s.session_db_id).await else {
                 continue;
             };
-            let meta = crate::session::read_meta_from_db(&db).await;
+            let meta = match crate::session::try_read_meta_from_db(&db).await {
+                Ok(meta) => meta,
+                Err(e) => {
+                    return CommandOutcome::Error(format!("Failed to read session metadata: {e}"));
+                }
+            };
             if meta.agents.iter().any(|a| {
                 a.db_id == entry.db_id.to_string()
                     && a.home_pubkey.as_deref() == Some(revoked_str.as_str())
@@ -1102,7 +1135,12 @@ pub(super) async fn agent_home_status(
             let Ok((_conv, db)) = ctx.server.registry().open_session(&s.session_db_id).await else {
                 continue;
             };
-            let meta = crate::session::read_meta_from_db(&db).await;
+            let meta = match crate::session::try_read_meta_from_db(&db).await {
+                Ok(meta) => meta,
+                Err(e) => {
+                    return CommandOutcome::Error(format!("Failed to read session metadata: {e}"));
+                }
+            };
             let Some(ar) = meta
                 .agents
                 .iter()

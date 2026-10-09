@@ -278,6 +278,12 @@ pub(super) fn handle_overlay_key(app: &mut App, key: KeyEvent) -> OverlayKey {
                 app.overlay = None;
             }
             KeyCode::Enter => {
+                if !app.backend_available || !app.operations.has_capacity() {
+                    app.operations.notice = Some(
+                        "Backend unavailable or action queue full — rename not submitted".into(),
+                    );
+                    return OverlayKey::Consumed;
+                }
                 let trimmed = input.trim();
                 let name = if trimmed.is_empty() {
                     None
@@ -635,7 +641,7 @@ fn handle_approval_key(app: &mut App, key: KeyEvent) -> bool {
     false
 }
 
-pub(super) async fn handle_chat_key(app: &mut App, key: KeyEvent) -> Option<ChatAction> {
+pub(super) fn handle_chat_key(app: &mut App, key: KeyEvent) -> Option<ChatAction> {
     if handle_approval_key(app, key) {
         return None;
     }
@@ -670,11 +676,19 @@ pub(super) async fn handle_chat_key(app: &mut App, key: KeyEvent) -> Option<Chat
                 return None;
             }
             if !app.input.is_empty() {
+                if !app.backend_available || !app.operations.has_capacity() {
+                    app.operations.notice = Some(
+                        "Backend unavailable or action queue full — draft not submitted".into(),
+                    );
+                    return None;
+                }
                 let text = std::mem::take(&mut app.input);
                 app.cursor = 0;
                 app.completion = None;
                 app.completion_dismissed = false;
-                return parse_chat_line(app, &text);
+                let action = parse_chat_line(app, &text);
+                app.command_input = matches!(action, Some(ChatAction::Dispatch(_))).then_some(text);
+                return action;
             }
         }
         KeyCode::Tab => {
@@ -803,11 +817,7 @@ fn parse_chat_line(app: &mut App, text: &str) -> Option<ChatAction> {
         "/models" => return Some(ChatAction::OpenModelsSettings),
         "/settings" => return Some(ChatAction::OpenSettings(SettingsScope::Session)),
         "/clear" => {
-            let tab = app.active_mut();
-            tab.entries.clear();
-            tab.scroll_offset = 0;
-            tab.expanded_entries.clear();
-            tab.touch_transcript();
+            app.active_mut().clear_view();
             return None;
         }
         "/debug" => {
@@ -1097,6 +1107,16 @@ pub(super) fn handle_settings_key(
             Some(super::PeerSettingsCategory::Defaults)
         )
     {
+        if (!app.backend_available || !app.operations.has_capacity())
+            && (matches!(key.code, KeyCode::Char('d'))
+                || (key.modifiers.contains(KeyModifiers::CONTROL)
+                    && matches!(key.code, KeyCode::Up | KeyCode::Down)))
+        {
+            app.operations.notice = Some(
+                "Backend unavailable or action queue full — defaults edit not accepted".into(),
+            );
+            return SettingsKey::None;
+        }
         let len = app.peer_defaults.len();
         let cursor = app.peer_defaults_cursor.min(len.saturating_sub(1));
         match key.code {
@@ -1298,6 +1318,13 @@ pub(super) fn handle_settings_key(
 /// modal in place and returns `None`.
 fn handle_agent_diff_key(app: &mut App, key: KeyEvent) -> SettingsKey {
     use chaz_core::agent_diff::{AgentMergeMode, FieldStatus};
+    if (!app.backend_available || !app.operations.has_capacity())
+        && matches!(key.code, KeyCode::Enter | KeyCode::Char('y' | 'R' | 'r'))
+    {
+        app.operations.notice =
+            Some("Backend unavailable or action queue full — merge not submitted".into());
+        return SettingsKey::None;
+    }
     let Some(view) = app.agent_diff.as_mut() else {
         return SettingsKey::None;
     };
@@ -1427,6 +1454,12 @@ fn handle_settings_picker_key(app: &mut App, key: KeyEvent) -> SettingsKey {
             app.settings_picker = None;
         }
         KeyCode::Enter => {
+            if !app.backend_available || !app.operations.has_capacity() {
+                app.operations.notice = Some(
+                    "Backend unavailable or action queue full — selection not submitted".into(),
+                );
+                return SettingsKey::None;
+            }
             if picker.viewport.width <= 4 || picker.viewport.height == 0 {
                 return SettingsKey::None;
             }
@@ -1505,6 +1538,13 @@ fn handle_settings_prompt_key(app: &mut App, key: KeyEvent) -> SettingsKey {
             app.settings_prompt = None;
         }
         KeyCode::Enter => {
+            if !app.backend_available || !app.operations.has_capacity() {
+                app.operations.notice = Some(
+                    "Backend unavailable or action queue full — Settings draft not submitted"
+                        .into(),
+                );
+                return SettingsKey::None;
+            }
             let value = prompt.input.trim().to_string();
             let intent = prompt.intent;
             app.settings_prompt = None;
