@@ -118,10 +118,10 @@ impl Bridge for TuiBridge {
                         if app.mode == TuiMode::Chat {
                             app.close_tab_at(app.active_tab);
                         }
-                    } else if key.code == KeyCode::Char(',')
+                    } else if key.code == KeyCode::Char('s')
                         && key.modifiers.contains(KeyModifiers::CONTROL)
                     {
-                        // Ctrl+, opens Settings, picking scope from the
+                        // Ctrl+S opens Settings, picking scope from the
                         // current mode. Chat → Session (routed through
                         // ChatAction so the meta snapshot gets seeded);
                         // picker → Peer (no snapshot needed). Already in
@@ -184,11 +184,11 @@ impl Bridge for TuiBridge {
                             // category navigation flow.
                             TuiMode::Settings(_) => {}
                         }
-                    } else if key.code == KeyCode::PageUp
+                    } else if key.code == KeyCode::Char('h')
                         && key.modifiers.contains(KeyModifiers::CONTROL)
                     {
                         cycle_tab(&mut app, -1);
-                    } else if key.code == KeyCode::PageDown
+                    } else if key.code == KeyCode::Char('l')
                         && key.modifiers.contains(KeyModifiers::CONTROL)
                     {
                         cycle_tab(&mut app, 1);

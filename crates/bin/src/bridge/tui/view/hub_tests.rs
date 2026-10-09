@@ -315,6 +315,17 @@ async fn new_open_switch_and_close_preserve_sessions_drafts_and_scroll() {
     app.set_active_tab(0);
     assert_eq!((app.input.as_str(), app.cursor), (draft.as_str(), cursor));
     assert_eq!(app.active().scroll_offset, 5);
+    // Plain PageUp/PageDown still scroll this view rather than switching tabs.
+    input::handle_chat_key(&mut app, key(KeyCode::PageUp)).await;
+    assert_eq!(app.active().scroll_offset, 25);
+    assert_eq!(app.active().session_db_id, created);
+    input::handle_chat_key(&mut app, key(KeyCode::PageDown)).await;
+    assert_eq!(app.active().scroll_offset, 5);
+    assert_eq!(app.active().session_db_id, created);
+    assert_eq!((app.input.as_str(), app.cursor), (draft.as_str(), cursor));
+    let screen = frame(&mut app, &server, &backend, 120, 40);
+    assert!(screen.contains("Ctrl+S settings"), "{screen}");
+    assert!(screen.contains("Ctrl+H/L tabs"), "{screen}");
     // Picking an already-open session focuses its view, not a duplicate.
     open_session_picker(&mut app, &server, &rows_tx);
     dispatch_picker_selection(

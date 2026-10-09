@@ -902,7 +902,7 @@ impl App {
 
     /// Enter Settings in `scope`, remembering `from` so Esc returns there.
     /// No-op when already in Settings (avoids clobbering the return-to mode
-    /// if `Ctrl+,` is hit twice).
+    /// if `Ctrl+S` is hit twice).
     pub(super) fn open_settings(&mut self, scope: SettingsScope, from: TuiMode) {
         if matches!(self.mode, TuiMode::Settings(_)) {
             return;
@@ -1788,7 +1788,7 @@ async fn handle_chat_action(
         }
         ChatAction::OpenSettings(scope) => {
             // From a chat-action context the caller mode is always Chat —
-            // the picker doesn't go through ChatAction. `Ctrl+,` from the
+            // the picker doesn't go through ChatAction. `Ctrl+S` from the
             // picker takes a different path that sets the return-to slot
             // correctly.
             if let SettingsScope::Session = scope {

@@ -13,6 +13,8 @@ All notable changes to this project will be documented in this file.
   reopening or creating that named session. Closing the last conversation view
   returns to the hub instead of being refused; closing never deletes a session.
   Existing sessions named `tui` are left as ordinary sessions.
+  Settings now opens with `Ctrl+S` instead of `Ctrl+,`; `Ctrl+H`/`Ctrl+L`
+  switch to the previous/next tab instead of `Ctrl+PageUp`/`Ctrl+PageDown`.
 
 - CLI arguments now follow `claude` / `pi` conventions. The TUI is the default
   when no other mode is selected; `--tui` and `--cli` are removed.

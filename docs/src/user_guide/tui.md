@@ -41,7 +41,7 @@ chaz exits with the error instead of opening or creating another conversation.
 
 The TUI has four main pieces:
 
-1. **Tab bar** — one tab per open conversation view. Click to switch, `×` to close, or use `Ctrl+PageUp`/`Ctrl+PageDown`. Closing a view never deletes, detaches, or stops its session; closing the last one returns to the [session hub](#session-hub). The right side lists the keys that fit.
+1. **Tab bar** — one tab per open conversation view. Click to switch, `×` to close, or use `Ctrl+H`/`Ctrl+L` for the previous/next tab. Closing a view never deletes, detaches, or stops its session; closing the last one returns to the [session hub](#session-hub). The right side lists the keys that fit.
 2. **Messages area** — conversation history with all entry types
 3. **Status bar** — session name, context usage/budget, then the agent and model. A single-agent
    session shows `agent: <name> | model: <model>`; a multi-agent session lists
@@ -219,7 +219,7 @@ See [Extensions](extensions.md). Extensions can also register their own slash co
 | ---------------------- | ------------------------------------------------------------- |
 | `/clear`               | Clear the display (entries remain in the database)            |
 | `/raw`                 | Dump raw entry data (index, timestamp, type, sender, content) |
-| `/settings`            | Open [Session Settings](#settings) (also `Ctrl+,` in chat)    |
+| `/settings`            | Open [Session Settings](#settings) (also `Ctrl+S` in chat)    |
 | `/debug`               | Toggle debug mode (also `Ctrl+D`)                             |
 | `/quit`, `/q`, `/exit` | Exit                                                          |
 
@@ -227,21 +227,22 @@ Unknown `/<name>` commands route to extension dispatch — see the error you get
 
 ## Key Bindings
 
-| Key                             | Action                                                              |
-| ------------------------------- | ------------------------------------------------------------------- |
-| `Enter`                         | Accept highlighted completion (if extending); else send / execute   |
-| `Tab` / `Shift+Tab`             | Open completion popup and cycle highlighted entry                   |
-| `Up` / `Down`                   | Move completion selection if popup is open; else scroll history (3) |
-| `PageUp` / `PageDown`           | Fast scroll history (20 lines)                                      |
-| `Home` / `End`                  | Move cursor to start / end of input                                 |
-| `Alt+Enter`                     | Insert a line break in the draft instead of sending                 |
-| `Esc`                           | First press: dismiss completion popup. Second (no popup): quit      |
-| `F1`                            | Open the help overlay                                               |
-| `Ctrl+P`                        | Open the session hub (in the hub: back to the open conversation)    |
-| `Ctrl+D`                        | Toggle debug mode                                                   |
-| `Ctrl+W`                        | Close the active view; the last one returns to the hub              |
-| `Ctrl+PageUp` / `Ctrl+PageDown` | Cycle to previous / next tab (wraps)                                |
-| `Ctrl+C`                        | Quit                                                                |
+| Key                   | Action                                                              |
+| --------------------- | ------------------------------------------------------------------- |
+| `Enter`               | Accept highlighted completion (if extending); else send / execute   |
+| `Tab` / `Shift+Tab`   | Open completion popup and cycle highlighted entry                   |
+| `Up` / `Down`         | Move completion selection if popup is open; else scroll history (3) |
+| `PageUp` / `PageDown` | Fast scroll history (20 lines)                                      |
+| `Home` / `End`        | Move cursor to start / end of input                                 |
+| `Alt+Enter`           | Insert a line break in the draft instead of sending                 |
+| `Esc`                 | First press: dismiss completion popup. Second (no popup): quit      |
+| `F1`                  | Open the help overlay                                               |
+| `Ctrl+P`              | Open the session hub (in the hub: back to the open conversation)    |
+| `Ctrl+D`              | Toggle debug mode                                                   |
+| `Ctrl+W`              | Close the active view; the last one returns to the hub              |
+| `Ctrl+H` / `Ctrl+L`   | Cycle to previous / next tab (wraps, chat only)                     |
+| `Ctrl+S`              | Open Session Settings in chat; Peer Settings in the hub             |
+| `Ctrl+C`              | Quit                                                                |
 
 Approval prompts hijack the keyboard while open: `y` approve, `n` deny, `a` approve all remaining tool calls for this turn.
 
@@ -284,7 +285,7 @@ The session hub is the TUI's home: the list of this peer's sessions plus a pinne
 | `Enter`, click   | Open the selected session, or create one on **New session** (click selects, second click opens) |
 | `n`              | Create a session and open it                                                                    |
 | `r`              | Rename the selected session                                                                     |
-| `s` / `Ctrl+,`   | [Peer Settings](#settings); `Esc` there returns to the hub                                      |
+| `s` / `Ctrl+S`   | [Peer Settings](#settings); `Esc` there returns to the hub                                      |
 | `Esc`            | Back to the open conversation; stays in the hub when none is open                               |
 | `Ctrl+P`         | Back to the open conversation; reload when the list failed or no conversation is open           |
 | `Ctrl+C`         | Quit                                                                                            |
@@ -298,7 +299,7 @@ A **session** is stored data: its transcript, roster and name live in the peer's
 - **Launching creates nothing.** `chaz` opens the hub even on an empty install; you create a session explicitly with **New session** or `n`, which stores it and opens it at once. The launch prompt and `--session` forms in the [launch table](#tui-mode) are the only other ways a launch creates one.
 - **Opening is not creating.** Selecting a session that already has a view focuses that view instead of adding a duplicate.
 - **Closing a view is local.** `Ctrl+W` or `×` removes the view only. The session keeps its history, agents and bridge attachments, and an agent already working in it carries on. Closing the last view returns to the hub; reopen the session from there.
-- **Drafts follow their view.** Unsent text and the cursor stay with each conversation when you switch tabs, visit the hub, or open Settings, as does each view's scroll position. Closing a view discards its draft.
+- **Drafts follow their view.** `Ctrl+H` moves left to the previous tab and `Ctrl+L` moves right to the next, wrapping at either end. Unsent text and the cursor stay with each conversation when you switch tabs, visit the hub, or open Settings, as does each view's scroll position. Closing a view discards its draft.
 - **Settings scope is explicit.** From the hub, `s` opens Peer Settings, which needs no open conversation. Session Settings exists only for an open conversation and is titled with its name.
 - **The list is local.** Rows come from this peer's session catalog: TUI sessions, Matrix-attached ones, `spawn_agent` / `spawn_worker` children, and anything synced so far. It is not an inventory of every remote peer. Agent names load only for visible rows; a row shows `…` until then. `*` marks the focused conversation.
 - **A session named `tui` is ordinary.** Earlier versions opened a session named `tui` on every launch. Existing ones stay as they are and appear in the list like any other session.
@@ -308,8 +309,8 @@ The list reads registry metadata only: root ID, name, bridge, agent, age and sta
 ### Walkthrough: from the hub and back
 
 1. On a fresh install, run `chaz --config config.yaml`. The hub shows only **New session**, followed by `No saved sessions yet — select "New session" above.` Nothing has been stored.
-2. Press `n`. A conversation opens with an empty composer. Its tab bar reads ` …3f9a1c0d ×  Ctrl+P sessions · Ctrl+, settings · Ctrl+W close`. Send a message and leave a half-typed reply in the composer.
-3. Press `Ctrl+P`. The hub lists the new session marked `*`. Press `Esc` to return; the half-typed reply and cursor are where you left them.
+2. Press `n`. A conversation opens with an empty composer. Its tab bar reads ` …3f9a1c0d ×  Ctrl+P sessions · Ctrl+S settings · Ctrl+W close`. Send a message and leave a half-typed reply in the composer.
+3. Press `Ctrl+P`. The hub lists the new session marked `*`. Press `Esc` to return; the half-typed reply and cursor are where you left them. To open another tab, press `Ctrl+P` then `n`. Use `Ctrl+H` to return to the first draft and `Ctrl+L` to switch right again; close the second view with `Ctrl+W` to return to the first.
 4. Press `Ctrl+W`. The view closes and the hub returns, still listing the session; its history is intact. Select it and press `Enter` to reopen it.
 5. Press `s` in the hub, read a Peer Settings page, and press `Esc` to come back to the hub. No conversation needed to be open.
 6. Quit with `Ctrl+C` and run `chaz --config config.yaml --session work "draft the agenda"`. A session named `work` is created and opened, with `draft the agenda` waiting unsent. Run the same command again: `work` reopens, and no second session appears.
@@ -330,11 +331,11 @@ Settings has two separate scopes: **Peer** covers this process's hosted agents a
 
 | Entry path                         | Opens                                                  |
 | ---------------------------------- | ------------------------------------------------------ |
-| `Ctrl+,` in chat or `/settings`    | Session Settings                                       |
+| `Ctrl+S` in chat or `/settings`    | Session Settings                                       |
 | `/models` in chat                  | Session Settings → Models, with the scope list focused |
-| `Ctrl+,` or `s` in the session hub | Peer Settings (no open conversation needed)            |
+| `Ctrl+S` or `s` in the session hub | Peer Settings (no open conversation needed)            |
 
-`Ctrl+,` does nothing while Settings or the model picker is already open. Tab-cycle shortcuts act only in chat, so Settings and pickers retain their conversation caller. Settings remembers its caller: `Esc` returns to chat or the session hub, rather than quitting. At normal terminal sizes the category rail stays on the left and the current page on the right. Navigation starts at **Category**, then enters **List → Content** (static/empty pages skip List); see [Reading Settings details](#reading-settings-details) for all keys and pointer controls. Number keys follow the sidebar order below (`1`–`9` for Peer, `1`–`6` for Session).
+`Ctrl+S` does nothing while Settings or the model picker is already open. `Ctrl+H` and `Ctrl+L` cycle tabs only in chat, so Settings and pickers retain their conversation caller. Plain `PageUp`/`PageDown` still scroll. Settings remembers its caller: `Esc` returns to chat or the session hub, rather than quitting. At normal terminal sizes the category rail stays on the left and the current page on the right. Navigation starts at **Category**, then enters **List → Content** (static/empty pages skip List); see [Reading Settings details](#reading-settings-details) for all keys and pointer controls. Number keys follow the sidebar order below (`1`–`9` for Peer, `1`–`6` for Session).
 
 A model picker returns to its Settings page on selection or `Esc`; canceling writes no model. Add prompts, add-agent pickers and YAML diffs handle `Esc` first, so cancel them before leaving Settings. Exiting Settings does not undo edits already applied.
 
@@ -367,7 +368,7 @@ These tables list every category in sidebar order. Read-only pages are inspector
 
 1. In chat, type `/models`. The Models page opens with `Session` selected. Press `↓` to select an attached agent's row, then `Enter`; the picker title names that agent's scope.
 2. Type to filter models and press `Enter` to apply one. You return to Models with a per-agent override for **this session only**. To back out instead, press `Esc` in the picker: you return to Models with no model change. Press `Esc` on Models to return to chat.
-3. Open the session hub with `Ctrl+P`, then press `s` (or `Ctrl+,`). This opens **Peer**, not the highlighted session's Settings. Select Backends (key `2`) to inspect configured backends without editing them. Press `Esc` to return to the session hub, then `Esc` to return to chat. Merely browsing either scope does not write settings.
+3. Open the session hub with `Ctrl+P`, then press `s` (or `Ctrl+S`). This opens **Peer**, not the highlighted session's Settings. Select Backends (key `2`) to inspect configured backends without editing them. Press `Esc` to return to the session hub, then `Esc` to return to chat. Merely browsing either scope does not write settings.
 
 ### Reading Settings details
 

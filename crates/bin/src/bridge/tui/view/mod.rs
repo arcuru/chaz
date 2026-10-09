@@ -1270,8 +1270,8 @@ fn render_tab_bar(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     let used = x.saturating_sub(area.x);
     let remaining = area.width.saturating_sub(used) as usize;
     if let Some(hint) = [
-        " Ctrl+P sessions · Ctrl+, settings · Ctrl+PgUp/PgDn · Ctrl+W close",
-        " Ctrl+P sessions · Ctrl+, settings · Ctrl+W close",
+        " Ctrl+P sessions · Ctrl+S settings · Ctrl+H/L tabs · Ctrl+W close",
+        " Ctrl+P sessions · Ctrl+S settings · Ctrl+W close",
         " Ctrl+P sessions",
     ]
     .into_iter()

@@ -268,6 +268,12 @@ default_agents: [chaz]
                 process.expect("New session")
                 # Only changed cells redraw, so match the tail that replaces "Loading".
                 process.expect("yet — select")
+                offset = len(process.raw)
+                process.send("\x13")  # Ctrl+S: Peer Settings with no conversation.
+                process.expect("Peer Settings", offset=offset)
+                offset = len(process.raw)
+                process.send("\x13\x1b")  # Repeating Ctrl+S must preserve the hub caller.
+                process.expect("New session", offset=offset)
                 quit_cleanly()
                 self.assertEqual(sessions(), [])
 
@@ -278,7 +284,57 @@ default_agents: [chaz]
                 process.expect("Ctrl+P sessions")
                 process.expect(" > ")
                 prompt = "pty-café-界-e\u0301"
-                process.send(prompt + "\r")
+                process.send(prompt)
+                process.expect("pty-café")
+                offset = len(process.raw)
+                process.send("\x13")  # Ctrl+S: Session Settings, not Peer Settings.
+                process.expect("Session Settings", offset=offset)
+                offset = len(process.raw)
+                process.send("\x13\x1b")
+                process.expect("pty-café", offset=offset)
+
+                # Two conversation views: real legacy control bytes must cycle
+                # in both directions, wrap, and retain each unsent draft.
+                offset = len(process.raw)
+                process.send("\x10")  # Ctrl+P
+                process.expect("New session", offset=offset)
+                offset = len(process.raw)
+                process.send("n")
+                process.expect(" > ", offset=offset)
+                other = "ABCDEFGHIJKLMNO"
+                process.send(other + "X\x7f")  # DEL still edits; it is not Ctrl+H.
+                process.expect(other)
+                for shortcut, draft in [("\x08", "pty-café"), ("\x0c", other),
+                                        ("\x0c", "pty-café"), ("\x08", other)]:
+                    offset = len(process.raw)
+                    process.send(shortcut)  # Ctrl+H / Ctrl+L
+                    process.expect(draft, offset=offset)
+
+                # Each shortcut is inert outside chat, even with two tabs.
+                for shortcut in ["\x08", "\x0c"]:
+                    offset = len(process.raw)
+                    process.send("\x13")
+                    process.expect("Session Settings", offset=offset)
+                    offset = len(process.raw)
+                    process.send(shortcut + "\x1b")
+                    process.expect(other, offset=offset)
+                    offset = len(process.raw)
+                    process.send("\x10")
+                    process.expect("New session", offset=offset)
+                    offset = len(process.raw)
+                    process.send(shortcut + "\x10")
+                    process.expect(other, offset=offset)
+
+                server.reply = "pty-tabs-ok"
+                process.send("\r")
+                self.assertIn(other, [m.get("content") for m in process.request(received)
+                                      if m.get("role") == "user"])
+                process.expect(server.reply)
+                offset = len(process.raw)
+                process.send("\x17")  # Close the second view, retaining its session.
+                process.expect("pty-café", offset=offset)
+                server.reply = "pty-first-ok"
+                process.send("\r")
                 self.assertIn(prompt, [m.get("content") for m in process.request(received)
                                        if m.get("role") == "user"])
                 process.expect(server.reply)
@@ -287,7 +343,7 @@ default_agents: [chaz]
                 # Wait for the wide-layout redraw before typing. crossterm's
                 # edge-triggered poll returns Resize and drops tty readiness
                 # in the same batch, stranding input until the next byte.
-                process.expect("Ctrl+, settings", offset=offset)
+                process.expect("Ctrl+S settings", offset=offset)
                 server.reply = "pty-resized-ok"
                 offset = len(process.raw)
                 process.send("pty-after-resize\r")
@@ -301,7 +357,7 @@ default_agents: [chaz]
                 process.expect("[tui]", offset=offset)
                 quit_cleanly()
                 created = sessions()
-                self.assertEqual(len(created), 1, created)
+                self.assertEqual(len(created), 2, created)
 
                 # Relaunching with an existing session still opens the hub and
                 # creates nothing.
@@ -317,7 +373,7 @@ default_agents: [chaz]
                 process.expect("Ctrl+P sessions")
                 assert_no_request()
                 quit_cleanly()
-                self.assertEqual(len(sessions()), 2)
+                self.assertEqual(len(sessions()), 3)
 
                 # --session NAME creates once (prefilled, unsent), then reopens.
                 launch("--session", "pty-work", "pty-named-prefill")
@@ -326,7 +382,7 @@ default_agents: [chaz]
                 assert_no_request()
                 quit_cleanly()
                 named = sessions()
-                self.assertEqual(len(named), 3, named)
+                self.assertEqual(len(named), 4, named)
                 self.assertEqual(sum("\tpty-work\t" in row for row in named), 1, named)
                 launch("--session", "pty-work")
                 process.expect("pty-work")
