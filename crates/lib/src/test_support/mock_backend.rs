@@ -69,7 +69,7 @@ pub(crate) struct MockBackend {
     state: Mutex<State>,
     default_model: String,
     supports_tools: bool,
-    next_call_gate: Mutex<Option<std::sync::Arc<CallGate>>>,
+    next_call_gates: Mutex<std::collections::VecDeque<std::sync::Arc<CallGate>>>,
 }
 
 impl MockBackend {
@@ -78,7 +78,7 @@ impl MockBackend {
             state: Mutex::new(State::default()),
             default_model: "mock-model".to_string(),
             supports_tools: true,
-            next_call_gate: Mutex::new(None),
+            next_call_gates: Mutex::new(std::collections::VecDeque::new()),
         }
     }
 
@@ -175,7 +175,7 @@ impl MockBackend {
             release: tokio::sync::Notify::new(),
             stopped: tokio::sync::Notify::new(),
         });
-        *self.next_call_gate.lock().unwrap() = Some(gate.clone());
+        self.next_call_gates.lock().unwrap().push_back(gate.clone());
         MockCallGate { gate }
     }
 }
@@ -220,7 +220,7 @@ impl BackendDispatch for MockBackend {
                     })
                 })
             };
-            let gate = self.next_call_gate.lock().unwrap().take();
+            let gate = self.next_call_gates.lock().unwrap().pop_front();
             if let Some(gate) = gate {
                 gate.started.notify_one();
                 let _wait = CallGateWait(gate.clone());
