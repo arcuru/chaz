@@ -716,4 +716,52 @@ mod tests {
         complete(&mut app).await;
         assert!(!app.operations.is_pending());
     }
+    #[tokio::test]
+    async fn local_commands_remain_available_offline_and_with_a_full_action_queue() {
+        let mut app = app().await;
+        app.backend_available = false;
+        app.input = "/settings".into();
+        app.cursor = app.input.len();
+        assert!(
+            matches!(
+                input::handle_chat_key(&mut app, key(KeyCode::Enter)),
+                Some(ChatAction::OpenSettings(SettingsScope::Session))
+            ),
+            "cached Settings command was blocked by backend admission"
+        );
+        app.input = "/expand".into();
+        app.cursor = app.input.len();
+        input::handle_chat_key(&mut app, key(KeyCode::Enter));
+        assert!(app.expand_all);
+        app.backend_available = true;
+        for _ in 0..CAPACITY {
+            submit(&mut app, true, None, std::future::pending());
+        }
+        app.input = "/settings".into();
+        app.cursor = app.input.len();
+        assert!(matches!(
+            input::handle_chat_key(&mut app, key(KeyCode::Enter)),
+            Some(ChatAction::OpenSettings(SettingsScope::Session))
+        ));
+        app.input = "/quit".into();
+        app.cursor = app.input.len();
+        assert!(matches!(
+            input::handle_chat_key(&mut app, key(KeyCode::Enter)),
+            Some(ChatAction::Dispatch(Command::Quit))
+        ));
+    }
+
+    #[tokio::test]
+    async fn refused_backend_submission_keeps_cursor_and_completion_state() {
+        let mut app = app().await;
+        app.backend_available = false;
+        app.input = "/name not-submitted".into();
+        app.cursor = 8;
+        input::recompute_completion(&mut app);
+        app.completion_dismissed = true;
+        assert!(input::handle_chat_key(&mut app, key(KeyCode::Enter)).is_none());
+        assert_eq!(app.input, "/name not-submitted");
+        assert_eq!(app.cursor, 8);
+        assert!(app.completion_dismissed);
+    }
 }

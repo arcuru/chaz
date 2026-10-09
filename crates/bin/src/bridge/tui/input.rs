@@ -676,17 +676,29 @@ pub(super) fn handle_chat_key(app: &mut App, key: KeyEvent) -> Option<ChatAction
                 return None;
             }
             if !app.input.is_empty() {
-                if !app.backend_available || !app.operations.has_capacity() {
+                let text = std::mem::take(&mut app.input);
+                let cursor = std::mem::take(&mut app.cursor);
+                let completion = app.completion.take();
+                let dismissed = std::mem::take(&mut app.completion_dismissed);
+                let action = parse_chat_line(app, &text);
+                // Admission governs backend effects, not local navigation,
+                // help/display commands or an explicit quit.
+                let backend_action = match &action {
+                    Some(ChatAction::Dispatch(chaz_core::commands::Command::Quit)) => false,
+                    Some(ChatAction::Dispatch(_) | ChatAction::SendMessage(_)) => true,
+                    _ => false,
+                };
+                if backend_action && (!app.backend_available || !app.operations.has_capacity()) {
+                    app.input = text;
+                    app.cursor = cursor;
+                    app.completion = completion;
+                    app.completion_dismissed = dismissed;
+                    app.command_input = None;
                     app.operations.notice = Some(
                         "Backend unavailable or action queue full — draft not submitted".into(),
                     );
                     return None;
                 }
-                let text = std::mem::take(&mut app.input);
-                app.cursor = 0;
-                app.completion = None;
-                app.completion_dismissed = false;
-                let action = parse_chat_line(app, &text);
                 app.command_input = matches!(action, Some(ChatAction::Dispatch(_))).then_some(text);
                 return action;
             }
