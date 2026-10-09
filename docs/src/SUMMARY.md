@@ -39,3 +39,4 @@
 - [Agent State Admin Capability](design/agent_state_admin.md)
 - [Skills & Prompts](design/skills_and_prompts.md)
 - [Model Info Store](design/model_info_store.md)
+- [Checkpointed Job Waits](design/checkpointed_waits.md)

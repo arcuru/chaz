@@ -6042,6 +6042,18 @@ async fn published_executor_with_mock(
     agents: Arc<AgentRegistry>,
     agent: DbEntry,
 ) -> (Arc<Server>, Arc<crate::test_support::MockBackend>) {
+    let mock = Arc::new(crate::test_support::MockBackend::new());
+    mock.push_text("finished");
+    published_executor_with_backend(settings, agents, agent, mock).await
+}
+
+/// Executor whose default backend (used by adopted jobs) is `mock`.
+async fn published_executor_with_backend(
+    settings: &crate::config::EideticaConfig,
+    agents: Arc<AgentRegistry>,
+    agent: DbEntry,
+    mock: Arc<crate::test_support::MockBackend>,
+) -> (Arc<Server>, Arc<crate::test_support::MockBackend>) {
     let connection =
         crate::instance::connect_with(settings, crate::config::ExecutionRole::Executor)
             .await
@@ -6053,8 +6065,6 @@ async fn published_executor_with_mock(
     );
     let index = HostedIndex::empty("agent");
     index.register(agent.clone());
-    let mock = Arc::new(crate::test_support::MockBackend::new());
-    mock.push_text("finished");
     let backend = crate::backends::BackendManager::with_mock(
         mock.clone(),
         crate::security::SecretStore::new(registry.chaz_peer().clone()).await,
@@ -7786,6 +7796,7 @@ async fn job_wait_executor_shutdown_and_claim_loss_stop_observation_or_reacquisi
                         processing: server.processing.clone(),
                     },
                     Some(permit),
+                    None,
                 )
                 .await;
             tokio::time::timeout(Duration::from_secs(5), entered.notified())
@@ -7869,3 +7880,6 @@ async fn job_wait_executor_shutdown_and_claim_loss_stop_observation_or_reacquisi
         }
     }
 }
+
+#[path = "wait_resume_tests.rs"]
+mod wait_resume;

@@ -30,7 +30,7 @@ Only `Message`, `Directive`, and `Summary` entries enter the conversation portio
 
 The **system prompt is assembled fresh every turn** from the agent's `system_prompt` + `system_prompt_files` (resolved at agent construction) plus `PromptAugmentation` contributions from the extension hub (skills) and the optional multi-agent room note. There is no per-session persona snapshot — the previous `PersonaSnapshot` entry type was deleted along with `persona.rs` / `role.rs` (see [Skills & Prompts](../design/skills_and_prompts.md)). To change an agent's prompt, edit `system_prompt` / `system_prompt_files` via `/agent set <ref> <field> <value>` (or restart against an edited config file).
 
-`ToolCall`, `ToolResult`, `Ack`, and `Error` entries are excluded from the LLM context. The runtime maintains its active ReAct history in memory. Structured completed model responses and tool results are also written to the attempt's `turn_transcript` store. On a later turn, the context builder joins visible request row IDs to their selected completed attempt at one Eidetica snapshot. It replays only complete native assistant-call/result groups, in request and attempt order, after the triggering request message. An interrupted attempt is not resumed or replayed, and older retry attempts are never included. Session-level tool entries remain display projections, never input for reconstruction.
+`ToolCall`, `ToolResult`, `Ack`, and `Error` entries are excluded from the LLM context. The runtime maintains its active ReAct history in memory. Structured completed model responses and tool results are also written to the attempt's `turn_transcript` store. On a later turn, the context builder joins visible request row IDs to their selected completed attempt at one Eidetica snapshot. It replays only complete native assistant-call/result groups, in request and attempt order, after the triggering request message. An interrupted attempt is not replayed, and older retry attempts are never included. The executor resumes one kind of interrupted attempt: one whose newest `job_wait_checkpoints` row is the pending end of its own strictly paired transcript (see Agent jobs below). Session-level tool entries remain display projections, never input for reconstruction.
 
 A context-only external observation or a pending addressed send is a known
 `BridgeEvent` with provenance and an inert role for turn scheduling.
@@ -109,13 +109,15 @@ For each request, reconciliation exposes one of four states:
 - **Queued** has no attempt and may run.
 - **In flight** has a started attempt owned by the current process.
 - **Interrupted** has a durable start without a completion but is not owned by
-  the current process.
+  the current process. A resumed checkpointed wait becomes in flight again
+  under the same attempt ID.
 - **Completed** has a completion and never runs again automatically.
 
 On registration, the server captures a session snapshot, installs its
 write callback from that snapshot, and reconciles the snapshot for queued
-requests. The callback covers commits after the snapshot; the catch-up read
-covers work already present before registration. Repeated callbacks are safe:
+requests, or for an interrupted attempt with a wait checkpoint. The callback
+covers commits after the snapshot; the catch-up read covers work already
+present before registration. Repeated callbacks are safe:
 the persisted request and attempt state decides whether there is work to run.
 
 When a local service client creates a session, the resident executor treats the
@@ -128,7 +130,10 @@ not add transport exposure metadata; bridge-created sessions continue through
 the agent registry's `exposed_on` adoption path.
 
 An interrupted attempt is deliberately not replayed. Model and tool work may
-already have caused an external effect before the process stopped. The public
+already have caused an external effect before the process stopped. The only
+automatic continuation resumes an exact checkpointed `job_wait` without
+re-executing anything before it (see
+[Agent jobs](#agent-jobs-and-worker-children)). The public
 library API exposes `Server::interrupted_turns()` to inspect that state and
 `Server::retry_interrupted_turn()` to request an explicit retry. The retry is
 submitted as a typed row in the session's `session_commands` store. The real
@@ -295,6 +300,8 @@ Agent jobs are admitted only for Agents hosted by the local executor. Their chil
 `spawn_agent` submits one durable Agent job, not a workflow graph. The submitter prepares one child session DB with parent delegation, a request record and exactly one Directive before publishing its ID to the existing watched catalog. An unpublished child is inert; a published child is `Pending` until an executor checks its parent, hosted target/home and broad scope, then pins inherited per-tool grants, capability and depth ceilings and records acceptance in the **same** DB. Invalid requests become `Rejected` without running. Submission returns the DB ID after publication, not after acceptance or execution. A lost creation response requires inspecting the indexed jobs before another submission; there is no stable parent request key or automatic submission retry. Same-login local clients can create and observe jobs but cannot admit or execute them. Narrow, workspace and private scopes are rejected in v1.
 
 After `Pending` admission or `Rejected` refusal, job status comes from the accepted Directive's attempt and typed terminal receipt: queued, running, started-unknown (a client cannot prove liveness), interrupted (executor sees a start without completion), succeeded, or failed. At most ten turns hold runtime permits for actual execution; accepted jobs wait **queued before starting an attempt** when capacity is full. An in-Agent `job_wait` yields its permit during observation without releasing its processing reservation, attempt, or claim. It reacquires before result hooks, further tools, or model requests, including after tool errors and timeouts. The existing claim-loss watcher covers observation and reacquisition; a fresh claim check after reacquisition prevents continuation on observed loss. Cancellation drops the turn's permit or pending acquisition. After restart, queued jobs are adopted; a started attempt without completion is not replayed automatically. Inspect it and explicitly retry if appropriate, since effects may already have occurred. `job_wait` only observes and a timeout does not cancel.
+
+**Checkpointed waits.** Before a `job_wait` that ends its model response observes, the runtime commits a versioned `JobWaitCheckpoint` row to the parent session DB's `job_wait_checkpoints` store. The row key is attempt, model sequence and call index, so rewriting the same call cannot add a row. The row records the request and attempt, Agent name, call ID and post-hook arguments, child handle, the session snapshot the turn's context came from, and an absolute deadline. The runtime gives the tool that same deadline (`ToolContext::observation_deadline`). A turn with **Approve all** or extension-injected pre-turn messages writes no row, because the loader could not restore that state. On a wake or the claim maintainer's tick, the executor examines interrupted requests in session order. It resumes one only when `plan_job_wait_resume` accepts it: the attempt's records are contiguous from sequence 0 for one attempt and request; every earlier model response is non-terminal and followed by exactly its paired results; and the last response's final call is the checkpointed `job_wait` with no result. The resumed attempt keeps its attempt ID and its context snapshot, and appends after its last sequence. Earlier results are reused with the exact content the live loop appended. Only the wait runs, under the remaining deadline and policy budget, and the loop then continues. Before marking the attempt live, the executor holds the session's processing reservation, revalidates the attempt and checkpoint, claims a job parent, and checks Agent resolution, home peer, attachment policy and `job_wait` scope. A process remembers every checkpoint it resumed or refused, so duplicate wakes and stopped resumes cannot advance it twice. Anything else, including a missing, advanced, mismatched or unknown-version checkpoint, stays `Interrupted` for `/retry`.
 
 Unlike the ordinary session protocol's single-executor assumption, an Agent job has a session-DB last-writer-wins owner claim for the same Agent/home identity. A contender losing the claim stops and records an interrupted/claim-loss marker while retaining the transcript. This is not fencing: delayed observations can overlap model or tool effects, and neither exactly-once effects nor cross-peer failover are promised. The pinned child authority cannot exceed the parent's admitted ceiling; `spawn_worker` is excluded from Agent-job delegation.
 

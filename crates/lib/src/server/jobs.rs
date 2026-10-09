@@ -722,6 +722,7 @@ impl Server {
             .to_string();
         let shutdown = self.shutting_down.clone();
         let live_attempts = self.live_attempts.clone();
+        let considered = self.considered_wait_checkpoints.clone();
         self.track_task(tokio::spawn(async move {
             if !authorized {
                 return;
@@ -754,13 +755,24 @@ impl Server {
                 let live = live_attempts.lock().await.clone();
                 match crate::session::jobs::status_from_db(&db, &live, true).await {
                     Ok(status) if status.state.is_terminal() => break,
-                    Ok(status)
-                        if matches!(
-                            status.state,
-                            crate::session::jobs::JobState::Interrupted { .. }
-                        ) =>
-                    {
-                        continue;
+                    Ok(crate::session::jobs::JobStatus {
+                        state: crate::session::jobs::JobState::Interrupted { attempt_id },
+                        ..
+                    }) => {
+                        // Held, unless its pending work is a checkpointed
+                        // wait this process has not yet considered: claim
+                        // and wake so the resume path can validate it once
+                        // the previous process's claim has lapsed.
+                        match crate::session::Session::latest_job_wait_checkpoint_in(
+                            &db,
+                            &attempt_id,
+                        )
+                        .await
+                        {
+                            Ok(Some(checkpoint))
+                                if !considered.lock().unwrap().contains(&checkpoint.key()) => {}
+                            _ => continue,
+                        }
                     }
                     Ok(_) => {}
                     Err(error) => {
