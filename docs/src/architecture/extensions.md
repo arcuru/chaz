@@ -513,3 +513,69 @@ or the runtime.
   declared scope + manifest the host inspects before loading, typed
   endpoints, and caps returning plain data over `CapFuture` so the same
   handler shape works across a sandbox boundary.
+
+## Durable context contributions
+
+`DurableContextContributor` is an instance endpoint in the normal build, not a
+loader or Cargo feature. Its manifest provides `DurableContext`; the operator
+must separately grant it in `durable_context`. The host resolves session over
+agent over global instances, attenuated by the turn's active set and current
+session/agent revocations. Built-ins have no bypass.
+
+`ExtensionHub::prepare_durable_context` is the scoped host operation. The server
+calls it before assembly. A contributor receives selected transcript rows,
+complete selected exchanges, stable row/request identities, its own committed
+contributions and its own JSON strategy state. It receives no raw DB handle.
+It returns a batch of conversation text plus an optional state replacement.
+The host assigns all provenance and commits state, text and the invocation
+receipt in one transaction before reconstructing the model view. Dropping a
+staged transaction exposes none of them. Each batch is limited to 64 messages
+and 64 KiB of serialized text/state; the final request has its own budget gate.
+
+The backward-compatible session stores are `context_contributions` (versioned
+batch/receipt rows) and `context_strategy_state` (namespace-keyed state). A
+namespace is the tuple of version, session root, responding agent, instance
+scope and extension name. An invocation adds the durable request ID, **not**
+the attempt ID. Message source IDs add the batch index. Tuple JSON encoding
+avoids delimiter collisions. Reopen or another attempt for that same request
+uses the receipt without invoking the extension again; a new request can
+contribute again. An empty batch is also a receipt. Existing sessions need no
+migration. Old transcript encodings are unchanged.
+
+`SessionContextView` reads entries/IDs, compact selection, selected completed
+attempts, contributions and state consistency at one immutable snapshot. Every
+state row must match a committed receipt in that snapshot. A failed read is
+not replaced with a resident transcript. There is no projection cache. Sync
+updates appear at the next snapshot; a pinned view remains unchanged. The
+existing runtime claim/turn serialization still owns execution. These stores
+are not a new execution lock or cross-peer exactly-once effect engine; a
+contributor must not perform external side effects before returning its batch.
+Concurrent legitimate state updates use Eidetica's existing table merge rules,
+not a new compare-and-swap protocol.
+
+Durable text is host-framed, escaped User data appended after selected history
+and ephemeral tails. It cannot supply System messages or native calls/results.
+This initial reconstruction retains granted contributions independently of the
+summary boundary; it does not infer that a summary covered them. Original
+entries and native transcripts stay untouched. Strategy state does not become
+live instructions, tools or grants. Projectors still receive a disposable copy
+and current execution checks remain independent. At every logical model call,
+required durable grants and current-request receipts are checked; optional
+revoked text is filtered from the request copy, without deleting its record.
+Transport retries reuse that accepted request.
+
+Required missing/failed contributors stop dispatch. Optional errors, panics,
+timeouts or invalid batches discard that batch, then reconstruct a fresh
+validated committed view, retaining earlier successful contributions. Read or
+state-integrity errors stop even optional fallback. The legacy schedule-turn
+caller has no durable request ID: optional new writes are skipped, required
+writes refuse, while an existing granted contribution can still be read. Its
+private wake prompt remains invocation-scoped. Direct runtime callers must
+prepare through the host too; required receipts cannot be bypassed.
+
+Compaction coverage and completed-attempt selection retain their existing
+rules. In particular, this API does not repair the older positional-summary
+case where a request queued _before_ the summary is hidden. It preserves rows
+selected by that reader, including current and queued rows after the boundary.
+It also retains the existing eager transcript hydration; a separate keyed
+reader can adopt the same pinned-view boundary without changing this schema.

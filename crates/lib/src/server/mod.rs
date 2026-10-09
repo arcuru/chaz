@@ -3353,16 +3353,26 @@ impl Server {
             };
 
             let tool_defs = tool_ctx.definitions();
+            let view = {
+                let s = session.lock().await;
+                spawn_extensions.prepare_durable_context(&s, &agent_name, Some(&attempt.request_id), &active_extensions).await
+            };
+            let view = match view {
+                Ok(view) => view,
+                Err(error) => {
+                    error!(%error, "Durable context preparation refused dispatch");
+                    let mut s = session.lock().await;
+                    if let Err(error) = s.complete_turn_attempt(&attempt, Some(SessionEntry {
+                        sender: agent_name.clone(), content: format!("Error: {error}"), timestamp: Utc::now(),
+                        entry_type: EntryType::Error, metadata: None, routing: None,
+                    })).await { error!(%error, "Failed to record context refusal"); }
+                    return;
+                }
+            };
             let (session_model, assembled) = {
                 let s = session.lock().await;
                 let meta = s.read_meta().await;
-                let (context_entries, tool_history) = match s.context_with_tool_history().await {
-                    Ok(entries) => entries,
-                    Err(error) => {
-                        error!(%error, "Failed to load compacted session context; using visible transcript");
-                        (s.entries().to_vec(), vec![Vec::new(); s.entries().len()])
-                    }
-                };
+
                 let roster: Vec<String> =
                     meta.agents.iter().map(|a| a.display_name.clone()).collect();
                 // Per-agent override > session pin > backend default. The
@@ -3390,12 +3400,12 @@ impl Server {
                     budget_model.as_deref(),
                     max_context_tokens,
                 );
-                let mut builder = ContextBuilder::new(&context_entries, &agent_name, &system_prompt, &context_config);
+                let mut builder = ContextBuilder::new(&view.entries, &agent_name, &system_prompt, &context_config);
                 if let Some(attachment) = &attachment {
                     builder = builder.with_attachment(attachment);
                 }
                 let assembled = builder.with_tools(&tool_defs)
-                        .with_tool_history(&tool_history)
+                        .with_context_view(&view)
                         .with_max_tokens_override(max_tokens_override)
                         .with_room_participants(&roster)
                         .with_extension_hub(spawn_extensions.clone())

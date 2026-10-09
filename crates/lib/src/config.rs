@@ -85,6 +85,9 @@ pub struct Config {
     /// names. Empty (the default) leaves every request untouched.
     #[serde(default)]
     pub context_projection: Vec<crate::extension::projection::ContextProjectionGrant>,
+    /// Intentional durable context/state grants; empty by default.
+    #[serde(default)]
+    pub durable_context: Vec<crate::extension::durable_context::DurableContextGrant>,
     /// Multi-agent chat-room tuning. Omit to use built-in defaults.
     pub multi_agent: Option<MultiAgentConfig>,
     /// Runtime-ownership mode for this peer: who claims the right to *run*
@@ -982,6 +985,7 @@ fn known_config_keys() -> HashSet<&'static str> {
         "cli",
         "agent_state_allowlist",
         "context_projection",
+        "durable_context",
         "multi_agent",
         "runtime",
         // Bridge-only top-level keys (MatrixBridgeConfig + DiscordBridgeConfig).
@@ -1180,6 +1184,10 @@ fn known_config_keys() -> HashSet<&'static str> {
 
     // ── agent_state_allowlist.<extension_name> ── (dynamic keys)
     keys.insert("agent_state_allowlist.");
+
+    for k in ["durable_context[].extension", "durable_context[].required"] {
+        keys.insert(k);
+    }
 
     // ── context_projection[] ──
     for k in [

@@ -904,6 +904,13 @@ async fn server_fixture() -> (Instance, Arc<Server>, Arc<crate::session::Session
 async fn server_fixture_with_host(
     host: Arc<dyn ToolHost>,
 ) -> (Instance, Arc<Server>, Arc<crate::session::SessionRegistry>) {
+    server_fixture_with_host_and_hub(host, Arc::new(crate::extension::ExtensionHub::new())).await
+}
+
+async fn server_fixture_with_host_and_hub(
+    host: Arc<dyn ToolHost>,
+    hub: Arc<crate::extension::ExtensionHub>,
+) -> (Instance, Arc<Server>, Arc<crate::session::SessionRegistry>) {
     let backend = InMemory::new();
     let (instance, user) =
         Instance::create_backend(Box::new(backend), NewUser::passwordless("test"))
@@ -938,7 +945,7 @@ async fn server_fixture_with_host(
         HashMap::new(),
         Default::default(),
         host,
-        Arc::new(crate::extension::ExtensionHub::new()),
+        hub,
         default_backend,
         Arc::new(crate::mcp::McpRegistry::new()),
         Some(crate::instance::ExecutorCapability::for_test()),
@@ -7868,4 +7875,209 @@ async fn job_wait_executor_shutdown_and_claim_loss_stop_observation_or_reacquisi
             );
         }
     }
+}
+
+#[tokio::test]
+async fn durable_context_server_commits_before_dispatch_and_preserves_native_exchanges() {
+    use crate::extension::{
+        Extension, ExtensionInstance, HookKind, ScopeCtx,
+        caps::{CapFuture, CapabilityKind},
+        durable_context::*,
+        manifest::ExtensionManifest,
+    };
+    use crate::test_support::MockBackend;
+    use crate::tool::{Tool, ToolContext, ToolDescriptor, ToolError};
+    use serde_json::{Value, json};
+    use std::pin::Pin;
+    struct Contribution;
+    impl DurableContextContributor for Contribution {
+        fn contribute<'a>(
+            &'a self,
+            call: &'a DurableContextCall<'a>,
+        ) -> CapFuture<'a, ContextContribution> {
+            Box::pin(async move {
+                Ok(ContextContribution {
+                    messages: vec![format!("SERVER-DURABLE:{}", call.request_id.as_str())],
+                    state: Some(json!({"committed": true})),
+                })
+            })
+        }
+    }
+    struct Ext;
+    impl Extension for Ext {
+        fn name(&self) -> &'static str {
+            "durable-test"
+        }
+        fn supported_hooks(&self) -> &[HookKind] {
+            &[]
+        }
+        fn manifest(&self) -> ExtensionManifest {
+            ExtensionManifest {
+                name: self.name().into(),
+                extension_ref: crate::extension::ExtensionRef::builtin(self.name()),
+                supported_hooks: vec![],
+                required_capabilities: vec![],
+                requested_capabilities: vec![],
+                provides_capabilities: vec![CapabilityKind::DurableContext],
+            }
+        }
+        fn instantiate<'a>(
+            &'a self,
+            _: ScopeCtx<'a>,
+        ) -> crate::extension::instance::InstantiateFuture<'a> {
+            struct Inst(ExtensionManifest);
+            impl ExtensionInstance for Inst {
+                fn manifest(&self) -> &ExtensionManifest {
+                    &self.0
+                }
+                fn durable_context_contributor(
+                    &self,
+                ) -> Option<Arc<dyn DurableContextContributor>> {
+                    Some(Arc::new(Contribution))
+                }
+            }
+            Box::pin(
+                async move { Ok(Arc::new(Inst(self.manifest())) as Arc<dyn ExtensionInstance>) },
+            )
+        }
+    }
+    struct Search;
+    impl Tool for Search {
+        fn descriptor(&self) -> ToolDescriptor {
+            ToolDescriptor {
+                name: "search".into(),
+                description: "inert test".into(),
+                parameters: json!({"type":"object"}),
+            }
+        }
+        fn execute<'a>(
+            &'a self,
+            _: Value,
+            _: &'a ToolContext,
+        ) -> Pin<Box<dyn std::future::Future<Output = Result<String, ToolError>> + Send + 'a>>
+        {
+            Box::pin(async { Ok("ORIGINAL TOOL BODY".into()) })
+        }
+    }
+    let (_peer_instance, peer_registry) = crate::test_support::fresh_session_registry().await;
+    let mut hub = crate::extension::ExtensionHub::new();
+    hub.set_peer_handles(Arc::new(crate::extension::PeerHandles {
+        registry: peer_registry,
+        agent_index: HostedIndex::empty("agent"),
+        memory_bank_index: HostedIndex::empty("bank"),
+        skill_bank_index: HostedIndex::empty("skill_bank"),
+        embedder: None,
+        secrets: None,
+        server_slot: Default::default(),
+        mcp_registry: Arc::new(crate::mcp::McpRegistry::new()),
+        agent_state_allowlist: Default::default(),
+        tool_registry: Arc::new(ToolRegistry::new()),
+    }));
+    hub.set_durable_context_grants(&[DurableContextGrant {
+        extension: "durable-test".into(),
+        required: true,
+    }])
+    .unwrap();
+    hub.install_all(vec![Arc::new(Ext)]).await.unwrap();
+    let hub = Arc::new(hub);
+    let (_instance, server, registry) = server_fixture_with_host_and_hub(
+        Arc::new(crate::tool_host::NativeToolHost::new()),
+        hub.clone(),
+    )
+    .await;
+    server.tools.register(Search);
+    let (agent, _) = seed_agent(&server, &registry, "alpha").await;
+    register_alpha_agent_runtime(&server);
+    let (_, db) = registry.create_session(Some("durable-test")).await.unwrap();
+    let sid = db.root_id().to_string();
+    registry
+        .attach_agent_to_session(&sid, &agent)
+        .await
+        .unwrap();
+    hub.record_active(&db).await.unwrap();
+    let first = write_user_message_with_content(&db, &sid, "first request").await;
+    let mock = Arc::new(MockBackend::new());
+    mock.push_tool_calls(vec![("call-id".into(), "search".into(), "{}".into())]);
+    mock.push_text("first reply");
+    mock.push_text("second reply");
+    let gate = mock.block_next_call();
+    server
+        .register_session(
+            &db,
+            BackendManager::with_mock(
+                mock.clone(),
+                crate::security::SecretStore::new(registry.chaz_peer().clone()).await,
+            ),
+            Some("alpha".into()),
+            None,
+        )
+        .await
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(10), gate.wait_started())
+        .await
+        .unwrap();
+    let s = Session::new(ConversationId(sid.clone()), db.clone()).await;
+    let at_dispatch = s
+        .context_view_at(db.snapshot().await.unwrap())
+        .await
+        .unwrap();
+    assert_eq!(
+        at_dispatch.contributions.len(),
+        1,
+        "model called before durable commit"
+    );
+    assert_eq!(at_dispatch.contributions[0].identity.request_id, first);
+    gate.release();
+    await_call_count(&mock, 2).await;
+    await_no_processing(&server, &sid).await;
+    let s = Session::new(ConversationId(sid.clone()), db.clone()).await;
+    let attempt = s
+        .attempts_for_test()
+        .await
+        .into_iter()
+        .find(|a| a.request_id == first)
+        .unwrap();
+    let originals =
+        serde_json::to_vec(&s.turn_transcript(&attempt.attempt_id).await.unwrap()).unwrap();
+    write_user_message_with_content(&db, &sid, "second request").await;
+    await_call_count(&mock, 3).await;
+    await_no_processing(&server, &sid).await;
+    let s = Session::new(ConversationId(sid.clone()), db.clone()).await;
+    assert_eq!(
+        serde_json::to_vec(&s.turn_transcript(&attempt.attempt_id).await.unwrap()).unwrap(),
+        originals
+    );
+    let calls = mock.recorded_calls();
+    assert!(calls.iter().all(|call| call.messages.iter().any(
+        |m| matches!(m, crate::runtime::RuntimeMessage::User(t) if t.contains("SERVER-DURABLE:"))
+    )));
+    for call in &calls[1..] {
+        let exchange: Vec<_> = call
+            .messages
+            .iter()
+            .filter(|m| {
+                matches!(
+                    m,
+                    crate::runtime::RuntimeMessage::AssistantToolCalls { .. }
+                        | crate::runtime::RuntimeMessage::ToolResult { .. }
+                )
+            })
+            .collect();
+        assert_eq!(exchange.len(), 2);
+        assert!(
+            matches!(exchange[0], crate::runtime::RuntimeMessage::AssistantToolCalls { tool_calls, .. } if tool_calls[0].id == "call-id")
+        );
+        assert!(
+            matches!(exchange[1], crate::runtime::RuntimeMessage::ToolResult { call_id, content } if call_id == "call-id" && content.contains("ORIGINAL TOOL BODY"))
+        );
+    }
+    assert_eq!(
+        s.context_view_at(db.snapshot().await.unwrap())
+            .await
+            .unwrap()
+            .contributions
+            .len(),
+        2,
+        "logical rounds duplicated contributions"
+    );
 }
