@@ -129,6 +129,9 @@ pub enum CapabilityKind {
     /// `context_projection`, with the authority that grant names. See
     /// [`crate::extension::projection`].
     ContextProjection,
+    /// Intentional durable conversation text and scoped strategy state. The
+    /// host commits returned data only under an explicit `durable_context` grant.
+    DurableContext,
 }
 
 impl CapabilityKind {
@@ -168,6 +171,7 @@ impl CapabilityKind {
             Self::ContextTail => "context_tail",
             Self::StatusSegment => "status_segment",
             Self::ContextProjection => "context_projection",
+            Self::DurableContext => "durable_context",
         }
     }
 }

@@ -140,6 +140,13 @@ pub enum ContextSource {
         sender: String,
         timestamp: DateTime<Utc>,
     },
+    /// Stable Eidetica row identity when supplied by coherent reconstruction.
+    PersistedSessionEntry { id: String },
+    /// Intentional committed custom context, identified by the host.
+    DurableContribution {
+        source_id: String,
+        extension: String,
+    },
     /// A completed native tool exchange replayed from an earlier turn's
     /// transcript.
     ReplayedExchange {

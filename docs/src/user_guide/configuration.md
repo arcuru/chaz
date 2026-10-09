@@ -540,6 +540,16 @@ agent_state_allowlist:
   memory: [chaz]
 ```
 
+`durable_context:` grants intentional session-backed text/state contributions.
+It defaults to `[]`; installation does not grant writes. Names must be distinct.
+See [Durable context](extensions.md#durable-context-is-an-explicit-write) for
+scope, retry, failure and privacy rules. It is independent of projection grants.
+
+| Key                           | Default | Meaning                                                                                                    |
+| ----------------------------- | ------- | ---------------------------------------------------------------------------------------------------------- |
+| `durable_context[].extension` | —       | Installed contributor's manifest name.                                                                     |
+| `durable_context[].required`  | `false` | Refuse dispatch if the contributor cannot commit; optional failures require a coherent committed fallback. |
+
 `context_projection:` lists the extensions allowed to reshape the request sent on each model call, in order. Installing or activating an extension never grants this; only this list does. See [Context projection grants](extensions.md#context-projection-grants).
 
 | Key                              | Default        | Meaning                                                                                                                                           |

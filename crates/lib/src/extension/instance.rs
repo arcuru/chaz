@@ -190,6 +190,14 @@ pub trait ExtensionInstance: Send + Sync + 'static {
         None
     }
 
+    /// Intentional durable text/state, committed by the scoped host before assembly.
+    /// Requires a current operator `durable_context` grant and activation.
+    fn durable_context_contributor(
+        &self,
+    ) -> Option<Arc<dyn super::durable_context::DurableContextContributor>> {
+        None
+    }
+
     // ── Extension-to-extension service endpoints ───────────────────
 
     fn memory_access(&self) -> Option<Arc<dyn MemoryAccess>> {

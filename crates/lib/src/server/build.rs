@@ -607,6 +607,9 @@ pub async fn build(
     extension_hub
         .set_context_projection_grants(&config.context_projection)
         .map_err(anyhow::Error::msg)?;
+    extension_hub
+        .set_durable_context_grants(&config.durable_context)
+        .map_err(anyhow::Error::msg)?;
     extension_hub.set_peer_handles(Arc::new(extension::PeerHandles {
         registry: registry.clone(),
         agent_index: agent_index_store.clone(),

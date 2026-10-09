@@ -687,6 +687,12 @@ impl Server {
         };
 
         let tool_defs = tool_ctx.definitions();
+        let view = {
+            let s = session.lock().await;
+            self.extensions
+                .prepare_durable_context(&s, agent_name, None, &active_extensions)
+                .await?
+        };
         let (session_model, mut assembled) = {
             let s = session.lock().await;
             let meta = s.read_meta().await;
@@ -711,7 +717,7 @@ impl Server {
                 max_context_tokens,
             );
             let mut builder = ContextBuilder::new(
-                s.entries(),
+                &view.entries,
                 agent_name,
                 &agent.system_prompt,
                 &self.context_config,
@@ -720,6 +726,7 @@ impl Server {
                 builder = builder.with_attachment(attachment);
             }
             let assembled = builder
+                .with_context_view(&view)
                 .with_tools(&tool_defs)
                 .with_max_tokens_override(max_tokens_override)
                 .with_room_participants(&roster)
