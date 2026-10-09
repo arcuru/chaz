@@ -184,6 +184,21 @@ impl runtime::RuntimeRecorder for SessionRuntimeRecorder {
                 .map_err(|error| format!("failed to persist job wait checkpoint: {error}"))
         })
     }
+
+    fn finish_job_wait<'a>(
+        &'a self,
+        model_sequence: u64,
+        call_index: usize,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(async move {
+            self.session
+                .lock()
+                .await
+                .finish_job_wait_checkpoint(&self.attempt_id, model_sequence, call_index)
+                .await
+                .map_err(|error| format!("failed to retire job wait checkpoint: {error}"))
+        })
+    }
 }
 
 /// Only the origin of this exact turn may acquire an external destination.

@@ -1640,7 +1640,7 @@ async fn injected_pre_turn_messages_prevent_wait_checkpoints_and_never_refire() 
     }
 
     #[derive(Default)]
-    struct Intents(std::sync::Mutex<usize>);
+    struct Intents(std::sync::Mutex<usize>, std::sync::atomic::AtomicUsize);
     impl RuntimeRecorder for Intents {
         fn record<'a>(
             &'a self,
@@ -1655,18 +1655,57 @@ async fn injected_pre_turn_messages_prevent_wait_checkpoints_and_never_refire() 
             *self.0.lock().unwrap() += 1;
             Box::pin(async { Ok(()) })
         }
+        fn finish_job_wait<'a>(
+            &'a self,
+            _: u64,
+            _: usize,
+        ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+            self.1.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    struct ResultHook {
+        recorder: Arc<Intents>,
+        observations: Arc<std::sync::Mutex<Vec<usize>>>,
+    }
+    impl handler::HookHandlerToolResult for ResultHook {
+        fn on_tool_result<'a>(
+            &'a self,
+            _: &'a str,
+            output: String,
+        ) -> handler::HandlerFuture<'a, String> {
+            Box::pin(async move {
+                self.observations
+                    .lock()
+                    .unwrap()
+                    .push(self.recorder.1.load(std::sync::atomic::Ordering::SeqCst));
+                output
+            })
+        }
     }
 
     let mut hub = test_hub().await;
     let fired = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    hub.install_all(vec![counting_ext("inject", fired.clone())])
-        .await
-        .unwrap();
+    let recorder = Arc::new(Intents::default());
+    let observations = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut result_ext = TestExt::new("result");
+    result_ext.supported.push(HookKind::ToolResult);
+    result_ext.parts.tool_result = Some(Arc::new(ResultHook {
+        recorder: recorder.clone(),
+        observations: observations.clone(),
+    }));
+    hub.install_all(vec![
+        counting_ext("inject", fired.clone()),
+        Arc::new(result_ext),
+    ])
+    .await
+    .unwrap();
     let (_instance, session) = crate::test_support::fresh_session().await;
     let tools = Arc::new(ToolRegistry::new());
     tools.register(Wait);
     let mut ctx = crate::test_support::tool_context(session, tools);
-    ctx.active_extensions = all_active(&["inject"]);
+    ctx.active_extensions = all_active(&["inject", "result"]);
     let arguments =
         serde_json::json!({"session_db_id": "child", "timeout_seconds": 30}).to_string();
     let mock = Arc::new(crate::test_support::MockBackend::new());
@@ -1677,7 +1716,6 @@ async fn injected_pre_turn_messages_prevent_wait_checkpoints_and_never_refire() 
         mock.clone(),
         crate::test_support::empty_secrets().await,
     );
-    let recorder = Arc::new(Intents::default());
     let policies = crate::tool::ToolPolicyRegistry::empty();
     let security = crate::test_support::permissive_security();
     let outcome = crate::runtime::execute_with_recorder(
@@ -1741,5 +1779,10 @@ async fn injected_pre_turn_messages_prevent_wait_checkpoints_and_never_refire() 
         fired.load(std::sync::atomic::Ordering::SeqCst),
         1,
         "before_agent_start does not run again on resume"
+    );
+    assert_eq!(
+        *observations.lock().unwrap(),
+        [1, 2],
+        "both live and resumed waits retire before result hooks"
     );
 }

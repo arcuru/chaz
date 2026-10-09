@@ -38,6 +38,9 @@ pub struct JobWaitCheckpoint {
     /// Absolute observation deadline; downtime counts against it.
     pub deadline: DateTime<Utc>,
     pub policy_timeout_seconds: u64,
+    /// Set durably before result hooks run. The receipt is retained, but an
+    /// unfinished result after this boundary is held for explicit retry.
+    pub observation_finished: bool,
 }
 
 impl JobWaitCheckpoint {
@@ -62,6 +65,7 @@ impl JobWaitCheckpoint {
             checkpointed_at: wait.checkpointed_at,
             deadline: wait.deadline,
             policy_timeout_seconds: wait.policy_timeout_seconds,
+            observation_finished: false,
         }
     }
 
@@ -73,9 +77,10 @@ impl JobWaitCheckpoint {
         )
     }
 
-    pub(crate) fn policy_deadline(&self) -> DateTime<Utc> {
+    pub(crate) fn policy_deadline(&self) -> Option<DateTime<Utc>> {
+        let seconds = i64::try_from(self.policy_timeout_seconds).ok()?;
         self.checkpointed_at
-            + chrono::Duration::seconds(self.policy_timeout_seconds.min(i64::MAX as u64) as i64)
+            .checked_add_signed(chrono::Duration::try_seconds(seconds)?)
     }
 }
 
@@ -99,6 +104,34 @@ impl Session {
             .set(checkpoint.key(), checkpoint.clone())
             .await?;
         txn.commit().await?;
+        Ok(())
+    }
+
+    pub(crate) async fn finish_job_wait_checkpoint(
+        &self,
+        attempt_id: &str,
+        model_sequence: u64,
+        call_index: usize,
+    ) -> anyhow::Result<()> {
+        let txn = self.database().new_transaction().await?;
+        let store = txn
+            .get_store::<Table<JobWaitCheckpoint>>(JOB_WAIT_CHECKPOINTS_STORE)
+            .await?;
+        let rows = store
+            .search(|checkpoint| {
+                checkpoint.attempt_id == attempt_id
+                    && checkpoint.model_sequence == model_sequence
+                    && checkpoint.call_index == call_index
+                    && !checkpoint.observation_finished
+            })
+            .await?;
+        if !rows.is_empty() {
+            for (key, mut checkpoint) in rows {
+                checkpoint.observation_finished = true;
+                store.set(key, checkpoint).await?;
+            }
+            txn.commit().await?;
+        }
         Ok(())
     }
 
@@ -177,6 +210,9 @@ pub(crate) fn plan_job_wait_resume(
     if checkpoint.version != JOB_WAIT_CHECKPOINT_VERSION {
         return Err("unknown checkpoint version");
     }
+    if checkpoint.observation_finished {
+        return Err("wait observation finished before interruption");
+    }
     let window = checkpoint.deadline - checkpoint.checkpointed_at;
     if window <= chrono::Duration::zero() || window > chrono::Duration::seconds(240) {
         return Err("checkpoint deadline is outside the job_wait bound");
@@ -184,6 +220,9 @@ pub(crate) fn plan_job_wait_resume(
     if checkpoint.policy_timeout_seconds == 0 {
         return Err("checkpoint has no policy timeout");
     }
+    let policy_deadline = checkpoint
+        .policy_deadline()
+        .ok_or("checkpoint policy deadline overflows")?;
     let arguments: serde_json::Value =
         serde_json::from_str(&checkpoint.arguments).map_err(|_| "checkpoint arguments")?;
     match crate::tools::jobs::job_wait_arguments(&arguments) {
@@ -231,7 +270,7 @@ pub(crate) fn plan_job_wait_resume(
         }
         let pending = *sequence == checkpoint.model_sequence;
         if pending
-            && (checkpoint.call_index + 1 != tool_calls.len()
+            && (checkpoint.call_index.checked_add(1) != Some(tool_calls.len())
                 || tool_calls[checkpoint.call_index].id != checkpoint.call_id
                 || tool_calls[checkpoint.call_index].name != crate::runtime::JOB_WAIT_TOOL)
         {
@@ -307,7 +346,7 @@ pub(crate) fn plan_job_wait_resume(
                 ..pending_call
             },
             deadline: checkpoint.deadline,
-            policy_deadline: checkpoint.policy_deadline(),
+            policy_deadline,
             policy_timeout_seconds: checkpoint.policy_timeout_seconds,
             metadata,
             matrix_send_queued,

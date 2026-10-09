@@ -57,6 +57,16 @@ pub trait RuntimeRecorder: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
         Box::pin(async { Ok(()) })
     }
+
+    /// Retire a wait checkpoint before result hooks or persistence can have
+    /// effects. Failure stops the turn without running those effects.
+    fn finish_job_wait<'a>(
+        &'a self,
+        _model_sequence: u64,
+        _call_index: usize,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(async { Ok(()) })
+    }
 }
 
 /// The single `job_wait` call a turn is about to run, after approval and
@@ -715,18 +725,22 @@ async fn run_turn(
                 // budget reports the original timeout immediately.
                 let timeout = (resume.policy_deadline - chrono::Utc::now())
                     .to_std()
-                    .unwrap_or_default();
+                    .unwrap_or_default()
+                    .min(policy.timeout_duration());
                 invoke_tool(
                     tool,
                     args,
                     &call_ctx,
                     timeout,
-                    resume.policy_timeout_seconds,
+                    resume.policy_timeout_seconds.min(policy.timeout),
                     &call.name,
                     &mut capacity,
                     security,
                     hub,
                     hook_ctx.as_ref(),
+                    recorder
+                        .as_deref()
+                        .map(|recorder| (recorder, model_sequence, resume.call_index)),
                 )
                 .await?
             }
@@ -1085,6 +1099,9 @@ async fn run_turn(
                                 security,
                                 hub,
                                 hook_ctx.as_ref(),
+                                recorder
+                                    .as_deref()
+                                    .map(|recorder| (recorder, model_sequence, call_index)),
                             )
                             .await?
                         }
@@ -1151,6 +1168,7 @@ async fn invoke_tool(
     security: &SecurityContext,
     hub: Option<&ExtensionHub>,
     hook_ctx: Option<&HookContext>,
+    checkpoint: Option<(&dyn RuntimeRecorder, u64, usize)>,
 ) -> Result<String, String> {
     if name == JOB_WAIT_TOOL
         && let Some(capacity) = capacity.as_mut()
@@ -1165,6 +1183,17 @@ async fn invoke_tool(
         && let Some(capacity) = capacity.as_mut()
     {
         capacity.reacquire().await?;
+    }
+
+    // Observation is safe to repeat; result hooks need not be. Retire the
+    // checkpoint before crossing that boundary, even on error or timeout.
+    if name == JOB_WAIT_TOOL
+        && let Some((recorder, model_sequence, call_index)) = checkpoint
+    {
+        recorder
+            .finish_job_wait(model_sequence, call_index)
+            .await
+            .map_err(|error| format!("runtime persistence failed: {error}"))?;
     }
 
     Ok(match exec_result {

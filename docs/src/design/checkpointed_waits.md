@@ -17,6 +17,7 @@ Persist exactly that record, and resume only that.
 - The same attempt ID continues, so the transcript stays one paired group that ordinary context replay accepts after completion.
 - The deadline is absolute and fixed when the wait first starts. The live wait uses it too, so restarted and uninterrupted waits behave the same way.
 - Current authority is rechecked before any further effect, and each checkpoint is considered at most once per process.
+- Observation completion retires the checkpoint durably before result hooks run. A crash during a hook or result commit stays held: the missing result does not prove the hook had no effects.
 
 ## Alternatives considered
 

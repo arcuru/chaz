@@ -283,6 +283,15 @@ async fn malformed_or_unknown_checkpoints_are_held() {
     let mut no_policy = valid.clone();
     no_policy.policy_timeout_seconds = 0;
     variants.push(("no policy timeout", no_policy));
+    let mut finished = valid.clone();
+    finished.observation_finished = true;
+    variants.push(("observation finished", finished));
+    let mut index_overflow = valid.clone();
+    index_overflow.call_index = usize::MAX;
+    variants.push(("call index overflow", index_overflow));
+    let mut policy_overflow = valid.clone();
+    policy_overflow.policy_timeout_seconds = u64::MAX;
+    variants.push(("policy deadline overflow", policy_overflow));
     for (name, checkpoint) in variants {
         assert!(
             plan_job_wait_resume(&checkpoint, &records).is_err(),

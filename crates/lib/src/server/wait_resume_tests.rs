@@ -158,6 +158,11 @@ async fn checkpoints(db: &eidetica::Database) -> Vec<JobWaitCheckpoint> {
         .collect()
 }
 
+fn finished_checkpoint(mut checkpoint: JobWaitCheckpoint) -> JobWaitCheckpoint {
+    checkpoint.observation_finished = true;
+    checkpoint
+}
+
 async fn job_count(server: &Server) -> usize {
     server
         .registry()
@@ -201,6 +206,8 @@ enum ChildAtCrash {
     Unpublished,
     /// Running behind a model gate: its own start becomes interrupted.
     Running,
+    /// Rejected while the parent is down; it must never execute.
+    Rejected,
 }
 
 struct Crashed {
@@ -225,7 +232,7 @@ async fn crash_while_waiting(fx: &Fixture, seconds: u64, mode: ChildAtCrash) -> 
         .await
         .unwrap();
     let (child, prepared) = match mode {
-        ChildAtCrash::Unpublished => {
+        ChildAtCrash::Unpublished | ChildAtCrash::Rejected => {
             let prepared = registry
                 .prepare_agent_job(&sid.0, "default", "child task")
                 .await
@@ -282,6 +289,11 @@ async fn crash_while_waiting(fx: &Fixture, seconds: u64, mode: ChildAtCrash) -> 
     );
     a.server.shutdown().await;
     drop(a);
+    if mode == ChildAtCrash::Rejected {
+        crate::session::jobs::reject_job(&prepared.as_ref().unwrap().db, "child refused")
+            .await
+            .unwrap();
+    }
     Crashed {
         sid: sid.0,
         db,
@@ -389,7 +401,7 @@ async fn restart_resumes_only_the_same_wait_and_survives_a_second_crash() {
     assert_eq!(job_count(&c.server).await, 1, "no second child");
     assert_eq!(
         checkpoints(&db).await,
-        std::slice::from_ref(&checkpoint),
+        [finished_checkpoint(checkpoint.clone())],
         "deadline unchanged"
     );
     let reply = Session::new(ConversationId(sid.clone()), db.clone()).await;
@@ -474,7 +486,10 @@ async fn downtime_counts_against_the_original_deadline() {
         result.contains("Pending"),
         "timeout returns current state: {result}"
     );
-    assert_eq!(checkpoints(&crashed.db).await, [crashed.checkpoint]);
+    assert_eq!(
+        checkpoints(&crashed.db).await,
+        [finished_checkpoint(crashed.checkpoint)]
+    );
     assert_eq!(fx.effects.load(Ordering::SeqCst), 1);
     assert_eq!(
         job_count(&b.server).await,
@@ -485,34 +500,52 @@ async fn downtime_counts_against_the_original_deadline() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn interrupted_child_is_reported_and_stays_held() {
-    let fx = Fixture::new("wait-interrupted").await;
-    let crashed = crash_while_waiting(&fx, 240, ChildAtCrash::Running).await;
+async fn interrupted_and_rejected_children_are_reported_without_rerunning() {
+    for (label, mode) in [
+        ("Interrupted", ChildAtCrash::Running),
+        ("Rejected", ChildAtCrash::Rejected),
+    ] {
+        let fx = Fixture::new(label).await;
+        let crashed = crash_while_waiting(&fx, 240, mode).await;
 
-    let b = fx.start().await;
-    await_calls(&b.child_mock, 1).await;
-    await_no_processing(&b.server, &crashed.sid).await;
-    let result = wait_result(&b.child_mock.recorded_calls()[0]);
-    assert!(result.contains("Interrupted"), "{result}");
-    // The child's uncheckpointed start is neither replayed nor respawned:
-    // the only model call was the parent's continuation.
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    assert_eq!(b.child_mock.recorded_calls().len(), 1);
-    assert!(matches!(
-        b.server.job_status(&crashed.child).await.unwrap().state,
-        JobState::Interrupted { .. }
-    ));
-    assert_eq!(
-        b.server
-            .interrupted_turns(&crashed.child)
-            .await
-            .unwrap()
-            .len(),
-        1
-    );
-    assert_eq!(job_count(&b.server).await, 1);
-    assert_eq!(checkpoints(&crashed.db).await, [crashed.checkpoint]);
-    b.server.shutdown().await;
+        let b = fx.start().await;
+        await_calls(&b.child_mock, 1).await;
+        await_no_processing(&b.server, &crashed.sid).await;
+        let result = wait_result(&b.child_mock.recorded_calls()[0]);
+        assert!(result.contains(label), "{result}");
+        // The child's uncheckpointed start is neither replayed nor respawned:
+        // the only model call was the parent's continuation.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(b.child_mock.recorded_calls().len(), 1);
+        let state = b.server.job_status(&crashed.child).await.unwrap().state;
+        if mode == ChildAtCrash::Running {
+            assert!(matches!(state, JobState::Interrupted { .. }));
+            assert_eq!(
+                b.server
+                    .interrupted_turns(&crashed.child)
+                    .await
+                    .unwrap()
+                    .len(),
+                1
+            );
+        } else {
+            assert_eq!(
+                state,
+                JobState::Rejected {
+                    message: "child refused".into()
+                }
+            );
+        }
+        assert_eq!(
+            job_count(&b.server).await,
+            usize::from(mode == ChildAtCrash::Running)
+        );
+        assert_eq!(
+            checkpoints(&crashed.db).await,
+            [finished_checkpoint(crashed.checkpoint)]
+        );
+        b.server.shutdown().await;
+    }
 }
 
 /// Crash before the checkpoint, and after the wait's result, both leave
@@ -644,6 +677,55 @@ async fn crash_before_checkpoint_or_after_result_stays_held() {
         );
     }
     b.server.shutdown().await;
+}
+
+/// A failed result commit must not authorize repeating result-hook effects.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn failure_after_observation_before_result_stays_held_after_restart() {
+    let fx = Fixture::new("wait-result-failure").await;
+    let crashed = crash_while_waiting(&fx, 240, ChildAtCrash::Unpublished).await;
+    let b = fx.start().await;
+    await_resumed(&b, &crashed.checkpoint.attempt_id).await;
+    // Fail the next record: the wait result, after a read-only observation.
+    *b.server.transcript_fail_after.lock().unwrap() = Some(0);
+    crate::session::jobs::reject_job(&crashed.prepared.unwrap().db, "child refused")
+        .await
+        .unwrap();
+    await_no_processing(&b.server, &crashed.sid).await;
+    let session = Session::new(ConversationId(crashed.sid.clone()), crashed.db.clone()).await;
+    assert_eq!(
+        session
+            .turn_transcript(&crashed.checkpoint.attempt_id)
+            .await
+            .unwrap()
+            .len(),
+        3
+    );
+    b.server.shutdown().await;
+    drop(b);
+
+    let c = fx.start().await;
+    for _ in 0..3 {
+        c.server.process_session(&crashed.sid).await.unwrap();
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        c.child_mock.recorded_calls().is_empty(),
+        "no automatic continuation after the result boundary"
+    );
+    assert_eq!(
+        checkpoints(&crashed.db).await,
+        [finished_checkpoint(crashed.checkpoint.clone())]
+    );
+    assert_eq!(
+        c.server.interrupted_turns(&crashed.sid).await.unwrap(),
+        vec![InterruptedTurn {
+            request_id: crashed.checkpoint.request_id,
+            attempt_id: crashed.checkpoint.attempt_id,
+        }]
+    );
+    assert_eq!(fx.effects.load(Ordering::SeqCst), 1);
+    c.server.shutdown().await;
 }
 
 struct JobParentCrash {

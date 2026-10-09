@@ -14,6 +14,7 @@ use tokio::sync::Semaphore;
 struct Recorder {
     intents: Mutex<Vec<JobWaitIntent>>,
     records: Mutex<Vec<RuntimeRecord>>,
+    fail_finish: bool,
 }
 
 impl RuntimeRecorder for Recorder {
@@ -31,6 +32,20 @@ impl RuntimeRecorder for Recorder {
     ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
         self.intents.lock().unwrap().push(wait);
         Box::pin(async { Ok(()) })
+    }
+
+    fn finish_job_wait<'a>(
+        &'a self,
+        _: u64,
+        _: usize,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(async move {
+            if self.fail_finish {
+                Err("retirement failed".into())
+            } else {
+                Ok(())
+            }
+        })
     }
 }
 
@@ -417,4 +432,112 @@ async fn expired_policy_budget_reports_the_original_timeout_without_waiting() {
         RuntimeMessage::ToolResult { call_id, content } if call_id == "w"
             && content.contains("Tool timed out after 300 seconds")))
     );
+}
+
+#[tokio::test]
+async fn retirement_failure_stops_live_and_resumed_turns_before_recording_or_continuing() {
+    for resumed in [false, true] {
+        let tools = Arc::new(ToolRegistry::new());
+        tools.register(Wait {
+            deadlines: Default::default(),
+            capacity: None,
+            hang: false,
+        });
+        let (_instance, session) = fresh_session().await;
+        let ctx = tool_context(session, tools);
+        let mock = Arc::new(MockBackend::new());
+        if !resumed {
+            mock.push_tool_calls([("w".into(), "job_wait".into(), wait_args(30))]);
+        }
+        mock.push_text("must not continue");
+        let backend = BackendManager::with_mock(mock.clone(), empty_secrets().await);
+        let recorder = Arc::new(Recorder {
+            fail_finish: true,
+            ..Default::default()
+        });
+        let now = chrono::Utc::now();
+        let result = run_turn(
+            None,
+            vec![RuntimeMessage::User("go".into())],
+            &backend,
+            &permissive_security(),
+            &ctx,
+            &ToolPolicyRegistry::empty(),
+            Some(recorder.clone()),
+            None,
+            None,
+            resumed.then(|| {
+                resume_fixture(
+                    now + chrono::Duration::seconds(30),
+                    now + chrono::Duration::seconds(300),
+                )
+            }),
+        )
+        .await;
+        assert_eq!(
+            result.err().as_deref(),
+            Some("runtime persistence failed: retirement failed")
+        );
+        assert_eq!(mock.recorded_calls().len(), usize::from(!resumed));
+        assert!(
+            recorder
+                .records
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|record| matches!(
+                    record,
+                    RuntimeRecord::ModelResponse {
+                        terminal: false,
+                        ..
+                    }
+                ))
+        );
+    }
+}
+
+#[tokio::test]
+async fn resumed_wait_obeys_a_shorter_current_policy_timeout() {
+    let tools = Arc::new(ToolRegistry::new());
+    tools.register(Wait {
+        deadlines: Default::default(),
+        capacity: None,
+        hang: true,
+    });
+    let (_instance, session) = fresh_session().await;
+    let ctx = tool_context(session, tools);
+    let mock = Arc::new(MockBackend::new());
+    mock.push_text("done");
+    let backend = BackendManager::with_mock(mock.clone(), empty_secrets().await);
+    let policies = ToolPolicyRegistry::new(std::collections::HashMap::from([(
+        "job_wait".into(),
+        ToolPolicy {
+            timeout: 1,
+            ..Default::default()
+        },
+    )]));
+    let now = chrono::Utc::now();
+    tokio::time::timeout(
+        Duration::from_secs(3),
+        resume_with_recorder(
+            None,
+            vec![RuntimeMessage::User("go".into())],
+            &backend,
+            &permissive_security(),
+            &ctx,
+            &policies,
+            None,
+            None,
+            None,
+            resume_fixture(
+                now + chrono::Duration::seconds(30),
+                now + chrono::Duration::seconds(300),
+            ),
+        ),
+    )
+    .await
+    .expect("current policy must bound the resumed wait")
+    .unwrap();
+    assert!(mock.recorded_calls()[0].messages.iter().any(|message| matches!(message,
+        RuntimeMessage::ToolResult { content, .. } if content.contains("Tool timed out after 1 seconds"))));
 }
