@@ -118,7 +118,7 @@ pub(super) fn ui_settings(
 
     let (title, subtitle): (&str, Option<String>) = match scope {
         SettingsScope::Peer => ("Peer Settings", None),
-        SettingsScope::Session => ("Session Settings", Some(app.active().title())),
+        SettingsScope::Session => ("Session Settings", app.current().map(|tab| tab.title())),
     };
 
     widgets::header(f, chunks[0], title, subtitle.as_deref(), Some("[Esc back]"));
@@ -172,7 +172,7 @@ pub(super) fn ui_settings(
         || app.settings_prompt.is_some()
         || app.settings_picker.is_some()
         || app.overlay.is_some()
-        || app.active().pending_approval.is_some()
+        || app.has_pending_approval()
     {
         app.click_regions.clear();
         app.settings_list_area = None;
@@ -181,7 +181,8 @@ pub(super) fn ui_settings(
 
     // Approval keys must never act on an unseen request. Reuse the chat panel
     // over the bottom rows without discarding the underlying reader or draft.
-    let hit_area = if let Some(exchange) = app.active().pending_approval.as_ref() {
+    let pending = app.current().and_then(|tab| tab.pending_approval.as_ref());
+    let hit_area = if let Some(exchange) = pending {
         let info = exchange.info.clone();
         let frame = f.area();
         let panel = Rect {
@@ -210,7 +211,7 @@ pub(super) fn ui_settings(
             && r.x.saturating_add(r.w) <= hit_area.right()
             && r.y.saturating_add(r.h) <= hit_area.bottom()
     });
-    if app.active().pending_approval.is_some() {
+    if app.has_pending_approval() {
         return;
     }
 

@@ -71,6 +71,8 @@ class PtyProcess:
         os.write(self.master, text.encode("utf-8"))
 
     def drain(self, timeout):
+        if self.master is None:
+            return
         if select.select([self.master], [], [], timeout)[0]:
             try:
                 self.raw.extend(os.read(self.master, 65536))
@@ -103,6 +105,8 @@ class PtyProcess:
             self.drain(min(0.05, max(0, deadline - time.monotonic())))
 
     def close(self):
+        if self.master is None:
+            return  # Already closed and reaped.
         try:
             if self.child.poll() is None:
                 try:
@@ -113,6 +117,7 @@ class PtyProcess:
         finally:
             os.close(self.master)
             os.close(self.slave)
+            self.master = self.slave = None
         # wait() must have reaped, not just sent a signal.
         try:
             os.waitpid(self.child.pid, os.WNOHANG)
@@ -223,16 +228,113 @@ agents:
     system_prompt: You are a test fixture.
 default_agents: [chaz]
 ''')
+            def sessions():
+                # One-shot catalog read between TUI runs; never a model turn.
+                out = subprocess.run([BINARY, "--config", config, "cmd", "/sessions"], env=env,
+                                     cwd=home, check=True, timeout=30, capture_output=True,
+                                     text=True).stdout
+                return [] if out.strip() == "No sessions found." else out.splitlines()
+
+            def launch(*args):
+                nonlocal process
+                process = PtyProcess([BINARY, "--config", config, *args], env, home)
+                return process
+
+            def quit_cleanly():
+                process.send("\x03")
+                self.assertEqual(process.child.wait(timeout=10), 0)
+                process.drain(0.1)
+                self.assertIn(b"\x1b[?1049l", process.raw, "alternate screen was not restored")
+                self.assertEqual(termios.tcgetattr(process.slave)[3] & (termios.ICANON | termios.ECHO),
+                                 termios.ICANON | termios.ECHO, "raw mode was not restored")
+                process.close()
+
+            def drain_requests():
+                while not received.empty():
+                    received.get_nowait()
+
+            def assert_no_request(seconds=1.5):
+                # A prefilled prompt is never sent on its own.
+                time.sleep(seconds)
+                self.assertTrue(received.empty(), "a prefilled prompt reached the model")
+
             try:
                 subprocess.run([FIXTURE, home / "fixture.db"], env=env, cwd=home,
                                check=True, timeout=20, capture_output=True)
-                process = PtyProcess([BINARY, "--config", config], env, home)
                 thread.start()
-                process.expect("Chaz")
-                # Fresh-store picker loading settles automatically into chat.
+                # An ordinary launch on an empty install shows a usable hub and
+                # creates nothing.
+                launch()
+                process.expect("New session")
+                # Only changed cells redraw, so match the tail that replaces "Loading".
+                process.expect("yet — select")
+                offset = len(process.raw)
+                process.send("\x13")  # Ctrl+S: Peer Settings with no conversation.
+                process.expect("Peer Settings", offset=offset)
+                offset = len(process.raw)
+                process.send("\x13\x1b")  # Repeating Ctrl+S must preserve the hub caller.
+                process.expect("New session", offset=offset)
+                quit_cleanly()
+                self.assertEqual(sessions(), [])
+
+                launch()
+                process.expect("New session")
+                process.send("n")
+                # New opens a conversation immediately: its tab bar and composer.
+                process.expect("Ctrl+P sessions")
                 process.expect(" > ")
                 prompt = "pty-café-界-e\u0301"
-                process.send(prompt + "\r")
+                process.send(prompt)
+                process.expect("pty-café")
+                offset = len(process.raw)
+                process.send("\x13")  # Ctrl+S: Session Settings, not Peer Settings.
+                process.expect("Session Settings", offset=offset)
+                offset = len(process.raw)
+                process.send("\x13\x1b")
+                process.expect("pty-café", offset=offset)
+
+                # Two conversation views: real legacy control bytes must cycle
+                # in both directions, wrap, and retain each unsent draft.
+                offset = len(process.raw)
+                process.send("\x10")  # Ctrl+P
+                process.expect("New session", offset=offset)
+                offset = len(process.raw)
+                process.send("n")
+                process.expect(" > ", offset=offset)
+                other = "ABCDEFGHIJKLMNO"
+                process.send(other + "X\x7f")  # DEL still edits; it is not Ctrl+H.
+                process.expect(other)
+                for shortcut, draft in [("\x08", "pty-café"), ("\x0c", other),
+                                        ("\x0c", "pty-café"), ("\x08", other)]:
+                    offset = len(process.raw)
+                    process.send(shortcut)  # Ctrl+H / Ctrl+L
+                    process.expect(draft, offset=offset)
+
+                # Each shortcut is inert outside chat, even with two tabs.
+                for shortcut in ["\x08", "\x0c"]:
+                    offset = len(process.raw)
+                    process.send("\x13")
+                    process.expect("Session Settings", offset=offset)
+                    offset = len(process.raw)
+                    process.send(shortcut + "\x1b")
+                    process.expect(other, offset=offset)
+                    offset = len(process.raw)
+                    process.send("\x10")
+                    process.expect("New session", offset=offset)
+                    offset = len(process.raw)
+                    process.send(shortcut + "\x10")
+                    process.expect(other, offset=offset)
+
+                server.reply = "pty-tabs-ok"
+                process.send("\r")
+                self.assertIn(other, [m.get("content") for m in process.request(received)
+                                      if m.get("role") == "user"])
+                process.expect(server.reply)
+                offset = len(process.raw)
+                process.send("\x17")  # Close the second view, retaining its session.
+                process.expect("pty-café", offset=offset)
+                server.reply = "pty-first-ok"
+                process.send("\r")
                 self.assertIn(prompt, [m.get("content") for m in process.request(received)
                                        if m.get("role") == "user"])
                 process.expect(server.reply)
@@ -241,19 +343,62 @@ default_agents: [chaz]
                 # Wait for the wide-layout redraw before typing. crossterm's
                 # edge-triggered poll returns Resize and drops tty readiness
                 # in the same batch, stranding input until the next byte.
-                process.expect("Ctrl+PgUp", offset=offset)
+                process.expect("Ctrl+S settings", offset=offset)
                 server.reply = "pty-resized-ok"
                 offset = len(process.raw)
                 process.send("pty-after-resize\r")
                 self.assertIn("pty-after-resize", [m.get("content") for m in process.request(received)
                                                    if m.get("role") == "user"])
                 process.expect(server.reply, offset=offset)
-                process.send("\x03")
-                self.assertEqual(process.child.wait(timeout=10), 0)
-                process.drain(0.1)
-                self.assertIn(b"\x1b[?1049l", process.raw, "alternate screen was not restored")
-                self.assertEqual(termios.tcgetattr(process.slave)[3] & (termios.ICANON | termios.ECHO),
-                                 termios.ICANON | termios.ECHO, "raw mode was not restored")
+                # Closing the last view returns to the hub, keeping the session.
+                offset = len(process.raw)
+                process.send("\x17")
+                process.expect("New session", offset=offset)
+                process.expect("[tui]", offset=offset)
+                quit_cleanly()
+                created = sessions()
+                self.assertEqual(len(created), 2, created)
+
+                # Relaunching with an existing session still opens the hub and
+                # creates nothing.
+                launch()
+                process.expect("[tui]")
+                quit_cleanly()
+                self.assertEqual(sessions(), created)
+
+                # A bare prompt creates exactly one session and prefills it.
+                drain_requests()
+                launch("pty-prefill-only")
+                process.expect("pty-prefill-only")
+                process.expect("Ctrl+P sessions")
+                assert_no_request()
+                quit_cleanly()
+                self.assertEqual(len(sessions()), 3)
+
+                # --session NAME creates once (prefilled, unsent), then reopens.
+                launch("--session", "pty-work", "pty-named-prefill")
+                process.expect("pty-named-prefill")
+                process.expect("pty-work")
+                assert_no_request()
+                quit_cleanly()
+                named = sessions()
+                self.assertEqual(len(named), 4, named)
+                self.assertEqual(sum("\tpty-work\t" in row for row in named), 1, named)
+                launch("--session", "pty-work")
+                process.expect("pty-work")
+                quit_cleanly()
+                self.assertEqual(sessions(), named)
+
+                # --print is unchanged: it runs in the named session and exits.
+                server.reply = "pty-print-ok"
+                drain_requests()
+                out = subprocess.run([BINARY, "--config", config, "-p", "--session", "pty-work",
+                                      "pty-print"], env=env, cwd=home, check=True, timeout=60,
+                                     capture_output=True, text=True).stdout
+                self.assertIn(server.reply, out)
+                self.assertIn("pty-print", [m.get("content") for m in received.get(timeout=5)
+                                            if m.get("role") == "user"])
+                self.assertEqual(sessions(), named)
             except BaseException:
                 if process:
                     artifact = ROOT / "target/tui-pty-failures" / str(time.time_ns())

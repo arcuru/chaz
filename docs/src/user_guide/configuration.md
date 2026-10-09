@@ -542,7 +542,7 @@ cli:
   auto_approved_tools: [shell, write_file, web_fetch]
 ```
 
-`-p --session NAME` reuses a named session across invocations (find-or-create). Without `--session` each invocation creates a fresh ephemeral session.
+`-p --session NAME` reuses a named session across invocations (find-or-create). Without `--session` each invocation creates a fresh ephemeral session. Without `-p`, `--session NAME` opens that session in the TUI instead of the session hub.
 
 ## State Directory
 

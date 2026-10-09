@@ -49,8 +49,11 @@ The terminal interface launches when you run `chaz` with no other mode flag:
 chaz --config config.yaml
 ```
 
-You can pass an initial prompt as a positional argument; it pre-fills the
-input box so you can review and send it:
+A plain launch opens the session hub, which lists your sessions and creates
+none until you choose **New session**. Pass an initial prompt as a positional
+argument to open a new conversation with it pre-filled, unsent, so you can
+review and send it; add `--session NAME` to open (or create) that named
+session instead:
 
 ```bash
 chaz "summarize today's stand-up"
@@ -87,7 +90,7 @@ alongside the bridge.
 | Command                                             | Description                                        |
 | --------------------------------------------------- | -------------------------------------------------- |
 | `/help`                                             | Show all commands and key bindings                 |
-| `/sessions`, `/s`                                   | Open session picker                                |
+| `/sessions`, `/s`                                   | Open the session hub                               |
 | `/new`                                              | Create a new session                               |
 | `/join <id>`                                        | Switch to session by name or eidetica DB ID        |
 | `/info`                                             | Show current session details                       |
