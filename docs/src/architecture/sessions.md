@@ -154,6 +154,26 @@ second command naming the old attempt is rejected as stale. This is durable
 deduplication under the documented one-executor assumption, not distributed
 fencing or exactly-once external effects.
 
+#### Reader-first wire compatibility
+
+Upgrade **every reader** sharing a session before enabling writers of new wire
+variants: executors, TUI/CLI clients, transport peers and history/export consumers.
+Entry-kind tolerance alone is insufficient; command, transcript and nested tool
+outcome readers must also preserve unknown variants. This is a manual upgrade
+contract, not peer discovery or version negotiation.
+
+Unknown variants retain their original JSON through serialization and sync.
+Unknown entries are audit-only; unknown commands never start attempts or fabricate
+results. Unknown command outcomes are not success or compaction. Unknown native
+records or tool outcomes exclude the **entire affected attempt** from replay, so
+no orphan call or result reaches the model. Other supported attempts remain readable.
+Malformed **known** payloads still fail validation.
+
+Compatibility-only readers do not implement cancellation. Enable stop/cancel
+writers only after all readers are upgraded, and use the later stop implementation
+for execution. If an older reader fails a history read or shows an empty
+conversation, upgrade it rather than deleting or rewriting preserved records.
+
 #### Legacy sessions
 
 New sessions write a turn-schema marker before their first request. When an
@@ -274,7 +294,7 @@ Agent jobs are admitted only for Agents hosted by the local executor. Their chil
 
 `spawn_agent` submits one durable Agent job, not a workflow graph. The submitter prepares one child session DB with parent delegation, a request record and exactly one Directive before publishing its ID to the existing watched catalog. An unpublished child is inert; a published child is `Pending` until an executor checks its parent, hosted target/home and broad scope, then pins inherited per-tool grants, capability and depth ceilings and records acceptance in the **same** DB. Invalid requests become `Rejected` without running. Submission returns the DB ID after publication, not after acceptance or execution. A lost creation response requires inspecting the indexed jobs before another submission; there is no stable parent request key or automatic submission retry. Same-login local clients can create and observe jobs but cannot admit or execute them. Narrow, workspace and private scopes are rejected in v1.
 
-After `Pending` admission or `Rejected` refusal, job status comes from the accepted Directive's attempt and typed terminal receipt: queued, running, started-unknown (a client cannot prove liveness), interrupted (executor sees a start without completion), succeeded, or failed. At most ten Agent-job runs hold runtime permits; accepted jobs wait **queued before starting an attempt** when capacity is full. After restart, queued jobs are adopted; a started attempt without completion is not replayed automatically. Inspect it and explicitly retry if appropriate, since effects may already have occurred. `job_wait` only observes and a timeout does not cancel.
+After `Pending` admission or `Rejected` refusal, job status comes from the accepted Directive's attempt and typed terminal receipt: queued, running, started-unknown (a client cannot prove liveness), interrupted (executor sees a start without completion), succeeded, or failed. At most ten turns hold runtime permits for actual execution; accepted jobs wait **queued before starting an attempt** when capacity is full. An in-Agent `job_wait` yields its permit during observation without releasing its processing reservation, attempt, or claim. It reacquires before result hooks, further tools, or model requests, including after tool errors and timeouts. The existing claim-loss watcher covers observation and reacquisition; a fresh claim check after reacquisition prevents continuation on observed loss. Cancellation drops the turn's permit or pending acquisition. After restart, queued jobs are adopted; a started attempt without completion is not replayed automatically. Inspect it and explicitly retry if appropriate, since effects may already have occurred. `job_wait` only observes and a timeout does not cancel.
 
 Unlike the ordinary session protocol's single-executor assumption, an Agent job has a session-DB last-writer-wins owner claim for the same Agent/home identity. A contender losing the claim stops and records an interrupted/claim-loss marker while retaining the transcript. This is not fencing: delayed observations can overlap model or tool effects, and neither exactly-once effects nor cross-peer failover are promised. The pinned child authority cannot exceed the parent's admitted ceiling; `spawn_worker` is excluded from Agent-job delegation.
 

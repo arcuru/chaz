@@ -78,7 +78,7 @@ pub(super) async fn open(
 ) -> anyhow::Result<()> {
     let open = async {
         if let Some(index) = app.tab_index_for(id) {
-            app.active_tab = index;
+            app.set_active_tab(index);
             app.mode = TuiMode::Chat;
             return Ok(());
         }
@@ -106,8 +106,7 @@ pub(super) async fn open(
             _callback: callback,
         });
         refresh_tab(&mut tab).await;
-        app.tabs.push(tab);
-        app.active_tab = app.tabs.len() - 1;
+        app.push_tab(tab);
         app.mode = TuiMode::Chat;
         Ok(())
     };

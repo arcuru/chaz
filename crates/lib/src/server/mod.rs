@@ -271,6 +271,7 @@ async fn bridge_reply_for_turn(
 /// Revalidate a selected request after acquiring the per-session processing
 /// slot; selection can be older than another turn's completed commit.
 async fn fresh_attempt_for_request(
+    server: &Server,
     session: &Session,
     request: &crate::session::TurnRequest,
     live_attempts: &std::collections::HashSet<String>,
@@ -295,8 +296,8 @@ async fn fresh_attempt_for_request(
     {
         return Ok(None);
     }
-    session
-        .start_turn_attempt(request.id.clone())
+    server
+        .start_live_attempt(session, request.id.clone())
         .await
         .map(Some)
 }
@@ -306,6 +307,11 @@ fn display_entries_for_record(
     record: &TurnTranscriptRecord,
 ) -> Vec<SessionEntry> {
     match &record.message {
+        TurnTranscriptMessage::Unknown { .. }
+        | TurnTranscriptMessage::ToolResult {
+            outcome: runtime::ToolResultOutcome::Unknown { .. },
+            ..
+        } => Vec::new(),
         TurnTranscriptMessage::ModelResponse { tool_calls, .. } => tool_calls
             .iter()
             .map(|call| SessionEntry {
@@ -1778,7 +1784,7 @@ impl Server {
     /// resolution `run_*_turn` feeds the context builder
     /// ([`resolve_context_max_tokens`]), with the static configured default
     /// applied when neither a window nor a cap narrows it. Surfaced so the
-    /// TUI can render `ctx N%` against the exact denominator the runtime uses.
+    /// TUI can show the same effective maximum in its numeric context pair.
     ///
     /// Resolves windows through the server's own `default_backend`, which is
     /// the manager whose overlay gets warmed at startup and updated by the
@@ -2138,6 +2144,9 @@ impl Server {
             | SessionCommandOutcome::Failed { message } => anyhow::bail!(message),
             SessionCommandOutcome::Compact { .. } => {
                 anyhow::bail!("retry command returned a compact result")
+            }
+            SessionCommandOutcome::Unknown { kind, .. } => {
+                anyhow::bail!("unsupported session command outcome: {kind}")
             }
         }
     }
@@ -2910,7 +2919,9 @@ impl Server {
             _ => false,
         };
         let attempt =
-            match fresh_attempt_for_request(&session, &request, &live_now, pending_retry).await {
+            match fresh_attempt_for_request(self, &session, &request, &live_now, pending_retry)
+                .await
+            {
                 Ok(Some(attempt)) => {
                     if pending_retry {
                         self.pending_retry_attempts
@@ -2996,11 +3007,7 @@ impl Server {
         {
             return Ok(false);
         }
-        let attempt = fresh.start_turn_attempt(request_id).await?;
-        self.live_attempts
-            .lock()
-            .await
-            .insert(attempt.attempt_id.clone());
+        let attempt = self.start_live_attempt(&fresh, request_id).await?;
         self.spawn_agent_task(
             sid,
             fresh,
@@ -3013,6 +3020,26 @@ impl Server {
         )
         .await;
         Ok(true)
+    }
+
+    /// Mark the attempt live before its Started record is written. Status
+    /// readers snapshot live attempts before reading the DB, so the reverse
+    /// order lets a write-triggered observer (e.g. `job_wait`) report a
+    /// just-started attempt as Interrupted.
+    async fn start_live_attempt(
+        &self,
+        session: &Session,
+        request_id: TurnRequestId,
+    ) -> anyhow::Result<TurnAttempt> {
+        let attempt_id = uuid::Uuid::new_v4().to_string();
+        self.live_attempts.lock().await.insert(attempt_id.clone());
+        let started = session
+            .start_turn_attempt_as(request_id, attempt_id.clone())
+            .await;
+        if started.is_err() {
+            self.live_attempts.lock().await.remove(&attempt_id);
+        }
+        started
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3056,6 +3083,10 @@ impl Server {
         request: SessionCommandRequest,
         existing_attempt_id: Option<String>,
     ) -> anyhow::Result<String> {
+        anyhow::ensure!(
+            !matches!(request.command, SessionCommand::Unknown { .. }),
+            "unsupported session command cannot execute"
+        );
         if !self.is_startup_ready() {
             self.await_startup_ready().await;
         }
@@ -3065,18 +3096,13 @@ impl Server {
                 .await?
                 .ok_or_else(|| anyhow::anyhow!("live command attempt {attempt_id} disappeared"))?,
             None => {
-                let attempt = session
-                    .start_turn_attempt(request.command_id.clone())
-                    .await?;
-                self.live_attempts
-                    .lock()
-                    .await
-                    .insert(attempt.attempt_id.clone());
-                attempt
+                self.start_live_attempt(&session, request.command_id.clone())
+                    .await?
             }
         };
         let attempt_id = attempt.attempt_id.clone();
         let outcome = match request.command {
+            SessionCommand::Unknown { .. } => unreachable!("checked before attempt start"),
             SessionCommand::Compact { source_snapshot } => {
                 self.execute_compact_command(session_db_id, &session, &source_snapshot)
                     .await
@@ -3319,9 +3345,9 @@ impl Server {
                 }
             });
             let _heartbeat = ActivityHeartbeat(heartbeat);
-            let _permit = match reserved_permit {
+            let permit = match reserved_permit {
                 Some(permit) => permit,
-                None => semaphore.acquire_owned().await.expect("semaphore closed"),
+                None => semaphore.clone().acquire_owned().await.expect("semaphore closed"),
             };
             if shutting_down.load(Ordering::Acquire) {
                 return;
@@ -3478,14 +3504,17 @@ impl Server {
                 &policies,
                 Some(recorder.clone()),
                 Some(spawn_extensions.as_ref()),
+                Some(runtime::ExecutionCapacity::new(
+                    semaphore,
+                    permit,
+                    incarnation.clone().map(|token| (claim_db.clone(), token)),
+                )),
             )
             .await;
 
             if shutting_down.load(Ordering::Acquire) {
                 return;
             }
-
-            drop(_permit);
 
             let mut s = session.lock().await;
             let persistence_failed =

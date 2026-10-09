@@ -360,29 +360,65 @@ pub enum CommandOutcome {
     Quit,
 }
 
-pub async fn dispatch(cmd: Command, ctx: &CommandContext<'_>) -> CommandOutcome {
-    if (service_owner_only(&cmd) || extension_service_owner_only(&cmd))
-        && ctx
-            .server
-            .registry()
-            .instance()
-            .remote_connection()
-            .is_some()
+/// Ownership and hosted-index gates shared by every dispatch entry point.
+async fn preflight(cmd: &Command, server: &Server) -> Option<CommandOutcome> {
+    if (service_owner_only(cmd) || extension_service_owner_only(cmd))
+        && server.registry().instance().remote_connection().is_some()
     {
-        return CommandOutcome::Error(owner_redirect(&cmd));
+        return Some(CommandOutcome::Error(owner_redirect(cmd)));
     }
-    if command_needs_complete_hosted_indices(&cmd)
-        && let Err(e) = ctx.server.ensure_hosted_indices_complete().await
+    if command_needs_complete_hosted_indices(cmd)
+        && let Err(e) = server.ensure_hosted_indices_complete().await
     {
-        return CommandOutcome::Error(format!("Failed to load hosted entities: {e}"));
+        return Some(CommandOutcome::Error(format!(
+            "Failed to load hosted entities: {e}"
+        )));
+    }
+    None
+}
+
+/// Run a command whose handler needs only the server, for a frontend with no
+/// open conversation. Session-scoped commands come back as `Err` unchanged.
+pub async fn dispatch_without_session(
+    cmd: Command,
+    server: &Arc<Server>,
+) -> Result<CommandOutcome, Command> {
+    if !matches!(
+        cmd,
+        Command::NewSession(_) | Command::SwitchSession(_) | Command::AgentSet { .. }
+    ) {
+        return Err(cmd);
+    }
+    if let Some(outcome) = preflight(&cmd, server).await {
+        return Ok(outcome);
+    }
+    Ok(match cmd {
+        Command::NewSession(group) => {
+            Box::pin(session::new_session(group.as_deref(), server)).await
+        }
+        Command::SwitchSession(id) => Box::pin(session::switch_session(&id, server)).await,
+        Command::AgentSet {
+            agent_ref,
+            field,
+            value,
+        } => Box::pin(agent::agent_set(&agent_ref, &field, &value, server)).await,
+        _ => unreachable!("filtered above"),
+    })
+}
+
+pub async fn dispatch(cmd: Command, ctx: &CommandContext<'_>) -> CommandOutcome {
+    if let Some(outcome) = preflight(&cmd, ctx.server).await {
+        return outcome;
     }
     // Keep command futures boxed: their combined unoptimized poll temporaries
     // otherwise overflow a default worker stack when nested in bridge sync.
     match cmd {
         Command::ListSessions => Box::pin(session::list_sessions(ctx)).await,
-        Command::NewSession(group) => Box::pin(session::new_session(group.as_deref(), ctx)).await,
+        Command::NewSession(group) => {
+            Box::pin(session::new_session(group.as_deref(), ctx.server)).await
+        }
         Command::ListAgentGroups => Box::pin(session::list_agent_groups(ctx)).await,
-        Command::SwitchSession(id) => Box::pin(session::switch_session(&id, ctx)).await,
+        Command::SwitchSession(id) => Box::pin(session::switch_session(&id, ctx.server)).await,
         Command::Info => Box::pin(session::info(ctx)).await,
         Command::ListCosts => Box::pin(session::list_costs(ctx)).await,
         Command::Interrupted => Box::pin(session::interrupted(ctx)).await,
@@ -417,7 +453,7 @@ pub async fn dispatch(cmd: Command, ctx: &CommandContext<'_>) -> CommandOutcome 
             agent_ref,
             field,
             value,
-        } => Box::pin(agent::agent_set(&agent_ref, &field, &value, ctx)).await,
+        } => Box::pin(agent::agent_set(&agent_ref, &field, &value, ctx.server)).await,
         Command::AgentReload(agent_ref) => {
             Box::pin(agent::agent_reload(agent_ref.as_deref(), ctx)).await
         }

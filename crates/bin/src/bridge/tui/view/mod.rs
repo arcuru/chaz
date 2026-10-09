@@ -9,6 +9,8 @@ use chaz_core::session::EntryType;
 use chaz_core::util::truncate_chars;
 
 use std::sync::Arc;
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 use chrono::{DateTime, Utc};
 
@@ -43,8 +45,12 @@ use theme::USER as COLOR_USER;
 
 mod composer;
 #[cfg(test)]
+mod hub_tests;
+#[cfg(test)]
 mod list_tests;
 mod settings;
+#[cfg(test)]
+mod settings_tests;
 
 /// Last `/`-separated segment of a model id (`anthropic/claude-opus-4-7` →
 /// `claude-opus-4-7`). Bare ids without `/` are returned as-is. Used for the
@@ -53,16 +59,38 @@ fn model_slug(model: &str) -> &str {
     model.rsplit('/').next().unwrap_or(model)
 }
 
-/// Percent of the context budget occupied by the latest turn's prompt, for
-/// the `ctx N%` status segment. `None` when the budget is unknown (zero) so
-/// the caller hides the segment rather than dividing by zero. Can exceed 100
-/// if a turn was packed past a later-lowered budget — reported honestly, not
-/// clamped, so an over-budget session is visible.
-fn ctx_pct(prompt_tokens: u32, budget: usize) -> Option<u64> {
-    if budget == 0 {
-        return None;
-    }
-    Some((prompt_tokens as f64 / budget as f64 * 100.0).round() as u64)
+/// Last reported input size is an estimate of current occupancy, not a fresh
+/// tokenization of the transcript. Zero can also mean missing provider usage.
+fn context_segment(tab: &super::Tab) -> String {
+    let last = tab
+        .entries
+        .iter()
+        .rev()
+        .find(|e| e.sender == tab.current_agent && e.entry_type == EntryType::Message);
+    let used = last
+        .and_then(|e| e.metadata.as_ref())
+        .filter(|m| m.model == tab.effective_model)
+        .and_then(|m| m.context_tokens)
+        .filter(|&n| n > 0);
+    let percentage = match used {
+        Some(n) if tab.context_budget > 0 => {
+            format!(
+                " ({:.1}%)",
+                f64::from(n) / tab.context_budget as f64 * 100.0
+            )
+        }
+        _ => String::new(),
+    };
+    let used = used.map_or_else(
+        || "unknown".to_string(),
+        |n| format!("~{}", human_tokens(u64::from(n))),
+    );
+    let max = if tab.context_budget == 0 {
+        "unknown".to_string()
+    } else {
+        human_tokens(tab.context_budget as u64)
+    };
+    format!(" | ctx {used}/{max}{percentage} tok")
 }
 
 /// One-line preview of a ToolCall entry's content. Server writes ToolCall
@@ -253,11 +281,37 @@ pub(super) fn ui(
     // Click regions are rebuilt from scratch each frame so coordinates match
     // what the user is currently seeing.
     app.click_regions.clear();
+    app.settings_list_area = None;
+    app.settings_reader.viewport = None;
+    if let Some(picker) = app.settings_picker.as_mut() {
+        picker.viewport = Rect::default();
+    }
 
     // Mirror the fast-start gate so ui_chat (which has no `server` handle)
     // can show the "reconciling agents…" indicator until the deferred
     // at-startup work releases it.
     app.startup_ready = server.is_startup_ready();
+    // Catalog discovery and agent-default edits need not write the session DB.
+    // Resolve pins against live defaults, windows and caps on every draw.
+    if let Some(tab) = app.current_mut() {
+        let agent = server.agents().get(&tab.current_agent);
+        let requested_model = tab
+            .model_pin
+            .as_deref()
+            .or_else(|| agent.as_ref().and_then(|a| a.default_model.as_deref()));
+        tab.effective_model = backend.resolve_model_name(requested_model);
+        let context_model = requested_model
+            .map(str::to_string)
+            .or_else(|| backend.default_model())
+            .unwrap_or_default();
+        let cap = agent.and_then(|a| a.max_context_tokens);
+        tab.context_budget = server.effective_context_budget(&context_model, cap);
+        for row in &mut tab.roster {
+            if row.name == tab.current_agent {
+                row.model.clone_from(&tab.effective_model);
+            }
+        }
+    }
 
     // Refresh peer-side caches whenever any Settings page is up. The Peer
     // Settings views index into these directly for action keys ([r]
@@ -833,26 +887,9 @@ fn ui_chat(f: &mut ratatui::Frame, app: &mut App, ext_segments: &[String]) {
             )
         }
     };
-    // Context occupancy for the *primary* (host) agent only — `tab.context_budget`
-    // is the host's window, and in a multi-agent room another agent's turn may
-    // run a different model/window, so mixing them would be incoherent. The
-    // `usage_segment` above is unaffected: cost/tokens still sum the whole
-    // session. Numerator is the host's most recent turn's `context_tokens` (the
-    // input size of that turn's final LLM call = how full the window was), NOT
-    // `usage.prompt_tokens`, which sums every ReAct iteration and overshoots.
-    // Hidden until the host has taken such a turn, or when no budget is known.
-    let ctx_segment = {
-        let last_ctx = tab
-            .entries
-            .iter()
-            .rev()
-            .filter(|e| e.sender == current_agent)
-            .find_map(|e| e.metadata.as_ref().and_then(|m| m.context_tokens));
-        match last_ctx.and_then(|p| ctx_pct(p, tab.context_budget)) {
-            Some(pct) => format!(" | ctx {pct}%"),
-            None => String::new(),
-        }
-    };
+    // Only the host's latest message belongs with its effective input budget;
+    // aggregate prompt usage sums ReAct calls and is not context occupancy.
+    let ctx_segment = context_segment(tab);
     let approval_info = tab.pending_approval.as_ref().map(|ex| {
         (
             ex.info.name.clone(),
@@ -967,9 +1004,28 @@ fn ui_chat(f: &mut ratatui::Frame, app: &mut App, ext_segments: &[String]) {
         format!(" | agent: {current_agent}{model_segment}")
     };
 
+    // A normal-width toolbar must keep the numeric pair visible even when a
+    // session has a long name. Clip only the label, using terminal-cell widths.
+    let label_width = (chunks[4].width as usize).saturating_sub(ctx_segment.width() + 1);
+    let session_label = if session_label.width() > label_width {
+        let mut cells = 0;
+        let mut label: String = session_label
+            .graphemes(true)
+            .take_while(|g| {
+                cells += g.width();
+                cells <= label_width.saturating_sub(1)
+            })
+            .collect();
+        if label_width > 0 {
+            label.push('…');
+        }
+        label
+    } else {
+        session_label
+    };
     let make_status = |agent_segment: &str| {
         format!(
-            " {session_label}{agent_segment}{ctx_segment}{usage_segment}{debug_indicator}{expand_indicator}{startup_indicator}"
+            " {session_label}{ctx_segment}{agent_segment}{usage_segment}{debug_indicator}{expand_indicator}{startup_indicator}"
         )
     };
     let mut status_text = make_status(&agent_segment);
@@ -1161,7 +1217,8 @@ pub(super) fn turn_activity_line(active_turns: usize) -> Option<Line<'static>> {
 
 fn render_tab_bar(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     let n = app.tabs.len();
-    let show_close = n > 1;
+    // Every view is closable: closing the last one returns to the hub.
+    let show_close = true;
     let bar_bg = Color::Rgb(0x1a, 0x1d, 0x26); // status-bar dark
     let mut spans: Vec<Span> = Vec::new();
     let mut x = area.x;
@@ -1221,12 +1278,18 @@ fn render_tab_bar(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
             x = x.saturating_add(1);
         }
     }
-    // Hint text at the right side if space allows.
-    let hint = " Ctrl+, settings · Ctrl+PgUp/PgDn · Ctrl+W";
+    // The widest key hint that fits at the right side.
     let used = x.saturating_sub(area.x);
-    let remaining = area.width.saturating_sub(used);
-    if remaining as usize >= hint.len() {
-        let pad = remaining as usize - hint.len();
+    let remaining = area.width.saturating_sub(used) as usize;
+    if let Some(hint) = [
+        " Ctrl+P sessions · Ctrl+S settings · Ctrl+H/L tabs · Ctrl+W close",
+        " Ctrl+P sessions · Ctrl+S settings · Ctrl+W close",
+        " Ctrl+P sessions",
+    ]
+    .into_iter()
+    .find(|hint| hint.chars().count() <= remaining)
+    {
+        let pad = remaining - hint.chars().count();
         spans.push(Span::styled(" ".repeat(pad), Style::default().bg(bar_bg)));
         spans.push(Span::styled(
             hint.to_string(),
@@ -1330,13 +1393,15 @@ fn render_approval_panel(
 
 /// Compact token count for the status bar: `942`, `12.3k`, `1.5M`.
 fn human_tokens(n: u64) -> String {
-    if n < 1000 {
-        n.to_string()
+    let (value, suffix) = if n < 1000 {
+        return n.to_string();
     } else if n < 1_000_000 {
-        format!("{:.1}k", n as f64 / 1000.0)
+        (n as f64 / 1000.0, "k")
     } else {
-        format!("{:.1}M", n as f64 / 1_000_000.0)
-    }
+        (n as f64 / 1_000_000.0, "M")
+    };
+    let value = format!("{value:.1}");
+    format!("{}{suffix}", value.trim_end_matches(".0"))
 }
 
 /// "5m ago", "3h ago", "2d ago", "5w ago" — coarse age for the picker.
@@ -1440,24 +1505,26 @@ pub(super) fn ui_picker(f: &mut ratatui::Frame, app: &mut App) {
     app.picker_visible_rows = window.first..window.end.min(window.first + visible_count);
 
     if app.session_list.is_empty() {
+        // Empty, loading and failed are distinct: a failure never reads as
+        // "no sessions". The list is this peer's local catalog.
         let message = if app.session_catalog_loading {
-            "  Loading sessions…"
-        } else if app.session_picker_error.is_some() {
-            "  Failed to load sessions — close and reopen to retry."
+            "  Loading sessions…".to_string()
+        } else if let Some(error) = &app.session_picker_error {
+            format!("  Failed to load sessions: {error} — Ctrl+P retries.")
         } else {
-            "  No saved sessions yet — select \"New session\" above."
+            "  No saved sessions yet — select \"New session\" above.".to_string()
         };
         lines.push(Line::from(vec![Span::styled(
             message,
             Style::default().fg(COLOR_DIM),
         )]));
     } else {
-        let current_session_db_id = app.active().session_db_id.clone();
+        let current_session_db_id = app.current().map(|tab| tab.session_db_id.clone());
         let now = Utc::now();
         for i in window.rows() {
             let info = &app.session_list[i];
             let is_selected = i + 1 == app.picker_index;
-            let is_current = info.session_db_id == current_session_db_id;
+            let is_current = current_session_db_id.as_deref() == Some(info.session_db_id.as_str());
 
             let marker = if is_selected { "> " } else { "  " };
             let current_marker = if is_current { " *" } else { "" };
@@ -1536,15 +1603,33 @@ pub(super) fn ui_picker(f: &mut ratatui::Frame, app: &mut App) {
     );
     f.render_widget(list, chunks[0]);
 
-    let help = Paragraph::new(
-        " [Up/Down] navigate | [Enter] open/new | [n] new | [r] rename | [s] settings | [Esc/Ctrl+P] cancel",
-    )
-    .style(
-        Style::default()
-            .bg(Color::Rgb(0x1a, 0x1d, 0x26))
-            .fg(Color::White),
-    );
-    f.render_widget(help, chunks[1]);
+    // Footer: a one-shot notice (failed open/create), else the keys the hub
+    // actually owns. Esc/Ctrl+P lead back only when a conversation is open.
+    let bar = Style::default()
+        .bg(Color::Rgb(0x1a, 0x1d, 0x26))
+        .fg(Color::White);
+    let footer = if let Some(notice) = &app.hub_notice {
+        Paragraph::new(format!(" {notice}")).style(bar.fg(COLOR_ERROR))
+    } else {
+        let back = if app.tabs.is_empty() {
+            ""
+        } else {
+            " · Esc back"
+        };
+        let width = chunks[1].width as usize;
+        let hint = [
+            format!(
+                " ↑↓ select · Enter open · n new · r rename · s peer settings{back} · Ctrl+C quit"
+            ),
+            format!(" ↑↓ · Enter open · n new · r rename · s settings{back}"),
+            format!(" Enter open · n new · s settings{back}"),
+        ]
+        .into_iter()
+        .find(|hint| hint.chars().count() <= width)
+        .unwrap_or_else(|| format!(" n new · s settings{back}"));
+        Paragraph::new(hint).style(bar)
+    };
+    f.render_widget(footer, chunks[1]);
 }
 
 /// Format a price (input $/Mtok) for the picker. `—` when missing so all
@@ -1690,7 +1775,8 @@ fn render_model_list_block(f: &mut ratatui::Frame, area: ratatui::layout::Rect, 
     let current = app
         .active_scope_pin()
         .map(str::to_string)
-        .unwrap_or_else(|| app.active().effective_model.clone());
+        .or_else(|| app.current().map(|tab| tab.effective_model.clone()))
+        .unwrap_or_default();
     let end = (scroll + visible_rows).min(app.model_picker_filtered.len());
     // Header occupies y_off=1 (after the top border at 0); rows start at 2.
     let mut y_off: u16 = 2;
@@ -1852,6 +1938,7 @@ mod chat_frame_tests {
             effective_model: String::new(),
             roster: Vec::new(),
             context_budget: 0,
+            model_pin: None,
             expanded_entries: HashSet::new(),
         };
         let mut app = App::new(HashSet::new(), tab);
@@ -1876,6 +1963,99 @@ mod chat_frame_tests {
             })
             .collect();
         (rows, (cursor.x, cursor.y))
+    }
+
+    #[tokio::test]
+    async fn toolbar_context_uses_last_host_call_and_current_model_budget() {
+        use chaz_core::runtime::{ResponseMetadata, TokenUsage};
+        use chaz_core::session::{EntryType, SessionEntry};
+        let mut app = test_app("", 0).await;
+        let tab = app.active_mut();
+        tab.effective_model = "large-model".into();
+        tab.context_budget = 1_050_000;
+        let entry = SessionEntry {
+            sender: "chaz".into(),
+            content: "fixture reply".into(),
+            timestamp: chrono::Utc::now(),
+            entry_type: EntryType::Message,
+            metadata: Some(ResponseMetadata {
+                model: "large-model".into(),
+                provider: None,
+                response_id: None,
+                usage: TokenUsage {
+                    prompt_tokens: 9_999_999,
+                    ..Default::default()
+                },
+                context_tokens: Some(12_345),
+                extra: Default::default(),
+            }),
+            routing: None,
+        };
+        tab.entries.push(entry.clone());
+        let mut other = entry.clone();
+        other.sender = "guest".into();
+        other.metadata.as_mut().unwrap().context_tokens = Some(900_000);
+        tab.entries.push(other);
+        let screen = draw(&mut app, 100, 16).0.join("\n");
+        assert!(screen.contains("ctx ~12.3k/1.1M (1.2%) tok"), "{screen}");
+
+        app.active_mut().entries[0]
+            .metadata
+            .as_mut()
+            .unwrap()
+            .context_tokens = Some(57_000);
+        app.active_mut().context_budget = 1_000_000;
+        let screen = draw(&mut app, 100, 16).0.join("\n");
+        assert!(screen.contains("ctx ~57k/1M (5.7%) tok"), "{screen}");
+
+        // New model, same session: don't pair its budget with an old count.
+        app.active_mut().effective_model = "small-model".into();
+        app.active_mut().context_budget = 32_000;
+        let screen = draw(&mut app, 80, 16).0.join("\n");
+        assert!(screen.contains("ctx unknown/32k tok"), "{screen}");
+        // A new response restores usage; a cap changes only the denominator.
+        let mut latest = entry;
+        latest.metadata.as_mut().unwrap().model = "small-model".into();
+        latest.metadata.as_mut().unwrap().context_tokens = Some(20_001);
+        app.active_mut().entries.push(latest);
+        app.active_mut().context_budget = 16_000;
+        let screen = draw(&mut app, 80, 16).0.join("\n");
+        assert!(screen.contains("ctx ~20k/16k (125.0%) tok"), "{screen}");
+        // A known count without a budget cannot produce a percentage.
+        app.active_mut().context_budget = 0;
+        let screen = draw(&mut app, 80, 16).0.join("\n");
+        assert!(screen.contains("ctx ~20k/unknown tok"), "{screen}");
+        app.active_mut().context_budget = 16_000;
+        // Missing/zero usage on the latest message must not resurrect older data.
+        app.active_mut()
+            .entries
+            .last_mut()
+            .unwrap()
+            .metadata
+            .as_mut()
+            .unwrap()
+            .context_tokens = Some(0);
+        let screen = draw(&mut app, 80, 16).0.join("\n");
+        assert!(screen.contains("ctx unknown/16k tok"), "{screen}");
+        app.active_mut().entries.last_mut().unwrap().metadata = None;
+        app.active_mut().context_budget = 0;
+        let screen = draw(&mut app, 80, 16).0.join("\n");
+        assert!(screen.contains("ctx unknown/unknown tok"), "{screen}");
+        app.active_mut().entries.clear();
+        app.active_mut().context_budget = 1_050_000;
+        let screen = draw(&mut app, 80, 16).0.join("\n");
+        assert!(screen.contains("ctx unknown/1.1M tok"), "{screen}");
+    }
+
+    #[tokio::test]
+    async fn toolbar_context_remains_visible_with_long_session_names() {
+        let mut app = test_app("", 0).await;
+        app.active_mut().context_budget = 1_050_000;
+        for name in ["long session name ".repeat(8), "界e\u{301}".repeat(40)] {
+            app.active_mut().session_name = Some(name);
+            let screen = draw(&mut app, 80, 16).0.join("\n");
+            assert!(screen.contains("ctx unknown/1.1M tok"), "{screen}");
+        }
     }
 
     #[tokio::test]
@@ -2011,35 +2191,6 @@ mod chat_frame_tests {
             },
         );
         assert_eq!(app.picker_index, 3);
-        assert_eq!(app.active().scroll_offset, 0);
-    }
-
-    #[tokio::test]
-    async fn settings_wheel_moves_detail_cursor_only_over_detail_pane() {
-        use super::super::input;
-        use super::super::{PeerSettingsCategory, SETTINGS_SIDEBAR_W, SettingsScope, TuiMode};
-        use crossterm::event::{KeyModifiers, MouseEvent, MouseEventKind};
-        let mut app = test_app("", 0).await;
-        app.mode = TuiMode::Settings(SettingsScope::Peer);
-        app.peer_settings_index = PeerSettingsCategory::ALL
-            .iter()
-            .position(|c| *c == PeerSettingsCategory::Defaults)
-            .unwrap();
-        app.peer_defaults = (0..10).map(|i| format!("agent-{i}")).collect();
-        let wheel = |column| MouseEvent {
-            kind: MouseEventKind::ScrollDown,
-            column,
-            row: 4,
-            modifiers: KeyModifiers::NONE,
-        };
-        input::handle_mouse(&mut app, wheel(SETTINGS_SIDEBAR_W - 1));
-        assert_eq!(app.peer_defaults_cursor, 0, "rail wheel must not move list");
-        input::handle_mouse(&mut app, wheel(SETTINGS_SIDEBAR_W));
-        assert_eq!(app.peer_defaults_cursor, 3);
-        for _ in 0..5 {
-            input::handle_mouse(&mut app, wheel(SETTINGS_SIDEBAR_W + 4));
-        }
-        assert_eq!(app.peer_defaults_cursor, 9, "wheel clamps at the last row");
         assert_eq!(app.active().scroll_offset, 0);
     }
 
@@ -2211,7 +2362,10 @@ mod tests {
     fn human_tokens_scales() {
         assert_eq!(human_tokens(0), "0");
         assert_eq!(human_tokens(942), "942");
+        assert_eq!(human_tokens(1_000), "1k");
         assert_eq!(human_tokens(12_345), "12.3k");
+        assert_eq!(human_tokens(57_000), "57k");
+        assert_eq!(human_tokens(1_000_000), "1M");
         assert_eq!(human_tokens(1_500_000), "1.5M");
     }
 
@@ -2254,27 +2408,6 @@ mod tests {
             model_slug("provider/family/qwen-2.5-coder:free"),
             "qwen-2.5-coder:free"
         );
-    }
-
-    #[test]
-    fn ctx_pct_basic_and_rounding() {
-        assert_eq!(ctx_pct(64_000, 128_000), Some(50));
-        // Rounds to nearest.
-        assert_eq!(ctx_pct(1, 3), Some(33));
-        assert_eq!(ctx_pct(2, 3), Some(67));
-    }
-
-    #[test]
-    fn ctx_pct_unknown_budget_is_hidden() {
-        // Zero budget -> None so the segment is omitted, never a divide-by-zero.
-        assert_eq!(ctx_pct(1000, 0), None);
-        assert_eq!(ctx_pct(0, 0), None);
-    }
-
-    #[test]
-    fn ctx_pct_reports_over_budget_unclamped() {
-        // A turn packed past a later-lowered budget shows >100, not a clamp.
-        assert_eq!(ctx_pct(200_000, 128_000), Some(156));
     }
 
     #[test]

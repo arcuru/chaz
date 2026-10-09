@@ -43,19 +43,17 @@ mod theme;
 mod view;
 mod widgets;
 
-/// Name used for the TUI's default/home session. Created on first TUI launch,
-/// reopened on subsequent launches.
-const TUI_DEFAULT_NAME: &str = "tui";
-
 pub struct TuiBridge {
     config: Config,
     secrets: SecretStore,
-    /// Optional text to pre-fill the input box with on launch. Mirrors
-    /// claude/pi: `chaz "hello"` opens the TUI with "hello" already in the
-    /// composer so the user can review and hit Enter. When set, the
-    /// session-picker auto-open is skipped — the user clearly wants to
-    /// type/send, not navigate.
+    /// Optional text to pre-fill the composer with on launch, unsent. Mirrors
+    /// claude/pi: `chaz "hello"` opens a conversation with "hello" already in
+    /// the composer so the user can review and hit Enter. Without `session`,
+    /// launch creates one new conversation for it instead of showing the hub.
     initial_prompt: Option<String>,
+    /// `--session NAME`: open that named session (creating it when absent)
+    /// instead of the hub.
+    session: Option<String>,
 }
 
 impl TuiBridge {
@@ -64,11 +62,17 @@ impl TuiBridge {
             config,
             secrets,
             initial_prompt: None,
+            session: None,
         }
     }
 
     pub fn with_initial_prompt(mut self, prompt: String) -> Self {
         self.initial_prompt = Some(prompt);
+        self
+    }
+
+    pub fn with_session(mut self, name: String) -> Self {
+        self.session = Some(name);
         self
     }
 }
@@ -104,7 +108,7 @@ enum SessionLoad {
 
 enum CatalogLoadOutcome {
     Ignored,
-    Loaded { fresh_default: bool },
+    Loaded,
     Failed,
 }
 
@@ -134,16 +138,40 @@ pub(super) enum SettingsScope {
     Session,
 }
 
-/// Which pane in a Settings page currently owns arrow-key input. Sidebar is
-/// the default on entry; Right / Enter / a sidebar click sets it. Detail
-/// takes over after Right / Enter into a category that owns an inner list
-/// (Session→Agents, Peer→Agents, Peer→Defaults) or after a click inside
-/// that list. Tab / BackTab cycle categories regardless of focus and snap
-/// focus back to Sidebar so the user never gets pinned inside the inner list.
+/// Category → List → Content input ownership. Static pages skip List;
+/// Tab / BackTab always return to Category.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum SettingsFocus {
-    Sidebar,
-    Detail,
+    Category,
+    List,
+    Content,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct SettingsReaderIdentity {
+    scope: SettingsScope,
+    category: usize,
+    entity: Option<String>,
+}
+
+/// One reading position, not a cache of positions for previously visited entities.
+#[derive(Default)]
+pub(super) struct SettingsReader {
+    identity: Option<SettingsReaderIdentity>,
+    pub offset: u16,
+    pub max_offset: u16,
+    pub visible_rows: u16,
+    pub viewport: Option<ratatui::layout::Rect>,
+}
+
+impl SettingsReader {
+    pub fn scroll(&mut self, down: bool, lines: u16) {
+        self.offset = if down {
+            self.offset.saturating_add(lines).min(self.max_offset)
+        } else {
+            self.offset.saturating_sub(lines)
+        };
+    }
 }
 
 /// Categories listed in the Peer Settings sidebar. Ordering here is the
@@ -284,6 +312,8 @@ pub(super) struct SettingsPicker {
     pub candidates: Vec<String>,
     pub selected: usize,
     pub intent: SettingsPickerIntent,
+    /// Match-row viewport from the last frame; hidden pickers own no hits.
+    pub viewport: ratatui::layout::Rect,
 }
 
 /// What the active settings picker is collecting. Same shape as
@@ -448,6 +478,8 @@ pub(super) enum ClickTarget {
     /// detail pane and moves the per-category cursor to row `i`. Only
     /// emitted for categories that own an inner list.
     SettingsDetailRow(usize),
+    /// Focus the visible read-only body without changing its selected entity.
+    SettingsContent,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -478,25 +510,25 @@ pub(super) struct Tab {
     pub current_agent: String,
     pub session_name: Option<String>,
     /// The model the runtime would actually use for this session's next
-    /// turn, as resolved by `BackendManager::resolve_model_name` from the
-    /// agent's `default_model`. Empty string when no backends are configured.
-    /// Resolved at tab construction; if the agent or backend default
-    /// changes mid-session the displayed value goes stale until the next
-    /// tab open.
+    /// turn, as resolved from session pins and the current agent/backend default.
+    /// Refreshed on every draw; empty when no backends are configured.
     pub effective_model: String,
     /// Full roster of agents attached to this session, each with its
     /// resolved effective model and whether it is the designated host.
     /// Drives the multi-agent status-bar segment; for a single-agent
     /// session the bar falls back to `current_agent`/`effective_model` so
-    /// its rendering stays byte-identical. Refreshed wherever
-    /// `effective_model` is.
+    /// its rendering stays byte-identical. Refreshed on session changes;
+    /// the current agent's model also refreshes on draw.
     pub roster: Vec<RosterAgent>,
     /// The per-turn context budget (tokens) the runtime would target for the
     /// current agent's effective model — the model's resolved window, lowered
     /// by any per-agent cap, or the configured default when the window is
-    /// unknown. Denominator for the status bar's `ctx N%`. Resolved at tab
-    /// construction alongside `effective_model`; goes stale the same way.
+    /// unknown. Denominator for the status bar's numeric context pair. Refreshed on
+    /// every draw from the runtime overlay and current agent cap.
     pub context_budget: usize,
+    /// Session/per-agent pin, retaining any backend prefix. Kept separate from
+    /// defaults so live agent edits can re-resolve unpinned models on draw.
+    pub model_pin: Option<String>,
     /// Per-entry expand override (entry index → "opposite of `App::expand_all`").
     /// Empty by default; click on an entry's icon toggles its presence here.
     pub expanded_entries: HashSet<usize>,
@@ -642,8 +674,13 @@ pub(super) struct App {
     pub(super) session_fill: Option<SessionFill>,
     pub(super) session_generation: u64,
     pub(super) session_catalog_loading: bool,
-    pub(super) session_picker_auto_open: bool,
     pub(super) session_picker_error: Option<String>,
+    /// One-shot result shown in the hub footer (a failed open or create);
+    /// cleared by the next hub key.
+    pub(super) hub_notice: Option<String>,
+    /// Unsent composer text and cursor of each open conversation that is not
+    /// focused. The focused one lives in `input`/`cursor`.
+    pub(super) drafts: HashMap<String, (String, usize)>,
     pub(super) session_rows_loading: HashSet<String>,
     pub(super) session_metadata_limit: Arc<Semaphore>,
     pub(super) picker_index: usize,
@@ -784,23 +821,36 @@ pub(super) struct App {
     /// Session Settings.
     pub(super) session_settings_index: usize,
     /// Which pane in the active Settings page owns ↑↓ / Enter input.
-    /// Reset to `Sidebar` on `open_settings`; flipped by Right / Enter,
+    /// Reset to `Category` on `open_settings`; flipped by Right / Enter,
     /// Left, or a click that lands inside the corresponding region.
     pub(super) settings_focus: SettingsFocus,
+    pub(super) settings_reader: SettingsReader,
+    /// Actual visible row slots, excluding the list header and footer.
+    pub(super) settings_list_area: Option<ratatui::layout::Rect>,
 }
 
 impl App {
+    /// An app focused on one open conversation.
+    #[cfg(test)]
     fn new(agent_names: HashSet<String>, initial_tab: Tab) -> Self {
+        let mut app = Self::hub(agent_names);
+        app.push_tab(initial_tab);
+        app.mode = TuiMode::Chat;
+        app
+    }
+
+    /// The launch state: the session hub with no conversation open.
+    fn hub(agent_names: HashSet<String>) -> Self {
         Self {
             jobs: jobs::JobsView::default(),
-            mode: TuiMode::Chat,
+            mode: TuiMode::SessionPicker,
             overlay: None,
             click_regions: Vec::new(),
             input: String::new(),
             cursor: 0,
             completion: None,
             completion_dismissed: false,
-            tabs: vec![initial_tab],
+            tabs: Vec::new(),
             active_tab: 0,
             agent_names,
             should_quit: false,
@@ -813,8 +863,9 @@ impl App {
             session_fill: None,
             session_generation: 0,
             session_catalog_loading: false,
-            session_picker_auto_open: false,
             session_picker_error: None,
+            hub_notice: None,
+            drafts: HashMap::new(),
             session_rows_loading: HashSet::new(),
             session_metadata_limit: Arc::new(Semaphore::new(4)),
             picker_index: 0,
@@ -850,19 +901,23 @@ impl App {
             agent_diff: None,
             settings_status: None,
             model_picker_caller: TuiMode::Chat,
-            settings_focus: SettingsFocus::Sidebar,
+            settings_focus: SettingsFocus::Category,
+            settings_reader: SettingsReader::default(),
+            settings_list_area: None,
         }
     }
 
     /// Enter Settings in `scope`, remembering `from` so Esc returns there.
     /// No-op when already in Settings (avoids clobbering the return-to mode
-    /// if `Ctrl+,` is hit twice).
+    /// if `Ctrl+S` is hit twice).
     pub(super) fn open_settings(&mut self, scope: SettingsScope, from: TuiMode) {
         if matches!(self.mode, TuiMode::Settings(_)) {
             return;
         }
+        self.settings_reader = SettingsReader::default();
+        self.settings_list_area = None;
         self.settings_return = Some(from);
-        self.settings_focus = SettingsFocus::Sidebar;
+        self.settings_focus = SettingsFocus::Category;
         self.mode = TuiMode::Settings(scope);
     }
 
@@ -873,6 +928,46 @@ impl App {
         self.mode = back;
         // Drop any transient Settings sub-state so re-entry starts clean.
         self.agent_diff = None;
+        self.settings_reader = SettingsReader::default();
+        self.settings_list_area = None;
+        self.click_regions.clear();
+    }
+
+    /// Refresh before rendering/input, including while a submodal covers the body.
+    /// A replacement at the same numeric cursor is still a different reader.
+    pub(super) fn sync_settings_reader(&mut self, scope: SettingsScope) {
+        let category = self.settings_index(scope);
+        let entity = match scope {
+            SettingsScope::Peer => match PeerSettingsCategory::ALL.get(category) {
+                Some(PeerSettingsCategory::Agents) => self
+                    .peer_agents_names
+                    .get(
+                        self.peer_agents_cursor
+                            .min(self.peer_agents_names.len().saturating_sub(1)),
+                    )
+                    .cloned(),
+                Some(PeerSettingsCategory::Mcp) => self
+                    .peer_mcp_servers
+                    .get(
+                        self.peer_mcp_cursor
+                            .min(self.peer_mcp_servers.len().saturating_sub(1)),
+                    )
+                    .map(|e| e.name.clone()),
+                _ => None,
+            },
+            SettingsScope::Session => self.current().map(|tab| tab.session_db_id.clone()),
+        };
+        let identity = SettingsReaderIdentity {
+            scope,
+            category,
+            entity,
+        };
+        if self.settings_reader.identity.as_ref() != Some(&identity) {
+            self.settings_reader = SettingsReader {
+                identity: Some(identity),
+                ..Default::default()
+            };
+        }
     }
 
     pub(super) fn settings_category_count(&self, scope: SettingsScope) -> usize {
@@ -895,18 +990,95 @@ impl App {
             return;
         }
         let clamped = idx.min(n - 1);
+        if self.settings_index(scope) != clamped {
+            self.settings_reader = SettingsReader::default();
+            self.settings_list_area = None;
+        }
         match scope {
             SettingsScope::Peer => self.peer_settings_index = clamped,
             SettingsScope::Session => self.session_settings_index = clamped,
         }
     }
 
+    /// The focused conversation. Only conversation-scoped modes (Chat,
+    /// Session Settings, a session-scoped model picker) may call this; the
+    /// hub and Peer Settings run with no conversation open.
     pub(super) fn active(&self) -> &Tab {
         &self.tabs[self.active_tab]
     }
 
     pub(super) fn active_mut(&mut self) -> &mut Tab {
         &mut self.tabs[self.active_tab]
+    }
+
+    /// The focused conversation, if any is open.
+    pub(super) fn current(&self) -> Option<&Tab> {
+        self.tabs.get(self.active_tab)
+    }
+
+    pub(super) fn current_mut(&mut self) -> Option<&mut Tab> {
+        self.tabs.get_mut(self.active_tab)
+    }
+
+    /// Whether the focused conversation is waiting on a tool approval.
+    pub(super) fn has_pending_approval(&self) -> bool {
+        self.current()
+            .is_some_and(|tab| tab.pending_approval.is_some())
+    }
+
+    /// Focus tab `i`, parking the outgoing conversation's unsent draft and
+    /// restoring the incoming one's.
+    pub(super) fn set_active_tab(&mut self, i: usize) {
+        if i >= self.tabs.len() || (i == self.active_tab && self.current().is_some()) {
+            return;
+        }
+        if let Some(id) = self.current().map(|tab| tab.session_db_id.clone()) {
+            let draft = (std::mem::take(&mut self.input), self.cursor);
+            if draft.0.is_empty() {
+                self.drafts.remove(&id);
+            } else {
+                self.drafts.insert(id, draft);
+            }
+        }
+        self.active_tab = i;
+        self.restore_draft();
+    }
+
+    fn restore_draft(&mut self) {
+        let draft = self
+            .current()
+            .and_then(|tab| self.drafts.get(&tab.session_db_id).cloned());
+        if let Some(id) = self.current().map(|tab| tab.session_db_id.clone()) {
+            self.drafts.remove(&id);
+        }
+        (self.input, self.cursor) = draft.unwrap_or_default();
+        self.completion = None;
+        self.completion_dismissed = false;
+        input::recompute_completion(self);
+    }
+
+    /// Open a conversation view and focus it with an empty composer.
+    pub(super) fn push_tab(&mut self, tab: Tab) {
+        self.tabs.push(tab);
+        self.set_active_tab(self.tabs.len() - 1);
+    }
+
+    /// Close one conversation view. The stored session, its attachments and
+    /// any running turn are untouched; a closed view's draft is discarded.
+    pub(super) fn close_tab_at(&mut self, i: usize) {
+        if i >= self.tabs.len() {
+            return;
+        }
+        let closed = self.tabs.remove(i);
+        self.drafts.remove(&closed.session_db_id);
+        if i == self.active_tab {
+            self.input.clear();
+            self.cursor = 0;
+            self.active_tab = i.min(self.tabs.len().saturating_sub(1));
+            self.restore_draft();
+        } else if i < self.active_tab {
+            self.active_tab -= 1;
+        }
     }
 
     /// Find a tab hosting the given session DB id, if any.
@@ -1001,7 +1173,8 @@ impl App {
         let current = self
             .active_scope_pin()
             .map(str::to_string)
-            .unwrap_or_else(|| self.active().effective_model.clone());
+            .or_else(|| self.current().map(|tab| tab.effective_model.clone()))
+            .unwrap_or_default();
 
         let catalog_by_id: std::collections::HashMap<String, &ModelInfo> =
             catalog.iter().map(|m| (m.id.clone(), m)).collect();
@@ -1207,29 +1380,49 @@ async fn setup_session(
     Ok(())
 }
 
-/// Find an existing session named "tui", or create one and name it.
-async fn default_tui_session(
-    server: &Server,
-) -> anyhow::Result<(chaz_core::types::ConversationId, eidetica::Database)> {
-    if let Some(id) = server.registry().find_by_name(TUI_DEFAULT_NAME).await? {
-        match server.registry().open_session(&id).await {
-            Ok(r) => return Ok(r),
-            Err(e) => tracing::warn!(id, "Default TUI session unreadable, recreating: {e}"),
-        }
+/// `--session NAME`: reopen the session with that name, or create and name
+/// one. An existing name that fails to open is an error, never a reason to
+/// create a second session or fall back to another conversation.
+async fn open_named_session(server: &Server, name: &str) -> anyhow::Result<eidetica::Database> {
+    use anyhow::Context as _;
+    if let Some(id) = server.registry().find_by_name(name).await? {
+        let (_conv_id, db) = server
+            .registry()
+            .open_session(&id)
+            .await
+            .with_context(|| format!("Failed to open session '{name}'"))?;
+        return Ok(db);
     }
-    let (conv_id, db) = server.registry().create_session(Some("tui")).await?;
+    let (_conv_id, db) = server.registry().create_session(Some("tui")).await?;
     let session_db_id = db.root_id().to_string();
-    if let Err(e) = server
+    server
         .registry()
-        .set_session_name(&session_db_id, TUI_DEFAULT_NAME.to_string())
+        .set_session_name(&session_db_id, name.to_string())
         .await
-    {
-        tracing::warn!("Failed to name default TUI session: {e}");
+        .with_context(|| format!("Failed to name new session '{name}'"))?;
+    // Mirror routing reality in `meta.agents`, as `--print --session` does.
+    server.auto_attach_default_agent(&session_db_id).await;
+    Ok(db)
+}
+
+/// Resolve the conversation a launch opens directly: the named session, a new
+/// one for a bare prompt, or none for the hub.
+async fn launch_session(
+    server: &Arc<Server>,
+    session: Option<&str>,
+    prompt: bool,
+) -> anyhow::Result<Option<eidetica::Database>> {
+    if let Some(name) = session {
+        return open_named_session(server, name).await.map(Some);
     }
-    // Mirror routing reality in `meta.agents` so `/agents` and the
-    // per-agent model picker reflect the agent that will actually answer.
-    let _ = server.auto_attach_default_agent(&session_db_id).await;
-    Ok((conv_id, db))
+    if !prompt {
+        return Ok(None);
+    }
+    match commands::dispatch_without_session(Command::NewSession(None), server).await {
+        Ok(CommandOutcome::SessionSwitched(switch)) => Ok(Some(switch.db)),
+        Ok(CommandOutcome::Error(e)) => anyhow::bail!(e),
+        _ => anyhow::bail!("Failed to create a session for the prompt"),
+    }
 }
 
 /// Compose the haystack the fuzzy matcher scores against for a given
@@ -1310,15 +1503,14 @@ fn open_session_picker(
     app: &mut App,
     server: &Arc<Server>,
     session_rows_tx: &mpsc::Sender<SessionLoad>,
-    auto_open: bool,
 ) {
     app.cancel_session_fill();
     app.picker_index = 0;
     app.mode = TuiMode::SessionPicker;
     app.session_picker_error = None;
-    app.session_picker_auto_open = auto_open;
+    app.hub_notice = None;
 
-    if app.session_list_fresh && !app.session_list.is_empty() {
+    if app.session_list_fresh {
         return;
     }
 
@@ -1383,11 +1575,8 @@ fn apply_session_catalog_result(
     }
     match result {
         Ok(indices) => {
-            let fresh_default = app.session_picker_auto_open
-                && indices.len() <= 1
-                && app.active().entries.is_empty();
             apply_session_catalog(app, indices);
-            CatalogLoadOutcome::Loaded { fresh_default }
+            CatalogLoadOutcome::Loaded
         }
         Err(error) => {
             app.session_catalog_loading = false;
@@ -1497,14 +1686,17 @@ async fn build_tab(
     .await;
     let meta = session.read_meta().await;
     let roster = build_roster(server, backend, &meta);
-    let session_name = meta.name;
-    // Mirror the runtime's resolution: the live turn passes
-    // `agent.default_model` into `runtime::execute`, which calls
-    // `BackendManager::resolve_model_name` to strip the backend prefix
-    // and fall back to the backend default when None.
-    let effective_model = backend.resolve_model_name(agent.default_model.as_deref());
-    let context_budget =
-        server.effective_context_budget(&effective_model, agent.max_context_tokens);
+    let session_name = meta.name.clone();
+    // Reopening a session must honor persisted pins just like a live refresh.
+    let requested_model = meta
+        .resolve_model_for_agent(&agent.name)
+        .or(agent.default_model.as_deref());
+    let effective_model = backend.resolve_model_name(requested_model);
+    let context_model = requested_model
+        .map(str::to_string)
+        .or_else(|| backend.default_model())
+        .unwrap_or_default();
+    let context_budget = server.effective_context_budget(&context_model, agent.max_context_tokens);
     let entries = session.entries().to_vec();
     let active_turns = Session::active_turn_attempts(&session_db)
         .await
@@ -1523,6 +1715,9 @@ async fn build_tab(
         effective_model,
         roster,
         context_budget,
+        model_pin: meta
+            .resolve_model_for_agent(&agent.name)
+            .map(str::to_string),
         expanded_entries: HashSet::new(),
     }
 }
@@ -1533,33 +1728,37 @@ async fn refresh_tab_activity(tab: &mut Tab) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Shift the active tab by `delta` (wraps around).
+/// Shift the active tab by `delta` (wraps around), only in the conversation
+/// view. Settings and pickers retain their caller and scoped identity.
 fn cycle_tab(app: &mut App, delta: i32) {
-    if app.tabs.is_empty() {
+    if app.mode != TuiMode::Chat || app.tabs.is_empty() {
         return;
     }
     let n = app.tabs.len() as i32;
     let i = (app.active_tab as i32 + delta).rem_euclid(n);
-    app.active_tab = i as usize;
-    if app.active().job.is_some() {
-        app.mode = TuiMode::Chat;
-    }
+    app.set_active_tab(i as usize);
 }
 
-fn close_active_tab(app: &mut App) {
-    close_tab_at(app, app.active_tab);
-}
-
-fn close_tab_at(app: &mut App, i: usize) {
-    // Refuse to close the last tab — TUI always shows at least one session.
-    if app.tabs.len() <= 1 || i >= app.tabs.len() {
-        return;
-    }
-    app.tabs.remove(i);
-    if app.active_tab >= app.tabs.len() {
-        app.active_tab = app.tabs.len() - 1;
-    } else if i < app.active_tab {
-        app.active_tab -= 1;
+/// The hub is the base view: whenever no conversation is open, a
+/// conversation-scoped mode falls back to it.
+fn ensure_view(app: &mut App, server: &Arc<Server>, session_rows_tx: &mpsc::Sender<SessionLoad>) {
+    let needs_conversation = match app.mode {
+        TuiMode::Chat | TuiMode::Settings(SettingsScope::Session) => true,
+        TuiMode::ModelPicker => !matches!(app.model_picker_scope, ModelPickerScope::AgentGlobal(_)),
+        TuiMode::Jobs | TuiMode::SessionPicker | TuiMode::Settings(SettingsScope::Peer) => false,
+    };
+    if app.tabs.is_empty() && needs_conversation {
+        app.settings_return = None;
+        app.session_settings_snapshot = None;
+        open_session_picker(app, server, session_rows_tx);
+    } else if app.mode == TuiMode::SessionPicker
+        && !app.session_list_fresh
+        && !app.session_catalog_loading
+        && app.session_picker_error.is_none()
+    {
+        // Settings can interrupt the initial catalog load. Resume it when
+        // the hub becomes visible, without rendering an incomplete empty list.
+        open_session_picker(app, server, session_rows_tx);
     }
 }
 
@@ -1575,7 +1774,7 @@ async fn handle_chat_action(
     models_tx: &mpsc::Sender<Result<Vec<ModelInfo>, String>>,
     session_rows_tx: &mpsc::Sender<SessionLoad>,
 ) {
-    if app.active().job.is_some()
+    if app.current().is_some_and(|tab| tab.job.is_some())
         && !matches!(
             action,
             ChatAction::OpenJobs | ChatAction::OpenPicker | ChatAction::SendMessage(_)
@@ -1620,7 +1819,7 @@ async fn handle_chat_action(
         }
         ChatAction::OpenSettings(scope) => {
             // From a chat-action context the caller mode is always Chat —
-            // the picker doesn't go through ChatAction. `Ctrl+,` from the
+            // the picker doesn't go through ChatAction. `Ctrl+S` from the
             // picker takes a different path that sets the return-to slot
             // correctly.
             if let SettingsScope::Session = scope {
@@ -1680,10 +1879,10 @@ async fn handle_chat_action(
             app.set_settings_index(SettingsScope::Session, models_idx);
             app.session_models_cursor = 0;
             app.open_settings(SettingsScope::Session, TuiMode::Chat);
-            app.settings_focus = SettingsFocus::Detail;
+            app.settings_focus = SettingsFocus::List;
         }
         ChatAction::OpenPicker => {
-            open_session_picker(app, server, session_rows_tx, false);
+            open_session_picker(app, server, session_rows_tx);
         }
         ChatAction::Dispatch(cmd) => {
             // Commands that mutate the catalog membership invalidate the
@@ -1757,38 +1956,23 @@ async fn apply_picker_rename(
     app.focus_picker_on(&session_db_id);
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Open the hub's selected row: focus an already-open view, open a stored
+/// session, or create one. Needs no current conversation; a failure stays in
+/// the hub with a notice instead of landing in an unrelated conversation.
 async fn dispatch_picker_selection(
     selected: String,
     app: &mut App,
     server: &Arc<Server>,
     backend: &BackendManager,
-    secrets: &SecretStore,
     approval_tx: &mpsc::Sender<TaggedApproval>,
     notify_tx: &mpsc::Sender<String>,
 ) {
-    // If the user picked an already-open session, just activate its tab
-    // instead of re-registering it.
+    app.hub_notice = None;
     if let Some(idx) = app.tab_index_for(&selected) {
-        app.active_tab = idx;
+        app.set_active_tab(idx);
         app.mode = TuiMode::Chat;
         return;
     }
-
-    let tab = app.active();
-    let session_db_id = tab.session_db_id.clone();
-    let session_db = tab.session_db.clone();
-    let current_agent = tab.current_agent.clone();
-    let session_name = tab.session_name.clone();
-    let ctx = CommandContext {
-        server,
-        secrets,
-        backend,
-        session_db_id: &session_db_id,
-        session_db: &session_db,
-        current_agent: &current_agent,
-        session_name: session_name.as_deref(),
-    };
     let cmd = if selected == "__new__" {
         Command::NewSession(None)
     } else {
@@ -1798,12 +1982,16 @@ async fn dispatch_picker_selection(
     // cache is now stale — invalidate it (mirrors the `/new` chat path) or
     // the next `/sessions` would show the cached list without this session.
     let invalidates_cache = matches!(cmd, Command::NewSession(_));
-    let outcome = commands::dispatch(cmd, &ctx).await;
+    let outcome = match commands::dispatch_without_session(cmd, server).await {
+        Ok(outcome) => outcome,
+        Err(_) => CommandOutcome::Error("Session command needs an open conversation".into()),
+    };
     if invalidates_cache {
         app.session_list_fresh = false;
     }
-    render_outcome(app, outcome, server, backend, approval_tx, notify_tx).await;
-    app.mode = TuiMode::Chat;
+    if render_outcome(app, outcome, server, backend, approval_tx, notify_tx).await {
+        app.mode = TuiMode::Chat;
+    }
 }
 
 /// Apply the model selected in the model picker. Dispatches either
@@ -1821,11 +2009,6 @@ async fn dispatch_model_selection(
     approval_tx: &mpsc::Sender<TaggedApproval>,
     notify_tx: &mpsc::Sender<String>,
 ) {
-    let tab = app.active();
-    let session_db_id = tab.session_db_id.clone();
-    let session_db = tab.session_db.clone();
-    let current_agent = tab.current_agent.clone();
-    let session_name = tab.session_name.clone();
     // Snapshot the picked model's info (pricing/window/modalities, as merged
     // from the live catalog) before `model_id` is consumed below, so we can
     // persist it as an in-use model once the selection commits.
@@ -1834,15 +2017,6 @@ async fn dispatch_model_selection(
     // pick between the session-wide Command::Model and per-agent
     // Command::AgentModel.
     let scope = app.model_picker_scope.clone();
-    let ctx = CommandContext {
-        server,
-        secrets,
-        backend,
-        session_db_id: &session_db_id,
-        session_db: &session_db,
-        current_agent: &current_agent,
-        session_name: session_name.as_deref(),
-    };
     let cmd = match scope {
         ModelPickerScope::Session => Command::Model(Some(model_id)),
         ModelPickerScope::Agent(name) => Command::AgentModel {
@@ -1855,7 +2029,30 @@ async fn dispatch_model_selection(
             value: model_id,
         },
     };
-    let outcome = commands::dispatch(cmd, &ctx).await;
+    // Agent-global edits come from Peer Settings, which may have no
+    // conversation open; only session scopes address the focused one.
+    let outcome = match commands::dispatch_without_session(cmd, server).await {
+        Ok(outcome) => outcome,
+        Err(cmd) => match app.current() {
+            Some(tab) => {
+                let session_db_id = tab.session_db_id.clone();
+                let session_db = tab.session_db.clone();
+                let current_agent = tab.current_agent.clone();
+                let session_name = tab.session_name.clone();
+                let ctx = CommandContext {
+                    server,
+                    secrets,
+                    backend,
+                    session_db_id: &session_db_id,
+                    session_db: &session_db,
+                    current_agent: &current_agent,
+                    session_name: session_name.as_deref(),
+                };
+                commands::dispatch(cmd, &ctx).await
+            }
+            None => CommandOutcome::Error("No conversation is open".into()),
+        },
+    };
     // Record the now-in-use model so the runtime budgets its window (this
     // turn's overlay + next startup's warm) without anyone editing YAML.
     if let Some(info) = selected_info {
@@ -2065,7 +2262,12 @@ async fn dispatch_settings_command(
     approval_tx: &mpsc::Sender<TaggedApproval>,
     notify_tx: &mpsc::Sender<String>,
 ) {
-    let tab = app.active();
+    // Settings actions that edit a session exist only in Session scope, but
+    // never let a stale action address a view that has since closed.
+    let Some(tab) = app.current() else {
+        app.settings_status = Some("No conversation is open".into());
+        return;
+    };
     let session_db_id = tab.session_db_id.clone();
     let session_db = tab.session_db.clone();
     let current_agent = tab.current_agent.clone();
@@ -2146,6 +2348,7 @@ async fn seed_session_settings_snapshot(app: &mut App, server: &Arc<Server>) {
     });
 }
 
+/// Apply a command outcome. Returns whether it focused a conversation view.
 async fn render_outcome(
     app: &mut App,
     outcome: CommandOutcome,
@@ -2153,7 +2356,7 @@ async fn render_outcome(
     backend: &BackendManager,
     approval_tx: &mpsc::Sender<TaggedApproval>,
     notify_tx: &mpsc::Sender<String>,
-) {
+) -> bool {
     match outcome {
         CommandOutcome::Text(t) => show_system_msg(app, t),
         CommandOutcome::Error(e) => show_error(app, e),
@@ -2194,17 +2397,18 @@ async fn render_outcome(
                 session_name,
             } = *switch;
             if chaz_core::session::jobs::is_job_session(&db).await {
-                if let Err(error) =
-                    jobs::open(app, server, backend, &session_db_id, notify_tx).await
-                {
-                    show_error(app, format!("Job unavailable: {error}"));
-                }
-                return;
+                return match jobs::open(app, server, backend, &session_db_id, notify_tx).await {
+                    Ok(()) => true,
+                    Err(error) => {
+                        show_error(app, format!("Job unavailable: {error}"));
+                        false
+                    }
+                };
             }
             // If the session is already open in some tab, switch to it.
             if let Some(idx) = app.tab_index_for(&session_db_id) {
-                app.active_tab = idx;
-                return;
+                app.set_active_tab(idx);
+                return true;
             }
             if let Err(e) = setup_session(
                 server,
@@ -2216,7 +2420,7 @@ async fn render_outcome(
             .await
             {
                 show_error(app, format!("Failed to register session: {e}"));
-                return;
+                return false;
             }
             let session = Session::new(conv_id, db.clone()).await;
             let entries = session.entries().to_vec();
@@ -2229,10 +2433,18 @@ async fn render_outcome(
             let agent = server.agents().get(&agent_name);
             let agent_default_model = agent.as_ref().and_then(|a| a.default_model.clone());
             let agent_cap = agent.as_ref().and_then(|a| a.max_context_tokens);
-            let effective_model = backend.resolve_model_name(agent_default_model.as_deref());
-            let context_budget = server.effective_context_budget(&effective_model, agent_cap);
-            let roster = build_roster(server, backend, &session.read_meta().await);
-            app.tabs.push(Tab {
+            let meta = session.read_meta().await;
+            let requested_model = meta
+                .resolve_model_for_agent(&agent_name)
+                .or(agent_default_model.as_deref());
+            let effective_model = backend.resolve_model_name(requested_model);
+            let context_model = requested_model
+                .map(str::to_string)
+                .or_else(|| backend.default_model())
+                .unwrap_or_default();
+            let context_budget = server.effective_context_budget(&context_model, agent_cap);
+            let roster = build_roster(server, backend, &meta);
+            app.push_tab(Tab {
                 job: None,
                 session_db_id,
                 session_db: db,
@@ -2240,6 +2452,9 @@ async fn render_outcome(
                 scroll_offset: 0,
                 pending_approval: None,
                 active_turns,
+                model_pin: meta
+                    .resolve_model_for_agent(&agent_name)
+                    .map(str::to_string),
                 current_agent: agent_name,
                 session_name,
                 effective_model,
@@ -2247,31 +2462,39 @@ async fn render_outcome(
                 context_budget,
                 expanded_entries: HashSet::new(),
             });
-            app.active_tab = app.tabs.len() - 1;
+            return true;
         }
         CommandOutcome::Quit => {
             app.should_quit = true;
         }
     }
+    false
 }
 
 pub(super) fn show_system_msg(app: &mut App, content: String) {
-    app.active_mut().entries.push(SessionEntry {
-        sender: "system".to_string(),
-        content,
-        timestamp: chrono::Utc::now(),
-        entry_type: EntryType::Message,
-        metadata: None,
-        routing: None,
-    });
+    show_local(app, content, EntryType::Message);
 }
 
 pub(super) fn show_error(app: &mut App, content: String) {
-    app.active_mut().entries.push(SessionEntry {
+    show_local(app, content, EntryType::Error);
+}
+
+/// Show a local result where the user is: in the hub's footer, in Settings'
+/// status strip when no conversation is open, else in the focused transcript.
+fn show_local(app: &mut App, content: String, entry_type: EntryType) {
+    if app.mode == TuiMode::SessionPicker {
+        app.hub_notice = Some(content);
+        return;
+    }
+    let Some(tab) = app.current_mut() else {
+        app.settings_status = Some(content);
+        return;
+    };
+    tab.entries.push(SessionEntry {
         sender: "system".to_string(),
         content,
         timestamp: chrono::Utc::now(),
-        entry_type: EntryType::Error,
+        entry_type,
         metadata: None,
         routing: None,
     });
@@ -2309,6 +2532,7 @@ mod session_picker_tests {
             effective_model: String::new(),
             roster: Vec::new(),
             context_budget: 0,
+            model_pin: None,
             expanded_entries: HashSet::new(),
         }
     }

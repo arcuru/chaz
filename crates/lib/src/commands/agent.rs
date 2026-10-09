@@ -16,10 +16,17 @@ pub(super) async fn resolve_agent_ref(
     agent_ref: &str,
     ctx: &CommandContext<'_>,
 ) -> Result<crate::hosted_index::DbEntry, String> {
-    if let Err(e) = ctx.server.ensure_hosted_indices_complete().await {
+    resolve_hosted_agent(agent_ref, ctx.server).await
+}
+
+async fn resolve_hosted_agent(
+    agent_ref: &str,
+    server: &crate::server::Server,
+) -> Result<crate::hosted_index::DbEntry, String> {
+    if let Err(e) = server.ensure_hosted_indices_complete().await {
         return Err(format!("Failed to load hosted agents: {e}"));
     }
-    let index = ctx.server.agent_index();
+    let index = server.agent_index();
     if let Some(entry) = index.find_by_name(agent_ref) {
         return Ok(entry);
     }
@@ -624,15 +631,14 @@ pub(super) async fn agent_set(
     agent_ref: &str,
     field: &str,
     value: &str,
-    ctx: &CommandContext<'_>,
+    server: &crate::server::Server,
 ) -> CommandOutcome {
-    let entry = match resolve_agent_ref(agent_ref, ctx).await {
+    let entry = match resolve_hosted_agent(agent_ref, server).await {
         Ok(e) => e,
         Err(msg) => return CommandOutcome::Error(msg),
     };
 
-    let agent_db = match ctx
-        .server
+    let agent_db = match server
         .registry()
         .open_agent_db(&entry.db_id, Some(&entry.pubkey))
         .await
@@ -660,7 +666,7 @@ pub(super) async fn agent_set(
     // `system_prompt_ref` would mask the new inline text / files at hydration.
     // Other fields leave the ref untouched.
     if matches!(field, "system_prompt" | "system_prompt_files")
-        && let Err(e) = ctx.server.refresh_prompt_ref(&mut cfg).await
+        && let Err(e) = server.refresh_prompt_ref(&mut cfg).await
     {
         return CommandOutcome::Error(format!("Failed to resolve system prompt: {e}"));
     }
@@ -669,11 +675,10 @@ pub(super) async fn agent_set(
         return CommandOutcome::Error(format!("Failed to write agent config: {e}"));
     }
 
-    let runtime_agent = ctx
-        .server
+    let runtime_agent = server
         .agents()
         .build_from_db_config(&entry.display_name, &cfg);
-    ctx.server.agents().upsert(runtime_agent.clone());
+    server.agents().upsert(runtime_agent.clone());
 
     CommandOutcome::Text(format!(
         "Set {field}={value} on agent '{}' (takes effect next message)",

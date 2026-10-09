@@ -106,4 +106,4 @@ RuntimeMessage::ToolResult(result)
 
 ## Concurrency
 
-The server uses a global `Semaphore(10)` to cap concurrent LLM calls across all sessions. Agent tasks acquire a permit before calling the runtime.
+The server uses a global `Semaphore(10)` to cap executing Agent turns across sessions. Agent tasks acquire a permit before calling the runtime and transfer it to the loop. Only `job_wait` yields it, after the usual approval and extension-call gates. The loop reacquires outside the tool's timeout before processing the result or executing another tool or model request. Observation retains its 30-second default and 240-second maximum; subsequent capacity acquisition may take longer. Executor cancellation and claim-loss handling cover both waits without a separate control path.

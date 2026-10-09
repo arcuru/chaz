@@ -191,6 +191,18 @@ security:
                     time.sleep(0.05)
                 process = JobPtyProcess([BINARY, "--config", configs["client"]], env, home)
                 process.resize(110, 35)
+                process.expect("New session")
+                process.send("\x07")  # Jobs also works with no conversation open.
+                process.expect("Jobs ancestry")
+                time.sleep(5.2)  # Exercise the activity tick with no active tab.
+                process.drain(0)
+                self.assertIsNone(process.child.poll(), "sessionless Jobs crashed")
+                self.assertEqual(calls, [], "opening Jobs must not call the model")
+                process.send("\x1b")
+                process.expect("New session")
+                process.send("\x07\x10")  # Ctrl+P from Jobs opens the hub.
+                process.expect("New session")
+                process.send("n")
                 process.expect(" > ")
                 process.send("parent-monitor\r")
                 deadline = time.monotonic() + 60
@@ -199,6 +211,8 @@ security:
                     self.assertLess(time.monotonic(), deadline, "resident job model call did not start")
                 self.assertTrue(any(m.get("role") == "tool" and "session_db_id" in m.get("content", "")
                     for request in calls for m in request["messages"]), "parent must have published the real child handle")
+                process.send("unsent-parent-draft")
+                process.expect("unsent-parent-draft")
                 process.send("\x07")  # Ctrl+G: observe Jobs, not a new turn.
                 process.expect("Jobs ancestry")
                 process.expect("context/unclaimed")  # Wait for the source-backed rows, not the loading frame.
@@ -208,6 +222,13 @@ security:
                 process.send("\r")
                 process.expect("JOB observer")
                 process.expect("next-call input")
+                self.assertNotIn("unsent-parent-draft", "\n".join(process.screen.display),
+                                 "opening an observer inherited the parent's draft")
+                process.send("\x08")  # Ctrl+H restores the ordinary tab's draft.
+                process.expect("unsent-parent-draft")
+                process.send("\x0c")  # Ctrl+L returns to the observer's empty draft.
+                process.expect("JOB observer")
+                self.assertNotIn("unsent-parent-draft", "\n".join(process.screen.display))
                 with self.assertRaisesRegex(AssertionError, "deadline"):
                     process.expect("deliberate-absent-job-marker", timeout=0.2)
                 self.assertEqual(len(job_calls), 1)
@@ -219,7 +240,15 @@ security:
                 process.expect("calculate")  # Persisted live job tool activity, not a fixture row.
                 process.expect("Accepted")
                 # Refresh/navigation/close while the continued resident call is blocked.
-                process.send("\x07r\x1b\x17")  # overview, refresh, return, close tab
+                process.send("\x07r")  # overview and refresh
+                process.expect("Jobs ancestry")
+                process.send("\x1b")
+                process.expect("JOB observer")
+                process.send("\x17")  # Close only the observer view.
+                process.expect("unsent-parent-draft")
+                process.send("\x17")  # Last view closes to the upstream hub, not a new session.
+                process.expect("New session")
+                self.assertEqual(len(job_calls), 2)
                 process.send("\x03")
                 self.assertEqual(process.child.wait(timeout=10), 0)
                 process.capture(evidence / "before-disconnect")

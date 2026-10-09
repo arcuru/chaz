@@ -1,0 +1,8 @@
+---
+source: crates/bin/src/bridge/tui/widgets/snapshot_tests.rs
+expression: s
+---
+ add agent: ▎           
+    agent-18            
+  > agent-19            
+  ↑↓ select · enter add

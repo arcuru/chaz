@@ -1,0 +1,18 @@
+---
+source: crates/bin/src/bridge/tui/view/list_tests.rs
+expression: "rows.join(\"\\n\")"
+---
+ Session Settings  —  Picker [Esc back] 
+  Overview                              
+> Agents          Agents    30 attached 
+  Models          ─────                 
+  Routing                               
+  History        add agent: ▎           
+  Sharing           candidate-24        
+                    candidate-25        
+                    candidate-26        
+                    candidate-27        
+                    candidate-28        
+                  > candidate-29        
+                  ↑↓ select · enter add 
+ type to filter · ↑↓ select · enter add

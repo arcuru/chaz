@@ -5,7 +5,7 @@
 //! is free to draw its own separator below if it wants one.
 
 use ratatui::Frame;
-use ratatui::layout::Rect;
+use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
@@ -29,17 +29,17 @@ pub(in super::super) fn header(
         left.push(Span::styled(format!("  —  {sub}"), theme::dim()));
     }
 
-    let left_w: usize = left.iter().map(|s| s.content.chars().count()).sum();
-    let right_text = right_hint.map(|s| format!("{s} ")).unwrap_or_default();
-    let right_w = right_text.chars().count();
-    let total_w = area.width as usize;
-    let pad = total_w.saturating_sub(left_w + right_w);
-
-    let mut spans = left;
-    spans.push(Span::raw(" ".repeat(pad)));
-    if !right_text.is_empty() {
-        spans.push(Span::styled(right_text, theme::dim()));
-    }
-
-    f.render_widget(Paragraph::new(Line::from(spans)), area);
+    let right = Line::from(Span::styled(
+        right_hint.map(|s| format!("{s} ")).unwrap_or_default(),
+        theme::dim(),
+    ));
+    // Reserve the active-key hint before clipping a long title/subtitle.
+    // Ratatui measures and clips terminal cells, including wide graphemes.
+    let chunks = Layout::horizontal([
+        Constraint::Min(0),
+        Constraint::Length(right.width().min(area.width as usize) as u16),
+    ])
+    .split(area);
+    f.render_widget(Paragraph::new(Line::from(left)), chunks[0]);
+    f.render_widget(Paragraph::new(right), chunks[1]);
 }

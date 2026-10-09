@@ -561,12 +561,40 @@ async fn service_steering(
             "job_wait".into(),
             serde_json::json!({"session_db_id": child, "timeout_seconds": 2}).to_string(),
         )]);
-        mock.push_text("continued terminal");
-        // The child may acquire the parent's released slot after settlement.
+        // Upstream yields the parent's slot inside job_wait: the child calls
+        // before the parent can reacquire and request its terminal answer.
         mock.push_text("child terminal");
+        mock.push_text("continued terminal");
+        assert!(
+            matches!(
+                observer.job_status(&child).await.unwrap().state,
+                JobState::Pending | JobState::Queued
+            ),
+            "child must be pending/queued before the parent yields"
+        );
+        // Before job_wait records its reference, an unclaimed child need not
+        // be discovered. If already projected, it still must not be started.
+        let graph = observer.job_monitor().await.unwrap();
+        for node in graph
+            .nodes
+            .iter()
+            .filter(|node| node.session_db_id == child)
+        {
+            assert!(
+                (node.state == Some(JobState::Pending) && !node.claimed)
+                    || node.state == Some(JobState::Queued),
+                "pending work is not a running job: {graph:#?}"
+            );
+        }
+        assert_eq!(
+            mock.recorded_calls().len(),
+            1,
+            "child cannot run before the parent yields"
+        );
         child_wait = Some((child, permits));
     }
     let continuation = mock.block_next_call();
+    let child_gate = child_wait.as_ref().map(|_| mock.block_next_call());
     gate.release();
     tokio::time::timeout(
         std::time::Duration::from_secs(10),
@@ -595,6 +623,12 @@ async fn service_steering(
     );
     continuation.release();
     if let Some((child, _)) = &child_wait {
+        let child_gate = child_gate.as_ref().unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), child_gate.wait_started())
+            .await
+            .expect("child must acquire the parent's yielded slot");
+        assert!(mock.recorded_calls()[2].messages.iter().any(|message|
+            matches!(message, RuntimeMessage::User(text) if text == "referenced queued child")));
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
                 let graph = observer.job_monitor().await.unwrap();
@@ -608,9 +642,9 @@ async fn service_steering(
                 }) {
                     assert!(
                         graph.nodes.iter().any(|node| node.session_db_id == *child
-                            && ((node.state == Some(JobState::Pending) && !node.claimed)
-                                || node.state == Some(JobState::Queued))),
-                        "referenced pending work is not a running job: {graph:#?}"
+                            && node.claimed
+                            && matches!(node.state, Some(JobState::StartedUnknown { .. }))),
+                        "child with an actual blocked model call must be claimed/started: {graph:#?}"
                     );
                     break;
                 }
@@ -619,6 +653,7 @@ async fn service_steering(
         })
         .await
         .expect("actual bounded child wait must be observable before it finishes");
+        child_gate.release();
     }
     let terminal = client
         .wait_job(&id, std::time::Duration::from_secs(14))

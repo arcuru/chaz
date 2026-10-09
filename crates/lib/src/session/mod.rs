@@ -37,9 +37,14 @@ pub mod steering;
 pub(crate) use registry::JobRequest;
 mod transport;
 pub mod usage;
+pub(crate) mod wire;
+
+use wire::session_wire_enum;
 
 pub use bridge_event::{BridgeEvent, BridgeEventRole};
 pub use keys::BootstrapOutcome;
+#[cfg(test)]
+pub(crate) mod compatibility_tests;
 #[cfg(test)]
 pub(crate) mod test_helpers;
 
@@ -257,17 +262,18 @@ pub struct TurnRequest {
     pub state: TurnRequestState,
 }
 
-/// The two frontend commands that require executor authority.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub enum SessionCommand {
-    /// Summarize the context visible at this immutable database snapshot.
-    Compact { source_snapshot: Snapshot },
-    /// Retry one specifically observed interrupted turn attempt.
-    Retry {
-        target_request_id: TurnRequestId,
-        expected_interrupted_attempt_id: String,
-    },
+session_wire_enum! {
+    /// Frontend commands that require executor authority.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum SessionCommand [serde(deny_unknown_fields)] {
+        /// Summarize the context visible at this immutable database snapshot.
+        Compact { source_snapshot: Snapshot },
+        /// Retry one specifically observed interrupted turn attempt.
+        Retry {
+            target_request_id: TurnRequestId,
+            expected_interrupted_attempt_id: String,
+        },
+    }
 }
 
 /// A typed command request written by any session client.
@@ -279,13 +285,15 @@ pub struct SessionCommandRequest {
     pub command: SessionCommand,
 }
 
-/// Terminal executor-owned command outcome.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum SessionCommandOutcome {
-    Compact { summary: String },
-    RetryAccepted { target_attempt_id: String },
-    Rejected { message: String },
-    Failed { message: String },
+session_wire_enum! {
+    /// Terminal executor-owned command outcome.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum SessionCommandOutcome {
+        Compact { summary: String },
+        RetryAccepted { target_attempt_id: String },
+        Rejected { message: String },
+        Failed { message: String },
+    }
 }
 
 /// Durable result observed by the client that submitted a command.
@@ -655,24 +663,26 @@ pub struct TurnTranscriptRecord {
     pub message: TurnTranscriptMessage,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub enum TurnTranscriptMessage {
-    ModelResponse {
-        model_sequence: u64,
-        content: Option<String>,
-        tool_calls: Vec<crate::runtime::ToolCallRequest>,
-        provider_extra: serde_json::Map<String, serde_json::Value>,
-        metadata: Option<crate::runtime::ResponseMetadata>,
-        terminal: bool,
-    },
-    ToolResult {
-        model_sequence: u64,
-        call_index: usize,
-        call_id: String,
-        name: String,
-        output: String,
-        outcome: crate::runtime::ToolResultOutcome,
-    },
+session_wire_enum! {
+    #[derive(Debug, Clone, PartialEq)]
+    pub enum TurnTranscriptMessage {
+        ModelResponse {
+            model_sequence: u64,
+            content: Option<String>,
+            tool_calls: Vec<crate::runtime::ToolCallRequest>,
+            provider_extra: serde_json::Map<String, serde_json::Value>,
+            metadata: Option<crate::runtime::ResponseMetadata>,
+            terminal: bool,
+        },
+        ToolResult {
+            model_sequence: u64,
+            call_index: usize,
+            call_id: String,
+            name: String,
+            output: String,
+            outcome: crate::runtime::ToolResultOutcome,
+        },
+    }
 }
 
 impl Session {
@@ -1138,33 +1148,14 @@ impl Session {
         Ok(())
     }
 
-    /// Return command requests in stable session order with derived states.
+    /// Return supported command work in stable session order with derived states.
+    /// Unknown requests or outcomes stay in storage, not the execution queue.
     pub async fn command_requests(
         &self,
         live_attempts: &HashSet<String>,
     ) -> anyhow::Result<Vec<SessionCommandWork>> {
-        let txn = self.database.new_transaction().await?;
-        let mut requests = txn
-            .get_store::<Table<SessionCommandRequest>>(SESSION_COMMANDS_STORE)
-            .await?
-            .search(|_| true)
-            .await?;
-        requests.sort_by(|(left_id, left), (right_id, right)| {
-            left.created_at
-                .cmp(&right.created_at)
-                .then_with(|| left_id.cmp(right_id))
-        });
-        let states = index_attempt_states(self.read_turn_attempts().await?, live_attempts);
-        Ok(requests
-            .into_iter()
-            .map(|(_, request)| SessionCommandWork {
-                state: states
-                    .get(&request.command_id)
-                    .cloned()
-                    .unwrap_or(TurnRequestState::Queued),
-                request,
-            })
-            .collect())
+        let snapshot = self.database.snapshot().await?;
+        self.command_requests_at(&snapshot, live_attempts).await
     }
 
     pub async fn command_requests_at(
@@ -1173,10 +1164,21 @@ impl Session {
         live_attempts: &HashSet<String>,
     ) -> anyhow::Result<Vec<SessionCommandWork>> {
         let txn = self.database.new_transaction_at(snapshot).await?;
+        let unsupported_results: HashSet<_> = txn
+            .get_store::<Table<SessionCommandResult>>(SESSION_COMMAND_RESULTS_STORE)
+            .await?
+            .search(|result| matches!(result.outcome, SessionCommandOutcome::Unknown { .. }))
+            .await?
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
         let mut requests = txn
             .get_store::<Table<SessionCommandRequest>>(SESSION_COMMANDS_STORE)
             .await?
-            .search(|_| true)
+            .search(|request| {
+                !matches!(request.command, SessionCommand::Unknown { .. })
+                    && !unsupported_results.contains(request.command_id.as_str())
+            })
             .await?;
         requests.sort_by(|(left_id, left), (right_id, right)| {
             left.created_at
@@ -1368,6 +1370,17 @@ impl Session {
         &self,
         request_id: TurnRequestId,
     ) -> anyhow::Result<TurnAttempt> {
+        self.start_turn_attempt_as(request_id, uuid::Uuid::new_v4().to_string())
+            .await
+    }
+
+    /// Start an attempt under a caller-chosen ID, so an executor can mark it
+    /// live before the Started record becomes visible to observers.
+    pub async fn start_turn_attempt_as(
+        &self,
+        request_id: TurnRequestId,
+        attempt_id: String,
+    ) -> anyhow::Result<TurnAttempt> {
         let generation = self
             .read_turn_attempts()
             .await?
@@ -1378,7 +1391,7 @@ impl Session {
             .unwrap_or(0)
             + 1;
         let attempt = TurnAttempt {
-            attempt_id: uuid::Uuid::new_v4().to_string(),
+            attempt_id,
             request_id,
             started_at: Utc::now(),
             generation,
