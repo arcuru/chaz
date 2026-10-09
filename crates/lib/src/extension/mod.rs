@@ -1026,7 +1026,8 @@ impl ExtensionHub {
         agent_name: &str,
         session_db: Option<&Database>,
     ) -> Vec<Arc<dyn instance::ExtensionInstance>> {
-        let mut by_name: HashMap<String, Arc<dyn instance::ExtensionInstance>> = HashMap::new();
+        // Stable prefix bytes across turns; session instances still win by name.
+        let mut by_name: BTreeMap<String, Arc<dyn instance::ExtensionInstance>> = BTreeMap::new();
         // Agent first, so a same-named per-session instance overwrites it.
         for inst in self.ensure_agent_instances_for_name(agent_name).await {
             by_name.insert(inst.manifest().name.clone(), inst);
