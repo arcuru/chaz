@@ -26,6 +26,7 @@ pub(crate) mod hook_bridge;
 pub mod hooks;
 pub mod instance;
 pub mod manifest;
+pub mod projection;
 
 #[allow(unused_imports)]
 pub use instance::{CapResolver, ExtensionInstance, PeerHandles, Scope, ScopeCtx, TurnCtx};
@@ -712,6 +713,9 @@ pub struct ExtensionHub {
     /// `Config::agent_state_allowlist`. Maps extension name → allowed
     /// agent display names. An absent entry means unrestricted.
     agent_state_allowlist: HashMap<String, Vec<String>>,
+    /// Operator `context_projection` grants, held in invocation order
+    /// (conversation phase, then full-context phase, list order within).
+    context_projection: Vec<projection::ContextProjectionGrant>,
 
     // ---- Lifecycle instance bookkeeping -----------------------------------
     //
@@ -779,6 +783,7 @@ impl ExtensionHub {
             session_registry: None,
             hosted_index: None,
             agent_state_allowlist: HashMap::new(),
+            context_projection: Vec::new(),
             global_instances: HashMap::new(),
             agent_instances: tokio::sync::RwLock::new(HashMap::new()),
             session_instances: tokio::sync::RwLock::new(HashMap::new()),
@@ -1060,6 +1065,142 @@ impl ExtensionHub {
     /// chaz's main. Must be set before `install_all`.
     pub fn set_agent_state_allowlist(&mut self, allowlist: HashMap<String, Vec<String>>) {
         self.agent_state_allowlist = allowlist;
+    }
+
+    /// Install the operator's `context_projection` grants. Rejects a list
+    /// the runtime could not apply unambiguously (blank or repeated names).
+    pub fn set_context_projection_grants(
+        &mut self,
+        grants: &[projection::ContextProjectionGrant],
+    ) -> Result<(), String> {
+        projection::validate_grants(grants)?;
+        self.context_projection = projection::invocation_order(grants);
+        Ok(())
+    }
+
+    /// Whether any context projector is granted. When false the runtime
+    /// sends every model call's baseline untouched.
+    pub fn has_context_projection(&self) -> bool {
+        !self.context_projection.is_empty()
+    }
+
+    /// Resolve the context projectors eligible for one model call.
+    ///
+    /// Eligible = granted ∩ instantiated for this agent/session (session
+    /// over agent over global by name) ∩ active for the turn (session set
+    /// minus agent opt-outs) ∩ still active in the session's extension log
+    /// at this call ∩ manifest provides `context_projection` ∩ endpoint
+    /// present. A required grant that fails any check refuses the call; an
+    /// optional one is skipped without being invoked. Current agent opt-outs
+    /// also attenuate the turn's active set at this boundary.
+    pub(crate) async fn resolve_context_projectors(
+        &self,
+        agent_name: &str,
+        session_db: Option<&Database>,
+        turn_active: &HashSet<String>,
+    ) -> Result<Vec<projection::ResolvedProjector>, projection::ProjectionError> {
+        if self.context_projection.is_empty() {
+            return Ok(Vec::new());
+        }
+        let active = self
+            .active_extensions_for_call(agent_name, session_db, turn_active)
+            .await;
+        let instances = self.scoped_instances(agent_name, session_db).await;
+        let mut resolved = Vec::new();
+        for grant in &self.context_projection {
+            let name = grant.extension.as_str();
+            let projector = match instances.get(name) {
+                None => Err("no instance exists for this agent or session"),
+                Some(_) if !active.contains(name) => {
+                    Err("it is not active for this session and agent")
+                }
+                Some(inst)
+                    if !inst
+                        .manifest()
+                        .provides_capabilities
+                        .contains(&caps::CapabilityKind::ContextProjection) =>
+                {
+                    Err("its manifest does not provide context_projection")
+                }
+                Some(inst) => inst
+                    .context_projector()
+                    .ok_or("it publishes no context projector"),
+            };
+            match projector {
+                Ok(projector) => resolved.push(projection::ResolvedProjector {
+                    extension: grant.extension.clone(),
+                    authority: grant.authority,
+                    required: grant.required,
+                    projector,
+                }),
+                Err(reason) if grant.required => {
+                    return Err(projection::ProjectionError::RequiredUnavailable {
+                        extension: grant.extension.clone(),
+                        reason: reason.to_string(),
+                    });
+                }
+                Err(reason) => {
+                    tracing::debug!(
+                        extension = name,
+                        reason,
+                        "Optional context projector skipped"
+                    );
+                }
+            }
+        }
+        Ok(resolved)
+    }
+
+    /// Attenuate the turn's active set with current session/agent revocations.
+    /// Used at both model-call and actual tool-execution boundaries; never
+    /// enables an extension that was absent from the turn's authority.
+    pub(crate) async fn active_extensions_for_call(
+        &self,
+        agent_name: &str,
+        session_db: Option<&Database>,
+        turn_active: &HashSet<String>,
+    ) -> HashSet<String> {
+        let mut active = turn_active.clone();
+        if let Some(db) = session_db {
+            match read_active(db).await {
+                Ok(refs) => {
+                    let session_active: HashSet<_> =
+                        refs.into_iter().map(|r| r.name().to_string()).collect();
+                    active.retain(|name| session_active.contains(name));
+                }
+                Err(error) => {
+                    warn!(%error, "Could not read active extensions; no extension is active");
+                    active.clear();
+                }
+            }
+        }
+        if let Some(server) = self
+            .peer_handles
+            .as_ref()
+            .and_then(|peer| peer.server_slot.get())
+        {
+            let disabled = server.agent_disabled_extensions(agent_name).await;
+            active.retain(|name| !disabled.contains(name));
+        }
+        active
+    }
+
+    /// Every instance reachable for `(agent, session)`, keyed by extension
+    /// name with per-session over per-agent over global precedence.
+    async fn scoped_instances(
+        &self,
+        agent_name: &str,
+        session_db: Option<&Database>,
+    ) -> HashMap<String, Arc<dyn instance::ExtensionInstance>> {
+        let mut instances: HashMap<String, Arc<dyn instance::ExtensionInstance>> = self
+            .global_instances
+            .iter()
+            .map(|(name, inst)| (name.clone(), inst.clone()))
+            .collect();
+        for inst in self.context_instances(agent_name, session_db).await {
+            instances.insert(inst.manifest().name.clone(), inst);
+        }
+        instances
     }
 
     /// Snapshot of `InstalledExtension` for a registered extension.
@@ -1737,16 +1878,8 @@ impl ExtensionHub {
     /// unchanged turn from growing the session DAG.
     pub async fn refresh_status_outputs(&self, agent_name: &str, session_db: &Database) {
         // Global instances (e.g. `core`) plus the turn's lazily-ensured
-        // agent/session instances. `context_instances` covers agent +
-        // session only, so global-scoped providers are folded in
-        // explicitly; per-session/agent instances win on name collision.
-        let mut instances: HashMap<String, Arc<dyn instance::ExtensionInstance>> = HashMap::new();
-        for (name, inst) in &self.global_instances {
-            instances.insert(name.clone(), inst.clone());
-        }
-        for inst in self.context_instances(agent_name, Some(session_db)).await {
-            instances.insert(inst.manifest().name.clone(), inst);
-        }
+        // agent/session instances; per-session/agent win on name collision.
+        let instances = self.scoped_instances(agent_name, Some(session_db)).await;
 
         let mut outputs: BTreeMap<String, ExtensionOutput> = BTreeMap::new();
         for inst in instances.into_values() {

@@ -14,10 +14,14 @@
 use crate::backends::BackendManager;
 use crate::bridge::ApprovalDecision;
 use crate::error::LlmError;
+use crate::extension::projection::{self, ContextSource, ProjectedRequest};
 use crate::extension::{ExtensionHub, HookContext, ToolCallDecision};
 use crate::security::SecurityContext;
-use crate::tool::{NO_REPLY_TOOL, RateLimiter, ToolApprovalInfo, ToolContext, ToolPolicyRegistry};
+use crate::tool::{
+    NO_REPLY_TOOL, RateLimiter, ToolApprovalInfo, ToolContext, ToolDefinition, ToolPolicyRegistry,
+};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -93,7 +97,7 @@ fn no_reply_arguments_empty(arguments: &str) -> bool {
 
 /// A message in the runtime conversation. Richer than simple text messages
 /// to support tool call/result exchanges in the ReAct loop.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum RuntimeMessage {
     System(String),
     User(String),
@@ -315,6 +319,7 @@ impl ExecutionCapacity {
 
 /// Outcome of a single agent turn: the visible reply plus aggregated
 /// token/cost metadata across every LLM call made in the ReAct loop.
+#[derive(Debug)]
 pub struct RuntimeOutcome {
     pub body: String,
     pub metadata: Option<ResponseMetadata>,
@@ -447,6 +452,35 @@ pub async fn execute(
     event_sink: Option<mpsc::Sender<RuntimeEvent>>,
     hub: Option<&ExtensionHub>,
 ) -> Result<RuntimeOutcome, String> {
+    execute_scoped(
+        model,
+        initial_messages,
+        backend,
+        security,
+        tool_ctx,
+        policies,
+        event_sink,
+        hub,
+        ModelCallScope::default(),
+    )
+    .await
+}
+
+/// [`execute`] with the per-call scope (budget, provenance, attempt) that
+/// context projection uses. Production callers supply it; a default scope
+/// has no budget gate and unattributed sources.
+#[allow(clippy::too_many_arguments)]
+pub async fn execute_scoped(
+    model: Option<&str>,
+    initial_messages: Vec<RuntimeMessage>,
+    backend: &BackendManager,
+    security: &SecurityContext,
+    tool_ctx: &ToolContext,
+    policies: &ToolPolicyRegistry,
+    event_sink: Option<mpsc::Sender<RuntimeEvent>>,
+    hub: Option<&ExtensionHub>,
+    scope: ModelCallScope,
+) -> Result<RuntimeOutcome, String> {
     let recorder = event_sink.map(|sink| Arc::new(EventRecorder(sink)) as Arc<dyn RuntimeRecorder>);
     execute_with_recorder(
         model,
@@ -458,8 +492,173 @@ pub async fn execute(
         recorder,
         hub,
         None,
+        scope,
     )
     .await
+}
+
+/// What a caller knows about a turn beyond its [`ToolContext`].
+#[derive(Clone, Debug, Default)]
+pub struct ModelCallScope {
+    /// The durable attempt this execution belongs to, if any.
+    pub attempt_id: Option<String>,
+    /// Estimated-token ceiling every projected request must fit.
+    pub request_budget_tokens: Option<usize>,
+    /// Provenance of `initial_messages`, index-aligned. A length mismatch
+    /// is treated as no provenance.
+    pub sources: Vec<ContextSource>,
+}
+
+/// Runs the granted context-projection chain before each logical model
+/// call. Holds the turn's derived-baseline bookkeeping; never the
+/// projected output, so each round starts from a fresh baseline.
+struct RoundProjector<'a> {
+    hub: Option<&'a ExtensionHub>,
+    tool_ctx: &'a ToolContext,
+    resolved_model: &'a str,
+    scope: ModelCallScope,
+    session_db: Option<eidetica::Database>,
+    session_db_id: Option<String>,
+    /// Sources for the messages present before the first model call.
+    base_sources: Vec<ContextSource>,
+    /// `(first message index, model sequence)` of each current-attempt
+    /// exchange, in order.
+    rounds: Vec<(usize, u64)>,
+    current_calls: HashSet<String>,
+}
+
+impl<'a> RoundProjector<'a> {
+    async fn new(
+        hub: Option<&'a ExtensionHub>,
+        tool_ctx: &'a ToolContext,
+        resolved_model: &'a str,
+        mut scope: ModelCallScope,
+        initial_len: usize,
+    ) -> Self {
+        let hub = hub.filter(|hub| hub.has_context_projection());
+        let session_db = match hub {
+            Some(_) => Some(tool_ctx.session.lock().await.database().clone()),
+            None => None,
+        };
+        let base_sources = if scope.sources.len() == initial_len {
+            std::mem::take(&mut scope.sources)
+        } else {
+            vec![ContextSource::Unattributed; initial_len]
+        };
+        Self {
+            hub,
+            tool_ctx,
+            resolved_model,
+            scope,
+            session_db_id: session_db.as_ref().map(|db| db.root_id().to_string()),
+            session_db,
+            base_sources,
+            rounds: Vec::new(),
+            current_calls: HashSet::new(),
+        }
+    }
+
+    fn note_injected(&mut self, count: usize) {
+        self.base_sources
+            .extend(std::iter::repeat_n(ContextSource::TurnInjection, count));
+    }
+
+    fn note_exchange(&mut self, index: usize, model_sequence: u64, calls: &[ToolCallRequest]) {
+        self.rounds.push((index, model_sequence));
+        self.current_calls
+            .extend(calls.iter().map(|call| call.id.clone()));
+    }
+
+    fn sources_for(&self, len: usize) -> Vec<ContextSource> {
+        let mut sources = self.base_sources.clone();
+        sources.truncate(len);
+        while sources.len() < len {
+            let index = sources.len();
+            let source = match self.rounds.iter().rev().find(|(start, _)| *start <= index) {
+                Some((_, model_sequence)) => ContextSource::CurrentAttempt {
+                    model_sequence: *model_sequence,
+                },
+                None => ContextSource::Unattributed,
+            };
+            sources.push(source);
+        }
+        sources
+    }
+
+    /// The request for logical model call `model_round`, or `None` when no
+    /// projector is granted and the baseline goes out untouched.
+    async fn project(
+        &self,
+        messages: &[RuntimeMessage],
+        tools: &[ToolDefinition],
+        model_round: u64,
+    ) -> Result<Option<ProjectedRequest>, String> {
+        let Some(hub) = self.hub else {
+            return Ok(None);
+        };
+        let refused = |error: projection::ProjectionError| {
+            warn!(%error, model_round, "Model call refused by context projection");
+            error.to_string()
+        };
+        let chain = hub
+            .resolve_context_projectors(
+                &self.tool_ctx.agent_name,
+                self.session_db.as_ref(),
+                &self.tool_ctx.active_extensions,
+            )
+            .await
+            .map_err(refused)?;
+        let baseline = ProjectedRequest {
+            messages: messages.to_vec(),
+            tools: tools.to_vec(),
+        };
+        let sources = self.sources_for(messages.len());
+        let inputs = projection::RoundInputs {
+            agent_name: &self.tool_ctx.agent_name,
+            session_db_id: self.session_db_id.as_deref(),
+            request_id: self.tool_ctx.turn_request_id.as_ref().map(|id| id.as_str()),
+            attempt_id: self.scope.attempt_id.as_deref(),
+            model: self.resolved_model,
+            model_round,
+            sources: &sources,
+            current_calls: &self.current_calls,
+            budget_tokens: self.scope.request_budget_tokens,
+        };
+        projection::run_chain(&chain, &baseline, &inputs)
+            .await
+            .map(Some)
+            .map_err(refused)
+    }
+
+    /// Project logical model call `model_round` and send it. Transport
+    /// retries resend the same accepted request. The outer error is a
+    /// projection refusal (nothing was sent); the inner one is the
+    /// provider's.
+    #[allow(clippy::too_many_arguments)]
+    async fn call_model(
+        &self,
+        backend: &BackendManager,
+        model: Option<&str>,
+        messages: &[RuntimeMessage],
+        tools: &[ToolDefinition],
+        model_round: u64,
+        max_retries: u32,
+    ) -> Result<Result<LLMResponse, LlmError>, String> {
+        let projected = self.project(messages, tools, model_round).await?;
+        let (messages, tools) = match &projected {
+            Some(request) => (request.messages.as_slice(), request.tools.as_slice()),
+            None => (messages, tools),
+        };
+        Ok(llm_call_with_retry(
+            backend,
+            model,
+            messages,
+            tools,
+            self.resolved_model,
+            max_retries,
+        )
+        .await)
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -473,6 +672,7 @@ pub async fn execute_with_recorder(
     recorder: Option<Arc<dyn RuntimeRecorder>>,
     hub: Option<&ExtensionHub>,
     mut capacity: Option<ExecutionCapacity>,
+    scope: ModelCallScope,
 ) -> Result<RuntimeOutcome, String> {
     let tools = &tool_ctx.tools;
     if tool_ctx.allow_no_reply {
@@ -487,6 +687,14 @@ pub async fn execute_with_recorder(
     let max_retries = backend.max_retries_for_model(model);
     let mut acc = MetadataAccumulator::default();
     let mut model_sequence = 0;
+    let mut projector = RoundProjector::new(
+        hub,
+        tool_ctx,
+        &resolved_model,
+        scope,
+        initial_messages.len(),
+    )
+    .await;
 
     let hook_ctx = hub.map(|_| HookContext {
         agent_name: tool_ctx.agent_name.clone(),
@@ -499,15 +707,16 @@ pub async fn execute_with_recorder(
 
     // Fast path: no tools or backend doesn't support them → single-shot (with retry)
     if (tools.is_empty() && !tool_ctx.allow_no_reply) || !backend.supports_tools_for_model(model) {
-        return match llm_call_with_retry(
+        // Boxed: keeps the call's state off this already large future.
+        return match Box::pin(projector.call_model(
             backend,
             model,
             &initial_messages,
             &[],
-            &resolved_model,
+            model_sequence,
             max_retries,
-        )
-        .await
+        ))
+        .await?
         {
             Ok(LLMResponse::Text { content, metadata }) if !content.trim().is_empty() => {
                 record_runtime(
@@ -554,6 +763,7 @@ pub async fn execute_with_recorder(
                 count = injected.len(),
                 "Extensions injected pre-turn messages"
             );
+            projector.note_injected(injected.len());
             messages.extend(injected);
         }
     }
@@ -564,15 +774,17 @@ pub async fn execute_with_recorder(
 
     let mut iteration: usize = 0;
     loop {
-        let response = match llm_call_with_retry(
+        // Project a fresh copy of the derived baseline for this logical
+        // call; transport retries reuse the accepted request.
+        let response = match Box::pin(projector.call_model(
             backend,
             model,
             &messages,
             &tool_defs,
-            &resolved_model,
+            model_sequence,
             max_retries,
-        )
-        .await
+        ))
+        .await?
         {
             Ok(resp) => resp,
             Err(e) => {
@@ -725,6 +937,7 @@ pub async fn execute_with_recorder(
                 );
 
                 // Record the assistant's tool call request
+                projector.note_exchange(messages.len(), model_sequence, &tool_calls);
                 messages.push(RuntimeMessage::AssistantToolCalls {
                     content: content.clone(),
                     tool_calls: tool_calls.clone(),
@@ -848,6 +1061,39 @@ pub async fn execute_with_recorder(
                                     content: wrap_tool_output(&call.name, &blocked_msg),
                                 });
                                 continue;
+                            }
+
+                            // Recheck extension authority after approval/hooks:
+                            // the turn's scoped filter is a ceiling, not a lease
+                            // to keep executing after a live revocation.
+                            if let (Some(hub), Some(owner)) = (hub, tools.owner_of(&call.name)) {
+                                let db = tool_ctx.session.lock().await.database().clone();
+                                let active = hub
+                                    .active_extensions_for_call(
+                                        &tool_ctx.agent_name,
+                                        Some(&db),
+                                        &tool_ctx.active_extensions,
+                                    )
+                                    .await;
+                                if !active.contains(owner) {
+                                    let result = format!(
+                                        "Tool unavailable: extension '{owner}' is inactive"
+                                    );
+                                    record_tool_result(
+                                        &recorder,
+                                        model_sequence,
+                                        call_index,
+                                        call,
+                                        &result,
+                                        ToolResultOutcome::Unavailable,
+                                    )
+                                    .await?;
+                                    messages.push(RuntimeMessage::ToolResult {
+                                        call_id: call.id.clone(),
+                                        content: wrap_tool_output(&call.name, &result),
+                                    });
+                                    continue;
+                                }
                             }
 
                             // --- Security: execute with timeout ---

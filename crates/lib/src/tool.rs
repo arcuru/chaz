@@ -473,7 +473,7 @@ pub struct ToolApprovalInfo {
 }
 
 /// Serializable tool definition for sending to the LLM
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ToolDefinition {
     pub name: String,
     pub description: String,
@@ -950,6 +950,11 @@ impl ScopedTools {
             return None;
         }
         self.registry.get(name)
+    }
+
+    /// Extension owning this tool, for live revocation checks at execution.
+    pub(crate) fn owner_of(&self, name: &str) -> Option<&'static str> {
+        self.registry.owner_of(name)
     }
 
     /// The still-loading source a [`Self::get`] miss would have come from.

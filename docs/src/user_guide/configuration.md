@@ -230,6 +230,13 @@ web_search:
 # agent_state_allowlist:
 #   schedule: [chaz, bash]
 #   memory: [chaz]             # memory tools can only touch chaz agent
+#
+# context_projection: extensions allowed to reshape each model request.
+# Empty (the default) sends every request unchanged.
+# context_projection:
+#   - extension: pruner
+#     authority: conversation  # or full_context (may edit instructions/tools)
+#     required: false          # true: refuse the call if it cannot run
 
 # Multi-agent chat-room tuning. Omit for built-in defaults.
 # multi_agent:
@@ -532,6 +539,25 @@ agent_state_allowlist:
   schedule: [chaz, bash]
   memory: [chaz]
 ```
+
+`context_projection:` lists the extensions allowed to reshape the request sent on each model call, in order. Installing or activating an extension never grants this; only this list does. See [Context projection grants](extensions.md#context-projection-grants).
+
+| Key                              | Default        | Meaning                                                                                                                                           |
+| -------------------------------- | -------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `context_projection[].extension` | —              | Extension (manifest) name. Each name may appear once.                                                                                             |
+| `context_projection[].authority` | `conversation` | `conversation`: conversation messages only. `full_context`: may also rewrite instructions and hide or re-describe tools the turn already exposes. |
+| `context_projection[].required`  | `false`        | `true`: if the extension is missing, inactive, fails, or returns an invalid request, the model call is refused. `false`: it is skipped.           |
+
+```yaml
+context_projection:
+  - extension: redactor
+    authority: conversation
+    required: true
+  - extension: pruner
+    authority: full_context
+```
+
+Conversation entries run before full-context entries; list order holds within each group. A blank or repeated name stops startup.
 
 ## Print mode
 

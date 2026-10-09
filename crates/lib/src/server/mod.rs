@@ -3427,6 +3427,11 @@ impl Server {
                 fail_after: transcript_fail_after,
             });
 
+            let scope = runtime::ModelCallScope {
+                attempt_id: Some(attempt.attempt_id.clone()),
+                request_budget_tokens: Some(assembled.request_budget_tokens),
+                sources: assembled.sources,
+            };
             let result = runtime::execute_with_recorder(
                 effective_model.as_deref(),
                 assembled.messages,
@@ -3441,6 +3446,7 @@ impl Server {
                     permit,
                     incarnation.clone().map(|token| (claim_db.clone(), token)),
                 )),
+                scope,
             )
             .await;
 

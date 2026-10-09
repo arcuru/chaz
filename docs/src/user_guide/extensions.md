@@ -195,6 +195,88 @@ extension stays in the log but does nothing — chaz can't load code
 it doesn't have. Re-opening the session on a peer that has the
 extension reactivates it from the existing log.
 
+## Context projection grants
+
+An extension can offer a **context projector**: code that sees the
+request about to be sent to the model and returns a reshaped one, such
+as recall inserted near the end, a large old tool output replaced with a
+stub, or secrets redacted. It runs before every model call of a turn,
+including each step of a tool loop, not once per turn. No built-in
+extension ships a projector yet; this is the mechanism they will use.
+
+What is automatic and what you control:
+
+- **You grant it.** Only extensions listed in `context_projection` in
+  the config ([reference](configuration.md#extensions)) ever run as
+  projectors. Installing or `/extensions add`-ing one is not a grant.
+- **Activation still applies.** A granted projector runs only while the
+  extension is active for the session and the responding agent.
+  `/extensions remove` stops it from the next model call, even mid-turn.
+  Session removal and agent opt-outs also stop the extension's tools at
+  their next actual execution; changing model-facing declarations does
+  not freeze earlier execution permissions.
+- **Authority is per grant.** `conversation` projectors cannot change the
+  system instructions or the tool list the model sees. `full_context`
+  projectors can, but they can only hide or re-describe tools the turn
+  already has. Neither affects what tools actually run.
+- **The originals are kept.** The session transcript, the stored tool
+  results, and the next call's starting point are the unprojected
+  originals. A projection never becomes history.
+
+The host checks every projector's output: tool calls and their results
+must stay paired and unaltered (a whole old exchange may be dropped),
+opaque provider data must match, the current turn's own tool exchanges
+must stay, and the whole request must fit the model's context budget.
+
+Failure modes:
+
+| Situation                                                | `required: false`                       | `required: true`                      |
+| -------------------------------------------------------- | --------------------------------------- | ------------------------------------- |
+| Extension missing, inactive, or not offering a projector | Skipped; never called                   | Turn ends with an error; nothing sent |
+| Projector errors, panics, takes over 30 s                | Skipped; earlier projectors' edits kept | Turn ends with an error; nothing sent |
+| Output breaks a rule above                               | Output discarded; earlier edits kept    | Turn ends with an error; nothing sent |
+| Request over budget after every step                     | Turn ends with an error; nothing sent   | Turn ends with an error; nothing sent |
+
+Mark a projector `required` when sending without it would be wrong, as
+with redaction. Leave it optional when it only saves tokens.
+
+## Walkthrough: a required projector that gets switched off
+
+Scenario: your config grants a `redactor` extension as a required
+conversation projector, and someone disables it in one session.
+
+1. The grant in `config.yaml`:
+
+   ```yaml
+   context_projection:
+     - extension: redactor
+       required: true
+   ```
+
+   Every model call in every session now passes through `redactor`
+   first.
+
+2. In one session, someone runs:
+
+   ```
+   /extensions remove redactor
+   ```
+
+3. The next model call in that session is refused before anything
+   reaches the model provider. The turn ends with an error entry:
+
+   ```
+   Error: required context projector 'redactor' is unavailable: it is not active for this session and agent
+   ```
+
+   If the extension is not installed on this peer at all, the reason
+   reads `no instance exists for this agent or session` instead.
+
+4. **Recovery:** run `/extensions add redactor` in that session and send
+   the message again. To let the session continue without redaction,
+   set `required: false` (or remove the entry) and restart chaz; the
+   projector is then skipped wherever it is inactive.
+
 ## Walkthrough: disable scheduling for one agent in a shared room
 
 Scenario: three agents (`chaz`, `nova`, `archivist`) share one Matrix room. You want `nova` to stop being able to schedule itself — but `chaz` and `archivist` should keep their schedulers.
