@@ -4148,7 +4148,8 @@ async fn next_turn_replays_prior_native_tool_exchange() {
             _: &'a ToolContext,
         ) -> Pin<Box<dyn std::future::Future<Output = Result<String, ToolError>> + Send + 'a>>
         {
-            Box::pin(async { Ok(format!("the retrieved result {}", "é".repeat(60_000))) })
+            // Whitespace avoids pathological tokenization; two spaces keep the cap inside UTF-8.
+            Box::pin(async { Ok(format!("the retrieved result {}", "🦊  ".repeat(17_067))) })
         }
     }
     let (_instance, server, registry) = server_fixture().await;
