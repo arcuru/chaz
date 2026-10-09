@@ -48,8 +48,12 @@ graph LR
 | `Summary`          |    Boundary    | /compact                | Context start boundary             |
 | `ApprovalRequest`  |       No       | Approval proxy (daemon) | Control: tool approval requested   |
 | `ApprovalDecision` |       No       | Bridge                  | Control: human's approval decision |
+| `Cancel`           |       No       | User frontend           | Control: stop one running attempt  |
 
 `Directive` entries are included in the LLM context as `user` role messages. This is because they are instructions to the agent, functionally equivalent to a user message.
+
+`Cancel` targets the active request and attempt IDs without entering context or waking another turn.
+The owning executor observes it even while model, approval, or tool work is waiting; see [ReAct Runtime → Cancellation](../architecture/react.md#cancellation).
 
 ## Server Processing Logic
 

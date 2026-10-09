@@ -7209,64 +7209,12 @@ async fn costs_command_preserves_operator_text_contract() {
 
 // ---- User stop requests ---------------------------------------------------
 
-/// A backend whose every model call waits for a permit, so a test decides
-/// exactly when (or whether) a turn's model call completes.
-struct GatedBackend {
-    gate: tokio::sync::Semaphore,
-}
-
-impl GatedBackend {
-    fn new() -> Arc<Self> {
-        Arc::new(Self {
-            gate: tokio::sync::Semaphore::new(0),
-        })
-    }
-    fn release_one(&self) {
-        self.gate.add_permits(1);
-    }
-}
-
-impl crate::backends::BackendDispatch for GatedBackend {
-    fn execute<'a>(
-        &'a self,
-        _context: &'a crate::backends::ChatContext,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<String, crate::error::LlmError>> + Send + 'a>,
-    > {
-        Box::pin(std::future::pending())
-    }
-    fn supports_tools(&self) -> bool {
-        true
-    }
-    fn chat_with_tools<'a>(
-        &'a self,
-        _messages: &'a [crate::runtime::RuntimeMessage],
-        _tools: &'a [crate::tool::ToolDefinition],
-        _model: &'a str,
-    ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<
-                    Output = Result<crate::runtime::LLMResponse, crate::error::LlmError>,
-                > + Send
-                + 'a,
-        >,
-    > {
-        Box::pin(async move {
-            self.gate.acquire().await.expect("gate open").forget();
-            Ok(crate::runtime::LLMResponse::Text {
-                content: "reply".to_string(),
-                metadata: None,
-            })
-        })
-    }
-}
-
 /// A registered session with `alpha` attached, answered by `backend`.
 async fn gated_session(
     server: &Arc<Server>,
     registry: &Arc<crate::session::SessionRegistry>,
     entry: &DbEntry,
-    backend: Arc<GatedBackend>,
+    backend: Arc<crate::test_support::MockBackend>,
 ) -> (eidetica::Database, String) {
     let (_conv, session_db) = registry.create_session(Some("t")).await.unwrap();
     let sid = session_db.root_id().to_string();
@@ -7314,9 +7262,6 @@ async fn await_entries(
     false
 }
 
-fn is_ack(e: &SessionEntry) -> bool {
-    e.sender == "alpha" && e.entry_type == EntryType::Ack
-}
 fn is_stop(e: &SessionEntry) -> bool {
     e.sender == "alpha" && e.entry_type == EntryType::Error && e.content == TURN_STOPPED_MESSAGE
 }
@@ -7335,21 +7280,22 @@ async fn a_user_stop_ends_only_the_turn_it_targets() {
     let (entry, _adb) = seed_agent(&server, &registry, "alpha").await;
     register_alpha_agent_runtime(&server);
 
-    let stopped_backend = GatedBackend::new();
-    let other_backend = GatedBackend::new();
+    let stopped_backend = Arc::new(crate::test_support::MockBackend::new());
+    stopped_backend.push_text("must not reply after stop");
+    let stopped_gate = stopped_backend.block_next_call();
+    let other_backend = Arc::new(crate::test_support::MockBackend::new());
+    other_backend.push_text("reply");
+    let other_gate = other_backend.block_next_call();
     let (db1, s1) = gated_session(&server, &registry, &entry, stopped_backend.clone()).await;
     let (db2, s2) = gated_session(&server, &registry, &entry, other_backend.clone()).await;
 
     write_user_message(&db1, &s1).await;
     write_user_message(&db2, &s2).await;
-    assert!(
-        await_entries(&db1, &s1, 1, is_ack).await,
-        "turn 1 never started"
-    );
-    assert!(
-        await_entries(&db2, &s2, 1, is_ack).await,
-        "other turn never started"
-    );
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        tokio::join!(stopped_gate.wait_started(), other_gate.wait_started());
+    })
+    .await
+    .expect("both model calls must start before stop");
 
     // The stop: the same client API as /stop, persisted to the session.
     let mut client = Session::new(ConversationId(s1.clone()), db1.clone()).await;
@@ -7367,25 +7313,25 @@ async fn a_user_stop_ends_only_the_turn_it_targets() {
     // Unrelated work continues: the other session's turn is still running
     // and completes normally once its model call returns.
     assert!(!session_entries(&db2, &s2).await.iter().any(is_stop));
-    other_backend.release_one();
+    other_gate.release();
     assert!(
         await_entries(&db2, &s2, 1, is_reply).await,
         "the other session's turn must complete"
     );
 
-    // A new turn in the stopped session. Wait for the stopped one to release
-    // the session first; a write while it is held is skipped by design.
-    for _ in 0..100 {
-        if !server.processing.lock().await.contains(&s1) {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    }
+    await_no_processing(&server, &s1).await;
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        stopped_gate.wait_stopped(),
+    )
+    .await
+    .expect("stop must drop the in-flight model request");
+    stopped_backend.push_text("reply");
+    let next_gate = stopped_backend.block_next_call();
     write_user_message(&db1, &s1).await;
-    assert!(
-        await_entries(&db1, &s1, 2, is_ack).await,
-        "turn 2 never started"
-    );
+    tokio::time::timeout(std::time::Duration::from_secs(2), next_gate.wait_started())
+        .await
+        .expect("turn 2 never started");
 
     // A delayed/repeated old event cannot stop the new attempt, even with
     // a future timestamp. An agent-written exact target is ignored too.
@@ -7406,59 +7352,113 @@ async fn a_user_stop_ends_only_the_turn_it_targets() {
         "turn 2 must not be stopped by a stale or agent-written stop"
     );
 
-    stopped_backend.release_one();
+    next_gate.release();
     assert!(
         await_entries(&db1, &s1, 1, is_reply).await,
         "turn 2 must complete"
     );
-    // The task clears its running-turn entry right after the reply.
-    let mut cleared = false;
-    for _ in 0..100 {
-        if server.turns.lock().await.is_empty() {
-            cleared = true;
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    }
-    assert!(
-        cleared,
-        "a finished turn must leave the running-turn registry"
-    );
+    await_no_processing(&server, &s1).await;
+    await_no_processing(&server, &s2).await;
+    assert!(server.turns.lock().await.is_empty());
+    server.shutdown().await;
 }
 
-/// A stop submitted after the durable start but before runtime registration
-/// is found by the fresh registration scan, rather than lost in the gap.
+/// A stop between durable start and runtime registration must be found by
+/// the spawn path's fresh scan. Failed terminal persistence must not settle it.
 #[tokio::test]
 async fn a_stop_that_lands_before_the_turn_starts_still_stops_it() {
-    let (_inst, server, registry) = server_fixture().await;
-    let (entry, _adb) = seed_agent(&server, &registry, "alpha").await;
-    register_alpha_agent_runtime(&server);
-    let backend = GatedBackend::new();
-    let (db, sid) = gated_session(&server, &registry, &entry, backend).await;
-    // Stop the fixture's dispatcher so this test controls the start/map gap.
-    server.shutdown().await;
-    server.shutting_down.store(false, Ordering::Release);
-    write_user_message(&db, &sid).await;
-    let client = Session::new(ConversationId(sid.clone()), db.clone()).await;
-    let (request, _) = client
-        .next_turn_request(|_| false, &Default::default())
-        .await
-        .unwrap()
-        .unwrap();
-    let attempt = client.start_turn_attempt(request.id).await.unwrap();
-    let mut frontend = Session::new(ConversationId(sid.clone()), db.clone()).await;
-    assert!(frontend.request_stop("user").await.unwrap());
-    let cancel = runtime::TurnCancel::new();
-    server.turns.lock().await.insert(
-        sid.clone(),
-        RunningTurn {
-            attempt,
-            cancel: cancel.clone(),
-        },
-    );
-    let fresh = Session::new(ConversationId(sid.clone()), db).await;
-    server.observe_stop_requests(&sid, &fresh).await;
-    assert!(cancel.is_cancelled());
+    for fail_terminal in [false, true] {
+        let (_inst, server, registry) = server_fixture().await;
+        let (entry, _adb) = seed_agent(&server, &registry, "alpha").await;
+        register_alpha_agent_runtime(&server);
+        let mock = Arc::new(crate::test_support::MockBackend::new());
+        let (db, sid) = gated_session(&server, &registry, &entry, mock.clone()).await;
+        // No dispatcher: only spawn's registration scan can observe this stop.
+        server.shutdown().await;
+        server.shutting_down.store(false, Ordering::Release);
+        write_user_message(&db, &sid).await;
+        let session = Session::new(ConversationId(sid.clone()), db.clone()).await;
+        let (request, _) = session
+            .next_turn_request(|_| false, &Default::default())
+            .await
+            .unwrap()
+            .unwrap();
+        let attempt = session
+            .start_turn_attempt(request.id.clone())
+            .await
+            .unwrap();
+        let mut frontend = Session::new(ConversationId(sid.clone()), db.clone()).await;
+        assert!(frontend.request_stop("user").await.unwrap());
+        if fail_terminal {
+            server.fail_transcript_after(0);
+        }
+        server.processing.lock().await.insert(sid.clone());
+        server
+            .live_attempts
+            .lock()
+            .await
+            .insert(attempt.attempt_id.clone());
+        let manager = crate::backends::BackendManager::with_mock(
+            mock.clone(),
+            crate::security::SecretStore::new(registry.chaz_peer().clone()).await,
+        );
+        server
+            .spawn_agent_task(
+                sid.clone(),
+                session,
+                server.agents.get("alpha").unwrap(),
+                None,
+                manager,
+                attempt.clone(),
+                SpawnContext {
+                    job_incarnation: None,
+                    job_authority: None,
+                    call_depth: 0,
+                    max_call_depth: 0,
+                    parent_tools: None,
+                    completion_tx: None,
+                    processing: server.processing.clone(),
+                    turns: server.turns.clone(),
+                },
+                None,
+            )
+            .await;
+        await_no_processing(&server, &sid).await;
+        let reopened = Session::new(ConversationId(sid), db).await;
+        let state = reopened
+            .turn_request(&request.id, |name| name == "alpha", &Default::default())
+            .await
+            .unwrap()
+            .unwrap()
+            .state;
+        let transcript = reopened.turn_transcript(&attempt.attempt_id).await.unwrap();
+        if fail_terminal {
+            assert_eq!(
+                state,
+                TurnRequestState::Interrupted {
+                    attempt_id: attempt.attempt_id
+                }
+            );
+            assert!(transcript.is_empty());
+            assert!(!reopened.entries().iter().any(is_stop));
+        } else {
+            assert!(
+                matches!(state, TurnRequestState::Completed { .. }),
+                "{state:?}"
+            );
+            assert_eq!(transcript.len(), 1);
+            assert!(matches!(
+                transcript[0].message,
+                TurnTranscriptMessage::Cancelled
+            ));
+            assert!(reopened.entries().iter().any(is_stop));
+        }
+        assert!(
+            mock.recorded_calls().is_empty(),
+            "pre-start stop must not call the model"
+        );
+        server.shutdown().await;
+    }
 }
 
 #[tokio::test]

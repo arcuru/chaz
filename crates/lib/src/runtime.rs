@@ -283,9 +283,9 @@ pub struct RuntimeOutcome {
 /// A user's request to stop one running turn.
 ///
 /// The executor that owns the turn creates one per turn and fires it when it
-/// observes an authorized stop event for that turn; the runtime watches it at
-/// every point where a turn can block — the model call (including retry
-/// backoff), a pending tool approval, and tool execution — and between steps.
+/// observes an authorized stop event for that turn. The runtime watches it
+/// during model calls (including retry backoff), pending tool approval, and
+/// tool execution, and before starting each tool call.
 /// Firing is idempotent and sticky: once requested, it stays requested.
 #[derive(Clone, Debug, Default)]
 pub struct TurnCancel(Arc<TurnCancelInner>);

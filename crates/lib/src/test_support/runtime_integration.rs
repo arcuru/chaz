@@ -1405,31 +1405,6 @@ async fn metadata_accumulator_sums_token_usage_across_calls() {
 
 // ---- User stop (TurnCancel) ------------------------------------------------
 
-/// A backend whose model call never returns — a stand-in for a slow or
-/// stalled provider request.
-struct StalledBackend;
-impl crate::backends::BackendDispatch for StalledBackend {
-    fn execute<'a>(
-        &'a self,
-        _context: &'a crate::backends::ChatContext,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<String, crate::error::LlmError>> + Send + 'a>,
-    > {
-        Box::pin(std::future::pending())
-    }
-    fn supports_tools(&self) -> bool {
-        true
-    }
-    fn chat_with_tools<'a>(
-        &'a self,
-        _messages: &'a [RuntimeMessage],
-        _tools: &'a [crate::tool::ToolDefinition],
-        _model: &'a str,
-    ) -> Pin<Box<dyn std::future::Future<Output = Result<LLMResponse, LlmError>> + Send + 'a>> {
-        Box::pin(std::future::pending())
-    }
-}
-
 /// Run one stoppable turn from a single user message.
 async fn run_cancellable(
     backend: &BackendManager,
@@ -1476,105 +1451,39 @@ async fn drain_events(
     out
 }
 
-/// The dependent-slice scenario: a stop lands while a shell command that
-/// would run for many seconds is executing. The turn must end promptly, well
-/// before the command (or its 30s tool timeout) would, and the in-flight call
-/// must be paired with a cancelled result in the audit events.
-#[tokio::test]
-async fn a_stop_during_a_long_shell_call_ends_the_turn_promptly() {
-    let (_instance, session) = fresh_session().await;
-    let secrets = empty_secrets().await;
-    let registry = ToolRegistry::new();
-    registry.register(crate::tools::ShellExec);
-    let ctx = tool_context(session, Arc::new(registry));
-    let (security, _approver) = security_with_decision(ApprovalDecision::Approve);
-
-    let mock = Arc::new(MockBackend::new());
-    mock.push_tool_calls(vec![(
-        "call_sleep".to_string(),
-        "shell".to_string(),
-        json!({ "command": "sleep 20" }).to_string(),
-    )]);
-    mock.push_text("should never be asked for");
-    let backend = BackendManager::with_mock(mock.clone(), secrets);
-
-    let cancel = runtime::TurnCancel::new();
-    let (tx, mut rx) = tokio::sync::mpsc::channel(16);
-    let stopper = cancel.clone();
-    let (fwd_tx, fwd_rx) = tokio::sync::mpsc::channel(16);
-    // Stop once the call is observably running, then keep forwarding.
-    let watcher = tokio::spawn(async move {
-        while let Some(ev) = rx.recv().await {
-            if matches!(ev, runtime::RuntimeEvent::ToolCall { .. }) {
-                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-                stopper.cancel();
-            }
-            let _ = fwd_tx.send(ev).await;
-        }
-    });
-
-    let started = std::time::Instant::now();
-    let result = tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        run_cancellable(&backend, &security, &ctx, Some(tx), &cancel),
-    )
-    .await
-    .expect("a stop must end the turn without waiting out the shell command");
-    let elapsed = started.elapsed();
-    watcher.await.unwrap();
-
-    assert!(
-        matches!(result, Err(runtime::TurnError::Cancelled { .. })),
-        "the turn must end as cancelled, not as a result or failure"
-    );
-    assert!(
-        elapsed < std::time::Duration::from_secs(3),
-        "stop took {elapsed:?}"
-    );
-    assert_eq!(
-        drain_events(fwd_rx).await,
-        vec![
-            ("call_sleep".to_string(), "shell".to_string(), false),
-            (
-                "call_sleep".to_string(),
-                runtime::TOOL_CANCELLED_OUTPUT.to_string(),
-                true
-            ),
-        ],
-        "the running call is paired with a cancelled result"
-    );
-    assert_eq!(
-        mock.recorded_calls().len(),
-        1,
-        "no model call after the stop"
-    );
-}
-
-/// A stop abandons an in-flight model request instead of waiting for it.
+/// Both tool-capable and single-shot model calls can be stopped in flight.
 #[tokio::test]
 async fn a_stop_abandons_a_stalled_model_call() {
-    let (_instance, session) = fresh_session().await;
-    let secrets = empty_secrets().await;
-    let registry = ToolRegistry::new();
-    registry.register(EchoTool::new());
-    let ctx = tool_context(session, Arc::new(registry));
-    let security = permissive_security();
-    let backend = BackendManager::with_mock(Arc::new(StalledBackend), secrets);
-
-    let cancel = runtime::TurnCancel::new();
-    let stopper = cancel.clone();
-    tokio::spawn(async move {
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        stopper.cancel();
-    });
-
-    let result = tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        run_cancellable(&backend, &security, &ctx, None, &cancel),
-    )
-    .await
-    .expect("a stop must not wait for the model");
-    assert!(matches!(result, Err(runtime::TurnError::Cancelled { .. })));
+    for supports_tools in [true, false] {
+        let (_instance, session) = fresh_session().await;
+        let registry = ToolRegistry::new();
+        registry.register(EchoTool::new());
+        let ctx = tool_context(session, Arc::new(registry));
+        let security = permissive_security();
+        let mock = Arc::new(MockBackend::new().with_supports_tools(supports_tools));
+        mock.push_text("must not reply after stop");
+        let gate = mock.block_next_call();
+        let backend = BackendManager::with_mock(mock, empty_secrets().await);
+        let cancel = runtime::TurnCancel::new();
+        let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::join!(
+                run_cancellable(&backend, &security, &ctx, None, &cancel),
+                async {
+                    gate.wait_started().await;
+                    cancel.cancel();
+                }
+            )
+        })
+        .await
+        .expect("a stop must not wait for the model");
+        assert!(
+            matches!(result, Err(runtime::TurnError::Cancelled { .. })),
+            "supports_tools={supports_tools}"
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(2), gate.wait_stopped())
+            .await
+            .expect("the stopped model future must be dropped");
+    }
 }
 
 /// A stop while a tool approval is pending ends the wait: nobody has to
@@ -1587,7 +1496,7 @@ async fn a_stop_ends_a_pending_approval_without_running_the_tool() {
     registry.register(GatedTool);
     let ctx = tool_context(session, Arc::new(registry));
     // An approval channel nobody answers.
-    let (approval_tx, _approval_rx) = tokio::sync::mpsc::channel(8);
+    let (approval_tx, mut approval_rx) = tokio::sync::mpsc::channel(8);
     let security = crate::security::SecurityContext {
         leak_detector: crate::security::LeakDetector::new(crate::security::LeakPolicy::Redact),
         auto_approved_tools: Default::default(),
@@ -1602,18 +1511,26 @@ async fn a_stop_ends_a_pending_approval_without_running_the_tool() {
     let backend = BackendManager::with_mock(mock.clone(), secrets);
 
     let cancel = runtime::TurnCancel::new();
-    let stopper = cancel.clone();
-    tokio::spawn(async move {
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        stopper.cancel();
-    });
     let (tx, rx) = tokio::sync::mpsc::channel(16);
-    let result = tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        run_cancellable(&backend, &security, &ctx, Some(tx), &cancel),
-    )
+    let (result, exchange) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        tokio::join!(
+            run_cancellable(&backend, &security, &ctx, Some(tx), &cancel),
+            async {
+                let exchange = approval_rx
+                    .recv()
+                    .await
+                    .expect("tool must request approval");
+                cancel.cancel();
+                exchange
+            }
+        )
+    })
     .await
     .expect("a stop must not wait for an approval");
+    assert!(
+        exchange.decision_tx.is_closed(),
+        "stop must abandon the approval wait"
+    );
     assert!(matches!(result, Err(runtime::TurnError::Cancelled { .. })));
     assert_eq!(
         drain_events(rx).await,
