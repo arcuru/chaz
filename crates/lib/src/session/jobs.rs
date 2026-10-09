@@ -227,8 +227,33 @@ pub(crate) async fn status_from_db(
         state,
     })
 }
+/// Local-v1 observation needs write-capable credentials because the current
+/// service materializes native record caches while reading. This checks existing
+/// authority only; it neither grants permission nor acquires execution.
+pub async fn require_observer_write(
+    db: &eidetica::Database,
+) -> anyhow::Result<eidetica::auth::types::Permission> {
+    // The pinned native resolver needs a local backend for delegated handles.
+    // Do not panic, guess authority, or substitute another key on service reads.
+    anyhow::ensure!(
+        !(db.instance()?.remote_connection().is_some()
+            && matches!(
+                db.auth_identity(),
+                Some(eidetica::auth::SigKey::Delegation { .. })
+            )),
+        "unavailable: cannot verify existing Write authority for this delegated service session identity; native permission query is unsupported"
+    );
+    let permission = db.current_permission().await?;
+    anyhow::ensure!(
+        permission.can_write(),
+        "insufficient permission: local-v1 job observation requires existing Write authority (Admin allowed); {permission:?} is unsupported"
+    );
+    Ok(permission)
+}
+
 /// Client evidence without a local live-attempt set: never promises liveness.
 pub async fn observer_status(db: &eidetica::Database) -> anyhow::Result<JobStatus> {
+    require_observer_write(db).await?;
     status_from_db(db, &Default::default(), false).await
 }
 
@@ -258,7 +283,10 @@ impl SessionRegistry {
         let key = user.get_default_key()?;
         user.map_key(&key, &root, eidetica::auth::SigKey::from_pubkey(&key))
             .await?;
-        let db = user.open_database_with_key(&root, &key).await?;
+        let db = user.open_database_with_key(&root, &key).await.map_err(|error| {
+            anyhow::anyhow!("job unavailable or insufficient permission: local-v1 observation requires existing Write authority (Admin allowed): {error}")
+        })?;
+        require_observer_write(&db).await?;
         self.local_client_sessions
             .lock()
             .await

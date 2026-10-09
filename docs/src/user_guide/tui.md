@@ -383,6 +383,22 @@ See `dev/tui-pty/README.md` for isolation details and failure artifact locations
 stable per-executor references, then reads the job Session DB for attempt and
 result evidence. A projection row is discovery, not execution authority.
 
+Local v1 requires **existing Write authority** on the observed databases;
+Admin is also supported, but not required. This includes the Agent/executor
+sources and job sessions. The observer UI is non-executing, **not a Read-only
+credential boundary**. The current Eidetica service needs Write to materialize
+native record caches when reading. True Read-only observation is deferred
+until that upstream path is repaired and verified; it is not supported yet.
+Chaz never upgrades a key, grants access, or substitutes a privileged credential.
+A delegated service session whose native Write query is unsupported also stays
+explicitly unavailable; the monitor does not guess its authority.
+
+| Existing authority | Local-v1 behavior                                       |
+| ------------------ | ------------------------------------------------------- |
+| Write or Admin     | Observe; steer only an active attempt within its limits |
+| Read only          | Explicit insufficient-permission outcome                |
+| Unauthorized       | Refuse access; a row or job handle grants nothing       |
+
 | Control      | Action                                                             |
 | ------------ | ------------------------------------------------------------------ |
 | `↑` / `↓`    | Select an ancestry node and preview its task, activity and result  |
@@ -408,7 +424,7 @@ Closing a tab or the client does not cancel the job or discard published input.
 ### Next-call steering and the final boundary
 
 An authorized session writer can send input while a recent started attempt is
-observable. Read-only keys can inspect but cannot publish. The original
+observable. Read-only keys cannot observe or publish in local v1. The original
 Directive and accepted tool, grant, capability and depth ceilings remain
 unchanged. Input cannot contain scope overrides or start another job.
 
@@ -431,7 +447,8 @@ model/tool effects never replay automatically after restart.
 ### Walkthrough: steer, then inspect
 
 1. Run a client-role TUI against the same configured Eidetica service as a
-   resident executor (`execution: client` on the viewer). Ask the executor's
+   resident executor (`execution: client` on the viewer), using existing
+   Write-authorized credentials (Admin also works). Ask the executor's
    ordinary conversation to submit a local Agent job with `spawn_agent`.
 2. Open `/jobs`, select the claimed job, and press `Enter`. The tab shows the
    original task and persisted tool activity. Its banner says
@@ -444,7 +461,12 @@ model/tool effects never replay automatically after restart.
 4. Reopen the job. Its recorded state is `Succeeded` or `Failed`, with the
    committed result and input receipts. Sending again displays
    `Finished job — view-only`; it cannot replace the result or start work.
-5. For a failure path, stop only the disposable viewer's access to its test
+5. With an independently Read-only credential, opening the job is refused:
+   `insufficient permission: local-v1 job observation requires existing Write authority (Admin allowed); Read is unsupported`.
+   An unreadable source stays explicitly unavailable; it is not an empty
+   successful Jobs view. Return to the viewer's already Write-authorized
+   credential to inspect it. Chaz does not grant or upgrade authority.
+6. For another failure path, stop only the disposable viewer's access to its test
    service. A refresh displays `unavailable` or `refresh timed out` with the
    retained snapshot labelled stale. Restore access and press `r` to refresh.
    A stale start is not an invitation to replay: inspect the attempt before

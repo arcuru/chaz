@@ -20,12 +20,14 @@ async fn service_steering(
         Instance::create_backend(Box::new(InMemory::new()), NewUser::passwordless("monitor"))
             .await
             .unwrap();
-    user.admin()
-        .await
-        .unwrap()
-        .create_user(NewUser::passwordless("monitor-reader"))
-        .await
-        .unwrap();
+    for name in ["monitor-observer", "monitor-reader"] {
+        user.admin()
+            .await
+            .unwrap()
+            .create_user(NewUser::passwordless(name))
+            .await
+            .unwrap();
+    }
     let (agent_db, pubkey) = create_agent_db(
         &mut user,
         "default",
@@ -90,7 +92,7 @@ async fn service_steering(
     }
     // Publish the parent after the executor's User snapshot, as the real
     // client-role TUI does. The registry binds its authenticated identity.
-    let (parent_id, _) = registry.create_session(Some("cli")).await.unwrap();
+    let (parent_id, parent_db) = registry.create_session(Some("cli")).await.unwrap();
     registry
         .attach_agent_to_session(&parent_id.0, &agent)
         .await
@@ -133,12 +135,77 @@ async fn service_steering(
         other => panic!("expected observable start, got {other:?}"),
     };
     assert!(!client.is_watching_session(&id).await);
+    // Fixture-only provisioning: a separate login holds Write, never the
+    // submitter/executor's Admin key. Production observation grants nothing.
+    let mut observer_settings = settings.clone();
+    observer_settings.login.username = "monitor-observer".into();
+    let mut observer_connection =
+        crate::instance::connect_with(&observer_settings, crate::config::ExecutionRole::Client)
+            .await
+            .unwrap();
+    let observer_key = observer_connection.user.get_default_key().unwrap();
+    for shared_db in [&db, &parent_db, agent_db.database(), registry.chaz_group()] {
+        let txn = shared_db.new_transaction().await.unwrap();
+        txn.get_settings()
+            .unwrap()
+            .set_auth_key(
+                &observer_key,
+                eidetica::auth::AuthKey::active(
+                    Some("write-observer"),
+                    eidetica::auth::types::Permission::Write(0),
+                ),
+            )
+            .await
+            .unwrap();
+        txn.commit().await.unwrap();
+        observer_connection
+            .user
+            .track_database(
+                shared_db.root_id().clone(),
+                &observer_key,
+                Default::default(),
+            )
+            .await
+            .unwrap();
+        let observed_db = observer_connection
+            .user
+            .open_database_with_key(shared_db.root_id(), &observer_key)
+            .await
+            .unwrap();
+        assert_eq!(
+            observed_db.current_permission().await.unwrap(),
+            eidetica::auth::types::Permission::Write(0)
+        );
+    }
+    let observer_registry = Arc::new(
+        crate::session::SessionRegistry::new(
+            observer_connection.instance,
+            observer_connection.user,
+            agents.clone(),
+        )
+        .await
+        .unwrap(),
+    );
+    assert_eq!(
+        observer_registry.chaz_group().root_id(),
+        registry.chaz_group().root_id()
+    );
+    let observer = client_server_fixture_from_registry(observer_registry.clone()).await;
+    observer.agent_index.register(DbEntry {
+        pubkey: observer_key,
+        ..agent.clone()
+    });
+    let (_, observed_db) = observer_registry.open_job_session(&id).await.unwrap();
+    assert_eq!(
+        observed_db.current_permission().await.unwrap(),
+        eidetica::auth::types::Permission::Write(0)
+    );
     let entries_before = Session::new(ConversationId(id.clone()), db.clone())
         .await
         .entries()
         .len();
     let catalog_before = registry.list_sessions().await.unwrap().len();
-    let monitor = client.job_monitor().await.unwrap();
+    let monitor = observer.job_monitor().await.unwrap();
     assert_eq!(
         Session::new(ConversationId(id.clone()), db.clone())
             .await
@@ -152,9 +219,14 @@ async fn service_steering(
         catalog_before,
         "monitoring created work"
     );
-    assert!(monitor.nodes.iter().any(|node| node.session_db_id == id
-        && node.claimed
-        && node.parent_id.as_deref() == Some(&parent_id.0)));
+    assert!(
+        monitor.nodes.iter().any(|node| node.session_db_id == id
+            && node.claimed
+            && node.unavailable.is_none()
+            && !node.preview.is_empty()
+            && node.parent_id.as_deref() == Some(&parent_id.0)),
+        "{monitor:#?}"
+    );
     assert!(
         monitor
             .nodes
@@ -185,11 +257,11 @@ async fn service_steering(
         );
         txn.commit().await.unwrap();
         assert!(matches!(
-            client.job_inputs(&id).await.unwrap()[0].state,
+            observer.job_inputs(&id).await.unwrap()[0].state,
             JobInputState::NotApplied { .. }
         ));
         assert!(
-            client
+            observer
                 .submit_job_input(&id, JobInputRequest::new(attempt_id, "too late".into()))
                 .await
                 .is_err()
@@ -212,7 +284,7 @@ async fn service_steering(
         return;
     }
     assert_eq!(
-        client
+        observer
             .submit_job_input(&id, input.clone())
             .await
             .unwrap()
@@ -220,9 +292,9 @@ async fn service_steering(
         JobInputState::Queued
     );
     // Lost acknowledgement: retry the same request without a second logical input.
-    client.submit_job_input(&id, input.clone()).await.unwrap();
+    observer.submit_job_input(&id, input.clone()).await.unwrap();
     assert!(
-        client
+        observer
             .submit_job_input(
                 &id,
                 JobInputRequest {
@@ -234,7 +306,7 @@ async fn service_steering(
             .is_err()
     );
     assert!(
-        client
+        observer
             .submit_job_input(
                 &id,
                 JobInputRequest {
@@ -262,8 +334,8 @@ async fn service_steering(
         crate::instance::connect_with(&reader_settings, crate::config::ExecutionRole::Client)
             .await
             .unwrap();
-    // Same service, a genuinely read-only signing identity can inspect but
-    // cannot publish; an unentitled identity fails rather than using a row.
+    // Same service, independent Read-only and unentitled keys remain refused.
+    // The deferred raw Read cache reproducer below retains the upstream bug.
     let read_db = {
         let user = &mut reader_connection.user;
         let read_key = user
@@ -315,8 +387,36 @@ async fn service_steering(
         read_db.current_permission().await.unwrap(),
         eidetica::auth::types::Permission::Read
     );
+    // DEFERRED READ-ONLY CACHE REPRODUCER: bypass only Chaz's new observation
+    // preflight, not Eidetica auth. Retain the original native query failure;
+    // success here requires revisiting this assertion and true Read support.
+    let raw_read = async {
+        read_db
+            .new_transaction()
+            .await?
+            .get_store::<eidetica::store::Table<JobInputRequest>>("job_inputs")
+            .await?
+            .search(|_: &JobInputRequest| true)
+            .await
+    }
+    .await;
+    let deferred_error = raw_read.unwrap_err().to_string();
+    eprintln!("DEFERRED Read-only cache materialization (not repaired): {deferred_error}");
+    assert!(deferred_error.contains("PermissionDenied") && deferred_error.contains("Write(0)"));
+    let refusal = crate::session::jobs::observer_status(&read_db)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(refusal.contains("insufficient permission") && refusal.contains("Write authority"));
     let reader = Session::new(ConversationId(id.clone()), read_db).await;
-    assert_eq!(reader.job_inputs().await.unwrap().len(), 1);
+    assert!(
+        reader
+            .job_inputs()
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("insufficient permission")
+    );
     assert!(
         reader
             .submit_job_input(JobInputRequest::new(
@@ -324,7 +424,9 @@ async fn service_steering(
                 "not authorized".into()
             ))
             .await
-            .is_err()
+            .unwrap_err()
+            .to_string()
+            .contains("insufficient permission")
     );
 
     assert!(
@@ -338,7 +440,7 @@ async fn service_steering(
         1,
         "observation/input must not run another executor or interrupt the current call"
     );
-    assert_eq!(client.job_inputs(&id).await.unwrap().len(), 1);
+    assert_eq!(observer.job_inputs(&id).await.unwrap().len(), 1);
     if let Some(sequence) = restart_at_call {
         let gate = if sequence == 1 {
             let continuation = mock.block_next_call();
@@ -357,7 +459,7 @@ async fn service_steering(
                 "parent cannot receive the provisional answer while accepted input is in flight"
             );
             assert_eq!(
-                client.job_inputs(&id).await.unwrap()[0].state,
+                observer.job_inputs(&id).await.unwrap()[0].state,
                 JobInputState::Dispatching { model_sequence: 1 }
             );
             continuation
@@ -406,7 +508,7 @@ async fn service_steering(
                 .iter()
                 .any(|m| matches!(m, RuntimeMessage::User(text) if text == &input.text))
         );
-        let input_state = client.job_inputs(&id).await.unwrap()[0].state.clone();
+        let input_state = observer.job_inputs(&id).await.unwrap()[0].state.clone();
         if sequence == 1 {
             assert!(
                 matches!(input_state, JobInputState::Uncertain { .. }),
@@ -434,6 +536,26 @@ async fn service_steering(
             .submit_agent_job(&id, "default", "referenced queued child")
             .await
             .unwrap();
+        // Provision this newly published fixture job explicitly too; no
+        // observer key acquisition or delegated session discovery is implied.
+        let (_, child_db) = registry.open_job_session(&child).await.unwrap();
+        let txn = child_db.new_transaction().await.unwrap();
+        txn.get_settings()
+            .unwrap()
+            .set_auth_key(
+                &observer_registry
+                    .user_for_tests()
+                    .await
+                    .get_default_key()
+                    .unwrap(),
+                eidetica::auth::AuthKey::active(
+                    Some("write-observer"),
+                    eidetica::auth::types::Permission::Write(0),
+                ),
+            )
+            .await
+            .unwrap();
+        txn.commit().await.unwrap();
         mock.push_tool_calls([(
             "wait".into(),
             "job_wait".into(),
@@ -460,7 +582,7 @@ async fn service_steering(
         "parent cannot receive a provisional result before the continuation finishes"
     );
     assert_eq!(
-        client.job_inputs(&id).await.unwrap()[0].state,
+        observer.job_inputs(&id).await.unwrap()[0].state,
         JobInputState::Dispatching { model_sequence: 1 }
     );
     assert_eq!(
@@ -475,7 +597,7 @@ async fn service_steering(
     if let Some((child, _)) = &child_wait {
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
-                let graph = client.job_monitor().await.unwrap();
+                let graph = observer.job_monitor().await.unwrap();
                 let parent = graph
                     .nodes
                     .iter()
@@ -559,12 +681,12 @@ async fn service_steering(
         .unwrap();
     assert_eq!(receipt.attempt_id, attempt_id);
     assert_eq!(
-        client.job_inputs(&id).await.unwrap()[0].state,
+        observer.job_inputs(&id).await.unwrap()[0].state,
         JobInputState::Included { model_sequence: 1 }
     );
-    client.submit_job_input(&id, input.clone()).await.unwrap();
+    observer.submit_job_input(&id, input.clone()).await.unwrap();
     assert!(
-        client
+        observer
             .submit_job_input(
                 &id,
                 JobInputRequest {
@@ -579,7 +701,7 @@ async fn service_steering(
         crate::session::jobs::read_job_result(&db).await.unwrap(),
         Some(receipt)
     );
-    let session = Session::new(ConversationId(id.clone()), db).await;
+    let session = Session::new(ConversationId(id.clone()), db.clone()).await;
     assert_eq!(
         session
             .entries()
@@ -612,7 +734,7 @@ async fn service_steering(
         })
         .await
         .unwrap();
-    let graph = client.job_monitor().await.unwrap();
+    let graph = observer.job_monitor().await.unwrap();
     assert!(
         graph
             .sources
@@ -636,6 +758,118 @@ async fn service_steering(
             .count(),
         calls.len(),
         "refresh must not execute another parent turn; the real child may run after parent settlement"
+    );
+    assert!(!observer.is_watching_session(&id).await);
+    assert!(
+        graph
+            .nodes
+            .iter()
+            .any(|node| node.session_db_id == parent_id.0
+                && node
+                    .unavailable
+                    .as_deref()
+                    .is_some_and(|error| error.contains("cannot verify existing Write authority"))),
+        "an unsupported delegated service session query must be an explicit gap, not a panic"
+    );
+    // A warm cache cannot hide an Executor delegation narrowed to Read.
+    let (executor_db, _) = registry
+        .ensure_executor_db(&agent.db_id, &agent.pubkey)
+        .await
+        .unwrap();
+    let original_delegation = executor_db
+        .get_settings()
+        .await
+        .unwrap()
+        .auth_snapshot()
+        .await
+        .unwrap()
+        .get_delegated_tree(agent_db.database().root_id())
+        .unwrap();
+    let mut narrowed = original_delegation.clone();
+    narrowed.permission_bounds.max = eidetica::auth::types::Permission::Read;
+    let txn = executor_db.new_transaction().await.unwrap();
+    txn.get_settings()
+        .unwrap()
+        .add_delegated_tree(narrowed)
+        .await
+        .unwrap();
+    txn.commit().await.unwrap();
+    let graph = observer.job_monitor().await.unwrap();
+    assert!(
+        graph
+            .sources
+            .iter()
+            .any(|source| source.contains("insufficient permission")
+                && source.contains("Executor DB"))
+    );
+    let txn = executor_db.new_transaction().await.unwrap();
+    txn.get_settings()
+        .unwrap()
+        .add_delegated_tree(original_delegation)
+        .await
+        .unwrap();
+    txn.commit().await.unwrap();
+    // Revocation/reduced authority on refresh stays an explicit gap even for
+    // a completed job, never an empty successful transcript or cached grant.
+    let txn = db.new_transaction().await.unwrap();
+    txn.get_settings()
+        .unwrap()
+        .set_auth_key(
+            &observer_registry
+                .user_for_tests()
+                .await
+                .get_default_key()
+                .unwrap(),
+            eidetica::auth::AuthKey::active(
+                Some("reduced-observer"),
+                eidetica::auth::types::Permission::Read,
+            ),
+        )
+        .await
+        .unwrap();
+    txn.commit().await.unwrap();
+    let refused = observer_registry
+        .open_job_session(&id)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(refused.contains("insufficient permission"));
+    let graph = observer.job_monitor().await.unwrap();
+    let gap = graph
+        .nodes
+        .iter()
+        .find(|node| node.session_db_id == id)
+        .unwrap();
+    assert!(gap.claimed && gap.preview.is_empty());
+    assert!(
+        gap.unavailable
+            .as_deref()
+            .unwrap()
+            .contains("insufficient permission")
+    );
+    let txn = agent_db.database().new_transaction().await.unwrap();
+    txn.get_settings()
+        .unwrap()
+        .set_auth_key(
+            &observer_registry
+                .user_for_tests()
+                .await
+                .get_default_key()
+                .unwrap(),
+            eidetica::auth::AuthKey::active(
+                Some("reduced-observer"),
+                eidetica::auth::types::Permission::Read,
+            ),
+        )
+        .await
+        .unwrap();
+    txn.commit().await.unwrap();
+    let graph = observer.job_monitor().await.unwrap();
+    assert!(
+        graph
+            .sources
+            .iter()
+            .any(|source| source.contains("insufficient permission"))
     );
     wait_slot.clear();
     executor.shutdown().await;

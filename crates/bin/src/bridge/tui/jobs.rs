@@ -135,6 +135,7 @@ async fn refresh_tab_snapshot(tab: &mut Tab) {
         return;
     };
     let entries = async {
+        chaz_core::session::jobs::require_observer_write(&tab.session_db).await?;
         let snapshot = tab.session_db.snapshot().await?;
         Session::entries_at_snapshot(&tab.session_db, &snapshot).await
     }
@@ -241,7 +242,7 @@ pub(super) fn banner(tab: &Tab) -> String {
         return String::new();
     };
     let mut text = format!(
-        "JOB observer — {:?} (recorded, not proven liveness)\n{}",
+        "JOB observer (Write-capable credentials) — {:?} (recorded, not proven liveness)\n{}",
         job.state, job.feedback
     );
     for input in &job.inputs {

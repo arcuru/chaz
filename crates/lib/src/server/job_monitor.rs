@@ -1,5 +1,6 @@
-//! Read-only local monitor. Projections discover claimed jobs; session DBs
-//! supply authority/evidence. No refresh here registers a runtime or syncs peers.
+//! Non-executing local monitor with existing Write authority (Admin allowed).
+//! Projections discover claimed jobs; session DBs supply authority/evidence.
+//! No refresh here registers a runtime or syncs peers.
 use super::Server;
 use crate::session::{
     Session, SessionEntry,
@@ -135,6 +136,7 @@ impl Server {
                 Ok(opened) => opened,
                 Err(_) => self.registry.open_job_session(id).await?,
             };
+            crate::session::jobs::require_observer_write(&db).await?;
             let session = Session::new(cid, db.clone()).await;
             node.preview = session.entries().iter().rev().take(4).cloned().collect();
             node.preview.reverse();

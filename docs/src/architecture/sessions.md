@@ -296,6 +296,20 @@ Entered `job_wait` calls write attempt-associated, bounded wait activity to
 The TUI derives ancestry from job request/acceptance records, with referenced
 pending children and ordinary parent conversations shown only as context.
 Observe-only tabs install DB callbacks, not server runtime registration.
+Local-v1 monitoring checks native `current_permission()` / `can_write()` on
+Agent sources and session reads. The existing single-hop Executor reference
+uses the Agent's native permission clamped by the Executor DB's native
+`PermissionBounds`; the service still validates its delegated identity on every
+operation. Existing Write or Admin authority is required. Read-only and unauthorized callers receive an
+explicit insufficient-permission/unavailable outcome. Refresh rechecks authority,
+including reductions after opening. These credentials are write-capable even
+though observation publishes no job changes and never acquires execution.
+This temporary boundary avoids the current service's Read-only native-record
+cache materialization failure; it does not repair that dependency. True Read
+support remains deferred. No automatic grants, key upgrades or alternate
+privileged identity are introduced. A service session handle whose native
+permission query cannot resolve delegation stays explicitly unavailable rather
+than guessing authority or falling back to another key.
 
 `job_inputs` stores stable caller-generated IDs, an expected started attempt
 and text. These are not Message or Directive entries. `job_input_receipts`

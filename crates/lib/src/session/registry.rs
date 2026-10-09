@@ -235,12 +235,23 @@ impl SessionRegistry {
         let agent = crate::agent_db::AgentDb::from_database(
             user.open_database_with_key(agent_db_id, agent_key).await?,
         );
+        let agent_permission = super::jobs::require_observer_write(agent.database()).await?;
         let mut queues = Vec::new();
         for reference in agent.list_executors().await? {
             let rows = async {
                 let db =
                     crate::executor_db::open_for_agent(&mut user, &agent, &reference, agent_key)
                         .await?;
+                // This path is the existing single-hop Agent delegation.
+                // current_permission on a delegated service handle requires a
+                // local backend; use native bounds on the proven source grant.
+                // The service still validates the identity on every operation.
+                let delegation = db.get_settings().await?.auth_snapshot().await?
+                    .get_delegated_tree(agent.database().root_id())?;
+                anyhow::ensure!(
+                    agent_permission.clamp_to_bounds(&delegation.permission_bounds).can_write(),
+                    "insufficient permission: local-v1 job observation requires existing Write authority (Admin allowed) on the Executor DB"
+                );
                 crate::executor_db::list_jobs(&db).await
             }
             .await;

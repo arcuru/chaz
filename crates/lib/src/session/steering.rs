@@ -54,9 +54,10 @@ pub struct JobInput {
 }
 
 impl Session {
-    /// Write using this DB handle's authenticated identity. A read-only key
-    /// fails at commit; possession of the job ID or projection is no grant.
+    /// Write using this DB handle's existing authenticated authority.
+    /// Possession of the job ID or projection is no grant.
     pub async fn submit_job_input(&self, request: JobInputRequest) -> anyhow::Result<JobInput> {
+        super::jobs::require_observer_write(&self.database).await?;
         anyhow::ensure!(
             uuid::Uuid::parse_str(&request.id).is_ok() && !request.text.trim().is_empty(),
             "input requires a stable UUID and nonempty text"
@@ -119,6 +120,7 @@ impl Session {
     /// Receipt plus canonical attempt/result evidence. Missing receipt never
     /// implies inclusion. In particular a restart does not consume old input.
     pub async fn job_inputs(&self) -> anyhow::Result<Vec<JobInput>> {
+        super::jobs::require_observer_write(&self.database).await?;
         let txn = self.database.new_transaction().await?;
         let requests = txn
             .get_store::<Table<JobInputRequest>>(INPUTS)
