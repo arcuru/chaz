@@ -26,16 +26,6 @@ use sha2::{Digest, Sha256};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::Mutex;
 
-fn capture(name: &str, value: &Value) {
-    if let Ok(dir) = std::env::var("CHAZ_PRUNER_CAPTURE_DIR") {
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(
-            std::path::Path::new(&dir).join(format!("{name}.json")),
-            serde_json::to_vec_pretty(value).unwrap(),
-        )
-        .unwrap();
-    }
-}
 fn entry(sender: &str, text: &str) -> SessionEntry {
     SessionEntry {
         sender: sender.into(),
@@ -80,6 +70,7 @@ impl RuntimeRecorder for Recorder {
     ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
         Box::pin(async move {
             let message = match message {
+                RuntimeRecord::Cancelled => TurnTranscriptMessage::Cancelled,
                 RuntimeRecord::ModelResponse {
                     model_sequence,
                     content,
@@ -130,6 +121,7 @@ impl RuntimeRecorder for Recorder {
     }
 }
 struct Fixture {
+    context_budget: usize,
     hub: Arc<ExtensionHub>,
     ctx: ToolContext,
     registry: Arc<ToolRegistry>,
@@ -177,6 +169,7 @@ impl Fixture {
             .map(|r| r.name().into())
             .collect();
         Self {
+            context_budget: 200000,
             hub: Arc::new(hub),
             ctx,
             registry,
@@ -208,7 +201,7 @@ impl Fixture {
             "test-agent",
             "fixture instructions",
             &ContextConfig {
-                max_context_tokens: 200000,
+                max_context_tokens: self.context_budget,
                 reserved_output_tokens: 256,
             },
         )
@@ -251,6 +244,7 @@ impl Fixture {
         .await
     }
     async fn seed(&mut self) -> TurnAttempt {
+        let executions_before = self.count.load(Ordering::SeqCst);
         let request = self
             .ctx
             .session
@@ -335,7 +329,7 @@ impl Fixture {
                 .await
                 .unwrap(),
         );
-        assert_eq!(self.count.load(Ordering::SeqCst), 3);
+        assert_eq!(self.count.load(Ordering::SeqCst), executions_before + 3);
         attempt
     }
     async fn hash(&self) -> String {
@@ -349,16 +343,7 @@ impl Fixture {
             .unwrap();
         rows.sort_by(|a, b| a.0.cmp(&b.0));
         let bytes = serde_json::to_vec(&rows).unwrap();
-        let hash = format!("{:x}", Sha256::digest(&bytes));
-        if let Ok(dir) = std::env::var("CHAZ_PRUNER_CAPTURE_DIR") {
-            std::fs::create_dir_all(&dir).unwrap();
-            std::fs::write(
-                std::path::Path::new(&dir).join(format!("retained-records-{hash}.json")),
-                bytes,
-            )
-            .unwrap();
-        }
-        hash
+        format!("{:x}", Sha256::digest(&bytes))
     }
     async fn reference(&self, call_id: &str) -> String {
         let built = self.assembled().await;
@@ -379,10 +364,10 @@ impl Fixture {
         }
         panic!("fixture call missing")
     }
-    async fn pages(&self, reference: &str, label: &str) -> String {
+    async fn pages(&self, reference: &str) -> String {
         let mut offset = 0;
         let mut output = String::new();
-        let mut pages = vec![];
+        let mut page_count = 0;
         loop {
             let page: Value = serde_json::from_str(
                 &ToolHistoryQuery
@@ -397,7 +382,7 @@ impl Fixture {
             assert!(page["content"].as_str().unwrap().len() <= 4096);
             output.push_str(page["content"].as_str().unwrap());
             let next = page["next_offset"].as_u64();
-            pages.push(page);
+            page_count += 1;
             if let Some(next) = next {
                 assert!(next as usize > offset);
                 offset = next as usize;
@@ -405,8 +390,7 @@ impl Fixture {
                 break;
             }
         }
-        assert!(pages.len() > 1);
-        capture(label, &json!(pages));
+        assert!(page_count > 1);
         output
     }
 }
@@ -465,10 +449,6 @@ async fn pruner_recorded_consumer_shrinks_preserves_frames_and_active_exchanges(
         calls[0].messages.as_slice()
     );
     assert_eq!(before, fx.hash().await);
-    capture(
-        "runtime-active-loop",
-        &json!({"before_hash":before,"after_hash":fx.hash().await,"baseline":format!("{:?}",baseline.messages),"calls":format!("{calls:?}")}),
-    );
     println!(
         "consumer: {} -> {} debug bytes; retained hash {}",
         format!("{:?}", baseline.messages).len(),
@@ -527,10 +507,6 @@ async fn pruner_toggle_stability_retry_no_tool_and_over_budget_reinflation() {
         plain.recorded_calls()[0].messages
     );
     assert_eq!(before, fx.hash().await);
-    capture(
-        "toggle-retry-budget",
-        &json!({"hash":before, "budget":budget,"disabled":format!("{:?}",disabled.recorded_calls()),"reenabled":format!("{:?}",again.recorded_calls()),"retry":format!("{:?}",retry.recorded_calls()),"no_tools":format!("{:?}",no_tools.recorded_calls())}),
-    );
 }
 
 #[tokio::test]
@@ -576,7 +552,7 @@ async fn pruner_exact_pages_true_sqlite_reopen_and_native_compaction() {
                 _ => None,
             })
             .unwrap();
-        assert_eq!(fx.pages(&reference, "pages-before-reopen").await, raw);
+        assert_eq!(fx.pages(&reference).await, raw);
         fx.settings(true).await;
         let mock = text_mock();
         fx.run(mock.clone(), None).await.unwrap();
@@ -595,7 +571,7 @@ async fn pruner_exact_pages_true_sqlite_reopen_and_native_compaction() {
     let db = user.open_database(&root).await.unwrap();
     let fx = Fixture::new(db, vec![], vec![grant("context_prune", false)]).await;
     assert_eq!(reference, fx.reference("old-0").await);
-    assert_eq!(raw, fx.pages(&reference, "pages-after-reopen").await);
+    assert_eq!(raw, fx.pages(&reference).await);
     let mock = text_mock();
     fx.run(mock.clone(), None).await.unwrap();
     assert_eq!(mock.recorded_calls()[0].messages, projected);
@@ -608,7 +584,7 @@ async fn pruner_exact_pages_true_sqlite_reopen_and_native_compaction() {
     .unwrap();
     assert_eq!(trunc["stored_truncation_marker"], true);
     assert_eq!(trunc["stored_bytes"], 102400);
-    let all_truncated = fx.pages(&trunc_ref, "truncated-pages").await;
+    let all_truncated = fx.pages(&trunc_ref).await;
     assert_eq!(all_truncated.len(), 102400);
     assert!(all_truncated.ends_with("[tool output truncated at 100 KB]"));
     let command_id = TurnRequestId::parse("fixture-compact");
@@ -643,16 +619,12 @@ async fn pruner_exact_pages_true_sqlite_reopen_and_native_compaction() {
             .iter()
             .any(|m| matches!(m, RuntimeMessage::ToolResult { .. }))
     );
-    assert_eq!(raw, fx.pages(&reference, "pages-after-compaction").await);
+    assert_eq!(raw, fx.pages(&reference).await);
     assert_eq!(hash, fx.hash().await);
     assert_eq!(
         fx.count.load(Ordering::SeqCst),
         0,
         "recovery executed original tools"
-    );
-    capture(
-        "reopen-compaction-hashes",
-        &json!({"before":hash,"after":fx.hash().await,"reference":reference,"compacted":format!("{:?}",compact.messages)}),
     );
 }
 
@@ -686,12 +658,18 @@ async fn pruner_recovery_denies_foreign_forged_revoked_and_missing_sources() {
             .await
             .is_err()
     );
-    assert!(
-        ToolHistoryQuery
-            .execute(json!({"reference":reference,"max_bytes":16385}), &fx.ctx)
-            .await
-            .is_err()
-    );
+    for max_bytes in [0, 16385] {
+        assert!(
+            ToolHistoryQuery
+                .execute(
+                    json!({"reference":reference,"max_bytes":max_bytes}),
+                    &fx.ctx
+                )
+                .await
+                .is_err(),
+            "invalid page size {max_bytes} was accepted"
+        );
+    }
     assert!(
         ToolHistoryQuery
             .execute(json!({"reference":reference,"offset":1}), &fx.ctx)
@@ -868,10 +846,6 @@ async fn pruner_optional_source_and_settings_failure_keep_all_required_transform
                 RuntimeMessage::User("required-after".into())
             ]
         );
-        capture(
-            &format!("optional-{failure}-failure"),
-            &json!({"sent":format!("{sent:?}")}),
-        );
     }
 }
 
@@ -923,10 +897,6 @@ async fn pruner_provider_fixture_captures_actual_openai_request() {
         .iter()
         .map(|r| serde_json::from_slice(&r.body).unwrap())
         .collect();
-    capture(
-        "provider-requests",
-        &json!({"baseline":bodies[0],"pruned":bodies[1],"stored_hash":hash,"request_bytes":[requests[0].body.len(),requests[1].body.len()]}),
-    );
     println!(
         "provider captured bytes {} -> {}; retained hash {}",
         requests[0].body.len(),
@@ -963,7 +933,7 @@ async fn pruner_runtime_recovery_pages_remain_raw_in_current_and_historical_exch
     fx.seed().await;
     fx.settings(true).await;
     let reference = fx.reference("old-0").await;
-    let expected = fx.pages(&reference, "runtime-recovery-expected").await;
+    let expected = fx.pages(&reference).await;
     let mock = Arc::new(MockBackend::new());
     let mut offset = 0;
     let mut queries = vec![];
@@ -1083,10 +1053,6 @@ async fn pruner_runtime_recovery_pages_remain_raw_in_current_and_historical_exch
         3,
         "recovery re-executed source tools"
     );
-    capture(
-        "runtime-recovery-pages",
-        &json!({"pages":pages,"calls":format!("{:?}",mock.recorded_calls()),"historical":format!("{:?}",next.recorded_calls())}),
-    );
 }
 
 #[tokio::test]
@@ -1131,6 +1097,19 @@ async fn pruner_required_body_edit_exclusions_thresholds_and_current_membership(
     write_settings(
         &fx.db,
         "context_prune",
+        json!({"enabled":true,"min_savings_bytes":1000000}),
+    )
+    .await
+    .unwrap();
+    let insufficient_savings = text_mock();
+    fx.run(insufficient_savings.clone(), None).await.unwrap();
+    assert_eq!(
+        result(&insufficient_savings.recorded_calls()[0].messages, "old-1"),
+        result(&baseline.messages, "old-1")
+    );
+    write_settings(
+        &fx.db,
+        "context_prune",
         json!({"enabled":true,"exclude_tools":["truncated"]}),
     )
     .await
@@ -1159,7 +1138,7 @@ async fn pruner_required_body_edit_exclusions_thresholds_and_current_membership(
 #[tokio::test]
 async fn pruner_scoped_sources_ungranted_projection_and_incomplete_history() {
     let (_instance, mut fx) = Fixture::memory().await;
-    let attempt = fx.seed().await;
+    fx.seed().await;
     let built = fx.assembled().await;
     let ref0 = fx.reference("old-0").await;
     let ref2 = fx.reference("old-2").await;
@@ -1183,6 +1162,21 @@ async fn pruner_scoped_sources_ungranted_projection_and_incomplete_history() {
         cache: Default::default(),
     };
     let sources: Vec<_> = selected.iter().map(|(_, s)| (*s).clone()).collect();
+    // Current activation must attenuate, never replace, the tool scope's ceiling.
+    let mut narrowed = fx.ctx.clone();
+    narrowed.tools = narrowed
+        .tools
+        .with_active_extensions(Some(Default::default()));
+    assert_eq!(
+        narrowed
+            .history()
+            .await
+            .page(&ref0, 0, 4096)
+            .await
+            .unwrap()
+            .status,
+        "missing_or_not_authorized"
+    );
     let scope = fx.ctx.history().await.for_projection(&baseline, &sources);
     assert_eq!(scope.page(&ref0, 0, 4096).await.unwrap().status, "retained");
     assert_eq!(
@@ -1250,8 +1244,230 @@ async fn pruner_scoped_sources_ungranted_projection_and_incomplete_history() {
             .any(|m| matches!(m,RuntimeMessage::ToolResult { call_id,.. } if call_id=="old-0"))
     );
     assert_eq!(fx.count.load(Ordering::SeqCst), 3);
-    capture(
-        "source-scope-missing",
-        &json!({"missing":missing,"attempt":attempt.attempt_id}),
+}
+
+#[tokio::test]
+async fn review_recovery_refuses_after_last_agent_detached() {
+    use crate::session::test_helpers::{make_agent_entry, make_registry};
+    let (_instance, registry) = make_registry().await;
+    let (_, db) = registry
+        .create_session(Some("review-fixture"))
+        .await
+        .unwrap();
+    let session_id = db.root_id().to_string();
+    let agent = make_agent_entry(&registry, "test-agent").await;
+    registry
+        .attach_agent_to_session(&session_id, &agent)
+        .await
+        .unwrap();
+    let mut fx = Fixture::new(db.clone(), vec![], vec![grant("context_prune", false)]).await;
+    fx.ctx.agent_identity = Some(agent.clone());
+    fx.seed().await;
+    let reference = fx.reference("old-0").await;
+    let before = ToolHistoryQuery
+        .execute(json!({"reference": reference}), &fx.ctx)
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(&before).unwrap()["status"],
+        "retained"
     );
+    registry
+        .detach_agent_from_session(&session_id, &agent)
+        .await
+        .unwrap();
+    let meta = crate::session::read_meta_from_db(&db).await;
+    assert!(meta.agents.is_empty());
+    let auth = db
+        .get_settings()
+        .await
+        .unwrap()
+        .get_auth_key(&agent.pubkey)
+        .await
+        .unwrap();
+    println!("REVIEW_DETACH_AUTH {auth:?}; legacy={:?}", meta.agent_name);
+    let after = ToolHistoryQuery
+        .execute(json!({"reference": reference}), &fx.ctx)
+        .await;
+    match after {
+        Err(error) => println!("REVIEW_DETACH_DENIED {error}"),
+        Ok(text) => {
+            let page: Value = serde_json::from_str(&text).unwrap();
+            println!(
+                "REVIEW_DETACH_RESULT status={} returned_bytes={} stored_bytes={}",
+                page["status"],
+                page["content"].as_str().unwrap().len(),
+                page["stored_bytes"]
+            );
+            assert_eq!(
+                page["status"], "missing_or_not_authorized",
+                "detached agent recovered retained bytes"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn pruner_recovery_uses_live_write_key_not_stale_roster() {
+    use crate::session::test_helpers::{make_agent_entry, make_registry};
+    use eidetica::auth::types::{AuthKey, Permission};
+    let (_instance, registry) = make_registry().await;
+    let (_, db) = registry
+        .create_session(Some("membership-fixture"))
+        .await
+        .unwrap();
+    let session_id = db.root_id().to_string();
+    let agent = make_agent_entry(&registry, "test-agent").await;
+    registry
+        .attach_agent_to_session(&session_id, &agent)
+        .await
+        .unwrap();
+    let mut fx = Fixture::new(db.clone(), vec![], vec![grant("context_prune", false)]).await;
+    fx.ctx.agent_identity = Some(agent.clone());
+    fx.seed().await;
+    let reference = fx.reference("old-0").await;
+    let scope = fx.ctx.history().await; // captured while authorized
+    let stored = fx.hash().await;
+    assert_eq!(
+        scope.page(&reference, 0, 4096).await.unwrap().status,
+        "retained"
+    );
+    let roster = crate::session::read_meta_from_db(&db).await.agents;
+    assert_eq!(roster.len(), 1);
+    for key in [
+        AuthKey::new(
+            Some("agent:test-agent"),
+            Permission::Write(10),
+            eidetica::auth::types::KeyStatus::Revoked,
+        ),
+        AuthKey::active(Some("agent:test-agent"), Permission::Read),
+        AuthKey::active(Some("agent:test-agent"), Permission::Admin(0)),
+    ] {
+        let txn = db.new_transaction().await.unwrap();
+        txn.get_settings()
+            .unwrap()
+            .set_auth_key(&agent.pubkey, key)
+            .await
+            .unwrap();
+        txn.commit().await.unwrap();
+        assert_eq!(crate::session::read_meta_from_db(&db).await.agents, roster);
+        assert!(
+            scope.page(&reference, 0, 4096).await.is_err(),
+            "stale roster bypassed current Active Write membership"
+        );
+        assert!(
+            ToolHistoryQuery
+                .execute(json!({"reference":reference}), &fx.ctx)
+                .await
+                .is_err()
+        );
+    }
+    registry
+        .attach_agent_to_session(&session_id, &agent)
+        .await
+        .unwrap();
+    assert_eq!(
+        scope.page(&reference, 0, 4096).await.unwrap().status,
+        "retained"
+    );
+    // The cache may lag in either direction; a current Write key is authority.
+    crate::session::update_meta_on_db(&db, |m| m.agents.clear())
+        .await
+        .unwrap();
+    assert_eq!(
+        scope.page(&reference, 0, 4096).await.unwrap().status,
+        "retained"
+    );
+    let mut unknown = fx.ctx.clone();
+    unknown.agent_identity = None;
+    assert!(
+        unknown
+            .history()
+            .await
+            .page(&reference, 0, 4096)
+            .await
+            .is_err()
+    );
+    registry
+        .detach_agent_from_session(&session_id, &agent)
+        .await
+        .unwrap();
+    // Even a matching legacy name must not reopen a revoked modern session.
+    crate::session::update_meta_on_db(&db, |m| m.agent_name = Some("test-agent".into()))
+        .await
+        .unwrap();
+    assert!(scope.page(&reference, 0, 4096).await.is_err());
+    assert_eq!(stored, fx.hash().await);
+    assert_eq!(fx.count.load(Ordering::SeqCst), 3);
+}
+
+#[tokio::test]
+async fn pruner_recovery_preserves_unmarked_and_named_legacy_sessions() {
+    let (_instance, mut fx) = Fixture::memory().await;
+    fx.seed().await;
+    let reference = fx.reference("old-0").await;
+    let scope = fx.ctx.history().await;
+    assert_eq!(
+        scope.page(&reference, 0, 4096).await.unwrap().status,
+        "retained"
+    );
+    crate::session::update_meta_on_db(&fx.db, |m| m.agent_name = Some("test-agent".into()))
+        .await
+        .unwrap();
+    assert_eq!(
+        scope.page(&reference, 0, 4096).await.unwrap().status,
+        "retained"
+    );
+    crate::session::update_meta_on_db(&fx.db, |m| m.agent_name = Some("other-agent".into()))
+        .await
+        .unwrap();
+    assert!(scope.page(&reference, 0, 4096).await.is_err());
+}
+
+#[tokio::test]
+async fn pruner_repeated_call_ids_bind_each_pointer_to_its_source_occurrence() {
+    let (_instance, mut fx) = Fixture::memory().await;
+    fx.context_budget = 400000;
+    fx.seed().await;
+    fx.seed().await; // identical calls and outputs in a different retained turn
+    let built = fx.assembled().await;
+    let scope = fx.ctx.history().await;
+    let mut expected = Vec::new();
+    for (index, message) in built.messages.iter().enumerate() {
+        if let RuntimeMessage::AssistantToolCalls { tool_calls, .. } = message {
+            for (offset, made) in tool_calls.iter().enumerate() {
+                let raw = scope
+                    .selected_result(&built.sources[index + 1 + offset], made)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                expected.push((index + 1 + offset, raw.reference));
+            }
+        }
+    }
+    assert_eq!(expected.len(), 6);
+    assert_eq!(
+        expected
+            .iter()
+            .map(|(_, r)| r)
+            .collect::<std::collections::HashSet<_>>()
+            .len(),
+        6
+    );
+    let stored = fx.hash().await;
+    fx.settings(true).await;
+    let mock = text_mock();
+    fx.run(mock.clone(), None).await.unwrap();
+    let sent = &mock.recorded_calls()[0].messages;
+    for (position, reference) in expected {
+        let RuntimeMessage::ToolResult { content, .. } = &sent[position] else {
+            panic!("missing result");
+        };
+        assert!(
+            content.contains(&reference),
+            "pointer resolved another occurrence with the same provider call ID"
+        );
+    }
+    assert_eq!(stored, fx.hash().await);
+    assert_eq!(fx.count.load(Ordering::SeqCst), 6);
 }

@@ -160,21 +160,6 @@ impl ExtensionHub {
                 )
             })
     }
-    pub(crate) async fn context_strategy_settings(
-        &self,
-        db: &eidetica::Database,
-        selected: &str,
-    ) -> anyhow::Result<Value> {
-        let txn = db.new_transaction().await?;
-        let store = txn
-            .get_store::<DocStore>(super::EXTENSION_SETTINGS_STORE)
-            .await?;
-        match store.get_string(selected).await {
-            Ok(value) => Ok(serde_json::from_str(&value)?),
-            Err(error) if error.is_not_found() => Ok(serde_json::json!({})),
-            Err(error) => Err(error.into()),
-        }
-    }
     /// Persist the explicit granted selection/settings in a session/agent key.
     /// This is reconstruction state, not an execution or projection grant.
     pub(crate) async fn record_context_selection(

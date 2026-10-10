@@ -105,16 +105,9 @@ pub const EXTENSION_SETTINGS_STORE: &str = "extension_settings";
 /// Missing key (or any read error) yields `json!({})` rather than
 /// propagating — settings absence is the normal "no overrides" state.
 pub async fn read_settings(session_db: &Database, ext_name: &str) -> serde_json::Value {
-    let Ok(txn) = session_db.new_transaction().await else {
-        return serde_json::json!({});
-    };
-    let Ok(store) = txn.get_store::<DocStore>(EXTENSION_SETTINGS_STORE).await else {
-        return serde_json::json!({});
-    };
-    match store.get_string(ext_name).await {
-        Ok(s) => serde_json::from_str(&s).unwrap_or_else(|_| serde_json::json!({})),
-        Err(_) => serde_json::json!({}),
-    }
+    read_settings_checked(session_db, ext_name)
+        .await
+        .unwrap_or_else(|_| serde_json::json!({}))
 }
 
 /// Strict call-time settings read: absence means defaults; corrupt/unavailable

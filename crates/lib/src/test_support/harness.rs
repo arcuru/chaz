@@ -138,6 +138,7 @@ pub(crate) fn tool_context_with_host(
 ) -> ToolContext {
     ToolContext {
         agent_name: "test-agent".to_string(),
+        agent_identity: None,
         turn_request_id: None,
         tool_call_key: None,
         call_depth: 0,

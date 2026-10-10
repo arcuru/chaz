@@ -3305,6 +3305,7 @@ impl Server {
         reserved_permit: Option<OwnedSemaphorePermit>,
     ) {
         let agent_name = agent.name.clone();
+        let agent_identity = self.agent_index.find_by_name(&agent_name);
         let system_prompt = agent.system_prompt.clone();
         let default_model = agent.default_model.clone();
         let allowed_tools = agent.allowed_tools.clone();
@@ -3461,6 +3462,7 @@ impl Server {
             };
             let tool_ctx = ToolContext {
                 agent_name: agent_name.clone(),
+                agent_identity,
                 turn_request_id: Some(attempt.request_id.clone()),
                 tool_call_key: None,
                 call_depth: spawn.call_depth,

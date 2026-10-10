@@ -18,6 +18,7 @@ pub const MAX_HISTORY_PAGE_BYTES: usize = 16 * 1024;
 pub struct ScopedHistory {
     db: Database,
     agent: String,
+    agent_identity: Option<crate::hosted_index::DbEntry>,
     tools: ScopedTools,
     active: HashSet<String>,
     selected: Option<Vec<(ContextSource, ToolCallRequest)>>,
@@ -57,12 +58,14 @@ impl ScopedHistory {
     pub(crate) fn new(
         db: Database,
         agent: String,
+        agent_identity: Option<crate::hosted_index::DbEntry>,
         tools: ScopedTools,
         active: HashSet<String>,
     ) -> Self {
         Self {
             db,
             agent,
+            agent_identity,
             tools,
             active,
             selected: None,
@@ -115,18 +118,42 @@ impl ScopedHistory {
             Err(error) if error.is_not_found() => None,
             Err(error) => return Err(error.into()),
         };
-        anyhow::ensure!(
-            if agents.is_empty() {
-                legacy.as_ref().is_none_or(|name| name == &self.agent)
-            } else {
-                agents.iter().any(|a| a.display_name == self.agent)
-            },
-            "caller is no longer a session participant"
-        );
+        // Membership lives in AuthSettings, not the readable roster cache.
+        // Revoked agent keys remain present after last-member detach; that
+        // modern session must never fall through to legacy authorization.
+        let auth = self.db.get_settings().await?.auth_snapshot().await?;
+        let keys = auth.get_all_keys()?;
+        let caller_key = self
+            .agent_identity
+            .as_ref()
+            .and_then(|agent| keys.get(&agent.pubkey.to_string()));
+        let modern = !agents.is_empty()
+            || caller_key.is_some()
+            || keys
+                .values()
+                .any(|key| key.name().is_some_and(|name| name.starts_with("agent:")));
+        let authorized = if modern {
+            self.agent_identity
+                .as_ref()
+                .is_some_and(|agent| agent.display_name == self.agent)
+                && caller_key.is_some_and(|key| {
+                    matches!(key.status(), eidetica::auth::types::KeyStatus::Active)
+                        && matches!(
+                            key.permissions(),
+                            eidetica::auth::types::Permission::Write(_)
+                        )
+                })
+        } else {
+            // Explicit pre-Living-Agent compatibility: no roster or agent
+            // membership keys have ever been recorded, and the legacy name
+            // (when present) matches. Modern sessions never use this fallback.
+            legacy.as_ref().is_none_or(|name| name == &self.agent)
+        };
+        anyhow::ensure!(authorized, "caller is no longer a session participant");
         let visible = self
             .tools
             .clone()
-            .with_active_extensions(Some(self.active.intersection(&current).cloned().collect()));
+            .narrow_active_extensions(self.active.intersection(&current).cloned().collect());
         // Keep only complete, structurally valid exchanges. Compaction changes
         // the visible context but does not itself revoke retained-source access.
         Ok(history
@@ -206,23 +233,11 @@ impl ScopedHistory {
         source: &ContextSource,
         call: &ToolCallRequest,
     ) -> anyhow::Result<Option<RetainedToolResult>> {
-        let ContextSource::ReplayedExchange {
-            request_id,
-            attempt_id,
-            model_sequence,
-        } = source
-        else {
+        if !matches!(source, ContextSource::ReplayedExchange { .. }) {
             return Ok(None);
-        };
+        }
         Ok(self
-            .selected_results(&[(
-                ContextSource::ReplayedExchange {
-                    request_id: request_id.clone(),
-                    attempt_id: attempt_id.clone(),
-                    model_sequence: *model_sequence,
-                },
-                call.clone(),
-            )])
+            .selected_results(&[(source.clone(), call.clone())])
             .await?
             .pop()
             .flatten())
@@ -235,13 +250,15 @@ impl ScopedHistory {
         selected: &[(ContextSource, ToolCallRequest)],
     ) -> anyhow::Result<Vec<Option<RetainedToolResult>>> {
         let records = self.records().await?;
-        Ok(selected.iter().map(|(source, call)| {
-            let ContextSource::ReplayedExchange { request_id, attempt_id, model_sequence } = source else { return None; };
-            records.iter().find(|(record, made)| made == call
-                && record.request_id.as_str() == request_id && &record.attempt_id == attempt_id
-                && matches!(&record.message, TurnTranscriptMessage::ToolResult { model_sequence: seq, .. } if seq == model_sequence))
-                .map(|(record, _)| self.result(record))
-        }).collect())
+        Ok(selected
+            .iter()
+            .map(|(source, call)| {
+                records
+                    .iter()
+                    .find(|(record, made)| made == call && matches_source(source, record))
+                    .map(|(record, _)| self.result(record))
+            })
+            .collect())
     }
 
     /// Exact UTF-8 pages, bounded in stored bytes. Unknown, forged, foreign,

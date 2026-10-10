@@ -543,7 +543,10 @@ index nor an in-memory replacement map participates in its identity.
 
 A reference is not permission. Recovery requires the normal current tool grant
 for `tool_history_query`, current extension activation and session participation,
-and current scoped visibility of the original source tool. Removing that source
+and current scoped visibility of the original source tool. Living Agent
+participation requires its current Active Write key, even if the roster cache
+still lists it. Detaching the last agent denies recovery from an already-running
+turn; an empty roster does not restore legacy access. Removing that source
 from the caller's allowed tools makes its results unavailable to recovery.
 Session/agent extension revocations attenuate this scope. Possessing a synced
 database or a `full_context` projection grant alone does not grant recovery or

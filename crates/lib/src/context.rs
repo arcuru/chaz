@@ -349,13 +349,7 @@ impl<'a> ContextBuilder<'a> {
             _ => anyhow::bail!("no required context strategy configured"),
         };
         let settings = match (self.session_db, strategy.as_deref()) {
-            (Some(db), Some(name)) => {
-                self.extension_hub
-                    .as_ref()
-                    .expect("resolved hub")
-                    .context_strategy_settings(db, name)
-                    .await?
-            }
+            (Some(db), Some(name)) => crate::extension::read_settings_checked(db, name).await?,
             _ => serde_json::Value::Null,
         };
         // Optional tails are invocation data and remain ephemeral. Reserve their

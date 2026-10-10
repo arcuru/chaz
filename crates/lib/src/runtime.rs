@@ -846,13 +846,18 @@ impl<'a> RoundProjector<'a> {
         let history = crate::extension::history::ScopedHistory::new(
             self.session_db.as_ref().expect("hub has database").clone(),
             self.tool_ctx.agent_name.clone(),
+            self.tool_ctx.agent_identity.clone(),
             self.tool_ctx.tools.clone(),
             active,
         )
         .for_projection(&baseline, &sources);
-        let current_exchanges = sources.iter().enumerate().filter_map(|(index, source)| {
-            matches!(source, ContextSource::CurrentAttempt { .. }).then_some(index)
-        }).collect();
+        let current_exchanges = sources
+            .iter()
+            .enumerate()
+            .filter_map(|(index, source)| {
+                matches!(source, ContextSource::CurrentAttempt { .. }).then_some(index)
+            })
+            .collect();
         let inputs = projection::RoundInputs {
             agent_name: &self.tool_ctx.agent_name,
             session_db_id: self.session_db_id.as_deref(),
@@ -1428,47 +1433,7 @@ pub async fn execute_cancellable_with_recorder(
                             // Recheck extension authority after approval/hooks:
                             // the turn's scoped filter is a ceiling, not a lease
                             // to keep executing after a live revocation.
-                            if let (Some(hub), Some(owner)) = (hub, tools.owner_of(&call.name)) {
-                                let db = tool_ctx.session.lock().await.database().clone();
-                                let active = hub
-                                    .active_extensions_for_call(
-                                        &tool_ctx.agent_name,
-                                        Some(&db),
-                                        &tool_ctx.active_extensions,
-                                    )
-                                    .await;
-                                if !active.contains(owner) {
-                                    let result = format!(
-                                        "Tool unavailable: extension '{owner}' is inactive"
-                                    );
-                                    record_tool_result(
-                                        &recorder,
-                                        model_sequence,
-                                        call_index,
-                                        call,
-                                        &result,
-                                        ToolResultOutcome::Unavailable,
-                                    )
-                                    .await?;
-                                    messages.push(RuntimeMessage::ToolResult {
-                                        call_id: call.id.clone(),
-                                        content: wrap_tool_output(&call.name, &result),
-                                    });
-                                    continue;
-                                }
-                            }
-
-                            // --- Security: execute with timeout ---
-                            let timeout = policy.timeout_duration();
-                            // Build per-call grants by attenuating the tool's
-                            // policy grant through the agent-wide cap and the
-                            // per-tool override (most-restrictive-wins).
-                            let call_grants =
-                                tool_ctx.resolve_call_grants(&policy.grants, &call.name);
                             let mut call_ctx = tool_ctx.clone();
-                            call_ctx.tool_call_key =
-                                Some(format!("{model_sequence}:{call_index}:{}", call.id));
-                            call_ctx.grants = call_grants;
                             if let Some(hub) = hub {
                                 let db = tool_ctx.session.lock().await.database().clone();
                                 call_ctx.active_extensions = hub
@@ -1478,10 +1443,41 @@ pub async fn execute_cancellable_with_recorder(
                                         &tool_ctx.active_extensions,
                                     )
                                     .await;
-                                call_ctx.tools = call_ctx.tools.with_active_extensions(Some(
-                                    call_ctx.active_extensions.clone(),
-                                ));
+                                call_ctx.tools = call_ctx
+                                    .tools
+                                    .narrow_active_extensions(call_ctx.active_extensions.clone());
                             }
+                            if let (Some(_), Some(owner)) = (hub, tools.owner_of(&call.name))
+                                && !call_ctx.active_extensions.contains(owner)
+                            {
+                                let result =
+                                    format!("Tool unavailable: extension '{owner}' is inactive");
+                                record_tool_result(
+                                    &recorder,
+                                    model_sequence,
+                                    call_index,
+                                    call,
+                                    &result,
+                                    ToolResultOutcome::Unavailable,
+                                )
+                                .await?;
+                                messages.push(RuntimeMessage::ToolResult {
+                                    call_id: call.id.clone(),
+                                    content: wrap_tool_output(&call.name, &result),
+                                });
+                                continue;
+                            }
+
+                            // --- Security: execute with timeout ---
+                            let timeout = policy.timeout_duration();
+                            // Build per-call grants by attenuating the tool's
+                            // policy grant through the agent-wide cap and the
+                            // per-tool override (most-restrictive-wins).
+                            let call_grants =
+                                tool_ctx.resolve_call_grants(&policy.grants, &call.name);
+                            call_ctx.tool_call_key =
+                                Some(format!("{model_sequence}:{call_index}:{}", call.id));
+                            call_ctx.grants = call_grants;
                             if call.name == "job_wait"
                                 && let Some(capacity) = capacity.as_mut()
                             {
@@ -2045,6 +2041,7 @@ mod tests {
         ));
         ToolContext {
             agent_name: "t".into(),
+            agent_identity: None,
             turn_request_id: None,
             tool_call_key: None,
             call_depth: 0,

@@ -260,6 +260,10 @@ pub const NO_REPLY_TOOL: &str = "no_reply";
 pub struct ToolContext {
     /// Name of the agent currently executing
     pub agent_name: String,
+    /// Host-resolved Living Agent identity. Retained reads check this key's
+    /// current Active Write membership, never the peer-owned database handle.
+    /// None supports legacy non-Living-Agent callers only.
+    pub agent_identity: Option<crate::hosted_index::DbEntry>,
     // Persisted parent request identity; absent on non-turn callers.
     pub turn_request_id: Option<crate::session::TurnRequestId>,
     // Stable model-response call site, set by the runtime before dispatch.
@@ -368,6 +372,7 @@ impl ToolContext {
         crate::extension::history::ScopedHistory::new(
             self.session.lock().await.database().clone(),
             self.agent_name.clone(),
+            self.agent_identity.clone(),
             self.tools.clone(),
             self.active_extensions.clone(),
         )
@@ -835,6 +840,18 @@ impl ScopedTools {
         active: Option<std::collections::HashSet<String>>,
     ) -> Self {
         self.active_extensions = active;
+        self
+    }
+
+    /// Apply current revocations without widening an existing extension ceiling.
+    pub(crate) fn narrow_active_extensions(
+        mut self,
+        active: std::collections::HashSet<String>,
+    ) -> Self {
+        self.active_extensions = Some(match self.active_extensions {
+            Some(ceiling) => ceiling.intersection(&active).cloned().collect(),
+            None => active,
+        });
         self
     }
 

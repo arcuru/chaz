@@ -648,7 +648,14 @@ and does not bypass later required steps.
 The host reads retained completed attempts and their original request rows at
 one Eidetica snapshot, validates complete native exchanges with the existing
 replay validator, then checks current participation and extension/tool
-visibility before releasing bytes. Stable versioned references hash the session
+visibility before releasing bytes, intersecting revocations with the caller's
+existing tool-extension ceiling rather than replacing it. For Living Agents,
+the scope carries the host-resolved agent identity/key and checks its current
+Active Write membership in AuthSettings. The roster is a display cache, not
+authority. Revoked membership keys prevent last-member detach from being
+mistaken for a legacy session. Pre-Living-Agent sessions without a roster or
+recorded agent membership keys retain their matching-name (or unmarked)
+legacy behavior. Stable versioned references hash the session
 root and recorded source; no visible index or mutable lookup table is needed.
 Pages count stored UTF-8 bytes rather than serialized JSON/framing overhead.
 Unknown or invisible references share a non-disclosing missing status. A

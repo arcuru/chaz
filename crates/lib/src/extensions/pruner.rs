@@ -101,34 +101,51 @@ impl ContextProjector for ContextPruner {
             let mut positions = Vec::new();
             let mut selected = Vec::new();
             for (position, message) in request.messages.iter().enumerate() {
-                let RuntimeMessage::ToolResult { call_id, .. } = message else {
-                    continue;
-                };
-                let Some((index, original)) = call.baseline.messages.iter().enumerate().find(|(_, m)| {
-                    matches!(m, RuntimeMessage::ToolResult { call_id: id, .. } if id == call_id)
-                }) else { continue; };
-                // An earlier required transform owns its edits. Never reinflate
-                // or overwrite them by reaching behind the accepted input.
-                if original != message {
-                    continue;
-                }
-                let Some(source @ ContextSource::ReplayedExchange { .. }) = call.sources.get(index)
+                let RuntimeMessage::AssistantToolCalls {
+                    exchange_id: Some(index),
+                    tool_calls,
+                    ..
+                } = message
                 else {
                     continue;
                 };
-                let Some(made) = call.baseline.messages.iter().find_map(|m| match m {
-                    RuntimeMessage::AssistantToolCalls { tool_calls, .. } => {
-                        tool_calls.iter().find(|c| &c.id == call_id)
-                    }
-                    _ => None,
-                }) else {
+                let Some(RuntimeMessage::AssistantToolCalls {
+                    tool_calls: made, ..
+                }) = call.baseline.messages.get(*index)
+                else {
                     continue;
                 };
-                if made.name == RECOVERY_TOOL || settings.exclude_tools.contains(&made.name) {
+                if tool_calls != made {
                     continue;
                 }
-                positions.push(position);
-                selected.push((source.clone(), made.clone()));
+                // Follow the host occurrence and call offset. Provider IDs can
+                // repeat across responses and are never a retained-source key.
+                for (offset, made) in made.iter().enumerate() {
+                    let result_index = position + 1 + offset;
+                    let baseline_index = index + 1 + offset;
+                    let Some(message @ RuntimeMessage::ToolResult { call_id, .. }) =
+                        request.messages.get(result_index)
+                    else {
+                        continue;
+                    };
+                    if call_id != &made.id
+                        || call.baseline.messages.get(baseline_index) != Some(message)
+                    {
+                        // Earlier transforms own their edits; never overwrite
+                        // them by reaching behind the accepted input.
+                        continue;
+                    }
+                    let Some(source @ ContextSource::ReplayedExchange { .. }) =
+                        call.sources.get(baseline_index)
+                    else {
+                        continue;
+                    };
+                    if made.name == RECOVERY_TOOL || settings.exclude_tools.contains(&made.name) {
+                        continue;
+                    }
+                    positions.push(result_index);
+                    selected.push((source.clone(), made.clone()));
+                }
             }
             if selected.is_empty() {
                 return Ok(request);

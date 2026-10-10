@@ -667,6 +667,7 @@ impl Server {
 
         let tool_ctx = ToolContext {
             agent_name: agent_name.to_string(),
+            agent_identity: self.agent_index.find_by_name(agent_name),
             turn_request_id: None,
             tool_call_key: None,
             call_depth: 0,
