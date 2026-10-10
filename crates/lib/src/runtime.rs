@@ -790,9 +790,13 @@ impl<'a> RoundProjector<'a> {
             .iter()
             .map(|(_, source)| (*source).clone())
             .collect();
-        let current_exchanges = sources.iter().enumerate().filter_map(|(index, source)| {
-            matches!(source, ContextSource::CurrentAttempt { .. }).then_some(index)
-        }).collect();
+        let current_exchanges = sources
+            .iter()
+            .enumerate()
+            .filter_map(|(index, source)| {
+                matches!(source, ContextSource::CurrentAttempt { .. }).then_some(index)
+            })
+            .collect();
         let inputs = projection::RoundInputs {
             agent_name: &self.tool_ctx.agent_name,
             session_db_id: self.session_db_id.as_deref(),
