@@ -128,7 +128,15 @@ impl ContextStrategy for Synthetic {
             match self.mode {
                 "duplicate" => plan.items.push(ContextItem::Entry(latest)),
                 "foreign" => plan.items.push(ContextItem::Entry(usize::MAX)),
-                "baseline" | "tail-error" | "durable" => {
+                "detached-exchange" => plan.items.extend([
+                    ContextItem::Tail,
+                    ContextItem::Exchange {
+                        entry: latest,
+                        budget: 100,
+                    },
+                ]),
+                "empty" => plan = ContextPlan::default(),
+                "baseline" | "tail-error" | "tail-panic" | "tail-timeout" | "durable" => {
                     plan = crate::extensions::context::BaselineContext
                         .select(call)
                         .await?
@@ -147,6 +155,12 @@ impl ContextTail for Synthetic {
             assert!(call.session_db_id.is_some());
             if self.mode == "tail-error" {
                 anyhow::bail!("synthetic optional recall failure");
+            }
+            if self.mode == "tail-panic" {
+                panic!("synthetic optional recall panic");
+            }
+            if self.mode == "tail-timeout" {
+                std::future::pending::<()>().await;
             }
             let text = self.tail.lock().unwrap().clone();
             Ok((!text.is_empty()).then_some(text))
@@ -256,11 +270,15 @@ async fn required_strategy_replacement_absence_failure_and_optional_recall() {
     for mode in [
         "replacement",
         "tail-error",
+        "tail-panic",
+        "tail-timeout",
         "error",
         "panic",
         "timeout",
         "foreign",
         "duplicate",
+        "detached-exchange",
+        "empty",
         "absent",
         "inactive",
         "undeclared",
@@ -319,7 +337,16 @@ async fn required_strategy_replacement_absence_failure_and_optional_recall() {
             Some("current"),
         )
         .await;
-        if matches!(mode, "replacement" | "tail-error") {
+        if mode == "empty" {
+            let error = send(&hub, session.clone(), built.unwrap(), mock.clone())
+                .await
+                .unwrap_err();
+            assert!(error.contains("request has no messages"), "{error}");
+            assert!(mock.recorded_calls().is_empty());
+        } else if matches!(
+            mode,
+            "replacement" | "tail-error" | "tail-panic" | "tail-timeout"
+        ) {
             send(&hub, session.clone(), built.unwrap(), mock.clone())
                 .await
                 .unwrap();
@@ -338,7 +365,7 @@ async fn required_strategy_replacement_absence_failure_and_optional_recall() {
                     .messages
                     .iter()
                     .any(|m| *m == RuntimeMessage::User("old-input".into())),
-                mode == "tail-error"
+                mode != "replacement"
             );
             println!("STRATEGY {mode}: {calls:?}");
         } else {
@@ -522,6 +549,58 @@ async fn explicit_synthetic_durable_recall_dedups_retry_reopen_and_new_requests(
         1
     );
     println!("DURABLE_DATABASE {:?}", view.contributions);
+
+    let mut built = assembled(hub.clone(), &*session.lock().await, "policy", None)
+        .await
+        .unwrap();
+    let recalled = built
+        .sources
+        .iter()
+        .position(|source| {
+            matches!(
+                source,
+                crate::extension::projection::ContextSource::DurableContribution { .. }
+            )
+        })
+        .unwrap();
+    // Invocation additions follow the assembled baseline, as a before-start
+    // hook can do. Revocation must remap surviving anchors and drop removed ones.
+    built
+        .messages
+        .push(RuntimeMessage::User("invocation-input".into()));
+    built
+        .sources
+        .push(crate::extension::projection::ContextSource::TurnInjection);
+    built.cache.anchors = vec![
+        CacheAnchor::Message(recalled),
+        CacheAnchor::Message(recalled + 1),
+    ];
+    crate::extension::append_event(
+        &db,
+        crate::extension::ExtensionEvent::Deactivated {
+            name: "synthetic_context".into(),
+            timestamp: Utc::now() + chrono::Duration::seconds(1),
+        },
+    )
+    .await
+    .unwrap();
+    let mock = Arc::new(MockBackend::new());
+    mock.push_text("ok after optional recall revocation");
+    send(&hub, session, built, mock.clone()).await.unwrap();
+    let calls = mock.recorded_calls();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].cache.anchors, vec![CacheAnchor::Message(recalled)]);
+    assert_eq!(
+        calls[0].messages[recalled],
+        RuntimeMessage::User("invocation-input".into())
+    );
+    assert!(
+        !calls[0]
+            .messages
+            .iter()
+            .any(|m| matches!(m, RuntimeMessage::User(text) if text.contains("synthetic-recall")))
+    );
+    println!("REVOKED_CACHE {calls:?}");
 }
 
 #[tokio::test]

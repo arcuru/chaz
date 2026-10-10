@@ -444,7 +444,7 @@ model request or an execution grant. There is no projection cache.
 
 Native memory recall still uses its existing activation, bank eligibility,
 query extraction and per-bank search budgets. Its typed invocation carries the
-agent, session and request identity plus recent selected text. Recall is still
+agent, session and request identity plus recent message text. Recall is still
 ephemeral: changing recall does not accumulate old tails in the session. A recall
 failure keeps the successful required selection; it never substitutes another
 strategy. Persisting recall requires a separate explicit durable contributor
@@ -455,6 +455,9 @@ OpenRouter's Anthropic models support explicit markers; other OpenAI-compatible
 providers receive no markers. A message anchor stays on that item's last block,
 even if Anthropic coalesces adjacent User messages. Marker placement does not
 prove a provider cache hit, and the default policy is unchanged.
+If an optional durable contribution is revoked, the host removes its message
+anchors and remaps the remaining anchors before projection. A projector that
+changes message positions must update its returned cache indices as well.
 
 ## Walkthrough: change cache settings and recover a disabled strategy
 

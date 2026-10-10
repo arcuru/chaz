@@ -408,7 +408,7 @@ impl<'a> ContextBuilder<'a> {
         let mut messages = Vec::new();
         let mut sources = Vec::new();
         let mut entries_included = 0;
-        for item in &plan.items {
+        for (position, item) in plan.items.iter().enumerate() {
             use crate::extension::context_strategy::ContextItem;
             let key = match item {
                 ContextItem::Exchange { entry, .. } => ContextItem::Exchange {
@@ -428,7 +428,8 @@ impl<'a> ContextBuilder<'a> {
                     entries_included += 1;
                 }
                 ContextItem::Exchange { entry, .. } => anyhow::ensure!(
-                    last_entry == Some(*entry),
+                    matches!(position.checked_sub(1).and_then(|i| plan.items.get(i)),
+                        Some(ContextItem::Entry(index)) if index == entry),
                     "exchange is not adjacent to its entry"
                 ),
                 _ => {}
