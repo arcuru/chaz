@@ -53,6 +53,16 @@ pub use transport::{
     session_attachment, transport_bindings, unbind_transport,
 };
 
+/// Selected transcript, native exchanges and durable contributions from one
+/// immutable database snapshot. This is a disposable view, not a second store.
+#[derive(Clone, Debug)]
+pub struct SessionContextView {
+    pub entry_ids: Vec<Option<TurnRequestId>>,
+    pub entries: Vec<SessionEntry>,
+    pub tool_history: Vec<Vec<TurnTranscriptRecord>>,
+    pub contributions: Vec<crate::extension::durable_context::CommittedContribution>,
+}
+
 /// Type of session entry. Participants (users and agents alike) write entries
 /// to a session. There is no user/agent distinction at the protocol level.
 #[derive(Debug, Clone, PartialEq)]
@@ -861,8 +871,17 @@ impl Session {
         &self,
     ) -> anyhow::Result<(Vec<SessionEntry>, Vec<Vec<TurnTranscriptRecord>>)> {
         let snapshot = self.database.snapshot().await?;
+        let view = self.context_view_at(snapshot).await?;
+        Ok((view.entries, view.tool_history))
+    }
+
+    /// Read every selected-context store at the supplied immutable snapshot.
+    /// A failed read is an error, never an in-memory transcript fallback.
+    pub async fn context_view_at(&self, snapshot: Snapshot) -> anyhow::Result<SessionContextView> {
         let rows =
             Self::context_entries_with_ids_at(self.database.clone(), snapshot.clone()).await?;
+        let contributions =
+            crate::extension::durable_context::read_at(&self.database, &snapshot).await?;
         let txn = self.database.new_transaction_at(&snapshot).await?;
         let attempts = txn
             .get_store::<Table<TurnAttempt>>(TURN_ATTEMPTS_STORE)
@@ -894,14 +913,23 @@ impl Session {
                     .push(record);
             }
         }
-        let (entries, history) = rows
+        let entry_ids = rows.iter().map(|(id, _)| id.clone()).collect();
+        let (entries, tool_history) = rows
             .into_iter()
             .map(|(id, entry)| {
-                let history = id.and_then(|id| records.remove(&id)).unwrap_or_default();
+                let history = id
+                    .as_ref()
+                    .and_then(|id| records.remove(id))
+                    .unwrap_or_default();
                 (entry, history)
             })
             .unzip();
-        Ok((entries, history))
+        Ok(SessionContextView {
+            entry_ids,
+            entries,
+            tool_history,
+            contributions,
+        })
     }
 
     /// Bridge ingress is a core decision: adapter facts request a wake, but

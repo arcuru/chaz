@@ -21,6 +21,7 @@
 
 pub mod agent_state;
 pub mod caps;
+pub mod durable_context;
 pub mod handler;
 pub(crate) mod hook_bridge;
 pub mod hooks;
@@ -716,6 +717,7 @@ pub struct ExtensionHub {
     /// Operator `context_projection` grants, held in invocation order
     /// (conversation phase, then full-context phase, list order within).
     context_projection: Vec<projection::ContextProjectionGrant>,
+    durable_context: Vec<durable_context::DurableContextGrant>,
 
     // ---- Lifecycle instance bookkeeping -----------------------------------
     //
@@ -784,6 +786,7 @@ impl ExtensionHub {
             hosted_index: None,
             agent_state_allowlist: HashMap::new(),
             context_projection: Vec::new(),
+            durable_context: Vec::new(),
             global_instances: HashMap::new(),
             agent_instances: tokio::sync::RwLock::new(HashMap::new()),
             session_instances: tokio::sync::RwLock::new(HashMap::new()),

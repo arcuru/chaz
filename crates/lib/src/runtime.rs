@@ -535,7 +535,7 @@ impl<'a> RoundProjector<'a> {
         mut scope: ModelCallScope,
         initial_len: usize,
     ) -> Self {
-        let hub = hub.filter(|hub| hub.has_context_projection());
+        let hub = hub.filter(|hub| hub.has_context_projection() || hub.has_durable_context());
         let session_db = match hub {
             Some(_) => Some(tool_ctx.session.lock().await.database().clone()),
             None => None,
@@ -600,6 +600,35 @@ impl<'a> RoundProjector<'a> {
             warn!(%error, model_round, "Model call refused by context projection");
             error.to_string()
         };
+        let allowed = if hub.has_durable_context() {
+            let db = self
+                .session_db
+                .as_ref()
+                .expect("hub has a session database");
+            hub.check_durable_receipts(
+                &self.tool_ctx.agent_name,
+                db,
+                self.tool_ctx.turn_request_id.as_ref(),
+                &self.tool_ctx.active_extensions,
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+            hub.durable_extensions_for_call(
+                &self.tool_ctx.agent_name,
+                db,
+                &self.tool_ctx.active_extensions,
+            )
+            .await
+            .map_err(|error| error.to_string())?
+        } else {
+            HashSet::new()
+        };
+        let sources = self.sources_for(messages.len());
+        // Optional revoked contributions disappear from the request copy only.
+        // The retained originals/receipts and actual exchange vector stay intact.
+        let selected: Vec<_> = messages.iter().zip(&sources).filter(|(_, source)| {
+            !matches!(source, ContextSource::DurableContribution { extension, .. } if !allowed.contains(extension))
+        }).collect();
         let chain = hub
             .resolve_context_projectors(
                 &self.tool_ctx.agent_name,
@@ -609,10 +638,16 @@ impl<'a> RoundProjector<'a> {
             .await
             .map_err(refused)?;
         let baseline = ProjectedRequest {
-            messages: messages.to_vec(),
+            messages: selected
+                .iter()
+                .map(|(message, _)| (*message).clone())
+                .collect(),
             tools: tools.to_vec(),
         };
-        let sources = self.sources_for(messages.len());
+        let sources: Vec<_> = selected
+            .iter()
+            .map(|(_, source)| (*source).clone())
+            .collect();
         let inputs = projection::RoundInputs {
             agent_name: &self.tool_ctx.agent_name,
             session_db_id: self.session_db_id.as_deref(),

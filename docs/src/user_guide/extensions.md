@@ -338,3 +338,76 @@ loaded from external sources — eidetica DBs, IPLD addresses, or git
 commits — but those loaders aren't implemented yet. See
 [the architecture doc](../architecture/extensions.md#extension-identity)
 for the shape that machinery will take.
+
+## Durable context is an explicit write
+
+A context projector changes only the next request. A durable contributor
+intentionally stores conversation text and strategy state in the session's
+Eidetica database, so they survive reopen and sync to the session's peers.
+No shipped extension uses this endpoint yet. It is available to trusted
+in-tree extensions without a feature flag or plugin loader.
+
+| Setting                       | Default | Meaning                                                                                                                                     |
+| ----------------------------- | ------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
+| `durable_context[].extension` | —       | Contributor's manifest name; distinct names run in list order.                                                                              |
+| `durable_context[].required`  | `false` | Stop dispatch if this contributor is absent, inactive or fails. Optional failures discard the new batch and require a valid committed view. |
+
+Installation and activation are not write grants. The responding agent and
+session bound the contributor's text/state namespace, with session instances
+taking precedence over agent and global instances. It cannot write another
+extension's state. The host commits a batch and its dedup receipt together,
+then builds context. A retry of the same request does not inject again; a new
+request may. This also applies after reopening the session.
+
+Stored text is escaped conversation data, not a new instruction or tool grant.
+Current instructions and tools always come from current authority. Disabling
+the extension hides its durable text at the next model call but does not erase
+its records. Re-enabling it can expose those records again. Contributions are
+retained independently of compaction summaries and must still fit the request
+budget. An oversized request is refused, not silently sent or summarized.
+
+Do not use this capability to persist private external recall into a synced
+session. It grants no new audience, auxiliary model calls or retention policy.
+The legacy schedule-turn path cannot create a contribution without a durable
+request identity; optional writes skip and required writes refuse there.
+
+## Walkthrough: retry and disable a durable contributor
+
+This example assumes your trusted in-tree extension `notes` provides the
+`DurableContextContributor` endpoint and returns one text item, `remember this`.
+It is an example consumer, not a preinstalled extension.
+
+1. Grant it and restart with the updated config:
+
+   ```yaml
+   durable_context:
+     - extension: notes
+       required: true
+   ```
+
+   Send a message. The model sees this host-framed User item only after its
+   batch has committed:
+
+   ```text
+   <custom_context>
+   remember this
+   </custom_context>
+   ```
+
+2. If the turn is interrupted, retry that same request. Reopening the session
+   does not change the result: the stored receipt prevents a second injection.
+   A later, genuinely new message has a distinct invocation and can add notes.
+
+3. Disable `notes` with `/extensions remove notes`. The next turn is refused
+   before any provider request, with this error entry:
+
+   ```text
+   Error: required durable contributor 'notes' is unavailable or inactive
+   ```
+
+4. Recover with `/extensions add notes`, then send a new message. The refusal
+   above is recorded as a completed error, so `/retry` cannot reopen it; an
+   earlier interrupted request can still be retried. To continue without notes,
+   remove its grant or set `required: false` and restart. Optional failure keeps
+   earlier committed batches only if the database view remains coherent;
+   storage corruption is never a reason to use a stale in-memory fallback.

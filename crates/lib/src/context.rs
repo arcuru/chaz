@@ -119,6 +119,8 @@ pub struct AssembledContext {
 pub struct ContextBuilder<'a> {
     entries: &'a [SessionEntry],
     tool_history: Option<&'a [Vec<TurnTranscriptRecord>]>,
+    entry_ids: Option<&'a [Option<crate::session::TurnRequestId>]>,
+    contributions: &'a [crate::extension::durable_context::CommittedContribution],
     agent_name: &'a str,
     system_prompt: &'a str,
     /// Tool definitions for this turn. Also the set that `requires_tools`
@@ -150,6 +152,8 @@ impl<'a> ContextBuilder<'a> {
         Self {
             entries,
             tool_history: None,
+            entry_ids: None,
+            contributions: &[],
             agent_name,
             system_prompt,
             tool_defs: &[],
@@ -196,6 +200,14 @@ impl<'a> ContextBuilder<'a> {
 
     pub fn with_tool_history(mut self, history: &'a [Vec<TurnTranscriptRecord>]) -> Self {
         self.tool_history = Some(history);
+        self
+    }
+
+    /// Supply the complete selected view from one coherent database snapshot.
+    pub fn with_context_view(mut self, view: &'a crate::session::SessionContextView) -> Self {
+        self.entry_ids = Some(&view.entry_ids);
+        self.tool_history = Some(&view.tool_history);
+        self.contributions = &view.contributions;
         self
     }
 
@@ -329,6 +341,36 @@ impl<'a> ContextBuilder<'a> {
             None => 0,
         };
         used_tokens += tail_tokens;
+        // Intentionally selected durable text has the same budget treatment as
+        // tails. It is data, framed by the host; oversize requests fail at dispatch.
+        let durable_messages: Vec<_> = self
+            .contributions
+            .iter()
+            .flat_map(|row| {
+                row.contribution
+                    .messages
+                    .iter()
+                    .enumerate()
+                    .map(move |(index, text)| {
+                        (
+                            RuntimeMessage::User(format!(
+                                "<custom_context>\n{}\n</custom_context>",
+                                text.replace('&', "&amp;")
+                                    .replace('<', "&lt;")
+                                    .replace('>', "&gt;")
+                            )),
+                            ContextSource::DurableContribution {
+                                source_id: row.source_id(index),
+                                extension: row.identity.extension.clone(),
+                            },
+                        )
+                    })
+            })
+            .collect();
+        used_tokens += durable_messages
+            .iter()
+            .map(|(message, _)| message_cost(message))
+            .sum::<usize>();
 
         // 3. Find context boundary: most recent Summary entry
         let boundary_idx = self
@@ -431,11 +473,22 @@ impl<'a> ContextBuilder<'a> {
                 RuntimeMessage::User(text)
             };
             messages.push(rm);
-            sources.push(ContextSource::SessionEntry {
-                index: *index,
-                sender: entry.sender.clone(),
-                timestamp: entry.timestamp,
-            });
+            sources.push(
+                match self
+                    .entry_ids
+                    .and_then(|ids| ids.get(*index))
+                    .and_then(Option::as_ref)
+                {
+                    Some(id) => ContextSource::PersistedSessionEntry {
+                        id: id.as_str().into(),
+                    },
+                    None => ContextSource::SessionEntry {
+                        index: *index,
+                        sender: entry.sender.clone(),
+                        timestamp: entry.timestamp,
+                    },
+                },
+            );
             let group = std::mem::take(&mut replay[*index]);
             if let Some(first) = self
                 .tool_history
@@ -466,6 +519,10 @@ impl<'a> ContextBuilder<'a> {
         if let Some(t) = tail_text {
             messages.push(RuntimeMessage::User(t));
             sources.push(ContextSource::ContextTail);
+        }
+        for (message, source) in durable_messages {
+            messages.push(message);
+            sources.push(source);
         }
         AssembledContext {
             messages,
