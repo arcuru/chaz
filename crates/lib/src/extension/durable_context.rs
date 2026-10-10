@@ -233,6 +233,9 @@ impl ExtensionHub {
         db: &Database,
         turn_active: &HashSet<String>,
     ) -> anyhow::Result<Vec<ResolvedContributor>> {
+        if self.durable_context.is_empty() {
+            return Ok(Vec::new());
+        }
         let active = self
             .active_extensions_for_call(agent, Some(db), turn_active)
             .await;
@@ -360,12 +363,11 @@ impl ExtensionHub {
                 }
                 let txn = db.new_transaction_at(&snapshot).await?;
                 let states = txn.get_store::<Table<StrategyState>>(STATE_STORE).await?;
-                let state = states
-                    .search(|_| true)
-                    .await?
-                    .into_iter()
-                    .find(|(key, _)| key == &identity.namespace())
-                    .map(|(_, state)| state);
+                let state = match states.get(identity.namespace()).await {
+                    Ok(state) => Some(state),
+                    Err(error) if error.is_not_found() => None,
+                    Err(error) => return Err(error.into()),
+                };
                 // Contributors see only their own durable namespace; transcript
                 // access is selected and read-only, not a raw session handle.
                 let mut scoped_view = view;

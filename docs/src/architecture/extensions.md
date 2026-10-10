@@ -102,6 +102,8 @@ empty / `None`:
 - **Per-turn context** — `prompt_augmentation()`, `context_tail()`
 - **Per-model-call projection** — `context_projector()`; invoked only for
   operator-granted extensions (see [Context projection](#context-projection))
+- **Durable context** — `durable_context_contributor()`; commits intentional
+  text/state before assembly (see [Durable context contributions](#durable-context-contributions))
 - **Extension-to-extension caps** — `memory_access()`, `messenger()`,
   and the TypeId-keyed escape hatch `extension_cap(type_id)`
 - **Hook handlers** — `before_agent_start_hook()`, `tool_call_hook()`,
@@ -206,13 +208,12 @@ authoritative):
   a cap handle.
 - **Extension-providable** — `Messenger`, `MemoryAccess`,
   `PromptAugmentation`, `ContextTail`, `StatusSegment`,
-  `ContextProjection`. Published by an instance through its endpoints;
-  `PromptAugmentation`/`ContextTail` are consumed directly by context
-  assembly, `Messenger`/`MemoryAccess` are resolvable through the
-  `CapResolver` (no consumer yet). `ContextProjection` is the one kind
-  whose declaration the runtime reads: the host invokes
-  `context_projector()` only when the manifest provides it **and** the
-  operator granted the extension.
+  `ContextProjection`, `DurableContext`. Published by an instance through
+  its endpoints; `PromptAugmentation`/`ContextTail` are consumed directly
+  by context assembly, `Messenger`/`MemoryAccess` are resolvable through
+  the `CapResolver` (no consumer yet). The host invokes context projectors
+  and durable contributors only when the manifest provides the capability
+  **and** the operator granted the extension.
 
 Required/requested capability declarations remain descriptive: nothing
 refuses to load an extension whose `required_capabilities` are absent,
@@ -244,9 +245,11 @@ struct ProjectedRequest { messages: Vec<RuntimeMessage>, tools: Vec<ToolDefiniti
 `ProjectionCall` is read-only: agent, session DB id, turn request id,
 attempt id, resolved model, model round, the granted authority and
 required flag, the round's baseline, its index-aligned `ContextSource`
-provenance (`Instructions`, `SessionEntry { index, sender, timestamp }`,
+provenance (`Instructions`, `PersistedSessionEntry { id }`,
+`SessionEntry { index, sender, timestamp }` for callers without row IDs,
 `ReplayedExchange { request_id, attempt_id, model_sequence }`,
-`ContextTail`, `TurnInjection`, `CurrentAttempt { model_sequence }`), and
+`DurableContribution { source_id, extension }`, `ContextTail`,
+`TurnInjection`, `CurrentAttempt { model_sequence }`), and
 the request budget. It carries no database handle or write path.
 
 **Eligibility, checked at each call.** A projector runs when all hold:

@@ -42,6 +42,7 @@ impl DurableContextContributor for Stub {
                     anyhow::bail!("synthetic late failure")
                 }
                 "panic" => panic!("synthetic panic"),
+                "timeout" => std::future::pending().await,
                 "empty" => Ok(ContextContribution::default()),
                 "large" => Ok(ContextContribution {
                     messages: vec!["x".repeat(MAX_BYTES + 1)],
@@ -361,9 +362,9 @@ async fn durable_context_aborted_transaction_exposes_neither_state_text_nor_rece
     assert_eq!(fx.db_rows().await.len(), 1);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn durable_context_failures_stop_required_and_optional_use_committed_view() {
-    for mode in ["error", "panic", "large"] {
+    for mode in ["error", "panic", "large", "timeout"] {
         for required in [false, true] {
             let fx = Fixture::new(required, mode).await;
             fx.session
@@ -416,6 +417,24 @@ async fn durable_context_failures_stop_required_and_optional_use_committed_view(
 #[tokio::test]
 async fn durable_context_declaration_activation_grants_and_scope_are_enforced() {
     let mut fx = Fixture::scoped(true, "ok", false, vec![Scope::Global]).await;
+    for names in [vec![" "], vec!["synthetic", "synthetic"]] {
+        let grants: Vec<_> = names
+            .into_iter()
+            .map(|name| DurableContextGrant {
+                extension: name.into(),
+                required: false,
+            })
+            .collect();
+        assert!(fx.hub.set_durable_context_grants(&grants).is_err());
+        assert!(
+            fx.prepare("denied")
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("required durable contributor 'synthetic'"),
+            "invalid configuration replaced the existing required grant"
+        );
+    }
     assert!(fx.prepare("denied").await.is_err());
     assert_eq!(fx.stub.calls.load(Ordering::SeqCst), 0);
     fx.hub.set_durable_context_grants(&[]).unwrap();

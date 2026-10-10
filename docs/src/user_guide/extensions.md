@@ -405,8 +405,9 @@ It is an example consumer, not a preinstalled extension.
    Error: required durable contributor 'notes' is unavailable or inactive
    ```
 
-4. Recover with `/extensions add notes`, then retry the interrupted request or
-   send a new message. To continue without notes, remove its grant or set
-   `required: false` and restart. Optional failure keeps earlier committed
-   batches only if the database view remains coherent; storage corruption is
-   never a reason to use a stale in-memory fallback.
+4. Recover with `/extensions add notes`, then send a new message. The refusal
+   above is recorded as a completed error, so `/retry` cannot reopen it; an
+   earlier interrupted request can still be retried. To continue without notes,
+   remove its grant or set `required: false` and restart. Optional failure keeps
+   earlier committed batches only if the database view remains coherent;
+   storage corruption is never a reason to use a stale in-memory fallback.
