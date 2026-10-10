@@ -22,7 +22,7 @@ use std::time::Duration;
 
 use crate::{
     backends::{ChatContext, LLMBackend, MessageRole, ModelInfo},
-    cache::{CacheControl, CacheRegion},
+    cache::{CacheAnchor, CacheControl, CacheOptions},
     config::Backend,
     error::LlmError,
     runtime::{LLMResponse, ResponseMetadata, RuntimeMessage, TokenUsage, ToolCallRequest},
@@ -281,12 +281,38 @@ impl Anthropic {
         tools: &[ToolDefinition],
         model: &str,
     ) -> Result<LLMResponse, LlmError> {
+        self.chat_with_cache_impl(
+            messages,
+            tools,
+            model,
+            &crate::extensions::context::default_cache_options(),
+        )
+        .await
+    }
+    async fn chat_with_cache_impl(
+        &self,
+        messages: &[RuntimeMessage],
+        tools: &[ToolDefinition],
+        model: &str,
+        cache: &CacheOptions,
+    ) -> Result<LLMResponse, LlmError> {
+        cache
+            .validate(messages)
+            .map_err(|e| LlmError::Configuration {
+                message: e.to_string(),
+            })?;
         let api_key = self.api_key()?;
         let client = self.http_client()?;
 
         let mut req_tools = convert_tool_definitions(tools);
         let (mut system, mut req_messages) = convert_runtime_messages(messages);
-        apply_cache_control(&mut system, &mut req_messages, &mut req_tools);
+        apply_cache_options(
+            &mut system,
+            &mut req_messages,
+            &mut req_tools,
+            messages,
+            cache,
+        );
 
         let url = format!("{}/messages", self.api_base().trim_end_matches('/'));
         let mut max_tokens = self.backend.max_output_tokens();
@@ -574,6 +600,16 @@ impl LLMBackend for Anthropic {
         true
     }
 
+    async fn chat_with_cache(
+        &self,
+        messages: &[RuntimeMessage],
+        tools: &[ToolDefinition],
+        model: &str,
+        cache: &CacheOptions,
+    ) -> Result<LLMResponse, LlmError> {
+        self.chat_with_cache_impl(messages, tools, model, cache)
+            .await
+    }
     async fn chat_with_tools(
         &self,
         messages: &[RuntimeMessage],
@@ -792,19 +828,35 @@ fn convert_tool_definitions(tools: &[ToolDefinition]) -> Vec<ReqTool> {
 /// Stamp first-class Anthropic prompt-cache breakpoints onto the request.
 /// Always applies (native Anthropic caching is unconditional) — the placement
 /// policy is shared with the OpenAI-compatible backend via [`crate::cache`].
+#[cfg(test)]
 fn apply_cache_control(
     system: &mut Option<Vec<TextBlock>>,
     messages: &mut [ReqMessage],
     tools: &mut [ReqTool],
 ) {
-    let cc = CacheControl::ephemeral();
+    apply_cache_options(
+        system,
+        messages,
+        tools,
+        &[],
+        &crate::extensions::context::default_cache_options(),
+    );
+}
+fn apply_cache_options(
+    system: &mut Option<Vec<TextBlock>>,
+    messages: &mut [ReqMessage],
+    tools: &mut [ReqTool],
+    original: &[RuntimeMessage],
+    options: &CacheOptions,
+) {
+    let cc = options.control();
     let mut remaining = crate::cache::MAX_BREAKPOINTS;
-    for region in crate::cache::CACHE_PLAN {
+    for region in &options.anchors {
         if remaining == 0 {
             break;
         }
         let placed = match region {
-            CacheRegion::LastTool => {
+            CacheAnchor::LastTool => {
                 if let Some(last_tool) = tools.last_mut() {
                     last_tool.cache_control = Some(cc.clone());
                     true
@@ -812,7 +864,7 @@ fn apply_cache_control(
                     false
                 }
             }
-            CacheRegion::System => {
+            CacheAnchor::System => {
                 if let Some(block) = system.as_mut().and_then(|s| s.last_mut()) {
                     block.cache_control = Some(cc.clone());
                     true
@@ -820,7 +872,47 @@ fn apply_cache_control(
                     false
                 }
             }
-            CacheRegion::LatestUser => {
+            CacheAnchor::Message(index) => {
+                let mut turn = 0usize;
+                let mut block = 0usize;
+                let mut previous = None;
+                let mut target = None;
+                for (i, message) in original.iter().enumerate() {
+                    let (role, count) = match message {
+                        RuntimeMessage::System(_) => continue,
+                        RuntimeMessage::User(_) | RuntimeMessage::ToolResult { .. } => ("user", 1),
+                        RuntimeMessage::Assistant(_) => ("assistant", 1),
+                        RuntimeMessage::AssistantToolCalls {
+                            content,
+                            tool_calls,
+                            ..
+                        } => (
+                            "assistant",
+                            tool_calls.len()
+                                + usize::from(content.as_ref().is_some_and(|c| !c.is_empty())),
+                        ),
+                    };
+                    if previous.is_some_and(|p| p != role) {
+                        turn += 1;
+                        block = 0;
+                    }
+                    block += count;
+                    previous = Some(role);
+                    if i == *index {
+                        target = Some((turn, block.saturating_sub(1)));
+                        break;
+                    }
+                }
+                if let Some(block) =
+                    target.and_then(|(t, b)| messages.get_mut(t).and_then(|m| m.content.get_mut(b)))
+                {
+                    block.set_cache_control(cc.clone());
+                    true
+                } else {
+                    false
+                }
+            }
+            CacheAnchor::LatestUser => {
                 if let Some(block) = messages
                     .iter_mut()
                     .rev()
@@ -865,6 +957,24 @@ fn convert_chat_context(
         model = default_model.clone().unwrap_or_default();
     }
     (model, msgs)
+}
+
+#[cfg(test)]
+pub(crate) fn serialize_cache_fixture(
+    messages: &[RuntimeMessage],
+    tools: &[ToolDefinition],
+    options: &CacheOptions,
+) -> Value {
+    let (mut system, mut wire_messages) = convert_runtime_messages(messages);
+    let mut wire_tools = convert_tool_definitions(tools);
+    apply_cache_options(
+        &mut system,
+        &mut wire_messages,
+        &mut wire_tools,
+        messages,
+        options,
+    );
+    serde_json::json!({"system": system, "messages": wire_messages, "tools": wire_tools})
 }
 
 #[cfg(test)]

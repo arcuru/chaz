@@ -16,24 +16,26 @@ These ship in the chaz binary today. The "Provides" column lists the
 declares — `Tool` and `Command` are the surfaces a user notices; the
 others are runtime hooks that fire around each agent turn.
 
-| Extension           | Provides            | What it gives you                                                                                                                                    |
-| ------------------- | ------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `core`              | Tool                | `shell`, `compact`, `spawn_agent`, `job_status`, `job_wait`, `spawn_worker`. The always-available baseline; disabling it is a footgun.               |
-| `system`            | Tool                | `get_time`, `calculate`, `describe_tool`. Small dependency-free helpers.                                                                             |
-| `fs`                | Tool                | `read_file`, `write_file`, `edit_file`.                                                                                                              |
-| `web`               | Tool                | `web_fetch`, `web_search`.                                                                                                                           |
-| `memory`            | Command, Tool       | `/memory` + `remember` / `recall` / `list_memory_banks`. See [Memory](memory.md).                                                                    |
-| `skills`            | Command, Tool       | `/skills` + `skill_list` / `skill_search` / `skill_show`, plus the per-session catalog prompt injection.                                             |
-| `schedule`          | Command, Tool       | `/schedule` + `schedule_add` / `schedule_modify` / `schedule_remove` / `schedule_list` / `schedule_once`.                                            |
-| `agent_schedule`    | _(routine handler)_ | Standalone fire path for agent-owned schedules. Not directly toggled by users; no tools or commands.                                                 |
-| `mcp-<server>`      | Tool                | One extension per configured [MCP server](mcp.md), named `mcp-<server_name>`. Wraps the server and registers its tools under the server's namespace. |
-| `path_normalizer`   | ToolCall            | Strips trailing slashes from `path` arguments on filesystem tools before they execute.                                                               |
-| `security_warnings` | ToolResult          | Scans tool output for prompt-injection patterns and logs warnings (warning-only — output is unmodified).                                             |
+| Extension           | Provides             | What it gives you                                                                                                                                    |
+| ------------------- | -------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `baseline_context`  | _(context strategy)_ | Required default history/layout selection; see [One required context strategy](#one-required-context-strategy).                                      |
+| `core`              | Tool                 | `shell`, `compact`, `spawn_agent`, `job_status`, `job_wait`, `spawn_worker`. The always-available baseline; disabling it is a footgun.               |
+| `system`            | Tool                 | `get_time`, `calculate`, `describe_tool`. Small dependency-free helpers.                                                                             |
+| `fs`                | Tool                 | `read_file`, `write_file`, `edit_file`.                                                                                                              |
+| `web`               | Tool                 | `web_fetch`, `web_search`.                                                                                                                           |
+| `memory`            | Command, Tool        | `/memory` + `remember` / `recall` / `list_memory_banks`. See [Memory](memory.md).                                                                    |
+| `skills`            | Command, Tool        | `/skills` + `skill_list` / `skill_search` / `skill_show`, plus the per-session catalog prompt injection.                                             |
+| `schedule`          | Command, Tool        | `/schedule` + `schedule_add` / `schedule_modify` / `schedule_remove` / `schedule_list` / `schedule_once`.                                            |
+| `agent_schedule`    | _(routine handler)_  | Standalone fire path for agent-owned schedules. Not directly toggled by users; no tools or commands.                                                 |
+| `mcp-<server>`      | Tool                 | One extension per configured [MCP server](mcp.md), named `mcp-<server_name>`. Wraps the server and registers its tools under the server's namespace. |
+| `path_normalizer`   | ToolCall             | Strips trailing slashes from `path` arguments on filesystem tools before they execute.                                                               |
+| `security_warnings` | ToolResult           | Scans tool output for prompt-injection patterns and logs warnings (warning-only — output is unmodified).                                             |
 
 Disabling an extension hides its tools from the LLM, stops its hooks
 from firing, and disarms its slash commands. The `core` and `system`
 extensions are practical floors — chaz still runs without them, but
-agents lose `shell`, `spawn_agent`, `get_time`, etc.
+agents lose `shell`, `spawn_agent`, `get_time`, etc. The configured context
+strategy is different: disabling it stops model dispatch, rather than hiding tools.
 
 ## Listing extensions
 
@@ -47,6 +49,7 @@ agent responding in this session:
 
 ```
 Extensions on this peer (✓ = live for agent 'chaz' this session; ✗ = disabled for this agent):
+  ✓ baseline_context [0.3.0] — —
   ✓ core [0.3.0] — Tool
   ✓ path_normalizer [0.3.0] — ToolCall
   ✓ security_warnings [0.3.0] — ToolResult
@@ -201,8 +204,7 @@ An extension can offer a **context projector**: code that sees the
 request about to be sent to the model and returns a reshaped one, such
 as recall inserted near the end, a large old tool output replaced with a
 stub, or secrets redacted. It runs before every model call of a turn,
-including each step of a tool loop, not once per turn. No built-in
-extension ships a projector yet; this is the mechanism they will use.
+including each step of a tool loop, not once per turn. The required baseline selection runs before this optional projection chain.
 
 What is automatic and what you control:
 
@@ -411,3 +413,89 @@ It is an example consumer, not a preinstalled extension.
    remove its grant or set `required: false` and restart. Optional failure keeps
    earlier committed batches only if the database view remains coherent;
    storage corruption is never a reason to use a stale in-memory fallback.
+
+## One required context strategy
+
+`baseline_context` ships in the normal build and is selected by default.
+It keeps the existing layout: current instructions, recent selected history
+with complete prior tool exchanges when they fit, ephemeral recall, then
+explicit durable contributions. The newest selected entry remains included;
+an oversized final request is refused at dispatch rather than silently sent.
+
+| Control                                    | Default                                   | Meaning                                                                                    |
+| ------------------------------------------ | ----------------------------------------- | ------------------------------------------------------------------------------------------ |
+| `context_strategy.extension`               | `baseline_context`                        | Required installed selection provider; replacement is explicit.                            |
+| `baseline_context` session setting `cache` | Last tool, system, latest user; 5 minutes | Typed anchor/TTL choices, not provider fields.                                             |
+| `cache.anchors`                            | `["last_tool", "system", "latest_user"]`  | At most four anchors; `{"message": 1}` selects a final-request conversation item by index. |
+| `cache.ttl`                                | `five_minutes`                            | `five_minutes` or `one_hour`; unsupported providers omit markers.                          |
+
+Selection is a permission boundary, not an optimization with a hidden fallback.
+Disabling or losing the configured strategy stops the next model call, including
+an active tool loop. Another trusted in-tree extension can replace it through
+`context_strategy.extension`; it must publish `ContextStrategy` and be active.
+Activation alone cannot select a replacement or grant it extra tools.
+
+The host reads a coherent Eidetica view. The extension chooses scoped references;
+the host renders transport framing, complete native exchanges and durable text,
+and assigns source identities. The selected name and settings are recorded in
+session-backed, agent/extension-scoped `context_selections` state. Session settings
+remain in `extension_settings` and are read anew each turn. Neither is a saved
+model request or an execution grant. There is no projection cache.
+
+Native memory recall still uses its existing activation, bank eligibility,
+query extraction and per-bank search budgets. Its typed invocation carries the
+agent, session and request identity plus recent selected text. Recall is still
+ephemeral: changing recall does not accumulate old tails in the session. A recall
+failure keeps the successful required selection; it never substitutes another
+strategy. Persisting recall requires a separate explicit durable contributor
+and grant; native memory does not install one.
+
+Adapters map selected anchors to supported wire fields. Native Anthropic and
+OpenRouter's Anthropic models support explicit markers; other OpenAI-compatible
+providers receive no markers. A message anchor stays on that item's last block,
+even if Anthropic coalesces adjacent User messages. Marker placement does not
+prove a provider cache hit, and the default policy is unchanged.
+
+## Walkthrough: change cache settings and recover a disabled strategy
+
+1. Inspect and change the baseline's session settings:
+
+   ```text
+   /extensions settings baseline_context
+   Settings for 'baseline_context' on this session:
+   {}
+   /extensions set baseline_context cache {"anchors":["last_tool","system","latest_user"],"ttl":"five_minutes"}
+   Set baseline_context.cache = {"anchors":["last_tool","system","latest_user"],"ttl":"five_minutes"}
+   ```
+
+   The next turn reads the new setting. This example keeps the default policy;
+   changing TTL or anchors is a deliberate operator choice, not an automatic
+   optimization. Invalid types, indices or more than four anchors stop selection.
+
+2. Disable it in this session:
+
+   ```text
+   /extensions remove baseline_context
+   ```
+
+   Send a new message. No provider request is sent; the error reads:
+
+   ```text
+   Error: required context strategy 'baseline_context' is unavailable or inactive
+   ```
+
+3. Recover with `/extensions add baseline_context`, then send a new message.
+   The refusal was recorded as a completed error, so it is not a retry target.
+   An earlier interrupted request can still be retried through the usual path.
+
+4. To use a replacement, install its trusted in-tree implementation and activate
+   it, then restart with:
+
+   ```yaml
+   context_strategy:
+     extension: my_context
+   ```
+
+   `my_context` now owns selection. Removing it refuses dispatch even though
+   `baseline_context` remains installed. No external loader or Cargo variant
+   is needed or provided.

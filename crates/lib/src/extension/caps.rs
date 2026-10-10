@@ -132,6 +132,7 @@ pub enum CapabilityKind {
     /// Intentional durable conversation text and scoped strategy state. The
     /// host commits returned data only under an explicit `durable_context` grant.
     DurableContext,
+    ContextStrategy,
 }
 
 impl CapabilityKind {
@@ -172,6 +173,7 @@ impl CapabilityKind {
             Self::StatusSegment => "status_segment",
             Self::ContextProjection => "context_projection",
             Self::DurableContext => "durable_context",
+            Self::ContextStrategy => "context_strategy",
         }
     }
 }
@@ -409,14 +411,17 @@ pub trait PromptAugmentation: Send + Sync {
 /// fires at the end of context, not in the system prompt. Like it, this
 /// is a **context/pull** output: consumed in-process at turn time, never
 /// materialized to a store.
+pub struct ContextTailCall<'a> {
+    pub agent_name: &'a str,
+    /// Preserve the existing newest-first input and native query extraction.
+    pub recent_message_text: &'a [String],
+    pub session_db_id: Option<String>,
+    pub request_id: Option<&'a str>,
+}
 pub trait ContextTail: Send + Sync {
     /// Return additional text to append after the conversation messages,
     /// or `None` if this extension has nothing to contribute for this turn.
-    fn context_tail<'a>(
-        &'a self,
-        agent_name: &'a str,
-        recent_message_text: &'a [String],
-    ) -> CapFuture<'a, Option<String>>;
+    fn context_tail<'a>(&'a self, call: &'a ContextTailCall<'a>) -> CapFuture<'a, Option<String>>;
 }
 
 /// Contribute keyed text segments to a gateway's status surface.

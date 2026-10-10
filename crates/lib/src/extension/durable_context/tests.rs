@@ -209,6 +209,8 @@ impl Fixture {
             Some(&self.hub),
             None,
             ModelCallScope {
+                cache: Default::default(),
+                context_strategy: None,
                 attempt_id: Some("new-attempt".into()),
                 request_budget_tokens: Some(budget),
                 sources: assembled.sources,

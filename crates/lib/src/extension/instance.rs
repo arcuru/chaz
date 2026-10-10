@@ -198,6 +198,10 @@ pub trait ExtensionInstance: Send + Sync + 'static {
         None
     }
 
+    fn context_strategy(&self) -> Option<Arc<dyn super::context_strategy::ContextStrategy>> {
+        None
+    }
+
     // ── Extension-to-extension service endpoints ───────────────────
 
     fn memory_access(&self) -> Option<Arc<dyn MemoryAccess>> {

@@ -732,8 +732,9 @@ impl Server {
                 .with_room_participants(&roster)
                 .with_extension_hub(self.extensions.clone())
                 .with_session_db(session_db)
-                .build()
-                .await;
+                .with_invocation(&active_extensions, None)
+                .try_build()
+                .await?;
             (session_model, assembled)
         };
         // Effective model resolution: per-agent override (new) > session pin
@@ -745,6 +746,11 @@ impl Server {
 
         // Prepend the wake-prompt as a private System message. This is
         // invocation-scoped — it never appears as a session entry.
+        for anchor in &mut assembled.cache.anchors {
+            if let crate::cache::CacheAnchor::Message(index) = anchor {
+                *index += 1;
+            }
+        }
         assembled.messages.insert(
             0,
             crate::runtime::RuntimeMessage::System(wake_prompt.to_string()),
@@ -840,6 +846,8 @@ impl Server {
             Some(event_tx),
             Some(self.extensions.as_ref()),
             crate::runtime::ModelCallScope {
+                cache: assembled.cache,
+                context_strategy: assembled.strategy,
                 attempt_id: None,
                 request_budget_tokens: Some(assembled.request_budget_tokens),
                 sources: assembled.sources,

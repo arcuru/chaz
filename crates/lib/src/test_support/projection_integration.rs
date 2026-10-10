@@ -824,6 +824,8 @@ async fn projector_receives_scoped_identity_and_sources() {
         .run(
             prompt(),
             ModelCallScope {
+                cache: Default::default(),
+                context_strategy: None,
                 attempt_id: Some("attempt-1".into()),
                 request_budget_tokens: Some(10_000),
                 sources: sources.clone(),
@@ -1276,6 +1278,8 @@ async fn oversize_output_and_oversize_fallback_are_not_dispatched() {
     .await;
     fx.mock.push_text("ok");
     let scope = ModelCallScope {
+        cache: Default::default(),
+        context_strategy: None,
         request_budget_tokens: budget,
         ..Default::default()
     };

@@ -78,15 +78,16 @@ impl BackendClient {
         }
     }
 
-    async fn chat_with_tools(
+    async fn chat_with_cache(
         &self,
         messages: &[RuntimeMessage],
         tools: &[ToolDefinition],
         model: &str,
+        cache: &crate::cache::CacheOptions,
     ) -> Result<LLMResponse, LlmError> {
         match self {
-            BackendClient::OpenAI(b) => b.chat_with_tools(messages, tools, model).await,
-            BackendClient::Anthropic(b) => b.chat_with_tools(messages, tools, model).await,
+            BackendClient::OpenAI(b) => b.chat_with_cache(messages, tools, model, cache).await,
+            BackendClient::Anthropic(b) => b.chat_with_cache(messages, tools, model, cache).await,
         }
     }
 }
@@ -125,6 +126,16 @@ pub trait LLMBackend {
     /// Execute a simple chat request (no tools). Used by /compact and Matrix commands.
     async fn execute(&self, context: &ChatContext) -> Result<String, LlmError>;
 
+    async fn chat_with_cache(
+        &self,
+        messages: &[RuntimeMessage],
+        tools: &[ToolDefinition],
+        model: &str,
+        _cache: &crate::cache::CacheOptions,
+    ) -> Result<LLMResponse, LlmError> {
+        self.chat_with_tools(messages, tools, model).await
+    }
+
     /// Whether this backend supports tool/function calling
     fn supports_tools(&self) -> bool {
         false
@@ -155,6 +166,15 @@ pub trait BackendDispatch: Send + Sync {
         context: &'a ChatContext,
     ) -> Pin<Box<dyn Future<Output = Result<String, LlmError>> + Send + 'a>>;
     fn supports_tools(&self) -> bool;
+    fn chat_with_cache<'a>(
+        &'a self,
+        messages: &'a [RuntimeMessage],
+        tools: &'a [ToolDefinition],
+        model: &'a str,
+        _cache: &'a crate::cache::CacheOptions,
+    ) -> Pin<Box<dyn Future<Output = Result<LLMResponse, LlmError>> + Send + 'a>> {
+        self.chat_with_tools(messages, tools, model)
+    }
     fn chat_with_tools<'a>(
         &'a self,
         messages: &'a [RuntimeMessage],
@@ -535,8 +555,27 @@ impl BackendManager {
         tools: &[ToolDefinition],
         resolved_model: &str,
     ) -> Result<LLMResponse, LlmError> {
+        self.chat_with_cache_for_model(
+            model,
+            messages,
+            tools,
+            resolved_model,
+            &crate::extensions::context::default_cache_options(),
+        )
+        .await
+    }
+    pub async fn chat_with_cache_for_model(
+        &self,
+        model: Option<&str>,
+        messages: &[RuntimeMessage],
+        tools: &[ToolDefinition],
+        resolved_model: &str,
+        cache: &crate::cache::CacheOptions,
+    ) -> Result<LLMResponse, LlmError> {
         if let Some(mock) = &self.mock {
-            return mock.chat_with_tools(messages, tools, resolved_model).await;
+            return mock
+                .chat_with_cache(messages, tools, resolved_model, cache)
+                .await;
         }
         if self.backends.is_empty() {
             return Err(LlmError::Configuration {
@@ -545,7 +584,7 @@ impl BackendManager {
         }
         let backend = self.select_backend_for_model(model);
         BackendClient::new(backend, &self.secrets)
-            .chat_with_tools(messages, tools, resolved_model)
+            .chat_with_cache(messages, tools, resolved_model, cache)
             .await
     }
 }
