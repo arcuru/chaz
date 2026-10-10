@@ -572,7 +572,13 @@ For example:
 3. If all slots remain busy or the child is still running, a shorter wait such as `{"session_db_id":"<child DB ID>","timeout_seconds":1}` can return `{"session_db_id":"<child DB ID>","state":"Queued"}`. Keep the handle and check again; the timeout did not cancel the job.
 4. If an executor stops after starting, a client may instead see `{"session_db_id":"<child DB ID>","state":{"StartedUnknown":{"attempt_id":"<attempt ID>","activity_recent":false}}}`. Check the child session's `/interrupted` and transcript before an explicit retry. Do not treat a stale start as a failed result.
 
-`spawn_worker` is separate: it invokes a Worker template under the calling Agent and waits by default. Its optional `async` mode is not a durable Agent job; Workers have no Agent identity or Agent-job status handle.
+`spawn_worker` invokes a Worker template under the calling Agent and waits by default. It also yields while observing, but only after registering the child and committing its Directive. Submission and `async: true` keep the parent's slot. A synchronous call returns the Worker's answer or error after reacquiring capacity; its default 300-second tool timeout does not include that capacity wait. Workers have no Agent identity or Agent-job status handle, and this wait cannot resume after a restart.
+
+For a declared `researcher` Worker:
+
+1. Call `spawn_worker` with `{"name":"researcher","task":"Find the canonical reference"}`. After submission the parent yields; the child can use its slot. A successful tool result might be `Canonical reference found`. The parent regains capacity before continuing.
+2. If the child exceeds the default tool timeout, the result is `Tool timed out after 300 seconds`, delivered after capacity is reacquired. The child may still be running. Inspect the spawned session and its transcript before another invocation; timeout does not automatically retry or create a replacement child.
+3. To submit without observing, use `{"name":"researcher","task":"Find the canonical reference","async":true}`. The result is `Worker 'researcher' spawned asynchronously in session <child DB ID>`. The parent retains its slot and continues; open that session to inspect the child's work.
 
 ## Resuming a checkpointed wait after restart
 
