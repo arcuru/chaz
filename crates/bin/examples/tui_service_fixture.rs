@@ -67,6 +67,7 @@ async fn main() -> anyhow::Result<()> {
         )]),
     )
     .await?;
+    let agents_json = serde_json::to_string(&session.try_read_meta().await?.agents)?;
     let service = ServiceServer::bind(owner.clone(), &socket).await?;
     let (shutdown, receiver) = watch::channel(());
     let mut running = Some((shutdown, tokio::spawn(service.run(receiver))));
@@ -87,6 +88,21 @@ async fn main() -> anyhow::Result<()> {
                 let (shutdown, receiver) = watch::channel(());
                 running = Some((shutdown, tokio::spawn(service.run(receiver))));
                 println!("STARTED");
+            }
+            "corrupt-meta" | "repair-meta" => {
+                let value = if command == "corrupt-meta" {
+                    "not-json".to_string()
+                } else {
+                    agents_json.clone()
+                };
+                db.with_transaction(|txn| async move {
+                    txn.get_store::<eidetica::store::DocStore>("meta")
+                        .await?
+                        .set_string("agents", &value)
+                        .await
+                })
+                .await?;
+                println!("META {}", command);
             }
             "name" => {
                 println!(

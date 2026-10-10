@@ -26,7 +26,7 @@ impl Bridge for TuiBridge {
         let (notify_tx, mut notify_rx) = mpsc::channel::<String>(64);
         // One-shot-style delivery of background model catalog fetches.
         // Buffered so a force-refresh kicked off mid-render doesn't block.
-        let (models_tx, mut models_rx) = mpsc::channel::<Result<Vec<ModelInfo>, String>>(4);
+        let (models_tx, mut models_rx) = mpsc::channel::<ModelCatalog>(4);
         let (session_rows_tx, mut session_rows_rx) = mpsc::channel::<SessionLoad>(128);
         // Background tab reads (session reloads, status strip, live-turn
         // counts). Tasks are owned by their tab's slots; the channel adds
@@ -154,6 +154,7 @@ impl Bridge for TuiBridge {
                     Some(load) = session_rows_rx.recv() => Action::SessionLoad(load),
                     _ = activity_tick.tick() => {
                         if app.backend_available {
+                            reconnect::request_tabs(&mut app, &server, &backend, &approval_tx, &notify_tx, &connection_tx);
                             let requests: Vec<_> = app.tabs.iter().flat_map(|tab| [refresh::RefreshKind::Session, refresh::RefreshKind::Status, refresh::RefreshKind::Activity].into_iter().filter(|kind| *kind == refresh::RefreshKind::Activity || tab.live.failed(*kind)).map(|kind| (tab.session_db_id.clone(), kind))).collect();
                             for (id, kind) in requests { refresh::request(&mut app, &id, kind, &refresh_tx); }
                         }
@@ -434,7 +435,12 @@ impl Bridge for TuiBridge {
                                     server = replacement.built.server.clone();
                                     self.secrets = replacement.built.secret_store.clone();
                                     backend = BackendManager::new(&self.config.backends, self.secrets.clone());
-                                    reconnect::apply(&mut app, &mut replacement, &backend);
+                                    reconnect::apply(&mut app, &mut replacement);
+                                    let ids: Vec<_> = app.tabs.iter().map(|t| t.session_db_id.clone()).collect();
+                                    for id in ids {
+                                        refresh::request(&mut app, &id, refresh::RefreshKind::Session, &refresh_tx);
+                                        refresh::request(&mut app, &id, refresh::RefreshKind::Status, &refresh_tx);
+                                    }
                                     runtime = Some(replacement.built);
                                     if app.mode == TuiMode::SessionPicker { open_session_picker(&mut app, &server, &session_rows_tx); }
                                 }
@@ -450,6 +456,12 @@ impl Bridge for TuiBridge {
                                         })));
                                     }
                                 }
+                            }
+                        }
+                        reconnect::ResultMessage::Tab { ticket, reopened } => {
+                            if let Some(id) = reconnect::apply_retry(&mut app, ticket, *reopened) {
+                                refresh::request(&mut app, &id, refresh::RefreshKind::Session, &refresh_tx);
+                                refresh::request(&mut app, &id, refresh::RefreshKind::Status, &refresh_tx);
                             }
                         }
                         reconnect::ResultMessage::Retry => { runtime_task = None; }
@@ -485,20 +497,7 @@ impl Bridge for TuiBridge {
                         }
                     }
                     Action::ModelsFetched(res) => {
-                        app.model_picker_loading = false;
-                        app.model_catalog_task = None;
-                        match res {
-                            Ok(catalog) => {
-                                app.model_picker_error = None;
-                                // Hold the pulled catalog in memory so reopening the
-                                // picker this session is instant (no re-fetch).
-                                app.session_catalog = Some(catalog.clone());
-                                app.rebuild_model_list(catalog);
-                            }
-                            Err(msg) => {
-                                app.model_picker_error = Some(msg);
-                            }
-                        }
+                        apply_model_catalog(&mut app, res);
                     }
                     Action::SessionLoad(load) => match load {
                         SessionLoad::Catalog { generation, result } => {

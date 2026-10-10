@@ -84,9 +84,8 @@ pub(super) struct TabLive {
     /// Last extension status segments read for this session. Shown as-is
     /// while a refresh is pending; never borrowed from another tab.
     pub(super) status_segments: Vec<String>,
-    /// Most recent backend read failure for this tab, cleared by the next
-    /// successful read. Shown in the status bar so a failed refresh doesn't
-    /// pass for fresh data.
+    /// An unresolved binding or per-kind read failure. A successful unrelated
+    /// read cannot clear it or make cached data pass for fresh data.
     pub(super) error: Option<String>,
     errors: [Option<String>; 3],
     pub(super) meta: SessionMeta,
@@ -94,6 +93,11 @@ pub(super) struct TabLive {
     local_entries: Vec<SessionEntry>,
     pub(super) incarnation: u64,
     pub(super) observation: Option<Observation>,
+    pub(super) rebind_needed: bool,
+    pub(super) unbound: bool,
+    pub(super) rebind_ticket: Option<u64>,
+    pub(super) rebind_task: Option<supervised::Task<()>>,
+    pub(super) binding_error: Option<String>,
     /// Bumped whenever `entries` or `expanded_entries` change, so the
     /// transcript render cache knows when its wrapped lines are stale.
     pub(super) transcript_rev: u64,
@@ -107,6 +111,8 @@ impl TabLive {
         self.reload = RefreshSlot::default();
         self.status = RefreshSlot::default();
         self.activity = RefreshSlot::default();
+        self.rebind_task = None;
+        self.rebind_ticket = None;
     }
     pub(super) fn with_meta(meta: SessionMeta) -> Self {
         Self {
@@ -121,6 +127,7 @@ impl TabLive {
         self.reload.in_flight.is_some()
             || self.status.in_flight.is_some()
             || self.activity.in_flight.is_some()
+            || self.rebind_task.is_some()
     }
 }
 
@@ -268,6 +275,9 @@ pub(super) fn request(
     let Some(idx) = app.tab_index_for(session_db_id) else {
         return;
     };
+    if app.tabs[idx].live.unbound {
+        return;
+    }
     let db = app.tabs[idx].session_db.clone();
     let id = session_db_id.to_string();
     request_with(app, session_db_id, kind, tx, move |ticket| async move {
@@ -336,7 +346,14 @@ fn record_error(tab: &mut Tab, kind: RefreshKind, error: Option<String>) {
         tracing::warn!(session = %tab.session_db_id, ?kind, "Refresh failed: {e}");
     }
     tab.live.errors[kind as usize] = error;
-    tab.live.error = tab.live.errors.iter().find_map(Clone::clone);
+    sync_error(tab);
+}
+pub(super) fn sync_error(tab: &mut Tab) {
+    tab.live.error = tab
+        .live
+        .binding_error
+        .clone()
+        .or_else(|| tab.live.errors.iter().find_map(Clone::clone));
 }
 
 fn apply_active_turns(tab: &mut Tab, ticket: u64, active_turns: Result<usize, String>) -> bool {
@@ -466,17 +483,6 @@ pub(super) fn replace_status(tab: &mut Tab, status: Result<Vec<String>, String>)
         }
         Err(error) => record_error(tab, RefreshKind::Status, Some(error)),
     }
-}
-
-pub(super) fn replace_snapshot(
-    app: &mut App,
-    idx: usize,
-    snapshot: SessionSnapshot,
-    resolve: impl FnOnce(&str, &SessionMeta) -> Resolved,
-) {
-    let ticket = app.next_ticket();
-    record_error(&mut app.tabs[idx], RefreshKind::Session, None);
-    apply_session_snapshot(app, idx, ticket, snapshot, resolve);
 }
 
 fn apply_session_snapshot(
@@ -1063,6 +1069,7 @@ mod tests {
         assert_eq!(app.active().session_name.as_deref(), Some("last-good-name"));
         assert_eq!(app.active().live.status_segments, ["last-good-status"]);
         println!("CONTROL: service alive -> entries=1 name=last-good-name status_maps=1");
+        let dead_db = app.active().session_db.clone();
         drop(shutdown);
         task.await.unwrap().unwrap();
         assert!(
@@ -1120,6 +1127,16 @@ mod tests {
         };
         let (approval_tx, _approval_rx) = mpsc::channel(8);
         let (notify_tx, _notify_rx) = mpsc::channel(64);
+        // The runtime can reopen the DB even while presentation meta is
+        // malformed. A hydration failure must not strand its old IPC handle.
+        db.with_transaction(|txn| async move {
+            txn.get_store::<eidetica::store::DocStore>("meta")
+                .await?
+                .set_string("agents", "not-json")
+                .await
+        })
+        .await
+        .unwrap();
         let mut replacement = reconnect::rebuild(
             None,
             config,
@@ -1132,7 +1149,93 @@ mod tests {
         .map_err(|e| e.0)
         .unwrap();
         let backend = BackendManager::new(&None, replacement.built.secret_store.clone());
-        reconnect::apply(&mut app, &mut replacement, &backend);
+        reconnect::apply(&mut app, &mut replacement);
+        assert!(
+            load_active_turns(&app.active().session_db).await.is_ok(),
+            "partial hydration failure retained the dead DB handle"
+        );
+        assert_eq!(app.active().entries[0].content, "last-good-transcript");
+        assert_eq!(app.active().live.status_segments, ["last-good-status"]);
+        request(&mut app, &id.to_string(), RefreshKind::Session, &tx);
+        apply(&mut app, rx.recv().await.unwrap(), resolved);
+        assert_eq!(app.active().entries[0].content, "last-good-transcript");
+        assert!(app.active().live.failed(RefreshKind::Session));
+        db.with_transaction(|txn| async move {
+            txn.get_store::<eidetica::store::DocStore>("meta")
+                .await?
+                .set_string("agents", "[]")
+                .await
+        })
+        .await
+        .unwrap();
+        // A different partial failure: inject a failed per-tab open into the
+        // rebuilt runtime result. Global health must not hide this tab's need
+        // to reopen. The next retry runs the REAL open/observation path.
+        app.active_mut().session_db = dead_db;
+        app.active_mut().live.unbound = true;
+        app.active_mut().live.observation = None;
+        replacement.tabs.push(reconnect::Reopened {
+            id: id.to_string(),
+            incarnation: app.active().live.incarnation,
+            result: Err("controlled transient per-tab open failure".into()),
+        });
+        reconnect::apply(&mut app, &mut replacement);
+        assert!(app.backend_available && app.active().live.unbound);
+        assert!(app.active().live.rebind_needed);
+        app.input = "draft-during-loss-界".into();
+        app.cursor = app.input.len();
+        assert!(
+            input::handle_chat_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+                .is_none()
+        );
+        assert_eq!(app.input, "draft-during-loss-界");
+        assert!(
+            !app.operations.is_pending(),
+            "unbound tab admitted a write against dead DB"
+        );
+        let (binding_tx, mut binding_rx) = mpsc::channel(8);
+        let (approval_tx, _approval_rx) = mpsc::channel(8);
+        let (notify_tx, _notify_rx) = mpsc::channel(64);
+        reconnect::request_tabs(
+            &mut app,
+            &replacement.built.server,
+            &backend,
+            &approval_tx,
+            &notify_tx,
+            &binding_tx,
+        );
+        reconnect::request_tabs(
+            &mut app,
+            &replacement.built.server,
+            &backend,
+            &approval_tx,
+            &notify_tx,
+            &binding_tx,
+        );
+        let reconnect::ResultMessage::Tab { ticket, reopened } = binding_rx.recv().await.unwrap()
+        else {
+            panic!("expected per-tab retry")
+        };
+        let stale = reconnect::Reopened {
+            id: id.to_string(),
+            incarnation: app.active().live.incarnation,
+            result: Err("stale binding completion".into()),
+        };
+        assert!(reconnect::apply_retry(&mut app, ticket - 1, stale).is_none());
+        assert!(
+            app.active().live.rebind_task.is_some(),
+            "stale completion dropped replacement binding"
+        );
+        reconnect::apply_retry(&mut app, ticket, *reopened);
+        assert!(!app.active().live.rebind_needed);
+        assert!(app.active().live.observation.is_some());
+        assert!(
+            binding_rx.try_recv().is_err(),
+            "duplicate per-tab retry spawned"
+        );
+        println!(
+            "PARTIAL RECONNECT CONTRACT: PASS; independent handle install, last-good hydration, per-tab retry on same runtime, stale-ticket rejection, no dead-handle write admission"
+        );
         for kind in [
             RefreshKind::Session,
             RefreshKind::Status,

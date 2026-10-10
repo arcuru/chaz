@@ -9,9 +9,9 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent,
 use unicode_segmentation::UnicodeSegmentation;
 
 use super::{
-    AgentDiffMode, App, ChatAction, ClickTarget, Completion, ModelPickerScope, Overlay,
-    SettingsFocus, SettingsPicker, SettingsPickerIntent, SettingsPrompt, SettingsPromptIntent,
-    SettingsScope, TuiMode, show_error, show_system_msg,
+    AgentDiffMode, App, ChatAction, ClickTarget, Completion, DefaultsEdit, ModelPickerScope,
+    Overlay, SettingsFocus, SettingsPicker, SettingsPickerIntent, SettingsPrompt,
+    SettingsPromptIntent, SettingsScope, TuiMode, show_error, show_system_msg,
 };
 
 /// Grouped, ordered catalog of every built-in slash command. Single source of
@@ -253,6 +253,7 @@ pub(super) enum OverlayKey {
 /// `handle_chat_key` / picker handling so overlays intercept input before the
 /// underlying mode sees it.
 pub(super) fn handle_overlay_key(app: &mut App, key: KeyEvent) -> OverlayKey {
+    let backend_ready = app.backend_ready();
     let Some(overlay) = app.overlay.as_mut() else {
         return OverlayKey::NotConsumed;
     };
@@ -278,7 +279,7 @@ pub(super) fn handle_overlay_key(app: &mut App, key: KeyEvent) -> OverlayKey {
                 app.overlay = None;
             }
             KeyCode::Enter => {
-                if !app.backend_available || !app.operations.has_capacity() {
+                if !backend_ready || !app.operations.has_capacity() {
                     app.operations.notice = Some(
                         "Backend unavailable or action queue full — rename not submitted".into(),
                     );
@@ -688,7 +689,7 @@ pub(super) fn handle_chat_key(app: &mut App, key: KeyEvent) -> Option<ChatAction
                     Some(ChatAction::Dispatch(_) | ChatAction::SendMessage(_)) => true,
                     _ => false,
                 };
-                if backend_action && (!app.backend_available || !app.operations.has_capacity()) {
+                if backend_action && (!app.backend_ready() || !app.operations.has_capacity()) {
                     app.input = text;
                     app.cursor = cursor;
                     app.completion = completion;
@@ -805,7 +806,7 @@ pub(super) fn handle_chat_key(app: &mut App, key: KeyEvent) -> Option<ChatAction
                 app.completion = None;
                 app.completion_dismissed = true;
             } else {
-                app.should_quit = true;
+                app.should_quit = app.operations.request_exit();
             }
         }
         KeyCode::F(1) => {
@@ -1006,11 +1007,9 @@ pub(super) enum SettingsKey {
         name: String,
         mode: chaz_core::agent_diff::AgentMergeMode,
     },
-    /// Replace the persisted peer-level `default_agents` list. Triggered
-    /// by [d] / Ctrl+↑↓ / submitted [a] prompt on Peer→Defaults. Main
-    /// loop applies via Server::set_default_agents and persists to
-    /// `chaz_peer`.
-    WritePeerDefaults(Vec<String>),
+    /// An identity-based edit, evaluated against the ordered worker's latest
+    /// defaults rather than replacing it with a possibly stale UI snapshot.
+    EditPeerDefaults(DefaultsEdit),
 }
 
 /// Category/List/Content navigation. Content reads wrapped lines without
@@ -1119,7 +1118,7 @@ pub(super) fn handle_settings_key(
             Some(super::PeerSettingsCategory::Defaults)
         )
     {
-        if (!app.backend_available || !app.operations.has_capacity())
+        if (!app.backend_ready() || !app.operations.has_capacity())
             && (matches!(key.code, KeyCode::Char('d'))
                 || (key.modifiers.contains(KeyModifiers::CONTROL)
                     && matches!(key.code, KeyCode::Up | KeyCode::Down)))
@@ -1142,24 +1141,28 @@ pub(super) fn handle_settings_key(
                 return SettingsKey::None;
             }
             KeyCode::Char('d') if len > 0 => {
-                let mut next = app.peer_defaults.clone();
-                next.remove(cursor);
-                return SettingsKey::WritePeerDefaults(next);
+                return SettingsKey::EditPeerDefaults(DefaultsEdit::Remove(
+                    app.peer_defaults[cursor].clone(),
+                ));
             }
             // Ctrl+Up / Ctrl+Down reorder the selected row. No-op at the
             // ends — the routing host is first, so users almost always
             // want to bump items toward the top.
             KeyCode::Up if key.modifiers.contains(KeyModifiers::CONTROL) && cursor > 0 => {
-                let mut next = app.peer_defaults.clone();
-                next.swap(cursor, cursor - 1);
+                let edit = DefaultsEdit::Move {
+                    name: app.peer_defaults[cursor].clone(),
+                    neighbor: app.peer_defaults[cursor - 1].clone(),
+                };
                 app.peer_defaults_cursor = cursor - 1;
-                return SettingsKey::WritePeerDefaults(next);
+                return SettingsKey::EditPeerDefaults(edit);
             }
             KeyCode::Down if key.modifiers.contains(KeyModifiers::CONTROL) && cursor + 1 < len => {
-                let mut next = app.peer_defaults.clone();
-                next.swap(cursor, cursor + 1);
+                let edit = DefaultsEdit::Move {
+                    name: app.peer_defaults[cursor].clone(),
+                    neighbor: app.peer_defaults[cursor + 1].clone(),
+                };
                 app.peer_defaults_cursor = cursor + 1;
-                return SettingsKey::WritePeerDefaults(next);
+                return SettingsKey::EditPeerDefaults(edit);
             }
             _ => {}
         }
@@ -1330,7 +1333,7 @@ pub(super) fn handle_settings_key(
 /// modal in place and returns `None`.
 fn handle_agent_diff_key(app: &mut App, key: KeyEvent) -> SettingsKey {
     use chaz_core::agent_diff::{AgentMergeMode, FieldStatus};
-    if (!app.backend_available || !app.operations.has_capacity())
+    if (!app.backend_ready() || !app.operations.has_capacity())
         && matches!(key.code, KeyCode::Enter | KeyCode::Char('y' | 'R' | 'r'))
     {
         app.operations.notice =
@@ -1455,6 +1458,7 @@ fn handle_agent_diff_key(app: &mut App, key: KeyEvent) -> SettingsKey {
 /// `SettingsKey::PromptSubmit` on Enter with a selected candidate (reusing
 /// the existing prompt-submit dispatch path), `None` for all other keys.
 fn handle_settings_picker_key(app: &mut App, key: KeyEvent) -> SettingsKey {
+    let backend_ready = app.backend_ready();
     let Some(picker) = app.settings_picker.as_mut() else {
         return SettingsKey::None;
     };
@@ -1466,7 +1470,7 @@ fn handle_settings_picker_key(app: &mut App, key: KeyEvent) -> SettingsKey {
             app.settings_picker = None;
         }
         KeyCode::Enter => {
-            if !app.backend_available || !app.operations.has_capacity() {
+            if !backend_ready || !app.operations.has_capacity() {
                 app.operations.notice = Some(
                     "Backend unavailable or action queue full — selection not submitted".into(),
                 );
@@ -1542,6 +1546,7 @@ fn handle_settings_picker_key(app: &mut App, key: KeyEvent) -> SettingsKey {
 }
 
 fn handle_settings_prompt_key(app: &mut App, key: KeyEvent) -> SettingsKey {
+    let backend_ready = app.backend_ready();
     let Some(prompt) = app.settings_prompt.as_mut() else {
         return SettingsKey::None;
     };
@@ -1550,7 +1555,7 @@ fn handle_settings_prompt_key(app: &mut App, key: KeyEvent) -> SettingsKey {
             app.settings_prompt = None;
         }
         KeyCode::Enter => {
-            if !app.backend_available || !app.operations.has_capacity() {
+            if !backend_ready || !app.operations.has_capacity() {
                 app.operations.notice = Some(
                     "Backend unavailable or action queue full — Settings draft not submitted"
                         .into(),

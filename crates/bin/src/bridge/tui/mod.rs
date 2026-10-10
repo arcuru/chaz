@@ -44,6 +44,8 @@ mod reconnect;
 mod refresh;
 mod supervised;
 mod theme;
+#[cfg(test)]
+mod transition_tests;
 mod view;
 mod widgets;
 
@@ -105,7 +107,7 @@ enum Action {
     ApprovalRequest(TaggedApproval),
     /// A background catalog fetch finished. `Ok` carries the live model
     /// list (already merged with cache); `Err` carries a display message.
-    ModelsFetched(Result<Vec<ModelInfo>, String>),
+    ModelsFetched(ModelCatalog),
     SessionLoad(SessionLoad),
     JobsLoaded(Result<chaz_core::server::JobMonitor, String>),
     /// A background tab read finished (see [`refresh`]).
@@ -744,6 +746,7 @@ pub(super) struct App {
     /// a "Loading…" hint and the catalog rows haven't arrived yet.
     pub(super) model_picker_loading: bool,
     model_catalog_task: Option<supervised::Task<()>>,
+    model_catalog_ticket: u64,
     /// Set when the last fetch failed; cleared on a successful retry.
     pub(super) model_picker_error: Option<String>,
     /// Scope the picker is editing. Set at open time from the caller
@@ -900,6 +903,7 @@ impl App {
             model_picker_favorites: Vec::new(),
             model_picker_loading: false,
             model_catalog_task: None,
+            model_catalog_ticket: 0,
             model_picker_error: None,
             model_picker_scope: ModelPickerScope::Session,
             model_picker_current_pin: None,
@@ -1033,6 +1037,18 @@ impl App {
         &mut self.tabs[self.active_tab]
     }
 
+    /// Admission must not capture a known-dead per-tab DB after the global
+    /// runtime has recovered. Cached/local UI remains usable while it reopens.
+    fn backend_ready(&self) -> bool {
+        self.backend_available
+            && (matches!(
+                self.mode,
+                TuiMode::SessionPicker | TuiMode::Settings(SettingsScope::Peer)
+            ) || (self.mode == TuiMode::ModelPicker
+                && matches!(self.model_picker_scope, ModelPickerScope::AgentGlobal(_)))
+                || self.current().is_none_or(|tab| !tab.live.unbound))
+    }
+
     /// The focused conversation, if any is open.
     pub(super) fn current(&self) -> Option<&Tab> {
         self.tabs.get(self.active_tab)
@@ -1104,6 +1120,27 @@ impl App {
             self.restore_draft();
         } else if i < self.active_tab {
             self.active_tab -= 1;
+        }
+        self.ensure_view();
+    }
+
+    /// Restore the view contract immediately after a mutation, before any
+    /// next batched handler or pre-click draw can access a conversation.
+    fn ensure_view(&mut self) -> bool {
+        let needs_conversation = match self.mode {
+            TuiMode::Chat | TuiMode::Settings(SettingsScope::Session) => true,
+            TuiMode::ModelPicker => {
+                !matches!(self.model_picker_scope, ModelPickerScope::AgentGlobal(_))
+            }
+            TuiMode::SessionPicker | TuiMode::Settings(SettingsScope::Peer) => false,
+        };
+        if self.tabs.is_empty() && needs_conversation {
+            self.settings_return = None;
+            self.session_settings_snapshot = None;
+            self.mode = TuiMode::SessionPicker;
+            true
+        } else {
+            false
         }
     }
 
@@ -1528,23 +1565,55 @@ pub(super) fn model_caps_badge(m: &ModelInfo) -> String {
 fn spawn_catalog_load(
     app: &mut App,
     backend: BackendManager,
-    models_tx: mpsc::Sender<Result<Vec<ModelInfo>, String>>,
+    models_tx: mpsc::Sender<ModelCatalog>,
+) {
+    start_catalog_load(app, models_tx, async move {
+        backend
+            .fetch_models_with_info()
+            .await
+            .map_err(|e| e.to_string())
+    });
+}
+
+struct ModelCatalog {
+    ticket: u64,
+    result: Result<Vec<ModelInfo>, String>,
+}
+
+fn start_catalog_load(
+    app: &mut App,
+    models_tx: mpsc::Sender<ModelCatalog>,
+    load: impl Future<Output = Result<Vec<ModelInfo>, String>> + Send + 'static,
 ) {
     if app.model_picker_loading {
         return;
     }
+    app.model_catalog_ticket += 1;
+    let ticket = app.model_catalog_ticket;
     app.model_picker_loading = true;
     app.model_picker_error = None;
     app.model_catalog_task = Some(supervised::Task(tokio::spawn(async move {
-        let res = supervised::read(async move {
-            backend
-                .fetch_models_with_info()
-                .await
-                .map_err(|e| e.to_string())
-        })
-        .await;
-        let _ = models_tx.send(res).await;
+        let result = supervised::read(load).await;
+        let _ = models_tx.send(ModelCatalog { ticket, result }).await;
     })));
+}
+
+fn apply_model_catalog(app: &mut App, completion: ModelCatalog) {
+    // A cancelled task can already have enqueued its result. Validate BEFORE
+    // dropping task ownership or clearing the replacement's loading state.
+    if completion.ticket != app.model_catalog_ticket {
+        return;
+    }
+    app.model_picker_loading = false;
+    app.model_catalog_task = None;
+    match completion.result {
+        Ok(catalog) => {
+            app.model_picker_error = None;
+            app.session_catalog = Some(catalog.clone());
+            app.rebuild_model_list(catalog);
+        }
+        Err(msg) => app.model_picker_error = Some(msg),
+    }
 }
 
 /// Enter the picker synchronously, then fetch catalog metadata in the
@@ -1819,14 +1888,7 @@ fn cycle_tab(app: &mut App, delta: i32) {
 /// The hub is the base view: whenever no conversation is open, a
 /// conversation-scoped mode falls back to it.
 fn ensure_view(app: &mut App, server: &Arc<Server>, session_rows_tx: &mpsc::Sender<SessionLoad>) {
-    let needs_conversation = match app.mode {
-        TuiMode::Chat | TuiMode::Settings(SettingsScope::Session) => true,
-        TuiMode::ModelPicker => !matches!(app.model_picker_scope, ModelPickerScope::AgentGlobal(_)),
-        TuiMode::Jobs | TuiMode::SessionPicker | TuiMode::Settings(SettingsScope::Peer) => false,
-    };
-    if app.tabs.is_empty() && needs_conversation {
-        app.settings_return = None;
-        app.session_settings_snapshot = None;
+    if app.ensure_view() {
         open_session_picker(app, server, session_rows_tx);
     } else if app.mode == TuiMode::SessionPicker
         && !app.session_list_fresh
@@ -1864,7 +1926,7 @@ fn handle_chat_action(
     secrets: &SecretStore,
     approval_tx: &mpsc::Sender<TaggedApproval>,
     notify_tx: &mpsc::Sender<String>,
-    models_tx: &mpsc::Sender<Result<Vec<ModelInfo>, String>>,
+    models_tx: &mpsc::Sender<ModelCatalog>,
     session_rows_tx: &mpsc::Sender<SessionLoad>,
 ) {
     if app.current().is_some_and(|tab| tab.job.is_some())
@@ -2031,7 +2093,7 @@ fn dispatch_model_selection(
     approval_tx: &mpsc::Sender<TaggedApproval>,
     notify_tx: &mpsc::Sender<String>,
 ) {
-    if !app.backend_available || !app.operations.has_capacity() {
+    if !app.backend_ready() || !app.operations.has_capacity() {
         app.operations.notice =
             Some("Backend unavailable or action queue full — model selection not accepted".into());
         return;
@@ -2064,7 +2126,7 @@ fn handle_settings_outcome(
     secrets: &SecretStore,
     approval_tx: &mpsc::Sender<TaggedApproval>,
     notify_tx: &mpsc::Sender<String>,
-    models_tx: &mpsc::Sender<Result<Vec<ModelInfo>, String>>,
+    models_tx: &mpsc::Sender<ModelCatalog>,
     session_rows_tx: &mpsc::Sender<SessionLoad>,
 ) {
     match outcome {
@@ -2110,29 +2172,7 @@ fn handle_settings_outcome(
             intent: SettingsPromptIntent::AddPeerDefault,
             value,
         } => {
-            let server = server.clone();
-            operations::submit(app, true, None, async move {
-                let name = value.trim().to_string();
-                if !server.agents().names().contains(&name) {
-                    return Err(format!("No agent named '{name}' — not added"));
-                }
-                let mut next = server.default_agents();
-                if next.contains(&name) {
-                    return Ok(operations::Effect::Settings(format!(
-                        "'{name}' already in defaults"
-                    )));
-                }
-                next.push(name.clone());
-                server
-                    .registry()
-                    .save_peer_default_agents(&next)
-                    .await
-                    .map_err(|e| e.to_string())?;
-                server.set_default_agents(next);
-                Ok(operations::Effect::Settings(format!(
-                    "Added '{name}' to defaults"
-                )))
-            });
+            submit_defaults_edit(app, server, DefaultsEdit::Add(value.trim().to_string()));
         }
         input::SettingsKey::OpenAgentDiff { name } => {
             let server = server.clone();
@@ -2180,25 +2220,79 @@ fn handle_settings_outcome(
                 Ok(operations::Effect::Settings(text))
             });
         }
-        input::SettingsKey::WritePeerDefaults(names) => {
-            if !app.backend_available || !app.operations.has_capacity() {
-                return;
-            }
-            // Pending preview, not a persisted-success claim. Later relative
-            // key actions derive from this ordered preview, not old DB state.
-            app.peer_defaults.clone_from(&names);
-            let server = server.clone();
-            operations::submit(app, true, None, async move {
-                server
-                    .registry()
-                    .save_peer_default_agents(&names)
-                    .await
-                    .map_err(|e| e.to_string())?;
-                server.set_default_agents(names);
-                Ok(operations::Effect::Settings("Defaults saved".into()))
-            });
+        input::SettingsKey::EditPeerDefaults(edit) => {
+            submit_defaults_edit(app, server, edit);
         }
     }
+}
+
+#[derive(Clone)]
+enum DefaultsEdit {
+    Add(String),
+    Remove(String),
+    Move { name: String, neighbor: String },
+}
+impl DefaultsEdit {
+    fn apply(&self, names: &mut Vec<String>) -> Result<String, String> {
+        match self {
+            Self::Add(name) => {
+                if names.contains(name) {
+                    return Ok(format!("'{name}' already in defaults"));
+                }
+                names.push(name.clone());
+                Ok(format!("Added '{name}' to defaults"))
+            }
+            Self::Remove(name) => {
+                names.retain(|n| n != name);
+                Ok(format!("Removed '{name}' from defaults"))
+            }
+            Self::Move { name, neighbor } => {
+                let i = names.iter().position(|n| n == name);
+                let j = names.iter().position(|n| n == neighbor);
+                let (Some(i), Some(j)) = (i, j) else {
+                    return Err(
+                        "Defaults changed — selected move target is no longer present".into(),
+                    );
+                };
+                names.swap(i, j);
+                Ok("Defaults reordered".into())
+            }
+        }
+    }
+}
+
+fn submit_defaults_edit(app: &mut App, server: &Arc<Server>, edit: DefaultsEdit) {
+    if !app.backend_ready() || !app.operations.has_capacity() {
+        app.operations.notice =
+            Some("Backend unavailable or action queue full — defaults edit not accepted".into());
+        return;
+    }
+    if let DefaultsEdit::Add(name) = &edit
+        && !server.agents().names().contains(name)
+    {
+        app.settings_status = Some(format!("No agent named '{name}' — not added"));
+        return;
+    }
+    let mut preview = app.peer_defaults.clone();
+    if let Err(error) = edit.apply(&mut preview) {
+        app.settings_status = Some(error);
+        return;
+    }
+    // Preview every accepted edit (including adds), so the next key targets
+    // the row the user sees. Persistence uses worker state, NEVER this preview.
+    app.peer_defaults = preview;
+    let server = server.clone();
+    operations::submit(app, true, None, async move {
+        let mut names = server.default_agents();
+        let text = edit.apply(&mut names)?;
+        server
+            .registry()
+            .save_peer_default_agents(&names)
+            .await
+            .map_err(|e| e.to_string())?;
+        server.set_default_agents(names);
+        Ok(operations::Effect::Settings(text))
+    });
 }
 
 /// Translate the Models page row cursor into the picker scope.

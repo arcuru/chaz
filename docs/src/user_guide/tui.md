@@ -344,17 +344,17 @@ A model picker returns to its Settings page on selection or `Esc`; canceling wri
 
 These tables list every category in sidebar order. Read-only pages are inspectors, not editors waiting for an apply key. The six **coming soon** pages are placeholders and have no settings controls.
 
-| Peer category | Current behavior                                                                                                                                                                                                                                                                              |
-| ------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Agents        | Inspect hosted agents and selected-agent details. In List or Content, `Enter` picks the agent's DB-default model. `r` opens a YAML diff: `r` applies the additive drift merge, `R` requests a full reseed with confirmation, and `a` lets you pick fields (`Space` toggles, `Enter` applies). |
-| Backends      | Read-only backend names, API base URLs, and configured/known model counts; no credential editor.                                                                                                                                                                                              |
-| Defaults      | Edit the ordered agents attached to new sessions; the first is the routing host. `a` opens an add prompt, `d` removes the selected row, and `Ctrl+↑` / `Ctrl+↓` reorder it. Changes persist in the peer DB, not YAML, and do not change existing session rosters.                             |
-| Bridges       | Read-only status: TUI active, CLI available, Matrix/Discord external binaries.                                                                                                                                                                                                                |
-| Extensions    | **Coming soon.**                                                                                                                                                                                                                                                                              |
-| MCP           | Read-only server list and selected-server status, tools, and failure details.                                                                                                                                                                                                                 |
-| Groups        | **Coming soon.**                                                                                                                                                                                                                                                                              |
-| Identity      | **Coming soon.**                                                                                                                                                                                                                                                                              |
-| About         | Read-only version, state directory, in-process bridges, and configuration/count summary.                                                                                                                                                                                                      |
+| Peer category | Current behavior                                                                                                                                                                                                                                                                                                                                                                |
+| ------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Agents        | Inspect hosted agents and selected-agent details. In List or Content, `Enter` picks the agent's DB-default model. `r` opens a YAML diff: `r` applies the additive drift merge, `R` requests a full reseed with confirmation, and `a` lets you pick fields (`Space` toggles, `Enter` applies).                                                                                   |
+| Backends      | Read-only backend names, API base URLs, and configured/known model counts; no credential editor.                                                                                                                                                                                                                                                                                |
+| Defaults      | Edit the ordered agents attached to new sessions; the first is the routing host. `a` opens an add prompt, `d` removes the selected row, and `Ctrl+↑` / `Ctrl+↓` reorder it. Changes persist in the peer DB, not YAML, and do not change existing session rosters. Accepted edits apply in order to the latest defaults; a pending add is not lost by a later remove or reorder. |
+| Bridges       | Read-only status: TUI active, CLI available, Matrix/Discord external binaries.                                                                                                                                                                                                                                                                                                  |
+| Extensions    | **Coming soon.**                                                                                                                                                                                                                                                                                                                                                                |
+| MCP           | Read-only server list and selected-server status, tools, and failure details.                                                                                                                                                                                                                                                                                                   |
+| Groups        | **Coming soon.**                                                                                                                                                                                                                                                                                                                                                                |
+| Identity      | **Coming soon.**                                                                                                                                                                                                                                                                                                                                                                |
+| About         | Read-only version, state directory, in-process bridges, and configuration/count summary.                                                                                                                                                                                                                                                                                        |
 
 | Session category | Current behavior                                                                                                                               |
 | ---------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -577,16 +577,16 @@ A completion addresses the requesting tab incarnation, never whichever tab
 happens to be focused. Closing and reopening a tab cannot apply its old results.
 A delayed open does not take focus after newer local navigation.
 
-| Trigger / display                      | Behavior                                                                |
-| -------------------------------------- | ----------------------------------------------------------------------- |
-| Session write / Settings open          | Coalesced background transcript/meta/status refresh                     |
-| Every five seconds                     | Refresh activity; check service health and retry failed reads           |
-| `⟳ refreshing (cached)`                | A read is pending; displayed data is the last successful read           |
-| `⚠ refresh failed`                     | That read failed; last-good data remains, even if another read succeeds |
-| `action(s) pending`                    | Accepted backend actions execute in order, one at a time                |
-| Queue full or backend disconnected     | New backend actions are not accepted; composer/prompts stay editable    |
-| `Write still pending; outcome unknown` | A deadline warns, but does not cancel, retry or advance past the write  |
-| Ctrl+C with unfinished actions         | Warn first; a second Ctrl+C explicitly exits and abandons queued work   |
+| Trigger / display                      | Behavior                                                                          |
+| -------------------------------------- | --------------------------------------------------------------------------------- |
+| Session write / Settings open          | Coalesced background transcript/meta/status refresh                               |
+| Every five seconds                     | Refresh activity; check service health and retry failed reads                     |
+| `⟳ refreshing (cached)`                | A read is pending; displayed data is the last successful read                     |
+| `⚠ refresh failed`                     | That read failed; last-good data remains, even if another read succeeds           |
+| `action(s) pending`                    | Accepted backend actions execute in order, one at a time                          |
+| Queue full or backend disconnected     | New backend actions are not accepted; composer/prompts stay editable              |
+| `Write still pending; outcome unknown` | A deadline warns, but does not cancel, retry or advance past the write            |
+| Quit with unfinished actions           | Esc (without popup), Ctrl+C and `/quit` warn first; repeat to abandon queued work |
 
 ### Cached is not confirmed
 
@@ -609,8 +609,13 @@ On an actual service disconnect, the TUI keeps the cached view and draft. Once
 accepted actions settle, it tears down the old runtime and reconnects through
 the normal connector using the same configured login and execution role.
 Successful recovery reopens the same session IDs and refreshes their caches;
-it does not replay submitted messages or commands. A slow health read alone
-is not grounds to replace a runtime. Configuration/login errors are displayed,
+it does not replay submitted messages or commands. Handle reopening is separate
+from hydration: a failed transcript read retains cached history while status can
+refresh independently. A tab that could not reopen retries on the healthy runtime
+without restarting other tabs. That tab refuses backend writes until its handle
+is available, but its cached view and draft remain usable. Admission/reconnect
+notices clear on acceptance, completion or recovery; unresolved write outcomes
+remain visible independently. A slow health read alone is not grounds to replace a runtime. Configuration/login errors are displayed,
 not retried indefinitely.
 
 Pending keypresses and wheel notches are handled in order, but can draw as one
@@ -641,16 +646,16 @@ all history for each keystroke.
    draft remains editable. Do not assume a previously submitted message failed
    to commit just because the service went away.
 
-3. When the service returns, the same views refresh and the draft survives:
-
-   ```text
-   Backend reconnected; writes were not replayed
-   ```
+3. When the service returns, the same views refresh and the draft survives.
+   The disconnect notice clears; `⟳ refreshing (cached)` remains while a read
+   is pending. If only transcript hydration fails, `⚠ refresh failed` and the
+   cached transcript remain even after the extension status becomes fresh.
+   A later successful read clears that read's error without replaying a write.
 
    Check the transcript or persisted command result before explicitly retrying
    any unconfirmed action. If you instead exit while work is pending, the first
-   Ctrl+C warns; Ctrl+C again restores the terminal and reports queued versus
-   potentially committed work, including unconfirmed accepted input.
+   quit request warns; repeating it restores the terminal and reports queued
+   versus potentially committed work, including unconfirmed accepted input.
 
 ## Entry Types
 

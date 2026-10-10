@@ -102,8 +102,13 @@ A service-connected executable gives the TUI ownership of its `BuiltServer`.
 Transport loss stops new backend admission and cancels presentation work while
 keeping cached views/drafts. After accepted actions settle, one owned worker
 shuts down the old runtime before using the existing connector/build path to
-replace it. Fresh observations/snapshots apply only to still-existing tab
-incarnations. A health-read timeout is not itself proof of transport loss, and
+replace it. Fresh handles apply only to still-existing tab incarnations, independently of
+snapshot/status hydration. Failed per-tab opens or observations retry on the
+healthy generation with an owned ticketed read; they do not reconstruct the
+runtime or replay accepted writes. Presentation failures retain last-good caches.
+Catalog completions validate their generation before releasing task ownership.
+Defaults edits capture selected row identities and apply semantically against
+ordered worker state, not stale UI replacement snapshots. A health-read timeout is not itself proof of transport loss, and
 runtime replacement does not replay UI actions. See
 [background refresh](../user_guide/tui.md#responsiveness-and-background-refresh)
 for pending, failure and exit behavior.

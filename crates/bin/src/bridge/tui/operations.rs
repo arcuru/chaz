@@ -70,6 +70,7 @@ pub(super) struct Operations {
     exit_confirm: bool,
     current_input: Option<String>,
     uncertain_inputs: Vec<String>,
+    uncertainty: Vec<String>,
     next_ticket: u64,
     current_ticket: Option<u64>,
     current_origin: Option<Origin>,
@@ -89,6 +90,7 @@ impl Default for Operations {
             exit_confirm: false,
             current_input: None,
             uncertain_inputs: Vec::new(),
+            uncertainty: Vec::new(),
             next_ticket: 0,
             current_ticket: None,
             current_origin: None,
@@ -104,16 +106,23 @@ impl Drop for Operations {
 }
 impl Operations {
     pub(super) fn indicator(&self) -> String {
+        let mut status = String::new();
         if let Some(notice) = &self.notice {
-            format!(" | ⚠ {notice}")
-        } else if self.is_pending() {
-            format!(
+            status.push_str(&format!(" | ⚠ {notice}"));
+        }
+        if self.is_pending() {
+            status.push_str(&format!(
                 " | {} action(s) pending",
                 self.queue.len() + usize::from(self.task.is_some())
-            )
-        } else {
-            String::new()
+            ));
         }
+        if self.warned {
+            status.push_str(" | ⚠ Write still pending; outcome unknown. Not cancelled or retried; later actions remain queued");
+        }
+        if let Some(uncertain) = self.uncertainty.last() {
+            status.push_str(&format!(" | ⚠ {uncertain}"));
+        }
+        status
     }
     pub(super) fn has_capacity(&self) -> bool {
         self.queue.len() + usize::from(self.task.is_some()) < CAPACITY
@@ -143,6 +152,7 @@ impl Operations {
             work: Some(Box::pin(work)),
         });
         self.exit_confirm = false;
+        self.notice = None;
         self.start();
         true
     }
@@ -178,7 +188,6 @@ impl Operations {
         if self.write && !self.warned && self.started.is_some_and(|t| t.elapsed() >= WRITE_WARNING)
         {
             self.warned = true;
-            self.notice = Some("Write still pending; outcome unknown. Not cancelled or retried; later actions remain queued".into());
             return true;
         }
         false
@@ -194,7 +203,7 @@ impl Operations {
         }
         self.exit_confirm = true;
         self.notice = Some(format!(
-            "Ctrl+C again to exit: {} queued action(s) cancelled before starting; in-flight {} may already have effects",
+            "Quit again to exit: {} queued action(s) would be cancelled before starting; in-flight {} may already have effects",
             self.queue.len(),
             if self.write { "write" } else { "read" }
         ));
@@ -208,7 +217,7 @@ impl Operations {
             .chain(self.uncertain_inputs.iter())
             .cloned()
             .collect();
-        (self.is_pending() || !inputs.is_empty()).then(|| format!("Exited with unfinished/unconfirmed actions: queued actions were cancelled before starting; a started write may already have committed. Check the session before retrying.\nUnconfirmed accepted inputs:\n{}", inputs.join("\n---\n")))
+        (self.is_pending() || !inputs.is_empty() || !self.uncertainty.is_empty()).then(|| format!("Exited with unfinished/unconfirmed actions: queued actions were cancelled before starting; a started write may already have committed. Check the session before retrying.\nUnconfirmed accepted inputs:\n{}\nUnresolved outcomes:\n{}", inputs.join("\n---\n"), self.uncertainty.join("\n---\n")))
     }
 }
 
@@ -250,7 +259,7 @@ pub(super) fn submit(
     input: Option<String>,
     work: impl Future<Output = Result<Effect, String>> + Send + 'static,
 ) {
-    if !app.backend_available {
+    if !app.backend_ready() {
         app.operations.notice = Some("Backend unavailable — action not accepted".into());
         return;
     }
@@ -269,9 +278,9 @@ pub(super) fn apply(app: &mut App, completion: Completion) {
     app.operations.task.take();
     app.operations.started = None;
     app.operations.current_input = None;
-    if app.operations.warned && !app.operations.exit_confirm {
-        app.operations.notice = None;
-    }
+    app.operations.warned = false;
+    app.operations.exit_confirm = false;
+    app.operations.notice = None;
     let Completion { pending, result } = completion;
     let nav_valid = pending.origin.navigation_valid(app);
     let target = pending.origin.tab_index(app);
@@ -303,7 +312,11 @@ pub(super) fn apply(app: &mut App, completion: Completion) {
                     app.settings_status = Some(notice.clone());
                 }
             }
-            app.operations.notice = Some(notice);
+            if pending.write {
+                app.operations.uncertainty.push(notice);
+            } else {
+                app.operations.notice = Some(notice);
+            }
         }
         Ok(Effect::Opened(tab)) => {
             app.session_list_fresh = false;
@@ -553,6 +566,61 @@ mod tests {
         KeyEvent::new(code, KeyModifiers::NONE)
     }
 
+    #[tokio::test]
+    async fn escape_confirms_accepted_work_but_first_dismisses_completion() {
+        let mut app = app().await;
+        submit(
+            &mut app,
+            true,
+            Some("accepted".into()),
+            std::future::pending(),
+        );
+        submit(
+            &mut app,
+            true,
+            Some("queued".into()),
+            std::future::pending(),
+        );
+        app.input = "/".into();
+        app.cursor = 1;
+        input::recompute_completion(&mut app);
+        assert!(app.completion.is_some());
+        input::handle_chat_key(&mut app, key(KeyCode::Esc));
+        assert!(!app.should_quit && app.completion.is_none());
+        assert_eq!(app.input, "/");
+        input::handle_chat_key(&mut app, key(KeyCode::Esc));
+        assert!(!app.should_quit, "Esc silently abandoned accepted work");
+        assert!(app.operations.is_pending());
+        assert!(app.operations.indicator().contains("again to exit"));
+        input::handle_chat_key(&mut app, key(KeyCode::Esc));
+        assert!(app.should_quit, "explicit second exit was not honored");
+        assert!(app.operations.exit_report().unwrap().contains("queued"));
+    }
+
+    #[tokio::test]
+    async fn transient_notice_clears_on_acceptance_without_losing_write_uncertainty() {
+        let mut app = app().await;
+        app.backend_available = false;
+        submit(&mut app, true, None, async { Ok(Effect::Sent) });
+        assert!(app.operations.indicator().contains("not accepted"));
+        app.backend_available = true;
+        submit(&mut app, true, Some("uncertain".into()), async {
+            Err("lost write".into())
+        });
+        assert!(
+            !app.operations.indicator().contains("not accepted"),
+            "rejection masked accepted work"
+        );
+        complete(&mut app).await;
+        assert!(app.operations.indicator().contains("outcome unknown"));
+        app.operations.notice = Some("Backend reconnected; writes were not replayed".into());
+        submit(&mut app, true, None, async { Ok(Effect::Sent) });
+        assert!(!app.operations.indicator().contains("reconnected"));
+        complete(&mut app).await;
+        assert!(app.operations.indicator().contains("outcome unknown"));
+        assert!(app.operations.exit_report().unwrap().contains("uncertain"));
+    }
+
     #[tokio::test(start_paused = true)]
     async fn accepted_actions_are_ordered_and_a_late_write_is_not_cancelled_or_retried() {
         let mut app = app().await;
@@ -580,13 +648,7 @@ mod tests {
         assert_eq!(app.active().scroll_offset, 20);
         tokio::time::advance(WRITE_WARNING * 2).await;
         assert!(app.operations.warn_if_late());
-        assert!(
-            app.operations
-                .notice
-                .as_ref()
-                .unwrap()
-                .contains("outcome unknown")
-        );
+        assert!(app.operations.indicator().contains("outcome unknown"));
         assert_eq!(
             *order.lock().unwrap(),
             [1],
@@ -668,13 +730,7 @@ mod tests {
                 .unwrap()
                 .contains("uncertain input")
         );
-        assert!(
-            app.operations
-                .notice
-                .as_ref()
-                .unwrap()
-                .contains("outcome unknown")
-        );
+        assert!(app.operations.indicator().contains("outcome unknown"));
         let drops = Arc::new(AtomicUsize::new(0));
         struct Guard(Arc<AtomicUsize>);
         impl Drop for Guard {
