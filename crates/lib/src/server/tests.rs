@@ -904,7 +904,7 @@ async fn server_fixture() -> (Instance, Arc<Server>, Arc<crate::session::Session
 async fn server_fixture_with_host(
     host: Arc<dyn ToolHost>,
 ) -> (Instance, Arc<Server>, Arc<crate::session::SessionRegistry>) {
-    server_fixture_with_host_and_hub(host, Arc::new(crate::extension::ExtensionHub::new())).await
+    server_fixture_with_host_and_hub(host, Arc::new(crate::test_support::context_hub().await)).await
 }
 
 async fn server_fixture_with_host_and_hub(
@@ -977,7 +977,7 @@ async fn server_fixture_from_registry(
         HashMap::new(),
         Default::default(),
         Arc::new(crate::tool_host::NativeToolHost::new()),
-        Arc::new(crate::extension::ExtensionHub::new()),
+        Arc::new(crate::test_support::context_hub().await),
         default_backend,
         Arc::new(crate::mcp::McpRegistry::new()),
         Some(crate::instance::ExecutorCapability::for_test()),
@@ -1007,7 +1007,7 @@ async fn client_server_fixture_from_registry(
         HashMap::new(),
         Default::default(),
         Arc::new(crate::tool_host::NativeToolHost::new()),
-        Arc::new(crate::extension::ExtensionHub::new()),
+        Arc::new(crate::test_support::context_hub().await),
         crate::backends::BackendManager::new(&None, secrets),
         Arc::new(crate::mcp::McpRegistry::new()),
         None,
@@ -5222,7 +5222,7 @@ async fn resident_executor_adopts_and_processes_local_client_session() {
         HashMap::new(),
         Default::default(),
         Arc::new(crate::tool_host::NativeToolHost::new()),
-        Arc::new(crate::extension::ExtensionHub::new()),
+        Arc::new(crate::test_support::context_hub().await),
         backend,
         Arc::new(crate::mcp::McpRegistry::new()),
         Some(crate::instance::ExecutorCapability::for_test()),
@@ -5364,7 +5364,7 @@ async fn service_restart_reopens_and_reconciles_persisted_work() {
         HashMap::new(),
         Default::default(),
         Arc::new(crate::tool_host::NativeToolHost::new()),
-        Arc::new(crate::extension::ExtensionHub::new()),
+        Arc::new(crate::test_support::context_hub().await),
         backend,
         Arc::new(crate::mcp::McpRegistry::new()),
         Some(crate::instance::ExecutorCapability::for_test()),
@@ -6086,7 +6086,7 @@ async fn published_executor_with_mock(
         HashMap::new(),
         Default::default(),
         Arc::new(crate::tool_host::NativeToolHost::new()),
-        Arc::new(crate::extension::ExtensionHub::new()),
+        Arc::new(crate::test_support::context_hub().await),
         backend,
         Arc::new(crate::mcp::McpRegistry::new()),
         Some(crate::instance::ExecutorCapability::for_test()),
@@ -7118,7 +7118,7 @@ async fn chaz_query_reports_persisted_agent_job_tool_ceilings() {
         HashMap::new(),
         Default::default(),
         host.clone(),
-        Arc::new(crate::extension::ExtensionHub::new()),
+        Arc::new(crate::test_support::context_hub().await),
         backend,
         Arc::new(crate::mcp::McpRegistry::new()),
         Some(crate::instance::ExecutorCapability::for_test()),
@@ -7722,6 +7722,7 @@ async fn job_wait_executor_shutdown_and_claim_loss_stop_observation_or_reacquisi
                 .create_session(Some("stoppable-wait"))
                 .await
                 .unwrap();
+            server.extensions.record_active(&db).await.unwrap();
             let entered = Arc::new(tokio::sync::Notify::new());
             let finish = Arc::new(tokio::sync::Notify::new());
             server.tools.register(StoppableWait {
@@ -7961,6 +7962,7 @@ async fn durable_context_server_commits_before_dispatch_and_preserves_native_exc
     }
     let (_peer_instance, peer_registry) = crate::test_support::fresh_session_registry().await;
     let mut hub = crate::extension::ExtensionHub::new();
+    hub.set_context_strategy_grant(&Default::default()).unwrap();
     hub.set_peer_handles(Arc::new(crate::extension::PeerHandles {
         registry: peer_registry,
         agent_index: HostedIndex::empty("agent"),
@@ -7978,7 +7980,12 @@ async fn durable_context_server_commits_before_dispatch_and_preserves_native_exc
         required: true,
     }])
     .unwrap();
-    hub.install_all(vec![Arc::new(Ext)]).await.unwrap();
+    hub.install_all(vec![
+        Arc::new(crate::extensions::context::BaselineContext),
+        Arc::new(Ext),
+    ])
+    .await
+    .unwrap();
     let hub = Arc::new(hub);
     let (_instance, server, registry) = server_fixture_with_host_and_hub(
         Arc::new(crate::tool_host::NativeToolHost::new()),

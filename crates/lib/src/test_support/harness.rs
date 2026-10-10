@@ -155,3 +155,26 @@ pub(crate) fn tool_context_with_host(
         routine_engine: None,
     }
 }
+
+/// Install the required baseline through ordinary public APIs for synthetic hosts.
+pub(crate) async fn context_hub() -> crate::extension::ExtensionHub {
+    let (_, registry) = fresh_session_registry().await;
+    let mut hub = crate::extension::ExtensionHub::new();
+    hub.set_peer_handles(Arc::new(crate::extension::PeerHandles {
+        registry,
+        agent_index: crate::hosted_index::HostedIndex::empty("agent"),
+        memory_bank_index: crate::hosted_index::HostedIndex::empty("bank"),
+        skill_bank_index: crate::hosted_index::HostedIndex::empty("skill_bank"),
+        embedder: None,
+        secrets: None,
+        server_slot: Default::default(),
+        mcp_registry: Arc::new(crate::mcp::McpRegistry::new()),
+        agent_state_allowlist: Default::default(),
+        tool_registry: Arc::new(ToolRegistry::new()),
+    }));
+    hub.set_context_strategy_grant(&Default::default()).unwrap();
+    hub.install_all(vec![Arc::new(crate::extensions::context::BaselineContext)])
+        .await
+        .unwrap();
+    hub
+}

@@ -334,8 +334,7 @@ impl caps::PromptAugmentation for FixedAug {
 impl caps::ContextTail for FixedAug {
     fn context_tail<'a>(
         &'a self,
-        _agent_name: &'a str,
-        _recent: &'a [String],
+        _call: &'a caps::ContextTailCall<'a>,
     ) -> caps::CapFuture<'a, Option<String>> {
         let text = self.0.to_string();
         Box::pin(async move { Ok(Some(text)) })

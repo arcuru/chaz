@@ -3410,9 +3410,22 @@ impl Server {
                         .with_room_participants(&roster)
                         .with_extension_hub(spawn_extensions.clone())
                         .with_session_db(s.database())
-                        .build()
+                        .with_invocation(&active_extensions, Some(attempt.request_id.as_str()))
+                        .try_build()
                         .await;
                 (session_model, assembled)
+            };
+            let assembled = match assembled {
+                Ok(assembled) => assembled,
+                Err(error) => {
+                    error!(%error, "Required context selection refused dispatch");
+                    let mut s = session.lock().await;
+                    if let Err(error) = s.complete_turn_attempt(&attempt, Some(SessionEntry {
+                        sender: agent_name.clone(), content: format!("Error: {error}"), timestamp: Utc::now(),
+                        entry_type: EntryType::Error, metadata: None, routing: None,
+                    })).await { error!(%error, "Failed to record context refusal"); }
+                    return;
+                }
             };
             // Per-agent override > session pin > agent default. See
             // `run_schedule_turn` for the matching path on scheduled fires.
@@ -3438,6 +3451,8 @@ impl Server {
             });
 
             let scope = runtime::ModelCallScope {
+                cache: assembled.cache,
+                context_strategy: assembled.strategy,
                 attempt_id: Some(attempt.attempt_id.clone()),
                 request_budget_tokens: Some(assembled.request_budget_tokens),
                 sources: assembled.sources,

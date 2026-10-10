@@ -11,7 +11,7 @@ use serde_json::{Map, Value};
 
 use crate::{
     backends::{ChatContext, LLMBackend},
-    cache::{CacheControl, CacheRegion},
+    cache::{CacheAnchor, CacheControl, CacheOptions},
     config::{Backend, ReasoningConfig},
     error::LlmError,
     runtime::{LLMResponse, ResponseMetadata, RuntimeMessage, TokenUsage, ToolCallRequest},
@@ -383,15 +383,36 @@ impl OpenAI {
         tools: &[ToolDefinition],
         model: &str,
     ) -> Result<LLMResponse, LlmError> {
+        self.chat_with_cache_impl(
+            messages,
+            tools,
+            model,
+            &crate::extensions::context::default_cache_options(),
+        )
+        .await
+    }
+    async fn chat_with_cache_impl(
+        &self,
+        messages: &[RuntimeMessage],
+        tools: &[ToolDefinition],
+        model: &str,
+        cache: &CacheOptions,
+    ) -> Result<LLMResponse, LlmError> {
+        cache
+            .validate(messages)
+            .map_err(|e| LlmError::Configuration {
+                message: e.to_string(),
+            })?;
         let client = self.build_client()?;
 
         let mut openai_messages = convert_runtime_messages(messages);
         let mut openai_tools = convert_tool_definitions(tools);
-        apply_anthropic_cache_control(
+        apply_cache_options(
             &mut openai_messages,
             &mut openai_tools,
             model,
             &self.backend,
+            cache,
         );
 
         let request = self.chat_request(
@@ -675,6 +696,16 @@ impl LLMBackend for OpenAI {
         true
     }
 
+    async fn chat_with_cache(
+        &self,
+        messages: &[RuntimeMessage],
+        tools: &[ToolDefinition],
+        model: &str,
+        cache: &CacheOptions,
+    ) -> Result<LLMResponse, LlmError> {
+        self.chat_with_cache_impl(messages, tools, model, cache)
+            .await
+    }
     async fn chat_with_tools(
         &self,
         messages: &[RuntimeMessage],
@@ -823,8 +854,8 @@ fn anthropic_cache_control(backend: &Backend, model: &str) -> Option<CacheContro
 
 /// Stamp Anthropic prompt-cache breakpoints onto the assembled request.
 ///
-/// Walks the shared [`crate::cache::CACHE_PLAN`] (last tool → system → latest
-/// user message, in cache-invalidation order) under the [`crate::cache`] cap.
+/// The legacy non-strategy caller explicitly selects the built-in defaults.
+/// Runtime requests carry the selected extension's typed cache options.
 /// No-op unless [`anthropic_cache_control`] says inline markers apply — every
 /// other provider caches server-side and may 400 on unexpected markers. The
 /// breakpoint *policy* is shared with the native Anthropic backend; only this
@@ -835,16 +866,32 @@ fn apply_anthropic_cache_control(
     model: &str,
     backend: &Backend,
 ) {
-    let Some(cc) = anthropic_cache_control(backend, model) else {
+    apply_cache_options(
+        messages,
+        tools,
+        model,
+        backend,
+        &crate::extensions::context::default_cache_options(),
+    );
+}
+fn apply_cache_options(
+    messages: &mut [ChatMessage],
+    tools: &mut [ChatTool],
+    model: &str,
+    backend: &Backend,
+    options: &CacheOptions,
+) {
+    let Some(_) = anthropic_cache_control(backend, model) else {
         return;
     };
+    let cc = options.control();
     let mut remaining = crate::cache::MAX_BREAKPOINTS;
-    for region in crate::cache::CACHE_PLAN {
+    for region in &options.anchors {
         if remaining == 0 {
             break;
         }
         let placed = match region {
-            CacheRegion::LastTool => {
+            CacheAnchor::LastTool => {
                 if let Some(last_tool) = tools.last_mut() {
                     last_tool.cache_control = Some(cc.clone());
                     true
@@ -852,7 +899,7 @@ fn apply_anthropic_cache_control(
                     false
                 }
             }
-            CacheRegion::System => {
+            CacheAnchor::System => {
                 if let Some(content) = messages
                     .iter_mut()
                     .find(|m| m.role == "system")
@@ -864,7 +911,15 @@ fn apply_anthropic_cache_control(
                     false
                 }
             }
-            CacheRegion::LatestUser => {
+            CacheAnchor::Message(index) => {
+                if let Some(content) = messages.get_mut(*index).and_then(|m| m.content.as_mut()) {
+                    content.set_cache_control(cc.clone());
+                    true
+                } else {
+                    false
+                }
+            }
+            CacheAnchor::LatestUser => {
                 if let Some(content) = messages
                     .iter_mut()
                     .rev()
@@ -917,6 +972,43 @@ fn convert_chat_context(
         model = default_model.clone().unwrap_or_default();
     }
     (model, messages)
+}
+
+#[cfg(test)]
+pub(crate) async fn serialize_cache_fixture(
+    messages: &[RuntimeMessage],
+    tools: &[ToolDefinition],
+    options: &CacheOptions,
+    openrouter: bool,
+    model: &str,
+) -> Value {
+    let mut backend = Backend::new(crate::config::BackendType::OpenAICompatible);
+    backend.name = Some(if openrouter { "openrouter" } else { "local" }.into());
+    backend.api_base = Some(
+        if openrouter {
+            "https://openrouter.ai/api/v1"
+        } else {
+            "http://localhost/v1"
+        }
+        .into(),
+    );
+    let secrets = crate::test_support::empty_secrets().await;
+    let adapter = OpenAI::new(&backend, &secrets);
+    let mut wire_messages = convert_runtime_messages(messages);
+    let mut wire_tools = convert_tool_definitions(tools);
+    apply_cache_options(
+        &mut wire_messages,
+        &mut wire_tools,
+        model,
+        &backend,
+        options,
+    );
+    serde_json::to_value(adapter.chat_request(
+        model,
+        wire_messages,
+        (!wire_tools.is_empty()).then_some(wire_tools),
+    ))
+    .unwrap()
 }
 
 #[cfg(test)]

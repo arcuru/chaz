@@ -21,6 +21,7 @@
 
 pub mod agent_state;
 pub mod caps;
+pub mod context_strategy;
 pub mod durable_context;
 pub mod handler;
 pub(crate) mod hook_bridge;
@@ -717,6 +718,7 @@ pub struct ExtensionHub {
     /// Operator `context_projection` grants, held in invocation order
     /// (conversation phase, then full-context phase, list order within).
     context_projection: Vec<projection::ContextProjectionGrant>,
+    pub(crate) context_strategy: Option<context_strategy::ContextStrategyGrant>,
     durable_context: Vec<durable_context::DurableContextGrant>,
 
     // ---- Lifecycle instance bookkeeping -----------------------------------
@@ -786,6 +788,7 @@ impl ExtensionHub {
             hosted_index: None,
             agent_state_allowlist: HashMap::new(),
             context_projection: Vec::new(),
+            context_strategy: None,
             durable_context: Vec::new(),
             global_instances: HashMap::new(),
             agent_instances: tokio::sync::RwLock::new(HashMap::new()),
@@ -1860,10 +1863,56 @@ impl ExtensionHub {
                 continue;
             }
             if let Some(ct) = inst.context_tail()
-                && let Ok(Some(text)) = ct.context_tail(agent_name, recent_message_text).await
+                && let Ok(Some(text)) = ct
+                    .context_tail(&caps::ContextTailCall {
+                        agent_name,
+                        recent_message_text,
+                        session_db_id: session_db.map(|db| db.root_id().to_string()),
+                        request_id: None,
+                    })
+                    .await
                 && !text.trim().is_empty()
             {
                 parts.push(text);
+            }
+        }
+        parts.join("\n\n")
+    }
+
+    /// Typed production invocation: current activation/agent opt-outs attenuate
+    /// the turn, and an optional recall error/panic/timeout cannot erase selection.
+    pub async fn context_tails_for_call(
+        &self,
+        call: &caps::ContextTailCall<'_>,
+        turn_active: &HashSet<String>,
+        db: Option<&Database>,
+    ) -> String {
+        let active = self
+            .active_extensions_for_call(call.agent_name, db, turn_active)
+            .await;
+        let mut parts = Vec::new();
+        for inst in self.context_instances(call.agent_name, db).await {
+            if !active.contains(&inst.manifest().name)
+                || !inst
+                    .manifest()
+                    .provides_capabilities
+                    .contains(&caps::CapabilityKind::ContextTail)
+            {
+                continue;
+            }
+            if let Some(endpoint) = inst.context_tail() {
+                let result = tokio::time::timeout(
+                    projection::PROJECTOR_TIMEOUT,
+                    AssertUnwindSafe(async { endpoint.context_tail(call).await }).catch_unwind(),
+                )
+                .await;
+                match result {
+                    Ok(Ok(Ok(Some(text)))) if !text.trim().is_empty() => parts.push(text),
+                    Ok(Ok(Ok(_))) => {}
+                    _ => {
+                        warn!(extension = %inst.manifest().name, "Optional context tail failed; retaining required selection")
+                    }
+                }
             }
         }
         parts.join("\n\n")

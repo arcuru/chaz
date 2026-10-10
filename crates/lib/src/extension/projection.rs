@@ -167,6 +167,7 @@ pub enum ContextSource {
 /// The model-facing request for one logical model call.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ProjectedRequest {
+    pub cache: crate::cache::CacheOptions,
     pub messages: Vec<RuntimeMessage>,
     pub tools: Vec<ToolDefinition>,
 }
@@ -218,6 +219,8 @@ pub(crate) struct ResolvedProjector {
 pub enum ProjectionViolation {
     #[error("the request has no messages")]
     Empty,
+    #[error("invalid cache options: {0}")]
+    Cache(String),
     #[error("an assistant tool-call message has no calls")]
     EmptyCallGroup,
     #[error("conversation authority cannot change the instructions")]
@@ -341,6 +344,10 @@ fn check_budget(
     request: &ProjectedRequest,
     budget: Option<usize>,
 ) -> Result<(), ProjectionViolation> {
+    request
+        .cache
+        .validate(&request.messages)
+        .map_err(|e| ProjectionViolation::Cache(e.to_string()))?;
     let Some(budget) = budget else {
         return Ok(());
     };
@@ -558,6 +565,7 @@ mod tests {
         messages.push(RuntimeMessage::User("new question".into()));
         messages.extend(exchange("now", json!({})));
         ProjectedRequest {
+            cache: Default::default(),
             messages,
             tools: vec![tool("echo")],
         }
@@ -675,6 +683,7 @@ mod tests {
         // Reordered exchanges.
         let base = baseline();
         let mut reordered = ProjectedRequest {
+            cache: Default::default(),
             messages: vec![base.messages[0].clone()],
             tools: base.tools.clone(),
         };
@@ -697,6 +706,7 @@ mod tests {
         );
         // Empty request.
         let empty = ProjectedRequest {
+            cache: Default::default(),
             messages: Vec::new(),
             tools: Vec::new(),
         };

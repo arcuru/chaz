@@ -57,6 +57,9 @@ pub use transport::{
 /// immutable database snapshot. This is a disposable view, not a second store.
 #[derive(Clone, Debug)]
 pub struct SessionContextView {
+    /// Test-only observed rows/serialized bytes returned by reconstruction reads.
+    #[cfg(test)]
+    pub(crate) read_volume: serde_json::Value,
     pub entry_ids: Vec<Option<TurnRequestId>>,
     pub entries: Vec<SessionEntry>,
     pub tool_history: Vec<Vec<TurnTranscriptRecord>>,
@@ -888,6 +891,8 @@ impl Session {
             .await?
             .search(|_| true)
             .await?;
+        #[cfg(test)]
+        let attempt_volume = (attempts.len(), serde_json::to_vec(&attempts)?.len());
         let states = index_attempt_states(attempts, &HashSet::new());
         let selected: HashMap<_, _> = states
             .into_iter()
@@ -900,12 +905,20 @@ impl Session {
             })
             .collect();
         let mut records: HashMap<TurnRequestId, Vec<TurnTranscriptRecord>> = HashMap::new();
-        for (_, record) in txn
+        let transcript_rows = txn
             .get_store::<Table<TurnTranscriptRecord>>(TURN_TRANSCRIPT_STORE)
             .await?
             .search(|_| true)
-            .await?
-        {
+            .await?;
+        #[cfg(test)]
+        let read_volume = serde_json::json!({
+            "scope": "context_view Table results only; excludes reopen, metadata, command/state lookups and backend physical I/O",
+            "entry_rows": rows.len(), "entry_bytes": serde_json::to_vec(&rows)?.len(),
+            "attempt_rows": attempt_volume.0, "attempt_bytes": attempt_volume.1,
+            "transcript_rows": transcript_rows.len(), "transcript_bytes": serde_json::to_vec(&transcript_rows)?.len(),
+            "contribution_rows": contributions.len(), "contribution_bytes": serde_json::to_vec(&contributions)?.len(),
+        });
+        for (_, record) in transcript_rows {
             if selected.get(&record.request_id) == Some(&record.attempt_id) {
                 records
                     .entry(record.request_id.clone())
@@ -925,6 +938,8 @@ impl Session {
             })
             .unzip();
         Ok(SessionContextView {
+            #[cfg(test)]
+            read_volume,
             entry_ids,
             entries,
             tool_history,

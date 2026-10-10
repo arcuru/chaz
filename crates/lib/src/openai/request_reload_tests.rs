@@ -192,15 +192,23 @@ async fn capture(session: &Session, agent_db: &AgentDb) -> RecordedCall {
     )
     .with_tools(&tools)
     .with_tool_history(&history)
-    .build()
-    .await;
+    .with_extension_hub({
+        let hub = std::sync::Arc::new(crate::test_support::context_hub().await);
+        hub.record_active(session.database()).await.unwrap();
+        hub
+    })
+    .with_session_db(session.database())
+    .try_build()
+    .await
+    .unwrap();
     assert!(!context.truncated);
     let mock = MockBackend::new();
     mock.push_text("unused response");
-    mock.chat_with_tools(
+    mock.chat_with_cache(
         &context.messages,
         &tools,
         agent.default_model.as_deref().unwrap(),
+        &context.cache,
     )
     .await
     .unwrap();
@@ -246,6 +254,8 @@ async fn equivalent_reload_preserves_request_prefix_and_native_pairs() {
             .filter(|r| r.request_id == selected.request_id)
             .all(|r| r.attempt_id == selected.attempt_id)
     );
+    println!("RELOAD_BASELINE {before}");
+    println!("RELOAD_REOPEN {after}");
     let messages = after["messages"].as_array().unwrap();
     assert_eq!(messages.len(), 9);
     assert_eq!(messages[1]["content"], "Earlier work summarized");

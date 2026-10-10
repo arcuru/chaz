@@ -1,16 +1,8 @@
-//! Context window management — assembles LLM context within token budgets.
+//! Host-owned context reconstruction, rendering and native exchange integrity.
 //!
-//! The `ContextBuilder` replaces the previous `Session::build_context()` +
-//! `context_to_messages()` pipeline. It takes session entries, agent config,
-//! tool definitions, and a token budget, then produces a `Vec<RuntimeMessage>`
-//! ready for the backend.
-//!
-//! Key behaviors:
-//! - Respects `EntryType::Summary` as a context boundary (most recent Summary
-//!   becomes the conversation start, older entries are excluded)
-//! - Estimates token usage for system prompt, tool definitions, and messages
-//! - Fills from newest messages backward until the budget is exhausted
-//! - Always includes the system prompt and at least the most recent message
+//! The required selected extension chooses history/layout through scoped item
+//! references. Core never substitutes an old selection algorithm on failure.
+//! The per-model-call gate validates the complete projected request budget.
 
 use crate::config::ContextConfig;
 use crate::extension::ExtensionHub;
@@ -113,20 +105,22 @@ pub struct AssembledContext {
     pub entries_included: usize,
     /// Whether older messages were truncated to fit the budget.
     pub truncated: bool,
+    pub cache: crate::cache::CacheOptions,
+    pub strategy: Option<String>,
 }
 
 /// Builds LLM context from session entries within a token budget.
 pub struct ContextBuilder<'a> {
-    entries: &'a [SessionEntry],
-    tool_history: Option<&'a [Vec<TurnTranscriptRecord>]>,
-    entry_ids: Option<&'a [Option<crate::session::TurnRequestId>]>,
-    contributions: &'a [crate::extension::durable_context::CommittedContribution],
-    agent_name: &'a str,
+    pub(crate) entries: &'a [SessionEntry],
+    pub(crate) tool_history: Option<&'a [Vec<TurnTranscriptRecord>]>,
+    pub(crate) entry_ids: Option<&'a [Option<crate::session::TurnRequestId>]>,
+    pub(crate) contributions: &'a [crate::extension::durable_context::CommittedContribution],
+    pub(crate) agent_name: &'a str,
     system_prompt: &'a str,
     /// Tool definitions for this turn. Also the set that `requires_tools`
     /// on a skill is matched against, so a builder left without
     /// [`Self::with_tools`] suppresses every skill that declares one.
-    tool_defs: &'a [ToolDefinition],
+    pub(crate) tool_defs: &'a [ToolDefinition],
     config: &'a ContextConfig,
     /// Per-agent override for max context tokens
     max_context_tokens_override: Option<usize>,
@@ -135,11 +129,13 @@ pub struct ContextBuilder<'a> {
     /// standard "room note" listing the *other* participants and the
     /// `@mention` convention is appended to the system prompt.
     room_participants: &'a [String],
-    attachment: Option<(&'a str, &'a str, &'a str)>,
+    pub(crate) attachment: Option<(&'a str, &'a str, &'a str)>,
     /// ExtensionHub for system prompt augmentation (skills, memory, etc.).
     extension_hub: Option<Arc<ExtensionHub>>,
     /// Session DB passed through to the hub for per-session provider resolution.
     session_db: Option<&'a Database>,
+    active: Option<&'a HashSet<String>>,
+    request_id: Option<&'a str>,
 }
 
 impl<'a> ContextBuilder<'a> {
@@ -163,6 +159,8 @@ impl<'a> ContextBuilder<'a> {
             attachment: None,
             extension_hub: None,
             session_db: None,
+            active: None,
+            request_id: None,
         }
     }
 
@@ -225,14 +223,29 @@ impl<'a> ContextBuilder<'a> {
         self
     }
 
-    /// Build the context, fitting messages within the token budget.
+    pub fn with_invocation(
+        mut self,
+        active: &'a HashSet<String>,
+        request_id: Option<&'a str>,
+    ) -> Self {
+        self.active = Some(active);
+        self.request_id = request_id;
+        self
+    }
+    /// Standalone fixtures explicitly select the built-in endpoint. Production
+    /// must resolve its required configured instance; there is no core fallback.
+    #[cfg(test)]
     pub async fn build(self) -> AssembledContext {
+        self.assemble(true).await.unwrap()
+    }
+    pub async fn try_build(self) -> anyhow::Result<AssembledContext> {
+        self.assemble(false).await
+    }
+    async fn assemble(self, standalone: bool) -> anyhow::Result<AssembledContext> {
         let max_tokens = self
             .max_context_tokens_override
             .unwrap_or(self.config.max_context_tokens);
         let budget = max_tokens.saturating_sub(self.config.reserved_output_tokens);
-
-        let mut used_tokens: usize = 0;
 
         // 1. System prompt (always included). The caller provides the
         //    agent's system_prompt directly — no snapshot lookup needed.
@@ -277,6 +290,21 @@ impl<'a> ContextBuilder<'a> {
             }
         }
 
+        let active = match self.active {
+            Some(active) => active.clone(),
+            None => match self.session_db {
+                Some(db) => crate::extension::read_active(db)
+                    .await?
+                    .into_iter()
+                    .map(|r| r.name().to_string())
+                    .collect(),
+                None => self
+                    .extension_hub
+                    .as_ref()
+                    .map(|h| h.extension_names().into_iter().map(String::from).collect())
+                    .unwrap_or_default(),
+            },
+        };
         // 1.5. Extensions: skills, memory, etc. inject augmentations.
         let recent_text: Vec<String> = self
             .entries
@@ -297,7 +325,7 @@ impl<'a> ContextBuilder<'a> {
                     self.agent_name,
                     &recent_text,
                     &available_tool_names,
-                    None,
+                    Some(&active.iter().cloned().collect::<Vec<_>>()),
                     self.session_db,
                 )
                 .await;
@@ -307,174 +335,169 @@ impl<'a> ContextBuilder<'a> {
             }
         }
 
-        let system_tokens = if !system_prompt.is_empty() {
-            estimate_tokens(&system_prompt) + MESSAGE_OVERHEAD_TOKENS
-        } else {
-            0
+        let (strategy, endpoint): (
+            _,
+            Arc<dyn crate::extension::context_strategy::ContextStrategy>,
+        ) = match &self.extension_hub {
+            Some(hub) if !standalone || hub.context_strategy.is_some() => {
+                let (name, endpoint) = hub
+                    .resolve_context_strategy(self.agent_name, self.session_db, &active)
+                    .await?;
+                (Some(name), endpoint)
+            }
+            _ if standalone => (None, Arc::new(crate::extensions::context::BaselineContext)),
+            _ => anyhow::bail!("no required context strategy configured"),
         };
-        used_tokens += system_tokens;
-
-        // 2. Tool definitions overhead
-        let tool_tokens: usize = self.tool_defs.iter().map(estimate_tool_tokens).sum();
-        used_tokens += tool_tokens;
-
-        // 2.5. Resolve context tails up front so their tokens count
-        // against the budget *before* we decide how many transcript
-        // messages to keep. Otherwise a large recall payload could push
-        // the assembled context past the model's window.
+        let settings = match (self.session_db, strategy.as_deref()) {
+            (Some(db), Some(name)) => {
+                self.extension_hub
+                    .as_ref()
+                    .expect("resolved hub")
+                    .context_strategy_settings(db, name)
+                    .await?
+            }
+            _ => serde_json::Value::Null,
+        };
+        // Optional tails are invocation data and remain ephemeral. Reserve their
+        // actual rendered cost before the strategy chooses visible history.
         let tail_text = if let Some(ref hub) = self.extension_hub {
-            // Turn boundary: also refresh the extension status outputs the
-            // frontend renders. Orthogonal to the prompt, so kept out of
-            // the token budget below.
             if let Some(db) = self.session_db {
                 hub.refresh_status_outputs(self.agent_name, db).await;
             }
-            let t = hub
-                .context_tails(self.agent_name, &recent_text, None, self.session_db)
+            let text = hub
+                .context_tails_for_call(
+                    &crate::extension::caps::ContextTailCall {
+                        agent_name: self.agent_name,
+                        recent_message_text: &recent_text,
+                        session_db_id: self.session_db.map(|db| db.root_id().to_string()),
+                        request_id: self.request_id,
+                    },
+                    &active,
+                    self.session_db,
+                )
                 .await;
-            if t.is_empty() { None } else { Some(t) }
+            (!text.is_empty()).then_some(text)
         } else {
             None
         };
-        let tail_tokens = match &tail_text {
-            Some(t) => estimate_tokens(t) + MESSAGE_OVERHEAD_TOKENS,
-            None => 0,
+        let context = crate::extension::context_strategy::ScopedContext {
+            builder: &self,
+            system: &system_prompt,
+            tail: tail_text.as_deref(),
+            sent: self
+                .entries
+                .iter()
+                .filter(|e| e.bridge_role() == Some(crate::session::BridgeEventRole::Receipt))
+                .filter_map(|e| e.routing.as_ref()?.reply_to.as_deref())
+                .collect(),
         };
-        used_tokens += tail_tokens;
-        // Intentionally selected durable text has the same budget treatment as
-        // tails. It is data, framed by the host; oversize requests fail at dispatch.
-        let durable_messages: Vec<_> = self
-            .contributions
-            .iter()
-            .flat_map(|row| {
-                row.contribution
-                    .messages
-                    .iter()
-                    .enumerate()
-                    .map(move |(index, text)| {
-                        (
-                            RuntimeMessage::User(format!(
-                                "<custom_context>\n{}\n</custom_context>",
-                                text.replace('&', "&amp;")
-                                    .replace('<', "&lt;")
-                                    .replace('>', "&gt;")
-                            )),
-                            ContextSource::DurableContribution {
-                                source_id: row.source_id(index),
-                                extension: row.identity.extension.clone(),
-                            },
-                        )
-                    })
-            })
-            .collect();
-        used_tokens += durable_messages
-            .iter()
-            .map(|(message, _)| message_cost(message))
-            .sum::<usize>();
-
-        // 3. Find context boundary: most recent Summary entry
-        let boundary_idx = self
-            .entries
-            .iter()
-            .rposition(|e| e.entry_type == EntryType::Summary);
-
-        // 4. Filter to contextable entries from boundary onward
-        let start_idx = boundary_idx.unwrap_or(0);
-        let contextable: Vec<(usize, &SessionEntry)> = self.entries[start_idx..]
-            .iter()
-            .enumerate()
-            .filter(|(_, e)| {
-                matches!(
-                    e.entry_type,
-                    EntryType::Message | EntryType::Directive | EntryType::Summary
-                ) || matches!(
-                    e.bridge_role(),
-                    Some(
-                        crate::session::BridgeEventRole::Observation
-                            | crate::session::BridgeEventRole::Outbound
-                    )
-                )
-            })
-            .map(|(i, e)| (start_idx + i, e))
-            .collect();
-
-        // 5. Render trusted routing separately from the untrusted body, then
-        // budget against exactly what the model will see.
-        let sent: HashSet<&str> = self
-            .entries
-            .iter()
-            .filter(|e| e.bridge_role() == Some(crate::session::BridgeEventRole::Receipt))
-            .filter_map(|e| e.routing.as_ref()?.reply_to.as_deref())
-            .collect();
-        let rendered: Vec<String> = contextable
-            .iter()
-            .map(|(_, e)| render_entry(e, self.attachment, &sent))
-            .collect();
-        let entry_costs: Vec<usize> = rendered
-            .iter()
-            .map(|text| estimate_tokens(text) + MESSAGE_OVERHEAD_TOKENS)
-            .collect();
-
-        // 6. Fill from newest backward until budget exhausted.
-        //    Always include the most recent message.
-        let remaining_budget = budget.saturating_sub(used_tokens);
-        let mut included_from = contextable.len(); // exclusive start index (we'll decrement)
-        let mut message_tokens: usize = 0;
-
-        for i in (0..contextable.len()).rev() {
-            let cost = entry_costs[i];
-            if message_tokens + cost > remaining_budget && i < contextable.len() - 1 {
-                // Would exceed budget and we already have at least one message
-                break;
+        let db_id = self.session_db.map(|db| db.root_id().to_string());
+        let call = crate::extension::context_strategy::ContextStrategyCall {
+            agent_name: self.agent_name,
+            session_db_id: db_id.as_deref(),
+            request_id: self.request_id,
+            context: &context,
+            budget_tokens: budget,
+            settings: &settings,
+        };
+        let plan = crate::extension::context_strategy::invoke(endpoint.as_ref(), &call).await?;
+        // References and provenance are host-owned. No extension can forge a
+        // native exchange or another namespace's durable source identity.
+        let mut seen = HashSet::new();
+        let mut last_entry = None;
+        let mut messages = Vec::new();
+        let mut sources = Vec::new();
+        let mut entries_included = 0;
+        for item in &plan.items {
+            use crate::extension::context_strategy::ContextItem;
+            let key = match item {
+                ContextItem::Exchange { entry, .. } => ContextItem::Exchange {
+                    entry: *entry,
+                    budget: 0,
+                },
+                _ => item.clone(),
+            };
+            anyhow::ensure!(seen.insert(key), "duplicate context reference");
+            match item {
+                ContextItem::Entry(index) => {
+                    anyhow::ensure!(
+                        last_entry.is_none_or(|last| *index > last),
+                        "reordered context entries"
+                    );
+                    last_entry = Some(*index);
+                    entries_included += 1;
+                }
+                ContextItem::Exchange { entry, .. } => anyhow::ensure!(
+                    last_entry == Some(*entry),
+                    "exchange is not adjacent to its entry"
+                ),
+                _ => {}
             }
-            message_tokens += cost;
-            included_from = i;
-            // If we just included a Summary, stop — it's the boundary
-            if contextable[i].1.entry_type == EntryType::Summary {
-                break;
+            for (message, source) in self.hydrate(&context, item)? {
+                messages.push(message);
+                sources.push(source);
             }
         }
-
-        let truncated = included_from > 0;
-        let included_entries = &contextable[included_from..];
-        used_tokens += message_tokens;
-
-        // 7. Assemble RuntimeMessages
-        let mut messages = Vec::with_capacity(included_entries.len() + 1);
-        let mut sources = Vec::with_capacity(included_entries.len() + 1);
-
-        if !system_prompt.is_empty() {
-            messages.push(RuntimeMessage::System(system_prompt));
-            sources.push(ContextSource::Instructions);
+        let estimated_tokens = estimate_request_tokens(&messages, self.tool_defs);
+        // The mandatory newest-row behavior can produce an oversized baseline;
+        // the per-model-call complete-request gate refuses it after projection.
+        plan.cache.validate(&messages)?;
+        if let (Some(hub), Some(name)) = (&self.extension_hub, strategy.as_deref()) {
+            hub.check_context_strategy(Some(name), self.agent_name, self.session_db, &active)
+                .await?;
+            if let Some(db) = self.session_db {
+                hub.record_context_selection(db, self.agent_name, name, &settings)
+                    .await?;
+            }
         }
+        Ok(AssembledContext {
+            messages,
+            sources,
+            request_budget_tokens: budget,
+            estimated_tokens,
+            entries_included,
+            truncated: plan.truncated,
+            cache: plan.cache,
+            strategy,
+        })
+    }
 
-        // Give visible conversation priority; replay complete native groups from
-        // newest to oldest only with the remaining token budget.
-        let mut replay = vec![Vec::new(); self.entries.len()];
-        if let Some(history) = self.tool_history.filter(|h| h.len() == self.entries.len()) {
-            let mut spare = remaining_budget.saturating_sub(message_tokens);
-            for (index, _) in included_entries.iter().rev() {
-                if let Some(group) = replay_turn(&history[*index], spare) {
-                    let cost = group.iter().map(message_cost).sum::<usize>();
-                    spare -= cost;
-                    used_tokens += cost;
-                    replay[*index] = group;
+    pub(crate) fn hydrate(
+        &self,
+        context: &crate::extension::context_strategy::ScopedContext<'_>,
+        item: &crate::extension::context_strategy::ContextItem,
+    ) -> anyhow::Result<Vec<(RuntimeMessage, ContextSource)>> {
+        use crate::extension::context_strategy::ContextItem;
+        Ok(match item {
+            ContextItem::Instructions => {
+                if context.system.is_empty() {
+                    vec![]
+                } else {
+                    vec![(
+                        RuntimeMessage::System(context.system.into()),
+                        ContextSource::Instructions,
+                    )]
                 }
             }
-        }
-
-        for (offset, (index, entry)) in included_entries.iter().enumerate() {
-            let text = rendered[included_from + offset].clone();
-            let rm = if entry.sender == self.agent_name
-                && entry.bridge_role() != Some(crate::session::BridgeEventRole::Observation)
-            {
-                RuntimeMessage::Assistant(text)
-            } else {
-                RuntimeMessage::User(text)
-            };
-            messages.push(rm);
-            sources.push(
-                match self
+            ContextItem::Tail => context
+                .tail
+                .map(|t| vec![(RuntimeMessage::User(t.into()), ContextSource::ContextTail)])
+                .unwrap_or_default(),
+            ContextItem::Entry(index) => {
+                let entry = self
+                    .entries
+                    .get(*index)
+                    .filter(|e| is_context_entry(e))
+                    .ok_or_else(|| anyhow::anyhow!("foreign context entry"))?;
+                let text = render_entry(entry, self.attachment, &context.sent);
+                let message = if entry.sender == self.agent_name
+                    && entry.bridge_role() != Some(crate::session::BridgeEventRole::Observation)
+                {
+                    RuntimeMessage::Assistant(text)
+                } else {
+                    RuntimeMessage::User(text)
+                };
+                let source = match self
                     .entry_ids
                     .and_then(|ids| ids.get(*index))
                     .and_then(Option::as_ref)
@@ -487,52 +510,81 @@ impl<'a> ContextBuilder<'a> {
                         sender: entry.sender.clone(),
                         timestamp: entry.timestamp,
                     },
-                },
-            );
-            let group = std::mem::take(&mut replay[*index]);
-            if let Some(first) = self
-                .tool_history
-                .and_then(|history| history[*index].iter().min_by_key(|r| r.sequence))
-            {
-                // `replay_turn` accepts only contiguous groups numbered from
-                // model sequence 0, so the k-th call message is sequence k.
-                let mut model_sequence = 0;
-                for (position, message) in group.iter().enumerate() {
-                    if position > 0 && matches!(message, RuntimeMessage::AssistantToolCalls { .. })
-                    {
-                        model_sequence += 1;
+                };
+                vec![(message, source)]
+            }
+            ContextItem::Exchange { entry, budget } => {
+                anyhow::ensure!(*entry < self.entries.len(), "foreign exchange reference");
+                let records = self
+                    .tool_history
+                    .filter(|h| h.len() == self.entries.len())
+                    .and_then(|h| h.get(*entry));
+                match records.and_then(|r| replay_turn(r, *budget).map(|g| (r, g))) {
+                    Some((records, group)) => {
+                        let first = records
+                            .iter()
+                            .min_by_key(|r| r.sequence)
+                            .expect("nonempty replay");
+                        let mut sequence = 0;
+                        group
+                            .into_iter()
+                            .enumerate()
+                            .map(|(i, m)| {
+                                if i > 0 && matches!(m, RuntimeMessage::AssistantToolCalls { .. }) {
+                                    sequence += 1;
+                                }
+                                (
+                                    m,
+                                    ContextSource::ReplayedExchange {
+                                        request_id: first.request_id.as_str().into(),
+                                        attempt_id: first.attempt_id.clone(),
+                                        model_sequence: sequence,
+                                    },
+                                )
+                            })
+                            .collect()
                     }
-                    sources.push(ContextSource::ReplayedExchange {
-                        request_id: first.request_id.as_str().to_string(),
-                        attempt_id: first.attempt_id.clone(),
-                        model_sequence,
-                    });
+                    None => vec![],
                 }
             }
-            messages.extend(group);
-        }
-
-        // 8. Context tails — memory surfacing, etc. Appended after the
-        //    conversation messages. Tail text and tokens were resolved
-        //    in step 2.5 so they were already deducted from the
-        //    message budget.
-        if let Some(t) = tail_text {
-            messages.push(RuntimeMessage::User(t));
-            sources.push(ContextSource::ContextTail);
-        }
-        for (message, source) in durable_messages {
-            messages.push(message);
-            sources.push(source);
-        }
-        AssembledContext {
-            messages,
-            sources,
-            request_budget_tokens: budget,
-            estimated_tokens: used_tokens,
-            entries_included: included_entries.len(),
-            truncated,
-        }
+            ContextItem::Durable { row, message } => {
+                let batch = self
+                    .contributions
+                    .get(*row)
+                    .ok_or_else(|| anyhow::anyhow!("foreign contribution"))?;
+                let text = batch
+                    .contribution
+                    .messages
+                    .get(*message)
+                    .ok_or_else(|| anyhow::anyhow!("foreign contribution message"))?;
+                vec![(
+                    RuntimeMessage::User(format!(
+                        "<custom_context>\n{}\n</custom_context>",
+                        text.replace('&', "&amp;")
+                            .replace('<', "&lt;")
+                            .replace('>', "&gt;")
+                    )),
+                    ContextSource::DurableContribution {
+                        source_id: batch.source_id(*message),
+                        extension: batch.identity.extension.clone(),
+                    },
+                )]
+            }
+        })
     }
+}
+
+pub(crate) fn is_context_entry(entry: &SessionEntry) -> bool {
+    matches!(
+        entry.entry_type,
+        EntryType::Message | EntryType::Directive | EntryType::Summary
+    ) || matches!(
+        entry.bridge_role(),
+        Some(
+            crate::session::BridgeEventRole::Observation
+                | crate::session::BridgeEventRole::Outbound
+        )
+    )
 }
 
 /// JSON framing escapes content so an in-body provenance header cannot become
