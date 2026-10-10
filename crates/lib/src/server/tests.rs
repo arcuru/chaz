@@ -8088,3 +8088,94 @@ async fn durable_context_server_commits_before_dispatch_and_preserves_native_exc
         "logical rounds duplicated contributions"
     );
 }
+
+#[tokio::test]
+async fn required_context_strategy_refuses_and_recovers_on_the_executor() {
+    use crate::commands::{CommandContext, CommandOutcome, Parsed, dispatch, parse};
+    use crate::session::TurnAttemptStatus;
+
+    let (_instance, server, registry) = server_fixture().await;
+    let (agent, _adb) = seed_agent(&server, &registry, "alpha").await;
+    register_alpha_agent_runtime(&server);
+    let (_, db) = registry
+        .create_session(Some("required-context"))
+        .await
+        .unwrap();
+    let sid = db.root_id().to_string();
+    registry
+        .attach_agent_to_session(&sid, &agent)
+        .await
+        .unwrap();
+    server.extensions.record_active(&db).await.unwrap();
+    let mock = Arc::new(crate::test_support::MockBackend::new());
+    mock.push_text("recovered reply");
+    let secrets = crate::security::SecretStore::new(registry.chaz_peer().clone()).await;
+    let backend = BackendManager::with_mock(mock.clone(), secrets.clone());
+    let command_context = CommandContext {
+        server: &server,
+        secrets: &secrets,
+        backend: &backend,
+        session_db_id: &sid,
+        session_db: &db,
+        current_agent: "alpha",
+        session_name: None,
+    };
+    let Parsed::Command(remove) = parse("/extensions remove baseline_context") else {
+        panic!("remove command");
+    };
+    assert!(
+        matches!(dispatch(remove, &command_context).await, CommandOutcome::Text(text) if text.contains("Deactivated"))
+    );
+    let refused = write_user_message_with_content(&db, &sid, "refused input").await;
+    server
+        .register_session(
+            &db,
+            BackendManager::with_mock(
+                mock.clone(),
+                crate::security::SecretStore::new(registry.chaz_peer().clone()).await,
+            ),
+            Some("alpha".into()),
+            None,
+        )
+        .await
+        .unwrap();
+    let session = Session::new(ConversationId(sid.clone()), db.clone()).await;
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if session.attempts_for_test().await.iter().any(|attempt| {
+                attempt.request_id == refused && attempt.status == TurnAttemptStatus::Completed
+            }) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("context refusal was not recorded");
+    await_no_processing(&server, &sid).await;
+    assert!(mock.recorded_calls().is_empty());
+    let reloaded = Session::new(ConversationId(sid.clone()), db.clone()).await;
+    assert!(reloaded.entries().iter().any(|entry| {
+        entry.entry_type == EntryType::Error
+            && entry
+                .content
+                .contains("required context strategy 'baseline_context' is unavailable or inactive")
+    }));
+    assert!(server.interrupted_turns(&sid).await.unwrap().is_empty());
+
+    let Parsed::Command(add) = parse("/extensions add baseline_context") else {
+        panic!("add command");
+    };
+    assert!(
+        matches!(dispatch(add, &command_context).await, CommandOutcome::Text(text) if text.contains("Activated"))
+    );
+    write_user_message_with_content(&db, &sid, "new input after recovery").await;
+    await_call_count(&mock, 1).await;
+    await_no_processing(&server, &sid).await;
+    let calls = mock.recorded_calls();
+    assert_eq!(calls.len(), 1);
+    assert!(calls[0].messages.iter().any(|message| matches!(message,
+        crate::runtime::RuntimeMessage::User(text) if text == "new input after recovery"
+    )));
+    server.shutdown().await;
+}

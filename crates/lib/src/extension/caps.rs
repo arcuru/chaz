@@ -403,14 +403,7 @@ pub trait PromptAugmentation: Send + Sync {
     ) -> CapFuture<'a, Option<String>>;
 }
 
-/// Append text after the conversation messages at context assembly time.
-///
-/// Extension-providable — extensions like 'memory' publish an impl;
-/// the host calls every provider and concatenates non-empty results
-/// after the assembled messages. Unlike [`PromptAugmentation`], this
-/// fires at the end of context, not in the system prompt. Like it, this
-/// is a **context/pull** output: consumed in-process at turn time, never
-/// materialized to a store.
+/// Identity and recent-text inputs for one ephemeral context-tail invocation.
 pub struct ContextTailCall<'a> {
     pub agent_name: &'a str,
     /// Preserve the existing newest-first input and native query extraction.
@@ -418,6 +411,8 @@ pub struct ContextTailCall<'a> {
     pub session_db_id: Option<String>,
     pub request_id: Option<&'a str>,
 }
+/// Append text at the tail of assembled context, not in the system prompt.
+/// This context/pull output is consumed in-process and never stored.
 pub trait ContextTail: Send + Sync {
     /// Return additional text to append after the conversation messages,
     /// or `None` if this extension has nothing to contribute for this turn.

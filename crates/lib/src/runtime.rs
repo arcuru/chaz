@@ -653,9 +653,27 @@ impl<'a> RoundProjector<'a> {
         let sources = self.sources_for(messages.len());
         // Optional revoked contributions disappear from the request copy only.
         // The retained originals/receipts and actual exchange vector stay intact.
-        let selected: Vec<_> = messages.iter().zip(&sources).filter(|(_, source)| {
+        let selected: Vec<_> = messages.iter().zip(&sources).enumerate().filter(|(_, (_, source))| {
             !matches!(source, ContextSource::DurableContribution { extension, .. } if !allowed.contains(extension))
         }).collect();
+        self.scope
+            .cache
+            .validate(messages)
+            .map_err(|error| error.to_string())?;
+        let mut cache = self.scope.cache.clone();
+        // Host-side revocation removes messages before extension projection.
+        // Keep anchors on the same surviving item, never on its new neighbour.
+        cache.anchors = cache
+            .anchors
+            .into_iter()
+            .filter_map(|anchor| match anchor {
+                crate::cache::CacheAnchor::Message(index) => selected
+                    .iter()
+                    .position(|(original, _)| *original == index)
+                    .map(crate::cache::CacheAnchor::Message),
+                anchor => Some(anchor),
+            })
+            .collect();
         let chain = hub
             .resolve_context_projectors(
                 &self.tool_ctx.agent_name,
@@ -665,16 +683,16 @@ impl<'a> RoundProjector<'a> {
             .await
             .map_err(refused)?;
         let baseline = ProjectedRequest {
-            cache: self.scope.cache.clone(),
+            cache,
             messages: selected
                 .iter()
-                .map(|(message, _)| (*message).clone())
+                .map(|(_, (message, _))| (*message).clone())
                 .collect(),
             tools: tools.to_vec(),
         };
         let sources: Vec<_> = selected
             .iter()
-            .map(|(_, source)| (*source).clone())
+            .map(|(_, (_, source))| (*source).clone())
             .collect();
         let inputs = projection::RoundInputs {
             agent_name: &self.tool_ctx.agent_name,

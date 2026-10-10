@@ -623,3 +623,6 @@ runtime/backend path. Anchors use final-request indices, not raw provider fields
 Adapters cap and map markers, including the precise pre-coalescing message block
 on native Anthropic, and omit them for incompatible providers. The built-in's
 legacy/default policy remains last tool, system, latest user with five-minute TTL.
+Host-side durable revocation remaps surviving message anchors and drops anchors
+on removed messages. Projectors own the final indices of their returned request.
+An empty or over-budget request cannot pass the final dispatch gate.

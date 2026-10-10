@@ -344,6 +344,9 @@ fn check_budget(
     request: &ProjectedRequest,
     budget: Option<usize>,
 ) -> Result<(), ProjectionViolation> {
+    if request.messages.is_empty() {
+        return Err(ProjectionViolation::Empty);
+    }
     request
         .cache
         .validate(&request.messages)

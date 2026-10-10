@@ -1810,12 +1810,36 @@ mod tests {
             )
             .await
             .unwrap();
+        let (_foreign_instance, _foreign_registry, foreign_cmd) = fixture().await;
+        assert_text(foreign_cmd.new_cmd("denied").await, "denied");
+        access_for(&foreign_cmd)
+            .remember(
+                "alpha",
+                "color",
+                "teal denied bank",
+                MemoryScope::Bank {
+                    name: "denied".into(),
+                },
+            )
+            .await
+            .unwrap();
+        let denied = foreign_cmd
+            .memory_bank_index
+            .find_by_name("denied")
+            .unwrap();
+        assert!(!matches!(
+            registry
+                .open_memory_bank(&denied.db_id, Some(&denied.pubkey))
+                .await,
+            Ok(Some(_))
+        ));
+        cmd.memory_bank_index.register(denied);
         let mut tail = MemoryContextTail {
             registry: registry.clone(),
             agent_index: cmd.agent_index.clone(),
             memory_bank_index: cmd.memory_bank_index.clone(),
             embedder: None,
-            session_attached_banks: vec!["eligible".into(), "absent-denied-bank".into()],
+            session_attached_banks: vec!["eligible".into(), "denied".into(), "absent".into()],
         };
         let recent = vec!["color teal".into()];
         let call = crate::extension::caps::ContextTailCall {
@@ -1828,6 +1852,7 @@ mod tests {
         println!("NATIVE_SESSION_BANK {unbounded}");
         assert!(unbounded.contains("eligible bank"));
         assert!(unbounded.contains(&"teal ".repeat(10)));
+        assert!(!unbounded.contains("denied bank"));
         // Attachment eligibility is captured by the native session instance;
         // exercise removal by constructing the next instance's attachment list.
         tail.session_attached_banks
@@ -1856,7 +1881,8 @@ mod tests {
         assert!(!text.contains(&"teal second ".repeat(10)));
         assert!(!text.contains("eligible bank"));
         assert!(!text.contains(&"teal ".repeat(10)));
-        assert!(!text.contains("absent-denied-bank"));
+        assert!(!text.contains("denied bank"));
+        assert!(!text.contains("absent"));
         println!("NATIVE_RECALL_CAPPED {text}");
         let mut config = config;
         config.auto_recall_enabled = false;

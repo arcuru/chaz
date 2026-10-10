@@ -1853,30 +1853,25 @@ impl ExtensionHub {
         active_extensions: Option<&[String]>,
         session_db: Option<&Database>,
     ) -> String {
-        let mut parts: Vec<String> = Vec::new();
-
-        for inst in self.context_instances(agent_name, session_db).await {
-            let name = inst.manifest().name.clone();
-            if let Some(active) = active_extensions
-                && !active.iter().any(|a| a == name.as_str())
-            {
-                continue;
-            }
-            if let Some(ct) = inst.context_tail()
-                && let Ok(Some(text)) = ct
-                    .context_tail(&caps::ContextTailCall {
-                        agent_name,
-                        recent_message_text,
-                        session_db_id: session_db.map(|db| db.root_id().to_string()),
-                        request_id: None,
-                    })
-                    .await
-                && !text.trim().is_empty()
-            {
-                parts.push(text);
-            }
-        }
-        parts.join("\n\n")
+        let active = match active_extensions {
+            Some(names) => names.iter().cloned().collect(),
+            None => self
+                .extension_names()
+                .into_iter()
+                .map(String::from)
+                .collect(),
+        };
+        self.context_tails_for_call(
+            &caps::ContextTailCall {
+                agent_name,
+                recent_message_text,
+                session_db_id: session_db.map(|db| db.root_id().to_string()),
+                request_id: None,
+            },
+            &active,
+            session_db,
+        )
+        .await
     }
 
     /// Typed production invocation: current activation/agent opt-outs attenuate
