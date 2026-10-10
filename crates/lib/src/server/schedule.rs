@@ -669,6 +669,7 @@ impl Server {
             agent_name: agent_name.to_string(),
             turn_request_id: None,
             tool_call_key: None,
+            observation_yield: None,
             call_depth: 0,
             max_call_depth,
             tools: scoped_tools,

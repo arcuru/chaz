@@ -7869,3 +7869,6 @@ async fn job_wait_executor_shutdown_and_claim_loss_stop_observation_or_reacquisi
         }
     }
 }
+
+#[path = "worker_capacity_tests.rs"]
+mod worker_capacity_tests;

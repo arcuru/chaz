@@ -3337,6 +3337,7 @@ impl Server {
                 agent_name: agent_name.clone(),
                 turn_request_id: Some(attempt.request_id.clone()),
                 tool_call_key: None,
+                observation_yield: None,
                 call_depth: spawn.call_depth,
                 max_call_depth,
                 tools: scoped_tools,
