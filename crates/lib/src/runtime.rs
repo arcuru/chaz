@@ -388,11 +388,12 @@ async fn llm_call_with_retry(
     tools: &[crate::tool::ToolDefinition],
     resolved_model: &str,
     max_retries: u32,
+    cache: &crate::cache::CacheOptions,
 ) -> Result<LLMResponse, LlmError> {
     let mut last_error = None;
     for attempt in 0..=max_retries {
         match backend
-            .chat_with_tools_for_model(model, messages, tools, resolved_model)
+            .chat_with_cache_for_model(model, messages, tools, resolved_model, cache)
             .await
         {
             Ok(response) => return Ok(response),
@@ -498,8 +499,10 @@ pub async fn execute_scoped(
 }
 
 /// What a caller knows about a turn beyond its [`ToolContext`].
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct ModelCallScope {
+    pub cache: crate::cache::CacheOptions,
+    pub context_strategy: Option<String>,
     /// The durable attempt this execution belongs to, if any.
     pub attempt_id: Option<String>,
     /// Estimated-token ceiling every projected request must fit.
@@ -507,6 +510,18 @@ pub struct ModelCallScope {
     /// Provenance of `initial_messages`, index-aligned. A length mismatch
     /// is treated as no provenance.
     pub sources: Vec<ContextSource>,
+}
+
+impl Default for ModelCallScope {
+    fn default() -> Self {
+        Self {
+            cache: crate::extensions::context::default_cache_options(),
+            context_strategy: None,
+            attempt_id: None,
+            request_budget_tokens: None,
+            sources: Vec::new(),
+        }
+    }
 }
 
 /// Runs the granted context-projection chain before each logical model
@@ -535,7 +550,11 @@ impl<'a> RoundProjector<'a> {
         mut scope: ModelCallScope,
         initial_len: usize,
     ) -> Self {
-        let hub = hub.filter(|hub| hub.has_context_projection() || hub.has_durable_context());
+        let hub = hub.filter(|hub| {
+            hub.has_context_projection()
+                || hub.has_durable_context()
+                || scope.context_strategy.is_some()
+        });
         let session_db = match hub {
             Some(_) => Some(tool_ctx.session.lock().await.database().clone()),
             None => None,
@@ -600,6 +619,14 @@ impl<'a> RoundProjector<'a> {
             warn!(%error, model_round, "Model call refused by context projection");
             error.to_string()
         };
+        hub.check_context_strategy(
+            self.scope.context_strategy.as_deref(),
+            &self.tool_ctx.agent_name,
+            self.session_db.as_ref(),
+            &self.tool_ctx.active_extensions,
+        )
+        .await
+        .map_err(|e| e.to_string())?;
         let allowed = if hub.has_durable_context() {
             let db = self
                 .session_db
@@ -626,9 +653,27 @@ impl<'a> RoundProjector<'a> {
         let sources = self.sources_for(messages.len());
         // Optional revoked contributions disappear from the request copy only.
         // The retained originals/receipts and actual exchange vector stay intact.
-        let selected: Vec<_> = messages.iter().zip(&sources).filter(|(_, source)| {
+        let selected: Vec<_> = messages.iter().zip(&sources).enumerate().filter(|(_, (_, source))| {
             !matches!(source, ContextSource::DurableContribution { extension, .. } if !allowed.contains(extension))
         }).collect();
+        self.scope
+            .cache
+            .validate(messages)
+            .map_err(|error| error.to_string())?;
+        let mut cache = self.scope.cache.clone();
+        // Host-side revocation removes messages before extension projection.
+        // Keep anchors on the same surviving item, never on its new neighbour.
+        cache.anchors = cache
+            .anchors
+            .into_iter()
+            .filter_map(|anchor| match anchor {
+                crate::cache::CacheAnchor::Message(index) => selected
+                    .iter()
+                    .position(|(original, _)| *original == index)
+                    .map(crate::cache::CacheAnchor::Message),
+                anchor => Some(anchor),
+            })
+            .collect();
         let chain = hub
             .resolve_context_projectors(
                 &self.tool_ctx.agent_name,
@@ -638,15 +683,16 @@ impl<'a> RoundProjector<'a> {
             .await
             .map_err(refused)?;
         let baseline = ProjectedRequest {
+            cache,
             messages: selected
                 .iter()
-                .map(|(message, _)| (*message).clone())
+                .map(|(_, (message, _))| (*message).clone())
                 .collect(),
             tools: tools.to_vec(),
         };
         let sources: Vec<_> = selected
             .iter()
-            .map(|(_, source)| (*source).clone())
+            .map(|(_, (_, source))| (*source).clone())
             .collect();
         let inputs = projection::RoundInputs {
             agent_name: &self.tool_ctx.agent_name,
@@ -691,6 +737,10 @@ impl<'a> RoundProjector<'a> {
             tools,
             self.resolved_model,
             max_retries,
+            projected
+                .as_ref()
+                .map(|r| &r.cache)
+                .unwrap_or(&self.scope.cache),
         )
         .await)
     }

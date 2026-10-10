@@ -608,6 +608,9 @@ pub async fn build(
         .set_context_projection_grants(&config.context_projection)
         .map_err(anyhow::Error::msg)?;
     extension_hub
+        .set_context_strategy_grant(&config.context_strategy)
+        .map_err(anyhow::Error::msg)?;
+    extension_hub
         .set_durable_context_grants(&config.durable_context)
         .map_err(anyhow::Error::msg)?;
     extension_hub.set_peer_handles(Arc::new(extension::PeerHandles {

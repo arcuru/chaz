@@ -203,6 +203,20 @@ impl Extension for TestExt {
     fn scopes(&self) -> &[instance::Scope] {
         &self.scopes
     }
+    fn manifest(&self) -> manifest::ExtensionManifest {
+        manifest::ExtensionManifest {
+            name: self.name().into(),
+            extension_ref: self.extension_ref(),
+            supported_hooks: self.supported.clone(),
+            required_capabilities: vec![],
+            requested_capabilities: vec![],
+            provides_capabilities: if self.parts.context_tail.is_some() {
+                vec![caps::CapabilityKind::ContextTail]
+            } else {
+                vec![]
+            },
+        }
+    }
     fn instantiate<'a>(
         &'a self,
         _scope_ctx: instance::ScopeCtx<'a>,
@@ -334,8 +348,7 @@ impl caps::PromptAugmentation for FixedAug {
 impl caps::ContextTail for FixedAug {
     fn context_tail<'a>(
         &'a self,
-        _agent_name: &'a str,
-        _recent: &'a [String],
+        _call: &'a caps::ContextTailCall<'a>,
     ) -> caps::CapFuture<'a, Option<String>> {
         let text = self.0.to_string();
         Box::pin(async move { Ok(Some(text)) })
@@ -392,7 +405,9 @@ async fn context_augmentation_order_is_stable_and_filtered() {
     hub.agent_instances.write().await.insert(
         (agent.db.id(), "echo".into()),
         Arc::new(TestInstance {
-            manifest: TestExt::new("echo").manifest(),
+            manifest: TestExt::new("echo")
+                .context_tail(Arc::new(FixedAug("AGENT-ECHO")))
+                .manifest(),
             parts: TestParts {
                 prompt_augmentation: Some(Arc::new(FixedAug("AGENT-ECHO"))),
                 context_tail: Some(Arc::new(FixedAug("AGENT-ECHO"))),
@@ -431,6 +446,7 @@ async fn context_augmentation_order_is_stable_and_filtered() {
     );
 
     let (_instance, db) = make_session_db().await;
+    hub.record_active(&db).await.unwrap();
     let expected = "alpha\n\nbravo\n\ncharlie\n\ndelta\n\necho\n\nfoxtrot\n\nzulu";
 
     // Each collection builds a fresh name map; cache hits must preserve the

@@ -22,7 +22,7 @@ use std::time::Duration;
 
 use crate::{
     backends::{ChatContext, LLMBackend, MessageRole, ModelInfo},
-    cache::{CacheControl, CacheRegion},
+    cache::{CacheAnchor, CacheControl, CacheOptions},
     config::Backend,
     error::LlmError,
     runtime::{LLMResponse, ResponseMetadata, RuntimeMessage, TokenUsage, ToolCallRequest},
@@ -281,12 +281,32 @@ impl Anthropic {
         tools: &[ToolDefinition],
         model: &str,
     ) -> Result<LLMResponse, LlmError> {
+        self.chat_with_cache_impl(
+            messages,
+            tools,
+            model,
+            &crate::extensions::context::default_cache_options(),
+        )
+        .await
+    }
+    async fn chat_with_cache_impl(
+        &self,
+        messages: &[RuntimeMessage],
+        tools: &[ToolDefinition],
+        model: &str,
+        cache: &CacheOptions,
+    ) -> Result<LLMResponse, LlmError> {
+        cache
+            .validate(messages)
+            .map_err(|e| LlmError::Configuration {
+                message: e.to_string(),
+            })?;
         let api_key = self.api_key()?;
         let client = self.http_client()?;
 
         let mut req_tools = convert_tool_definitions(tools);
-        let (mut system, mut req_messages) = convert_runtime_messages(messages);
-        apply_cache_control(&mut system, &mut req_messages, &mut req_tools);
+        let (mut system, mut req_messages) = convert_runtime_messages(messages, cache);
+        apply_cache_options(&mut system, &mut req_messages, &mut req_tools, cache);
 
         let url = format!("{}/messages", self.api_base().trim_end_matches('/'));
         let mut max_tokens = self.backend.max_output_tokens();
@@ -574,6 +594,16 @@ impl LLMBackend for Anthropic {
         true
     }
 
+    async fn chat_with_cache(
+        &self,
+        messages: &[RuntimeMessage],
+        tools: &[ToolDefinition],
+        model: &str,
+        cache: &CacheOptions,
+    ) -> Result<LLMResponse, LlmError> {
+        self.chat_with_cache_impl(messages, tools, model, cache)
+            .await
+    }
     async fn chat_with_tools(
         &self,
         messages: &[RuntimeMessage],
@@ -714,19 +744,19 @@ fn text_block(text: String) -> ReqBlock {
 /// top-level `system` field.
 fn convert_runtime_messages(
     messages: &[RuntimeMessage],
+    cache: &CacheOptions,
 ) -> (Option<Vec<TextBlock>>, Vec<ReqMessage>) {
     let mut system_texts: Vec<String> = Vec::new();
     let mut turns: Vec<ReqMessage> = Vec::new();
 
-    for msg in messages {
-        match msg {
-            RuntimeMessage::System(content) => system_texts.push(content.clone()),
-            RuntimeMessage::User(content) => {
-                push_turn(&mut turns, "user", vec![text_block(content.clone())]);
+    for (index, msg) in messages.iter().enumerate() {
+        let (role, mut blocks) = match msg {
+            RuntimeMessage::System(content) => {
+                system_texts.push(content.clone());
+                continue;
             }
-            RuntimeMessage::Assistant(content) => {
-                push_turn(&mut turns, "assistant", vec![text_block(content.clone())]);
-            }
+            RuntimeMessage::User(content) => ("user", vec![text_block(content.clone())]),
+            RuntimeMessage::Assistant(content) => ("assistant", vec![text_block(content.clone())]),
             RuntimeMessage::AssistantToolCalls {
                 content,
                 tool_calls,
@@ -748,20 +778,24 @@ fn convert_runtime_messages(
                             .unwrap_or_else(|_| Value::Object(Map::new())),
                     });
                 }
-                push_turn(&mut turns, "assistant", blocks);
+                ("assistant", blocks)
             }
-            RuntimeMessage::ToolResult { call_id, content } => {
-                push_turn(
-                    &mut turns,
-                    "user",
-                    vec![ReqBlock::ToolResult {
-                        tool_use_id: call_id.clone(),
-                        content: content.clone(),
-                        cache_control: None,
-                    }],
-                );
-            }
+            RuntimeMessage::ToolResult { call_id, content } => (
+                "user",
+                vec![ReqBlock::ToolResult {
+                    tool_use_id: call_id.clone(),
+                    content: content.clone(),
+                    cache_control: None,
+                }],
+            ),
+        };
+        // Anchor the original item's last block before same-role turns merge.
+        if cache.anchors.contains(&CacheAnchor::Message(index))
+            && let Some(block) = blocks.last_mut()
+        {
+            block.set_cache_control(cache.control());
         }
+        push_turn(&mut turns, role, blocks);
     }
 
     let system = if system_texts.is_empty() {
@@ -789,22 +823,34 @@ fn convert_tool_definitions(tools: &[ToolDefinition]) -> Vec<ReqTool> {
         .collect()
 }
 
-/// Stamp first-class Anthropic prompt-cache breakpoints onto the request.
-/// Always applies (native Anthropic caching is unconditional) — the placement
-/// policy is shared with the OpenAI-compatible backend via [`crate::cache`].
+/// Use the built-in defaults for legacy cache-placement fixtures.
+#[cfg(test)]
 fn apply_cache_control(
     system: &mut Option<Vec<TextBlock>>,
     messages: &mut [ReqMessage],
     tools: &mut [ReqTool],
 ) {
-    let cc = CacheControl::ephemeral();
+    apply_cache_options(
+        system,
+        messages,
+        tools,
+        &crate::extensions::context::default_cache_options(),
+    );
+}
+fn apply_cache_options(
+    system: &mut Option<Vec<TextBlock>>,
+    messages: &mut [ReqMessage],
+    tools: &mut [ReqTool],
+    options: &CacheOptions,
+) {
+    let cc = options.control();
     let mut remaining = crate::cache::MAX_BREAKPOINTS;
-    for region in crate::cache::CACHE_PLAN {
+    for region in &options.anchors {
         if remaining == 0 {
             break;
         }
         let placed = match region {
-            CacheRegion::LastTool => {
+            CacheAnchor::LastTool => {
                 if let Some(last_tool) = tools.last_mut() {
                     last_tool.cache_control = Some(cc.clone());
                     true
@@ -812,7 +858,7 @@ fn apply_cache_control(
                     false
                 }
             }
-            CacheRegion::System => {
+            CacheAnchor::System => {
                 if let Some(block) = system.as_mut().and_then(|s| s.last_mut()) {
                     block.cache_control = Some(cc.clone());
                     true
@@ -820,7 +866,9 @@ fn apply_cache_control(
                     false
                 }
             }
-            CacheRegion::LatestUser => {
+            // Already stamped during conversion, before coalescing.
+            CacheAnchor::Message(_) => false,
+            CacheAnchor::LatestUser => {
                 if let Some(block) = messages
                     .iter_mut()
                     .rev()
@@ -865,6 +913,18 @@ fn convert_chat_context(
         model = default_model.clone().unwrap_or_default();
     }
     (model, msgs)
+}
+
+#[cfg(test)]
+pub(crate) fn serialize_cache_fixture(
+    messages: &[RuntimeMessage],
+    tools: &[ToolDefinition],
+    options: &CacheOptions,
+) -> Value {
+    let (mut system, mut wire_messages) = convert_runtime_messages(messages, options);
+    let mut wire_tools = convert_tool_definitions(tools);
+    apply_cache_options(&mut system, &mut wire_messages, &mut wire_tools, options);
+    serde_json::json!({"system": system, "messages": wire_messages, "tools": wire_tools})
 }
 
 #[cfg(test)]
@@ -926,7 +986,7 @@ mod tests {
                 content: "r2".into(),
             },
         ];
-        let (system, turns) = convert_runtime_messages(&messages);
+        let (system, turns) = convert_runtime_messages(&messages, &CacheOptions::default());
 
         // System is top-level, not a message.
         let sys = system.expect("system present");
@@ -966,12 +1026,15 @@ mod tests {
 
     #[test]
     fn cache_control_marks_system_last_tool_and_latest_user() {
-        let (mut system, mut messages) = convert_runtime_messages(&[
-            RuntimeMessage::System("s".into()),
-            RuntimeMessage::User("first".into()),
-            RuntimeMessage::Assistant("reply".into()),
-            RuntimeMessage::User("latest".into()),
-        ]);
+        let (mut system, mut messages) = convert_runtime_messages(
+            &[
+                RuntimeMessage::System("s".into()),
+                RuntimeMessage::User("first".into()),
+                RuntimeMessage::Assistant("reply".into()),
+                RuntimeMessage::User("latest".into()),
+            ],
+            &CacheOptions::default(),
+        );
         let mut tools = convert_tool_definitions(&[
             ToolDefinition {
                 name: "a".into(),
@@ -998,6 +1061,61 @@ mod tests {
         assert!(first["content"][0].get("cache_control").is_none());
         let latest = serde_json::to_value(messages.last().unwrap()).unwrap();
         assert_eq!(latest["content"][0]["cache_control"]["type"], "ephemeral");
+    }
+
+    #[test]
+    fn message_cache_anchors_survive_tool_blocks_and_role_coalescing() {
+        let messages = vec![
+            RuntimeMessage::System("policy".into()),
+            RuntimeMessage::User("start".into()),
+            RuntimeMessage::AssistantToolCalls {
+                content: Some("checking".into()),
+                tool_calls: vec![
+                    ToolCallRequest {
+                        id: "a".into(),
+                        name: "lookup".into(),
+                        arguments: "{}".into(),
+                    },
+                    ToolCallRequest {
+                        id: "b".into(),
+                        name: "lookup".into(),
+                        arguments: "{}".into(),
+                    },
+                ],
+                provider_extra: Default::default(),
+            },
+            RuntimeMessage::ToolResult {
+                call_id: "a".into(),
+                content: "one".into(),
+            },
+            RuntimeMessage::ToolResult {
+                call_id: "b".into(),
+                content: "two".into(),
+            },
+            RuntimeMessage::User("after tools".into()),
+            RuntimeMessage::Assistant("answer".into()),
+            RuntimeMessage::Assistant("continuation".into()),
+        ];
+        let cache = CacheOptions {
+            anchors: vec![3, 5, 6, 7]
+                .into_iter()
+                .map(CacheAnchor::Message)
+                .collect(),
+            ttl: crate::cache::CacheTtl::OneHour,
+        };
+        cache.validate(&messages).unwrap();
+        let wire = serialize_cache_fixture(&messages, &[], &cache);
+        let turns = wire["messages"].as_array().unwrap();
+        assert_eq!(turns.len(), 4);
+        let results = &turns[2]["content"];
+        assert_eq!(results[0]["tool_use_id"], "a");
+        assert_eq!(results[0]["cache_control"]["ttl"], "1h");
+        assert!(results[1].get("cache_control").is_none());
+        assert_eq!(results[2]["text"], "after tools");
+        assert_eq!(results[2]["cache_control"]["ttl"], "1h");
+        for block in turns[3]["content"].as_array().unwrap() {
+            assert_eq!(block["cache_control"]["ttl"], "1h");
+        }
     }
 
     #[test]

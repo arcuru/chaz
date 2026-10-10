@@ -236,7 +236,9 @@ Sessions can be given human-friendly names via `set_session_name()` (TUI: `/name
 
 ## Context Building
 
-`ContextBuilder` (in `context.rs`) assembles the LLM context within a token budget:
+`ContextBuilder` (in `context.rs`) renders a coherent host-owned view. The required
+`baseline_context` extension selects history and layout through public scoped APIs
+within the existing token budget:
 
 1. Account for system prompt and tool definition tokens first
 2. Resolve a successful `/compact` snapshot boundary, or the most recent legacy `Summary`

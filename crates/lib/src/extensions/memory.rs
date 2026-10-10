@@ -325,11 +325,11 @@ struct MemoryContextTail {
 impl ContextTail for MemoryContextTail {
     fn context_tail<'a>(
         &'a self,
-        agent_name: &'a str,
-        recent_message_text: &'a [String],
+        call: &'a crate::extension::caps::ContextTailCall<'a>,
     ) -> CapFuture<'a, Option<String>> {
         Box::pin(async move {
-            let query = extract_query(recent_message_text);
+            let agent_name = call.agent_name;
+            let query = extract_query(call.recent_message_text);
             if query.is_empty() {
                 return Ok(None);
             }
@@ -1777,6 +1777,133 @@ mod tests {
             memory_bank_index: cmd.memory_bank_index.clone(),
             embedder: None,
         }
+    }
+
+    #[tokio::test]
+    async fn typed_native_recall_preserves_budgets_sources_disabled_and_ephemeral_default() {
+        let (_i, registry, cmd) = fixture().await;
+        seed_agent(&registry, &cmd, "alpha").await;
+        let access = access_for(&cmd);
+        access
+            .remember("alpha", "color", &"teal ".repeat(100), MemoryScope::Agent)
+            .await
+            .unwrap();
+        access
+            .remember(
+                "alpha",
+                "color-two",
+                &"teal second ".repeat(100),
+                MemoryScope::Agent,
+            )
+            .await
+            .unwrap();
+        cmd.new_cmd("eligible").await;
+        cmd.grant_cmd("eligible alpha write").await;
+        access
+            .remember(
+                "alpha",
+                "color-bank",
+                "teal eligible bank",
+                MemoryScope::Bank {
+                    name: "eligible".into(),
+                },
+            )
+            .await
+            .unwrap();
+        let (_foreign_instance, _foreign_registry, foreign_cmd) = fixture().await;
+        assert_text(foreign_cmd.new_cmd("denied").await, "denied");
+        access_for(&foreign_cmd)
+            .remember(
+                "alpha",
+                "color",
+                "teal denied bank",
+                MemoryScope::Bank {
+                    name: "denied".into(),
+                },
+            )
+            .await
+            .unwrap();
+        let denied = foreign_cmd
+            .memory_bank_index
+            .find_by_name("denied")
+            .unwrap();
+        assert!(!matches!(
+            registry
+                .open_memory_bank(&denied.db_id, Some(&denied.pubkey))
+                .await,
+            Ok(Some(_))
+        ));
+        cmd.memory_bank_index.register(denied);
+        let mut tail = MemoryContextTail {
+            registry: registry.clone(),
+            agent_index: cmd.agent_index.clone(),
+            memory_bank_index: cmd.memory_bank_index.clone(),
+            embedder: None,
+            session_attached_banks: vec!["eligible".into(), "denied".into(), "absent".into()],
+        };
+        let recent = vec!["color teal".into()];
+        let call = crate::extension::caps::ContextTailCall {
+            agent_name: "alpha",
+            recent_message_text: &recent,
+            session_db_id: Some("synthetic-session".into()),
+            request_id: Some("synthetic-request"),
+        };
+        let unbounded = tail.context_tail(&call).await.unwrap().unwrap();
+        println!("NATIVE_SESSION_BANK {unbounded}");
+        assert!(unbounded.contains("eligible bank"));
+        assert!(unbounded.contains(&"teal ".repeat(10)));
+        assert!(!unbounded.contains("denied bank"));
+        // Attachment eligibility is captured by the native session instance;
+        // exercise removal by constructing the next instance's attachment list.
+        tail.session_attached_banks
+            .retain(|name| name != "eligible");
+        let own = cmd.agent_index.find_by_name("alpha").unwrap();
+        let adb = registry
+            .open_agent_db(&own.db_id, Some(&own.pubkey))
+            .await
+            .unwrap()
+            .unwrap();
+        let config = AutoRecallConfig {
+            auto_recall_max_entries: 1,
+            auto_recall_max_chars: 32,
+            auto_recall_banks: Some(vec![]),
+            ..Default::default()
+        };
+        save_auto_recall_config(adb.database(), &config)
+            .await
+            .unwrap();
+        let text = tail.context_tail(&call).await.unwrap().unwrap();
+        assert!(text.contains("teal"));
+        assert_eq!(
+            text.lines().filter(|line| line.starts_with("- **")).count(),
+            1
+        );
+        assert!(!text.contains(&"teal second ".repeat(10)));
+        assert!(!text.contains("eligible bank"));
+        assert!(!text.contains(&"teal ".repeat(10)));
+        assert!(!text.contains("denied bank"));
+        assert!(!text.contains("absent"));
+        println!("NATIVE_RECALL_CAPPED {text}");
+        let mut config = config;
+        config.auto_recall_enabled = false;
+        save_auto_recall_config(adb.database(), &config)
+            .await
+            .unwrap();
+        assert!(tail.context_tail(&call).await.unwrap().is_none());
+        let missing = crate::extension::caps::ContextTailCall {
+            agent_name: "not-held",
+            ..call
+        };
+        assert!(tail.context_tail(&missing).await.unwrap().is_none());
+        // Migration intentionally does not install a durable contributor endpoint.
+        let instance = MemoryInstance {
+            manifest: MemoryExtension::new(registry, cmd.agent_index, cmd.memory_bank_index, None)
+                .manifest(),
+            context_tail: Arc::new(tail),
+        };
+        assert!(
+            crate::extension::ExtensionInstance::durable_context_contributor(&instance).is_none()
+        );
     }
 
     #[tokio::test]

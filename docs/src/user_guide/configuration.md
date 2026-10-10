@@ -540,6 +540,19 @@ agent_state_allowlist:
   memory: [chaz]
 ```
 
+`context_strategy:` selects one required installed context provider. The default
+is the built-in `baseline_context`; missing, inactive or failed selection stops
+dispatch, with no old core fallback. See [One required context strategy](extensions.md#one-required-context-strategy).
+
+| Setting                      | Default            | Description                                              |
+| ---------------------------- | ------------------ | -------------------------------------------------------- |
+| `context_strategy.extension` | `baseline_context` | Manifest name of the required active selection provider. |
+
+```yaml
+context_strategy:
+  extension: baseline_context
+```
+
 `durable_context:` grants intentional session-backed text/state contributions.
 It defaults to `[]`; installation does not grant writes. Names must be distinct.
 See [Durable context](extensions.md#durable-context-is-an-explicit-write) for

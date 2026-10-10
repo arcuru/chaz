@@ -109,6 +109,7 @@ empty / `None`:
 - **Hook handlers** — `before_agent_start_hook()`, `tool_call_hook()`,
   `tool_result_hook()`, `agent_end_hook()`, `session_start_hook()`,
   `session_shutdown_hook()`
+- **Selection** — `context_strategy()` (required operator-selected endpoint)
 - **Routine** — `routine_handler()`
 - **Lifecycle** — `shutdown()` (async; not yet triggered)
 
@@ -141,7 +142,8 @@ from non-Global instances.
 ### 2. Live-instance path (per-turn)
 
 System-prompt and context-tail augmentation consult live instances
-directly each turn. `augment_system_prompt` and `context_tails`
+directly each turn. `augment_system_prompt` and the typed
+`context_tails_for_call`
 (`mod.rs`) call `context_instances(agent_name, session_db)`, which
 returns the deduped union of per-session ∪ per-agent instances (session
 wins on name collision; Global is intentionally excluded — those
@@ -457,6 +459,7 @@ so it round-trips through eidetica.
 
 | Extension           | Scopes                 | Declared hooks    | Routine | What it provides                                                            |
 | ------------------- | ---------------------- | ----------------- | ------- | --------------------------------------------------------------------------- |
+| `baseline_context`  | `Global`               | —                 | —       | Required scoped context selection and default cache options                 |
 | `core`              | `Global`               | `Tool`            | —       | `shell`, `compact`, `spawn_agent`, `job_status`, `job_wait`, `spawn_worker` |
 | `fs`                | `Global`               | `Tool`            | —       | `read_file`, `write_file`, `edit_file`                                      |
 | `system`            | `Global`               | `Tool`            | —       | `get_time`, `calculate`, `describe_tool`                                    |
@@ -582,3 +585,44 @@ case where a request queued _before_ the summary is hidden. It preserves rows
 selected by that reader, including current and queued rows after the boundary.
 It also retains the existing eager transcript hydration; a separate keyed
 reader can adopt the same pinned-view boundary without changing this schema.
+
+## Required selection and typed recall
+
+`ContextStrategy` is a normal instance endpoint declared as `ContextStrategy`
+and selected by the operator's `ContextStrategyGrant`. Resolution uses the same
+session-over-agent-over-global precedence and current activation attenuation as
+projection. The grant has no optional flag: absence, failure, panic, timeout or
+invalid references refuse dispatch. The runtime rechecks the selected instance
+before each logical call; transport retries reuse the accepted request/options.
+
+`ContextStrategyCall` carries identity, budget, the instance's current session
+settings and a read-only `ScopedContext`. Its public selection/hydration methods
+expose only host-selected rows. `ContextPlan` chooses instructions, entry indices,
+bounded native exchanges, ephemeral tail and committed contribution references.
+Core rejects duplicates, foreign indices, reordered entries and non-adjacent
+exchanges; it owns rendering, provider echo, stable provenance and final budgets.
+The built-in `BaselineContext` uses only this public facility. Its algorithm no
+longer lives in `ContextBuilder`.
+
+This migration adds no history hydration pass. The existing coherent
+`SessionContextView` still loads selected completed transcript records eagerly;
+scoped item rendering/replay is lazy and bounded by the chosen budget. Further
+storage-read optimization is separate work, not a second authoritative transcript.
+Tests measure returned Table row/byte volume separately from selection elapsed
+cost; this is not a measurement of physical backend I/O or provider cache hits.
+
+`ContextTailCall` replaces the native recall endpoint's loose argument pair with
+agent/session/request identity and the same recent-text input. Current activation
+and declarations gate the production call; errors, panic and timeout discard only
+that optional tail. Native memory's search policy and ephemeral default are
+unchanged. The durable recall example is synthetic and explicitly granted; it
+does not authorize private-data retention or external recall rollout.
+
+`ProjectedRequest.cache` carries typed `CacheOptions` through the existing
+runtime/backend path. Anchors use final-request indices, not raw provider fields.
+Adapters cap and map markers, including the precise pre-coalescing message block
+on native Anthropic, and omit them for incompatible providers. The built-in's
+legacy/default policy remains last tool, system, latest user with five-minute TTL.
+Host-side durable revocation remaps surviving message anchors and drops anchors
+on removed messages. Projectors own the final indices of their returned request.
+An empty or over-budget request cannot pass the final dispatch gate.

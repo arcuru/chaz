@@ -85,6 +85,9 @@ pub struct Config {
     /// names. Empty (the default) leaves every request untouched.
     #[serde(default)]
     pub context_projection: Vec<crate::extension::projection::ContextProjectionGrant>,
+    /// Required context selection provider, defaulting to the built-in baseline.
+    #[serde(default)]
+    pub context_strategy: crate::extension::context_strategy::ContextStrategyGrant,
     /// Intentional durable context/state grants; empty by default.
     #[serde(default)]
     pub durable_context: Vec<crate::extension::durable_context::DurableContextGrant>,
@@ -985,6 +988,7 @@ fn known_config_keys() -> HashSet<&'static str> {
         "cli",
         "agent_state_allowlist",
         "context_projection",
+        "context_strategy",
         "durable_context",
         "multi_agent",
         "runtime",
@@ -1188,6 +1192,8 @@ fn known_config_keys() -> HashSet<&'static str> {
     for k in ["durable_context[].extension", "durable_context[].required"] {
         keys.insert(k);
     }
+
+    keys.insert("context_strategy.extension");
 
     // ── context_projection[] ──
     for k in [
