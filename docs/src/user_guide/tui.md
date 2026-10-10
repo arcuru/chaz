@@ -764,6 +764,13 @@ turn. The tab follows persisted messages and tool activity. Job-local settings,
 retry, cancellation and approval-policy changes are unavailable here.
 Closing a tab or the client does not cancel the job or discard published input.
 
+Jobs uses the same [background boundary](#responsiveness-and-background-refresh)
+as ordinary conversations: selection, diagnostics, cached scrolling and drafts
+stay local while refreshes or accepted actions run. Overview refreshes coalesce;
+opening an observer and publishing steering use the ordered action queue.
+Pending work and exit confirmation remain visible in both Jobs and observer tabs.
+Reconnect reopens job tabs as observers, never as ordinary executing sessions.
+
 ### Next-call steering and the final boundary
 
 An authorized session writer can send input while a recent started attempt is
@@ -785,7 +792,7 @@ input. **Included · call N returned** means a response to the request containin
 that input was observed. **Not applied** and **Uncertain** explain late
 publication, failure or interruption. Input numbers are display labels, not
 submission order or request identities; `F2` exposes the durable IDs. A lost acknowledgement retains the
-request ID: resend the same text to retry that publication, not create a second
+request ID for the client lifetime, including tab close/reopen and service reconnect: resend the same text to retry that publication, not create a second
 logical input. Different text is refused while that publication is unresolved.
 There is no globally exactly-once effect guarantee. Interrupted input and
 model/tool effects never replay automatically after restart.
@@ -820,6 +827,9 @@ model/tool effects never replay automatically after restart.
    credential to inspect it. Chaz does not grant or upgrade authority.
 6. For another failure path, stop only the disposable viewer's access to its test
    service. A refresh displays `Stale · refresh failed/timed out` with the
-   retained task and result still readable. `d` shows the actual error. Restore access and press `r` to refresh.
+   retained task and result still readable. Selection and `d` diagnostics remain
+   usable; an observer retains its transcript, receipts and editable draft with
+   an `Unavailable` banner. Restore access and press `r` to refresh. After an
+   actual reconnect, the same observer and draft recover without another job turn.
    A stale start is not an invitation to replay: inspect the attempt before
    using the separate explicit retry workflow outside the job observer.

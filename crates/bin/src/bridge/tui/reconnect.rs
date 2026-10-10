@@ -35,18 +35,19 @@ async fn reopen(
     backend: BackendManager,
     id: String,
     incarnation: u64,
+    job: bool,
     approval_tx: mpsc::Sender<TaggedApproval>,
     notify_tx: mpsc::Sender<String>,
 ) -> Reopened {
     let opener = server.clone();
     let target = id.clone();
     let result = supervised::read(async move {
-        opener
-            .registry()
-            .open_session(&target)
-            .await
-            .map(|(_, db)| db)
-            .map_err(|e| e.to_string())
+        let opened = if job {
+            opener.registry().open_job_session(&target).await
+        } else {
+            opener.registry().open_session(&target).await
+        };
+        opened.map(|(_, db)| db).map_err(|e| e.to_string())
     })
     .await;
     let result = match result {
@@ -58,9 +59,15 @@ async fn reopen(
             // like construction; a read deadline is not rollback authority.
             // Keep the large registration future off the worker's stack.
             let observation = supervised::work(Box::pin(async move {
-                setup_session(&server, &observed, backend, approval_tx, notify_tx)
-                    .await
-                    .map_err(|e| e.to_string())
+                if job {
+                    jobs::observe(&observed, notify_tx)
+                        .await
+                        .map_err(|e| e.to_string())
+                } else {
+                    setup_session(&server, &observed, backend, approval_tx, notify_tx)
+                        .await
+                        .map_err(|e| e.to_string())
+                }
             }))
             .await;
             Ok(ReopenedState { db, observation })
@@ -78,7 +85,7 @@ pub(super) async fn rebuild(
     old: Option<BuiltServer>,
     mut config: Config,
     path: PathBuf,
-    tabs: Vec<(String, u64)>,
+    tabs: Vec<(String, u64, bool)>,
     approval_tx: mpsc::Sender<TaggedApproval>,
     notify_tx: mpsc::Sender<String>,
 ) -> Result<Box<Replacement>, (String, bool)> {
@@ -107,13 +114,14 @@ pub(super) async fn rebuild(
         })?;
     let backend = BackendManager::new(&config.backends, built.secret_store.clone());
     let mut reopened = Vec::new();
-    for (id, incarnation) in tabs {
+    for (id, incarnation, job) in tabs {
         reopened.push(
             reopen(
                 built.server.clone(),
                 backend.clone(),
                 id,
                 incarnation,
+                job,
                 approval_tx.clone(),
                 notify_tx.clone(),
             )
@@ -128,6 +136,8 @@ pub(super) async fn rebuild(
 
 pub(super) fn disconnect(app: &mut App) {
     app.backend_available = false;
+    jobs::cancel(app);
+    app.jobs.error = Some("Backend disconnected; retained snapshot is stale".into());
     app.cancel_session_fill();
     app.model_catalog_ticket += 1;
     app.model_catalog_task = None;
@@ -202,13 +212,23 @@ pub(super) fn request_tabs(
         tab.live.rebind_ticket = Some(ticket);
         let id = tab.session_db_id.clone();
         let incarnation = tab.live.incarnation;
+        let job = tab.job.is_some();
         let server = server.clone();
         let backend = backend.clone();
         let approval_tx = approval_tx.clone();
         let notify_tx = notify_tx.clone();
         let tx = tx.clone();
         tab.live.rebind_task = Some(supervised::Task(tokio::spawn(async move {
-            let reopened = reopen(server, backend, id, incarnation, approval_tx, notify_tx).await;
+            let reopened = reopen(
+                server,
+                backend,
+                id,
+                incarnation,
+                job,
+                approval_tx,
+                notify_tx,
+            )
+            .await;
             let _ = tx
                 .send(ResultMessage::Tab {
                     ticket,

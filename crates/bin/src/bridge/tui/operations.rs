@@ -42,6 +42,7 @@ pub(super) enum Effect {
     Outcome(CommandOutcome),
     Opened(Box<Tab>),
     Sent,
+    JobSent(String),
     Renamed { id: String, name: Option<String> },
     Settings(String),
     Diff(AgentDiffView),
@@ -291,6 +292,10 @@ pub(super) fn apply(app: &mut App, completion: Completion) {
     }
     match result {
         Err(error) => {
+            if let Some(i) = target.filter(|&i| app.tabs[i].job.is_some()) {
+                app.tabs[i].job.as_mut().unwrap().feedback = error.clone();
+                app.tabs[i].touch_transcript();
+            }
             let qualifier = if pending.write {
                 "outcome unknown; check before retrying"
             } else {
@@ -335,6 +340,12 @@ pub(super) fn apply(app: &mut App, completion: Completion) {
             }
         }
         Ok(Effect::Sent) => {}
+        Ok(Effect::JobSent(feedback)) => {
+            if let Some(i) = target.filter(|&i| app.tabs[i].job.is_some()) {
+                app.tabs[i].job.as_mut().unwrap().feedback = feedback;
+                app.tabs[i].touch_transcript();
+            }
+        }
         Ok(Effect::Renamed { id, name }) => {
             // A closed/reopened view receives fresh meta through its own read.
             if let Some(i) = target.filter(|&i| app.tabs[i].session_db_id == id) {
@@ -456,6 +467,16 @@ impl Context {
     async fn prepare(&self, outcome: CommandOutcome) -> Result<Effect, String> {
         match outcome {
             CommandOutcome::SessionSwitched(switch) => {
+                if chaz_core::session::jobs::is_job_session(&switch.db).await {
+                    return jobs::open_tab(
+                        &self.server,
+                        &self.backend,
+                        &switch.session_db_id,
+                        self.notify_tx.clone(),
+                    )
+                    .await
+                    .map(|tab| Effect::Opened(Box::new(tab)));
+                }
                 let server = self.server.clone();
                 let backend = self.backend.clone();
                 let db = switch.db.clone();
@@ -541,6 +562,7 @@ mod tests {
         App::new(
             HashSet::new(),
             Tab {
+                job: None,
                 session_db_id: "a".into(),
                 session_db: db,
                 entries: Vec::new(),

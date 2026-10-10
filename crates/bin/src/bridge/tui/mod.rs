@@ -109,7 +109,7 @@ enum Action {
     /// list (already merged with cache); `Err` carries a display message.
     ModelsFetched(ModelCatalog),
     SessionLoad(SessionLoad),
-    JobsLoaded(Result<chaz_core::server::JobMonitor, String>),
+    JobsLoaded(jobs::Loaded),
     /// A background tab read finished (see [`refresh`]).
     Refresh(refresh::Refresh),
     Operation(operations::Completion),
@@ -1043,7 +1043,7 @@ impl App {
         self.backend_available
             && (matches!(
                 self.mode,
-                TuiMode::SessionPicker | TuiMode::Settings(SettingsScope::Peer)
+                TuiMode::Jobs | TuiMode::SessionPicker | TuiMode::Settings(SettingsScope::Peer)
             ) || (self.mode == TuiMode::ModelPicker
                 && matches!(self.model_picker_scope, ModelPickerScope::AgentGlobal(_)))
                 || self.current().is_none_or(|tab| !tab.live.unbound))
@@ -1098,6 +1098,14 @@ impl App {
 
     /// Open a conversation view and focus it with an empty composer.
     pub(super) fn push_tab(&mut self, mut tab: Tab) {
+        if let Some(job) = tab.job.as_mut() {
+            job.retry = self
+                .jobs
+                .publications
+                .entry(tab.session_db_id.clone())
+                .or_insert_with(|| job.retry.clone())
+                .clone();
+        }
         self.refresh_ticket += 1;
         tab.live.incarnation = self.refresh_ticket;
         self.tabs.push(tab);
@@ -1132,7 +1140,9 @@ impl App {
             TuiMode::ModelPicker => {
                 !matches!(self.model_picker_scope, ModelPickerScope::AgentGlobal(_))
             }
-            TuiMode::SessionPicker | TuiMode::Settings(SettingsScope::Peer) => false,
+            TuiMode::Jobs | TuiMode::SessionPicker | TuiMode::Settings(SettingsScope::Peer) => {
+                false
+            }
         };
         if self.tabs.is_empty() && needs_conversation {
             self.settings_return = None;
@@ -1932,7 +1942,10 @@ fn handle_chat_action(
     if app.current().is_some_and(|tab| tab.job.is_some())
         && !matches!(
             action,
-            ChatAction::OpenJobs | ChatAction::OpenPicker | ChatAction::SendMessage(_)
+            ChatAction::OpenJobs
+                | ChatAction::OpenPicker
+                | ChatAction::SendMessage(_)
+                | ChatAction::Dispatch(Command::Quit)
         )
     {
         show_error(
@@ -1946,6 +1959,12 @@ fn handle_chat_action(
             app.mode = TuiMode::Jobs;
         }
         ChatAction::SendMessage(text) => {
+            if let Some(tab) = app.current().filter(|tab| tab.job.is_some()) {
+                let db = tab.session_db.clone();
+                let retry = tab.job.as_ref().unwrap().retry.clone();
+                operations::submit(app, true, Some(text.clone()), jobs::send(db, retry, text));
+                return;
+            }
             let Some(target) = operations::Target::capture(app) else {
                 return;
             };

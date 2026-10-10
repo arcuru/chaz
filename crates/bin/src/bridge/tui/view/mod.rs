@@ -582,7 +582,11 @@ pub(super) fn ui_chat(f: &mut ratatui::Frame, app: &mut App, ext_segments: &[Str
         inner_width,
     );
     let tab = app.active();
-    let activity = turn_activity_line(tab.active_turns);
+    let activity = tab
+        .job
+        .is_none()
+        .then(|| turn_activity_line(tab.active_turns))
+        .flatten();
 
     // Snapshot what we need from `tab` before releasing the borrow so the
     // approval panel can take a &mut borrow of app.click_regions.
@@ -791,7 +795,9 @@ pub(super) fn ui_chat(f: &mut ratatui::Frame, app: &mut App, ext_segments: &[Str
             " {session_label}{ctx_segment}{agent_segment}{usage_segment}{debug_indicator}{expand_indicator}{startup_indicator}{refresh_indicator}{operation_indicator}"
         )
     };
-    let mut status_text = if let Some(notice) = &app.operations.notice {
+    let mut status_text = if app.active().job.is_some() {
+        format!("{operation_indicator}{refresh_indicator} | {session_label}")
+    } else if let Some(notice) = &app.operations.notice {
         format!(" ⚠ {notice}{refresh_indicator}")
     } else {
         make_status(&agent_segment)
@@ -1339,6 +1345,7 @@ fn build_transcript(
             }
         }
     }
+    lines.extend(super::jobs::input_lines(tab));
     (lines, pending_clicks)
 }
 
@@ -2143,7 +2150,7 @@ mod chat_frame_tests {
             .unwrap();
         app.active_mut().session_db_id = db.root_id().to_string();
         app.active_mut().session_db = db.clone();
-        let callback = db
+        let _callback = db
             .on_write_at_tips(db.snapshot().await.unwrap(), |_, _| async { Ok(()) })
             .await
             .unwrap();
@@ -2161,9 +2168,8 @@ mod chat_frame_tests {
                 state: JobInputState::Dispatching { model_sequence: 1 },
             }],
             feedback: String::new(),
-            retry: None,
+            retry: Default::default(),
             details: false,
-            _callback: callback,
         });
         app.active_mut().active_turns = 1;
         for (w, h) in [(80, 24), (120, 35), (180, 45)] {
@@ -2183,11 +2189,13 @@ mod chat_frame_tests {
                 assert!(!text.contains(hidden), "{text}");
             }
         }
-        app.active_mut().job.as_mut().unwrap().details = true;
+        // Same-width local toggles must invalidate cached details even offline.
+        draw(&mut app, 120, 35);
+        super::super::jobs::toggle_tab_details(app.active_mut());
         let text = draw(&mut app, 120, 35).0.join("\n");
         assert!(text.contains("Request: diagnostic-request"), "{text}");
         assert!(text.contains("Attempt: diagnostic-attempt"), "{text}");
-        app.active_mut().job.as_mut().unwrap().details = false;
+        super::super::jobs::toggle_tab_details(app.active_mut());
         app.active_mut().job.as_mut().unwrap().state = Some(JobState::Succeeded {
             text: Some("Smaller example result".into()),
         });
@@ -2739,6 +2747,7 @@ mod transcript_tests {
             .await
             .unwrap();
         let mut tab = Tab {
+            job: None,
             session_db_id: db.root_id().to_string(),
             session_db: db,
             entries: Vec::new(),

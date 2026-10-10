@@ -245,3 +245,101 @@ async fn last_tab_close_then_preclick_draw_in_same_batch() {
     }))
     .await;
 }
+
+#[tokio::test]
+async fn sessionless_jobs_escape_and_pending_exit_preserve_batch_view_contract() {
+    let dir = tempfile::tempdir().unwrap();
+    let built = runtime(dir.path()).await;
+    let backend = BackendManager::new(&None, built.secret_store.clone());
+    let (notify, _) = mpsc::channel(64);
+    let (jobs_tx, _) = mpsc::channel(1);
+    let mut app = App::hub(HashSet::new());
+    app.mode = TuiMode::Jobs;
+    jobs::handle_key(
+        &mut app,
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+        &built.server,
+        &backend,
+        &notify,
+        &jobs_tx,
+    );
+    assert_eq!(app.mode, TuiMode::SessionPicker);
+    // Real pre-click draw follows Esc in the same event batch, before ensure_view.
+    let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+    terminal
+        .draw(|f| view::ui(f, &mut app, &built.server, &backend, &Config::default()))
+        .unwrap();
+    app.mode = TuiMode::Jobs;
+    operations::submit(
+        &mut app,
+        true,
+        Some("accepted steering".into()),
+        std::future::pending(),
+    );
+    assert!(!app.operations.request_exit());
+    terminal
+        .draw(|f| view::ui(f, &mut app, &built.server, &backend, &Config::default()))
+        .unwrap();
+    let buffer = terminal.backend().buffer();
+    let text: String = buffer.content.iter().map(|c| c.symbol()).collect();
+    assert!(
+        text.contains("Quit again"),
+        "Jobs concealed pending exit confirmation"
+    );
+    assert!(app.operations.request_exit());
+    assert!(
+        app.operations
+            .exit_report()
+            .unwrap()
+            .contains("accepted steering")
+    );
+    drop(app);
+    built.shutdown().await;
+}
+
+#[tokio::test]
+async fn uncertain_job_publication_identity_survives_close_and_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let built = runtime(dir.path()).await;
+    let backend = BackendManager::new(&None, built.secret_store.clone());
+    let (_, db) = built.registry.create_session(Some("tui")).await.unwrap();
+    let id = db.root_id().to_string();
+    let mut app = App::hub(HashSet::new());
+    let retry = Arc::new(tokio::sync::Mutex::new(Some(
+        chaz_core::session::steering::JobInputRequest::new(
+            "attempt".into(),
+            "accepted text".into(),
+        ),
+    )));
+    for opening in 0..2 {
+        let mut tab = build_tab(&built.server, &backend, db.clone(), id.clone())
+            .await
+            .unwrap();
+        tab.job = Some(jobs::JobTab {
+            state: None,
+            inputs: Vec::new(),
+            feedback: String::new(),
+            retry: Default::default(),
+            details: false,
+        });
+        app.push_tab(tab);
+        if opening == 0 {
+            *app.active().job.as_ref().unwrap().retry.lock().await = retry.lock().await.clone();
+        }
+        assert_eq!(
+            app.active()
+                .job
+                .as_ref()
+                .unwrap()
+                .retry
+                .lock()
+                .await
+                .as_ref()
+                .unwrap()
+                .id,
+            retry.lock().await.as_ref().unwrap().id
+        );
+        app.close_tab_at(0);
+    }
+    built.shutdown().await;
+}

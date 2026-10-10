@@ -78,6 +78,7 @@ pub(super) struct TabLive {
     pub(super) status: RefreshSlot,
     /// Live-turn claim count, polled on the activity tick.
     pub(super) activity: RefreshSlot,
+    pub(super) job: RefreshSlot,
     /// Ticket of the newest read whose `active_turns` has been applied, so a
     /// slow tick can't overwrite a newer reload's count (or vice versa).
     activity_applied: u64,
@@ -87,7 +88,7 @@ pub(super) struct TabLive {
     /// An unresolved binding or per-kind read failure. A successful unrelated
     /// read cannot clear it or make cached data pass for fresh data.
     pub(super) error: Option<String>,
-    errors: [Option<String>; 3],
+    errors: [Option<String>; 4],
     pub(super) meta: SessionMeta,
     /// View-local command/error output is not stored in the session DB.
     local_entries: Vec<SessionEntry>,
@@ -111,6 +112,7 @@ impl TabLive {
         self.reload = RefreshSlot::default();
         self.status = RefreshSlot::default();
         self.activity = RefreshSlot::default();
+        self.job = RefreshSlot::default();
         self.rebind_task = None;
         self.rebind_ticket = None;
     }
@@ -127,6 +129,7 @@ impl TabLive {
         self.reload.in_flight.is_some()
             || self.status.in_flight.is_some()
             || self.activity.in_flight.is_some()
+            || self.job.in_flight.is_some()
             || self.rebind_task.is_some()
     }
 }
@@ -140,6 +143,11 @@ pub(super) struct SessionSnapshot {
 
 /// A completed background read, routed back to the run loop.
 pub(super) enum Refresh {
+    Job {
+        session_db_id: String,
+        ticket: u64,
+        snapshot: Result<Box<jobs::Snapshot>, String>,
+    },
     Session {
         session_db_id: String,
         ticket: u64,
@@ -164,6 +172,7 @@ pub(super) enum RefreshKind {
     Session,
     Status,
     Activity,
+    Job,
 }
 
 /// Result of applying one [`Refresh`].
@@ -234,6 +243,7 @@ pub(super) fn request_with<Fut>(
         RefreshKind::Session => &mut live.reload,
         RefreshKind::Status => &mut live.status,
         RefreshKind::Activity => &mut live.activity,
+        RefreshKind::Job => &mut live.job,
     };
     if !slot.begin(ticket) {
         return;
@@ -244,6 +254,11 @@ pub(super) fn request_with<Fut>(
         let msg = supervised::read(async move { Ok(load(ticket).await) })
             .await
             .unwrap_or_else(|e| match kind {
+                RefreshKind::Job => Refresh::Job {
+                    session_db_id: id,
+                    ticket,
+                    snapshot: Err(e),
+                },
                 RefreshKind::Session => Refresh::Session {
                     session_db_id: id,
                     ticket,
@@ -278,10 +293,26 @@ pub(super) fn request(
     if app.tabs[idx].live.unbound {
         return;
     }
+    let kind = if app.tabs[idx].job.is_some() {
+        RefreshKind::Job
+    } else {
+        kind
+    };
     let db = app.tabs[idx].session_db.clone();
     let id = session_db_id.to_string();
     request_with(app, session_db_id, kind, tx, move |ticket| async move {
         match kind {
+            RefreshKind::Job => Refresh::Job {
+                snapshot: tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    jobs::snapshot(&db),
+                )
+                .await
+                .unwrap_or_else(|_| Err("refresh timed out; retained evidence is stale".into()))
+                .map(Box::new),
+                session_db_id: id,
+                ticket,
+            },
             RefreshKind::Session => Refresh::Session {
                 snapshot: load_session_snapshot(&id, db).await.map(Box::new),
                 session_db_id: id,
@@ -384,6 +415,11 @@ pub(super) fn apply(
     resolve: impl FnOnce(&str, &SessionMeta) -> Resolved,
 ) -> Applied {
     let (session_db_id, ticket, kind) = match &msg {
+        Refresh::Job {
+            session_db_id,
+            ticket,
+            ..
+        } => (session_db_id.clone(), *ticket, RefreshKind::Job),
         Refresh::Session {
             session_db_id,
             ticket,
@@ -409,6 +445,7 @@ pub(super) fn apply(
         RefreshKind::Session => &mut live.reload,
         RefreshKind::Status => &mut live.status,
         RefreshKind::Activity => &mut live.activity,
+        RefreshKind::Job => &mut live.job,
     };
     let Some(again) = slot.finish(ticket) else {
         return Applied::default();
@@ -416,6 +453,12 @@ pub(super) fn apply(
     let follow_up = again.then(|| (session_db_id.clone(), kind));
 
     let redraw = match msg {
+        Refresh::Job { snapshot, .. } => {
+            let tab = &mut app.tabs[idx];
+            record_error(tab, kind, snapshot.as_ref().err().cloned());
+            jobs::apply_snapshot(tab, snapshot.map(|snapshot| *snapshot));
+            true
+        }
         Refresh::Status { segments, .. } => {
             let tab = &mut app.tabs[idx];
             replace_status(tab, segments);
@@ -580,6 +623,7 @@ mod tests {
 
     fn tab(id: &str, db: eidetica::Database) -> Tab {
         Tab {
+            job: None,
             session_db_id: id.to_string(),
             session_db: db,
             entries: Vec::new(),
@@ -1141,7 +1185,7 @@ mod tests {
             None,
             config,
             dir.path().join("config.yaml"),
-            vec![(id.to_string(), app.active().live.incarnation)],
+            vec![(id.to_string(), app.active().live.incarnation, false)],
             approval_tx,
             notify_tx,
         )

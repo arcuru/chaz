@@ -113,6 +113,13 @@ runtime replacement does not replay UI actions. See
 [background refresh](../user_guide/tui.md#responsiveness-and-background-refresh)
 for pending, failure and exit behavior.
 
+Job overview reads have an owned generation ticket; disconnect invalidates it
+before replacing read ownership. Observe-only job tabs use the same per-tab
+refresh slots and reconnect through the existing Write-authorized job opener,
+not ordinary session registration. Accepted steering publications use the FIFO;
+uncertain request IDs survive tab closure for the client lifetime. Transcript
+cache invalidation includes local observer-detail toggles and input receipts.
+
 ### Server
 
 The callback-driven server watches session databases and reconciles durable
