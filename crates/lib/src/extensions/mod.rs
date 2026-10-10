@@ -13,6 +13,7 @@ pub mod fs;
 pub mod mcp;
 pub mod memory;
 pub mod path_normalizer;
+pub mod pruner;
 pub mod schedule;
 pub mod security_warnings;
 pub mod skills;
@@ -54,6 +55,7 @@ pub fn all_builtins(deps: BuiltinDeps) -> Vec<Arc<dyn crate::extension::Extensio
     let session_registry = deps.session_registry;
     vec![
         Arc::new(context::BaselineContext),
+        Arc::new(pruner::ContextPruner),
         Arc::new(core::CoreExtension::new(
             server_slot.clone(),
             deps.backend_manager,

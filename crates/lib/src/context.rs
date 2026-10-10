@@ -629,7 +629,10 @@ fn render_entry(
 }
 
 // Reject interrupted or malformed groups instead of inventing tool results.
-fn replay_turn(records: &[TurnTranscriptRecord], budget: usize) -> Option<Vec<RuntimeMessage>> {
+pub(crate) fn replay_turn(
+    records: &[TurnTranscriptRecord],
+    budget: usize,
+) -> Option<Vec<RuntimeMessage>> {
     if records.is_empty() || budget == 0 {
         return None;
     }

@@ -633,3 +633,32 @@ legacy/default policy remains last tool, system, latest user with five-minute TT
 Host-side durable revocation remaps surviving message anchors and drops anchors
 on removed messages. Projectors own the final indices of their returned request.
 An empty or over-budget request cannot pass the final dispatch gate.
+
+## Scoped retained tool evidence
+
+`ProjectionCall` carries current per-extension settings and a host-created
+`ScopedHistory`. Projection scope contains only selected historical source/call
+pairs from that logical call's baseline. `ToolContext::history()` offers the
+same read-only facility under the caller's session and current source-tool
+ceiling for normal recovery tools, independent of context compaction.
+Neither exposes a database or execution handle. Strict settings/source reads
+fail the invoking projection step; optional failure preserves accepted edits
+and does not bypass later required steps.
+
+The host reads retained completed attempts and their original request rows at
+one Eidetica snapshot, validates complete native exchanges with the existing
+replay validator, then checks current participation and extension/tool
+visibility before releasing bytes. Stable versioned references hash the session
+root and recorded source; no visible index or mutable lookup table is needed.
+Pages count stored UTF-8 bytes rather than serialized JSON/framing overhead.
+Unknown or invisible references share a non-disclosing missing status. A
+recording truncation marker is reported without promising pre-recording bytes.
+
+The normal-build `context_prune` extension uses this public facility in batched
+per-call projection. Its policy is opt-in, shrink-only pointer replacement of
+untouched successful historical result bodies. It leaves recovery output and
+all current exchanges alone. It has no committed strategy state: settings,
+selected sources and recorded bytes reconstruct every decision. The generic
+host's integrity, current-authority and final-budget gates apply unchanged.
+Actual recovery executes a normal owner-attributed tool, not a privileged
+built-in path, and never re-executes the source tool.

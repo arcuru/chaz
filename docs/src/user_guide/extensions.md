@@ -16,20 +16,21 @@ These ship in the chaz binary today. The "Provides" column lists the
 declares — `Tool` and `Command` are the surfaces a user notices; the
 others are runtime hooks that fire around each agent turn.
 
-| Extension           | Provides             | What it gives you                                                                                                                                    |
-| ------------------- | -------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `baseline_context`  | _(context strategy)_ | Required default history/layout selection; see [One required context strategy](#one-required-context-strategy).                                      |
-| `core`              | Tool                 | `shell`, `compact`, `spawn_agent`, `job_status`, `job_wait`, `spawn_worker`. The always-available baseline; disabling it is a footgun.               |
-| `system`            | Tool                 | `get_time`, `calculate`, `describe_tool`. Small dependency-free helpers.                                                                             |
-| `fs`                | Tool                 | `read_file`, `write_file`, `edit_file`.                                                                                                              |
-| `web`               | Tool                 | `web_fetch`, `web_search`.                                                                                                                           |
-| `memory`            | Command, Tool        | `/memory` + `remember` / `recall` / `list_memory_banks`. See [Memory](memory.md).                                                                    |
-| `skills`            | Command, Tool        | `/skills` + `skill_list` / `skill_search` / `skill_show`, plus the per-session catalog prompt injection.                                             |
-| `schedule`          | Command, Tool        | `/schedule` + `schedule_add` / `schedule_modify` / `schedule_remove` / `schedule_list` / `schedule_once`.                                            |
-| `agent_schedule`    | _(routine handler)_  | Standalone fire path for agent-owned schedules. Not directly toggled by users; no tools or commands.                                                 |
-| `mcp-<server>`      | Tool                 | One extension per configured [MCP server](mcp.md), named `mcp-<server_name>`. Wraps the server and registers its tools under the server's namespace. |
-| `path_normalizer`   | ToolCall             | Strips trailing slashes from `path` arguments on filesystem tools before they execute.                                                               |
-| `security_warnings` | ToolResult           | Scans tool output for prompt-injection patterns and logs warnings (warning-only — output is unmodified).                                             |
+| Extension           | Provides                     | What it gives you                                                                                                                                    |
+| ------------------- | ---------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `context_prune`     | Tool, _(context projection)_ | Opt-in historical pointers and `tool_history_query`; see [Pointers instead of old tool payloads](#pointers-instead-of-old-tool-payloads).            |
+| `baseline_context`  | _(context strategy)_         | Required default history/layout selection; see [One required context strategy](#one-required-context-strategy).                                      |
+| `core`              | Tool                         | `shell`, `compact`, `spawn_agent`, `job_status`, `job_wait`, `spawn_worker`. The always-available baseline; disabling it is a footgun.               |
+| `system`            | Tool                         | `get_time`, `calculate`, `describe_tool`. Small dependency-free helpers.                                                                             |
+| `fs`                | Tool                         | `read_file`, `write_file`, `edit_file`.                                                                                                              |
+| `web`               | Tool                         | `web_fetch`, `web_search`.                                                                                                                           |
+| `memory`            | Command, Tool                | `/memory` + `remember` / `recall` / `list_memory_banks`. See [Memory](memory.md).                                                                    |
+| `skills`            | Command, Tool                | `/skills` + `skill_list` / `skill_search` / `skill_show`, plus the per-session catalog prompt injection.                                             |
+| `schedule`          | Command, Tool                | `/schedule` + `schedule_add` / `schedule_modify` / `schedule_remove` / `schedule_list` / `schedule_once`.                                            |
+| `agent_schedule`    | _(routine handler)_          | Standalone fire path for agent-owned schedules. Not directly toggled by users; no tools or commands.                                                 |
+| `mcp-<server>`      | Tool                         | One extension per configured [MCP server](mcp.md), named `mcp-<server_name>`. Wraps the server and registers its tools under the server's namespace. |
+| `path_normalizer`   | ToolCall                     | Strips trailing slashes from `path` arguments on filesystem tools before they execute.                                                               |
+| `security_warnings` | ToolResult                   | Scans tool output for prompt-injection patterns and logs warnings (warning-only — output is unmodified).                                             |
 
 Disabling an extension hides its tools from the LLM, stops its hooks
 from firing, and disarms its slash commands. The `core` and `system`
@@ -502,3 +503,134 @@ changes message positions must update its returned cache indices as well.
    `my_context` now owns selection. Removing it refuses dispatch even though
    `baseline_context` remains installed. No external loader or Cargo variant
    is needed or provided.
+
+## Pointers instead of old tool payloads
+
+`context_prune` ships in the normal build, but does not substitute anything by
+default. It needs an operator `context_projection` grant, current session/agent
+activation, and the session setting `enabled: true`. Keep the grant optional:
+pruning is an optimization, not the required context strategy.
+
+| Setting or tool                   | Default  | Meaning                                                                                      |
+| --------------------------------- | -------- | -------------------------------------------------------------------------------------------- |
+| `context_prune.enabled`           | `false`  | Substitute eligible historical results in outgoing requests only.                            |
+| `context_prune.min_bytes`         | `16384`  | Minimum retained result size in UTF-8 bytes.                                                 |
+| `context_prune.min_savings_bytes` | `1024`   | Minimum reduction in the framed request payload; replacements must also be strictly shorter. |
+| `context_prune.exclude_tools`     | `[]`     | Tool names whose results stay unchanged.                                                     |
+| `tool_history_query.reference`    | Required | Stable `tr1:` reference from a pointer, not a visible message index.                         |
+| `tool_history_query.offset`       | `0`      | Stored UTF-8 byte offset; must be a character boundary.                                      |
+| `tool_history_query.max_bytes`    | `16384`  | Page bound in stored bytes, from 1 through 16384.                                            |
+
+The thresholds deliberately leave small results alone. No model chooses them,
+no summary is generated, and no auxiliary inference runs. A pointer reports
+the recorded byte length, content hash, stored truncation marker and recovery
+call. The host preserves the tool-result envelope, call arguments, identities,
+order and opaque provider continuation data.
+
+Only successful results in completed historical exchanges are eligible.
+Current or incomplete exchanges, recovery-tool output, and bodies already
+edited by an earlier transform stay unchanged. If the model-facing tool list
+omits `tool_history_query`, no pointers are emitted. The selected required
+strategy still controls which exchanges enter the request; pruning does not
+retrieve extra history or silently replace that strategy.
+
+### Retained evidence is not an archive promise
+
+Recovery reads existing Eidetica `turn_transcript` records. The reference binds
+the session and immutable recorded source, including its bytes. It survives a
+real database reopen and context compaction because neither a visible-vector
+index nor an in-memory replacement map participates in its identity.
+
+A reference is not permission. Recovery requires the normal current tool grant
+for `tool_history_query`, current extension activation and session participation,
+and current scoped visibility of the original source tool. Removing that source
+from the caller's allowed tools makes its results unavailable to recovery.
+Session/agent extension revocations attenuate this scope. Possessing a synced
+database or a `full_context` projection grant alone does not grant recovery or
+permission to execute the original tool. Reading evidence never executes it;
+filesystem/network execution grants remain separate resource permissions.
+Compaction hides context, not retained evidence authorized under this scope.
+
+`status: "missing_or_not_authorized"` reports an unavailable source without
+revealing whether it exists elsewhere. `stored_truncation_marker: true` reports
+the recording bound's marker; legacy records have no independent truncation
+bit, so even a literal marker is reported conservatively. Recovery promises
+only recorded, retained bytes after tool hooks, security scanning and recording
+bounds. It cannot restore earlier output, bytes never recorded, or sources
+removed by a future retention policy.
+
+Disabling `enabled` stops all substitutions on the next logical call. The
+required baseline exposes retained originals under its normal selection and
+budgeting policy. If the resulting request exceeds the final budget, the host
+sends nothing; it does not secretly keep a disabled pruner running. Re-enabling
+reconstructs fresh pointers from current sources and settings. There is no
+persisted replacement state to leak across toggles. Optional read/projector
+failure keeps the preceding accepted request, including required transforms;
+the remaining chain and final budget check still run.
+
+### Walkthrough: enable, recover, and disable
+
+1. Add an optional grant to `config.yaml` and restart your disposable/test peer:
+
+   ```yaml
+   context_projection:
+     - extension: context_prune
+       authority: conversation
+       required: false
+   ```
+
+   Permit `tool_history_query` and the desired original source tools in the
+   agent's allowed tools. Activate the extension if it was removed:
+
+   ```text
+   /extensions add context_prune
+   /extensions set context_prune enabled true
+   Set context_prune.enabled = true
+   ```
+
+2. Complete a turn that produces a large tool result, then send another message.
+   The historical result can become a pointer inside the same `tool_output`
+   envelope. Copy its `tr1:` reference into a recovery call (replace `REF` with
+   the full reference):
+
+   ```json
+   { "reference": "REF", "offset": 0, "max_bytes": 4096 }
+   ```
+
+   `tool_history_query` returns JSON with `status: "retained"`, `content`,
+   `stored_bytes`, `sha256`, `stored_truncation_marker` and `next_offset`.
+   Request the next page using that offset until `next_offset` is `null`.
+   Reopen the peer or compact context and the same authorized reference still
+   resolves while its records are retained.
+
+3. Remove the source tool from the caller's allowed tools and try the reference
+   again. The response reports:
+
+   ```json
+   {
+     "reference": "REF",
+     "status": "missing_or_not_authorized",
+     "offset": 0,
+     "next_offset": null,
+     "stored_bytes": 0,
+     "sha256": null,
+     "stored_truncation_marker": false,
+     "content": ""
+   }
+   ```
+
+   Restore the source-tool allowlist to recover access. A foreign-session or
+   forged reference returns the same unavailable status. Removing the recovery
+   tool itself instead prevents tool execution.
+
+4. Stop substitutions without revoking read-only recovery:
+
+   ```text
+   /extensions set context_prune enabled false
+   Set context_prune.enabled = false
+   ```
+
+   Send another message: original historical payloads return, subject to normal
+   baseline budgeting. An over-budget final request is refused before provider
+   dispatch. Set `enabled true` again to reconstruct pointers, or remove the
+   optional projection grant to stop projection everywhere on this peer.

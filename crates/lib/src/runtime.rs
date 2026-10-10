@@ -836,13 +836,23 @@ impl<'a> RoundProjector<'a> {
             .iter()
             .map(|(_, (_, source))| (*source).clone())
             .collect();
-        let current_exchanges = sources
-            .iter()
-            .enumerate()
-            .filter_map(|(index, source)| {
-                matches!(source, ContextSource::CurrentAttempt { .. }).then_some(index)
-            })
-            .collect();
+        let active = hub
+            .active_extensions_for_call(
+                &self.tool_ctx.agent_name,
+                self.session_db.as_ref(),
+                &self.tool_ctx.active_extensions,
+            )
+            .await;
+        let history = crate::extension::history::ScopedHistory::new(
+            self.session_db.as_ref().expect("hub has database").clone(),
+            self.tool_ctx.agent_name.clone(),
+            self.tool_ctx.tools.clone(),
+            active,
+        )
+        .for_projection(&baseline, &sources);
+        let current_exchanges = sources.iter().enumerate().filter_map(|(index, source)| {
+            matches!(source, ContextSource::CurrentAttempt { .. }).then_some(index)
+        }).collect();
         let inputs = projection::RoundInputs {
             agent_name: &self.tool_ctx.agent_name,
             session_db_id: self.session_db_id.as_deref(),
@@ -853,6 +863,8 @@ impl<'a> RoundProjector<'a> {
             sources: &sources,
             current_exchanges: &current_exchanges,
             budget_tokens: self.scope.request_budget_tokens,
+            session_db: self.session_db.as_ref(),
+            history: Some(&history),
         };
         let mut accepted = projection::run_chain(&chain, &baseline, &inputs)
             .await
@@ -1457,6 +1469,19 @@ pub async fn execute_cancellable_with_recorder(
                             call_ctx.tool_call_key =
                                 Some(format!("{model_sequence}:{call_index}:{}", call.id));
                             call_ctx.grants = call_grants;
+                            if let Some(hub) = hub {
+                                let db = tool_ctx.session.lock().await.database().clone();
+                                call_ctx.active_extensions = hub
+                                    .active_extensions_for_call(
+                                        &tool_ctx.agent_name,
+                                        Some(&db),
+                                        &tool_ctx.active_extensions,
+                                    )
+                                    .await;
+                                call_ctx.tools = call_ctx.tools.with_active_extensions(Some(
+                                    call_ctx.active_extensions.clone(),
+                                ));
+                            }
                             if call.name == "job_wait"
                                 && let Some(capacity) = capacity.as_mut()
                             {

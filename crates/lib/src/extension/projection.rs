@@ -201,6 +201,10 @@ pub struct ProjectionCall<'a> {
     pub baseline: &'a ProjectedRequest,
     /// Provenance of `baseline.messages`, index-aligned.
     pub sources: &'a [ContextSource],
+    /// This extension's current persisted settings; read errors fail this step.
+    pub settings: &'a serde_json::Value,
+    /// Host-scoped retained source reads. No ambient database/execute handle.
+    pub history: Option<&'a super::history::ScopedHistory>,
     /// Estimated-token ceiling the final request must fit, when known.
     pub budget_tokens: Option<usize>,
 }
@@ -283,6 +287,8 @@ pub(crate) struct RoundInputs<'a> {
     /// call IDs are not occurrence identities and may legally repeat.
     pub current_exchanges: &'a HashSet<usize>,
     pub budget_tokens: Option<usize>,
+    pub session_db: Option<&'a eidetica::Database>,
+    pub history: Option<&'a super::history::ScopedHistory>,
 }
 
 /// Run the resolved chain over `baseline` and return the accepted request.
@@ -293,25 +299,32 @@ pub(crate) async fn run_chain(
 ) -> Result<ProjectedRequest, ProjectionError> {
     let mut current = baseline.clone();
     for step in chain {
-        let call = ProjectionCall {
-            agent_name: inputs.agent_name,
-            session_db_id: inputs.session_db_id,
-            request_id: inputs.request_id,
-            attempt_id: inputs.attempt_id,
-            model: inputs.model,
-            model_round: inputs.model_round,
-            authority: step.authority,
-            required: step.required,
-            baseline,
-            sources: inputs.sources,
-            budget_tokens: inputs.budget_tokens,
-        };
-        // The endpoint call sits inside the guarded future so a panic while
-        // building the future is caught as well as one while polling it.
         let input = current.clone();
         let invoked = tokio::time::timeout(
             PROJECTOR_TIMEOUT,
-            AssertUnwindSafe(async { step.projector.project(&call, input).await }).catch_unwind(),
+            AssertUnwindSafe(async {
+                let settings = match inputs.session_db {
+                    Some(db) => super::read_settings_checked(db, &step.extension).await?,
+                    None => serde_json::json!({}),
+                };
+                let call = ProjectionCall {
+                    agent_name: inputs.agent_name,
+                    session_db_id: inputs.session_db_id,
+                    request_id: inputs.request_id,
+                    attempt_id: inputs.attempt_id,
+                    model: inputs.model,
+                    model_round: inputs.model_round,
+                    authority: step.authority,
+                    required: step.required,
+                    baseline,
+                    sources: inputs.sources,
+                    budget_tokens: inputs.budget_tokens,
+                    settings: &settings,
+                    history: inputs.history,
+                };
+                step.projector.project(&call, input).await
+            })
+            .catch_unwind(),
         )
         .await;
         let outcome = match invoked {

@@ -1646,6 +1646,46 @@ impl Session {
         Ok(records)
     }
 
+    /// Retained completed source groups, independent of context compaction.
+    /// This host-only read does not grant access; scoped facilities apply current
+    /// caller/source visibility before returning any recorded bytes.
+    pub(crate) async fn retained_tool_history_at(
+        db: &Database,
+        snapshot: &Snapshot,
+    ) -> anyhow::Result<Vec<Vec<TurnTranscriptRecord>>> {
+        let txn = db.new_transaction_at(snapshot).await?;
+        let states = index_attempt_states(
+            txn.get_store::<Table<TurnAttempt>>(TURN_ATTEMPTS_STORE)
+                .await?
+                .search(|_| true)
+                .await?,
+            &HashSet::new(),
+        );
+        let entries: HashSet<_> = Self::entries_with_ids_at_snapshot(db, snapshot)
+            .await?
+            .into_iter()
+            .filter(|(_, e)| matches!(e.entry_type, EntryType::Message | EntryType::Directive))
+            .map(|(id, _)| id)
+            .collect();
+        let mut groups: HashMap<String, Vec<TurnTranscriptRecord>> = HashMap::new();
+        for (_, record) in txn
+            .get_store::<Table<TurnTranscriptRecord>>(TURN_TRANSCRIPT_STORE)
+            .await?
+            .search(|_| true)
+            .await?
+        {
+            if entries.contains(&record.request_id)
+                && matches!(states.get(&record.request_id), Some(TurnRequestState::Completed { attempt_id }) if attempt_id == &record.attempt_id)
+            {
+                groups
+                    .entry(record.attempt_id.clone())
+                    .or_default()
+                    .push(record);
+            }
+        }
+        Ok(groups.into_values().collect())
+    }
+
     /// Visible, unexpired per-turn claims. Never infer activity from Ack or
     /// session-level runtime ownership. Clients re-read this on sync and timer.
     pub async fn active_turn_attempts(database: &Database) -> anyhow::Result<Vec<String>> {

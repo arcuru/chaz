@@ -362,6 +362,17 @@ impl ToolContext {
             .collect()
     }
 
+    /// Read-only retained evidence under this caller's session/source ceiling.
+    /// References never grant access or execute an original tool.
+    pub async fn history(&self) -> crate::extension::history::ScopedHistory {
+        crate::extension::history::ScopedHistory::new(
+            self.session.lock().await.database().clone(),
+            self.agent_name.clone(),
+            self.tools.clone(),
+            self.active_extensions.clone(),
+        )
+    }
+
     /// Access the execution host for sandboxed capability requests.
     pub fn host(&self) -> &dyn ToolHost {
         self.host.as_ref()

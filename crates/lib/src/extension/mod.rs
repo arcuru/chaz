@@ -24,6 +24,7 @@ pub mod caps;
 pub mod context_strategy;
 pub mod durable_context;
 pub mod handler;
+pub mod history;
 pub(crate) mod hook_bridge;
 pub mod hooks;
 pub mod instance;
@@ -113,6 +114,21 @@ pub async fn read_settings(session_db: &Database, ext_name: &str) -> serde_json:
     match store.get_string(ext_name).await {
         Ok(s) => serde_json::from_str(&s).unwrap_or_else(|_| serde_json::json!({})),
         Err(_) => serde_json::json!({}),
+    }
+}
+
+/// Strict call-time settings read: absence means defaults; corrupt/unavailable
+/// settings are a failed step, never silently replaced by permissive defaults.
+pub async fn read_settings_checked(
+    session_db: &Database,
+    ext_name: &str,
+) -> anyhow::Result<serde_json::Value> {
+    let txn = session_db.new_transaction().await?;
+    let store = txn.get_store::<DocStore>(EXTENSION_SETTINGS_STORE).await?;
+    match store.get_string(ext_name).await {
+        Ok(value) => Ok(serde_json::from_str(&value)?),
+        Err(error) if error.is_not_found() => Ok(serde_json::json!({})),
+        Err(error) => Err(error.into()),
     }
 }
 
