@@ -1,7 +1,7 @@
 //! Model-free Worker submission/observation tests against a disposable executor.
 use super::*;
 use crate::test_support::{MockBackend, MockCallGate, tool_context};
-use crate::tool::{Tool, ToolDescriptor, ToolError, ToolPolicy, ToolPolicyRegistry};
+use crate::tool::{ToolPolicy, ToolPolicyRegistry};
 use std::time::Duration;
 
 async fn worker_fixture() -> (
@@ -38,30 +38,6 @@ async fn worker_fixture() -> (
         security: crate::test_support::permissive_security(),
     });
     (owner, server, slot, child)
-}
-
-struct WorkerEffect(Arc<AtomicUsize>);
-
-impl Tool for WorkerEffect {
-    fn descriptor(&self) -> ToolDescriptor {
-        ToolDescriptor {
-            name: "worker_effect".into(),
-            description: "post-wait effect".into(),
-            parameters: serde_json::json!({"type": "object", "properties": {}}),
-        }
-    }
-
-    fn execute<'a>(
-        &'a self,
-        _: serde_json::Value,
-        _: &'a ToolContext,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, ToolError>> + Send + 'a>>
-    {
-        Box::pin(async move {
-            self.0.fetch_add(1, Ordering::SeqCst);
-            Ok("effect".into())
-        })
-    }
 }
 
 struct Parent {
@@ -104,7 +80,7 @@ async fn start_parent(
             "spawn_worker".into(),
             serde_json::json!({"name":"helper", "task":"one child", "async": is_async}).to_string(),
         ),
-        ("effect".into(), "worker_effect".into(), "{}".into()),
+        ("effect".into(), "permit_probe".into(), "{}".into()),
     ]);
     mock.push_text("parent finished");
     let first = mock.block_next_call();
@@ -201,7 +177,10 @@ async fn synchronous_worker_yields_at_capacity_one_and_ten_saturated_parents() {
             .await
             .unwrap();
         let effects = Arc::new(AtomicUsize::new(0));
-        server.tools.register(WorkerEffect(effects.clone()));
+        server.tools.register(PermitProbe {
+            semaphore: server.semaphore.clone(),
+            calls: effects.clone(),
+        });
         let mut parents = Vec::new();
         let mut child_gates = Vec::new();
         for _ in 0..count {
@@ -318,7 +297,10 @@ async fn worker_wait_balances_capacity_after_error_timeout_cancellation_and_clai
             .await
             .unwrap();
         let effects = Arc::new(AtomicUsize::new(0));
-        server.tools.register(WorkerEffect(effects.clone()));
+        server.tools.register(PermitProbe {
+            semaphore: server.semaphore.clone(),
+            calls: effects.clone(),
+        });
         if mode == "error" {
             child.push_err(crate::error::LlmError::Configuration {
                 message: "child failed".into(),
@@ -382,13 +364,18 @@ async fn worker_wait_balances_capacity_after_error_timeout_cancellation_and_clai
                 }
                 drop(blocker);
                 if mode == "claim-loss" || mode == "closed" {
-                    assert!(
-                        tokio::time::timeout(Duration::from_secs(10), parent.task)
-                            .await
-                            .unwrap()
-                            .unwrap()
-                            .is_err()
-                    );
+                    let error = tokio::time::timeout(Duration::from_secs(10), parent.task)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .err()
+                        .expect("parent must stop before further effects");
+                    let expected = if mode == "claim-loss" {
+                        "job lost claim while observing"
+                    } else {
+                        "executor capacity closed"
+                    };
+                    assert!(error.contains(expected), "{mode}: {error}");
                     assert_eq!(effects.load(Ordering::SeqCst), 0);
                     assert_eq!(parent.mock.recorded_calls().len(), 1);
                 } else {
@@ -438,7 +425,10 @@ async fn asynchronous_worker_keeps_parent_capacity_and_submits_once() {
         .await
         .unwrap();
     let effects = Arc::new(AtomicUsize::new(0));
-    server.tools.register(WorkerEffect(effects.clone()));
+    server.tools.register(PermitProbe {
+        semaphore: server.semaphore.clone(),
+        calls: effects.clone(),
+    });
     child.push_text("child finished");
     let gate = child.block_next_call();
     let permit = server.semaphore.clone().acquire_owned().await.unwrap();
@@ -448,6 +438,8 @@ async fn asynchronous_worker_keeps_parent_capacity_and_submits_once() {
         .await
         .unwrap();
     assert_eq!(effects.load(Ordering::SeqCst), 1);
+    assert!(parent.mock.recorded_calls()[1].messages.iter().any(|msg| matches!(msg,
+        runtime::RuntimeMessage::ToolResult { call_id, content } if call_id == "spawn" && content.contains("Worker 'helper' spawned asynchronously in session "))));
     assert!(
         child.recorded_calls().is_empty(),
         "async submission must retain parent capacity"
@@ -485,7 +477,10 @@ async fn worker_executor_shutdown_stops_observation_and_reacquisition() {
             .await
             .unwrap();
         let effects = Arc::new(AtomicUsize::new(0));
-        server.tools.register(WorkerEffect(effects.clone()));
+        server.tools.register(PermitProbe {
+            semaphore: server.semaphore.clone(),
+            calls: effects.clone(),
+        });
         child.push_text("child finished");
         let gate = child.block_next_call();
         let mock = Arc::new(MockBackend::new());
@@ -495,7 +490,7 @@ async fn worker_executor_shutdown_stops_observation_and_reacquisition() {
                 "spawn_worker".into(),
                 serde_json::json!({"name":"helper", "task":"one child"}).to_string(),
             ),
-            ("effect".into(), "worker_effect".into(), "{}".into()),
+            ("effect".into(), "permit_probe".into(), "{}".into()),
         ]);
         mock.push_text("must not continue");
         let (sid, db) = server
