@@ -827,6 +827,7 @@ mod tests {
             host: Arc::new(crate::tool_host::NativeToolHost::new()),
             active_extensions: std::collections::HashSet::new(),
             routine_engine: None,
+            observation_deadline: None,
         }
     }
 

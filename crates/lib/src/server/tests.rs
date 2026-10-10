@@ -6050,6 +6050,7 @@ async fn published_executor_with_mock(
     published_executor_using_mock(settings, agents, agent, mock).await
 }
 
+/// Executor whose default backend (used by adopted jobs) is `mock`.
 async fn published_executor_using_mock(
     settings: &crate::config::EideticaConfig,
     agents: Arc<AgentRegistry>,
@@ -7799,6 +7800,7 @@ async fn job_wait_executor_shutdown_and_claim_loss_stop_observation_or_reacquisi
                         processing: server.processing.clone(),
                     },
                     Some(permit),
+                    None,
                 )
                 .await;
             tokio::time::timeout(Duration::from_secs(5), entered.notified())
@@ -7882,3 +7884,6 @@ async fn job_wait_executor_shutdown_and_claim_loss_stop_observation_or_reacquisi
         }
     }
 }
+
+#[path = "wait_resume_tests.rs"]
+mod wait_resume;

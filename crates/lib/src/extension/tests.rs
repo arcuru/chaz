@@ -1611,3 +1611,178 @@ async fn install_all_validates_manifests_before_instantiation() {
         .unwrap_err();
     assert!(err.to_string().contains("name"), "got: {err}");
 }
+
+/// Injected pre-turn messages are not persisted, so a wait in that turn is
+/// never checkpointed; a resumed turn never fires `before_agent_start` again.
+#[tokio::test]
+async fn injected_pre_turn_messages_prevent_wait_checkpoints_and_never_refire() {
+    use crate::runtime::{JobWaitIntent, RuntimeRecord, RuntimeRecorder};
+    use crate::tool::{ToolDescriptor, ToolError};
+    use std::future::Future;
+    use std::pin::Pin;
+
+    struct Wait;
+    impl Tool for Wait {
+        fn descriptor(&self) -> ToolDescriptor {
+            ToolDescriptor {
+                name: "job_wait".into(),
+                description: "test wait".into(),
+                parameters: serde_json::json!({"type": "object", "properties": {}}),
+            }
+        }
+        fn execute<'a>(
+            &'a self,
+            _: serde_json::Value,
+            _: &'a crate::tool::ToolContext,
+        ) -> Pin<Box<dyn Future<Output = Result<String, ToolError>> + Send + 'a>> {
+            Box::pin(async { Ok("observed".into()) })
+        }
+    }
+
+    #[derive(Default)]
+    struct Intents(std::sync::Mutex<usize>, std::sync::atomic::AtomicUsize);
+    impl RuntimeRecorder for Intents {
+        fn record<'a>(
+            &'a self,
+            _: RuntimeRecord,
+        ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn checkpoint_job_wait<'a>(
+            &'a self,
+            _: JobWaitIntent,
+        ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+            *self.0.lock().unwrap() += 1;
+            Box::pin(async { Ok(()) })
+        }
+        fn finish_job_wait<'a>(
+            &'a self,
+            _: u64,
+            _: usize,
+        ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+            self.1.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    struct ResultHook {
+        recorder: Arc<Intents>,
+        observations: Arc<std::sync::Mutex<Vec<usize>>>,
+    }
+    impl handler::HookHandlerToolResult for ResultHook {
+        fn on_tool_result<'a>(
+            &'a self,
+            _: &'a str,
+            output: String,
+        ) -> handler::HandlerFuture<'a, String> {
+            Box::pin(async move {
+                self.observations
+                    .lock()
+                    .unwrap()
+                    .push(self.recorder.1.load(std::sync::atomic::Ordering::SeqCst));
+                output
+            })
+        }
+    }
+
+    let mut hub = test_hub().await;
+    let fired = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let recorder = Arc::new(Intents::default());
+    let observations = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut result_ext = TestExt::new("result");
+    result_ext.supported.push(HookKind::ToolResult);
+    result_ext.parts.tool_result = Some(Arc::new(ResultHook {
+        recorder: recorder.clone(),
+        observations: observations.clone(),
+    }));
+    hub.install_all(vec![
+        counting_ext("inject", fired.clone()),
+        Arc::new(result_ext),
+    ])
+    .await
+    .unwrap();
+    let (_instance, session) = crate::test_support::fresh_session().await;
+    let tools = Arc::new(ToolRegistry::new());
+    tools.register(Wait);
+    let mut ctx = crate::test_support::tool_context(session, tools);
+    ctx.active_extensions = all_active(&["inject", "result"]);
+    let arguments =
+        serde_json::json!({"session_db_id": "child", "timeout_seconds": 30}).to_string();
+    let mock = Arc::new(crate::test_support::MockBackend::new());
+    mock.push_tool_calls([("w".into(), "job_wait".into(), arguments.clone())]);
+    mock.push_text("done");
+    mock.push_text("resumed done");
+    let backend = crate::backends::BackendManager::with_mock(
+        mock.clone(),
+        crate::test_support::empty_secrets().await,
+    );
+    let policies = crate::tool::ToolPolicyRegistry::empty();
+    let security = crate::test_support::permissive_security();
+    let outcome = crate::runtime::execute_with_recorder(
+        None,
+        vec![RuntimeMessage::User("go".into())],
+        &backend,
+        &security,
+        &ctx,
+        &policies,
+        Some(recorder.clone()),
+        Some(&hub),
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(outcome.body, "done");
+    assert_eq!(fired.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(
+        *recorder.0.lock().unwrap(),
+        0,
+        "no checkpoint after injection"
+    );
+
+    let call = crate::runtime::ToolCallRequest {
+        id: "w".into(),
+        name: "job_wait".into(),
+        arguments,
+    };
+    let now = chrono::Utc::now();
+    let outcome = crate::runtime::resume_with_recorder(
+        None,
+        vec![RuntimeMessage::User("go".into())],
+        &backend,
+        &security,
+        &ctx,
+        &policies,
+        Some(recorder),
+        Some(&hub),
+        None,
+        crate::runtime::RuntimeResume {
+            prior_messages: vec![RuntimeMessage::AssistantToolCalls {
+                content: None,
+                tool_calls: vec![call.clone()],
+                provider_extra: Default::default(),
+            }],
+            model_sequence: 0,
+            call_index: 0,
+            call,
+            deadline: now + chrono::Duration::seconds(30),
+            policy_deadline: now + chrono::Duration::seconds(60),
+            policy_timeout_seconds: 60,
+            metadata: Vec::new(),
+            matrix_send_queued: false,
+            rate_limited_calls: Vec::new(),
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(outcome.body, "resumed done");
+    assert_eq!(
+        fired.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "before_agent_start does not run again on resume"
+    );
+    assert_eq!(
+        *observations.lock().unwrap(),
+        [1, 2],
+        "both live and resumed waits retire before result hooks"
+    );
+}

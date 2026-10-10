@@ -21,6 +21,18 @@ fn session_id(arguments: &Value) -> Result<&str, ToolError> {
         .ok_or_else(|| "Missing 'session_db_id' job handle".into())
 }
 
+/// Validated `job_wait` handle and relative observation bound in seconds.
+pub(crate) fn job_wait_arguments(arguments: &Value) -> Result<(String, u64), ToolError> {
+    let id = session_id(arguments)?.to_string();
+    let seconds = arguments
+        .get("timeout_seconds")
+        .map(Value::as_u64)
+        .unwrap_or(Some(30))
+        .filter(|secs| (1..=240).contains(secs))
+        .ok_or_else(|| "timeout_seconds must be 1..240".to_string())?;
+    Ok((id, seconds))
+}
+
 impl Tool for JobStatusTool {
     fn descriptor(&self) -> ToolDescriptor {
         ToolDescriptor {
@@ -84,13 +96,16 @@ impl Tool for JobWaitTool {
         ctx: &'a ToolContext,
     ) -> Pin<Box<dyn Future<Output = Result<String, ToolError>> + Send + 'a>> {
         Box::pin(async move {
-            let id = session_id(&arguments)?;
-            let seconds = arguments
-                .get("timeout_seconds")
-                .map(Value::as_u64)
-                .unwrap_or(Some(30))
-                .filter(|secs| (1..=240).contains(secs))
-                .ok_or_else(|| "timeout_seconds must be 1..240".to_string())?;
+            let (id, seconds) = job_wait_arguments(&arguments)?;
+            // The runtime fixes an absolute deadline when the call starts; a
+            // resumed wait therefore counts executor downtime against it.
+            let bound = match ctx.observation_deadline {
+                Some(deadline) => (deadline - chrono::Utc::now())
+                    .to_std()
+                    .unwrap_or_default()
+                    .min(std::time::Duration::from_secs(seconds)),
+                None => std::time::Duration::from_secs(seconds),
+            };
             let server = self
                 .server
                 .get()
@@ -107,7 +122,7 @@ impl Tool for JobWaitTool {
                 (session.database().clone(), wait)
             };
             let status = server
-                .wait_job(id, std::time::Duration::from_secs(seconds))
+                .wait_job(&id, bound)
                 .await;
             if let Some((key, mut row)) = wait {
                 row.finished = true;
@@ -117,6 +132,7 @@ impl Tool for JobWaitTool {
             }
             serde_json::to_string(&status.map_err(|e| e.to_string())?)
                 .map_err(|e| e.to_string().into())
+
         })
     }
 }

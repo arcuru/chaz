@@ -35,8 +35,11 @@ mod keys;
 mod registry;
 pub mod steering;
 pub(crate) use registry::JobRequest;
+#[cfg(test)]
+pub(crate) use registry::PreparedAgentJob;
 mod transport;
 pub mod usage;
+pub(crate) mod wait_resume;
 pub(crate) mod wire;
 
 use wire::session_wire_enum;
@@ -862,6 +865,15 @@ impl Session {
         &self,
     ) -> anyhow::Result<(Vec<SessionEntry>, Vec<Vec<TurnTranscriptRecord>>)> {
         let snapshot = self.database.snapshot().await?;
+        self.context_with_tool_history_at(snapshot).await
+    }
+
+    /// [`Self::context_with_tool_history`] at a recorded snapshot, so a
+    /// resumed turn sees the same conversation its attempt started from.
+    pub async fn context_with_tool_history_at(
+        &self,
+        snapshot: Snapshot,
+    ) -> anyhow::Result<(Vec<SessionEntry>, Vec<Vec<TurnTranscriptRecord>>)> {
         let rows =
             Self::context_entries_with_ids_at(self.database.clone(), snapshot.clone()).await?;
         let txn = self.database.new_transaction_at(&snapshot).await?;
