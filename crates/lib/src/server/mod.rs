@@ -72,6 +72,8 @@ struct SessionRuntimeRecorder {
     explicit_bridge_send: AtomicBool,
     agent_name: String,
     job_input: bool,
+    /// The job execution branch whose evidence this recorder writes.
+    branch: Option<String>,
     /// The session state this attempt's context was assembled from. Without
     /// it a wait cannot be reconstructed, so none is checkpointed.
     context_snapshot: Option<eidetica::Snapshot>,
@@ -91,20 +93,42 @@ impl runtime::RuntimeRecorder for SessionRuntimeRecorder {
                 return Ok(Vec::new());
             }
             let session = self.session.lock().await;
-            crate::session::steering::input_boundary(
-                session.database(),
-                &self.attempt_id,
-                model_sequence,
-                closing,
-            )
-            .await
-            .map(|texts| {
-                texts
-                    .into_iter()
-                    .map(runtime::RuntimeMessage::User)
-                    .collect()
-            })
-            .map_err(|error| format!("runtime persistence failed: job input boundary: {error}"))
+            let mut messages: Vec<runtime::RuntimeMessage> =
+                crate::session::steering::input_boundary(
+                    session.database(),
+                    &self.attempt_id,
+                    model_sequence,
+                    closing,
+                )
+                .await
+                .map(|texts| {
+                    texts
+                        .into_iter()
+                        .map(runtime::RuntimeMessage::User)
+                        .collect()
+                })
+                .map_err(|error| {
+                    format!("runtime persistence failed: job input boundary: {error}")
+                })?;
+            // Parallel-execution notices join at the same safe boundary;
+            // a closing boundary never demands another model call for them.
+            if let Some(branch) = &self.branch {
+                if let Some(yielded) =
+                    crate::session::execution::observe(session.database(), branch)
+                        .await
+                        .map_err(|error| format!("execution observation failed: {error}"))?
+                {
+                    return Err(execution_yield_error(&yielded));
+                }
+                messages.extend(
+                    crate::session::execution::take_notices(session.database(), branch, closing)
+                        .await
+                        .map_err(|error| format!("execution notice delivery failed: {error}"))?
+                        .into_iter()
+                        .map(runtime::RuntimeMessage::User),
+                );
+            }
+            Ok(messages)
         })
     }
 
@@ -194,7 +218,7 @@ impl runtime::RuntimeRecorder for SessionRuntimeRecorder {
             self.session
                 .lock()
                 .await
-                .append_turn_transcript(record, display_entries)
+                .append_turn_transcript_for_branch(record, display_entries, self.branch.as_deref())
                 .await
                 .map_err(|error| format!("failed to persist runtime transcript: {error}"))?;
             if explicit_send {
@@ -242,6 +266,15 @@ impl runtime::RuntimeRecorder for SessionRuntimeRecorder {
                 .map_err(|error| format!("failed to retire job wait checkpoint: {error}"))
         })
     }
+}
+
+const EXECUTION_YIELDED: &str = "execution yielded to an earlier branch";
+
+fn execution_yield_error(yielded: &crate::session::execution::ExecutionYield) -> String {
+    format!(
+        "{EXECUTION_YIELDED}: {} (entry {})",
+        yielded.earlier_execution, yielded.earlier_entry
+    )
 }
 
 /// Only the origin of this exact turn may acquire an external destination.
@@ -489,6 +522,9 @@ struct SessionRuntime {
 struct SpawnContext {
     job_projection: Option<(eidetica::Database, String, String)>,
     job_incarnation: Option<String>,
+    /// Explicit retry command identity for a job execution branch; ordinary
+    /// starts and checkpoint continuations carry none of their own.
+    job_retry: Option<String>,
     job_authority: Option<crate::session::jobs::AcceptedAgentJob>,
     call_depth: usize,
     max_call_depth: usize,
@@ -2644,6 +2680,13 @@ impl Server {
                 .await?
                 .is_some()
         {
+            // An earlier branch learned after delivery (for example through
+            // sync) appends a correction; the delivered receipt is unchanged.
+            if let Err(error) =
+                Box::pin(crate::session::execution::observe_delivered(&session_db)).await
+            {
+                warn!(%error, session_db_id, "Could not observe delivered execution ordering");
+            }
             return Ok(None);
         }
         let session = Session::new(conversation_id.clone(), session_db.clone()).await;
@@ -2748,7 +2791,7 @@ impl Server {
             anyhow::bail!("job session contains an unauthorized turn request");
         }
         if let Some(job) = &job_authority
-            && !self.claim_accepted_job(&session_db, job).await?
+            && !self.participate_in_accepted_job(&session_db, job).await?
         {
             self.processing.lock().await.remove(session_db_id);
             return Ok(None);
@@ -2846,6 +2889,7 @@ impl Server {
                     m.approval_tx.clone(),
                     SpawnContext {
                         job_projection: None,
+                        job_retry: None,
                         job_incarnation: job_authority
                             .as_ref()
                             .map(|_| self.job_incarnation.clone()),
@@ -2867,7 +2911,7 @@ impl Server {
 
         let mut spawn_ctx = spawn_ctx;
         if let Some(job) = &job_authority {
-            match self.record_claimed_job(&session_db, job).await {
+            match self.record_participating_job(&session_db, job).await {
                 Ok(projection) => spawn_ctx.job_projection = Some(projection),
                 Err(error) => {
                     self.processing.lock().await.remove(session_db_id);
@@ -3028,6 +3072,10 @@ impl Server {
             .lock()
             .await
             .insert(attempt.attempt_id.clone());
+        let mut spawn_ctx = spawn_ctx;
+        if pending_retry {
+            spawn_ctx.job_retry = Some(uuid::Uuid::new_v4().to_string());
+        }
 
         let attempt_id = attempt.attempt_id.clone();
         self.spawn_agent_task(
@@ -3139,7 +3187,7 @@ impl Server {
             if crate::session::jobs::read_job_result(session_db)
                 .await?
                 .is_some()
-                || !self.claim_accepted_job(session_db, job).await?
+                || !self.participate_in_accepted_job(session_db, job).await?
             {
                 return Ok(Some(None));
             }
@@ -3191,6 +3239,8 @@ impl Server {
                     m.agent_override.clone(),
                     m.approval_tx.clone(),
                     SpawnContext {
+                        job_projection: None,
+                        job_retry: None,
                         job_incarnation: job.map(|_| self.job_incarnation.clone()),
                         job_authority: job.cloned(),
                         call_depth: m.call_depth,
@@ -3270,6 +3320,16 @@ impl Server {
                 return Err(error);
             }
         };
+        let mut spawn_ctx = spawn_ctx;
+        if let Some(job) = job {
+            match self.record_participating_job(session_db, job).await {
+                Ok(projection) => spawn_ctx.job_projection = Some(projection),
+                Err(error) => {
+                    release().await;
+                    return Err(error.context("cannot persist resumed job before execution"));
+                }
+            }
+        }
         // Once per process, whatever the resumed run's outcome: a run that
         // stops without settling stays held until restart or explicit retry.
         self.considered_wait_checkpoints
@@ -3300,7 +3360,7 @@ impl Server {
     }
 
     // A waiting job is rechecked after the permit arrives. Nothing durable is
-    // started by the capacity waiter; a lost LWW claim or changed authority
+    // started by the capacity waiter; changed authority or a settled receipt
     // simply drops the permit without producing an interrupted attempt.
     #[allow(clippy::too_many_arguments)]
     async fn start_queued_job(
@@ -3319,7 +3379,6 @@ impl Server {
         if self.shutting_down.load(Ordering::Acquire)
             || self.validate_accepted_job(db).await?.as_ref() != Some(&job)
             || crate::session::jobs::read_job_result(db).await?.is_some()
-            || !crate::session::jobs::owns_job(db, &self.job_incarnation).await?
             || !self.peer_is_home_for(&sid, &job.definition.target).await
             || agent.name != job.definition.target
             || request_id.as_str() != job.directive_id
@@ -3654,6 +3713,13 @@ impl Server {
             let projection = spawn.job_projection.clone();
             let projection_job = spawn.job_authority.clone();
             let projection_lock = Arc::new(Mutex::new(()));
+            // Each run of a job attempt, including a resumed segment, is its
+            // own immutable execution branch.
+            let branch_id = incarnation
+                .as_ref()
+                .and(projection.as_ref())
+                .map(|_| uuid::Uuid::new_v4().to_string());
+            let (branch_started, branch_recorded) = tokio::sync::oneshot::channel::<()>();
             let work = async {
             if let (Some((queue, agent_db_id, peer)), Some(job)) = (&projection, &projection_job) {
                 let _guard = projection_lock.lock().await;
@@ -3662,6 +3728,61 @@ impl Server {
                     error!(%error, session_db_id, "Cannot record job start; stopping before model/tool work");
                     return;
                 }
+            }
+            if let (Some(id), Some(token), Some((_, agent_db_id, peer))) =
+                (&branch_id, &incarnation, &projection)
+            {
+                use crate::session::execution;
+                let predecessor = match &resume {
+                    Some(_) => match execution::latest_branch(&claim_db, &attempt.attempt_id).await {
+                        Ok(predecessor) => predecessor,
+                        Err(error) => {
+                            error!(%error, session_db_id, "Cannot read execution lineage; holding resumed attempt");
+                            return;
+                        }
+                    },
+                    None => None,
+                };
+                let start = execution::ExecutionStart {
+                    version: execution::VERSION,
+                    id: id.clone(),
+                    // The same identity participation recorded: the
+                    // hosted target Agent and its home-peer key.
+                    executor: execution::job_executor(
+                        agent_db_id,
+                        projection_job
+                            .as_ref()
+                            .map_or(peer.as_str(), |job| job.definition.executor_pubkey.as_str()),
+                    ),
+                    incarnation: token.clone(),
+                    attempt: attempt.clone(),
+                    retry_command: match &predecessor {
+                        Some(predecessor) => predecessor.retry_command.clone(),
+                        None => spawn.job_retry.clone(),
+                    },
+                    continuation: predecessor.zip(resume.as_ref()).map(|(predecessor, plan)| {
+                        execution::Continuation {
+                            predecessor: predecessor.id,
+                            checkpoint: plan.checkpoint.key(),
+                        }
+                    }),
+                };
+                if let Err(error) = Box::pin(execution::start(&claim_db, &start)).await {
+                    error!(%error, session_db_id, "Cannot record execution start; stopping before model/tool work");
+                    return;
+                }
+                match Box::pin(execution::observe(&claim_db, id)).await {
+                    Ok(None) => {}
+                    Ok(Some(yielded)) => {
+                        info!(session_db_id, branch = %id, earlier = %yielded.earlier_execution, "Execution yielded before model/tool work");
+                        return;
+                    }
+                    Err(error) => {
+                        error!(%error, session_db_id, "Execution observation failed; stopping before model/tool work");
+                        return;
+                    }
+                }
+                let _ = branch_started.send(());
             }
             // The persisted start is the per-turn claim. Refresh its bounded
             // visibility even while waiting for a semaphore or tool approval.
@@ -3848,6 +3969,7 @@ impl Server {
                 ),
                 agent_name: agent_name.clone(),
                 job_input: spawn.job_authority.is_some(),
+                branch: branch_id.clone(),
                 context_snapshot,
                 #[cfg(test)]
                 fail_after: transcript_fail_after,
@@ -3856,7 +3978,7 @@ impl Server {
             let capacity = Some(runtime::ExecutionCapacity::new(
                 semaphore,
                 permit,
-                incarnation.clone().map(|token| (claim_db.clone(), token)),
+                branch_id.clone().map(|id| (claim_db.clone(), id)),
             ));
             let result = match resume {
                 Some(plan) => runtime::resume_with_recorder(
@@ -3893,6 +4015,10 @@ impl Server {
             let mut s = session.lock().await;
             let persistence_failed =
                 matches!(&result, Err(error) if error.starts_with("runtime persistence failed:"));
+            // A branch stopped by an observed yield computed no result of its
+            // own; it must not be preserved as a failure outcome.
+            let stopped_by_yield = matches!(&result, Err(error)
+                if error.contains(EXECUTION_YIELDED) || error.starts_with(runtime::JOB_EXECUTION_YIELDED));
             let mut reply_preflight_failed = false;
             let (final_entry, outbound) = match result {
                 Ok(outcome) if tool_ctx.allow_no_reply && outcome.body.trim().is_empty() => {
@@ -3951,13 +4077,36 @@ impl Server {
                     }), None)
                 }
             };
-            if let Some(ref token) = incarnation {
-                match crate::session::jobs::owns_job(&claim_db, token).await {
-                    Ok(true) => {},
-                    other => {
-                        warn!(?other, session_db_id, "Job lost claim before settlement");
+            // Settlement needs no fresh ownership: only an observed earlier
+            // branch keeps this result from becoming the receipt. It stays
+            // evidence; the attempt record is left for the earlier branch.
+            if let Some(id) = &branch_id {
+                let undelivered = match Box::pin(crate::session::execution::observe(&claim_db, id)).await {
+                    Ok(None) => None,
+                    Ok(Some(yielded)) => Some(yielded),
+                    Err(error) => {
+                        error!(%error, session_db_id, "Execution observation failed before settlement; attempt remains interrupted");
                         return;
                     }
+                };
+                if let Some(yielded) = undelivered {
+                    info!(session_db_id, branch = %id, earlier = %yielded.earlier_execution, "Execution yielded; preserving its result as undelivered evidence");
+                    if !persistence_failed
+                        && !stopped_by_yield
+                        && let Some(terminal) = crate::session::jobs::job_terminal_for(final_entry.as_ref())
+                        && let Err(error) = crate::session::execution::record_undelivered(&claim_db, &crate::session::execution::ExecutionOutcome {
+                            execution_id: id.clone(),
+                            result: crate::session::jobs::JobResult {
+                                attempt_id: attempt.attempt_id.clone(),
+                                terminal,
+                                execution_id: Some(id.clone()),
+                            },
+                            delivered: false,
+                        }).await
+                    {
+                        error!(%error, session_db_id, "Failed to preserve yielded execution outcome");
+                    }
+                    return;
                 }
             }
             if persistence_failed || reply_preflight_failed {
@@ -3967,11 +4116,25 @@ impl Server {
                 );
             } else {
                 let terminal = recorder.terminal.lock().unwrap().take();
+                let late = branch_id.as_ref().zip(crate::session::jobs::job_terminal_for(final_entry.as_ref()));
                 if let Err(error) = s
-                    .complete_turn_attempt_with_outbound(&attempt, final_entry, outbound, terminal)
+                    .complete_turn_attempt_for_branch(&attempt, final_entry, outbound, terminal, branch_id.as_deref())
                     .await
                 {
                     error!("Failed to complete turn attempt for {session_db_id}: {error}");
+                    if let Some((id, terminal)) = late
+                        && let Err(error) = crate::session::execution::record_undelivered(&claim_db, &crate::session::execution::ExecutionOutcome {
+                            execution_id: id.clone(),
+                            result: crate::session::jobs::JobResult {
+                                attempt_id: attempt.attempt_id.clone(),
+                                terminal,
+                                execution_id: Some(id.clone()),
+                            },
+                            delivered: false,
+                        }).await
+                    {
+                        error!(%error, session_db_id, "Failed to preserve undelivered execution outcome");
+                    }
                 }
             }
             drop(s);
@@ -3983,7 +4146,7 @@ impl Server {
                 }
             }
             };
-            if let Some(ref token) = incarnation {
+            if let Some(id) = &branch_id {
                 let projection_watch = async {
                     let (Some((queue, agent_db_id, peer)), Some(job)) = (&projection, &projection_job) else {
                         std::future::pending::<()>().await;
@@ -4003,14 +4166,17 @@ impl Server {
                 tokio::select! {
                     biased;
                     () = projection_watch => {},
-                    loss = crate::session::jobs::wait_for_claim_loss(&claim_db, token) => {
-                        match loss {
-                            Ok(winner) => {
-                                if let Err(error) = crate::session::jobs::record_job_stop(&claim_db, &attempt.attempt_id, token, &winner).await {
-                                    error!(%error, session_db_id, "Failed to persist job claim-loss marker");
-                                }
-                            },
-                            Err(error) => error!(%error, session_db_id, "Job claim watch failed; stopping attempt"),
+                    // Cooperative: stops further model/tool steps once an
+                    // earlier branch is observed. In-flight effects stay.
+                    yielded = async {
+                        if branch_recorded.await.is_err() {
+                            std::future::pending::<()>().await;
+                        }
+                        crate::session::execution::wait_for_yield(&claim_db, id).await
+                    } => {
+                        match yielded {
+                            Ok(yielded) => info!(session_db_id, branch = %id, earlier = %yielded.earlier_execution, "Execution yielded to an earlier branch; stopping"),
+                            Err(error) => error!(%error, session_db_id, "Execution observation failed; stopping attempt"),
                         }
                     },
                     () = work => {},

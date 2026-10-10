@@ -53,7 +53,7 @@ async fn start_parent(
     permit: tokio::sync::OwnedSemaphorePermit,
     is_async: bool,
     timeout: u64,
-    claim: bool,
+    observed_yield: bool,
 ) -> Parent {
     let (sid, db) = server
         .registry
@@ -63,12 +63,10 @@ async fn start_parent(
     let session = Arc::new(Mutex::new(Session::new(sid, db.clone()).await));
     let mut ctx = tool_context(session, server.tools.clone());
     ctx.agent_name = "default".into();
-    let job_claim = if claim {
-        assert!(
-            crate::session::jobs::claim_job(&db, "peer", "default", "owner")
-                .await
-                .unwrap()
-        );
+    let job_execution = if observed_yield {
+        crate::session::execution::test_branch(&db, "owner")
+            .await
+            .unwrap();
         Some((db.clone(), "owner".into()))
     } else {
         None
@@ -96,7 +94,7 @@ async fn start_parent(
             ..Default::default()
         },
     )]));
-    let capacity = runtime::ExecutionCapacity::new(server.semaphore.clone(), permit, job_claim);
+    let capacity = runtime::ExecutionCapacity::new(server.semaphore.clone(), permit, job_execution);
     let task = tokio::spawn(async move {
         runtime::execute_with_recorder(
             None,
@@ -280,13 +278,13 @@ async fn synchronous_worker_yields_at_capacity_one_and_ten_saturated_parents() {
 }
 
 #[tokio::test]
-async fn worker_wait_balances_capacity_after_error_timeout_cancellation_and_claim_loss() {
+async fn worker_wait_balances_capacity_after_error_timeout_cancellation_and_observed_yield() {
     for mode in [
         "error",
         "timeout",
         "cancel-observation",
         "cancel-reacquire",
-        "claim-loss",
+        "observed-yield",
         "closed",
     ] {
         let (_owner, server, slot, child) = worker_fixture().await;
@@ -310,7 +308,7 @@ async fn worker_wait_balances_capacity_after_error_timeout_cancellation_and_clai
         }
         let gate = child.block_next_call();
         let permit = server.semaphore.clone().acquire_owned().await.unwrap();
-        let parent = start_parent(&server, permit, false, 1, mode == "claim-loss").await;
+        let parent = start_parent(&server, permit, false, 1, mode == "observed-yield").await;
         parent.first.release();
         tokio::time::timeout(Duration::from_secs(10), gate.wait_started())
             .await
@@ -343,35 +341,24 @@ async fn worker_wait_balances_capacity_after_error_timeout_cancellation_and_clai
                 assert!(matches!(parent.task.await, Err(error) if error.is_cancelled()));
                 drop(blocker);
             } else {
-                if mode == "claim-loss" {
-                    use eidetica::store::DocStore;
-                    let txn = parent.db.new_transaction().await.unwrap();
-                    let mut owner = crate::session::jobs::read_job_owner(&parent.db)
-                        .await
-                        .unwrap()
-                        .unwrap();
-                    owner.incarnation = "rival".into();
-                    txn.get_store::<DocStore>("job_owner")
-                        .await
-                        .unwrap()
-                        .set_string("v1", serde_json::to_string(&owner).unwrap())
+                if mode == "observed-yield" {
+                    crate::session::execution::test_supersede(&parent.db)
                         .await
                         .unwrap();
-                    txn.commit().await.unwrap();
                 }
                 if mode == "closed" {
                     server.semaphore.close();
                 }
                 drop(blocker);
-                if mode == "claim-loss" || mode == "closed" {
+                if mode == "observed-yield" || mode == "closed" {
                     let error = tokio::time::timeout(Duration::from_secs(10), parent.task)
                         .await
                         .unwrap()
                         .unwrap()
                         .err()
                         .expect("parent must stop before further effects");
-                    let expected = if mode == "claim-loss" {
-                        "job lost claim while observing"
+                    let expected = if mode == "observed-yield" {
+                        "job execution yielded while observing"
                     } else {
                         "executor capacity closed"
                     };

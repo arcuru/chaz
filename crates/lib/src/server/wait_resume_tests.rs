@@ -796,64 +796,55 @@ async fn crash_job_parent_while_waiting(fx: &Fixture) -> JobParentCrash {
     }
 }
 
-async fn write_owner(db: &eidetica::Database, incarnation: &str, refreshed: chrono::DateTime<Utc>) {
-    use eidetica::store::DocStore;
-    let mut owner = crate::session::jobs::read_job_owner(db)
-        .await
-        .unwrap()
-        .expect("the crashed process claimed the job");
-    owner.incarnation = incarnation.into();
-    owner.refreshed_at = refreshed;
-    let txn = db.new_transaction().await.unwrap();
-    txn.get_store::<DocStore>("job_owner")
-        .await
-        .unwrap()
-        .set_string("v1", serde_json::to_string(&owner).unwrap())
-        .await
-        .unwrap();
-    txn.commit().await.unwrap();
+async fn await_branches(db: &eidetica::Database, count: usize) {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while crate::session::execution::ordered_starts(db)
+            .await
+            .unwrap()
+            .len()
+            < count
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("resumed execution branch is recorded");
 }
 
-/// A rival's live claim defers the resume; once it lapses the executor
-/// claims, resumes the same wait, and continues with the job's own scope.
+/// With no claim to lapse, the restarted executor resumes the same wait at
+/// once as an exact continuation of the crashed branch, keeping its scope.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn job_parent_resumes_only_after_claiming_and_keeps_its_scope() {
+async fn job_parent_resumes_as_exact_continuation_and_keeps_its_scope() {
     let fx = Fixture::new("wait-job-parent").await;
     let crashed = crash_job_parent_while_waiting(&fx).await;
-    write_owner(
-        &crashed.parent_db,
-        "rival",
-        Utc::now() + chrono::Duration::seconds(3),
-    )
-    .await;
 
     let b_mock = Arc::new(MockBackend::new());
     b_mock.push_text("grandchild finished");
     b_mock.push_text("orchestrated");
     let b = fx.start_with(b_mock.clone()).await;
-    tokio::time::sleep(Duration::from_secs(2)).await;
-    assert!(
-        !b.server
-            .live_attempts
-            .lock()
-            .await
-            .contains(&crashed.checkpoint.attempt_id),
-        "a live rival claim defers resumption"
-    );
-    assert_eq!(
-        crate::session::jobs::read_job_owner(&crashed.parent_db)
-            .await
-            .unwrap()
-            .unwrap()
-            .incarnation,
-        "rival"
-    );
     await_resumed(&b, &crashed.checkpoint.attempt_id).await;
+    await_branches(&crashed.parent_db, 2).await;
+    let starts = crate::session::execution::ordered_starts(&crashed.parent_db)
+        .await
+        .unwrap();
+    assert_eq!(starts.len(), 2, "one branch per process run");
     assert!(
-        crate::session::jobs::owns_job(&crashed.parent_db, &b.server.job_incarnation)
-            .await
-            .unwrap()
+        starts
+            .iter()
+            .all(|s| s.start.attempt.attempt_id == crashed.checkpoint.attempt_id)
     );
+    let resumed = starts[1]
+        .start
+        .continuation
+        .as_ref()
+        .expect("legitimate lineage");
+    assert_eq!(resumed.predecessor, starts[0].start.id);
+    assert_eq!(resumed.checkpoint, crashed.checkpoint.key());
+    assert_eq!(
+        starts[0].start.executor, starts[1].start.executor,
+        "same executor, new incarnation"
+    );
+    assert_ne!(starts[0].start.incarnation, starts[1].start.incarnation);
     assert!(b_mock.recorded_calls().is_empty());
     let grandchild = crashed.grandchild.db.root_id().to_string();
     crashed
@@ -916,29 +907,21 @@ async fn job_parent_resumes_only_after_claiming_and_keeps_its_scope() {
     b.server.shutdown().await;
 }
 
-/// Claim loss while the resumed wait observes stops the attempt without a
-/// continuation; this process does not resume it again.
+/// A later continuation of the resumed branch, observed while the wait
+/// observes, stops it without a continuation; this process does not resume
+/// it again.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn claim_loss_during_resumed_wait_stops_without_continuing() {
-    let fx = Fixture::new("wait-claim-loss").await;
+async fn observed_successor_during_resumed_wait_stops_without_continuing() {
+    let fx = Fixture::new("wait-observed-yield").await;
     let crashed = crash_job_parent_while_waiting(&fx).await;
-    // Let the crashed process's claim lapse so B can claim promptly.
-    write_owner(
-        &crashed.parent_db,
-        "crashed",
-        Utc::now() - chrono::Duration::seconds(10),
-    )
-    .await;
     let b_mock = Arc::new(MockBackend::new());
     b_mock.push_text("must not run");
     let b = fx.start_with(b_mock.clone()).await;
     await_resumed(&b, &crashed.checkpoint.attempt_id).await;
-    write_owner(
-        &crashed.parent_db,
-        "rival",
-        Utc::now() + chrono::Duration::seconds(1),
-    )
-    .await;
+    await_branches(&crashed.parent_db, 2).await;
+    let successor = crate::session::execution::test_supersede(&crashed.parent_db)
+        .await
+        .unwrap();
     tokio::time::timeout(Duration::from_secs(30), async {
         while b
             .server
@@ -951,15 +934,15 @@ async fn claim_loss_during_resumed_wait_stops_without_continuing() {
         }
     })
     .await
-    .expect("claim loss stops the resumed attempt");
-    assert_eq!(
-        crate::session::jobs::job_stop_count(&crashed.parent_db)
-            .await
-            .unwrap(),
-        1
-    );
-    // Even after the rival's claim lapses, this process holds the attempt.
-    tokio::time::sleep(Duration::from_secs(6)).await;
+    .expect("an observed successor stops the resumed attempt");
+    let yields = crate::session::execution::yields(&crashed.parent_db)
+        .await
+        .unwrap();
+    assert_eq!(yields.len(), 1);
+    assert_eq!(yields[0].earlier_execution, successor);
+    assert!(yields[0].continuation_handover);
+    // No elapsed-time takeover or revival: this process holds the attempt.
+    tokio::time::sleep(Duration::from_secs(3)).await;
     assert!(b_mock.recorded_calls().is_empty(), "no continuation");
     assert!(
         !b.server

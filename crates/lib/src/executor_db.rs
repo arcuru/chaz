@@ -99,21 +99,25 @@ pub async fn ensure(
     // the Agent's delegated key on this DB in the shared User key map;
     // find_database chooses an arbitrary mapping, which is unsafe on a
     // remote service and can fail to discover an existing DB.
-    let references: Vec<_> = agent
+    // Concurrent incarnations of one peer participate in the same jobs and
+    // can race this find-before-create. Every reader converges on the lowest
+    // verified DB ID instead of refusing forever.
+    let mut references: Vec<_> = agent
         .list_executors()
         .await?
         .into_iter()
         .filter(|r| r.peer_pubkey == peer.to_string())
         .collect();
-    anyhow::ensure!(
-        references.len() <= 1,
-        "duplicate executor references for peer"
-    );
+    references.sort_by(|a, b| a.db_id.cmp(&b.db_id));
+    references.dedup_by(|a, b| a.db_id == b.db_id);
     let mut matches = Vec::new();
     if let Some(reference) = references.first() {
-        let db = user
-            .open_database_with_key(&ID::parse(&reference.db_id)?, &peer)
+        // Another incarnation may have created it after this User's key-map
+        // snapshot was loaded; map the peer's own key, as job sessions do.
+        let root = ID::parse(&reference.db_id)?;
+        user.map_key(&peer, &root, SigKey::from_pubkey(&peer))
             .await?;
+        let db = user.open_database_with_key(&root, &peer).await?;
         anyhow::ensure!(
             db.get_name().await? == name,
             "executor reference targets another database"
@@ -133,10 +137,7 @@ pub async fn ensure(
             }
         }
     }
-    anyhow::ensure!(
-        matches.len() <= 1,
-        "duplicate executor databases for {name}"
-    );
+    matches.sort_by_key(|db| db.root_id().to_string());
     let db = match matches.into_iter().next() {
         Some(db) => db,
         None => {
