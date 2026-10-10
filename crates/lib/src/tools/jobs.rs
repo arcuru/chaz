@@ -33,6 +33,27 @@ pub(crate) fn job_wait_arguments(arguments: &Value) -> Result<(String, u64), Too
     Ok((id, seconds))
 }
 
+/// An ordering correction learned after delivery reaches the parent at its
+/// next observation; the status itself, and the delivered result, are kept.
+async fn with_corrections(
+    server: &crate::server::Server,
+    id: &str,
+    status: &crate::session::jobs::JobStatus,
+) -> Result<String, ToolError> {
+    let corrections = server
+        .job_execution_corrections(id)
+        .await
+        .map_err(|e| e.to_string())?;
+    if corrections.is_empty() {
+        return serde_json::to_string(status).map_err(|e| e.to_string().into());
+    }
+    serde_json::to_string(&serde_json::json!({
+        "status": status,
+        "execution_corrections": corrections,
+    }))
+    .map_err(|e| e.to_string().into())
+}
+
 impl Tool for JobStatusTool {
     fn descriptor(&self) -> ToolDescriptor {
         ToolDescriptor {
@@ -88,18 +109,7 @@ impl Tool for JobStatusTool {
                 .map_err(|e| e.to_string().into());
             }
             let status = server.job_status(id).await.map_err(|e| e.to_string())?;
-            let corrections = server
-                .job_execution_corrections(id)
-                .await
-                .map_err(|e| e.to_string())?;
-            if corrections.is_empty() {
-                return serde_json::to_string(&status).map_err(|e| e.to_string().into());
-            }
-            serde_json::to_string(&serde_json::json!({
-                "status": status,
-                "execution_corrections": corrections,
-            }))
-            .map_err(|e| e.to_string().into())
+            with_corrections(&server, id, &status).await
         })
     }
 }
@@ -166,8 +176,8 @@ impl Tool for JobWaitTool {
                     .await
                     .map_err(|e| e.to_string())?;
             }
-            serde_json::to_string(&status.map_err(|e| e.to_string())?)
-                .map_err(|e| e.to_string().into())
+            let status = status.map_err(|e| e.to_string())?;
+            with_corrections(&server, &id, &status).await
         })
     }
 }
