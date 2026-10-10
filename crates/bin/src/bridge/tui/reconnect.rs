@@ -56,11 +56,12 @@ async fn reopen(
             let observed = db.clone();
             // Observation installation can register/reconcile runtime state,
             // like construction; a read deadline is not rollback authority.
-            let observation = supervised::work(async move {
+            // Keep the large registration future off the worker's stack.
+            let observation = supervised::work(Box::pin(async move {
                 setup_session(&server, &observed, backend, approval_tx, notify_tx)
                     .await
                     .map_err(|e| e.to_string())
-            })
+            }))
             .await;
             Ok(ReopenedState { db, observation })
         }
