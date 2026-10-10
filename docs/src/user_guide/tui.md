@@ -605,3 +605,126 @@ that children are reaped.
 This complements the fast widget snapshots; it does not test in-flight job
 cancellation.
 See `dev/tui-pty/README.md` for isolation details and failure artifact locations.
+
+## Jobs: observe without taking over
+
+`/jobs` (or `Ctrl+G`) opens the local Jobs monitor. It follows the Agent DB's
+stable per-executor references, then reads the job Session DB for attempt and
+result evidence. A projection row is discovery, not execution authority.
+
+Local v1 requires **existing Write authority** on the observed databases;
+Admin is also supported, but not required. This includes the Agent/executor
+sources and job sessions. The observer UI is non-executing, **not a Read-only
+credential boundary**. The current Eidetica service needs Write to materialize
+native record caches when reading. True Read-only observation is deferred
+until that upstream path is repaired and verified; it is not supported yet.
+Chaz never upgrades a key, grants access, or substitutes a privileged credential.
+A delegated service session whose native Write query is unsupported also stays
+explicitly unavailable; the monitor does not guess its authority.
+
+| Existing authority | Local-v1 behavior                                       |
+| ------------------ | ------------------------------------------------------- |
+| Write or Admin     | Observe; steer only an active attempt within its limits |
+| Read only          | Explicit insufficient-permission outcome                |
+| Unauthorized       | Refuse access; a row or job handle grants nothing       |
+
+| Control                         | Action                                                                |
+| ------------------------------- | --------------------------------------------------------------------- |
+| `↑` / `↓`                       | Select an ancestry node and preview its task, activity and result     |
+| `Enter`                         | Open a job in an observe-only conversation tab                        |
+| `PgUp` / `PgDn`, `Home` / `End` | Read the selected task or its diagnostics                             |
+| `d` / `F2`                      | Toggle technical details in Jobs (IDs, source errors, wait deadlines) |
+| `F2` in a job tab               | Toggle observer/input identifiers and diagnostics                     |
+| `r`                             | Refresh the overview without registering an executor                  |
+| `Esc`                           | Return from the overview                                              |
+| `Ctrl+G`                        | Toggle between chat and Jobs                                          |
+| `Ctrl+W`                        | Close the current tab; the resident job continues                     |
+| Job composer                    | Publish authenticated input for the same attempt's next model call    |
+
+### Read tasks first, inspect identifiers when needed
+
+The tree uses task titles, preserves ancestry and sibling order, and highlights
+the selected row in bold. Its second line names the recorded status and Agent.
+The header counts only claimed jobs; **Context** rows (originating conversations
+and unclaimed references) have a separate count. A completed job says
+**Completed**, not “claimed.” Missing data says **Unavailable**, not “no jobs.”
+
+Wide terminals show the tree and selected task side by side. Below 110 columns
+they stack, leaving the detail pane the larger share. The detail starts with
+the task, parent/children, recorded waits and terminal result, then recent
+activity. Long tasks wrap; `PgUp`/`PgDn` read them without moving the tree
+selection. `Home`/`End` jump to either end. `d` switches to IDs, executor/source
+diagnostics and full recent records; press it again to return to the task.
+
+**Started · recent activity** means activity was recently recorded, not that the
+job is proven running. **Started · status uncertain** has no such recent evidence.
+Wait labels come from entered, bounded `job_wait` calls, not model intentions.
+**Wait recorded (unfinished)** is persisted evidence, not proof the execution is
+still waiting. The freshness line shows snapshot age or a stale refresh failure;
+unavailable sources stay visible. No progress, ETA or heartbeat is invented.
+This view does not fetch remote databases or request access automatically.
+
+Opening a job does not start work, adopt a runtime, or append another ordinary
+turn. The tab follows persisted messages and tool activity. Job-local settings,
+retry, cancellation and approval-policy changes are unavailable here.
+Closing a tab or the client does not cancel the job or discard published input.
+
+### Next-call steering and the final boundary
+
+An authorized session writer can send input while a recent started attempt is
+observable. Read-only keys cannot observe or publish in local v1. The original
+Directive and accepted tool, grant, capability and depth ceilings remain
+unchanged. Input cannot contain scope overrides or start another job.
+
+The executor reads input only between complete model/tool exchanges. It does
+not interrupt a model call, tool or approval wait. Tool-free jobs use the same
+boundary. If input is accepted before closing, a model's final text is
+provisional: the same attempt continues and only its continued terminal result
+becomes available to the parent. Completed jobs are view-only; there is no
+reopen or follow-up action.
+
+Receipts distinguish **Queued · published, awaiting acceptance**,
+**Accepted · awaiting next call**, and **Accepted · dispatch recorded for call N;
+inclusion unconfirmed**. Dispatch intent does not prove the backend received
+input. **Included · call N returned** means a response to the request containing
+that input was observed. **Not applied** and **Uncertain** explain late
+publication, failure or interruption. Input numbers are display labels, not
+submission order or request identities; `F2` exposes the durable IDs. A lost acknowledgement retains the
+request ID: resend the same text to retry that publication, not create a second
+logical input. Different text is refused while that publication is unresolved.
+There is no globally exactly-once effect guarantee. Interrupted input and
+model/tool effects never replay automatically after restart.
+
+### Walkthrough: steer, then inspect
+
+1. Run a client-role TUI against the same configured Eidetica service as a
+   resident executor (`execution: client` on the viewer), using existing
+   Write-authorized credentials (Admin also works). Ask the executor's
+   ordinary conversation to submit a local Agent job with `spawn_agent`.
+2. Open `/jobs`. At 80 columns the tree sits above the detail. Select the task
+   titled `Compare storage choices`; its row and detail heading say
+   `Started · recent activity`. The preview names its parent and any recorded
+   child waits. Press `d` to see the source/attempt IDs, then `d` to hide them.
+   `PgDn` reads a long task; the tree selection stays put. Resize to 120 columns
+   for the side-by-side layout. Press `Enter` to open the job tab. Its fixed
+   banner says `Job observer` and `Write-capable · recorded, not proven live`.
+3. Send `Use the smaller example first`. The receipt reads
+   `Input 1 · Queued · published, awaiting acceptance`, then
+   `Input 1 · Accepted · dispatch recorded for call 1; inclusion unconfirmed`,
+   and finally `Input 1 · Included · call 1 returned`. Input/call numbers here
+   are illustrative. `F2` reveals the request and attempt IDs; it does not send
+   input. Close the tab with `Ctrl+W`: the resident executor still finishes.
+4. Reopen Jobs. The row says `Completed` (or `Failed`), and the preview's
+   `Result` (or `Outcome`) appears above recent activity. Open it to read the
+   transcript and input receipts. The composer says `Finished job · view-only`.
+   Sending again is refused; it cannot replace the result or start work.
+5. With an independently Read-only credential, opening the job is refused:
+   `insufficient permission: local-v1 job observation requires existing Write authority (Admin allowed); Read is unsupported`.
+   An unreadable source stays explicitly unavailable; it is not an empty
+   successful Jobs view. Return to the viewer's already Write-authorized
+   credential to inspect it. Chaz does not grant or upgrade authority.
+6. For another failure path, stop only the disposable viewer's access to its test
+   service. A refresh displays `Stale · refresh failed/timed out` with the
+   retained task and result still readable. `d` shows the actual error. Restore access and press `r` to refresh.
+   A stale start is not an invitation to replay: inspect the attempt before
+   using the separate explicit retry workflow outside the job observer.

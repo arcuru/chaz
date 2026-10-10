@@ -14,6 +14,7 @@ impl Bridge for TuiBridge {
         // Buffered so a force-refresh kicked off mid-render doesn't block.
         let (models_tx, mut models_rx) = mpsc::channel::<Result<Vec<ModelInfo>, String>>(4);
         let (session_rows_tx, mut session_rows_rx) = mpsc::channel::<SessionLoad>(128);
+        let (jobs_tx, mut jobs_rx) = mpsc::channel(1);
 
         // Resolve any directly opened conversation before touching the
         // terminal, so a bad `--session` surfaces as a plain error.
@@ -76,6 +77,12 @@ impl Bridge for TuiBridge {
                 request_session_metadata(&mut app, &server, &session_rows_tx);
             }
 
+            if matches!(app.mode, TuiMode::Jobs)
+                && app.jobs.data.observed_at.is_none()
+                && app.jobs.error.is_none()
+            {
+                jobs::refresh(&mut app, &server, &jobs_tx);
+            }
             let action = tokio::select! {
                 Some(Ok(event)) = events.next() => {
                     match event {
@@ -86,14 +93,21 @@ impl Bridge for TuiBridge {
                 }
                 Some(id) = notify_rx.recv() => Action::SessionChanged(id),
                 _ = activity_tick.tick() => {
+                    let observing_jobs = matches!(app.mode, TuiMode::Jobs)
+                        || app.current().is_some_and(|tab| tab.job.is_some());
                     for tab in &mut app.tabs {
-                        refresh_tab_activity(tab).await?;
+                        if tab.job.is_some() { jobs::refresh_tab(tab).await; }
+                        else if !observing_jobs { refresh_tab_activity(tab).await?; }
+                    }
+                    if matches!(app.mode, TuiMode::Jobs) {
+                        jobs::refresh(&mut app, &server, &jobs_tx);
                     }
                     continue;
                 },
                 Some(msg) = approval_rx.recv() => Action::ApprovalRequest(msg),
                 Some(res) = models_rx.recv() => Action::ModelsFetched(res),
                 Some(load) = session_rows_rx.recv() => Action::SessionLoad(load),
+                Some(result) = jobs_rx.recv() => Action::JobsLoaded(result),
             };
 
             match action {
@@ -102,6 +116,26 @@ impl Bridge for TuiBridge {
                         && key.modifiers.contains(KeyModifiers::CONTROL)
                     {
                         app.should_quit = true;
+                    } else if key.code == KeyCode::Char('g')
+                        && key.modifiers.contains(KeyModifiers::CONTROL)
+                    {
+                        app.mode = if matches!(app.mode, TuiMode::Jobs) {
+                            TuiMode::Chat
+                        } else {
+                            TuiMode::Jobs
+                        };
+                        if matches!(app.mode, TuiMode::Jobs) {
+                            jobs::refresh(&mut app, &server, &jobs_tx);
+                        }
+                    } else if key.code == KeyCode::F(2) {
+                        if app.mode == TuiMode::Jobs {
+                            app.jobs.details = !app.jobs.details;
+                            app.jobs.detail_scroll = 0;
+                        } else if app.mode == TuiMode::Chat
+                            && let Some(job) = app.active_mut().job.as_mut()
+                        {
+                            job.details = !job.details;
+                        }
                     } else if key.code == KeyCode::Char('d')
                         && key.modifiers.contains(KeyModifiers::CONTROL)
                     {
@@ -144,7 +178,7 @@ impl Bridge for TuiBridge {
                             TuiMode::SessionPicker => {
                                 app.open_settings(SettingsScope::Peer, TuiMode::SessionPicker);
                             }
-                            TuiMode::ModelPicker | TuiMode::Settings(_) => {}
+                            TuiMode::Jobs | TuiMode::ModelPicker | TuiMode::Settings(_) => {}
                         }
                     } else if key.code == KeyCode::Char('p')
                         && key.modifiers.contains(KeyModifiers::CONTROL)
@@ -167,6 +201,9 @@ impl Bridge for TuiBridge {
                                     &session_rows_tx,
                                 )
                                 .await;
+                            }
+                            TuiMode::Jobs => {
+                                open_session_picker(&mut app, &server, &session_rows_tx);
                             }
                             TuiMode::SessionPicker => {
                                 if app.tabs.is_empty() || app.session_picker_error.is_some() {
@@ -205,6 +242,47 @@ impl Bridge for TuiBridge {
                             input::OverlayKey::NotConsumed => {}
                         }
                         match app.mode {
+                            TuiMode::Jobs => match key.code {
+                                KeyCode::Esc => app.mode = TuiMode::Chat,
+                                KeyCode::Up => {
+                                    let selected = app.jobs.selected.saturating_sub(1);
+                                    jobs::select(&mut app.jobs, selected);
+                                }
+                                KeyCode::Down => {
+                                    let selected = app.jobs.selected + 1;
+                                    jobs::select(&mut app.jobs, selected);
+                                }
+                                KeyCode::PageUp => {
+                                    app.jobs.detail_scroll =
+                                        app.jobs.detail_scroll.saturating_sub(5)
+                                }
+                                KeyCode::PageDown => {
+                                    app.jobs.detail_scroll =
+                                        app.jobs.detail_scroll.saturating_add(5)
+                                }
+                                KeyCode::Home => app.jobs.detail_scroll = 0,
+                                KeyCode::End => app.jobs.detail_scroll = u16::MAX,
+                                KeyCode::Char('d') => {
+                                    app.jobs.details = !app.jobs.details;
+                                    app.jobs.detail_scroll = 0;
+                                }
+                                KeyCode::Char('r') => jobs::refresh(&mut app, &server, &jobs_tx),
+                                KeyCode::Enter => {
+                                    if let Some(node) = app.jobs.data.nodes.get(app.jobs.selected) {
+                                        let id = node.session_db_id.clone();
+                                        if node.state.is_some()
+                                            && let Err(error) = jobs::open(
+                                                &mut app, &server, &backend, &id, &notify_tx,
+                                            )
+                                            .await
+                                        {
+                                            app.jobs.error =
+                                                Some(format!("Job unavailable: {error}"));
+                                        }
+                                    }
+                                }
+                                _ => {}
+                            },
                             TuiMode::Chat => {
                                 if let Some(chat_action) =
                                     input::handle_chat_key(&mut app, key).await
@@ -322,6 +400,10 @@ impl Bridge for TuiBridge {
                 }
                 Action::SessionChanged(id) => {
                     if let Some(idx) = app.tab_index_for(&id) {
+                        if app.tabs[idx].job.is_some() {
+                            jobs::refresh_tab(&mut app.tabs[idx]).await;
+                            continue;
+                        }
                         let (db_id, db) = {
                             let tab = &app.tabs[idx];
                             (tab.session_db_id.clone(), tab.session_db.clone())
@@ -423,6 +505,7 @@ impl Bridge for TuiBridge {
                         }
                     }
                 }
+                Action::JobsLoaded(result) => jobs::apply(&mut app, result),
                 Action::SessionLoad(load) => match load {
                     SessionLoad::Catalog { generation, result } => {
                         apply_session_catalog_result(&mut app, generation, result);
@@ -449,7 +532,11 @@ impl Bridge for TuiBridge {
             // coding: cheap local store read per event; gate on
             // SessionChanged / tab-switch if it ever shows in a profile.
             if matches!(app.mode, TuiMode::Chat) {
-                refresh_status_segments(&mut app).await;
+                if app.active().job.is_some() {
+                    app.status_segments.clear();
+                } else {
+                    refresh_status_segments(&mut app).await;
+                }
             }
 
             if app.should_quit {

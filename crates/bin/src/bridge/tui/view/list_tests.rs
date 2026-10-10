@@ -82,6 +82,7 @@ async fn fixture_with_backends(
     );
     server.set_default_agents((0..30).map(|i| format!("agent-{i:02}")).collect());
     let tab = Tab {
+        job: None,
         session_db_id: id.to_string(),
         session_db: db,
         entries: Vec::new(),

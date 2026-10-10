@@ -33,6 +33,7 @@ mod bridge_event;
 pub mod jobs;
 mod keys;
 mod registry;
+pub mod steering;
 pub(crate) use registry::JobRequest;
 mod transport;
 pub mod usage;

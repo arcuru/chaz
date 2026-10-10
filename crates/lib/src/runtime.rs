@@ -43,6 +43,16 @@ pub enum RuntimeEvent {
 
 /// Awaited persistence boundary for completed runtime messages.
 pub trait RuntimeRecorder: Send + Sync {
+    /// Called only at a complete model/tool boundary. A closing boundary may
+    /// return input that requires continuing before any terminal publication.
+    fn input_boundary<'a>(
+        &'a self,
+        _model_sequence: u64,
+        _closing: bool,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<RuntimeMessage>, String>> + Send + 'a>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+
     fn record<'a>(
         &'a self,
         message: RuntimeRecord,
@@ -497,50 +507,58 @@ pub async fn execute_with_recorder(
         routine_engine: tool_ctx.routine_engine.clone(),
     });
 
-    // Fast path: no tools or backend doesn't support them → single-shot (with retry)
+    // Tool-free jobs have the same next-call/closing boundary without adding
+    // tool authority or changing standalone callers' single-shot behavior.
     if (tools.is_empty() && !tool_ctx.allow_no_reply) || !backend.supports_tools_for_model(model) {
-        return match llm_call_with_retry(
-            backend,
-            model,
-            &initial_messages,
-            &[],
-            &resolved_model,
-            max_retries,
-        )
-        .await
-        {
-            Ok(LLMResponse::Text { content, metadata }) if !content.trim().is_empty() => {
-                record_runtime(
-                    &recorder,
-                    RuntimeRecord::ModelResponse {
-                        model_sequence,
-                        content: Some(content.clone()),
-                        tool_calls: Vec::new(),
-                        provider_extra: Default::default(),
-                        metadata: metadata.clone(),
-                        terminal: true,
-                    },
-                )
-                .await?;
-                if let Some(m) = metadata {
-                    acc.record(m);
+        let mut messages = initial_messages;
+        loop {
+            messages.extend(input_boundary(&recorder, model_sequence, false).await?);
+            let response =
+                llm_call_with_retry(backend, model, &messages, &[], &resolved_model, max_retries)
+                    .await
+                    .map_err(|e| e.to_string())?;
+            match response {
+                LLMResponse::Text { content, metadata } if !content.trim().is_empty() => {
+                    let pending = input_boundary(&recorder, model_sequence + 1, true).await?;
+                    record_runtime(
+                        &recorder,
+                        RuntimeRecord::ModelResponse {
+                            model_sequence,
+                            content: Some(content.clone()),
+                            tool_calls: Vec::new(),
+                            provider_extra: Default::default(),
+                            metadata: metadata.clone(),
+                            terminal: pending.is_empty(),
+                        },
+                    )
+                    .await?;
+                    if let Some(m) = metadata {
+                        acc.record(m);
+                    }
+                    if !pending.is_empty() {
+                        messages.push(RuntimeMessage::Assistant(content));
+                        messages.extend(pending);
+                        model_sequence += 1;
+                        continue;
+                    }
+                    return Ok(finalize_outcome(
+                        hub,
+                        hook_ctx.as_ref(),
+                        RuntimeOutcome {
+                            body: content,
+                            metadata: acc.finalize(),
+                        },
+                    )
+                    .await);
                 }
-                Ok(finalize_outcome(
-                    hub,
-                    hook_ctx.as_ref(),
-                    RuntimeOutcome {
-                        body: content,
-                        metadata: acc.finalize(),
-                    },
-                )
-                .await)
+                LLMResponse::Text { .. } => {
+                    return Err("Model returned empty final response".into());
+                }
+                LLMResponse::ToolCalls { .. } => {
+                    return Err("Unexpected tool calls in no-tools fallback".into());
+                }
             }
-            Ok(LLMResponse::Text { .. }) => Err("Model returned empty final response".into()),
-            Ok(LLMResponse::ToolCalls { .. }) => {
-                Err("Unexpected tool calls in no-tools fallback".to_string())
-            }
-            Err(e) => Err(e.to_string()),
-        };
+        }
     }
 
     let tool_defs = tool_ctx.definitions();
@@ -564,6 +582,7 @@ pub async fn execute_with_recorder(
 
     let mut iteration: usize = 0;
     loop {
+        messages.extend(input_boundary(&recorder, model_sequence, false).await?);
         let response = match llm_call_with_retry(
             backend,
             model,
@@ -595,6 +614,7 @@ pub async fn execute_with_recorder(
                 return Err("opted-in turn returned empty text without calling no_reply".into());
             }
             LLMResponse::Text { content, metadata } if !content.trim().is_empty() => {
+                let pending = input_boundary(&recorder, model_sequence + 1, true).await?;
                 record_runtime(
                     &recorder,
                     RuntimeRecord::ModelResponse {
@@ -603,12 +623,18 @@ pub async fn execute_with_recorder(
                         tool_calls: Vec::new(),
                         provider_extra: Default::default(),
                         metadata: metadata.clone(),
-                        terminal: true,
+                        terminal: pending.is_empty(),
                     },
                 )
                 .await?;
                 if let Some(m) = metadata {
                     acc.record(m);
+                }
+                if !pending.is_empty() {
+                    messages.push(RuntimeMessage::Assistant(content));
+                    messages.extend(pending);
+                    model_sequence += 1;
+                    continue;
                 }
                 if iteration > 0 {
                     info!("ReAct loop completed after {} tool iterations", iteration);
@@ -624,6 +650,7 @@ pub async fn execute_with_recorder(
                 .await);
             }
             LLMResponse::Text { metadata, .. } if iteration > 0 => {
+                let pending = input_boundary(&recorder, model_sequence + 1, true).await?;
                 record_runtime(
                     &recorder,
                     RuntimeRecord::ModelResponse {
@@ -632,7 +659,7 @@ pub async fn execute_with_recorder(
                         tool_calls: Vec::new(),
                         provider_extra: Default::default(),
                         metadata: metadata.clone(),
-                        terminal: true,
+                        terminal: pending.is_empty(),
                     },
                 )
                 .await?;
@@ -642,6 +669,11 @@ pub async fn execute_with_recorder(
                 // Model returned empty response after tool calls — some models do this.
                 // Return the last tool result as the response.
                 info!("Empty response after tool calls, using last tool result");
+                if !pending.is_empty() {
+                    messages.extend(pending);
+                    model_sequence += 1;
+                    continue;
+                }
                 if let Some(RuntimeMessage::ToolResult { content, .. }) = messages.last() {
                     return Ok(finalize_outcome(
                         hub,
@@ -1041,6 +1073,17 @@ impl RuntimeRecorder for EventRecorder {
             }
             Ok(())
         })
+    }
+}
+
+async fn input_boundary(
+    recorder: &Option<Arc<dyn RuntimeRecorder>>,
+    model_sequence: u64,
+    closing: bool,
+) -> Result<Vec<RuntimeMessage>, String> {
+    match recorder {
+        Some(recorder) => recorder.input_boundary(model_sequence, closing).await,
+        None => Ok(Vec::new()),
     }
 }
 

@@ -48,7 +48,7 @@ pub(crate) async fn read_accepted_job(
 
 /// Prevent ordinary runtime registration for any job-marked DB, including
 /// obsolete staged rows that have no submitter-owned acceptance path.
-pub(crate) async fn is_job_session(db: &eidetica::Database) -> bool {
+pub async fn is_job_session(db: &eidetica::Database) -> bool {
     crate::db_kind::read_marker(db)
         .await
         .is_some_and(|(kind, name)| {
@@ -70,7 +70,7 @@ pub struct JobResult {
     pub terminal: JobTerminal,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum JobState {
     Pending,
     Rejected {
@@ -227,6 +227,36 @@ pub(crate) async fn status_from_db(
         state,
     })
 }
+/// Local-v1 observation needs write-capable credentials because the current
+/// service materializes native record caches while reading. This checks existing
+/// authority only; it neither grants permission nor acquires execution.
+pub async fn require_observer_write(
+    db: &eidetica::Database,
+) -> anyhow::Result<eidetica::auth::types::Permission> {
+    // The pinned native resolver needs a local backend for delegated handles.
+    // Do not panic, guess authority, or substitute another key on service reads.
+    anyhow::ensure!(
+        !(db.instance()?.remote_connection().is_some()
+            && matches!(
+                db.auth_identity(),
+                Some(eidetica::auth::SigKey::Delegation { .. })
+            )),
+        "unavailable: cannot verify existing Write authority for this delegated service session identity; native permission query is unsupported"
+    );
+    let permission = db.current_permission().await?;
+    anyhow::ensure!(
+        permission.can_write(),
+        "insufficient permission: local-v1 job observation requires existing Write authority (Admin allowed); {permission:?} is unsupported"
+    );
+    Ok(permission)
+}
+
+/// Client evidence without a local live-attempt set: never promises liveness.
+pub async fn observer_status(db: &eidetica::Database) -> anyhow::Result<JobStatus> {
+    require_observer_write(db).await?;
+    status_from_db(db, &Default::default(), false).await
+}
+
 impl SessionRegistry {
     /// Open a locally indexed job created by another same-login service
     /// process after this client's User key-map snapshot was loaded.
@@ -253,7 +283,10 @@ impl SessionRegistry {
         let key = user.get_default_key()?;
         user.map_key(&key, &root, eidetica::auth::SigKey::from_pubkey(&key))
             .await?;
-        let db = user.open_database_with_key(&root, &key).await?;
+        let db = user.open_database_with_key(&root, &key).await.map_err(|error| {
+            anyhow::anyhow!("job unavailable or insufficient permission: local-v1 observation requires existing Write authority (Admin allowed): {error}")
+        })?;
+        require_observer_write(&db).await?;
         self.local_client_sessions
             .lock()
             .await
@@ -439,4 +472,76 @@ mod ownership_tests {
             .unwrap();
         assert_eq!(job_stop_count(&db).await.unwrap(), 1);
     }
+}
+
+/// An actual entered job_wait, not a model's proposed dependency. A persisted
+/// unfinished row is recorded activity, never proof a process is still waiting.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JobWait {
+    pub attempt_id: String,
+    pub child_id: String,
+    pub deadline_at: chrono::DateTime<chrono::Utc>,
+    pub finished: bool,
+}
+
+const JOB_WAITS: &str = "job_waits";
+
+pub async fn job_waits(db: &eidetica::Database) -> anyhow::Result<Vec<JobWait>> {
+    let txn = db.new_transaction().await?;
+    Ok(txn
+        .get_store::<eidetica::store::Table<JobWait>>(JOB_WAITS)
+        .await?
+        .search(|_: &JobWait| true)
+        .await?
+        .into_iter()
+        .map(|(_, row)| row)
+        .collect())
+}
+
+impl super::Session {
+    pub(crate) async fn start_job_wait(
+        &self,
+        request_id: &super::TurnRequestId,
+        tool_call_key: &str,
+        child_id: &str,
+        seconds: u64,
+    ) -> anyhow::Result<Option<(String, JobWait)>> {
+        let Some(accepted) = read_accepted_job(self.database()).await? else {
+            return Ok(None);
+        };
+        anyhow::ensure!(
+            accepted.directive_id == request_id.as_str(),
+            "wait must belong to original job Directive"
+        );
+        let attempt_id = match self
+            .turn_state_for_entry(request_id, &Default::default())
+            .await?
+        {
+            super::TurnRequestState::Interrupted { attempt_id } => attempt_id,
+            _ => anyhow::bail!("job wait has no started attempt"),
+        };
+        let key = format!("{attempt_id}:{tool_call_key}");
+        let row = JobWait {
+            attempt_id,
+            child_id: child_id.into(),
+            deadline_at: chrono::Utc::now() + chrono::Duration::seconds(seconds as i64),
+            finished: false,
+        };
+        write_job_wait(self.database(), &key, row.clone()).await?;
+        Ok(Some((key, row)))
+    }
+}
+
+pub(crate) async fn write_job_wait(
+    db: &eidetica::Database,
+    key: &str,
+    row: JobWait,
+) -> anyhow::Result<()> {
+    let txn = db.new_transaction().await?;
+    txn.get_store::<eidetica::store::Table<JobWait>>(JOB_WAITS)
+        .await?
+        .set(key, row)
+        .await?;
+    txn.commit().await?;
+    Ok(())
 }
