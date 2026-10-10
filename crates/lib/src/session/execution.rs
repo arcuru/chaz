@@ -308,6 +308,35 @@ fn ancestor(older: &str, newer: &str, starts: &[OrderedStart]) -> bool {
     false
 }
 
+/// A continuation is the same execution as its lineage, so it competes at
+/// its lineage root's native position; parallel resumes within one lineage
+/// fall back to their own positions. Without this, a competitor committed
+/// between a branch and its continuation would make every branch yield.
+fn order_key(id: &str, starts: &[OrderedStart]) -> (usize, usize) {
+    let own = starts
+        .iter()
+        .position(|s| s.start.id == id)
+        .unwrap_or(usize::MAX);
+    let (mut root, mut current) = (own, id);
+    for _ in 0..starts.len() {
+        let Some(predecessor) = starts
+            .iter()
+            .find(|s| s.start.id == current)
+            .and_then(|s| s.start.continuation.as_ref())
+            .and_then(|c| {
+                starts
+                    .iter()
+                    .position(|s| s.start.id == c.predecessor)
+                    .map(|p| (p, c.predecessor.as_str()))
+            })
+        else {
+            break;
+        };
+        (root, current) = predecessor;
+    }
+    (root, own)
+}
+
 fn competitors(a: &ExecutionStart, b: &ExecutionStart, starts: &[OrderedStart]) -> bool {
     a.attempt.request_id == b.attempt.request_id
         && a.retry_command == b.retry_command
@@ -335,14 +364,19 @@ pub(crate) async fn observe(db: &Database, id: &str) -> anyhow::Result<Option<Ex
         }
         return Ok(Some(yielded));
     }
-    let position = starts
+    let current = &starts
         .iter()
-        .position(|s| s.start.id == id)
-        .ok_or_else(|| anyhow::anyhow!("execution start is unavailable"))?;
-    let current = &starts[position].start;
-    let earlier = starts[..position]
+        .find(|s| s.start.id == id)
+        .ok_or_else(|| anyhow::anyhow!("execution start is unavailable"))?
+        .start;
+    let key = order_key(id, &starts);
+    let earlier = starts
         .iter()
-        .find(|s| competitors(current, &s.start, &starts));
+        .filter(|s| competitors(current, &s.start, &starts))
+        .map(|s| (order_key(&s.start.id, &starts), s))
+        .filter(|(other, _)| *other < key)
+        .min_by_key(|(other, _)| *other)
+        .map(|(_, s)| s);
     let successor = starts.iter().find(|s| ancestor(id, &s.start.id, &starts));
     if let Some(winner) = earlier.or(successor) {
         let yielded = ExecutionYield {

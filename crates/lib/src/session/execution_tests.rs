@@ -571,3 +571,56 @@ async fn stale_incarnation_hands_over_to_its_exact_continuation() {
         "lineage is not parallel work"
     );
 }
+
+/// A competitor committed between a branch and its exact continuation does
+/// not outrank that lineage: the continuation inherits its root's order, so
+/// exactly one lineage keeps running instead of every branch yielding.
+#[tokio::test]
+async fn continuation_keeps_its_lineage_order_over_an_interleaved_competitor() {
+    for competitor_observes_first in [true, false] {
+        let (_instance, registry) = make_registry().await;
+        let (cid, db) = registry.create_session(Some("interleaved")).await.unwrap();
+        activate_fresh(&db).await.unwrap();
+        let session = Session::new(cid, db.clone()).await;
+        let attempt = session
+            .start_turn_attempt_as(TurnRequestId::parse("request"), "logical-attempt".into())
+            .await
+            .unwrap();
+        start(&db, &branch(&attempt, "root", "executor-a"))
+            .await
+            .unwrap();
+        start(&db, &branch(&attempt, "rival", "executor-b"))
+            .await
+            .unwrap();
+        if competitor_observes_first {
+            assert_eq!(
+                observe(&db, "rival")
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .earlier_execution,
+                "root"
+            );
+        }
+        let mut resumed = branch(&attempt, "resumed", "executor-a");
+        resumed.continuation = Some(Continuation {
+            predecessor: "root".into(),
+            checkpoint: "exact".into(),
+        });
+        start(&db, &resumed).await.unwrap();
+        assert!(
+            observe(&db, "resumed").await.unwrap().is_none(),
+            "the earlier lineage continues"
+        );
+        assert!(
+            observe(&db, "root")
+                .await
+                .unwrap()
+                .unwrap()
+                .continuation_handover
+        );
+        let rival = observe(&db, "rival").await.unwrap().unwrap();
+        assert!(!rival.continuation_handover);
+        assert_eq!(rival.earlier_execution, "root");
+    }
+}
