@@ -377,7 +377,8 @@ pub(super) fn handle_mouse(app: &mut App, m: MouseEvent) -> Option<MouseOutcome>
                     app.model_picker_filtered.len(),
                 );
             } else if app.mode == TuiMode::Jobs {
-                app.jobs.selected = wheel_step(app.jobs.selected, down, app.jobs.data.nodes.len());
+                let selected = wheel_step(app.jobs.selected, down, app.jobs.data.nodes.len());
+                super::jobs::select(&mut app.jobs, selected);
             } else if app.mode == TuiMode::SessionPicker {
                 app.picker_index = wheel_step(app.picker_index, down, app.picker_len());
             } else if let TuiMode::Settings(scope) = app.mode {

@@ -127,6 +127,15 @@ impl Bridge for TuiBridge {
                         if matches!(app.mode, TuiMode::Jobs) {
                             jobs::refresh(&mut app, &server, &jobs_tx);
                         }
+                    } else if key.code == KeyCode::F(2) {
+                        if app.mode == TuiMode::Jobs {
+                            app.jobs.details = !app.jobs.details;
+                            app.jobs.detail_scroll = 0;
+                        } else if app.mode == TuiMode::Chat
+                            && let Some(job) = app.active_mut().job.as_mut()
+                        {
+                            job.details = !job.details;
+                        }
                     } else if key.code == KeyCode::Char('d')
                         && key.modifiers.contains(KeyModifiers::CONTROL)
                     {
@@ -236,11 +245,26 @@ impl Bridge for TuiBridge {
                             TuiMode::Jobs => match key.code {
                                 KeyCode::Esc => app.mode = TuiMode::Chat,
                                 KeyCode::Up => {
-                                    app.jobs.selected = app.jobs.selected.saturating_sub(1)
+                                    let selected = app.jobs.selected.saturating_sub(1);
+                                    jobs::select(&mut app.jobs, selected);
                                 }
                                 KeyCode::Down => {
-                                    app.jobs.selected = (app.jobs.selected + 1)
-                                        .min(app.jobs.data.nodes.len().saturating_sub(1))
+                                    let selected = app.jobs.selected + 1;
+                                    jobs::select(&mut app.jobs, selected);
+                                }
+                                KeyCode::PageUp => {
+                                    app.jobs.detail_scroll =
+                                        app.jobs.detail_scroll.saturating_sub(5)
+                                }
+                                KeyCode::PageDown => {
+                                    app.jobs.detail_scroll =
+                                        app.jobs.detail_scroll.saturating_add(5)
+                                }
+                                KeyCode::Home => app.jobs.detail_scroll = 0,
+                                KeyCode::End => app.jobs.detail_scroll = u16::MAX,
+                                KeyCode::Char('d') => {
+                                    app.jobs.details = !app.jobs.details;
+                                    app.jobs.detail_scroll = 0;
                                 }
                                 KeyCode::Char('r') => jobs::refresh(&mut app, &server, &jobs_tx),
                                 KeyCode::Enter => {

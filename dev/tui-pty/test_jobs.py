@@ -5,6 +5,7 @@
 # ///
 """Real client-role TUI + resident executor + disposable Eidetica service."""
 import json
+import html
 import os
 from pathlib import Path
 import select
@@ -53,6 +54,46 @@ class JobPtyProcess(PtyProcess):
                 raise AssertionError(f"child exited {self.child.returncode} before {text!r}")
             if time.monotonic() >= deadline:
                 raise AssertionError(f"deadline waiting for {text!r}; screen: {self.screen.display}")
+
+    def screen_capture(self, evidence, label):
+        self.drain(0.1)
+        dest = evidence / label
+        self.capture(dest)
+        (dest / "screen.txt").write_text("\n".join(self.screen.display) + "\n")
+        # Cell positions/styles come from the live terminal emulator; no
+        # reconstructed fixture screenshot or concatenated cursor deltas.
+        cols, rows = self.screen.columns, self.screen.lines
+        svg = [f'<svg xmlns="http://www.w3.org/2000/svg" width="{cols * 9}" height="{rows * 18}" viewBox="0 0 {cols * 9} {rows * 18}">',
+               '<rect width="100%" height="100%" fill="#101218"/>',
+               '<g font-family="monospace" font-size="14">']
+        palette = {"default": "#ededed", "black": "#101218", "white": "#ededed"}
+        def color(value):
+            return palette.get(value, "#" + value if len(value) == 6 else "#ededed")
+        for y in range(rows):
+            for x in range(cols):
+                cell = self.screen.buffer[y][x]
+                if cell.bg != "default":
+                    svg.append(f'<rect x="{x * 9}" y="{y * 18}" width="9" height="18" fill="{color(cell.bg)}"/>')
+                if cell.data.strip():
+                    svg.append(f'<text x="{x * 9}" y="{y * 18 + 14}" fill="{color(cell.fg)}" font-weight="{"bold" if cell.bold else "normal"}">{html.escape(cell.data)}</text>')
+        svg.append('</g></svg>')
+        (dest / "screen.svg").write_text("\n".join(svg))
+
+    def readability_sizes(self, evidence, phase, status, result=None):
+        for cols, rows in [(80, 24), (120, 35), (180, 45)]:
+            self.resize(cols, rows)
+            self.expect("original job task")
+            self.expect(status)
+            self.expect("1 jobs")
+            if result:
+                self.expect(result)
+            screen = "\n".join(self.screen.display)
+            for hidden in ["Some(", "StartedUnknown", "Succeeded {", "attempt_id", "bafyr4i", "ed25519:"]:
+                if hidden in screen:
+                    raise AssertionError(f"default leaked {hidden}: {screen}")
+            self.screen_capture(evidence, f"{phase}-{cols}x{rows}")
+        self.resize(110, 35)
+        self.expect(status)
 
     def expect_absent(self, text, timeout=20):
         deadline = time.monotonic() + timeout
@@ -193,7 +234,7 @@ security:
                 process.resize(110, 35)
                 process.expect("New session")
                 process.send("\x07")  # Jobs also works with no conversation open.
-                process.expect("Jobs ancestry")
+                process.expect("Tasks")
                 time.sleep(5.2)  # Exercise the activity tick with no active tab.
                 process.drain(0)
                 self.assertIsNone(process.child.poll(), "sessionless Jobs crashed")
@@ -214,36 +255,67 @@ security:
                 process.send("unsent-parent-draft")
                 process.expect("unsent-parent-draft")
                 process.send("\x07")  # Ctrl+G: observe Jobs, not a new turn.
-                process.expect("Jobs ancestry")
-                process.expect("context/unclaimed")  # Wait for the source-backed rows, not the loading frame.
+                process.expect("Tasks")
+                process.expect("Context · not a job")  # Wait for the source-backed rows, not the loading frame.
                 process.send("\x1b[B")  # Context root first, claimed child second.
-                process.expect("StartedUnknown")
+                process.expect("Started · recent activity")
                 process.expect("original job task")
+                process.readability_sizes(evidence, "started", "Started · recent activity")
+                process.resize(80, 24)
+                process.expect("Started · recent activity")
+                process.send("d")
+                process.expect("Session:")
+                process.expect("bafyr4i")
+                process.expect("Attempt:")
+                process.screen_capture(evidence, "started-details")
+                process.resize(40, 16)  # Force overflow of the real diagnostic fields.
+                process.send("\x1b[F")  # End reads to the diagnostic tail, not the tree.
+                process.expect("Source:")
+                process.expect_absent("Session:")
+                process.screen_capture(evidence, "started-details-scrolled-40x16")
+                process.send("\x1b[H")
+                process.expect("Session:")
+                process.resize(80, 24)
+                process.send("d")
+                process.expect("Task · Started · recent activity")
+                process.expect_absent("Session:")
                 process.send("\r")
-                process.expect("JOB observer")
+                process.expect("Job observer")
                 process.expect("next-call input")
+                process.resize(80, 24)
+                process.expect("Started · recent activity")
+                process.screen_capture(evidence, "observer-started-80x24")
+                process.send("\x1bOQ")  # F2: observer diagnostics, not a typed job message.
+                process.expect("Observer details")
+                process.expect("Session:")
+                process.expect("bafyr4i")
+                process.send("\x1bOQ")
+                process.expect_absent("Observer details")
                 self.assertNotIn("unsent-parent-draft", "\n".join(process.screen.display),
                                  "opening an observer inherited the parent's draft")
                 process.send("\x08")  # Ctrl+H restores the ordinary tab's draft.
                 process.expect("unsent-parent-draft")
                 process.send("\x0c")  # Ctrl+L returns to the observer's empty draft.
-                process.expect("JOB observer")
+                process.expect("Job observer")
                 self.assertNotIn("unsent-parent-draft", "\n".join(process.screen.display))
                 with self.assertRaisesRegex(AssertionError, "deadline"):
                     process.expect("deliberate-absent-job-marker", timeout=0.2)
                 self.assertEqual(len(job_calls), 1)
                 process.send("PTY steering input\r")
-                process.expect("Queued")
+                process.expect("Queued · published, awaiting acceptance")
+                process.screen_capture(evidence, "observer-queued-80x24")
                 self.assertEqual(len(job_calls), 1, "viewer/steering must not run or interrupt a job")
                 release.set()
                 self.assertTrue(continued.wait(20), "steering must reach the actual next request")
                 process.expect("calculate")  # Persisted live job tool activity, not a fixture row.
-                process.expect("Accepted")
+                process.expect("Accepted · dispatch recorded")
+                process.expect("inclusion unconfirmed")
+                process.screen_capture(evidence, "observer-dispatch-80x24")
                 # Refresh/navigation/close while the continued resident call is blocked.
                 process.send("\x07r")  # overview and refresh
-                process.expect("Jobs ancestry")
+                process.expect("Tasks")
                 process.send("\x1b")
-                process.expect("JOB observer")
+                process.expect("Job observer")
                 process.send("\x17")  # Close only the observer view.
                 process.expect("unsent-parent-draft")
                 process.send("\x17")  # Last view closes to the upstream hub, not a new session.
@@ -269,29 +341,37 @@ security:
                 process.resize(110, 35)
                 process.expect("inspect-only")
                 process.send("\x07")
-                process.expect("Jobs ancestry")
-                process.expect("context/unclaimed")
+                process.expect("Tasks")
+                process.expect("Context · not a job")
                 process.send("\x1b[B")
-                process.expect("Succeeded")
+                process.expect("Completed")
+                process.readability_sizes(evidence, "completed", "Completed", "continued job terminal")
+                process.send("\x1b[6~")  # Read recent activity below the task/result.
+                process.expect("Tool result: calculate")
+                process.send("\x1b[5~")
+                process.expect("Result")
                 process.send("\r")
                 process.expect("continued job terminal")
-                process.expect("Included")
+                process.expect("Included · call 1 returned")
+                process.resize(80, 24)
+                process.expect("continued job terminal")
+                process.screen_capture(evidence, "observer-completed-80x24")
                 process.send("must not reopen\r")
                 process.expect("Finished job")
                 self.assertEqual(len(job_calls), 2, "completed observer cannot execute again")
                 process.send("\x07")
-                process.expect("Jobs ancestry")
+                process.expect("Tasks")
                 service.send_signal(signal.SIGSTOP)
                 process.send("r")
-                process.expect("refresh timed out", timeout=15)
+                process.expect("Stale · refresh failed/timed out", timeout=15)
                 process.expect("original job task")  # Retained, explicitly stale snapshot.
                 process.send("\x07")
-                process.expect("unavailable", timeout=10)  # Tab reads are bounded too.
+                process.expect("Unavailable", timeout=10)  # Tab reads are bounded too.
                 self.assertEqual(len(job_calls), 2)
                 process.send("\x07")
                 service.send_signal(signal.SIGCONT)
                 process.send("r")
-                process.expect_absent("refresh timed out")
+                process.expect_absent("Stale · refresh failed/timed out")
                 self.assertEqual(len(job_calls), 2)
                 process.send("\x03")
                 self.assertEqual(process.child.wait(timeout=10), 0)

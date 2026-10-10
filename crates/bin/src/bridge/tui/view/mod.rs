@@ -96,7 +96,7 @@ fn context_segment(tab: &super::Tab) -> String {
 /// One-line preview of a ToolCall entry's content. Server writes ToolCall
 /// content as `{name}({json_args})` (see `server.rs`). Returns
 /// `(tool_name, args_preview)` — args collapsed to single line, truncated.
-fn summarize_tool_call(content: &str) -> (String, String) {
+pub(super) fn summarize_tool_call(content: &str) -> (String, String) {
     let (name, rest) = content.split_once('(').unwrap_or((content, ""));
     let args = rest.strip_suffix(')').unwrap_or(rest);
     let oneline: String = args
@@ -110,7 +110,7 @@ fn summarize_tool_call(content: &str) -> (String, String) {
 /// One-line preview of a ToolResult entry's content. Server writes
 /// `{name}: {output}` or `{name}: ERROR: {output}`. Returns
 /// `(tool_name, summary, is_error)`.
-fn summarize_tool_result(content: &str) -> (String, String, bool) {
+pub(super) fn summarize_tool_result(content: &str) -> (String, String, bool) {
     let (name, rest) = content.split_once(": ").unwrap_or((content, ""));
     let (is_error, body) = match rest.strip_prefix("ERROR: ") {
         Some(b) => (true, b),
@@ -547,7 +547,20 @@ fn ui_chat(f: &mut ratatui::Frame, app: &mut App, ext_segments: &[String]) {
 
     render_tab_bar(f, app, chunks[0]);
 
-    let messages_area = chunks[1];
+    let messages_area = if app.active().job.is_some() {
+        let observer = Layout::vertical([
+            Constraint::Length(3.min(chunks[1].height.saturating_sub(3))),
+            Constraint::Min(0),
+        ])
+        .split(chunks[1]);
+        f.render_widget(
+            Paragraph::new(super::jobs::banner(app.active())).style(theme::text_on_bar()),
+            observer[0],
+        );
+        observer[1]
+    } else {
+        chunks[1]
+    };
     let inner_x = messages_area.x.saturating_add(1);
     let inner_y = messages_area.y.saturating_add(1);
     let inner_width = messages_area.width.saturating_sub(2);
@@ -830,7 +843,9 @@ fn ui_chat(f: &mut ratatui::Frame, app: &mut App, ext_segments: &[String]) {
         }
     }
 
-    if let Some(line) = turn_activity_line(tab.active_turns) {
+    if tab.job.is_none()
+        && let Some(line) = turn_activity_line(tab.active_turns)
+    {
         lines.push(line);
     }
 
@@ -840,10 +855,7 @@ fn ui_chat(f: &mut ratatui::Frame, app: &mut App, ext_segments: &[String]) {
     // Never surface the full session DB id here — it's long and noisy. Show
     // the alias if set, otherwise a short id prefix; the full id is available
     // via /info and /share when actually needed.
-    let session_label = match &tab.session_name {
-        Some(name) => name.clone(),
-        None => short_session_id(&tab.session_db_id),
-    };
+    let session_label = tab.title();
     let current_agent = tab.current_agent.clone();
     let effective_model = tab.effective_model.clone();
     let roster = tab.roster.clone();
@@ -897,10 +909,7 @@ fn ui_chat(f: &mut ratatui::Frame, app: &mut App, ext_segments: &[String]) {
             ex.info.arguments_display.clone(),
         )
     });
-    let job_banner = super::jobs::banner(tab);
-    if !job_banner.is_empty() {
-        lines.extend(job_banner.lines().map(|line| Line::from(line.to_string())));
-    }
+    lines.extend(super::jobs::input_lines(tab));
     let _ = tab;
 
     // Per-line visual heights, accumulated. Used to translate
@@ -1079,7 +1088,7 @@ fn ui_chat(f: &mut ratatui::Frame, app: &mut App, ext_segments: &[String]) {
             .border_style(Style::default().fg(COLOR_DIM))
             .title(Span::styled(
                 if app.active().job.is_some() {
-                    " > next-call input (finished: view-only) "
+                    super::jobs::composer_title(app.active())
                 } else {
                     " > "
                 },
@@ -1963,6 +1972,87 @@ mod chat_frame_tests {
             })
             .collect();
         (rows, (cursor.x, cursor.y))
+    }
+
+    #[tokio::test]
+    async fn job_observer_banner_and_receipts_are_readable_without_diagnostics() {
+        use super::super::jobs::JobTab;
+        use chaz_core::session::{
+            jobs::JobState,
+            steering::{JobInput, JobInputRequest, JobInputState},
+        };
+        let mut app = test_app("", 0).await;
+        let (_instance, mut user) = Instance::create_backend(
+            Box::new(InMemory::new()),
+            NewUser::passwordless("observer-frame"),
+        )
+        .await
+        .unwrap();
+        let key = user.get_default_key().unwrap();
+        let db = user
+            .create_database(eidetica::crdt::Doc::new(), &key)
+            .await
+            .unwrap();
+        app.active_mut().session_db_id = db.root_id().to_string();
+        app.active_mut().session_db = db.clone();
+        let callback = db
+            .on_write_at_tips(db.snapshot().await.unwrap(), |_, _| async { Ok(()) })
+            .await
+            .unwrap();
+        app.active_mut().job = Some(JobTab {
+            state: Some(JobState::StartedUnknown {
+                attempt_id: "diagnostic-attempt".into(),
+                activity_recent: true,
+            }),
+            inputs: vec![JobInput {
+                request: JobInputRequest {
+                    id: "diagnostic-request".into(),
+                    attempt_id: "diagnostic-attempt".into(),
+                    text: "Use the smaller example".into(),
+                },
+                state: JobInputState::Dispatching { model_sequence: 1 },
+            }],
+            feedback: String::new(),
+            retry: None,
+            details: false,
+            _callback: callback,
+        });
+        app.active_mut().active_turns = 1;
+        for (w, h) in [(80, 24), (120, 35), (180, 45)] {
+            let text = draw(&mut app, w, h).0.join("\n");
+            for expected in [
+                "Job observer · Started · recent activity",
+                "Write-capable",
+                "not proven live",
+                "dispatch recorded for call 1",
+                "inclusion unconfirmed",
+                "Use the smaller example",
+                "F2 details",
+            ] {
+                assert!(text.contains(expected), "{text}");
+            }
+            for hidden in ["Some(", "StartedUnknown", "diagnostic-", "thinking..."] {
+                assert!(!text.contains(hidden), "{text}");
+            }
+        }
+        app.active_mut().job.as_mut().unwrap().details = true;
+        let text = draw(&mut app, 120, 35).0.join("\n");
+        assert!(text.contains("Request: diagnostic-request"), "{text}");
+        assert!(text.contains("Attempt: diagnostic-attempt"), "{text}");
+        app.active_mut().job.as_mut().unwrap().details = false;
+        app.active_mut().job.as_mut().unwrap().state = Some(JobState::Succeeded {
+            text: Some("Smaller example result".into()),
+        });
+        let text = draw(&mut app, 80, 24).0.join("\n");
+        assert!(text.contains("Job observer · Completed"));
+        assert!(text.contains("Finished job · view-only"));
+        assert!(!text.contains("thinking..."));
+        app.active_mut().job.as_mut().unwrap().state = None;
+        app.active_mut().job.as_mut().unwrap().feedback =
+            "unavailable: native diagnostic-attempt query failed".into();
+        let text = draw(&mut app, 80, 24).0.join("\n");
+        assert!(text.contains("Unavailable · retained evidence is stale"));
+        assert!(!text.contains("native diagnostic-attempt"));
     }
 
     #[tokio::test]

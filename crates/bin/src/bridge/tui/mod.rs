@@ -590,6 +590,9 @@ pub(super) fn short_session_id(s: &str) -> String {
 impl Tab {
     /// Title shown on the tab bar — session name if set, else a short id.
     pub fn title(&self) -> String {
+        if self.job.is_some() {
+            return jobs::clip(&jobs::tab_title(self), 32);
+        }
         match &self.session_name {
             Some(name) => name.clone(),
             None => short_session_id(&self.session_db_id),
