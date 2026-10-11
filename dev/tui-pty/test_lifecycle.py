@@ -575,20 +575,22 @@ eidetica:
                 self.assertIsNone(process.child.poll(), "Esc discarded accepted work")
                 self.assertNotIn(b"\x1b[?1049l", process.raw)
                 print("PENDING ESC CONTRACT: PASS; accepted work retained, explicit confirmation visible")
+                # The armed banner owns the mode header. Assert decoded
+                # destination content, not the deliberately covered title.
                 process.send("\x7f" * 30)
                 offset = len(process.raw); process.send("\x13")
-                process.expect("Settings", offset=offset, timeout=1)
+                process.expect_screen("> Overview", timeout=1)
                 offset = len(process.raw); process.send("\x1b")
-                process.expect("Ctrl+S settings", offset=offset, timeout=1)
+                process.expect_screen("SERVICE-CACHED-TRANSCRIPT", timeout=1)
                 offset = len(process.raw); process.send("\x10")
-                process.expect("Sessions", offset=offset, timeout=1)
+                process.expect_screen("New session", timeout=1)
                 process.send("n")  # queues create/open behind the accepted write
                 offset = len(process.raw); process.send("s")
-                process.expect("Settings", offset=offset, timeout=1)
+                process.expect_screen("Backends", timeout=1)
                 offset = len(process.raw); process.send("\x1b")
-                process.expect("Sessions", offset=offset, timeout=1)
+                process.expect_screen("New session", timeout=1)
                 offset = len(process.raw); process.send("\x10")
-                process.expect("Ctrl+S settings", offset=offset, timeout=1)
+                process.expect_screen("SERVICE-CACHED-TRANSCRIPT", timeout=1)
                 visible_input("界NAV-LIVE")
                 # Leave the backend stopped beyond the read timeout; pending
                 # work must fail/release, not restore the terminal or hang UI.
