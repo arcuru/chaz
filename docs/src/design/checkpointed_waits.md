@@ -32,4 +32,4 @@ Persist exactly that record, and resume only that.
 
 ## Limits
 
-The claim on a job parent is still last-writer-wins, not a fence: two executors that both believe they own a job can overlap, as they can for any job turn. Only the home executor acts on a checkpoint. Deadlines use wall-clock time. A waiting parent remains resident while it observes; unloading it is separate work.
+A resumed segment is a new execution branch naming its exact checkpoint and predecessor branch, so it is lineage, not a competitor. It keeps its lineage root's order against other competitors. Two resumes of the same predecessor compete, and the later one in Eidetica's entry order yields; this ordering is cooperative, not a fence, and effects can overlap before a yield is observed. Only the home executor acts on a checkpoint. Deadlines use wall-clock time. A waiting parent remains resident while it observes; unloading it is separate work.

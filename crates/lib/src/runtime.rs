@@ -346,9 +346,12 @@ impl MetadataAccumulator {
     }
 }
 
+/// Error prefix when a job branch observes an earlier branch after a wait.
+pub(crate) const JOB_EXECUTION_YIELDED: &str = "job execution yielded while observing";
+
 /// Runtime-owned permit handle for a tool's observation-only interval.
 /// After yielding, the tool must only observe and return: the runtime regains
-/// capacity and rechecks the parent claim before any further effects.
+/// capacity and rechecks the job execution branch before any further effects.
 #[derive(Clone)]
 pub struct ObservationYield {
     permit: Arc<std::sync::Mutex<Option<tokio::sync::OwnedSemaphorePermit>>>,
@@ -365,21 +368,21 @@ impl ObservationYield {
 pub struct ExecutionCapacity {
     semaphore: Arc<tokio::sync::Semaphore>,
     observation: ObservationYield,
-    job_claim: Option<(eidetica::Database, String)>,
+    job_execution: Option<(eidetica::Database, String)>,
 }
 
 impl ExecutionCapacity {
     pub fn new(
         semaphore: Arc<tokio::sync::Semaphore>,
         permit: tokio::sync::OwnedSemaphorePermit,
-        job_claim: Option<(eidetica::Database, String)>,
+        job_execution: Option<(eidetica::Database, String)>,
     ) -> Self {
         Self {
             semaphore,
             observation: ObservationYield {
                 permit: Arc::new(std::sync::Mutex::new(Some(permit))),
             },
-            job_claim,
+            job_execution,
         }
     }
 
@@ -394,14 +397,19 @@ impl ExecutionCapacity {
             .await
             .map_err(|_| "executor capacity closed".to_string())?;
         *self.observation.permit.lock().unwrap() = Some(permit);
-        // The existing executor claim-loss watcher also covers the wait and
-        // acquisition. Recheck here before any resumed model/tool effects;
-        // the LWW claim remains an observation, not a fencing token.
-        if let Some((db, incarnation)) = &self.job_claim {
-            match crate::session::jobs::owns_job(db, incarnation).await {
-                Ok(true) => {}
-                Ok(false) => return Err("job lost claim while observing".into()),
-                Err(error) => return Err(format!("job claim recheck failed: {error}")),
+        // The executor's yield watcher also covers the wait and acquisition.
+        // Recheck here before any resumed model/tool effects; observing an
+        // earlier branch is cooperative, not a fencing token.
+        if let Some((db, branch)) = &self.job_execution {
+            match crate::session::execution::observe(db, branch).await {
+                Ok(None) => {}
+                Ok(Some(yielded)) => {
+                    return Err(format!(
+                        "{JOB_EXECUTION_YIELDED}: earlier branch {}",
+                        yielded.earlier_execution
+                    ));
+                }
+                Err(error) => return Err(format!("job execution recheck failed: {error}")),
             }
         }
         Ok(())
