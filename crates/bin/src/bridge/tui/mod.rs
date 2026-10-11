@@ -2455,6 +2455,96 @@ mod session_picker_tests {
     }
 
     #[tokio::test]
+    async fn escape_stops_active_turn_but_dismisses_completion_first() {
+        let mut app = App::new(HashSet::new(), test_tab().await);
+        app.active_mut().active_turns = 1;
+        let action =
+            input::handle_chat_key(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(matches!(
+            action,
+            Some(ChatAction::Dispatch(commands::Command::Stop))
+        ));
+        assert!(!app.should_quit);
+        app.input = "/st".into();
+        app.cursor = app.input.len();
+        input::recompute_completion(&mut app);
+        assert!(app.completion.is_some());
+        assert!(
+            input::handle_chat_key(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+                .is_none()
+        );
+        assert!(app.completion.is_none());
+        assert!(!app.should_quit);
+        app.active_mut().active_turns = 0;
+        input::handle_chat_key(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.should_quit);
+    }
+
+    #[tokio::test]
+    async fn pending_approval_allows_stop_without_answering_or_sticking() {
+        // Unlike metadata-only picker tests, activity refresh needs a live DB.
+        let (_instance, mut user) = Instance::create_backend(
+            Box::new(InMemory::new()),
+            NewUser::passwordless("approval-tab"),
+        )
+        .await
+        .unwrap();
+        let key = user.get_default_key().unwrap();
+        let db = user
+            .create_database(eidetica::crdt::Doc::new(), &key)
+            .await
+            .unwrap();
+        let mut tab = test_tab().await;
+        tab.session_db_id = db.root_id().to_string();
+        tab.session_db = db;
+        let mut app = App::new(HashSet::new(), tab);
+        app.active_mut().active_turns = 1;
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        app.active_mut().pending_approval = Some(ApprovalExchange {
+            info: chaz_core::tool::ToolApprovalInfo {
+                name: "shell".into(),
+                arguments_display: "{}".into(),
+                risk_level: chaz_core::tool::RiskLevel::High,
+            },
+            decision_tx: tx,
+        });
+        let action =
+            input::handle_chat_key(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(matches!(action, Some(ChatAction::Dispatch(Command::Stop))));
+        assert!(matches!(
+            rx.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        for c in "/stop".chars() {
+            input::handle_chat_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE),
+            );
+        }
+        let action =
+            input::handle_chat_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(action, Some(ChatAction::Dispatch(Command::Stop))));
+        assert!(matches!(
+            rx.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        drop(rx); // Cancellation drops the runtime's pending decision receiver.
+        let (tx, mut rx) = mpsc::channel(1);
+        let id = app.active().session_db_id.clone();
+        refresh::request(&mut app, &id, refresh::RefreshKind::Activity, &tx);
+        refresh::apply(&mut app, rx.recv().await.unwrap(), |_, _| unreachable!());
+        assert!(app.active().pending_approval.is_none());
+        input::handle_chat_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE),
+        );
+        assert_eq!(
+            app.input, "y",
+            "closed approval cannot consume the next draft"
+        );
+    }
+
+    #[tokio::test]
     async fn chat_composer_edits_graphemes_and_multiline() {
         let mut app = App::new(HashSet::new(), test_tab().await);
         for c in "a界e\u{301}👍🏽z".chars() {

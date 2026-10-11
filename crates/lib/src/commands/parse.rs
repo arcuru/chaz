@@ -78,6 +78,7 @@ pub fn parse(input: &str) -> Parsed {
         "/costs" => return Parsed::Command(Command::ListCosts),
         "/interrupted" => return Parsed::Command(Command::Interrupted),
         "/print" => return Parsed::Command(Command::Print),
+        "/stop" => return Parsed::Command(Command::Stop),
         "/backends" => return Parsed::Command(Command::ListBackends),
         "/new" => return Parsed::Command(Command::NewSession(None)),
         "/groups" => return Parsed::Command(Command::ListAgentGroups),
@@ -520,6 +521,7 @@ mod tests {
         assert!(matches!(cmd("/sessions"), Command::ListSessions));
         assert!(matches!(cmd("/s"), Command::ListSessions));
         assert!(matches!(cmd("/print"), Command::Print));
+        assert!(matches!(cmd("/stop"), Command::Stop));
         assert!(matches!(cmd("/costs"), Command::ListCosts));
         assert!(matches!(cmd("/pubkey"), Command::Pubkey));
     }

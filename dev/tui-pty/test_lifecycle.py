@@ -18,6 +18,7 @@ import queue
 import re
 import select
 import signal
+import shutil
 import struct
 import subprocess
 import sys
@@ -190,6 +191,9 @@ class Lifecycle(unittest.TestCase):
     def test_tui_lifecycle(self):
         received = queue.Queue()
         requests = []
+        gates = {name: threading.Event() for name in [
+            "pty-stop-escape", "pty-stop-command", "pty-quit-busy",
+        ]}
 
         class Handler(stub.Handler):
             def setup(self):
@@ -202,6 +206,29 @@ class Lifecycle(unittest.TestCase):
                 requests.append(messages)
                 received.put(messages)
                 return text
+
+            def _schedule_fixture(self, messages, tools):
+                latest = next((m.get("content") for m in reversed(messages)
+                               if m.get("role") == "user"
+                               and isinstance(m.get("content"), str)
+                               and not m["content"].startswith("## Relevant Memories")), "")
+                if latest in gates:
+                    # Keep the request blocked until the TUI has settled stop.
+                    # The bounded wait also makes failed tests clean up safely.
+                    gates[latest].wait(timeout=20)
+                    try:
+                        self._fixture_reply(content="forbidden-late-reply")
+                    except (BrokenPipeError, ConnectionResetError):
+                        pass  # The stopped model request has been dropped.
+                    return True
+                if latest in ("pty-stop-approval", "pty-stop-shell"):
+                    if self._has_tool_result(messages):
+                        self._fixture_reply(content="forbidden-shell-reply")
+                    else:
+                        self._fixture_reply(name="shell", call_id=latest,
+                                            arguments={"command": self.server.shell_command})
+                    return True
+                return super()._schedule_fixture(messages, tools)
 
             def log_message(self, *_args):
                 pass
@@ -223,6 +250,11 @@ class Lifecycle(unittest.TestCase):
                 path.mkdir(mode=0o700)
                 env[f"XDG_{name}_HOME" if name != "RUNTIME" else "XDG_RUNTIME_DIR"] = str(path)
             (home / "bin").mkdir()
+            # Only these native programs can run the canned shell fixture.
+            for cli in ["sh", "sleep"]:
+                (home / "bin" / cli).symlink_to(shutil.which(cli))
+            ready, leaked = home / "shell-ready", home / "shell-leaked"
+            server.shell_command = f"echo ready > '{ready}'; (sleep 2; echo leaked > '{leaked}') & wait"
             for cli in ["claude", "pi", "codex", "chaz", "gemini"]:
                 path = home / "bin" / cli
                 path.write_text("#!/bin/sh\necho 'unexpected model CLI' >&2\nexit 97\n")
@@ -374,6 +406,70 @@ default_agents: [chaz]
                 self.assertIn("pty-after-resize", [m.get("content") for m in process.request(received)
                                                    if m.get("role") == "user"])
                 process.expect(server.reply, offset=offset)
+                for prompt, control in [("pty-stop-escape", "\x1b"),
+                                        ("pty-stop-command", "/stop\r"),
+                                        ("pty-stop-approval", "\x1b"),
+                                        ("pty-stop-shell", "\x1b")]:
+                    offset = len(process.raw)
+                    process.send(prompt + "\r")
+                    self.assertIn(prompt, [m.get("content") for m in process.request(received)
+                                           if m.get("role") == "user"])
+                    process.expect("Esc stop", offset=offset)
+                    if prompt == "pty-stop-escape":
+                        # Help overlay then slash completion must dismiss first.
+                        process.send("\x1bOP")  # F1
+                        process.expect("Help", offset=offset)
+                        before_dismiss = len(process.raw)
+                        process.send("\x1b")
+                        process.expect_screen("Esc stop")
+                        process.send("/st")
+                        process.expect("commands", offset=before_dismiss)
+                        before_dismiss = len(process.raw)
+                        process.send("\x1b")
+                        process.expect_screen("Esc stop")
+                        process.send("\x7f" * 3)  # clear the unsubmitted /st draft
+                    if prompt in ("pty-stop-approval", "pty-stop-shell"):
+                        process.expect("Tool approval", offset=offset)
+                    if prompt == "pty-stop-shell":
+                        process.send("y")
+                        deadline = time.monotonic() + 5
+                        while not ready.exists():
+                            self.assertLess(time.monotonic(), deadline, "shell never started")
+                            process.drain(0.05)
+                    stopped_at = time.monotonic()
+                    stop_offset = len(process.raw)
+                    process.send(control)
+                    process.expect("Stopped:", timeout=3, offset=stop_offset)
+                    self.assertLess(time.monotonic() - stopped_at, 3)
+                    if prompt in gates:
+                        gates[prompt].set()
+                    if prompt == "pty-stop-shell":
+                        deadline = time.monotonic() + 2.2
+                        while time.monotonic() < deadline:
+                            process.drain(0.05)
+                        self.assertFalse(leaked.exists(), "stopped shell descendant survived")
+                    self.assertNotIn(b"forbidden-", CSI.sub(b"", bytes(process.raw)))
+                    # This exercises the next turn and catches stale approval UI.
+                    server.reply = prompt + "-recovered"
+                    next_offset = len(process.raw)
+                    process.send("after-" + prompt + "\r")
+                    followup = process.request(received)
+                    self.assertIn("after-" + prompt, [m.get("content") for m in followup
+                                                     if m.get("role") == "user"])
+                    self.assertFalse(any('"attempt_id"' in str(m.get("content"))
+                                         for m in followup), "stop event entered model context")
+                    native_calls = [call["id"] for m in followup for call in m.get("tool_calls", [])]
+                    native_results = [m["tool_call_id"] for m in followup if m.get("role") == "tool"]
+                    self.assertCountEqual(native_calls, native_results, "unpaired native tool exchange")
+                    if prompt in ("pty-stop-approval", "pty-stop-shell"):
+                        self.assertIn(prompt, native_results, "cancelled exchange was not replayed")
+                    process.expect(server.reply, offset=next_offset)
+                    if prompt == "pty-stop-escape":
+                        # An idle stop is a no-op, not a queued future stop.
+                        idle_offset = len(process.raw)
+                        process.send("/stop\r")
+                        process.expect("No running turn to stop.", offset=idle_offset)
+                        self.assertTrue(received.empty(), "idle stop invoked the model")
                 # Closing the last view returns to the hub, keeping the session.
                 offset = len(process.raw)
                 process.send("\x17")
@@ -410,6 +506,8 @@ default_agents: [chaz]
                 self.assertEqual(sum("\tpty-work\t" in row for row in named), 1, named)
                 launch("--session", "pty-work")
                 process.expect("pty-work")
+                process.send("pty-quit-busy\r")
+                process.request(received)
                 quit_cleanly()
                 self.assertEqual(sessions(), named)
 
@@ -443,6 +541,8 @@ default_agents: [chaz]
                     if process:
                         process.close()
                 finally:
+                    for gate in gates.values():
+                        gate.set()
                     if thread.ident is not None:
                         server.shutdown()
                         thread.join(timeout=5)

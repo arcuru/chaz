@@ -209,16 +209,56 @@ async fn exec_shell(
         cmd.current_dir(dir);
     }
 
-    let output = cmd
-        .output()
+    cmd.kill_on_drop(true);
+    #[cfg(unix)]
+    cmd.process_group(0);
+    let child = cmd
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| ToolError::Execution(format!("Failed to execute command: {e}")))?;
+    #[cfg(unix)]
+    let mut group = ShellProcessGroup(child.id());
+    let output = child
+        .wait_with_output()
         .await
         .map_err(|e| ToolError::Execution(format!("Failed to execute command: {e}")))?;
 
+    #[cfg(unix)]
+    {
+        group.0 = None;
+    }
     Ok(CapabilityResult::Shell(ShellOutput {
         stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
         stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
         exit_code: output.status.code().unwrap_or(-1),
     }))
+}
+
+/// Dropping a shell wait (user stop, timeout, or shutdown) must also stop
+/// descendants. Use the native shell's kill builtin, with the child in its
+/// own process group; kill_on_drop reaps the direct child through Tokio.
+#[cfg(unix)]
+struct ShellProcessGroup(Option<u32>);
+
+#[cfg(unix)]
+impl Drop for ShellProcessGroup {
+    fn drop(&mut self) {
+        if let Some(pid) = self.0 {
+            let result = std::process::Command::new("sh")
+                .args([
+                    "-c",
+                    "kill -KILL -- -\"$1\"",
+                    "kill-shell-group",
+                    &pid.to_string(),
+                ])
+                .stderr(std::process::Stdio::null())
+                .status();
+            if let Err(error) = result {
+                tracing::warn!(%error, pid, "Could not kill shell process group");
+            }
+        }
+    }
 }
 
 /// Check a shell command against allowlist/denylist from a `ShellGrant`.

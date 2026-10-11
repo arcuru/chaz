@@ -13,6 +13,7 @@ struct WaitTool {
     blocker: Arc<Mutex<Option<OwnedSemaphorePermit>>>,
     entered: Arc<Notify>,
     finish: Arc<Notify>,
+    returned: Arc<Notify>,
     fail: bool,
 }
 
@@ -39,6 +40,7 @@ impl Tool for WaitTool {
             *self.blocker.lock().await = Some(permit);
             self.entered.notify_one();
             self.finish.notified().await;
+            self.returned.notify_one();
             if self.fail {
                 Err("observation failed".into())
             } else {
@@ -102,6 +104,7 @@ async fn job_wait_reacquires_after_success_error_and_policy_timeout() {
             blocker: blocker.clone(),
             entered: entered.clone(),
             finish: finish.clone(),
+            returned: Arc::new(Notify::new()),
             fail: mode == "error",
         });
         tools.register(EffectTool {
@@ -237,5 +240,97 @@ async fn job_wait_reacquires_after_success_error_and_policy_timeout() {
                 "{mode}: no leaked capacity"
             );
         }
+    }
+}
+
+#[tokio::test]
+async fn user_stop_pairs_calls_while_job_wait_yields_or_reacquires_capacity() {
+    for reacquiring in [false, true] {
+        let semaphore = Arc::new(Semaphore::new(1));
+        let permit = semaphore.clone().acquire_owned().await.unwrap();
+        let blocker = Arc::new(Mutex::new(None));
+        let entered = Arc::new(Notify::new());
+        let finish = Arc::new(Notify::new());
+        let returned = Arc::new(Notify::new());
+        let effects = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let tools = Arc::new(ToolRegistry::new());
+        tools.register(WaitTool {
+            semaphore: semaphore.clone(),
+            blocker: blocker.clone(),
+            entered: entered.clone(),
+            finish: finish.clone(),
+            returned: returned.clone(),
+            fail: false,
+        });
+        tools.register(EffectTool {
+            semaphore: semaphore.clone(),
+            calls: effects.clone(),
+        });
+        let (instance, session) = fresh_session().await;
+        let ctx = tool_context(session, tools);
+        let mock = Arc::new(MockBackend::new());
+        mock.push_tool_calls([
+            ("wait".into(), "job_wait".into(), "{}".into()),
+            ("effect".into(), "effect".into(), "{}".into()),
+        ]);
+        mock.push_text("must not continue");
+        let backend = BackendManager::with_mock(mock.clone(), empty_secrets().await);
+        let cancel = TurnCancel::default();
+        let signal = cancel.clone();
+        let (tx, mut rx) = mpsc::channel(16);
+        let capacity = ExecutionCapacity::new(semaphore.clone(), permit, None);
+        let task = tokio::spawn(async move {
+            let _instance = instance;
+            execute_cancellable_with_recorder(
+                None,
+                vec![RuntimeMessage::User("test".into())],
+                &backend,
+                &permissive_security(),
+                &ctx,
+                &ToolPolicyRegistry::empty(),
+                Some(Arc::new(EventRecorder(tx))),
+                None,
+                Some(&cancel),
+                Some(capacity),
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), entered.notified())
+            .await
+            .unwrap();
+        if reacquiring {
+            finish.notify_one();
+            tokio::time::timeout(Duration::from_secs(5), returned.notified())
+                .await
+                .unwrap();
+        }
+        signal.cancel();
+        let result = tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("user stop must not wait for child-held capacity")
+            .unwrap();
+        assert!(matches!(result, Err(TurnError::Cancelled { .. })));
+        assert_eq!(mock.recorded_calls().len(), 1);
+        assert_eq!(effects.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let mut calls = Vec::new();
+        let mut results = Vec::new();
+        while let Some(event) = rx.recv().await {
+            match event {
+                RuntimeEvent::ToolCall { id, .. } => calls.push(id),
+                RuntimeEvent::ToolResult { id, is_error, .. } => {
+                    assert!(is_error);
+                    results.push(id);
+                }
+            }
+        }
+        assert_eq!(calls, ["wait", "effect"]);
+        assert_eq!(results, calls, "every native call has a cancelled result");
+        blocker.lock().await.take();
+        let all = tokio::time::timeout(Duration::from_secs(1), semaphore.clone().acquire_owned())
+            .await
+            .expect("stop leaked execution capacity")
+            .unwrap();
+        drop(all);
+        assert_eq!(semaphore.available_permits(), 1);
     }
 }

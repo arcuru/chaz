@@ -94,6 +94,9 @@ pub enum EntryType {
     /// matches it back to the blocked request by `request_id`. Same exclusions
     /// as `ApprovalRequest`.
     ApprovalDecision,
+    /// User control event targeting one durable turn attempt. Content is a
+    /// JSON [`CancelRequest`]. Never enters model context or wakes a turn.
+    Cancel,
     /// A later version's entry, preserved in storage and inert in this reader.
     Unknown {
         kind: String,
@@ -117,6 +120,7 @@ impl EntryType {
             Self::Summary => "Summary",
             Self::ApprovalRequest => "ApprovalRequest",
             Self::ApprovalDecision => "ApprovalDecision",
+            Self::Cancel => "Cancel",
             Self::Unknown { kind, .. } => kind,
         }
     }
@@ -159,6 +163,7 @@ impl<'de> Deserialize<'de> for EntryType {
             "Summary" => Some(Self::Summary),
             "ApprovalRequest" => Some(Self::ApprovalRequest),
             "ApprovalDecision" => Some(Self::ApprovalDecision),
+            "Cancel" => Some(Self::Cancel),
             _ => None,
         };
         match (known, &raw) {
@@ -171,15 +176,26 @@ impl<'de> Deserialize<'de> for EntryType {
     }
 }
 
+/// Exact target captured by the client when the user requests a stop.
+/// Attempt identity, not timestamps, prevents delayed events from reaching
+/// a later turn or an explicit retry of the same request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CancelRequest {
+    pub request_id: TurnRequestId,
+    pub attempt_id: String,
+}
+
 /// An entry in a session. Participants (human users and AI agents) are
 /// treated identically — both write SessionEntries with their name as sender.
 /// The agent determines assistant vs user roles at context-building time by
 /// comparing the sender to its own name.
 ///
 /// `metadata` carries token/cost provenance for assistant `Message` entries
-/// (aggregated across the turn's ReAct loop). It is `None` for all other
-/// entry kinds (human messages, directives, tool calls, tool results,
-/// acks, and errors). Stored alongside the entry so cost attribution
+/// (aggregated across the turn's ReAct loop), and for the `Error` entry that
+/// ends a stopped turn (the calls it made before the stop). It is `None` for
+/// all other entry kinds (human messages, directives, tool calls, tool
+/// results, acks, and other errors). Stored alongside the entry so cost attribution
 /// survives session sync.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionEntry {
@@ -666,6 +682,8 @@ pub struct TurnTranscriptRecord {
 session_wire_enum! {
     #[derive(Debug, Clone, PartialEq)]
     pub enum TurnTranscriptMessage {
+        /// The executor settled this attempt at the user's request.
+        Cancelled,
         ModelResponse {
             model_sequence: u64,
             content: Option<String>,
@@ -1607,6 +1625,39 @@ impl Session {
         Ok(visible_attempts(attempts, &heartbeats, Utc::now()))
     }
 
+    /// Record a user stop for the one visibly active turn. No active turn is
+    /// a no-op; queued requests and interrupted attempts are not targeted.
+    pub async fn request_stop(&mut self, sender: &str) -> anyhow::Result<bool> {
+        let mut targets = Vec::new();
+        for id in Self::active_turn_attempts(&self.database).await? {
+            if let Some(attempt) = self.read_turn_attempt(&id).await?
+                && self.entry_ids.contains(&attempt.request_id)
+            {
+                targets.push(CancelRequest {
+                    request_id: attempt.request_id,
+                    attempt_id: attempt.attempt_id,
+                });
+            }
+        }
+        anyhow::ensure!(
+            targets.len() <= 1,
+            "multiple active turns; cannot choose a stop target"
+        );
+        let Some(target) = targets.pop() else {
+            return Ok(false);
+        };
+        self.add_entry(SessionEntry {
+            sender: sender.to_string(),
+            content: serde_json::to_string(&target)?,
+            timestamp: Utc::now(),
+            entry_type: EntryType::Cancel,
+            metadata: None,
+            routing: None,
+        })
+        .await?;
+        Ok(true)
+    }
+
     /// Renew only the activity timestamp; the original started_at remains an
     /// audit fact. Completion lives in a separate store from these writes.
     pub async fn renew_turn_activity(database: &Database, attempt_id: &str) -> anyhow::Result<()> {
@@ -2158,6 +2209,22 @@ pub fn session_origin(entries: &[SessionEntry]) -> (Option<DateTime<Utc>>, Optio
     (started_at, source)
 }
 
+/// Find an authorized stop for this exact attempt. Agent-authored and
+/// malformed events fail closed; wall-clock ordering is deliberately unused.
+pub fn stop_request_for_turn<'a>(
+    entries: &'a [SessionEntry],
+    attempt: &TurnAttempt,
+    is_agent: impl Fn(&str) -> bool,
+) -> Option<&'a SessionEntry> {
+    entries.iter().find(|entry| {
+        entry.entry_type == EntryType::Cancel
+            && !is_agent(&entry.sender)
+            && serde_json::from_str::<CancelRequest>(&entry.content).is_ok_and(|target| {
+                target.request_id == attempt.request_id && target.attempt_id == attempt.attempt_id
+            })
+    })
+}
+
 /// Extract `@<token>` mentions from free-form text. Returns the tokens
 /// without the leading `@`, in appearance order. Tokens are split on
 /// whitespace; punctuation directly adjacent to a mention is trimmed
@@ -2230,6 +2297,55 @@ async fn find_or_create_db(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn stop_requires_session_write_authority() {
+        let (instance, _user, db) = test_session_db().await;
+        let mut owner = Session::new(ConversationId("stop-auth".into()), db.clone()).await;
+        let id = owner.add_entry(entry_at("user", 0, None)).await.unwrap();
+        let attempt = owner.start_turn_attempt(id).await.unwrap();
+        let read_only = Database::open(&instance, db.root_id()).await.unwrap();
+        let mut client = Session::new(ConversationId("stop-auth".into()), read_only).await;
+        assert!(client.request_stop("user").await.is_err());
+        let fresh = Session::new(ConversationId("stop-auth".into()), db).await;
+        assert!(stop_request_for_turn(fresh.entries(), &attempt, |_| false).is_none());
+    }
+
+    #[test]
+    fn stop_targets_exact_attempt_not_clock_or_request_alone() {
+        use super::*;
+        let attempt = TurnAttempt {
+            request_id: TurnRequestId::parse("request"),
+            attempt_id: "attempt-1".into(),
+            started_at: Utc::now(),
+            generation: 0,
+            status: TurnAttemptStatus::Started,
+            completed_at: None,
+        };
+        let mut stop = SessionEntry {
+            sender: "user".into(),
+            content: serde_json::to_string(&CancelRequest {
+                request_id: attempt.request_id.clone(),
+                attempt_id: attempt.attempt_id.clone(),
+            })
+            .unwrap(),
+            timestamp: attempt.started_at - chrono::Duration::days(1),
+            entry_type: EntryType::Cancel,
+            metadata: None,
+            routing: None,
+        };
+        assert!(stop_request_for_turn(&[stop.clone()], &attempt, |_| false).is_some());
+        let retry = TurnAttempt {
+            attempt_id: "attempt-2".into(),
+            generation: 1,
+            ..attempt.clone()
+        };
+        stop.timestamp = Utc::now() + chrono::Duration::days(1);
+        assert!(stop_request_for_turn(&[stop.clone()], &retry, |_| false).is_none());
+        assert!(stop_request_for_turn(&[stop.clone()], &attempt, |_| true).is_none());
+        stop.content = "{}".into();
+        assert!(stop_request_for_turn(&[stop], &attempt, |_| false).is_none());
+    }
+
     use super::test_helpers::*;
     use super::*;
 

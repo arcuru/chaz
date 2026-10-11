@@ -16,6 +16,7 @@ enum EntryType {
     Summary,    // Compacted summary of older messages (context-builder boundary)
     ApprovalRequest,  // Tool approval requested (control entry, daemon → bridge)
     ApprovalDecision, // Human's approval decision (control entry, bridge → daemon)
+    Cancel,           // Participant's stop request for the running turn (control entry)
 }
 ```
 
@@ -41,6 +42,12 @@ Readers still accept existing Matrix-specific event kinds without rewriting
 shared history.
 
 `ApprovalRequest` and `ApprovalDecision` are **control entries** for the tool-approval protocol a dumb bridge relays over the session DB — also excluded from the LLM context, from bridge message delivery, and from waking an agent turn. See [Dumb Transport Bridges → Tool approvals over the session DB](../design/transport_bridges.md#tool-approvals-over-the-session-db).
+
+`Cancel` is a control entry too: `/stop` captures the active request ID and attempt ID in a JSON `CancelRequest`, and the owning executor observes it through the session-write path.
+Only an exact match from a non-agent sender can stop the running attempt; timestamps are not targeting authority.
+An idle stop records nothing, and the event never enters model context or wakes a turn.
+A stopped attempt completes with a terminal cancellation transcript record and an agent `Error` carrying completed-call usage.
+See [ReAct Runtime → Cancellation](react.md#cancellation) and [TUI → Stopping a Running Turn](../user_guide/tui.md#stopping-a-running-turn).
 
 ### Assistant `ResponseMetadata`
 

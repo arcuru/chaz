@@ -553,6 +553,8 @@ async fn settings_modals_keep_reader_position_and_own_background_input() {
     draw(&mut terminal, &mut app, &server, &backend);
     let offset = app.settings_reader.offset;
     let list = app.settings_list_area.unwrap();
+    // A live receiver: a dropped one means the executor already settled it.
+    let mut _approval_rx = None;
     for modal in 0..5 {
         match modal {
             0 => {
@@ -595,7 +597,8 @@ async fn settings_modals_keep_reader_position_and_own_background_input() {
                 })
             }
             _ => {
-                let (tx, _rx) = tokio::sync::oneshot::channel();
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                _approval_rx = Some(rx);
                 app.active_mut().pending_approval = Some(chaz_core::bridge::ApprovalExchange {
                     info: chaz_core::tool::ToolApprovalInfo {
                         name: "test".into(),

@@ -415,7 +415,14 @@ fn apply_active_turns(tab: &mut Tab, ticket: u64, active_turns: Result<usize, St
     tab.live.activity_applied = ticket;
     match active_turns {
         Ok(n) => {
-            let changed = tab.active_turns != n || tab.live.error.is_some();
+            let approval_closed = tab
+                .pending_approval
+                .as_ref()
+                .is_some_and(|ex| ex.decision_tx.is_closed());
+            if approval_closed {
+                tab.pending_approval = None;
+            }
+            let changed = tab.active_turns != n || tab.live.error.is_some() || approval_closed;
             tab.active_turns = n;
             record_error(tab, RefreshKind::Activity, None);
             changed

@@ -142,6 +142,7 @@ impl runtime::RuntimeRecorder for SessionRuntimeRecorder {
             );
             let sequence = self.sequence.fetch_add(1, Ordering::SeqCst) as u64;
             let message = match message {
+                runtime::RuntimeRecord::Cancelled => TurnTranscriptMessage::Cancelled,
                 runtime::RuntimeRecord::ModelResponse {
                     model_sequence,
                     content,
@@ -183,6 +184,7 @@ impl runtime::RuntimeRecorder for SessionRuntimeRecorder {
             if matches!(
                 record.message,
                 TurnTranscriptMessage::ModelResponse { terminal: true, .. }
+                    | TurnTranscriptMessage::Cancelled
             ) {
                 *self.terminal.lock().unwrap() = Some(record);
                 return Ok(());
@@ -307,7 +309,8 @@ fn display_entries_for_record(
     record: &TurnTranscriptRecord,
 ) -> Vec<SessionEntry> {
     match &record.message {
-        TurnTranscriptMessage::Unknown { .. }
+        TurnTranscriptMessage::Cancelled
+        | TurnTranscriptMessage::Unknown { .. }
         | TurnTranscriptMessage::ToolResult {
             outcome: runtime::ToolResultOutcome::Unknown { .. },
             ..
@@ -454,7 +457,18 @@ struct SpawnContext {
     completion_tx: Option<mpsc::Sender<()>>,
     /// Per-session processing lock — cleared when the task completes
     processing: Arc<Mutex<std::collections::HashSet<String>>>,
+    /// Running-turn registry — the task removes its own entry on completion.
+    turns: RunningTurns,
 }
+
+struct RunningTurn {
+    attempt: TurnAttempt,
+    cancel: runtime::TurnCancel,
+}
+
+type RunningTurns = Arc<Mutex<HashMap<String, RunningTurn>>>;
+
+pub const TURN_STOPPED_MESSAGE: &str = "Stopped: the turn was cancelled at the user's request.";
 
 /// Public recovery view for a persisted request.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -688,6 +702,7 @@ pub struct Server {
     watched: Arc<Mutex<std::collections::HashSet<String>>>,
     /// Sessions currently being processed (prevents concurrent agent runs per session)
     processing: Arc<Mutex<std::collections::HashSet<String>>>,
+    turns: RunningTurns,
     #[cfg(test)]
     transcript_fail_after: Arc<std::sync::Mutex<Option<usize>>>,
     /// Attempts started by this process and not yet durably completed.
@@ -840,6 +855,7 @@ impl Server {
             sessions: Arc::new(Mutex::new(HashMap::new())),
             watched: Arc::new(Mutex::new(std::collections::HashSet::new())),
             processing: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            turns: Arc::new(Mutex::new(HashMap::new())),
             #[cfg(test)]
             transcript_fail_after: Arc::new(std::sync::Mutex::new(None)),
             live_attempts: Arc::new(Mutex::new(std::collections::HashSet::new())),
@@ -2598,6 +2614,9 @@ impl Server {
             crate::session::acknowledge_ambient_participation(&session_db, &policy.generation)
                 .await?;
         }
+        // Observe control entries before command/queue/processing gates: the
+        // current turn may be blocked in a model, approval, or tool wait.
+        self.observe_stop_requests(session_db_id, &session).await;
 
         let live_attempts = self.live_attempts.lock().await.clone();
         let command = session.next_command_request(&live_attempts).await?;
@@ -2779,6 +2798,7 @@ impl Server {
                         parent_tools: m.parent_tools.clone(),
                         completion_tx: m.completion_tx.clone(),
                         processing: self.processing.clone(),
+                        turns: self.turns.clone(),
                     },
                 ),
                 None => {
@@ -3254,6 +3274,24 @@ impl Server {
         }
     }
 
+    async fn observe_stop_requests(&self, session_db_id: &str, session: &Session) {
+        let meta = session.read_meta().await;
+        let turns = self.turns.lock().await;
+        let Some(turn) = turns.get(session_db_id) else {
+            return;
+        };
+        if let Some(request) =
+            crate::session::stop_request_for_turn(session.entries(), &turn.attempt, |name| {
+                self.agents.get(name).is_some()
+                    || meta.agents.iter().any(|a| a.display_name == name)
+            })
+            && turn.cancel.cancel()
+        {
+            info!(session_db_id, requested_by = %request.sender,
+                attempt_id = %turn.attempt.attempt_id, "User stop reached the running turn");
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn spawn_agent_task(
         &self,
@@ -3316,6 +3354,23 @@ impl Server {
         #[cfg(test)]
         let transcript_fail_after = self.transcript_fail_after.clone();
 
+        let cancel = runtime::TurnCancel::new();
+        self.turns.lock().await.insert(
+            session_db_id.clone(),
+            RunningTurn {
+                attempt: attempt.clone(),
+                cancel: cancel.clone(),
+            },
+        );
+        // Re-read after registration so an event between the durable start
+        // and installation of the signal is not lost.
+        let fresh = Session::new(
+            ConversationId(session_db_id.clone()),
+            session.database().clone(),
+        )
+        .await;
+        self.observe_stop_requests(&session_db_id, &fresh).await;
+
         self.track_task(tokio::spawn(async move {
             let claim_db = session.database().clone();
             let incarnation = spawn.job_incarnation.clone();
@@ -3346,8 +3401,12 @@ impl Server {
             });
             let _heartbeat = ActivityHeartbeat(heartbeat);
             let permit = match reserved_permit {
-                Some(permit) => permit,
-                None => semaphore.clone().acquire_owned().await.expect("semaphore closed"),
+                Some(permit) => Some(permit),
+                None => tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => None,
+                    permit = semaphore.clone().acquire_owned() => Some(permit.expect("semaphore closed")),
+                },
             };
             if shutting_down.load(Ordering::Acquire) {
                 return;
@@ -3495,7 +3554,7 @@ impl Server {
                 fail_after: transcript_fail_after,
             });
 
-            let result = runtime::execute_with_recorder(
+            let result = runtime::execute_cancellable_with_recorder(
                 effective_model.as_deref(),
                 assembled.messages,
                 &backend,
@@ -3504,7 +3563,8 @@ impl Server {
                 &policies,
                 Some(recorder.clone()),
                 Some(spawn_extensions.as_ref()),
-                Some(runtime::ExecutionCapacity::new(
+                Some(&cancel),
+                permit.map(|permit| runtime::ExecutionCapacity::new(
                     semaphore,
                     permit,
                     incarnation.clone().map(|token| (claim_db.clone(), token)),
@@ -3518,7 +3578,7 @@ impl Server {
 
             let mut s = session.lock().await;
             let persistence_failed =
-                matches!(&result, Err(error) if error.starts_with("runtime persistence failed:"));
+                matches!(&result, Err(runtime::TurnError::Failed(error)) if error.starts_with("runtime persistence failed:"));
             let mut reply_preflight_failed = false;
             let (final_entry, outbound) = match result {
                 Ok(outcome) if tool_ctx.allow_no_reply && outcome.body.trim().is_empty() => {
@@ -3565,7 +3625,15 @@ impl Server {
                         routing: final_routing,
                     }), outbound)
                 }
-                Err(err) => {
+                Err(runtime::TurnError::Cancelled { metadata }) => (Some(SessionEntry {
+                    sender: agent_name,
+                    content: TURN_STOPPED_MESSAGE.to_string(),
+                    timestamp: Utc::now(),
+                    entry_type: EntryType::Error,
+                    metadata,
+                    routing: None,
+                }), None),
+                Err(runtime::TurnError::Failed(err)) => {
                     error!("Agent error for {}: {err}", session_db_id);
                     (Some(SessionEntry {
                         sender: agent_name,
@@ -3645,6 +3713,7 @@ impl Server {
 
             live_attempts.lock().await.remove(&attempt.attempt_id);
 
+            spawn.turns.lock().await.remove(&session_db_id);
             {
                 let mut proc = spawn.processing.lock().await;
                 proc.remove(&session_db_id);

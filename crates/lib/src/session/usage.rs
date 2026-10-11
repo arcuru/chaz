@@ -197,7 +197,7 @@ pub async fn collect_usage(
     })
 }
 
-/// Tally recorded Message metadata in entry order. Session selection stays
+/// Tally recorded message and stopped-turn metadata in entry order. Session selection stays
 /// with the caller; sharing the model accumulator preserves cost arithmetic.
 pub(crate) fn collect_session_usage(
     entries: &[SessionEntry],
@@ -226,7 +226,7 @@ pub(crate) fn collect_session_usage(
 }
 
 fn include_entry(entry: &SessionEntry, filter: &UsageFilter) -> bool {
-    if entry.entry_type != EntryType::Message {
+    if !matches!(entry.entry_type, EntryType::Message | EntryType::Error) {
         return false;
     }
     if let Some(since) = filter.since
@@ -402,6 +402,16 @@ mod tests {
             &mut BTreeMap::new(),
         );
         assert_eq!(recent.calls, 2, "since-filter drops earlier entries");
+    }
+
+    #[test]
+    fn collect_session_usage_counts_stopped_turn_metadata() {
+        let mut stopped = mk_entry(Utc::now(), "haiku", Some(0.05));
+        stopped.entry_type = EntryType::Error;
+        let t = collect_session_usage(&[stopped], &UsageFilter::default(), &mut BTreeMap::new());
+        assert_eq!(t.calls, 1);
+        assert_eq!(t.prompt_tokens, 100);
+        assert_eq!(t.cost_usd, 0.05);
     }
 
     #[test]

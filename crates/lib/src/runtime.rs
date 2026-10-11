@@ -20,7 +20,7 @@ use crate::tool::{NO_REPLY_TOOL, RateLimiter, ToolApprovalInfo, ToolContext, Too
 use serde::{Deserialize, Serialize};
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, atomic::Ordering};
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
@@ -61,6 +61,8 @@ pub trait RuntimeRecorder: Send + Sync {
 
 #[derive(Clone, Debug)]
 pub enum RuntimeRecord {
+    /// Executor-observed user cancellation, not a fabricated model reply.
+    Cancelled,
     ModelResponse {
         model_sequence: u64,
         content: Option<String>,
@@ -90,6 +92,7 @@ crate::session::wire::session_wire_enum! {
         Blocked,
         TimedOut,
         Unavailable,
+        Cancelled,
     }
 }
 
@@ -330,6 +333,102 @@ pub struct RuntimeOutcome {
     pub metadata: Option<ResponseMetadata>,
 }
 
+/// A user's request to stop one running turn.
+///
+/// The executor that owns the turn creates one per turn and fires it when it
+/// observes an authorized stop event for that turn. The runtime watches it
+/// during model calls (including retry backoff), pending tool approval, and
+/// tool execution, and before starting each tool call.
+/// Firing is idempotent and sticky: once requested, it stays requested.
+#[derive(Clone, Debug, Default)]
+pub struct TurnCancel(Arc<TurnCancelInner>);
+
+#[derive(Debug, Default)]
+struct TurnCancelInner {
+    requested: std::sync::atomic::AtomicBool,
+    notify: tokio::sync::Notify,
+}
+
+impl TurnCancel {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Request the stop. Returns `true` only for the call that requested it
+    /// first, so the caller can log a stop exactly once.
+    pub fn cancel(&self) -> bool {
+        let first = !self.0.requested.swap(true, Ordering::SeqCst);
+        if first {
+            self.0.notify.notify_waiters();
+        }
+        first
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.0.requested.load(Ordering::SeqCst)
+    }
+
+    /// Resolves once the stop has been requested.
+    pub async fn cancelled(&self) {
+        loop {
+            // Register before checking so a `cancel` between the check and
+            // the await still wakes this waiter.
+            let notified = self.0.notify.notified();
+            if self.is_cancelled() {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+/// Why a turn ended without an outcome.
+#[derive(Debug)]
+pub enum TurnError {
+    /// The turn failed; the message says why.
+    Failed(String),
+    /// The turn was stopped at the user's request. `metadata` covers the
+    /// model calls that completed before the stop.
+    Cancelled { metadata: Option<ResponseMetadata> },
+}
+
+impl From<String> for TurnError {
+    fn from(message: String) -> Self {
+        TurnError::Failed(message)
+    }
+}
+
+impl From<&str> for TurnError {
+    fn from(message: &str) -> Self {
+        Self::Failed(message.to_string())
+    }
+}
+
+impl std::fmt::Display for TurnError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TurnError::Failed(message) => f.write_str(message),
+            TurnError::Cancelled { .. } => f.write_str("turn cancelled"),
+        }
+    }
+}
+
+/// Run `fut` unless `cancel` fires first; `None` means it fired. Dropping the
+/// losing future is what abandons an in-flight model request or tool call.
+async fn until_cancelled<F: std::future::Future>(
+    cancel: Option<&TurnCancel>,
+    fut: F,
+) -> Option<F::Output> {
+    match cancel {
+        None => Some(fut.await),
+        Some(cancel) => tokio::select! {
+            biased;
+            _ = cancel.cancelled() => None,
+            out = fut => Some(out),
+        },
+    }
+}
+
 /// Base delay for exponential backoff (1 second).
 const RETRY_BASE_DELAY: Duration = Duration::from_secs(1);
 
@@ -439,6 +538,26 @@ async fn finalize_outcome(
     outcome
 }
 
+/// Fire `agent_end` for a stopped turn and build its terminal error. A stop is
+/// an end of the run like any other, so hooks see it.
+async fn cancelled_outcome(
+    recorder: &Option<Arc<dyn RuntimeRecorder>>,
+    hub: Option<&ExtensionHub>,
+    ctx: Option<&HookContext>,
+    acc: MetadataAccumulator,
+) -> TurnError {
+    info!("Turn stopped at the user's request");
+    if let (Some(hub), Some(ctx)) = (hub, ctx) {
+        hub.fire_agent_end(ctx).await;
+    }
+    if let Err(error) = record_runtime(recorder, RuntimeRecord::Cancelled).await {
+        return TurnError::Failed(error);
+    }
+    TurnError::Cancelled {
+        metadata: acc.finalize(),
+    }
+}
+
 /// Run the agent runtime for a single turn.
 ///
 /// If tools are registered and the backend supports tool calling,
@@ -482,8 +601,40 @@ pub async fn execute_with_recorder(
     policies: &ToolPolicyRegistry,
     recorder: Option<Arc<dyn RuntimeRecorder>>,
     hub: Option<&ExtensionHub>,
-    mut capacity: Option<ExecutionCapacity>,
+    capacity: Option<ExecutionCapacity>,
 ) -> Result<RuntimeOutcome, String> {
+    execute_cancellable_with_recorder(
+        model,
+        initial_messages,
+        backend,
+        security,
+        tool_ctx,
+        policies,
+        recorder,
+        hub,
+        None,
+        capacity,
+    )
+    .await
+    .map_err(|error| error.to_string())
+}
+
+/// Run a turn with awaited transcript persistence and an executor-owned stop.
+/// Persistence is never abandoned on stop: every recorded native call is
+/// paired, including calls in the batch that were not started.
+#[allow(clippy::too_many_arguments)]
+pub async fn execute_cancellable_with_recorder(
+    model: Option<&str>,
+    initial_messages: Vec<RuntimeMessage>,
+    backend: &BackendManager,
+    security: &SecurityContext,
+    tool_ctx: &ToolContext,
+    policies: &ToolPolicyRegistry,
+    recorder: Option<Arc<dyn RuntimeRecorder>>,
+    hub: Option<&ExtensionHub>,
+    cancel: Option<&TurnCancel>,
+    mut capacity: Option<ExecutionCapacity>,
+) -> Result<RuntimeOutcome, TurnError> {
     let tools = &tool_ctx.tools;
     if tool_ctx.allow_no_reply {
         if tools.get(NO_REPLY_TOOL).is_some() {
@@ -513,10 +664,15 @@ pub async fn execute_with_recorder(
         let mut messages = initial_messages;
         loop {
             messages.extend(input_boundary(&recorder, model_sequence, false).await?);
-            let response =
-                llm_call_with_retry(backend, model, &messages, &[], &resolved_model, max_retries)
-                    .await
-                    .map_err(|e| e.to_string())?;
+            let Some(response) = until_cancelled(
+                cancel,
+                llm_call_with_retry(backend, model, &messages, &[], &resolved_model, max_retries),
+            )
+            .await
+            else {
+                return Err(cancelled_outcome(&recorder, hub, hook_ctx.as_ref(), acc).await);
+            };
+            let response = response.map_err(|e| e.to_string())?;
             match response {
                 LLMResponse::Text { content, metadata } if !content.trim().is_empty() => {
                     let pending = input_boundary(&recorder, model_sequence + 1, true).await?;
@@ -583,16 +739,22 @@ pub async fn execute_with_recorder(
     let mut iteration: usize = 0;
     loop {
         messages.extend(input_boundary(&recorder, model_sequence, false).await?);
-        let response = match llm_call_with_retry(
-            backend,
-            model,
-            &messages,
-            &tool_defs,
-            &resolved_model,
-            max_retries,
+        let Some(response) = until_cancelled(
+            cancel,
+            llm_call_with_retry(
+                backend,
+                model,
+                &messages,
+                &tool_defs,
+                &resolved_model,
+                max_retries,
+            ),
         )
         .await
-        {
+        else {
+            return Err(cancelled_outcome(&recorder, hub, hook_ctx.as_ref(), acc).await);
+        };
+        let response = match response {
             Ok(resp) => resp,
             Err(e) => {
                 // All retries exhausted or non-retryable — stop
@@ -603,7 +765,7 @@ pub async fn execute_with_recorder(
                     iteration,
                     "LLM error during ReAct loop (retries exhausted)"
                 );
-                return Err(e.to_string());
+                return Err(e.to_string().into());
             }
         };
 
@@ -685,7 +847,9 @@ pub async fn execute_with_recorder(
                     )
                     .await);
                 }
-                return Err("Model returned empty response after tool execution".to_string());
+                return Err("Model returned empty response after tool execution"
+                    .to_string()
+                    .into());
             }
             LLMResponse::Text { .. } => return Err("Model returned empty final response".into()),
             LLMResponse::ToolCalls {
@@ -765,6 +929,11 @@ pub async fn execute_with_recorder(
 
                 // Execute each tool with security checks
                 for (call_index, call) in tool_calls.iter().enumerate() {
+                    if cancel.is_some_and(TurnCancel::is_cancelled) {
+                        record_cancelled_calls(&recorder, model_sequence, call_index, &tool_calls)
+                            .await?;
+                        return Err(cancelled_outcome(&recorder, hub, hook_ctx.as_ref(), acc).await);
+                    }
                     let result = match tools.get(&call.name) {
                         Some(tool) => {
                             let tool: &dyn crate::tool::Tool = &*tool;
@@ -808,7 +977,24 @@ pub async fn execute_with_recorder(
                                     risk_level: policy.risk.clone(),
                                 };
 
-                                let decision = security.request_approval(info).await;
+                                let Some(decision) =
+                                    until_cancelled(cancel, security.request_approval(info)).await
+                                else {
+                                    record_cancelled_calls(
+                                        &recorder,
+                                        model_sequence,
+                                        call_index,
+                                        &tool_calls,
+                                    )
+                                    .await?;
+                                    return Err(cancelled_outcome(
+                                        &recorder,
+                                        hub,
+                                        hook_ctx.as_ref(),
+                                        acc,
+                                    )
+                                    .await);
+                                };
                                 match decision {
                                     ApprovalDecision::Approve => {} // proceed
                                     ApprovalDecision::ApproveAll => {
@@ -898,17 +1084,38 @@ pub async fn execute_with_recorder(
                             {
                                 capacity.permit.take();
                             }
-                            let exec_result =
-                                execute_with_retry(tool, args, &call_ctx, timeout, &call.name)
-                                    .await;
-                            // Outside the tool timeout: success, error and timeout
-                            // all regain capacity before hooks, another tool in
-                            // this batch, or the next model request can execute.
-                            if call.name == "job_wait"
-                                && let Some(capacity) = capacity.as_mut()
-                            {
-                                capacity.reacquire().await?;
-                            }
+                            let Some(exec_result) = until_cancelled(cancel, async {
+                                let result =
+                                    execute_with_retry(tool, args, &call_ctx, timeout, &call.name)
+                                        .await;
+                                // Outside the tool timeout: success, error and timeout
+                                // all regain capacity before hooks, another tool in
+                                // this batch, or the next model request can execute.
+                                if call.name == "job_wait"
+                                    && let Some(capacity) = capacity.as_mut()
+                                {
+                                    capacity.reacquire().await?;
+                                }
+                                Ok::<_, String>(result)
+                            })
+                            .await
+                            else {
+                                record_cancelled_calls(
+                                    &recorder,
+                                    model_sequence,
+                                    call_index,
+                                    &tool_calls,
+                                )
+                                .await?;
+                                return Err(cancelled_outcome(
+                                    &recorder,
+                                    hub,
+                                    hook_ctx.as_ref(),
+                                    acc,
+                                )
+                                .await);
+                            };
+                            let exec_result = exec_result?;
 
                             match exec_result {
                                 Ok(Ok(output)) => {
@@ -1028,7 +1235,7 @@ pub async fn execute_with_recorder(
     }
 }
 
-struct EventRecorder(mpsc::Sender<RuntimeEvent>);
+pub(crate) struct EventRecorder(pub(crate) mpsc::Sender<RuntimeEvent>);
 
 impl RuntimeRecorder for EventRecorder {
     fn record<'a>(
@@ -1037,6 +1244,7 @@ impl RuntimeRecorder for EventRecorder {
     ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
         Box::pin(async move {
             match message {
+                RuntimeRecord::Cancelled => {}
                 RuntimeRecord::ModelResponse { tool_calls, .. } => {
                     for call in tool_calls {
                         if call.name == NO_REPLY_TOOL {
@@ -1135,6 +1343,30 @@ pub(crate) fn bound_tool_output(output: &str) -> String {
         end -= 1;
     }
     format!("{}{}", &output[..end], MARKER)
+}
+
+/// Output recorded for a tool call that a stop interrupted.
+pub const TOOL_CANCELLED_OUTPUT: &str = "Tool execution cancelled by user";
+
+/// Pair every remaining native call, without starting unexecuted tools.
+async fn record_cancelled_calls(
+    recorder: &Option<Arc<dyn RuntimeRecorder>>,
+    model_sequence: u64,
+    first: usize,
+    calls: &[ToolCallRequest],
+) -> Result<(), String> {
+    for (call_index, call) in calls.iter().enumerate().skip(first) {
+        record_tool_result(
+            recorder,
+            model_sequence,
+            call_index,
+            call,
+            TOOL_CANCELLED_OUTPUT,
+            ToolResultOutcome::Cancelled,
+        )
+        .await?;
+    }
+    Ok(())
 }
 
 /// Wrap tool output in XML delimiters for injection defense.

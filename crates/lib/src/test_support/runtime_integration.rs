@@ -17,7 +17,7 @@ use super::{
 use crate::backends::BackendManager;
 use crate::bridge::ApprovalDecision;
 use crate::error::LlmError;
-use crate::runtime::{self, RuntimeMessage};
+use crate::runtime::{self, LLMResponse, RuntimeMessage};
 use crate::tool::{
     ApprovalRequirement, RiskLevel, Tool, ToolContext, ToolDescriptor, ToolError, ToolPolicy,
     ToolPolicyRegistry, ToolRegistry,
@@ -1332,7 +1332,7 @@ async fn provider_failure_with_tools_is_an_error_not_a_no_tools_retry() {
 
 #[tokio::test]
 async fn metadata_accumulator_sums_token_usage_across_calls() {
-    use crate::runtime::{LLMResponse, ResponseMetadata, TokenUsage, ToolCallRequest};
+    use crate::runtime::{ResponseMetadata, TokenUsage, ToolCallRequest};
 
     // We need finer control over per-response metadata than `push_*` provides,
     // so we use a fresh MockBackend constructed manually.
@@ -1400,5 +1400,241 @@ async fn metadata_accumulator_sums_token_usage_across_calls() {
     assert_eq!(
         meta.model, "mock-model",
         "the final call's model surfaces in the outcome"
+    );
+}
+
+// ---- User stop (TurnCancel) ------------------------------------------------
+
+/// Run one stoppable turn from a single user message.
+async fn run_cancellable(
+    backend: &BackendManager,
+    security: &crate::security::SecurityContext,
+    ctx: &ToolContext,
+    events: Option<tokio::sync::mpsc::Sender<runtime::RuntimeEvent>>,
+    cancel: &runtime::TurnCancel,
+) -> Result<runtime::RuntimeOutcome, runtime::TurnError> {
+    let recorder = events
+        .map(|sink| Arc::new(runtime::EventRecorder(sink)) as Arc<dyn runtime::RuntimeRecorder>);
+    runtime::execute_cancellable_with_recorder(
+        Some("mock-model"),
+        vec![RuntimeMessage::User("go".into())],
+        backend,
+        security,
+        ctx,
+        &ToolPolicyRegistry::empty(),
+        recorder,
+        None,
+        Some(cancel),
+        None,
+    )
+    .await
+}
+
+/// Collect every event the runtime emitted, once the sink has closed.
+async fn drain_events(
+    mut rx: tokio::sync::mpsc::Receiver<runtime::RuntimeEvent>,
+) -> Vec<(String, String, bool)> {
+    let mut out = Vec::new();
+    while let Some(ev) = rx.recv().await {
+        match ev {
+            runtime::RuntimeEvent::ToolCall { id, name, .. } => out.push((id, name, false)),
+            runtime::RuntimeEvent::ToolResult {
+                id,
+                output,
+                is_error,
+                ..
+            } => {
+                assert!(is_error, "a cancelled result is an error result");
+                out.push((id, output, true));
+            }
+        }
+    }
+    out
+}
+
+/// Both tool-capable and single-shot model calls can be stopped in flight.
+#[tokio::test]
+async fn a_stop_abandons_a_stalled_model_call() {
+    for supports_tools in [true, false] {
+        let (_instance, session) = fresh_session().await;
+        let registry = ToolRegistry::new();
+        registry.register(EchoTool::new());
+        let ctx = tool_context(session, Arc::new(registry));
+        let security = permissive_security();
+        let mock = Arc::new(MockBackend::new().with_supports_tools(supports_tools));
+        mock.push_text("must not reply after stop");
+        let gate = mock.block_next_call();
+        let backend = BackendManager::with_mock(mock, empty_secrets().await);
+        let cancel = runtime::TurnCancel::new();
+        let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::join!(
+                run_cancellable(&backend, &security, &ctx, None, &cancel),
+                async {
+                    gate.wait_started().await;
+                    cancel.cancel();
+                }
+            )
+        })
+        .await
+        .expect("a stop must not wait for the model");
+        assert!(
+            matches!(result, Err(runtime::TurnError::Cancelled { .. })),
+            "supports_tools={supports_tools}"
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(2), gate.wait_stopped())
+            .await
+            .expect("the stopped model future must be dropped");
+    }
+}
+
+/// A stop while a tool approval is pending ends the wait: nobody has to
+/// answer the prompt for the turn to end, and the tool never runs.
+#[tokio::test]
+async fn a_stop_ends_a_pending_approval_without_running_the_tool() {
+    let (_instance, session) = fresh_session().await;
+    let secrets = empty_secrets().await;
+    let registry = ToolRegistry::new();
+    registry.register(GatedTool);
+    let ctx = tool_context(session, Arc::new(registry));
+    // An approval channel nobody answers.
+    let (approval_tx, mut approval_rx) = tokio::sync::mpsc::channel(8);
+    let security = crate::security::SecurityContext {
+        leak_detector: crate::security::LeakDetector::new(crate::security::LeakPolicy::Redact),
+        auto_approved_tools: Default::default(),
+        approval_callback: Some(approval_tx),
+    };
+    let mock = Arc::new(MockBackend::new());
+    mock.push_tool_calls(vec![(
+        "call_gated".to_string(),
+        "gated".to_string(),
+        json!({ "text": "x" }).to_string(),
+    )]);
+    let backend = BackendManager::with_mock(mock.clone(), secrets);
+
+    let cancel = runtime::TurnCancel::new();
+    let (tx, rx) = tokio::sync::mpsc::channel(16);
+    let (result, exchange) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        tokio::join!(
+            run_cancellable(&backend, &security, &ctx, Some(tx), &cancel),
+            async {
+                let exchange = approval_rx
+                    .recv()
+                    .await
+                    .expect("tool must request approval");
+                cancel.cancel();
+                exchange
+            }
+        )
+    })
+    .await
+    .expect("a stop must not wait for an approval");
+    assert!(
+        exchange.decision_tx.is_closed(),
+        "stop must abandon the approval wait"
+    );
+    assert!(matches!(result, Err(runtime::TurnError::Cancelled { .. })));
+    assert_eq!(
+        drain_events(rx).await,
+        vec![
+            ("call_gated".to_string(), "gated".to_string(), false),
+            (
+                "call_gated".to_string(),
+                runtime::TOOL_CANCELLED_OUTPUT.to_string(),
+                true
+            ),
+        ]
+    );
+}
+
+/// A stop that is already requested when the turn reaches its next step ends
+/// it there: the rest of the requested calls are never started (so no call
+/// execution occurs for them) and the model is not called again. The usage of
+/// the call that did complete is kept.
+#[tokio::test]
+async fn a_stop_between_calls_leaves_the_rest_unstarted() {
+    /// Requests the stop as its own side effect, so the stop lands exactly
+    /// between the first and second call of one batch.
+    struct StopTool(runtime::TurnCancel);
+    impl Tool for StopTool {
+        fn descriptor(&self) -> ToolDescriptor {
+            ToolDescriptor {
+                name: "stopper".to_string(),
+                description: "test".to_string(),
+                parameters: json!({ "type": "object", "properties": {} }),
+            }
+        }
+        fn execute<'a>(
+            &'a self,
+            _arguments: Value,
+            _ctx: &'a ToolContext,
+        ) -> Pin<Box<dyn std::future::Future<Output = Result<String, ToolError>> + Send + 'a>>
+        {
+            Box::pin(async move {
+                self.0.cancel();
+                Ok("ok".to_string())
+            })
+        }
+    }
+
+    let (_instance, session) = fresh_session().await;
+    let secrets = empty_secrets().await;
+    let cancel = runtime::TurnCancel::new();
+    let echo = EchoTool::new();
+    let echo_calls = echo.calls.clone();
+    let registry = ToolRegistry::new();
+    registry.register(StopTool(cancel.clone()));
+    registry.register(echo);
+    let ctx = tool_context(session, Arc::new(registry));
+    let security = permissive_security();
+    let mock = Arc::new(MockBackend::new());
+    mock.push_tool_calls(vec![
+        ("c1".to_string(), "stopper".to_string(), "{}".to_string()),
+        (
+            "c2".to_string(),
+            "echo".to_string(),
+            json!({ "text": "never" }).to_string(),
+        ),
+    ]);
+    mock.push_text("never asked");
+    let backend = BackendManager::with_mock(mock.clone(), secrets);
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+    let result = run_cancellable(&backend, &security, &ctx, Some(tx), &cancel).await;
+
+    match result {
+        Err(runtime::TurnError::Cancelled { metadata }) => assert!(
+            metadata.is_some(),
+            "the completed model call's usage survives the stop"
+        ),
+        other => panic!("expected a cancelled turn, got {:?}", other.map(|o| o.body)),
+    }
+    assert_eq!(echo_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(mock.recorded_calls().len(), 1);
+    let mut calls = Vec::new();
+    let mut cancelled = Vec::new();
+    while let Some(ev) = rx.recv().await {
+        match ev {
+            runtime::RuntimeEvent::ToolCall { id, .. } => calls.push(id),
+            runtime::RuntimeEvent::ToolResult {
+                id,
+                output,
+                is_error,
+                ..
+            } if output == runtime::TOOL_CANCELLED_OUTPUT => {
+                assert!(is_error);
+                cancelled.push(id);
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(
+        calls,
+        vec!["c1", "c2"],
+        "the recorded native batch retains both calls"
+    );
+    assert_eq!(
+        cancelled,
+        vec!["c2"],
+        "the unstarted call is paired without execution"
     );
 }
