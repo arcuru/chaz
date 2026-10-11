@@ -48,6 +48,20 @@ Every assistant `Message` entry carries an optional `ResponseMetadata`: the mode
 
 `crates/lib/src/session/usage.rs` walks the session catalog and folds these per-entry metadata records into per-session, per-model, and total rollups. Two surfaces consume those rollups today: the `/costs` slash command (TUI) and the `chaz usage` CLI subcommand. See [Cost Tracking & Usage](../user_guide/usage.md) for the user-facing view.
 
+## Metadata writes refuse unreadable state
+
+`Session::update_meta` and `update_meta_on_db` read all existing metadata
+strictly before invoking the mutator or writing. Absent fields use defaults;
+storage/read errors, wrong field types, malformed JSON and invalid numeric
+fields refuse the entire update. Even an edit to an unrelated field fails.
+This prevents a failed read from replacing stored values with defaults.
+
+The rule applies to commands such as `/name` and `/model`, bridge participation
+settings, and runtime, agent and job metadata writers, not just the TUI.
+Supported legacy ambient metadata formats remain accepted. Malformed metadata
+stays write-blocking; these APIs provide no automatic repair or reset policy.
+Tolerant routing reads do not authorize a later write from defaulted state.
+
 ## Session Lifecycle
 
 ```mermaid

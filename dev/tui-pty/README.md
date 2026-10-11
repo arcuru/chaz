@@ -6,7 +6,7 @@ On Linux, from the default development shell with `uv` available:
 nix develop .# -c just tui-pty
 ```
 
-The recipe builds the actual `chaz` binary and a test-only store provisioner.
+The recipe builds the actual `chaz` binary and disposable store/service fixtures.
 Python's standard-library PTY facilities drive a 40×16 terminal, submit a
 Unicode prompt (`café`, a wide character, and a combining accent), check that
 the existing loopback model stub received it and that its final reply rendered,
@@ -22,7 +22,20 @@ fail-loud stubs.
 The final idle Ctrl+C must exit successfully, leave the alternate screen, and
 restore canonical input and echo. This covers the documented **quit** behavior,
 not in-flight cancellation or the semantics of cancelling a durable job.
-Widget snapshots remain the faster rendering tests.
+Widget tests remain the faster rendering checks.
+
+Additional regressions stop the test-owned IPC process beyond the read timeout
+while Enter, Session Settings and hub create/open actions are pending; local
+Unicode input and navigation must remain live. Two queued `/name` commands are
+checked against the owner's persisted metadata, not redraw-byte counts. An
+actual stop/restart must retain cached transcript/name/status, reconnect the
+owned client runtime without replaying submissions, and preserve the composer.
+A test-only Rust entry point under a controlling PTY catches a background panic
+and read timeout, draws a live frame, and restores raw mode exactly once at exit.
+The screen assertions use pinned `pyte` via the script's `uv` metadata: ratatui
+delta frames can split unchanged text between raw cursor moves. Raw first-glyph
+and downstream request assertions remain available for latency probes.
+`TUI_BINARY` can select an immutable final build for the same acceptance gate.
 
 Two negative controls require missing text to fail when a child exits cleanly
 and when a child remains alive beyond a monotonic deadline. Both assert that
@@ -35,3 +48,12 @@ On lifecycle failure, `target/tui-pty-failures/<timestamp>/` contains `pty.raw`,
 `requests.json`, and the run's `chaz-tui` log. Inspect the original unittest traceback first; artifact
 write errors are reported separately and do not replace it. Negative-control
 artifacts are checked inside disposable directories and then deleted.
+
+Interaction regressions request real approval-gated shell tools from the local
+stub and explicitly deny each prompt before and after `/join`, including an
+open discarded after newer navigation. Pending-exit tests stop only disposable
+storage while Settings inline/picker and model edits hold drafts; the first
+warning must be visible and only a second explicit quit leaves the terminal.
+The job suite closes an authorized observer and reopens it through the hub,
+checks draft isolation, and proves observation makes no extra resident model
+calls or ordinary session registration.

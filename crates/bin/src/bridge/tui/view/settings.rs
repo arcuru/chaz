@@ -220,10 +220,26 @@ pub(super) fn ui_settings(
     // hints when set (until the next nav keypress clears it). When a
     // picker is open (multi-line, rendered inside the detail area), the
     // strip degrades to a static hint reminder.
+    let operation = app.operations.indicator();
+    let refresh = app
+        .current()
+        .map(|t| {
+            if t.live.error.is_some() {
+                " | ⚠ refresh failed (cached)"
+            } else if t.live.pending() {
+                " | ⟳ refreshing (cached)"
+            } else {
+                ""
+            }
+        })
+        .unwrap_or_default();
     match (
         &app.settings_prompt,
         app.settings_picker.is_some(),
-        &app.settings_status,
+        &app.operations
+            .notice
+            .as_ref()
+            .or(app.settings_status.as_ref()),
     ) {
         (Some(prompt), _, _) => {
             widgets::inline_edit_prompt(f, chunks[2], &prompt.label, &prompt.input, prompt.cursor)
@@ -235,10 +251,12 @@ pub(super) fn ui_settings(
                 " type to filter · ↑↓ select · enter add · esc cancel ",
             );
         }
-        (None, false, Some(msg)) => widgets::status_strip(f, chunks[2], msg),
+        (None, false, Some(msg)) => {
+            widgets::status_strip(f, chunks[2], &format!("{msg}{operation}{refresh}"))
+        }
         (None, false, None) => {
             let hint = settings_status_hint(app, scope);
-            widgets::status_strip(f, chunks[2], hint);
+            widgets::status_strip(f, chunks[2], &format!("{hint}{operation}{refresh}"));
         }
     }
 }

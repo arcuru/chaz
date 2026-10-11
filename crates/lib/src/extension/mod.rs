@@ -186,6 +186,25 @@ pub async fn read_extension_outputs(session_db: &Database) -> BTreeMap<String, E
         .collect()
 }
 
+/// Fallible presentation read: missing outputs are empty, backend/parse errors
+/// are not. A frontend can retain its last-good strip on a failed refresh.
+pub async fn try_read_extension_outputs(
+    session_db: &Database,
+) -> anyhow::Result<BTreeMap<String, ExtensionOutput>> {
+    let txn = session_db.new_transaction().await?;
+    let doc = txn
+        .get_store::<DocStore>(EXTENSION_OUTPUTS_STORE)
+        .await?
+        .get_all()
+        .await?;
+    doc.iter()
+        .map(|(ext, value)| {
+            let json: String = value.try_into()?;
+            Ok((ext.clone(), serde_json::from_str(&json)?))
+        })
+        .collect()
+}
+
 /// Materialize the daemon-collected extension outputs into this session's
 /// DB, one JSON doc per extension. Write-on-change: reads the current
 /// store and only opens a write transaction when something differs, so an

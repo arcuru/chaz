@@ -8,6 +8,7 @@ use chaz_core::server::Server;
 use chaz_core::session::EntryType;
 use chaz_core::util::truncate_chars;
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
@@ -322,15 +323,20 @@ pub(super) fn ui(
         let mut names = server.agents().names();
         names.sort();
         app.peer_agents_names = names;
-        app.peer_defaults = server.default_agents();
+        if !app.operations.is_pending() {
+            app.peer_defaults = server.default_agents();
+        }
         app.peer_mcp_servers = server.mcp_registry().snapshot();
     }
 
     // Extension status segments rendered on a dedicated second status
-    // line. `app.status_segments` is refreshed by the run loop from the
-    // session's `extension_outputs` store (the daemon writes it at the turn
-    // boundary). Cloned so `ui_chat` can still take `&mut App`.
-    let ext_segments = app.status_segments.clone();
+    // line: the active tab's last read of its session's `extension_outputs`
+    // store (the daemon writes it at the turn boundary), refreshed in the
+    // background. Cloned so `ui_chat` can still take `&mut App`.
+    let ext_segments = app
+        .current()
+        .map(|t| t.live.status_segments.clone())
+        .unwrap_or_default();
 
     match app.mode {
         TuiMode::Jobs => super::jobs::draw(f, app),
@@ -342,6 +348,18 @@ pub(super) fn ui(
 
     if app.overlay.is_some() {
         ui_overlay(f, app);
+    }
+    // The first quit must be visible above every mode and overlay. Leave the
+    // composer, inline editor and picker drafts on screen; do not replace
+    // their footers or introduce another confirmation state.
+    if let Some(warning) = app.operations.exit_warning() {
+        let area = Rect {
+            height: f.area().height.min(1),
+            ..f.area()
+        };
+        f.render_widget(Clear, area);
+        widgets::status_strip(f, area, &warning);
+        app.click_regions.retain(|r| r.y >= area.bottom());
     }
 }
 
@@ -514,7 +532,7 @@ fn ui_rename_overlay(f: &mut ratatui::Frame, app: &mut App) {
     f.set_cursor_position((cursor_x, cursor_y));
 }
 
-fn ui_chat(f: &mut ratatui::Frame, app: &mut App, ext_segments: &[String]) {
+pub(super) fn ui_chat(f: &mut ratatui::Frame, app: &mut App, ext_segments: &[String]) {
     // 4-line approval panel when a tool is waiting on the user; 0 otherwise.
     let has_approval = app.active().pending_approval.is_some();
     let approval_h: u16 = if has_approval { 4 } else { 0 };
@@ -566,288 +584,21 @@ fn ui_chat(f: &mut ratatui::Frame, app: &mut App, ext_segments: &[String]) {
     let inner_width = messages_area.width.saturating_sub(2);
     let messages_height = messages_area.height.saturating_sub(2);
 
-    let mut lines: Vec<Line> = Vec::new();
-    // (logical line idx, x col offset from inner messages area, target).
-    // Translated to absolute ClickRegions after wrap math below.
-    let mut pending_clicks: Vec<(usize, u16, ClickTarget)> = Vec::new();
-
+    let (debug_mode, expand_all) = (app.debug_mode, app.expand_all);
+    let active_tab = app.active_tab;
+    refresh_transcript(
+        &mut app.tabs[active_tab],
+        &app.agent_names,
+        debug_mode,
+        expand_all,
+        inner_width,
+    );
     let tab = app.active();
-    for (entry_idx, entry) in tab.entries.iter().enumerate() {
-        let debug_prefix = if app.debug_mode {
-            let ts = entry.timestamp.format("%H:%M:%S");
-            let typ = format!("{:?}", entry.entry_type);
-            format!("[{ts} {typ:<10}] ")
-        } else {
-            String::new()
-        };
-        let dim = Style::default().fg(COLOR_DIM);
-
-        match &entry.entry_type {
-            EntryType::Message => {
-                let is_agent = app.agent_names.contains(&entry.sender);
-                let is_system = entry.sender == "system";
-                let sender_style = if is_system {
-                    Style::default()
-                        .fg(COLOR_SYSTEM)
-                        .add_modifier(Modifier::BOLD)
-                } else if is_agent {
-                    Style::default()
-                        .fg(COLOR_ASSISTANT)
-                        .add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default().fg(COLOR_USER).add_modifier(Modifier::BOLD)
-                };
-
-                // Horizontal separator above each user turn so blocks of
-                // tool work / agent replies group visually. Skip for the
-                // very first entry — no preceding turn to separate from.
-                if !is_agent && !is_system && !lines.is_empty() {
-                    let rule: String = "─".repeat(inner_width as usize);
-                    lines.push(Line::from(vec![Span::styled(rule, dim)]));
-                }
-
-                let source = entry
-                    .routing
-                    .as_ref()
-                    .and_then(|r| r.source.as_ref())
-                    .map(|r| format!(" [via {} {}]", r.transport, r.channel))
-                    .unwrap_or_else(|| {
-                        if is_agent {
-                            " [local]".into()
-                        } else {
-                            String::new()
-                        }
-                    });
-                let label = format!("{}{}{}:", debug_prefix, entry.sender, source);
-
-                lines.push(Line::from(vec![Span::styled(label, sender_style)]));
-
-                for content_line in entry.content.lines() {
-                    lines.push(Line::from(format!("  {content_line}")));
-                }
-                lines.push(Line::from(""));
-            }
-            EntryType::MatrixObserved | EntryType::MatrixSend | EntryType::BridgeEvent => {
-                use chaz_core::session::BridgeEventRole;
-                let Some(role) = entry.bridge_role() else {
-                    continue;
-                }; // future role is inert
-                if role == BridgeEventRole::Receipt {
-                    continue;
-                }
-                let (label, address) = if role == BridgeEventRole::Observation {
-                    (
-                        "observed, no wake",
-                        entry.routing.as_ref().and_then(|r| r.source.as_ref()),
-                    )
-                } else {
-                    let dest = entry.routing.as_ref().and_then(|r| r.destinations.first());
-                    let id = dest.and_then(|d| d.message_id.as_deref());
-                    let delivered = tab.entries.iter().any(|e| {
-                        e.bridge_role() == Some(BridgeEventRole::Receipt)
-                            && e.routing.as_ref().and_then(|r| r.reply_to.as_deref()) == id
-                    });
-                    (if delivered { "sent" } else { "pending" }, dest)
-                };
-                let transport = address.map(|a| a.transport.as_str()).unwrap_or("external");
-                let channel = address
-                    .map(|a| a.channel.as_str())
-                    .unwrap_or("unknown channel");
-                lines.push(Line::from(vec![Span::styled(
-                    format!(
-                        "{debug_prefix}{} [{transport} {label} in {channel}]:",
-                        entry.sender
-                    ),
-                    dim,
-                )]));
-                if let Some(body) = entry.bridge_body() {
-                    for content_line in body.lines() {
-                        lines.push(Line::from(format!("  {content_line}")));
-                    }
-                }
-                lines.push(Line::from(""));
-            }
-            EntryType::MatrixSent | EntryType::Unknown { .. } => {} // Inert audit records.
-            // Directives, ToolCall, ToolResult are collapsible. Per-entry
-            // override flips the global default (`app.expand_all`).
-            EntryType::Directive => {
-                let expanded = app.expand_all != tab.expanded_entries.contains(&entry_idx);
-                let icon = if expanded { "▾" } else { "▸" };
-                let icon_col = debug_prefix.chars().count() as u16 + 2; // "  " before icon
-                let first = entry.content.lines().next().unwrap_or("");
-                let head_label = format!("{} (directive)", entry.sender);
-                let header_spans: Vec<Span> = if expanded {
-                    vec![
-                        Span::styled(format!("{debug_prefix}  "), dim),
-                        Span::styled(icon, dim),
-                        Span::styled(format!(" {head_label}"), dim),
-                    ]
-                } else {
-                    let preview = ellipsize(&first.replace('\t', " "), 80);
-                    vec![
-                        Span::styled(format!("{debug_prefix}  "), dim),
-                        Span::styled(icon, dim),
-                        Span::styled(format!(" {head_label}: {preview}"), dim),
-                    ]
-                };
-                lines.push(Line::from(header_spans));
-                pending_clicks.push((
-                    lines.len() - 1,
-                    icon_col,
-                    ClickTarget::ToggleEntryExpanded(entry_idx),
-                ));
-                if expanded {
-                    for l in display_lines(&entry.content, None) {
-                        lines.push(Line::from(vec![Span::styled(format!("      {l}"), dim)]));
-                    }
-                }
-            }
-            EntryType::Ack => {
-                lines.push(Line::from(vec![Span::styled(
-                    format!("{debug_prefix}{} acknowledged turn", entry.sender),
-                    dim,
-                )]));
-            }
-            EntryType::ToolCall => {
-                let (name, args) = summarize_tool_call(&entry.content);
-                let tool_style = Style::default().fg(COLOR_TOOL);
-                let expanded = app.expand_all != tab.expanded_entries.contains(&entry_idx);
-                let icon = if expanded { "▾" } else { "▸" };
-                let icon_col = debug_prefix.chars().count() as u16 + 2;
-                let header_spans: Vec<Span> = if expanded {
-                    vec![
-                        Span::styled(format!("{debug_prefix}  "), dim),
-                        Span::styled(icon, dim),
-                        Span::styled(" ", dim),
-                        Span::styled(name, tool_style),
-                    ]
-                } else {
-                    let preview = ellipsize(&args, 90);
-                    vec![
-                        Span::styled(format!("{debug_prefix}  "), dim),
-                        Span::styled(icon, dim),
-                        Span::styled(" ", dim),
-                        Span::styled(name, tool_style),
-                        Span::styled(format!(" {preview}"), dim),
-                    ]
-                };
-                lines.push(Line::from(header_spans));
-                pending_clicks.push((
-                    lines.len() - 1,
-                    icon_col,
-                    ClickTarget::ToggleEntryExpanded(entry_idx),
-                ));
-                if expanded {
-                    for l in display_lines(&args, None) {
-                        lines.push(Line::from(vec![Span::styled(format!("      {l}"), dim)]));
-                    }
-                }
-            }
-            EntryType::ToolResult => {
-                let (name, summary, is_error) = summarize_tool_result(&entry.content);
-                let tool_style = Style::default().fg(COLOR_TOOL);
-                let expanded = app.expand_all != tab.expanded_entries.contains(&entry_idx);
-                let icon = if is_error {
-                    "✗"
-                } else if expanded {
-                    "▾"
-                } else {
-                    "▸"
-                };
-                let icon_style = if is_error {
-                    Style::default().fg(COLOR_ERROR)
-                } else {
-                    dim
-                };
-                let icon_col = debug_prefix.chars().count() as u16 + 2;
-                let header_spans: Vec<Span> = if expanded {
-                    vec![
-                        Span::styled(format!("{debug_prefix}  "), dim),
-                        Span::styled(icon, icon_style),
-                        Span::styled(" ", dim),
-                        Span::styled(name, tool_style),
-                    ]
-                } else {
-                    let preview = ellipsize(&summary, 90);
-                    vec![
-                        Span::styled(format!("{debug_prefix}  "), dim),
-                        Span::styled(icon, icon_style),
-                        Span::styled(" ", dim),
-                        Span::styled(name, tool_style),
-                        Span::styled(format!(" {preview}"), dim),
-                    ]
-                };
-                lines.push(Line::from(header_spans));
-                pending_clicks.push((
-                    lines.len() - 1,
-                    icon_col,
-                    ClickTarget::ToggleEntryExpanded(entry_idx),
-                ));
-                if expanded {
-                    let body = entry
-                        .content
-                        .split_once(": ")
-                        .map(|(_, b)| b)
-                        .unwrap_or(&entry.content);
-                    for l in display_lines(body, None) {
-                        lines.push(Line::from(vec![Span::styled(format!("      {l}"), dim)]));
-                    }
-                }
-            }
-            EntryType::Error => {
-                let red = Style::default().fg(COLOR_ERROR);
-                for (i, l) in display_lines(&entry.content, None).into_iter().enumerate() {
-                    let text = if i == 0 {
-                        format!("{debug_prefix}  ERROR {}: {l}", entry.sender)
-                    } else {
-                        format!("    {l}")
-                    };
-                    lines.push(Line::from(vec![Span::styled(text, red)]));
-                }
-                lines.push(Line::from(""));
-            }
-            EntryType::Summary => {
-                let label = format!("{debug_prefix}--- context summary ---");
-                lines.push(Line::from(vec![Span::styled(
-                    label,
-                    Style::default()
-                        .fg(COLOR_ACCENT)
-                        .add_modifier(Modifier::BOLD),
-                )]));
-                for content_line in entry.content.lines() {
-                    lines.push(Line::from(vec![Span::styled(
-                        format!("  {content_line}"),
-                        Style::default().fg(COLOR_ACCENT),
-                    )]));
-                }
-                lines.push(Line::from(""));
-            }
-            EntryType::ApprovalRequest => {
-                let label = chaz_core::bridge::parse_approval_request(entry)
-                    .map(|p| format!("🔒 approval requested: {}", p.tool_name))
-                    .unwrap_or_else(|| "🔒 approval requested".to_string());
-                lines.push(Line::from(vec![Span::styled(
-                    format!("{debug_prefix}  {label}"),
-                    dim,
-                )]));
-            }
-            EntryType::ApprovalDecision => {
-                let label = chaz_core::bridge::parse_approval_decision(entry)
-                    .map(|p| format!("🔓 approval {}", p.decision))
-                    .unwrap_or_else(|| "🔓 approval decision".to_string());
-                lines.push(Line::from(vec![Span::styled(
-                    format!("{debug_prefix}  {label}"),
-                    dim,
-                )]));
-            }
-        }
-    }
-
-    if tab.job.is_none()
-        && let Some(line) = turn_activity_line(tab.active_turns)
-    {
-        lines.push(line);
-    }
+    let activity = tab
+        .job
+        .is_none()
+        .then(|| turn_activity_line(tab.active_turns))
+        .flatten();
 
     // Snapshot what we need from `tab` before releasing the borrow so the
     // approval panel can take a &mut borrow of app.click_regions.
@@ -909,52 +660,71 @@ fn ui_chat(f: &mut ratatui::Frame, app: &mut App, ext_segments: &[String]) {
             ex.info.arguments_display.clone(),
         )
     });
-    lines.extend(super::jobs::input_lines(tab));
-    let _ = tab;
-
-    // Per-line visual heights, accumulated. Used to translate
-    // logical-line positions of pending click regions into screen rows that
-    // account for wrap. Mirrors ratatui's word-wrap by running each line
-    // through its own line_count probe.
-    let mut visual_offsets: Vec<u16> = Vec::with_capacity(lines.len() + 1);
-    visual_offsets.push(0);
-    for l in &lines {
-        let probe = Paragraph::new(l.clone()).wrap(Wrap { trim: false });
-        let h = probe.line_count(inner_width).min(u16::MAX as usize) as u16;
-        visual_offsets.push(visual_offsets.last().unwrap().saturating_add(h.max(1)));
+    // Window the cached transcript: only the logical lines that intersect
+    // the viewport are cloned and wrapped this frame. `Paragraph` wraps each
+    // `Line` independently, so starting at the first visible logical line and
+    // scrolling past its hidden head draws the same cells as wrapping the
+    // whole transcript and scrolling to `scroll`.
+    let cache = &tab.live.render;
+    let transcript_height = *cache.offsets.last().unwrap_or(&0);
+    let activity_height = activity
+        .as_ref()
+        .map_or(0, |l| wrapped_height(l, inner_width));
+    let content_height = transcript_height + activity_height;
+    let messages_height = messages_height as usize;
+    let scroll = content_height
+        .saturating_sub(messages_height)
+        .saturating_sub(scroll_offset as usize);
+    let view_end = scroll + messages_height;
+    // First logical line whose wrapped rows reach past `scroll`.
+    let first = cache.offsets[1..].partition_point(|&end| end <= scroll);
+    let mut visible: Vec<Line<'static>> = cache.lines[first..]
+        .iter()
+        .zip(&cache.offsets[first..])
+        .take_while(|(_, start)| **start < view_end)
+        .map(|(l, _)| l.clone())
+        .collect();
+    if transcript_height < view_end
+        && let Some(line) = activity
+    {
+        visible.push(line);
     }
-    let content_height = *visual_offsets.last().unwrap();
-    let scroll = if content_height > messages_height {
-        content_height
-            .saturating_sub(messages_height)
-            .saturating_sub(scroll_offset)
-    } else {
-        0
-    };
+    let head_skip = scroll.saturating_sub(cache.offsets.get(first).copied().unwrap_or(0));
+    let head_skip = head_skip.min(u16::MAX as usize) as u16;
 
-    // Translate pending header clicks into absolute screen regions, skipping
+    // Translate cached header clicks into absolute screen regions, skipping
     // any whose line is currently scrolled out of view.
-    for (logical_idx, x_offset, target) in pending_clicks {
-        let visual_row = visual_offsets[logical_idx];
-        if visual_row < scroll {
-            continue;
-        }
-        let row_relative = visual_row - scroll;
-        if row_relative >= messages_height {
-            continue;
-        }
-        app.click_regions.push(ClickRegion {
-            x: inner_x.saturating_add(x_offset),
-            y: inner_y.saturating_add(row_relative),
-            w: 1,
-            h: 1,
-            target,
-        });
-    }
+    let clicks: Vec<ClickRegion> = cache
+        .clicks
+        .iter()
+        .filter_map(|&(logical_idx, x_offset, target)| {
+            let visual_row = cache.offsets[logical_idx];
+            let row_relative = visual_row.checked_sub(scroll)?;
+            (row_relative < messages_height).then(|| ClickRegion {
+                x: inner_x.saturating_add(x_offset),
+                y: inner_y.saturating_add(row_relative as u16),
+                w: 1,
+                h: 1,
+                target,
+            })
+        })
+        .collect();
+    // A failed background read leaves the last good data on screen; say so
+    // rather than letting it pass for fresh.
+    let refresh_indicator = if tab.live.error.is_some() {
+        " | ⚠ refresh failed"
+    } else if tab.live.pending() {
+        " | ⟳ refreshing (cached)"
+    } else {
+        ""
+    };
+    let operation_indicator = app.operations.indicator();
+    let _ = tab;
+    app.click_regions.extend(clicks);
 
-    let messages = Paragraph::new(lines)
+    let messages = Paragraph::new(visible)
         .wrap(Wrap { trim: false })
-        .scroll((scroll, 0))
+        .scroll((head_skip, 0))
         .block(
             Block::bordered()
                 .border_type(BorderType::Rounded)
@@ -1034,14 +804,23 @@ fn ui_chat(f: &mut ratatui::Frame, app: &mut App, ext_segments: &[String]) {
     };
     let make_status = |agent_segment: &str| {
         format!(
-            " {session_label}{ctx_segment}{agent_segment}{usage_segment}{debug_indicator}{expand_indicator}{startup_indicator}"
+            " {session_label}{ctx_segment}{agent_segment}{usage_segment}{debug_indicator}{expand_indicator}{startup_indicator}{refresh_indicator}{operation_indicator}"
         )
     };
-    let mut status_text = make_status(&agent_segment);
+    let mut status_text = if app.active().job.is_some() {
+        format!("{operation_indicator}{refresh_indicator} | {session_label}")
+    } else if let Some(notice) = &app.operations.notice {
+        format!(" ⚠ {notice}{refresh_indicator}")
+    } else {
+        make_status(&agent_segment)
+    };
 
     // If the full roster would overflow the status line, collapse it to a
     // count plus the host, leaving the per-agent detail to the Settings page.
-    if multi_agent && status_text.chars().count() > chunks[4].width as usize {
+    if app.operations.notice.is_none()
+        && multi_agent
+        && status_text.chars().count() > chunks[4].width as usize
+    {
         let collapsed = match roster.iter().find(|r| r.is_host) {
             Some(h) if !h.model.is_empty() => format!(
                 " | agents: {} · host {}→{}",
@@ -1209,6 +988,377 @@ fn render_completion_popup(
 
     let para = Paragraph::new(lines);
     f.render_widget(para, inner);
+}
+
+/// Wrapped transcript lines for one tab, plus the logical line of every
+/// clickable entry header. Rebuilt only when [`TranscriptKey`] changes — never
+/// per keystroke — so typing, scrolling and status updates redraw in time
+/// proportional to the viewport, not the session length.
+#[derive(Default)]
+pub(super) struct TranscriptCache {
+    key: Option<TranscriptKey>,
+    lines: Vec<Line<'static>>,
+    /// (logical line idx, x col offset from inner messages area, target).
+    clicks: Vec<(usize, u16, ClickTarget)>,
+    /// Cumulative wrapped height before each logical line; one extra
+    /// trailing element holds the total. Mirrors ratatui's word wrap by
+    /// probing each line on its own, which is how `Paragraph` wraps.
+    offsets: Vec<usize>,
+}
+
+impl std::fmt::Debug for TranscriptCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TranscriptCache")
+            .field("key", &self.key)
+            .field("lines", &self.lines.len())
+            .finish()
+    }
+}
+
+/// Everything the cached lines depend on besides the entries themselves,
+/// which are tracked by the tab's `transcript_rev`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TranscriptKey {
+    rev: u64,
+    width: u16,
+    debug_mode: bool,
+    expand_all: bool,
+}
+
+impl TranscriptCache {
+    /// Identity of the cached line buffer — test-only probe that proves an
+    /// input-only frame reused the wrapped transcript instead of rebuilding.
+    #[cfg(test)]
+    pub(super) fn lines_ptr(&self) -> *const Line<'static> {
+        self.lines.as_ptr()
+    }
+}
+
+fn wrapped_height(line: &Line<'_>, width: u16) -> usize {
+    Paragraph::new(line.clone())
+        .wrap(Wrap { trim: false })
+        .line_count(width)
+        .max(1)
+}
+
+/// Make `tab`'s transcript cache current for this frame's settings.
+fn refresh_transcript(
+    tab: &mut super::Tab,
+    agent_names: &HashSet<String>,
+    debug_mode: bool,
+    expand_all: bool,
+    width: u16,
+) {
+    let key = TranscriptKey {
+        rev: tab.live.transcript_rev,
+        width,
+        debug_mode,
+        expand_all,
+    };
+    if tab.live.render.key == Some(key) {
+        return;
+    }
+    let (lines, clicks) = build_transcript(tab, agent_names, debug_mode, expand_all, width);
+    let mut offsets = Vec::with_capacity(lines.len() + 1);
+    let mut total = 0usize;
+    offsets.push(0);
+    for l in &lines {
+        total += wrapped_height(l, width);
+        offsets.push(total);
+    }
+    tab.live.render = TranscriptCache {
+        key: Some(key),
+        lines,
+        clicks,
+        offsets,
+    };
+}
+
+#[allow(clippy::type_complexity)]
+fn build_transcript(
+    tab: &super::Tab,
+    agent_names: &HashSet<String>,
+    debug_mode: bool,
+    expand_all: bool,
+    inner_width: u16,
+) -> (Vec<Line<'static>>, Vec<(usize, u16, ClickTarget)>) {
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    // (logical line idx, x col offset from inner messages area, target).
+    // Translated to absolute ClickRegions after wrap math below.
+    let mut pending_clicks: Vec<(usize, u16, ClickTarget)> = Vec::new();
+
+    for (entry_idx, entry) in tab.entries.iter().enumerate() {
+        let debug_prefix = if debug_mode {
+            let ts = entry.timestamp.format("%H:%M:%S");
+            let typ = format!("{:?}", entry.entry_type);
+            format!("[{ts} {typ:<10}] ")
+        } else {
+            String::new()
+        };
+        let dim = Style::default().fg(COLOR_DIM);
+
+        match &entry.entry_type {
+            EntryType::Message => {
+                let is_agent = agent_names.contains(&entry.sender);
+                let is_system = entry.sender == "system";
+                let sender_style = if is_system {
+                    Style::default()
+                        .fg(COLOR_SYSTEM)
+                        .add_modifier(Modifier::BOLD)
+                } else if is_agent {
+                    Style::default()
+                        .fg(COLOR_ASSISTANT)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(COLOR_USER).add_modifier(Modifier::BOLD)
+                };
+
+                // Horizontal separator above each user turn so blocks of
+                // tool work / agent replies group visually. Skip for the
+                // very first entry — no preceding turn to separate from.
+                if !is_agent && !is_system && !lines.is_empty() {
+                    let rule: String = "─".repeat(inner_width as usize);
+                    lines.push(Line::from(vec![Span::styled(rule, dim)]));
+                }
+
+                let source = entry
+                    .routing
+                    .as_ref()
+                    .and_then(|r| r.source.as_ref())
+                    .map(|r| format!(" [via {} {}]", r.transport, r.channel))
+                    .unwrap_or_else(|| {
+                        if is_agent {
+                            " [local]".into()
+                        } else {
+                            String::new()
+                        }
+                    });
+                let label = format!("{}{}{}:", debug_prefix, entry.sender, source);
+
+                lines.push(Line::from(vec![Span::styled(label, sender_style)]));
+
+                for content_line in entry.content.lines() {
+                    lines.push(Line::from(format!("  {content_line}")));
+                }
+                lines.push(Line::from(""));
+            }
+            EntryType::MatrixObserved | EntryType::MatrixSend | EntryType::BridgeEvent => {
+                use chaz_core::session::BridgeEventRole;
+                let Some(role) = entry.bridge_role() else {
+                    continue;
+                }; // future role is inert
+                if role == BridgeEventRole::Receipt {
+                    continue;
+                }
+                let (label, address) = if role == BridgeEventRole::Observation {
+                    (
+                        "observed, no wake",
+                        entry.routing.as_ref().and_then(|r| r.source.as_ref()),
+                    )
+                } else {
+                    let dest = entry.routing.as_ref().and_then(|r| r.destinations.first());
+                    let id = dest.and_then(|d| d.message_id.as_deref());
+                    let delivered = tab.entries.iter().any(|e| {
+                        e.bridge_role() == Some(BridgeEventRole::Receipt)
+                            && e.routing.as_ref().and_then(|r| r.reply_to.as_deref()) == id
+                    });
+                    (if delivered { "sent" } else { "pending" }, dest)
+                };
+                let transport = address.map(|a| a.transport.as_str()).unwrap_or("external");
+                let channel = address
+                    .map(|a| a.channel.as_str())
+                    .unwrap_or("unknown channel");
+                lines.push(Line::from(vec![Span::styled(
+                    format!(
+                        "{debug_prefix}{} [{transport} {label} in {channel}]:",
+                        entry.sender
+                    ),
+                    dim,
+                )]));
+                if let Some(body) = entry.bridge_body() {
+                    for content_line in body.lines() {
+                        lines.push(Line::from(format!("  {content_line}")));
+                    }
+                }
+                lines.push(Line::from(""));
+            }
+            EntryType::MatrixSent | EntryType::Unknown { .. } => {} // Inert audit records.
+            // Directives, ToolCall, ToolResult are collapsible. Per-entry
+            // override flips the global default (`expand_all`).
+            EntryType::Directive => {
+                let expanded = expand_all != tab.expanded_entries.contains(&entry_idx);
+                let icon = if expanded { "▾" } else { "▸" };
+                let icon_col = debug_prefix.chars().count() as u16 + 2; // "  " before icon
+                let first = entry.content.lines().next().unwrap_or("");
+                let head_label = format!("{} (directive)", entry.sender);
+                let header_spans: Vec<Span> = if expanded {
+                    vec![
+                        Span::styled(format!("{debug_prefix}  "), dim),
+                        Span::styled(icon, dim),
+                        Span::styled(format!(" {head_label}"), dim),
+                    ]
+                } else {
+                    let preview = ellipsize(&first.replace('\t', " "), 80);
+                    vec![
+                        Span::styled(format!("{debug_prefix}  "), dim),
+                        Span::styled(icon, dim),
+                        Span::styled(format!(" {head_label}: {preview}"), dim),
+                    ]
+                };
+                lines.push(Line::from(header_spans));
+                pending_clicks.push((
+                    lines.len() - 1,
+                    icon_col,
+                    ClickTarget::ToggleEntryExpanded(entry_idx),
+                ));
+                if expanded {
+                    for l in display_lines(&entry.content, None) {
+                        lines.push(Line::from(vec![Span::styled(format!("      {l}"), dim)]));
+                    }
+                }
+            }
+            EntryType::Ack => {
+                lines.push(Line::from(vec![Span::styled(
+                    format!("{debug_prefix}{} acknowledged turn", entry.sender),
+                    dim,
+                )]));
+            }
+            EntryType::ToolCall => {
+                let (name, args) = summarize_tool_call(&entry.content);
+                let tool_style = Style::default().fg(COLOR_TOOL);
+                let expanded = expand_all != tab.expanded_entries.contains(&entry_idx);
+                let icon = if expanded { "▾" } else { "▸" };
+                let icon_col = debug_prefix.chars().count() as u16 + 2;
+                let header_spans: Vec<Span> = if expanded {
+                    vec![
+                        Span::styled(format!("{debug_prefix}  "), dim),
+                        Span::styled(icon, dim),
+                        Span::styled(" ", dim),
+                        Span::styled(name, tool_style),
+                    ]
+                } else {
+                    let preview = ellipsize(&args, 90);
+                    vec![
+                        Span::styled(format!("{debug_prefix}  "), dim),
+                        Span::styled(icon, dim),
+                        Span::styled(" ", dim),
+                        Span::styled(name, tool_style),
+                        Span::styled(format!(" {preview}"), dim),
+                    ]
+                };
+                lines.push(Line::from(header_spans));
+                pending_clicks.push((
+                    lines.len() - 1,
+                    icon_col,
+                    ClickTarget::ToggleEntryExpanded(entry_idx),
+                ));
+                if expanded {
+                    for l in display_lines(&args, None) {
+                        lines.push(Line::from(vec![Span::styled(format!("      {l}"), dim)]));
+                    }
+                }
+            }
+            EntryType::ToolResult => {
+                let (name, summary, is_error) = summarize_tool_result(&entry.content);
+                let tool_style = Style::default().fg(COLOR_TOOL);
+                let expanded = expand_all != tab.expanded_entries.contains(&entry_idx);
+                let icon = if is_error {
+                    "✗"
+                } else if expanded {
+                    "▾"
+                } else {
+                    "▸"
+                };
+                let icon_style = if is_error {
+                    Style::default().fg(COLOR_ERROR)
+                } else {
+                    dim
+                };
+                let icon_col = debug_prefix.chars().count() as u16 + 2;
+                let header_spans: Vec<Span> = if expanded {
+                    vec![
+                        Span::styled(format!("{debug_prefix}  "), dim),
+                        Span::styled(icon, icon_style),
+                        Span::styled(" ", dim),
+                        Span::styled(name, tool_style),
+                    ]
+                } else {
+                    let preview = ellipsize(&summary, 90);
+                    vec![
+                        Span::styled(format!("{debug_prefix}  "), dim),
+                        Span::styled(icon, icon_style),
+                        Span::styled(" ", dim),
+                        Span::styled(name, tool_style),
+                        Span::styled(format!(" {preview}"), dim),
+                    ]
+                };
+                lines.push(Line::from(header_spans));
+                pending_clicks.push((
+                    lines.len() - 1,
+                    icon_col,
+                    ClickTarget::ToggleEntryExpanded(entry_idx),
+                ));
+                if expanded {
+                    let body = entry
+                        .content
+                        .split_once(": ")
+                        .map(|(_, b)| b)
+                        .unwrap_or(&entry.content);
+                    for l in display_lines(body, None) {
+                        lines.push(Line::from(vec![Span::styled(format!("      {l}"), dim)]));
+                    }
+                }
+            }
+            EntryType::Error => {
+                let red = Style::default().fg(COLOR_ERROR);
+                for (i, l) in display_lines(&entry.content, None).into_iter().enumerate() {
+                    let text = if i == 0 {
+                        format!("{debug_prefix}  ERROR {}: {l}", entry.sender)
+                    } else {
+                        format!("    {l}")
+                    };
+                    lines.push(Line::from(vec![Span::styled(text, red)]));
+                }
+                lines.push(Line::from(""));
+            }
+            EntryType::Summary => {
+                let label = format!("{debug_prefix}--- context summary ---");
+                lines.push(Line::from(vec![Span::styled(
+                    label,
+                    Style::default()
+                        .fg(COLOR_ACCENT)
+                        .add_modifier(Modifier::BOLD),
+                )]));
+                for content_line in entry.content.lines() {
+                    lines.push(Line::from(vec![Span::styled(
+                        format!("  {content_line}"),
+                        Style::default().fg(COLOR_ACCENT),
+                    )]));
+                }
+                lines.push(Line::from(""));
+            }
+            EntryType::ApprovalRequest => {
+                let label = chaz_core::bridge::parse_approval_request(entry)
+                    .map(|p| format!("🔒 approval requested: {}", p.tool_name))
+                    .unwrap_or_else(|| "🔒 approval requested".to_string());
+                lines.push(Line::from(vec![Span::styled(
+                    format!("{debug_prefix}  {label}"),
+                    dim,
+                )]));
+            }
+            EntryType::ApprovalDecision => {
+                let label = chaz_core::bridge::parse_approval_decision(entry)
+                    .map(|p| format!("🔓 approval {}", p.decision))
+                    .unwrap_or_else(|| "🔓 approval decision".to_string());
+                lines.push(Line::from(vec![Span::styled(
+                    format!("{debug_prefix}  {label}"),
+                    dim,
+                )]));
+            }
+        }
+    }
+    lines.extend(super::jobs::input_lines(tab));
+    (lines, pending_clicks)
 }
 
 /// Render the tab bar: one line across the top showing each tab's title,
@@ -1552,12 +1702,16 @@ pub(super) fn ui_picker(f: &mut ratatui::Frame, app: &mut App) {
 
             // Name is available from the peer-local index. Agent metadata is
             // loaded only for rows visible in the picker viewport.
+            let row_error = app.session_row_errors.contains_key(&info.session_db_id);
+            let stale_suffix = if row_error { " ⚠ metadata stale" } else { "" };
             let header = if info.loaded {
                 format!(
-                    "{marker}{title}{current_marker} [{bridge}] {agent_str} • {age}{closed_suffix}"
+                    "{marker}{title}{current_marker} [{bridge}] {agent_str} • {age}{closed_suffix}{stale_suffix}"
                 )
             } else {
-                format!("{marker}{title}{current_marker} [{bridge}] … • {age}{closed_suffix}")
+                format!(
+                    "{marker}{title}{current_marker} [{bridge}] … • {age}{closed_suffix}{stale_suffix}"
+                )
             };
 
             let is_closed = matches!(info.status, chaz_core::session::SessionStatus::Closed);
@@ -1617,7 +1771,19 @@ pub(super) fn ui_picker(f: &mut ratatui::Frame, app: &mut App) {
     let bar = Style::default()
         .bg(Color::Rgb(0x1a, 0x1d, 0x26))
         .fg(Color::White);
-    let footer = if let Some(notice) = &app.hub_notice {
+    let operation = app.operations.indicator();
+    let metadata_error = app
+        .session_row_errors
+        .values()
+        .next()
+        .map(|e| format!("Metadata refresh failed: {e}; cached rows retained"));
+    let footer = if let Some(notice) = app
+        .operations
+        .notice
+        .as_ref()
+        .or(app.hub_notice.as_ref())
+        .or(metadata_error.as_ref())
+    {
         Paragraph::new(format!(" {notice}")).style(bar.fg(COLOR_ERROR))
     } else {
         let back = if app.tabs.is_empty() {
@@ -1636,7 +1802,7 @@ pub(super) fn ui_picker(f: &mut ratatui::Frame, app: &mut App) {
         .into_iter()
         .find(|hint| hint.chars().count() <= width)
         .unwrap_or_else(|| format!(" n new · s settings{back}"));
-        Paragraph::new(hint).style(bar)
+        Paragraph::new(format!("{hint}{operation}")).style(bar)
     };
     f.render_widget(footer, chunks[1]);
 }
@@ -1943,12 +2109,13 @@ mod chat_frame_tests {
             pending_approval: None,
             active_turns: 0,
             current_agent: "chaz".into(),
+            model_pin: None,
             session_name: None,
             effective_model: String::new(),
             roster: Vec::new(),
             context_budget: 0,
-            model_pin: None,
             expanded_entries: HashSet::new(),
+            live: Default::default(),
         };
         let mut app = App::new(HashSet::new(), tab);
         app.input = input.to_string();
@@ -1995,7 +2162,7 @@ mod chat_frame_tests {
             .unwrap();
         app.active_mut().session_db_id = db.root_id().to_string();
         app.active_mut().session_db = db.clone();
-        let callback = db
+        let _callback = db
             .on_write_at_tips(db.snapshot().await.unwrap(), |_, _| async { Ok(()) })
             .await
             .unwrap();
@@ -2013,9 +2180,8 @@ mod chat_frame_tests {
                 state: JobInputState::Dispatching { model_sequence: 1 },
             }],
             feedback: String::new(),
-            retry: None,
+            retry: Default::default(),
             details: false,
-            _callback: callback,
         });
         app.active_mut().active_turns = 1;
         for (w, h) in [(80, 24), (120, 35), (180, 45)] {
@@ -2035,11 +2201,13 @@ mod chat_frame_tests {
                 assert!(!text.contains(hidden), "{text}");
             }
         }
-        app.active_mut().job.as_mut().unwrap().details = true;
+        // Same-width local toggles must invalidate cached details even offline.
+        draw(&mut app, 120, 35);
+        super::super::jobs::toggle_tab_details(app.active_mut());
         let text = draw(&mut app, 120, 35).0.join("\n");
         assert!(text.contains("Request: diagnostic-request"), "{text}");
         assert!(text.contains("Attempt: diagnostic-attempt"), "{text}");
-        app.active_mut().job.as_mut().unwrap().details = false;
+        super::super::jobs::toggle_tab_details(app.active_mut());
         app.active_mut().job.as_mut().unwrap().state = Some(JobState::Succeeded {
             text: Some("Smaller example result".into()),
         });
@@ -2517,5 +2685,229 @@ mod tests {
     fn format_price_uses_one_decimal_for_dollars() {
         assert_eq!(format_price(Some(3.0)), "$3.0");
         assert_eq!(format_price(Some(15.0)), "$15.0");
+    }
+}
+
+#[cfg(test)]
+mod transcript_tests {
+    //! The windowed transcript render must draw exactly what wrapping the
+    //! whole transcript and scrolling would, while reusing its wrapped lines
+    //! across frames that only change local state.
+
+    use super::super::{App, Tab, show_system_msg};
+    use super::*;
+    use chaz_core::session::SessionEntry;
+    use eidetica::backend::database::InMemory;
+    use eidetica::{Instance, NewUser};
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    fn entry(sender: &str, content: &str, entry_type: EntryType) -> SessionEntry {
+        SessionEntry {
+            sender: sender.into(),
+            content: content.into(),
+            timestamp: chrono::Utc::now(),
+            entry_type,
+            metadata: None,
+            routing: None,
+        }
+    }
+
+    /// Mixed transcript: wrapping prose, wide CJK and emoji graphemes, tool
+    /// headers (clickable), multi-line errors and blank lines.
+    fn transcript(n: usize) -> Vec<SessionEntry> {
+        (0..n)
+            .map(|i| match i % 5 {
+                0 => entry(
+                    "user",
+                    &format!("question {i}: {}", "wrap me please ".repeat(i % 7 + 1)),
+                    EntryType::Message,
+                ),
+                1 => entry(
+                    "chaz",
+                    &format!(
+                        "answer {i}\n界界界 {} 👍🏽 done\n\ntrailing",
+                        "長い".repeat(i % 9 + 3)
+                    ),
+                    EntryType::Message,
+                ),
+                2 => entry(
+                    "chaz",
+                    &format!(r#"{{"name":"shell","arguments":{{"cmd":"echo {i}"}}}}"#),
+                    EntryType::ToolCall,
+                ),
+                3 => entry("chaz", &format!("shell: ok {i}"), EntryType::ToolResult),
+                _ => entry(
+                    "system",
+                    &format!("failure {i}\nsecond line"),
+                    EntryType::Error,
+                ),
+            })
+            .collect()
+    }
+
+    async fn app_with(entries: Vec<SessionEntry>) -> (Instance, App) {
+        let (instance, mut user) = Instance::create_backend(
+            Box::new(InMemory::new()),
+            NewUser::passwordless("transcript-frame"),
+        )
+        .await
+        .unwrap();
+        let key = user.get_default_key().unwrap();
+        let db = user
+            .create_database(eidetica::crdt::Doc::new(), &key)
+            .await
+            .unwrap();
+        let mut tab = Tab {
+            job: None,
+            session_db_id: db.root_id().to_string(),
+            session_db: db,
+            entries: Vec::new(),
+            scroll_offset: 0,
+            pending_approval: None,
+            active_turns: 1,
+            current_agent: "chaz".into(),
+            model_pin: None,
+            session_name: None,
+            effective_model: String::new(),
+            roster: Vec::new(),
+            context_budget: 0,
+            expanded_entries: HashSet::new(),
+            live: Default::default(),
+        };
+        tab.set_entries(entries);
+        let app = App::new(HashSet::from(["chaz".to_string()]), tab);
+        (instance, app)
+    }
+
+    fn rows(terminal: &Terminal<TestBackend>, from: u16, to: u16) -> Vec<String> {
+        let buffer = terminal.backend().buffer();
+        (from..to)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// Reference: the pre-windowing algorithm — wrap every line, scroll the
+    /// whole paragraph — drawn into a box the size of the messages area.
+    fn reference(app: &App, width: u16, messages_h: u16) -> Vec<String> {
+        let tab = app.active();
+        let mut lines = tab.live.render.lines.clone();
+        lines.extend(turn_activity_line(tab.active_turns));
+        let inner_h = messages_h.saturating_sub(2) as usize;
+        let total = Paragraph::new(lines.clone())
+            .wrap(Wrap { trim: false })
+            .line_count(width - 2);
+        let scroll = total
+            .saturating_sub(inner_h)
+            .saturating_sub(tab.scroll_offset as usize);
+        let mut terminal = Terminal::new(TestBackend::new(width, messages_h)).unwrap();
+        terminal
+            .draw(|f| {
+                f.render_widget(
+                    Paragraph::new(lines)
+                        .wrap(Wrap { trim: false })
+                        .scroll((scroll as u16, 0))
+                        .block(
+                            Block::bordered()
+                                .border_type(BorderType::Rounded)
+                                .title(Span::raw(" Chaz ")),
+                        ),
+                    f.area(),
+                )
+            })
+            .unwrap();
+        rows(&terminal, 0, messages_h)
+    }
+
+    #[tokio::test]
+    async fn windowed_render_matches_full_render_at_every_scroll_position() {
+        let (_instance, mut app) = app_with(transcript(100)).await;
+        app.active_mut().expanded_entries.insert(2); // one expanded tool call
+        app.active_mut().touch_transcript();
+        let (width, height) = (47, 24);
+        // Tab bar (1) + status (1) + empty composer (3) around the messages box.
+        let messages_h = height - 5;
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|f| ui_chat(f, &mut app, &[])).unwrap();
+        let total = *app.active().live.render.offsets.last().unwrap();
+        assert!(total > 300, "transcript must span many screens: {total}");
+
+        for offset in (0..=total as u16 + 5).step_by(7) {
+            app.active_mut().scroll_offset = offset;
+            app.click_regions.clear();
+            // Fresh buffer per frame: TestBackend keeps the stale symbol
+            // under a wide grapheme's continuation cell across draws.
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal.draw(|f| ui_chat(f, &mut app, &[])).unwrap();
+            let drawn = rows(&terminal, 1, 1 + messages_h);
+            assert_eq!(drawn, reference(&app, width, messages_h), "offset {offset}");
+            // Every header click target sits on a drawn expand/collapse icon.
+            for region in &app.click_regions {
+                if let ClickTarget::ToggleEntryExpanded(_) = region.target {
+                    let cell = terminal.backend().buffer()[(region.x, region.y)].symbol();
+                    assert!(matches!(cell, "▸" | "▾"), "offset {offset}: {cell:?}");
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn local_only_frames_reuse_the_wrapped_transcript() {
+        let (_instance, mut app) = app_with(transcript(200)).await;
+        let mut terminal = Terminal::new(TestBackend::new(80, 30)).unwrap();
+        terminal.draw(|f| ui_chat(f, &mut app, &[])).unwrap();
+        let built = app.active().live.render.lines_ptr();
+
+        // Typing, cursor motion, scrolling and status updates are local.
+        app.input = "typing".into();
+        app.cursor = 3;
+        app.active_mut().scroll_offset = 40;
+        terminal
+            .draw(|f| ui_chat(f, &mut app, &["status".into()]))
+            .unwrap();
+        assert_eq!(app.active().live.render.lines_ptr(), built);
+
+        // A transcript change, a width change and a display toggle rebuild.
+        show_system_msg(&mut app, "new message".into());
+        app.active_mut().scroll_offset = 0;
+        terminal.draw(|f| ui_chat(f, &mut app, &[])).unwrap();
+        let rebuilt = app.active().live.render.lines_ptr();
+        assert_ne!(rebuilt, built);
+        assert!(rows(&terminal, 0, 30).join("\n").contains("new message"));
+        app.expand_all = true;
+        terminal.draw(|f| ui_chat(f, &mut app, &[])).unwrap();
+        assert_ne!(app.active().live.render.lines_ptr(), rebuilt);
+    }
+
+    /// Render cost by transcript size. Not a pass/fail gate; run with
+    /// `--ignored --nocapture` to print per-frame timings.
+    #[tokio::test]
+    #[ignore]
+    async fn render_cost_by_transcript_size() {
+        for n in [500usize, 1000, 2000, 4000, 8000] {
+            let (_instance, mut app) = app_with(transcript(n)).await;
+            let mut terminal = Terminal::new(TestBackend::new(160, 48)).unwrap();
+            terminal.draw(|f| ui_chat(f, &mut app, &[])).unwrap();
+            let frames = 50;
+            let start = std::time::Instant::now();
+            for i in 0..frames {
+                app.input.push('x');
+                app.cursor = app.input.len();
+                app.active_mut().scroll_offset = (i % 5) * 3;
+                terminal.draw(|f| ui_chat(f, &mut app, &[])).unwrap();
+            }
+            let per_frame = start.elapsed() / frames as u32;
+            let start = std::time::Instant::now();
+            app.active_mut().touch_transcript();
+            terminal.draw(|f| ui_chat(f, &mut app, &[])).unwrap();
+            let rebuild = start.elapsed();
+            println!(
+                "entries={n} keystroke_frame={per_frame:?} transcript_rebuild_frame={rebuild:?}"
+            );
+        }
     }
 }

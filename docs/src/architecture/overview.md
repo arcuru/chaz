@@ -80,6 +80,47 @@ Bridges are transport-specific but the server is transport-agnostic. Adding a ne
 
 **Source**: `crates/bin/src/bridge/` (TUI: `tui/mod.rs`, Matrix: `matrix/mod.rs`, CLI: `cli.rs`)
 
+### TUI backend boundary
+
+The TUI's input routers and completion application are synchronous. They mutate
+`App`/`Tab`, enqueue accepted actions, or request presentation reads; storage
+awaits belong to owned workers. One bounded FIFO preserves accepted command and
+message order. Each completion carries its original session/tab incarnation and
+navigation generation, so data can reach a background tab without moving local
+focus or touching a closed/reopened view. Admission backpressure retains
+unaccepted drafts rather than dropping input.
+
+Presentation reads coalesce per tab/kind, retain last-good values on error, and
+supervise timeouts/panics/cancellation. Writes are not rollback-safe: their
+deadline warns without cancelling or starting a successor, and uncertain
+outcomes are never automatically retried. Tab-close cancels its reads and
+observation/approval forwarder, not an already accepted write. The terminal
+owner restores the terminal on exit/error/unwind; caught background panics do
+not restore a live terminal.
+
+A service-connected executable gives the TUI ownership of its `BuiltServer`.
+Transport loss stops new backend admission and cancels presentation work while
+keeping cached views/drafts. After accepted actions settle, one owned worker
+shuts down the old runtime before using the existing connector/build path to
+replace it. Fresh handles apply only to still-existing tab incarnations,
+independently of snapshot/status hydration. Failed per-tab opens or observations
+retry on the healthy generation with an owned ticketed read; they do not reconstruct the
+runtime or replay accepted writes. Presentation failures retain last-good caches.
+Catalog completions validate their generation before releasing task ownership.
+Defaults edits capture selected row identities and apply semantically against
+ordered worker state, not stale UI replacement snapshots. A health-read timeout
+is not itself proof of transport loss, and runtime replacement does not replay
+UI actions. See
+[background refresh](../user_guide/tui.md#responsiveness-and-background-refresh)
+for pending, failure and exit behavior.
+
+Job overview reads have an owned generation ticket; disconnect invalidates it
+before replacing read ownership. Observe-only job tabs use the same per-tab
+refresh slots and reconnect through the existing Write-authorized job opener,
+not ordinary session registration. Accepted steering publications use the FIFO;
+uncertain request IDs survive tab closure for the client lifetime. Transcript
+cache invalidation includes local observer-detail toggles and input receipts.
+
 ### Server
 
 The callback-driven server watches session databases and reconciles durable

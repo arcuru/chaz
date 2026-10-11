@@ -292,3 +292,57 @@ fn jobs_input_labels_distinguish_publication_dispatch_inclusion() {
         assert!(!input_label(&state).contains('{'));
     }
 }
+
+#[tokio::test(start_paused = true)]
+async fn slow_job_refresh_keeps_cached_navigation_and_offline_recovers() {
+    let mut app = app(vec![
+        node("a", "Cached task a", Some(JobState::Queued)),
+        node("b", "Cached task b", Some(JobState::Queued)),
+    ]);
+    let (tx, mut rx) = mpsc::channel(1);
+    request_with(&mut app, &tx, std::future::pending());
+    let ticket = app.jobs.ticket;
+    request_with(&mut app, &tx, std::future::pending());
+    assert_eq!(app.jobs.ticket, ticket, "refresh did not coalesce");
+    select(&mut app.jobs, 1);
+    app.jobs.details = true;
+    app.jobs.detail_scroll = 5;
+    assert!(frame(&mut app, 80, 24).0.contains("Cached task b"));
+    assert!(app.jobs.loading && app.jobs.task.is_some());
+    apply_loaded(&mut app, rx.recv().await.unwrap());
+    assert!(!app.jobs.loading && app.jobs.task.is_none());
+    assert!(app.jobs.error.as_ref().unwrap().contains("timed out"));
+    let screen = frame(&mut app, 80, 24).0;
+    assert!(screen.contains("Stale") && screen.contains("Cached task b"));
+    let recovered = app.jobs.data.clone();
+    request_with(&mut app, &tx, async move { Ok(recovered) });
+    apply_loaded(&mut app, rx.recv().await.unwrap());
+    assert!(app.jobs.error.is_none());
+    assert_eq!(app.jobs.selected, 1);
+}
+
+#[tokio::test]
+async fn queued_old_jobs_completion_cannot_drop_replacement_after_disconnect() {
+    let mut app = app(vec![node("a", "Cached task", Some(JobState::Queued))]);
+    let (tx, mut rx) = mpsc::channel(1);
+    let data = app.jobs.data.clone();
+    request_with(&mut app, &tx, async move { Ok(data) });
+    let old = rx.recv().await.unwrap();
+    reconnect::disconnect(&mut app);
+    app.backend_available = true;
+    let (release, gate) = tokio::sync::oneshot::channel::<()>();
+    let data = app.jobs.data.clone();
+    request_with(&mut app, &tx, async move {
+        gate.await.unwrap();
+        Ok(data)
+    });
+    apply_loaded(&mut app, old);
+    assert!(
+        app.jobs.loading && app.jobs.task.is_some(),
+        "stale Jobs completion mutated replacement ownership"
+    );
+    assert!(!release.is_closed());
+    release.send(()).unwrap();
+    apply_loaded(&mut app, rx.recv().await.unwrap());
+    assert!(!app.jobs.loading && app.jobs.error.is_none());
+}
