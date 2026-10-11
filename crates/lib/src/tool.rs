@@ -278,6 +278,8 @@ pub struct ToolContext {
     pub turn_request_id: Option<crate::session::TurnRequestId>,
     // Stable model-response call site, set by the runtime before dispatch.
     pub tool_call_key: Option<String>,
+    /// Runtime-owned capacity handle, populated for each turn's tool call.
+    pub observation_yield: Option<crate::runtime::ObservationYield>,
     /// Current spawn depth (0 = root agent from bridge)
     pub call_depth: usize,
     /// Maximum allowed spawn depth
@@ -327,6 +329,15 @@ pub struct ToolContext {
 }
 
 impl ToolContext {
+    /// Yield capacity only after submission/effects are complete. From here
+    /// until return, the tool may only observe; the runtime reacquires outside
+    /// the tool timeout before processing the result. No-op on non-turn callers.
+    pub fn yield_for_observation(&self) {
+        if let Some(observation) = &self.observation_yield {
+            observation.yield_capacity();
+        }
+    }
+
     /// Mirror the terminal action into context budgeting and the model request.
     pub fn definitions(&self) -> Vec<ToolDefinition> {
         let mut defs = self.tools.definitions(&self.profile);

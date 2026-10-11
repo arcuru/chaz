@@ -8603,3 +8603,5 @@ async fn required_context_strategy_refuses_and_recovers_on_the_executor() {
 
 #[path = "wait_resume_tests.rs"]
 mod wait_resume;
+#[path = "worker_capacity_tests.rs"]
+mod worker_capacity_tests;

@@ -346,11 +346,25 @@ impl MetadataAccumulator {
     }
 }
 
-/// Executor capacity owned by one running turn. Only job observation yields
+/// Runtime-owned permit handle for a tool's observation-only interval.
+/// After yielding, the tool must only observe and return: the runtime regains
+/// capacity and rechecks the parent claim before any further effects.
+#[derive(Clone)]
+pub struct ObservationYield {
+    permit: Arc<std::sync::Mutex<Option<tokio::sync::OwnedSemaphorePermit>>>,
+}
+
+impl ObservationYield {
+    pub(crate) fn yield_capacity(&self) {
+        self.permit.lock().unwrap().take();
+    }
+}
+
+/// Executor capacity owned by one running turn. Child observation can yield
 /// it; cancellation drops the turn (and any held permit) as usual.
 pub struct ExecutionCapacity {
     semaphore: Arc<tokio::sync::Semaphore>,
-    permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    observation: ObservationYield,
     job_claim: Option<(eidetica::Database, String)>,
 }
 
@@ -362,19 +376,24 @@ impl ExecutionCapacity {
     ) -> Self {
         Self {
             semaphore,
-            permit: Some(permit),
+            observation: ObservationYield {
+                permit: Arc::new(std::sync::Mutex::new(Some(permit))),
+            },
             job_claim,
         }
     }
 
     async fn reacquire(&mut self) -> Result<(), String> {
-        self.permit = Some(
-            self.semaphore
-                .clone()
-                .acquire_owned()
-                .await
-                .map_err(|_| "executor capacity closed".to_string())?,
-        );
+        if self.observation.permit.lock().unwrap().is_some() {
+            return Ok(());
+        }
+        let permit = self
+            .semaphore
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| "executor capacity closed".to_string())?;
+        *self.observation.permit.lock().unwrap() = Some(permit);
         // The existing executor claim-loss watcher also covers the wait and
         // acquisition. Recheck here before any resumed model/tool effects;
         // the LWW claim remains an observation, not a fencing token.
@@ -1849,12 +1868,13 @@ async fn run_turn(
     }
 }
 
-/// Name of the only tool whose observation yields capacity and checkpoints.
+/// Name of the only tool whose observation can resume from a checkpoint.
 pub(crate) const JOB_WAIT_TOOL: &str = "job_wait";
 
 /// Run one admitted call and turn its outcome into the model-visible result.
-/// A `job_wait` releases turn capacity while it observes and regains it
-/// outside the tool timeout, before result hooks or any later effect.
+/// `job_wait` yields for its whole call; submission tools yield only after
+/// committing the child. Regain capacity outside the tool timeout, before
+/// checkpoint retirement, result hooks or any later effect.
 #[allow(clippy::too_many_arguments)]
 async fn invoke_tool(
     tool: &dyn crate::tool::Tool,
@@ -1870,19 +1890,19 @@ async fn invoke_tool(
     hook_ctx: Option<&HookContext>,
     checkpoint: Option<(&dyn RuntimeRecorder, u64, usize)>,
 ) -> Result<Option<String>, String> {
-    if name == JOB_WAIT_TOOL
-        && let Some(capacity) = capacity.as_mut()
-    {
-        capacity.permit.take();
+    let mut call_ctx = call_ctx.clone();
+    call_ctx.observation_yield = capacity
+        .as_ref()
+        .map(|capacity| capacity.observation.clone());
+    if name == JOB_WAIT_TOOL {
+        call_ctx.yield_for_observation();
     }
     let Some(exec_result) = until_cancelled(cancel, async {
-        let result = execute_with_retry(tool, args, call_ctx, timeout, name).await;
+        let result = execute_with_retry(tool, args, &call_ctx, timeout, name).await;
         // Outside the tool timeout: success, error and timeout
         // all regain capacity before hooks, another tool in
         // this batch, or the next model request can execute.
-        if name == JOB_WAIT_TOOL
-            && let Some(capacity) = capacity.as_mut()
-        {
+        if let Some(capacity) = capacity.as_mut() {
             capacity.reacquire().await?;
         }
         Ok::<_, String>(result)
@@ -2402,6 +2422,7 @@ mod tests {
             agent_identity: None,
             turn_request_id: None,
             tool_call_key: None,
+            observation_yield: None,
             call_depth: 0,
             max_call_depth: 5,
             tools: ScopedTools::new(Arc::new(ToolRegistry::new()), None),

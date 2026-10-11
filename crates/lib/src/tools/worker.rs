@@ -260,6 +260,9 @@ impl Tool for SpawnWorker {
                 ));
             }
 
+            // Submission is complete. Only observation remains, so let the
+            // child use the shared executor slot until the runtime reacquires.
+            ctx.yield_for_observation();
             let completion = completion_rx.recv().await;
             completion.ok_or_else(|| "Worker dropped without completing".to_string())?;
 
