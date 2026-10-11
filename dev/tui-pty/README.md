@@ -48,3 +48,12 @@ On lifecycle failure, `target/tui-pty-failures/<timestamp>/` contains `pty.raw`,
 `requests.json`, and the run's `chaz-tui` log. Inspect the original unittest traceback first; artifact
 write errors are reported separately and do not replace it. Negative-control
 artifacts are checked inside disposable directories and then deleted.
+
+Interaction regressions request real approval-gated shell tools from the local
+stub and explicitly deny each prompt before and after `/join`, including an
+open discarded after newer navigation. Pending-exit tests stop only disposable
+storage while Settings inline/picker and model edits hold drafts; the first
+warning must be visible and only a second explicit quit leaves the terminal.
+The job suite closes an authorized observer and reopens it through the hub,
+checks draft isolation, and proves observation makes no extra resident model
+calls or ordinary session registration.

@@ -41,6 +41,7 @@ impl Origin {
 pub(super) enum Effect {
     Outcome(CommandOutcome),
     Opened(Box<Tab>),
+    Open(Box<Open>),
     Sent,
     JobSent(String),
     Renamed { id: String, name: Option<String> },
@@ -118,7 +119,10 @@ impl Operations {
             ));
         }
         if self.warned {
-            status.push_str(" | ⚠ Write still pending; outcome unknown. Not cancelled or retried; later actions remain queued");
+            status.push_str(concat!(
+                " | ⚠ Write still pending; outcome unknown. ",
+                "Not cancelled or retried; later actions remain queued"
+            ));
         }
         if let Some(uncertain) = self.uncertainty.last() {
             status.push_str(&format!(" | ⚠ {uncertain}"));
@@ -203,12 +207,22 @@ impl Operations {
             return true;
         }
         self.exit_confirm = true;
-        self.notice = Some(format!(
-            "Quit again to exit: {} queued action(s) would be cancelled before starting; in-flight {} may already have effects",
-            self.queue.len(),
-            if self.write { "write" } else { "read" }
-        ));
+        self.notice = self.exit_warning();
         false
+    }
+    /// Derived from the same armed quit state in every view, even when an
+    /// editor/help footer or a later notice would otherwise hide the warning.
+    pub(super) fn exit_warning(&self) -> Option<String> {
+        (self.exit_confirm && self.is_pending()).then(|| {
+            format!(
+                concat!(
+                    "Quit again to exit: {} queued action(s) would be cancelled before starting; ",
+                    "in-flight {} may already have effects"
+                ),
+                self.queue.len(),
+                if self.write { "write" } else { "read" }
+            )
+        })
     }
     pub(super) fn exit_report(&self) -> Option<String> {
         let inputs: Vec<_> = self
@@ -218,7 +232,17 @@ impl Operations {
             .chain(self.uncertain_inputs.iter())
             .cloned()
             .collect();
-        (self.is_pending() || !inputs.is_empty() || !self.uncertainty.is_empty()).then(|| format!("Exited with unfinished/unconfirmed actions: queued actions were cancelled before starting; a started write may already have committed. Check the session before retrying.\nUnconfirmed accepted inputs:\n{}\nUnresolved outcomes:\n{}", inputs.join("\n---\n"), self.uncertainty.join("\n---\n")))
+        (self.is_pending() || !inputs.is_empty() || !self.uncertainty.is_empty()).then(|| {
+            format!(
+                concat!(
+                    "Exited with unfinished/unconfirmed actions: queued actions were cancelled before ",
+                    "starting; a started write may already have committed. Check the session before retrying.",
+                    "\nUnconfirmed accepted inputs:\n{}\nUnresolved outcomes:\n{}"
+                ),
+                inputs.join("\n---\n"),
+                self.uncertainty.join("\n---\n")
+            )
+        })
     }
 }
 
@@ -321,6 +345,21 @@ pub(super) fn apply(app: &mut App, completion: Completion) {
                 app.operations.uncertainty.push(notice);
             } else {
                 app.operations.notice = Some(notice);
+            }
+        }
+        Ok(Effect::Open(open)) => {
+            if nav_valid {
+                if let Some(i) = app.tab_index_for(&open.switch.session_db_id) {
+                    app.set_active_tab(i);
+                    app.mode = TuiMode::Chat;
+                } else {
+                    // Continue the same accepted action, not a new submission:
+                    // retain its origin/input and run before the next FIFO item.
+                    app.operations.queue.push_front(Pending {
+                        work: Some(Box::pin(open.prepare())),
+                        ..pending
+                    });
+                }
             }
         }
         Ok(Effect::Opened(tab)) => {
@@ -466,37 +505,13 @@ impl Context {
     }
     async fn prepare(&self, outcome: CommandOutcome) -> Result<Effect, String> {
         match outcome {
-            CommandOutcome::SessionSwitched(switch) => {
-                if chaz_core::session::jobs::is_job_session(&switch.db).await {
-                    return jobs::open_tab(
-                        &self.server,
-                        &self.backend,
-                        &switch.session_db_id,
-                        self.notify_tx.clone(),
-                    )
-                    .await
-                    .map(|tab| Effect::Opened(Box::new(tab)));
-                }
-                let server = self.server.clone();
-                let backend = self.backend.clone();
-                let db = switch.db.clone();
-                let id = switch.session_db_id.clone();
-                let mut tab =
-                    supervised::read(async move { build_tab(&server, &backend, db, id).await })
-                        .await?;
-                tab.live.observation = Some(
-                    setup_session(
-                        &self.server,
-                        &switch.db,
-                        self.backend.clone(),
-                        self.approval_tx.clone(),
-                        self.notify_tx.clone(),
-                    )
-                    .await
-                    .map_err(|e| e.to_string())?,
-                );
-                Ok(Effect::Opened(Box::new(tab)))
-            }
+            CommandOutcome::SessionSwitched(switch) => Ok(resolved_open(
+                &self.server,
+                &self.backend,
+                self.approval_tx.clone(),
+                self.notify_tx.clone(),
+                switch,
+            )),
             CommandOutcome::SessionsList(list) => Ok(Effect::Outcome(CommandOutcome::Text(
                 list.into_iter()
                     .map(|s| format!("{} {:?}", s.session_db_id, s.name))
@@ -522,6 +537,64 @@ impl Context {
             .await
             .map_err(|e| e.to_string())?;
         Ok(Effect::Sent)
+    }
+}
+
+/// Resolution and observation installation have different ownership points.
+/// The UI first chooses an existing view or discards stale navigation; only a
+/// new accepted destination continues preparation, ahead of later FIFO actions.
+pub(super) struct Open {
+    server: Arc<Server>,
+    backend: BackendManager,
+    approval_tx: mpsc::Sender<TaggedApproval>,
+    notify_tx: mpsc::Sender<String>,
+    switch: Box<chaz_core::commands::SessionSwitch>,
+}
+pub(super) fn resolved_open(
+    server: &Arc<Server>,
+    backend: &BackendManager,
+    approval_tx: mpsc::Sender<TaggedApproval>,
+    notify_tx: mpsc::Sender<String>,
+    switch: Box<chaz_core::commands::SessionSwitch>,
+) -> Effect {
+    Effect::Open(Box::new(Open {
+        server: server.clone(),
+        backend: backend.clone(),
+        approval_tx,
+        notify_tx,
+        switch,
+    }))
+}
+impl Open {
+    async fn prepare(self) -> Result<Effect, String> {
+        if chaz_core::session::jobs::is_job_session(&self.switch.db).await {
+            return jobs::open_tab(
+                &self.server,
+                &self.backend,
+                &self.switch.session_db_id,
+                self.notify_tx,
+            )
+            .await
+            .map(|tab| Effect::Opened(Box::new(tab)));
+        }
+        let server = self.server.clone();
+        let backend = self.backend.clone();
+        let db = self.switch.db.clone();
+        let id = self.switch.session_db_id.clone();
+        let mut tab =
+            supervised::read(async move { build_tab(&server, &backend, db, id).await }).await?;
+        tab.live.observation = Some(
+            setup_session(
+                &self.server,
+                &self.switch.db,
+                self.backend,
+                self.approval_tx,
+                self.notify_tx,
+            )
+            .await
+            .map_err(|e| e.to_string())?,
+        );
+        Ok(Effect::Opened(Box::new(tab)))
     }
 }
 

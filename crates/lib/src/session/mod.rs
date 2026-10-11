@@ -1779,7 +1779,10 @@ impl Session {
     }
 
     /// Mutate session metadata in the session's own DB.
-    /// The closure receives the current meta (default if unset) and may modify it.
+    /// The closure receives the current meta (default only for absent fields).
+    /// Storage/read errors or malformed existing fields refuse the whole update
+    /// before invoking the closure or writing; existing values are not reset.
+    /// See [`update_meta_on_db`] for the shared cross-surface contract.
     pub async fn update_meta<F>(&self, mutator: F) -> anyhow::Result<()>
     where
         F: FnOnce(&mut SessionMeta),
@@ -1979,6 +1982,14 @@ pub async fn try_read_meta_from_db(database: &Database) -> anyhow::Result<Sessio
 }
 
 /// Apply a mutator to the meta DocStore of a session DB and commit.
+///
+/// Strictly read all existing metadata before invoking the mutator. An unreadable
+/// store, wrong field type, malformed JSON or invalid numeric field refuses the
+/// entire update, even when the requested edit targets another field. Only absent
+/// fields receive defaults; a failed read never authorizes overwriting with them.
+/// This applies to every caller, including commands, bridges and runtime/job
+/// metadata writers. Supported legacy metadata formats remain readable. No
+/// malformed-data repair or recovery policy is implemented by this helper.
 pub async fn update_meta_on_db<F>(database: &Database, mutator: F) -> anyhow::Result<()>
 where
     F: FnOnce(&mut SessionMeta),

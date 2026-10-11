@@ -349,6 +349,18 @@ pub(super) fn ui(
     if app.overlay.is_some() {
         ui_overlay(f, app);
     }
+    // The first quit must be visible above every mode and overlay. Leave the
+    // composer, inline editor and picker drafts on screen; do not replace
+    // their footers or introduce another confirmation state.
+    if let Some(warning) = app.operations.exit_warning() {
+        let area = Rect {
+            height: f.area().height.min(1),
+            ..f.area()
+        };
+        f.render_widget(Clear, area);
+        widgets::status_strip(f, area, &warning);
+        app.click_regions.retain(|r| r.y >= area.bottom());
+    }
 }
 
 /// Centered popup rect: `percent_x%` wide × `percent_y%` tall, at least 20×5.

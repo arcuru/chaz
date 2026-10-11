@@ -716,8 +716,8 @@ pub(super) struct App {
     /// In-memory cache of the live provider catalog for this session, set the
     /// first time the picker pulls it and reused on subsequent opens (instant,
     /// no re-fetch). Never persisted — that's the whole point of the in-use
-    /// model store. Cleared by the picker's refresh binding to force a re-pull;
-    /// gone entirely on restart, where the next open re-fetches.
+    /// model store. A refresh bypasses this cache, retaining last-good rows
+    /// until a successful replacement; restart discards the in-memory cache.
     pub(super) session_catalog: Option<Vec<ModelInfo>>,
     /// Index into `model_picker_filtered`, NOT into `model_list`. Resolved
     /// to a `ModelInfo` via `model_list[model_picker_filtered[idx]]`.
@@ -742,8 +742,8 @@ pub(super) struct App {
     /// on these favorites by id-matching against the live catalog before
     /// the merged `model_list` is rebuilt.
     pub(super) model_picker_favorites: Vec<ModelInfo>,
-    /// True while a background `/models` fetch is in flight. Picker shows
-    /// a "Loading…" hint and the catalog rows haven't arrived yet.
+    /// True while a background catalog fetch is in flight. The fetching hint
+    /// can coexist with last-good rows retained from an earlier load.
     pub(super) model_picker_loading: bool,
     model_catalog_task: Option<supervised::Task<()>>,
     model_catalog_ticket: u64,
@@ -2080,22 +2080,13 @@ fn dispatch_picker_selection(
                 .map_err(|_| "Session command needs an open conversation".to_owned())?
         };
         match outcome {
-            CommandOutcome::SessionSwitched(switch) => {
-                let tab_server = server.clone();
-                let tab_backend = backend.clone();
-                let tab_db = switch.db.clone();
-                let tab_id = switch.session_db_id.clone();
-                let mut tab = supervised::read(async move {
-                    build_tab(&tab_server, &tab_backend, tab_db, tab_id).await
-                })
-                .await?;
-                tab.live.observation = Some(
-                    setup_session(&server, &switch.db, backend, approval_tx, notify_tx)
-                        .await
-                        .map_err(|e| e.to_string())?,
-                );
-                Ok(operations::Effect::Opened(Box::new(tab)))
-            }
+            CommandOutcome::SessionSwitched(switch) => Ok(operations::resolved_open(
+                &server,
+                &backend,
+                approval_tx,
+                notify_tx,
+                switch,
+            )),
             CommandOutcome::Error(e) => Err(e),
             outcome => Ok(operations::Effect::Outcome(outcome)),
         }

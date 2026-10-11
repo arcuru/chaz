@@ -7,6 +7,7 @@
 import json
 import html
 import os
+import re
 from pathlib import Path
 import select
 import signal
@@ -269,7 +270,32 @@ security:
                 process.expect_absent("Session:")
                 process.send("\r")
                 process.expect("Job observer")
+                # The known authorized job must also reopen through the hub.
+                # Close first so the hub cannot just focus an existing tab.
+                process.send("\x17")
+                process.expect("unsent-parent-draft")
+                process.send("\x10")
+                process.expect("New session")
+                process.expect_absent("Loading sessions")
+                process.expect("[other]")  # The job row, before the older parent.
+                process.screen_capture(evidence, "job-hub-before")
+                process.send("\x1b[B\r")
+                process.expect("Job observer", timeout=5)
                 process.expect("next-call input")
+                self.assertNotIn("outcome unknown", "\n".join(process.screen.display))
+                self.assertNotIn("job sessions must be opened as observers", "\n".join(process.screen.display))
+                self.assertNotIn("unsent-parent-draft", "\n".join(process.screen.display))
+                self.assertEqual(len(job_calls), 1, "hub observation executed a job")
+                handles = [re.search(r'"session_db_id":"([^"]+)"', message.get("content", ""))
+                           for request in calls for message in request["messages"]
+                           if message.get("role") == "tool"]
+                job_id = next(match.group(1) for match in handles if match)
+                client_log = "".join(path.read_text() for path in (home / "client-state").glob("chaz-tui*.log*"))
+                self.assertFalse(any("Server watching session" in line and job_id in line
+                                     for line in client_log.splitlines()),
+                                 "hub acquired ordinary session registration for the job")
+                process.screen_capture(evidence, "job-hub-reopened")
+                print("JOB HUB CONTRACT: PASS; authorized observer reopened without ordinary registration or model calls")
                 process.resize(80, 24)
                 process.expect("Started · recent activity")
                 process.screen_capture(evidence, "observer-started-80x24")

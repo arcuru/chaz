@@ -184,6 +184,27 @@ pub(super) struct Applied {
     pub(super) follow_up: Option<(String, RefreshKind)>,
 }
 
+/// Retry failed presentation reads and poll activity on the existing tick.
+pub(super) fn request_tick(app: &mut App, tx: &mpsc::Sender<Refresh>) {
+    let requests: Vec<_> = app
+        .tabs
+        .iter()
+        .flat_map(|tab| {
+            [
+                RefreshKind::Session,
+                RefreshKind::Status,
+                RefreshKind::Activity,
+            ]
+            .into_iter()
+            .filter(|kind| *kind == RefreshKind::Activity || tab.live.failed(*kind))
+            .map(|kind| (tab.session_db_id.clone(), kind))
+        })
+        .collect();
+    for (id, kind) in requests {
+        request(app, &id, kind, tx);
+    }
+}
+
 impl App {
     fn next_ticket(&mut self) -> u64 {
         self.refresh_ticket += 1;
@@ -1277,9 +1298,10 @@ mod tests {
             binding_rx.try_recv().is_err(),
             "duplicate per-tab retry spawned"
         );
-        println!(
-            "PARTIAL RECONNECT CONTRACT: PASS; independent handle install, last-good hydration, per-tab retry on same runtime, stale-ticket rejection, no dead-handle write admission"
-        );
+        println!(concat!(
+            "PARTIAL RECONNECT CONTRACT: PASS; independent handle install, last-good hydration, ",
+            "per-tab retry on same runtime, stale-ticket rejection, no dead-handle write admission"
+        ));
         for kind in [
             RefreshKind::Session,
             RefreshKind::Status,

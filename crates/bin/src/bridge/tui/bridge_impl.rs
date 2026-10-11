@@ -20,8 +20,63 @@ impl Bridge for TuiBridge {
         let (connection_tx, mut connection_rx) = mpsc::channel(1);
         let mut probe_task: Option<supervised::Task<()>> = None;
         let mut runtime_task: Option<supervised::Task<()>> = None;
+        let result = self
+            .run_terminal(
+                &mut server,
+                &mut runtime,
+                runtime_path,
+                &connection_tx,
+                &mut connection_rx,
+                &mut probe_task,
+                &mut runtime_task,
+            )
+            .await;
+        if let Some(mut task) = probe_task.take() {
+            task.0.abort();
+            let _ = (&mut task.0).await;
+        }
+        // Reconstruction may include writes: joining it is not cancellation or
+        // rollback. The terminal has already been restored on all exit paths.
+        if let Some(mut task) = runtime_task.take() {
+            // Drain the bounded result channel while joining; otherwise a
+            // completed worker could block shutdown sending its owned result.
+            loop {
+                tokio::select! {
+                    _ = &mut task.0 => break,
+                    Some(message) = connection_rx.recv() => {
+                        if let reconnect::ResultMessage::Rebuilt(Ok(replacement)) = message {
+                            replacement.built.shutdown().await;
+                        }
+                    }
+                }
+            }
+        }
+        while let Ok(message) = connection_rx.try_recv() {
+            if let reconnect::ResultMessage::Rebuilt(Ok(replacement)) = message {
+                replacement.built.shutdown().await;
+            }
+        }
+        if let Some(built) = runtime {
+            built.shutdown().await;
+        }
+        result
+    }
+}
+
+impl TuiBridge {
+    /// Own the live terminal separately from the joined runtime shutdown.
+    #[allow(clippy::too_many_arguments)]
+    async fn run_terminal(
+        &mut self,
+        server: &mut Arc<Server>,
+        runtime: &mut Option<chaz_core::server::BuiltServer>,
+        runtime_path: Option<std::path::PathBuf>,
+        connection_tx: &mpsc::Sender<reconnect::ResultMessage>,
+        connection_rx: &mut mpsc::Receiver<reconnect::ResultMessage>,
+        probe_task: &mut Option<supervised::Task<()>>,
+        runtime_task: &mut Option<supervised::Task<()>>,
+    ) -> anyhow::Result<()> {
         let mut reconnect_allowed = true;
-        let result = async {
         let (approval_tx, mut approval_rx) = mpsc::channel::<TaggedApproval>(8);
         let (notify_tx, mut notify_rx) = mpsc::channel::<String>(64);
         // One-shot-style delivery of background model catalog fetches.
@@ -37,7 +92,7 @@ impl Bridge for TuiBridge {
         // Resolve any directly opened conversation before touching the
         // terminal, so a bad `--session` surfaces as a plain error.
         let launch = launch_session(
-            &server,
+            server,
             self.session.as_deref(),
             self.initial_prompt.is_some(),
         )
@@ -55,13 +110,29 @@ impl Bridge for TuiBridge {
         let mut app = App::hub(agent_names);
         if let Some(session_db) = launch {
             let tab = if chaz_core::session::jobs::is_job_session(&session_db).await {
-                jobs::open_tab(&server, &backend, &session_db.root_id().to_string(), notify_tx.clone()).await.map_err(anyhow::Error::msg)?
+                jobs::open_tab(
+                    server,
+                    &backend,
+                    &session_db.root_id().to_string(),
+                    notify_tx.clone(),
+                )
+                .await
+                .map_err(anyhow::Error::msg)?
             } else {
-            let observation = setup_session(&server, &session_db, backend.clone(), approval_tx.clone(), notify_tx.clone()).await?;
-            let session_db_id = session_db.root_id().to_string();
-            let mut tab = build_tab(&server, &backend, session_db, session_db_id).await.map_err(anyhow::Error::msg)?;
-            tab.live.observation = Some(observation);
-            tab
+                let observation = setup_session(
+                    server,
+                    &session_db,
+                    backend.clone(),
+                    approval_tx.clone(),
+                    notify_tx.clone(),
+                )
+                .await?;
+                let session_db_id = session_db.root_id().to_string();
+                let mut tab = build_tab(server, &backend, session_db, session_db_id)
+                    .await
+                    .map_err(anyhow::Error::msg)?;
+                tab.live.observation = Some(observation);
+                tab
             };
             app.push_tab(tab);
             app.mode = TuiMode::Chat;
@@ -80,13 +151,16 @@ impl Bridge for TuiBridge {
         // An ordinary launch opens the hub — even on an empty install — and
         // creates nothing. The catalog loads in the background.
         if app.tabs.is_empty() {
-            open_session_picker(&mut app, &server, &session_rows_tx);
+            open_session_picker(&mut app, server, &session_rows_tx);
         }
 
         // The run loop never awaits a storage read: backend-dependent state
         // is requested from `refresh` and arrives later as `Action::Refresh`,
         // while the frame shows what is already cached.
-        let initial = app.current().map(|t| t.session_db_id.clone()).unwrap_or_default();
+        let initial = app
+            .current()
+            .map(|t| t.session_db_id.clone())
+            .unwrap_or_default();
         refresh::request(
             &mut app,
             &initial,
@@ -98,32 +172,36 @@ impl Bridge for TuiBridge {
         let mut needs_draw = true;
         'run: loop {
             operations::cancel_closed_reads(&mut app);
-            if !app.backend_available && reconnect_allowed && runtime_task.is_none() && !app.operations.is_pending()
+            if !app.backend_available
+                && reconnect_allowed
+                && runtime_task.is_none()
+                && !app.operations.is_pending()
                 && let Some(path) = runtime_path.clone()
             {
-                let old = runtime.take();
-                let config = self.config.clone();
-                let tabs = app.tabs.iter().map(|t| (t.session_db_id.clone(), t.live.incarnation, t.job.is_some())).collect();
-                let tx = connection_tx.clone(); let approval_tx = approval_tx.clone(); let notify_tx = notify_tx.clone();
-                runtime_task = Some(supervised::Task(tokio::spawn(async move {
-                    let result = supervised::work(async move { Ok(reconnect::rebuild(old, config, path, tabs, approval_tx, notify_tx).await) }).await
-                        .unwrap_or_else(|e| Err((e, false)));
-                    if let Err(e) = tx.send(reconnect::ResultMessage::Rebuilt(result)).await
-                        && let reconnect::ResultMessage::Rebuilt(Ok(replacement)) = e.0
-                    { replacement.built.shutdown().await; }
-                })));
+                *runtime_task = Some(reconnect::spawn_rebuild(
+                    runtime.take(),
+                    self.config.clone(),
+                    path,
+                    &app,
+                    &approval_tx,
+                    &notify_tx,
+                    connection_tx,
+                ));
             }
             if needs_draw {
-                terminal.draw(|f| view::ui(f, &mut app, &server, &backend, &self.config))?;
+                terminal.draw(|f| view::ui(f, &mut app, server, &backend, &self.config))?;
                 // Use this frame's viewport, not the previous frame's cursor or size.
                 if matches!(app.mode, TuiMode::SessionPicker) {
-                    request_session_metadata(&mut app, &server, &session_rows_tx);
+                    request_session_metadata(&mut app, server, &session_rows_tx);
                 }
                 needs_draw = false;
             }
 
-            if app.mode == TuiMode::Jobs && app.jobs.data.observed_at.is_none() && app.jobs.error.is_none() {
-                jobs::refresh(&mut app, &server, &jobs_tx);
+            if app.mode == TuiMode::Jobs
+                && app.jobs.data.observed_at.is_none()
+                && app.jobs.error.is_none()
+            {
+                jobs::refresh(&mut app, server, &jobs_tx);
             }
             // Block for one action, then drain whatever else is already
             // queued (bounded) before drawing again, so a burst of keys,
@@ -139,7 +217,9 @@ impl Bridge for TuiBridge {
                                 // draw first if earlier events in this batch
                                 // moved anything.
                                 if needs_draw && matches!(m.kind, MouseEventKind::Down(_)) {
-                                    terminal.draw(|f| view::ui(f, &mut app, &server, &backend, &self.config))?;
+                                    terminal.draw(|f| {
+                                        view::ui(f, &mut app, server, &backend, &self.config)
+                                    })?;
                                     needs_draw = false;
                                 }
                                 Action::Mouse(m)
@@ -164,27 +244,23 @@ impl Bridge for TuiBridge {
                     Some(loaded) = jobs_rx.recv() => Action::JobsLoaded(loaded),
                     _ = activity_tick.tick() => {
                         if app.backend_available {
-                            if app.mode == TuiMode::Jobs { jobs::refresh(&mut app, &server, &jobs_tx); }
-                            reconnect::request_tabs(&mut app, &server, &backend, &approval_tx, &notify_tx, &connection_tx);
-                            let requests: Vec<_> = app.tabs.iter().flat_map(|tab| [refresh::RefreshKind::Session, refresh::RefreshKind::Status, refresh::RefreshKind::Activity].into_iter().filter(|kind| *kind == refresh::RefreshKind::Activity || tab.live.failed(*kind)).map(|kind| (tab.session_db_id.clone(), kind))).collect();
-                            for (id, kind) in requests { refresh::request(&mut app, &id, kind, &refresh_tx); }
+                            if app.mode == TuiMode::Jobs {
+                                jobs::refresh(&mut app, server, &jobs_tx);
+                            }
+                            reconnect::request_tabs(
+                                &mut app, server, &backend, &approval_tx, &notify_tx, connection_tx,
+                            );
+                            refresh::request_tick(&mut app, &refresh_tx);
                         }
                         if app.backend_available && runtime_path.is_some() && probe_task.is_none()
                             && server.registry().instance().remote_connection().is_some()
                         {
-                            let instance = server.registry().instance().clone(); let tx = connection_tx.clone();
-                            probe_task = Some(supervised::Task(tokio::spawn(async move {
-                                let result = supervised::read(async move {
-                                    match chaz_core::instance::probe_service(&instance).await {
-                                        Ok(()) => Ok(Ok(())),
-                                        Err(e) => { let transient = e.is_transient_service(); Ok(Err((e.to_string(), transient))) }
-                                    }
-                                }).await.unwrap_or_else(|e| Err((e, false)));
-                                let _ = tx.send(reconnect::ResultMessage::Probe(result)).await;
-                            })));
+                            *probe_task = Some(reconnect::spawn_probe(server, connection_tx));
                         }
                         needs_draw |= app.operations.warn_if_late();
-                        if !app.session_row_errors.is_empty() && app.mode == TuiMode::SessionPicker {
+                        if !app.session_row_errors.is_empty()
+                            && app.mode == TuiMode::SessionPicker
+                        {
                             app.session_row_errors.clear();
                             needs_draw = true;
                         }
@@ -199,20 +275,38 @@ impl Bridge for TuiBridge {
                     needs_draw = true;
                 }
 
-                let navigation_before = (app.mode, app.current().map(|t| t.live.incarnation), app.peer_settings_index, app.session_settings_index, app.peer_agents_cursor);
+                let navigation_before = (
+                    app.mode,
+                    app.current().map(|t| t.live.incarnation),
+                    app.peer_settings_index,
+                    app.session_settings_index,
+                    app.peer_agents_cursor,
+                );
                 match action {
                     Action::Key(key) => {
                         if key.code == KeyCode::Char('c')
                             && key.modifiers.contains(KeyModifiers::CONTROL)
                         {
                             app.should_quit = app.operations.request_exit();
-                        } else if key.code == KeyCode::Char('g') && key.modifiers.contains(KeyModifiers::CONTROL) {
-                            app.mode = if app.mode == TuiMode::Jobs { TuiMode::Chat } else { TuiMode::Jobs };
+                        } else if key.code == KeyCode::Char('g')
+                            && key.modifiers.contains(KeyModifiers::CONTROL)
+                        {
+                            app.mode = if app.mode == TuiMode::Jobs {
+                                TuiMode::Chat
+                            } else {
+                                TuiMode::Jobs
+                            };
                             app.ensure_view();
-                            if app.mode == TuiMode::Jobs { jobs::refresh(&mut app, &server, &jobs_tx); }
+                            if app.mode == TuiMode::Jobs {
+                                jobs::refresh(&mut app, server, &jobs_tx);
+                            }
                         } else if key.code == KeyCode::F(2) {
-                            if app.mode == TuiMode::Jobs { app.jobs.details = !app.jobs.details; app.jobs.detail_scroll = 0; }
-                            else if app.mode == TuiMode::Chat { jobs::toggle_tab_details(app.active_mut()); }
+                            if app.mode == TuiMode::Jobs {
+                                app.jobs.details = !app.jobs.details;
+                                app.jobs.detail_scroll = 0;
+                            } else if app.mode == TuiMode::Chat {
+                                jobs::toggle_tab_details(app.active_mut());
+                            }
                         } else if key.code == KeyCode::Char('d')
                             && key.modifiers.contains(KeyModifiers::CONTROL)
                         {
@@ -224,11 +318,13 @@ impl Bridge for TuiBridge {
                         } else if key.code == KeyCode::Char('w')
                             && key.modifiers.contains(KeyModifiers::CONTROL)
                         {
-                            if app.mode == TuiMode::Chat { app.close_tab_at(app.active_tab); }
+                            if app.mode == TuiMode::Chat {
+                                app.close_tab_at(app.active_tab);
+                            }
                         } else if key.code == KeyCode::Char('s')
                             && key.modifiers.contains(KeyModifiers::CONTROL)
                         {
-                            // Ctrl+, opens Settings, picking scope from the
+                            // Ctrl+S opens Settings, picking scope from the
                             // current mode. Chat → Session (routed through
                             // ChatAction so the meta snapshot gets seeded);
                             // picker → Peer (no snapshot needed). Already in
@@ -238,7 +334,7 @@ impl Bridge for TuiBridge {
                                     handle_chat_action(
                                         ChatAction::OpenSettings(SettingsScope::Session),
                                         &mut app,
-                                        &server,
+                                        server,
                                         &backend,
                                         &self.secrets,
                                         &approval_tx,
@@ -255,15 +351,19 @@ impl Bridge for TuiBridge {
                         } else if key.code == KeyCode::Char('p')
                             && key.modifiers.contains(KeyModifiers::CONTROL)
                         {
-                            // Ctrl+P toggles the session picker. In chat mode it
-                            // opens it; in picker mode it dismisses back to chat.
+                            // Ctrl+P toggles the session hub. In chat mode it
+                            // opens it; in the hub it returns to the open
+                            // conversation, or reloads a hub that has none (or
+                            // whose catalog failed to load).
                             match app.mode {
-                                TuiMode::Jobs => open_session_picker(&mut app, &server, &session_rows_tx),
+                                TuiMode::Jobs => {
+                                    open_session_picker(&mut app, server, &session_rows_tx)
+                                }
                                 TuiMode::Chat => {
                                     handle_chat_action(
                                         ChatAction::OpenPicker,
                                         &mut app,
-                                        &server,
+                                        server,
                                         &backend,
                                         &self.secrets,
                                         &approval_tx,
@@ -275,8 +375,10 @@ impl Bridge for TuiBridge {
                                 TuiMode::SessionPicker => {
                                     if app.tabs.is_empty() || app.session_picker_error.is_some() {
                                         app.session_list_fresh = false;
-                                        open_session_picker(&mut app, &server, &session_rows_tx);
-                                    } else { app.mode = TuiMode::Chat; }
+                                        open_session_picker(&mut app, server, &session_rows_tx);
+                                    } else {
+                                        app.mode = TuiMode::Chat;
+                                    }
                                 }
                                 TuiMode::ModelPicker => {
                                     app.mode = app.model_picker_caller;
@@ -301,21 +403,22 @@ impl Bridge for TuiBridge {
                                     session_db_id,
                                     name,
                                 } => {
-                                    apply_picker_rename(&mut app, &server, session_db_id, name);
+                                    apply_picker_rename(&mut app, server, session_db_id, name);
                                     continue;
                                 }
                                 input::OverlayKey::NotConsumed => {}
                             }
                             match app.mode {
-                                TuiMode::Jobs => jobs::handle_key(&mut app, key, &server, &backend, &notify_tx, &jobs_tx),
+                                TuiMode::Jobs => jobs::handle_key(
+                                    &mut app, key, server, &backend, &notify_tx, &jobs_tx,
+                                ),
                                 TuiMode::Chat => {
-                                    if let Some(chat_action) =
-                                        input::handle_chat_key(&mut app, key)
+                                    if let Some(chat_action) = input::handle_chat_key(&mut app, key)
                                     {
                                         handle_chat_action(
                                             chat_action,
                                             &mut app,
-                                            &server,
+                                            server,
                                             &backend,
                                             &self.secrets,
                                             &approval_tx,
@@ -331,7 +434,7 @@ impl Bridge for TuiBridge {
                                         dispatch_picker_selection(
                                             selected,
                                             &mut app,
-                                            &server,
+                                            server,
                                             &backend,
                                             &approval_tx,
                                             &notify_tx,
@@ -344,7 +447,7 @@ impl Bridge for TuiBridge {
                                             dispatch_model_selection(
                                                 model_id,
                                                 &mut app,
-                                                &server,
+                                                server,
                                                 &backend,
                                                 &self.secrets,
                                                 &approval_tx,
@@ -370,7 +473,7 @@ impl Bridge for TuiBridge {
                                     handle_settings_outcome(
                                         outcome,
                                         &mut app,
-                                        &server,
+                                        server,
                                         &backend,
                                         &self.secrets,
                                         &approval_tx,
@@ -390,7 +493,7 @@ impl Bridge for TuiBridge {
                                     dispatch_picker_selection(
                                         selected,
                                         &mut app,
-                                        &server,
+                                        server,
                                         &backend,
                                         &approval_tx,
                                         &notify_tx,
@@ -409,7 +512,7 @@ impl Bridge for TuiBridge {
                                         dispatch_model_selection(
                                             model_id,
                                             &mut app,
-                                            &server,
+                                            server,
                                             &backend,
                                             &self.secrets,
                                             &approval_tx,
@@ -421,7 +524,9 @@ impl Bridge for TuiBridge {
                         }
                     }
                     Action::SessionChanged(id) => {
-                        if !app.backend_available { continue; }
+                        if !app.backend_available {
+                            continue;
+                        }
                         // Coalesced: a burst of writes while a reload is running
                         // costs one follow-up reload, not one per write.
                         refresh::request(&mut app, &id, refresh::RefreshKind::Session, &refresh_tx);
@@ -436,7 +541,7 @@ impl Bridge for TuiBridge {
                     }
                     Action::Connection(msg) => match msg {
                         reconnect::ResultMessage::Probe(result) => {
-                            probe_task = None;
+                            *probe_task = None;
                             if let Err((error, transient)) = result {
                                 if transient {
                                     tracing::warn!("TUI service disconnected: {error}");
@@ -449,57 +554,105 @@ impl Bridge for TuiBridge {
                             }
                         }
                         reconnect::ResultMessage::Rebuilt(result) => {
-                            runtime_task = None;
+                            *runtime_task = None;
                             match result {
                                 Ok(mut replacement) => {
-                                    server = replacement.built.server.clone();
+                                    *server = replacement.built.server.clone();
                                     self.secrets = replacement.built.secret_store.clone();
-                                    backend = BackendManager::new(&self.config.backends, self.secrets.clone());
+                                    backend = BackendManager::new(
+                                        &self.config.backends,
+                                        self.secrets.clone(),
+                                    );
                                     reconnect::apply(&mut app, &mut replacement);
-                                    if app.mode == TuiMode::Jobs { jobs::refresh(&mut app, &server, &jobs_tx); }
-                                    let ids: Vec<_> = app.tabs.iter().map(|t| t.session_db_id.clone()).collect();
-                                    for id in ids {
-                                        refresh::request(&mut app, &id, refresh::RefreshKind::Session, &refresh_tx);
-                                        refresh::request(&mut app, &id, refresh::RefreshKind::Status, &refresh_tx);
+                                    if app.mode == TuiMode::Jobs {
+                                        jobs::refresh(&mut app, server, &jobs_tx);
                                     }
-                                    runtime = Some(replacement.built);
-                                    if app.mode == TuiMode::SessionPicker { open_session_picker(&mut app, &server, &session_rows_tx); }
+                                    let ids: Vec<_> =
+                                        app.tabs.iter().map(|t| t.session_db_id.clone()).collect();
+                                    for id in ids {
+                                        refresh::request(
+                                            &mut app,
+                                            &id,
+                                            refresh::RefreshKind::Session,
+                                            &refresh_tx,
+                                        );
+                                        refresh::request(
+                                            &mut app,
+                                            &id,
+                                            refresh::RefreshKind::Status,
+                                            &refresh_tx,
+                                        );
+                                    }
+                                    *runtime = Some(replacement.built);
+                                    if app.mode == TuiMode::SessionPicker {
+                                        open_session_picker(&mut app, server, &session_rows_tx);
+                                    }
                                 }
                                 Err((error, transient)) => {
                                     reconnect_allowed = transient;
-                                    app.operations.notice = Some(format!("Reconnect failed: {error}; cached data retained"));
+                                    app.operations.notice = Some(format!(
+                                        "Reconnect failed: {error}; cached data retained"
+                                    ));
                                     // Park a retry rather than spin if the socket is still absent.
                                     if transient {
                                         let tx = connection_tx.clone();
-                                        runtime_task = Some(supervised::Task(tokio::spawn(async move {
-                                            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                                            let _ = tx.send(reconnect::ResultMessage::Retry).await;
-                                        })));
+                                        *runtime_task =
+                                            Some(supervised::Task(tokio::spawn(async move {
+                                                tokio::time::sleep(std::time::Duration::from_secs(
+                                                    5,
+                                                ))
+                                                .await;
+                                                let _ =
+                                                    tx.send(reconnect::ResultMessage::Retry).await;
+                                            })));
                                     }
                                 }
                             }
                         }
                         reconnect::ResultMessage::Tab { ticket, reopened } => {
                             if let Some(id) = reconnect::apply_retry(&mut app, ticket, *reopened) {
-                                refresh::request(&mut app, &id, refresh::RefreshKind::Session, &refresh_tx);
-                                refresh::request(&mut app, &id, refresh::RefreshKind::Status, &refresh_tx);
+                                refresh::request(
+                                    &mut app,
+                                    &id,
+                                    refresh::RefreshKind::Session,
+                                    &refresh_tx,
+                                );
+                                refresh::request(
+                                    &mut app,
+                                    &id,
+                                    refresh::RefreshKind::Status,
+                                    &refresh_tx,
+                                );
                             }
                         }
-                        reconnect::ResultMessage::Retry => { runtime_task = None; }
+                        reconnect::ResultMessage::Retry => {
+                            *runtime_task = None;
+                        }
                     },
                     Action::Operation(msg) => {
                         operations::apply(&mut app, msg);
                         if app.backend_available {
-                            let ids: Vec<_> = app.tabs.iter().map(|t| t.session_db_id.clone()).collect();
+                            let ids: Vec<_> =
+                                app.tabs.iter().map(|t| t.session_db_id.clone()).collect();
                             for id in ids {
-                                refresh::request(&mut app, &id, refresh::RefreshKind::Session, &refresh_tx);
-                                refresh::request(&mut app, &id, refresh::RefreshKind::Status, &refresh_tx);
+                                refresh::request(
+                                    &mut app,
+                                    &id,
+                                    refresh::RefreshKind::Session,
+                                    &refresh_tx,
+                                );
+                                refresh::request(
+                                    &mut app,
+                                    &id,
+                                    refresh::RefreshKind::Status,
+                                    &refresh_tx,
+                                );
                             }
                         }
                     }
                     Action::Refresh(msg) => {
                         let applied = refresh::apply(&mut app, msg, |agent, meta| {
-                            refresh::resolve(&server, &backend, agent, meta)
+                            refresh::resolve(server, &backend, agent, meta)
                         });
                         needs_draw |= applied.redraw;
                         if let Some((id, kind)) = applied.follow_up {
@@ -507,7 +660,13 @@ impl Bridge for TuiBridge {
                         }
                     }
                     Action::ApprovalRequest((id, observation_id, exchange)) => {
-                        if let Some(idx) = app.tab_index_for(&id).filter(|&i| app.tabs[i].live.observation.as_ref().is_some_and(|o| o.id == observation_id)) {
+                        if let Some(idx) = app.tab_index_for(&id).filter(|&i| {
+                            app.tabs[i]
+                                .live
+                                .observation
+                                .as_ref()
+                                .is_some_and(|o| o.id == observation_id)
+                        }) {
                             app.tabs[idx].pending_approval = Some(exchange);
                         } else {
                             // Tab was closed but an approval snuck through — deny
@@ -525,19 +684,40 @@ impl Bridge for TuiBridge {
                         SessionLoad::Catalog { generation, result } => {
                             apply_session_catalog_result(&mut app, generation, result);
                         }
-                        SessionLoad::Row { generation, id, result } => {
+                        SessionLoad::Row {
+                            generation,
+                            id,
+                            result,
+                        } => {
                             apply_session_row(&mut app, generation, id, result);
                         }
                     },
                 }
 
-                let navigation_after = (app.mode, app.current().map(|t| t.live.incarnation), app.peer_settings_index, app.session_settings_index, app.peer_agents_cursor);
+                let navigation_after = (
+                    app.mode,
+                    app.current().map(|t| t.live.incarnation),
+                    app.peer_settings_index,
+                    app.session_settings_index,
+                    app.peer_agents_cursor,
+                );
                 if navigation_before != navigation_after {
                     app.navigation_generation += 1;
-                    if app.backend_available && matches!(app.mode, TuiMode::Chat | TuiMode::Settings(SettingsScope::Session))
+                    if app.backend_available
+                        && matches!(
+                            app.mode,
+                            TuiMode::Chat | TuiMode::Settings(SettingsScope::Session)
+                        )
                         && let Some(id) = app.current().map(|t| t.session_db_id.clone())
                     {
-                        if matches!(app.mode, TuiMode::Settings(SettingsScope::Session)) { refresh::request(&mut app, &id, refresh::RefreshKind::Session, &refresh_tx); }
+                        if matches!(app.mode, TuiMode::Settings(SettingsScope::Session)) {
+                            refresh::request(
+                                &mut app,
+                                &id,
+                                refresh::RefreshKind::Session,
+                                &refresh_tx,
+                            );
+                        }
                         refresh::request(&mut app, &id, refresh::RefreshKind::Status, &refresh_tx);
                     }
                 }
@@ -554,42 +734,16 @@ impl Bridge for TuiBridge {
                 }
             }
 
-            ensure_view(&mut app, &server, &session_rows_tx);
+            ensure_view(&mut app, server, &session_rows_tx);
         }
 
         let exit_report = app.operations.exit_report();
         drop(app);
         drop(terminal);
         drop(_terminal_owner);
-        if let Some(report) = exit_report { eprintln!("{report}"); }
+        if let Some(report) = exit_report {
+            eprintln!("{report}");
+        }
         Ok::<(), anyhow::Error>(())
-        }.await;
-        if let Some(mut task) = probe_task.take() {
-            task.0.abort();
-            let _ = (&mut task.0).await;
-        }
-        // Reconstruction may include writes: joining it is not cancellation or
-        // rollback. The terminal has already been restored on all exit paths.
-        if let Some(mut task) = runtime_task.take() {
-            // Drain the bounded result channel while joining; otherwise a
-            // completed worker could block shutdown sending its owned result.
-            loop {
-                tokio::select! {
-                    _ = &mut task.0 => break,
-                    Some(message) = connection_rx.recv() => {
-                        if let reconnect::ResultMessage::Rebuilt(Ok(replacement)) = message { replacement.built.shutdown().await; }
-                    }
-                }
-            }
-        }
-        while let Ok(message) = connection_rx.try_recv() {
-            if let reconnect::ResultMessage::Rebuilt(Ok(replacement)) = message {
-                replacement.built.shutdown().await;
-            }
-        }
-        if let Some(built) = runtime {
-            built.shutdown().await;
-        }
-        result
     }
 }

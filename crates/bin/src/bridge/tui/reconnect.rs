@@ -81,6 +81,60 @@ async fn reopen(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+pub(super) fn spawn_rebuild(
+    old: Option<BuiltServer>,
+    config: Config,
+    path: PathBuf,
+    app: &App,
+    approval_tx: &mpsc::Sender<TaggedApproval>,
+    notify_tx: &mpsc::Sender<String>,
+    tx: &mpsc::Sender<ResultMessage>,
+) -> supervised::Task<()> {
+    let tabs = app
+        .tabs
+        .iter()
+        .map(|t| (t.session_db_id.clone(), t.live.incarnation, t.job.is_some()))
+        .collect();
+    let tx = tx.clone();
+    let approval_tx = approval_tx.clone();
+    let notify_tx = notify_tx.clone();
+    supervised::Task(tokio::spawn(async move {
+        let result = supervised::work(async move {
+            Ok(rebuild(old, config, path, tabs, approval_tx, notify_tx).await)
+        })
+        .await
+        .unwrap_or_else(|e| Err((e, false)));
+        if let Err(e) = tx.send(ResultMessage::Rebuilt(result)).await
+            && let ResultMessage::Rebuilt(Ok(replacement)) = e.0
+        {
+            replacement.built.shutdown().await;
+        }
+    }))
+}
+
+pub(super) fn spawn_probe(
+    server: &Server,
+    tx: &mpsc::Sender<ResultMessage>,
+) -> supervised::Task<()> {
+    let instance = server.registry().instance().clone();
+    let tx = tx.clone();
+    supervised::Task(tokio::spawn(async move {
+        let result = supervised::read(async move {
+            match instance::probe_service(&instance).await {
+                Ok(()) => Ok(Ok(())),
+                Err(e) => {
+                    let transient = e.is_transient_service();
+                    Ok(Err((e.to_string(), transient)))
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|e| Err((e, false)));
+        let _ = tx.send(ResultMessage::Probe(result)).await;
+    }))
+}
+
 pub(super) async fn rebuild(
     old: Option<BuiltServer>,
     mut config: Config,
@@ -148,7 +202,13 @@ pub(super) fn disconnect(app: &mut App) {
         tab.live.rebind_needed = true;
         tab.live.unbound = true;
     }
-    app.operations.notice = Some("Backend disconnected — cached data is stale; reconnecting after accepted actions settle. No writes replayed".into());
+    app.operations.notice = Some(
+        concat!(
+            "Backend disconnected — cached data is stale; ",
+            "reconnecting after accepted actions settle. No writes replayed"
+        )
+        .into(),
+    );
 }
 
 fn apply_tab(app: &mut App, reopened: Reopened) -> Option<String> {

@@ -485,6 +485,18 @@ Named sessions can be referenced anywhere a session identifier is accepted:
 
 The name appears in the status bar, session hub, and `/info` output. Names must be unique across all sessions. Use `/name` (with no argument) to clear the name.
 
+### Metadata edits need readable stored state
+
+Session metadata edits, including `/name`, `/model` and agent/settings changes,
+first read all existing metadata. A storage failure or malformed field refuses
+the whole edit, even if it targets another field. Missing fields are allowed;
+unreadable fields are not treated as empty or reset to defaults.
+
+This also applies to bridge participation settings and runtime, agent and job
+metadata updates. On a transport failure, restore the connection before editing
+again. Malformed stored metadata stays write-blocking; reopening the TUI or
+retrying another edit does not repair it. There is no automatic reset policy.
+
 ## Model Picker
 
 Pick a model for a specific scope — the whole session, or one agent in this session. `/models` opens Session Settings → Models, where each row is a scope you can edit:
@@ -575,7 +587,11 @@ and opening a stored session leaves the hub usable while its data loads.
 Each tab owns its transcript, name/models, extension strip and live-turn count.
 A completion addresses the requesting tab incarnation, never whichever tab
 happens to be focused. Closing and reopening a tab cannot apply its old results.
-A delayed open does not take focus after newer local navigation.
+A delayed open does not take focus after newer local navigation. Ordinary opens
+resolve their destination before installing observation: `/join` to an open
+tab reuses its live approval receiver. New destinations finish observation
+setup before exposing their composer. Jobs opened from either Jobs or the hub
+remain authorized observers, never ordinary execution sessions.
 
 | Trigger / display                      | Behavior                                                                          |
 | -------------------------------------- | --------------------------------------------------------------------------------- |
@@ -589,6 +605,11 @@ A delayed open does not take focus after newer local navigation.
 | Quit with unfinished actions           | Esc (without popup), Ctrl+C and `/quit` warn first; repeat to abandon queued work |
 
 ### Cached is not confirmed
+
+The first quit with pending work shows a top-of-screen `Quit again to exit`
+warning in every mode, including Settings editors, model selection and overlays.
+Drafts remain intact and visible; a second explicit quit confirms exit. An open
+completion popup still consumes the first Esc without arming quit.
 
 Reads have a bounded wait and supervised panic/cancellation handling. A failed
 read releases its slot for recovery without clearing cached data or restoring
@@ -615,8 +636,9 @@ refresh independently. A tab that could not reopen retries on the healthy runtim
 without restarting other tabs. That tab refuses backend writes until its handle
 is available, but its cached view and draft remain usable. Admission/reconnect
 notices clear on acceptance, completion or recovery; unresolved write outcomes
-remain visible independently. A slow health read alone is not grounds to replace a runtime. Configuration/login errors are displayed,
-not retried indefinitely.
+remain visible independently. A slow health read alone is not grounds to
+replace a runtime. Configuration/login errors are displayed, not retried
+indefinitely.
 
 Pending keypresses and wheel notches are handled in order, but can draw as one
 frame. Pointer motion is ignored without redrawing. Rendering reuses wrapped

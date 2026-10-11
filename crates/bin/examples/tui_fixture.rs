@@ -37,9 +37,13 @@ async fn main() -> anyhow::Result<()> {
                         match line?.as_deref() {
                             Some("stop") => {
                                 let (shutdown, task) = running.take().expect("service running");
-                                drop(shutdown); task.await??;
+                                drop(shutdown);
+                                task.await??;
                                 println!("fixture service stopped");
-                                anyhow::ensure!(lines.next_line().await?.as_deref() == Some("start"), "expected explicit start");
+                                anyhow::ensure!(
+                                    lines.next_line().await?.as_deref() == Some("start"),
+                                    "expected explicit start"
+                                );
                             }
                             None | Some("quit") => break,
                             _ => anyhow::bail!("unknown fixture command"),

@@ -11,7 +11,23 @@ async fn runtime(dir: &std::path::Path) -> BuiltServer {
     )
     .await
     .unwrap();
-    let mut config: Config = serde_yaml::from_str(&format!("execution: client\nstate_dir: {0}\neidetica:\n  connection: sqlite://{0}/unused.db\n  login:\n    username: ui-transitions\n    passwordless: true\nagents:\n  - name: a\n  - name: b\n  - name: c\ndefault_agents: [a, b]\n", dir.display())).unwrap();
+    let mut config: Config = serde_yaml::from_str(&format!(
+        r#"execution: client
+state_dir: {0}
+eidetica:
+  connection: sqlite://{0}/unused.db
+  login:
+    username: ui-transitions
+    passwordless: true
+agents:
+  - name: a
+  - name: b
+  - name: c
+default_agents: [a, b]
+"#,
+        dir.display()
+    ))
+    .unwrap();
     chaz_core::server::build(
         &mut config,
         instance,
@@ -341,5 +357,197 @@ async fn uncertain_job_publication_identity_survives_close_and_reopen() {
         );
         app.close_tab_at(0);
     }
+    built.shutdown().await;
+}
+
+#[tokio::test]
+async fn pending_exit_banner_wins_in_all_modes_without_consuming_edits() {
+    let dir = tempfile::tempdir().unwrap();
+    let built = runtime(dir.path()).await;
+    let backend = BackendManager::new(&None, built.secret_store.clone());
+    let (_, db) = built.registry.create_session(Some("tui")).await.unwrap();
+    let id = db.root_id().to_string();
+    let mut app = App::new(
+        HashSet::new(),
+        build_tab(&built.server, &backend, db, id).await.unwrap(),
+    );
+    app.input = "composer-draft".into();
+    operations::submit(
+        &mut app,
+        true,
+        Some("accepted-write".into()),
+        std::future::pending(),
+    );
+    assert!(!app.operations.request_exit());
+    let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+    for mode in [
+        TuiMode::Chat,
+        TuiMode::Jobs,
+        TuiMode::SessionPicker,
+        TuiMode::Settings(SettingsScope::Peer),
+        TuiMode::Settings(SettingsScope::Session),
+        TuiMode::ModelPicker,
+    ] {
+        app.mode = mode;
+        app.settings_prompt = Some(SettingsPrompt {
+            label: "edit".into(),
+            input: "inline-draft".into(),
+            cursor: 12,
+            intent: SettingsPromptIntent::AddPeerDefault,
+        });
+        app.model_search = "model-draft".into();
+        // Later transient notices cannot conceal the armed decision either.
+        app.operations.notice = Some("another notice".into());
+        for overlay in [
+            None,
+            Some(Overlay::Help { scroll: 0 }),
+            Some(Overlay::RenamePrompt {
+                session_db_id: "rename-target".into(),
+                title: "Rename".into(),
+                input: "rename-draft".into(),
+                cursor: 12,
+            }),
+        ] {
+            app.overlay = overlay;
+            terminal
+                .draw(|f| view::ui(f, &mut app, &built.server, &backend, &Config::default()))
+                .unwrap();
+            let text: String = terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|c| c.symbol())
+                .collect();
+            assert!(text.contains("Quit again"), "armed quit hidden in {mode:?}");
+            assert_eq!(app.input, "composer-draft");
+            assert_eq!(app.settings_prompt.as_ref().unwrap().input, "inline-draft");
+            assert!(app.operations.is_pending());
+        }
+    }
+    assert!(app.operations.request_exit());
+    assert!(
+        app.operations
+            .exit_report()
+            .unwrap()
+            .contains("accepted-write")
+    );
+    drop(app);
+    built.shutdown().await;
+}
+
+#[tokio::test]
+async fn ordinary_open_candidates_do_not_register_before_view_ownership() {
+    let dir = tempfile::tempdir().unwrap();
+    let built = runtime(dir.path()).await;
+    let backend = BackendManager::new(&None, built.secret_store.clone());
+    let (_, db) = built.registry.create_session(Some("tui")).await.unwrap();
+    let id = db.root_id().to_string();
+    let (approval, _) = mpsc::channel(8);
+    let (notify, _) = mpsc::channel(64);
+    let mut app = App::hub(HashSet::new());
+    let ctx = operation_context(
+        &built.server,
+        &backend,
+        &built.secret_store,
+        &approval,
+        &notify,
+    );
+    operations::submit(
+        &mut app,
+        true,
+        None,
+        ctx.command(Command::SwitchSession(id.clone()), None, None),
+    );
+    let result = app.operations.recv().await.unwrap();
+    assert!(
+        !built.server.is_session_open(&id).await,
+        "candidate registered before ownership"
+    );
+    app.navigation_generation += 1; // Discard after newer navigation.
+    operations::apply(&mut app, result);
+    assert!(app.tabs.is_empty());
+    assert!(
+        !built.server.is_session_open(&id).await,
+        "discarded open installed a receiver"
+    );
+
+    let ctx = operation_context(
+        &built.server,
+        &backend,
+        &built.secret_store,
+        &approval,
+        &notify,
+    );
+    operations::submit(
+        &mut app,
+        true,
+        None,
+        ctx.command(Command::SwitchSession(id.clone()), None, None),
+    );
+    let following_server = built.server.clone();
+    let following_id = id.clone();
+    operations::submit(
+        &mut app,
+        true,
+        Some("following action".into()),
+        async move {
+            assert!(
+                following_server.is_session_open(&following_id).await,
+                "later action ran before open registration completed"
+            );
+            Ok(operations::Effect::Sent)
+        },
+    );
+    let result = app.operations.recv().await.unwrap();
+    operations::apply(&mut app, result);
+    assert!(
+        app.operations
+            .exit_report()
+            .unwrap()
+            .contains("following action")
+    );
+    assert!(
+        app.tabs.is_empty(),
+        "view exposed before observation installation"
+    );
+    let result = app.operations.recv().await.unwrap();
+    operations::apply(&mut app, result);
+    assert_eq!(app.active().session_db_id, id);
+    assert!(built.server.is_session_open(&id).await);
+    let result = app.operations.recv().await.unwrap();
+    operations::apply(&mut app, result);
+    assert!(!app.operations.is_pending());
+    let observation = app.active().live.observation.as_ref().unwrap().id;
+    let incarnation = app.active().live.incarnation;
+    app.input = "retained-draft".into();
+    for stale in [false, true] {
+        let ctx = operation_context(
+            &built.server,
+            &backend,
+            &built.secret_store,
+            &approval,
+            &notify,
+        );
+        operations::submit(
+            &mut app,
+            true,
+            None,
+            ctx.command(Command::SwitchSession(id.clone()), None, None),
+        );
+        let result = app.operations.recv().await.unwrap();
+        if stale {
+            app.navigation_generation += 1;
+        }
+        operations::apply(&mut app, result);
+        assert_eq!(app.tabs.len(), 1);
+        assert_eq!(app.active().live.incarnation, incarnation);
+        assert_eq!(
+            app.active().live.observation.as_ref().unwrap().id,
+            observation
+        );
+        assert_eq!(app.input, "retained-draft");
+    }
+    drop(app);
     built.shutdown().await;
 }
