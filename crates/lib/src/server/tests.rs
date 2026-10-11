@@ -7492,6 +7492,7 @@ async fn a_stop_that_lands_before_the_turn_starts_still_stops_it() {
                     turns: server.turns.clone(),
                 },
                 None,
+                None,
             )
             .await;
         await_no_processing(&server, &sid).await;
@@ -8213,6 +8214,7 @@ async fn job_wait_executor_shutdown_and_claim_loss_stop_observation_or_reacquisi
                         turns: server.turns.clone(),
                     },
                     Some(permit),
+                    None,
                 )
                 .await;
             tokio::time::timeout(Duration::from_secs(5), entered.notified())
@@ -8598,3 +8600,6 @@ async fn required_context_strategy_refuses_and_recovers_on_the_executor() {
     )));
     server.shutdown().await;
 }
+
+#[path = "wait_resume_tests.rs"]
+mod wait_resume;

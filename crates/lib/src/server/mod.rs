@@ -71,6 +71,9 @@ struct SessionRuntimeRecorder {
     terminal: std::sync::Mutex<Option<TurnTranscriptRecord>>,
     explicit_bridge_send: AtomicBool,
     agent_name: String,
+    /// The session state this attempt's context was assembled from. Without
+    /// it a wait cannot be reconstructed, so none is checkpointed.
+    context_snapshot: Option<eidetica::Snapshot>,
     job_input: bool,
     #[cfg(test)]
     fail_after: Arc<std::sync::Mutex<Option<usize>>>,
@@ -200,6 +203,45 @@ impl runtime::RuntimeRecorder for SessionRuntimeRecorder {
                 self.explicit_bridge_send.store(true, Ordering::Release);
             }
             Ok(())
+        })
+    }
+
+    fn checkpoint_job_wait<'a>(
+        &'a self,
+        wait: runtime::JobWaitIntent,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(async move {
+            let Some(snapshot) = self.context_snapshot.clone() else {
+                return Err("turn context has no recorded snapshot".into());
+            };
+            let checkpoint = crate::session::wait_resume::JobWaitCheckpoint::new(
+                self.request_id.clone(),
+                self.attempt_id.clone(),
+                self.agent_name.clone(),
+                snapshot,
+                wait,
+            );
+            self.session
+                .lock()
+                .await
+                .record_job_wait_checkpoint(&checkpoint)
+                .await
+                .map_err(|error| format!("failed to persist job wait checkpoint: {error}"))
+        })
+    }
+
+    fn finish_job_wait<'a>(
+        &'a self,
+        model_sequence: u64,
+        call_index: usize,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(async move {
+            self.session
+                .lock()
+                .await
+                .finish_job_wait_checkpoint(&self.attempt_id, model_sequence, call_index)
+                .await
+                .map_err(|error| format!("failed to retire job wait checkpoint: {error}"))
         })
     }
 }
@@ -715,6 +757,9 @@ pub struct Server {
     /// A retry command durably created these attempts, but no runtime has
     /// consumed them yet. Consuming one marker is process-local and one-shot.
     pending_retry_attempts: Arc<Mutex<std::collections::HashSet<String>>>,
+    /// Wait checkpoints this process already resumed or found ineligible.
+    /// Each is considered for automatic resume at most once per process.
+    considered_wait_checkpoints: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
     /// Per-schedule accounting locks. Schedule turns deliberately overlap, but
     /// their lifecycle read-modify-write operations must not lose increments:
     /// `max_fires` admission reserves its slot under these locks, so
@@ -861,6 +906,7 @@ impl Server {
             live_attempts: Arc::new(Mutex::new(std::collections::HashSet::new())),
             job_incarnation: uuid::Uuid::new_v4().to_string(),
             pending_retry_attempts: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            considered_wait_checkpoints: Default::default(),
             schedule_accounting: Arc::new(Mutex::new(HashMap::new())),
             skip_counters: Arc::new(Mutex::new(HashMap::new())),
             active_extensions: Arc::new(Mutex::new(HashMap::new())),
@@ -2011,6 +2057,21 @@ impl Server {
                 &self.live_attempts.lock().await.clone(),
             )
             .await?;
+        // A checkpointed wait left by a previous process is also catch-up
+        // work: nothing else will write to announce it.
+        let has_catch_up = has_catch_up || {
+            let live = self.live_attempts.lock().await.clone();
+            let interrupted = catch_up_session
+                .turn_requests(|name| self.agents.get(name).is_some(), &live)
+                .await?
+                .into_iter()
+                .filter_map(|request| match request.state {
+                    TurnRequestState::Interrupted { attempt_id } => Some(attempt_id),
+                    _ => None,
+                })
+                .collect();
+            Session::has_job_wait_checkpoint_for(session_db, &interrupted).await?
+        };
         if has_catch_up
             && self
                 .notify_tx
@@ -2682,6 +2743,21 @@ impl Server {
             }
             return Ok(None);
         }
+        // An exact checkpointed wait from a previous process resumes before
+        // newer work, just as its live turn would have kept the session busy.
+        if let Some((request, plan)) = self.find_resumable_wait(&session, &live_attempts).await
+            && let Some(outcome) = self
+                .resume_checkpointed_wait(
+                    session_db_id,
+                    &session_db,
+                    job_authority.as_ref(),
+                    request,
+                    plan,
+                )
+                .await?
+        {
+            return Ok(outcome);
+        }
         let Some((request, existing_attempt_id)) = queued.or(agent_mention) else {
             return Ok(None);
         };
@@ -2983,10 +3059,275 @@ impl Server {
             attempt,
             spawn_ctx,
             None,
+            None,
         )
         .await;
 
         Ok(Some(attempt_id))
+    }
+
+    /// The oldest interrupted request whose attempt's pending work is exactly
+    /// its newest wait checkpoint. Ineligible checkpoints are remembered so
+    /// they are held, not re-evaluated on every wake.
+    async fn find_resumable_wait(
+        &self,
+        session: &Session,
+        live_attempts: &std::collections::HashSet<String>,
+    ) -> Option<(
+        crate::session::TurnRequest,
+        crate::session::wait_resume::ResumableWait,
+    )> {
+        let requests = match session
+            .turn_requests(|name| self.agents.get(name).is_some(), live_attempts)
+            .await
+        {
+            Ok(requests) => requests,
+            Err(error) => {
+                warn!(%error, "Could not read turn requests for wait resumption");
+                return None;
+            }
+        };
+        for request in requests {
+            let TurnRequestState::Interrupted { attempt_id } = &request.state else {
+                continue;
+            };
+            let checkpoint = match session.latest_job_wait_checkpoint(attempt_id).await {
+                Ok(Some(checkpoint)) => checkpoint,
+                Ok(None) => continue,
+                Err(error) => {
+                    warn!(%error, attempt_id, "Unreadable job wait checkpoint; holding attempt");
+                    continue;
+                }
+            };
+            let key = checkpoint.key();
+            if self
+                .considered_wait_checkpoints
+                .lock()
+                .unwrap()
+                .contains(&key)
+            {
+                continue;
+            }
+            match session.resumable_job_wait(&request.id, checkpoint).await {
+                Ok(Ok(plan)) => return Some((request, plan)),
+                Ok(Err(reason)) => {
+                    info!(
+                        attempt_id,
+                        reason, "Checkpointed job wait is not resumable; holding attempt"
+                    );
+                    self.considered_wait_checkpoints.lock().unwrap().insert(key);
+                }
+                Err(error) => {
+                    warn!(%error, attempt_id, "Could not validate job wait checkpoint; holding attempt");
+                    self.considered_wait_checkpoints.lock().unwrap().insert(key);
+                }
+            }
+        }
+        None
+    }
+
+    /// Resume one validated checkpointed wait under the same attempt.
+    ///
+    /// Returns `None` when this checkpoint is now held, so ordinary queued
+    /// work may run; `Some` when the session was handled, including when a
+    /// transient gate (claim, home peer, a busy session) defers the resume.
+    async fn resume_checkpointed_wait(
+        self: &Arc<Self>,
+        session_db_id: &str,
+        session_db: &eidetica::Database,
+        job: Option<&crate::session::jobs::AcceptedAgentJob>,
+        request: crate::session::TurnRequest,
+        plan: crate::session::wait_resume::ResumableWait,
+    ) -> anyhow::Result<Option<Option<String>>> {
+        let key = plan.checkpoint.key();
+        let attempt_id = plan.checkpoint.attempt_id.clone();
+        let hold = |reason: &str| {
+            warn!(
+                session_db_id,
+                attempt_id, reason, "Holding checkpointed job wait for explicit retry"
+            );
+            self.considered_wait_checkpoints
+                .lock()
+                .unwrap()
+                .insert(key.clone());
+        };
+        if let Some(job) = job {
+            if request.id.as_str() != job.directive_id {
+                hold("job session request is not its accepted Directive");
+                return Ok(None);
+            }
+            if crate::session::jobs::read_job_result(session_db)
+                .await?
+                .is_some()
+                || !self.claim_accepted_job(session_db, job).await?
+            {
+                return Ok(Some(None));
+            }
+        }
+        // The original turn passed the attachment and ambient gates; the
+        // current policy must still admit it before any further effect.
+        if let Some(source) = request
+            .entry
+            .routing
+            .as_ref()
+            .and_then(|r| r.source.as_ref())
+        {
+            let attachment = crate::session::session_attachment(session_db).await?;
+            if !attachment.is_some_and(|a| {
+                a.transport == source.transport
+                    && a.login_id == source.login_id
+                    && a.channel == source.channel
+            }) || (request
+                .entry
+                .routing
+                .as_ref()
+                .is_some_and(|r| r.ambient_candidate)
+                && !crate::session::ambient_participation_for_entry(session_db, &request.entry)
+                    .await)
+            {
+                hold("external turn no longer passes attachment or ambient policy gate");
+                return Ok(None);
+            }
+        }
+        if !self.is_startup_ready() {
+            self.await_startup_ready().await;
+        }
+        if !self
+            .processing
+            .lock()
+            .await
+            .insert(session_db_id.to_string())
+        {
+            return Ok(Some(None));
+        }
+        let release = || async {
+            self.processing.lock().await.remove(session_db_id);
+        };
+        let runtime = {
+            let sessions = self.sessions.lock().await;
+            sessions.get(session_db_id).map(|m| {
+                (
+                    m.backend.clone(),
+                    m.agent_override.clone(),
+                    m.approval_tx.clone(),
+                    SpawnContext {
+                        job_projection: None,
+                        job_incarnation: job.map(|_| self.job_incarnation.clone()),
+                        job_authority: job.cloned(),
+                        call_depth: m.call_depth,
+                        max_call_depth: m.max_call_depth,
+                        parent_tools: m.parent_tools.clone(),
+                        completion_tx: m.completion_tx.clone(),
+                        processing: self.processing.clone(),
+                        turns: self.turns.clone(),
+                    },
+                )
+            })
+        };
+        let Some((backend, agent_override, approval_tx, mut spawn_ctx)) = runtime else {
+            release().await;
+            return Ok(Some(None));
+        };
+        if let Some(job) = job {
+            match self.record_claimed_job(session_db, job).await {
+                Ok(projection) => spawn_ctx.job_projection = Some(projection),
+                Err(error) => {
+                    release().await;
+                    return Err(error.context("cannot persist claimed job before execution"));
+                }
+            }
+        }
+        let agent = self
+            .registry
+            .resolve_agent_for_entry(
+                session_db_id,
+                agent_override.as_deref(),
+                &self.agent_index,
+                Some(&request.entry.content),
+            )
+            .await;
+        if agent.name != plan.checkpoint.agent_name {
+            release().await;
+            hold("request now resolves to a different Agent");
+            return Ok(None);
+        }
+        let agent = self.hydrate_agent_from_db(agent).await;
+        if !self.peer_is_home_for(session_db_id, &agent.name).await {
+            release().await;
+            self.record_home_skip(session_db_id, &agent.name).await;
+            return Ok(Some(None));
+        }
+        self.reset_home_skip(session_db_id, &agent.name).await;
+
+        // Revalidate under the processing reservation: an explicit retry or
+        // another wake may have advanced this request since selection.
+        let fresh = Session::new(
+            ConversationId(session_db_id.to_string()),
+            session_db.clone(),
+        )
+        .await;
+        let live = self.live_attempts.lock().await.clone();
+        let current = match fresh.turn_state_for_entry(&request.id, &live).await {
+            Ok(TurnRequestState::Interrupted {
+                attempt_id: current,
+            }) if current == plan.checkpoint.attempt_id => fresh
+                .latest_job_wait_checkpoint(&current)
+                .await
+                .ok()
+                .flatten()
+                .filter(|checkpoint| checkpoint == &plan.checkpoint),
+            _ => None,
+        };
+        let plan = match current {
+            Some(checkpoint) => fresh.resumable_job_wait(&request.id, checkpoint).await,
+            None => Ok(Err("attempt changed before resumption")),
+        };
+        let (plan, attempt) = match plan {
+            Ok(Ok(plan)) => match fresh.read_turn_attempt(&attempt_id).await {
+                Ok(Some(attempt)) => (plan, attempt),
+                _ => {
+                    release().await;
+                    hold("attempt record is unavailable");
+                    return Ok(None);
+                }
+            },
+            Ok(Err(reason)) => {
+                release().await;
+                hold(reason);
+                return Ok(None);
+            }
+            Err(error) => {
+                release().await;
+                return Err(error);
+            }
+        };
+        // Once per process, whatever the resumed run's outcome: a run that
+        // stops without settling stays held until restart or explicit retry.
+        self.considered_wait_checkpoints
+            .lock()
+            .unwrap()
+            .insert(key.clone());
+        self.live_attempts.lock().await.insert(attempt_id.clone());
+        info!(
+            session_db_id,
+            attempt_id,
+            child = %plan.checkpoint.child_session_db_id,
+            deadline = %plan.checkpoint.deadline,
+            "Resuming checkpointed job wait"
+        );
+        self.spawn_agent_task(
+            session_db_id.to_string(),
+            fresh,
+            agent,
+            approval_tx,
+            backend,
+            attempt,
+            spawn_ctx,
+            None,
+            Some(plan),
+        )
+        .await;
+        Ok(Some(Some(attempt_id)))
     }
 
     // A waiting job is rechecked after the permit arrives. Nothing durable is
@@ -3037,6 +3378,7 @@ impl Server {
             attempt,
             spawn,
             Some(permit),
+            None,
         )
         .await;
         Ok(true)
@@ -3303,6 +3645,7 @@ impl Server {
         attempt: TurnAttempt,
         spawn: SpawnContext,
         reserved_permit: Option<OwnedSemaphorePermit>,
+        resume: Option<crate::session::wait_resume::ResumableWait>,
     ) {
         let agent_name = agent.name.clone();
         let agent_identity = self.agent_index.find_by_name(&agent_name);
@@ -3414,7 +3757,8 @@ impl Server {
             }
             let session = Arc::new(Mutex::new(session));
 
-            {
+            // A resumed attempt already acknowledged its turn.
+            if resume.is_none() {
                 let mut s = session.lock().await;
                 if let Err(e) = s
                     .add_entry(SessionEntry {
@@ -3478,17 +3822,35 @@ impl Server {
                 host: host.clone(),
                 active_extensions: active_extensions.clone(),
                 routine_engine: routine_engine.clone(),
+                observation_deadline: None,
             };
 
+            if resume.is_some() && tool_ctx.tools.get(runtime::JOB_WAIT_TOOL).is_none() {
+                warn!(session_db_id, attempt_id = %attempt.attempt_id, "job_wait is no longer in scope; holding checkpointed attempt");
+                return;
+            }
             let tool_defs = tool_ctx.definitions();
-            let view = {
+            let prepared = {
                 let s = session.lock().await;
-                spawn_extensions.prepare_durable_context(&s, &agent_name, Some(&attempt.request_id), &active_extensions).await
+                let snapshot = match &resume {
+                    Some(plan) => Ok(plan.checkpoint.context_snapshot.clone()),
+                    None => match spawn_extensions.prepare_durable_context(&s, &agent_name, Some(&attempt.request_id), &active_extensions).await {
+                        Ok(_) => s.database().snapshot().await.map_err(anyhow::Error::from),
+                        Err(error) => Err(error),
+                    },
+                };
+                match snapshot {
+                    Ok(snapshot) => s.context_view_at(snapshot.clone()).await.map(|view| (view, Some(snapshot))),
+                    Err(error) => Err(error),
+                }
             };
-            let view = match view {
-                Ok(view) => view,
+            let (view, context_snapshot) = match prepared {
+                Ok(prepared) => prepared,
                 Err(error) => {
                     error!(%error, "Durable context preparation refused dispatch");
+                    if resume.is_some() {
+                        return;
+                    }
                     let mut s = session.lock().await;
                     if let Err(error) = s.complete_turn_attempt(&attempt, Some(SessionEntry {
                         sender: agent_name.clone(), content: format!("Error: {error}"), timestamp: Utc::now(),
@@ -3500,7 +3862,6 @@ impl Server {
             let (session_model, assembled) = {
                 let s = session.lock().await;
                 let meta = s.read_meta().await;
-
                 let roster: Vec<String> =
                     meta.agents.iter().map(|a| a.display_name.clone()).collect();
                 // Per-agent override > session pin > backend default. The
@@ -3547,6 +3908,9 @@ impl Server {
                 Ok(assembled) => assembled,
                 Err(error) => {
                     error!(%error, "Required context selection refused dispatch");
+                    if resume.is_some() {
+                        return;
+                    }
                     let mut s = session.lock().await;
                     if let Err(error) = s.complete_turn_attempt(&attempt, Some(SessionEntry {
                         sender: agent_name.clone(), content: format!("Error: {error}"), timestamp: Utc::now(),
@@ -3570,10 +3934,16 @@ impl Server {
                 session: session.clone(),
                 request_id: attempt.request_id.clone(),
                 attempt_id: attempt.attempt_id.clone(),
-                sequence: AtomicU32::new(0),
+                // A resumed attempt appends after its own persisted records.
+                sequence: AtomicU32::new(
+                    resume.as_ref().map_or(0, |plan| plan.next_sequence as u32),
+                ),
                 terminal: std::sync::Mutex::new(None),
-                explicit_bridge_send: AtomicBool::new(false),
+                explicit_bridge_send: AtomicBool::new(
+                    resume.as_ref().is_some_and(|plan| plan.runtime.matrix_send_queued),
+                ),
                 agent_name: agent_name.clone(),
+                context_snapshot,
                 job_input: spawn.job_authority.is_some(),
                 #[cfg(test)]
                 fail_after: transcript_fail_after,
@@ -3586,24 +3956,42 @@ impl Server {
                 request_budget_tokens: Some(assembled.request_budget_tokens),
                 sources: assembled.sources,
             };
-            let result = runtime::execute_cancellable_with_recorder(
-                effective_model.as_deref(),
-                assembled.messages,
-                &backend,
-                &request_security,
-                &tool_ctx,
-                &policies,
-                Some(recorder.clone()),
-                Some(spawn_extensions.as_ref()),
-                Some(&cancel),
-                permit.map(|permit| runtime::ExecutionCapacity::new(
-                    semaphore,
-                    permit,
-                    incarnation.clone().map(|token| (claim_db.clone(), token)),
-                )),
-                scope,
-            )
-            .await;
+            let capacity = permit.map(|permit| runtime::ExecutionCapacity::new(
+                semaphore,
+                permit,
+                incarnation.clone().map(|token| (claim_db.clone(), token)),
+            ));
+            let result = match resume {
+                Some(plan) => runtime::resume_cancellable_with_recorder(
+                    effective_model.as_deref(),
+                    assembled.messages,
+                    &backend,
+                    &request_security,
+                    &tool_ctx,
+                    &policies,
+                    Some(recorder.clone()),
+                    Some(spawn_extensions.as_ref()),
+                    Some(&cancel),
+                    capacity,
+                    plan.runtime,
+                    scope,
+                )
+                .await,
+                None => runtime::execute_cancellable_with_recorder(
+                    effective_model.as_deref(),
+                    assembled.messages,
+                    &backend,
+                    &request_security,
+                    &tool_ctx,
+                    &policies,
+                    Some(recorder.clone()),
+                    Some(spawn_extensions.as_ref()),
+                    Some(&cancel),
+                    capacity,
+                    scope,
+                )
+                .await,
+            };
 
             if shutting_down.load(Ordering::Acquire) {
                 return;

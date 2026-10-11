@@ -149,6 +149,16 @@ impl RateLimiter {
         timestamps.push(now);
         Ok(())
     }
+
+    /// Count a call admitted `age` ago, e.g. by the same turn before an
+    /// executor restart, so a resumed turn keeps the same sliding window.
+    pub fn record_past(&mut self, tool_name: &str, age: Duration) {
+        let now = std::time::Instant::now();
+        let at = now.checked_sub(age).unwrap_or(now);
+        let timestamps = self.calls.entry(tool_name.to_string()).or_default();
+        timestamps.push(at);
+        timestamps.sort();
+    }
 }
 
 /// How a tool's definition is presented to the LLM.
@@ -310,6 +320,10 @@ pub struct ToolContext {
     /// heap through this after a committed write. `None` under `--print`
     /// (no engine running) and in tests.
     pub routine_engine: Option<Arc<crate::routine::RoutineEngine>>,
+    /// Absolute observation deadline for the current `job_wait` call, set by
+    /// the runtime. A resumed wait keeps its original deadline across a
+    /// restart instead of starting a new relative timeout.
+    pub observation_deadline: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 impl ToolContext {

@@ -246,7 +246,7 @@ async fn job_wait_reacquires_after_success_error_and_policy_timeout() {
 
 #[tokio::test]
 async fn user_stop_pairs_calls_while_job_wait_yields_or_reacquires_capacity() {
-    for reacquiring in [false, true] {
+    for (resumed, reacquiring) in [(false, false), (false, true), (true, false), (true, true)] {
         let semaphore = Arc::new(Semaphore::new(1));
         let permit = semaphore.clone().acquire_owned().await.unwrap();
         let blocker = Arc::new(Mutex::new(None));
@@ -282,7 +282,8 @@ async fn user_stop_pairs_calls_while_job_wait_yields_or_reacquires_capacity() {
         let capacity = ExecutionCapacity::new(semaphore.clone(), permit, None);
         let task = tokio::spawn(async move {
             let _instance = instance;
-            execute_cancellable_with_recorder(
+            let now = chrono::Utc::now();
+            run_turn(
                 None,
                 vec![RuntimeMessage::User("test".into())],
                 &backend,
@@ -293,6 +294,22 @@ async fn user_stop_pairs_calls_while_job_wait_yields_or_reacquires_capacity() {
                 None,
                 Some(&cancel),
                 Some(capacity),
+                resumed.then(|| RuntimeResume {
+                    prior_messages: Vec::new(),
+                    model_sequence: 0,
+                    call_index: 1,
+                    call: ToolCallRequest {
+                        id: "wait".into(),
+                        name: "job_wait".into(),
+                        arguments: "{}".into(),
+                    },
+                    deadline: now + chrono::Duration::seconds(240),
+                    policy_deadline: now + chrono::Duration::seconds(300),
+                    policy_timeout_seconds: 300,
+                    metadata: Vec::new(),
+                    matrix_send_queued: false,
+                    rate_limited_calls: Vec::new(),
+                }),
                 ModelCallScope::default(),
             )
             .await
@@ -312,7 +329,7 @@ async fn user_stop_pairs_calls_while_job_wait_yields_or_reacquires_capacity() {
             .expect("user stop must not wait for child-held capacity")
             .unwrap();
         assert!(matches!(result, Err(TurnError::Cancelled { .. })));
-        assert_eq!(mock.recorded_calls().len(), 1);
+        assert_eq!(mock.recorded_calls().len(), usize::from(!resumed));
         assert_eq!(effects.load(std::sync::atomic::Ordering::SeqCst), 0);
         let mut calls = Vec::new();
         let mut results = Vec::new();
@@ -325,8 +342,13 @@ async fn user_stop_pairs_calls_while_job_wait_yields_or_reacquires_capacity() {
                 }
             }
         }
-        assert_eq!(calls, ["wait", "effect"]);
-        assert_eq!(results, calls, "every native call has a cancelled result");
+        if resumed {
+            assert!(calls.is_empty(), "the persisted model call is not replayed");
+            assert_eq!(results, ["wait"], "only the pending call is paired");
+        } else {
+            assert_eq!(calls, ["wait", "effect"]);
+            assert_eq!(results, calls, "every native call has a cancelled result");
+        }
         blocker.lock().await.take();
         let all = tokio::time::timeout(Duration::from_secs(1), semaphore.clone().acquire_owned())
             .await

@@ -35,8 +35,11 @@ mod keys;
 mod registry;
 pub mod steering;
 pub(crate) use registry::JobRequest;
+#[cfg(test)]
+pub(crate) use registry::PreparedAgentJob;
 mod transport;
 pub mod usage;
+pub(crate) mod wait_resume;
 pub(crate) mod wire;
 
 use wire::session_wire_enum;

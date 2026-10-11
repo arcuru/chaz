@@ -504,7 +504,7 @@ impl super::Session {
         request_id: &super::TurnRequestId,
         tool_call_key: &str,
         child_id: &str,
-        seconds: u64,
+        deadline_at: chrono::DateTime<chrono::Utc>,
     ) -> anyhow::Result<Option<(String, JobWait)>> {
         let Some(accepted) = read_accepted_job(self.database()).await? else {
             return Ok(None);
@@ -524,7 +524,7 @@ impl super::Session {
         let row = JobWait {
             attempt_id,
             child_id: child_id.into(),
-            deadline_at: chrono::Utc::now() + chrono::Duration::seconds(seconds as i64),
+            deadline_at,
             finished: false,
         };
         write_job_wait(self.database(), &key, row.clone()).await?;
