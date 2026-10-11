@@ -290,6 +290,13 @@ pub(super) fn ui(
     // Click regions are rebuilt from scratch each frame so coordinates match
     // what the user is currently seeing.
     app.click_regions.clear();
+    if app.mode != TuiMode::Chat
+        || app.overlay.is_some()
+        || app.completion.is_some()
+        || app.has_pending_approval()
+    {
+        app.selection.clear();
+    }
     app.settings_list_area = None;
     app.settings_reader.viewport = None;
     if let Some(picker) = app.settings_picker.as_mut() {
@@ -776,6 +783,15 @@ pub(super) fn ui_chat(f: &mut ratatui::Frame, app: &mut App, ext_segments: &[Str
                 .title(Span::styled(" Chaz ", Style::default().fg(COLOR_ACCENT))),
         );
     f.render_widget(messages, messages_area);
+    let tab = &app.tabs[active_tab];
+    app.selection.viewport(
+        &tab.session_db_id,
+        tab.live.transcript_rev,
+        Rect::new(inner_x, inner_y, inner_width, messages_height as u16),
+        scroll,
+    );
+    app.selection
+        .highlight(&tab.live.render.copy_text, f.buffer_mut());
 
     if let Some((tool_name, risk, args)) = approval_info {
         render_approval_panel(
@@ -1050,6 +1066,7 @@ pub(super) struct TranscriptCache {
     /// trailing element holds the total. Mirrors ratatui's word wrap by
     /// probing each line on its own, which is how `Paragraph` wraps.
     offsets: Vec<usize>,
+    pub(super) copy_text: super::selection::CopyText,
 }
 
 impl std::fmt::Debug for TranscriptCache {
@@ -1104,7 +1121,8 @@ fn refresh_transcript(
     if tab.live.render.key == Some(key) {
         return;
     }
-    let (lines, clicks) = build_transcript(tab, agent_names, debug_mode, expand_all, width);
+    let (lines, clicks, sources) =
+        build_transcript(tab, agent_names, debug_mode, expand_all, width);
     let mut offsets = Vec::with_capacity(lines.len() + 1);
     let mut total = 0usize;
     offsets.push(0);
@@ -1112,11 +1130,16 @@ fn refresh_transcript(
         total += wrapped_height(l, width);
         offsets.push(total);
     }
+    let mut copy_text = super::selection::CopyText::default();
+    for (line, text) in sources {
+        copy_text.add(line, offsets[line], &text, width);
+    }
     tab.live.render = TranscriptCache {
         key: Some(key),
         lines,
         clicks,
         offsets,
+        copy_text,
     };
 }
 
@@ -1127,8 +1150,13 @@ fn build_transcript(
     debug_mode: bool,
     expand_all: bool,
     inner_width: u16,
-) -> (Vec<Line<'static>>, Vec<(usize, u16, ClickTarget)>) {
+) -> (
+    Vec<Line<'static>>,
+    Vec<(usize, u16, ClickTarget)>,
+    Vec<(usize, String)>,
+) {
     let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut sources = Vec::new();
     // (logical line idx, x col offset from inner messages area, target).
     // Translated to absolute ClickRegions after wrap math below.
     let mut pending_clicks: Vec<(usize, u16, ClickTarget)> = Vec::new();
@@ -1184,6 +1212,7 @@ fn build_transcript(
                 lines.push(Line::from(vec![Span::styled(label, sender_style)]));
 
                 for content_line in entry.content.lines() {
+                    sources.push((lines.len(), content_line.to_owned()));
                     lines.push(Line::from(format!("  {content_line}")));
                 }
                 lines.push(Line::from(""));
@@ -1223,6 +1252,7 @@ fn build_transcript(
                 )]));
                 if let Some(body) = entry.bridge_body() {
                     for content_line in body.lines() {
+                        sources.push((lines.len(), content_line.to_owned()));
                         lines.push(Line::from(format!("  {content_line}")));
                     }
                 }
@@ -1410,7 +1440,7 @@ fn build_transcript(
         }
     }
     lines.extend(super::jobs::input_lines(tab, debug_mode));
-    (lines, pending_clicks)
+    (lines, pending_clicks, sources)
 }
 
 /// Render the tab bar: one line across the top showing each tab's title,

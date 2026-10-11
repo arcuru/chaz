@@ -273,6 +273,74 @@ Approval prompts accept `y` to approve, `n` to deny, and `a` to approve all rema
 
 Mouse capture is enabled. Click on completion rows, help-overlay command rows, approval buttons, hub and picker rows, tab titles, or tab close `×` widgets to act on them. The scroll wheel scrolls the help overlay when it is open; in the session hub and model picker it moves the selection three rows. In Settings, it selects over the visible list rows and reads over the visible content body (see [Reading Settings details](#reading-settings-details)); headers, the category rail, and the status strip swallow it. Other overlays swallow it; otherwise it scrolls history.
 
+### Copy conversation text
+
+| Input                                       | Action                                                       |
+| ------------------------------------------- | ------------------------------------------------------------ |
+| Left drag over a message body, then release | Highlight and request clipboard copy automatically           |
+| Wheel / PageUp before selecting             | Read earlier conversation text and select there              |
+| Wheel while dragging                        | Extend the same selection into earlier/later visible history |
+| Click elsewhere or press any key            | Clear the highlight; leave the clipboard unchanged           |
+
+Mouse capture sends ordinary drags to Chaz rather than the terminal's native
+selection. Chaz selects **message bodies**, including multiline code and external
+bridge message bodies. Sender labels, timestamps, borders, separators, tool audit
+rows and live activity are not copied. Copying uses the original text: source
+newlines and indentation remain, but visual soft wraps do not add newlines.
+Select after scrolling to an older message, or hold the drag and use the wheel
+before releasing. There is no edge-hover auto-scroll. A plain click does not copy.
+Resizing, refreshing the transcript, switching views or opening an overlay clears
+the selection rather than using stale coordinates. Approval controls and other
+click targets still work, and keyboard bindings (including Ctrl+C **quit**) are
+unchanged.
+
+On release, Chaz sends an **OSC 52 clipboard-write request** to the terminal. This
+works over SSH without a clipboard utility on the remote host. The terminal must
+support and allow OSC 52 writes; Chaz cannot read back or confirm your desktop
+clipboard. Some terminals limit the size or disable remote clipboard access.
+Inside tmux, application writes require `set-clipboard on` (not `external`) and
+an OSC 52-capable outer terminal/terminfo. tmux can also keep the copied text in
+its paste buffer. These are terminal settings, not Chaz configuration.
+
+If your clipboard does not change, paste into a scratch document to check, then
+check the terminal's OSC 52 permissions and tmux's `set-clipboard` setting.
+A fallback is your terminal's mouse-capture override (often **Shift+drag**) and
+its normal Copy action. That selects screen cells, not Chaz source text: it may
+include borders/indentation and visual wrap newlines, and only covers visible
+text. Chaz does not claim automatic clipboard copy on terminals that reject
+OSC 52.
+
+#### Walkthrough: copy a reply and code from history
+
+1. With OSC 52 writes allowed, drag over `A short reply.` in a message body
+   and release. Paste into a scratch document. It should contain exactly:
+
+   ```text
+   A short reply.
+   ```
+
+2. Scroll up with the wheel or PageUp to a reply containing code. Start at
+   the first `f` and drag through the closing `}` of:
+
+   ```rust
+   fn main() {
+       println!("hello");
+   }
+   ```
+
+   Release and paste. The clipboard should contain those three source lines,
+   including the four-space code indentation, without the sender label or
+   Chaz's two-space message margin. A soft-wrapped long line remains one
+   source line. To select beyond the viewport, keep holding the mouse button
+   and wheel until the last line is visible, then release there.
+
+3. If the highlight appears but pasting still yields the previous clipboard,
+   the terminal may have refused OSC 52. Allow clipboard writes in that
+   terminal; with tmux, check `tmux show -s set-clipboard` and enable
+   `set-clipboard on` if desired. Retry the short reply and paste again.
+   If writes cannot be enabled, use the terminal-native override and Copy,
+   accounting for its screen-cell limitations above.
+
 ## Debug Mode
 
 Toggle with `Ctrl+D` or `/debug`. When active:

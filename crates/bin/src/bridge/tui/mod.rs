@@ -42,6 +42,7 @@ mod jobs;
 mod operations;
 mod reconnect;
 mod refresh;
+mod selection;
 mod supervised;
 mod theme;
 #[cfg(test)]
@@ -675,6 +676,7 @@ pub(super) struct ListScroll {
 
 pub(super) struct App {
     jobs: jobs::JobsView,
+    selection: selection::Selection,
     pub(super) mode: TuiMode,
     pub(super) overlay: Option<Overlay>,
     pub(super) click_regions: Vec<ClickRegion>,
@@ -884,6 +886,7 @@ impl App {
     fn hub(agent_names: HashSet<String>) -> Self {
         Self {
             jobs: jobs::JobsView::default(),
+            selection: selection::Selection::default(),
             mode: TuiMode::SessionPicker,
             overlay: None,
             click_regions: Vec::new(),

@@ -18,6 +18,7 @@ path = "src/main.rs"
 chaz-core = { path = "../lib" }
 
 anyhow.workspace = true
+base64.workspace = true
 chrono.workspace = true
 clap.workspace = true
 crossterm.workspace = true

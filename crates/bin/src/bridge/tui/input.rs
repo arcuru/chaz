@@ -351,6 +351,7 @@ pub(super) fn handle_overlay_key(app: &mut App, key: KeyEvent) -> OverlayKey {
 /// its own because they need cross-module context (command dispatch, session
 /// switching, etc.). None for the common no-op path.
 pub(super) enum MouseOutcome {
+    Copy(String),
     /// Open the currently selected session picker row — equivalent to
     /// pressing Enter.
     PickerOpenSelected,
@@ -364,21 +365,49 @@ pub(super) enum MouseOutcome {
 }
 
 /// Whether `handle_mouse` can do anything with `m`. The run loop drops every
-/// other report (motion, drags, releases, other buttons) before it costs a
-/// handler pass or a redraw — with mouse capture on, a terminal reports every
-/// pointer move.
+/// other report before it costs a handler pass or a redraw. Left drags and
+/// releases implement conversation selection; idle pointer motion stays ignored.
 pub(super) fn mouse_is_actionable(m: &MouseEvent) -> bool {
     matches!(
         m.kind,
         MouseEventKind::ScrollUp
             | MouseEventKind::ScrollDown
             | MouseEventKind::Down(MouseButton::Left)
+            | MouseEventKind::Drag(MouseButton::Left)
+            | MouseEventKind::Up(MouseButton::Left)
     )
 }
 
 pub(super) fn handle_mouse(app: &mut App, m: MouseEvent) -> Option<MouseOutcome> {
     if app.settings_too_small() {
         return None;
+    }
+    let selectable = app.mode == TuiMode::Chat
+        && app.overlay.is_none()
+        && !app.has_pending_approval()
+        && app.completion.is_none();
+    if !selectable {
+        app.selection.clear();
+    } else if let Some(tab) = app.tabs.get(app.active_tab) {
+        let text = &tab.live.render.copy_text;
+        match m.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                if app.selection.begin(text, m.column, m.row) {
+                    return None;
+                }
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                app.selection.drag(text, m.column, m.row);
+                return None;
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                return app
+                    .selection
+                    .finish(text, m.column, m.row)
+                    .map(MouseOutcome::Copy);
+            }
+            _ => {}
+        }
     }
     // Route the wheel to the visible cursor list; never scroll chat behind it.
     match m.kind {
@@ -1766,7 +1795,7 @@ mod tests {
     use std::collections::HashSet;
 
     /// Only reports `handle_mouse` acts on survive the run loop's filter;
-    /// pointer motion and drags never reach a handler or a redraw.
+    /// idle pointer motion never reaches a handler or a redraw.
     #[test]
     fn only_actionable_mouse_reports_pass_the_filter() {
         use super::{MouseButton, MouseEvent, MouseEventKind, mouse_is_actionable};
@@ -1780,13 +1809,13 @@ mod tests {
             MouseEventKind::ScrollUp,
             MouseEventKind::ScrollDown,
             MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Drag(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
         ] {
             assert!(mouse_is_actionable(&at(kind)), "{kind:?}");
         }
         for kind in [
             MouseEventKind::Moved,
-            MouseEventKind::Drag(MouseButton::Left),
-            MouseEventKind::Up(MouseButton::Left),
             MouseEventKind::Down(MouseButton::Right),
             MouseEventKind::ScrollLeft,
         ] {

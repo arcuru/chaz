@@ -3,7 +3,10 @@
 # dependencies = ["pyte==0.8.2"]
 # ///
 """Approval ownership and visible pending-exit decisions on disposable peers."""
+import base64
 import json
+import re
+import shutil
 import os
 from pathlib import Path
 import select
@@ -14,6 +17,7 @@ import tempfile
 import threading
 import time
 import unittest
+import unicodedata
 from http.server import HTTPServer
 
 sys.dont_write_bytecode = True
@@ -43,6 +47,162 @@ def evidence(name):
 
 
 class Interactions(unittest.TestCase):
+    def test_conversation_selection_copies_source_text(self):
+        self.selection_case(False)
+
+    @unittest.skipUnless(shutil.which("tmux"), "tmux is not installed")
+    def test_conversation_selection_reaches_tmux_clipboard(self):
+        self.selection_case(True)
+
+    def selection_case(self, multiplexed):
+        ordinary = "Selection ordinary café 界 e\u0301."
+        screen_ordinary = unicodedata.normalize("NFC", ordinary)
+        code = 'fn main() {\n    println!("hello");\n}'
+        reply = ordinary + "\n\n```rust\n" + code + "\n```\n" + "\n".join(
+            f"history filler {i:02}" for i in range(35))
+
+        class Handler(stub.Handler):
+            def log_message(self, *_):
+                pass
+
+            def do_POST(self):
+                self.rfile.read(int(self.headers["Content-Length"]))
+                self._fixture_reply(content=reply)
+
+        http = HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=http.serve_forever, daemon=True)
+        thread.start()
+        process = None
+        socket = None
+        out = evidence("selection-tmux" if multiplexed else "selection-direct")
+        try:
+            with tempfile.TemporaryDirectory(prefix="chaz-selection-pty-") as directory:
+                home = Path(directory)
+                env = environment(home)
+                config = home / "config.yaml"
+                config.write_text(f'''execution: executor
+state_dir: "{home}/state"
+unlock_password: fixture-only
+eidetica:
+  connection: "sqlite://{home}/fixture.db"
+  login:
+    username: pty-test
+    passwordless: true
+backends:
+  - name: stub
+    type: openaicompatible
+    api_base: "http://127.0.0.1:{http.server_port}/v1"
+    api_key: not-a-real-key
+    models:
+      - name: stub
+agents:
+  - name: chaz
+    model: stub
+    tools: []
+    system_prompt: You are a disposable test fixture.
+default_agents: [chaz]
+''')
+                subprocess.run([FIXTURE, home / "fixture.db"], env=env, cwd=home,
+                               check=True, timeout=20, capture_output=True)
+                command = [BINARY, "--config", config, "--session", "selection"]
+                if multiplexed:
+                    socket_dir = Path(os.environ.get("AVA_TMUX_SOCKET_DIR", "/tmp/ava-tmux-sockets"))
+                    socket_dir.mkdir(parents=True, exist_ok=True)
+                    socket = socket_dir / ("chaz-copy-" + str(time.time_ns()) + ".sock")
+                    tmux = shutil.which("tmux")
+                    command = [tmux, "-S", socket, "-f", "/dev/null", "new-session",
+                               "-s", "selection", *command]
+                    # Set clipboard/mouse before the app starts; no shared server
+                    # or user configuration is changed by this disposable check.
+                    tmux_config = home / "tmux.conf"
+                    tmux_config.write_text("set -s set-clipboard on\nset -g mouse on\n"
+                                           "set -as terminal-features ',xterm-256color:clipboard'\n")
+                    command[command.index("/dev/null")] = tmux_config
+                    print(f"Monitor: tmux -S {socket} attach -t selection", file=sys.stderr)
+                process = PtyProcess(command, env, home)
+                if multiplexed:
+                    # pyte 0.8.2 rejects DEC's private status-query keyword;
+                    # tmux sends it during attach, before Chaz renders anything.
+                    process.screen.report_device_status = lambda *_args, **_kwargs: None
+                    process.stream.attach(process.screen)
+                process.resize(80, 24)
+                process.expect_screen("Ctrl+S settings")
+                process.send("show fixture\r")
+                process.expect_screen("history filler 34")
+                # The reply's beginning and code really are off-screen first.
+                self.assertNotIn(screen_ordinary, "\n".join(process.screen.display))
+                for _ in range(20):
+                    process.send("\x1b[<64;40;10M")
+                    process.drain(0.05)
+                    if screen_ordinary in "\n".join(process.screen.display):
+                        break
+                process.expect_screen(screen_ordinary)
+
+                def position(fragment):
+                    for row, line in enumerate(process.screen.display):
+                        column = line.find(fragment)
+                        if column >= 0:
+                            return column + 1, row + 1
+                    self.fail(f"missing selectable fragment {fragment!r}")
+
+                results = []
+                def drag(start, end, expected):
+                    offset = len(process.raw)
+                    process.send(f"\x1b[<0;{start[0]};{start[1]}M")
+                    process.send(f"\x1b[<32;{end[0]};{end[1]}M")
+                    process.send(f"\x1b[<0;{end[0]};{end[1]}m")
+                    deadline = time.monotonic() + 5
+                    clipboard = None
+                    while time.monotonic() < deadline:
+                        process.drain(0.05)
+                        if multiplexed:
+                            result = subprocess.run([tmux, "-S", socket, "save-buffer", "-"],
+                                                    capture_output=True, timeout=2)
+                            if result.returncode == 0:
+                                clipboard = result.stdout.decode()
+                        else:
+                            matches = re.findall(rb"\x1b]52;c;([A-Za-z0-9+/=]*)\x07",
+                                                 process.raw[offset:])
+                            if matches:
+                                clipboard = base64.b64decode(matches[-1]).decode()
+                        highlighted = process.screen.buffer[start[1] - 1][start[0] - 1].bg in ("blue", "0000ee")
+                        if clipboard == expected and highlighted:
+                            break
+                    self.assertEqual(clipboard, expected)
+                    self.assertIn(process.screen.buffer[start[1] - 1][start[0] - 1].bg, ("blue", "0000ee"))
+                    results.append({"expected": expected, "clipboard": clipboard,
+                                    "clipboard_kind": "tmux paste buffer" if multiplexed else "OSC 52 decoded request"})
+
+                start = position("Selection ordinary")
+                end = (79, start[1])  # padding reaches the source line end
+                drag(start, end, ordinary)
+                # Code is earlier history too, and its source indentation must
+                # survive without Chaz's margin, label, fences or borders.
+                start = position("fn main() {")
+                end = position("}")
+                drag(start, end, code)
+                out.mkdir(parents=True, exist_ok=True)
+                (out / "clipboard.json").write_text(json.dumps(results, ensure_ascii=False, indent=2))
+                process.capture(out)
+                process.send("\x03")
+                deadline = time.monotonic() + 5
+                while process.child.poll() is None and time.monotonic() < deadline:
+                    process.drain(0.05)
+                self.assertEqual(process.child.poll(), 0)
+        except BaseException:
+            if process:
+                process.capture(out)
+            raise
+        finally:
+            if process:
+                process.close()
+            if socket:
+                subprocess.run([shutil.which("tmux"), "-S", socket, "kill-server"],
+                               capture_output=True, timeout=5)
+            http.shutdown()
+            http.server_close()
+            thread.join(timeout=5)
+
     def test_join_keeps_real_approval_prompts_and_explicit_decisions(self):
         self.approval_reopen_case(False)
 

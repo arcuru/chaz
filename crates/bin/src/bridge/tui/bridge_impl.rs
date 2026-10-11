@@ -216,7 +216,7 @@ impl TuiBridge {
                                 // A click maps through the last frame's regions;
                                 // draw first if earlier events in this batch
                                 // moved anything.
-                                if needs_draw && matches!(m.kind, MouseEventKind::Down(_)) {
+                                if needs_draw && matches!(m.kind, MouseEventKind::Down(_) | MouseEventKind::Drag(_) | MouseEventKind::Up(_)) {
                                     terminal.draw(|f| {
                                         view::ui(f, &mut app, server, &backend, &self.config)
                                     })?;
@@ -284,6 +284,7 @@ impl TuiBridge {
                 );
                 match action {
                     Action::Key(key) => {
+                        app.selection.clear();
                         if key.code == KeyCode::Char('c')
                             && key.modifiers.contains(KeyModifiers::CONTROL)
                         {
@@ -491,6 +492,12 @@ impl TuiBridge {
                     Action::Mouse(m) => {
                         if let Some(outcome) = input::handle_mouse(&mut app, m) {
                             match outcome {
+                                input::MouseOutcome::Copy(text) => {
+                                    if let Err(error) = selection::copy_to(&mut io::stdout(), &text)
+                                    {
+                                        tracing::warn!(%error, "Terminal clipboard request failed");
+                                    }
+                                }
                                 input::MouseOutcome::PickerOpenSelected => {
                                     let selected = app.picker_selection();
                                     dispatch_picker_selection(
