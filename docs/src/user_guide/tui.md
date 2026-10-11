@@ -52,7 +52,8 @@ The TUI has four main pieces:
    After the agent/model comes the session's
    running token totals and cost (`<prompt>/<completion> tok • <cached>% cached
 • $<cost>`), summed across **all** agents. `DEBUG` / `EXP` indicators append
-   when those modes are on.
+   when those modes are on, and `⚠ refresh failed` appends while the tab's last
+   background read failed (see [Responsiveness](#responsiveness-and-background-refresh)).
 4. **Input box** — type messages and commands. Slash commands open an inline completion popup with grouped categories; arrow keys move the highlight. The input wraps at the terminal edge and grows with the draft, capped so it never takes the whole frame (a long draft squeezes the transcript instead); past that cap the box scrolls to keep the cursor visible. Use `Alt+Enter` for a new line, `Enter` to send, and `Left`/`Right` to move by a visible character (including combined Unicode characters).
 
 An ordinary launch opens the [session hub](#session-hub) rather than any conversation; there is no built-in default session.
@@ -344,17 +345,17 @@ A model picker returns to its Settings page on selection or `Esc`; canceling wri
 
 These tables list every category in sidebar order. Read-only pages are inspectors, not editors waiting for an apply key. The six **coming soon** pages are placeholders and have no settings controls.
 
-| Peer category | Current behavior                                                                                                                                                                                                                                                                              |
-| ------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Agents        | Inspect hosted agents and selected-agent details. In List or Content, `Enter` picks the agent's DB-default model. `r` opens a YAML diff: `r` applies the additive drift merge, `R` requests a full reseed with confirmation, and `a` lets you pick fields (`Space` toggles, `Enter` applies). |
-| Backends      | Read-only backend names, API base URLs, and configured/known model counts; no credential editor.                                                                                                                                                                                              |
-| Defaults      | Edit the ordered agents attached to new sessions; the first is the routing host. `a` opens an add prompt, `d` removes the selected row, and `Ctrl+↑` / `Ctrl+↓` reorder it. Changes persist in the peer DB, not YAML, and do not change existing session rosters.                             |
-| Bridges       | Read-only status: TUI active, CLI available, Matrix/Discord external binaries.                                                                                                                                                                                                                |
-| Extensions    | **Coming soon.**                                                                                                                                                                                                                                                                              |
-| MCP           | Read-only server list and selected-server status, tools, and failure details.                                                                                                                                                                                                                 |
-| Groups        | **Coming soon.**                                                                                                                                                                                                                                                                              |
-| Identity      | **Coming soon.**                                                                                                                                                                                                                                                                              |
-| About         | Read-only version, state directory, in-process bridges, and configuration/count summary.                                                                                                                                                                                                      |
+| Peer category | Current behavior                                                                                                                                                                                                                                                                                                                                                                |
+| ------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Agents        | Inspect hosted agents and selected-agent details. In List or Content, `Enter` picks the agent's DB-default model. `r` opens a YAML diff: `r` applies the additive drift merge, `R` requests a full reseed with confirmation, and `a` lets you pick fields (`Space` toggles, `Enter` applies).                                                                                   |
+| Backends      | Read-only backend names, API base URLs, and configured/known model counts; no credential editor.                                                                                                                                                                                                                                                                                |
+| Defaults      | Edit the ordered agents attached to new sessions; the first is the routing host. `a` opens an add prompt, `d` removes the selected row, and `Ctrl+↑` / `Ctrl+↓` reorder it. Changes persist in the peer DB, not YAML, and do not change existing session rosters. Accepted edits apply in order to the latest defaults; a pending add is not lost by a later remove or reorder. |
+| Bridges       | Read-only status: TUI active, CLI available, Matrix/Discord external binaries.                                                                                                                                                                                                                                                                                                  |
+| Extensions    | **Coming soon.**                                                                                                                                                                                                                                                                                                                                                                |
+| MCP           | Read-only server list and selected-server status, tools, and failure details.                                                                                                                                                                                                                                                                                                   |
+| Groups        | **Coming soon.**                                                                                                                                                                                                                                                                                                                                                                |
+| Identity      | **Coming soon.**                                                                                                                                                                                                                                                                                                                                                                |
+| About         | Read-only version, state directory, in-process bridges, and configuration/count summary.                                                                                                                                                                                                                                                                                        |
 
 | Session category | Current behavior                                                                                                                               |
 | ---------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -485,6 +486,18 @@ Named sessions can be referenced anywhere a session identifier is accepted:
 
 The name appears in the status bar, session hub, and `/info` output. Names must be unique across all sessions. Use `/name` (with no argument) to clear the name.
 
+### Metadata edits need readable stored state
+
+Session metadata edits, including `/name`, `/model` and agent/settings changes,
+first read all existing metadata. A storage failure or malformed field refuses
+the whole edit, even if it targets another field. Missing fields are allowed;
+unreadable fields are not treated as empty or reset to defaults.
+
+This also applies to bridge participation settings and runtime, agent and job
+metadata updates. On a transport failure, restore the connection before editing
+again. Malformed stored metadata stays write-blocking; reopening the TUI or
+retrying another edit does not repair it. There is no automatic reset policy.
+
 ## Model Picker
 
 Pick a model for a specific scope — the whole session, or one agent in this session. `/models` opens Session Settings → Models, where each row is a scope you can edit:
@@ -565,6 +578,107 @@ For example, after sending `@chaz:example` a question in a shared Matrix room:
 3. If the executor exits before completion, `thinking...` clears after the
    heartbeat expires. `/interrupted` then lists the interrupted request;
    `/retry <request_id>` starts a new claim after you decide retrying is safe.
+
+## Responsiveness and background refresh
+
+The TUI draws cached state and handles local input independently of backend
+work. Enter accepts an action into an ordered queue; it does not wait for a
+session read, command, or message write. Settings opens from cached metadata,
+and opening a stored session leaves the hub usable while its data loads.
+Each tab owns its transcript, name/models, extension strip and live-turn count.
+A completion addresses the requesting tab incarnation, never whichever tab
+happens to be focused. Closing and reopening a tab cannot apply its old results.
+A delayed open does not take focus after newer local navigation. Ordinary opens
+resolve their destination before installing observation: `/join` to an open
+tab reuses its live approval receiver. New destinations finish observation
+setup before exposing their composer. Jobs opened from either Jobs or the hub
+remain authorized observers, never ordinary execution sessions.
+
+| Trigger / display                      | Behavior                                                                          |
+| -------------------------------------- | --------------------------------------------------------------------------------- |
+| Session write / Settings open          | Coalesced background transcript/meta/status refresh                               |
+| Every five seconds                     | Refresh activity; check service health and retry failed reads                     |
+| `⟳ refreshing (cached)`                | A read is pending; displayed data is the last successful read                     |
+| `⚠ refresh failed`                     | That read failed; last-good data remains, even if another read succeeds           |
+| `action(s) pending`                    | Accepted backend actions execute in order, one at a time                          |
+| Queue full or backend disconnected     | New backend actions are not accepted; composer/prompts stay editable              |
+| `Write still pending; outcome unknown` | A deadline warns, but does not cancel, retry or advance past the write            |
+| Quit with unfinished actions           | Esc (without popup), Ctrl+C and `/quit` warn first; repeat to abandon queued work |
+
+### Cached is not confirmed
+
+The first quit with pending work shows a top-of-screen `Quit again to exit`
+warning in every mode, including Settings editors, model selection and overlays.
+Drafts remain intact and visible; a second explicit quit confirms exit. An open
+completion popup still consumes the first Esc without arming quit.
+
+Reads have a bounded wait and supervised panic/cancellation handling. A failed
+read releases its slot for recovery without clearing cached data or restoring
+an otherwise live terminal. Errors are tracked separately for transcript/meta,
+status and activity; a successful activity poll cannot hide a failed transcript
+read. Catalog failures likewise retain prior rows and mark their metadata stale.
+Errors are logged at `warn`; worker panics are logged at `error`.
+
+Writes are different. A transport failure, timeout or cancellation cannot prove
+that a message or command did not commit. The TUI never automatically retries
+an accepted action. A slow write stays owned and later accepted actions remain
+queued behind it. Errors report an unknown outcome rather than success; check
+persisted state before deciding to resubmit. Unconfirmed accepted input is kept
+and reported after terminal restoration on exit. Queued actions abandoned by
+an explicit exit were not started; a started write may already have effects.
+
+On an actual service disconnect, the TUI keeps the cached view and draft. Once
+accepted actions settle, it tears down the old runtime and reconnects through
+the normal connector using the same configured login and execution role.
+Successful recovery reopens the same session IDs and refreshes their caches;
+it does not replay submitted messages or commands. Handle reopening is separate
+from hydration: a failed transcript read retains cached history while status can
+refresh independently. A tab that could not reopen retries on the healthy runtime
+without restarting other tabs. That tab refuses backend writes until its handle
+is available, but its cached view and draft remain usable. Admission/reconnect
+notices clear on acceptance, completion or recovery; unresolved write outcomes
+remain visible independently. A slow health read alone is not grounds to
+replace a runtime. Configuration/login errors are displayed, not retried
+indefinitely.
+
+Pending keypresses and wheel notches are handled in order, but can draw as one
+frame. Pointer motion is ignored without redrawing. Rendering reuses wrapped
+transcripts until they change and draws the visible rows rather than rebuilding
+all history for each keystroke.
+
+### Walkthrough: a slow backend, then a lost connection
+
+1. In a conversation, submit a message and keep typing a second draft. The
+   first action may remain pending while the second draft and local scrolling
+   stay usable. Open Settings with Ctrl+S, or the hub with Ctrl+P; browsing cached
+   data does not wait for the first write. If the write remains slow, the status
+   reports:
+
+   ```text
+   Write still pending; outcome unknown. Not cancelled or retried; later actions remain queued
+   ```
+
+2. If a refresh fails, the transcript/name/status do not become empty. The bar
+   shows `⚠ refresh failed`. An actual service disconnect reports:
+
+   ```text
+   Backend disconnected — cached data is stale; reconnecting after accepted actions settle. No writes replayed
+   ```
+
+   New backend submissions are refused while disconnected, but the existing
+   draft remains editable. Do not assume a previously submitted message failed
+   to commit just because the service went away.
+
+3. When the service returns, the same views refresh and the draft survives.
+   The disconnect notice clears; `⟳ refreshing (cached)` remains while a read
+   is pending. If only transcript hydration fails, `⚠ refresh failed` and the
+   cached transcript remain even after the extension status becomes fresh.
+   A later successful read clears that read's error without replaying a write.
+
+   Check the transcript or persisted command result before explicitly retrying
+   any unconfirmed action. If you instead exit while work is pending, the first
+   quit request warns; repeating it restores the terminal and reports queued
+   versus potentially committed work, including unconfirmed accepted input.
 
 ## Entry Types
 
@@ -679,6 +793,144 @@ approval and native shell cancellation, next-turn recovery, and Ctrl+C quit
 while busy with terminal restoration.
 It also checks that missing output fails on both early exit and timeout, and
 that children are reaped.
-This complements the fast widget snapshots and executor tests; it does not
-exercise production providers or cross-peer delivery.
+
+It also stops a disposable IPC owner while Enter, Settings and hub actions
+are pending, verifies ordered commands and cache/draft retention across an
+actual service stop/restart, and exercises read timeout/panic under a controlling
+PTY without losing terminal ownership. This complements the widget and executor tests; it does not exercise
+production providers or assert rollback of effects or cancellation of durable
+child jobs.
 See `dev/tui-pty/README.md` for isolation details and failure artifact locations.
+
+## Jobs: observe without taking over
+
+`/jobs` (or `Ctrl+G`) opens the local Jobs monitor. It follows the Agent DB's
+stable per-executor references, then reads the job Session DB for attempt and
+result evidence. A projection row is discovery, not execution authority.
+
+Local v1 requires **existing Write authority** on the observed databases;
+Admin is also supported, but not required. This includes the Agent/executor
+sources and job sessions. The observer UI is non-executing, **not a Read-only
+credential boundary**. The current Eidetica service needs Write to materialize
+native record caches when reading. True Read-only observation is deferred
+until that upstream path is repaired and verified; it is not supported yet.
+Chaz never upgrades a key, grants access, or substitutes a privileged credential.
+A delegated service session whose native Write query is unsupported also stays
+explicitly unavailable; the monitor does not guess its authority.
+
+| Existing authority | Local-v1 behavior                                       |
+| ------------------ | ------------------------------------------------------- |
+| Write or Admin     | Observe; steer only an active attempt within its limits |
+| Read only          | Explicit insufficient-permission outcome                |
+| Unauthorized       | Refuse access; a row or job handle grants nothing       |
+
+| Control                         | Action                                                                |
+| ------------------------------- | --------------------------------------------------------------------- |
+| `↑` / `↓`                       | Select an ancestry node and preview its task, activity and result     |
+| `Enter`                         | Open a job in an observe-only conversation tab                        |
+| `PgUp` / `PgDn`, `Home` / `End` | Read the selected task or its diagnostics                             |
+| `d` / `F2`                      | Toggle technical details in Jobs (IDs, source errors, wait deadlines) |
+| `F2` in a job tab               | Toggle observer/input identifiers and diagnostics                     |
+| `r`                             | Refresh the overview without registering an executor                  |
+| `Esc`                           | Return from the overview                                              |
+| `Ctrl+G`                        | Toggle between chat and Jobs                                          |
+| `Ctrl+W`                        | Close the current tab; the resident job continues                     |
+| Job composer                    | Publish authenticated input for the same attempt's next model call    |
+
+### Read tasks first, inspect identifiers when needed
+
+The tree uses task titles, preserves ancestry and sibling order, and highlights
+the selected row in bold. Its second line names the recorded status and Agent.
+The header counts only claimed jobs; **Context** rows (originating conversations
+and unclaimed references) have a separate count. A completed job says
+**Completed**, not “claimed.” Missing data says **Unavailable**, not “no jobs.”
+
+Wide terminals show the tree and selected task side by side. Below 110 columns
+they stack, leaving the detail pane the larger share. The detail starts with
+the task, parent/children, recorded waits and terminal result, then recent
+activity. Long tasks wrap; `PgUp`/`PgDn` read them without moving the tree
+selection. `Home`/`End` jump to either end. `d` switches to IDs, executor/source
+diagnostics and full recent records; press it again to return to the task.
+
+**Started · recent activity** means activity was recently recorded, not that the
+job is proven running. **Started · status uncertain** has no such recent evidence.
+Wait labels come from entered, bounded `job_wait` calls, not model intentions.
+**Wait recorded (unfinished)** is persisted evidence, not proof the execution is
+still waiting. The freshness line shows snapshot age or a stale refresh failure;
+unavailable sources stay visible. No progress, ETA or heartbeat is invented.
+This view does not fetch remote databases or request access automatically.
+
+Opening a job does not start work, adopt a runtime, or append another ordinary
+turn. The tab follows persisted messages and tool activity. Job-local settings,
+retry, cancellation and approval-policy changes are unavailable here.
+Closing a tab or the client does not cancel the job or discard published input.
+
+Jobs uses the same [background boundary](#responsiveness-and-background-refresh)
+as ordinary conversations: selection, diagnostics, cached scrolling and drafts
+stay local while refreshes or accepted actions run. Overview refreshes coalesce;
+opening an observer and publishing steering use the ordered action queue.
+Pending work and exit confirmation remain visible in both Jobs and observer tabs.
+Reconnect reopens job tabs as observers, never as ordinary executing sessions.
+
+### Next-call steering and the final boundary
+
+An authorized session writer can send input while a recent started attempt is
+observable. Read-only keys cannot observe or publish in local v1. The original
+Directive and accepted tool, grant, capability and depth ceilings remain
+unchanged. Input cannot contain scope overrides or start another job.
+
+The executor reads input only between complete model/tool exchanges. It does
+not interrupt a model call, tool or approval wait. Tool-free jobs use the same
+boundary. If input is accepted before closing, a model's final text is
+provisional: the same attempt continues and only its continued terminal result
+becomes available to the parent. Completed jobs are view-only; there is no
+reopen or follow-up action.
+
+Receipts distinguish **Queued · published, awaiting acceptance**,
+**Accepted · awaiting next call**, and **Accepted · dispatch recorded for call N;
+inclusion unconfirmed**. Dispatch intent does not prove the backend received
+input. **Included · call N returned** means a response to the request containing
+that input was observed. **Not applied** and **Uncertain** explain late
+publication, failure or interruption. Input numbers are display labels, not
+submission order or request identities; `F2` exposes the durable IDs. A lost acknowledgement retains the
+request ID for the client lifetime, including tab close/reopen and service reconnect: resend the same text to retry that publication, not create a second
+logical input. Different text is refused while that publication is unresolved.
+There is no globally exactly-once effect guarantee. Interrupted input and
+model/tool effects never replay automatically after restart.
+
+### Walkthrough: steer, then inspect
+
+1. Run a client-role TUI against the same configured Eidetica service as a
+   resident executor (`execution: client` on the viewer), using existing
+   Write-authorized credentials (Admin also works). Ask the executor's
+   ordinary conversation to submit a local Agent job with `spawn_agent`.
+2. Open `/jobs`. At 80 columns the tree sits above the detail. Select the task
+   titled `Compare storage choices`; its row and detail heading say
+   `Started · recent activity`. The preview names its parent and any recorded
+   child waits. Press `d` to see the source/attempt IDs, then `d` to hide them.
+   `PgDn` reads a long task; the tree selection stays put. Resize to 120 columns
+   for the side-by-side layout. Press `Enter` to open the job tab. Its fixed
+   banner says `Job observer` and `Write-capable · recorded, not proven live`.
+3. Send `Use the smaller example first`. The receipt reads
+   `Input 1 · Queued · published, awaiting acceptance`, then
+   `Input 1 · Accepted · dispatch recorded for call 1; inclusion unconfirmed`,
+   and finally `Input 1 · Included · call 1 returned`. Input/call numbers here
+   are illustrative. `F2` reveals the request and attempt IDs; it does not send
+   input. Close the tab with `Ctrl+W`: the resident executor still finishes.
+4. Reopen Jobs. The row says `Completed` (or `Failed`), and the preview's
+   `Result` (or `Outcome`) appears above recent activity. Open it to read the
+   transcript and input receipts. The composer says `Finished job · view-only`.
+   Sending again is refused; it cannot replace the result or start work.
+5. With an independently Read-only credential, opening the job is refused:
+   `insufficient permission: local-v1 job observation requires existing Write authority (Admin allowed); Read is unsupported`.
+   An unreadable source stays explicitly unavailable; it is not an empty
+   successful Jobs view. Return to the viewer's already Write-authorized
+   credential to inspect it. Chaz does not grant or upgrade authority.
+6. For another failure path, stop only the disposable viewer's access to its test
+   service. A refresh displays `Stale · refresh failed/timed out` with the
+   retained task and result still readable. Selection and `d` diagnostics remain
+   usable; an observer retains its transcript, receipts and editable draft with
+   an `Unavailable` banner. Restore access and press `r` to refresh. After an
+   actual reconnect, the same observer and draft recover without another job turn.
+   A stale start is not an invitation to replay: inspect the attempt before
+   using the separate explicit retry workflow outside the job observer.

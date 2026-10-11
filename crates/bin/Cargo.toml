@@ -23,6 +23,7 @@ clap.workspace = true
 crossterm.workspace = true
 dirs.workspace = true
 eidetica.workspace = true
+futures.workspace = true
 matrix-sdk.workspace = true
 nucleo-matcher.workspace = true
 ratatui.workspace = true

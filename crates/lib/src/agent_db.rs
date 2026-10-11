@@ -57,6 +57,14 @@ pub const LOGINS_STORE: &str = "logins";
 /// (which room/channel) lives in the session DB, not here — this is just the
 /// index.
 pub const SESSIONS_STORE: &str = "sessions";
+/// Executor databases belonging to this Agent, indexed by stable peer key.
+pub const EXECUTORS_STORE: &str = "executors";
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExecutorRef {
+    pub peer_pubkey: String,
+    pub db_id: String,
+}
 
 const BLOB_KEY: &str = "value";
 
@@ -561,7 +569,35 @@ impl AgentDb {
             .await?;
         txn.get_store::<Table<LoginRef>>(LOGINS_STORE).await?;
         txn.get_store::<Table<SessionRef>>(SESSIONS_STORE).await?;
+        txn.get_store::<Table<ExecutorRef>>(EXECUTORS_STORE).await?;
         txn.commit().await?;
+        Ok(())
+    }
+
+    pub async fn list_executors(&self) -> anyhow::Result<Vec<ExecutorRef>> {
+        let txn = self.database.new_transaction().await?;
+        let rows = txn
+            .get_store::<Table<ExecutorRef>>(EXECUTORS_STORE)
+            .await?
+            .search(|_: &ExecutorRef| true)
+            .await?;
+        Ok(rows.into_iter().map(|(_, row)| row).collect())
+    }
+
+    pub async fn register_executor(&self, reference: ExecutorRef) -> anyhow::Result<()> {
+        let txn = self.database.new_transaction().await?;
+        let store = txn.get_store::<Table<ExecutorRef>>(EXECUTORS_STORE).await?;
+        let rows = store
+            .search(|row: &ExecutorRef| row.peer_pubkey == reference.peer_pubkey)
+            .await?;
+        anyhow::ensure!(
+            rows.iter().all(|(_, row)| row.db_id == reference.db_id),
+            "executor reference conflicts with existing DB"
+        );
+        if rows.is_empty() {
+            store.insert(reference).await?;
+            txn.commit().await?;
+        }
         Ok(())
     }
 

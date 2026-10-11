@@ -43,6 +43,16 @@ pub enum RuntimeEvent {
 
 /// Awaited persistence boundary for completed runtime messages.
 pub trait RuntimeRecorder: Send + Sync {
+    /// Called only at a complete model/tool boundary. A closing boundary may
+    /// return input that requires continuing before any terminal publication.
+    fn input_boundary<'a>(
+        &'a self,
+        _model_sequence: u64,
+        _closing: bool,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<RuntimeMessage>, String>> + Send + 'a>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+
     fn record<'a>(
         &'a self,
         message: RuntimeRecord,
@@ -270,6 +280,49 @@ impl MetadataAccumulator {
             context_tokens: Some(self.last_prompt_tokens),
             extra: self.last_extra,
         })
+    }
+}
+
+/// Executor capacity owned by one running turn. Only job observation yields
+/// it; cancellation drops the turn (and any held permit) as usual.
+pub struct ExecutionCapacity {
+    semaphore: Arc<tokio::sync::Semaphore>,
+    permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    job_claim: Option<(eidetica::Database, String)>,
+}
+
+impl ExecutionCapacity {
+    pub fn new(
+        semaphore: Arc<tokio::sync::Semaphore>,
+        permit: tokio::sync::OwnedSemaphorePermit,
+        job_claim: Option<(eidetica::Database, String)>,
+    ) -> Self {
+        Self {
+            semaphore,
+            permit: Some(permit),
+            job_claim,
+        }
+    }
+
+    async fn reacquire(&mut self) -> Result<(), String> {
+        self.permit = Some(
+            self.semaphore
+                .clone()
+                .acquire_owned()
+                .await
+                .map_err(|_| "executor capacity closed".to_string())?,
+        );
+        // The existing executor claim-loss watcher also covers the wait and
+        // acquisition. Recheck here before any resumed model/tool effects;
+        // the LWW claim remains an observation, not a fencing token.
+        if let Some((db, incarnation)) = &self.job_claim {
+            match crate::session::jobs::owns_job(db, incarnation).await {
+                Ok(true) => {}
+                Ok(false) => return Err("job lost claim while observing".into()),
+                Err(error) => return Err(format!("job claim recheck failed: {error}")),
+            }
+        }
+        Ok(())
     }
 }
 
@@ -533,6 +586,7 @@ pub async fn execute(
         policies,
         recorder,
         hub,
+        None,
     )
     .await
 }
@@ -547,6 +601,7 @@ pub async fn execute_with_recorder(
     policies: &ToolPolicyRegistry,
     recorder: Option<Arc<dyn RuntimeRecorder>>,
     hub: Option<&ExtensionHub>,
+    capacity: Option<ExecutionCapacity>,
 ) -> Result<RuntimeOutcome, String> {
     execute_cancellable_with_recorder(
         model,
@@ -558,6 +613,7 @@ pub async fn execute_with_recorder(
         recorder,
         hub,
         None,
+        capacity,
     )
     .await
     .map_err(|error| error.to_string())
@@ -577,6 +633,7 @@ pub async fn execute_cancellable_with_recorder(
     recorder: Option<Arc<dyn RuntimeRecorder>>,
     hub: Option<&ExtensionHub>,
     cancel: Option<&TurnCancel>,
+    mut capacity: Option<ExecutionCapacity>,
 ) -> Result<RuntimeOutcome, TurnError> {
     let tools = &tool_ctx.tools;
     if tool_ctx.allow_no_reply {
@@ -601,58 +658,63 @@ pub async fn execute_cancellable_with_recorder(
         routine_engine: tool_ctx.routine_engine.clone(),
     });
 
-    // Fast path: no tools or backend doesn't support them → single-shot (with retry)
+    // Tool-free jobs have the same next-call/closing boundary without adding
+    // tool authority or changing standalone callers' single-shot behavior.
     if (tools.is_empty() && !tool_ctx.allow_no_reply) || !backend.supports_tools_for_model(model) {
-        let Some(response) = until_cancelled(
-            cancel,
-            llm_call_with_retry(
-                backend,
-                model,
-                &initial_messages,
-                &[],
-                &resolved_model,
-                max_retries,
-            ),
-        )
-        .await
-        else {
-            return Err(cancelled_outcome(&recorder, hub, hook_ctx.as_ref(), acc).await);
-        };
-        return match response {
-            Ok(LLMResponse::Text { content, metadata }) if !content.trim().is_empty() => {
-                record_runtime(
-                    &recorder,
-                    RuntimeRecord::ModelResponse {
-                        model_sequence,
-                        content: Some(content.clone()),
-                        tool_calls: Vec::new(),
-                        provider_extra: Default::default(),
-                        metadata: metadata.clone(),
-                        terminal: true,
-                    },
-                )
-                .await?;
-                if let Some(m) = metadata {
-                    acc.record(m);
+        let mut messages = initial_messages;
+        loop {
+            messages.extend(input_boundary(&recorder, model_sequence, false).await?);
+            let Some(response) = until_cancelled(
+                cancel,
+                llm_call_with_retry(backend, model, &messages, &[], &resolved_model, max_retries),
+            )
+            .await
+            else {
+                return Err(cancelled_outcome(&recorder, hub, hook_ctx.as_ref(), acc).await);
+            };
+            let response = response.map_err(|e| e.to_string())?;
+            match response {
+                LLMResponse::Text { content, metadata } if !content.trim().is_empty() => {
+                    let pending = input_boundary(&recorder, model_sequence + 1, true).await?;
+                    record_runtime(
+                        &recorder,
+                        RuntimeRecord::ModelResponse {
+                            model_sequence,
+                            content: Some(content.clone()),
+                            tool_calls: Vec::new(),
+                            provider_extra: Default::default(),
+                            metadata: metadata.clone(),
+                            terminal: pending.is_empty(),
+                        },
+                    )
+                    .await?;
+                    if let Some(m) = metadata {
+                        acc.record(m);
+                    }
+                    if !pending.is_empty() {
+                        messages.push(RuntimeMessage::Assistant(content));
+                        messages.extend(pending);
+                        model_sequence += 1;
+                        continue;
+                    }
+                    return Ok(finalize_outcome(
+                        hub,
+                        hook_ctx.as_ref(),
+                        RuntimeOutcome {
+                            body: content,
+                            metadata: acc.finalize(),
+                        },
+                    )
+                    .await);
                 }
-                Ok(finalize_outcome(
-                    hub,
-                    hook_ctx.as_ref(),
-                    RuntimeOutcome {
-                        body: content,
-                        metadata: acc.finalize(),
-                    },
-                )
-                .await)
+                LLMResponse::Text { .. } => {
+                    return Err("Model returned empty final response".into());
+                }
+                LLMResponse::ToolCalls { .. } => {
+                    return Err("Unexpected tool calls in no-tools fallback".into());
+                }
             }
-            Ok(LLMResponse::Text { .. }) => {
-                Err("Model returned empty final response".to_string().into())
-            }
-            Ok(LLMResponse::ToolCalls { .. }) => Err("Unexpected tool calls in no-tools fallback"
-                .to_string()
-                .into()),
-            Err(e) => Err(e.to_string().into()),
-        };
+        }
     }
 
     let tool_defs = tool_ctx.definitions();
@@ -676,6 +738,7 @@ pub async fn execute_cancellable_with_recorder(
 
     let mut iteration: usize = 0;
     loop {
+        messages.extend(input_boundary(&recorder, model_sequence, false).await?);
         let Some(response) = until_cancelled(
             cancel,
             llm_call_with_retry(
@@ -713,6 +776,7 @@ pub async fn execute_cancellable_with_recorder(
                 return Err("opted-in turn returned empty text without calling no_reply".into());
             }
             LLMResponse::Text { content, metadata } if !content.trim().is_empty() => {
+                let pending = input_boundary(&recorder, model_sequence + 1, true).await?;
                 record_runtime(
                     &recorder,
                     RuntimeRecord::ModelResponse {
@@ -721,12 +785,18 @@ pub async fn execute_cancellable_with_recorder(
                         tool_calls: Vec::new(),
                         provider_extra: Default::default(),
                         metadata: metadata.clone(),
-                        terminal: true,
+                        terminal: pending.is_empty(),
                     },
                 )
                 .await?;
                 if let Some(m) = metadata {
                     acc.record(m);
+                }
+                if !pending.is_empty() {
+                    messages.push(RuntimeMessage::Assistant(content));
+                    messages.extend(pending);
+                    model_sequence += 1;
+                    continue;
                 }
                 if iteration > 0 {
                     info!("ReAct loop completed after {} tool iterations", iteration);
@@ -742,6 +812,7 @@ pub async fn execute_cancellable_with_recorder(
                 .await);
             }
             LLMResponse::Text { metadata, .. } if iteration > 0 => {
+                let pending = input_boundary(&recorder, model_sequence + 1, true).await?;
                 record_runtime(
                     &recorder,
                     RuntimeRecord::ModelResponse {
@@ -750,7 +821,7 @@ pub async fn execute_cancellable_with_recorder(
                         tool_calls: Vec::new(),
                         provider_extra: Default::default(),
                         metadata: metadata.clone(),
-                        terminal: true,
+                        terminal: pending.is_empty(),
                     },
                 )
                 .await?;
@@ -760,6 +831,11 @@ pub async fn execute_cancellable_with_recorder(
                 // Model returned empty response after tool calls — some models do this.
                 // Return the last tool result as the response.
                 info!("Empty response after tool calls, using last tool result");
+                if !pending.is_empty() {
+                    messages.extend(pending);
+                    model_sequence += 1;
+                    continue;
+                }
                 if let Some(RuntimeMessage::ToolResult { content, .. }) = messages.last() {
                     return Ok(finalize_outcome(
                         hub,
@@ -1003,10 +1079,25 @@ pub async fn execute_cancellable_with_recorder(
                             call_ctx.tool_call_key =
                                 Some(format!("{model_sequence}:{call_index}:{}", call.id));
                             call_ctx.grants = call_grants;
-                            let Some(exec_result) = until_cancelled(
-                                cancel,
-                                execute_with_retry(tool, args, &call_ctx, timeout, &call.name),
-                            )
+                            if call.name == "job_wait"
+                                && let Some(capacity) = capacity.as_mut()
+                            {
+                                capacity.permit.take();
+                            }
+                            let Some(exec_result) = until_cancelled(cancel, async {
+                                let result =
+                                    execute_with_retry(tool, args, &call_ctx, timeout, &call.name)
+                                        .await;
+                                // Outside the tool timeout: success, error and timeout
+                                // all regain capacity before hooks, another tool in
+                                // this batch, or the next model request can execute.
+                                if call.name == "job_wait"
+                                    && let Some(capacity) = capacity.as_mut()
+                                {
+                                    capacity.reacquire().await?;
+                                }
+                                Ok::<_, String>(result)
+                            })
                             .await
                             else {
                                 record_cancelled_calls(
@@ -1024,6 +1115,7 @@ pub async fn execute_cancellable_with_recorder(
                                 )
                                 .await);
                             };
+                            let exec_result = exec_result?;
 
                             match exec_result {
                                 Ok(Ok(output)) => {
@@ -1192,6 +1284,17 @@ impl RuntimeRecorder for EventRecorder {
     }
 }
 
+async fn input_boundary(
+    recorder: &Option<Arc<dyn RuntimeRecorder>>,
+    model_sequence: u64,
+    closing: bool,
+) -> Result<Vec<RuntimeMessage>, String> {
+    match recorder {
+        Some(recorder) => recorder.input_boundary(model_sequence, closing).await,
+        None => Ok(Vec::new()),
+    }
+}
+
 async fn record_runtime(
     recorder: &Option<Arc<dyn RuntimeRecorder>>,
     record: RuntimeRecord,
@@ -1296,6 +1399,10 @@ fn redact_sensitive_params(arguments_json: &str, sensitive: &[&str]) -> String {
         arguments_json.to_string()
     }
 }
+
+#[cfg(test)]
+#[path = "runtime/capacity_tests.rs"]
+mod capacity_tests;
 
 #[cfg(test)]
 mod tests {

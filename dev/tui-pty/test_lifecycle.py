@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
-"""Linux PTY smoke test of the built TUI; stdlib only, no live services."""
+# /// script
+# dependencies = ["pyte==0.8.2"]
+# ///
+"""Linux PTY regression of the built TUI; disposable owners and stub models."""
 
+import codecs
+import pyte
 import errno
 import fcntl
 import hashlib
@@ -26,7 +31,7 @@ from http.server import HTTPServer
 
 ROOT = Path(__file__).resolve().parents[2]
 TARGET = Path(os.environ.get("CARGO_TARGET_DIR", ROOT / "target")).resolve()
-BINARY = TARGET / "debug/chaz"
+BINARY = Path(os.environ.get("TUI_BINARY", TARGET / "debug/chaz"))
 FIXTURE = TARGET / "debug/examples/tui_fixture"
 spec = importlib.util.spec_from_file_location(
     "stub_llm", ROOT / "dev/matrix-e2e/stub_llm.py"
@@ -43,6 +48,9 @@ class PtyProcess:
         self.checkpoints = []
         self.command = [str(arg) for arg in command]
         self.master, self.slave = pty.openpty()
+        self.screen = pyte.Screen(40, 16)
+        self.stream = pyte.Stream(self.screen)
+        self.decoder = codecs.getincrementaldecoder("utf-8")("replace")
         self.resize(40, 16)
         # A fresh session must acquire the slave as its controlling terminal:
         # crossterm reads /dev/tty, not merely the redirected stdin.
@@ -65,6 +73,7 @@ class PtyProcess:
     def resize(self, columns, rows):
         # The kernel delivers SIGWINCH to the foreground process group; a
         # second, explicit signal could arrive after the redraw being awaited.
+        self.screen.resize(lines=rows, columns=columns)
         fcntl.ioctl(self.slave, termios.TIOCSWINSZ, struct.pack("HHHH", rows, columns, 0, 0))
         self.checkpoints.append({"resize": [columns, rows], "time": time.monotonic()})
 
@@ -76,7 +85,9 @@ class PtyProcess:
             return
         if select.select([self.master], [], [], timeout)[0]:
             try:
-                self.raw.extend(os.read(self.master, 65536))
+                chunk = os.read(self.master, 65536)
+                self.raw.extend(chunk)
+                self.stream.feed(self.decoder.decode(chunk))
             except OSError as error:
                 if error.errno != errno.EIO:
                     raise
@@ -92,6 +103,18 @@ class PtyProcess:
                 raise AssertionError(f"child exited {self.child.returncode} before {text!r}")
             if time.monotonic() >= deadline:
                 raise AssertionError(f"deadline waiting for {text!r}")
+
+    def expect_screen(self, text, timeout=20):
+        deadline = time.monotonic() + timeout
+        while True:
+            self.drain(min(0.05, max(0, deadline - time.monotonic())))
+            if text in "\n".join(self.screen.display):
+                self.checkpoints.append({"screen_seen": text, "time": time.monotonic()})
+                return
+            if self.child.poll() is not None:
+                raise AssertionError(f"child exited {self.child.returncode} before screen {text!r}")
+            if time.monotonic() >= deadline:
+                raise AssertionError(f"deadline waiting for screen {text!r}:\n" + "\n".join(self.screen.display))
 
     def request(self, received, timeout=20):
         # Keep reading the PTY so failure artifacts show what the TUI drew.
@@ -131,6 +154,7 @@ class PtyProcess:
         try:
             directory.mkdir(parents=True, exist_ok=True)
             (directory / "pty.raw").write_bytes(self.raw)
+            (directory / "screen.txt").write_text("\n".join(self.screen.display))
             (directory / "checkpoints.json").write_text(json.dumps({
                 "command": self.command,
                 "binary_sha256": hashlib.sha256(Path(self.command[0]).read_bytes()).hexdigest(),
@@ -397,12 +421,12 @@ default_agents: [chaz]
                         process.expect("Help", offset=offset)
                         before_dismiss = len(process.raw)
                         process.send("\x1b")
-                        process.expect("Esc stop", offset=before_dismiss)
+                        process.expect_screen("Esc stop")
                         process.send("/st")
                         process.expect("commands", offset=before_dismiss)
                         before_dismiss = len(process.raw)
                         process.send("\x1b")
-                        process.expect("Esc stop", offset=before_dismiss)
+                        process.expect_screen("Esc stop")
                         process.send("\x7f" * 3)  # clear the unsubmitted /st draft
                     if prompt in ("pty-stop-approval", "pty-stop-shell"):
                         process.expect("Tool approval", offset=offset)
@@ -527,6 +551,230 @@ default_agents: [chaz]
             with self.assertRaises(OSError):
                 # The listener itself is closed, not just an idle serve loop.
                 server.socket.getsockname()
+
+    def test_last_tab_close_batch(self):
+        with tempfile.TemporaryDirectory(prefix="chaz-close-batch-") as directory:
+            home = Path(directory)
+            env = {"HOME": directory, "PATH": str(home / "bin"), "TERM": "xterm-256color", "LANG": "C.UTF-8", "RUST_LOG": "warn"}
+            (home / "bin").mkdir()
+            for cli in ["claude", "pi", "codex", "gemini"]:
+                path = home / "bin" / cli
+                path.write_text("#!/bin/sh\necho unexpected-model-CLI >&2\nexit 97\n")
+                path.chmod(0o700)
+            for name in ["CONFIG", "DATA", "STATE", "CACHE", "RUNTIME"]:
+                path = home / name.lower(); path.mkdir(mode=0o700)
+                env[f"XDG_{name}_HOME" if name != "RUNTIME" else "XDG_RUNTIME_DIR"] = str(path)
+            if "LD_LIBRARY_PATH" in os.environ:
+                env["LD_LIBRARY_PATH"] = os.environ["LD_LIBRARY_PATH"]
+            config = home / "config.yaml"
+            config.write_text(f"execution: client\nstate_dir: {home}/state\neidetica:\n  connection: sqlite://{home}/fixture.db\n  login:\n    username: pty-test\n    passwordless: true\n")
+            subprocess.run([FIXTURE, home / "fixture.db"], env=env, cwd=home, check=True, timeout=20, capture_output=True)
+            # One terminal write queues all input before the loop can redraw.
+            # The mouse case forces the intermediate pre-click draw too.
+            for index, (tail, expected) in enumerate( [("\x1b[5~", "Sessions"), ("\x13", "Peer Settings"), ("\x1b[<0;119;38M", "Sessions")]):
+                process = PtyProcess([BINARY, "--config", config, "--session", "batch"], env, home)
+                try:
+                    process.resize(120, 40)
+                    process.expect_screen("Ctrl+S settings")
+                    process.send("draft-to-close")
+                    process.expect_screen("draft-to-close")
+                    os.kill(process.child.pid, signal.SIGSTOP)
+                    process.send("\x17" + tail)
+                    os.kill(process.child.pid, signal.SIGCONT)
+                    process.expect_screen(expected, timeout=5)
+                    self.assertIsNone(process.child.poll(), "next batched event crashed empty-tab view")
+                    if evidence := os.environ.get("TUI_EVIDENCE"):
+                        process.capture(Path(evidence) / f"last-tab-{index}")
+                    process.send("\x03")
+                    self.assertEqual(process.child.wait(timeout=10), 0)
+                    process.drain(0.1)
+                    self.assertEqual(bytes(process.raw).count(b"\x1b[?1049l"), 1)
+                    attrs = termios.tcgetattr(process.slave)
+                    self.assertTrue(attrs[3] & termios.ICANON and attrs[3] & termios.ECHO)
+                except BaseException:
+                    process.capture(ROOT / "target/tui-pty-failures" / str(time.time_ns()))
+                    raise
+                finally:
+                    process.close()
+            print("LAST-TAB BATCH CONTRACT: PASS; PageUp, Settings and pre-click draw remain valid")
+
+    def test_background_panic_and_read_timeout_keep_terminal_owned(self):
+        build = subprocess.run(["cargo", "test", "-p", "chaz", "--bin", "chaz", "--no-run", "--message-format", "json"], capture_output=True, text=True, check=True, timeout=180)
+        artifacts = [json.loads(line) for line in build.stdout.splitlines() if line.startswith("{")]
+        binary = next(item["executable"] for item in artifacts if item.get("reason") == "compiler-artifact" and item.get("profile", {}).get("test") and item.get("executable"))
+        with tempfile.TemporaryDirectory(prefix="chaz-panic-pty-") as directory:
+            process = PtyProcess([binary, "background_panic_keeps_the_live_terminal_owned", "--ignored", "--nocapture", "--test-threads=1"], {"TERM": "xterm-256color", "PATH": directory, "LD_LIBRARY_PATH": os.environ.get("LD_LIBRARY_PATH", "")}, directory)
+            try:
+                process.resize(80, 24)
+                process.expect("LIVE-AFTER-WORKER-PANIC-AND-TIMEOUT", timeout=20)
+                self.assertEqual(process.child.wait(timeout=10), 0)
+                process.drain(0.2)
+                raw = bytes(process.raw)
+                self.assertEqual(raw.count(b"\x1b[?1049l"), 1, "worker panic restored the live terminal")
+                self.assertIn(b"1 passed; 0 failed", raw)
+                attrs = termios.tcgetattr(process.slave)
+                self.assertTrue(attrs[3] & termios.ICANON)
+                self.assertTrue(attrs[3] & termios.ECHO)
+                print("TERMINAL WORKER CONTRACT: PASS; panic/timeout caught, live frame drawn, restored exactly once")
+            except BaseException:
+                process.capture(ROOT / "target/tui-pty-failures" / str(time.time_ns()))
+                raise
+            finally:
+                process.close()
+
+    def test_stalled_ipc_actions_and_service_loss_recovery(self):
+        fixture = TARGET / "debug/examples/tui_service_fixture"
+        process = owner = None
+        with tempfile.TemporaryDirectory(prefix="chaz-ipc-pty-") as directory:
+            home = Path(directory)
+            (home / "bin").mkdir()
+            for cli in ["claude", "pi", "codex", "gemini"]:
+                path = home / "bin" / cli
+                path.write_text("#!/bin/sh\necho unexpected-model-CLI >&2\nexit 97\n")
+                path.chmod(0o700)
+            env = {"HOME": directory, "PATH": str(home / "bin"), "TERM": "xterm-256color", "LANG": "C.UTF-8", "RUST_LOG": "warn"}
+            for name in ["CONFIG", "DATA", "STATE", "CACHE", "RUNTIME"]:
+                path = home / name.lower(); path.mkdir(mode=0o700)
+                env[f"XDG_{name}_HOME" if name != "RUNTIME" else "XDG_RUNTIME_DIR"] = str(path)
+            if "LD_LIBRARY_PATH" in os.environ:
+                env["LD_LIBRARY_PATH"] = os.environ["LD_LIBRARY_PATH"]
+            config = home / "config.yaml"
+            config.write_text(f'''execution: client
+state_dir: "{home}/state"
+eidetica:
+  connection: "unix://{home}/service.sock"
+  login:
+    username: pty-service
+    passwordless: true
+''')
+            owner = subprocess.Popen([fixture, home / "service.sock"], env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            def owner_reply(expected):
+                self.assertTrue(select.select([owner.stdout], [], [], 15)[0], "fixture control deadline")
+                line = owner.stdout.readline().strip()
+                self.assertTrue(line.startswith(expected), (expected, line))
+            def control(command, expected):
+                owner.stdin.write(command + "\n"); owner.stdin.flush(); owner_reply(expected)
+            def visible_input(text, limit=1.0):
+                offset = len(process.raw); started = time.monotonic()
+                process.send(text); process.expect_screen(text, timeout=limit)
+                latency = (time.monotonic() - started) * 1000
+                print(f"STALLED IPC visible input {text!r}: {latency:.3f}ms")
+            try:
+                owner_reply("READY")
+                process = PtyProcess([BINARY, "--config", config, "--session", "service-fixture"], env, home)
+                process.resize(120, 40)
+                process.expect("SERVICE-CACHED-TRANSCRIPT")
+                process.expect("SERVICE-CACHED-STATUS")
+                # A stopped owner cannot answer *any* read or write. The UI
+                # must remain alive during Enter, Settings and hub actions.
+                os.kill(owner.pid, signal.SIGSTOP)
+                process.send("accepted-before-stall\r")
+                visible_input("ЖLOCAL-LIVE")
+                process.send("\x1b")
+                process.expect_screen("Quit again to exit", timeout=1)
+                self.assertIsNone(process.child.poll(), "Esc discarded accepted work")
+                self.assertNotIn(b"\x1b[?1049l", process.raw)
+                print("PENDING ESC CONTRACT: PASS; accepted work retained, explicit confirmation visible")
+                # The armed banner owns the mode header. Assert decoded
+                # destination content, not the deliberately covered title.
+                process.send("\x7f" * 30)
+                offset = len(process.raw); process.send("\x13")
+                process.expect_screen("> Overview", timeout=1)
+                offset = len(process.raw); process.send("\x1b")
+                process.expect_screen("SERVICE-CACHED-TRANSCRIPT", timeout=1)
+                offset = len(process.raw); process.send("\x10")
+                process.expect_screen("New session", timeout=1)
+                process.send("n")  # queues create/open behind the accepted write
+                offset = len(process.raw); process.send("s")
+                process.expect_screen("Backends", timeout=1)
+                offset = len(process.raw); process.send("\x1b")
+                process.expect_screen("New session", timeout=1)
+                offset = len(process.raw); process.send("\x10")
+                process.expect_screen("SERVICE-CACHED-TRANSCRIPT", timeout=1)
+                visible_input("界NAV-LIVE")
+                # Leave the backend stopped beyond the read timeout; pending
+                # work must fail/release, not restore the terminal or hang UI.
+                deadline = time.monotonic() + 12
+                while time.monotonic() < deadline:
+                    process.drain(0.05)
+                self.assertNotIn(b"\x1b[?1049l", process.raw)
+                visible_input("éAFTER-TIMEOUT")
+                os.kill(owner.pid, signal.SIGCONT)
+                # Accepted actions settle once; no automatic write retry.
+                deadline = time.monotonic() + 8
+                while time.monotonic() < deadline:
+                    process.drain(0.05)
+                process.send("\x7f" * 100)
+                os.kill(owner.pid, signal.SIGSTOP)
+                process.send("/name ordered-one\r/name ordered-two\r")
+                visible_input("ЖORDERED-DRAFT")
+                os.kill(owner.pid, signal.SIGCONT)
+                deadline = time.monotonic() + 15
+                while True:
+                    process.drain(0.05)
+                    owner.stdin.write("name\n"); owner.stdin.flush()
+                    self.assertTrue(select.select([owner.stdout], [], [], 5)[0])
+                    if owner.stdout.readline().strip() == "NAME ordered-two": break
+                    self.assertLess(time.monotonic(), deadline, "ordered commands did not persist the final name")
+                print("ORDERED COMMAND CONTRACT: PASS; final persisted name ordered-two")
+                process.send("\x7f" * 100)
+                visible_input("draft-during-loss")
+                offset = len(process.raw)
+                control("stop", "STOPPED")
+                deadline = time.monotonic() + 15
+                while True:
+                    process.drain(0.05)
+                    logs = "".join(path.read_text() for path in (home / "state").glob("chaz-tui*.log*"))
+                    if "TUI service disconnected" in logs: break
+                    self.assertLess(time.monotonic(), deadline, "health supervision did not observe actual service loss")
+                # Force a complete local redraw while service is absent:
+                # cached transcript/status remain present, not empty defaults.
+                offset = len(process.raw); process.resize(121, 41)
+                process.expect("SERVICE-CACHED-TRANSCRIPT", offset=offset, timeout=2)
+                process.expect("SERVICE-CACHED-STATUS", offset=offset, timeout=2)
+                process.expect_screen("ordered-two", timeout=2)
+                visible_input("-界OFFLINE")
+                process.send("\r")
+                process.expect_screen("draft-during-loss-界OFFLINE", timeout=1)
+                control("append", "APPENDED")
+                control("corrupt-meta", "META corrupt-meta")
+                offset = len(process.raw); control("start", "STARTED")
+                # The global runtime recovered but this tab's hydration fails.
+                # A fresh handle must still refresh status independently, while
+                # the failed snapshot retains the last-good transcript/name.
+                process.expect_screen("RECOVERY-STATUS", timeout=25)
+                process.expect_screen("SERVICE-CACHED-TRANSCRIPT", timeout=2)
+                process.expect_screen("ordered-two", timeout=2)
+                process.expect_screen("refresh failed", timeout=2)
+                control("repair-meta", "META repair-meta")
+                process.expect("RECOVERY-VISIBLE", offset=offset, timeout=15)
+                process.expect_screen("RECOVERY-STATUS", timeout=5)
+                process.expect_screen("draft-during-loss-界OFFLINE", timeout=5)
+                self.assertNotIn(b"\x1b[?1049l", process.raw)
+                self.assertNotIn("Backend unavailable", "\n".join(process.screen.display), "transient rejection survived recovery")
+                if evidence := os.environ.get("TUI_EVIDENCE"):
+                    process.capture(Path(evidence) / "ipc-partial-recovery")
+                process.send("\x03")
+                self.assertEqual(process.child.wait(timeout=20), 0)
+                process.drain(0.2)
+                attrs = termios.tcgetattr(process.slave)
+                self.assertTrue(attrs[3] & termios.ICANON)
+                self.assertTrue(attrs[3] & termios.ECHO)
+                self.assertIn(b"\x1b[?1049l", process.raw)
+                print("IPC ACTION/RECOVERY CONTRACT: PASS; Enter/Settings/hub navigation live, cached transcript/meta/status retained, draft preserved after recovery, clean exit")
+            except BaseException:
+                if process:
+                    process.capture(ROOT / "target/tui-pty-failures" / str(time.time_ns()))
+                raise
+            finally:
+                if process: process.close()
+                if owner:
+                    if owner.poll() is None:
+                        os.kill(owner.pid, signal.SIGCONT)
+                        owner.stdin.write("quit\n"); owner.stdin.flush()
+                        try: owner.wait(timeout=10)
+                        except subprocess.TimeoutExpired: owner.kill(); owner.wait(timeout=5)
+                    owner.stdin.close(); owner.stdout.close(); owner.stderr.close()
 
 
 if __name__ == "__main__":

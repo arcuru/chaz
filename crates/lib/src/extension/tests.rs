@@ -109,6 +109,7 @@ struct TestParts {
     session_shutdown: Option<Arc<dyn handler::HookHandlerSessionShutdown>>,
     routine_handler: Option<Arc<dyn handler::RoutineHandler>>,
     prompt_augmentation: Option<Arc<dyn caps::PromptAugmentation>>,
+    context_tail: Option<Arc<dyn caps::ContextTail>>,
     status_segment: Option<Arc<dyn caps::StatusSegment>>,
     tools: Vec<Arc<dyn Tool>>,
     commands: Vec<(String, Arc<dyn ExtensionCommand>)>,
@@ -161,6 +162,10 @@ impl TestExt {
     }
     fn prompt_augmentation(mut self, p: Arc<dyn caps::PromptAugmentation>) -> Self {
         self.parts.prompt_augmentation = Some(p);
+        self
+    }
+    fn context_tail(mut self, tail: Arc<dyn caps::ContextTail>) -> Self {
+        self.parts.context_tail = Some(tail);
         self
     }
     fn status_segment(mut self, s: Arc<dyn caps::StatusSegment>) -> Self {
@@ -260,6 +265,9 @@ impl instance::ExtensionInstance for TestInstance {
     fn prompt_augmentation(&self) -> Option<Arc<dyn caps::PromptAugmentation>> {
         self.parts.prompt_augmentation.clone()
     }
+    fn context_tail(&self) -> Option<Arc<dyn caps::ContextTail>> {
+        self.parts.context_tail.clone()
+    }
     fn status_segment(&self) -> Option<Arc<dyn caps::StatusSegment>> {
         self.parts.status_segment.clone()
     }
@@ -321,6 +329,136 @@ impl caps::PromptAugmentation for FixedAug {
         let text = self.0.to_string();
         Box::pin(async move { Ok(Some(text)) })
     }
+}
+
+impl caps::ContextTail for FixedAug {
+    fn context_tail<'a>(
+        &'a self,
+        _agent_name: &'a str,
+        _recent: &'a [String],
+    ) -> caps::CapFuture<'a, Option<String>> {
+        let text = self.0.to_string();
+        Box::pin(async move { Ok(Some(text)) })
+    }
+}
+
+#[tokio::test]
+async fn context_augmentation_order_is_stable_and_filtered() {
+    let mut hub = test_hub().await;
+    let names = ["zulu", "echo", "alpha", "delta", "bravo", "charlie"];
+    let mut extensions: Vec<Arc<dyn Extension>> = names
+        .iter()
+        .map(|&name| {
+            let scopes = if name == "echo" {
+                vec![instance::Scope::PerAgent, instance::Scope::PerSession]
+            } else {
+                vec![instance::Scope::PerSession]
+            };
+            Arc::new(
+                TestExt::new(name)
+                    .scopes(scopes)
+                    .prompt_augmentation(Arc::new(FixedAug(name)))
+                    .context_tail(Arc::new(FixedAug(name))),
+            ) as Arc<dyn Extension>
+        })
+        .collect();
+    extensions.push(Arc::new(
+        TestExt::new("global")
+            .prompt_augmentation(Arc::new(FixedAug("GLOBAL")))
+            .context_tail(Arc::new(FixedAug("GLOBAL"))),
+    ));
+    extensions.push(Arc::new(
+        TestExt::new("foxtrot")
+            .scopes(vec![instance::Scope::PerAgent])
+            .prompt_augmentation(Arc::new(FixedAug("foxtrot")))
+            .context_tail(Arc::new(FixedAug("foxtrot"))),
+    ));
+    hub.install_all(extensions).await.unwrap();
+
+    // Wire the real agent-name lookup, then seed distinguishable cached
+    // agent output for the same-named session provider to override.
+    let peer = hub.peer_handles.as_ref().unwrap().clone();
+    let registry = peer.registry.clone();
+    let agent = crate::agent_db::ensure_agent_db(&mut *registry.user_for_tests().await, "chaz")
+        .await
+        .unwrap();
+    peer.agent_index.register(crate::hosted_index::DbEntry {
+        db_id: agent.db.id(),
+        display_name: "chaz".into(),
+        pubkey: agent.pubkey,
+    });
+    hub.ensure_agent_instances("chaz", agent.db.database())
+        .await;
+    hub.agent_instances.write().await.insert(
+        (agent.db.id(), "echo".into()),
+        Arc::new(TestInstance {
+            manifest: TestExt::new("echo").manifest(),
+            parts: TestParts {
+                prompt_augmentation: Some(Arc::new(FixedAug("AGENT-ECHO"))),
+                context_tail: Some(Arc::new(FixedAug("AGENT-ECHO"))),
+                ..Default::default()
+            },
+        }),
+    );
+    let hub = Arc::new(hub);
+    let secrets = crate::security::SecretStore::new(registry.chaz_peer().clone()).await;
+    let server = crate::server::Server::new(
+        registry.clone(),
+        registry.agents.clone(),
+        peer.agent_index.clone(),
+        peer.memory_bank_index.clone(),
+        peer.skill_bank_index.clone(),
+        peer.tool_registry.clone(),
+        Arc::new(crate::tool::ToolPolicyRegistry::empty()),
+        crate::test_support::permissive_security(),
+        Default::default(),
+        Default::default(),
+        Arc::new(crate::tool_host::NativeToolHost::new()),
+        hub.clone(),
+        crate::backends::BackendManager::new(&None, secrets),
+        peer.mcp_registry.clone(),
+        None,
+    );
+    peer.server_slot.set(server.clone());
+    assert_eq!(
+        hub.augment_system_prompt("chaz", &[], &[], None, None)
+            .await,
+        "AGENT-ECHO\n\nfoxtrot"
+    );
+    assert_eq!(
+        hub.context_tails("chaz", &[], None, None).await,
+        "AGENT-ECHO\n\nfoxtrot"
+    );
+
+    let (_instance, db) = make_session_db().await;
+    let expected = "alpha\n\nbravo\n\ncharlie\n\ndelta\n\necho\n\nfoxtrot\n\nzulu";
+
+    // Each collection builds a fresh name map; cache hits must preserve the
+    // same model-facing bytes as the initial lazy instantiation.
+    for _ in 0..8 {
+        assert_eq!(
+            hub.augment_system_prompt("chaz", &[], &[], None, Some(&db))
+                .await,
+            expected
+        );
+        assert_eq!(
+            hub.context_tails("chaz", &[], None, Some(&db)).await,
+            expected
+        );
+    }
+    let active = vec!["zulu".to_string(), "bravo".to_string()];
+    assert_eq!(
+        hub.augment_system_prompt("chaz", &[], &[], Some(&active), Some(&db))
+            .await,
+        "bravo\n\nzulu"
+    );
+    assert_eq!(
+        hub.context_tails("chaz", &[], Some(&active), Some(&db))
+            .await,
+        "bravo\n\nzulu"
+    );
+    peer.server_slot.clear();
+    server.shutdown().await;
 }
 
 struct FixedStatus(&'static str, &'static str);

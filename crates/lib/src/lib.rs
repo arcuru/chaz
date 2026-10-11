@@ -22,6 +22,7 @@ pub mod db_kind;
 pub mod defaults;
 pub mod embedding;
 pub mod error;
+pub mod executor_db;
 pub mod extension;
 pub mod extensions;
 pub mod grants;

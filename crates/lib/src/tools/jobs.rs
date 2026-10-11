@@ -81,7 +81,7 @@ impl Tool for JobWaitTool {
     fn execute<'a>(
         &'a self,
         arguments: Value,
-        _ctx: &'a ToolContext,
+        ctx: &'a ToolContext,
     ) -> Pin<Box<dyn Future<Output = Result<String, ToolError>> + Send + 'a>> {
         Box::pin(async move {
             let id = session_id(&arguments)?;
@@ -95,11 +95,28 @@ impl Tool for JobWaitTool {
                 .server
                 .get()
                 .ok_or_else(|| "Server not initialized".to_string())?;
+            let (db, wait) = {
+                let session = ctx.session.lock().await;
+                let wait = match (&ctx.turn_request_id, &ctx.tool_call_key) {
+                    (Some(request), Some(call)) => session
+                        .start_job_wait(request, call, id, seconds)
+                        .await
+                        .map_err(|e| e.to_string())?,
+                    _ => None,
+                };
+                (session.database().clone(), wait)
+            };
             let status = server
                 .wait_job(id, std::time::Duration::from_secs(seconds))
-                .await
-                .map_err(|e| e.to_string())?;
-            serde_json::to_string(&status).map_err(|e| e.to_string().into())
+                .await;
+            if let Some((key, mut row)) = wait {
+                row.finished = true;
+                crate::session::jobs::write_job_wait(&db, &key, row)
+                    .await
+                    .map_err(|e| e.to_string())?;
+            }
+            serde_json::to_string(&status.map_err(|e| e.to_string())?)
+                .map_err(|e| e.to_string().into())
         })
     }
 }

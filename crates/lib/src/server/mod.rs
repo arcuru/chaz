@@ -42,7 +42,9 @@ use tracing::{debug, error, info, warn};
 
 mod approval_proxy;
 mod build;
+mod job_monitor;
 mod jobs;
+pub use job_monitor::{JobMonitor, JobMonitorNode};
 mod runtime_lease;
 mod schedule;
 
@@ -69,11 +71,40 @@ struct SessionRuntimeRecorder {
     terminal: std::sync::Mutex<Option<TurnTranscriptRecord>>,
     explicit_bridge_send: AtomicBool,
     agent_name: String,
+    job_input: bool,
     #[cfg(test)]
     fail_after: Arc<std::sync::Mutex<Option<usize>>>,
 }
 
 impl runtime::RuntimeRecorder for SessionRuntimeRecorder {
+    fn input_boundary<'a>(
+        &'a self,
+        model_sequence: u64,
+        closing: bool,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<runtime::RuntimeMessage>, String>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            if !self.job_input {
+                return Ok(Vec::new());
+            }
+            let session = self.session.lock().await;
+            crate::session::steering::input_boundary(
+                session.database(),
+                &self.attempt_id,
+                model_sequence,
+                closing,
+            )
+            .await
+            .map(|texts| {
+                texts
+                    .into_iter()
+                    .map(runtime::RuntimeMessage::User)
+                    .collect()
+            })
+            .map_err(|error| format!("runtime persistence failed: job input boundary: {error}"))
+        })
+    }
+
     fn record<'a>(
         &'a self,
         message: runtime::RuntimeRecord,
@@ -88,6 +119,18 @@ impl runtime::RuntimeRecorder for SessionRuntimeRecorder {
                     }
                     *value -= 1;
                 }
+            }
+            if self.job_input
+                && let runtime::RuntimeRecord::ModelResponse { model_sequence, .. } = &message
+            {
+                let session = self.session.lock().await;
+                crate::session::steering::input_call_observed(
+                    session.database(),
+                    &self.attempt_id,
+                    *model_sequence,
+                )
+                .await
+                .map_err(|error| format!("job input receipt: {error}"))?;
             }
             let explicit_send = matches!(
                 &message,
@@ -230,6 +273,7 @@ async fn bridge_reply_for_turn(
 /// Revalidate a selected request after acquiring the per-session processing
 /// slot; selection can be older than another turn's completed commit.
 async fn fresh_attempt_for_request(
+    server: &Server,
     session: &Session,
     request: &crate::session::TurnRequest,
     live_attempts: &std::collections::HashSet<String>,
@@ -254,8 +298,8 @@ async fn fresh_attempt_for_request(
     {
         return Ok(None);
     }
-    session
-        .start_turn_attempt(request.id.clone())
+    server
+        .start_live_attempt(session, request.id.clone())
         .await
         .map(Some)
 }
@@ -404,6 +448,7 @@ struct SessionRuntime {
 
 /// Context for spawned agent tasks (call depth, tool scope, completion signal).
 struct SpawnContext {
+    job_projection: Option<(eidetica::Database, String, String)>,
     job_incarnation: Option<String>,
     job_authority: Option<crate::session::jobs::AcceptedAgentJob>,
     call_depth: usize,
@@ -2743,6 +2788,7 @@ impl Server {
                     m.agent_override.clone(),
                     m.approval_tx.clone(),
                     SpawnContext {
+                        job_projection: None,
                         job_incarnation: job_authority
                             .as_ref()
                             .map(|_| self.job_incarnation.clone()),
@@ -2762,6 +2808,17 @@ impl Server {
                 }
             }
         };
+
+        let mut spawn_ctx = spawn_ctx;
+        if let Some(job) = &job_authority {
+            match self.record_claimed_job(&session_db, job).await {
+                Ok(projection) => spawn_ctx.job_projection = Some(projection),
+                Err(error) => {
+                    self.processing.lock().await.remove(session_db_id);
+                    return Err(error.context("cannot persist claimed job before execution"));
+                }
+            }
+        }
 
         // For the agent→agent case the speaker is already pinned to the
         // mentioned agent (computed in the gate above); only the
@@ -2882,7 +2939,9 @@ impl Server {
             _ => false,
         };
         let attempt =
-            match fresh_attempt_for_request(&session, &request, &live_now, pending_retry).await {
+            match fresh_attempt_for_request(self, &session, &request, &live_now, pending_retry)
+                .await
+            {
                 Ok(Some(attempt)) => {
                     if pending_retry {
                         self.pending_retry_attempts
@@ -2968,11 +3027,7 @@ impl Server {
         {
             return Ok(false);
         }
-        let attempt = fresh.start_turn_attempt(request_id).await?;
-        self.live_attempts
-            .lock()
-            .await
-            .insert(attempt.attempt_id.clone());
+        let attempt = self.start_live_attempt(&fresh, request_id).await?;
         self.spawn_agent_task(
             sid,
             fresh,
@@ -2985,6 +3040,26 @@ impl Server {
         )
         .await;
         Ok(true)
+    }
+
+    /// Mark the attempt live before its Started record is written. Status
+    /// readers snapshot live attempts before reading the DB, so the reverse
+    /// order lets a write-triggered observer (e.g. `job_wait`) report a
+    /// just-started attempt as Interrupted.
+    async fn start_live_attempt(
+        &self,
+        session: &Session,
+        request_id: TurnRequestId,
+    ) -> anyhow::Result<TurnAttempt> {
+        let attempt_id = uuid::Uuid::new_v4().to_string();
+        self.live_attempts.lock().await.insert(attempt_id.clone());
+        let started = session
+            .start_turn_attempt_as(request_id, attempt_id.clone())
+            .await;
+        if started.is_err() {
+            self.live_attempts.lock().await.remove(&attempt_id);
+        }
+        started
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3041,14 +3116,8 @@ impl Server {
                 .await?
                 .ok_or_else(|| anyhow::anyhow!("live command attempt {attempt_id} disappeared"))?,
             None => {
-                let attempt = session
-                    .start_turn_attempt(request.command_id.clone())
-                    .await?;
-                self.live_attempts
-                    .lock()
-                    .await
-                    .insert(attempt.attempt_id.clone());
-                attempt
+                self.start_live_attempt(&session, request.command_id.clone())
+                    .await?
             }
         };
         let attempt_id = attempt.attempt_id.clone();
@@ -3305,7 +3374,18 @@ impl Server {
         self.track_task(tokio::spawn(async move {
             let claim_db = session.database().clone();
             let incarnation = spawn.job_incarnation.clone();
+            let projection = spawn.job_projection.clone();
+            let projection_job = spawn.job_authority.clone();
+            let projection_lock = Arc::new(Mutex::new(()));
             let work = async {
+            if let (Some((queue, agent_db_id, peer)), Some(job)) = (&projection, &projection_job) {
+                let _guard = projection_lock.lock().await;
+                let live = live_attempts.lock().await.clone();
+                if let Err(error) = crate::executor_db::reconcile_job(queue, &claim_db, job, agent_db_id, peer, &live).await {
+                    error!(%error, session_db_id, "Cannot record job start; stopping before model/tool work");
+                    return;
+                }
+            }
             // The persisted start is the per-turn claim. Refresh its bounded
             // visibility even while waiting for a semaphore or tool approval.
             let heartbeat_db = session.database().clone();
@@ -3320,12 +3400,12 @@ impl Server {
                 }
             });
             let _heartbeat = ActivityHeartbeat(heartbeat);
-            let _permit = match reserved_permit {
+            let permit = match reserved_permit {
                 Some(permit) => Some(permit),
                 None => tokio::select! {
                     biased;
                     _ = cancel.cancelled() => None,
-                    permit = semaphore.acquire_owned() => Some(permit.expect("semaphore closed")),
+                    permit = semaphore.clone().acquire_owned() => Some(permit.expect("semaphore closed")),
                 },
             };
             if shutting_down.load(Ordering::Acquire) {
@@ -3469,6 +3549,7 @@ impl Server {
                 terminal: std::sync::Mutex::new(None),
                 explicit_bridge_send: AtomicBool::new(false),
                 agent_name: agent_name.clone(),
+                job_input: spawn.job_authority.is_some(),
                 #[cfg(test)]
                 fail_after: transcript_fail_after,
             });
@@ -3483,14 +3564,17 @@ impl Server {
                 Some(recorder.clone()),
                 Some(spawn_extensions.as_ref()),
                 Some(&cancel),
+                permit.map(|permit| runtime::ExecutionCapacity::new(
+                    semaphore,
+                    permit,
+                    incarnation.clone().map(|token| (claim_db.clone(), token)),
+                )),
             )
             .await;
 
             if shutting_down.load(Ordering::Acquire) {
                 return;
             }
-
-            drop(_permit);
 
             let mut s = session.lock().await;
             let persistence_failed =
@@ -3585,10 +3669,34 @@ impl Server {
                 }
             }
             drop(s);
+            if let (Some((queue, agent_db_id, peer)), Some(job)) = (&projection, &projection_job) {
+                let _guard = projection_lock.lock().await;
+                let live = live_attempts.lock().await.clone();
+                if let Err(error) = crate::executor_db::reconcile_job(queue, &claim_db, job, agent_db_id, peer, &live).await {
+                    error!(%error, session_db_id, "Session result committed but job projection failed; reconciliation required");
+                }
+            }
             };
             if let Some(ref token) = incarnation {
+                let projection_watch = async {
+                    let (Some((queue, agent_db_id, peer)), Some(job)) = (&projection, &projection_job) else {
+                        std::future::pending::<()>().await;
+                        return;
+                    };
+                    let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
+                    loop {
+                        tick.tick().await;
+                        let _guard = projection_lock.lock().await;
+                        let live = live_attempts.lock().await.clone();
+                        if let Err(error) = crate::executor_db::reconcile_job(queue, &claim_db, job, agent_db_id, peer, &live).await {
+                            error!(%error, session_db_id, "Job projection failed; stopping model/tool execution");
+                            return;
+                        }
+                    }
+                };
                 tokio::select! {
                     biased;
+                    () = projection_watch => {},
                     loss = crate::session::jobs::wait_for_claim_loss(&claim_db, token) => {
                         match loss {
                             Ok(winner) => {

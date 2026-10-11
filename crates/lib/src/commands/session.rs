@@ -7,7 +7,7 @@
 use crate::server::Server;
 use crate::session::{EntryType, Session, SessionIndex, SessionRegistry};
 use crate::types::ConversationId;
-use futures::{StreamExt, stream};
+use futures::{StreamExt, TryStreamExt, stream};
 
 use super::{CommandContext, CommandOutcome, SessionInfo, SessionSwitch};
 
@@ -28,10 +28,10 @@ pub(super) async fn list_sessions(ctx: &CommandContext<'_>) -> CommandOutcome {
 pub async fn collect_session_infos(registry: &SessionRegistry) -> anyhow::Result<Vec<SessionInfo>> {
     let indices = registry.list_sessions().await?;
     let mut sessions: Vec<_> = stream::iter(indices)
-        .map(|index| load_session_metadata(registry, index))
+        .map(|index| try_load_session_metadata(registry, index))
         .buffer_unordered(8)
-        .collect()
-        .await;
+        .try_collect()
+        .await?;
 
     sort_session_infos(&mut sessions);
 
@@ -41,22 +41,27 @@ pub async fn collect_session_infos(registry: &SessionRegistry) -> anyhow::Result
 /// Load mutable metadata for one picker row without constructing a `Session`
 /// or reading its transcript. A failed open leaves the catalog row usable.
 pub async fn load_session_metadata(registry: &SessionRegistry, index: SessionIndex) -> SessionInfo {
-    let (agent_name, meta_name) = match registry.open_session(&index.session_db_id).await {
-        Ok((_conv_id, db)) => {
-            let meta = crate::session::read_meta_from_db(&db).await;
-            (meta.agent_name, meta.name)
-        }
-        Err(_) => (None, None),
-    };
-    SessionInfo {
+    try_load_session_metadata(registry, index.clone())
+        .await
+        .unwrap_or_else(|_| SessionInfo::placeholder(&index))
+}
+
+/// Fallible picker row read: a failed read leaves the caller's cached row intact.
+pub async fn try_load_session_metadata(
+    registry: &SessionRegistry,
+    index: SessionIndex,
+) -> anyhow::Result<SessionInfo> {
+    let (_conv_id, db) = registry.open_session(&index.session_db_id).await?;
+    let meta = crate::session::try_read_meta_from_db(&db).await?;
+    Ok(SessionInfo {
         session_db_id: index.session_db_id,
-        agent_name,
-        name: meta_name.or(index.name),
+        agent_name: meta.agent_name,
+        name: meta.name.or(index.name),
         bridge: index.bridge,
         created_at: index.created_at,
         status: index.status,
         loaded: true,
-    }
+    })
 }
 
 /// Order sessions for display: most-recently created first, with legacy
@@ -147,7 +152,10 @@ pub(super) async fn switch_session(identifier: &str, server: &Server) -> Command
     };
 
     let session_db_id = db.root_id().to_string();
-    let meta = crate::session::read_meta_from_db(&db).await;
+    let meta = match crate::session::try_read_meta_from_db(&db).await {
+        Ok(meta) => meta,
+        Err(e) => return CommandOutcome::Error(format!("Failed to read session metadata: {e}")),
+    };
 
     let agent = server
         .registry()
@@ -164,11 +172,15 @@ pub(super) async fn switch_session(identifier: &str, server: &Server) -> Command
 }
 
 pub(super) async fn info(ctx: &CommandContext<'_>) -> CommandOutcome {
-    let session = Session::new(
+    let session = match Session::try_new(
         ConversationId(ctx.session_db_id.to_string()),
         ctx.session_db.clone(),
     )
-    .await;
+    .await
+    {
+        Ok(session) => session,
+        Err(e) => return CommandOutcome::Error(format!("Failed to read session: {e}")),
+    };
     let entries = session.entries();
     let msg_count = entries
         .iter()
@@ -190,12 +202,15 @@ pub(super) async fn info(ctx: &CommandContext<'_>) -> CommandOutcome {
         Some(n) => format!("\nName: {n}"),
         None => String::new(),
     };
-    let channels = ctx
+    let channels = match ctx
         .server
         .registry()
         .channels_for_session(ctx.session_db_id)
         .await
-        .unwrap_or_default();
+    {
+        Ok(channels) => channels,
+        Err(e) => return CommandOutcome::Error(format!("Failed to read channels: {e}")),
+    };
     let channels_line = if channels.is_empty() {
         String::new()
     } else {
@@ -443,11 +458,15 @@ async fn submit_command(
             ));
         }
     };
-    let session = Session::new(
+    let session = match Session::try_new(
         ConversationId(ctx.session_db_id.to_string()),
         ctx.session_db.clone(),
     )
-    .await;
+    .await
+    {
+        Ok(session) => session,
+        Err(e) => return CommandOutcome::Error(format!("Failed to read session: {e}")),
+    };
     if let Err(error) = session.submit_command(request).await {
         return CommandOutcome::Error(format!("Command {command_id} was not submitted: {error}"));
     }
@@ -502,11 +521,15 @@ pub(super) async fn stop(ctx: &CommandContext<'_>) -> CommandOutcome {
 }
 
 pub(super) async fn print_transcript(ctx: &CommandContext<'_>) -> CommandOutcome {
-    let session = Session::new(
+    let session = match Session::try_new(
         ConversationId(ctx.session_db_id.to_string()),
         ctx.session_db.clone(),
     )
-    .await;
+    .await
+    {
+        Ok(session) => session,
+        Err(e) => return CommandOutcome::Error(format!("Failed to read session: {e}")),
+    };
     let mut buf = String::new();
     for entry in session.entries() {
         let label: &str = if entry.sender == ctx.current_agent {
@@ -564,17 +587,26 @@ pub(super) async fn list_channels(ctx: &CommandContext<'_>) -> CommandOutcome {
 // -----------------------------------------------------------------------------
 
 pub(super) async fn model(arg: Option<String>, ctx: &CommandContext<'_>) -> CommandOutcome {
-    let session = Session::new(
+    let session = match Session::try_new(
         ConversationId(ctx.session_db_id.to_string()),
         ctx.session_db.clone(),
     )
-    .await;
+    .await
+    {
+        Ok(session) => session,
+        Err(e) => return CommandOutcome::Error(format!("Failed to read session: {e}")),
+    };
     match arg {
         None => {
             // Mirror the runtime: per-agent override → per-session pin →
             // agent default → backend default. Matches what `runtime::execute`
             // routes to so the display agrees with reality.
-            let meta = session.read_meta().await;
+            let meta = match session.try_read_meta().await {
+                Ok(meta) => meta,
+                Err(e) => {
+                    return CommandOutcome::Error(format!("Failed to read session metadata: {e}"));
+                }
+            };
             let agent_default = ctx
                 .server
                 .agents()
@@ -657,12 +689,19 @@ pub(super) async fn agent_model(
             "Agent name required. Usage: /model <agent> <model-id> | /model <agent> clear".into(),
         );
     }
-    let session = Session::new(
+    let session = match Session::try_new(
         ConversationId(ctx.session_db_id.to_string()),
         ctx.session_db.clone(),
     )
-    .await;
-    let meta = session.read_meta().await;
+    .await
+    {
+        Ok(session) => session,
+        Err(e) => return CommandOutcome::Error(format!("Failed to read session: {e}")),
+    };
+    let meta = match session.try_read_meta().await {
+        Ok(meta) => meta,
+        Err(e) => return CommandOutcome::Error(format!("Failed to read session metadata: {e}")),
+    };
     let known_agent = meta.agents.iter().any(|a| a.display_name == agent);
 
     match model_arg {
@@ -721,14 +760,23 @@ pub(super) async fn role(
     arg: Option<(String, Option<String>)>,
     ctx: &CommandContext<'_>,
 ) -> CommandOutcome {
-    let session = Session::new(
+    let session = match Session::try_new(
         ConversationId(ctx.session_db_id.to_string()),
         ctx.session_db.clone(),
     )
-    .await;
+    .await
+    {
+        Ok(session) => session,
+        Err(e) => return CommandOutcome::Error(format!("Failed to read session: {e}")),
+    };
     match arg {
         None => {
-            let meta = session.read_meta().await;
+            let meta = match session.try_read_meta().await {
+                Ok(meta) => meta,
+                Err(e) => {
+                    return CommandOutcome::Error(format!("Failed to read session metadata: {e}"));
+                }
+            };
             let current_role = meta.role_name.unwrap_or_else(|| "none".to_string());
             let role_prompt = meta.role_prompt.as_deref().unwrap_or("(none)");
             let msg = format!(
@@ -766,11 +814,15 @@ pub(super) async fn set_backend(
     ctx.secrets
         .insert(ref_id.clone(), api_key.to_string())
         .await;
-    let session = Session::new(
+    let session = match Session::try_new(
         ConversationId(ctx.session_db_id.to_string()),
         ctx.session_db.clone(),
     )
-    .await;
+    .await
+    {
+        Ok(session) => session,
+        Err(e) => return CommandOutcome::Error(format!("Failed to read session: {e}")),
+    };
     let name_owned = name.to_string();
     let url_owned = url.to_string();
     let ref_id_clone = ref_id.clone();

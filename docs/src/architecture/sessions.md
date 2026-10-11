@@ -55,6 +55,20 @@ Every assistant `Message` entry carries an optional `ResponseMetadata`: the mode
 
 `crates/lib/src/session/usage.rs` walks the session catalog and folds these per-entry metadata records into per-session, per-model, and total rollups. Two surfaces consume those rollups today: the `/costs` slash command (TUI) and the `chaz usage` CLI subcommand. See [Cost Tracking & Usage](../user_guide/usage.md) for the user-facing view.
 
+## Metadata writes refuse unreadable state
+
+`Session::update_meta` and `update_meta_on_db` read all existing metadata
+strictly before invoking the mutator or writing. Absent fields use defaults;
+storage/read errors, wrong field types, malformed JSON and invalid numeric
+fields refuse the entire update. Even an edit to an unrelated field fails.
+This prevents a failed read from replacing stored values with defaults.
+
+The rule applies to commands such as `/name` and `/model`, bridge participation
+settings, and runtime, agent and job metadata writers, not just the TUI.
+Supported legacy ambient metadata formats remain accepted. Malformed metadata
+stays write-blocking; these APIs provide no automatic repair or reset policy.
+Tolerant routing reads do not authorize a later write from defaulted state.
+
 ## Session Lifecycle
 
 ```mermaid
@@ -301,8 +315,50 @@ Agent jobs are admitted only for Agents hosted by the local executor. Their chil
 
 `spawn_agent` submits one durable Agent job, not a workflow graph. The submitter prepares one child session DB with parent delegation, a request record and exactly one Directive before publishing its ID to the existing watched catalog. An unpublished child is inert; a published child is `Pending` until an executor checks its parent, hosted target/home and broad scope, then pins inherited per-tool grants, capability and depth ceilings and records acceptance in the **same** DB. Invalid requests become `Rejected` without running. Submission returns the DB ID after publication, not after acceptance or execution. A lost creation response requires inspecting the indexed jobs before another submission; there is no stable parent request key or automatic submission retry. Same-login local clients can create and observe jobs but cannot admit or execute them. Narrow, workspace and private scopes are rejected in v1.
 
-After `Pending` admission or `Rejected` refusal, job status comes from the accepted Directive's attempt and typed terminal receipt: queued, running, started-unknown (a client cannot prove liveness), interrupted (executor sees a start without completion), succeeded, or failed. At most ten Agent-job runs hold runtime permits; accepted jobs wait **queued before starting an attempt** when capacity is full. After restart, queued jobs are adopted; a started attempt without completion is not replayed automatically. Inspect it and explicitly retry if appropriate, since effects may already have occurred. `job_wait` only observes and a timeout does not cancel.
+After `Pending` admission or `Rejected` refusal, job status comes from the accepted Directive's attempt and typed terminal receipt: queued, running, started-unknown (a client cannot prove liveness), interrupted (executor sees a start without completion), succeeded, or failed. At most ten turns hold runtime permits for actual execution; accepted jobs wait **queued before starting an attempt** when capacity is full. An in-Agent `job_wait` yields its permit during observation without releasing its processing reservation, attempt, or claim. It reacquires before result hooks, further tools, or model requests, including after tool errors and timeouts. The existing claim-loss watcher covers observation and reacquisition; a fresh claim check after reacquisition prevents continuation on observed loss. Cancellation drops the turn's permit or pending acquisition. After restart, queued jobs are adopted; a started attempt without completion is not replayed automatically. Inspect it and explicitly retry if appropriate, since effects may already have occurred. `job_wait` only observes and a timeout does not cancel.
 
 Unlike the ordinary session protocol's single-executor assumption, an Agent job has a session-DB last-writer-wins owner claim for the same Agent/home identity. A contender losing the claim stops and records an interrupted/claim-loss marker while retaining the transcript. This is not fencing: delayed observations can overlap model or tool effects, and neither exactly-once effects nor cross-peer failover are promised. The pinned child authority cannot exceed the parent's admitted ceiling; `spawn_worker` is excluded from Agent-job delegation.
 
 `spawn_worker` is a separate Worker-template invocation, synchronous by default, with no durable Agent-job handle or Agent identity. Its child session must not be treated as an accepted Agent job.
+
+### Local job monitoring and next-call input
+
+Each Agent references one stable Executor DB per local executor key. Its
+`jobs` table projects only successfully claimed jobs, with immutable job,
+parent and Agent/executor identities. The Session DB owns attempts and terminal
+receipts. Claim/start projection failures stop before model/tool work; a failed
+mid-run projection stops further effects. Restart reconciliation repairs the
+projection without replaying interrupted attempts. Local readers use the
+Agent's authorized delegated identity. Unreadable references remain explicit
+unavailable sources; this path adds no remote fetch or Chaz sync engine.
+
+Entered `job_wait` calls write attempt-associated, bounded wait activity to
+`job_waits`. An unfinished record can survive interruption and is not liveness.
+The TUI derives ancestry from job request/acceptance records, with referenced
+pending children and ordinary parent conversations shown only as context.
+Observe-only tabs install DB callbacks, not server runtime registration.
+Local-v1 monitoring checks native `current_permission()` / `can_write()` on
+Agent sources and session reads. The existing single-hop Executor reference
+uses the Agent's native permission clamped by the Executor DB's native
+`PermissionBounds`; the service still validates its delegated identity on every
+operation. Existing Write or Admin authority is required. Read-only and unauthorized callers receive an
+explicit insufficient-permission/unavailable outcome. Refresh rechecks authority,
+including reductions after opening. These credentials are write-capable even
+though observation publishes no job changes and never acquires execution.
+This temporary boundary avoids the current service's Read-only native-record
+cache materialization failure; it does not repair that dependency. True Read
+support remains deferred. No automatic grants, key upgrades or alternate
+privileged identity are introduced. A service session handle whose native
+permission query cannot resolve delegation stays explicitly unavailable rather
+than guessing authority or falling back to another key.
+
+`job_inputs` stores stable caller-generated IDs, an expected started attempt
+and text. These are not Message or Directive entries. `job_input_receipts`
+separates executor acceptance, dispatch intent and observed model inclusion.
+Input is consumed at complete native tool boundaries, including the tool-free
+runtime path. `job_input_closed` records the executor's empty closing boundary;
+a racing publication not accepted before it is not applied. Accepted input
+forces same-attempt continuation before the terminal receipt, never replacement
+of a result already visible to the parent. These records use the existing
+signed session authority and best-effort local claim model, not distributed
+fencing. A retry attempt cannot consume an older attempt's pending input.

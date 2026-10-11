@@ -82,6 +82,7 @@ async fn fixture_with_backends(
     );
     server.set_default_agents((0..30).map(|i| format!("agent-{i:02}")).collect());
     let tab = Tab {
+        job: None,
         session_db_id: id.to_string(),
         session_db: db,
         entries: Vec::new(),
@@ -95,6 +96,7 @@ async fn fixture_with_backends(
         context_budget: 0,
         model_pin: None,
         expanded_entries: HashSet::new(),
+        live: Default::default(),
     };
     let mut app = App::new(HashSet::new(), tab);
     app.session_settings_snapshot = Some(SessionMetaSnapshot {
@@ -523,7 +525,9 @@ async fn toolbar_context_reopen_honors_pins_and_refreshes_runtime_budget() {
             ..Default::default()
         })
         .await;
-    let tab = super::super::build_tab(&server, &backend, db.clone(), id.clone()).await;
+    let tab = super::super::build_tab(&server, &backend, db.clone(), id.clone())
+        .await
+        .unwrap();
     assert_eq!(tab.effective_model, "large-model");
     assert_eq!(tab.context_budget, 1_050_000);
     assert_eq!(tab.model_pin.as_deref(), Some("secondary:large-model"));
@@ -567,7 +571,9 @@ async fn toolbar_context_reopen_honors_pins_and_refreshes_runtime_budget() {
     server
         .agents()
         .upsert(Agent::from_db_config("agent-00", &AgentDbConfig::default()));
-    let tab = super::super::build_tab(&server, &backend, db.clone(), id.clone()).await;
+    let tab = super::super::build_tab(&server, &backend, db.clone(), id.clone())
+        .await
+        .unwrap();
     assert_eq!(tab.effective_model, "small-model");
     assert_eq!(tab.context_budget, 64_000);
     app.tabs[0] = tab;
@@ -589,7 +595,9 @@ async fn toolbar_context_reopen_honors_pins_and_refreshes_runtime_budget() {
         })
         .await
         .unwrap();
-    app.tabs[0] = super::super::build_tab(&server, &backend, db, id).await;
+    app.tabs[0] = super::super::build_tab(&server, &backend, db, id)
+        .await
+        .unwrap();
     let screen = draw(&mut terminal, &mut app, &server, &backend).join("\n");
     assert!(screen.contains("ctx unknown/2M tok"), "{screen}");
     server.agents().upsert(Agent::from_db_config(

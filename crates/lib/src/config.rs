@@ -128,13 +128,15 @@ fn redact_connection_url(connection: &str) -> String {
     let Some((scheme, rest)) = connection.split_once("://") else {
         return connection.to_string();
     };
-    // Split at the last `@`: passwords may legally contain `@`, and splitting
-    // at the first would leave a password fragment in the endpoint.
-    let Some((userinfo, endpoint)) = rest.rsplit_once('@') else {
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (authority, suffix) = rest.split_at(authority_end);
+    // The last authority `@` handles raw password `@` without treating path,
+    // query, or fragment characters as userinfo delimiters.
+    let Some((userinfo, endpoint)) = authority.rsplit_once('@') else {
         return connection.to_string();
     };
     if userinfo.contains(':') {
-        format!("{scheme}://<redacted>@{endpoint}")
+        format!("{scheme}://<redacted>@{endpoint}{suffix}")
     } else {
         connection.to_string()
     }
@@ -1994,6 +1996,43 @@ eidetica:
             check_unknown_config_keys(yaml).is_empty(),
             "valid eidetica block must not warn"
         );
+    }
+
+    #[test]
+    fn connection_redaction_preserves_endpoint() {
+        for (connection, expected) in [
+            ("postgres://u:p@ss@h/db", "postgres://<redacted>@h/db"),
+            ("postgres://u:p%40ss@h/db", "postgres://<redacted>@h/db"),
+            (
+                "postgres://u:p@ss@h/db?application_name=a@b",
+                "postgres://<redacted>@h/db?application_name=a@b",
+            ),
+            ("postgres://u:p%40ss@h/d@b", "postgres://<redacted>@h/d@b"),
+            (
+                "postgres://u:p@h?application_name=a@b",
+                "postgres://<redacted>@h?application_name=a@b",
+            ),
+            ("postgres://u:p@h#f@b", "postgres://<redacted>@h#f@b"),
+        ] {
+            assert_eq!(redact_connection_url(connection), expected);
+        }
+    }
+
+    #[test]
+    fn connection_redaction_preserves_no_password_urls() {
+        for connection in [
+            "memory://",
+            "unix:///run/eidetica.sock",
+            "sqlite:///tmp/dir@x/c.db",
+            "sqlite://./c@z.db",
+            "postgres://h:5432/d@b?application_name=a@b",
+            "postgres://u@h:5432/d@b",
+            "postgres://h:5432?application_name=a@b",
+            "postgres://h:5432#f@b",
+            "sqlite:local.db",
+        ] {
+            assert_eq!(redact_connection_url(connection), connection);
+        }
     }
 
     #[test]
