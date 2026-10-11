@@ -38,6 +38,10 @@ pub(super) fn command_catalog() -> Vec<(&'static str, &'static str)> {
         ("/join ", "switch to session by name or DB ID"),
         ("/name ", "set (or clear) a session alias"),
         ("/rename ", "alias for /name"),
+        (
+            "/description ",
+            "set (or clear) a browse-only session description",
+        ),
         ("/info", "show current session info"),
         ("/costs", "aggregate LLM usage + cost across all sessions"),
         ("/interrupted", "list turns requiring an explicit retry"),

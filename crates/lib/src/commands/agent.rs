@@ -1172,4 +1172,4 @@ pub(super) async fn agent_home_status(
 
 #[cfg(test)]
 #[path = "agent_tests.rs"]
-mod tests;
+pub(super) mod tests;

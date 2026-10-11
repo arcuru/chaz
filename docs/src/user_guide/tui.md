@@ -127,6 +127,8 @@ The TUI catalogs every built-in slash command in its inline completion popup —
 | `/join <ref>`     | Switch to a session by name or eidetica DB ID                          |
 | `/name <alias>`   | Set a human-friendly alias for the current session (also `/rename`)    |
 | `/name`           | Clear the session alias                                                |
+| `/description <text>` | Set a browse-only description (up to 200 characters) |
+| `/description` | Clear the session description |
 | `/info`           | Show current session details (name, DB ID, entry counts)               |
 | `/costs`          | Aggregate LLM usage and cost across all sessions ([details](usage.md)) |
 | `/interrupted`    | List turns that require an explicit retry decision                     |
@@ -577,6 +579,79 @@ This also applies to bridge participation settings and runtime, agent and job
 metadata updates. On a transport failure, restore the connection before editing
 again. Malformed stored metadata stays write-blocking; reopening the TUI or
 retrying another edit does not repair it. There is no automatic reset policy.
+
+## Session Descriptions
+
+A description is one short line that helps you recognize a session while browsing. The [name](#named-sessions) is a unique handle you type (`/join planning`); the description is free text you read. It appears beneath the session's row in the [session hub](#session-hub) and as a `Description:` line in `/info`.
+
+| Command               | Effect                                                     |
+| --------------------- | ---------------------------------------------------------- |
+| `/description <text>` | Set or replace the description                             |
+| `/description`        | Clear it (as bare `/name` clears the name)                 |
+| `/info`               | Show it, after `Name:`; no line when none is set           |
+| `!chaz description …` | The same commands from a Matrix room attached to a session |
+
+What to keep in mind:
+
+- **It is for people, not models.** A description is never a system instruction, never a compaction summary, and never part of any model request. Agents cannot read or change it and get no tool for it, so describing a session costs no tokens and cannot steer a reply.
+- **It is not an identifier.** It need not be unique, and `/join`, `--session` and other session references never match it. Setting or clearing it leaves the name and its lookups untouched.
+- **It travels with the session.** It lives in the session's own metadata, so every peer that syncs the session sees the same text. Older sessions simply have none.
+- **Writing it needs write access.** The edit is signed with your key on that session; a participant holding only read access is refused and the stored text is unchanged.
+- **Input is checked, not rewritten.** Surrounding whitespace is trimmed. Text must be a single line of at most 200 characters, with no newlines, tabs or other control characters; anything else is refused and the previous description stays.
+
+It is set by hand today. Extensions may set it through the same validated, permission-checked path the command uses.
+
+### Walkthrough: describing a session
+
+1. Open the session you want to describe, here one named `planning`, and set a description:
+
+   ```text
+   /description Q3 budget review with finance
+   ```
+
+   The transcript shows:
+
+   ```text
+   Session description set: Q3 budget review with finance
+   ```
+
+2. Check it with `/info`. The description follows the name:
+
+   ```text
+   Session: <session DB id>
+   Name: planning
+   Description: Q3 budget review with finance
+   Agent: chaz
+   ```
+
+3. Press `Ctrl+P`. The hub row shows the description on its second line, dimmed, and cut short with `…` when the pane is narrow:
+
+   ```text
+   +--[ Sessions ]-------------------------------------------+
+   |                                                         |
+   | > + New session                                         |
+   |                                                         |
+   |   "planning" * [tui] chaz • 2h ago                      |
+   |     Q3 budget review with finance                       |
+   +---------------------------------------------------------+
+   ```
+
+4. A description that is too long, or that spans lines, is refused and the old text stays. From a script:
+
+   ```text
+   $ chaz cmd --session planning "/description $(printf 'x%.0s' {1..231})"
+   Error: Failed to update description: Description is 231 characters; the limit is 200
+   ```
+
+   Shorten it and run `/description` again. A pasted multi-line description reports `Description must be a single line without control characters`.
+
+5. Clear it with a bare `/description`:
+
+   ```text
+   Session description cleared.
+   ```
+
+   The hub row returns to a blank second line, `/info` drops the `Description:` line, and the name `planning` still works with `/join`.
 
 ## Model Picker
 

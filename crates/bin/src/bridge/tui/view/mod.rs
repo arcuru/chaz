@@ -1800,7 +1800,25 @@ pub(super) fn ui_picker(f: &mut ratatui::Frame, app: &mut App) {
 
             lines.push(Line::from(vec![Span::styled(header, style)]));
 
-            lines.push(Line::from(""));
+            // The row's second line carries the browse-only description, if
+            // any; it stays blank otherwise so row height is unchanged.
+            match &info.description {
+                Some(description) => {
+                    // Indent plus ellipsis; the unwrapped paragraph clips any rest.
+                    let budget = (inner_w as usize).saturating_sub(5).max(1);
+                    let shown = truncate_chars(description, budget);
+                    let ellipsis = if shown.len() < description.len() {
+                        "…"
+                    } else {
+                        ""
+                    };
+                    lines.push(Line::from(vec![Span::styled(
+                        format!("    {shown}{ellipsis}"),
+                        Style::default().fg(COLOR_DIM),
+                    )]));
+                }
+                None => lines.push(Line::from("")),
+            }
         }
     }
 

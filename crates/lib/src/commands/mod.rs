@@ -90,6 +90,10 @@ pub enum Command {
     NameSession(String),
     /// Remove the current session's alias.
     ClearSessionName,
+    /// Set the current session's browse-only description.
+    DescribeSession(String),
+    /// Remove the current session's description.
+    ClearSessionDescription,
     /// Generate a shareable ticket URL for the current session.
     Share,
     /// Stop sharing the current session — disable sync so the source peer
@@ -314,6 +318,8 @@ pub struct SessionInfo {
     pub session_db_id: String,
     pub agent_name: Option<String>,
     pub name: Option<String>,
+    /// Browse-only description from session metadata; `None` until loaded.
+    pub description: Option<String>,
     /// Normalized bridge-of-origin from the session catalog.
     pub bridge: crate::session::BridgeKind,
     /// Catalog creation timestamp. `None` for sessions that predate the
@@ -332,6 +338,7 @@ impl SessionInfo {
             session_db_id: index.session_db_id.clone(),
             agent_name: None,
             name: index.name.clone(),
+            description: None,
             bridge: index.bridge,
             created_at: index.created_at,
             status: index.status,
@@ -435,6 +442,10 @@ pub async fn dispatch(cmd: Command, ctx: &CommandContext<'_>) -> CommandOutcome 
         }
         Command::NameSession(name) => Box::pin(session::name_session(&name, ctx)).await,
         Command::ClearSessionName => Box::pin(session::clear_session_name(ctx)).await,
+        Command::DescribeSession(text) => {
+            Box::pin(session::set_description(Some(&text), ctx)).await
+        }
+        Command::ClearSessionDescription => Box::pin(session::set_description(None, ctx)).await,
         Command::Share => Box::pin(session::share(ctx)).await,
         Command::SessionUnshare => Box::pin(session::unshare(ctx)).await,
         Command::Sync(ticket) => Box::pin(session::sync_ticket(&ticket, ctx)).await,

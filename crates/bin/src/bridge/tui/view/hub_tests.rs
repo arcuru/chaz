@@ -565,3 +565,120 @@ async fn hub_return_from_settings_restarts_cancelled_catalog_discovery() {
     assert!(!app.session_catalog_loading);
     assert!(app.session_list_fresh);
 }
+
+#[tokio::test]
+async fn description_edit_patches_the_cached_picker_row_without_renaming() {
+    use super::super::{ChatAction, apply_session_catalog, handle_chat_action};
+    use chaz_core::commands::Command;
+
+    let (_instance, server, backend, _) = fixture().await;
+    let (approval_tx, notify_tx, rows_tx) = channels();
+    let models_tx = mpsc::channel(8).0;
+    let secrets = SecretStore::new(server.registry().chaz_peer().clone()).await;
+    let mut app = App::hub(HashSet::new());
+    open_session_picker(&mut app, &server, &rows_tx);
+    dispatch_picker_selection(
+        "__new__".into(),
+        &mut app,
+        &server,
+        &backend,
+        &approval_tx,
+        &notify_tx,
+    );
+    settle(&mut app).await;
+    let id = app.active().session_db_id.clone();
+    server
+        .registry()
+        .set_session_name(&id, "planning".into())
+        .await
+        .unwrap();
+
+    // Seed the picker cache with this session's loaded (description-free) row.
+    let index = server
+        .registry()
+        .list_sessions()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|index| index.session_db_id == id)
+        .unwrap();
+    apply_session_catalog(&mut app, vec![index.clone()]);
+    app.session_list[0] = chaz_core::commands::try_load_session_metadata(server.registry(), index)
+        .await
+        .unwrap();
+    assert_eq!(app.session_list[0].description, None);
+    app.mode = TuiMode::Chat;
+
+    let run = async |app: &mut App, cmd: Command| {
+        handle_chat_action(
+            ChatAction::Dispatch(cmd),
+            app,
+            &server,
+            &backend,
+            &secrets,
+            &approval_tx,
+            &notify_tx,
+            &models_tx,
+            &rows_tx,
+        );
+        settle(app).await;
+    };
+    let canonical = async || {
+        let (_, db) = server.registry().open_session(&id).await.unwrap();
+        chaz_core::session::try_read_meta_from_db(&db)
+            .await
+            .unwrap()
+    };
+
+    run(
+        &mut app,
+        Command::DescribeSession("Q3 budget with finance".into()),
+    )
+    .await;
+    // The cached row is patched in place (no catalog reload) and keeps its name.
+    assert!(app.session_list_fresh);
+    assert_eq!(
+        app.session_list[0].description.as_deref(),
+        Some("Q3 budget with finance")
+    );
+    assert_eq!(app.session_list[0].name.as_deref(), Some("planning"));
+    let meta = canonical().await;
+    assert_eq!(meta.description.as_deref(), Some("Q3 budget with finance"));
+    assert_eq!(meta.name.as_deref(), Some("planning"));
+    assert!(
+        app.active()
+            .entries
+            .iter()
+            .any(|e| e.content == "Session description set: Q3 budget with finance")
+    );
+
+    open_session_picker(&mut app, &server, &rows_tx);
+    let screen = frame(&mut app, &server, &backend, 80, 24);
+    assert!(screen.contains("\"planning\""), "{screen}");
+    assert!(screen.contains("    Q3 budget with finance"), "{screen}");
+    // A narrow pane truncates the description line rather than wrapping it.
+    let narrow = frame(&mut app, &server, &backend, 20, 8);
+    assert!(narrow.contains("    Q3 budget wit…│"), "{narrow}");
+    app.mode = TuiMode::Chat;
+
+    // A refused edit leaves both the cached row and stored value unchanged.
+    run(&mut app, Command::DescribeSession("two\nlines".into())).await;
+    assert_eq!(
+        app.session_list[0].description.as_deref(),
+        Some("Q3 budget with finance")
+    );
+    assert_eq!(
+        canonical().await.description.as_deref(),
+        Some("Q3 budget with finance")
+    );
+
+    run(&mut app, Command::ClearSessionDescription).await;
+    assert_eq!(app.session_list[0].description, None);
+    assert_eq!(app.session_list[0].name.as_deref(), Some("planning"));
+    let meta = canonical().await;
+    assert_eq!(meta.description, None);
+    assert_eq!(meta.name.as_deref(), Some("planning"));
+    open_session_picker(&mut app, &server, &rows_tx);
+    let screen = frame(&mut app, &server, &backend, 80, 24);
+    assert!(!screen.contains("Q3 budget"), "{screen}");
+}

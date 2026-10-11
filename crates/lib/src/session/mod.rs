@@ -454,6 +454,12 @@ pub struct AgentRef {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SessionMeta {
     pub name: Option<String>,
+    /// Short browse-only text for telling sessions apart in listings.
+    /// Presentation metadata only: never system instructions, a compaction
+    /// summary, or model context. Absent on sessions that never set one.
+    /// Write it through [`set_session_description`] so input is validated.
+    #[serde(default)]
+    pub description: Option<String>,
     pub agent_name: Option<String>,
     #[serde(default)]
     pub agents: Vec<AgentRef>,
@@ -2165,6 +2171,7 @@ pub async fn read_meta_from_db(database: &Database) -> SessionMeta {
     SessionMeta {
         ambient_participation,
         name: store.get_string("name").await.ok(),
+        description: store.get_string("description").await.ok(),
         agent_name: store.get_string("agent_name").await.ok(),
         agents,
         host_agent_db_id: store.get_string("host_agent_db_id").await.ok(),
@@ -2203,6 +2210,7 @@ pub async fn try_read_meta_from_db(database: &Database) -> anyhow::Result<Sessio
     }
     Ok(SessionMeta {
         name: text("name")?,
+        description: text("description")?,
         agent_name: text("agent_name")?,
         agents: json(text("agents")?)?,
         host_agent_db_id: text("host_agent_db_id")?,
@@ -2244,6 +2252,7 @@ where
     let store = txn.get_store::<DocStore>(META_STORE).await?;
 
     write_field(&store, "name", current.name.as_deref()).await?;
+    write_field(&store, "description", current.description.as_deref()).await?;
     write_field(&store, "agent_name", current.agent_name.as_deref()).await?;
     if current.agents.is_empty() {
         let _ = store.delete("agents").await;
@@ -2300,6 +2309,52 @@ where
 
     txn.commit().await?;
     Ok(())
+}
+
+/// Longest accepted session description, in Unicode scalar values.
+pub const MAX_SESSION_DESCRIPTION_CHARS: usize = 200;
+
+/// Validate user- or extension-supplied description text for storage.
+///
+/// Surrounding whitespace is trimmed. Empty text, text longer than
+/// [`MAX_SESSION_DESCRIPTION_CHARS`], and control characters (including
+/// newlines and tabs) are refused rather than silently rewritten, so a
+/// description always renders as one bounded line in a session listing.
+pub fn validate_session_description(raw: &str) -> Result<String, String> {
+    let text = raw.trim();
+    if text.is_empty() {
+        return Err("Description is empty".to_string());
+    }
+    let len = text.chars().count();
+    if len > MAX_SESSION_DESCRIPTION_CHARS {
+        return Err(format!(
+            "Description is {len} characters; the limit is {MAX_SESSION_DESCRIPTION_CHARS}"
+        ));
+    }
+    if text.chars().any(char::is_control) {
+        return Err("Description must be a single line without control characters".to_string());
+    }
+    Ok(text.to_string())
+}
+
+/// Set (`Some`) or clear (`None`) a session's browse-only description.
+///
+/// The shared mutation path for commands and extensions. It validates input
+/// with [`validate_session_description`], then writes through
+/// [`update_meta_on_db`] with the caller's own `database` handle, so the
+/// session's AuthSettings decide whether that caller may write. Returns the
+/// stored value. The description stays out of model context.
+pub async fn set_session_description(
+    database: &Database,
+    description: Option<&str>,
+) -> anyhow::Result<Option<String>> {
+    let description = description
+        .map(validate_session_description)
+        .transpose()
+        .map_err(anyhow::Error::msg)?;
+    let stored = description.clone();
+    update_meta_on_db(database, |meta| meta.description = description).await?;
+    Ok(stored)
 }
 
 /// No action can opt in without both the bridge's per-entry mark and a

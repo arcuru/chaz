@@ -197,6 +197,7 @@ Commands are sent as Matrix messages. Session ops go through the same transport-
 | `!chaz sessions`             | List every session known to the registry                                          |
 | `!chaz info`                 | Show details for the session attached to this room                                |
 | `!chaz name [<alias>]`       | Set (or clear, with no arg) a human-friendly alias                                |
+| `!chaz description [<text>]` | Set (or clear, with no arg) a browse-only [session description](tui.md#session-descriptions) |
 | `!chaz attach <session>`     | Bind this room to a specific session (name or DB ID)                              |
 | `!chaz detach`               | Detach this room from its session                                                 |
 | `!chaz participation on`     | Enable agent-selected replies for this group room after executor confirmation     |

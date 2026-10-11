@@ -165,6 +165,7 @@ mod tests {
             session_db_id: "bafyabc".to_string(),
             agent_name: agent.map(str::to_string),
             name: name.map(str::to_string),
+            description: None,
             bridge: BridgeKind::Cli,
             created_at: None,
             status: SessionStatus::default(),

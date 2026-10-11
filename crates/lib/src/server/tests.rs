@@ -1031,6 +1031,59 @@ async fn client_server_fixture_from_registry(
 }
 
 #[tokio::test]
+async fn session_description_never_reaches_the_model_request() {
+    let (_instance, server, registry) = server_fixture().await;
+    let (sid, db) = registry.create_session(Some("described")).await.unwrap();
+    let marker = "DESCRIPTION-MARKER browse-only text";
+    crate::session::set_session_description(&db, Some(marker))
+        .await
+        .unwrap();
+    let mock = Arc::new(crate::test_support::MockBackend::new());
+    mock.push_text("plain reply");
+    let backend = crate::backends::BackendManager::with_mock(
+        mock.clone(),
+        crate::security::SecretStore::new(registry.chaz_peer().clone()).await,
+    );
+    server
+        .register_session(&db, backend, Some("agent".into()), None)
+        .await
+        .unwrap();
+    let mut session = Session::new(sid, db.clone()).await;
+    session
+        .add_entry(SessionEntry {
+            sender: "user".into(),
+            content: "hello".into(),
+            timestamp: Utc::now(),
+            entry_type: EntryType::Message,
+            metadata: None,
+            routing: None,
+        })
+        .await
+        .unwrap();
+    await_call_count(&mock, 1).await;
+    await_no_processing(&server, &db.root_id().to_string()).await;
+
+    let calls = mock.recorded_calls();
+    assert_eq!(calls.len(), 1);
+    // Positive control: the request carried the user's message.
+    let request = format!("{:?} {:?}", calls[0].messages, calls[0].tools);
+    assert!(request.contains("hello"), "{request}");
+    assert!(
+        !request.contains("DESCRIPTION-MARKER"),
+        "description leaked into the model request: {request}"
+    );
+    // The description is not a model-facing tool, and the turn left it intact.
+    assert!(
+        calls[0]
+            .tools
+            .iter()
+            .all(|t| !t.name.contains("description"))
+    );
+    let meta = crate::session::try_read_meta_from_db(&db).await.unwrap();
+    assert_eq!(meta.description.as_deref(), Some(marker));
+}
+
+#[tokio::test]
 async fn shutdown_aborts_an_in_flight_model_turn_before_replacement() {
     let (_instance, server, registry) = server_fixture().await;
     let (sid, db) = registry
