@@ -630,6 +630,24 @@ wait_for "the agent's reply in the room" "$REPLY_TIMEOUT" reply_arrived
 
 printf '\033[1;32mPASS\033[0m — cold boot: the reply crossed Matrix, sync, the agent, and came back\n' >&2
 
+# The explicit send can reach Matrix before the turn's terminal transaction,
+# and local completion only queues async sync. Preserve that terminal fact on
+# the surviving bridge before discarding the daemon's only copy; this case
+# tests recovery of a completed conversation, not interruption of a live turn.
+DM_SESSION_ID="$(sed -E $'s/\x1B\[[0-9;]*[[:alpha:]]//g' "$WORKSPACE/bridge.log" | \
+    sed -nE '/Channel bound to session/s/.*session_db_id=([^ ]+).*/\1/p' | head -1)"
+[[ "$DM_SESSION_ID" =~ ^[a-z0-9]+$ ]] || fail "could not identify disposable DM session ID"
+completed_attempts() {
+    local peer="${1:-daemon}"
+    sqlite3 -readonly "$WORKSPACE/state-$peer/eidetica.db" \
+    "select count(distinct json_extract(cast(r.record_value as text),'\$.attempt_id'))
+     from store_state_namespaces n join store_state_records r on n.namespace_id=r.namespace_id
+     where n.database_id='$DM_SESSION_ID' and n.store_name='turn_attempts'
+     and json_extract(cast(r.record_value as text),'\$.status')='Completed'"
+}
+first_dm_completed_on_bridge() { [[ "$(completed_attempts bridge)" -eq 1 ]]; }
+wait_for "first DM attempt completed and synced to the bridge" 60 first_dm_completed_on_bridge
+
 # Restore the pre-session daemon state while keeping the bridge alive. The
 # next message resolves the existing channel session on the bridge, rather
 # than creating a new one. It must refresh session sync and exposure so the
@@ -1247,19 +1265,8 @@ DM_OUTBOUND="$(mx GET "/_matrix/client/v3/rooms/$ROOM_URI/messages?dir=b&limit=2
     '[.chunk[] | select(.type == "m.room.message" and .sender == $a) | select(.content.body // "" | contains($m))] | length')"
 [[ "$DM_OUTBOUND" == 6 ]] || fail "expected six explicit Matrix sends across the DM lifecycle; found $DM_OUTBOUND"
 
-# The daemon's disposable SQLite store-state projection retains Completed
-# attempt records. Query only this room's DB; the original first turn is
-# restored from the bridge on the copied-state recovery path.
-DM_SESSION_ID="$(sed -E $'s/\x1B\[[0-9;]*[[:alpha:]]//g' "$WORKSPACE/bridge.log" | \
-    sed -nE '/Channel bound to session/s/.*session_db_id=([^ ]+).*/\1/p' | head -1)"
-[[ "$DM_SESSION_ID" =~ ^[a-z0-9]+$ ]] || fail "could not identify disposable DM session ID"
-completed_attempts() {
-    sqlite3 "$WORKSPACE/state-daemon/eidetica.db" \
-    "select count(distinct json_extract(cast(r.record_value as text),'\$.attempt_id'))
-     from store_state_namespaces n join store_state_records r on n.namespace_id=r.namespace_id
-     where n.database_id='$DM_SESSION_ID' and n.store_name='turn_attempts'
-     and json_extract(cast(r.record_value as text),'\$.status')='Completed'"
-}
+# The first completion was preserved on the bridge before copied-state
+# recovery. Require all seven attempts in the daemon's room-scoped projection.
 seven_completed_attempts() { [[ "$(completed_attempts)" -ge 7 ]]; }
 wait_for "seven durable completed DM attempts" 60 seven_completed_attempts
 COMPLETED="$(completed_attempts)"
