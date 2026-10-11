@@ -21,37 +21,70 @@ pub(super) struct JobsView {
     pub details: bool,
     pub loading: bool,
     pub error: Option<String>,
+    ticket: u64,
+    task: Option<supervised::Task<()>>,
+    pub publications:
+        std::collections::HashMap<String, Arc<tokio::sync::Mutex<Option<JobInputRequest>>>>,
 }
 
 pub(super) struct JobTab {
     pub state: Option<JobState>,
     pub inputs: Vec<JobInput>,
     pub feedback: String,
-    pub retry: Option<JobInputRequest>,
+    pub retry: Arc<tokio::sync::Mutex<Option<JobInputRequest>>>,
     pub details: bool,
-    pub _callback: eidetica::WriteCallback,
 }
 
-pub(super) fn refresh(
+pub(super) struct Loaded {
+    pub ticket: u64,
+    pub result: Result<JobMonitor, String>,
+}
+
+pub(super) fn cancel(app: &mut App) {
+    app.jobs.ticket += 1;
+    app.jobs.task = None;
+    app.jobs.loading = false;
+}
+
+pub(super) fn refresh(app: &mut App, server: &Arc<Server>, tx: &mpsc::Sender<Loaded>) {
+    if !app.backend_available || app.jobs.loading {
+        return;
+    }
+    let server = server.clone();
+    request_with(app, tx, async move {
+        server.job_monitor().await.map_err(|e| e.to_string())
+    });
+}
+
+fn request_with(
     app: &mut App,
-    server: &Arc<Server>,
-    tx: &mpsc::Sender<Result<JobMonitor, String>>,
+    tx: &mpsc::Sender<Loaded>,
+    load: impl Future<Output = Result<JobMonitor, String>> + Send + 'static,
 ) {
     if app.jobs.loading {
         return;
     }
     app.jobs.loading = true;
-    let server = server.clone();
+    app.jobs.ticket += 1;
+    let ticket = app.jobs.ticket;
     let tx = tx.clone();
-    tokio::spawn(async move {
-        let result =
-            tokio::time::timeout(std::time::Duration::from_secs(5), server.job_monitor()).await;
-        let result = match result {
-            Ok(result) => result.map_err(|e| e.to_string()),
-            Err(_) => Err("refresh timed out; retained snapshot is stale".into()),
-        };
-        let _ = tx.send(result).await;
-    });
+    app.jobs.task = Some(supervised::Task(tokio::spawn(async move {
+        let result = supervised::read(async move {
+            tokio::time::timeout(std::time::Duration::from_secs(5), load)
+                .await
+                .unwrap_or_else(|_| Err("refresh timed out; retained snapshot is stale".into()))
+        })
+        .await;
+        let _ = tx.send(Loaded { ticket, result }).await;
+    })));
+}
+
+pub(super) fn apply_loaded(app: &mut App, loaded: Loaded) {
+    if loaded.ticket != app.jobs.ticket {
+        return;
+    }
+    app.jobs.task = None;
+    apply(app, loaded.result);
 }
 
 pub(super) fn apply(app: &mut App, result: Result<JobMonitor, String>) {
@@ -78,154 +111,181 @@ pub(super) fn apply(app: &mut App, result: Result<JobMonitor, String>) {
     }
 }
 
-pub(super) async fn open(
-    app: &mut App,
+pub(super) async fn observe(
+    db: &eidetica::Database,
+    tx: mpsc::Sender<String>,
+) -> anyhow::Result<Observation> {
+    chaz_core::session::jobs::require_observer_write(db).await?;
+    let tips = db.snapshot().await?;
+    let sid = db.root_id().to_string();
+    let callback = db
+        .on_write_at_tips(tips, move |_, _| {
+            let tx = tx.clone();
+            let sid = sid.clone();
+            async move {
+                let _ = tx.send(sid).await;
+                Ok(())
+            }
+        })
+        .await?;
+    Ok(Observation {
+        id: 0,
+        callback: Some(callback),
+        forwarder: None,
+    })
+}
+
+pub(super) async fn open_tab(
     server: &Server,
     backend: &BackendManager,
     id: &str,
+    tx: mpsc::Sender<String>,
+) -> Result<Tab, String> {
+    let (_, db) = server
+        .registry()
+        .open_job_session(id)
+        .await
+        .map_err(|e| e.to_string())?;
+    let observation = observe(&db, tx).await.map_err(|e| e.to_string())?;
+    let mut tab = build_tab(server, backend, db.clone(), id.into()).await?;
+    tab.job = Some(JobTab {
+        state: None,
+        inputs: Vec::new(),
+        feedback: String::new(),
+        retry: Default::default(),
+        details: false,
+    });
+    tab.live.observation = Some(observation);
+    apply_snapshot(&mut tab, snapshot(&db).await);
+    Ok(tab)
+}
+
+pub(super) fn open(
+    app: &mut App,
+    server: &Arc<Server>,
+    backend: &BackendManager,
+    id: String,
     tx: &mpsc::Sender<String>,
-) -> anyhow::Result<()> {
-    let open = async {
-        if let Some(index) = app.tab_index_for(id) {
-            app.set_active_tab(index);
-            app.mode = TuiMode::Chat;
-            return Ok(());
-        }
-        let (_, db) = server.registry().open_job_session(id).await?;
-        let tips = db.snapshot().await?;
-        let notify = tx.clone();
-        let sid = id.to_string();
-        let callback = db
-            .on_write_at_tips(tips, move |_, _| {
-                let notify = notify.clone();
-                let sid = sid.clone();
-                async move {
-                    let _ = notify.send(sid).await;
-                    Ok(())
-                }
-            })
-            .await?;
-        // Read after callback installation to cover both existing and new writes.
-        let mut tab = build_tab(server, backend, db, id.into()).await;
-        tab.job = Some(JobTab {
-            state: None,
-            inputs: Vec::new(),
-            feedback: String::new(),
-            retry: None,
-            details: false,
-            _callback: callback,
-        });
-        refresh_tab(&mut tab).await;
-        app.push_tab(tab);
+) {
+    if let Some(index) = app.tab_index_for(&id) {
+        app.set_active_tab(index);
         app.mode = TuiMode::Chat;
-        Ok(())
-    };
-    tokio::time::timeout(std::time::Duration::from_secs(5), open)
-        .await
-        .map_err(|_| anyhow::anyhow!("job observation timed out; no execution acquired"))?
-}
-
-pub(super) async fn refresh_tab(tab: &mut Tab) {
-    if tab.job.is_none() {
         return;
     }
-    if tokio::time::timeout(std::time::Duration::from_secs(2), refresh_tab_snapshot(tab))
-        .await
-        .is_err()
-        && let Some(job) = tab.job.as_mut()
-    {
-        job.state = None;
-        job.feedback = "unavailable: refresh timed out; retained evidence is stale".into();
-    }
+    let server = server.clone();
+    let backend = backend.clone();
+    let tx = tx.clone();
+    operations::submit(app, false, None, async move {
+        open_tab(&server, &backend, &id, tx)
+            .await
+            .map(|tab| operations::Effect::Opened(Box::new(tab)))
+    });
 }
 
-async fn refresh_tab_snapshot(tab: &mut Tab) {
-    let Some(job) = tab.job.as_mut() else {
-        return;
-    };
-    let entries = async {
-        chaz_core::session::jobs::require_observer_write(&tab.session_db).await?;
-        let snapshot = tab.session_db.snapshot().await?;
-        Session::entries_at_snapshot(&tab.session_db, &snapshot).await
+pub(super) struct Snapshot {
+    entries: Vec<SessionEntry>,
+    state: JobState,
+    inputs: Result<Vec<JobInput>, String>,
+}
+
+pub(super) async fn snapshot(db: &eidetica::Database) -> Result<Snapshot, String> {
+    async {
+        chaz_core::session::jobs::require_observer_write(db).await?;
+        let tips = db.snapshot().await?;
+        let entries = Session::entries_at_snapshot(db, &tips).await?;
+        let state = chaz_core::session::jobs::observer_status(db).await?.state;
+        let session = Session::new(
+            chaz_core::types::ConversationId(db.root_id().to_string()),
+            db.clone(),
+        )
+        .await;
+        Ok::<_, anyhow::Error>(Snapshot {
+            entries,
+            state,
+            inputs: session.job_inputs().await.map_err(|e| e.to_string()),
+        })
     }
-    .await;
-    match entries {
-        Ok(entries) => tab.entries = entries,
-        Err(error) => {
-            job.state = None;
-            job.feedback = format!("unavailable; retained transcript is stale: {error}");
-            return;
-        }
-    }
-    let session = Session::new(
-        chaz_core::types::ConversationId(tab.session_db_id.clone()),
-        tab.session_db.clone(),
-    )
-    .await;
-    match chaz_core::session::jobs::observer_status(&tab.session_db).await {
-        Ok(status) => {
+    .await
+    .map_err(|e| e.to_string())
+}
+
+pub(super) fn apply_snapshot(tab: &mut Tab, result: Result<Snapshot, String>) {
+    match result {
+        Ok(snapshot) => {
+            tab.set_entries(snapshot.entries);
             tab.active_turns = usize::from(matches!(
-                status.state,
+                snapshot.state,
                 JobState::StartedUnknown {
                     activity_recent: true,
                     ..
                 }
             ));
-            job.state = Some(status.state);
-        }
-        Err(error) => {
-            job.state = None;
-            job.feedback = format!("unavailable: {error}");
-        }
-    }
-    match session.job_inputs().await {
-        Ok(inputs) => {
-            job.inputs = inputs;
-            if job.state.is_some()
-                && (job.feedback.starts_with("unavailable")
-                    || job.feedback.starts_with("input evidence unavailable"))
-            {
-                job.feedback.clear();
+            let job = tab.job.as_mut().expect("job snapshot belongs to observer");
+            job.state = Some(snapshot.state);
+            match snapshot.inputs {
+                Ok(inputs) => {
+                    job.inputs = inputs;
+                    if job.feedback.starts_with("unavailable")
+                        || job.feedback.starts_with("input evidence unavailable")
+                    {
+                        job.feedback.clear();
+                    }
+                }
+                Err(error) => job.feedback = format!("input evidence unavailable: {error}"),
             }
         }
-        Err(error) => job.feedback = format!("input evidence unavailable: {error}"),
+        Err(error) => {
+            let job = tab.job.as_mut().expect("job snapshot belongs to observer");
+            job.state = None;
+            job.feedback = format!("unavailable; retained evidence is stale: {error}");
+            tab.touch_transcript();
+        }
     }
 }
 
-pub(super) async fn send(tab: &mut Tab, text: String) {
-    refresh_tab(tab).await;
-    let job = tab.job.as_mut().expect("job tab");
-    let attempt_id = match &job.state {
-        Some(JobState::StartedUnknown {
+pub(super) async fn send(
+    db: eidetica::Database,
+    retry: Arc<tokio::sync::Mutex<Option<JobInputRequest>>>,
+    text: String,
+) -> Result<operations::Effect, String> {
+    let status = chaz_core::session::jobs::observer_status(&db)
+        .await
+        .map_err(|e| e.to_string())?;
+    let attempt_id = match status.state {
+        JobState::StartedUnknown {
             attempt_id,
             activity_recent: true,
-        }) => attempt_id.clone(),
-        Some(state) if state.is_terminal() => {
-            job.feedback = "Finished job — view-only".into();
-            return;
+        } => attempt_id,
+        state if state.is_terminal() => {
+            return Ok(operations::Effect::JobSent(
+                "Finished job — view-only".into(),
+            ));
         }
         _ => {
-            job.feedback =
-                "No recent started attempt; steering unavailable, no automatic replay".into();
-            return;
+            return Ok(operations::Effect::JobSent(
+                "No recent started attempt; steering unavailable, no automatic replay".into(),
+            ));
         }
     };
-    let request = match job.retry.take() {
+    // This state belongs to the accepted publication, not the view. Closing
+    // the tab cannot lose its ID or authorize a different uncertain input.
+    let mut retry = retry.lock().await;
+    let request = match retry.take() {
         Some(request) if request.text == text => request,
         Some(request) => {
-            job.retry = Some(request);
-            job.feedback = "Prior publication uncertain: resend the same text/ID before submitting different input".into();
-            return;
+            *retry = Some(request);
+            return Err("Prior publication uncertain: resend the same text/ID before submitting different input".into());
         }
         None => JobInputRequest::new(attempt_id, text),
     };
+    *retry = Some(request.clone());
     let publication = async {
         let session = Session::new(
-            chaz_core::types::ConversationId(tab.session_db_id.clone()),
-            tab.session_db.clone(),
+            chaz_core::types::ConversationId(db.root_id().to_string()),
+            db,
         )
         .await;
-        session.submit_job_input(request.clone()).await
+        session.submit_job_input(request).await
     };
     let result = tokio::time::timeout(std::time::Duration::from_secs(5), publication)
         .await
@@ -235,15 +295,69 @@ pub(super) async fn send(tab: &mut Tab, text: String) {
             ))
         });
     match result {
-        Ok(_) => job.feedback = "Input published · see current receipts below".into(),
-        Err(error) => {
-            job.feedback = format!(
-                "Refused or publication uncertain: {error}. Same text retries the same ID."
-            );
-            job.retry = Some(request);
+        Ok(_) => {
+            *retry = None;
+            Ok(operations::Effect::JobSent(
+                "Input published · see current receipts below".into(),
+            ))
         }
+        Err(error) => Err(format!(
+            "Refused or publication uncertain: {error}. Same text retries the same ID."
+        )),
     }
-    refresh_tab(tab).await;
+}
+
+pub(super) fn toggle_tab_details(tab: &mut Tab) {
+    if let Some(job) = tab.job.as_mut() {
+        job.details = !job.details;
+        tab.touch_transcript();
+    }
+}
+
+pub(super) fn handle_key(
+    app: &mut App,
+    key: KeyEvent,
+    server: &Arc<Server>,
+    backend: &BackendManager,
+    notify_tx: &mpsc::Sender<String>,
+    jobs_tx: &mpsc::Sender<Loaded>,
+) {
+    match key.code {
+        KeyCode::Esc => {
+            app.mode = TuiMode::Chat;
+            app.ensure_view();
+        }
+        KeyCode::Up => {
+            let selected = app.jobs.selected.saturating_sub(1);
+            select(&mut app.jobs, selected);
+        }
+        KeyCode::Down => {
+            let selected = app.jobs.selected + 1;
+            select(&mut app.jobs, selected);
+        }
+        KeyCode::PageUp => app.jobs.detail_scroll = app.jobs.detail_scroll.saturating_sub(5),
+        KeyCode::PageDown => app.jobs.detail_scroll = app.jobs.detail_scroll.saturating_add(5),
+        KeyCode::Home => app.jobs.detail_scroll = 0,
+        KeyCode::End => app.jobs.detail_scroll = u16::MAX,
+        KeyCode::Char('d') => {
+            app.jobs.details = !app.jobs.details;
+            app.jobs.detail_scroll = 0;
+        }
+        KeyCode::Char('r') => refresh(app, server, jobs_tx),
+        KeyCode::Enter => {
+            if let Some(node) = app
+                .jobs
+                .data
+                .nodes
+                .get(app.jobs.selected)
+                .filter(|node| node.state.is_some())
+            {
+                let id = node.session_db_id.clone();
+                open(app, server, backend, id, notify_tx);
+            }
+        }
+        _ => {}
+    }
 }
 
 // Labels describe persisted evidence, never turn a claim into liveness.
@@ -786,7 +900,11 @@ pub(super) fn draw(f: &mut ratatui::Frame, app: &mut App) {
     } else {
         " ↑↓ select · Enter open · Pg↑↓ read · d details · r refresh"
     };
-    widgets::status_strip(f, panes[3], help);
+    widgets::status_strip(
+        f,
+        panes[3],
+        &format!("{}{help}", app.operations.indicator()),
+    );
 }
 
 #[cfg(test)]

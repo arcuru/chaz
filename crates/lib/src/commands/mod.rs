@@ -33,7 +33,9 @@ mod sharing;
 
 pub use extensions::{ExtensionsAction, split_ext_scope};
 pub use parse::{Parsed, parse};
-pub use session::{collect_session_infos, load_session_metadata, sort_session_infos};
+pub use session::{
+    collect_session_infos, load_session_metadata, sort_session_infos, try_load_session_metadata,
+};
 
 /// User-visible permission level for co-ownership grants on an Agent DB.
 /// Stays separate from eidetica's `Permission` so the CLI grammar is
@@ -614,7 +616,10 @@ async fn dispatch_extension(name: &str, args: &str, ctx: &CommandContext<'_>) ->
     }
 
     let conv_id = crate::types::ConversationId(ctx.session_db_id.to_string());
-    let session = Session::new(conv_id, ctx.session_db.clone()).await;
+    let session = match Session::try_new(conv_id, ctx.session_db.clone()).await {
+        Ok(session) => session,
+        Err(e) => return CommandOutcome::Error(format!("Failed to read session: {e}")),
+    };
     let hook_ctx = HookContext {
         agent_name: ctx.current_agent.to_string(),
         model: None,

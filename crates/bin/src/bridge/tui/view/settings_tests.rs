@@ -395,7 +395,7 @@ async fn settings_focus_ladder_category_keys_and_existing_actions() {
         SettingsScope::Peer,
     );
     assert!(
-        matches!(outcome, input::SettingsKey::WritePeerDefaults(names) if names[3] == "agent-04")
+        matches!(outcome, input::SettingsKey::EditPeerDefaults(super::super::DefaultsEdit::Move { name, neighbor }) if name == "agent-04" && neighbor == "agent-03")
     );
     key(&mut app, KeyCode::Esc);
     assert_eq!(app.mode, TuiMode::SessionPicker);

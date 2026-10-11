@@ -398,7 +398,8 @@ async fn main() -> anyhow::Result<()> {
         let bridge = bridge::cli::CliBridge::new(config, secret_store, prompt, args.session);
         bridge.run(server).await
     } else {
-        let mut tui_bridge = bridge::tui::TuiBridge::new(config, secret_store);
+        let mut tui_bridge = bridge::tui::TuiBridge::new(config, secret_store)
+            .with_runtime(built.take().unwrap(), config_path.clone());
         if let Some(prompt) = args.prompt {
             tui_bridge = tui_bridge.with_initial_prompt(prompt);
         }

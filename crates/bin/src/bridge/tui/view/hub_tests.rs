@@ -47,6 +47,16 @@ fn channels() -> (
     (mpsc::channel(8).0, mpsc::channel(8).0, mpsc::channel(8).0)
 }
 
+async fn settle(app: &mut App) {
+    while app.operations.is_pending() {
+        let done = tokio::time::timeout(std::time::Duration::from_secs(5), app.operations.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        super::super::operations::apply(app, done);
+    }
+}
+
 #[tokio::test]
 async fn hub_launch_creates_nothing_and_is_a_safe_base_view() {
     let (_instance, server, backend, _) = fixture().await;
@@ -273,8 +283,8 @@ async fn new_open_switch_and_close_preserve_sessions_drafts_and_scroll() {
         &backend,
         &approval_tx,
         &notify_tx,
-    )
-    .await;
+    );
+    settle(&mut app).await;
     assert_eq!(app.mode, TuiMode::Chat);
     assert_eq!(app.tabs.len(), 1);
     let created = app.active().session_db_id.clone();
@@ -283,9 +293,9 @@ async fn new_open_switch_and_close_preserve_sessions_drafts_and_scroll() {
     assert!(after_new.contains(&created));
 
     for c in "draft-é界".chars() {
-        input::handle_chat_key(&mut app, key(KeyCode::Char(c))).await;
+        input::handle_chat_key(&mut app, key(KeyCode::Char(c)));
     }
-    input::handle_chat_key(&mut app, key(KeyCode::Left)).await;
+    input::handle_chat_key(&mut app, key(KeyCode::Left));
     let (draft, cursor) = (app.input.clone(), app.cursor);
     app.active_mut().scroll_offset = 5;
 
@@ -303,8 +313,8 @@ async fn new_open_switch_and_close_preserve_sessions_drafts_and_scroll() {
         &backend,
         &approval_tx,
         &notify_tx,
-    )
-    .await;
+    );
+    settle(&mut app).await;
     assert_eq!(app.tabs.len(), 2);
     assert_eq!(app.active().session_db_id, existing[0]);
     assert!(app.input.is_empty());
@@ -316,10 +326,10 @@ async fn new_open_switch_and_close_preserve_sessions_drafts_and_scroll() {
     assert_eq!((app.input.as_str(), app.cursor), (draft.as_str(), cursor));
     assert_eq!(app.active().scroll_offset, 5);
     // Plain PageUp/PageDown still scroll this view rather than switching tabs.
-    input::handle_chat_key(&mut app, key(KeyCode::PageUp)).await;
+    input::handle_chat_key(&mut app, key(KeyCode::PageUp));
     assert_eq!(app.active().scroll_offset, 25);
     assert_eq!(app.active().session_db_id, created);
-    input::handle_chat_key(&mut app, key(KeyCode::PageDown)).await;
+    input::handle_chat_key(&mut app, key(KeyCode::PageDown));
     assert_eq!(app.active().scroll_offset, 5);
     assert_eq!(app.active().session_db_id, created);
     assert_eq!((app.input.as_str(), app.cursor), (draft.as_str(), cursor));
@@ -335,8 +345,8 @@ async fn new_open_switch_and_close_preserve_sessions_drafts_and_scroll() {
         &backend,
         &approval_tx,
         &notify_tx,
-    )
-    .await;
+    );
+    settle(&mut app).await;
     assert_eq!(app.tabs.len(), 2);
     assert_eq!((app.input.as_str(), app.cursor), ("second", 3));
 
@@ -371,8 +381,8 @@ async fn new_open_switch_and_close_preserve_sessions_drafts_and_scroll() {
         &backend,
         &approval_tx,
         &notify_tx,
-    )
-    .await;
+    );
+    settle(&mut app).await;
     assert_eq!(app.mode, TuiMode::Chat);
     assert_eq!(app.active().session_db_id, created);
     assert_eq!(session_ids(&server).await, after_new);
@@ -392,8 +402,8 @@ async fn hub_failures_stay_in_the_hub_and_peer_actions_need_no_conversation() {
         &backend,
         &approval_tx,
         &notify_tx,
-    )
-    .await;
+    );
+    settle(&mut app).await;
     assert_eq!(app.mode, TuiMode::SessionPicker);
     assert!(app.tabs.is_empty());
     let notice = app.hub_notice.clone().expect("failure notice");
@@ -421,8 +431,8 @@ async fn hub_failures_stay_in_the_hub_and_peer_actions_need_no_conversation() {
         &SecretStore::new(server.registry().chaz_peer().clone()).await,
         &approval_tx,
         &notify_tx,
-    )
-    .await;
+    );
+    settle(&mut app).await;
     assert_eq!(app.mode, TuiMode::Settings(SettingsScope::Peer));
     let status = app.settings_status.clone().unwrap_or_default();
     assert!(
@@ -477,7 +487,9 @@ async fn hub_tab_cycle_cannot_change_settings_or_switcher_caller() {
     let first = app.active().session_db_id.clone();
     let (_, db) = server.registry().create_session(Some("tui")).await.unwrap();
     let id = db.root_id().to_string();
-    let tab = super::super::build_tab(&server, &backend, db, id).await;
+    let tab = super::super::build_tab(&server, &backend, db, id)
+        .await
+        .unwrap();
     app.push_tab(tab);
     app.set_active_tab(0);
     app.input = "first draft".into();

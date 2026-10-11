@@ -7,6 +7,7 @@
 import json
 import html
 import os
+import re
 from pathlib import Path
 import select
 import signal
@@ -18,27 +19,12 @@ import time
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-import pyte
 
 sys.dont_write_bytecode = True
 from test_lifecycle import BINARY, FIXTURE, ROOT, PtyProcess
 
 
 class JobPtyProcess(PtyProcess):
-    def __init__(self, *args):
-        self.screen = pyte.Screen(40, 16)
-        self.stream = pyte.ByteStream(self.screen)
-        super().__init__(*args)
-
-    def resize(self, columns, rows):
-        super().resize(columns, rows)
-        self.screen.resize(rows, columns)
-
-    def drain(self, timeout):
-        before = len(self.raw)
-        super().drain(timeout)
-        self.stream.feed(bytes(self.raw[before:]))
-
     def expect(self, text, timeout=20, offset=0):
         # Ratatui sends cursor deltas, not full frames. Assert the actual
         # terminal screen rather than concatenate fragments into fake text.
@@ -174,7 +160,7 @@ class Jobs(unittest.TestCase):
         process = None
         service = None
         executor = None
-        evidence = ROOT / "target/job-monitor-pty" / str(time.time_ns())
+        evidence = Path(os.environ.get("TUI_JOB_EVIDENCE", ROOT / "target/job-monitor-pty")) / str(time.time_ns())
         evidence.mkdir(parents=True)
         with tempfile.TemporaryDirectory(prefix="chaz-jobs-pty-") as directory:
             home = Path(directory)
@@ -220,7 +206,7 @@ security:
                 configs[role] = config
             log = (evidence / "executor.log").open("wb")
             try:
-                service = subprocess.Popen([FIXTURE, home / "fixture.db", socket], env=env, cwd=home, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                service = subprocess.Popen([FIXTURE, home / "fixture.db", socket, "controlled"], env=env, cwd=home, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
                 self.assertTrue(select.select([service.stdout], [], [], 20)[0], "fixture service did not become ready")
                 self.assertEqual(service.stdout.readline().strip(), b"fixture service ready")
                 thread.start()
@@ -241,9 +227,12 @@ security:
                 self.assertEqual(calls, [], "opening Jobs must not call the model")
                 process.send("\x1b")
                 process.expect("New session")
-                process.send("\x07\x10")  # Ctrl+P from Jobs opens the hub.
+                process.send("\x07")
+                process.expect("Tasks")
+                process.send("\x10")  # Ctrl+P from Jobs opens the hub.
                 process.expect("New session")
                 process.send("n")
+                process.expect_absent("New session")
                 process.expect(" > ")
                 process.send("parent-monitor\r")
                 deadline = time.monotonic() + 60
@@ -281,7 +270,32 @@ security:
                 process.expect_absent("Session:")
                 process.send("\r")
                 process.expect("Job observer")
+                # The known authorized job must also reopen through the hub.
+                # Close first so the hub cannot just focus an existing tab.
+                process.send("\x17")
+                process.expect("unsent-parent-draft")
+                process.send("\x10")
+                process.expect("New session")
+                process.expect_absent("Loading sessions")
+                process.expect("[other]")  # The job row, before the older parent.
+                process.screen_capture(evidence, "job-hub-before")
+                process.send("\x1b[B\r")
+                process.expect("Job observer", timeout=5)
                 process.expect("next-call input")
+                self.assertNotIn("outcome unknown", "\n".join(process.screen.display))
+                self.assertNotIn("job sessions must be opened as observers", "\n".join(process.screen.display))
+                self.assertNotIn("unsent-parent-draft", "\n".join(process.screen.display))
+                self.assertEqual(len(job_calls), 1, "hub observation executed a job")
+                handles = [re.search(r'"session_db_id":"([^"]+)"', message.get("content", ""))
+                           for request in calls for message in request["messages"]
+                           if message.get("role") == "tool"]
+                job_id = next(match.group(1) for match in handles if match)
+                client_log = "".join(path.read_text() for path in (home / "client-state").glob("chaz-tui*.log*"))
+                self.assertFalse(any("Server watching session" in line and job_id in line
+                                     for line in client_log.splitlines()),
+                                 "hub acquired ordinary session registration for the job")
+                process.screen_capture(evidence, "job-hub-reopened")
+                print("JOB HUB CONTRACT: PASS; authorized observer reopened without ordinary registration or model calls")
                 process.resize(80, 24)
                 process.expect("Started · recent activity")
                 process.screen_capture(evidence, "observer-started-80x24")
@@ -297,12 +311,23 @@ security:
                 process.expect("unsent-parent-draft")
                 process.send("\x0c")  # Ctrl+L returns to the observer's empty draft.
                 process.expect("Job observer")
+                process.expect_absent("unsent-parent-draft")
                 self.assertNotIn("unsent-parent-draft", "\n".join(process.screen.display))
                 with self.assertRaisesRegex(AssertionError, "deadline"):
                     process.expect("deliberate-absent-job-marker", timeout=0.2)
                 self.assertEqual(len(job_calls), 1)
+                service.send_signal(signal.SIGSTOP)
                 process.send("PTY steering input\r")
+                process.expect("action(s) pending", timeout=1)
+                process.send("queued-next-draft")
+                process.expect("queued-next-draft", timeout=1)
+                process.send("\x03")
+                process.expect("Quit again", timeout=1)
+                self.assertIsNone(process.child.poll(), "first exit abandoned accepted steering")
+                process.screen_capture(evidence, "observer-stalled-publication")
+                service.send_signal(signal.SIGCONT)
                 process.expect("Queued · published, awaiting acceptance")
+                process.send("\x15")  # Clear the unsent next draft, never publish it.
                 process.screen_capture(evidence, "observer-queued-80x24")
                 self.assertEqual(len(job_calls), 1, "viewer/steering must not run or interrupt a job")
                 release.set()
@@ -366,6 +391,12 @@ security:
                 process.expect("Stale · refresh failed/timed out", timeout=15)
                 process.expect("original job task")  # Retained, explicitly stale snapshot.
                 process.send("\x07")
+                process.expect("Job observer", timeout=1)
+                process.send("offline-cached-draft")
+                process.expect("offline-cached-draft", timeout=1)
+                process.send("\x1bOQ")
+                process.expect("Observer details", timeout=1)
+                process.send("\x1bOQ\x1b[5~\x1b[6~")
                 process.expect("Unavailable", timeout=10)  # Tab reads are bounded too.
                 self.assertEqual(len(job_calls), 2)
                 process.send("\x07")
@@ -373,8 +404,26 @@ security:
                 process.send("r")
                 process.expect_absent("Stale · refresh failed/timed out")
                 self.assertEqual(len(job_calls), 2)
-                process.send("\x03")
+                process.send("\x07")
+                process.expect("offline-cached-draft")
+                # Genuine generation loss, not only a timed-out read. Reopen
+                # the observer through the job-authorized path on a fresh service.
+                service.stdin.write(b"stop\n")
+                service.stdin.flush()
+                self.assertTrue(select.select([service.stdout], [], [], 20)[0])
+                self.assertEqual(service.stdout.readline().strip(), b"fixture service stopped")
+                service.stdin.write(b"start\n")
+                service.stdin.flush()
+                self.assertTrue(select.select([service.stdout], [], [], 20)[0])
+                self.assertEqual(service.stdout.readline().strip(), b"fixture service ready")
+                process.expect("Completed", timeout=35)
+                process.expect("offline-cached-draft")
+                process.expect_absent("Unavailable", timeout=35)
+                process.screen_capture(evidence, "observer-generation-recovered")
+                self.assertEqual(len(job_calls), 2, "observer recovery executed a job")
+                process.send("\x15\x03")
                 self.assertEqual(process.child.wait(timeout=10), 0)
+                print("JOB MONITOR INTEGRATION CONTRACT: PASS; cached navigation/typing, queued steering/exit, receipts, observer generation recovery, no extra model calls")
             finally:
                 release.set()
                 second_release.set()
@@ -394,6 +443,7 @@ security:
                             child.wait(timeout=5)
                 if service:
                     (evidence / "service-stderr.log").write_bytes(service.stderr.read())
+                    service.stdin.close()
                     service.stdout.close()
                     service.stderr.close()
                 log.close()

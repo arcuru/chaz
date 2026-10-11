@@ -793,6 +793,7 @@ dependencies = [
  "crossterm",
  "dirs",
  "eidetica",
+ "futures",
  "insta",
  "matrix-sdk",
  "nucleo-matcher",
