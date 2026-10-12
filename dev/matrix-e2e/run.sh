@@ -20,8 +20,9 @@
 #
 # Usage:
 #   dev/matrix-e2e/run.sh [--keep] [--timeout SECONDS] [--verbose]
-#                         [--transport http|iroh] [--legacy-max-iterations N]
+#                         [--transport http|iroh] [--legacy-max-iterations N] [--real-model]
 #
+#   --real-model run the opt-in capped smoke instead of the stub suite (see README)
 #   --keep      leave the workspace in place and print its path
 #   --timeout   seconds to wait for the reply (default 120)
 #   --verbose   stream component logs to stderr as they are written
@@ -42,10 +43,12 @@ VERBOSE=0
 REPLY_TIMEOUT=120
 TRANSPORT="http"
 LEGACY_MAX_ITERATIONS=""
+REAL_MODEL=0
 while [[ $# -gt 0 ]]; do
 	case "$1" in
 	--) ;; # `just` passes -- to separate its flags from ours; fall through to outer shift
 	--keep) KEEP=1 ;;
+	--real-model) REAL_MODEL=1 ;;
 	--verbose) VERBOSE=1 ;;
 	--timeout)
 		[[ $# -ge 2 ]] || {
@@ -90,13 +93,25 @@ while [[ $# -gt 0 ]]; do
 	shift
 done
 
+if [[ $REAL_MODEL -eq 1 ]]; then
+	[[ $TRANSPORT == http ]] || { echo "real-model smoke requires loopback http transport" >&2; exit 2; }
+	for variable in MATRIX_E2E_MODEL_ENDPOINT MATRIX_E2E_MODEL MATRIX_E2E_INPUT_RATE MATRIX_E2E_OUTPUT_RATE MATRIX_E2E_EVIDENCE; do
+		[[ -n ${!variable:-} ]] || { echo "missing $variable for --real-model" >&2; exit 2; }
+	done
+	mkdir -p "$MATRIX_E2E_EVIDENCE"
+	[[ ! -e $MATRIX_E2E_EVIDENCE/result.json && ! -e $MATRIX_E2E_EVIDENCE/model.jsonl ]] || { echo "use a fresh evidence directory" >&2; exit 2; }
+	REPLY_TIMEOUT=300
+fi
+
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 HERE="$REPO_ROOT/dev/matrix-e2e"
 CHAZ_BIN="${CHAZ_BIN:-$REPO_ROOT/target/debug/chaz}"
 CHAZ_MATRIX_BIN="${CHAZ_MATRIX_BIN:-$REPO_ROOT/target/debug/chaz-matrix}"
 E2EE_PROBE_BIN="${E2EE_PROBE_BIN:-$REPO_ROOT/target/debug/examples/e2ee_probe}"
 
-for bin in "$CHAZ_BIN" "$CHAZ_MATRIX_BIN" "$E2EE_PROBE_BIN"; do
+BINS=("$CHAZ_BIN" "$CHAZ_MATRIX_BIN")
+[[ $REAL_MODEL -eq 1 ]] || BINS+=("$E2EE_PROBE_BIN")
+for bin in "${BINS[@]}"; do
 	if [[ ! -x $bin ]]; then
 		echo "missing binary: $bin (run 'just e2e', or set CHAZ_BIN / CHAZ_MATRIX_BIN / E2EE_PROBE_BIN)" >&2
 		exit 2
@@ -139,6 +154,9 @@ cleanup() {
 		done
 		kill -KILL "$pid" 2>/dev/null || true
 	done
+	if [[ $REAL_MODEL -eq 1 && -f $WORKSPACE/model.jsonl ]]; then
+		cp "$WORKSPACE/model.jsonl" "$MATRIX_E2E_EVIDENCE/model.jsonl"
+	fi
 	if [[ $KEEP -eq 1 ]]; then
 		log "workspace kept at $WORKSPACE"
 	else
@@ -277,8 +295,17 @@ fi
 EIDETICA_FLAKE="${EIDETICA_FLAKE:-git+https://github.com/arcuru/eidetica?rev=$(sed -n 's/^eidetica = .*rev = "\([^"]*\)".*/\1/p' "$REPO_ROOT/Cargo.toml")}"
 
 # ---------------------------------------------------------------- stub LLM ---
-log "starting stub LLM"
-spawn stub-llm python3 "$HERE/stub_llm.py" "$STUB_PORT" "$MARKER"
+MODEL_NAME=stub
+if [[ $REAL_MODEL -eq 1 ]]; then
+	log "starting capped real-model relay (900s/run, six calls, USD 0.10 reserved maximum)"
+	MODEL_NAME="$MATRIX_E2E_MODEL"
+	spawn real-model python3 "$HERE/real_model.py" --port "$STUB_PORT" --trace "$WORKSPACE/model.jsonl"
+	trap 'exit 124' TERM
+	spawn deadline bash -c 'sleep 900 & timer=$!; trap '"'"'kill "$timer" 2>/dev/null; exit'"'"' TERM; wait "$timer" && kill -TERM "$1"' _ "$$"
+else
+	log "starting stub LLM"
+	spawn stub-llm python3 "$HERE/stub_llm.py" "$STUB_PORT" "$MARKER"
+fi
 wait_for "stub LLM" 30 curl -sf --max-time "$CURL_MAX_TIME" "http://127.0.0.1:$STUB_PORT/v1/models"
 
 # ----------------------------------------------------------------- synapse ---
@@ -400,11 +427,11 @@ backends:
     api_base: "http://127.0.0.1:$STUB_PORT/v1"
     api_key: "not-a-real-key"
     models:
-      - name: stub
+      - name: "$MODEL_NAME"
 
 agents:
   - name: chaz
-    model: "stub"
+    model: "$MODEL_NAME"
 ${LEGACY_MAX_ITERATIONS:+    max_iterations: $LEGACY_MAX_ITERATIONS}
     system_prompt: |
       You are a test fixture.
@@ -632,6 +659,11 @@ agent_joined() {
 		"$PUPPET_TOKEN" | jq -e --arg a "$AGENT_MXID" '.joined | has($a)'
 }
 wait_for "the agent to join the room" 90 agent_joined
+
+if [[ $REAL_MODEL -eq 1 ]]; then
+	source "$HERE/real-smoke.sh"
+	exit 0
+fi
 
 log "sending the prompt"
 PROMPT_DATE_BEFORE="$(date -u +%F)"
