@@ -5,7 +5,7 @@ mod compact;
 mod describe;
 mod edit;
 mod file;
-mod jobs;
+pub(crate) mod jobs;
 mod matrix;
 mod memory;
 mod schedule;

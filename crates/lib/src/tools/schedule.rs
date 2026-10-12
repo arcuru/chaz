@@ -815,6 +815,7 @@ mod tests {
             agent_identity: None,
             turn_request_id: None,
             tool_call_key: None,
+            observation_yield: None,
             call_depth: 0,
             max_call_depth: 10,
             tools: ScopedTools::new(Arc::new(ToolRegistry::new()), None),
@@ -828,6 +829,7 @@ mod tests {
             host: Arc::new(crate::tool_host::NativeToolHost::new()),
             active_extensions: std::collections::HashSet::new(),
             routine_engine: None,
+            observation_deadline: None,
         }
     }
 

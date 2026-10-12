@@ -670,6 +670,7 @@ impl Server {
             agent_identity: self.agent_index.find_by_name(agent_name),
             turn_request_id: None,
             tool_call_key: None,
+            observation_yield: None,
             call_depth: 0,
             max_call_depth,
             tools: scoped_tools,
@@ -685,6 +686,7 @@ impl Server {
             host: self.host.clone(),
             active_extensions: active_extensions.clone(),
             routine_engine: self.routine_engine().cloned(),
+            observation_deadline: None,
         };
 
         let tool_defs = tool_ctx.definitions();

@@ -1,5 +1,5 @@
 //! Non-executing local monitor with existing Write authority (Admin allowed).
-//! Projections discover claimed jobs; session DBs supply authority/evidence.
+//! Projections discover participating jobs; session DBs supply authority/evidence.
 //! No refresh here registers a runtime or syncs peers.
 use super::Server;
 use crate::session::{

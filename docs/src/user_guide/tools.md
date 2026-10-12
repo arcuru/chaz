@@ -16,7 +16,7 @@ Every built-in is owned by an [extension](extensions.md); disabling an extension
 | `spawn_agent`       | `core`     | Medium | UnlessAutoApproved | Submits a durable Agent job and returns its DB handle immediately      |
 | `job_status`        | `core`     | Low    | Never              | Reads the durable state and typed result of an Agent job               |
 | `job_wait`          | `core`     | Low    | Never              | Observes a job with a deadline, yielding the Agent's execution slot    |
-| `spawn_worker`      | `core`     | Medium | UnlessAutoApproved | Invokes a Worker template declared under the calling Agent (no keys)   |
+| `spawn_worker`      | `core`     | Medium | UnlessAutoApproved | Invokes a Worker template; yields its slot while waiting synchronously |
 | `shell`             | `core`     | High   | Always             | Executes a shell command                                               |
 | `read_file`         | `fs`       | Low    | Never              | Reads a text file from disk, one bounded page of lines at a time       |
 | `write_file`        | `fs`       | Medium | UnlessAutoApproved | Writes content to a file                                               |
@@ -287,7 +287,9 @@ Use the `session_db_id` returned by `spawn_agent` to check a job, or wait for a 
 {"session_db_id":"<child DB ID>","timeout_seconds":30}
 ```
 
-The first object is for `job_status`; the second is for `job_wait` (`timeout_seconds` is an integer from 1 to 240, default 30). Both return `session_db_id` and a typed `state`: `Pending`, `Rejected`, `Queued`, `Running`, `StartedUnknown`, `Interrupted`, `Succeeded`, or `Failed` (with attempt ID, recent-activity hint, text, or error as applicable). A timed-out wait returns current status; it does not cancel work. A start with no completion may already have caused effects: inspect and explicitly retry an interrupted request, never assume automatic replay. If creation returns an uncertain outcome, inspect the catalog before submitting another job; there is no stable request key or automatic submission retry. The handle does not grant session DB access. During an in-Agent wait, the parent yields its execution slot so queued children can run, then reacquires a slot before continuing. The observation deadline does not bound this subsequent capacity wait; see [Waiting without holding a slot](agents.md#waiting-without-holding-a-slot).
+`job_status` also accepts `execution_id` (with optional `search`, `offset`, and `limit` 1–50) to page through one execution branch's transcript instead of the status; see [Parallel executions of one job](agents.md#parallel-executions-of-one-job). When an ordering correction exists, `job_status` and `job_wait` wrap the status as `{"status":...,"execution_corrections":[...]}`.
+
+The first object is for `job_status`; the second is for `job_wait` (`timeout_seconds` is an integer from 1 to 240, default 30). Both return `session_db_id` and a typed `state`: `Pending`, `Rejected`, `Queued`, `Running`, `StartedUnknown`, `Interrupted`, `Succeeded`, or `Failed` (with attempt ID, recent-activity hint, text, or error as applicable). A timed-out wait returns current status; it does not cancel work. A start with no completion may already have caused effects: inspect and explicitly retry an interrupted request, never assume automatic replay. The one exception is a turn stopped inside a checkpointed `job_wait`: a restarted executor observes the same child again under the original absolute deadline and continues that turn without rerunning earlier work; see [Resuming a checkpointed wait after restart](agents.md#resuming-a-checkpointed-wait-after-restart). If creation returns an uncertain outcome, inspect the catalog before submitting another job; there is no stable request key or automatic submission retry. The handle does not grant session DB access. During an in-Agent wait, the parent yields its execution slot so queued children can run, then reacquires a slot before continuing. The observation deadline does not bound this subsequent capacity wait; see [Waiting without holding a slot](agents.md#waiting-without-holding-a-slot).
 
 ### spawn_worker
 
@@ -305,6 +307,8 @@ Worker templates are per-Agent (Chaz's `researcher` is distinct from Scout's `re
 ```
 
 `name` is required and selects the Worker template. `tools` narrows the resolved scope for this invocation (must be a subset of what the Worker template + parent Agent allow). `model` and `preset` are optional overrides. Unset fields on a Worker template fall back to the parent Agent's defaults. `max_spawn_depth` overrides the Worker's nested spawn-depth ceiling; it does not limit tool calls. A Worker, like an Agent, keeps calling tools until the model replies without one. See [Spawn Permissions](agents.md#spawn-permissions) and [How a turn ends](agents.md#how-a-turn-ends).
+
+By default, `spawn_worker` waits for the answer. It keeps the Agent's execution slot while registering the child and writing its Directive, then yields the slot during observation so the Worker can run even when all ten slots were occupied by parents. The runtime reacquires capacity and rechecks the parent job's execution branch before result hooks, another tool, or another model request. The default tool timeout remains 300 seconds; reacquiring capacity is outside that timeout. `async: true` returns after submission without yielding. A timeout or cancellation does not resubmit the Worker or guarantee that the child stopped; inspect its session before deciding whether another invocation is safe. See [Waiting without holding a slot](agents.md#waiting-without-holding-a-slot).
 
 ### skill_list / skill_search / skill_show
 

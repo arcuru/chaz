@@ -394,21 +394,27 @@ impl Server {
             return Ok(false);
         };
         let session_db_id = child_db.root_id().to_string();
-        if let Some(owner) = crate::session::jobs::read_job_owner(child_db).await?
-            && owner.agent_db_id
-                == self
-                    .agent_index
-                    .find_by_name(&accepted.definition.target)
-                    .ok_or_else(|| anyhow::anyhow!("job target no longer hosted"))?
-                    .db_id
-                    .to_string()
+        let participating = match self.agent_index.find_by_name(&accepted.definition.target) {
+            Some(target) => {
+                let executor = crate::session::execution::job_executor(
+                    &target.db_id.to_string(),
+                    &target.pubkey.to_string(),
+                );
+                crate::session::execution::participants(child_db)
+                    .await?
+                    .iter()
+                    .any(|participation| participation.executor == executor)
+            }
+            None => false,
+        };
+        if participating
             && self
                 .peer_is_home_for(&session_db_id, &accepted.definition.target)
                 .await
         {
-            // A crash may have split the session claim/start/receipt from its
+            // A crash may have split participation/start/receipt from its
             // projection. Reconstruct it without replaying an attempt.
-            self.record_claimed_job(child_db, &accepted).await?;
+            self.record_participating_job(child_db, &accepted).await?;
         }
         if self.watched.lock().await.contains(&session_db_id) {
             return Ok(true);
@@ -465,7 +471,6 @@ impl Server {
             }
         }
         self.watched.lock().await.insert(session_db_id.clone());
-        self.maintain_job_claim(child_db.clone(), accepted);
         // Reconcile the persisted Directive even if the acceptance commit
         // preceded this callback or the process restarted after acceptance.
         let _ = self
@@ -614,6 +619,46 @@ impl Server {
         crate::session::jobs::status_from_db(&db, &live, self.executor_authorized).await
     }
 
+    /// One execution branch's transcript, bounded, through the same session
+    /// access as `job_status`. Peer transcripts are evidence, not input.
+    pub async fn job_execution_transcript(
+        &self,
+        session_db_id: &str,
+        execution_id: &str,
+        search: &str,
+        offset: usize,
+        limit: usize,
+    ) -> anyhow::Result<Vec<crate::session::TurnTranscriptRecord>> {
+        let (_, db) = match self.registry.open_session(session_db_id).await {
+            Ok(opened) => opened,
+            Err(_) => self.registry.open_job_session(session_db_id).await?,
+        };
+        crate::session::execution::view_transcript(&db, execution_id, search, offset, limit).await
+    }
+
+    /// Ordering corrections appended after a branch had already delivered.
+    /// The delivered receipt is unchanged; this is how a parent learns of it.
+    pub async fn job_execution_corrections(
+        &self,
+        session_db_id: &str,
+    ) -> anyhow::Result<Vec<String>> {
+        let (_, db) = match self.registry.open_session(session_db_id).await {
+            Ok(opened) => opened,
+            Err(_) => self.registry.open_job_session(session_db_id).await?,
+        };
+        let mut corrections: Vec<_> = crate::session::execution::notices(&db)
+            .await?
+            .into_iter()
+            .filter(|notice| notice.correction)
+            .collect();
+        corrections.sort_by(|a, b| a.id.cmp(&b.id));
+        Ok(corrections
+            .into_iter()
+            .take(4)
+            .map(|notice| notice.text)
+            .collect())
+    }
+
     /// A timed-out wait returns current durable status; execution continues.
     pub async fn wait_job(
         &self,
@@ -690,9 +735,9 @@ impl Server {
 }
 
 impl Server {
-    /// Only the executor with the accepted Agent/home identity can claim. A
+    /// Only the executor with the accepted Agent/home identity participates. A
     /// pubkey identifies the home peer, not a process generation.
-    pub(super) async fn claim_accepted_job(
+    pub(super) async fn participate_in_accepted_job(
         &self,
         db: &eidetica::Database,
         accepted: &AcceptedAgentJob,
@@ -714,23 +759,28 @@ impl Server {
             self.validate_accepted_job(db).await?.as_ref() == Some(accepted),
             "job admission authority changed"
         );
-        if !crate::session::jobs::claim_job(
-            db,
-            &target.pubkey.to_string(),
-            &target.db_id.to_string(),
-            &self.job_incarnation,
-        )
-        .await?
-        {
+        // Participation is idempotent and non-exclusive: it neither expires
+        // nor needs renewal, and grants nothing beyond the checks above.
+        // Competing executions are arbitrated per branch by entry order.
+        if let Err(error) = Box::pin(crate::session::execution::activate_fresh(db)).await {
+            tracing::warn!(%error, session_db_id = %db.root_id(), "Job session is not on the execution-participation protocol; holding");
             return Ok(false);
         }
-        // This write is an execution gate: the persisted session claim alone
+        Box::pin(crate::session::execution::participate(
+            db,
+            &crate::session::execution::job_executor(
+                &target.db_id.to_string(),
+                &target.pubkey.to_string(),
+            ),
+        ))
+        .await?;
+        // This write is an execution gate: persisted participation alone
         // must never launch model/tool work without a discoverable queue row.
-        self.record_claimed_job(db, accepted).await?;
+        self.record_participating_job(db, accepted).await?;
         Ok(true)
     }
 
-    pub(super) async fn record_claimed_job(
+    pub(super) async fn record_participating_job(
         &self,
         session: &eidetica::Database,
         accepted: &AcceptedAgentJob,
@@ -754,81 +804,6 @@ impl Server {
         )
         .await?;
         Ok((db, target.db_id.to_string(), peer.to_string()))
-    }
-
-    /// A registered job keeps its claim fresh and periodically retries stale
-    /// claims after executor death; wakeups also arrive on session DB writes.
-    pub(super) fn maintain_job_claim(&self, db: eidetica::Database, accepted: AcceptedAgentJob) {
-        let notify = self.notify_tx.clone();
-        let incarnation = self.job_incarnation.clone();
-        let authorized = self.executor_authorized;
-        let peer = accepted.definition.executor_pubkey.clone();
-        let agent_db_id = self
-            .agent_index
-            .find_by_name(&accepted.definition.target)
-            .expect("validated target")
-            .db_id
-            .to_string();
-        let shutdown = self.shutting_down.clone();
-        let live_attempts = self.live_attempts.clone();
-        self.track_task(tokio::spawn(async move {
-            if !authorized {
-                return;
-            }
-            let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
-            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            loop {
-                tick.tick().await;
-                if shutdown.load(std::sync::atomic::Ordering::Acquire) {
-                    break;
-                }
-                // Don't renew a settled job. An interrupted attempt stays held
-                // until explicit retry, even after a new process takes over.
-                match crate::session::jobs::read_job_result(&db).await {
-                    Ok(Some(_)) => break,
-                    Ok(None) => {}
-                    Err(error) => {
-                        tracing::warn!(%error, "Job receipt read failed; pausing claim refresh");
-                        continue;
-                    }
-                }
-                let meta = crate::session::read_meta_from_db(&db).await;
-                if meta.agents.len() != 1
-                    || meta.agents[0].db_id != agent_db_id
-                    || meta.agents[0].home_pubkey.as_deref() != Some(peer.as_str())
-                {
-                    tracing::warn!("Job Agent/home identity changed; stopping claim refresh");
-                    break;
-                }
-                let live = live_attempts.lock().await.clone();
-                match crate::session::jobs::status_from_db(&db, &live, true).await {
-                    Ok(status) if status.state.is_terminal() => break,
-                    Ok(status)
-                        if matches!(
-                            status.state,
-                            crate::session::jobs::JobState::Interrupted { .. }
-                        ) =>
-                    {
-                        continue;
-                    }
-                    Ok(_) => {}
-                    Err(error) => {
-                        tracing::warn!(%error, "Job status read failed; pausing claim refresh");
-                        continue;
-                    }
-                }
-                match crate::session::jobs::claim_job(&db, &peer, &agent_db_id, &incarnation).await
-                {
-                    Ok(true) => {
-                        let _ = notify
-                            .send(super::ProcessingCommand::Wake(db.root_id().to_string()))
-                            .await;
-                    }
-                    Ok(false) => {}
-                    Err(error) => tracing::warn!(%error, "Job claim refresh failed"),
-                }
-            }
-        }));
     }
 }
 

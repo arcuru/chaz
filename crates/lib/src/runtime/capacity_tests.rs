@@ -90,7 +90,7 @@ async fn job_wait_reacquires_after_success_error_and_policy_timeout() {
         "abort-observation",
         "abort-reacquire",
         "closed",
-        "claim-loss",
+        "observed-yield",
     ] {
         let semaphore = Arc::new(Semaphore::new(1));
         let permit = semaphore.clone().acquire_owned().await.unwrap();
@@ -113,12 +113,10 @@ async fn job_wait_reacquires_after_success_error_and_policy_timeout() {
         });
         let (instance, session) = fresh_session().await;
         let db = session.lock().await.database().clone();
-        let claim = if mode == "claim-loss" {
-            assert!(
-                crate::session::jobs::claim_job(&db, "peer", "agent", "owner")
-                    .await
-                    .unwrap()
-            );
+        let claim = if mode == "observed-yield" {
+            crate::session::execution::test_branch(&db, "owner")
+                .await
+                .unwrap();
             Some((db.clone(), "owner".into()))
         } else {
             None
@@ -163,21 +161,10 @@ async fn job_wait_reacquires_after_success_error_and_policy_timeout() {
             task.abort();
             assert!(matches!(task.await, Err(error) if error.is_cancelled()));
         } else {
-            if mode == "claim-loss" {
-                use eidetica::store::DocStore;
-                let txn = db.new_transaction().await.unwrap();
-                let mut owner = crate::session::jobs::read_job_owner(&db)
-                    .await
-                    .unwrap()
-                    .unwrap();
-                owner.incarnation = "rival".into();
-                txn.get_store::<DocStore>("job_owner")
-                    .await
-                    .unwrap()
-                    .set_string("v1", serde_json::to_string(&owner).unwrap())
+            if mode == "observed-yield" {
+                crate::session::execution::test_supersede(&db)
                     .await
                     .unwrap();
-                txn.commit().await.unwrap();
             }
             if mode != "timeout" {
                 finish.notify_one();
@@ -208,7 +195,7 @@ async fn job_wait_reacquires_after_success_error_and_policy_timeout() {
                     .await
                     .unwrap()
                     .unwrap();
-                if mode == "closed" || mode == "claim-loss" {
+                if mode == "closed" || mode == "observed-yield" {
                     assert!(result.is_err(), "{mode}: runtime must stop");
                     assert_eq!(mock.recorded_calls().len(), 1);
                     assert_eq!(effects.load(std::sync::atomic::Ordering::SeqCst), 0);
@@ -246,7 +233,7 @@ async fn job_wait_reacquires_after_success_error_and_policy_timeout() {
 
 #[tokio::test]
 async fn user_stop_pairs_calls_while_job_wait_yields_or_reacquires_capacity() {
-    for reacquiring in [false, true] {
+    for (resumed, reacquiring) in [(false, false), (false, true), (true, false), (true, true)] {
         let semaphore = Arc::new(Semaphore::new(1));
         let permit = semaphore.clone().acquire_owned().await.unwrap();
         let blocker = Arc::new(Mutex::new(None));
@@ -282,7 +269,8 @@ async fn user_stop_pairs_calls_while_job_wait_yields_or_reacquires_capacity() {
         let capacity = ExecutionCapacity::new(semaphore.clone(), permit, None);
         let task = tokio::spawn(async move {
             let _instance = instance;
-            execute_cancellable_with_recorder(
+            let now = chrono::Utc::now();
+            run_turn(
                 None,
                 vec![RuntimeMessage::User("test".into())],
                 &backend,
@@ -293,6 +281,22 @@ async fn user_stop_pairs_calls_while_job_wait_yields_or_reacquires_capacity() {
                 None,
                 Some(&cancel),
                 Some(capacity),
+                resumed.then(|| RuntimeResume {
+                    prior_messages: Vec::new(),
+                    model_sequence: 0,
+                    call_index: 1,
+                    call: ToolCallRequest {
+                        id: "wait".into(),
+                        name: "job_wait".into(),
+                        arguments: "{}".into(),
+                    },
+                    deadline: now + chrono::Duration::seconds(240),
+                    policy_deadline: now + chrono::Duration::seconds(300),
+                    policy_timeout_seconds: 300,
+                    metadata: Vec::new(),
+                    matrix_send_queued: false,
+                    rate_limited_calls: Vec::new(),
+                }),
                 ModelCallScope::default(),
             )
             .await
@@ -312,7 +316,7 @@ async fn user_stop_pairs_calls_while_job_wait_yields_or_reacquires_capacity() {
             .expect("user stop must not wait for child-held capacity")
             .unwrap();
         assert!(matches!(result, Err(TurnError::Cancelled { .. })));
-        assert_eq!(mock.recorded_calls().len(), 1);
+        assert_eq!(mock.recorded_calls().len(), usize::from(!resumed));
         assert_eq!(effects.load(std::sync::atomic::Ordering::SeqCst), 0);
         let mut calls = Vec::new();
         let mut results = Vec::new();
@@ -325,8 +329,13 @@ async fn user_stop_pairs_calls_while_job_wait_yields_or_reacquires_capacity() {
                 }
             }
         }
-        assert_eq!(calls, ["wait", "effect"]);
-        assert_eq!(results, calls, "every native call has a cancelled result");
+        if resumed {
+            assert!(calls.is_empty(), "the persisted model call is not replayed");
+            assert_eq!(results, ["wait"], "only the pending call is paired");
+        } else {
+            assert_eq!(calls, ["wait", "effect"]);
+            assert_eq!(results, calls, "every native call has a cancelled result");
+        }
         blocker.lock().await.take();
         let all = tokio::time::timeout(Duration::from_secs(1), semaphore.clone().acquire_owned())
             .await

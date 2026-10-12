@@ -141,6 +141,7 @@ pub(crate) fn tool_context_with_host(
         agent_identity: None,
         turn_request_id: None,
         tool_call_key: None,
+        observation_yield: None,
         call_depth: 0,
         max_call_depth: 5,
         tools: ScopedTools::new(registry, None),
@@ -154,6 +155,7 @@ pub(crate) fn tool_context_with_host(
         agent_grants: Default::default(),
         host,
         routine_engine: None,
+        observation_deadline: None,
     }
 }
 

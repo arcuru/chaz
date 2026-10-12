@@ -6060,6 +6060,7 @@ async fn published_executor_with_mock(
     published_executor_using_mock(settings, agents, agent, mock).await
 }
 
+/// Executor whose default backend (used by adopted jobs) is `mock`.
 async fn published_executor_using_mock(
     settings: &crate::config::EideticaConfig,
     agents: Arc<AgentRegistry>,
@@ -6997,6 +6998,20 @@ async fn client_submission_publishes_one_child_then_executor_runs_it() {
             .is_empty()
     );
     assert_eq!(mock.recorded_calls().len(), 1);
+    let queued_tips = queued_db.snapshot().await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(4500)).await;
+    assert_eq!(
+        queued_db.snapshot().await.unwrap(),
+        queued_tips,
+        "queued participation has zero timer writes beyond the former TTL"
+    );
+    assert_eq!(
+        crate::session::execution::participants(&queued_db)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
     drop(permits);
     assert_eq!(
         client
@@ -7482,6 +7497,7 @@ async fn a_stop_that_lands_before_the_turn_starts_still_stops_it() {
                 attempt.clone(),
                 SpawnContext {
                     job_projection: None,
+                    job_retry: None,
                     job_incarnation: None,
                     job_authority: None,
                     call_depth: 0,
@@ -7491,6 +7507,7 @@ async fn a_stop_that_lands_before_the_turn_starts_still_stops_it() {
                     processing: server.processing.clone(),
                     turns: server.turns.clone(),
                 },
+                None,
                 None,
             )
             .await;
@@ -7831,12 +7848,437 @@ impl crate::tool::Tool for PermitProbe {
     }
 }
 
-// Unoptimized builds can stretch a child's claim refresh past the claim TTL
-// under this load, so settlement is skipped. The Nix test gate runs it.
-#[cfg_attr(
-    debug_assertions,
-    ignore = "claim refresh lags past the TTL in unoptimized builds"
-)]
+/// A child held well past the former four-second claim TTL settles as the
+/// sole execution, with no ownership writes while it runs, and its waiting
+/// parent receives the result. Settlement needs no fresh claim.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sole_job_settles_after_former_claim_ttl_without_ownership_writes() {
+    use crate::session::jobs::JobState;
+    use eidetica::service::ServiceServer;
+    use std::time::Duration;
+    use tokio::sync::watch;
+
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("delayed-settlement.sock");
+    let (owner, mut user) = Instance::create_backend(
+        Box::new(InMemory::new()),
+        NewUser::passwordless("delayed-settlement"),
+    )
+    .await
+    .unwrap();
+    let (agent_db, pubkey) = create_agent_db(
+        &mut user,
+        "default",
+        &AgentDbConfig::default(),
+        &AgentMeta {
+            display_name: Some("default".into()),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let agent = DbEntry {
+        db_id: agent_db.id(),
+        display_name: "default".into(),
+        pubkey,
+    };
+    let service = ServiceServer::bind(owner, &socket).await.unwrap();
+    let (shutdown, receiver) = watch::channel(());
+    let service_task = tokio::spawn(service.run(receiver));
+    // Delay an actual client-signed receipt transaction before the native
+    // service persists it. All other frames remain real Eidetica operations;
+    // no completion, authorization or storage result is fabricated.
+    let proxy_socket = dir.path().join("delayed-receipt.sock");
+    let listener = tokio::net::UnixListener::bind(&proxy_socket).unwrap();
+    let delayed = Arc::new(AtomicUsize::new(0));
+    let receipt_started = Arc::new(tokio::sync::Notify::new());
+    let target = Arc::new(std::sync::Mutex::new(None::<String>));
+    let proxy = ActivityHeartbeat(tokio::spawn({
+        let target = target.clone();
+        let delayed = delayed.clone();
+        let receipt_started = receipt_started.clone();
+        async move {
+            use eidetica::service::protocol::{
+                DatabaseOp, ServiceRequest, read_frame, write_frame,
+            };
+            let mut connections = tokio::task::JoinSet::new();
+            loop {
+                tokio::select! {
+                    accepted = listener.accept() => {
+                        let (client, _) = accepted.unwrap();
+                        let service = tokio::net::UnixStream::connect(&socket).await.unwrap();
+                        let target = target.clone();
+                        let delayed = delayed.clone();
+                        let receipt_started = receipt_started.clone();
+                        connections.spawn(async move {
+                            let (mut from_client, mut to_client) = client.into_split();
+                            let (mut from_service, mut to_service) = service.into_split();
+                            let requests = async {
+                                while let Some(frame) = read_frame::<_, serde_json::Value>(&mut from_client).await? {
+                                    if let Ok(ServiceRequest::AuthenticatedDb(request)) = serde_json::from_value::<ServiceRequest>(frame.clone())
+                                        && let DatabaseOp::SubmitSignedEntry { entry } = request.op
+                                        && entry.in_subtree("job_result")
+                                        && target.lock().unwrap().as_deref() == Some(request.root_id.to_string().as_str())
+                                    {
+                                        delayed.fetch_add(1, Ordering::SeqCst);
+                                        receipt_started.notify_one();
+                                        tokio::time::sleep(Duration::from_millis(4500)).await;
+                                    }
+                                    write_frame(&mut to_service, &frame).await?;
+                                }
+                                Ok::<_, eidetica::Error>(())
+                            };
+                            let responses = async {
+                                tokio::io::copy(&mut from_service, &mut to_client).await?;
+                                Ok::<_, eidetica::Error>(())
+                            };
+                            tokio::select! { result = requests => result, result = responses => result }
+                        });
+                    },
+                    Some(result) = connections.join_next() => { result.unwrap().unwrap(); },
+                }
+            }
+        }
+    }));
+    let settings = crate::config::EideticaConfig {
+        connection: format!("unix://{}", proxy_socket.display()),
+        login: crate::config::EideticaLoginConfig {
+            username: "delayed-settlement".into(),
+            password: None,
+            passwordless: true,
+        },
+        sync: None,
+    };
+    let (executor, child_mock) = published_executor_with_mock(
+        &settings,
+        Arc::new(AgentRegistry::with_default_agent()),
+        agent.clone(),
+    )
+    .await;
+    let registry = executor.registry.clone();
+    let client = client_server_fixture_from_registry(registry.clone()).await;
+    let secrets = crate::security::SecretStore::new(registry.chaz_peer().clone()).await;
+    let slot = crate::instance::ServerSlot::default();
+    slot.set(executor.clone());
+    executor.tools.register(crate::tools::JobWaitTool {
+        server: slot.clone(),
+    });
+    let (sid, db) = registry
+        .create_session(Some("delayed-parent"))
+        .await
+        .unwrap();
+    registry
+        .attach_agent_to_session(&sid.0, &agent)
+        .await
+        .unwrap();
+    let child = registry
+        .prepare_agent_job(&sid.0, "default", "slow child")
+        .await
+        .unwrap();
+    let child_id = child.db.root_id().to_string();
+    let child_db = child.db.clone();
+    let child_gate = child_mock.block_next_call();
+    let mock = Arc::new(crate::test_support::MockBackend::new());
+    mock.push_tool_calls([(
+        "wait".into(),
+        "job_wait".into(),
+        serde_json::json!({"session_db_id": child_id, "timeout_seconds": 240}).to_string(),
+    )]);
+    mock.push_text("parent finished");
+    let first = mock.block_next_call();
+    let final_call = mock.block_next_call();
+    executor
+        .register_session(
+            &db,
+            crate::backends::BackendManager::with_mock(mock.clone(), secrets.clone()),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    registry.publish_agent_job(child).await.unwrap();
+    Session::new(sid.clone(), db)
+        .await
+        .add_entry(SessionEntry {
+            sender: "user".into(),
+            content: "observe child".into(),
+            timestamp: Utc::now(),
+            entry_type: EntryType::Directive,
+            metadata: None,
+            routing: None,
+        })
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(30), first.wait_started())
+        .await
+        .expect("parent starts");
+    first.release();
+    tokio::time::timeout(Duration::from_secs(30), child_gate.wait_started())
+        .await
+        .expect("child starts");
+    *target.lock().unwrap() = Some(child_id.clone());
+    let held_tips = child_db.snapshot().await.unwrap();
+    tokio::time::sleep(Duration::from_millis(4500)).await;
+    assert_eq!(
+        child_db.snapshot().await.unwrap(),
+        held_tips,
+        "no ownership/renewal writes while a running job waits on storage"
+    );
+    let participants = crate::session::execution::participants(&child_db)
+        .await
+        .unwrap();
+    assert_eq!(participants.len(), 1);
+    assert_eq!(
+        crate::session::execution::ordered_starts(&child_db)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    let settlement_started = std::time::Instant::now();
+    child_gate.release();
+    tokio::time::timeout(Duration::from_secs(15), receipt_started.notified())
+        .await
+        .expect("the real receipt transaction reaches delayed native storage");
+    tokio::time::timeout(Duration::from_secs(60), final_call.wait_started())
+        .await
+        .expect("parent continues after the child settles");
+    assert!(settlement_started.elapsed() >= Duration::from_millis(4500));
+    assert_eq!(
+        delayed.load(Ordering::SeqCst),
+        1,
+        "one real terminal transaction, never resubmitted"
+    );
+    assert_eq!(
+        client.job_status(&child_id).await.unwrap().state,
+        JobState::Succeeded {
+            text: Some("finished".into())
+        }
+    );
+    let receipt = crate::session::jobs::read_job_result(&child_db)
+        .await
+        .unwrap()
+        .unwrap();
+    let branch = crate::session::execution::ordered_starts(&child_db)
+        .await
+        .unwrap()
+        .remove(0)
+        .start
+        .id;
+    assert_eq!(receipt.execution_id.as_deref(), Some(branch.as_str()));
+    let calls = mock.recorded_calls();
+    assert!(calls[1].messages.iter().any(|message| matches!(message,
+        crate::runtime::RuntimeMessage::ToolResult { call_id, content }
+            if call_id == "wait" && content.contains("finished"))));
+    final_call.release();
+    executor.shutdown().await;
+    client.shutdown().await;
+    let _ = shutdown.send(());
+    let _ = service_task.await;
+    drop(proxy);
+}
+
+/// A later competing branch of a running job does not stop it: the earlier
+/// branch is told once, at its next model boundary, and delivers normally.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn running_job_branch_gets_one_parallel_notice_and_still_delivers() {
+    use crate::session::jobs::JobState;
+    use eidetica::service::ServiceServer;
+    use std::time::Duration;
+    use tokio::sync::watch;
+
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("parallel-notice.sock");
+    let (owner, mut user) = Instance::create_backend(
+        Box::new(InMemory::new()),
+        NewUser::passwordless("parallel-notice"),
+    )
+    .await
+    .unwrap();
+    let (agent_db, pubkey) = create_agent_db(
+        &mut user,
+        "default",
+        &AgentDbConfig::default(),
+        &AgentMeta {
+            display_name: Some("default".into()),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let agent = DbEntry {
+        db_id: agent_db.id(),
+        display_name: "default".into(),
+        pubkey,
+    };
+    let service = ServiceServer::bind(owner, &socket).await.unwrap();
+    let (shutdown, receiver) = watch::channel(());
+    let service_task = tokio::spawn(service.run(receiver));
+    let settings = crate::config::EideticaConfig {
+        connection: format!("unix://{}", socket.display()),
+        login: crate::config::EideticaLoginConfig {
+            username: "parallel-notice".into(),
+            password: None,
+            passwordless: true,
+        },
+        sync: None,
+    };
+    // The child makes one tool call, so its second model request is a safe
+    // non-closing boundary after the rival branch appears.
+    let child_mock = Arc::new(crate::test_support::MockBackend::new());
+    child_mock.push_tool_calls([("probe".into(), "missing_tool".into(), "{}".into())]);
+    child_mock.push_text("finished");
+    let (executor, child_mock) = published_executor_using_mock(
+        &settings,
+        Arc::new(AgentRegistry::with_default_agent()),
+        agent.clone(),
+        child_mock,
+    )
+    .await;
+    let registry = executor.registry.clone();
+    let client = client_server_fixture_from_registry(registry.clone()).await;
+    let secrets = crate::security::SecretStore::new(registry.chaz_peer().clone()).await;
+    let slot = crate::instance::ServerSlot::default();
+    slot.set(executor.clone());
+    executor.tools.register(crate::tools::JobWaitTool {
+        server: slot.clone(),
+    });
+    let (sid, db) = registry
+        .create_session(Some("notice-parent"))
+        .await
+        .unwrap();
+    registry
+        .attach_agent_to_session(&sid.0, &agent)
+        .await
+        .unwrap();
+    let child = registry
+        .prepare_agent_job(&sid.0, "default", "slow child")
+        .await
+        .unwrap();
+    let child_id = child.db.root_id().to_string();
+    let child_db = child.db.clone();
+    let child_gate = child_mock.block_next_call();
+    let mock = Arc::new(crate::test_support::MockBackend::new());
+    mock.push_tool_calls([(
+        "wait".into(),
+        "job_wait".into(),
+        serde_json::json!({"session_db_id": child_id, "timeout_seconds": 240}).to_string(),
+    )]);
+    mock.push_text("parent finished");
+    let first = mock.block_next_call();
+    let final_call = mock.block_next_call();
+    executor
+        .register_session(
+            &db,
+            crate::backends::BackendManager::with_mock(mock.clone(), secrets.clone()),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    registry.publish_agent_job(child).await.unwrap();
+    Session::new(sid.clone(), db)
+        .await
+        .add_entry(SessionEntry {
+            sender: "user".into(),
+            content: "observe child".into(),
+            timestamp: Utc::now(),
+            entry_type: EntryType::Directive,
+            metadata: None,
+            routing: None,
+        })
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(30), first.wait_started())
+        .await
+        .expect("parent starts");
+    first.release();
+    tokio::time::timeout(Duration::from_secs(30), child_gate.wait_started())
+        .await
+        .expect("child starts");
+    let rival = crate::session::execution::test_compete(&child_db)
+        .await
+        .unwrap();
+    child_gate.release();
+    tokio::time::timeout(Duration::from_secs(60), final_call.wait_started())
+        .await
+        .expect("parent continues after the child settles");
+    assert_eq!(
+        client.job_status(&child_id).await.unwrap().state,
+        JobState::Succeeded {
+            text: Some("finished".into())
+        }
+    );
+    let receipt = crate::session::jobs::read_job_result(&child_db)
+        .await
+        .unwrap()
+        .unwrap();
+    let branch = crate::session::execution::ordered_starts(&child_db)
+        .await
+        .unwrap()
+        .remove(0)
+        .start
+        .id;
+    assert_eq!(receipt.execution_id.as_deref(), Some(branch.as_str()));
+    let child_calls = child_mock.recorded_calls();
+    let notices: Vec<_> = child_calls
+        .iter()
+        .flat_map(|call| call.messages.iter())
+        .filter(|message| matches!(message,
+            crate::runtime::RuntimeMessage::User(text) if text.starts_with("Parallel execution evidence")))
+        .collect();
+    assert_eq!(notices.len(), 1, "one bounded notice, never repeated");
+    assert!(
+        matches!(notices[0], crate::runtime::RuntimeMessage::User(text)
+        if text.contains(&rival) && text.contains("other-executor") && text.contains("job_status"))
+    );
+    assert!(
+        crate::session::execution::yields(&child_db)
+            .await
+            .unwrap()
+            .is_empty(),
+        "the earlier branch keeps running"
+    );
+    assert!(
+        client
+            .job_execution_transcript(&child_id, &rival, "", 0, 10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        !client
+            .job_execution_transcript(&child_id, &branch, "finished", 0, 10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let (_outside_instance, outsider, _) = server_fixture().await;
+    assert!(
+        outsider
+            .job_execution_transcript(&child_id, &branch, "", 0, 10)
+            .await
+            .is_err(),
+        "knowing the branch handle is not DB authorization"
+    );
+    assert!(
+        client
+            .job_execution_transcript(&child_id, "absent", "", 0, 10)
+            .await
+            .is_err()
+    );
+    outsider.shutdown().await;
+    let calls = mock.recorded_calls();
+    assert!(calls[1].messages.iter().any(|message| matches!(message,
+        crate::runtime::RuntimeMessage::ToolResult { call_id, content }
+            if call_id == "wait" && content.contains("finished"))));
+    final_call.release();
+    executor.shutdown().await;
+    client.shutdown().await;
+    let _ = shutdown.send(());
+    let _ = service_task.await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn ten_job_wait_parents_yield_capacity_and_reacquire_before_continuing() {
     use crate::session::jobs::JobState;
@@ -8130,7 +8572,7 @@ impl crate::tool::Tool for StoppableWait {
 }
 
 #[tokio::test]
-async fn job_wait_executor_shutdown_and_claim_loss_stop_observation_or_reacquisition() {
+async fn job_wait_executor_shutdown_and_observed_yield_stop_observation_or_reacquisition() {
     use std::time::Duration;
     for claim_loss in [false, true] {
         for reacquiring in [false, true] {
@@ -8161,6 +8603,9 @@ async fn job_wait_executor_shutdown_and_claim_loss_stop_observation_or_reacquisi
                 mock.clone(),
                 crate::security::SecretStore::new(registry.chaz_peer().clone()).await,
             );
+            crate::session::execution::activate_fresh(&db)
+                .await
+                .unwrap();
             let mut session = Session::new(sid.clone(), db.clone()).await;
             let request_id = session
                 .add_entry(SessionEntry {
@@ -8184,13 +8629,6 @@ async fn job_wait_executor_shutdown_and_claim_loss_stop_observation_or_reacquisi
                 .insert(attempt.attempt_id.clone());
             server.processing.lock().await.insert(sid.0.clone());
             let token = claim_loss.then(|| "owner".to_string());
-            if claim_loss {
-                assert!(
-                    crate::session::jobs::claim_job(&db, "peer", "agent", "owner")
-                        .await
-                        .unwrap()
-                );
-            }
             let (completion_tx, mut completion_rx) = mpsc::channel(1);
             let permit = server.semaphore.clone().acquire_owned().await.unwrap();
             server
@@ -8202,7 +8640,11 @@ async fn job_wait_executor_shutdown_and_claim_loss_stop_observation_or_reacquisi
                     backend,
                     attempt.clone(),
                     SpawnContext {
-                        job_projection: None,
+                        // Identity only: without job authority no queue
+                        // projection is reconciled.
+                        job_projection: claim_loss
+                            .then(|| (db.clone(), "agent".to_string(), "peer".to_string())),
+                        job_retry: None,
                         job_incarnation: token,
                         job_authority: None,
                         call_depth: 0,
@@ -8213,6 +8655,7 @@ async fn job_wait_executor_shutdown_and_claim_loss_stop_observation_or_reacquisi
                         turns: server.turns.clone(),
                     },
                     Some(permit),
+                    None,
                 )
                 .await;
             tokio::time::timeout(Duration::from_secs(5), entered.notified())
@@ -8235,25 +8678,16 @@ async fn job_wait_executor_shutdown_and_claim_loss_stop_observation_or_reacquisi
             assert_eq!(mock.recorded_calls().len(), 1);
             assert_eq!(effects.load(Ordering::SeqCst), 0);
             if claim_loss {
-                use eidetica::store::DocStore;
-                let txn = db.new_transaction().await.unwrap();
-                let mut owner = crate::session::jobs::read_job_owner(&db)
-                    .await
-                    .unwrap()
-                    .unwrap();
-                owner.incarnation = "rival".into();
-                txn.get_store::<DocStore>("job_owner")
-                    .await
-                    .unwrap()
-                    .set_string("v1", serde_json::to_string(&owner).unwrap())
+                let successor = crate::session::execution::test_supersede(&db)
                     .await
                     .unwrap();
-                txn.commit().await.unwrap();
                 tokio::time::timeout(Duration::from_secs(5), completion_rx.recv())
                     .await
                     .unwrap()
                     .unwrap();
-                assert_eq!(crate::session::jobs::job_stop_count(&db).await.unwrap(), 1);
+                let yields = crate::session::execution::yields(&db).await.unwrap();
+                assert_eq!(yields.len(), 1);
+                assert_eq!(yields[0].earlier_execution, successor);
                 assert!(
                     !server
                         .live_attempts
@@ -8598,3 +9032,8 @@ async fn required_context_strategy_refuses_and_recovers_on_the_executor() {
     )));
     server.shutdown().await;
 }
+
+#[path = "wait_resume_tests.rs"]
+mod wait_resume;
+#[path = "worker_capacity_tests.rs"]
+mod worker_capacity_tests;

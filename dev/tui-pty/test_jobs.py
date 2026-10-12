@@ -198,6 +198,8 @@ agents:
 default_agents: [chaz]
 security:
   auto_approved_tools: [spawn_agent]
+context:
+  reserved_output_tokens: 512
 '''
             configs = {}
             for role in ["client", "executor"]:

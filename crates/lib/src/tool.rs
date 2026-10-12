@@ -149,6 +149,16 @@ impl RateLimiter {
         timestamps.push(now);
         Ok(())
     }
+
+    /// Count a call admitted `age` ago, e.g. by the same turn before an
+    /// executor restart, so a resumed turn keeps the same sliding window.
+    pub fn record_past(&mut self, tool_name: &str, age: Duration) {
+        let now = std::time::Instant::now();
+        let at = now.checked_sub(age).unwrap_or(now);
+        let timestamps = self.calls.entry(tool_name.to_string()).or_default();
+        timestamps.push(at);
+        timestamps.sort();
+    }
 }
 
 /// How a tool's definition is presented to the LLM.
@@ -268,6 +278,8 @@ pub struct ToolContext {
     pub turn_request_id: Option<crate::session::TurnRequestId>,
     // Stable model-response call site, set by the runtime before dispatch.
     pub tool_call_key: Option<String>,
+    /// Runtime-owned capacity handle, populated for each turn's tool call.
+    pub observation_yield: Option<crate::runtime::ObservationYield>,
     /// Current spawn depth (0 = root agent from bridge)
     pub call_depth: usize,
     /// Maximum allowed spawn depth
@@ -310,9 +322,22 @@ pub struct ToolContext {
     /// heap through this after a committed write. `None` under `--print`
     /// (no engine running) and in tests.
     pub routine_engine: Option<Arc<crate::routine::RoutineEngine>>,
+    /// Absolute observation deadline for the current `job_wait` call, set by
+    /// the runtime. A resumed wait keeps its original deadline across a
+    /// restart instead of starting a new relative timeout.
+    pub observation_deadline: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 impl ToolContext {
+    /// Yield capacity only after submission/effects are complete. From here
+    /// until return, the tool may only observe; the runtime reacquires outside
+    /// the tool timeout before processing the result. No-op on non-turn callers.
+    pub fn yield_for_observation(&self) {
+        if let Some(observation) = &self.observation_yield {
+            observation.yield_capacity();
+        }
+    }
+
     /// Mirror the terminal action into context budgeting and the model request.
     pub fn definitions(&self) -> Vec<ToolDefinition> {
         let mut defs = self.tools.definitions(&self.profile);

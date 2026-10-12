@@ -1787,3 +1787,127 @@ async fn projection_preserves_user_stop_and_scope_on_both_runtime_paths() {
         ));
     }
 }
+
+#[tokio::test]
+async fn resumed_wait_projects_restored_exchanges_with_current_scope() {
+    for revoked in [false, true] {
+        let projection = probe("resume-scope", |call, request| {
+            assert_eq!(call.model_round, 2);
+            assert_eq!(call.attempt_id, Some("same-attempt"));
+            assert_eq!(call.budget_tokens, Some(10_000));
+            assert_eq!(
+                &call.sources[2..],
+                &[
+                    ContextSource::CurrentAttempt { model_sequence: 0 },
+                    ContextSource::CurrentAttempt { model_sequence: 0 },
+                    ContextSource::CurrentAttempt { model_sequence: 1 },
+                    ContextSource::CurrentAttempt { model_sequence: 1 },
+                ]
+            );
+            Ok(request)
+        });
+        let fixture = Fixture::new(
+            &[&projection],
+            &[grant(
+                "resume-scope",
+                ProjectionAuthority::Conversation,
+                true,
+            )],
+            &["resume-scope"],
+        )
+        .await;
+        let waits = Arc::new(AtomicUsize::new(0));
+        let effects = Arc::new(AtomicUsize::new(0));
+        fixture.register(CountingTool {
+            name: "job_wait",
+            output: "same child",
+            calls: waits.clone(),
+        });
+        fixture.register(CountingTool {
+            name: "effect",
+            output: "must not replay",
+            calls: effects.clone(),
+        });
+        if revoked {
+            let db = fixture.session.lock().await.database().clone();
+            append_event(
+                &db,
+                ExtensionEvent::Deactivated {
+                    name: "resume-scope".into(),
+                    timestamp: chrono::Utc::now() + chrono::Duration::seconds(1),
+                },
+            )
+            .await
+            .unwrap();
+        }
+        fixture.mock.push_text("done");
+        let call = ToolCallRequest {
+            id: "wait".into(),
+            name: "job_wait".into(),
+            arguments: "{}".into(),
+        };
+        let now = chrono::Utc::now();
+        let result = runtime::resume_with_recorder(
+            Some("mock-model"),
+            prompt(),
+            &fixture.backend,
+            &permissive_security(),
+            &fixture.ctx,
+            &ToolPolicyRegistry::empty(),
+            None,
+            Some(&fixture.hub),
+            None,
+            runtime::RuntimeResume {
+                prior_messages: vec![
+                    RuntimeMessage::AssistantToolCalls {
+                        exchange_id: None,
+                        content: None,
+                        tool_calls: vec![ToolCallRequest {
+                            id: "effect".into(),
+                            name: "effect".into(),
+                            arguments: "{}".into(),
+                        }],
+                        provider_extra: Default::default(),
+                    },
+                    RuntimeMessage::ToolResult {
+                        call_id: "effect".into(),
+                        content: "retained effect".into(),
+                    },
+                    RuntimeMessage::AssistantToolCalls {
+                        exchange_id: None,
+                        content: None,
+                        tool_calls: vec![call.clone()],
+                        provider_extra: Default::default(),
+                    },
+                ],
+                model_sequence: 1,
+                call_index: 0,
+                call,
+                deadline: now + chrono::Duration::seconds(30),
+                policy_deadline: now + chrono::Duration::seconds(60),
+                policy_timeout_seconds: 60,
+                metadata: Vec::new(),
+                matrix_send_queued: false,
+                rate_limited_calls: Vec::new(),
+            },
+            ModelCallScope {
+                attempt_id: Some("same-attempt".into()),
+                request_budget_tokens: Some(10_000),
+                ..Default::default()
+            },
+        )
+        .await;
+        assert_eq!(waits.load(Ordering::SeqCst), 1);
+        assert_eq!(effects.load(Ordering::SeqCst), 0);
+        assert_eq!(projection.count(), usize::from(!revoked));
+        assert_eq!(fixture.calls().len(), usize::from(!revoked));
+        if revoked {
+            assert!(
+                result.is_err(),
+                "revoked required projection must refuse continuation"
+            );
+        } else {
+            assert_eq!(result.unwrap().body, "done");
+        }
+    }
+}

@@ -590,11 +590,15 @@ impl AgentDb {
         let rows = store
             .search(|row: &ExecutorRef| row.peer_pubkey == reference.peer_pubkey)
             .await?;
+        // Racing incarnations of one peer may each publish a reference;
+        // executor_db::ensure converges on the lowest one, which must be
+        // already present or be this one.
         anyhow::ensure!(
-            rows.iter().all(|(_, row)| row.db_id == reference.db_id),
+            rows.iter().all(|(_, row)| row.db_id >= reference.db_id)
+                || rows.iter().any(|(_, row)| row.db_id == reference.db_id),
             "executor reference conflicts with existing DB"
         );
-        if rows.is_empty() {
+        if !rows.iter().any(|(_, row)| row.db_id == reference.db_id) {
             store.insert(reference).await?;
             txn.commit().await?;
         }

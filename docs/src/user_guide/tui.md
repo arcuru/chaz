@@ -841,8 +841,8 @@ explicitly unavailable; the monitor does not guess its authority.
 
 The tree uses task titles, preserves ancestry and sibling order, and highlights
 the selected row in bold. Its second line names the recorded status and Agent.
-The header counts only claimed jobs; **Context** rows (originating conversations
-and unclaimed references) have a separate count. A completed job says
+The header counts only jobs in the executor projection; **Context** rows
+(originating conversations and references outside that projection) have a separate count. A completed job says
 **Completed**, not “claimed.” Missing data says **Unavailable**, not “no jobs.”
 
 Wide terminals show the tree and selected task side by side. Below 110 columns

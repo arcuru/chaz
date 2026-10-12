@@ -30,13 +30,17 @@ use tracing::{error, info, warn};
 
 mod agents;
 mod bridge_event;
+pub mod execution;
 pub mod jobs;
 mod keys;
 mod registry;
 pub mod steering;
 pub(crate) use registry::JobRequest;
+#[cfg(test)]
+pub(crate) use registry::PreparedAgentJob;
 mod transport;
 pub mod usage;
+pub(crate) mod wait_resume;
 pub(crate) mod wire;
 
 use wire::session_wire_enum;
@@ -1510,6 +1514,22 @@ impl Session {
         outbound: Option<SessionEntry>,
         transcript: Option<TurnTranscriptRecord>,
     ) -> anyhow::Result<()> {
+        self.complete_turn_attempt_for_branch(attempt, final_entry, outbound, transcript, None)
+            .await
+    }
+
+    /// A job execution branch commits its delivered outcome, the job receipt
+    /// and its terminal transcript with the completion. The receipt slot is
+    /// never replaced: a branch finding another branch's receipt fails here
+    /// and keeps its result as undelivered evidence instead.
+    pub(crate) async fn complete_turn_attempt_for_branch(
+        &mut self,
+        attempt: &TurnAttempt,
+        final_entry: Option<SessionEntry>,
+        outbound: Option<SessionEntry>,
+        transcript: Option<TurnTranscriptRecord>,
+        branch: Option<&str>,
+    ) -> anyhow::Result<()> {
         if let Some(send) = outbound.as_ref() {
             if send.bridge_role() != Some(BridgeEventRole::Outbound) {
                 anyhow::bail!("turn outbound must be a supported bridge outbound event");
@@ -1556,28 +1576,32 @@ impl Session {
         if let Some(accepted) = crate::session::jobs::read_accepted_job(&self.database).await?
             && accepted.directive_id == attempt.request_id.as_str()
         {
-            let terminal = match final_entry.as_ref() {
-                Some(entry) if entry.entry_type == EntryType::Message => {
-                    crate::session::jobs::JobTerminal::Success {
-                        text: Some(entry.content.clone()),
-                    }
-                }
-                Some(entry) if entry.entry_type == EntryType::Error => {
-                    crate::session::jobs::JobTerminal::Failure {
-                        message: entry.content.clone(),
-                    }
-                }
-                None => crate::session::jobs::JobTerminal::Success { text: None },
-                Some(_) => anyhow::bail!("job completion has an invalid terminal entry"),
+            let terminal = crate::session::jobs::job_terminal_for(final_entry.as_ref())
+                .ok_or_else(|| anyhow::anyhow!("job completion has an invalid terminal entry"))?;
+            let result = crate::session::jobs::JobResult {
+                attempt_id: attempt.attempt_id.clone(),
+                terminal,
+                execution_id: branch.map(str::to_string),
             };
-            crate::session::jobs::write_job_result_in_txn(
-                &txn,
-                &crate::session::jobs::JobResult {
-                    attempt_id: attempt.attempt_id.clone(),
-                    terminal,
-                },
-            )
-            .await?;
+            if let Some(branch) = branch {
+                anyhow::ensure!(
+                    crate::session::jobs::read_job_result_in_txn(&txn)
+                        .await?
+                        .is_none(),
+                    "job already settled by another execution"
+                );
+                execution::outcome_in_txn(
+                    &txn,
+                    &execution::ExecutionOutcome {
+                        execution_id: branch.to_string(),
+                        result: result.clone(),
+                        delivered: true,
+                    },
+                    transcript.as_ref(),
+                )
+                .await?;
+            }
+            crate::session::jobs::write_job_result_in_txn(&txn, &result).await?;
         }
         let mut committed_entries = Vec::new();
         if final_entry.is_some() || outbound.is_some() {
@@ -1613,7 +1637,22 @@ impl Session {
         record: TurnTranscriptRecord,
         display_entries: Vec<SessionEntry>,
     ) -> anyhow::Result<()> {
+        self.append_turn_transcript_for_branch(record, display_entries, None)
+            .await
+    }
+
+    /// The branch copy keeps each execution's records separately readable
+    /// even when two branches of one attempt reuse a sequence number.
+    pub(crate) async fn append_turn_transcript_for_branch(
+        &self,
+        record: TurnTranscriptRecord,
+        display_entries: Vec<SessionEntry>,
+        branch: Option<&str>,
+    ) -> anyhow::Result<()> {
         let txn = self.database.new_transaction().await?;
+        if let Some(branch) = branch {
+            execution::transcript_in_txn(&txn, branch, &record).await?;
+        }
         let key = format!("{:020}:{}", record.sequence, uuid::Uuid::new_v4());
         txn.get_store::<Table<TurnTranscriptRecord>>(TURN_TRANSCRIPT_STORE)
             .await?

@@ -1,4 +1,4 @@
-//! Per-Agent, per-peer durable projection of claimed Agent jobs.
+//! Per-Agent, per-peer durable projection of participating Agent jobs.
 //! The session DB remains authoritative for attempt and terminal receipt.
 use crate::agent_db::{AgentDb, ExecutorRef};
 use crate::session::jobs::{AcceptedAgentJob, JobState, status_from_db};
@@ -55,7 +55,7 @@ pub async fn record(db: &Database, row: ExecutorJob) -> anyhow::Result<()> {
             row.last_recorded,
             JobState::Pending | JobState::Rejected { .. }
         ),
-        "only claimed jobs enter executor DB"
+        "only participating jobs enter executor DB"
     );
     let txn = db.new_transaction().await?;
     let store = txn.get_store::<Table<ExecutorJob>>(JOBS).await?;
@@ -99,21 +99,25 @@ pub async fn ensure(
     // the Agent's delegated key on this DB in the shared User key map;
     // find_database chooses an arbitrary mapping, which is unsafe on a
     // remote service and can fail to discover an existing DB.
-    let references: Vec<_> = agent
+    // Concurrent incarnations of one peer participate in the same jobs and
+    // can race this find-before-create. Every reader converges on the lowest
+    // verified DB ID instead of refusing forever.
+    let mut references: Vec<_> = agent
         .list_executors()
         .await?
         .into_iter()
         .filter(|r| r.peer_pubkey == peer.to_string())
         .collect();
-    anyhow::ensure!(
-        references.len() <= 1,
-        "duplicate executor references for peer"
-    );
+    references.sort_by(|a, b| a.db_id.cmp(&b.db_id));
+    references.dedup_by(|a, b| a.db_id == b.db_id);
     let mut matches = Vec::new();
     if let Some(reference) = references.first() {
-        let db = user
-            .open_database_with_key(&ID::parse(&reference.db_id)?, &peer)
+        // Another incarnation may have created it after this User's key-map
+        // snapshot was loaded; map the peer's own key, as job sessions do.
+        let root = ID::parse(&reference.db_id)?;
+        user.map_key(&peer, &root, SigKey::from_pubkey(&peer))
             .await?;
+        let db = user.open_database_with_key(&root, &peer).await?;
         anyhow::ensure!(
             db.get_name().await? == name,
             "executor reference targets another database"
@@ -133,10 +137,7 @@ pub async fn ensure(
             }
         }
     }
-    anyhow::ensure!(
-        matches.len() <= 1,
-        "duplicate executor databases for {name}"
-    );
+    matches.sort_by_key(|db| db.root_id().to_string());
     let db = match matches.into_iter().next() {
         Some(db) => db,
         None => {
@@ -314,6 +315,107 @@ mod tests {
             )
             .await
             .is_err()
+        );
+    }
+
+    /// Two find-before-create incarnations can publish different Executor DBs.
+    /// Every subsequent reader chooses the same verified lower ID, including
+    /// a User whose key-map snapshot predates both creations.
+    #[tokio::test]
+    async fn raced_incarnations_converge_and_reject_a_wrong_identity() {
+        let (instance, mut user) = Instance::create_backend(
+            Box::new(InMemory::new()),
+            NewUser::passwordless("executor-race"),
+        )
+        .await
+        .unwrap();
+        let (agent, key) = crate::agent_db::create_agent_db(
+            &mut user,
+            "B",
+            &Default::default(),
+            &Default::default(),
+        )
+        .await
+        .unwrap();
+        let mut stale = instance.login_user("executor-race", None).await.unwrap();
+        let peer = user.get_default_key().unwrap();
+        let name = format!("executor:{}:{peer}", agent.database().root_id());
+        let mut settings = eidetica::crdt::Doc::new();
+        settings.set("name", name.as_str());
+        let first = user.create_database(settings.clone(), &peer).await.unwrap();
+        let second = user.create_database(settings, &peer).await.unwrap();
+        let mut roots = [first.root_id().to_string(), second.root_id().to_string()];
+        roots.sort();
+        for root in roots.iter().rev() {
+            agent
+                .register_executor(ExecutorRef {
+                    peer_pubkey: peer.to_string(),
+                    db_id: root.clone(),
+                })
+                .await
+                .unwrap();
+        }
+        let (a, _) = ensure(&mut user, &agent, &key).await.unwrap();
+        let (b, _) = ensure(&mut stale, &agent, &key).await.unwrap();
+        assert_eq!(a.root_id().to_string(), roots[0]);
+        assert_eq!(a.root_id(), b.root_id());
+        let tips = b.snapshot().await.unwrap();
+        assert_eq!(
+            ensure(&mut stale, &agent, &key)
+                .await
+                .unwrap()
+                .0
+                .snapshot()
+                .await
+                .unwrap(),
+            tips,
+            "idempotent convergence"
+        );
+        assert_eq!(
+            agent.list_executors().await.unwrap().len(),
+            2,
+            "retain the losing reference; no deletion"
+        );
+        let reference = ExecutorRef {
+            peer_pubkey: peer.to_string(),
+            db_id: roots[0].clone(),
+        };
+        assert!(
+            list_jobs(
+                &open_for_agent(&mut stale, &agent, &reference, &key)
+                    .await
+                    .unwrap()
+            )
+            .await
+            .unwrap()
+            .is_empty()
+        );
+        // A lexically earlier pointer must still identify this exact Agent/
+        // peer queue, not merely any database accessible with the peer key.
+        let mut wrong = eidetica::crdt::Doc::new();
+        wrong.set("name", "another-executor");
+        let wrong = user.create_database(wrong, &peer).await.unwrap();
+        let txn = agent.database().new_transaction().await.unwrap();
+        let refs = txn
+            .get_store::<Table<ExecutorRef>>("executors")
+            .await
+            .unwrap();
+        for (id, _) in refs.search(|_: &ExecutorRef| true).await.unwrap() {
+            refs.delete(&id).await.unwrap();
+        }
+        refs.insert(ExecutorRef {
+            peer_pubkey: peer.to_string(),
+            db_id: wrong.root_id().to_string(),
+        })
+        .await
+        .unwrap();
+        txn.commit().await.unwrap();
+        assert!(
+            ensure(&mut stale, &agent, &key)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("another database")
         );
     }
 

@@ -61,6 +61,61 @@ pub trait RuntimeRecorder: Send + Sync {
         &'a self,
         message: RuntimeRecord,
     ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
+
+    /// Persist the exact pending `job_wait` before it starts observing, so a
+    /// restarted executor can resume only that observation. Recorders without
+    /// a durable turn attempt keep the default no-op.
+    fn checkpoint_job_wait<'a>(
+        &'a self,
+        _wait: JobWaitIntent,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    /// Retire a wait checkpoint before result hooks or persistence can have
+    /// effects. Failure stops the turn without running those effects.
+    fn finish_job_wait<'a>(
+        &'a self,
+        _model_sequence: u64,
+        _call_index: usize,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(async { Ok(()) })
+    }
+}
+
+/// The single `job_wait` call a turn is about to run, after approval and
+/// argument hooks. `deadline` is absolute: downtime counts against it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct JobWaitIntent {
+    pub model_sequence: u64,
+    pub call_index: usize,
+    pub call_id: String,
+    pub arguments: String,
+    pub child_session_db_id: String,
+    pub checkpointed_at: chrono::DateTime<chrono::Utc>,
+    pub deadline: chrono::DateTime<chrono::Utc>,
+    pub policy_timeout_seconds: u64,
+}
+
+/// State a restarted executor reconstructs from one checkpointed wait and the
+/// attempt's paired transcript. Only the pending wait runs again; every
+/// earlier model response and tool result is reused, never re-executed.
+#[derive(Clone, Debug)]
+pub struct RuntimeResume {
+    /// Completed tool groups plus the pending batch's assistant message and
+    /// the results of calls before the wait.
+    pub prior_messages: Vec<RuntimeMessage>,
+    pub model_sequence: u64,
+    pub call_index: usize,
+    /// The pending call with its post-hook arguments.
+    pub call: ToolCallRequest,
+    pub deadline: chrono::DateTime<chrono::Utc>,
+    pub policy_deadline: chrono::DateTime<chrono::Utc>,
+    pub policy_timeout_seconds: u64,
+    pub metadata: Vec<ResponseMetadata>,
+    pub matrix_send_queued: bool,
+    /// Calls that already passed the per-turn rate limiter, by tool name.
+    pub rate_limited_calls: Vec<(String, chrono::DateTime<chrono::Utc>)>,
 }
 
 #[derive(Clone, Debug)]
@@ -291,43 +346,70 @@ impl MetadataAccumulator {
     }
 }
 
-/// Executor capacity owned by one running turn. Only job observation yields
+/// Error prefix when a job branch observes an earlier branch after a wait.
+pub(crate) const JOB_EXECUTION_YIELDED: &str = "job execution yielded while observing";
+
+/// Runtime-owned permit handle for a tool's observation-only interval.
+/// After yielding, the tool must only observe and return: the runtime regains
+/// capacity and rechecks the job execution branch before any further effects.
+#[derive(Clone)]
+pub struct ObservationYield {
+    permit: Arc<std::sync::Mutex<Option<tokio::sync::OwnedSemaphorePermit>>>,
+}
+
+impl ObservationYield {
+    pub(crate) fn yield_capacity(&self) {
+        self.permit.lock().unwrap().take();
+    }
+}
+
+/// Executor capacity owned by one running turn. Child observation can yield
 /// it; cancellation drops the turn (and any held permit) as usual.
 pub struct ExecutionCapacity {
     semaphore: Arc<tokio::sync::Semaphore>,
-    permit: Option<tokio::sync::OwnedSemaphorePermit>,
-    job_claim: Option<(eidetica::Database, String)>,
+    observation: ObservationYield,
+    job_execution: Option<(eidetica::Database, String)>,
 }
 
 impl ExecutionCapacity {
     pub fn new(
         semaphore: Arc<tokio::sync::Semaphore>,
         permit: tokio::sync::OwnedSemaphorePermit,
-        job_claim: Option<(eidetica::Database, String)>,
+        job_execution: Option<(eidetica::Database, String)>,
     ) -> Self {
         Self {
             semaphore,
-            permit: Some(permit),
-            job_claim,
+            observation: ObservationYield {
+                permit: Arc::new(std::sync::Mutex::new(Some(permit))),
+            },
+            job_execution,
         }
     }
 
     async fn reacquire(&mut self) -> Result<(), String> {
-        self.permit = Some(
-            self.semaphore
-                .clone()
-                .acquire_owned()
-                .await
-                .map_err(|_| "executor capacity closed".to_string())?,
-        );
-        // The existing executor claim-loss watcher also covers the wait and
-        // acquisition. Recheck here before any resumed model/tool effects;
-        // the LWW claim remains an observation, not a fencing token.
-        if let Some((db, incarnation)) = &self.job_claim {
-            match crate::session::jobs::owns_job(db, incarnation).await {
-                Ok(true) => {}
-                Ok(false) => return Err("job lost claim while observing".into()),
-                Err(error) => return Err(format!("job claim recheck failed: {error}")),
+        if self.observation.permit.lock().unwrap().is_some() {
+            return Ok(());
+        }
+        let permit = self
+            .semaphore
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| "executor capacity closed".to_string())?;
+        *self.observation.permit.lock().unwrap() = Some(permit);
+        // The executor's yield watcher also covers the wait and acquisition.
+        // Recheck here before any resumed model/tool effects; observing an
+        // earlier branch is cooperative, not a fencing token.
+        if let Some((db, branch)) = &self.job_execution {
+            match crate::session::execution::observe(db, branch).await {
+                Ok(None) => {}
+                Ok(Some(yielded)) => {
+                    return Err(format!(
+                        "{JOB_EXECUTION_YIELDED}: earlier branch {}",
+                        yielded.earlier_execution
+                    ));
+                }
+                Err(error) => return Err(format!("job execution recheck failed: {error}")),
             }
         }
         Ok(())
@@ -932,7 +1014,7 @@ pub async fn execute_with_recorder(
     capacity: Option<ExecutionCapacity>,
     scope: ModelCallScope,
 ) -> Result<RuntimeOutcome, String> {
-    execute_cancellable_with_recorder(
+    run_turn(
         model,
         initial_messages,
         backend,
@@ -943,6 +1025,46 @@ pub async fn execute_with_recorder(
         hub,
         None,
         capacity,
+        None,
+        scope,
+    )
+    .await
+    .map_err(|error| error.to_string())
+}
+
+/// Continue a restarted turn from its checkpointed `job_wait`.
+///
+/// `initial_messages` is the turn's original context. The persisted model
+/// responses and tool results in `resume` are appended verbatim; only the
+/// pending observation runs, bounded by its original absolute deadline, and
+/// the loop then continues with the next model request. Extension
+/// `before_agent_start` hooks already ran for this attempt and do not rerun.
+#[allow(clippy::too_many_arguments)]
+pub async fn resume_with_recorder(
+    model: Option<&str>,
+    initial_messages: Vec<RuntimeMessage>,
+    backend: &BackendManager,
+    security: &SecurityContext,
+    tool_ctx: &ToolContext,
+    policies: &ToolPolicyRegistry,
+    recorder: Option<Arc<dyn RuntimeRecorder>>,
+    hub: Option<&ExtensionHub>,
+    capacity: Option<ExecutionCapacity>,
+    resume: RuntimeResume,
+    scope: ModelCallScope,
+) -> Result<RuntimeOutcome, String> {
+    run_turn(
+        model,
+        initial_messages,
+        backend,
+        security,
+        tool_ctx,
+        policies,
+        recorder,
+        hub,
+        None,
+        capacity,
+        Some(resume),
         scope,
     )
     .await
@@ -963,7 +1085,72 @@ pub async fn execute_cancellable_with_recorder(
     recorder: Option<Arc<dyn RuntimeRecorder>>,
     hub: Option<&ExtensionHub>,
     cancel: Option<&TurnCancel>,
+    capacity: Option<ExecutionCapacity>,
+    scope: ModelCallScope,
+) -> Result<RuntimeOutcome, TurnError> {
+    run_turn(
+        model,
+        initial_messages,
+        backend,
+        security,
+        tool_ctx,
+        policies,
+        recorder,
+        hub,
+        cancel,
+        capacity,
+        None,
+        scope,
+    )
+    .await
+}
+
+/// Resume the pending observation under the same executor-owned stop control.
+#[allow(clippy::too_many_arguments)]
+pub async fn resume_cancellable_with_recorder(
+    model: Option<&str>,
+    initial_messages: Vec<RuntimeMessage>,
+    backend: &BackendManager,
+    security: &SecurityContext,
+    tool_ctx: &ToolContext,
+    policies: &ToolPolicyRegistry,
+    recorder: Option<Arc<dyn RuntimeRecorder>>,
+    hub: Option<&ExtensionHub>,
+    cancel: Option<&TurnCancel>,
+    capacity: Option<ExecutionCapacity>,
+    resume: RuntimeResume,
+    scope: ModelCallScope,
+) -> Result<RuntimeOutcome, TurnError> {
+    run_turn(
+        model,
+        initial_messages,
+        backend,
+        security,
+        tool_ctx,
+        policies,
+        recorder,
+        hub,
+        cancel,
+        capacity,
+        Some(resume),
+        scope,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_turn(
+    model: Option<&str>,
+    initial_messages: Vec<RuntimeMessage>,
+    backend: &BackendManager,
+    security: &SecurityContext,
+    tool_ctx: &ToolContext,
+    policies: &ToolPolicyRegistry,
+    recorder: Option<Arc<dyn RuntimeRecorder>>,
+    hub: Option<&ExtensionHub>,
+    cancel: Option<&TurnCancel>,
     mut capacity: Option<ExecutionCapacity>,
+    resume: Option<RuntimeResume>,
     scope: ModelCallScope,
 ) -> Result<RuntimeOutcome, TurnError> {
     let tools = &tool_ctx.tools;
@@ -996,6 +1183,13 @@ pub async fn execute_cancellable_with_recorder(
         active_extensions: tool_ctx.active_extensions.clone(),
         routine_engine: tool_ctx.routine_engine.clone(),
     });
+
+    if resume.is_some()
+        && ((tools.is_empty() && !tool_ctx.allow_no_reply)
+            || !backend.supports_tools_for_model(model))
+    {
+        return Err("checkpointed job wait requires a tool-capable turn".into());
+    }
 
     // Tool-free jobs have the same next-call/closing boundary without adding
     // tool authority or changing standalone callers' single-shot behavior.
@@ -1071,9 +1265,14 @@ pub async fn execute_cancellable_with_recorder(
 
     let tool_defs = tool_ctx.definitions();
     let mut messages = initial_messages;
+    // Injected pre-turn messages are not persisted, so a turn that has any
+    // cannot be reconstructed and never checkpoints a wait.
+    let mut hooks_injected = false;
 
     // Hook: before_agent_start — append extension-injected messages.
-    if let (Some(hub), Some(ctx)) = (hub, hook_ctx.as_ref()) {
+    if resume.is_none()
+        && let (Some(hub), Some(ctx)) = (hub, hook_ctx.as_ref())
+    {
         let injected = hub.fire_before_agent_start(ctx).await;
         if !injected.is_empty() {
             debug!(
@@ -1081,15 +1280,103 @@ pub async fn execute_cancellable_with_recorder(
                 "Extensions injected pre-turn messages"
             );
             projector.note_injected(injected.len());
+            hooks_injected = true;
             messages.extend(injected);
         }
     }
 
+    // ApproveAll is never carried across a restart: a resumed turn starts
+    // without it, and a turn holding it does not checkpoint.
     let mut approve_all = false; // tracks if user chose "approve all" this turn
     let mut rate_limiter = RateLimiter::new();
     let mut matrix_send_queued = false;
 
     let mut iteration: usize = 0;
+    if let Some(resume) = resume {
+        let now = chrono::Utc::now();
+        for (name, at) in &resume.rate_limited_calls {
+            rate_limiter.record_past(name, (now - *at).to_std().unwrap_or_default());
+        }
+        for metadata in resume.metadata {
+            acc.record(metadata);
+        }
+        matrix_send_queued = resume.matrix_send_queued;
+        // Restored exchanges keep current-attempt provenance so the next
+        // projection can prune/recover them under the same scoped ceilings.
+        let mut restored_sequence = 0;
+        for message in resume.prior_messages {
+            if matches!(message, RuntimeMessage::AssistantToolCalls { .. }) {
+                projector.note_exchange(messages.len(), restored_sequence);
+                restored_sequence += 1;
+            }
+            messages.push(message);
+        }
+        model_sequence = resume.model_sequence;
+        let call = resume.call;
+        let result = match tools.get(&call.name) {
+            Some(tool) => {
+                let tool: &dyn crate::tool::Tool = &*tool;
+                let policy = policies.resolve(tool);
+                let args: serde_json::Value =
+                    serde_json::from_str(&call.arguments).unwrap_or_default();
+                let mut call_ctx = tool_ctx.clone();
+                call_ctx.tool_call_key = Some(format!(
+                    "{model_sequence}:{}:{}",
+                    resume.call_index, call.id
+                ));
+                call_ctx.grants = tool_ctx.resolve_call_grants(&policy.grants, &call.name);
+                call_ctx.observation_deadline = Some(resume.deadline);
+                // The remaining policy budget, not a fresh one: an expired
+                // budget reports the original timeout immediately.
+                let timeout = (resume.policy_deadline - chrono::Utc::now())
+                    .to_std()
+                    .unwrap_or_default()
+                    .min(policy.timeout_duration());
+                invoke_tool(
+                    tool,
+                    args,
+                    &call_ctx,
+                    timeout,
+                    resume.policy_timeout_seconds.min(policy.timeout),
+                    &call.name,
+                    cancel,
+                    &mut capacity,
+                    security,
+                    hub,
+                    hook_ctx.as_ref(),
+                    recorder
+                        .as_deref()
+                        .map(|recorder| (recorder, model_sequence, resume.call_index)),
+                )
+                .await?
+            }
+            None => Some(format!("Unknown tool: {}", call.name)),
+        };
+        let Some(result) = result else {
+            record_tool_result(
+                &recorder,
+                model_sequence,
+                resume.call_index,
+                &call,
+                TOOL_CANCELLED_OUTPUT,
+                ToolResultOutcome::Cancelled,
+            )
+            .await?;
+            return Err(cancelled_outcome(&recorder, hub, hook_ctx.as_ref(), acc).await);
+        };
+        settle_tool_result(
+            &recorder,
+            &mut messages,
+            model_sequence,
+            resume.call_index,
+            &call,
+            result,
+            &mut matrix_send_queued,
+        )
+        .await?;
+        model_sequence += 1;
+        iteration = model_sequence as usize;
+    }
     loop {
         projector.append_boundary_input(
             &mut messages,
@@ -1478,26 +1765,54 @@ pub async fn execute_cancellable_with_recorder(
                             call_ctx.tool_call_key =
                                 Some(format!("{model_sequence}:{call_index}:{}", call.id));
                             call_ctx.grants = call_grants;
-                            if call.name == "job_wait"
-                                && let Some(capacity) = capacity.as_mut()
+                            if call.name == JOB_WAIT_TOOL
+                                && let Ok((child, seconds)) =
+                                    crate::tools::jobs::job_wait_arguments(&args)
                             {
-                                capacity.permit.take();
-                            }
-                            let Some(exec_result) = until_cancelled(cancel, async {
-                                let result =
-                                    execute_with_retry(tool, args, &call_ctx, timeout, &call.name)
-                                        .await;
-                                // Outside the tool timeout: success, error and timeout
-                                // all regain capacity before hooks, another tool in
-                                // this batch, or the next model request can execute.
-                                if call.name == "job_wait"
-                                    && let Some(capacity) = capacity.as_mut()
+                                let checkpointed_at = chrono::Utc::now();
+                                let deadline =
+                                    checkpointed_at + chrono::Duration::seconds(seconds as i64);
+                                call_ctx.observation_deadline = Some(deadline);
+                                // Only a wait that ends its batch, in a turn
+                                // whose state the loader fully restores, is
+                                // resumable. Anything else stays held.
+                                if call_index + 1 == tool_calls.len()
+                                    && !approve_all
+                                    && !hooks_injected
+                                    && let Some(recorder) = &recorder
+                                    && let Err(error) = recorder
+                                        .checkpoint_job_wait(JobWaitIntent {
+                                            model_sequence,
+                                            call_index,
+                                            call_id: call.id.clone(),
+                                            arguments: args.to_string(),
+                                            child_session_db_id: child,
+                                            checkpointed_at,
+                                            deadline,
+                                            policy_timeout_seconds: timeout.as_secs(),
+                                        })
+                                        .await
                                 {
-                                    capacity.reacquire().await?;
+                                    warn!(%error, "Could not checkpoint job wait; it will not resume after restart");
                                 }
-                                Ok::<_, String>(result)
-                            })
-                            .await
+                            }
+                            let Some(result) = invoke_tool(
+                                tool,
+                                args,
+                                &call_ctx,
+                                timeout,
+                                timeout.as_secs(),
+                                &call.name,
+                                cancel,
+                                &mut capacity,
+                                security,
+                                hub,
+                                hook_ctx.as_ref(),
+                                recorder
+                                    .as_deref()
+                                    .map(|recorder| (recorder, model_sequence, call_index)),
+                            )
+                            .await?
                             else {
                                 record_cancelled_calls(
                                     &recorder,
@@ -1514,51 +1829,7 @@ pub async fn execute_cancellable_with_recorder(
                                 )
                                 .await);
                             };
-                            let exec_result = exec_result?;
-
-                            match exec_result {
-                                Ok(Ok(output)) => {
-                                    debug!(
-                                        tool = %call.name,
-                                        len = output.len(),
-                                        "Tool returned: {}",
-                                        crate::util::truncate_chars(&output, 200)
-                                    );
-
-                                    // --- Extension hook: tool_result ---
-                                    // Extensions may transform the output and/or perform
-                                    // warning-only checks (e.g. the `security_warnings`
-                                    // built-in scans for prompt-injection patterns).
-                                    let output = if let (Some(hub_ref), Some(ctx)) =
-                                        (hub, hook_ctx.as_ref())
-                                    {
-                                        hub_ref.fire_tool_result(ctx, &call.name, output).await
-                                    } else {
-                                        output
-                                    };
-
-                                    // --- Security: leak detection ---
-                                    match security.leak_detector.scan(&output) {
-                                        Ok(scanned) => scanned,
-                                        Err(e) => {
-                                            warn!(tool = %call.name, "Tool output blocked by leak detector");
-                                            format!("Tool output blocked: {e}")
-                                        }
-                                    }
-                                }
-                                Ok(Err(e)) => {
-                                    warn!(tool = %call.name, "Tool execution error: {e}");
-                                    format!("Tool error: {e}")
-                                }
-                                Err(_) => {
-                                    warn!(
-                                        tool = %call.name,
-                                        timeout_secs = timeout.as_secs(),
-                                        "Tool execution timed out"
-                                    );
-                                    format!("Tool timed out after {} seconds", timeout.as_secs())
-                                }
-                            }
+                            result
                         }
                         None => match tools.pending_source_for(&call.name) {
                             // The tool's namespace belongs to a source that
@@ -1586,45 +1857,16 @@ pub async fn execute_cancellable_with_recorder(
                         },
                     };
 
-                    let outcome = if result.starts_with("Tool error:") {
-                        ToolResultOutcome::Error
-                    } else if result.starts_with("Tool timed out") {
-                        ToolResultOutcome::TimedOut
-                    } else if result.starts_with("Unknown tool:")
-                        || result.contains(" is not available yet:")
-                    {
-                        ToolResultOutcome::Unavailable
-                    } else {
-                        ToolResultOutcome::Success
-                    };
-                    // A shared session syncs full results to its authorized peers.
-                    // Bound native/custom tools just as MCP tools are bounded.
-                    let result = bound_tool_output(&result);
-                    let queued_this_call =
-                        call.name == "matrix__send" && outcome == ToolResultOutcome::Success;
-                    record_tool_result(
+                    settle_tool_result(
                         &recorder,
+                        &mut messages,
                         model_sequence,
                         call_index,
                         call,
-                        &result,
-                        outcome,
+                        result,
+                        &mut matrix_send_queued,
                     )
                     .await?;
-                    matrix_send_queued |= queued_this_call;
-
-                    debug!(
-                        call_id = %call.id,
-                        tool = %call.name,
-                        "Tool result: {}",
-                        crate::util::truncate_chars(&result, 200)
-                    );
-                    // Wrap tool output in XML delimiters to prevent injection
-                    let wrapped = wrap_tool_output(&call.name, &result);
-                    messages.push(RuntimeMessage::ToolResult {
-                        call_id: call.id.clone(),
-                        content: wrapped,
-                    });
                 }
             }
         }
@@ -1632,6 +1874,146 @@ pub async fn execute_cancellable_with_recorder(
         model_sequence += 1;
         iteration += 1;
     }
+}
+
+/// Name of the only tool whose observation can resume from a checkpoint.
+pub(crate) const JOB_WAIT_TOOL: &str = "job_wait";
+
+/// Run one admitted call and turn its outcome into the model-visible result.
+/// `job_wait` yields for its whole call; submission tools yield only after
+/// committing the child. Regain capacity outside the tool timeout, before
+/// checkpoint retirement, result hooks or any later effect.
+#[allow(clippy::too_many_arguments)]
+async fn invoke_tool(
+    tool: &dyn crate::tool::Tool,
+    args: serde_json::Value,
+    call_ctx: &ToolContext,
+    timeout: Duration,
+    timeout_label_secs: u64,
+    name: &str,
+    cancel: Option<&TurnCancel>,
+    capacity: &mut Option<ExecutionCapacity>,
+    security: &SecurityContext,
+    hub: Option<&ExtensionHub>,
+    hook_ctx: Option<&HookContext>,
+    checkpoint: Option<(&dyn RuntimeRecorder, u64, usize)>,
+) -> Result<Option<String>, String> {
+    let mut call_ctx = call_ctx.clone();
+    call_ctx.observation_yield = capacity
+        .as_ref()
+        .map(|capacity| capacity.observation.clone());
+    if name == JOB_WAIT_TOOL {
+        call_ctx.yield_for_observation();
+    }
+    let Some(exec_result) = until_cancelled(cancel, async {
+        let result = execute_with_retry(tool, args, &call_ctx, timeout, name).await;
+        // Outside the tool timeout: success, error and timeout
+        // all regain capacity before hooks, another tool in
+        // this batch, or the next model request can execute.
+        if let Some(capacity) = capacity.as_mut() {
+            capacity.reacquire().await?;
+        }
+        Ok::<_, String>(result)
+    })
+    .await
+    else {
+        return Ok(None);
+    };
+    let exec_result = exec_result?;
+
+    // Observation is safe to repeat; result hooks need not be. Retire the
+    // checkpoint before crossing that boundary, even on error or timeout.
+    if name == JOB_WAIT_TOOL
+        && let Some((recorder, model_sequence, call_index)) = checkpoint
+    {
+        recorder
+            .finish_job_wait(model_sequence, call_index)
+            .await
+            .map_err(|error| format!("runtime persistence failed: {error}"))?;
+    }
+
+    Ok(Some(match exec_result {
+        Ok(Ok(output)) => {
+            debug!(
+                tool = %name,
+                len = output.len(),
+                "Tool returned: {}",
+                crate::util::truncate_chars(&output, 200)
+            );
+
+            // --- Extension hook: tool_result ---
+            // Extensions may transform the output and/or perform
+            // warning-only checks (e.g. the `security_warnings`
+            // built-in scans for prompt-injection patterns).
+            let output = if let (Some(hub_ref), Some(ctx)) = (hub, hook_ctx) {
+                hub_ref.fire_tool_result(ctx, name, output).await
+            } else {
+                output
+            };
+
+            // --- Security: leak detection ---
+            match security.leak_detector.scan(&output) {
+                Ok(scanned) => scanned,
+                Err(e) => {
+                    warn!(tool = %name, "Tool output blocked by leak detector");
+                    format!("Tool output blocked: {e}")
+                }
+            }
+        }
+        Ok(Err(e)) => {
+            warn!(tool = %name, "Tool execution error: {e}");
+            format!("Tool error: {e}")
+        }
+        Err(_) => {
+            warn!(
+                tool = %name,
+                timeout_secs = timeout_label_secs,
+                "Tool execution timed out"
+            );
+            format!("Tool timed out after {timeout_label_secs} seconds")
+        }
+    }))
+}
+
+/// Classify, bound, persist and append one executed call's result.
+async fn settle_tool_result(
+    recorder: &Option<Arc<dyn RuntimeRecorder>>,
+    messages: &mut Vec<RuntimeMessage>,
+    model_sequence: u64,
+    call_index: usize,
+    call: &ToolCallRequest,
+    result: String,
+    matrix_send_queued: &mut bool,
+) -> Result<(), String> {
+    let outcome = if result.starts_with("Tool error:") {
+        ToolResultOutcome::Error
+    } else if result.starts_with("Tool timed out") {
+        ToolResultOutcome::TimedOut
+    } else if result.starts_with("Unknown tool:") || result.contains(" is not available yet:") {
+        ToolResultOutcome::Unavailable
+    } else {
+        ToolResultOutcome::Success
+    };
+    // A shared session syncs full results to its authorized peers.
+    // Bound native/custom tools just as MCP tools are bounded.
+    let result = bound_tool_output(&result);
+    let queued_this_call = call.name == "matrix__send" && outcome == ToolResultOutcome::Success;
+    record_tool_result(recorder, model_sequence, call_index, call, &result, outcome).await?;
+    *matrix_send_queued |= queued_this_call;
+
+    debug!(
+        call_id = %call.id,
+        tool = %call.name,
+        "Tool result: {}",
+        crate::util::truncate_chars(&result, 200)
+    );
+    // Wrap tool output in XML delimiters to prevent injection
+    let wrapped = wrap_tool_output(&call.name, &result);
+    messages.push(RuntimeMessage::ToolResult {
+        call_id: call.id.clone(),
+        content: wrapped,
+    });
+    Ok(())
 }
 
 pub(crate) struct EventRecorder(pub(crate) mpsc::Sender<RuntimeEvent>);
@@ -1802,6 +2184,10 @@ fn redact_sensitive_params(arguments_json: &str, sensitive: &[&str]) -> String {
 #[cfg(test)]
 #[path = "runtime/capacity_tests.rs"]
 mod capacity_tests;
+
+#[cfg(test)]
+#[path = "runtime/resume_tests.rs"]
+mod resume_tests;
 
 #[cfg(test)]
 mod tests {
@@ -2044,6 +2430,7 @@ mod tests {
             agent_identity: None,
             turn_request_id: None,
             tool_call_key: None,
+            observation_yield: None,
             call_depth: 0,
             max_call_depth: 5,
             tools: ScopedTools::new(Arc::new(ToolRegistry::new()), None),
@@ -2057,6 +2444,7 @@ mod tests {
             host: Arc::new(crate::tool_host::NativeToolHost::new()),
             active_extensions: std::collections::HashSet::new(),
             routine_engine: None,
+            observation_deadline: None,
         }
     }
 
