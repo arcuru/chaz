@@ -54,6 +54,19 @@ pub use transport::{
     session_attachment, transport_bindings, unbind_transport,
 };
 
+/// Selected transcript, native exchanges and durable contributions from one
+/// immutable database snapshot. This is a disposable view, not a second store.
+#[derive(Clone, Debug)]
+pub struct SessionContextView {
+    /// Test-only observed rows/serialized bytes returned by reconstruction reads.
+    #[cfg(test)]
+    pub(crate) read_volume: serde_json::Value,
+    pub entry_ids: Vec<Option<TurnRequestId>>,
+    pub entries: Vec<SessionEntry>,
+    pub tool_history: Vec<Vec<TurnTranscriptRecord>>,
+    pub contributions: Vec<crate::extension::durable_context::CommittedContribution>,
+}
+
 /// Type of session entry. Participants (users and agents alike) write entries
 /// to a session. There is no user/agent distinction at the protocol level.
 #[derive(Debug, Clone, PartialEq)]
@@ -896,14 +909,25 @@ impl Session {
         &self,
     ) -> anyhow::Result<(Vec<SessionEntry>, Vec<Vec<TurnTranscriptRecord>>)> {
         let snapshot = self.database.snapshot().await?;
+        let view = self.context_view_at(snapshot).await?;
+        Ok((view.entries, view.tool_history))
+    }
+
+    /// Read every selected-context store at the supplied immutable snapshot.
+    /// A failed read is an error, never an in-memory transcript fallback.
+    pub async fn context_view_at(&self, snapshot: Snapshot) -> anyhow::Result<SessionContextView> {
         let rows =
             Self::context_entries_with_ids_at(self.database.clone(), snapshot.clone()).await?;
+        let contributions =
+            crate::extension::durable_context::read_at(&self.database, &snapshot).await?;
         let txn = self.database.new_transaction_at(&snapshot).await?;
         let attempts = txn
             .get_store::<Table<TurnAttempt>>(TURN_ATTEMPTS_STORE)
             .await?
             .search(|_| true)
             .await?;
+        #[cfg(test)]
+        let attempt_volume = (attempts.len(), serde_json::to_vec(&attempts)?.len());
         let states = index_attempt_states(attempts, &HashSet::new());
         let selected: HashMap<_, _> = states
             .into_iter()
@@ -916,12 +940,20 @@ impl Session {
             })
             .collect();
         let mut records: HashMap<TurnRequestId, Vec<TurnTranscriptRecord>> = HashMap::new();
-        for (_, record) in txn
+        let transcript_rows = txn
             .get_store::<Table<TurnTranscriptRecord>>(TURN_TRANSCRIPT_STORE)
             .await?
             .search(|_| true)
-            .await?
-        {
+            .await?;
+        #[cfg(test)]
+        let read_volume = serde_json::json!({
+            "scope": "context_view Table results only; excludes reopen, metadata, command/state lookups and backend physical I/O",
+            "entry_rows": rows.len(), "entry_bytes": serde_json::to_vec(&rows)?.len(),
+            "attempt_rows": attempt_volume.0, "attempt_bytes": attempt_volume.1,
+            "transcript_rows": transcript_rows.len(), "transcript_bytes": serde_json::to_vec(&transcript_rows)?.len(),
+            "contribution_rows": contributions.len(), "contribution_bytes": serde_json::to_vec(&contributions)?.len(),
+        });
+        for (_, record) in transcript_rows {
             if selected.get(&record.request_id) == Some(&record.attempt_id) {
                 records
                     .entry(record.request_id.clone())
@@ -929,14 +961,25 @@ impl Session {
                     .push(record);
             }
         }
-        let (entries, history) = rows
+        let entry_ids = rows.iter().map(|(id, _)| id.clone()).collect();
+        let (entries, tool_history) = rows
             .into_iter()
             .map(|(id, entry)| {
-                let history = id.and_then(|id| records.remove(&id)).unwrap_or_default();
+                let history = id
+                    .as_ref()
+                    .and_then(|id| records.remove(id))
+                    .unwrap_or_default();
                 (entry, history)
             })
             .unzip();
-        Ok((entries, history))
+        Ok(SessionContextView {
+            #[cfg(test)]
+            read_volume,
+            entry_ids,
+            entries,
+            tool_history,
+            contributions,
+        })
     }
 
     /// Bridge ingress is a core decision: adapter facts request a wake, but
@@ -1601,6 +1644,46 @@ impl Session {
             .collect();
         records.sort_by_key(|record| record.sequence);
         Ok(records)
+    }
+
+    /// Retained completed source groups, independent of context compaction.
+    /// This host-only read does not grant access; scoped facilities apply current
+    /// caller/source visibility before returning any recorded bytes.
+    pub(crate) async fn retained_tool_history_at(
+        db: &Database,
+        snapshot: &Snapshot,
+    ) -> anyhow::Result<Vec<Vec<TurnTranscriptRecord>>> {
+        let txn = db.new_transaction_at(snapshot).await?;
+        let states = index_attempt_states(
+            txn.get_store::<Table<TurnAttempt>>(TURN_ATTEMPTS_STORE)
+                .await?
+                .search(|_| true)
+                .await?,
+            &HashSet::new(),
+        );
+        let entries: HashSet<_> = Self::entries_with_ids_at_snapshot(db, snapshot)
+            .await?
+            .into_iter()
+            .filter(|(_, e)| matches!(e.entry_type, EntryType::Message | EntryType::Directive))
+            .map(|(id, _)| id)
+            .collect();
+        let mut groups: HashMap<String, Vec<TurnTranscriptRecord>> = HashMap::new();
+        for (_, record) in txn
+            .get_store::<Table<TurnTranscriptRecord>>(TURN_TRANSCRIPT_STORE)
+            .await?
+            .search(|_| true)
+            .await?
+        {
+            if entries.contains(&record.request_id)
+                && matches!(states.get(&record.request_id), Some(TurnRequestState::Completed { attempt_id }) if attempt_id == &record.attempt_id)
+            {
+                groups
+                    .entry(record.attempt_id.clone())
+                    .or_default()
+                    .push(record);
+            }
+        }
+        Ok(groups.into_values().collect())
     }
 
     /// Visible, unexpired per-turn claims. Never infer activity from Ack or

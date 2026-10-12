@@ -230,6 +230,13 @@ web_search:
 # agent_state_allowlist:
 #   schedule: [chaz, bash]
 #   memory: [chaz]             # memory tools can only touch chaz agent
+#
+# context_projection: extensions allowed to reshape each model request.
+# Empty (the default) sends every request unchanged.
+# context_projection:
+#   - extension: pruner
+#     authority: conversation  # or full_context (may edit instructions/tools)
+#     required: false          # true: refuse the call if it cannot run
 
 # Multi-agent chat-room tuning. Omit for built-in defaults.
 # multi_agent:
@@ -532,6 +539,48 @@ agent_state_allowlist:
   schedule: [chaz, bash]
   memory: [chaz]
 ```
+
+`context_strategy:` selects one required installed context provider. The default
+is the built-in `baseline_context`; missing, inactive or failed selection stops
+dispatch, with no old core fallback. See [One required context strategy](extensions.md#one-required-context-strategy).
+
+| Setting                      | Default            | Description                                              |
+| ---------------------------- | ------------------ | -------------------------------------------------------- |
+| `context_strategy.extension` | `baseline_context` | Manifest name of the required active selection provider. |
+
+```yaml
+context_strategy:
+  extension: baseline_context
+```
+
+`durable_context:` grants intentional session-backed text/state contributions.
+It defaults to `[]`; installation does not grant writes. Names must be distinct.
+See [Durable context](extensions.md#durable-context-is-an-explicit-write) for
+scope, retry, failure and privacy rules. It is independent of projection grants.
+
+| Key                           | Default | Meaning                                                                                                    |
+| ----------------------------- | ------- | ---------------------------------------------------------------------------------------------------------- |
+| `durable_context[].extension` | —       | Installed contributor's manifest name.                                                                     |
+| `durable_context[].required`  | `false` | Refuse dispatch if the contributor cannot commit; optional failures require a coherent committed fallback. |
+
+`context_projection:` lists the extensions allowed to reshape the request sent on each model call, in order. Installing or activating an extension never grants this; only this list does. See [Context projection grants](extensions.md#context-projection-grants).
+
+| Key                              | Default        | Meaning                                                                                                                                           |
+| -------------------------------- | -------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `context_projection[].extension` | —              | Extension (manifest) name. Each name may appear once.                                                                                             |
+| `context_projection[].authority` | `conversation` | `conversation`: conversation messages only. `full_context`: may also rewrite instructions and hide or re-describe tools the turn already exposes. |
+| `context_projection[].required`  | `false`        | `true`: if the extension is missing, inactive, fails, or returns an invalid request, the model call is refused. `false`: it is skipped.           |
+
+```yaml
+context_projection:
+  - extension: redactor
+    authority: conversation
+    required: true
+  - extension: pruner
+    authority: full_context
+```
+
+Conversation entries run before full-context entries; list order holds within each group. A blank or repeated name stops startup.
 
 ## Print mode
 

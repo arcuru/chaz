@@ -23,7 +23,8 @@
 //!   their session structurally through the instance model
 //!   (`ExtensionInstance` endpoints + `ScopeCtx`), not through a cap.
 //! * **Extension-providable** — [`Messenger`], [`MemoryAccess`],
-//!   [`PromptAugmentation`], [`ContextTail`], [`StatusSegment`]. An
+//!   [`PromptAugmentation`], [`ContextTail`], [`StatusSegment`], and the
+//!   operator-granted [`crate::extension::projection::ContextProjector`]. An
 //!   extension publishes an impl from the matching
 //!   [`crate::extension::instance::ExtensionInstance`]
 //!   endpoint; consumers resolve them at turn time through the
@@ -122,6 +123,16 @@ pub enum CapabilityKind {
     /// Extension-providable — pure data, so it crosses the gateway
     /// boundary cleanly. Modeled on pi's `setStatus` tier.
     StatusSegment,
+    /// Reshape the model-facing request before every logical model call.
+    /// Extension-providable, but a declaration alone is inert: the host
+    /// invokes the endpoint only for extensions the operator lists in
+    /// `context_projection`, with the authority that grant names. See
+    /// [`crate::extension::projection`].
+    ContextProjection,
+    /// Intentional durable conversation text and scoped strategy state. The
+    /// host commits returned data only under an explicit `durable_context` grant.
+    DurableContext,
+    ContextStrategy,
 }
 
 impl CapabilityKind {
@@ -160,6 +171,9 @@ impl CapabilityKind {
             Self::PromptAugmentation => "prompt_augmentation",
             Self::ContextTail => "context_tail",
             Self::StatusSegment => "status_segment",
+            Self::ContextProjection => "context_projection",
+            Self::DurableContext => "durable_context",
+            Self::ContextStrategy => "context_strategy",
         }
     }
 }
@@ -389,22 +403,20 @@ pub trait PromptAugmentation: Send + Sync {
     ) -> CapFuture<'a, Option<String>>;
 }
 
-/// Append text after the conversation messages at context assembly time.
-///
-/// Extension-providable — extensions like 'memory' publish an impl;
-/// the host calls every provider and concatenates non-empty results
-/// after the assembled messages. Unlike [`PromptAugmentation`], this
-/// fires at the end of context, not in the system prompt. Like it, this
-/// is a **context/pull** output: consumed in-process at turn time, never
-/// materialized to a store.
+/// Identity and recent-text inputs for one ephemeral context-tail invocation.
+pub struct ContextTailCall<'a> {
+    pub agent_name: &'a str,
+    /// Preserve the existing newest-first input and native query extraction.
+    pub recent_message_text: &'a [String],
+    pub session_db_id: Option<String>,
+    pub request_id: Option<&'a str>,
+}
+/// Append text at the tail of assembled context, not in the system prompt.
+/// This context/pull output is consumed in-process and never stored.
 pub trait ContextTail: Send + Sync {
     /// Return additional text to append after the conversation messages,
     /// or `None` if this extension has nothing to contribute for this turn.
-    fn context_tail<'a>(
-        &'a self,
-        agent_name: &'a str,
-        recent_message_text: &'a [String],
-    ) -> CapFuture<'a, Option<String>>;
+    fn context_tail<'a>(&'a self, call: &'a ContextTailCall<'a>) -> CapFuture<'a, Option<String>>;
 }
 
 /// Contribute keyed text segments to a gateway's status surface.
@@ -458,6 +470,7 @@ mod tests {
             CapabilityKind::PromptAugmentation,
             CapabilityKind::ContextTail,
             CapabilityKind::StatusSegment,
+            CapabilityKind::ContextProjection,
         ];
         for k in providable {
             assert!(!k.is_host_only(), "{k} should not be host-only");
@@ -479,6 +492,7 @@ mod tests {
             (CapabilityKind::Messenger, "\"messenger\""),
             (CapabilityKind::Memory, "\"memory\""),
             (CapabilityKind::AgentStateAdmin, "\"agent_state_admin\""),
+            (CapabilityKind::ContextProjection, "\"context_projection\""),
         ];
         for (kind, wire) in cases {
             let s = serde_json::to_string(&kind).unwrap();

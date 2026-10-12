@@ -68,6 +68,7 @@ async fn fixture(
 fn make_ctx(agent_name: &str, session: Arc<TokioMutex<Session>>) -> ToolContext {
     ToolContext {
         agent_name: agent_name.to_string(),
+        agent_identity: None,
         turn_request_id: None,
         tool_call_key: None,
         call_depth: 0,

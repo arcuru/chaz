@@ -3305,6 +3305,7 @@ impl Server {
         reserved_permit: Option<OwnedSemaphorePermit>,
     ) {
         let agent_name = agent.name.clone();
+        let agent_identity = self.agent_index.find_by_name(&agent_name);
         let system_prompt = agent.system_prompt.clone();
         let default_model = agent.default_model.clone();
         let allowed_tools = agent.allowed_tools.clone();
@@ -3461,6 +3462,7 @@ impl Server {
             };
             let tool_ctx = ToolContext {
                 agent_name: agent_name.clone(),
+                agent_identity,
                 turn_request_id: Some(attempt.request_id.clone()),
                 tool_call_key: None,
                 call_depth: spawn.call_depth,
@@ -3479,16 +3481,26 @@ impl Server {
             };
 
             let tool_defs = tool_ctx.definitions();
+            let view = {
+                let s = session.lock().await;
+                spawn_extensions.prepare_durable_context(&s, &agent_name, Some(&attempt.request_id), &active_extensions).await
+            };
+            let view = match view {
+                Ok(view) => view,
+                Err(error) => {
+                    error!(%error, "Durable context preparation refused dispatch");
+                    let mut s = session.lock().await;
+                    if let Err(error) = s.complete_turn_attempt(&attempt, Some(SessionEntry {
+                        sender: agent_name.clone(), content: format!("Error: {error}"), timestamp: Utc::now(),
+                        entry_type: EntryType::Error, metadata: None, routing: None,
+                    })).await { error!(%error, "Failed to record context refusal"); }
+                    return;
+                }
+            };
             let (session_model, assembled) = {
                 let s = session.lock().await;
                 let meta = s.read_meta().await;
-                let (context_entries, tool_history) = match s.context_with_tool_history().await {
-                    Ok(entries) => entries,
-                    Err(error) => {
-                        error!(%error, "Failed to load compacted session context; using visible transcript");
-                        (s.entries().to_vec(), vec![Vec::new(); s.entries().len()])
-                    }
-                };
+
                 let roster: Vec<String> =
                     meta.agents.iter().map(|a| a.display_name.clone()).collect();
                 // Per-agent override > session pin > backend default. The
@@ -3516,19 +3528,32 @@ impl Server {
                     budget_model.as_deref(),
                     max_context_tokens,
                 );
-                let mut builder = ContextBuilder::new(&context_entries, &agent_name, &system_prompt, &context_config);
+                let mut builder = ContextBuilder::new(&view.entries, &agent_name, &system_prompt, &context_config);
                 if let Some(attachment) = &attachment {
                     builder = builder.with_attachment(attachment);
                 }
                 let assembled = builder.with_tools(&tool_defs)
-                        .with_tool_history(&tool_history)
+                        .with_context_view(&view)
                         .with_max_tokens_override(max_tokens_override)
                         .with_room_participants(&roster)
                         .with_extension_hub(spawn_extensions.clone())
                         .with_session_db(s.database())
-                        .build()
+                        .with_invocation(&active_extensions, Some(attempt.request_id.as_str()))
+                        .try_build()
                         .await;
                 (session_model, assembled)
+            };
+            let assembled = match assembled {
+                Ok(assembled) => assembled,
+                Err(error) => {
+                    error!(%error, "Required context selection refused dispatch");
+                    let mut s = session.lock().await;
+                    if let Err(error) = s.complete_turn_attempt(&attempt, Some(SessionEntry {
+                        sender: agent_name.clone(), content: format!("Error: {error}"), timestamp: Utc::now(),
+                        entry_type: EntryType::Error, metadata: None, routing: None,
+                    })).await { error!(%error, "Failed to record context refusal"); }
+                    return;
+                }
             };
             // Per-agent override > session pin > agent default. See
             // `run_schedule_turn` for the matching path on scheduled fires.
@@ -3554,6 +3579,13 @@ impl Server {
                 fail_after: transcript_fail_after,
             });
 
+            let scope = runtime::ModelCallScope {
+                cache: assembled.cache,
+                context_strategy: assembled.strategy,
+                attempt_id: Some(attempt.attempt_id.clone()),
+                request_budget_tokens: Some(assembled.request_budget_tokens),
+                sources: assembled.sources,
+            };
             let result = runtime::execute_cancellable_with_recorder(
                 effective_model.as_deref(),
                 assembled.messages,
@@ -3569,6 +3601,7 @@ impl Server {
                     permit,
                     incarnation.clone().map(|token| (claim_db.clone(), token)),
                 )),
+                scope,
             )
             .await;
 

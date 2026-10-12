@@ -152,6 +152,7 @@ async fn job_wait_reacquires_after_success_error_and_policy_timeout() {
                 None,
                 None,
                 Some(capacity),
+                ModelCallScope::default(),
             )
             .await
         });
@@ -292,6 +293,7 @@ async fn user_stop_pairs_calls_while_job_wait_yields_or_reacquires_capacity() {
                 None,
                 Some(&cancel),
                 Some(capacity),
+                ModelCallScope::default(),
             )
             .await
         });

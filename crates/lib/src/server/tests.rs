@@ -907,6 +907,13 @@ async fn server_fixture() -> (Instance, Arc<Server>, Arc<crate::session::Session
 async fn server_fixture_with_host(
     host: Arc<dyn ToolHost>,
 ) -> (Instance, Arc<Server>, Arc<crate::session::SessionRegistry>) {
+    server_fixture_with_host_and_hub(host, Arc::new(crate::test_support::context_hub().await)).await
+}
+
+async fn server_fixture_with_host_and_hub(
+    host: Arc<dyn ToolHost>,
+    hub: Arc<crate::extension::ExtensionHub>,
+) -> (Instance, Arc<Server>, Arc<crate::session::SessionRegistry>) {
     let backend = InMemory::new();
     let (instance, user) =
         Instance::create_backend(Box::new(backend), NewUser::passwordless("test"))
@@ -941,7 +948,7 @@ async fn server_fixture_with_host(
         HashMap::new(),
         Default::default(),
         host,
-        Arc::new(crate::extension::ExtensionHub::new()),
+        hub,
         default_backend,
         Arc::new(crate::mcp::McpRegistry::new()),
         Some(crate::instance::ExecutorCapability::for_test()),
@@ -973,7 +980,7 @@ async fn server_fixture_from_registry(
         HashMap::new(),
         Default::default(),
         Arc::new(crate::tool_host::NativeToolHost::new()),
-        Arc::new(crate::extension::ExtensionHub::new()),
+        Arc::new(crate::test_support::context_hub().await),
         default_backend,
         Arc::new(crate::mcp::McpRegistry::new()),
         Some(crate::instance::ExecutorCapability::for_test()),
@@ -1003,7 +1010,7 @@ async fn client_server_fixture_from_registry(
         HashMap::new(),
         Default::default(),
         Arc::new(crate::tool_host::NativeToolHost::new()),
-        Arc::new(crate::extension::ExtensionHub::new()),
+        Arc::new(crate::test_support::context_hub().await),
         crate::backends::BackendManager::new(&None, secrets),
         Arc::new(crate::mcp::McpRegistry::new()),
         None,
@@ -5218,7 +5225,7 @@ async fn resident_executor_adopts_and_processes_local_client_session() {
         HashMap::new(),
         Default::default(),
         Arc::new(crate::tool_host::NativeToolHost::new()),
-        Arc::new(crate::extension::ExtensionHub::new()),
+        Arc::new(crate::test_support::context_hub().await),
         backend,
         Arc::new(crate::mcp::McpRegistry::new()),
         Some(crate::instance::ExecutorCapability::for_test()),
@@ -5360,7 +5367,7 @@ async fn service_restart_reopens_and_reconciles_persisted_work() {
         HashMap::new(),
         Default::default(),
         Arc::new(crate::tool_host::NativeToolHost::new()),
-        Arc::new(crate::extension::ExtensionHub::new()),
+        Arc::new(crate::test_support::context_hub().await),
         backend,
         Arc::new(crate::mcp::McpRegistry::new()),
         Some(crate::instance::ExecutorCapability::for_test()),
@@ -6094,7 +6101,7 @@ async fn published_executor_using_mock(
         HashMap::new(),
         Default::default(),
         Arc::new(crate::tool_host::NativeToolHost::new()),
-        Arc::new(crate::extension::ExtensionHub::new()),
+        Arc::new(crate::test_support::context_hub().await),
         backend,
         Arc::new(crate::mcp::McpRegistry::new()),
         Some(crate::instance::ExecutorCapability::for_test()),
@@ -7126,7 +7133,7 @@ async fn chaz_query_reports_persisted_agent_job_tool_ceilings() {
         HashMap::new(),
         Default::default(),
         host.clone(),
-        Arc::new(crate::extension::ExtensionHub::new()),
+        Arc::new(crate::test_support::context_hub().await),
         backend,
         Arc::new(crate::mcp::McpRegistry::new()),
         Some(crate::instance::ExecutorCapability::for_test()),
@@ -8132,6 +8139,7 @@ async fn job_wait_executor_shutdown_and_claim_loss_stop_observation_or_reacquisi
                 .create_session(Some("stoppable-wait"))
                 .await
                 .unwrap();
+            server.extensions.record_active(&db).await.unwrap();
             let entered = Arc::new(tokio::sync::Notify::new());
             let finish = Arc::new(tokio::sync::Notify::new());
             server.tools.register(StoppableWait {
@@ -8287,4 +8295,306 @@ async fn job_wait_executor_shutdown_and_claim_loss_stop_observation_or_reacquisi
             );
         }
     }
+}
+
+#[tokio::test]
+async fn durable_context_server_commits_before_dispatch_and_preserves_native_exchanges() {
+    use crate::extension::{
+        Extension, ExtensionInstance, HookKind, ScopeCtx,
+        caps::{CapFuture, CapabilityKind},
+        durable_context::*,
+        manifest::ExtensionManifest,
+    };
+    use crate::test_support::MockBackend;
+    use crate::tool::{Tool, ToolContext, ToolDescriptor, ToolError};
+    use serde_json::{Value, json};
+    use std::pin::Pin;
+    struct Contribution;
+    impl DurableContextContributor for Contribution {
+        fn contribute<'a>(
+            &'a self,
+            call: &'a DurableContextCall<'a>,
+        ) -> CapFuture<'a, ContextContribution> {
+            Box::pin(async move {
+                Ok(ContextContribution {
+                    messages: vec![format!("SERVER-DURABLE:{}", call.request_id.as_str())],
+                    state: Some(json!({"committed": true})),
+                })
+            })
+        }
+    }
+    struct Ext;
+    impl Extension for Ext {
+        fn name(&self) -> &'static str {
+            "durable-test"
+        }
+        fn supported_hooks(&self) -> &[HookKind] {
+            &[]
+        }
+        fn manifest(&self) -> ExtensionManifest {
+            ExtensionManifest {
+                name: self.name().into(),
+                extension_ref: crate::extension::ExtensionRef::builtin(self.name()),
+                supported_hooks: vec![],
+                required_capabilities: vec![],
+                requested_capabilities: vec![],
+                provides_capabilities: vec![CapabilityKind::DurableContext],
+            }
+        }
+        fn instantiate<'a>(
+            &'a self,
+            _: ScopeCtx<'a>,
+        ) -> crate::extension::instance::InstantiateFuture<'a> {
+            struct Inst(ExtensionManifest);
+            impl ExtensionInstance for Inst {
+                fn manifest(&self) -> &ExtensionManifest {
+                    &self.0
+                }
+                fn durable_context_contributor(
+                    &self,
+                ) -> Option<Arc<dyn DurableContextContributor>> {
+                    Some(Arc::new(Contribution))
+                }
+            }
+            Box::pin(
+                async move { Ok(Arc::new(Inst(self.manifest())) as Arc<dyn ExtensionInstance>) },
+            )
+        }
+    }
+    struct Search;
+    impl Tool for Search {
+        fn descriptor(&self) -> ToolDescriptor {
+            ToolDescriptor {
+                name: "search".into(),
+                description: "inert test".into(),
+                parameters: json!({"type":"object"}),
+            }
+        }
+        fn execute<'a>(
+            &'a self,
+            _: Value,
+            _: &'a ToolContext,
+        ) -> Pin<Box<dyn std::future::Future<Output = Result<String, ToolError>> + Send + 'a>>
+        {
+            Box::pin(async { Ok("ORIGINAL TOOL BODY".into()) })
+        }
+    }
+    let (_peer_instance, peer_registry) = crate::test_support::fresh_session_registry().await;
+    let mut hub = crate::extension::ExtensionHub::new();
+    hub.set_context_strategy_grant(&Default::default()).unwrap();
+    hub.set_peer_handles(Arc::new(crate::extension::PeerHandles {
+        registry: peer_registry,
+        agent_index: HostedIndex::empty("agent"),
+        memory_bank_index: HostedIndex::empty("bank"),
+        skill_bank_index: HostedIndex::empty("skill_bank"),
+        embedder: None,
+        secrets: None,
+        server_slot: Default::default(),
+        mcp_registry: Arc::new(crate::mcp::McpRegistry::new()),
+        agent_state_allowlist: Default::default(),
+        tool_registry: Arc::new(ToolRegistry::new()),
+    }));
+    hub.set_durable_context_grants(&[DurableContextGrant {
+        extension: "durable-test".into(),
+        required: true,
+    }])
+    .unwrap();
+    hub.install_all(vec![
+        Arc::new(crate::extensions::context::BaselineContext),
+        Arc::new(Ext),
+    ])
+    .await
+    .unwrap();
+    let hub = Arc::new(hub);
+    let (_instance, server, registry) = server_fixture_with_host_and_hub(
+        Arc::new(crate::tool_host::NativeToolHost::new()),
+        hub.clone(),
+    )
+    .await;
+    server.tools.register(Search);
+    let (agent, _) = seed_agent(&server, &registry, "alpha").await;
+    register_alpha_agent_runtime(&server);
+    let (_, db) = registry.create_session(Some("durable-test")).await.unwrap();
+    let sid = db.root_id().to_string();
+    registry
+        .attach_agent_to_session(&sid, &agent)
+        .await
+        .unwrap();
+    hub.record_active(&db).await.unwrap();
+    let first = write_user_message_with_content(&db, &sid, "first request").await;
+    let mock = Arc::new(MockBackend::new());
+    mock.push_tool_calls(vec![("call-id".into(), "search".into(), "{}".into())]);
+    mock.push_text("first reply");
+    mock.push_text("second reply");
+    let gate = mock.block_next_call();
+    server
+        .register_session(
+            &db,
+            BackendManager::with_mock(
+                mock.clone(),
+                crate::security::SecretStore::new(registry.chaz_peer().clone()).await,
+            ),
+            Some("alpha".into()),
+            None,
+        )
+        .await
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(10), gate.wait_started())
+        .await
+        .unwrap();
+    let s = Session::new(ConversationId(sid.clone()), db.clone()).await;
+    let at_dispatch = s
+        .context_view_at(db.snapshot().await.unwrap())
+        .await
+        .unwrap();
+    assert_eq!(
+        at_dispatch.contributions.len(),
+        1,
+        "model called before durable commit"
+    );
+    assert_eq!(at_dispatch.contributions[0].identity.request_id, first);
+    gate.release();
+    await_call_count(&mock, 2).await;
+    await_no_processing(&server, &sid).await;
+    let s = Session::new(ConversationId(sid.clone()), db.clone()).await;
+    let attempt = s
+        .attempts_for_test()
+        .await
+        .into_iter()
+        .find(|a| a.request_id == first)
+        .unwrap();
+    let originals =
+        serde_json::to_vec(&s.turn_transcript(&attempt.attempt_id).await.unwrap()).unwrap();
+    write_user_message_with_content(&db, &sid, "second request").await;
+    await_call_count(&mock, 3).await;
+    await_no_processing(&server, &sid).await;
+    let s = Session::new(ConversationId(sid.clone()), db.clone()).await;
+    assert_eq!(
+        serde_json::to_vec(&s.turn_transcript(&attempt.attempt_id).await.unwrap()).unwrap(),
+        originals
+    );
+    let calls = mock.recorded_calls();
+    assert!(calls.iter().all(|call| call.messages.iter().any(
+        |m| matches!(m, crate::runtime::RuntimeMessage::User(t) if t.contains("SERVER-DURABLE:"))
+    )));
+    for call in &calls[1..] {
+        let exchange: Vec<_> = call
+            .messages
+            .iter()
+            .filter(|m| {
+                matches!(
+                    m,
+                    crate::runtime::RuntimeMessage::AssistantToolCalls { .. }
+                        | crate::runtime::RuntimeMessage::ToolResult { .. }
+                )
+            })
+            .collect();
+        assert_eq!(exchange.len(), 2);
+        assert!(
+            matches!(exchange[0], crate::runtime::RuntimeMessage::AssistantToolCalls { tool_calls, .. } if tool_calls[0].id == "call-id")
+        );
+        assert!(
+            matches!(exchange[1], crate::runtime::RuntimeMessage::ToolResult { call_id, content } if call_id == "call-id" && content.contains("ORIGINAL TOOL BODY"))
+        );
+    }
+    assert_eq!(
+        s.context_view_at(db.snapshot().await.unwrap())
+            .await
+            .unwrap()
+            .contributions
+            .len(),
+        2,
+        "logical rounds duplicated contributions"
+    );
+}
+
+#[tokio::test]
+async fn required_context_strategy_refuses_and_recovers_on_the_executor() {
+    use crate::commands::{CommandContext, CommandOutcome, Parsed, dispatch, parse};
+    use crate::session::TurnAttemptStatus;
+
+    let (_instance, server, registry) = server_fixture().await;
+    let (agent, _adb) = seed_agent(&server, &registry, "alpha").await;
+    register_alpha_agent_runtime(&server);
+    let (_, db) = registry
+        .create_session(Some("required-context"))
+        .await
+        .unwrap();
+    let sid = db.root_id().to_string();
+    registry
+        .attach_agent_to_session(&sid, &agent)
+        .await
+        .unwrap();
+    server.extensions.record_active(&db).await.unwrap();
+    let mock = Arc::new(crate::test_support::MockBackend::new());
+    mock.push_text("recovered reply");
+    let secrets = crate::security::SecretStore::new(registry.chaz_peer().clone()).await;
+    let backend = BackendManager::with_mock(mock.clone(), secrets.clone());
+    let command_context = CommandContext {
+        server: &server,
+        secrets: &secrets,
+        backend: &backend,
+        session_db_id: &sid,
+        session_db: &db,
+        current_agent: "alpha",
+        session_name: None,
+    };
+    let Parsed::Command(remove) = parse("/extensions remove baseline_context") else {
+        panic!("remove command");
+    };
+    assert!(
+        matches!(dispatch(remove, &command_context).await, CommandOutcome::Text(text) if text.contains("Deactivated"))
+    );
+    let refused = write_user_message_with_content(&db, &sid, "refused input").await;
+    server
+        .register_session(
+            &db,
+            BackendManager::with_mock(
+                mock.clone(),
+                crate::security::SecretStore::new(registry.chaz_peer().clone()).await,
+            ),
+            Some("alpha".into()),
+            None,
+        )
+        .await
+        .unwrap();
+    let session = Session::new(ConversationId(sid.clone()), db.clone()).await;
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if session.attempts_for_test().await.iter().any(|attempt| {
+                attempt.request_id == refused && attempt.status == TurnAttemptStatus::Completed
+            }) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("context refusal was not recorded");
+    await_no_processing(&server, &sid).await;
+    assert!(mock.recorded_calls().is_empty());
+    let reloaded = Session::new(ConversationId(sid.clone()), db.clone()).await;
+    assert!(reloaded.entries().iter().any(|entry| {
+        entry.entry_type == EntryType::Error
+            && entry
+                .content
+                .contains("required context strategy 'baseline_context' is unavailable or inactive")
+    }));
+    assert!(server.interrupted_turns(&sid).await.unwrap().is_empty());
+
+    let Parsed::Command(add) = parse("/extensions add baseline_context") else {
+        panic!("add command");
+    };
+    assert!(
+        matches!(dispatch(add, &command_context).await, CommandOutcome::Text(text) if text.contains("Activated"))
+    );
+    write_user_message_with_content(&db, &sid, "new input after recovery").await;
+    await_call_count(&mock, 1).await;
+    await_no_processing(&server, &sid).await;
+    let calls = mock.recorded_calls();
+    assert_eq!(calls.len(), 1);
+    assert!(calls[0].messages.iter().any(|message| matches!(message,
+        crate::runtime::RuntimeMessage::User(text) if text == "new input after recovery"
+    )));
+    server.shutdown().await;
 }

@@ -260,6 +260,10 @@ pub const NO_REPLY_TOOL: &str = "no_reply";
 pub struct ToolContext {
     /// Name of the agent currently executing
     pub agent_name: String,
+    /// Host-resolved Living Agent identity. Retained reads check this key's
+    /// current Active Write membership, never the peer-owned database handle.
+    /// None supports legacy non-Living-Agent callers only.
+    pub agent_identity: Option<crate::hosted_index::DbEntry>,
     // Persisted parent request identity; absent on non-turn callers.
     pub turn_request_id: Option<crate::session::TurnRequestId>,
     // Stable model-response call site, set by the runtime before dispatch.
@@ -360,6 +364,18 @@ impl ToolContext {
                 ))
             })
             .collect()
+    }
+
+    /// Read-only retained evidence under this caller's session/source ceiling.
+    /// References never grant access or execute an original tool.
+    pub async fn history(&self) -> crate::extension::history::ScopedHistory {
+        crate::extension::history::ScopedHistory::new(
+            self.session.lock().await.database().clone(),
+            self.agent_name.clone(),
+            self.agent_identity.clone(),
+            self.tools.clone(),
+            self.active_extensions.clone(),
+        )
     }
 
     /// Access the execution host for sandboxed capability requests.
@@ -473,7 +489,7 @@ pub struct ToolApprovalInfo {
 }
 
 /// Serializable tool definition for sending to the LLM
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ToolDefinition {
     pub name: String,
     pub description: String,
@@ -827,6 +843,18 @@ impl ScopedTools {
         self
     }
 
+    /// Apply current revocations without widening an existing extension ceiling.
+    pub(crate) fn narrow_active_extensions(
+        mut self,
+        active: std::collections::HashSet<String>,
+    ) -> Self {
+        self.active_extensions = Some(match self.active_extensions {
+            Some(ceiling) => ceiling.intersection(&active).cloned().collect(),
+            None => active,
+        });
+        self
+    }
+
     fn passes_extension_filter(&self, owner: Option<&'static str>) -> bool {
         match (&self.active_extensions, owner) {
             (None, _) => true,
@@ -950,6 +978,11 @@ impl ScopedTools {
             return None;
         }
         self.registry.get(name)
+    }
+
+    /// Extension owning this tool, for live revocation checks at execution.
+    pub(crate) fn owner_of(&self, name: &str) -> Option<&'static str> {
+        self.registry.owner_of(name)
     }
 
     /// The still-loading source a [`Self::get`] miss would have come from.

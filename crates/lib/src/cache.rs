@@ -1,12 +1,7 @@
-//! Prompt-cache breakpoint policy shared by the LLM backends.
+//! Provider-neutral cache options and adapter wire markers.
 //!
-//! Anthropic prompt caching is driven by `cache_control` breakpoints. The
-//! *policy* — which structural regions get a breakpoint, in what order, under
-//! Anthropic's hard cap of 4 per request — is identical whether the marker
-//! rides inline on an OpenAI-compatible request (the OpenRouter→Anthropic path
-//! in [`crate::openai`]) or as a first-class field on a native Anthropic
-//! request ([`crate::anthropic`]). Only the wire serialization differs, so the
-//! policy lives here and each backend stamps its own wire type.
+//! Extensions choose anchors/TTL; adapters place supported markers and omit
+//! them on incompatible providers. The built-in strategy owns the defaults.
 
 use serde::{Deserialize, Serialize};
 
@@ -35,22 +30,62 @@ impl CacheControl {
     }
 }
 
-/// A region of an assembled request that can carry a prompt-cache breakpoint.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CacheRegion {
-    /// End of the tool-schema block (last tool).
+/// Provider-neutral supported anchors. Message indices refer to the final
+/// projected request, before adapter coalescing. They cannot carry raw fields.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CacheAnchor {
     LastTool,
-    /// System prompt — head of the stable prefix.
     System,
-    /// Latest user message — the boundary intra-turn tool round-trips share.
     LatestUser,
+    Message(usize),
 }
-
-/// Ordered breakpoint plan, most cache-stable region first so the longest-lived
-/// prefix is covered even if [`MAX_BREAKPOINTS`] ever forces later slots to
-/// drop. Both backends iterate this and stamp their own wire type.
-pub const CACHE_PLAN: [CacheRegion; 3] = [
-    CacheRegion::LastTool,
-    CacheRegion::System,
-    CacheRegion::LatestUser,
-];
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CacheTtl {
+    #[default]
+    FiveMinutes,
+    OneHour,
+}
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CacheOptions {
+    pub anchors: Vec<CacheAnchor>,
+    #[serde(default)]
+    pub ttl: CacheTtl,
+}
+impl CacheOptions {
+    pub fn validate(&self, messages: &[crate::runtime::RuntimeMessage]) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.anchors.len() <= MAX_BREAKPOINTS as usize,
+            "too many cache anchors"
+        );
+        let mut seen = std::collections::HashSet::new();
+        for anchor in &self.anchors {
+            anyhow::ensure!(seen.insert(*anchor), "duplicate cache anchor");
+            if let CacheAnchor::Message(i) = anchor {
+                anyhow::ensure!(
+                    matches!(
+                        messages.get(*i),
+                        Some(
+                            crate::runtime::RuntimeMessage::User(_)
+                                | crate::runtime::RuntimeMessage::Assistant(_)
+                                | crate::runtime::RuntimeMessage::ToolResult { .. }
+                        )
+                    ),
+                    "unsupported cache message anchor"
+                );
+            }
+        }
+        Ok(())
+    }
+    pub(crate) fn control(&self) -> CacheControl {
+        CacheControl {
+            kind: "ephemeral".into(),
+            ttl: match self.ttl {
+                CacheTtl::FiveMinutes => None,
+                CacheTtl::OneHour => Some("1h".into()),
+            },
+        }
+    }
+}

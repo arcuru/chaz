@@ -18,6 +18,7 @@ use crate::tool::ToolDefinition;
 /// Inputs observed by `MockBackend::chat_with_tools` on a single call.
 #[derive(Clone, Debug)]
 pub(crate) struct RecordedCall {
+    pub cache: crate::cache::CacheOptions,
     pub messages: Vec<RuntimeMessage>,
     pub tools: Vec<ToolDefinition>,
     pub model: String,
@@ -207,9 +208,27 @@ impl BackendDispatch for MockBackend {
         model: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<LLMResponse, LlmError>> + Send + 'a>> {
         Box::pin(async move {
+            self.chat_with_cache(
+                messages,
+                tools,
+                model,
+                &crate::extensions::context::default_cache_options(),
+            )
+            .await
+        })
+    }
+    fn chat_with_cache<'a>(
+        &'a self,
+        messages: &'a [RuntimeMessage],
+        tools: &'a [ToolDefinition],
+        model: &'a str,
+        cache: &'a crate::cache::CacheOptions,
+    ) -> Pin<Box<dyn Future<Output = Result<LLMResponse, LlmError>> + Send + 'a>> {
+        Box::pin(async move {
             let response = {
                 let mut state = self.state.lock().unwrap();
                 state.calls.push(RecordedCall {
+                    cache: cache.clone(),
                     messages: messages.to_vec(),
                     tools: tools.to_vec(),
                     model: model.to_string(),

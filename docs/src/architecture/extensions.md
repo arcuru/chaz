@@ -100,11 +100,16 @@ empty / `None`:
 - **Tools** — `tools() -> Vec<Arc<dyn Tool>>`
 - **Commands** — `commands() -> Vec<(String, Arc<dyn ExtensionCommand>)>`
 - **Per-turn context** — `prompt_augmentation()`, `context_tail()`
+- **Per-model-call projection** — `context_projector()`; invoked only for
+  operator-granted extensions (see [Context projection](#context-projection))
+- **Durable context** — `durable_context_contributor()`; commits intentional
+  text/state before assembly (see [Durable context contributions](#durable-context-contributions))
 - **Extension-to-extension caps** — `memory_access()`, `messenger()`,
   and the TypeId-keyed escape hatch `extension_cap(type_id)`
 - **Hook handlers** — `before_agent_start_hook()`, `tool_call_hook()`,
   `tool_result_hook()`, `agent_end_hook()`, `session_start_hook()`,
   `session_shutdown_hook()`
+- **Selection** — `context_strategy()` (required operator-selected endpoint)
 - **Routine** — `routine_handler()`
 - **Lifecycle** — `shutdown()` (async; not yet triggered)
 
@@ -137,7 +142,8 @@ from non-Global instances.
 ### 2. Live-instance path (per-turn)
 
 System-prompt and context-tail augmentation consult live instances
-directly each turn. `augment_system_prompt` and `context_tails`
+directly each turn. `augment_system_prompt` and the typed
+`context_tails_for_call`
 (`mod.rs`) call `context_instances(agent_name, session_db)`, which
 returns the deduped union of per-session ∪ per-agent instances (session
 wins on name collision; Global is intentionally excluded — those
@@ -203,10 +209,105 @@ authoritative):
   instance model (`ExtensionInstance` endpoints + `ScopeCtx`), not through
   a cap handle.
 - **Extension-providable** — `Messenger`, `MemoryAccess`,
-  `PromptAugmentation`, `ContextTail`. Published by an instance through
+  `PromptAugmentation`, `ContextTail`, `StatusSegment`,
+  `ContextProjection`, `DurableContext`. Published by an instance through
   its endpoints; `PromptAugmentation`/`ContextTail` are consumed directly
   by context assembly, `Messenger`/`MemoryAccess` are resolvable through
-  the `CapResolver` (no consumer yet).
+  the `CapResolver` (no consumer yet). The host invokes context projectors
+  and durable contributors only when the manifest provides the capability
+  **and** the operator granted the extension.
+
+Required/requested capability declarations remain descriptive: nothing
+refuses to load an extension whose `required_capabilities` are absent,
+and `AgentStateAdmin { agents }` is not the live scope source
+(`agent_state_allowlist` is).
+
+## Context projection
+
+Before **every logical model call** — the first call of a turn, each
+tool-loop continuation, and the no-tools single-shot path — the runtime
+builds a fresh baseline (assembled context, `before_agent_start`
+injections, and the current attempt's completed exchanges) and runs the
+granted projection chain over a copy of it
+(`extension/projection.rs`, `RoundProjector` in `runtime.rs`). The
+accepted result is what the backend receives; transport retries inside
+`llm_call_with_retry` resend exactly that request without projecting
+again. The runtime's own message vector, the recorder stream, and the
+session transcript keep the originals, and the next call projects a new
+baseline rather than the previous output.
+
+```rust,ignore
+trait ContextProjector: Send + Sync {
+    fn project<'a>(&'a self, call: &'a ProjectionCall<'a>,
+                   request: ProjectedRequest) -> CapFuture<'a, ProjectedRequest>;
+}
+struct ProjectedRequest { messages: Vec<RuntimeMessage>, tools: Vec<ToolDefinition> }
+```
+
+`ProjectionCall` is read-only: agent, session DB id, turn request id,
+attempt id, resolved model, model round, the granted authority and
+required flag, the round's baseline, its index-aligned `ContextSource`
+provenance (`Instructions`, `PersistedSessionEntry { id }`,
+`SessionEntry { index, sender, timestamp }` for callers without row IDs,
+`ReplayedExchange { request_id, attempt_id, model_sequence }`,
+`DurableContribution { source_id, extension }`, `ContextTail`,
+`TurnInjection`, `CurrentAttempt { model_sequence }`), and
+the request budget. It carries no database handle or write path.
+
+**Eligibility, checked at each call.** A projector runs when all hold:
+listed in the operator's `context_projection` config; instantiated for
+the agent or session (per-session over per-agent over Global by name —
+the same precedence as other instance lookups); in the turn's active
+set (session set minus agent opt-outs); still active in the session's
+extension log at that call, so `/extensions remove` takes effect at the
+next model call; current agent opt-outs also attenuate the turn set;
+manifest provides `ContextProjection`; and `context_projector()` returns `Some`.
+
+**Order.** Conversation grants run first, then full-context grants;
+within a phase, configured list order. Each step receives the previous
+accepted output.
+
+**Authority.** `conversation` may rewrite, drop, or add conversation
+messages but must return the System messages and tool declarations
+unchanged. `full_context` may also rewrite instructions and the
+model-facing tool declarations, but may only keep, drop, or re-describe
+tools the call already exposes. Neither touches execution: tool calls are
+resolved against the turn's `ScopedTools`, so a hidden but granted tool is
+still executable and an out-of-scope one is still refused. The host rechecks
+session/agent extension activation immediately before execution, after
+approval and hooks; revocation therefore stops execution even within a
+batch already returned by the model. Unowned tools retain their existing
+scope/grant checks.
+
+**Host validation** (every step, both authorities): non-empty request;
+no empty tool-call messages; each tool-call group kept whole (call message, then one result per call,
+in order) or omitted whole; call ids, names, arguments and opaque
+`provider_extra` byte-identical to the baseline; no invented, repeated,
+or reordered groups; exchanges completed by the current attempt kept;
+estimated size of the complete request (messages, call arguments,
+provider data, tool declarations) within the budget (context window minus
+reserved output). Result bodies and other text may change, and whole
+historical exchanges may be dropped.
+
+Each assistant call group carries a host-assigned `exchange_id`, its message
+index in that logical call's baseline. Projectors preserve it through edits.
+This distinguishes separate occurrences even when a provider reuses identical
+call IDs, arguments and echo data. The host strips these request-local
+coordinates before backend dispatch; neither provider payloads nor recorded
+transcripts change.
+
+**Failure.** A required grant that is unavailable, errors, panics, times
+out (30 s), or returns invalid output stops the call before any request
+is sent; the turn ends with that error. An optional step that fails is
+skipped and its validated input — including earlier required edits —
+continues down the chain. Optional grants that are inactive are never
+invoked. Whatever survives must still pass the budget gate; an
+over-budget baseline is not a fallback. With no grants configured the
+runtime does no projection work and every request is byte-identical to
+before.
+
+This is a guardrail for operator-trusted in-process extensions, not a
+sandbox: an instance can still use handles captured at construction.
 
 ## Routine handlers
 
@@ -344,6 +445,7 @@ so it round-trips through eidetica.
 | `crates/lib/src/extension/caps.rs`               | Cap traits (`Messenger`, `MemoryAccess`, `PromptAugmentation`, `ContextTail`, `AgentStateAdmin`) + `CapabilityKind`/`CapabilityRequest` declaration vocab |
 | `crates/lib/src/extension/agent_state.rs`        | `AgentStateAdmin` cap + scoped impl                                                                                                                       |
 | `crates/lib/src/extension/manifest.rs`           | `ExtensionManifest` + per-manifest validation                                                                                                             |
+| `crates/lib/src/extension/projection.rs`         | Per-model-call context projection: grants, `ContextProjector`, chain runner and host validation                                                           |
 | `crates/lib/src/extension/handler.rs`            | Hook-handler traits + `InstalledExtension` (Global drain target)                                                                                          |
 | `crates/lib/src/extension/hook_bridge.rs`        | Adapters bridging instance hook handlers into the fire vecs                                                                                               |
 | `crates/lib/src/extension/hooks.rs`              | Per-kind hook trait definitions + `HookKind`                                                                                                              |
@@ -364,6 +466,7 @@ so it round-trips through eidetica.
 
 | Extension           | Scopes                 | Declared hooks    | Routine | What it provides                                                            |
 | ------------------- | ---------------------- | ----------------- | ------- | --------------------------------------------------------------------------- |
+| `baseline_context`  | `Global`               | —                 | —       | Required scoped context selection and default cache options                 |
 | `core`              | `Global`               | `Tool`            | —       | `shell`, `compact`, `spawn_agent`, `job_status`, `job_wait`, `spawn_worker` |
 | `fs`                | `Global`               | `Tool`            | —       | `read_file`, `write_file`, `edit_file`                                      |
 | `system`            | `Global`               | `Tool`            | —       | `get_time`, `calculate`, `describe_tool`                                    |
@@ -390,7 +493,8 @@ lifecycle. All built-ins are in the default-active set for new sessions
    - implement `instantiate(ctx)` to return an `ExtensionInstance` that
      overrides the endpoints you contribute — `tools()`, `commands()`,
      the `*_hook()` slots, `prompt_augmentation()` / `context_tail()`,
-     `memory_access()` / `messenger()`, `routine_handler()`.
+     `context_projector()`, `memory_access()` / `messenger()`,
+     `routine_handler()`.
 2. Add the module to `crates/lib/src/extensions/mod.rs` and the constructor to the
    `all_builtins` vec. If it needs shared deps (session registry, agent
    index, embedder, …), add them to `BuiltinDeps` and thread through
@@ -422,3 +526,146 @@ or the runtime.
   declared scope + manifest the host inspects before loading, typed
   endpoints, and caps returning plain data over `CapFuture` so the same
   handler shape works across a sandbox boundary.
+
+## Durable context contributions
+
+`DurableContextContributor` is an instance endpoint in the normal build, not a
+loader or Cargo feature. Its manifest provides `DurableContext`; the operator
+must separately grant it in `durable_context`. The host resolves session over
+agent over global instances, attenuated by the turn's active set and current
+session/agent revocations. Built-ins have no bypass.
+
+`ExtensionHub::prepare_durable_context` is the scoped host operation. The server
+calls it before assembly. A contributor receives selected transcript rows,
+complete selected exchanges, stable row/request identities, its own committed
+contributions and its own JSON strategy state. It receives no raw DB handle.
+It returns a batch of conversation text plus an optional state replacement.
+The host assigns all provenance and commits state, text and the invocation
+receipt in one transaction before reconstructing the model view. Dropping a
+staged transaction exposes none of them. Each batch is limited to 64 messages
+and 64 KiB of serialized text/state; the final request has its own budget gate.
+
+The backward-compatible session stores are `context_contributions` (versioned
+batch/receipt rows) and `context_strategy_state` (namespace-keyed state). A
+namespace is the tuple of version, session root, responding agent, instance
+scope and extension name. An invocation adds the durable request ID, **not**
+the attempt ID. Message source IDs add the batch index. Tuple JSON encoding
+avoids delimiter collisions. Reopen or another attempt for that same request
+uses the receipt without invoking the extension again; a new request can
+contribute again. An empty batch is also a receipt. Existing sessions need no
+migration. Old transcript encodings are unchanged.
+
+`SessionContextView` reads entries/IDs, compact selection, selected completed
+attempts, contributions and state consistency at one immutable snapshot. Every
+state row must match a committed receipt in that snapshot. A failed read is
+not replaced with a resident transcript. There is no projection cache. Sync
+updates appear at the next snapshot; a pinned view remains unchanged. The
+existing runtime claim/turn serialization still owns execution. These stores
+are not a new execution lock or cross-peer exactly-once effect engine; a
+contributor must not perform external side effects before returning its batch.
+Concurrent legitimate state updates use Eidetica's existing table merge rules,
+not a new compare-and-swap protocol.
+
+Durable text is host-framed, escaped User data appended after selected history
+and ephemeral tails. It cannot supply System messages or native calls/results.
+This initial reconstruction retains granted contributions independently of the
+summary boundary; it does not infer that a summary covered them. Original
+entries and native transcripts stay untouched. Strategy state does not become
+live instructions, tools or grants. Projectors still receive a disposable copy
+and current execution checks remain independent. At every logical model call,
+required durable grants and current-request receipts are checked; optional
+revoked text is filtered from the request copy, without deleting its record.
+Transport retries reuse that accepted request.
+
+Required missing/failed contributors stop dispatch. Optional errors, panics,
+timeouts or invalid batches discard that batch, then reconstruct a fresh
+validated committed view, retaining earlier successful contributions. Read or
+state-integrity errors stop even optional fallback. The legacy schedule-turn
+caller has no durable request ID: optional new writes are skipped, required
+writes refuse, while an existing granted contribution can still be read. Its
+private wake prompt remains invocation-scoped. Direct runtime callers must
+prepare through the host too; required receipts cannot be bypassed.
+
+Compaction coverage and completed-attempt selection retain their existing
+rules. In particular, this API does not repair the older positional-summary
+case where a request queued _before_ the summary is hidden. It preserves rows
+selected by that reader, including current and queued rows after the boundary.
+It also retains the existing eager transcript hydration; a separate keyed
+reader can adopt the same pinned-view boundary without changing this schema.
+
+## Required selection and typed recall
+
+`ContextStrategy` is a normal instance endpoint declared as `ContextStrategy`
+and selected by the operator's `ContextStrategyGrant`. Resolution uses the same
+session-over-agent-over-global precedence and current activation attenuation as
+projection. The grant has no optional flag: absence, failure, panic, timeout or
+invalid references refuse dispatch. The runtime rechecks the selected instance
+before each logical call; transport retries reuse the accepted request/options.
+
+`ContextStrategyCall` carries identity, budget, the instance's current session
+settings and a read-only `ScopedContext`. Its public selection/hydration methods
+expose only host-selected rows. `ContextPlan` chooses instructions, entry indices,
+bounded native exchanges, ephemeral tail and committed contribution references.
+Core rejects duplicates, foreign indices, reordered entries and non-adjacent
+exchanges; it owns rendering, provider echo, stable provenance and final budgets.
+The built-in `BaselineContext` uses only this public facility. Its algorithm no
+longer lives in `ContextBuilder`.
+
+This migration adds no history hydration pass. The existing coherent
+`SessionContextView` still loads selected completed transcript records eagerly;
+scoped item rendering/replay is lazy and bounded by the chosen budget. Further
+storage-read optimization is separate work, not a second authoritative transcript.
+Tests measure returned Table row/byte volume separately from selection elapsed
+cost; this is not a measurement of physical backend I/O or provider cache hits.
+
+`ContextTailCall` replaces the native recall endpoint's loose argument pair with
+agent/session/request identity and the same recent-text input. Current activation
+and declarations gate the production call; errors, panic and timeout discard only
+that optional tail. Native memory's search policy and ephemeral default are
+unchanged. The durable recall example is synthetic and explicitly granted; it
+does not authorize private-data retention or external recall rollout.
+
+`ProjectedRequest.cache` carries typed `CacheOptions` through the existing
+runtime/backend path. Anchors use final-request indices, not raw provider fields.
+Adapters cap and map markers, including the precise pre-coalescing message block
+on native Anthropic, and omit them for incompatible providers. The built-in's
+legacy/default policy remains last tool, system, latest user with five-minute TTL.
+Host-side durable revocation remaps surviving message anchors and drops anchors
+on removed messages. Projectors own the final indices of their returned request.
+An empty or over-budget request cannot pass the final dispatch gate.
+
+## Scoped retained tool evidence
+
+`ProjectionCall` carries current per-extension settings and a host-created
+`ScopedHistory`. Projection scope contains only selected historical source/call
+pairs from that logical call's baseline. `ToolContext::history()` offers the
+same read-only facility under the caller's session and current source-tool
+ceiling for normal recovery tools, independent of context compaction.
+Neither exposes a database or execution handle. Strict settings/source reads
+fail the invoking projection step; optional failure preserves accepted edits
+and does not bypass later required steps.
+
+The host reads retained completed attempts and their original request rows at
+one Eidetica snapshot, validates complete native exchanges with the existing
+replay validator, then checks current participation and extension/tool
+visibility before releasing bytes, intersecting revocations with the caller's
+existing tool-extension ceiling rather than replacing it. For Living Agents,
+the scope carries the host-resolved agent identity/key and checks its current
+Active Write membership in AuthSettings. The roster is a display cache, not
+authority. Revoked membership keys prevent last-member detach from being
+mistaken for a legacy session. Pre-Living-Agent sessions without a roster or
+recorded agent membership keys retain their matching-name (or unmarked)
+legacy behavior. Stable versioned references hash the session
+root and recorded source; no visible index or mutable lookup table is needed.
+Pages count stored UTF-8 bytes rather than serialized JSON/framing overhead.
+Unknown or invisible references share a non-disclosing missing status. A
+recording truncation marker is reported without promising pre-recording bytes.
+
+The normal-build `context_prune` extension uses this public facility in batched
+per-call projection. Its policy is opt-in, shrink-only pointer replacement of
+untouched successful historical result bodies. It leaves recovery output and
+all current exchanges alone. It has no committed strategy state: settings,
+selected sources and recorded bytes reconstruct every decision. The generic
+host's integrity, current-authority and final-budget gates apply unchanged.
+Actual recovery executes a normal owner-attributed tool, not a privileged
+built-in path, and never re-executes the source tool.

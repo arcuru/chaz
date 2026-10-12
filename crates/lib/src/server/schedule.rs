@@ -667,6 +667,7 @@ impl Server {
 
         let tool_ctx = ToolContext {
             agent_name: agent_name.to_string(),
+            agent_identity: self.agent_index.find_by_name(agent_name),
             turn_request_id: None,
             tool_call_key: None,
             call_depth: 0,
@@ -687,6 +688,12 @@ impl Server {
         };
 
         let tool_defs = tool_ctx.definitions();
+        let view = {
+            let s = session.lock().await;
+            self.extensions
+                .prepare_durable_context(&s, agent_name, None, &active_extensions)
+                .await?
+        };
         let (session_model, mut assembled) = {
             let s = session.lock().await;
             let meta = s.read_meta().await;
@@ -711,7 +718,7 @@ impl Server {
                 max_context_tokens,
             );
             let mut builder = ContextBuilder::new(
-                s.entries(),
+                &view.entries,
                 agent_name,
                 &agent.system_prompt,
                 &self.context_config,
@@ -720,13 +727,15 @@ impl Server {
                 builder = builder.with_attachment(attachment);
             }
             let assembled = builder
+                .with_context_view(&view)
                 .with_tools(&tool_defs)
                 .with_max_tokens_override(max_tokens_override)
                 .with_room_participants(&roster)
                 .with_extension_hub(self.extensions.clone())
                 .with_session_db(session_db)
-                .build()
-                .await;
+                .with_invocation(&active_extensions, None)
+                .try_build()
+                .await?;
             (session_model, assembled)
         };
         // Effective model resolution: per-agent override (new) > session pin
@@ -738,10 +747,18 @@ impl Server {
 
         // Prepend the wake-prompt as a private System message. This is
         // invocation-scoped — it never appears as a session entry.
+        for anchor in &mut assembled.cache.anchors {
+            if let crate::cache::CacheAnchor::Message(index) = anchor {
+                *index += 1;
+            }
+        }
         assembled.messages.insert(
             0,
             crate::runtime::RuntimeMessage::System(wake_prompt.to_string()),
         );
+        assembled
+            .sources
+            .insert(0, crate::extension::projection::ContextSource::Instructions);
 
         if assembled.truncated {
             tracing::info!(
@@ -820,7 +837,7 @@ impl Server {
             approval_callback: None, // no interactive approval for schedule fires
         };
 
-        let result = crate::runtime::execute(
+        let result = crate::runtime::execute_scoped(
             effective_model.as_deref(),
             assembled.messages,
             &self.default_backend,
@@ -829,6 +846,13 @@ impl Server {
             &self.policies,
             Some(event_tx),
             Some(self.extensions.as_ref()),
+            crate::runtime::ModelCallScope {
+                cache: assembled.cache,
+                context_strategy: assembled.strategy,
+                attempt_id: None,
+                request_budget_tokens: Some(assembled.request_budget_tokens),
+                sources: assembled.sources,
+            },
         )
         .await;
 

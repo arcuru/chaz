@@ -42,6 +42,7 @@ use crate::extension::handler::{
     HookHandlerSessionStart, HookHandlerToolCall, HookHandlerToolResult, RoutineHandler,
 };
 use crate::extension::manifest::ExtensionManifest;
+use crate::extension::projection::ContextProjector;
 use crate::tool::{Tool, ToolRegistry};
 use eidetica::Database;
 use std::any::Any;
@@ -178,6 +179,26 @@ pub trait ExtensionInstance: Send + Sync + 'static {
         None
     }
     fn status_segment(&self) -> Option<Arc<dyn StatusSegment>> {
+        None
+    }
+
+    /// Per-model-call context projection. Invoked only when the manifest
+    /// provides [`crate::extension::caps::CapabilityKind::ContextProjection`],
+    /// the operator granted this extension in `context_projection`, and the
+    /// extension is active for the session and agent at that call.
+    fn context_projector(&self) -> Option<Arc<dyn ContextProjector>> {
+        None
+    }
+
+    /// Intentional durable text/state, committed by the scoped host before assembly.
+    /// Requires a current operator `durable_context` grant and activation.
+    fn durable_context_contributor(
+        &self,
+    ) -> Option<Arc<dyn super::durable_context::DurableContextContributor>> {
+        None
+    }
+
+    fn context_strategy(&self) -> Option<Arc<dyn super::context_strategy::ContextStrategy>> {
         None
     }
 
