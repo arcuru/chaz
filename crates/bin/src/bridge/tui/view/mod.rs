@@ -1804,16 +1804,25 @@ pub(super) fn ui_picker(f: &mut ratatui::Frame, app: &mut App) {
             // any; it stays blank otherwise so row height is unchanged.
             match &info.description {
                 Some(description) => {
-                    // Indent plus ellipsis; the unwrapped paragraph clips any rest.
-                    let budget = (inner_w as usize).saturating_sub(5).max(1);
-                    let shown = truncate_chars(description, budget);
-                    let ellipsis = if shown.len() < description.len() {
-                        "…"
+                    // Clip by terminal cells after the indent so wide text
+                    // still ends in an ellipsis instead of being cut silently.
+                    let avail = (inner_w as usize).saturating_sub(4);
+                    let shown = if description.width() > avail {
+                        let mut cells = 0;
+                        let mut clipped: String = description
+                            .graphemes(true)
+                            .take_while(|g| {
+                                cells += g.width();
+                                cells < avail
+                            })
+                            .collect();
+                        clipped.push('…');
+                        clipped
                     } else {
-                        ""
+                        description.clone()
                     };
                     lines.push(Line::from(vec![Span::styled(
-                        format!("    {shown}{ellipsis}"),
+                        format!("    {shown}"),
                         Style::default().fg(COLOR_DIM),
                     )]));
                 }

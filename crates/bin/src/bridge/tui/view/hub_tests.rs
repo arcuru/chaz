@@ -681,4 +681,12 @@ async fn description_edit_patches_the_cached_picker_row_without_renaming() {
     open_session_picker(&mut app, &server, &rows_tx);
     let screen = frame(&mut app, &server, &backend, 80, 24);
     assert!(!screen.contains("Q3 budget"), "{screen}");
+    app.mode = TuiMode::Chat;
+
+    // Double-width text is clipped by terminal cells and still shows the ellipsis.
+    run(&mut app, Command::DescribeSession("界".repeat(12))).await;
+    open_session_picker(&mut app, &server, &rows_tx);
+    let narrow = frame(&mut app, &server, &backend, 20, 8);
+    let line = narrow.lines().find(|l| l.contains('界')).expect(&narrow);
+    assert!(line.contains('…') && line.ends_with('│'), "{narrow}");
 }

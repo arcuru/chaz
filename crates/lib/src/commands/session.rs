@@ -203,13 +203,13 @@ pub(super) async fn info(ctx: &CommandContext<'_>) -> CommandOutcome {
         Some(n) => format!("\nName: {n}"),
         None => String::new(),
     };
-    let description_line = match crate::session::try_read_meta_from_db(ctx.session_db).await {
-        Ok(meta) => meta
-            .description
-            .map(|d| format!("\nDescription: {d}"))
-            .unwrap_or_default(),
-        Err(e) => return CommandOutcome::Error(format!("Failed to read session metadata: {e}")),
-    };
+    // Lenient read: a browse-only line must not make `/info` itself fail
+    // on a session whose other metadata fields are malformed.
+    let description_line = crate::session::read_meta_from_db(ctx.session_db)
+        .await
+        .description
+        .map(|d| format!("\nDescription: {d}"))
+        .unwrap_or_default();
     let channels = match ctx
         .server
         .registry()
