@@ -142,15 +142,7 @@ const JOB_RESULT: &str = "job_result";
 
 pub(crate) async fn read_job_result(db: &eidetica::Database) -> anyhow::Result<Option<JobResult>> {
     let txn = db.new_transaction().await?;
-    let store = txn.get_store::<DocStore>(JOB_RESULT).await?;
-    let doc = store.get_all().await?;
-    match doc.get("v1") {
-        Some(value) => {
-            let json: String = value.try_into()?;
-            Ok(Some(serde_json::from_str(&json)?))
-        }
-        None => Ok(None),
-    }
+    read_job_result_in_txn(&txn).await
 }
 
 /// The typed terminal a job final entry settles to, if it is one.

@@ -212,7 +212,7 @@ impl SessionRegistry {
         &self.instance
     }
 
-    /// Called only after an executor has durably claimed an accepted job.
+    /// Called only after an executor has recorded participation in an accepted job.
     pub(crate) async fn ensure_executor_db(
         &self,
         agent_db_id: &eidetica::entry::ID,

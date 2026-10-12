@@ -2935,7 +2935,7 @@ impl Server {
                 Ok(projection) => spawn_ctx.job_projection = Some(projection),
                 Err(error) => {
                     self.processing.lock().await.remove(session_db_id);
-                    return Err(error.context("cannot persist claimed job before execution"));
+                    return Err(error.context("cannot persist participating job before execution"));
                 }
             }
         }
@@ -3178,7 +3178,7 @@ impl Server {
     ///
     /// Returns `None` when this checkpoint is now held, so ordinary queued
     /// work may run; `Some` when the session was handled, including when a
-    /// transient gate (claim, home peer, a busy session) defers the resume.
+    /// transient gate (participation, home peer, a busy session) defers the resume.
     async fn resume_checkpointed_wait(
         self: &Arc<Self>,
         session_db_id: &str,
@@ -4197,6 +4197,7 @@ impl Server {
                 };
                 if let Some(yielded) = undelivered {
                     info!(session_db_id, branch = %id, earlier = %yielded.earlier_execution, "Execution yielded; preserving its result as undelivered evidence");
+                    let transcript = recorder.terminal.lock().unwrap().take();
                     if !persistence_failed
                         && !stopped_by_yield
                         && let Some(terminal) = crate::session::jobs::job_terminal_for(final_entry.as_ref())
@@ -4208,7 +4209,7 @@ impl Server {
                                 execution_id: Some(id.clone()),
                             },
                             delivered: false,
-                        }).await
+                        }, transcript.as_ref()).await
                     {
                         error!(%error, session_db_id, "Failed to preserve yielded execution outcome");
                     }
@@ -4221,10 +4222,10 @@ impl Server {
                     attempt.attempt_id
                 );
             } else {
-                let terminal = recorder.terminal.lock().unwrap().take();
+                let transcript = recorder.terminal.lock().unwrap().take();
                 let late = branch_id.as_ref().zip(crate::session::jobs::job_terminal_for(final_entry.as_ref()));
                 if let Err(error) = s
-                    .complete_turn_attempt_for_branch(&attempt, final_entry, outbound, terminal, branch_id.as_deref())
+                    .complete_turn_attempt_for_branch(&attempt, final_entry, outbound, transcript.clone(), branch_id.as_deref())
                     .await
                 {
                     error!("Failed to complete turn attempt for {session_db_id}: {error}");
@@ -4237,7 +4238,7 @@ impl Server {
                                 execution_id: Some(id.clone()),
                             },
                             delivered: false,
-                        }).await
+                        }, transcript.as_ref()).await
                     {
                         error!(%error, session_db_id, "Failed to preserve undelivered execution outcome");
                     }

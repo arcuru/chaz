@@ -537,7 +537,9 @@ async fn branch_receipt_is_never_replaced_and_late_results_stay_evidence() {
             },
         };
         if yielded_first {
-            record_undelivered(&db, &late).await.unwrap();
+            record_undelivered(&db, &late, Some(&record(&attempt, "late")))
+                .await
+                .unwrap();
         }
         session
             .complete_turn_attempt_for_branch(
@@ -552,12 +554,20 @@ async fn branch_receipt_is_never_replaced_and_late_results_stay_evidence() {
         // A second completion (a racing branch that missed the yield) fails
         // closed instead of replacing the receipt.
         let err = session
-            .complete_turn_attempt_for_branch(&attempt, Some(reply("late")), None, None, Some("b"))
+            .complete_turn_attempt_for_branch(
+                &attempt,
+                Some(reply("late")),
+                None,
+                Some(record(&attempt, "late")),
+                Some("b"),
+            )
             .await
             .unwrap_err();
         assert!(err.to_string().contains("already settled"), "{err}");
         if !yielded_first {
-            record_undelivered(&db, &late).await.unwrap();
+            record_undelivered(&db, &late, Some(&record(&attempt, "late")))
+                .await
+                .unwrap();
         }
         let receipt = super::super::jobs::read_job_result(&db)
             .await
@@ -584,7 +594,8 @@ async fn branch_receipt_is_never_replaced_and_late_results_stay_evidence() {
                 &ExecutionOutcome {
                     delivered: true,
                     ..late.clone()
-                }
+                },
+                None,
             )
             .await
             .is_err()
@@ -595,6 +606,24 @@ async fn branch_receipt_is_never_replaced_and_late_results_stay_evidence() {
                 .unwrap()
                 .len(),
             1
+        );
+        assert_eq!(
+            view_transcript(&db, "b", "late", 0, 10)
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "the undelivered result retains its terminal model evidence"
+        );
+        let outcome_entries = store_entries_at(&db, OUTCOMES, &db.snapshot().await.unwrap())
+            .await
+            .unwrap();
+        assert_eq!(outcome_entries.len(), 2);
+        assert!(
+            outcome_entries
+                .iter()
+                .all(|entry| entry.in_subtree(TRANSCRIPT)),
+            "both delivered and undelivered outcomes commit their terminal evidence atomically"
         );
         assert_eq!(
             super::super::jobs::status_from_db(&db, &Default::default(), true)

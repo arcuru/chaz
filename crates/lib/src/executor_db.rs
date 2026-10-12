@@ -1,4 +1,4 @@
-//! Per-Agent, per-peer durable projection of claimed Agent jobs.
+//! Per-Agent, per-peer durable projection of participating Agent jobs.
 //! The session DB remains authoritative for attempt and terminal receipt.
 use crate::agent_db::{AgentDb, ExecutorRef};
 use crate::session::jobs::{AcceptedAgentJob, JobState, status_from_db};
@@ -55,7 +55,7 @@ pub async fn record(db: &Database, row: ExecutorJob) -> anyhow::Result<()> {
             row.last_recorded,
             JobState::Pending | JobState::Rejected { .. }
         ),
-        "only claimed jobs enter executor DB"
+        "only participating jobs enter executor DB"
     );
     let txn = db.new_transaction().await?;
     let store = txn.get_store::<Table<ExecutorJob>>(JOBS).await?;

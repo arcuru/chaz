@@ -356,8 +356,7 @@ async fn worker_wait_balances_capacity_after_error_timeout_cancellation_and_obse
                         .await
                         .unwrap()
                         .unwrap()
-                        .err()
-                        .expect("parent must stop before further effects");
+                        .expect_err("parent must stop before further effects");
                     let expected = if mode == "observed-yield" {
                         "job execution yielded while observing"
                     } else {

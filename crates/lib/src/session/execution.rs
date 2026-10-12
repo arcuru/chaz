@@ -449,16 +449,21 @@ pub(crate) async fn wait_for_yield(db: &Database, id: &str) -> anyhow::Result<Ex
     }
 }
 
-/// A yielded branch's computed result stays evidence, never the receipt.
+/// A yielded branch's computed result and terminal transcript stay together
+/// as evidence, without changing the receipt or completing the attempt.
 pub(crate) async fn record_undelivered(
     db: &Database,
     outcome: &ExecutionOutcome,
+    terminal: Option<&TurnTranscriptRecord>,
 ) -> anyhow::Result<()> {
     anyhow::ensure!(
         !outcome.delivered,
         "undelivered outcome cannot claim delivery"
     );
-    put_once(db, OUTCOMES, &outcome.execution_id, outcome).await
+    let txn = db.new_transaction().await?;
+    outcome_in_txn(&txn, outcome, terminal).await?;
+    txn.commit().await?;
+    Ok(())
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -533,17 +538,18 @@ pub(crate) async fn take_notices(
     pending.sort_by(|a, b| a.id.cmp(&b.id));
     let txn = db.new_transaction().await?;
     let seen = txn.get_store::<Table<bool>>(NOTICE_SEEN).await?;
+    let consumed: HashSet<_> = seen
+        .search(|_: &bool| true)
+        .await?
+        .into_iter()
+        .map(|(key, _)| key)
+        .collect();
     let mut messages = Vec::new();
     for notice in pending {
         if messages.len() == 4 {
             break;
         }
-        if !seen
-            .search(|_: &bool| true)
-            .await?
-            .iter()
-            .any(|(key, _)| key == &notice.id)
-        {
+        if !consumed.contains(&notice.id) {
             seen.set(&notice.id, true).await?;
             messages.push(notice.text);
         }

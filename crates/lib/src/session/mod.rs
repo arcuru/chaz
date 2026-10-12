@@ -1576,20 +1576,8 @@ impl Session {
         if let Some(accepted) = crate::session::jobs::read_accepted_job(&self.database).await?
             && accepted.directive_id == attempt.request_id.as_str()
         {
-            let terminal = match final_entry.as_ref() {
-                Some(entry) if entry.entry_type == EntryType::Message => {
-                    crate::session::jobs::JobTerminal::Success {
-                        text: Some(entry.content.clone()),
-                    }
-                }
-                Some(entry) if entry.entry_type == EntryType::Error => {
-                    crate::session::jobs::JobTerminal::Failure {
-                        message: entry.content.clone(),
-                    }
-                }
-                None => crate::session::jobs::JobTerminal::Success { text: None },
-                Some(_) => anyhow::bail!("job completion has an invalid terminal entry"),
-            };
+            let terminal = crate::session::jobs::job_terminal_for(final_entry.as_ref())
+                .ok_or_else(|| anyhow::anyhow!("job completion has an invalid terminal entry"))?;
             let result = crate::session::jobs::JobResult {
                 attempt_id: attempt.attempt_id.clone(),
                 terminal,
