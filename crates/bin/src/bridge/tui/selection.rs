@@ -25,17 +25,53 @@ struct Cell {
     end: Point,
 }
 
+/// Source text of the selectable transcript lines. Cell maps are derived on
+/// demand for the rows a pointer or highlight touches, so a long history costs
+/// one copy of its source text rather than a map of every wrapped cell.
 #[derive(Default, Debug)]
 pub(super) struct CopyText {
+    width: u16,
     lines: BTreeMap<usize, String>,
-    rows: BTreeMap<usize, Vec<Cell>>,
+    /// First visual row of each source line -> its logical line.
+    starts: BTreeMap<usize, usize>,
 }
 
 impl CopyText {
     pub(super) fn add(&mut self, line: usize, visual_row: usize, text: &str, width: u16) {
+        self.width = width;
         self.lines.insert(line, text.to_owned());
+        self.starts.insert(visual_row, line);
+    }
+
+    /// Cell maps of the visual rows in `rows`, ascending.
+    fn visible(&self, rows: std::ops::Range<usize>) -> Vec<(usize, Vec<Cell>)> {
+        let first = self
+            .starts
+            .range(..=rows.start)
+            .next_back()
+            .map_or(rows.start, |(&start, _)| start);
+        let mut visible = Vec::new();
+        let mut lines = self.starts.range(first..rows.end).peekable();
+        while let Some((&start, &line)) = lines.next() {
+            // A later source line owns its first row, as the transcript does.
+            let next = lines.peek().map_or(usize::MAX, |&(&next, _)| next);
+            for (offset, cells) in self.rows(line).into_iter().enumerate() {
+                let row = start + offset;
+                if row < next && rows.contains(&row) {
+                    visible.push((row, cells));
+                }
+            }
+        }
+        visible
+    }
+
+    /// Ratatui's wrapped rows of one source line, each `width` cells wide.
+    fn rows(&self, line: usize) -> Vec<Vec<Cell>> {
+        let (Some(text), width) = (self.lines.get(&line), self.width) else {
+            return Vec::new();
+        };
         if width == 0 {
-            return;
+            return Vec::new();
         }
         let decorated = format!("  {text}");
         let paragraph = Paragraph::new(decorated.as_str()).wrap(Wrap { trim: false });
@@ -43,6 +79,7 @@ impl CopyText {
         let area = Rect::new(0, 0, width, height);
         let mut buffer = Buffer::empty(area);
         paragraph.render(area, &mut buffer);
+        let mut rows = Vec::with_capacity(height as usize);
         let mut consumed = 0;
         for y in 0..height {
             // Wide glyph continuation cells are blank in Buffer, not source
@@ -83,19 +120,16 @@ impl CopyText {
             // meaningful trailing spaces, but never copies viewport padding.
             let end = Point {
                 line,
-                byte: byte.saturating_sub(2).min(text.len()),
-            };
-            let end = if y + 1 == height {
-                Point {
-                    line,
-                    byte: text.len(),
-                }
-            } else {
-                end
+                byte: if y + 1 == height {
+                    text.len()
+                } else {
+                    byte.saturating_sub(2).min(text.len())
+                },
             };
             cells.resize(width as usize, Cell { start: end, end });
-            self.rows.insert(visual_row + y as usize, cells);
+            rows.push(cells);
         }
+        rows
     }
 
     fn text(&self, start: Point, end: Point) -> String {
@@ -149,14 +183,15 @@ impl Selection {
         let x = x.clamp(self.area.x, self.area.right() - 1) - self.area.x;
         let y = y.clamp(self.area.y, self.area.bottom() - 1) - self.area.y;
         let row = self.scroll + y as usize;
-        let cells = if clamp {
-            text.rows
-                .range(self.scroll..self.scroll + self.area.height as usize)
-                .min_by_key(|(index, _)| index.abs_diff(row))
-                .map(|(_, cells)| cells)?
+        let rows = if clamp {
+            self.scroll..self.scroll + self.area.height as usize
         } else {
-            text.rows.get(&row)?
+            row..row + 1
         };
+        let (_, cells) = text
+            .visible(rows)
+            .into_iter()
+            .min_by_key(|(index, _)| index.abs_diff(row))?;
         cells.get(x as usize).copied()
     }
 
@@ -207,10 +242,7 @@ impl Selection {
         let Some((start, end)) = self.bounds() else {
             return;
         };
-        for (&row, cells) in text
-            .rows
-            .range(self.scroll..self.scroll + self.area.height as usize)
-        {
+        for (row, cells) in text.visible(self.scroll..self.scroll + self.area.height as usize) {
             for (x, cell) in cells.iter().enumerate() {
                 if cell.start < end && cell.end > start {
                     buffer[(
@@ -274,6 +306,8 @@ mod tests {
             select(&text, 10, 20, (2, 0), (5, 3)),
             "one two three four five\nnext"
         );
+        // The viewport may begin inside a wrapped source line.
+        assert_eq!(select(&text, 10, 21, (0, 0), (3, 2)), "three four five\nne");
     }
 
     #[test]
