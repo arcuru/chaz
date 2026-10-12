@@ -4075,7 +4075,7 @@ impl Server {
                 branch_id.clone().map(|id| (claim_db.clone(), id)),
             ));
             let result = match resume {
-                Some(plan) => runtime::resume_cancellable_with_recorder(
+                Some(plan) => Box::pin(runtime::resume_cancellable_with_recorder(
                     effective_model.as_deref(),
                     assembled.messages,
                     &backend,
@@ -4088,9 +4088,9 @@ impl Server {
                     capacity,
                     plan.runtime,
                     scope,
-                )
+                ))
                 .await,
-                None => runtime::execute_cancellable_with_recorder(
+                None => Box::pin(runtime::execute_cancellable_with_recorder(
                     effective_model.as_deref(),
                     assembled.messages,
                     &backend,
@@ -4102,7 +4102,7 @@ impl Server {
                     Some(&cancel),
                     capacity,
                     scope,
-                )
+                ))
                 .await,
             };
 
