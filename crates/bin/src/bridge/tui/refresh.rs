@@ -790,8 +790,8 @@ mod tests {
             assert!(applied.redraw, "background telemetry must request a frame");
             let screen = draw_chat(&mut app, 180, 20).join("\n");
             let expected = match sequence {
-                0 | 1 => "ctx ~1k/10k (10.0%) tok",
-                2 => "ctx ~2k/10k (20.0%) tok",
+                0 | 1 => "ctx 1k/10k (10.0%) tok",
+                2 => "ctx 2k/10k (20.0%) tok",
                 _ => "ctx unknown/10k tok",
             };
             assert!(screen.contains(expected), "{screen}");

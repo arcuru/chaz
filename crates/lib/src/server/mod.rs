@@ -248,6 +248,23 @@ impl runtime::RuntimeRecorder for SessionRuntimeRecorder {
         })
     }
 
+    fn observe_call<'a>(
+        &'a self,
+        call: crate::session::usage::CallObservation,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(async move {
+            let session = self.session.lock().await;
+            crate::session::usage::persist_call(
+                session.database(),
+                &self.attempt_id,
+                self.branch.as_deref(),
+                &self.agent_name,
+                call,
+            )
+            .await
+        })
+    }
+
     fn checkpoint_job_wait<'a>(
         &'a self,
         wait: runtime::JobWaitIntent,
@@ -726,9 +743,7 @@ fn spawn_model_window_fetch(
         match backend.fetch_models_with_info().await {
             Ok(models) => {
                 if let Some(info) = models.into_iter().find(|m| m.id == model) {
-                    if let Some(w) = info.context_window {
-                        backend.insert_model_window(info.id.clone(), w);
-                    }
+                    backend.insert_model_info(info.clone());
                     if let Err(e) = store.put(&info).await {
                         tracing::warn!(model = %model, "model info store write failed: {e}");
                     }
@@ -1865,9 +1880,11 @@ impl Server {
     /// per-session worker backend cloned from `default_backend`.
     pub async fn warm_model_windows(&self) {
         let store = crate::model_info_store::ModelInfoStore::new(self.registry.chaz_peer().clone());
-        let windows = store.context_windows().await;
-        let n = windows.len();
-        self.default_backend.set_model_windows(windows);
+        let infos = store.all().await;
+        let n = infos.len();
+        for info in infos.into_values() {
+            self.default_backend.insert_model_info(info);
+        }
         if n > 0 {
             tracing::info!(models = n, "Warmed context-window overlay from model store");
         }
@@ -1917,9 +1934,7 @@ impl Server {
     /// selects a model in the picker — the "on switch" half of populating the
     /// store (the background first-use fetch is the other half).
     pub async fn cache_model_info(&self, info: &ModelInfo) {
-        if let Some(w) = info.context_window {
-            self.default_backend.insert_model_window(info.id.clone(), w);
-        }
+        self.default_backend.insert_model_info(info.clone());
         let store = crate::model_info_store::ModelInfoStore::new(self.registry.chaz_peer().clone());
         if let Err(e) = store.put(info).await {
             tracing::warn!(model = %info.id, "model info store write failed: {e}");

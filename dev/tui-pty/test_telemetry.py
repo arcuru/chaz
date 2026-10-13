@@ -82,6 +82,8 @@ backends:
     models:
       - name: gpt-sol-latest
         context_window: 10000
+        price_input: 2.0
+        price_output: 4.0
 agents:
   - name: chaz
     model: gpt-sol-latest
@@ -97,32 +99,51 @@ default_agents: [chaz]
                 process.expect_screen("ctx unknown/10k tok")
                 process.send("telemetry fixture\r")
                 self.assertTrue(arrived[0].wait(10), "first call not started")
+                process.expect_screen("ctx ~")
+                process.expect_screen("0/0 reported")
+                process.expect_screen("/unknown tok partial")
+                process.expect_screen("~$")
+                process.expect_screen("partial")
+                process.capture(out / "held-first-estimate")
                 # No send(), resize(), or signal between these gates and redraws.
-                for index, context, totals in [
-                    (0, "ctx ~1k/10k (10.0%) tok", "1k/100 tok • 50% cached • $0.0100"),
-                    (1, "ctx ~2k/10k (20.0%) tok", "3k/200 tok • 50% cached • $0.0200"),
+                for index, reports, cost in [
+                    (0, "1k/100 reported", "$0.0100"),
+                    (1, "3k/200 reported", "$0.0200"),
                 ]:
                     release[index].set()
                     self.assertTrue(arrived[index + 1].wait(10), "next call not blocked")
-                    process.expect_screen(context)
-                    process.expect_screen(totals)
+                    process.expect_screen("ctx ~")
+                    process.expect_screen(reports)
+                    process.expect_screen(cost)
                     self.assertNotIn("TELEMETRY-FINAL", "\n".join(process.screen.display))
                     process.capture(out / f"intermediate-{index + 1}")
                 release[2].set()
                 process.expect_screen("TELEMETRY-FINAL")
                 expected = "6k/300 tok • 50% cached • $0.0300"
-                process.expect_screen("ctx ~3k/10k (30.0%) tok")
+                process.expect_screen("ctx 3k/10k (30.0%) tok")
                 process.expect_screen(expected)
                 process.capture(out / "finalized")
                 self.assertEqual([call["model"] for call in calls], ["gpt-sol-latest"] * 3)
+                process.send("/costs\r")
+                process.expect_screen("6000 prompt + 300 completion")
+                process.expect_screen("3 calls")
+                process.capture(out / "costs")
                 # A reopened frontend sees the same durable calls, not a live counter.
                 process.send("\x1b")
                 process.child.wait(timeout=10)
                 process.close()
+                cli = subprocess.run([BINARY, "--config", config, "usage", "--json"], env=env, cwd=home,
+                                     check=True, timeout=20, capture_output=True, text=True)
+                (out / "usage.json").write_text(cli.stdout)
+                total = json.loads(cli.stdout)["total"]
+                self.assertEqual((total["calls"], total["prompt_tokens"], total["completion_tokens"]), (3, 6000, 300))
+                self.assertAlmostEqual(total["cost_usd"], 0.03)
+                self.assertEqual(total["estimated"], {"prompt_tokens": 0, "completion_tokens": 0, "cost_usd": 0.0})
+                self.assertEqual(total["coverage"]["cost_reported"], 3)
                 process = PtyProcess(command, env, home)
                 process.resize(180, 35)
                 process.expect_screen(expected)
-                process.expect_screen("ctx ~3k/10k (30.0%) tok")
+                process.expect_screen("ctx 3k/10k (30.0%) tok")
                 process.capture(out / "reopened")
                 process.send("\x1b")
                 process.child.wait(timeout=10)

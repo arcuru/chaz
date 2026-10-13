@@ -62,6 +62,14 @@ pub trait RuntimeRecorder: Send + Sync {
         message: RuntimeRecord,
     ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
 
+    /// Presentation-only call evidence; never a request or a completion marker.
+    fn observe_call<'a>(
+        &'a self,
+        _call: crate::session::usage::CallObservation,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(async { Ok(()) })
+    }
+
     /// Persist the exact pending `job_wait` before it starts observing, so a
     /// restarted executor can resume only that observation. Recorders without
     /// a durable turn attempt keep the default no-op.
@@ -984,13 +992,31 @@ impl<'a> RoundProjector<'a> {
         tools: &[ToolDefinition],
         model_round: u64,
         max_retries: u32,
+        recorder: &Option<Arc<dyn RuntimeRecorder>>,
     ) -> Result<Result<LLMResponse, LlmError>, String> {
         let projected = self.project(messages, tools, model_round).await?;
         let (messages, tools) = match &projected {
             Some(request) => (request.messages.as_slice(), request.tools.as_slice()),
             None => (messages, tools),
         };
-        Ok(llm_call_with_retry(
+        let mut observation = crate::session::usage::CallObservation {
+            model_sequence: model_round,
+            timestamp: chrono::Utc::now(),
+            requested_model: model
+                .map(str::to_string)
+                .or_else(|| backend.default_model())
+                .unwrap_or_default(),
+            request_budget_tokens: self.scope.request_budget_tokens,
+            input_tokens: crate::context::estimate_request_tokens(messages, tools) as u64,
+            output_tokens: None,
+            prices: backend.model_info_for_call(model, None),
+            metadata: None,
+            responded: false,
+        };
+        if let Some(recorder) = recorder {
+            recorder.observe_call(observation.clone()).await?;
+        }
+        let response = llm_call_with_retry(
             backend,
             model,
             messages,
@@ -1002,7 +1028,18 @@ impl<'a> RoundProjector<'a> {
                 .map(|r| &r.cache)
                 .unwrap_or(&self.scope.cache),
         )
-        .await)
+        .await;
+        if let Ok(response) = &response {
+            observation.response(response);
+            observation.prices = backend.model_info_for_call(
+                model,
+                observation.metadata.as_ref().map(|m| m.model.as_str()),
+            );
+            if let Some(recorder) = recorder {
+                recorder.observe_call(observation).await?;
+            }
+        }
+        Ok(response)
     }
 }
 
@@ -1216,6 +1253,7 @@ async fn run_turn(
                     &[],
                     model_sequence,
                     max_retries,
+                    &recorder,
                 )),
             )
             .await
@@ -1399,6 +1437,7 @@ async fn run_turn(
                 &tool_defs,
                 model_sequence,
                 max_retries,
+                &recorder,
             )),
         )
         .await

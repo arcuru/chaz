@@ -53,14 +53,29 @@ See [ReAct Runtime → Cancellation](react.md#cancellation) and [TUI → Stoppin
 
 Every assistant `Message` entry carries an optional `ResponseMetadata`: the model name, an optional provider and response ID, a `TokenUsage` (prompt/completion/cached/cache_creation/reasoning tokens plus an optional `cost_usd`), and any extra wire-format fields the backend retained. This is populated from the `LLMResponse` returned by the configured `LLMBackend` at the moment the assistant turn is committed to the session DB — there is no separate billing log.
 
-`crates/lib/src/session/usage.rs` walks the session catalog and folds these per-entry metadata records into per-session, per-model, and total rollups for `/costs` and `chaz usage`.
-The TUI status bar instead reads per-call `turn_transcript` telemetry at the same immutable snapshot as its entries.
-New transcript records carry the agent, requested model, and optional job execution branch separately from the returned wire model.
-Terminal calls are observable before end hooks and reply preflight; this publishes neither a final Message nor a completion or addressed send.
-The terminal record has the same attempt/branch/sequence key at atomic settlement, so it remains one call.
-Finalized metadata carries `turn_attempt_id`: the status bar uses the identified calls instead of adding that turn summary again.
-Older unmarked summaries remain readable, and a resumed identified attempt includes its earlier legacy raw calls.
-Missing usage clears that agent's context numerator without discarding previous totals; interrupted calls remain usage evidence, not replayable context or proof of completion.
+`crates/lib/src/session/usage.rs` provides the common snapshot view for the bar,
+`/costs`, the usage tool and `chaz usage`. The awaited `RuntimeRecorder` observes
+requests after projection and responses before validation, end hooks or final
+publication. The session's `call_telemetry` table has one replaceable presentation
+row per invocation/branch/model sequence, with request token estimate, host
+budget, requested model, available model-price provenance, returned usage and
+visible-output estimate. It stores no request or output text and never feeds
+context replay or completion/admission logic.
+
+Identified `turn_transcript` calls remain the fallback for older attempts.
+New observations supersede matching transcript calls; `turn_attempt_id` on final
+metadata prevents counting an attempt summary again. Scheduled executions use
+an observation-only invocation UUID and `extra.chaz_telemetry_id` on summaries,
+not a fabricated request/attempt or restart checkpoint. Old unmarked summaries
+remain readable. Branch identity preserves competing calls, and snapshots keep
+racing finalization from exposing both forms.
+
+Reports and estimates have separate totals and per-field call coverage. Provider
+zero replaces an estimate; omitted new wire fields remain distinguishable from
+zero through `extra.chaz_usage_fields`. The requested model selects the host
+context budget; returned wire identity selects response price provenance. Reads
+need no provider call. Interrupted requests may retain input-only estimates,
+which are not proof of a sent/billed/completed call.
 Session-write notifications use the existing bounded, owned, ticket-protected background refresh and redraw path.
 See [Cost Tracking & Usage](../user_guide/usage.md) and [TUI context usage](../user_guide/tui.md#context-usage).
 

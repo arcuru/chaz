@@ -183,9 +183,9 @@ enum RespBlock {
 #[derive(Debug, Default, Deserialize)]
 struct AnthUsage {
     #[serde(default)]
-    input_tokens: u32,
+    input_tokens: Option<u32>,
     #[serde(default)]
-    output_tokens: u32,
+    output_tokens: Option<u32>,
     #[serde(default)]
     cache_read_input_tokens: Option<u32>,
     #[serde(default)]
@@ -204,12 +204,13 @@ impl AnthUsage {
         let cache_creation = self.cache_creation_input_tokens.unwrap_or(0);
         let prompt_tokens = self
             .input_tokens
+            .unwrap_or(0)
             .saturating_add(cache_read)
             .saturating_add(cache_creation);
         TokenUsage {
             prompt_tokens,
-            completion_tokens: self.output_tokens,
-            total_tokens: prompt_tokens.saturating_add(self.output_tokens),
+            completion_tokens: self.output_tokens.unwrap_or(0),
+            total_tokens: prompt_tokens.saturating_add(self.output_tokens.unwrap_or(0)),
             cached_tokens: self.cache_read_input_tokens,
             cache_creation_tokens: self.cache_creation_input_tokens,
             reasoning_tokens: None,
@@ -644,6 +645,12 @@ fn build_metadata(
     if id.is_none() && model.is_none() && usage.is_none() {
         return None;
     }
+    let mut extra = Map::new();
+    crate::session::usage::mark_usage_fields(
+        &mut extra,
+        usage.as_ref().is_some_and(|u| u.input_tokens.is_some()),
+        usage.as_ref().is_some_and(|u| u.output_tokens.is_some()),
+    );
     Some(ResponseMetadata {
         model: model.unwrap_or_else(|| requested_model.to_string()),
         provider: None,
@@ -651,7 +658,7 @@ fn build_metadata(
         usage: usage.map(AnthUsage::into_token_usage).unwrap_or_default(),
         turn_attempt_id: None,
         context_tokens: None,
-        extra: Map::new(),
+        extra,
     })
 }
 
@@ -1011,8 +1018,8 @@ mod tests {
     #[test]
     fn usage_folds_cache_tokens_into_prompt() {
         let u = AnthUsage {
-            input_tokens: 100,
-            output_tokens: 50,
+            input_tokens: Some(100),
+            output_tokens: Some(50),
             cache_read_input_tokens: Some(40),
             cache_creation_input_tokens: Some(10),
         };

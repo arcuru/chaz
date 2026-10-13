@@ -66,11 +66,11 @@ fn context_segment(
     tab: &super::Tab,
     telemetry: &chaz_core::session::usage::SessionTelemetry,
 ) -> String {
-    let used = telemetry
+    let call = telemetry
         .last_calls
         .get(&tab.current_agent)
-        .filter(|call| call.requested_model == tab.effective_model)
-        .and_then(|call| call.context_tokens);
+        .filter(|call| call.requested_model == tab.effective_model);
+    let used = call.and_then(|call| call.context_tokens);
     let percentage = match used {
         Some(n) if tab.context_budget > 0 => {
             format!(
@@ -82,7 +82,17 @@ fn context_segment(
     };
     let used = used.map_or_else(
         || "unknown".to_string(),
-        |n| format!("~{}", human_tokens(u64::from(n))),
+        |n| {
+            format!(
+                "{}{}",
+                if call.is_some_and(|call| call.context_estimated) {
+                    "~"
+                } else {
+                    ""
+                },
+                human_tokens(u64::from(n))
+            )
+        },
     );
     let max = if tab.context_budget == 0 {
         "unknown".to_string()
@@ -620,29 +630,61 @@ pub(super) fn ui_chat(f: &mut ratatui::Frame, app: &mut App, ext_segments: &[Str
     };
     let usage_segment = {
         let totals = &telemetry.totals;
-        let (prompt, completion, cached) = (
-            totals.prompt_tokens,
-            totals.completion_tokens,
-            totals.cached_tokens,
-        );
-        let (cost, saw_cost, calls) = (totals.cost_usd, totals.cost_reported, totals.calls);
-        if calls == 0 {
+        if totals.calls == 0 {
             String::new()
         } else {
-            let pct = if prompt > 0 {
-                (cached as f64 / prompt as f64 * 100.0).round() as u64
+            let prompt = totals.prompt_tokens + totals.estimated.prompt_tokens;
+            let completion = totals.completion_tokens + totals.estimated.completion_tokens;
+            let partial = totals.coverage.prompt_reported + totals.coverage.prompt_estimated
+                < totals.calls
+                || totals.coverage.completion_reported + totals.coverage.completion_estimated
+                    < totals.calls;
+            let approximate =
+                totals.coverage.prompt_estimated > 0 || totals.coverage.completion_estimated > 0;
+            let cache = if totals.coverage.cached_reported == totals.calls {
+                if prompt > 0 {
+                    format!(
+                        "{}% cached",
+                        (totals.cached_tokens as f64 / prompt as f64 * 100.0).round() as u64
+                    )
+                } else {
+                    "cache unknown".into()
+                }
+            } else if totals.coverage.cached_reported == 0 {
+                "cache unknown".into()
             } else {
-                0
+                "cache partial".into()
             };
-            let cost_part = if saw_cost {
-                format!(" • ${cost:.4}")
+            let prompt = if totals.coverage.prompt_reported + totals.coverage.prompt_estimated == 0
+            {
+                "unknown".into()
             } else {
-                String::new()
+                human_tokens(prompt)
+            };
+            let completion = if totals.coverage.completion_reported
+                + totals.coverage.completion_estimated
+                == 0
+            {
+                "unknown".into()
+            } else {
+                human_tokens(completion)
             };
             format!(
-                " | {}/{} tok • {pct}% cached{cost_part}",
-                human_tokens(prompt),
-                human_tokens(completion)
+                " | {}{}/{} tok{}{} • {cache} • {}",
+                if approximate { "~" } else { "" },
+                prompt,
+                completion,
+                if partial { " partial" } else { "" },
+                if approximate {
+                    format!(
+                        " ({}/{} reported)",
+                        human_tokens(totals.prompt_tokens),
+                        human_tokens(totals.completion_tokens)
+                    )
+                } else {
+                    String::new()
+                },
+                totals.cost_text()
             )
         }
     };
@@ -2258,7 +2300,7 @@ mod chat_frame_tests {
         other.metadata.as_mut().unwrap().context_tokens = Some(900_000);
         tab.entries.push(other);
         let screen = draw(&mut app, 100, 16).0.join("\n");
-        assert!(screen.contains("ctx ~12.3k/1.1M (1.2%) tok"), "{screen}");
+        assert!(screen.contains("ctx 12.3k/1.1M (1.2%) tok"), "{screen}");
 
         app.active_mut().entries[0]
             .metadata
@@ -2267,7 +2309,7 @@ mod chat_frame_tests {
             .context_tokens = Some(57_000);
         app.active_mut().context_budget = 1_000_000;
         let screen = draw(&mut app, 100, 16).0.join("\n");
-        assert!(screen.contains("ctx ~57k/1M (5.7%) tok"), "{screen}");
+        assert!(screen.contains("ctx 57k/1M (5.7%) tok"), "{screen}");
 
         // New model, same session: don't pair its budget with an old count.
         app.active_mut().effective_model = "small-model".into();
@@ -2281,11 +2323,11 @@ mod chat_frame_tests {
         app.active_mut().entries.push(latest);
         app.active_mut().context_budget = 16_000;
         let screen = draw(&mut app, 80, 16).0.join("\n");
-        assert!(screen.contains("ctx ~20k/16k (125.0%) tok"), "{screen}");
+        assert!(screen.contains("ctx 20k/16k (125.0%) tok"), "{screen}");
         // A known count without a budget cannot produce a percentage.
         app.active_mut().context_budget = 0;
         let screen = draw(&mut app, 80, 16).0.join("\n");
-        assert!(screen.contains("ctx ~20k/unknown tok"), "{screen}");
+        assert!(screen.contains("ctx 20k/unknown tok"), "{screen}");
         app.active_mut().context_budget = 16_000;
         // Missing/zero usage on the latest message must not resurrect older data.
         app.active_mut()

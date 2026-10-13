@@ -47,7 +47,7 @@ The TUI has four main pieces:
    session shows `agent: <name> | model: <model>`; a multi-agent session lists
    the whole roster with the host marked `*` and each agent's model
    (`agents: alpha*→opus, beta→haiku`), collapsing to a count if it would
-   overflow. `ctx ~<used>/<max> (<percent>%) tok` shows the host's last reported input
+   overflow. `ctx <used>/<max> (<percent>%) tok` shows the host's last reported input
    count, effective input budget, and occupancy percentage (see [Context usage](#context-usage)).
    After the agent/model comes the session's
    running token totals and cost (`<prompt>/<completion> tok • <cached>% cached
@@ -60,23 +60,25 @@ An ordinary launch opens the [session hub](#session-hub) rather than any convers
 
 ## Context usage
 
-The status bar's `ctx ~57k/1M (5.7%) tok` pair is separate from the running
-prompt/completion totals. The numerator is the **host agent's last observed LLM
-call's reported prompt tokens**, not the sum of every tool-loop call.
-It updates during tool iterations and when terminal provider usage arrives,
-even if the final reply is still pending. Token/cache/cost totals include
-reported calls from all agents; finalizing a turn does not count them again.
-`~` marks an estimate of current occupancy: the last call does not include
-subsequent messages or a freshly rebuilt system prompt.
-Chaz does not manufacture a count from a percentage or locally estimate a
-missing provider count. `unknown` means no usable count is available (including
-missing/zero usage or a last call requested through a different model).
-A requested alias and its returned wire model are distinct: a call requested
-as `gpt-sol-latest` can report `gpt-6.1-sol` without losing its occupancy count.
-Changing the requested model still invalidates the old numerator.
-Cache reads and cost come only from provider reports, never local tokenization.
-Scheduled turns still use the legacy event adapter; their usage appears when
-the final reply is recorded, not after each call.
+The status bar's `ctx 57k/1M (5.7%) tok` pair is separate from running
+prompt/completion totals. It uses the host agent's latest call, not the sum of
+all tool-loop inputs. While a request is held, Chaz estimates its actual
+projected messages and tool definitions locally. A reported input count replaces
+that estimate, including a reported zero. `~` on the context numerator identifies local token counting rather than a
+provider report. Neither count includes messages arriving after that call.
+
+The token and cost totals share accounting with `/costs` and `chaz usage`.
+They include all agents, interactive and scheduled calls, and survive later
+errors, `no_reply`, stops and reopening. A final reply never adds those calls
+again. `~` on totals or cost marks local fallback data; cost shows the reported
+and estimated portions separately. `partial` means some data remains unknown.
+Missing cache reports are not shown as zero cache hits.
+
+Requested aliases and returned wire models are distinct. A request for
+`gpt-sol-latest` can return `gpt-6.1-sol` without losing its context count.
+Changing the requested model invalidates the previous numerator. Cost estimates
+use only configured or already cached prices for the matching model; an alias's
+price is not guessed for a different wire model. See [usage coverage](usage.md#reported-estimated-and-unknown).
 
 Counts use rounded `k`/`M` suffixes, omitting a redundant `.0`.
 The percentage is calculated from the unrounded counts and shown only when
@@ -94,15 +96,15 @@ For example:
 1. Select a model advertising a 1,050,000-token window via `/models` → select a scope → `Enter`.
    Before a response, the bar shows `ctx unknown/1.1M tok`.
 2. Send a message that uses tools. If a call reports 12,345 prompt tokens,
-   it shows `ctx ~12.3k/1.1M (1.2%) tok` while the turn is still running.
+   it shows `ctx 12.3k/1.1M (1.2%) tok` while the turn is still running.
    If the next call reports 20,000 input tokens, the pair becomes
-   `ctx ~20k/1.1M (1.9%) tok`; the session input total includes both calls.
+   `ctx 20k/1.1M (1.9%) tok`; the session input total includes both calls.
    No keystroke is needed to redraw, and the final reply does not add those
    calls a second time.
 3. Switch to a 32,000-token model. Until that model replies, the old model's
    count is not reused: `ctx unknown/32k tok`.
-4. If the provider omits usage, it remains `unknown`; a later response with
-   usage restores the numerator. An agent cap of 16,000 changes the denominator
+4. While the request is pending, the numerator is locally estimated. If the
+   provider omits usage, that estimate remains; a later report replaces it. An agent cap of 16,000 changes the denominator
    to `16k`, including after reopening the session.
 5. If a later call fails or you stop the turn, already reported usage remains
    recorded. Reopening or reconnecting reloads it from the session; during a

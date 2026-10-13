@@ -1912,3 +1912,82 @@ async fn resumed_wait_projects_restored_exchanges_with_current_scope() {
         }
     }
 }
+
+#[tokio::test]
+async fn telemetry_counts_projected_request_while_held_and_replaces_with_reported_zero() {
+    struct Observer {
+        calls: Mutex<Vec<crate::session::usage::CallObservation>>,
+    }
+    impl RuntimeRecorder for Observer {
+        fn record<'a>(
+            &'a self,
+            _: RuntimeRecord,
+        ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn observe_call<'a>(
+            &'a self,
+            call: crate::session::usage::CallObservation,
+        ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+            self.calls.lock().unwrap().push(call);
+            Box::pin(async { Ok(()) })
+        }
+    }
+    let p = probe("shrink", |_, mut request| {
+        request.messages = vec![RuntimeMessage::User("small".into())];
+        request.tools.clear();
+        Ok(request)
+    });
+    let fx = Fixture::new(
+        &[&p],
+        &[grant("shrink", ProjectionAuthority::FullContext, true)],
+        &["shrink"],
+    )
+    .await;
+    fx.mock.push_text("observed output");
+    let gate = fx.mock.block_next_call();
+    let observer = Arc::new(Observer {
+        calls: Default::default(),
+    });
+    let runtime = fx.execute(
+        vec![RuntimeMessage::User(
+            "very large original request ".repeat(500),
+        )],
+        ModelCallScope {
+            request_budget_tokens: Some(4096),
+            ..Default::default()
+        },
+        observer.clone(),
+    );
+    tokio::pin!(runtime);
+    tokio::select! { _ = gate.wait_started() => {}, _ = &mut runtime => panic!("model must be held") }
+    let accepted = fx.calls().pop().unwrap();
+    let observation = observer.calls.lock().unwrap()[0].clone();
+    assert_eq!(
+        observation.input_tokens,
+        crate::context::estimate_request_tokens(&accepted.messages, &accepted.tools) as u64
+    );
+    assert!(observation.input_tokens < 20, "not the discarded baseline");
+    assert_eq!(observation.request_budget_tokens, Some(4096));
+    assert_eq!(observation.output_tokens, None, "no unseen output estimate");
+    gate.release();
+    runtime.await.unwrap();
+    let observations = observer.calls.lock().unwrap();
+    assert_eq!(observations.len(), 2);
+    assert_eq!(
+        observations[0].model_sequence,
+        observations[1].model_sequence
+    );
+    assert_eq!(observations[0].timestamp, observations[1].timestamp);
+    assert!(observations[1].responded);
+    assert!(observations[1].output_tokens.unwrap() > 0);
+    assert_eq!(
+        observations[1]
+            .metadata
+            .as_ref()
+            .unwrap()
+            .usage
+            .prompt_tokens,
+        0
+    );
+}
