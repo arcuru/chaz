@@ -516,6 +516,9 @@ impl TurnCancel {
 pub enum TurnError {
     /// The turn failed; the message says why.
     Failed(String),
+    /// A native continuation cannot run on this target. Keep its attempt and
+    /// checkpoint interrupted, rather than settling it as a failed turn.
+    ContinuationHeld(String),
     /// The turn was stopped at the user's request. `metadata` covers the
     /// model calls that completed before the stop.
     Cancelled { metadata: Option<ResponseMetadata> },
@@ -536,7 +539,9 @@ impl From<&str> for TurnError {
 impl std::fmt::Display for TurnError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            TurnError::Failed(message) => f.write_str(message),
+            TurnError::Failed(message) | TurnError::ContinuationHeld(message) => {
+                f.write_str(message)
+            }
             TurnError::Cancelled { .. } => f.write_str("turn cancelled"),
         }
     }
@@ -1222,6 +1227,13 @@ async fn run_turn(
     resume: Option<RuntimeResume>,
     scope: ModelCallScope,
 ) -> Result<RuntimeOutcome, TurnError> {
+    let resolved_model = backend.resolve_model_name(model);
+    if let Some(resume) = &resume {
+        // Before capability errors, projector/hooks, approval, observation or retirement.
+        backend
+            .validate_pending_replay(model, &resolved_model, &resume.prior_messages)
+            .map_err(|error| TurnError::ContinuationHeld(error.to_string()))?;
+    }
     let tools = &tool_ctx.tools;
     let supports_tools = backend
         .try_supports_tools_for_model(model)
@@ -1247,7 +1259,6 @@ async fn run_turn(
     };
     let scoped_backend = backend.for_session(&session_id, &caller);
     let backend = &scoped_backend;
-    let resolved_model = backend.resolve_model_name(model);
     let max_retries = backend.max_retries_for_model(model);
     let mut acc = MetadataAccumulator::default();
     let mut model_sequence = 0;

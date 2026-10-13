@@ -821,7 +821,14 @@ fn convert_runtime_messages(messages: &[RuntimeMessage]) -> Vec<ChatMessage> {
                 tool_call_id: None,
                 extra: provider_extra
                     .iter()
-                    .filter(|(key, _)| key.as_str() != crate::responses::OUTPUT_ITEMS)
+                    .filter(|(key, _)| {
+                        !matches!(
+                            key.as_str(),
+                            crate::responses::OUTPUT_ITEMS
+                                | crate::responses::REPLAY_ORIGIN
+                                | crate::responses::ENTRY_PROVENANCE
+                        )
+                    })
                     .map(|(key, value)| (key.clone(), value.clone()))
                     .collect(),
             },

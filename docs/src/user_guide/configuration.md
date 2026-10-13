@@ -400,12 +400,27 @@ A model override works whether its ID appears in the live catalog or only in YAM
 Models discovered without an override, or supplied manually, use the backend default.
 
 These settings live in the executor's YAML and take effect after restart.
-They do not change agent defaults stored in AgentDb, the model selected for a session, or model naming: one backend uses raw IDs, multiple backends still use `backend:model`.
+Changing only `api` on an existing model row does not change agent defaults stored in AgentDb, the model selected for a session, or model naming: one backend uses raw IDs, multiple backends still use `backend:model`.
 Discovery continues through the backend type's catalog endpoint using the same credentials, even when its request API is set to Responses.
+
+### Favorites are also the default list
+
+`models` is the configured favorites/default list, not a separate API override map.
+The first model of the first backend remains the implicit default for unpinned
+calls, including `/compact`, which does not inherit the session's selected model.
+Discovery supplies neither a default nor a durable offline catalog; when catalog
+loading fails, the picker retains the YAML favorites and shows the fetch error.
+Edit matching model rows in place, preserve the first/default row and other
+favorites, and do not append duplicate rows to override earlier ones: the first
+exact match wins.
+Replacing the list with only a Responses row, or reordering it, can therefore
+change the effective fallback model and protocol even with pinned agents.
 
 ### Walkthrough: one connection, two API choices
 
-1. Keep a single provider connection and declare only the overrides you need:
+1. Keep a single provider connection and edit the desired existing model row in place.
+   Retain its default row, other favorites and their ordering; this fragment is
+   not a replacement catalog:
 
    ```yaml
    backends:
@@ -424,6 +439,11 @@ Discovery continues through the backend type's catalog endpoint using the same c
    Its requests use `/v1/chat/completions`.
    The IDs remain `example/chat-model` and `example/response-model`, not `proxy:example/chat-model`.
    Any additional IDs discovered from `/v1/models` also use Chat Completions unless explicitly overridden.
+   With this order, unpinned calls and `/compact` still use `example/chat-model`,
+   even after selecting the Responses model for the session.
+   If `/v1/models` is unavailable, the picker shows its fetch error and both
+   configured favorites remain selectable; restore discovery and reopen the
+   picker to add live catalog entries without changing the default.
 
 3. Select `example/response-model` to send requests to `/v1/responses`.
    Its model ID and credentials remain unchanged.
@@ -674,15 +694,17 @@ family's default.
 | `backends[].models[].api: responses`   | Select the native Responses client for this exact model ID.                                                                           |
 | `backends[].models[].reasoning.effort` | Send `none`, `minimal`, `low`, `medium`, `high` or `xhigh`; `max` is rejected before sending. Provider/model support may be narrower. |
 | `backends[].max_tokens`                | Send an optional `max_output_tokens` ceiling; omission leaves the provider default.                                                   |
-| Conversation storage                   | Use stateless requests (`store: false`) and replay retained output, including encrypted reasoning.                                    |
+| Conversation storage                   | Use stateless requests (`store: false`); replay opaque output only for the same API, requested raw model and connection origin.       |
 | Cache identity                         | Send an opaque `prompt_cache_key` scoped to the caller, connection and persisted session.                                             |
 | Cache accounting                       | Record the returned `usage.input_tokens_details.cached_tokens`; zero is a reported miss, absence or malformed data is unknown.        |
+| Completed model switches               | Convert only retained visible text and complete real call/result pairs; unsupported history refuses before HTTP.                      |
+| Pending waits                          | Changed or unknown origin refuses before wait observation, approval or further effects.                                               |
 
 ### What survives a restart
 
 The session holds complete ordered native output in its durable transcript;
 terminal text output also travels with the final entry's metadata.
-Chaz replays those items in order, followed by each tool's
+On the same origin, Chaz replays those items in order, followed by each tool's
 `function_call_output` using the original `call_id`.
 Reasoning items are not flattened into text or reconstructed from a summary.
 Existing context budgets and explicit compaction still determine which history
@@ -690,6 +712,29 @@ is retained in a request.
 An interrupted tool batch stays held unless it meets the existing pending-wait
 recovery contract; Chaz does not invent a missing tool result.
 See [durable turn recovery](../architecture/sessions.md#durable-turn-recovery).
+
+### Switching models is not transferring provider state
+
+Host-owned replay origin records the effective API and requested raw model,
+not the provider-returned alias, plus an opaque connection digest.
+The digest binds the peer-local credential store, connection name, normalized
+endpoint and credential namespace/value without exposing them in history or
+requests.
+Changing the endpoint, namespace or credential after reopening a session is
+not a compatible origin, even if the model ID and connection display name match.
+Missing legacy origin is unknown, never assumed compatible.
+Context projectors cannot change this origin independently of the native output.
+
+For completed foreign or legacy history, Chaz constructs a request-only view
+from retained visible assistant text and complete, unambiguous real function
+call/result pairs.
+Foreign reasoning and native item IDs are not forwarded; the stored transcript
+is never rewritten and earlier effects are not rerun.
+Unknown provider output, non-text content, incomplete results or unsupported
+ordering instead produce a conversion error before HTTP.
+A pending native wait is stricter: restore its original API/model/connection
+before resuming, or explicitly interrupt it after inspecting the turn.
+Changing targets cannot reinterpret or retire that checkpoint.
 
 Runtime calls in the same persisted session reuse the cache key across turns
 and restarts on the same caller and connection.
@@ -729,3 +774,23 @@ The existing usage ledger and TUI consume the normalized token counts.
    If the gateway rejects `/responses` itself, correct the endpoint or the
    model's explicit API setting; Chaz does not hide that rejection by sending
    a Chat request.
+
+4. After a completed turn, select a different Responses model.
+   Portable visible history and real tool results continue without the old
+   model's encrypted reasoning or native item IDs.
+   If history contains an unsupported provider action, a representative error is:
+
+   ```text
+   Invalid request: Cannot convert Responses history: unknown provider output item. Restore the original model/connection or start a new session; the transcript is unchanged
+   ```
+
+   Restore the original target to keep native replay, or start a new session.
+   For a checkpointed native wait, switching models instead reports:
+
+   ```text
+   Invalid request: Pending Responses continuation has an incompatible or unknown origin; restore the original API, requested model and connection before resuming, or explicitly interrupt the turn. No wait or tool effect was run
+   ```
+
+   Restore the original configuration and inspect `/interrupted` before
+   explicitly resuming/retrying; do not treat the refusal as permission to
+   repeat effects from an interrupted tool batch.

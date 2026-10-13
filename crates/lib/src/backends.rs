@@ -644,6 +644,42 @@ impl BackendManager {
         resolved
     }
 
+    /// Native pending continuations are not completed history: never reinterpret
+    /// their in-progress exchange, even when visible conversion would be possible.
+    pub(crate) fn validate_pending_replay(
+        &self,
+        model: Option<&str>,
+        resolved_model: &str,
+        messages: &[RuntimeMessage],
+    ) -> Result<(), LlmError> {
+        for message in messages {
+            let (RuntimeMessage::AssistantWithExtra { provider_extra, .. }
+            | RuntimeMessage::AssistantToolCalls { provider_extra, .. }) = message
+            else {
+                continue;
+            };
+            if !provider_extra.contains_key(crate::responses::OUTPUT_ITEMS) {
+                continue;
+            }
+            let compatible = !self.backends.is_empty() && self.mock.is_none() && {
+                let backend = self.select_backend_for_model(model);
+                crate::responses::ReplayOrigin::new(
+                    backend,
+                    &self.secrets,
+                    resolved_model,
+                    backend.api_for_model(resolved_model),
+                )
+                .matches(provider_extra)
+            };
+            if !compatible {
+                return Err(LlmError::InvalidRequest {
+                    message: "Pending Responses continuation has an incompatible or unknown origin; restore the original API, requested model and connection before resuming, or explicitly interrupt the turn. No wait or tool effect was run".into(),
+                });
+            }
+        }
+        Ok(())
+    }
+
     /// Maximum retry attempts for transient errors on the backend for the given model.
     pub fn max_retries_for_model(&self, model: Option<&str>) -> u32 {
         if self.backends.is_empty() {
@@ -692,7 +728,11 @@ impl BackendManager {
             .session_scope
             .as_ref()
             .map(|(session, caller)| self.secrets.session_cache_key(session, caller, backend));
-        BackendClient::for_model(backend, &self.secrets, resolved_model)?
+        let client = BackendClient::for_model(backend, &self.secrets, resolved_model)?;
+        if backend.api_for_model(resolved_model) != ModelApi::Responses {
+            crate::responses::validate_foreign_history(messages)?;
+        }
+        client
             .chat_with_cache(messages, tools, resolved_model, cache, key.as_deref())
             .await
     }

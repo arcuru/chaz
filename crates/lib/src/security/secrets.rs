@@ -96,6 +96,26 @@ impl SecretStore {
             .to_string()
     }
 
+    /// Non-secret, peer-local connection boundary for opaque provider replay.
+    /// Endpoint, namespace or credential changes conservatively break compatibility.
+    pub(crate) fn replay_connection_scope(
+        &self,
+        backend: &crate::config::Backend,
+        credential: Option<&str>,
+    ) -> String {
+        let scope = serde_json::json!([
+            "chaz-responses-origin-v1",
+            self.database.root_id().to_string(),
+            backend.get_name(),
+            backend.api_base.as_deref().map(|s| s.trim_end_matches('/')),
+            backend.api_key_ref,
+            credential,
+        ]);
+        blake3::hash(scope.to_string().as_bytes())
+            .to_hex()
+            .to_string()
+    }
+
     /// Look up a secret by reference ID. Sync — reads from in-memory cache.
     pub fn get(&self, id: &str) -> Option<String> {
         self.cache

@@ -151,9 +151,26 @@ The Responses request appends that envelope as user context after the original
 items, preserving delivery state without rewriting provider output.
 Other APIs use the rendered assistant text as before.
 Tool IDs use `call_id`, not the output item's `id`.
-The adapter replays every retained item, including encrypted reasoning, before
+For compatible origins, the adapter replays every retained item, including encrypted reasoning, before
 appending correlated `function_call_output` items.
-Pending-wait resume reuses the same provider data from its durable transcript.
+The host stamps `chaz_responses_origin` alongside ordered output and terminal
+metadata: version, effective API, requested raw model and a non-secret digest of
+the peer-local credential store, connection name, normalized endpoint and
+credential namespace/value.
+Provider-returned model aliases and session cache keys do not establish replay
+compatibility.
+Hydration retains the origin in the same immutable `provider_extra` map as output,
+so required projector alteration refuses and optional alteration is skipped.
+Completed foreign or unknown-origin records may convert only retained visible
+text and complete, uniquely paired function calls/results.
+Unknown provider items, non-text output, interleaving or missing/ambiguous results
+refuse before HTTP; conversion changes only the request view.
+Other API clients preflight this conversion too, and never forward host origin.
+Pending-wait resume validates every native response in the checkpointed attempt
+against the current target before hooks, approval, observation or checkpoint
+retirement.
+Incompatible or unknown origins hold the wait with an actionable error, without
+rerunning earlier effects or fabricating results.
 
 Each runtime entry point clones the backend manager into a persisted-session
 scope, including resumed turns.

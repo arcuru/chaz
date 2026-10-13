@@ -498,6 +498,14 @@ impl<'a> ContextBuilder<'a> {
                                 crate::responses::OUTPUT_ITEMS.into(),
                                 items.clone(),
                             )]);
+                            if let Some(origin) = entry
+                                .metadata
+                                .as_ref()
+                                .and_then(|m| m.extra.get(crate::responses::REPLAY_ORIGIN))
+                            {
+                                provider_extra
+                                    .insert(crate::responses::REPLAY_ORIGIN.into(), origin.clone());
+                            }
                             if text != entry.content {
                                 provider_extra.insert(
                                     crate::responses::ENTRY_PROVENANCE.into(),

@@ -69,6 +69,15 @@ async fn ordered_wire_replay_keeps_every_item_and_call_id() {
         .and(path("/v1/responses"))
         .and(header("authorization", "Bearer test-only-token"))
         .respond_with(ResponseTemplate::new(200).set_body_json(response(output())))
+        .with_priority(1)
+        .up_to_n_times(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(response(final_output())))
+        .with_priority(2)
         .expect(1)
         .mount(&server)
         .await;
@@ -160,7 +169,10 @@ async fn ordered_wire_replay_keeps_every_item_and_call_id() {
         content,
         provider_extra,
         metadata,
-    } = parse(response(final_output())).unwrap()
+    } = client
+        .chat_with_tools(&messages, &[], "test-model", Some("opaque-key"))
+        .await
+        .unwrap()
     else {
         panic!("expected text")
     };

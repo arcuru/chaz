@@ -6,7 +6,7 @@ use serde_json::{Map, Value, json};
 
 use crate::{
     backends::{ChatContext, LLMBackend, MessageRole, ModelInfo},
-    config::{Backend, ReasoningConfig, ReasoningEffort},
+    config::{Backend, ModelApi, ReasoningConfig, ReasoningEffort},
     error::LlmError,
     openai::OpenAI,
     runtime::{LLMResponse, ResponseMetadata, RuntimeMessage, TokenUsage, ToolCallRequest},
@@ -15,6 +15,56 @@ use crate::{
 };
 
 pub(crate) const OUTPUT_ITEMS: &str = "openai_responses_output";
+pub(crate) const REPLAY_ORIGIN: &str = "chaz_responses_origin";
+
+/// Host-owned replay boundary, not the provider's returned alias or a session cache key.
+/// The connection digest contains no reusable credential or private host identifier.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ReplayOrigin {
+    version: u8,
+    api: String,
+    requested_model: String,
+    connection: String,
+}
+
+impl ReplayOrigin {
+    pub(crate) fn new(
+        backend: &Backend,
+        secrets: &SecretStore,
+        model: &str,
+        api: ModelApi,
+    ) -> Self {
+        let credential = backend
+            .api_key_ref
+            .as_ref()
+            .and_then(|r| secrets.get(r))
+            .or_else(|| backend.api_key.clone());
+        Self::with_credential(backend, secrets, model, api, credential.as_deref())
+    }
+
+    fn with_credential(
+        backend: &Backend,
+        secrets: &SecretStore,
+        model: &str,
+        api: ModelApi,
+        credential: Option<&str>,
+    ) -> Self {
+        Self {
+            version: 1,
+            api: api.as_str().into(),
+            requested_model: model.into(),
+            connection: secrets.replay_connection_scope(backend, credential),
+        }
+    }
+
+    pub(crate) fn matches(&self, extra: &Map<String, Value>) -> bool {
+        extra
+            .get(REPLAY_ORIGIN)
+            .and_then(|v| serde_json::from_value::<Self>(v.clone()).ok())
+            .is_some_and(|origin| origin == *self)
+    }
+}
 /// Host-rendered routing context, kept separate from immutable native output.
 pub(crate) const ENTRY_PROVENANCE: &str = "chaz_entry_provenance";
 
@@ -87,12 +137,30 @@ impl Responses {
         true
     }
 
+    #[cfg(test)]
     fn request<'a>(
         &self,
         messages: &[RuntimeMessage],
         tools: &[ToolDefinition],
         model: &'a str,
         prompt_cache_key: Option<&'a str>,
+    ) -> Result<Request<'a>, LlmError> {
+        self.request_with_origin(
+            messages,
+            tools,
+            model,
+            prompt_cache_key,
+            &ReplayOrigin::new(&self.backend, &self.secrets, model, ModelApi::Responses),
+        )
+    }
+
+    fn request_with_origin<'a>(
+        &self,
+        messages: &[RuntimeMessage],
+        tools: &[ToolDefinition],
+        model: &'a str,
+        prompt_cache_key: Option<&'a str>,
+        origin: &ReplayOrigin,
     ) -> Result<Request<'a>, LlmError> {
         let reasoning = self
             .backend
@@ -112,7 +180,7 @@ impl Responses {
         }
         let mut instructions = Vec::new();
         let mut input = Vec::new();
-        for message in messages {
+        for (index, message) in messages.iter().enumerate() {
             match message {
                 RuntimeMessage::System(text) if input.is_empty() => {
                     instructions.push(text.as_str())
@@ -126,21 +194,18 @@ impl Responses {
                     "content": [{"type": "input_text", "text": text}]
                 })),
                 RuntimeMessage::Assistant(text) => input.push(assistant_message(text)),
-                RuntimeMessage::AssistantWithExtra {
-                    content,
-                    provider_extra,
-                    ..
-                }
-                | RuntimeMessage::AssistantToolCalls {
-                    content,
-                    provider_extra,
-                    ..
-                } => {
+                RuntimeMessage::AssistantWithExtra { provider_extra, .. }
+                | RuntimeMessage::AssistantToolCalls { provider_extra, .. } => {
                     if let Some(items) = provider_extra.get(OUTPUT_ITEMS) {
                         let items = items.as_array().ok_or_else(|| LlmError::InvalidRequest {
                             message: "Invalid persisted Responses output items".into(),
                         })?;
-                        input.extend(items.iter().cloned());
+                        if origin.matches(provider_extra) {
+                            input.extend(items.iter().cloned());
+                        } else {
+                            validate_portable_output(items, message, messages, index)?;
+                            append_visible_message(&mut input, message);
+                        }
                         if let Some(envelope) = provider_extra.get(ENTRY_PROVENANCE) {
                             // Native output must stay unchanged, but it cannot
                             // replace the host's local/bridge delivery context.
@@ -152,15 +217,7 @@ impl Responses {
                                 "content":[{"type":"input_text", "text":envelope}]}));
                         }
                     } else {
-                        if let Some(text) = content.as_ref().filter(|s| !s.is_empty()) {
-                            input.push(assistant_message(text));
-                        }
-                        if let RuntimeMessage::AssistantToolCalls { tool_calls, .. } = message {
-                            for call in tool_calls {
-                                input.push(json!({"type": "function_call", "call_id": call.id,
-                                    "name": call.name, "arguments": call.arguments}));
-                            }
-                        }
+                        append_visible_message(&mut input, message);
                     }
                 }
                 RuntimeMessage::ToolResult { call_id, content } => input.push(json!({
@@ -197,7 +254,6 @@ impl Responses {
         model: &str,
         prompt_cache_key: Option<&str>,
     ) -> Result<LLMResponse, LlmError> {
-        let request = self.request(messages, tools, model, prompt_cache_key)?;
         let api_key = self
             .backend
             .api_key_ref
@@ -207,6 +263,15 @@ impl Responses {
             .ok_or_else(|| LlmError::Configuration {
                 message: "API key not configured".into(),
             })?;
+        let origin = ReplayOrigin::with_credential(
+            &self.backend,
+            &self.secrets,
+            model,
+            ModelApi::Responses,
+            Some(&api_key),
+        );
+        let request =
+            self.request_with_origin(messages, tools, model, prompt_cache_key, &origin)?;
         let api_base = self
             .backend
             .api_base
@@ -249,7 +314,26 @@ impl Responses {
             serde_json::from_slice::<Response>(&body).map_err(|e| LlmError::InvalidRequest {
                 message: format!("decode Responses response: {e}"),
             })?;
-        parse_response(response, model)
+        let mut result = parse_response(response, model)?;
+        let origin = json!(origin);
+        let (provider_extra, metadata) = match &mut result {
+            LLMResponse::Text {
+                provider_extra,
+                metadata,
+                ..
+            }
+            | LLMResponse::ToolCalls {
+                provider_extra,
+                metadata,
+                ..
+            } => (provider_extra, metadata),
+        };
+        // Never accept provenance supplied by the remote response's flattened extras.
+        provider_extra.insert(REPLAY_ORIGIN.into(), origin.clone());
+        if let Some(metadata) = metadata {
+            metadata.extra.insert(REPLAY_ORIGIN.into(), origin);
+        }
+        Ok(result)
     }
 
     pub async fn execute(&self, context: &ChatContext) -> Result<String, LlmError> {
@@ -283,6 +367,156 @@ impl Responses {
             }),
         }
     }
+}
+
+fn append_visible_message(input: &mut Vec<Value>, message: &RuntimeMessage) {
+    let (RuntimeMessage::AssistantWithExtra { content, .. }
+    | RuntimeMessage::AssistantToolCalls { content, .. }) = message
+    else {
+        return;
+    };
+    if let Some(text) = content.as_ref().filter(|s| !s.is_empty()) {
+        input.push(assistant_message(text));
+    }
+    if let RuntimeMessage::AssistantToolCalls { tool_calls, .. } = message {
+        for call in tool_calls {
+            input.push(json!({"type": "function_call", "call_id": call.id,
+                "name": call.name, "arguments": call.arguments}));
+        }
+    }
+}
+
+fn conversion_error(reason: &str) -> LlmError {
+    LlmError::InvalidRequest {
+        message: format!(
+            "Cannot convert Responses history: {reason}. Restore the original model/connection or start a new session; the transcript is unchanged"
+        ),
+    }
+}
+
+pub(crate) fn validate_foreign_history(messages: &[RuntimeMessage]) -> Result<(), LlmError> {
+    for (index, message) in messages.iter().enumerate() {
+        let (RuntimeMessage::AssistantWithExtra { provider_extra, .. }
+        | RuntimeMessage::AssistantToolCalls { provider_extra, .. }) = message
+        else {
+            continue;
+        };
+        if let Some(items) = provider_extra.get(OUTPUT_ITEMS) {
+            let items = items
+                .as_array()
+                .ok_or_else(|| conversion_error("invalid persisted output items"))?;
+            validate_portable_output(items, message, messages, index)?;
+        }
+    }
+    Ok(())
+}
+
+/// Conversion is a request view only. Unknown provider actions, non-text output,
+/// incomplete or ambiguous exchanges have no demonstrated portable equivalent.
+fn validate_portable_output(
+    items: &[Value],
+    message: &RuntimeMessage,
+    messages: &[RuntimeMessage],
+    index: usize,
+) -> Result<(), LlmError> {
+    let mut native_calls = Vec::new();
+    for item in items {
+        if item
+            .get("status")
+            .is_some_and(|s| s.as_str() != Some("completed"))
+        {
+            return Err(conversion_error("output is not completed"));
+        }
+        match item.get("type").and_then(Value::as_str) {
+            Some("reasoning") => {} // Opaque reasoning has no portable meaning.
+            Some("message") => {
+                if item["role"] != "assistant" || !native_calls.is_empty() {
+                    return Err(conversion_error(
+                        "unsupported message role or interleaved output",
+                    ));
+                }
+                let content = item
+                    .get("content")
+                    .and_then(Value::as_array)
+                    .ok_or_else(|| conversion_error("invalid visible output"))?;
+                for part in content {
+                    let field = match part.get("type").and_then(Value::as_str) {
+                        Some("output_text") => "text",
+                        Some("refusal") => "refusal",
+                        _ => return Err(conversion_error("non-text output")),
+                    };
+                    if part.get(field).and_then(Value::as_str).is_none() {
+                        return Err(conversion_error("invalid visible text"));
+                    }
+                }
+            }
+            Some("function_call") => {
+                let string = |field| {
+                    item.get(field)
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| conversion_error("invalid function call"))
+                };
+                let arguments = string("arguments")?;
+                if !serde_json::from_str::<Value>(arguments).is_ok_and(|v| v.is_object()) {
+                    return Err(conversion_error("incomplete function arguments"));
+                }
+                native_calls.push(ToolCallRequest {
+                    id: string("call_id")?.into(),
+                    name: string("name")?.into(),
+                    arguments: arguments.into(),
+                });
+            }
+            _ => return Err(conversion_error("unknown provider output item")),
+        }
+    }
+    let (content, calls) = match message {
+        RuntimeMessage::AssistantToolCalls {
+            content,
+            tool_calls,
+            ..
+        } => (content, tool_calls.as_slice()),
+        RuntimeMessage::AssistantWithExtra { content, .. } => (content, &[][..]),
+        _ => unreachable!("native output is assistant data"),
+    };
+    if native_calls != calls {
+        return Err(conversion_error(
+            "retained calls do not match native output",
+        ));
+    }
+    if calls.is_empty() && content.as_ref().is_none_or(|s| s.is_empty()) {
+        return Err(conversion_error("no retained visible text"));
+    }
+    for (offset, call) in calls.iter().enumerate() {
+        if call.id.is_empty()
+            || call.name.is_empty()
+            || !matches!(messages.get(index + 1 + offset),
+            Some(RuntimeMessage::ToolResult { call_id, .. }) if call_id == &call.id)
+        {
+            return Err(conversion_error(
+                "function call lacks its complete recorded result",
+            ));
+        }
+        let made = messages
+            .iter()
+            .filter_map(|m| match m {
+                RuntimeMessage::AssistantToolCalls { tool_calls, .. } => Some(tool_calls),
+                _ => None,
+            })
+            .flatten()
+            .filter(|c| c.id == call.id)
+            .count();
+        let results = messages
+            .iter()
+            .filter(|m| {
+                matches!(m,
+            RuntimeMessage::ToolResult { call_id, .. } if call_id == &call.id)
+            })
+            .count();
+        if made != 1 || results != 1 {
+            return Err(conversion_error("ambiguous function call/result identity"));
+        }
+    }
+    Ok(())
 }
 
 fn assistant_message(text: &str) -> Value {
@@ -447,3 +681,6 @@ mod tests;
 
 #[cfg(test)]
 mod runtime_tests;
+
+#[cfg(test)]
+mod origin_tests;

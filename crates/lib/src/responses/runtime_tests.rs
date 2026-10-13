@@ -26,9 +26,9 @@ use wiremock::{
     matchers::{method, path},
 };
 
-struct Echo {
-    calls: Arc<AtomicUsize>,
-    name: &'static str,
+pub(super) struct Echo {
+    pub(super) calls: Arc<AtomicUsize>,
+    pub(super) name: &'static str,
 }
 impl Tool for Echo {
     fn descriptor(&self) -> ToolDescriptor {
@@ -53,10 +53,10 @@ impl Tool for Echo {
         })
     }
 }
-struct Recorder {
-    session: Arc<AsyncMutex<Session>>,
-    attempt: TurnAttempt,
-    sequence: Mutex<u64>,
+pub(super) struct Recorder {
+    pub(super) session: Arc<AsyncMutex<Session>>,
+    pub(super) attempt: TurnAttempt,
+    pub(super) sequence: Mutex<u64>,
 }
 impl RuntimeRecorder for Recorder {
     fn record<'a>(
@@ -121,7 +121,11 @@ impl RuntimeRecorder for Recorder {
         })
     }
 }
-fn entry(sender: &str, content: &str, metadata: Option<ResponseMetadata>) -> SessionEntry {
+pub(super) fn entry(
+    sender: &str,
+    content: &str,
+    metadata: Option<ResponseMetadata>,
+) -> SessionEntry {
     SessionEntry {
         sender: sender.into(),
         content: content.into(),
@@ -131,7 +135,7 @@ fn entry(sender: &str, content: &str, metadata: Option<ResponseMetadata>) -> Ses
         routing: None,
     }
 }
-async fn context(session: &Session) -> Vec<RuntimeMessage> {
+pub(super) async fn context(session: &Session) -> Vec<RuntimeMessage> {
     let (entries, history) = session.context_with_tool_history().await.unwrap();
     ContextBuilder::new(
         &entries,
@@ -147,7 +151,7 @@ async fn context(session: &Session) -> Vec<RuntimeMessage> {
     .await
     .messages
 }
-fn native_backend(base: &str) -> Backend {
+pub(super) fn native_backend(base: &str) -> Backend {
     let mut config = backend(base);
     config.models.as_mut().unwrap()[0].api = Some(ModelApi::Responses);
     config
@@ -317,14 +321,14 @@ async fn native_runtime_persists_full_replay_usage_and_identity_across_reopen() 
     );
 }
 
-#[tokio::test]
-async fn native_pending_wait_resume_preserves_items_and_never_reexecutes_prior_effects() {
+async fn pending_change(change: &str) {
     use crate::session::wait_resume::{JobWaitCheckpoint, plan_job_wait_resume};
     let server = MockServer::start().await;
+    let secrets = empty_secrets().await;
+    let config = native_backend(&server.uri());
     Mock::given(method("POST"))
         .and(path("/responses"))
         .respond_with(ResponseTemplate::new(200).set_body_json(response(final_output())))
-        .expect(1)
         .mount(&server)
         .await;
     let (_instance, session) = fresh_session().await;
@@ -341,19 +345,29 @@ async fn native_pending_wait_resume_preserves_items_and_never_reexecutes_prior_e
     items[4]["arguments"] = json!({"session_db_id":"child", "timeout_seconds":30})
         .to_string()
         .into();
+    Mock::given(method("POST"))
+        .and(path("/responses"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(response(items.clone())))
+        .with_priority(1)
+        .up_to_n_times(1)
+        .expect(1)
+        .mount(&server)
+        .await;
     let LLMResponse::ToolCalls {
         content,
         tool_calls,
-        provider_extra,
+        mut provider_extra,
         metadata,
-    } = parse_response(
-        serde_json::from_value(response(items.clone())).unwrap(),
-        "test-model",
-    )
-    .unwrap()
+    } = Responses::new(&config, &secrets)
+        .chat_with_tools(&[], &[], "test-model", None)
+        .await
+        .unwrap()
     else {
         panic!("calls")
     };
+    if change == "legacy" {
+        provider_extra.remove("chaz_responses_origin");
+    }
     let records = vec![
         TurnTranscriptRecord {
             request_id: attempt.request_id.clone(),
@@ -439,12 +453,28 @@ async fn native_pending_wait_resume_preserves_items_and_never_reexecutes_prior_e
         name: "job_wait",
     });
     let db_id = reopened.database().root_id().to_string();
-    let secrets = empty_secrets().await;
-    let config = native_backend(&server.uri());
-    let manager = BackendManager::new(&Some(vec![config.clone()]), secrets.clone());
+    let mut target = config.clone();
+    let model = if change == "model" {
+        "other-model"
+    } else {
+        "test-model"
+    };
+    match change {
+        "endpoint" => target.api_base = Some(format!("{}/changed", server.uri())),
+        "namespace" => target.api_key_ref = Some("other-namespace".into()),
+        "connection" => target.name = Some("east".into()),
+        "api" => target.models.as_mut().unwrap()[0].api = Some(ModelApi::ChatCompletions),
+        "incompatible-api" => {
+            target.models.as_mut().unwrap()[0].api = Some(ModelApi::AnthropicMessages)
+        }
+        "model" => target.api = Some(ModelApi::Responses),
+        "same" | "legacy" => {}
+        _ => panic!("unknown change"),
+    }
+    let manager = BackendManager::new(&Some(vec![target]), secrets.clone());
     let ctx = tool_context(Arc::new(AsyncMutex::new(reopened)), tools);
-    runtime::resume_with_recorder(
-        Some("test-model"),
+    let result = runtime::resume_with_recorder(
+        Some(model),
         vec![RuntimeMessage::User("question".into())],
         &manager,
         &permissive_security(),
@@ -453,15 +483,62 @@ async fn native_pending_wait_resume_preserves_items_and_never_reexecutes_prior_e
         None,
         None,
         None,
-        resume,
+        resume.clone(),
         ModelCallScope::default(),
     )
-    .await
-    .unwrap();
+    .await;
+    if change != "same" {
+        let error = result
+            .expect_err("incompatible pending continuation must refuse")
+            .to_string();
+        assert!(error.contains("Pending Responses continuation"), "{error}");
+        assert_eq!(prior.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            wait.load(Ordering::SeqCst),
+            0,
+            "refuse before observing/retiring the pending wait"
+        );
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            1,
+            "no resumed HTTP"
+        );
+        assert!(
+            ctx.session
+                .lock()
+                .await
+                .latest_job_wait_checkpoint(&attempt.attempt_id)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        if change == "legacy" {
+            return;
+        }
+        // Restoring the original target reuses the same checkpointed exchange.
+        let original = BackendManager::new(&Some(vec![config.clone()]), secrets.clone());
+        runtime::resume_with_recorder(
+            Some("test-model"),
+            vec![RuntimeMessage::User("question".into())],
+            &original,
+            &permissive_security(),
+            &ctx,
+            &ToolPolicyRegistry::empty(),
+            None,
+            None,
+            None,
+            resume,
+            ModelCallScope::default(),
+        )
+        .await
+        .unwrap();
+    } else {
+        result.unwrap();
+    }
     assert_eq!(prior.load(Ordering::SeqCst), 0);
     assert_eq!(wait.load(Ordering::SeqCst), 1);
     let requests = server.received_requests().await.unwrap();
-    let payload: Value = requests[0].body_json().unwrap();
+    let payload: Value = requests[1].body_json().unwrap();
     assert_eq!(&payload["input"].as_array().unwrap()[1..6], items);
     assert_eq!(payload["input"][6]["call_id"], "call1");
     assert!(
@@ -490,15 +567,55 @@ async fn native_pending_wait_resume_preserves_items_and_never_reexecutes_prior_e
 }
 
 #[tokio::test]
+async fn native_pending_wait_resume_preserves_items_and_never_reexecutes_prior_effects() {
+    pending_change("same").await;
+}
+#[tokio::test]
+async fn origin_pending_model_change() {
+    pending_change("model").await;
+}
+#[tokio::test]
+async fn origin_pending_connection_change() {
+    pending_change("connection").await;
+}
+#[tokio::test]
+async fn origin_pending_endpoint_change() {
+    pending_change("endpoint").await;
+}
+#[tokio::test]
+async fn origin_pending_namespace_change() {
+    pending_change("namespace").await;
+}
+#[tokio::test]
+async fn origin_pending_legacy_missing() {
+    pending_change("legacy").await;
+}
+#[tokio::test]
+async fn origin_pending_incompatible_api_change() {
+    pending_change("incompatible-api").await;
+}
+#[tokio::test]
+async fn origin_pending_api_change() {
+    pending_change("api").await;
+}
+
+#[tokio::test]
 async fn native_final_replay_keeps_bridge_provenance() {
     use crate::session::EntryRouting;
-    let config = native_backend("http://localhost/v1");
+    let server = MockServer::start().await;
+    let config = native_backend(&server.uri());
     let client = Responses::new(&config, &empty_secrets().await);
-    let LLMResponse::Text { metadata, .. } = parse_response(
-        serde_json::from_value(response(final_output())).unwrap(),
-        "test-model",
-    )
-    .unwrap() else {
+    Mock::given(method("POST"))
+        .and(path("/responses"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(response(final_output())))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let LLMResponse::Text { metadata, .. } = client
+        .chat_with_tools(&[], &[], "test-model", None)
+        .await
+        .unwrap()
+    else {
         panic!("text response")
     };
     for delivery in ["local", "pending", "sent"] {
