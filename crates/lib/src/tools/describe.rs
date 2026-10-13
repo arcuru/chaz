@@ -3,7 +3,7 @@ use serde_json::Value;
 use std::future::Future;
 use std::pin::Pin;
 
-/// Returns the full description and parameter schema for a tool in the agent's scope.
+/// Returns the description and a parameter summary for a tool in the agent's scope.
 ///
 /// Useful when tools are presented in `summary` or `brief` mode — the agent
 /// can call this to discover full details before invoking the tool.
@@ -13,7 +13,7 @@ impl Tool for DescribeTool {
     fn descriptor(&self) -> ToolDescriptor {
         ToolDescriptor {
             name: "describe_tool".to_string(),
-            description: "Get the full description and parameter schema for a tool. Use this to learn about tools before calling them.".to_string(),
+            description: "Get the description and parameter summary for a tool. Use this to learn about tools before calling them.".to_string(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -117,36 +117,9 @@ mod tests {
     use super::*;
     use crate::test_support::{fresh_session, tool_context};
     use crate::tool::{Tool, ToolError, ToolRegistry};
+    use serde_json::json;
     use std::pin::Pin;
     use std::sync::Arc;
-
-    /// Helper tool with one required and one optional parameter for verifying
-    /// the `Parameters:` section rendering.
-    struct TwoParamTool;
-    impl Tool for TwoParamTool {
-        fn descriptor(&self) -> ToolDescriptor {
-            ToolDescriptor {
-                name: "twop".to_string(),
-                description: "A tool with two params.".to_string(),
-                parameters: serde_json::json!({
-                    "type": "object",
-                    "properties": {
-                        "req": { "type": "string", "description": "required one" },
-                        "opt": { "type": "number" }
-                    },
-                    "required": ["req"]
-                }),
-            }
-        }
-        fn execute<'a>(
-            &'a self,
-            _arguments: Value,
-            _ctx: &'a ToolContext,
-        ) -> Pin<Box<dyn std::future::Future<Output = Result<String, ToolError>> + Send + 'a>>
-        {
-            Box::pin(async { Ok(String::new()) })
-        }
-    }
 
     struct SchemaTool(Value);
     impl Tool for SchemaTool {
@@ -154,10 +127,7 @@ mod tests {
             ToolDescriptor {
                 name: "schema".to_string(),
                 description: "Schema rendering fixture.".to_string(),
-                parameters: serde_json::json!({
-                    "type": "object",
-                    "properties": { "value": self.0 }
-                }),
+                parameters: self.0.clone(),
             }
         }
         fn execute<'a>(
@@ -165,27 +135,6 @@ mod tests {
             _arguments: Value,
             _ctx: &'a ToolContext,
         ) -> Pin<Box<dyn Future<Output = Result<String, ToolError>> + Send + 'a>> {
-            Box::pin(async { Ok(String::new()) })
-        }
-    }
-
-    /// Tool with no parameters; exercises the empty-properties branch
-    /// (no `Parameters:` section emitted).
-    struct NoParamTool;
-    impl Tool for NoParamTool {
-        fn descriptor(&self) -> ToolDescriptor {
-            ToolDescriptor {
-                name: "nop".to_string(),
-                description: "No params here.".to_string(),
-                parameters: serde_json::json!({ "type": "object", "properties": {} }),
-            }
-        }
-        fn execute<'a>(
-            &'a self,
-            _arguments: Value,
-            _ctx: &'a ToolContext,
-        ) -> Pin<Box<dyn std::future::Future<Output = Result<String, ToolError>> + Send + 'a>>
-        {
             Box::pin(async { Ok(String::new()) })
         }
     }
@@ -237,13 +186,21 @@ mod tests {
 
     #[tokio::test]
     async fn renders_parameters_with_required_and_optional_marker() {
-        let (_i, c) = ctx_with(vec![Box::new(TwoParamTool)]).await;
+        let (_i, c) = ctx_with(vec![Box::new(SchemaTool(json!({
+            "type": "object",
+            "properties": {
+                "req": { "type": "string", "description": "required one" },
+                "opt": { "type": "number" }
+            },
+            "required": ["req"]
+        })))])
+        .await;
         let out = DescribeTool
-            .execute(serde_json::json!({ "name": "twop" }), &c)
+            .execute(json!({ "name": "schema" }), &c)
             .await
             .unwrap();
-        assert!(out.starts_with("## twop"), "header line, got: {out}");
-        assert!(out.contains("A tool with two params."));
+        assert!(out.starts_with("## schema"), "header line, got: {out}");
+        assert!(out.contains("Schema rendering fixture."));
         assert!(out.contains("Parameters:"));
         assert!(
             out.contains("req (string, required): required one"),
@@ -273,7 +230,6 @@ mod tests {
 
     #[tokio::test]
     async fn renders_schema_types_and_falls_back_for_unknown_or_malformed_types() {
-        use serde_json::json;
         let cases = [
             (json!({}), "any"),
             (json!({ "type": null }), "any"),
@@ -294,14 +250,23 @@ mod tests {
             (json!({ "type": "array" }), "array"),
             (json!({ "type": "null" }), "null"),
         ];
-        for (schema, expected) in cases {
-            let (_i, c) = ctx_with(vec![Box::new(SchemaTool(schema.clone()))]).await;
-            let out = DescribeTool
-                .execute(json!({ "name": "schema" }), &c)
-                .await
-                .unwrap();
+        let properties: serde_json::Map<_, _> = cases
+            .iter()
+            .enumerate()
+            .map(|(i, (schema, _))| (format!("case_{i}"), schema.clone()))
+            .collect();
+        let (_i, c) = ctx_with(vec![Box::new(SchemaTool(json!({
+            "type": "object",
+            "properties": properties
+        })))])
+        .await;
+        let out = DescribeTool
+            .execute(json!({ "name": "schema" }), &c)
+            .await
+            .unwrap();
+        for (i, (schema, expected)) in cases.iter().enumerate() {
             assert!(
-                out.contains(&format!("value ({expected}, optional)")),
+                out.contains(&format!("case_{i} ({expected}, optional)")),
                 "schema {schema}: got {out}"
             );
         }
@@ -309,13 +274,17 @@ mod tests {
 
     #[tokio::test]
     async fn no_parameters_omits_parameters_section() {
-        let (_i, c) = ctx_with(vec![Box::new(NoParamTool)]).await;
+        let (_i, c) = ctx_with(vec![Box::new(SchemaTool(json!({
+            "type": "object",
+            "properties": {}
+        })))])
+        .await;
         let out = DescribeTool
-            .execute(serde_json::json!({ "name": "nop" }), &c)
+            .execute(json!({ "name": "schema" }), &c)
             .await
             .unwrap();
-        assert!(out.starts_with("## nop"));
-        assert!(out.contains("No params here."));
+        assert!(out.starts_with("## schema"));
+        assert!(out.contains("Schema rendering fixture."));
         assert!(
             !out.contains("Parameters:"),
             "expected no Parameters block, got: {out}"
