@@ -69,7 +69,7 @@ An ordinary launch opens the [session hub](#session-hub) rather than any convers
 | Click the `▸` / `▾` icon | Expand or collapse that entry                                                                             |
 | `Ctrl+T` or `/expand`    | Toggle expansion for all tool entries and directives                                                      |
 
-### Formatting is a view, not a rewrite
+## Formatting is a view, not a rewrite
 
 Messages use Markdown styling automatically. Links show their label and target;
 they do not launch a browser. Tool output is **not** Markdown, so shell syntax,

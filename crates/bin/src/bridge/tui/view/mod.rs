@@ -278,12 +278,10 @@ fn display_lines(content: &str, max_chars: Option<usize>) -> Vec<String> {
         }
         None => content,
     };
-    let out: Vec<String> = src.split('\n').map(content::safe_line).collect();
-    if out.is_empty() {
-        vec![String::new()]
-    } else {
-        out
-    }
+    src.replace("\r\n", "\n")
+        .split('\n')
+        .map(content::safe_line)
+        .collect()
 }
 
 pub(super) fn ui(
@@ -3025,6 +3023,71 @@ mod transcript_tests {
     }
 
     #[tokio::test]
+    async fn markdown_containers_restore_parent_indentation() {
+        let markdown = "10. parent\n\n    - child\n\n    continuation\n\n    > quote\n    >\n    > - quoted child\n\n    after quote\n\n11. sibling\n\noutside";
+        let (_instance, mut app) =
+            app_with(vec![entry("chaz", markdown, EntryType::Message)]).await;
+        app.active_mut().active_turns = 0;
+        let mut terminal = Terminal::new(TestBackend::new(64, 24)).unwrap();
+        terminal.draw(|f| ui_chat(f, &mut app, &[])).unwrap();
+        let drawn = rows(&terminal, 0, 24);
+        for expected in [
+            "  10. parent",
+            "      • child",
+            "      continuation",
+            "      │ quote",
+            "      │ • quoted child",
+            "      after quote",
+            "  11. sibling",
+            "  outside",
+        ] {
+            assert!(
+                drawn
+                    .iter()
+                    .any(|row| row.starts_with(&format!("│{expected}"))),
+                "missing indentation for {expected:?}: {drawn:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn crlf_markdown_and_tool_text_render_as_lines() {
+        let markdown = "# Report\r\n\r\n```text\r\n  C:\\new\\file\r\n```";
+        let (_instance, mut app) = app_with(vec![
+            entry("chaz", markdown, EntryType::Message),
+            entry(
+                "chaz",
+                "shell: one\r\n  two\nkeep \\r\\n",
+                EntryType::ToolResult,
+            ),
+        ])
+        .await;
+        app.active_mut().active_turns = 0;
+        app.expand_all = true;
+        let mut terminal = Terminal::new(TestBackend::new(64, 20)).unwrap();
+        terminal.draw(|f| ui_chat(f, &mut app, &[])).unwrap();
+        let drawn = rows(&terminal, 0, 20);
+        assert!(
+            drawn
+                .iter()
+                .any(|row| row.starts_with("│    C:\\new\\file"))
+        );
+        assert!(
+            drawn
+                .iter()
+                .any(|row| row.trim_matches(['│', ' ']) == "one")
+        );
+        assert!(
+            drawn
+                .iter()
+                .any(|row| row.trim_matches(['│', ' ']) == "two")
+        );
+        assert!(drawn.iter().any(|row| row.contains(r"keep \r\n")));
+        assert!(!drawn.iter().any(|row| row.contains("```")));
+        assert_eq!(app.active().entries[0].content, markdown);
+    }
+
+    #[tokio::test]
     async fn tool_output_shapes_reach_the_chat_buffer() {
         let outputs = [
             "shell: first line\n  indented line\nkeep \\n and C:\\new\\file".to_string(),
@@ -3093,7 +3156,7 @@ mod transcript_tests {
         let json = serde_json::json!({"text": "ok\n\u{1b}[2J\u{9b}hidden\u{7}\u{202e} 日", "literal": r"\u001b"});
         let (_instance, mut app) = app_with(vec![
             entry("chaz", &format!("query: {json}"), EntryType::ToolResult),
-            // Markdown entities are decoded by the parser, after input quarantine.
+            // Decoded Markdown entities need the same quarantine as raw text.
             entry(
                 "chaz",
                 "**safe** &#27;[2J\n`literal \\n`",
@@ -3136,7 +3199,12 @@ mod transcript_tests {
                 assert!(screen.contains("Done"));
                 insta::assert_snapshot!("partial_markdown_narrow", screen);
             } else if partial.starts_with("```rust") {
-                assert!(screen.contains("let path"));
+                assert!(screen.contains(r"C:\new"));
+            } else if partial.starts_with("[Guide]") {
+                assert!(screen.contains("[Guide]"));
+                assert!(screen.contains("https://exam"));
+            } else {
+                assert!(screen.contains("unfinished"));
             }
         }
         // Even sub-indent terminal widths must not panic during wrap/scroll.

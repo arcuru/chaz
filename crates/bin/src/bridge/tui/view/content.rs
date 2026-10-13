@@ -6,7 +6,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use serde_json::Value;
 
-use super::{display_lines, theme};
+use super::theme;
 
 /// Reuse the peer-text quarantine, but keep transcript newlines and indentation.
 /// Sanitizing after decoding also neutralizes JSON-escaped terminal controls.
@@ -114,13 +114,14 @@ impl MarkdownLines {
 /// CommonMark events become existing theme styles and Ratatui spans. Wrapping,
 /// viewport caching and scrolling remain the transcript renderer's job.
 pub(super) fn markdown(content: &str) -> Vec<Line<'static>> {
-    let safe = display_lines(content, None).join("\n");
     let mut out = MarkdownLines::default();
     let mut styles = vec![Style::default()];
     let mut lists: Vec<Option<u64>> = Vec::new();
     let mut links = Vec::new();
-    let mut quotes = 0usize;
-    for event in Parser::new(&safe) {
+    let mut indents = Vec::new();
+    // Let CommonMark handle tabs and line endings; quarantine emitted text,
+    // including decoded entities and link targets, before it reaches the screen.
+    for event in Parser::new(content) {
         let style = *styles.last().unwrap();
         match event {
             Event::Start(tag) => {
@@ -150,11 +151,7 @@ pub(super) fn markdown(content: &str) -> Vec<Line<'static>> {
                     }
                     Tag::Item => {
                         out.finish_line();
-                        out.indent = format!(
-                            "{}{}",
-                            "│ ".repeat(quotes),
-                            "  ".repeat(lists.len().saturating_sub(1))
-                        );
+                        indents.push(out.indent.clone());
                         let marker = match lists.last_mut() {
                             Some(Some(n)) => {
                                 let marker = format!("{n}. ");
@@ -169,8 +166,8 @@ pub(super) fn markdown(content: &str) -> Vec<Line<'static>> {
                     }
                     Tag::BlockQuote(_) => {
                         out.block_break();
-                        quotes += 1;
-                        out.indent = "│ ".repeat(quotes);
+                        indents.push(out.indent.clone());
+                        out.indent.push_str("│ ");
                         style
                     }
                     Tag::Emphasis => style.add_modifier(Modifier::ITALIC),
@@ -206,18 +203,15 @@ pub(super) fn markdown(content: &str) -> Vec<Line<'static>> {
                     | TagEnd::Heading(_)
                     | TagEnd::CodeBlock
                     | TagEnd::HtmlBlock => out.finish_line(),
-                    TagEnd::Item => out.finish_line(),
+                    TagEnd::Item | TagEnd::BlockQuote(_) => {
+                        out.finish_line();
+                        out.indent = indents.pop().unwrap();
+                    }
                     TagEnd::List(_) => {
                         lists.pop();
-                        out.indent = format!("{}{}", "│ ".repeat(quotes), "  ".repeat(lists.len()));
                         if lists.is_empty() {
                             out.block_break();
                         }
-                    }
-                    TagEnd::BlockQuote(_) => {
-                        out.finish_line();
-                        quotes -= 1;
-                        out.indent = "│ ".repeat(quotes);
                     }
                     TagEnd::Link | TagEnd::Image => {
                         if let Some(url) = links.pop().filter(|url| !url.is_empty()) {
