@@ -610,6 +610,7 @@ async fn crash_before_checkpoint_or_after_result_stays_held() {
         let attempt = session.start_turn_attempt(request.clone()).await.unwrap();
         let (_, _, arguments) = wait_call("missing-child", 30);
         let record = |sequence, message| TurnTranscriptRecord {
+            identity: None,
             request_id: request.clone(),
             attempt_id: attempt.attempt_id.clone(),
             sequence,

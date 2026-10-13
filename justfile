@@ -47,6 +47,7 @@ tui-pty:
     uv run --no-project dev/tui-pty/test_lifecycle.py
     uv run --no-project dev/tui-pty/test_interactions.py
     uv run --no-project dev/tui-pty/test_jobs.py
+    uv run --no-project dev/tui-pty/test_telemetry.py
 
 # Matrix bridge end-to-end test against a throwaway homeserver
 e2e *args='':

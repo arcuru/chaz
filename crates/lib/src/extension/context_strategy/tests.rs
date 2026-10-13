@@ -753,6 +753,7 @@ async fn fixed_cold_reconstruction_elapsed_and_logical_database_read_volume() {
                     .set(
                         format!("{i:06}:{sequence}"),
                         TurnTranscriptRecord {
+                            identity: None,
                             request_id: id.clone(),
                             attempt_id: attempt.attempt_id.clone(),
                             sequence: sequence as u64,

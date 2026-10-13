@@ -208,9 +208,9 @@ struct ChatChoice {
 #[derive(Debug, Clone, Default, Deserialize)]
 struct Usage {
     #[serde(default)]
-    prompt_tokens: u32,
+    prompt_tokens: Option<u32>,
     #[serde(default)]
-    completion_tokens: u32,
+    completion_tokens: Option<u32>,
     #[serde(default)]
     total_tokens: u32,
     /// Backend-reported cost in USD. Populated when the request opts into
@@ -275,8 +275,8 @@ impl Usage {
             .as_ref()
             .and_then(|d| d.reasoning_tokens);
         TokenUsage {
-            prompt_tokens: self.prompt_tokens,
-            completion_tokens: self.completion_tokens,
+            prompt_tokens: self.prompt_tokens.unwrap_or(0),
+            completion_tokens: self.completion_tokens.unwrap_or(0),
             total_tokens: self.total_tokens,
             cached_tokens,
             cache_creation_tokens,
@@ -293,7 +293,7 @@ fn build_metadata(
     model: Option<String>,
     provider: Option<String>,
     usage: Option<Usage>,
-    extra: Map<String, Value>,
+    mut extra: Map<String, Value>,
     requested_model: &str,
 ) -> Option<ResponseMetadata> {
     // If absolutely nothing useful came back, surface None so callers know
@@ -301,13 +301,21 @@ fn build_metadata(
     if response_id.is_none() && model.is_none() && provider.is_none() && usage.is_none() {
         return None;
     }
+    crate::session::usage::mark_usage_fields(
+        &mut extra,
+        usage.as_ref().is_some_and(|u| u.prompt_tokens.is_some()),
+        usage
+            .as_ref()
+            .is_some_and(|u| u.completion_tokens.is_some()),
+    );
     Some(ResponseMetadata {
         model: model.unwrap_or_else(|| requested_model.to_string()),
         provider,
         response_id,
         usage: usage.map(Usage::into_token_usage).unwrap_or_default(),
-        // Per-call metadata; the turn's context high-water mark is set when
-        // the ReAct accumulator finalizes (see `MetadataAccumulator`).
+        turn_attempt_id: None,
+        // Per-call occupancy comes from usage. The accumulator sets the
+        // finalized turn's last-call context_tokens separately.
         context_tokens: None,
         extra,
     })
@@ -1020,8 +1028,8 @@ mod tests {
     #[test]
     fn usage_normalizes_openai_style_cached_tokens() {
         let u = Usage {
-            prompt_tokens: 100,
-            completion_tokens: 50,
+            prompt_tokens: Some(100),
+            completion_tokens: Some(50),
             total_tokens: 150,
             cost: Some(0.0123),
             prompt_tokens_details: Some(PromptTokensDetails {
@@ -1047,8 +1055,8 @@ mod tests {
         // Anthropic uses flat cache_read_input_tokens / cache_creation_input_tokens
         // instead of nested prompt_tokens_details.cached_tokens.
         let u = Usage {
-            prompt_tokens: 200,
-            completion_tokens: 100,
+            prompt_tokens: Some(200),
+            completion_tokens: Some(100),
             total_tokens: 300,
             cost: None,
             prompt_tokens_details: None,
@@ -1067,8 +1075,8 @@ mod tests {
         // If a backend somehow returns both shapes, the nested OpenAI-style
         // field wins. Arbitrary but consistent.
         let u = Usage {
-            prompt_tokens: 0,
-            completion_tokens: 0,
+            prompt_tokens: Some(0),
+            completion_tokens: Some(0),
             total_tokens: 0,
             cost: None,
             prompt_tokens_details: Some(PromptTokensDetails {
@@ -1323,8 +1331,8 @@ mod tests {
     fn cached_tokens_back_out_openrouter_cache_write_double_count() {
         // OpenRouter quirk: cached_tokens = previous_reads + current_writes.
         let u = Usage {
-            prompt_tokens: 1000,
-            completion_tokens: 10,
+            prompt_tokens: Some(1000),
+            completion_tokens: Some(10),
             total_tokens: 1010,
             cost: None,
             prompt_tokens_details: Some(PromptTokensDetails {
@@ -1349,8 +1357,8 @@ mod tests {
         // Native Anthropic reports reads/creation already separate and has no
         // nested cache_write_tokens, so the subtraction must not fire.
         let u = Usage {
-            prompt_tokens: 300,
-            completion_tokens: 100,
+            prompt_tokens: Some(300),
+            completion_tokens: Some(100),
             total_tokens: 400,
             cost: None,
             prompt_tokens_details: None,
@@ -1434,3 +1442,37 @@ mod tests {
 
 #[cfg(test)]
 mod request_reload_tests;
+
+#[cfg(test)]
+mod telemetry_tests {
+    use super::*;
+    #[test]
+    fn omitted_usage_fields_differ_from_explicit_zero_without_changing_counts() {
+        for (raw, prompt, completion) in [
+            ("{}", false, false),
+            (r#"{"prompt_tokens":0}"#, true, false),
+            (r#"{"prompt_tokens":0,"completion_tokens":0}"#, true, true),
+        ] {
+            let metadata = build_metadata(
+                None,
+                Some("wire".into()),
+                None,
+                Some(serde_json::from_str(raw).unwrap()),
+                Map::new(),
+                "alias",
+            )
+            .unwrap();
+            assert_eq!(metadata.usage.prompt_tokens, 0);
+            assert_eq!(
+                metadata.extra["chaz_usage_fields"],
+                serde_json::json!({"prompt": prompt, "completion": completion})
+            );
+        }
+        let metadata =
+            build_metadata(None, Some("wire".into()), None, None, Map::new(), "alias").unwrap();
+        assert_eq!(
+            metadata.extra["chaz_usage_fields"],
+            serde_json::json!({"prompt": false, "completion": false})
+        );
+    }
+}

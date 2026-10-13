@@ -854,6 +854,7 @@ mod tests {
     fn records(output: &str) -> Vec<TurnTranscriptRecord> {
         let request_id = crate::session::TurnRequestId::parse("request");
         let mk = |sequence, message| TurnTranscriptRecord {
+            identity: None,
             request_id: request_id.clone(),
             attempt_id: "complete".into(),
             sequence,
@@ -1089,6 +1090,7 @@ mod tests {
         rows.insert(
             2,
             TurnTranscriptRecord {
+                identity: None,
                 request_id: rows[0].request_id.clone(),
                 attempt_id: "complete".into(),
                 sequence: 2,
@@ -1306,6 +1308,7 @@ mod tests {
         rows.insert(
             2,
             TurnTranscriptRecord {
+                identity: None,
                 request_id: rows[0].request_id.clone(),
                 attempt_id: "complete".into(),
                 sequence: 2,

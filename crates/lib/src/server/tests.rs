@@ -914,6 +914,14 @@ async fn server_fixture_with_host_and_hub(
     host: Arc<dyn ToolHost>,
     hub: Arc<crate::extension::ExtensionHub>,
 ) -> (Instance, Arc<Server>, Arc<crate::session::SessionRegistry>) {
+    server_fixture_backend(host, hub, None).await
+}
+
+pub(super) async fn server_fixture_backend(
+    host: Arc<dyn ToolHost>,
+    hub: Arc<crate::extension::ExtensionHub>,
+    backend_override: Option<BackendManager>,
+) -> (Instance, Arc<Server>, Arc<crate::session::SessionRegistry>) {
     let backend = InMemory::new();
     let (instance, user) =
         Instance::create_backend(Box::new(backend), NewUser::passwordless("test"))
@@ -935,7 +943,8 @@ async fn server_fixture_with_host_and_hub(
         approval_callback: None,
     };
     let secrets = crate::security::SecretStore::new(registry.chaz_peer().clone()).await;
-    let default_backend = crate::backends::BackendManager::new(&None, secrets);
+    let default_backend =
+        backend_override.unwrap_or_else(|| crate::backends::BackendManager::new(&None, secrets));
     let server = Server::new(
         registry.clone(),
         agents,
@@ -1368,7 +1377,7 @@ use crate::routine::{AgentSchedulePayload, Trigger};
 
 /// Create an agent DB, register it in the HostedIndex, seed its
 /// config, and return the DbEntry and AgentDb handle.
-async fn seed_agent(
+pub(super) async fn seed_agent(
     server: &Server,
     registry: &crate::session::SessionRegistry,
     name: &str,

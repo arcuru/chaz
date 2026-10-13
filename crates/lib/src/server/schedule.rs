@@ -7,6 +7,30 @@
 
 use super::*;
 
+struct ScheduleRecorder {
+    events: crate::runtime::EventRecorder,
+    db: eidetica::Database,
+    invocation: String,
+    agent: String,
+}
+impl crate::runtime::RuntimeRecorder for ScheduleRecorder {
+    fn record<'a>(
+        &'a self,
+        record: crate::runtime::RuntimeRecord,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>> {
+        self.events.record(record)
+    }
+    fn observe_call<'a>(
+        &'a self,
+        call: crate::session::usage::CallObservation,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(async move {
+            crate::session::usage::persist_call(&self.db, &self.invocation, None, &self.agent, call)
+                .await
+        })
+    }
+}
+
 /// Outcome of [`Server::try_admit_schedule_fire`].
 pub(super) enum ScheduleAdmission {
     /// The schedule may fire. `retired_now` carries the bound message
@@ -839,15 +863,23 @@ impl Server {
             approval_callback: None, // no interactive approval for schedule fires
         };
 
-        let result = crate::runtime::execute_scoped(
+        let invocation = uuid::Uuid::new_v4().to_string();
+        let recorder = Arc::new(ScheduleRecorder {
+            events: crate::runtime::EventRecorder(event_tx),
+            db: session_db.clone(),
+            invocation: invocation.clone(),
+            agent: agent_name.into(),
+        });
+        let result = crate::runtime::execute_with_recorder(
             effective_model.as_deref(),
             assembled.messages,
             &self.default_backend,
             &request_security,
             &tool_ctx,
             &self.policies,
-            Some(event_tx),
+            Some(recorder),
             Some(self.extensions.as_ref()),
+            None,
             crate::runtime::ModelCallScope {
                 cache: assembled.cache,
                 context_strategy: assembled.strategy,
@@ -858,6 +890,15 @@ impl Server {
         )
         .await;
 
+        let result = result.map(|mut outcome| {
+            if let Some(metadata) = &mut outcome.metadata {
+                metadata.extra.insert(
+                    crate::session::usage::SUMMARY_ID.into(),
+                    serde_json::Value::String(invocation),
+                );
+            }
+            outcome
+        });
         let _ = event_writer.await;
 
         // Write the terminal Message unless the Matrix-bound turn ended with no_reply.
@@ -944,5 +985,152 @@ impl Server {
         self.extensions
             .refresh_status_outputs(&status_agent, &status_db)
             .await;
+    }
+}
+
+#[cfg(test)]
+mod telemetry_tests {
+    use super::*;
+    use crate::runtime::{LLMResponse, ResponseMetadata, TokenUsage};
+    use crate::test_support::MockBackend;
+
+    #[tokio::test]
+    async fn scheduled_telemetry_is_live_and_retained_after_no_reply_failure_and_reopen() {
+        for fail in [false, true] {
+            let model = Arc::new(MockBackend::new());
+            let backend = BackendManager::with_mock(
+                model.clone(),
+                crate::test_support::empty_secrets().await,
+            );
+            let (_instance, server, registry) = super::super::tests::server_fixture_backend(
+                Arc::new(crate::tool_host::NativeToolHost::new()),
+                Arc::new(crate::test_support::context_hub().await),
+                Some(backend),
+            )
+            .await;
+            server.tools.register(crate::tools::Calculate);
+            let (_agent, _adb) = super::super::tests::seed_agent(&server, &registry, "host").await;
+            let (_id, db) = registry.create_session(Some("matrix")).await.unwrap();
+            let sid = db.root_id().to_string();
+            server.extensions.record_active(&db).await.unwrap();
+            crate::session::bind_transport(&db, "matrix", "@host:example", "!room:example")
+                .await
+                .unwrap();
+            let metadata = || {
+                Some(ResponseMetadata {
+                    model: "wire".into(),
+                    usage: TokenUsage {
+                        prompt_tokens: 100,
+                        completion_tokens: 10,
+                        cost_usd: Some(0.01),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                })
+            };
+            model.push_response(Ok(LLMResponse::ToolCalls {
+                content: None,
+                tool_calls: vec![runtime::ToolCallRequest {
+                    id: "one".into(),
+                    name: "calculate".into(),
+                    arguments: "{\"expression\":\"1+1\"}".into(),
+                }],
+                provider_extra: Default::default(),
+                metadata: metadata(),
+            }));
+            if fail {
+                model.push_err(crate::error::LlmError::Configuration {
+                    message: "later failure".into(),
+                });
+            } else {
+                model.push_response(Ok(LLMResponse::ToolCalls {
+                    content: None,
+                    tool_calls: vec![runtime::ToolCallRequest {
+                        id: "quiet".into(),
+                        name: "no_reply".into(),
+                        arguments: "{}".into(),
+                    }],
+                    provider_extra: Default::default(),
+                    metadata: metadata(),
+                }));
+            }
+            let first = model.block_next_call();
+            let second = model.block_next_call();
+            let run_server = server.clone();
+            let run_db = db.clone();
+            let run_sid = sid.clone();
+            let mut task = tokio::spawn(async move {
+                run_server
+                    .run_schedule_turn(
+                        "host",
+                        &run_db,
+                        &run_sid,
+                        "PRIVATE SCHEDULE PROMPT",
+                        "fixture",
+                    )
+                    .await
+            });
+            tokio::select! {
+                result = &mut task => panic!("scheduled turn exited before first call: {result:?}"),
+                result = tokio::time::timeout(std::time::Duration::from_secs(5), first.wait_started()) => result.unwrap(),
+            }
+            first.release();
+            tokio::time::timeout(std::time::Duration::from_secs(5), second.wait_started())
+                .await
+                .unwrap();
+            let snapshot = db.snapshot().await.unwrap();
+            let entries = Session::entries_at_snapshot(&db, &snapshot).await.unwrap();
+            let live = crate::session::usage::telemetry_at_snapshot(&db, &snapshot, &entries)
+                .await
+                .unwrap();
+            assert_eq!(
+                live.totals.prompt_tokens, 100,
+                "first reported call visible while next blocks"
+            );
+            assert!(
+                live.totals.estimated.prompt_tokens > 0,
+                "held second request estimated"
+            );
+            assert!(!entries.iter().any(|e| e.entry_type == EntryType::Message));
+            assert!(
+                Session::active_turn_attempts(&db).await.unwrap().is_empty(),
+                "schedule has no fabricated attempt"
+            );
+            second.release();
+            let result = tokio::time::timeout(std::time::Duration::from_secs(5), task)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(result.is_err(), fail);
+            let snapshot = db.snapshot().await.unwrap();
+            let entries = Session::entries_at_snapshot(&db, &snapshot).await.unwrap();
+            let reopened = crate::session::usage::telemetry_at_snapshot(&db, &snapshot, &entries)
+                .await
+                .unwrap();
+            assert_eq!(reopened.totals.prompt_tokens, if fail { 100 } else { 200 });
+            assert_eq!(reopened.totals.calls, 2);
+            assert!(
+                !entries.iter().any(|e| e.entry_type == EntryType::Message),
+                "no_reply stays silent"
+            );
+            assert!(
+                !entries
+                    .iter()
+                    .any(|e| e.content.contains("PRIVATE SCHEDULE PROMPT"))
+            );
+            let txn = db.new_transaction().await.unwrap();
+            let rows = txn
+                .get_store::<eidetica::store::Table<serde_json::Value>>("call_telemetry")
+                .await
+                .unwrap()
+                .search(|_| true)
+                .await
+                .unwrap();
+            assert!(
+                !serde_json::to_string(&rows)
+                    .unwrap()
+                    .contains("PRIVATE SCHEDULE PROMPT")
+            );
+        }
     }
 }

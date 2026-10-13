@@ -460,7 +460,7 @@ async fn supervise_daemon_service(
 }
 
 /// `chaz usage` — open the eidetica DB read-only, walk the user-central
-/// session catalog, aggregate per-message `ResponseMetadata`, print either
+/// session catalog, aggregate deduplicated call evidence and legacy summaries, print either
 /// human-readable text or JSON, then exit. Skips all bridge/sync/scheduler
 /// setup since we never serve a session here.
 async fn run_usage_subcommand(args: UsageArgs, config: &Config) -> anyhow::Result<()> {

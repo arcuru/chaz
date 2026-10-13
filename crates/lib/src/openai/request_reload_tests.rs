@@ -85,6 +85,7 @@ fn round(attempt: &TurnAttempt, label: &str) -> Vec<TurnTranscriptRecord> {
         .into_iter()
         .enumerate()
         .map(|(sequence, message)| TurnTranscriptRecord {
+            identity: None,
             request_id: attempt.request_id.clone(),
             attempt_id: attempt.attempt_id.clone(),
             sequence: sequence as u64,

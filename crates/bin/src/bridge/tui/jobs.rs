@@ -178,6 +178,7 @@ pub(super) fn open(
 
 pub(super) struct Snapshot {
     entries: Vec<SessionEntry>,
+    telemetry: chaz_core::session::usage::SessionTelemetry,
     state: JobState,
     inputs: Result<Vec<JobInput>, String>,
 }
@@ -187,6 +188,8 @@ pub(super) async fn snapshot(db: &eidetica::Database) -> Result<Snapshot, String
         chaz_core::session::jobs::require_observer_write(db).await?;
         let tips = db.snapshot().await?;
         let entries = Session::entries_at_snapshot(db, &tips).await?;
+        let telemetry =
+            chaz_core::session::usage::telemetry_at_snapshot(db, &tips, &entries).await?;
         let state = chaz_core::session::jobs::observer_status(db).await?.state;
         let session = Session::new(
             chaz_core::types::ConversationId(db.root_id().to_string()),
@@ -195,6 +198,7 @@ pub(super) async fn snapshot(db: &eidetica::Database) -> Result<Snapshot, String
         .await;
         Ok::<_, anyhow::Error>(Snapshot {
             entries,
+            telemetry,
             state,
             inputs: session
                 .turn_inputs_at(&tips)
@@ -210,6 +214,7 @@ pub(super) fn apply_snapshot(tab: &mut Tab, result: Result<Snapshot, String>) {
     match result {
         Ok(snapshot) => {
             tab.set_entries(snapshot.entries);
+            tab.live.telemetry = Some(snapshot.telemetry);
             tab.active_turns = usize::from(matches!(
                 snapshot.state,
                 JobState::StartedUnknown {

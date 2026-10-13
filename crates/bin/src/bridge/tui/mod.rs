@@ -1879,7 +1879,7 @@ async fn build_tab(
             .map(str::to_string),
         expanded_entries: HashSet::new(),
         live: {
-            let mut live = refresh::TabLive::with_meta(meta);
+            let mut live = refresh::TabLive::with_meta(meta, snapshot.telemetry);
             live.inputs = snapshot.inputs;
             live.input_attempt = snapshot.input_attempt;
             live

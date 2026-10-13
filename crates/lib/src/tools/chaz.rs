@@ -1,10 +1,9 @@
 //! Read-only queries over the calling runtime's own session and tool scope.
 
-use crate::session::usage::{UsageFilter, collect_session_usage};
+use crate::session::usage::{UsageFilter, telemetry_filtered_at_snapshot};
 use crate::tool::{Tool, ToolContext, ToolDescriptor, ToolError, ToolPolicyRegistry};
 use chrono::{DateTime, Datelike, Days, Utc};
 use serde_json::{Value, json};
-use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -158,15 +157,28 @@ impl Tool for ChazTool {
                 Query::Usage(period) => {
                     let since = period.since(Utc::now());
                     let session = ctx.session.lock().await;
-                    let mut per_model = BTreeMap::new();
-                    let total = collect_session_usage(
-                        session.entries(),
+                    let snapshot = session
+                        .database()
+                        .snapshot()
+                        .await
+                        .map_err(|e| ToolError::Execution(e.to_string()))?;
+                    let entries =
+                        crate::session::Session::entries_at_snapshot(session.database(), &snapshot)
+                            .await
+                            .map_err(|e| ToolError::Execution(e.to_string()))?;
+                    let telemetry = telemetry_filtered_at_snapshot(
+                        session.database(),
+                        &snapshot,
+                        &entries,
                         &UsageFilter {
                             since,
                             ..Default::default()
                         },
-                        &mut per_model,
-                    );
+                    )
+                    .await
+                    .map_err(|e| ToolError::Execution(e.to_string()))?;
+                    let total = telemetry.totals;
+                    let per_model = telemetry.per_model;
                     json!({
                         "session_db_id": session.database().root_id().to_string(),
                         "period": period.as_str(),
