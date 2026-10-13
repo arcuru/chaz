@@ -704,6 +704,11 @@ mx PUT "/_matrix/client/v3/rooms/$(jq -rn --arg r "$ROOM_ID" '$r|@uri')/send/m.r
 	"$PUPPET_TOKEN" "$(jq -nc --arg b "third turn after bridge restart" '{msgtype:"m.text",body:$b}')" >/dev/null
 
 wait_for "fourth reply" "$REPLY_TIMEOUT" replies_at_least 4
+# An explicit send can precede tool-result persistence and the terminal model
+# call. This case tests a completed-turn restart, not interruption/recovery.
+# Wait on durable attempts, never presentation telemetry or delivered text.
+four_dm_completed() { [[ "$(completed_attempts)" -ge 4 ]]; }
+wait_for "fourth DM attempt completed before daemon restart" 60 four_dm_completed
 
 # Case B — restart the daemon mid-conversation
 log "Case B: restarting the daemon"

@@ -53,7 +53,31 @@ See [ReAct Runtime → Cancellation](react.md#cancellation) and [TUI → Stoppin
 
 Every assistant `Message` entry carries an optional `ResponseMetadata`: the model name, an optional provider and response ID, a `TokenUsage` (prompt/completion/cached/cache_creation/reasoning tokens plus an optional `cost_usd`), and any extra wire-format fields the backend retained. This is populated from the `LLMResponse` returned by the configured `LLMBackend` at the moment the assistant turn is committed to the session DB — there is no separate billing log.
 
-`crates/lib/src/session/usage.rs` walks the session catalog and folds these per-entry metadata records into per-session, per-model, and total rollups. Two surfaces consume those rollups today: the `/costs` slash command (TUI) and the `chaz usage` CLI subcommand. See [Cost Tracking & Usage](../user_guide/usage.md) for the user-facing view.
+`crates/lib/src/session/usage.rs` provides the common snapshot view for the bar,
+`/costs`, the usage tool and `chaz usage`. The awaited `RuntimeRecorder` observes
+requests after projection and responses before validation, end hooks or final
+publication. The session's `call_telemetry` table has one replaceable presentation
+row per invocation/branch/model sequence, with request token estimate, host
+budget, requested model, available model-price provenance, returned usage and
+visible-output estimate. It stores no request or output text and never feeds
+context replay or completion/admission logic.
+
+Identified `turn_transcript` calls remain the fallback for older attempts.
+New observations supersede matching transcript calls; `turn_attempt_id` on final
+metadata prevents counting an attempt summary again. Scheduled executions use
+an observation-only invocation UUID and `extra.chaz_telemetry_id` on summaries,
+not a fabricated request/attempt or restart checkpoint. Old unmarked summaries
+remain readable. Branch identity preserves competing calls, and snapshots keep
+racing finalization from exposing both forms.
+
+Reports and estimates have separate totals and per-field call coverage. Provider
+zero replaces an estimate; omitted new wire fields remain distinguishable from
+zero through `extra.chaz_usage_fields`. The requested model selects the host
+context budget; returned wire identity selects response price provenance. Reads
+need no provider call. Interrupted requests may retain input-only estimates,
+which are not proof of a sent/billed/completed call.
+Session-write notifications use the existing bounded, owned, ticket-protected background refresh and redraw path.
+See [Cost Tracking & Usage](../user_guide/usage.md) and [TUI context usage](../user_guide/tui.md#context-usage).
 
 ## Metadata writes refuse unreadable state
 
@@ -121,7 +145,7 @@ clock movement across processes or restarts as a newer attempt.
 
 Each completed model response and tool result is stored in `turn_transcript` with the request row key, attempt ID, a monotonic attempt-local sequence, and a timestamp. Model records retain optional text, normalized response metadata, opaque provider continuation fields, and ordered tool calls with their provider IDs, names, and full argument strings. Result records retain the model sequence, call index, call ID, tool name, full output, and a structured outcome.
 
-The recorder is awaited. A tool-call response commits before approval or execution begins, and every tool result commits before another model request. A persistence failure stops the turn. If the tool already caused an external effect, the unmatched attempt remains interrupted and is not replayed automatically. The visible final response and terminal model record commit in the same transaction as completion. Provider retries that have not produced a completed response and streamed tokens do not create records.
+The recorder is awaited. A tool-call response commits before approval or execution begins, and every tool result commits before another model request. A persistence failure stops the turn. If the tool already caused an external effect, the unmatched attempt remains interrupted and is not replayed automatically. Terminal provider evidence is recorded before response hooks and reply preflight, without publishing a final or completing the attempt. Settlement writes the same terminal row with the visible final response and completion in one transaction. Provider retries that have not produced a completed response and streamed tokens do not create records.
 
 The full arguments and results live in the transcript store. `ToolCall` and `ToolResult` session entries are presentation records created by the same successful transaction; result display remains truncated and bridge delivery continues to exclude tool entries. This does not widen approval prompts or bridge exposure of tool secrets.
 
@@ -336,7 +360,7 @@ Before marking the attempt live, the executor holds the session's processing res
 
 Every run of a job attempt, including a resumed checkpoint segment, records an immutable `execution_starts_v1` row before model/tool work: branch ID, executor, process incarnation, attempt, optional explicit-retry identity, and, for a continuation, the exact checkpoint and predecessor branch. Branch order is Eidetica's canonical store-entry order (subtree height, then entry ID), the same comparator it uses for CRDT replay, so every reader with the same committed starts derives the same order regardless of arrival, row-iteration or completion order. Two branches compete when they serve the same request with the same retry identity and neither continues the other. A continuation competes at its lineage root's position, so a competitor committed between a branch and its continuation still yields to that lineage; parallel resumes of one predecessor fall back to their own positions. A branch that observes an earlier competitor, or a continuation of itself, records an `execution_yields_v1` row, stops further model/tool steps and releases its capacity; it is never revived. Observation happens on session writes, at each model boundary, after a yielded wait reacquires capacity and immediately before settlement. It is cooperative, not a fence: an in-flight tool's effects remain and no exactly-once effect is promised.
 
-Settlement needs no fresh ownership. A branch that has observed no earlier competitor commits its `execution_outcomes_v1` row (`delivered: true`), the job receipt naming its branch, the completed attempt and its terminal transcript in one transaction. The receipt slot is never replaced: a branch that finds another branch's receipt, or has yielded, keeps its computed result as an undelivered outcome and leaves the attempt to the earlier branch. Each branch's transcript is also kept separately in `execution_transcript_v1`, so two branches of one attempt never share a sequence. An undelivered computed result and its buffered terminal transcript are committed together as branch evidence, without completing the attempt or replacing its receipt. The continuing branch receives at most four deduplicated notices per boundary (`execution_notices_v1`/`execution_notice_seen_v1`) naming the parallel executor and a `job_status` handle that views or searches that branch's transcript in bounded pages; the transcript is never injected. A closing boundary consumes none, so no model call is made just to announce one. If an earlier branch is learned only after delivery, the delivered branch records its yield and an ordering-correction notice; the receipt and transcript are unchanged and the parent's next `job_status` or `job_wait` reports the correction. Nothing is replayed or rolled back.
+Settlement needs no fresh ownership. A branch that has observed no earlier competitor commits its `execution_outcomes_v1` row (`delivered: true`), the job receipt naming its branch, the completed attempt and its terminal transcript in one transaction. The receipt slot is never replaced: a branch that finds another branch's receipt, or has yielded, keeps its computed result as an undelivered outcome and leaves the attempt to the earlier branch. Each branch's transcript is also kept separately in `execution_transcript_v1`, so two branches of one attempt never share a sequence. An undelivered computed result is committed with its already-observed terminal transcript as branch evidence, without completing the attempt or replacing its receipt. The continuing branch receives at most four deduplicated notices per boundary (`execution_notices_v1`/`execution_notice_seen_v1`) naming the parallel executor and a `job_status` handle that views or searches that branch's transcript in bounded pages; the transcript is never injected. A closing boundary consumes none, so no model call is made just to announce one. If an earlier branch is learned only after delivery, the delivered branch records its yield and an ordering-correction notice; the receipt and transcript are unchanged and the parent's next `job_status` or `job_wait` reports the correction. Nothing is replayed or rolled back.
 
 A session joins this protocol through an `execution_protocol` activation row. A new job session activates itself before its first attempt. A historical session, with attempts or a legacy `job_owner` row, is held until an operator stops every old writer and calls the explicit coordinated-upgrade activation (`session::execution::activate_after_coordinated_upgrade`; there is no slash command for it yet); activation records the legacy row exactly, and any later legacy write makes new writers refuse the session. An old binary ignores the marker, so the check detects mixed writers but cannot stop them. Historical receipts and transcripts stay readable.
 

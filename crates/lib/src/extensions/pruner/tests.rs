@@ -107,6 +107,7 @@ impl RuntimeRecorder for Recorder {
                 .await
                 .append_turn_transcript(
                     TurnTranscriptRecord {
+                        identity: None,
                         request_id: self.attempt.request_id.clone(),
                         attempt_id: self.attempt.attempt_id.clone(),
                         sequence: self.sequence.fetch_add(1, Ordering::SeqCst) as u64,

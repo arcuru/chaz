@@ -189,7 +189,7 @@ async fn seven_valid_calls_are_read_only_and_need_no_host_capabilities() {
         assert_eq!(out["since"].is_null(), period == "all");
         assert_eq!(
             out["total"],
-            json!({"calls": 0, "prompt_tokens": 0, "completion_tokens": 0, "cached_tokens": 0, "cache_creation_tokens": 0, "reasoning_tokens": 0, "cost_usd": 0.0, "cost_reported": false})
+            serde_json::to_value(crate::session::usage::UsageTotals::default()).unwrap()
         );
         assert_eq!(out["per_model"], json!({}));
     }
@@ -275,6 +275,8 @@ async fn same_peer_other_sessions_and_metadata_are_not_disclosed() {
                 "completion_tokens",
                 "cost_usd",
                 "cost_reported",
+                "estimated",
+                "coverage",
             ],
         );
     }

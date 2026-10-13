@@ -68,7 +68,8 @@ Use `describe_tool` (when permitted) for full descriptions and schemas.
 Usage periods are the current **UTC calendar** day, Monday-start week, or month, not rolling windows or local time.
 Entries exactly at the boundary are included.
 `total` contains `calls`, `prompt_tokens`, `completion_tokens`, `cached_tokens`, `cache_creation_tokens`, `reasoning_tokens`, `cost_usd`, and `cost_reported`.
-Each `per_model` row contains only `calls`, `prompt_tokens`, `completion_tokens`, `cost_usd`, and `cost_reported`.
+Each `per_model` row retains `calls` plus reported-only `prompt_tokens`, `completion_tokens`, `cost_usd`, and `cost_reported`, with additive `estimated` and `coverage` fields (see [usage coverage](usage.md#reported-estimated-and-unknown)).
+`calls` counts deduplicated observations, including calls whose usage is missing.
 `calls` counts Message metadata records, not individual backend requests.
 Usage includes all qualifying participants in this session, but excludes other sessions and the current turn's final message until it is committed.
 Missing costs are not estimated; `cost_reported: true` means at least one cost was reported, not complete coverage.

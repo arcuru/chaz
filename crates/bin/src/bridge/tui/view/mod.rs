@@ -62,17 +62,15 @@ fn model_slug(model: &str) -> &str {
 
 /// Last reported input size is an estimate of current occupancy, not a fresh
 /// tokenization of the transcript. Zero can also mean missing provider usage.
-fn context_segment(tab: &super::Tab) -> String {
-    let last = tab
-        .entries
-        .iter()
-        .rev()
-        .find(|e| e.sender == tab.current_agent && e.entry_type == EntryType::Message);
-    let used = last
-        .and_then(|e| e.metadata.as_ref())
-        .filter(|m| m.model == tab.effective_model)
-        .and_then(|m| m.context_tokens)
-        .filter(|&n| n > 0);
+fn context_segment(
+    tab: &super::Tab,
+    telemetry: &chaz_core::session::usage::SessionTelemetry,
+) -> String {
+    let call = telemetry
+        .last_calls
+        .get(&tab.current_agent)
+        .filter(|call| call.requested_model == tab.effective_model);
+    let used = call.and_then(|call| call.context_tokens);
     let percentage = match used {
         Some(n) if tab.context_budget > 0 => {
             format!(
@@ -84,7 +82,17 @@ fn context_segment(tab: &super::Tab) -> String {
     };
     let used = used.map_or_else(
         || "unknown".to_string(),
-        |n| format!("~{}", human_tokens(u64::from(n))),
+        |n| {
+            format!(
+                "{}{}",
+                if call.is_some_and(|call| call.context_estimated) {
+                    "~"
+                } else {
+                    ""
+                },
+                human_tokens(u64::from(n))
+            )
+        },
     );
     let max = if tab.context_budget == 0 {
         "unknown".to_string()
@@ -610,49 +618,79 @@ pub(super) fn ui_chat(f: &mut ratatui::Frame, app: &mut App, ext_segments: &[Str
     let current_agent = tab.current_agent.clone();
     let effective_model = tab.effective_model.clone();
     let roster = tab.roster.clone();
-    // Aggregate this session's LLM usage for the status bar. Mirrors
-    // `commands::session::format_usage_summary`: only entries carrying
-    // response metadata count, and `cached` is the cache-read subset of
-    // prompt tokens.
-    let usage_segment = {
-        let (mut prompt, mut completion, mut cached) = (0u64, 0u64, 0u64);
-        let mut cost = 0.0f64;
-        let mut saw_cost = false;
-        let mut calls = 0u32;
-        for e in &tab.entries {
-            let Some(m) = &e.metadata else { continue };
-            calls += 1;
-            prompt += m.usage.prompt_tokens as u64;
-            completion += m.usage.completion_tokens as u64;
-            cached += m.usage.cached_tokens.unwrap_or(0) as u64;
-            if let Some(c) = m.usage.cost_usd {
-                cost += c;
-                saw_cost = true;
-            }
+    // Snapshot totals include observed calls even before the turn publishes a
+    // final Message. Legacy sessions still use their recorded turn summaries.
+    let legacy;
+    let telemetry = match &tab.live.telemetry {
+        Some(telemetry) => telemetry,
+        None => {
+            legacy = chaz_core::session::usage::SessionTelemetry::from_entries(&tab.entries);
+            &legacy
         }
-        if calls == 0 {
+    };
+    let usage_segment = {
+        let totals = &telemetry.totals;
+        if totals.calls == 0 {
             String::new()
         } else {
-            let pct = if prompt > 0 {
-                (cached as f64 / prompt as f64 * 100.0).round() as u64
+            let prompt = totals.prompt_tokens + totals.estimated.prompt_tokens;
+            let completion = totals.completion_tokens + totals.estimated.completion_tokens;
+            let partial = totals.coverage.prompt_reported + totals.coverage.prompt_estimated
+                < totals.calls
+                || totals.coverage.completion_reported + totals.coverage.completion_estimated
+                    < totals.calls;
+            let approximate =
+                totals.coverage.prompt_estimated > 0 || totals.coverage.completion_estimated > 0;
+            let cache = if totals.coverage.cached_reported == totals.calls {
+                if prompt > 0 {
+                    format!(
+                        "{}% cached",
+                        (totals.cached_tokens as f64 / prompt as f64 * 100.0).round() as u64
+                    )
+                } else {
+                    "cache unknown".into()
+                }
+            } else if totals.coverage.cached_reported == 0 {
+                "cache unknown".into()
             } else {
-                0
+                "cache partial".into()
             };
-            let cost_part = if saw_cost {
-                format!(" • ${cost:.4}")
+            let prompt = if totals.coverage.prompt_reported + totals.coverage.prompt_estimated == 0
+            {
+                "unknown".into()
             } else {
-                String::new()
+                human_tokens(prompt)
+            };
+            let completion = if totals.coverage.completion_reported
+                + totals.coverage.completion_estimated
+                == 0
+            {
+                "unknown".into()
+            } else {
+                human_tokens(completion)
             };
             format!(
-                " | {}/{} tok • {pct}% cached{cost_part}",
-                human_tokens(prompt),
-                human_tokens(completion)
+                " | {}{}/{} tok{}{} • {cache} • {}",
+                if approximate { "~" } else { "" },
+                prompt,
+                completion,
+                if partial { " partial" } else { "" },
+                if approximate {
+                    format!(
+                        " ({}/{} reported)",
+                        human_tokens(totals.prompt_tokens),
+                        human_tokens(totals.completion_tokens)
+                    )
+                } else {
+                    String::new()
+                },
+                totals.cost_text()
             )
         }
     };
-    // Only the host's latest message belongs with its effective input budget;
+    // Only the host's latest call belongs with its effective input budget;
     // aggregate prompt usage sums ReAct calls and is not context occupancy.
-    let ctx_segment = context_segment(tab);
+    let ctx_segment = context_segment(tab, telemetry);
     let approval_info = tab.pending_approval.as_ref().map(|ex| {
         (
             ex.info.name.clone(),
@@ -2250,6 +2288,7 @@ mod chat_frame_tests {
                     prompt_tokens: 9_999_999,
                     ..Default::default()
                 },
+                turn_attempt_id: None,
                 context_tokens: Some(12_345),
                 extra: Default::default(),
             }),
@@ -2261,7 +2300,7 @@ mod chat_frame_tests {
         other.metadata.as_mut().unwrap().context_tokens = Some(900_000);
         tab.entries.push(other);
         let screen = draw(&mut app, 100, 16).0.join("\n");
-        assert!(screen.contains("ctx ~12.3k/1.1M (1.2%) tok"), "{screen}");
+        assert!(screen.contains("ctx 12.3k/1.1M (1.2%) tok"), "{screen}");
 
         app.active_mut().entries[0]
             .metadata
@@ -2270,7 +2309,7 @@ mod chat_frame_tests {
             .context_tokens = Some(57_000);
         app.active_mut().context_budget = 1_000_000;
         let screen = draw(&mut app, 100, 16).0.join("\n");
-        assert!(screen.contains("ctx ~57k/1M (5.7%) tok"), "{screen}");
+        assert!(screen.contains("ctx 57k/1M (5.7%) tok"), "{screen}");
 
         // New model, same session: don't pair its budget with an old count.
         app.active_mut().effective_model = "small-model".into();
@@ -2284,11 +2323,11 @@ mod chat_frame_tests {
         app.active_mut().entries.push(latest);
         app.active_mut().context_budget = 16_000;
         let screen = draw(&mut app, 80, 16).0.join("\n");
-        assert!(screen.contains("ctx ~20k/16k (125.0%) tok"), "{screen}");
+        assert!(screen.contains("ctx 20k/16k (125.0%) tok"), "{screen}");
         // A known count without a budget cannot produce a percentage.
         app.active_mut().context_budget = 0;
         let screen = draw(&mut app, 80, 16).0.join("\n");
-        assert!(screen.contains("ctx ~20k/unknown tok"), "{screen}");
+        assert!(screen.contains("ctx 20k/unknown tok"), "{screen}");
         app.active_mut().context_budget = 16_000;
         // Missing/zero usage on the latest message must not resurrect older data.
         app.active_mut()

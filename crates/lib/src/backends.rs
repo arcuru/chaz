@@ -240,6 +240,7 @@ pub struct BackendManager {
     /// background fetch when a not-yet-seen model is first used — can refresh
     /// it in place.
     model_windows: Arc<RwLock<HashMap<String, u32>>>,
+    model_info: Arc<RwLock<HashMap<String, ModelInfo>>>,
 }
 
 /// A generic Message
@@ -299,6 +300,7 @@ impl BackendManager {
             secrets,
             mock: None,
             model_windows: Arc::new(RwLock::new(HashMap::new())),
+            model_info: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -312,6 +314,7 @@ impl BackendManager {
             secrets,
             mock: Some(mock),
             model_windows: Arc::new(RwLock::new(HashMap::new())),
+            model_info: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -437,6 +440,53 @@ impl BackendManager {
     /// for a restart. Shares the same `Arc`, so all clones see it.
     pub fn insert_model_window(&self, model: String, window: u32) {
         self.model_windows.write().unwrap().insert(model, window);
+    }
+
+    /// Refresh cached in-use prices and windows without a network request.
+    pub fn insert_model_info(&self, info: ModelInfo) {
+        if let Some(window) = info.context_window {
+            self.insert_model_window(info.id.clone(), window);
+        }
+        self.model_info
+            .write()
+            .unwrap()
+            .insert(info.id.clone(), info);
+    }
+
+    /// Configured fields win over cached fields. Lookup remains backend-scoped;
+    /// an alias's price is not silently applied to a different returned model.
+    pub(crate) fn model_info_for_call(
+        &self,
+        requested: Option<&str>,
+        wire: Option<&str>,
+    ) -> Option<ModelInfo> {
+        let backend = self
+            .backends
+            .first()
+            .map(|_| self.select_backend_for_model(requested))?;
+        let model = wire
+            .filter(|m| !m.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| self.resolve_model_name(requested));
+        let id = if self.backends.len() > 1 {
+            format!("{}:{model}", backend.get_name())
+        } else {
+            model
+        };
+        let configured = self
+            .list_known_models_with_info()
+            .into_iter()
+            .find(|m| m.id == id);
+        let cached = self.model_info.read().unwrap().get(&id).cloned();
+        match (configured, cached) {
+            (Some(mut info), Some(cache)) => {
+                info.price_input = info.price_input.or(cache.price_input);
+                info.price_output = info.price_output.or(cache.price_output);
+                info.price_cache_read = info.price_cache_read.or(cache.price_cache_read);
+                Some(info)
+            }
+            (info, cache) => info.or(cache),
+        }
     }
 
     /// Validate that the model name is valid
@@ -625,6 +675,51 @@ mod tests {
                 .collect(),
         );
         b
+    }
+
+    #[tokio::test]
+    async fn telemetry_prices_use_config_cached_info_and_exact_backend_wire_identity() {
+        let manager = BackendManager::new(
+            &Some(vec![backend("one", &["alias"]), backend("two", &["wire"])]),
+            empty_secrets().await,
+        );
+        manager.insert_model_info(ModelInfo {
+            id: "one:alias".into(),
+            price_input: Some(2.0),
+            ..Default::default()
+        });
+        manager.insert_model_info(ModelInfo {
+            id: "two:wire".into(),
+            price_input: Some(9.0),
+            ..Default::default()
+        });
+        assert_eq!(
+            manager
+                .model_info_for_call(Some("one:alias"), None)
+                .unwrap()
+                .price_input,
+            Some(2.0)
+        );
+        assert!(
+            manager
+                .model_info_for_call(Some("one:alias"), Some("wire"))
+                .is_none(),
+            "other backend's matching wire slug is not price data"
+        );
+        manager.insert_model_info(ModelInfo {
+            id: "one:wire".into(),
+            price_input: Some(3.0),
+            context_window: Some(8000),
+            ..Default::default()
+        });
+        assert_eq!(
+            manager
+                .model_info_for_call(Some("one:alias"), Some("wire"))
+                .unwrap()
+                .price_input,
+            Some(3.0)
+        );
+        assert_eq!(manager.context_window("one:wire"), Some(8000));
     }
 
     // ================================================================

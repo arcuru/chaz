@@ -693,7 +693,33 @@ pub struct TurnTranscriptRecord {
     pub attempt_id: String,
     pub sequence: u64,
     pub timestamp: DateTime<Utc>,
+    /// Execution provenance, independent of the provider's returned model.
+    /// Absent on transcripts written before per-call observation was supported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<TurnCallIdentity>,
     pub message: TurnTranscriptMessage,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TurnCallIdentity {
+    pub agent: String,
+    pub requested_model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_id: Option<String>,
+}
+
+/// Identified calls keep the same row through early observation and atomic
+/// settlement. Parallel job branches still have separate evidence keys.
+fn turn_transcript_key(record: &TurnTranscriptRecord) -> String {
+    match &record.identity {
+        Some(identity) => format!(
+            "{:020}:{}:{}",
+            record.sequence,
+            record.attempt_id,
+            identity.execution_id.as_deref().unwrap_or("")
+        ),
+        None => format!("{:020}:{}", record.sequence, uuid::Uuid::new_v4()),
+    }
 }
 
 session_wire_enum! {
@@ -1567,6 +1593,16 @@ impl Session {
                 anyhow::bail!("turn final and addressed outbox event must match");
             }
         }
+        let mut final_entry = final_entry;
+        if transcript
+            .as_ref()
+            .is_some_and(|record| record.identity.is_some())
+            && let Some(metadata) = final_entry
+                .as_mut()
+                .and_then(|entry| entry.metadata.as_mut())
+        {
+            metadata.turn_attempt_id = Some(attempt.attempt_id.clone());
+        }
         let completed = TurnAttempt {
             status: TurnAttemptStatus::Completed,
             completed_at: Some(Utc::now()),
@@ -1618,7 +1654,7 @@ impl Session {
             .set(completed.attempt_id.clone(), completed)
             .await?;
         if let Some(record) = transcript {
-            let key = format!("{:020}:{}", record.sequence, uuid::Uuid::new_v4());
+            let key = turn_transcript_key(&record);
             txn.get_store::<Table<TurnTranscriptRecord>>(TURN_TRANSCRIPT_STORE)
                 .await?
                 .set(key, record)
@@ -1653,7 +1689,7 @@ impl Session {
         if let Some(branch) = branch {
             execution::transcript_in_txn(&txn, branch, &record).await?;
         }
-        let key = format!("{:020}:{}", record.sequence, uuid::Uuid::new_v4());
+        let key = turn_transcript_key(&record);
         txn.get_store::<Table<TurnTranscriptRecord>>(TURN_TRANSCRIPT_STORE)
             .await?
             .set(key, record)
