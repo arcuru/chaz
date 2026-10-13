@@ -929,8 +929,8 @@ incorporated input in place and drains newly pending input after the wait's
 paired result. Only that observation resumes; earlier model calls and tools do
 not run again. Other interrupted attempts require explicit retry, which does
 not adopt their unconfirmed steering. Stopping while a steered call is in
-flight leaves its receipt uncertain; that attempt's structured history is
-not replayed into later Chat context. No exactly-once external-effect guarantee
+flight leaves its receipt uncertain. Later Chat context excludes that
+unconfirmed input but keeps earlier observed text and paired tool exchanges. No exactly-once external-effect guarantee
 is implied.
 
 Upgrade every executor, client, transport peer and history consumer sharing

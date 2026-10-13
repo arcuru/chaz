@@ -9605,6 +9605,15 @@ async fn steering_cancelled_after_dispatch_never_enters_later_context() {
             .any(|m| matches!(m, RuntimeMessage::User(t) if t == "unconfirmed steering")),
         "cancellation is not an observation of the dispatched request"
     );
+    assert_eq!(
+        mock.recorded_calls()[2]
+            .messages
+            .iter()
+            .filter(|m| matches!(m, RuntimeMessage::Assistant(t) if t == "provisional"))
+            .count(),
+        1,
+        "an uncertain suffix must not erase earlier observed text"
+    );
     assert_eq!(mock.recorded_calls().len(), 3);
     server.shutdown().await;
 }

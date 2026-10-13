@@ -640,7 +640,7 @@ fn replay_turn_tagged(
     let mut previous = None;
     let mut model_sequence = None;
     let mut terminal = false;
-    let mut steering_pending = false;
+    let mut steering_pending = None;
     let mut i = 0;
     while i < sorted.len() {
         let record = &sorted[i];
@@ -652,10 +652,13 @@ fn replay_turn_tagged(
         }
         previous = Some(record.sequence);
         if matches!(record.message, TurnTranscriptMessage::Cancelled) {
-            // Cancellation does not confirm an in-flight steering request.
-            // Refuse this group rather than adopt uncertain input next turn.
-            if steering_pending || i + 1 != sorted.len() {
+            if i + 1 != sorted.len() {
                 return None;
+            }
+            // Cancellation does not confirm an in-flight steering request.
+            // Keep earlier observed history, but never adopt this uncertain tail.
+            if let Some(start) = steering_pending {
+                messages.truncate(start);
             }
             terminal = true;
             break;
@@ -665,7 +668,7 @@ fn replay_turn_tagged(
             inputs,
         } = &record.message
         {
-            if steering_pending
+            if steering_pending.is_some()
                 || *seq != model_sequence.map_or(0, |p| p + 1)
                 || !crate::session::steering::validate_boundary(
                     inputs,
@@ -675,7 +678,7 @@ fn replay_turn_tagged(
             {
                 return None;
             }
-            steering_pending = true;
+            steering_pending = Some(messages.len());
             messages.extend(
                 inputs
                     .iter()
@@ -699,7 +702,7 @@ fn replay_turn_tagged(
             return None;
         }
         model_sequence = Some(*seq);
-        steering_pending = false;
+        steering_pending = None;
         i += 1;
         if *end {
             // Terminal no_reply has no tool result and is not replayed.
@@ -1173,6 +1176,32 @@ mod tests {
             [0, 0, 1]
         );
         assert_eq!(tagged[2].0, RuntimeMessage::User("continue".into()));
+        let mut cancelled = rows.clone();
+        if let TurnTranscriptMessage::ModelResponse { terminal, .. } = &mut cancelled[3].message {
+            *terminal = false;
+        }
+        let mut uncertain = boundary.clone();
+        uncertain.sequence = 4;
+        if let TurnTranscriptMessage::Steering {
+            model_sequence,
+            inputs,
+        } = &mut uncertain.message
+        {
+            *model_sequence = 2;
+            inputs[0].id = uuid::Uuid::new_v4().to_string();
+            inputs[0].text = "unconfirmed".into();
+        }
+        cancelled.push(uncertain);
+        let mut stop = rows[3].clone();
+        stop.sequence = 5;
+        stop.message = TurnTranscriptMessage::Cancelled;
+        cancelled.push(stop);
+        let replayed =
+            replay_turn(&cancelled, 1000).expect("earlier confirmed history survives stop");
+        assert_eq!(replayed[2], RuntimeMessage::User("continue".into()));
+        assert_eq!(replayed[3], RuntimeMessage::Assistant("answer".into()));
+        assert_eq!(replayed.len(), 4, "unconfirmed suffix alone is excluded");
+
         if let TurnTranscriptMessage::Steering { inputs, .. } = &mut boundary.message {
             inputs[0].id = uuid::Uuid::new_v4().to_string();
         }
