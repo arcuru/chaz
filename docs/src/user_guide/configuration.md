@@ -702,26 +702,13 @@ The existing usage ledger and TUI consume the normalized token counts.
 
 ### Example: one connection, two protocols
 
-1. Configure both model IDs on one gateway that supports both endpoints:
+1. Use the two-model connection in [the API selection walkthrough](#walkthrough-one-connection-two-api-choices).
+   Its gateway must support both endpoints.
+   The Chat model keeps Chat Completions; `example/response-model` uses Responses
+   with the same credentials and no added model-name prefix.
+   Add `reasoning: { effort: high }` to that model if the endpoint supports it.
 
-   ```yaml
-   backends:
-     - name: gateway
-       type: openaicompatible
-       api_base: https://gateway.example/v1
-       api_key: "${GATEWAY_API_KEY}"
-       models:
-         - name: conversational-model
-         - name: reasoning-model
-           api: responses
-           reasoning: { effort: high }
-   ```
-
-   `conversational-model` still uses Chat Completions.
-   `reasoning-model` uses Responses with the same gateway and credentials;
-   selecting it does not add a model-name prefix to a single-backend setup.
-
-2. Select `reasoning-model` in a persisted session and ask a question that uses
+2. Select `example/response-model` in a persisted session and ask a question that uses
    a tool.
    Chaz sends the function schemas, then replays the returned reasoning and
    function calls together with their results on the next request.

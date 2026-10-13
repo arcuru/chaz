@@ -166,6 +166,7 @@ async fn ordered_wire_replay_keeps_every_item_and_call_id() {
     };
     assert_eq!(metadata.unwrap().extra[OUTPUT_ITEMS], json!(final_output()));
     messages.push(RuntimeMessage::AssistantWithExtra {
+        exchange_id: None,
         content: Some(content),
         provider_extra,
     });
@@ -234,6 +235,15 @@ fn refusals_errors_truncation_and_malformed_calls() {
     };
     assert_eq!(content, "Cannot help");
     assert_eq!(provider_extra[OUTPUT_ITEMS], json!([refusal]));
+    let mut opaque = final_output();
+    opaque.insert(
+        1,
+        json!({"type":"provider_extension", "state":{"opaque":"kept"}}),
+    );
+    let LLMResponse::Text { provider_extra, .. } = parse(response(opaque.clone())).unwrap() else {
+        panic!("text response")
+    };
+    assert_eq!(provider_extra[OUTPUT_ITEMS], json!(opaque));
     assert!(matches!(
         parse(
             json!({"status":"failed", "error":{"code":"rate_limit_exceeded", "message":"slow down"}})
@@ -291,7 +301,13 @@ async fn http_errors_keep_endpoint_and_do_not_fall_back_to_chat() {
 
 #[tokio::test]
 async fn scoped_identity_reuses_persisted_roots_and_isolates_callers_sessions_connections() {
-    let secrets = empty_secrets().await;
+    let (_instance, mut user) = crate::test_support::fresh_eidetica().await;
+    let key = user.get_default_key().unwrap();
+    let database = user
+        .create_database(eidetica::crdt::Doc::new(), &key)
+        .await
+        .unwrap();
+    let secrets = SecretStore::new(database.clone()).await;
     let config = backend("http://localhost/v1");
     let first = secrets.session_cache_key("session-root-1", "caller-1", &config);
     assert_eq!(first.len(), 64);
@@ -301,8 +317,8 @@ async fn scoped_identity_reuses_persisted_roots_and_isolates_callers_sessions_co
     );
     assert_eq!(
         first,
-        secrets
-            .clone()
+        SecretStore::new(database)
+            .await
             .session_cache_key("session-root-1", "caller-1", &config)
     );
     assert_ne!(
@@ -352,6 +368,7 @@ async fn unsupported_reasoning_and_corrupt_replay_fail_before_http() {
     config.models.as_mut().unwrap()[0].reasoning = None;
     let client = Responses::new(&config, &empty_secrets().await);
     let messages = [RuntimeMessage::AssistantWithExtra {
+        exchange_id: None,
         content: None,
         provider_extra: Map::from_iter([(OUTPUT_ITEMS.into(), json!("corrupt"))]),
     }];

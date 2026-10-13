@@ -178,8 +178,10 @@ pub enum RuntimeMessage {
     System(String),
     User(String),
     Assistant(String),
-    /// Complete terminal assistant output retained by a stateless transport.
+    /// Assistant output with retained provider data.
     AssistantWithExtra {
+        /// Same request-local occurrence identity as `AssistantToolCalls`.
+        exchange_id: Option<usize>,
         content: Option<String>,
         provider_extra: serde_json::Map<String, serde_json::Value>,
     },
@@ -212,6 +214,7 @@ impl RuntimeMessage {
             Self::Assistant(content)
         } else {
             Self::AssistantWithExtra {
+                exchange_id: None,
                 content: Some(content),
                 provider_extra,
             }
@@ -994,7 +997,9 @@ impl<'a> RoundProjector<'a> {
         // Host coordinates are projection-only. Backend requests and transport
         // retries remain identical to the ordinary unprojected message shape.
         for message in &mut accepted.messages {
-            if let RuntimeMessage::AssistantToolCalls { exchange_id, .. } = message {
+            if let RuntimeMessage::AssistantToolCalls { exchange_id, .. }
+            | RuntimeMessage::AssistantWithExtra { exchange_id, .. } = message
+            {
                 *exchange_id = None;
             }
         }
@@ -1218,11 +1223,14 @@ async fn run_turn(
     scope: ModelCallScope,
 ) -> Result<RuntimeOutcome, TurnError> {
     let tools = &tool_ctx.tools;
+    let supports_tools = backend
+        .try_supports_tools_for_model(model)
+        .map_err(|error| error.to_string())?;
     if tool_ctx.allow_no_reply {
         if tools.get(NO_REPLY_TOOL).is_some() {
             return Err("no_reply is reserved for the runtime terminal action".into());
         }
-        if !backend.supports_tools_for_model(model) {
+        if !supports_tools {
             return Err("no_reply requires a tool-capable model".into());
         }
     }
@@ -1261,16 +1269,13 @@ async fn run_turn(
         routine_engine: tool_ctx.routine_engine.clone(),
     });
 
-    if resume.is_some()
-        && ((tools.is_empty() && !tool_ctx.allow_no_reply)
-            || !backend.supports_tools_for_model(model))
-    {
+    if resume.is_some() && ((tools.is_empty() && !tool_ctx.allow_no_reply) || !supports_tools) {
         return Err("checkpointed job wait requires a tool-capable turn".into());
     }
 
     // Tool-free jobs have the same next-call/closing boundary without adding
     // tool authority or changing standalone callers' single-shot behavior.
-    if (tools.is_empty() && !tool_ctx.allow_no_reply) || !backend.supports_tools_for_model(model) {
+    if (tools.is_empty() && !tool_ctx.allow_no_reply) || !supports_tools {
         let mut messages = initial_messages;
         loop {
             projector.append_boundary_input(

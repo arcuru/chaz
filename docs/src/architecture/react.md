@@ -145,6 +145,11 @@ new input.
 Final entries retain the terminal array in `ResponseMetadata.extra` so context
 assembly restores it at the assistant entry's position rather than duplicating
 its flattened text.
+In attached sessions, context keeps the host-rendered local/bridge envelope
+separately from native output.
+The Responses request appends that envelope as user context after the original
+items, preserving delivery state without rewriting provider output.
+Other APIs use the rendered assistant text as before.
 Tool IDs use `call_id`, not the output item's `id`.
 The adapter replays every retained item, including encrypted reasoning, before
 appending correlated `function_call_output` items.

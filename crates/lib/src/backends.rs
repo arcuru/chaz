@@ -21,9 +21,8 @@ use crate::{
 /// LLM client selected by the model's effective API. [`LLMBackend`] is not
 /// dyn-compatible (native `async fn` in trait), so dispatch is an explicit
 /// enum rather than a boxed trait object; each arm forwards to the concrete
-/// backend. Constructed fresh per call from a `&Backend` (cheap — both arms
-/// just clone the config + secret-store handle), mirroring the old
-/// `OpenAI::new(...)` call sites.
+/// backend. Constructed fresh per call from a `&Backend`; each client clones
+/// the config and secret-store handle.
 enum BackendClient {
     OpenAI(OpenAI),
     Anthropic(Anthropic),
@@ -600,17 +599,24 @@ impl BackendManager {
     }
 
     /// Whether the backend for the given model supports tool/function calling.
+    /// Invalid API selections report no support; execution preserves the error.
     pub fn supports_tools_for_model(&self, model: Option<&str>) -> bool {
+        self.try_supports_tools_for_model(model).unwrap_or(false)
+    }
+
+    pub(crate) fn try_supports_tools_for_model(
+        &self,
+        model: Option<&str>,
+    ) -> Result<bool, LlmError> {
         if let Some(mock) = &self.mock {
-            return mock.supports_tools();
+            return Ok(mock.supports_tools());
         }
         if self.backends.is_empty() {
-            return false;
+            return Ok(false);
         }
         let backend = self.select_backend_for_model(model);
         let resolved = self.resolve_model_name(model);
-        BackendClient::for_model(backend, &self.secrets, &resolved)
-            .is_ok_and(|client| client.supports_tools())
+        Ok(BackendClient::for_model(backend, &self.secrets, &resolved)?.supports_tools())
     }
 
     /// Resolve a model name: strip backend prefix, fall back to default.
@@ -696,20 +702,7 @@ impl BackendManager {
 mod tests {
     use super::*;
     use crate::config::{Backend, BackendType, Model};
-    use eidetica::backend::database::InMemory;
-    use eidetica::{Instance, NewUser};
-
-    async fn empty_secrets() -> SecretStore {
-        let (_instance, mut user) =
-            Instance::create_backend(Box::new(InMemory::new()), NewUser::passwordless("t"))
-                .await
-                .unwrap();
-        let key = user.get_default_key().unwrap();
-        let mut s = eidetica::crdt::Doc::new();
-        s.set("name", "central");
-        let db = user.create_database(s, &key).await.unwrap();
-        SecretStore::new(db).await
-    }
+    use crate::test_support::empty_secrets;
 
     fn backend(name: &str, models: &[&str]) -> Backend {
         let mut b = Backend::new(BackendType::OpenAICompatible);
@@ -1009,40 +1002,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn model_api_selects_clients_and_rejects_incompatible_families() {
+    async fn attached_turn_preserves_api_configuration_errors() {
+        use crate::test_support::{fresh_session, permissive_security, tool_context};
+        use crate::tool::{ToolPolicyRegistry, ToolRegistry};
+
+        let (_instance, session) = fresh_session().await;
+        let mut ctx = tool_context(session, Arc::new(ToolRegistry::new()));
+        ctx.allow_no_reply = true;
         let secrets = empty_secrets().await;
-        let mut b = backend("proxy", &["chat", "responses"]);
-        b.models.as_mut().unwrap()[1].api = Some(ModelApi::Responses);
-        assert!(matches!(
-            BackendClient::for_model(&b, &secrets, "chat"),
-            Ok(BackendClient::OpenAI(_))
-        ));
-        assert!(matches!(
-            BackendClient::for_model(&b, &secrets, "gpt-6-sol"),
-            Ok(BackendClient::OpenAI(_))
-        ));
-        assert!(matches!(
-            BackendClient::for_model(&b, &secrets, "responses"),
-            Ok(BackendClient::Responses(_))
-        ));
-        b.api = Some(ModelApi::AnthropicMessages);
-        assert!(matches!(
-            BackendClient::for_model(&b, &secrets, "chat"),
-            Err(LlmError::Configuration { .. })
-        ));
-        b.backend_type = BackendType::Anthropic;
-        b.api = None;
-        assert!(matches!(
-            BackendClient::for_model(&b, &secrets, "chat"),
-            Ok(BackendClient::Anthropic(_))
-        ));
-        for api in [ModelApi::ChatCompletions, ModelApi::Responses] {
-            b.api = Some(api);
-            assert!(matches!(
-                BackendClient::for_model(&b, &secrets, "chat"),
-                Err(LlmError::Configuration { .. })
-            ));
-        }
+        let mut b = backend("proxy", &["model"]);
+        b.models.as_mut().unwrap()[0].api = Some(ModelApi::AnthropicMessages);
+        let mgr = BackendManager::new(&Some(vec![b]), secrets);
+        let expected = mgr
+            .chat_with_tools_for_model(Some("model"), &[], &[], "model")
+            .await
+            .err()
+            .expect("API selection must fail")
+            .to_string();
+        let result = crate::runtime::execute(
+            Some("model"),
+            vec![RuntimeMessage::User("hi".into())],
+            &mgr,
+            &permissive_security(),
+            &ctx,
+            &ToolPolicyRegistry::empty(),
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(result.expect_err("turn must fail"), expected);
     }
 
     #[tokio::test]

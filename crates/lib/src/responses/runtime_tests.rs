@@ -490,6 +490,74 @@ async fn native_pending_wait_resume_preserves_items_and_never_reexecutes_prior_e
 }
 
 #[tokio::test]
+async fn native_final_replay_keeps_bridge_provenance() {
+    use crate::session::EntryRouting;
+    let config = native_backend("http://localhost/v1");
+    let client = Responses::new(&config, &empty_secrets().await);
+    let LLMResponse::Text { metadata, .. } = parse_response(
+        serde_json::from_value(response(final_output())).unwrap(),
+        "test-model",
+    )
+    .unwrap() else {
+        panic!("text response")
+    };
+    for delivery in ["local", "pending", "sent"] {
+        let mut final_entry = entry("test-agent", "Done", metadata.clone());
+        let mut entries = vec![entry("user", "question", None)];
+        if delivery != "local" {
+            final_entry.routing = Some(EntryRouting {
+                outbound_id: Some("outbound".into()),
+                ..Default::default()
+            });
+        }
+        entries.push(final_entry);
+        if delivery == "sent" {
+            let mut receipt = entry("test-agent", "", None);
+            receipt.entry_type = EntryType::MatrixSent;
+            receipt.routing = Some(EntryRouting {
+                reply_to: Some("outbound".into()),
+                ..Default::default()
+            });
+            entries.push(receipt);
+        }
+        let messages = ContextBuilder::new(
+            &entries,
+            "test-agent",
+            "Policy",
+            &ContextConfig {
+                max_context_tokens: 8192,
+                reserved_output_tokens: 256,
+            },
+        )
+        .with_matrix_binding("@agent:example", "!room:example")
+        .build()
+        .await
+        .messages;
+        let request = client.request(&messages, &[], "test-model", None).unwrap();
+        assert_eq!(
+            &request.input[1..3],
+            final_output(),
+            "native items stay unchanged"
+        );
+        let envelope: Value = request
+            .input
+            .iter()
+            .filter(|item| item["role"] == "user")
+            .filter_map(|item| item["content"][0]["text"].as_str())
+            .filter_map(|text| serde_json::from_str::<Value>(text).ok())
+            .find(|value| value["sender"] == "test-agent")
+            .expect("native replay must retain the host-rendered bridge envelope");
+        assert_eq!(envelope["body"], "Done");
+        if delivery == "local" {
+            assert_eq!(envelope["kind"], "local_message");
+        } else {
+            assert_eq!(envelope["kind"], "matrix_reply");
+            assert_eq!(envelope["delivery"], delivery);
+        }
+    }
+}
+
+#[tokio::test]
 async fn native_silence_and_tool_free_turns_keep_terminal_items_and_scoped_identity() {
     for silent in [false, true] {
         let server = MockServer::start().await;

@@ -493,13 +493,23 @@ impl<'a> ContextBuilder<'a> {
                         .as_ref()
                         .and_then(|m| m.extra.get(crate::responses::OUTPUT_ITEMS))
                     {
-                        Some(items) => RuntimeMessage::AssistantWithExtra {
-                            content: Some(text),
-                            provider_extra: serde_json::Map::from_iter([(
+                        Some(items) => {
+                            let mut provider_extra = serde_json::Map::from_iter([(
                                 crate::responses::OUTPUT_ITEMS.into(),
                                 items.clone(),
-                            )]),
-                        },
+                            )]);
+                            if text != entry.content {
+                                provider_extra.insert(
+                                    crate::responses::ENTRY_PROVENANCE.into(),
+                                    serde_json::Value::String(text.clone()),
+                                );
+                            }
+                            RuntimeMessage::AssistantWithExtra {
+                                exchange_id: None,
+                                content: Some(text),
+                                provider_extra,
+                            }
+                        }
                         None => RuntimeMessage::Assistant(text),
                     }
                 } else {
@@ -817,6 +827,7 @@ fn message_cost(msg: &RuntimeMessage) -> usize {
         RuntimeMessage::AssistantWithExtra {
             content,
             provider_extra,
+            ..
         } => format!(
             "{}{}",
             content.as_deref().unwrap_or_default(),

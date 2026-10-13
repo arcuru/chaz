@@ -15,6 +15,8 @@ use crate::{
 };
 
 pub(crate) const OUTPUT_ITEMS: &str = "openai_responses_output";
+/// Host-rendered routing context, kept separate from immutable native output.
+pub(crate) const ENTRY_PROVENANCE: &str = "chaz_entry_provenance";
 
 pub struct Responses {
     backend: Backend,
@@ -127,6 +129,7 @@ impl Responses {
                 RuntimeMessage::AssistantWithExtra {
                     content,
                     provider_extra,
+                    ..
                 }
                 | RuntimeMessage::AssistantToolCalls {
                     content,
@@ -138,6 +141,16 @@ impl Responses {
                             message: "Invalid persisted Responses output items".into(),
                         })?;
                         input.extend(items.iter().cloned());
+                        if let Some(envelope) = provider_extra.get(ENTRY_PROVENANCE) {
+                            // Native output must stay unchanged, but it cannot
+                            // replace the host's local/bridge delivery context.
+                            let envelope =
+                                envelope.as_str().ok_or_else(|| LlmError::InvalidRequest {
+                                    message: "Invalid Responses entry provenance".into(),
+                                })?;
+                            input.push(json!({"type":"message", "role":"user",
+                                "content":[{"type":"input_text", "text":envelope}]}));
+                        }
                     } else {
                         if let Some(text) = content.as_ref().filter(|s| !s.is_empty()) {
                             input.push(assistant_message(text));
