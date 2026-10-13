@@ -45,6 +45,7 @@ use theme::TOOL as COLOR_TOOL;
 use theme::USER as COLOR_USER;
 
 mod composer;
+mod content;
 #[cfg(test)]
 mod hub_tests;
 #[cfg(test)]
@@ -125,8 +126,13 @@ pub(super) fn summarize_tool_result(content: &str) -> (String, String, bool) {
         Some(b) => (true, b),
         None => (false, rest),
     };
-    let first = body.lines().next().unwrap_or("");
-    let oneline = first.split_whitespace().collect::<Vec<_>>().join(" ");
+    let formatted = content::tool_output(body);
+    let first = if formatted.starts_with(['{', '[']) {
+        formatted.as_str()
+    } else {
+        formatted.lines().next().unwrap_or("")
+    };
+    let oneline = content::safe_line(&first.split_whitespace().collect::<Vec<_>>().join(" "));
     (name.trim().to_string(), oneline, is_error)
 }
 
@@ -272,7 +278,7 @@ fn display_lines(content: &str, max_chars: Option<usize>) -> Vec<String> {
         }
         None => content,
     };
-    let out: Vec<String> = src.split('\n').map(str::to_owned).collect();
+    let out: Vec<String> = src.split('\n').map(content::safe_line).collect();
     if out.is_empty() {
         vec![String::new()]
     } else {
@@ -1211,9 +1217,10 @@ fn build_transcript(
 
                 lines.push(Line::from(vec![Span::styled(label, sender_style)]));
 
-                for content_line in entry.content.lines() {
-                    sources.push((lines.len(), content_line.to_owned()));
-                    lines.push(Line::from(format!("  {content_line}")));
+                for line in content::markdown(&entry.content) {
+                    let body: String = line.spans.iter().map(|span| span.content.as_ref()).collect();
+                    sources.push((lines.len(), body.strip_prefix("  ").unwrap_or(&body).to_owned()));
+                    lines.push(line);
                 }
                 lines.push(Line::from(""));
             }
@@ -1380,7 +1387,8 @@ fn build_transcript(
                         .split_once(": ")
                         .map(|(_, b)| b)
                         .unwrap_or(&entry.content);
-                    for l in display_lines(body, None) {
+                    let body = body.strip_prefix("ERROR: ").unwrap_or(body);
+                    for l in display_lines(&content::tool_output(body), None) {
                         lines.push(Line::from(vec![Span::styled(format!("      {l}"), dim)]));
                     }
                 }
@@ -2935,32 +2943,264 @@ mod transcript_tests {
     }
 
     #[tokio::test]
+    async fn structured_tool_text_renders_newlines_without_unescaping_literals() {
+        // Same representation as context_prune_recover: a JSON-serialized page
+        // inside the server's `name: output` display envelope.
+        let output = serde_json::json!({
+            "text": "first line\n  second line\n日 🦀",
+            "literal": r"keep \n and C:\new\file",
+            "ok": true,
+        });
+        let content = format!("context_prune_recover: {output}");
+        let (_instance, mut app) =
+            app_with(vec![entry("chaz", &content, EntryType::ToolResult)]).await;
+        app.active_mut().expanded_entries.insert(0);
+        app.active_mut().active_turns = 0;
+        let mut terminal = Terminal::new(TestBackend::new(64, 24)).unwrap();
+        terminal.draw(|f| ui_chat(f, &mut app, &[])).unwrap();
+        let drawn = rows(&terminal, 0, 24);
+        println!("{}", drawn.join("\n"));
+        assert!(
+            drawn
+                .iter()
+                .any(|line| line.trim_matches(['│', ' ']) == "second line"),
+            "JSON text must occupy distinct rendered lines: {drawn:?}"
+        );
+        assert!(
+            drawn
+                .iter()
+                .any(|line| line.contains(r"keep \n and C:\new\file"))
+        );
+        assert_eq!(
+            app.active().entries[0].content,
+            content,
+            "display must not change stored bytes"
+        );
+    }
+
+    fn snapshot_rows(terminal: &Terminal<TestBackend>) -> String {
+        rows(terminal, 0, terminal.backend().buffer().area.height)
+            .iter()
+            .map(|row| row.trim_end())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[tokio::test]
+    async fn markdown_styles_reach_the_chat_buffer() {
+        let markdown = "# Report\n\n**Bold** and *italic* with `x\\n`\n\n- first item\n- [Guide](https://example.org)\n  - nested item\n\n3. ordered\n4. next\n\n```rust\n  let path = r\"C:\\new\\file\";\n\n  // 日 🦀 and literal \\n\n```\n\n> quoted text";
+        let (_instance, mut app) =
+            app_with(vec![entry("chaz", markdown, EntryType::Message)]).await;
+        app.active_mut().session_name = Some("render-demo".into());
+        app.active_mut().active_turns = 0;
+        let mut terminal = Terminal::new(TestBackend::new(64, 32)).unwrap();
+        terminal.draw(|f| ui_chat(f, &mut app, &[])).unwrap();
+        let drawn = rows(&terminal, 0, 32);
+        let buffer = terminal.backend().buffer();
+        for (text, modifier) in [
+            ("Report", Modifier::BOLD),
+            ("Bold", Modifier::BOLD),
+            ("italic", Modifier::ITALIC),
+            ("Guide", Modifier::UNDERLINED),
+        ] {
+            let (y, x) = drawn
+                .iter()
+                .enumerate()
+                .find_map(|(y, row)| row.find(text).map(|x| (y, row[..x].width())))
+                .unwrap();
+            assert!(
+                buffer[(x as u16, y as u16)].modifier.contains(modifier),
+                "style for {text}"
+            );
+        }
+        let (y, x) = drawn
+            .iter()
+            .enumerate()
+            .find_map(|(y, row)| row.find(r"x\n").map(|x| (y, row[..x].width())))
+            .unwrap();
+        assert_eq!(buffer[(x as u16, y as u16)].bg, theme::BAR_BG);
+        assert_eq!(buffer[(x as u16, y as u16)].fg, theme::ACCENT);
+        assert!(drawn.iter().any(|row| row.contains(r"C:\new\file")));
+        insta::assert_snapshot!("markdown_chat", snapshot_rows(&terminal));
+    }
+
+    #[tokio::test]
+    async fn tool_output_shapes_reach_the_chat_buffer() {
+        let outputs = [
+            "shell: first line\n  indented line\nkeep \\n and C:\\new\\file".to_string(),
+            format!(
+                "query: {}",
+                serde_json::json!({"items": [{"text": "one\ntwo", "count": 2}, {}], "empty": "", "missing": null})
+            ),
+            format!(
+                "text: {}",
+                serde_json::json!("quoted\n  text and literal \\n")
+            ),
+            "empty: ".into(),
+            "query: ERROR: {\"reason\":\"failed\\n  retry later\"}".into(),
+            "clipped: {\"text\":\"not decoded\\n…".into(),
+        ];
+        let entries = outputs
+            .iter()
+            .map(|output| entry("chaz", output, EntryType::ToolResult))
+            .collect();
+        let (_instance, mut app) = app_with(entries).await;
+        app.active_mut().session_name = Some("render-demo".into());
+        app.active_mut().active_turns = 0;
+        app.expand_all = true;
+        let mut terminal = Terminal::new(TestBackend::new(64, 38)).unwrap();
+        terminal.draw(|f| ui_chat(f, &mut app, &[])).unwrap();
+        let drawn = rows(&terminal, 0, 38);
+        assert!(
+            drawn
+                .iter()
+                .any(|row| row.trim_matches(['│', ' ']) == "indented line")
+        );
+        assert!(
+            drawn
+                .iter()
+                .any(|row| row.trim_matches(['│', ' ']) == "two")
+        );
+        assert!(drawn.iter().any(|row| row.contains(r"text and literal \n")));
+        assert!(
+            drawn
+                .iter()
+                .any(|row| row.contains(r#"{"text":"not decoded\n…"#))
+        );
+        assert!(
+            drawn
+                .iter()
+                .any(|row| row.trim_matches(['│', ' ']) == "retry later")
+        );
+        let y = drawn
+            .iter()
+            .position(|row| row.contains("✗ query"))
+            .unwrap();
+        assert_eq!(terminal.backend().buffer()[(3, y as u16)].fg, COLOR_ERROR);
+        assert_eq!(
+            app.active()
+                .entries
+                .iter()
+                .map(|e| &e.content)
+                .collect::<Vec<_>>(),
+            outputs.iter().collect::<Vec<_>>()
+        );
+        insta::assert_snapshot!("tool_output_chat", snapshot_rows(&terminal));
+    }
+
+    #[tokio::test]
+    async fn decoded_controls_are_quarantined_in_the_chat_buffer() {
+        let json = serde_json::json!({"text": "ok\n\u{1b}[2J\u{9b}hidden\u{7}\u{202e} 日", "literal": r"\u001b"});
+        let (_instance, mut app) = app_with(vec![
+            entry("chaz", &format!("query: {json}"), EntryType::ToolResult),
+            // Markdown entities are decoded by the parser, after input quarantine.
+            entry(
+                "chaz",
+                "**safe** &#27;[2J\n`literal \\n`",
+                EntryType::Message,
+            ),
+        ])
+        .await;
+        app.expand_all = true;
+        let mut terminal = Terminal::new(TestBackend::new(64, 24)).unwrap();
+        terminal.draw(|f| ui_chat(f, &mut app, &[])).unwrap();
+        let screen = snapshot_rows(&terminal);
+        assert!(
+            !screen.chars().any(|c| c.is_control() && c != '\n'),
+            "unsafe screen: {screen:?}"
+        );
+        assert!(!screen.contains('\u{202e}'));
+        assert!(screen.contains(r"\u001b"));
+        assert!(screen.contains('�'));
+    }
+
+    #[tokio::test]
+    async fn partial_markdown_replacements_rebuild_and_remain_readable() {
+        let (_instance, mut app) = app_with(Vec::new()).await;
+        app.active_mut().session_name = Some("render-demo".into());
+        app.active_mut().active_turns = 0;
+        for partial in [
+            "**unfinished",
+            "[Guide](https://exam",
+            "```rust\n  let path = r\"C:\\new",
+            "```rust\n  let path = r\"C:\\new\\file\";\n```\n\n**Done**",
+        ] {
+            app.active_mut()
+                .set_entries(vec![entry("chaz", partial, EntryType::Message)]);
+            let mut terminal = Terminal::new(TestBackend::new(28, 16)).unwrap();
+            terminal.draw(|f| ui_chat(f, &mut app, &[])).unwrap();
+            assert_eq!(app.active().entries[0].content, partial);
+            assert!(!app.active().live.render.lines.is_empty());
+            let screen = snapshot_rows(&terminal);
+            if partial.ends_with("**Done**") {
+                assert!(screen.contains("Done"));
+                insta::assert_snapshot!("partial_markdown_narrow", screen);
+            } else if partial.starts_with("```rust") {
+                assert!(screen.contains("let path"));
+            }
+        }
+        // Even sub-indent terminal widths must not panic during wrap/scroll.
+        for width in [1, 2, 5, 8, 12] {
+            let mut terminal = Terminal::new(TestBackend::new(width, 10)).unwrap();
+            terminal.draw(|f| ui_chat(f, &mut app, &[])).unwrap();
+        }
+    }
+
+    #[test]
+    fn collapsed_tool_preview_decodes_once_and_keeps_its_bound() {
+        let (name, summary, error) =
+            summarize_tool_result(r#"query: ERROR: "one\n  two and literal \\n""#);
+        assert_eq!(name, "query");
+        assert_eq!(summary, "one");
+        assert!(error);
+        assert_eq!(
+            summarize_tool_result(r"shell: keep \n and C:\new\file").1,
+            r"keep \n and C:\new\file"
+        );
+        let output = serde_json::json!({"text": "one\ntwo", "more": "x".repeat(200)});
+        let (_, summary, _) = summarize_tool_result(&format!("query: {output}"));
+        assert!(summary.contains("one two"));
+        assert_eq!(ellipsize(&summary, 90).chars().count(), 91);
+    }
+
+    #[tokio::test]
     async fn windowed_render_matches_full_render_at_every_scroll_position() {
-        let (_instance, mut app) = app_with(transcript(100)).await;
+        let mut entries = transcript(100);
+        entries.extend([
+            entry("chaz", "# Markdown\n\n**wrap me please** [link](https://example.org/long/path)\n\n- first\n  - second\n\n```\n  literal \\n\n```", EntryType::Message),
+            entry("chaz", r#"query: {"text":"first\n  second","nested":[true,null]}"#, EntryType::ToolResult),
+        ]);
+        let (_instance, mut app) = app_with(entries).await;
+        app.active_mut().expanded_entries.insert(101);
         app.active_mut().expanded_entries.insert(2); // one expanded tool call
         app.active_mut().touch_transcript();
-        let (width, height) = (47, 24);
-        // Tab bar (1) + status (1) + empty composer (3) around the messages box.
-        let messages_h = height - 5;
-        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
-        terminal.draw(|f| ui_chat(f, &mut app, &[])).unwrap();
-        let total = *app.active().live.render.offsets.last().unwrap();
-        assert!(total > 300, "transcript must span many screens: {total}");
-
-        for offset in (0..=total as u16 + 5).step_by(7) {
-            app.active_mut().scroll_offset = offset;
-            app.click_regions.clear();
-            // Fresh buffer per frame: TestBackend keeps the stale symbol
-            // under a wide grapheme's continuation cell across draws.
+        for (width, height) in [(12, 12), (28, 16), (47, 24)] {
+            // Tab bar (1) + status (1) + empty composer (3) around the messages box.
+            let messages_h = height - 5;
             let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
             terminal.draw(|f| ui_chat(f, &mut app, &[])).unwrap();
-            let drawn = rows(&terminal, 1, 1 + messages_h);
-            assert_eq!(drawn, reference(&app, width, messages_h), "offset {offset}");
-            // Every header click target sits on a drawn expand/collapse icon.
-            for region in &app.click_regions {
-                if let ClickTarget::ToggleEntryExpanded(_) = region.target {
-                    let cell = terminal.backend().buffer()[(region.x, region.y)].symbol();
-                    assert!(matches!(cell, "▸" | "▾"), "offset {offset}: {cell:?}");
+            let total = *app.active().live.render.offsets.last().unwrap();
+            assert!(total > 300, "transcript must span many screens: {total}");
+
+            for offset in (0..=total as u16 + 5).step_by(7) {
+                app.active_mut().scroll_offset = offset;
+                app.click_regions.clear();
+                // Fresh buffer per frame: TestBackend keeps the stale symbol
+                // under a wide grapheme's continuation cell across draws.
+                let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+                terminal.draw(|f| ui_chat(f, &mut app, &[])).unwrap();
+                let drawn = rows(&terminal, 1, 1 + messages_h);
+                assert_eq!(
+                    drawn,
+                    reference(&app, width, messages_h),
+                    "width {width}, offset {offset}"
+                );
+                // Every header click target sits on a drawn expand/collapse icon.
+                for region in &app.click_regions {
+                    if let ClickTarget::ToggleEntryExpanded(_) = region.target {
+                        let cell = terminal.backend().buffer()[(region.x, region.y)].symbol();
+                        assert!(matches!(cell, "▸" | "▾"), "offset {offset}: {cell:?}");
+                    }
                 }
             }
         }

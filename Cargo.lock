@@ -798,6 +798,7 @@ dependencies = [
  "insta",
  "matrix-sdk",
  "nucleo-matcher",
+ "pulldown-cmark",
  "ratatui",
  "regex",
  "serde",

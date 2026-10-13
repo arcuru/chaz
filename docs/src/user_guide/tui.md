@@ -58,6 +58,67 @@ The TUI has four main pieces:
 
 An ordinary launch opens the [session hub](#session-hub) rather than any conversation; there is no built-in default session.
 
+## Reading messages and tool output
+
+| Content                  | Display                                                                                                   |
+| ------------------------ | --------------------------------------------------------------------------------------------------------- |
+| Message Markdown         | Headings, bold/italic emphasis, ordered/nested lists and readable links                                   |
+| Inline and fenced code   | Accent text on a dark background; code indentation and literal escapes are retained                       |
+| Collapsed tool entry     | One-line preview, capped at 90 characters plus an ellipsis                                                |
+| Expanded tool result     | Indented plain text, with line breaks; complete JSON becomes an indented outline with decoded text values |
+| Click the `▸` / `▾` icon | Expand or collapse that entry                                                                             |
+| `Ctrl+T` or `/expand`    | Toggle expansion for all tool entries and directives                                                      |
+
+### Formatting is a view, not a rewrite
+
+Messages use Markdown styling automatically. Links show their label and target;
+they do not launch a browser. Tool output is **not** Markdown, so shell syntax,
+asterisks and code remain text. Both wrap to the pane's width and use the same
+history scrolling as other entries.
+
+The TUI decodes a tool result only when its body is a complete JSON value.
+JSON string values become text with real line breaks; an intentionally literal
+backslash-n stays literal. It does not decode nested JSON inside a text value,
+or guess at escapes in ordinary text. Empty strings, objects and arrays remain
+visible in structured output. The outline is for reading, not for copying as
+valid JSON. Terminal controls are quarantined after decoding.
+
+Stored entries, wire payloads and output limits do not change. A successful tool
+result's stored display preview can already be clipped at 500 characters.
+If clipping makes JSON incomplete, the TUI shows that preview as plain text,
+including its escapes and truncation marker, rather than guessing the missing
+structure. `/raw` still shows the stored entry representation.
+
+### Walkthrough: read an escaped result
+
+1. Send a message containing `# Report`, `**bold**`, `*italic*` and an inline
+   code span. The message shows a styled heading and emphasis; code such as
+   `C:\new\file` keeps its backslashes.
+2. Suppose a tool returns this complete JSON body:
+
+   ```json
+   { "text": "one\n  two", "literal": "keep \\n" }
+   ```
+
+   The collapsed row starts with `▸ query` and a short preview. Click its icon,
+   or press `Ctrl+T`. The body reads:
+
+   ```text
+     ▾ query
+         {
+           "literal": keep \n
+           "text": one
+             two
+         }
+   ```
+
+   `two` occupies a separate line, while `keep \n` remains on one line.
+
+3. If the preview ends midway through JSON, for example
+   `{"text":"one\n…`, expansion cannot recover the missing bytes. Ask the tool
+   for a smaller page or shorter result and expand the next complete result.
+   Merely toggling expansion does not repair clipped JSON or rerun the tool.
+
 ## Context usage
 
 The status bar's `ctx 57k/1M (5.7%) tok` pair is separate from running

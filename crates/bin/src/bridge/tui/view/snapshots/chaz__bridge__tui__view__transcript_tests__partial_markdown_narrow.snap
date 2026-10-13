@@ -1,0 +1,20 @@
+---
+source: crates/bin/src/bridge/tui/view/mod.rs
+expression: screen
+---
+ render-demo ×
+╭ Chaz ────────────────────╮
+│chaz [local]:             │
+│    let path =            │
+│r"C:\new\file";           │
+│                          │
+│  Done                    │
+│                          │
+│                          │
+│                          │
+│                          │
+╰──────────────────────────╯
+ … | ctx unknown/unknown tok
+╭ > ───────────────────────╮
+│                          │
+╰──────────────────────────╯
