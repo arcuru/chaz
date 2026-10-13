@@ -67,7 +67,7 @@ impl Tool for DescribeTool {
 
                 output.push_str("\n\nParameters:\n");
                 for (param_name, schema) in props {
-                    let type_str = schema.get("type").and_then(|t| t.as_str()).unwrap_or("any");
+                    let type_str = describe_type(schema.get("type"));
                     let req = if required.contains(&param_name.as_str()) {
                         "required"
                     } else {
@@ -91,6 +91,25 @@ impl Tool for DescribeTool {
             Ok(output)
         })
     }
+}
+
+fn describe_type(value: Option<&Value>) -> String {
+    let known_type = |name: &&str| {
+        matches!(
+            *name,
+            "string" | "number" | "integer" | "boolean" | "object" | "array" | "null"
+        )
+    };
+    match value {
+        Some(Value::Array(types)) if !types.is_empty() => types
+            .iter()
+            .map(|value| value.as_str().filter(known_type))
+            .collect::<Option<Vec<_>>>()
+            .map(|types| types.join(" | ")),
+        Some(value) => value.as_str().filter(known_type).map(str::to_owned),
+        None => None,
+    }
+    .unwrap_or_else(|| "any".to_string())
 }
 
 #[cfg(test)]
@@ -125,6 +144,27 @@ mod tests {
             _ctx: &'a ToolContext,
         ) -> Pin<Box<dyn std::future::Future<Output = Result<String, ToolError>> + Send + 'a>>
         {
+            Box::pin(async { Ok(String::new()) })
+        }
+    }
+
+    struct SchemaTool(Value);
+    impl Tool for SchemaTool {
+        fn descriptor(&self) -> ToolDescriptor {
+            ToolDescriptor {
+                name: "schema".to_string(),
+                description: "Schema rendering fixture.".to_string(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": { "value": self.0 }
+                }),
+            }
+        }
+        fn execute<'a>(
+            &'a self,
+            _arguments: Value,
+            _ctx: &'a ToolContext,
+        ) -> Pin<Box<dyn Future<Output = Result<String, ToolError>> + Send + 'a>> {
             Box::pin(async { Ok(String::new()) })
         }
     }
@@ -213,6 +253,58 @@ mod tests {
             out.contains("opt (number, optional)"),
             "expected opt row without description, got: {out}"
         );
+    }
+
+    #[tokio::test]
+    async fn renders_read_file_nullable_integer_parameters() {
+        let (_i, c) = ctx_with(vec![Box::new(crate::tools::ReadFile)]).await;
+        let out = DescribeTool
+            .execute(serde_json::json!({ "name": "read_file" }), &c)
+            .await
+            .unwrap();
+        assert!(out.contains("path (string, required)"), "got: {out}");
+        for name in ["offset", "limit"] {
+            assert!(
+                out.contains(&format!("{name} (integer | null, required)")),
+                "got: {out}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn renders_schema_types_and_falls_back_for_unknown_or_malformed_types() {
+        use serde_json::json;
+        let cases = [
+            (json!({}), "any"),
+            (json!({ "type": null }), "any"),
+            (json!({ "type": 42 }), "any"),
+            (json!({ "type": {} }), "any"),
+            (json!({ "type": "unknown" }), "any"),
+            (json!({ "type": [] }), "any"),
+            (json!({ "type": ["integer", null] }), "any"),
+            (json!({ "type": ["integer", "unknown"] }), "any"),
+            (json!({ "type": ["integer", "null"] }), "integer | null"),
+            (json!({ "type": ["null", "string"] }), "null | string"),
+            (json!({ "type": ["boolean"] }), "boolean"),
+            (json!({ "type": "string" }), "string"),
+            (json!({ "type": "number" }), "number"),
+            (json!({ "type": "integer" }), "integer"),
+            (json!({ "type": "boolean" }), "boolean"),
+            (json!({ "type": "object" }), "object"),
+            (json!({ "type": "array" }), "array"),
+            (json!({ "type": "null" }), "null"),
+        ];
+        for (schema, expected) in cases {
+            let (_i, c) = ctx_with(vec![Box::new(SchemaTool(schema.clone()))]).await;
+            let out = DescribeTool
+                .execute(json!({ "name": "schema" }), &c)
+                .await
+                .unwrap();
+            assert!(
+                out.contains(&format!("value ({expected}, optional)")),
+                "schema {schema}: got {out}"
+            );
+        }
     }
 
     #[tokio::test]
