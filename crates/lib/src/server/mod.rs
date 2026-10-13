@@ -4259,6 +4259,10 @@ impl Server {
                     metadata,
                     routing: None,
                 }), None),
+                Err(runtime::TurnError::ContinuationHeld(reason)) => {
+                    warn!(session_db_id, %reason, "Holding native continuation; attempt and checkpoint remain interrupted");
+                    return;
+                }
                 Err(runtime::TurnError::Failed(err)) => {
                     error!("Agent error for {}: {err}", session_db_id);
                     (Some(SessionEntry {

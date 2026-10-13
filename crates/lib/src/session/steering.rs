@@ -451,6 +451,7 @@ pub(crate) async fn dispatch_inputs(
             && !messages[start..].iter().any(|message| matches!(
                 message,
                 crate::runtime::RuntimeMessage::Assistant(_)
+                    | crate::runtime::RuntimeMessage::AssistantWithExtra { .. }
                     | crate::runtime::RuntimeMessage::AssistantToolCalls { .. }
                     | crate::runtime::RuntimeMessage::ToolResult { .. }
             )),

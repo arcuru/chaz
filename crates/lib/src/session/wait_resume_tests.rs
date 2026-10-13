@@ -360,15 +360,27 @@ async fn steering_and_nonterminal_text_keep_exact_call_sources_or_refuse() {
     assert_eq!(resume.prior_model_sequences, [0, 0, 1, 2, 2]);
     assert_eq!(
         resume.prior_messages[2],
-        RuntimeMessage::Assistant("thinking 1".into())
+        RuntimeMessage::assistant(
+            "thinking 1".into(),
+            serde_json::Map::from_iter([("reasoning".into(), serde_json::json!("step-1"))])
+        )
     );
     assert_eq!(
         resume.prior_messages[3],
         RuntimeMessage::User(input.text.clone())
     );
-    // Empty responses still advance the call sequence without adding text.
+    // Empty visible text cannot discard retained provider state.
     if let TurnTranscriptMessage::ModelResponse { content, .. } = &mut rows[2].message {
         *content = Some(String::new());
+    }
+    let (resume, _) = plan_job_wait_resume(&checkpoint, &rows).unwrap();
+    assert_eq!(resume.prior_model_sequences, [0, 0, 1, 2, 2]);
+    assert!(
+        matches!(&resume.prior_messages[2], RuntimeMessage::AssistantWithExtra { content:Some(text), provider_extra,.. } if text.is_empty() && provider_extra["reasoning"] == "step-1")
+    );
+    // A genuinely empty response still advances the call without adding a message.
+    if let TurnTranscriptMessage::ModelResponse { provider_extra, .. } = &mut rows[2].message {
+        provider_extra.clear();
     }
     let (resume, _) = plan_job_wait_resume(&checkpoint, &rows).unwrap();
     assert_eq!(resume.prior_model_sequences, [0, 0, 2, 2]);

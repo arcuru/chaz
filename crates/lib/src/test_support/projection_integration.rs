@@ -815,7 +815,24 @@ async fn projection_refuses_steered_continuation_on_required_failure_or_budget()
             if tool_capable {
                 fx.register(echo_tool(&echo_calls));
             }
-            fx.mock.push_text("provisional");
+            let extra = serde_json::Map::from_iter([
+                (
+                    crate::responses::OUTPUT_ITEMS.into(),
+                    json!([
+                        {"type":"reasoning","id":"native","encrypted_content":"retained","summary":[]},
+                        {"type":"message","role":"assistant","content":[{"type":"output_text","text":"provisional"}]}
+                    ]),
+                ),
+                (
+                    crate::responses::REPLAY_ORIGIN.into(),
+                    json!({"version":1,"api":"responses","requested_model":"mock-model","connection":"opaque-scope"}),
+                ),
+            ]);
+            fx.mock.push_response(Ok(LLMResponse::Text {
+                content: "provisional".into(),
+                provider_extra: extra.clone(),
+                metadata: None,
+            }));
             fx.mock.push_text("must not dispatch");
             let recorder = Arc::new(BoundaryRecorder {
                 records: CollectingRecorder::default(),
@@ -845,6 +862,9 @@ async fn projection_refuses_steered_continuation_on_required_failure_or_budget()
             assert_eq!(fx.calls().len(), 1, "invalid continuation reached backend");
             assert_eq!(echo_calls.load(Ordering::SeqCst), 0);
             assert_eq!(p.count(), 2);
+            assert!(p.seen()[1].input.messages.iter().any(|m| matches!(m,
+                RuntimeMessage::AssistantWithExtra {provider_extra,..} if provider_extra == &extra)),
+                "native output and origin must survive steering before refusal");
             assert_eq!(recorder.observations.lock().unwrap().len(), 2);
             assert!(
                 recorder
@@ -2104,4 +2124,99 @@ async fn telemetry_counts_projected_request_while_held_and_replaces_with_reporte
             .prompt_tokens,
         0
     );
+}
+
+#[tokio::test]
+async fn optional_projector_cannot_change_native_replay_origin() {
+    for required in [false, true] {
+        for tool_group in [false, true] {
+            for remove in [false, true] {
+                let edit = probe("origin-edit", move |_, mut request| {
+                    for message in &mut request.messages {
+                        match message {
+                            RuntimeMessage::AssistantWithExtra { provider_extra, .. }
+                            | RuntimeMessage::AssistantToolCalls { provider_extra, .. } => {
+                                if remove {
+                                    provider_extra.remove(crate::responses::REPLAY_ORIGIN);
+                                } else {
+                                    provider_extra.insert(
+                                        crate::responses::REPLAY_ORIGIN.into(),
+                                        json!("forged"),
+                                    );
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    Ok(request)
+                });
+                let f = Fixture::new(
+                    &[&edit],
+                    &[grant(
+                        "origin-edit",
+                        ProjectionAuthority::FullContext,
+                        required,
+                    )],
+                    &["origin-edit"],
+                )
+                .await;
+                f.mock.push_text("final");
+                let extra = serde_json::Map::from_iter([
+                    (
+                        crate::responses::OUTPUT_ITEMS.into(),
+                        json!([{"type":"reasoning","encrypted_content":"retained"}]),
+                    ),
+                    (
+                        crate::responses::REPLAY_ORIGIN.into(),
+                        json!({"version":1,"api":"responses","requested_model":"requested","connection":"opaque-host-scope"}),
+                    ),
+                ]);
+                let mut messages = vec![RuntimeMessage::System("policy".into())];
+                if tool_group {
+                    messages.push(RuntimeMessage::AssistantToolCalls {
+                        exchange_id: None,
+                        content: None,
+                        tool_calls: vec![ToolCallRequest {
+                            id: "prior".into(),
+                            name: "echo".into(),
+                            arguments: "{}".into(),
+                        }],
+                        provider_extra: extra.clone(),
+                    });
+                    messages.push(RuntimeMessage::ToolResult {
+                        call_id: "prior".into(),
+                        content: "real result".into(),
+                    });
+                } else {
+                    messages.push(RuntimeMessage::assistant(
+                        "prior visible".into(),
+                        extra.clone(),
+                    ));
+                }
+                messages.push(RuntimeMessage::User("question".into()));
+                let (result, _) = f.run(messages, ModelCallScope::default()).await;
+                assert_eq!(edit.count(), 1);
+                if required {
+                    assert!(result.is_err());
+                    assert!(
+                        f.calls().is_empty(),
+                        "required alteration refuses before backend"
+                    );
+                } else {
+                    assert_eq!(result.unwrap().body, "final");
+                    let calls = f.calls();
+                    assert_eq!(calls.len(), 1);
+                    assert!(
+                        calls[0].messages.iter().any(|m| match m {
+                            RuntimeMessage::AssistantWithExtra { provider_extra, .. }
+                            | RuntimeMessage::AssistantToolCalls { provider_extra, .. } =>
+                                provider_extra == &extra,
+                            _ => false,
+                        }),
+                        "optional alteration must be skipped, not launder the origin"
+                    );
+                }
+            }
+        }
+    }
 }

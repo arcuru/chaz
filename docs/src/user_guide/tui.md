@@ -918,8 +918,8 @@ or silence decision becomes provisional if input was accepted before closing;
 the same attempt continues before publishing its terminal result.
 
 The whole pending body is gray. Acceptance alone does not promote it. After
-required context projection and budget checks, the host records incorporation
-before invoking the backend. That moves the input into normal history after
+required context projection, budget and native replay checks, the host records
+incorporation before invoking the backend. That moves the input into normal history after
 the preceding assistant/tool exchange and before the next assistant reply.
 Intermediate assistant text stays visible. Refresh and reopening reconstruct
 that order from durable boundaries, not the time you typed the input.
@@ -943,7 +943,10 @@ converted into an idle follow-up turn. Inspect the outcome, then explicitly
 resubmit if you still want it. A completed Job cannot accept that resubmission.
 
 Completed supported attempts preserve steering in later Chat context within
-the normal history budget. A valid checkpointed `job_wait` restores already
+the normal history budget. Chat Completions and Responses use the same steering
+boundaries. Responses retains the original native assistant items and paired
+function outputs around steering, including after reopening or wait recovery;
+it does not replace them with the displayed text. A valid checkpointed `job_wait` restores already
 incorporated input in place and drains newly pending input after the wait's
 paired result. Only that observation resumes; earlier model calls and tools do
 not run again. Other interrupted attempts require explicit retry, which does

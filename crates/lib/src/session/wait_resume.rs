@@ -296,8 +296,11 @@ pub(crate) fn plan_job_wait_resume(
             if *sequence >= checkpoint.model_sequence {
                 return Err("checkpointed response has no calls");
             }
-            if let Some(text) = content.as_ref().filter(|t| !t.is_empty()) {
-                messages.push(RuntimeMessage::Assistant(text.clone()));
+            if content.as_ref().is_some_and(|text| !text.is_empty()) || !provider_extra.is_empty() {
+                messages.push(RuntimeMessage::assistant(
+                    content.clone().unwrap_or_default(),
+                    provider_extra.clone(),
+                ));
                 message_sequences.push(*sequence);
             }
             metadata.extend(response_metadata.clone());
@@ -351,6 +354,7 @@ pub(crate) fn plan_job_wait_resume(
             let content = match outcome {
                 ToolResultOutcome::Unknown { .. } => return Err("unknown tool outcome"),
                 ToolResultOutcome::Denied | ToolResultOutcome::ApprovalTimedOut => output.clone(),
+                ToolResultOutcome::Success if name == crate::tool::NO_REPLY_TOOL => output.clone(),
                 _ => crate::runtime::wrap_tool_output(name, output),
             };
             if !matches!(
