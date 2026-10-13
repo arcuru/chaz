@@ -375,13 +375,51 @@ privileged identity are introduced. A service session handle whose native
 permission query cannot resolve delegation stays explicitly unavailable rather
 than guessing authority or falling back to another key.
 
-`job_inputs` stores stable caller-generated IDs, an expected started attempt
-and text. These are not Message or Directive entries. `job_input_receipts`
-separates executor acceptance, dispatch intent and observed model inclusion.
-Input is consumed at complete native tool boundaries, including the tool-free
-runtime path. `job_input_closed` records the executor's empty closing boundary;
-a racing publication not accepted before it is not applied. Accepted input
-forces same-attempt continuation before the terminal receipt, never replacement
-of a result already visible to the parent. These records use the existing
-signed session authority and cooperative execution-branch model, not distributed
-fencing. A retry attempt cannot consume an older attempt's pending input.
+### Shared active-turn steering
+
+Chat and Job observers publish the same `JobInputRequest` through Session's
+steering API. Existing `job_inputs`, `job_input_receipts` and `job_input_closed`
+wire names remain unchanged. The native signed input-store DAG orders
+publications, including encrypted stores; random Table keys and publisher
+clocks do not rank inputs. One request is published per commit. The latest
+attempt generation plus recent activity is required; an old heartbeat cannot
+authorize input for a superseded attempt. Jobs additionally require their
+accepted Directive's attempt and retain their terminal view-only restriction.
+Idle Chat alone creates an ordinary Message. A delayed busy publication keeps
+its observed attempt target and is never silently converted to idle work.
+
+At a whole-response/full-native-batch boundary the executor selects all pending
+input and records acceptance, with its intended model sequence in
+`job_input_calls`. Selection does not imply dispatch. After required projection
+and request-budget validation, `RuntimeRecorder::input_dispatch` verifies that
+the actual message vector retains the selected input in order. It atomically
+writes a structured `TurnTranscriptMessage::Steering`, dispatch receipts and
+non-runnable `TurnContext` display rows. The latter also preserve nonterminal
+assistant text, but are not Message/Directive requests or bridge outbox events.
+A response observation advances the receipt independently of local
+incorporation; a failed dispatch remains uncertain. The TUI reads incorporation
+and display at one snapshot, so refresh cannot hide pending text before its
+promoted rows exist.
+
+Completed-attempt context reconstruction includes steering and nonterminal
+assistant text in their original positions alongside strictly paired native
+exchanges, with exact call provenance and token costs. The same validation
+restores a checkpointed wait; only its pending observation executes. Unknown
+records, invalid boundaries, duplicate input identities or unpaired native
+history refuse the entire reconstruction. `TurnContext` rows alone never
+supply context, including on retry, so unconfirmed input cannot leak from a
+failed attempt's display into a later turn. Normal history selection and
+compaction budgets still apply.
+
+An empty closing boundary writes `job_input_closed`. A publication racing that
+marker remains recoverable but is not applied; accepted input demands
+same-attempt continuation before the terminal receipt. Finished Jobs cannot
+replace a parent-delivered result. These records use the existing signed
+session authority and cooperative execution branches, not distributed fencing.
+There is no new executor, tool authority, follow-up queue or effects replay.
+
+Upgrade readers before enabling writers of `Steering` transcript records and
+`TurnContext` entries, following the [reader-first contract](#reader-first-wire-compatibility).
+Older tolerant readers preserve those variants but cannot reconstruct them;
+they hold an affected checkpoint/attempt rather than partially replaying it.
+This is a coordinated reader/writer upgrade, not a migration of existing history.

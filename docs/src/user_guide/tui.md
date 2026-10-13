@@ -872,31 +872,101 @@ opening an observer and publishing steering use the ordered action queue.
 Pending work and exit confirmation remain visible in both Jobs and observer tabs.
 Reconnect reopens job tabs as observers, never as ordinary executing sessions.
 
-### Next-call steering and the final boundary
+### Steering an active turn
 
-An authorized session writer can send input while a recent started attempt is
-observable. Read-only keys cannot observe or publish in local v1. The original
-Directive and accepted tool, grant, capability and depth ceilings remain
-unchanged. Input cannot contain scope overrides or start another job.
+Chat and Jobs use the same next-call input path. The lifecycle differs:
+idle Chat starts a new turn; a finished Job stays view-only and cannot change
+the result already delivered to its parent. A Job tab is still an observer,
+not another executor or a way to change its tools, grants or limits.
 
-The executor reads input only between complete model/tool exchanges. It does
-not interrupt a model call, tool or approval wait. Tool-free jobs use the same
-boundary. If input is accepted before closing, a model's final text is
-provisional: the same attempt continues and only its continued terminal result
-becomes available to the parent. Completed jobs are view-only; there is no
-reopen or follow-up action.
+| Control / display             | Meaning                                                                     |
+| ----------------------------- | --------------------------------------------------------------------------- |
+| `Enter` while busy            | Publish steering for the observed active attempt                            |
+| `Enter` in idle Chat          | Start an ordinary turn                                                      |
+| `Alt+Enter`                   | Insert a newline; do not submit                                             |
+| `> next-call input`           | The composer is targeting a started turn                                    |
+| Gray input body below history | Published or selected, but not yet incorporated                             |
+| Normal user text in history   | Incorporated in a model request after its projection and budget checks      |
+| `F2`                          | Inspect request/attempt IDs and receipts, including inputs already promoted |
+| Finished Job composer         | View-only; sending cannot reopen the job                                    |
 
-Receipts distinguish **Queued · published, awaiting acceptance**,
-**Accepted · awaiting next call**, and **Accepted · dispatch recorded for call N;
-inclusion unconfirmed**. Dispatch intent does not prove the backend received
-input. **Included · call N returned** means a response to the request containing
-that input was observed. **Not applied** and **Uncertain** explain late
-publication, failure or interruption. Input numbers are display labels, not
-submission order or request identities; `F2` exposes the durable IDs. A lost acknowledgement retains the
-request ID for the client lifetime, including tab close/reopen and service reconnect: resend the same text to retry that publication, not create a second
-logical input. Different text is refused while that publication is unresolved.
-There is no globally exactly-once effect guarantee. Interrupted input and
-model/tool effects never replay automatically after restart.
+The executor finishes the current model response and **every tool in its native
+batch** before taking steering. It takes **all pending inputs together**, in
+publication order, not UUID or timestamp order. Concurrent publications with
+no causal order use the database's canonical entry order. Tools and approval
+waits are not interrupted. Tool-free turns use the same boundary. A final text
+or silence decision becomes provisional if input was accepted before closing;
+the same attempt continues before publishing its terminal result.
+
+The whole pending body is gray. Acceptance alone does not promote it. After
+required context projection and budget checks, the host records incorporation
+before invoking the backend. That moves the input into normal history after
+the preceding assistant/tool exchange and before the next assistant reply.
+Intermediate assistant text stays visible. Refresh and reopening reconstruct
+that order from durable boundaries, not the time you typed the input.
+
+Incorporation is a **local** fact, not proof that a remote model received or
+understood anything. Receipts distinguish `Queued · published, awaiting
+acceptance`, `Accepted · awaiting next call`, and `Accepted · dispatch recorded
+for call N; inclusion unconfirmed`. `Included · call N returned` means a response
+to that request was observed. `F2` retains those diagnostics after promotion.
+A backend failure can leave promoted text with an uncertain receipt; it is not
+silently replayed into a new attempt. A projection or budget refusal leaves
+unincorporated text gray and reports `Not applied` when the attempt ends.
+
+Closing a tab does not discard published input. A lost publication
+acknowledgement retains the request ID for the client lifetime, including tab
+close/reopen and reconnect. Resending the same text retries that ID; different
+text is refused until the publication is resolved. A definite pre-publication
+refusal recovers the text without retaining an uncertain ID. If the observed
+attempt closes or is retried before publication, the input is refused, not
+converted into an idle follow-up turn. Inspect the outcome, then explicitly
+resubmit if you still want it. A completed Job cannot accept that resubmission.
+
+Completed supported attempts preserve steering in later Chat context within
+the normal history budget. A valid checkpointed `job_wait` restores already
+incorporated input in place and drains newly pending input after the wait's
+paired result. Only that observation resumes; earlier model calls and tools do
+not run again. Other interrupted attempts require explicit retry, which does
+not adopt their unconfirmed steering. No exactly-once external-effect guarantee
+is implied.
+
+### Walkthrough: busy Chat and recovery
+
+1. In Chat, send `Compare the two formats`. While the agent is busy, type
+   `Use a small example`, press `Alt+Enter`, type `Show the trade-off`, then
+   press `Enter`. The pending area shows both lines in gray:
+
+   ```text
+   Input 1 · Queued · published, awaiting acceptance
+   Use a small example
+   Show the trade-off
+   ```
+
+2. Send another steering message before the next boundary. The current
+   response and full tool batch finish first. All pending messages then appear
+   together as normal user text, followed by the assistant's continuation.
+   There is no separately scheduled follow-up turn. Press `F2` while that
+   response is in flight to inspect `Accepted · dispatch recorded for call 1;
+inclusion unconfirmed`. A returned response changes the receipt to
+   `Included · call 1 returned`. Call numbers are illustrative.
+
+3. Close and reopen the tab. The provisional assistant text, promoted input
+   and continued answer still appear once, in that order. Idle Chat can now
+   accept an ordinary new turn.
+
+4. If the attempt finishes before your queued publication runs, the action
+   fails with `Input refused before publication` and recovers your text. It
+   has not scheduled another turn. Read the final answer before pressing
+   `Enter` again in idle Chat. If instead acknowledgement was lost, inspect
+   persisted receipts and resend the **same** text to resolve the existing ID,
+   rather than creating duplicate input.
+
+5. If a required context projector refuses the continuation or its input
+   exceeds the budget, the body stays gray with `Not applied`. A backend
+   dispatch failure instead can leave normal-colored text with `Uncertain` in
+   `F2` details. Neither outcome is confirmation of remote delivery or a reason
+   to replay automatically. Recover the text and make an explicit next action.
 
 ### Walkthrough: steer, then inspect
 
@@ -913,8 +983,9 @@ model/tool effects never replay automatically after restart.
    banner says `Job observer` and `Write-capable · recorded, not proven live`.
 3. Send `Use the smaller example first`. The receipt reads
    `Input 1 · Queued · published, awaiting acceptance`, then
+   the body moves into normal history before the next response. `F2` shows
    `Input 1 · Accepted · dispatch recorded for call 1; inclusion unconfirmed`,
-   and finally `Input 1 · Included · call 1 returned`. Input/call numbers here
+   and later `Input 1 · Included · call 1 returned`. Input/call numbers here
    are illustrative. `F2` reveals the request and attempt IDs; it does not send
    input. Close the tab with `Ctrl+W`: the resident executor still finishes.
 4. Reopen Jobs. The row says `Completed` (or `Failed`), and the preview's

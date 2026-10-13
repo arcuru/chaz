@@ -50,6 +50,15 @@ The `before_agent_start` and `agent_end` hooks bracket the whole turn (used toda
 
 Executor-backed turns pass an awaited `RuntimeRecorder` into the loop. It persists each completed model response before the runtime acts on tool calls, then persists each complete tool result before the next model request. Errors from this interface stop progression rather than becoming best-effort audit warnings.
 
+Chat and Jobs share `input_boundary` for selecting all pending steering at a
+whole-response/full-native-tool-batch boundary. `input_dispatch` runs only after
+required projection and budget checks, on the actual accepted message vector,
+and persists local incorporation before the backend call. Transport retries
+reuse that request and do not select or promote the input again. A response
+observation is separate evidence; a dispatch error is not remote delivery.
+Accepted input at a text or silence closing boundary requires another call of
+the same attempt before terminal publication. See [shared steering](sessions.md#shared-active-turn-steering).
+
 Scheduled turns currently retain the compatibility `RuntimeEvent` adapter because they do not have a durable turn-attempt record. That adapter projects tool-call and tool-result events to ordinary session entries.
 
 ## Cancellation
