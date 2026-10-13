@@ -1098,6 +1098,8 @@ fn known_config_keys() -> HashSet<&'static str> {
         "durable_context",
         "multi_agent",
         "runtime",
+        "tool_host",
+        "tool_host_writable_roots",
         // Bridge-only top-level keys (MatrixBridgeConfig + DiscordBridgeConfig).
         // Config doesn't own these, but they're legit when the bridge
         // double-parses the same file.
@@ -2022,6 +2024,20 @@ agent_groups:
         assert_eq!(
             check_unknown_config_keys("agent_gruops:\n  research: [a]\n"),
             vec!["agent_gruops"]
+        );
+    }
+
+    #[test]
+    fn tool_host_keys_are_known() {
+        assert!(
+            check_unknown_config_keys(
+                "tool_host: bubblewrap\ntool_host_writable_roots:\n  - /srv/work\n"
+            )
+            .is_empty()
+        );
+        assert_eq!(
+            check_unknown_config_keys("tool_host_writable_root:\n  - /srv/work\n"),
+            vec!["tool_host_writable_root"]
         );
     }
 

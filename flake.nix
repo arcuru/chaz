@@ -197,7 +197,7 @@
 
         chaz-test-runner = pkgs.writeShellApplication {
           name = "chaz-test-runner";
-          runtimeInputs = [pkgs.cargo-nextest pkgs.python3 pkgs.coreutils];
+          runtimeInputs = [pkgs.cargo-nextest pkgs.python3 pkgs.coreutils] ++ bwrapInputs;
           text = ''
             if [[ ! -f ./Cargo.toml ]]; then
               echo "Run nix run .#test from the Chaz workspace root." >&2
