@@ -26,3 +26,6 @@ target-test/
 # Coverage reports (lcov + html from `just coverage`)
 /coverage
 /coverage-result
+
+# Local verification artifacts
+/.evidence

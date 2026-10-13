@@ -51,7 +51,6 @@ async fn terminal_telemetry_precedes_publication_and_settles_once() {
         agent_name: "host".into(),
         requested_model: "gpt-sol-latest".into(),
         context_snapshot: None,
-        job_input: false,
         branch: None,
         fail_after: Default::default(),
     };

@@ -50,6 +50,15 @@ The `before_agent_start` and `agent_end` hooks bracket the whole turn (used toda
 
 Executor-backed turns pass an awaited `RuntimeRecorder` into the loop. It persists each completed model response before the runtime acts on tool calls, then persists each complete tool result before the next model request. Errors from this interface stop progression rather than becoming best-effort audit warnings.
 
+Chat and Jobs share `input_boundary` for selecting all pending steering at a
+whole-response/full-native-tool-batch boundary. `input_dispatch` runs only after
+required projection and budget checks, on the actual accepted message vector,
+and persists local incorporation before the backend call. Transport retries
+reuse that request and do not select or promote the input again. A response
+observation is separate evidence; a dispatch error is not remote delivery.
+Accepted input at a text or silence closing boundary requires another call of
+the same attempt before terminal publication. See [shared steering](sessions.md#shared-active-turn-steering).
+
 Scheduled turns currently retain the compatibility `RuntimeEvent` adapter because they do not have a durable turn-attempt record. That adapter projects tool-call and tool-result events to ordinary session entries.
 
 ## Cancellation
@@ -141,7 +150,11 @@ The native Responses adapter keeps the ordered `output` array in the model
 response's `provider_extra.openai_responses_output`.
 Text responses carry provider data just like tool responses; the runtime
 records it before progression, including on a closing boundary that receives
-new input.
+new input. Steering-prefix hydration and checkpointed wait reconstruction retain
+that same output and origin, not a text-only substitute. Native replay validation
+runs on the projected request before steering incorporation and call telemetry.
+If steering makes a native `no_reply` provisional, the host records its empty
+function output and continues with the original items and call ID.
 Final entries retain the terminal array in `ResponseMetadata.extra` so context
 assembly restores it at the assistant entry's position rather than duplicating
 its flattened text.

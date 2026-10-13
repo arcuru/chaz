@@ -137,7 +137,14 @@ impl Responses {
         true
     }
 
-    #[cfg(test)]
+    pub(crate) fn validate_request(
+        &self,
+        messages: &[RuntimeMessage],
+        model: &str,
+    ) -> Result<(), LlmError> {
+        self.request(messages, &[], model, None).map(|_| ())
+    }
+
     fn request<'a>(
         &self,
         messages: &[RuntimeMessage],

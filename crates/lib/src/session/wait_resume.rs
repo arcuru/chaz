@@ -242,6 +242,9 @@ pub(crate) fn plan_job_wait_resume(
     }
 
     let mut messages = Vec::new();
+    let mut message_sequences = Vec::new();
+    let mut input_ids = std::collections::HashSet::new();
+    let mut steering_pending = false;
     let mut metadata = Vec::new();
     let mut matrix_send_queued = false;
     let mut rate_limited_calls = Vec::new();
@@ -251,6 +254,26 @@ pub(crate) fn plan_job_wait_resume(
         let Some(record) = records.next() else {
             return Err("transcript ends before the checkpointed call");
         };
+        if let TurnTranscriptMessage::Steering {
+            model_sequence: sequence,
+            inputs,
+        } = &record.message
+        {
+            if steering_pending
+                || *sequence != model_sequence
+                || !super::steering::validate_boundary(
+                    inputs,
+                    &checkpoint.attempt_id,
+                    &mut input_ids,
+                )
+            {
+                return Err("steering boundary does not match the attempt/call");
+            }
+            steering_pending = true;
+            messages.extend(inputs.iter().map(|r| RuntimeMessage::User(r.text.clone())));
+            message_sequences.extend(std::iter::repeat_n(*sequence, inputs.len()));
+            continue;
+        }
         let TurnTranscriptMessage::ModelResponse {
             model_sequence: sequence,
             content,
@@ -262,11 +285,27 @@ pub(crate) fn plan_job_wait_resume(
         else {
             return Err("expected a model response");
         };
-        if *sequence != model_sequence || *terminal || tool_calls.is_empty() {
+        if *sequence != model_sequence || *terminal {
             return Err("model response is out of order, terminal, or has no calls");
         }
         if *sequence > checkpoint.model_sequence {
             return Err("transcript advanced past the checkpoint");
+        }
+        steering_pending = false;
+        if tool_calls.is_empty() {
+            if *sequence >= checkpoint.model_sequence {
+                return Err("checkpointed response has no calls");
+            }
+            if content.as_ref().is_some_and(|text| !text.is_empty()) || !provider_extra.is_empty() {
+                messages.push(RuntimeMessage::assistant(
+                    content.clone().unwrap_or_default(),
+                    provider_extra.clone(),
+                ));
+                message_sequences.push(*sequence);
+            }
+            metadata.extend(response_metadata.clone());
+            model_sequence += 1;
+            continue;
         }
         let pending = *sequence == checkpoint.model_sequence;
         if pending
@@ -277,6 +316,7 @@ pub(crate) fn plan_job_wait_resume(
             return Err("checkpointed call is not the final job_wait of its batch");
         }
         metadata.extend(response_metadata.clone());
+        message_sequences.push(*sequence);
         messages.push(RuntimeMessage::AssistantToolCalls {
             exchange_id: None,
             content: content.clone(),
@@ -314,6 +354,7 @@ pub(crate) fn plan_job_wait_resume(
             let content = match outcome {
                 ToolResultOutcome::Unknown { .. } => return Err("unknown tool outcome"),
                 ToolResultOutcome::Denied | ToolResultOutcome::ApprovalTimedOut => output.clone(),
+                ToolResultOutcome::Success if name == crate::tool::NO_REPLY_TOOL => output.clone(),
                 _ => crate::runtime::wrap_tool_output(name, output),
             };
             if !matches!(
@@ -323,6 +364,7 @@ pub(crate) fn plan_job_wait_resume(
                 rate_limited_calls.push((name.clone(), result.timestamp));
             }
             matrix_send_queued |= name == "matrix__send" && *outcome == ToolResultOutcome::Success;
+            message_sequences.push(*sequence);
             messages.push(RuntimeMessage::ToolResult {
                 call_id: call.id.clone(),
                 content,
@@ -340,6 +382,7 @@ pub(crate) fn plan_job_wait_resume(
     Ok((
         RuntimeResume {
             prior_messages: messages,
+            prior_model_sequences: message_sequences,
             model_sequence: checkpoint.model_sequence,
             call_index: checkpoint.call_index,
             call: crate::runtime::ToolCallRequest {

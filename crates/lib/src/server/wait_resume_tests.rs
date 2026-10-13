@@ -224,6 +224,15 @@ struct Crashed {
 /// Process A runs `effect`, then waits on the child and dies after
 /// persisting the checkpoint.
 async fn crash_while_waiting(fx: &Fixture, seconds: u64, mode: ChildAtCrash) -> Crashed {
+    crash_while_waiting_with_input(fx, seconds, mode, false).await
+}
+
+async fn crash_while_waiting_with_input(
+    fx: &Fixture,
+    seconds: u64,
+    mode: ChildAtCrash,
+    steer: bool,
+) -> Crashed {
     let a = fx.start().await;
     let registry = a.server.registry.clone();
     let (sid, db) = registry.create_session(Some("wait-parent")).await.unwrap();
@@ -255,6 +264,7 @@ async fn crash_while_waiting(fx: &Fixture, seconds: u64, mode: ChildAtCrash) -> 
     let parent_mock = Arc::new(MockBackend::new());
     parent_mock.push_tool_calls([("effect-call".into(), "effect".into(), "{}".into())]);
     parent_mock.push_tool_calls([wait_call(&child, seconds)]);
+    let gate = steer.then(|| parent_mock.block_next_call());
     a.register_parent(&db, &parent_mock).await;
     Session::new(sid.clone(), db.clone())
         .await
@@ -268,6 +278,25 @@ async fn crash_while_waiting(fx: &Fixture, seconds: u64, mode: ChildAtCrash) -> 
         })
         .await
         .unwrap();
+    if let Some(gate) = gate {
+        tokio::time::timeout(Duration::from_secs(30), gate.wait_started())
+            .await
+            .unwrap();
+        let attempt = Session::steering_attempts(&db)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        Session::new(sid.clone(), db.clone())
+            .await
+            .submit_turn_input(crate::session::steering::JobInputRequest::new(
+                attempt,
+                "before checkpoint steering".into(),
+            ))
+            .await
+            .unwrap();
+        gate.release();
+    }
     let checkpoint = tokio::time::timeout(Duration::from_secs(30), async {
         loop {
             if let Some(checkpoint) = checkpoints(&db).await.pop() {
@@ -1168,6 +1197,162 @@ async fn user_stop_during_resumed_job_wait_pairs_history_and_preserves_monitor_d
             .is_empty()
     );
     c.server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn checkpointed_wait_restores_prior_steering_without_model_or_effect_replay() {
+    let fx = Fixture::new("wait-prior-steering").await;
+    let crashed = crash_while_waiting_with_input(&fx, 240, ChildAtCrash::Unpublished, true).await;
+    let b = fx.start().await;
+    await_resumed(&b, &crashed.checkpoint.attempt_id).await;
+    assert_eq!(fx.effects.load(Ordering::SeqCst), 1);
+    assert!(
+        b.child_mock.recorded_calls().is_empty(),
+        "resumption only observes the pending wait"
+    );
+    b.child_mock.push_text("parent done");
+    crashed
+        .registry
+        .publish_agent_job(crashed.prepared.unwrap())
+        .await
+        .unwrap();
+    await_calls(&b.child_mock, 2).await;
+    await_no_processing(&b.server, &crashed.sid).await;
+    let calls = b.child_mock.recorded_calls();
+    let messages = &calls[1].messages;
+    let index = messages
+        .iter()
+        .position(
+            |m| matches!(m, runtime::RuntimeMessage::User(t) if t == "before checkpoint steering"),
+        )
+        .unwrap();
+    assert!(
+        matches!(&messages[index-1], runtime::RuntimeMessage::ToolResult {call_id, ..} if call_id == "effect-call")
+    );
+    assert!(
+        matches!(&messages[index+1], runtime::RuntimeMessage::AssistantToolCalls {tool_calls, ..} if tool_calls[0].name == "job_wait")
+    );
+    assert_eq!(messages.iter().filter(|m| matches!(m, runtime::RuntimeMessage::User(t) if t == "before checkpoint steering")).count(), 1);
+    assert_eq!(crashed.first_mock.recorded_calls().len(), 2);
+    assert_eq!(fx.effects.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        Session::new(ConversationId(crashed.sid), crashed.db)
+            .await
+            .attempts_for_test()
+            .await
+            .len(),
+        1
+    );
+    b.server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn service_job_steering_all_publications_follow_fifo_in_actual_request() {
+    use crate::session::steering::JobInputRequest;
+    let fx = Fixture::new("job-fifo-steering").await;
+    let mock = Arc::new(MockBackend::new());
+    mock.push_text("provisional");
+    mock.push_text("finished");
+    let first = mock.block_next_call();
+    let next = mock.block_next_call();
+    let process = fx.start_with(mock.clone()).await;
+    let (parent, _) = process
+        .server
+        .registry
+        .create_session(Some("tui"))
+        .await
+        .unwrap();
+    process
+        .server
+        .registry
+        .attach_agent_to_session(&parent.0, &fx.agent)
+        .await
+        .unwrap();
+    let job = process
+        .server
+        .submit_agent_job(&parent.0, "default", "original job")
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(30), first.wait_started())
+        .await
+        .unwrap();
+    let (_, db) = process
+        .server
+        .registry
+        .open_job_session(&job)
+        .await
+        .unwrap();
+    let attempt = Session::steering_attempts(&db)
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    for (id, text) in [
+        ("ffffffff-ffff-4fff-8fff-ffffffffffff", "first job steer"),
+        ("00000000-0000-4000-8000-000000000000", "second job steer"),
+    ] {
+        process
+            .server
+            .submit_job_input(
+                &job,
+                JobInputRequest {
+                    id: id.into(),
+                    attempt_id: attempt.clone(),
+                    text: text.into(),
+                },
+            )
+            .await
+            .unwrap();
+    }
+    first.release();
+    tokio::time::timeout(Duration::from_secs(30), next.wait_started())
+        .await
+        .unwrap();
+    let calls = mock.recorded_calls();
+    let messages = &calls[1].messages;
+    assert_eq!(
+        &messages[messages.len() - 3..],
+        &[
+            runtime::RuntimeMessage::Assistant("provisional".into()),
+            runtime::RuntimeMessage::User("first job steer".into()),
+            runtime::RuntimeMessage::User("second job steer".into())
+        ]
+    );
+    assert!(
+        process
+            .server
+            .job_inputs(&job)
+            .await
+            .unwrap()
+            .iter()
+            .all(|input| input.incorporated)
+    );
+    assert!(
+        crate::session::jobs::read_job_result(&db)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    next.release();
+    assert!(
+        process
+            .server
+            .wait_job(&job, Duration::from_secs(30))
+            .await
+            .unwrap()
+            .state
+            .is_terminal()
+    );
+    assert_eq!(mock.recorded_calls().len(), 2);
+    assert_eq!(
+        Session::new(ConversationId(job), db)
+            .await
+            .attempts_for_test()
+            .await
+            .len(),
+        1
+    );
+    process.server.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

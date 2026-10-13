@@ -559,7 +559,9 @@ async fn service_steering(
         mock.push_tool_calls([(
             "wait".into(),
             "job_wait".into(),
-            serde_json::json!({"session_db_id": child, "timeout_seconds": 2}).to_string(),
+            // This exercises a live child wait, not timeout expiry. Service
+            // discovery and debug-mode projection must fit inside the bound.
+            serde_json::json!({"session_db_id": child, "timeout_seconds": 30}).to_string(),
         )]);
         // Upstream yields the parent's slot inside job_wait: the child calls
         // before the parent can reacquire and request its terminal answer.

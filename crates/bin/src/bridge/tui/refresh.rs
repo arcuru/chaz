@@ -72,6 +72,11 @@ impl RefreshSlot {
 /// `Tab` literal only needs `live: TabLive::default()`.
 #[derive(Default)]
 pub(super) struct TabLive {
+    pub(super) input_attempt: Option<String>,
+    pub(super) inputs: Vec<chaz_core::session::steering::JobInput>,
+    pub(super) input_feedback: String,
+    pub(super) input_retry:
+        Arc<tokio::sync::Mutex<Option<chaz_core::session::steering::JobInputRequest>>>,
     /// Full session reload (entries + meta + activity) after a write.
     pub(super) reload: RefreshSlot,
     /// Extension status strip read.
@@ -141,6 +146,8 @@ impl TabLive {
 
 /// What a session reload read from storage.
 pub(super) struct SessionSnapshot {
+    pub(super) input_attempt: Option<String>,
+    pub(super) inputs: Vec<chaz_core::session::steering::JobInput>,
     pub(super) entries: Vec<SessionEntry>,
     pub(super) telemetry: chaz_core::session::usage::SessionTelemetry,
     pub(super) meta: SessionMeta,
@@ -371,7 +378,18 @@ pub(super) async fn load_session_snapshot(
         let telemetry =
             chaz_core::session::usage::telemetry_at_snapshot(&db, &snapshot, &entries).await?;
         let meta = chaz_core::session::try_read_meta_from_db(&db).await?;
+        let session = Session::try_new(
+            chaz_core::types::ConversationId(db.root_id().to_string()),
+            db.clone(),
+        )
+        .await?;
+        let attempts = Session::steering_attempts_at(&db, &snapshot).await?;
         Ok::<_, anyhow::Error>(SessionSnapshot {
+            input_attempt: match attempts.as_slice() {
+                [id] => Some(id.clone()),
+                _ => None,
+            },
+            inputs: session.turn_inputs_at(&snapshot).await?,
             entries,
             telemetry,
             meta,
@@ -575,6 +593,8 @@ fn apply_session_snapshot(
     resolve: impl FnOnce(&str, &SessionMeta) -> Resolved,
 ) {
     let SessionSnapshot {
+        input_attempt,
+        inputs,
         entries,
         telemetry,
         meta,
@@ -587,6 +607,8 @@ fn apply_session_snapshot(
     } = resolve(&app.tabs[idx].current_agent, &meta);
 
     let tab = &mut app.tabs[idx];
+    tab.live.input_attempt = input_attempt;
+    tab.live.inputs = inputs;
     tab.set_entries(entries);
     tab.live.telemetry = Some(telemetry);
     tab.session_name = meta.name.clone();
@@ -714,6 +736,8 @@ mod tests {
             session_db_id: id.into(),
             ticket,
             snapshot: Ok(Box::new(SessionSnapshot {
+                input_attempt: None,
+                inputs: vec![],
                 telemetry: chaz_core::session::usage::SessionTelemetry::from_entries(&entries),
                 entries,
                 meta: SessionMeta {

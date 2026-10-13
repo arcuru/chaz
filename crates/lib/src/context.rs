@@ -545,27 +545,15 @@ impl<'a> ContextBuilder<'a> {
                     .tool_history
                     .filter(|h| h.len() == self.entries.len())
                     .and_then(|h| h.get(*entry));
-                match records.and_then(|r| replay_turn(r, *budget).map(|g| (r, g))) {
+                match records.and_then(|r| replay_turn_tagged(r, *budget).map(|g| (r, g))) {
                     Some((records, group)) => {
                         let first = records
                             .iter()
                             .min_by_key(|r| r.sequence)
                             .expect("nonempty replay");
-                        let mut sequence = 0;
                         group
                             .into_iter()
-                            .enumerate()
-                            .map(|(i, m)| {
-                                if i > 0
-                                    && matches!(
-                                        m,
-                                        RuntimeMessage::AssistantToolCalls { .. }
-                                            | RuntimeMessage::Assistant(_)
-                                            | RuntimeMessage::AssistantWithExtra { .. }
-                                    )
-                                {
-                                    sequence += 1;
-                                }
+                            .map(|(m, sequence)| {
                                 (
                                     m,
                                     ContextSource::ReplayedExchange {
@@ -665,15 +653,25 @@ pub(crate) fn replay_turn(
     records: &[TurnTranscriptRecord],
     budget: usize,
 ) -> Option<Vec<RuntimeMessage>> {
+    replay_turn_tagged(records, budget)
+        .map(|group| group.into_iter().map(|(message, _)| message).collect())
+}
+
+fn replay_turn_tagged(
+    records: &[TurnTranscriptRecord],
+    budget: usize,
+) -> Option<Vec<(RuntimeMessage, u64)>> {
     if records.is_empty() || budget == 0 {
         return None;
     }
     let mut sorted = records.to_vec();
     sorted.sort_by_key(|r| r.sequence);
     let mut messages = Vec::new();
+    let mut input_ids = std::collections::HashSet::new();
     let mut previous = None;
     let mut model_sequence = None;
     let mut terminal = false;
+    let mut steering_pending = None;
     let mut i = 0;
     while i < sorted.len() {
         let record = &sorted[i];
@@ -688,8 +686,37 @@ pub(crate) fn replay_turn(
             if i + 1 != sorted.len() {
                 return None;
             }
+            // Cancellation does not confirm an in-flight steering request.
+            // Keep earlier observed history, but never adopt this uncertain tail.
+            if let Some(start) = steering_pending {
+                messages.truncate(start);
+            }
             terminal = true;
             break;
+        }
+        if let TurnTranscriptMessage::Steering {
+            model_sequence: seq,
+            inputs,
+        } = &record.message
+        {
+            if steering_pending.is_some()
+                || *seq != model_sequence.map_or(0, |p| p + 1)
+                || !crate::session::steering::validate_boundary(
+                    inputs,
+                    &record.attempt_id,
+                    &mut input_ids,
+                )
+            {
+                return None;
+            }
+            steering_pending = Some(messages.len());
+            messages.extend(
+                inputs
+                    .iter()
+                    .map(|r| (RuntimeMessage::User(r.text.clone()), *seq)),
+            );
+            i += 1;
+            continue;
         }
         let TurnTranscriptMessage::ModelResponse {
             model_sequence: seq,
@@ -706,6 +733,7 @@ pub(crate) fn replay_turn(
             return None;
         }
         model_sequence = Some(*seq);
+        steering_pending = None;
         i += 1;
         if *end {
             // Ordinary terminal text is restored from its final entry.
@@ -717,33 +745,47 @@ pub(crate) fn replay_turn(
             if silent && provider_extra.contains_key(crate::responses::OUTPUT_ITEMS) {
                 // The terminal record proves the host fulfilled no_reply. Its
                 // actual output is empty; acknowledge it for stateless replay.
-                messages.push(RuntimeMessage::AssistantToolCalls {
-                    exchange_id: None,
-                    content: content.clone(),
-                    tool_calls: tool_calls.clone(),
-                    provider_extra: provider_extra.clone(),
-                });
-                messages.push(RuntimeMessage::ToolResult {
-                    call_id: tool_calls[0].id.clone(),
-                    content: String::new(),
-                });
+                messages.push((
+                    RuntimeMessage::AssistantToolCalls {
+                        exchange_id: None,
+                        content: content.clone(),
+                        tool_calls: tool_calls.clone(),
+                        provider_extra: provider_extra.clone(),
+                    },
+                    *seq,
+                ));
+                messages.push((
+                    RuntimeMessage::ToolResult {
+                        call_id: tool_calls[0].id.clone(),
+                        content: String::new(),
+                    },
+                    *seq,
+                ));
             }
             terminal = true;
             break;
         }
         if tool_calls.is_empty() {
-            messages.push(RuntimeMessage::assistant(
-                content.clone()?,
-                provider_extra.clone(),
-            ));
+            if content.as_ref().is_some_and(|text| !text.is_empty()) || !provider_extra.is_empty() {
+                messages.push((
+                    RuntimeMessage::assistant(
+                        content.clone().unwrap_or_default(),
+                        provider_extra.clone(),
+                    ),
+                    *seq,
+                ));
+            }
             continue;
         }
-        messages.push(RuntimeMessage::AssistantToolCalls {
-            exchange_id: None,
-            content: content.clone(),
-            tool_calls: tool_calls.clone(),
-            provider_extra: provider_extra.clone(),
-        });
+        messages.push((
+            RuntimeMessage::AssistantToolCalls {
+                exchange_id: None,
+                content: content.clone(),
+                tool_calls: tool_calls.clone(),
+                provider_extra: provider_extra.clone(),
+            },
+            *seq,
+        ));
         for (call_index, call) in tool_calls.iter().enumerate() {
             let result = sorted.get(i)?;
             let TurnTranscriptMessage::ToolResult {
@@ -769,21 +811,28 @@ pub(crate) fn replay_turn(
                 return None;
             }
             previous = Some(result.sequence);
-            messages.push(RuntimeMessage::ToolResult {
-                call_id: call.id.clone(),
-                content: crate::runtime::wrap_tool_output(
-                    &call.name,
-                    &crate::runtime::bound_tool_output(output),
-                ),
-            });
+            messages.push((
+                RuntimeMessage::ToolResult {
+                    call_id: call.id.clone(),
+                    content: if call.name == NO_REPLY_TOOL {
+                        output.clone()
+                    } else {
+                        crate::runtime::wrap_tool_output(
+                            &call.name,
+                            &crate::runtime::bound_tool_output(output),
+                        )
+                    },
+                },
+                *seq,
+            ));
             i += 1;
         }
     }
     if !terminal || messages.is_empty() {
         return None;
     }
-    if messages.iter().map(message_cost).sum::<usize>() > budget {
-        for msg in &mut messages {
+    if messages.iter().map(|(m, _)| message_cost(m)).sum::<usize>() > budget {
+        for (msg, _) in &mut messages {
             if let RuntimeMessage::ToolResult { content, .. } = msg {
                 let start = content.find('\n')? + 1;
                 let output = content[start..].strip_suffix("\n</tool_output>")?;
@@ -796,7 +845,7 @@ pub(crate) fn replay_turn(
             }
         }
     }
-    (messages.iter().map(message_cost).sum::<usize>() <= budget).then_some(messages)
+    (messages.iter().map(|(m, _)| message_cost(m)).sum::<usize>() <= budget).then_some(messages)
 }
 
 /// Estimate the whole model-facing request: every message kind, including
@@ -842,7 +891,9 @@ fn message_cost(msg: &RuntimeMessage) -> usize {
             serde_json::Value::Object(provider_extra.clone())
         ),
         RuntimeMessage::ToolResult { call_id, content } => format!("{call_id}{content}"),
-        _ => return 0,
+        RuntimeMessage::User(text)
+        | RuntimeMessage::Assistant(text)
+        | RuntimeMessage::System(text) => text.clone(),
     };
     estimate_tokens(&text) + MESSAGE_OVERHEAD_TOKENS
 }
@@ -1228,6 +1279,63 @@ mod tests {
     }
 
     #[test]
+    fn steering_replay_retains_call_sources_and_refuses_repeated_boundaries() {
+        let mut rows = records("result");
+        let mut boundary = rows[2].clone();
+        boundary.message = TurnTranscriptMessage::Steering {
+            model_sequence: 1,
+            inputs: vec![crate::session::steering::JobInputRequest::new(
+                "complete".into(),
+                "continue".into(),
+            )],
+        };
+        rows.insert(2, boundary.clone());
+        rows[3].sequence = 3;
+        let tagged = replay_turn_tagged(&rows, 1000).unwrap();
+        assert_eq!(
+            tagged.iter().map(|(_, seq)| *seq).collect::<Vec<_>>(),
+            [0, 0, 1]
+        );
+        assert_eq!(tagged[2].0, RuntimeMessage::User("continue".into()));
+        let mut cancelled = rows.clone();
+        if let TurnTranscriptMessage::ModelResponse { terminal, .. } = &mut cancelled[3].message {
+            *terminal = false;
+        }
+        let mut uncertain = boundary.clone();
+        uncertain.sequence = 4;
+        if let TurnTranscriptMessage::Steering {
+            model_sequence,
+            inputs,
+        } = &mut uncertain.message
+        {
+            *model_sequence = 2;
+            inputs[0].id = uuid::Uuid::new_v4().to_string();
+            inputs[0].text = "unconfirmed".into();
+        }
+        cancelled.push(uncertain);
+        let mut stop = rows[3].clone();
+        stop.sequence = 5;
+        stop.message = TurnTranscriptMessage::Cancelled;
+        cancelled.push(stop);
+        let replayed =
+            replay_turn(&cancelled, 1000).expect("earlier confirmed history survives stop");
+        assert_eq!(replayed[2], RuntimeMessage::User("continue".into()));
+        assert_eq!(replayed[3], RuntimeMessage::Assistant("answer".into()));
+        assert_eq!(replayed.len(), 4, "unconfirmed suffix alone is excluded");
+
+        if let TurnTranscriptMessage::Steering { inputs, .. } = &mut boundary.message {
+            inputs[0].id = uuid::Uuid::new_v4().to_string();
+        }
+        boundary.sequence = 3;
+        rows.insert(3, boundary);
+        rows[4].sequence = 4;
+        assert!(
+            replay_turn(&rows, 1000).is_none(),
+            "one incorporation record per call"
+        );
+    }
+
+    #[test]
     fn malformed_or_incomplete_turns_never_replay() {
         let valid = records("ok");
         assert_eq!(replay_turn(&valid, 1000).unwrap().len(), 2);
@@ -1256,6 +1364,7 @@ mod tests {
             match &mut record.message {
                 TurnTranscriptMessage::Cancelled | TurnTranscriptMessage::Unknown { .. } => {}
                 TurnTranscriptMessage::ModelResponse { model_sequence, .. }
+                | TurnTranscriptMessage::Steering { model_sequence, .. }
                 | TurnTranscriptMessage::ToolResult { model_sequence, .. } => *model_sequence += 1,
             }
         }
@@ -1274,6 +1383,7 @@ mod tests {
                 match &mut record.message {
                     TurnTranscriptMessage::Cancelled | TurnTranscriptMessage::Unknown { .. } => {}
                     TurnTranscriptMessage::ModelResponse { model_sequence, .. }
+                    | TurnTranscriptMessage::Steering { model_sequence, .. }
                     | TurnTranscriptMessage::ToolResult { model_sequence, .. } => {
                         *model_sequence += model_offset;
                     }

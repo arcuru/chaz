@@ -343,6 +343,13 @@ impl RuntimeRecorder for CollectingRecorder {
                 return Ok(());
             };
             let message = match message {
+                RuntimeRecord::Steering {
+                    model_sequence,
+                    inputs,
+                } => TurnTranscriptMessage::Steering {
+                    model_sequence,
+                    inputs,
+                },
                 RuntimeRecord::Cancelled => TurnTranscriptMessage::Cancelled,
                 RuntimeRecord::ModelResponse {
                     model_sequence,
@@ -398,11 +405,26 @@ impl RuntimeRecorder for CollectingRecorder {
 /// Sends one opening input and one input at the first closing boundary.
 struct BoundaryRecorder {
     records: CollectingRecorder,
+    dispatches: Mutex<Vec<u64>>,
+    observations: Mutex<Vec<crate::session::usage::CallObservation>>,
     opening: Mutex<Option<String>>,
     closing: Mutex<Option<String>>,
 }
 
 impl RuntimeRecorder for BoundaryRecorder {
+    fn observe_call<'a>(
+        &'a self,
+        call: crate::session::usage::CallObservation,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+        assert_eq!(
+            self.dispatches.lock().unwrap().last().copied(),
+            Some(call.model_sequence),
+            "input incorporation must precede call observation"
+        );
+        self.observations.lock().unwrap().push(call);
+        Box::pin(async { Ok(()) })
+    }
+
     fn input_boundary<'a>(
         &'a self,
         _model_sequence: u64,
@@ -421,6 +443,21 @@ impl RuntimeRecorder for BoundaryRecorder {
             .into_iter()
             .collect();
         Box::pin(async move { Ok(messages) })
+    }
+
+    fn input_dispatch<'a>(
+        &'a self,
+        sequence: u64,
+        messages: &'a [RuntimeMessage],
+        _baseline: &'a [RuntimeMessage],
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+        self.dispatches.lock().unwrap().push(sequence);
+        assert!(
+            messages
+                .iter()
+                .any(|m| matches!(m, RuntimeMessage::User(_)))
+        );
+        Box::pin(async { Ok(()) })
     }
 
     fn record<'a>(
@@ -672,6 +709,8 @@ async fn projection_preserves_steering_boundaries_and_originals() {
         fx.mock.push_text("terminal");
         let recorder = Arc::new(BoundaryRecorder {
             records: CollectingRecorder::default(),
+            dispatches: Mutex::new(Vec::new()),
+            observations: Mutex::new(Vec::new()),
             opening: Mutex::new(Some("steer-before".into())),
             closing: Mutex::new(Some("steer-after".into())),
         });
@@ -684,6 +723,19 @@ async fn projection_preserves_steering_boundaries_and_originals() {
         let final_round = if tool_exchange { 2 } else { 1 };
         assert_eq!(calls.len(), final_round + 1);
         assert_eq!(p.count(), calls.len());
+        let observations = recorder.observations.lock().unwrap();
+        assert_eq!(observations.len(), calls.len() * 2);
+        for (call, pair) in calls.iter().zip(observations.chunks_exact(2)) {
+            assert!(!pair[0].responded);
+            assert!(pair[1].responded);
+            assert_eq!(pair[0].model_sequence, pair[1].model_sequence);
+            assert_eq!(pair[0].timestamp, pair[1].timestamp);
+            assert_eq!(
+                pair[0].input_tokens,
+                crate::context::estimate_request_tokens(&call.messages, &call.tools) as u64,
+                "telemetry must count the projected request including steering"
+            );
+        }
         assert_eq!(
             echo_calls.load(Ordering::SeqCst),
             usize::from(tool_exchange)
@@ -763,10 +815,29 @@ async fn projection_refuses_steered_continuation_on_required_failure_or_budget()
             if tool_capable {
                 fx.register(echo_tool(&echo_calls));
             }
-            fx.mock.push_text("provisional");
+            let extra = serde_json::Map::from_iter([
+                (
+                    crate::responses::OUTPUT_ITEMS.into(),
+                    json!([
+                        {"type":"reasoning","id":"native","encrypted_content":"retained","summary":[]},
+                        {"type":"message","role":"assistant","content":[{"type":"output_text","text":"provisional"}]}
+                    ]),
+                ),
+                (
+                    crate::responses::REPLAY_ORIGIN.into(),
+                    json!({"version":1,"api":"responses","requested_model":"mock-model","connection":"opaque-scope"}),
+                ),
+            ]);
+            fx.mock.push_response(Ok(LLMResponse::Text {
+                content: "provisional".into(),
+                provider_extra: extra.clone(),
+                metadata: None,
+            }));
             fx.mock.push_text("must not dispatch");
             let recorder = Arc::new(BoundaryRecorder {
                 records: CollectingRecorder::default(),
+                dispatches: Mutex::new(Vec::new()),
+                observations: Mutex::new(Vec::new()),
                 opening: Mutex::new(None),
                 closing: Mutex::new(Some(if oversize {
                     "oversize steering ".repeat(10_000)
@@ -791,6 +862,23 @@ async fn projection_refuses_steered_continuation_on_required_failure_or_budget()
             assert_eq!(fx.calls().len(), 1, "invalid continuation reached backend");
             assert_eq!(echo_calls.load(Ordering::SeqCst), 0);
             assert_eq!(p.count(), 2);
+            assert!(p.seen()[1].input.messages.iter().any(|m| matches!(m,
+                RuntimeMessage::AssistantWithExtra {provider_extra,..} if provider_extra == &extra)),
+                "native output and origin must survive steering before refusal");
+            assert_eq!(recorder.observations.lock().unwrap().len(), 2);
+            assert!(
+                recorder
+                    .observations
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .all(|c| c.model_sequence == 0)
+            );
+            assert_eq!(
+                *recorder.dispatches.lock().unwrap(),
+                [0],
+                "refused input cannot be promoted"
+            );
             assert!(matches!(
                 recorder.records.records.lock().unwrap().last().unwrap(),
                 RuntimeRecord::ModelResponse {
@@ -1859,6 +1947,7 @@ async fn resumed_wait_projects_restored_exchanges_with_current_scope() {
             Some(&fixture.hub),
             None,
             runtime::RuntimeResume {
+                prior_model_sequences: vec![0, 0, 1],
                 prior_messages: vec![
                     RuntimeMessage::AssistantToolCalls {
                         exchange_id: None,
@@ -1911,6 +2000,51 @@ async fn resumed_wait_projects_restored_exchanges_with_current_scope() {
             assert_eq!(result.unwrap().body, "done");
         }
     }
+}
+
+#[tokio::test]
+async fn steering_drains_before_terminal_silence_without_orphan_tool_history() {
+    let mut fx = Fixture::new(&[], &[], &[]).await;
+    fx.ctx.allow_no_reply = true;
+    fx.mock.push_tool_calls([(
+        "silence".into(),
+        crate::tool::NO_REPLY_TOOL.into(),
+        "{}".into(),
+    )]);
+    fx.mock.push_text("steered answer");
+    let recorder = Arc::new(BoundaryRecorder {
+        records: CollectingRecorder::default(),
+        dispatches: Mutex::new(Vec::new()),
+        observations: Mutex::new(Vec::new()),
+        opening: Mutex::new(None),
+        closing: Mutex::new(Some("reply after all".into())),
+    });
+    let result = fx
+        .execute(prompt(), ModelCallScope::default(), recorder.clone())
+        .await
+        .unwrap();
+    assert_eq!(result.body, "steered answer");
+    let calls = fx.calls();
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[0].tools, calls[1].tools);
+    assert_eq!(
+        calls[1].messages.last(),
+        Some(&RuntimeMessage::User("reply after all".into()))
+    );
+    assert!(
+        !calls[1].messages.iter().any(|m| matches!(
+            m,
+            RuntimeMessage::AssistantToolCalls { .. } | RuntimeMessage::ToolResult { .. }
+        )),
+        "no_reply is not an effectful native batch to replay"
+    );
+    assert!(matches!(
+        recorder.records.records.lock().unwrap()[0],
+        RuntimeRecord::ModelResponse {
+            terminal: false,
+            ..
+        }
+    ));
 }
 
 #[tokio::test]

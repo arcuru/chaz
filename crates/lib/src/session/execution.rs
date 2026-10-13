@@ -73,7 +73,7 @@ struct Activation {
 /// get_store_entries takes a store frontier, not arbitrary main-tree tips.
 /// Follow main parents until reaching that store on each branch, then let the
 /// native API traverse and canonically sort the immutable store DAG.
-async fn store_entries_at(
+pub(crate) async fn store_entries_at(
     db: &Database,
     store: &str,
     snapshot: &Snapshot,

@@ -71,6 +71,13 @@ impl RuntimeRecorder for Recorder {
                 next
             };
             let message = match record {
+                RuntimeRecord::Steering {
+                    model_sequence,
+                    inputs,
+                } => TurnTranscriptMessage::Steering {
+                    model_sequence,
+                    inputs,
+                },
                 RuntimeRecord::Cancelled => TurnTranscriptMessage::Cancelled,
                 RuntimeRecord::ModelResponse {
                     model_sequence,

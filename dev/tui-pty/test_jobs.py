@@ -335,9 +335,19 @@ context:
                 release.set()
                 self.assertTrue(continued.wait(20), "steering must reach the actual next request")
                 process.expect("calculate")  # Persisted live job tool activity, not a fixture row.
+                process.expect("PTY steering input")
+                self.assertEqual("\n".join(process.screen.display).count("PTY steering input"), 1)
+                self.assertNotIn("continued job terminal", "\n".join(process.screen.display))
+                # Incorporated input lives in the transcript; receipts remain
+                # inspectable in details while the response is still blocked.
+                process.resize(110, 35)
+                process.send("\x1bOQ")
                 process.expect("Accepted · dispatch recorded")
                 process.expect("inclusion unconfirmed")
-                process.screen_capture(evidence, "observer-dispatch-80x24")
+                process.screen_capture(evidence, "observer-dispatch-details-110x35")
+                process.send("\x1bOQ")
+                process.resize(80, 24)
+                process.expect_absent("Observer details")
                 # Refresh/navigation/close while the continued resident call is blocked.
                 process.send("\x07r")  # overview and refresh
                 process.expect("Tasks")
@@ -378,8 +388,13 @@ context:
                 process.send("\x1b[5~")
                 process.expect("Result")
                 process.send("\r")
+                process.expect("Job observer")
                 process.expect("continued job terminal")
+                process.resize(110, 35)
+                process.send("\x1bOQ")
                 process.expect("Included · call 1 returned")
+                process.screen_capture(evidence, "observer-included-details-110x35")
+                process.send("\x1bOQ")
                 process.resize(80, 24)
                 process.expect("continued job terminal")
                 process.screen_capture(evidence, "observer-completed-80x24")

@@ -29,9 +29,6 @@ pub(super) struct JobsView {
 
 pub(super) struct JobTab {
     pub state: Option<JobState>,
-    pub inputs: Vec<JobInput>,
-    pub feedback: String,
-    pub retry: Arc<tokio::sync::Mutex<Option<JobInputRequest>>>,
     pub details: bool,
 }
 
@@ -150,9 +147,6 @@ pub(super) async fn open_tab(
     let mut tab = build_tab(server, backend, db.clone(), id.into()).await?;
     tab.job = Some(JobTab {
         state: None,
-        inputs: Vec::new(),
-        feedback: String::new(),
-        retry: Default::default(),
         details: false,
     });
     tab.live.observation = Some(observation);
@@ -206,7 +200,10 @@ pub(super) async fn snapshot(db: &eidetica::Database) -> Result<Snapshot, String
             entries,
             telemetry,
             state,
-            inputs: session.job_inputs().await.map_err(|e| e.to_string()),
+            inputs: session
+                .turn_inputs_at(&tips)
+                .await
+                .map_err(|e| e.to_string()),
         })
     }
     .await
@@ -226,23 +223,29 @@ pub(super) fn apply_snapshot(tab: &mut Tab, result: Result<Snapshot, String>) {
                 }
             ));
             let job = tab.job.as_mut().expect("job snapshot belongs to observer");
+            tab.live.input_attempt = attempt_id(Some(&snapshot.state)).map(str::to_owned);
             job.state = Some(snapshot.state);
             match snapshot.inputs {
                 Ok(inputs) => {
-                    job.inputs = inputs;
-                    if job.feedback.starts_with("unavailable")
-                        || job.feedback.starts_with("input evidence unavailable")
+                    tab.live.inputs = inputs;
+                    if tab.live.input_feedback.starts_with("unavailable")
+                        || tab
+                            .live
+                            .input_feedback
+                            .starts_with("input evidence unavailable")
                     {
-                        job.feedback.clear();
+                        tab.live.input_feedback.clear();
                     }
                 }
-                Err(error) => job.feedback = format!("input evidence unavailable: {error}"),
+                Err(error) => {
+                    tab.live.input_feedback = format!("input evidence unavailable: {error}")
+                }
             }
         }
         Err(error) => {
             let job = tab.job.as_mut().expect("job snapshot belongs to observer");
             job.state = None;
-            job.feedback = format!("unavailable; retained evidence is stale: {error}");
+            tab.live.input_feedback = format!("unavailable; retained evidence is stale: {error}");
             tab.touch_transcript();
         }
     }
@@ -252,45 +255,72 @@ pub(super) async fn send(
     db: eidetica::Database,
     retry: Arc<tokio::sync::Mutex<Option<JobInputRequest>>>,
     text: String,
+    is_job: bool,
+    expected: Option<String>,
+    busy: bool,
 ) -> Result<operations::Effect, String> {
-    let status = chaz_core::session::jobs::observer_status(&db)
-        .await
-        .map_err(|e| e.to_string())?;
-    let attempt_id = match status.state {
-        JobState::StartedUnknown {
-            attempt_id,
-            activity_recent: true,
-        } => attempt_id,
-        state if state.is_terminal() => {
-            return Ok(operations::Effect::JobSent(
-                "Finished job — view-only".into(),
-            ));
-        }
-        _ => {
-            return Ok(operations::Effect::JobSent(
-                "No recent started attempt; steering unavailable, no automatic replay".into(),
-            ));
-        }
-    };
-    // This state belongs to the accepted publication, not the view. Closing
-    // the tab cannot lose its ID or authorize a different uncertain input.
+    let session = Session::try_new(
+        chaz_core::types::ConversationId(db.root_id().to_string()),
+        db.clone(),
+    )
+    .await
+    .map_err(|e| e.to_string())?;
     let mut retry = retry.lock().await;
-    let request = match retry.take() {
-        Some(request) if request.text == text => request,
-        Some(request) => {
-            *retry = Some(request);
+    let request = if let Some(request) = retry.as_ref() {
+        if request.text != text {
             return Err("Prior publication uncertain: resend the same text/ID before submitting different input".into());
         }
-        None => JobInputRequest::new(attempt_id, text),
+        request.clone()
+    } else {
+        if is_job {
+            let status = chaz_core::session::jobs::observer_status(&db)
+                .await
+                .map_err(|e| e.to_string())?;
+            if status.state.is_terminal() {
+                return Err("Finished job — view-only; input not published".into());
+            }
+        }
+        let active = if let Some(attempt) = expected {
+            vec![attempt]
+        } else if busy {
+            return Err("Current attempt identity unavailable; text not published. Refresh before resubmitting.".into());
+        } else {
+            Session::steering_attempts(&db)
+                .await
+                .map_err(|e| e.to_string())?
+        };
+        match active.as_slice() {
+            [attempt_id] => JobInputRequest::new(attempt_id.clone(), text),
+            [] if !is_job => {
+                // The only interaction difference: idle Chat starts a normal
+                // turn. Never convert a refused/uncertain steering to one.
+                let mut session = session;
+                session
+                    .add_entry(SessionEntry {
+                        sender: "user".into(),
+                        content: text,
+                        timestamp: chrono::Utc::now(),
+                        entry_type: EntryType::Message,
+                        metadata: None,
+                        routing: None,
+                    })
+                    .await
+                    .map_err(|e| e.to_string())?;
+                return Ok(operations::Effect::Sent);
+            }
+            _ => return Err(
+                "No unambiguous recent started attempt; input not published, no automatic replay"
+                    .into(),
+            ),
+        }
     };
     *retry = Some(request.clone());
     let publication = async {
-        let session = Session::new(
-            chaz_core::types::ConversationId(db.root_id().to_string()),
-            db,
-        )
-        .await;
-        session.submit_job_input(request).await
+        if is_job {
+            session.submit_job_input(request).await
+        } else {
+            session.submit_turn_input(request).await
+        }
     };
     let result = tokio::time::timeout(std::time::Duration::from_secs(5), publication)
         .await
@@ -306,9 +336,21 @@ pub(super) async fn send(
                 "Input published · see current receipts below".into(),
             ))
         }
-        Err(error) => Err(format!(
-            "Refused or publication uncertain: {error}. Same text retries the same ID."
-        )),
+        Err(error) => {
+            if error
+                .downcast_ref::<chaz_core::session::steering::InputRefused>()
+                .is_some()
+            {
+                *retry = None;
+                Err(format!(
+                    "Input refused before publication: {error}. Text recovered; not queued as another turn."
+                ))
+            } else {
+                Err(format!(
+                    "Refused or publication uncertain: {error}. Same text retries the same ID."
+                ))
+            }
+        }
     }
 }
 
@@ -432,14 +474,21 @@ pub(super) fn banner(tab: &Tab) -> String {
     let Some(job) = &tab.job else {
         return String::new();
     };
-    let feedback = if job.feedback.starts_with("unavailable")
-        || job.feedback.starts_with("input evidence unavailable")
+    let feedback = if tab.live.input_feedback.starts_with("unavailable")
+        || tab
+            .live
+            .input_feedback
+            .starts_with("input evidence unavailable")
     {
         "Unavailable · retained evidence is stale; F2 details"
-    } else if job.feedback.starts_with("Refused or publication uncertain") {
+    } else if tab
+        .live
+        .input_feedback
+        .starts_with("Refused or publication uncertain")
+    {
         "Publication refused or uncertain · resend same text; F2 details"
     } else {
-        &job.feedback
+        &tab.live.input_feedback
     };
     format!(
         "Job observer · {}\nWrite-capable · recorded, not proven live · Ctrl+G jobs · F2 details\n{}",
@@ -454,26 +503,35 @@ pub(super) fn banner(tab: &Tab) -> String {
     )
 }
 
-pub(super) fn input_lines(tab: &Tab) -> Vec<Line<'static>> {
-    let Some(job) = &tab.job else {
-        return Vec::new();
-    };
+pub(super) fn input_lines(tab: &Tab, debug: bool) -> Vec<Line<'static>> {
+    let details = debug || tab.job.as_ref().is_some_and(|job| job.details);
     let mut lines = Vec::new();
-    if job.details {
+    if details {
         lines.push(Line::styled("Observer details", theme::accent_bold()));
         lines.push(Line::from(format!("Session: {}", tab.session_db_id)));
-        if let Some(id) = attempt_id(job.state.as_ref()) {
+        if let Some(id) = attempt_id(tab.job.as_ref().and_then(|job| job.state.as_ref())) {
             lines.push(Line::from(format!("Attempt: {id}")));
         }
-        lines.push(Line::from(job.feedback.clone()));
+        lines.push(Line::from(tab.live.input_feedback.clone()));
     }
-    for (i, input) in job.inputs.iter().enumerate() {
+    for (i, input) in tab.live.inputs.iter().enumerate() {
+        if input.incorporated && !details {
+            continue;
+        }
         lines.push(Line::styled(
             format!("Input {} · {}", i + 1, input_label(&input.state)),
-            theme::accent(),
+            theme::dim(),
         ));
-        lines.push(Line::from(input.request.text.clone()));
-        if job.details {
+        if !input.incorporated {
+            lines.extend(
+                input
+                    .request
+                    .text
+                    .lines()
+                    .map(|line| Line::styled(line.to_owned(), theme::dim())),
+            );
+        }
+        if details {
             lines.push(Line::from(format!(
                 "Request: {} · attempt: {}",
                 input.request.id, input.request.attempt_id

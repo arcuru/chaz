@@ -114,6 +114,8 @@ pub enum EntryType {
     /// User control event targeting one durable turn attempt. Content is a
     /// JSON [`CancelRequest`]. Never enters model context or wakes a turn.
     Cancel,
+    /// Display-only text from an active attempt; context uses its structured transcript.
+    TurnContext,
     /// A later version's entry, preserved in storage and inert in this reader.
     Unknown {
         kind: String,
@@ -138,6 +140,7 @@ impl EntryType {
             Self::ApprovalRequest => "ApprovalRequest",
             Self::ApprovalDecision => "ApprovalDecision",
             Self::Cancel => "Cancel",
+            Self::TurnContext => "TurnContext",
             Self::Unknown { kind, .. } => kind,
         }
     }
@@ -181,6 +184,7 @@ impl<'de> Deserialize<'de> for EntryType {
             "ApprovalRequest" => Some(Self::ApprovalRequest),
             "ApprovalDecision" => Some(Self::ApprovalDecision),
             "Cancel" => Some(Self::Cancel),
+            "TurnContext" => Some(Self::TurnContext),
             _ => None,
         };
         match (known, &raw) {
@@ -725,6 +729,11 @@ fn turn_transcript_key(record: &TurnTranscriptRecord) -> String {
 session_wire_enum! {
     #[derive(Debug, Clone, PartialEq)]
     pub enum TurnTranscriptMessage {
+        /// Selected steering actually incorporated after projection/budget gates.
+        Steering {
+            model_sequence: u64,
+            inputs: Vec<steering::JobInputRequest>,
+        },
         /// The executor settled this attempt at the user's request.
         Cancelled,
         ModelResponse {
@@ -946,8 +955,12 @@ impl Session {
     /// Read every selected-context store at the supplied immutable snapshot.
     /// A failed read is an error, never an in-memory transcript fallback.
     pub async fn context_view_at(&self, snapshot: Snapshot) -> anyhow::Result<SessionContextView> {
-        let rows =
-            Self::context_entries_with_ids_at(self.database.clone(), snapshot.clone()).await?;
+        let rows: Vec<_> =
+            Self::context_entries_with_ids_at(self.database.clone(), snapshot.clone())
+                .await?
+                .into_iter()
+                .filter(|(_, entry)| entry.entry_type != EntryType::TurnContext)
+                .collect();
         let contributions =
             crate::extension::durable_context::read_at(&self.database, &snapshot).await?;
         let txn = self.database.new_transaction_at(&snapshot).await?;
@@ -1689,6 +1702,15 @@ impl Session {
         if let Some(branch) = branch {
             execution::transcript_in_txn(&txn, branch, &record).await?;
         }
+        if let TurnTranscriptMessage::Steering {
+            model_sequence,
+            inputs,
+        } = &record.message
+        {
+            steering::dispatch_in_txn(&txn, *model_sequence, inputs).await?;
+        }
+        let record_sequence = record.sequence;
+        let display_attempt = record.attempt_id.clone();
         let key = turn_transcript_key(&record);
         txn.get_store::<Table<TurnTranscriptRecord>>(TURN_TRANSCRIPT_STORE)
             .await?
@@ -1697,8 +1719,20 @@ impl Session {
         let entries = txn
             .get_store::<Table<SessionEntry>>(&self.store_name)
             .await?;
-        for entry in display_entries {
-            entries.insert(entry).await?;
+        for (index, entry) in display_entries.into_iter().enumerate() {
+            // Shared timestamp within one boundary; index pins its FIFO display
+            // order instead of Table's random insertion UUIDs.
+            entries
+                .set(
+                    format!(
+                        "{}:{}:{:020}:{index:010}",
+                        display_attempt,
+                        branch.unwrap_or(""),
+                        record_sequence
+                    ),
+                    entry,
+                )
+                .await?;
         }
         txn.commit().await?;
         Ok(())

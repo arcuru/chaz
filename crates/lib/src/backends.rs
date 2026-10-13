@@ -680,6 +680,32 @@ impl BackendManager {
         Ok(())
     }
 
+    /// Validate the accepted request's native replay before host incorporation
+    /// and presentation telemetry. Dispatch revalidates against current credentials.
+    pub(crate) fn validate_request_replay(
+        &self,
+        model: Option<&str>,
+        resolved_model: &str,
+        messages: &[RuntimeMessage],
+    ) -> Result<(), LlmError> {
+        if self.mock.is_some() {
+            return Ok(());
+        }
+        if self.backends.is_empty() {
+            return Err(LlmError::Configuration {
+                message: "No backends configured".into(),
+            });
+        }
+        let backend = self.select_backend_for_model(model);
+        if backend.api_for_model(resolved_model) == ModelApi::Responses {
+            crate::responses::Responses::new(backend, &self.secrets)
+                .validate_request(messages, resolved_model)?;
+        } else {
+            crate::responses::validate_foreign_history(messages)?;
+        }
+        Ok(())
+    }
+
     /// Maximum retry attempts for transient errors on the backend for the given model.
     pub fn max_retries_for_model(&self, model: Option<&str>) -> u32 {
         if self.backends.is_empty() {
