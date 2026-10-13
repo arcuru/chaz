@@ -587,10 +587,12 @@ pub struct AgentPreset {
 /// between config load and the startup extraction that clears it.
 #[derive(Deserialize, Clone)]
 pub struct Backend {
-    /// The type of backend (kept for config compat, only "openaicompatible" supported)
+    /// Provider family, used for catalog discovery and the default request API.
     #[serde(rename = "type")]
     #[allow(dead_code)]
     pub backend_type: BackendType,
+    /// Default request API. Omit to retain this backend type's existing API.
+    pub api: Option<ModelApi>,
     /// The base URL for the API
     pub api_base: Option<String>,
     /// The API key from config (extracted into SecretStore at startup, then cleared).
@@ -612,7 +614,8 @@ pub struct Backend {
     pub max_retries: Option<u32>,
     /// Maximum output tokens per response (default: 8192). Required by the
     /// Anthropic-native backend (`type: anthropic`), whose API mandates an
-    /// explicit `max_tokens`; ignored by the OpenAI-compatible backend.
+    /// explicit `max_tokens`. Responses sends an explicitly configured value as
+    /// `max_output_tokens`; Chat Completions ignores this field.
     #[serde(default)]
     pub max_tokens: Option<u32>,
 }
@@ -621,6 +624,7 @@ impl std::fmt::Debug for Backend {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Backend")
             .field("backend_type", &self.backend_type)
+            .field("api", &self.api)
             .field("api_base", &self.api_base)
             .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
             .field("api_key_ref", &self.api_key_ref)
@@ -638,6 +642,7 @@ impl Backend {
     pub fn new(backend_type: BackendType) -> Self {
         Backend {
             backend_type,
+            api: None,
             api_base: None,
             api_key: None,
             api_key_ref: None,
@@ -675,12 +680,29 @@ impl Backend {
     pub fn get_name(&self) -> String {
         self.name.clone().unwrap_or_else(|| "openai".to_string())
     }
+
+    /// Resolve operator intent for a raw (backend-prefix-free) model id.
+    /// Catalog discovery does not choose a protocol: unconfigured, discovered,
+    /// and unknown ids all inherit the backend default, without name heuristics.
+    pub fn api_for_model(&self, model: &str) -> ModelApi {
+        self.models
+            .as_ref()
+            .and_then(|models| models.iter().find(|m| m.name == model))
+            .and_then(|m| m.api)
+            .or(self.api)
+            .unwrap_or(match self.backend_type {
+                BackendType::OpenAICompatible => ModelApi::ChatCompletions,
+                BackendType::Anthropic => ModelApi::AnthropicMessages,
+            })
+    }
 }
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct Model {
     /// The name of the model
     pub name: String,
+    /// Request API override for this exact model id on its backend.
+    pub api: Option<ModelApi>,
     /// OpenAI-compatible reasoning mode for requests to this model. Omit to
     /// leave the provider's default unchanged.
     pub reasoning: Option<ReasoningConfig>,
@@ -737,11 +759,31 @@ pub enum ReasoningEffort {
 #[derive(Debug, Deserialize, Clone)]
 #[serde(rename_all = "lowercase")]
 pub enum BackendType {
-    /// OpenAI chat-completions shape (`type: openaicompatible`): OpenAI,
-    /// OpenRouter, DeepSeek, Ollama, …
+    /// OpenAI-compatible provider (`type: openaicompatible`): OpenAI,
+    /// OpenRouter, DeepSeek, Ollama, … Defaults to Chat Completions.
     OpenAICompatible,
     /// Native Anthropic Messages API (`type: anthropic`, `api.anthropic.com`).
     Anthropic,
+}
+
+/// Request protocol, independent of the provider connection and model id.
+/// Unknown YAML values fail deserialization rather than falling back to chat.
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ModelApi {
+    ChatCompletions,
+    Responses,
+    AnthropicMessages,
+}
+
+impl ModelApi {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ChatCompletions => "chat-completions",
+            Self::Responses => "responses",
+            Self::AnthropicMessages => "anthropic-messages",
+        }
+    }
 }
 
 /// Configuration for a scheduled task
@@ -1007,6 +1049,7 @@ fn known_config_keys() -> HashSet<&'static str> {
     // ── backends[] ──
     for k in [
         "backends[].type",
+        "backends[].api",
         "backends[].api_base",
         "backends[].api_key",
         "backends[].models",
@@ -1022,6 +1065,7 @@ fn known_config_keys() -> HashSet<&'static str> {
     // ── backends[].models[] ──
     for k in [
         "backends[].models[].name",
+        "backends[].models[].api",
         "backends[].models[].reasoning",
         "backends[].models[].reasoning.effort",
         "backends[].models[].price_input",
@@ -1540,6 +1584,59 @@ backends:
           effort: turbo
 "#;
         assert!(serde_yaml::from_str::<Config>(yaml).is_err());
+    }
+
+    #[test]
+    fn model_api_defaults_and_overrides() {
+        let yaml = r#"
+backends:
+  - type: openaicompatible
+    api: responses
+    models:
+      - name: inherited
+      - name: overridden
+        api: chat-completions
+  - type: anthropic
+    models:
+      - name: claude
+        api: anthropic-messages
+"#;
+        let cfg: Config = serde_yaml::from_str(yaml).unwrap();
+        assert!(check_unknown_config_keys(yaml).is_empty());
+        let backends = cfg.backends.unwrap();
+        assert_eq!(backends[0].api_for_model("inherited"), ModelApi::Responses);
+        assert_eq!(
+            backends[0].api_for_model("overridden"),
+            ModelApi::ChatCompletions
+        );
+        assert_eq!(backends[0].api_for_model("unknown"), ModelApi::Responses);
+        // Exact model id matching: no case folding, prefix or name heuristics.
+        assert_eq!(backends[0].api_for_model("Overridden"), ModelApi::Responses);
+        assert_eq!(
+            backends[1].api_for_model("claude"),
+            ModelApi::AnthropicMessages
+        );
+        assert_eq!(
+            backends[1].api_for_model("unknown"),
+            ModelApi::AnthropicMessages
+        );
+        let chat = Backend::new(BackendType::OpenAICompatible);
+        assert_eq!(chat.api_for_model("gpt-6-sol"), ModelApi::ChatCompletions);
+    }
+
+    #[test]
+    fn invalid_api_values_are_rejected_at_backend_and_model_scope() {
+        for yaml in [
+            "backends: [{type: openaicompatible, api: guessed}]",
+            "backends: [{type: openaicompatible, models: [{name: m, api: guessed}]}]",
+        ] {
+            let error = serde_yaml::from_str::<Config>(yaml)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("unknown variant `guessed`"), "{error}");
+            assert!(error.contains("chat-completions"), "{error}");
+            assert!(error.contains("responses"), "{error}");
+        }
     }
 
     #[test]

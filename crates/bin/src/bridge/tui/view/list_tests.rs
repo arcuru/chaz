@@ -498,6 +498,7 @@ async fn toolbar_context_reopen_honors_pins_and_refreshes_runtime_budget() {
     configured.name = Some("primary".into());
     configured.models = Some(vec![Model {
         name: "small-model".into(),
+        api: None,
         reasoning: None,
         price_input: None,
         price_output: None,

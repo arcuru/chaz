@@ -862,6 +862,7 @@ async fn budget_model_falls_back_to_backend_default() {
     let mut b = crate::config::Backend::new(crate::config::BackendType::OpenAICompatible);
     b.name = Some("openrouter".to_string());
     b.models = Some(vec![crate::config::Model {
+        api: None,
         name: "deepseek/deepseek-v4-flash".to_string(),
         reasoning: None,
         price_input: None,
@@ -9046,3 +9047,128 @@ async fn required_context_strategy_refuses_and_recovers_on_the_executor() {
 mod wait_resume;
 #[path = "worker_capacity_tests.rs"]
 mod worker_capacity_tests;
+
+#[tokio::test]
+async fn api_override_preserves_default_and_actual_compact_target_after_discovery_failure() {
+    use wiremock::{
+        Mock, MockServer, ResponseTemplate,
+        matchers::{method, path},
+    };
+    let http = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/models"))
+        .respond_with(ResponseTemplate::new(503))
+        .expect(1)
+        .mount(&http)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id":"compact", "choices":[{"message":{"role":"assistant","content":"compact summary"}}]
+        })))
+        .expect(1)
+        .mount(&http)
+        .await;
+    let (_instance, executor, registry) = server_fixture().await;
+    let (_, db) = registry.create_session(Some("compact-api")).await.unwrap();
+    let sid = db.root_id().to_string();
+    let mut config: crate::config::Backend = serde_yaml::from_str("type: openaicompatible\nmodels:\n  - name: chat-default\n  - name: favorite\n  - name: reasoner\n    api: responses\n").unwrap();
+    config.api_base = Some(http.uri());
+    config.api_key = Some("test-only-token".into());
+    let manager = BackendManager::new(
+        &Some(vec![config.clone()]),
+        crate::test_support::empty_secrets().await,
+    );
+    assert_eq!(manager.resolve_model_name(None), "chat-default");
+    assert!(manager.fetch_models_with_info().await.is_err());
+    assert_eq!(
+        manager.list_known_models(),
+        vec!["chat-default", "favorite", "reasoner"]
+    );
+    assert_eq!(manager.resolve_model_name(None), "chat-default");
+    executor
+        .register_session(&db, manager, Some("default".into()), None)
+        .await
+        .unwrap();
+    let mut session = Session::new(ConversationId(sid.clone()), db.clone()).await;
+    session
+        .update_meta(|meta| meta.model = Some("reasoner".into()))
+        .await
+        .unwrap();
+    for content in ["one", "two", "three"] {
+        session
+            .add_entry(SessionEntry {
+                sender: "default".into(),
+                content: content.into(),
+                timestamp: Utc::now(),
+                entry_type: EntryType::Message,
+                metadata: None,
+                routing: None,
+            })
+            .await
+            .unwrap();
+    }
+    let observer = executor.observe_session_command(&sid).await.unwrap();
+    let command_id = TurnRequestId::parse("compact-api-target");
+    session
+        .submit_command(crate::session::SessionCommandRequest {
+            command_id: command_id.clone(),
+            sender: "user".into(),
+            created_at: Utc::now(),
+            command: crate::session::SessionCommand::Compact {
+                source_snapshot: db.snapshot().await.unwrap(),
+            },
+        })
+        .await
+        .unwrap();
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        observer.wait(&command_id),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(
+        matches!(
+            result.outcome,
+            crate::session::SessionCommandOutcome::Compact { .. }
+        ),
+        "{result:?}"
+    );
+    let requests = http.received_requests().await.unwrap();
+    assert_eq!(
+        requests.len(),
+        2,
+        "{:?}",
+        requests.iter().map(|r| r.url.path()).collect::<Vec<_>>()
+    );
+    let body: serde_json::Value = requests[1].body_json().unwrap();
+    assert_eq!(requests[1].url.path(), "/chat/completions");
+    assert_eq!(
+        body["model"], "chat-default",
+        "compact does not inherit the Responses session pin"
+    );
+    let reopened = Session::new(ConversationId(sid), db).await;
+    assert!(
+        reopened
+            .context_entries()
+            .await
+            .unwrap()
+            .iter()
+            .any(|e| e.entry_type == EntryType::Summary && e.content == "compact summary")
+    );
+    executor.shutdown().await;
+    // Sparse replacement/reordering intentionally changes the pre-existing default rule.
+    config.models.as_mut().unwrap().remove(0);
+    let manager = BackendManager::new(
+        &Some(vec![config.clone()]),
+        crate::test_support::empty_secrets().await,
+    );
+    assert_eq!(manager.resolve_model_name(None), "favorite");
+    config.models.as_mut().unwrap().remove(0);
+    let manager = BackendManager::new(
+        &Some(vec![config]),
+        crate::test_support::empty_secrets().await,
+    );
+    assert_eq!(manager.resolve_model_name(None), "reasoner");
+}

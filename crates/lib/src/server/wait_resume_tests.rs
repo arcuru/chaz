@@ -1169,3 +1169,91 @@ async fn user_stop_during_resumed_job_wait_pairs_history_and_preserves_monitor_d
     );
     c.server.shutdown().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn origin_pending_refusal_remains_interrupted_at_executor() {
+    use crate::session::{TurnTranscriptMessage, TurnTranscriptRecord};
+    let fx = Fixture::new("native-origin-hold").await;
+    let process = fx.start().await;
+    let registry = process.server.registry.clone();
+    let (sid, db) = registry.create_session(Some("origin-held")).await.unwrap();
+    registry
+        .attach_agent_to_session(&sid.0, &fx.agent)
+        .await
+        .unwrap();
+    let mut session = Session::new(sid.clone(), db.clone()).await;
+    let request = session
+        .add_entry(SessionEntry {
+            sender: "user".into(),
+            content: "wait".into(),
+            timestamp: Utc::now(),
+            entry_type: EntryType::Directive,
+            metadata: None,
+            routing: None,
+        })
+        .await
+        .unwrap();
+    let attempt = session.start_turn_attempt(request.clone()).await.unwrap();
+    let (_, _, arguments) = wait_call("missing-child", 30);
+    session.append_turn_transcript(TurnTranscriptRecord { request_id: request.clone(),
+        attempt_id: attempt.attempt_id.clone(), sequence: 0, timestamp: Utc::now(), identity: None,
+        message: TurnTranscriptMessage::ModelResponse { model_sequence: 0, content: None,
+            tool_calls: vec![runtime::ToolCallRequest { id: "wait".into(), name: "job_wait".into(), arguments: arguments.clone() }],
+            provider_extra: serde_json::Map::from_iter([(crate::responses::OUTPUT_ITEMS.into(), serde_json::json!([
+                {"type":"function_call","id":"native-wait","call_id":"wait","name":"job_wait","arguments":arguments}
+            ]))]), metadata: None, terminal: false } }, vec![]).await.unwrap();
+    let now = Utc::now();
+    let checkpoint = JobWaitCheckpoint::new(
+        request.clone(),
+        attempt.attempt_id.clone(),
+        "default".into(),
+        db.snapshot().await.unwrap(),
+        runtime::JobWaitIntent {
+            model_sequence: 0,
+            call_index: 0,
+            call_id: "wait".into(),
+            arguments,
+            child_session_db_id: "missing-child".into(),
+            checkpointed_at: now,
+            deadline: now + chrono::Duration::seconds(30),
+            policy_timeout_seconds: 300,
+        },
+    );
+    session
+        .record_job_wait_checkpoint(&checkpoint)
+        .await
+        .unwrap();
+    process.register_parent(&db, &process.child_mock).await;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if process
+                .server
+                .considered_wait_checkpoints
+                .lock()
+                .unwrap()
+                .contains(&checkpoint.key())
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    await_no_processing(&process.server, &sid.0).await;
+    assert!(
+        process.child_mock.recorded_calls().is_empty(),
+        "no resumed model call"
+    );
+    assert_eq!(fx.effects.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        process.server.interrupted_turns(&sid.0).await.unwrap(),
+        vec![InterruptedTurn {
+            request_id: request,
+            attempt_id: attempt.attempt_id.clone(),
+        }],
+        "origin refusal must hold the existing attempt, not complete it as failed"
+    );
+    assert_eq!(checkpoints(&db).await, vec![checkpoint]);
+    process.server.shutdown().await;
+}

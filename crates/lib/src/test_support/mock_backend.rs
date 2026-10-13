@@ -99,6 +99,7 @@ impl MockBackend {
             .script
             .push_back(Ok(LLMResponse::Text {
                 content: content.into(),
+                provider_extra: Default::default(),
                 metadata: Some(ResponseMetadata {
                     model,
                     ..Default::default()

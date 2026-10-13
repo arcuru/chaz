@@ -488,7 +488,38 @@ impl<'a> ContextBuilder<'a> {
                 let message = if entry.sender == self.agent_name
                     && entry.bridge_role() != Some(crate::session::BridgeEventRole::Observation)
                 {
-                    RuntimeMessage::Assistant(text)
+                    match entry
+                        .metadata
+                        .as_ref()
+                        .and_then(|m| m.extra.get(crate::responses::OUTPUT_ITEMS))
+                    {
+                        Some(items) => {
+                            let mut provider_extra = serde_json::Map::from_iter([(
+                                crate::responses::OUTPUT_ITEMS.into(),
+                                items.clone(),
+                            )]);
+                            if let Some(origin) = entry
+                                .metadata
+                                .as_ref()
+                                .and_then(|m| m.extra.get(crate::responses::REPLAY_ORIGIN))
+                            {
+                                provider_extra
+                                    .insert(crate::responses::REPLAY_ORIGIN.into(), origin.clone());
+                            }
+                            if text != entry.content {
+                                provider_extra.insert(
+                                    crate::responses::ENTRY_PROVENANCE.into(),
+                                    serde_json::Value::String(text.clone()),
+                                );
+                            }
+                            RuntimeMessage::AssistantWithExtra {
+                                exchange_id: None,
+                                content: Some(text),
+                                provider_extra,
+                            }
+                        }
+                        None => RuntimeMessage::Assistant(text),
+                    }
                 } else {
                     RuntimeMessage::User(text)
                 };
@@ -525,7 +556,14 @@ impl<'a> ContextBuilder<'a> {
                             .into_iter()
                             .enumerate()
                             .map(|(i, m)| {
-                                if i > 0 && matches!(m, RuntimeMessage::AssistantToolCalls { .. }) {
+                                if i > 0
+                                    && matches!(
+                                        m,
+                                        RuntimeMessage::AssistantToolCalls { .. }
+                                            | RuntimeMessage::Assistant(_)
+                                            | RuntimeMessage::AssistantWithExtra { .. }
+                                    )
+                                {
                                     sequence += 1;
                                 }
                                 (
@@ -670,17 +708,35 @@ pub(crate) fn replay_turn(
         model_sequence = Some(*seq);
         i += 1;
         if *end {
-            // Terminal no_reply has no tool result and is not replayed.
-            // Completed tool exchanges earlier in the turn still belong in context.
+            // Ordinary terminal text is restored from its final entry.
+            // no_reply is a completed host action with no visible final.
             let silent = tool_calls.len() == 1 && tool_calls[0].name == NO_REPLY_TOOL;
             if (!tool_calls.is_empty() && !silent) || i != sorted.len() {
                 return None;
+            }
+            if silent && provider_extra.contains_key(crate::responses::OUTPUT_ITEMS) {
+                // The terminal record proves the host fulfilled no_reply. Its
+                // actual output is empty; acknowledge it for stateless replay.
+                messages.push(RuntimeMessage::AssistantToolCalls {
+                    exchange_id: None,
+                    content: content.clone(),
+                    tool_calls: tool_calls.clone(),
+                    provider_extra: provider_extra.clone(),
+                });
+                messages.push(RuntimeMessage::ToolResult {
+                    call_id: tool_calls[0].id.clone(),
+                    content: String::new(),
+                });
             }
             terminal = true;
             break;
         }
         if tool_calls.is_empty() {
-            return None;
+            messages.push(RuntimeMessage::assistant(
+                content.clone()?,
+                provider_extra.clone(),
+            ));
+            continue;
         }
         messages.push(RuntimeMessage::AssistantToolCalls {
             exchange_id: None,
@@ -776,6 +832,15 @@ fn message_cost(msg: &RuntimeMessage) -> usize {
                 serde_json::Value::Object(provider_extra.clone())
             )
         }
+        RuntimeMessage::AssistantWithExtra {
+            content,
+            provider_extra,
+            ..
+        } => format!(
+            "{}{}",
+            content.as_deref().unwrap_or_default(),
+            serde_json::Value::Object(provider_extra.clone())
+        ),
         RuntimeMessage::ToolResult { call_id, content } => format!("{call_id}{content}"),
         _ => return 0,
     };
@@ -1029,6 +1094,55 @@ mod tests {
             Some(ContextSource::SessionEntry { index: 2, .. })
         ));
         assert_eq!(result.request_budget_tokens, 220);
+    }
+
+    #[tokio::test]
+    async fn replayed_native_text_keeps_its_model_round() {
+        let entries = vec![
+            make_entry("user", "question", EntryType::Message),
+            make_entry("agent", "answer", EntryType::Message),
+        ];
+        let mut rows = records("output");
+        let mut terminal = rows.last().unwrap().clone();
+        if let TurnTranscriptMessage::ModelResponse {
+            terminal,
+            content,
+            provider_extra,
+            ..
+        } = &mut rows.last_mut().unwrap().message
+        {
+            *terminal = false;
+            *content = Some("continuing".into());
+            provider_extra.insert(crate::responses::OUTPUT_ITEMS.into(), serde_json::json!([
+                {"type":"reasoning", "encrypted_content":"opaque"},
+                {"type":"message", "role":"assistant", "content":[{"type":"output_text", "text":"continuing"}]}]));
+        }
+        terminal.sequence += 1;
+        if let TurnTranscriptMessage::ModelResponse { model_sequence, .. } = &mut terminal.message {
+            *model_sequence += 1;
+        }
+        rows.push(terminal);
+        let history = [rows, vec![]];
+        let config = ContextConfig {
+            max_context_tokens: 4096,
+            reserved_output_tokens: 128,
+        };
+        let result = ContextBuilder::new(&entries, "agent", "", &config)
+            .with_tool_history(&history)
+            .build()
+            .await;
+        let index = result
+            .messages
+            .iter()
+            .position(|message| matches!(message, RuntimeMessage::AssistantWithExtra { .. }))
+            .unwrap();
+        assert!(matches!(
+            result.sources[index],
+            ContextSource::ReplayedExchange {
+                model_sequence: 1,
+                ..
+            }
+        ));
     }
 
     #[test]

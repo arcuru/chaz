@@ -70,6 +70,7 @@ impl CacheOptions {
                         Some(
                             crate::runtime::RuntimeMessage::User(_)
                                 | crate::runtime::RuntimeMessage::Assistant(_)
+                                | crate::runtime::RuntimeMessage::AssistantWithExtra { .. }
                                 | crate::runtime::RuntimeMessage::ToolResult { .. }
                         )
                     ),

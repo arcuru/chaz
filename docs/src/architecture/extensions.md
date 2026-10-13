@@ -288,8 +288,11 @@ estimated size of the complete request (messages, call arguments,
 provider data, tool declarations) within the budget (context window minus
 reserved output). Result bodies and other text may change, and whole
 historical exchanges may be dropped.
+Retained assistant output without tool calls follows the same provider-data,
+occurrence-order and current-attempt protections, including host routing
+provenance kept alongside native output.
 
-Each assistant call group carries a host-assigned `exchange_id`, its message
+Each assistant call group or retained assistant output carries a host-assigned `exchange_id`, its message
 index in that logical call's baseline. Projectors preserve it through edits.
 This distinguishes separate occurrences even when a provider reuses identical
 call IDs, arguments and echo data. The host strips these request-local

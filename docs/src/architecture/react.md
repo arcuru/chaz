@@ -134,3 +134,52 @@ The server uses a global `Semaphore(10)` to cap executing Agent turns across ses
 The loop reacquires a yielded permit outside the tool's timeout and rechecks the parent job's execution branch for an observed earlier branch before processing the result, firing result hooks, or executing another tool or model request. Success, child error, and policy timeout take the same path; reacquisition never registers or submits another child. `job_wait` retains its 30-second default and 240-second maximum, and `spawn_worker` its default 300-second tool policy. Subsequent capacity acquisition may take longer. Executor cancellation and the branch's yield watcher cover observation and acquisition without a separate control path; yielding is cooperative, not a fence.
 
 Before a `job_wait` that ends its batch observes, the loop asks its `RuntimeRecorder` to checkpoint it (`checkpoint_job_wait`). It then gives the tool the same absolute `observation_deadline`. `resume_with_recorder` is the restart entry point: it appends the persisted messages, rebuilds rate-limit, metadata and queued-send state, runs only the pending wait, and enters the normal loop at the next model sequence. It skips `before_agent_start` and starts without **Approve all**. After observation and capacity reacquisition, the recorder durably marks the checkpoint `observation_finished` before any result hook runs. A crash beyond that boundary stays held even if the tool result was not committed. See [Sessions](sessions.md#agent-jobs-and-worker-children).
+
+## Stateless Responses replay
+
+The native Responses adapter keeps the ordered `output` array in the model
+response's `provider_extra.openai_responses_output`.
+Text responses carry provider data just like tool responses; the runtime
+records it before progression, including on a closing boundary that receives
+new input.
+Final entries retain the terminal array in `ResponseMetadata.extra` so context
+assembly restores it at the assistant entry's position rather than duplicating
+its flattened text.
+In attached sessions, context keeps the host-rendered local/bridge envelope
+separately from native output.
+The Responses request appends that envelope as user context after the original
+items, preserving delivery state without rewriting provider output.
+Other APIs use the rendered assistant text as before.
+Tool IDs use `call_id`, not the output item's `id`.
+For compatible origins, the adapter replays every retained item, including encrypted reasoning, before
+appending correlated `function_call_output` items.
+The host stamps `chaz_responses_origin` alongside ordered output and terminal
+metadata: version, effective API, requested raw model and a non-secret digest of
+the peer-local credential store, connection name, normalized endpoint and
+credential namespace/value.
+Provider-returned model aliases and session cache keys do not establish replay
+compatibility.
+Hydration retains the origin in the same immutable `provider_extra` map as output,
+so required projector alteration refuses and optional alteration is skipped.
+Completed foreign or unknown-origin records may convert only retained visible
+text and complete, uniquely paired function calls/results.
+Unknown provider items, non-text output, interleaving or missing/ambiguous results
+refuse before HTTP; conversion changes only the request view.
+Other API clients preflight this conversion too, and never forward host origin.
+Pending-wait resume validates every native response in the checkpointed attempt
+against the current target before hooks, approval, observation or checkpoint
+retirement.
+Incompatible or unknown origins hold the wait with an actionable error, without
+rerunning earlier effects or fabricating results.
+
+Each runtime entry point clones the backend manager into a persisted-session
+scope, including resumed turns.
+Only the Responses client turns that host-owned scope into `prompt_cache_key`;
+cache anchors and extension projection cannot choose it.
+The key is a domain-separated digest of the peer-local credential database
+root, the existing Living Agent identity (or legacy caller name), backend
+connection/credential namespace and session database root.
+No raw scope identifier or credential enters the wire key, and no prompt bytes
+participate in its derivation.
+Legacy standalone calls without a session omit the key.
+Usage comes from the response, not from the identity or a predicted cache hit.

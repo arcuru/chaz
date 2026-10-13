@@ -2410,6 +2410,41 @@ mod session_picker_tests {
     }
 
     #[tokio::test]
+    async fn api_override_discovery_failure_keeps_offline_favorites() {
+        let tab = test_tab().await;
+        let secrets = chaz_core::security::SecretStore::new(tab.session_db.clone()).await;
+        let configs = serde_yaml::from_str::<Vec<chaz_core::config::Backend>>(
+            "- type: openaicompatible\n  models:\n    - name: chat-default\n    - name: favorite\n    - name: reasoner\n      api: responses\n"
+        ).unwrap();
+        let backend = BackendManager::new(&Some(configs), secrets);
+        let mut app = App::new(HashSet::new(), tab);
+        app.seed_model_picker(&backend, None, ModelPickerScope::Session);
+        app.model_picker_loading = true;
+        let ticket = app.model_catalog_ticket;
+        apply_model_catalog(
+            &mut app,
+            ModelCatalog {
+                ticket,
+                result: Err("discovery unavailable".into()),
+            },
+        );
+        assert!(!app.model_picker_loading);
+        assert_eq!(
+            app.model_picker_error.as_deref(),
+            Some("discovery unavailable")
+        );
+        assert_eq!(
+            app.model_list
+                .iter()
+                .map(|m| m.id.as_str())
+                .collect::<Vec<_>>(),
+            ["chat-default", "favorite", "reasoner"]
+        );
+        assert_eq!(app.model_picker_filtered.len(), 3);
+        assert_eq!(backend.resolve_model_name(None), "chat-default");
+    }
+
+    #[tokio::test]
     async fn tab_activity_follows_persisted_claim_not_old_ack() {
         // Keep the backend alive: the picker fixture normally drops it because
         // picker tests only inspect tab metadata, not session DB writes.

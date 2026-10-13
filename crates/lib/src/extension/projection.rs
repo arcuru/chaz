@@ -29,7 +29,8 @@
 //! in order) or omitted whole; ids, names, arguments and opaque provider data
 //! are byte-identical to the baseline; groups never repeat or reorder; and
 //! exchanges completed in the current attempt are never dropped. Result
-//! bodies and other message text may change.
+//! bodies and other message text may change. Retained assistant output without
+//! calls has the same immutable provider data, order and current-attempt checks.
 //!
 //! # Order and failure
 //!
@@ -177,7 +178,9 @@ impl ProjectedRequest {
     /// projector's output. Identities stay with their groups through Vec edits.
     pub(crate) fn identify_exchanges(&mut self) {
         for (index, message) in self.messages.iter_mut().enumerate() {
-            if let RuntimeMessage::AssistantToolCalls { exchange_id, .. } = message {
+            if let RuntimeMessage::AssistantToolCalls { exchange_id, .. }
+            | RuntimeMessage::AssistantWithExtra { exchange_id, .. } = message
+            {
                 *exchange_id = Some(index);
             }
         }
@@ -259,6 +262,8 @@ pub enum ProjectionViolation {
     HalfExchange(String),
     #[error("current-attempt tool exchange '{0}' was dropped")]
     DroppedCurrentExchange(String),
+    #[error("retained assistant output {0}")]
+    InvalidAssistantOutput(&'static str),
     #[error("the request is ~{estimated} tokens, over the {budget}-token budget")]
     OverBudget { estimated: usize, budget: usize },
 }
@@ -469,6 +474,35 @@ pub(crate) fn validate_step(
     let mut i = 0;
     while i < candidate.messages.len() {
         match &candidate.messages[i] {
+            RuntimeMessage::AssistantWithExtra {
+                exchange_id,
+                provider_extra,
+                ..
+            } => {
+                let Some(index) = exchange_id else {
+                    return Err(ProjectionViolation::InvalidAssistantOutput(
+                        "has no host occurrence",
+                    ));
+                };
+                let Some(RuntimeMessage::AssistantWithExtra {
+                    provider_extra: original,
+                    ..
+                }) = baseline.messages.get(*index)
+                else {
+                    return Err(ProjectionViolation::InvalidAssistantOutput(
+                        "was never made by the model",
+                    ));
+                };
+                if provider_extra != original {
+                    return Err(ProjectionViolation::InvalidAssistantOutput("was altered"));
+                }
+                if !seen.insert(*index) || last_order.is_some_and(|last| *index <= last) {
+                    return Err(ProjectionViolation::InvalidAssistantOutput(
+                        "was repeated or reordered",
+                    ));
+                }
+                last_order = Some(*index);
+            }
             RuntimeMessage::AssistantToolCalls { tool_calls, .. } if tool_calls.is_empty() => {
                 return Err(ProjectionViolation::EmptyCallGroup);
             }
@@ -528,6 +562,17 @@ pub(crate) fn validate_step(
             _ => {}
         }
         i += 1;
+    }
+
+    if current_exchanges.iter().any(|index| {
+        matches!(
+            baseline.messages.get(*index),
+            Some(RuntimeMessage::AssistantWithExtra { .. })
+        ) && !seen.contains(index)
+    }) {
+        return Err(ProjectionViolation::InvalidAssistantOutput(
+            "from the current attempt was dropped",
+        ));
     }
 
     if let Some((_, group)) = groups
@@ -797,6 +842,78 @@ mod tests {
             validate(&forged),
             Err(ProjectionViolation::ForgedCall("old".into()))
         );
+    }
+
+    #[test]
+    fn retained_assistant_output_obeys_exchange_integrity() {
+        let mut base = baseline();
+        let native = crate::runtime::RuntimeMessage::assistant(
+            "answer".into(),
+            serde_json::Map::from_iter([(
+                crate::responses::OUTPUT_ITEMS.into(),
+                json!([{"type":"reasoning", "encrypted_content":"opaque"}]),
+            )]),
+        );
+        // Identical provider bytes still represent two distinct occurrences.
+        base.messages.insert(4, native.clone());
+        base.messages.push(native);
+        base.identify_exchanges();
+        let current = HashSet::from([6, 8]);
+        for authority in [
+            ProjectionAuthority::Conversation,
+            ProjectionAuthority::FullContext,
+        ] {
+            let validate = |candidate: &ProjectedRequest| {
+                validate_step(&base, &base, candidate, authority, &current, None)
+            };
+            validate(&base).unwrap();
+            let mut text_edited = base.clone();
+            if let RuntimeMessage::AssistantWithExtra { content, .. } =
+                text_edited.messages.last_mut().unwrap()
+            {
+                *content = Some("display text changed".into());
+            }
+            validate(&text_edited).unwrap();
+            let mut historical_omitted = base.clone();
+            historical_omitted.messages.remove(4);
+            validate(&historical_omitted).unwrap();
+            let mut altered = base.clone();
+            if let RuntimeMessage::AssistantWithExtra { provider_extra, .. } =
+                altered.messages.last_mut().unwrap()
+            {
+                provider_extra.clear();
+            }
+            assert!(
+                validate(&altered).is_err(),
+                "opaque output cannot be edited"
+            );
+            let mut dropped = base.clone();
+            dropped.messages.pop();
+            assert!(
+                validate(&dropped).is_err(),
+                "current output cannot be dropped"
+            );
+            let mut repeated = base.clone();
+            repeated.messages.push(base.messages[4].clone());
+            assert!(validate(&repeated).is_err(), "output cannot repeat");
+            let mut swapped = base.clone();
+            swapped.messages.swap(4, 8);
+            assert!(
+                validate(&swapped).is_err(),
+                "equal bytes cannot exchange occurrences"
+            );
+            let mut forged = base.clone();
+            forged
+                .messages
+                .push(crate::runtime::RuntimeMessage::assistant(
+                    "invented".into(),
+                    serde_json::Map::from_iter([("unknown".into(), json!("forged"))]),
+                ));
+            assert!(
+                validate(&forged).is_err(),
+                "provider output needs a host occurrence"
+            );
+        }
     }
 
     #[test]

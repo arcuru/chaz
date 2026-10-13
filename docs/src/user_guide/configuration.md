@@ -370,9 +370,87 @@ backends:
         reasoning: { effort: none }
 ```
 
-Available levels, from least to most thinking: `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`. Setting `none` turns the extra thinking off, which keeps small prompts fast. Anything else is passed straight through to the provider, so only use levels your provider supports.
+Available levels, from least to most thinking: `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`. Setting `none` turns the extra thinking off, which keeps small prompts fast. Other levels are passed through to the selected API, except `max`, which the native Responses client rejects.
+Only use levels your provider and model support.
 
-When present, Chaz includes `reasoning` in the `/v1/chat/completions` request body, so this explicit choice takes precedence over a backend or provider default. Omit `reasoning` to leave that default unchanged. The setting applies only to the named model; models on the same backend may use different levels.
+When present, Chaz includes `reasoning` in the Chat Completions or Responses request body, so this explicit choice takes precedence over a backend or provider default. Omit `reasoning` to leave that default unchanged. The setting applies only to the named model; models on the same backend may use different levels.
+
+## Choosing an API without renaming models
+
+A backend is one provider connection: its URL, credentials, timeout and retries.
+The request API can differ by model on that connection without adding a second backend.
+`type: openaicompatible` still defaults to Chat Completions; `type: anthropic` still defaults to native Anthropic Messages.
+
+| Field                     | Default              | Meaning                                                                                   |
+| ------------------------- | -------------------- | ----------------------------------------------------------------------------------------- |
+| `backends[].api`          | Determined by `type` | Request API for models without an override, including live-discovered and unknown IDs.    |
+| `backends[].models[].api` | Backend's API        | Override for this exact `name`, written as the raw provider model ID (no backend prefix). |
+
+API values are `chat-completions`, `responses`, and `anthropic-messages`.
+Unknown values fail YAML parsing.
+OpenAI-compatible backends accept Chat Completions and Responses selection; Anthropic backends accept only Anthropic Messages.
+An incompatible selection fails with a configuration error before sending a request.
+Responses uses a native stateless client; see [Native Responses conversations](#native-responses-conversations) for replay, reasoning and cache identity.
+Endpoint rejection is an error, never an automatic fallback to Chat Completions.
+
+Resolution is model override, then backend `api`, then the default for `type`.
+Chaz does not guess from names such as `gpt-*`, and `/models` metadata does not select or override the protocol.
+The live catalog supplies picker entries and model information, not an allowlist: you can still request IDs absent from it.
+A model override works whether its ID appears in the live catalog or only in YAML.
+Models discovered without an override, or supplied manually, use the backend default.
+
+These settings live in the executor's YAML and take effect after restart.
+Changing only `api` on an existing model row does not change agent defaults stored in AgentDb, the model selected for a session, or model naming: one backend uses raw IDs, multiple backends still use `backend:model`.
+Discovery continues through the backend type's catalog endpoint using the same credentials, even when its request API is set to Responses.
+
+### Favorites are also the default list
+
+`models` is the configured favorites/default list, not a separate API override map.
+The first model of the first backend remains the implicit default for unpinned
+calls, including `/compact`, which does not inherit the session's selected model.
+Discovery supplies neither a default nor a durable offline catalog; when catalog
+loading fails, the picker retains the YAML favorites and shows the fetch error.
+Edit matching model rows in place, preserve the first/default row and other
+favorites, and do not append duplicate rows to override earlier ones: the first
+exact match wins.
+Replacing the list with only a Responses row, or reordering it, can therefore
+change the effective fallback model and protocol even with pinned agents.
+
+### Walkthrough: one connection, two API choices
+
+1. Keep a single provider connection and edit the desired existing model row in place.
+   Retain its default row, other favorites and their ordering; this fragment is
+   not a replacement catalog:
+
+   ```yaml
+   backends:
+     - name: proxy
+       type: openaicompatible
+       api_base: http://127.0.0.1:18081/v1
+       api_key: "${PROXY_API_KEY}"
+       # api: chat-completions   # already the default
+       models:
+         - name: example/chat-model
+         - name: example/response-model
+           api: responses
+   ```
+
+2. Restart the executor and select `example/chat-model` as usual.
+   Its requests use `/v1/chat/completions`.
+   The IDs remain `example/chat-model` and `example/response-model`, not `proxy:example/chat-model`.
+   Any additional IDs discovered from `/v1/models` also use Chat Completions unless explicitly overridden.
+   With this order, unpinned calls and `/compact` still use `example/chat-model`,
+   even after selecting the Responses model for the session.
+   If `/v1/models` is unavailable, the picker shows its fetch error and both
+   configured favorites remain selectable; restore discovery and reopen the
+   picker to add live catalog entries without changing the default.
+
+3. Select `example/response-model` to send requests to `/v1/responses`.
+   Its model ID and credentials remain unchanged.
+   For a failure/recovery example, see the [native transport walkthrough](#example-one-connection-two-protocols).
+
+4. For a provider where most IDs require Responses, set `backends[].api: responses` instead and give Chat-compatible models an explicit `api: chat-completions` override.
+   This also covers newly discovered and unknown IDs, without maintaining a complete YAML model list.
 
 ## Agents
 
@@ -601,3 +679,118 @@ Chaz persists all data in the state directory:
 - Headjack session data (Matrix sync token, device keys)
 
 The state directory defaults to `$XDG_STATE_HOME/chaz`. Override with `state_dir` in config.
+
+## Native Responses conversations
+
+Select `api: responses` only for models whose configured endpoint supports the
+OpenAI Responses protocol.
+Chaz posts to `<api_base>/responses`; a rejected request never falls back to
+Chat Completions.
+Other models on the same connection keep their configured API or the backend
+family's default.
+
+| Setting or behavior                    | Responses transport                                                                                                                   |
+| -------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
+| `backends[].models[].api: responses`   | Select the native Responses client for this exact model ID.                                                                           |
+| `backends[].models[].reasoning.effort` | Send `none`, `minimal`, `low`, `medium`, `high` or `xhigh`; `max` is rejected before sending. Provider/model support may be narrower. |
+| `backends[].max_tokens`                | Send an optional `max_output_tokens` ceiling; omission leaves the provider default.                                                   |
+| Conversation storage                   | Use stateless requests (`store: false`); replay opaque output only for the same API, requested raw model and connection origin.       |
+| Cache identity                         | Send an opaque `prompt_cache_key` scoped to the caller, connection and persisted session.                                             |
+| Cache accounting                       | Record the returned `usage.input_tokens_details.cached_tokens`; zero is a reported miss, absence or malformed data is unknown.        |
+| Completed model switches               | Convert only retained visible text and complete real call/result pairs; unsupported history refuses before HTTP.                      |
+| Pending waits                          | Changed or unknown origin refuses before wait observation, approval or further effects.                                               |
+
+### What survives a restart
+
+The session holds complete ordered native output in its durable transcript;
+terminal text output also travels with the final entry's metadata.
+On the same origin, Chaz replays those items in order, followed by each tool's
+`function_call_output` using the original `call_id`.
+Reasoning items are not flattened into text or reconstructed from a summary.
+Existing context budgets and explicit compaction still determine which history
+is retained in a request.
+An interrupted tool batch stays held unless it meets the existing pending-wait
+recovery contract; Chaz does not invent a missing tool result.
+See [durable turn recovery](../architecture/sessions.md#durable-turn-recovery).
+
+### Switching models is not transferring provider state
+
+Host-owned replay origin records the effective API and requested raw model,
+not the provider-returned alias, plus an opaque connection digest.
+The digest binds the peer-local credential store, connection name, normalized
+endpoint and credential namespace/value without exposing them in history or
+requests.
+Changing the endpoint, namespace or credential after reopening a session is
+not a compatible origin, even if the model ID and connection display name match.
+Missing legacy origin is unknown, never assumed compatible.
+Context projectors cannot change this origin independently of the native output.
+
+For completed foreign or legacy history, Chaz constructs a request-only view
+from retained visible assistant text and complete, unambiguous real function
+call/result pairs.
+Foreign reasoning and native item IDs are not forwarded; the stored transcript
+is never rewritten and earlier effects are not rerun.
+Unknown provider output, non-text content, incomplete results or unsupported
+ordering instead produce a conversion error before HTTP.
+A pending native wait is stricter: restore its original API/model/connection
+before resuming, or explicitly interrupt it after inspecting the turn.
+Changing targets cannot reinterpret or retire that checkpoint.
+
+Runtime calls in the same persisted session reuse the cache key across turns
+and restarts on the same caller and connection.
+New sessions, other callers and other connections use different keys, even
+with identical prompt text.
+Raw database IDs, local paths and credentials are not sent as the key.
+Standalone calls without a persisted-session scope omit it.
+A stable key is not evidence of a cache hit: only returned usage reports that.
+The existing usage ledger and TUI consume the normalized token counts.
+
+### Example: one connection, two protocols
+
+1. Use the two-model connection in [the API selection walkthrough](#walkthrough-one-connection-two-api-choices).
+   Its gateway must support both endpoints.
+   The Chat model keeps Chat Completions; `example/response-model` uses Responses
+   with the same credentials and no added model-name prefix.
+   Add `reasoning: { effort: high }` to that model if the endpoint supports it.
+
+2. Select `example/response-model` in a persisted session and ask a question that uses
+   a tool.
+   Chaz sends the function schemas, then replays the returned reasoning and
+   function calls together with their results on the next request.
+   Reopen that session to continue with the same scoped key and retained
+   native items.
+
+3. If the model is configured with `reasoning: { effort: max }`, the turn fails
+   before HTTP with:
+
+   ```text
+   Configuration error: Responses reasoning effort 'max' is unsupported; configure a supported effort such as 'xhigh'
+   ```
+
+   Choose an effort supported by that endpoint/model, restart the executor
+   with the corrected configuration, and resend the question.
+   If a process stop instead left the turn interrupted, inspect
+   `/interrupted` before explicitly using `/retry <request_id>`.
+   If the gateway rejects `/responses` itself, correct the endpoint or the
+   model's explicit API setting; Chaz does not hide that rejection by sending
+   a Chat request.
+
+4. After a completed turn, select a different Responses model.
+   Portable visible history and real tool results continue without the old
+   model's encrypted reasoning or native item IDs.
+   If history contains an unsupported provider action, a representative error is:
+
+   ```text
+   Invalid request: Cannot convert Responses history: unknown provider output item. Restore the original model/connection or start a new session; the transcript is unchanged
+   ```
+
+   Restore the original target to keep native replay, or start a new session.
+   For a checkpointed native wait, switching models instead reports:
+
+   ```text
+   Invalid request: Pending Responses continuation has an incompatible or unknown origin; restore the original API, requested model and connection before resuming, or explicitly interrupt the turn. No wait or tool effect was run
+   ```
+
+   Restore the original configuration and inspect `/interrupted` before
+   explicitly resuming/retrying; do not treat the refusal as permission to
+   repeat effects from an interrupted tool batch.

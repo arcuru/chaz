@@ -510,6 +510,7 @@ impl OpenAI {
         // Final text response
         Ok(LLMResponse::Text {
             content: content.unwrap_or_default(),
+            provider_extra: Map::new(),
             metadata,
         })
     }
@@ -789,6 +790,13 @@ fn convert_runtime_messages(messages: &[RuntimeMessage]) -> Vec<ChatMessage> {
                 tool_call_id: None,
                 extra: Map::new(),
             },
+            RuntimeMessage::AssistantWithExtra { content, .. } => ChatMessage {
+                role: "assistant".to_string(),
+                content: content.clone().map(MessageContent::Text),
+                tool_calls: None,
+                tool_call_id: None,
+                extra: Map::new(),
+            },
             RuntimeMessage::AssistantToolCalls {
                 content,
                 tool_calls,
@@ -811,7 +819,18 @@ fn convert_runtime_messages(messages: &[RuntimeMessage]) -> Vec<ChatMessage> {
                         .collect(),
                 ),
                 tool_call_id: None,
-                extra: provider_extra.clone(),
+                extra: provider_extra
+                    .iter()
+                    .filter(|(key, _)| {
+                        !matches!(
+                            key.as_str(),
+                            crate::responses::OUTPUT_ITEMS
+                                | crate::responses::REPLAY_ORIGIN
+                                | crate::responses::ENTRY_PROVENANCE
+                        )
+                    })
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect(),
             },
             RuntimeMessage::ToolResult { call_id, content } => ChatMessage {
                 role: "tool".to_string(),
@@ -1167,6 +1186,7 @@ mod tests {
         backend.api_key = Some("test-key".into());
         backend.models = Some(vec![crate::config::Model {
             name: "test-model".into(),
+            api: None,
             reasoning: reasoning.map(|effort| ReasoningConfig { effort }),
             price_input: None,
             price_output: None,
