@@ -296,14 +296,29 @@ async fn recent_states(
         .await?
         .into_iter()
         .collect();
-    let active = super::visible_attempts(
+    let active: std::collections::HashSet<_> = super::visible_attempts(
         attempts.iter().map(|(_, a)| a.clone()).collect(),
         &heartbeats,
         chrono::Utc::now(),
     )
     .into_iter()
     .collect();
-    Ok(super::index_attempt_states(attempts, &active))
+    // Select lifecycle precedence before considering activity. Otherwise the
+    // index's live-first choice can revive an older generation's heartbeat.
+    Ok(super::index_attempt_states(attempts, &Default::default())
+        .into_iter()
+        .map(|(request, state)| {
+            let state = match state {
+                super::TurnRequestState::Interrupted { attempt_id }
+                    if active.contains(&attempt_id) =>
+                {
+                    super::TurnRequestState::InFlight { attempt_id }
+                }
+                state => state,
+            };
+            (request, state)
+        })
+        .collect())
 }
 
 async fn ordered_inputs_at(
@@ -408,7 +423,39 @@ pub(crate) async fn dispatch_inputs(
         .collect();
     // The projector must not erase/reorder selected steering then claim it was
     // incorporated. Refuse before dispatch; the original text remains pending.
-    let mut actual = messages.iter();
+    if selected.is_empty() {
+        return Ok(selected);
+    }
+    let is_selected = |message: &crate::runtime::RuntimeMessage| {
+        selected.iter().any(
+            |input| matches!(message, crate::runtime::RuntimeMessage::User(t) if t == &input.text),
+        )
+    };
+    // Use the last matching occurrences, not an older identical message that
+    // could hide reordering. Projectors may still append distinct context.
+    let end = messages
+        .iter()
+        .rposition(is_selected)
+        .ok_or_else(|| anyhow::anyhow!("projection removed steering input"))?
+        + 1;
+    let start = end
+        .checked_sub(selected.len())
+        .ok_or_else(|| anyhow::anyhow!("projection removed steering input"))?;
+    anyhow::ensure!(
+        selected
+            .iter()
+            .zip(&messages[start..end])
+            .all(|(input, message)| {
+                matches!(message, crate::runtime::RuntimeMessage::User(t) if t == &input.text)
+            })
+            && !messages[start..].iter().any(|message| matches!(
+                message,
+                crate::runtime::RuntimeMessage::Assistant(_)
+                    | crate::runtime::RuntimeMessage::AssistantToolCalls { .. }
+                    | crate::runtime::RuntimeMessage::ToolResult { .. }
+            )),
+        "projection removed or reordered steering boundary"
+    );
     for input in &selected {
         let occurrences = |messages: &[crate::runtime::RuntimeMessage]| {
             messages
@@ -423,11 +470,6 @@ pub(crate) async fn dispatch_inputs(
         anyhow::ensure!(
             occurrences(messages) >= occurrences(baseline),
             "projection ambiguously removed steering input"
-        );
-        anyhow::ensure!(
-            actual
-                .any(|m| matches!(m, crate::runtime::RuntimeMessage::User(t) if t == &input.text)),
-            "projection removed or reordered steering input"
         );
     }
     Ok(selected)

@@ -405,8 +405,10 @@ Completed-attempt context reconstruction includes steering and nonterminal
 assistant text in their original positions alongside strictly paired native
 exchanges, with exact call provenance and token costs. The same validation
 restores a checkpointed wait; only its pending observation executes. Unknown
-records, invalid boundaries, duplicate input identities or unpaired native
-history refuse the entire reconstruction. `TurnContext` rows alone never
+records, repeated call boundaries, duplicate input identities or unpaired
+native history refuse the entire reconstruction. Cancellation before a
+steered call returns also refuses replay of that group: local incorporation
+alone cannot carry unconfirmed input into a later turn. `TurnContext` rows alone never
 supply context, including on retry, so unconfirmed input cannot leak from a
 failed attempt's display into a later turn. Normal history selection and
 compaction budgets still apply.
@@ -420,6 +422,8 @@ There is no new executor, tool authority, follow-up queue or effects replay.
 
 Upgrade readers before enabling writers of `Steering` transcript records and
 `TurnContext` entries, following the [reader-first contract](#reader-first-wire-compatibility).
-Older tolerant readers preserve those variants but cannot reconstruct them;
-they hold an affected checkpoint/attempt rather than partially replaying it.
-This is a coordinated reader/writer upgrade, not a migration of existing history.
+Older tolerant readers preserve those variants but do not display promoted
+text or replay the affected attempt's structured history. They hold an affected
+checkpoint rather than partially resuming it. Older executors do not implement
+Chat steering, so mixed writers can leave published input unapplied. There is
+no automatic negotiation or migration of existing history.

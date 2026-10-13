@@ -9489,3 +9489,180 @@ async fn steering_dispatch_refuses_an_older_identical_match_after_projection() {
         1
     );
 }
+
+#[tokio::test]
+async fn steering_superseded_heartbeat_cannot_authorize_an_expired_latest_attempt() {
+    let (_instance, _server, registry) = server_fixture().await;
+    let (sid, db) = registry.create_session(Some("tui")).await.unwrap();
+    let mut session = Session::new(sid, db.clone()).await;
+    let request = session
+        .add_entry(SessionEntry {
+            sender: "user".into(),
+            content: "original".into(),
+            timestamp: Utc::now(),
+            entry_type: EntryType::Message,
+            metadata: None,
+            routing: None,
+        })
+        .await
+        .unwrap();
+    let old = session.start_turn_attempt(request.clone()).await.unwrap();
+    let mut latest = session.start_turn_attempt(request).await.unwrap();
+    latest.started_at = Utc::now() - crate::session::TURN_ACTIVITY_TIMEOUT * 2;
+    let txn = db.new_transaction().await.unwrap();
+    txn.get_store::<eidetica::store::Table<TurnAttempt>>("turn_attempts")
+        .await
+        .unwrap()
+        .set(&latest.attempt_id, latest.clone())
+        .await
+        .unwrap();
+    txn.commit().await.unwrap();
+    Session::renew_turn_activity(&db, &old.attempt_id)
+        .await
+        .unwrap();
+    assert!(
+        Session::steering_attempts(&db).await.unwrap().is_empty(),
+        "old heartbeat must not revive superseded input authority"
+    );
+    for attempt in [&old, &latest] {
+        assert!(
+            session
+                .submit_turn_input(crate::session::steering::JobInputRequest::new(
+                    attempt.attempt_id.clone(),
+                    "stale input".into()
+                ))
+                .await
+                .is_err()
+        );
+    }
+    assert!(session.turn_inputs().await.unwrap().is_empty());
+    Session::renew_turn_activity(&db, &latest.attempt_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        Session::steering_attempts(&db).await.unwrap(),
+        [latest.attempt_id]
+    );
+}
+
+#[tokio::test]
+async fn steering_cancelled_after_dispatch_never_enters_later_context() {
+    use crate::{
+        runtime::RuntimeMessage,
+        session::steering::{JobInputRequest, JobInputState},
+    };
+    let (_instance, server, registry) = server_fixture().await;
+    let (sid, db) = registry.create_session(Some("tui")).await.unwrap();
+    let mock = Arc::new(crate::test_support::MockBackend::new().with_supports_tools(false));
+    mock.push_text("provisional");
+    mock.push_text("not observed");
+    let first = mock.block_next_call();
+    let next = mock.block_next_call();
+    let backend = BackendManager::with_mock(
+        mock.clone(),
+        crate::security::SecretStore::new(registry.chaz_peer().clone()).await,
+    );
+    server
+        .register_session(&db, backend, Some("agent".into()), None)
+        .await
+        .unwrap();
+    write_user_message_with_content(&db, &sid.0, "original").await;
+    tokio::time::timeout(std::time::Duration::from_secs(5), first.wait_started())
+        .await
+        .unwrap();
+    let mut session = Session::new(sid.clone(), db.clone()).await;
+    let attempt = Session::steering_attempts(&db)
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    session
+        .submit_turn_input(JobInputRequest::new(attempt, "unconfirmed steering".into()))
+        .await
+        .unwrap();
+    first.release();
+    tokio::time::timeout(std::time::Duration::from_secs(5), next.wait_started())
+        .await
+        .unwrap();
+    assert!(
+        mock.recorded_calls()[1]
+            .messages
+            .iter()
+            .any(|m| matches!(m, RuntimeMessage::User(t) if t == "unconfirmed steering"))
+    );
+    assert!(session.request_stop("user").await.unwrap());
+    await_no_processing(&server, &sid.0).await;
+    let input = session.turn_inputs().await.unwrap().pop().unwrap();
+    assert!(input.incorporated && matches!(input.state, JobInputState::Uncertain { .. }));
+    mock.push_text("later answer");
+    write_user_message_with_content(&db, &sid.0, "later question").await;
+    await_call_count(&mock, 3).await;
+    await_no_processing(&server, &sid.0).await;
+    assert!(
+        !mock.recorded_calls()[2]
+            .messages
+            .iter()
+            .any(|m| matches!(m, RuntimeMessage::User(t) if t == "unconfirmed steering")),
+        "cancellation is not an observation of the dispatched request"
+    );
+    assert_eq!(mock.recorded_calls().len(), 3);
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn steering_dispatch_rejects_reordering_hidden_by_older_equal_text() {
+    use crate::{runtime::RuntimeMessage, session::steering::JobInputRequest};
+    let (_instance, _server, registry) = server_fixture().await;
+    let (_, db) = registry.create_session(Some("tui")).await.unwrap();
+    for text in ["first", "second"] {
+        let input = JobInputRequest::new("attempt".into(), text.into());
+        let txn = db.new_transaction().await.unwrap();
+        txn.get_store::<eidetica::store::Table<JobInputRequest>>("job_inputs")
+            .await
+            .unwrap()
+            .set(&input.id, input.clone())
+            .await
+            .unwrap();
+        txn.commit().await.unwrap();
+    }
+    crate::session::steering::input_boundary(&db, "attempt", 1, false)
+        .await
+        .unwrap();
+    let baseline = vec![
+        RuntimeMessage::User("first".into()),
+        RuntimeMessage::Assistant("provisional".into()),
+        RuntimeMessage::User("first".into()),
+        RuntimeMessage::User("second".into()),
+    ];
+    for candidate in [
+        vec![
+            baseline[0].clone(),
+            baseline[1].clone(),
+            baseline[3].clone(),
+            baseline[2].clone(),
+        ],
+        vec![
+            baseline[0].clone(),
+            baseline[2].clone(),
+            baseline[3].clone(),
+            baseline[1].clone(),
+        ],
+    ] {
+        assert!(
+            crate::session::steering::dispatch_inputs(&db, "attempt", 1, &candidate, &baseline)
+                .await
+                .is_err(),
+            "old equal text cannot mask a reordered current boundary: {candidate:?}"
+        );
+    }
+    let mut appended = baseline.clone();
+    appended.push(RuntimeMessage::User("ephemeral projector tail".into()));
+    assert_eq!(
+        crate::session::steering::dispatch_inputs(&db, "attempt", 1, &appended, &baseline)
+            .await
+            .unwrap()
+            .len(),
+        2,
+        "distinct ephemeral tails remain supported"
+    );
+}

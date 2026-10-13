@@ -640,6 +640,7 @@ fn replay_turn_tagged(
     let mut previous = None;
     let mut model_sequence = None;
     let mut terminal = false;
+    let mut steering_pending = false;
     let mut i = 0;
     while i < sorted.len() {
         let record = &sorted[i];
@@ -651,7 +652,9 @@ fn replay_turn_tagged(
         }
         previous = Some(record.sequence);
         if matches!(record.message, TurnTranscriptMessage::Cancelled) {
-            if i + 1 != sorted.len() {
+            // Cancellation does not confirm an in-flight steering request.
+            // Refuse this group rather than adopt uncertain input next turn.
+            if steering_pending || i + 1 != sorted.len() {
                 return None;
             }
             terminal = true;
@@ -662,7 +665,8 @@ fn replay_turn_tagged(
             inputs,
         } = &record.message
         {
-            if *seq != model_sequence.map_or(0, |p| p + 1)
+            if steering_pending
+                || *seq != model_sequence.map_or(0, |p| p + 1)
                 || !crate::session::steering::validate_boundary(
                     inputs,
                     &record.attempt_id,
@@ -671,6 +675,7 @@ fn replay_turn_tagged(
             {
                 return None;
             }
+            steering_pending = true;
             messages.extend(
                 inputs
                     .iter()
@@ -694,6 +699,7 @@ fn replay_turn_tagged(
             return None;
         }
         model_sequence = Some(*seq);
+        steering_pending = false;
         i += 1;
         if *end {
             // Terminal no_reply has no tool result and is not replayed.
@@ -1145,6 +1151,37 @@ mod tests {
         assert!(
             replay_turn(&history, 1000).is_none(),
             "other terminal calls are incomplete"
+        );
+    }
+
+    #[test]
+    fn steering_replay_retains_call_sources_and_refuses_repeated_boundaries() {
+        let mut rows = records("result");
+        let mut boundary = rows[2].clone();
+        boundary.message = TurnTranscriptMessage::Steering {
+            model_sequence: 1,
+            inputs: vec![crate::session::steering::JobInputRequest::new(
+                "complete".into(),
+                "continue".into(),
+            )],
+        };
+        rows.insert(2, boundary.clone());
+        rows[3].sequence = 3;
+        let tagged = replay_turn_tagged(&rows, 1000).unwrap();
+        assert_eq!(
+            tagged.iter().map(|(_, seq)| *seq).collect::<Vec<_>>(),
+            [0, 0, 1]
+        );
+        assert_eq!(tagged[2].0, RuntimeMessage::User("continue".into()));
+        if let TurnTranscriptMessage::Steering { inputs, .. } = &mut boundary.message {
+            inputs[0].id = uuid::Uuid::new_v4().to_string();
+        }
+        boundary.sequence = 3;
+        rows.insert(3, boundary);
+        rows[4].sequence = 4;
+        assert!(
+            replay_turn(&rows, 1000).is_none(),
+            "one incorporation record per call"
         );
     }
 

@@ -376,7 +376,13 @@ async fn steering_and_nonterminal_text_keep_exact_call_sources_or_refuse() {
         serde_json::from_value::<TurnTranscriptMessage>(raw.clone()).unwrap(),
         rows[3].message
     );
-    for bad in ["wrong-attempt", "empty", "duplicate", "unknown"] {
+    for bad in [
+        "wrong-attempt",
+        "empty",
+        "duplicate",
+        "unknown",
+        "second-boundary",
+    ] {
         let mut changed = rows.clone();
         if let TurnTranscriptMessage::Steering { inputs, .. } = &mut changed[3].message {
             match bad {
@@ -391,6 +397,15 @@ async fn steering_and_nonterminal_text_keep_exact_call_sources_or_refuse() {
                 kind: "FutureSteering".into(),
                 raw: serde_json::json!({"FutureSteering":raw}),
             };
+        }
+        if bad == "second-boundary" {
+            let mut second = changed[3].clone();
+            if let TurnTranscriptMessage::Steering { inputs, .. } = &mut second.message {
+                inputs[0].id = uuid::Uuid::new_v4().to_string();
+            }
+            changed.insert(4, second);
+            changed[5].sequence = 5;
+            changed[4].sequence = 4;
         }
         assert!(
             plan_job_wait_resume(&checkpoint, &changed).is_err(),

@@ -928,8 +928,17 @@ the normal history budget. A valid checkpointed `job_wait` restores already
 incorporated input in place and drains newly pending input after the wait's
 paired result. Only that observation resumes; earlier model calls and tools do
 not run again. Other interrupted attempts require explicit retry, which does
-not adopt their unconfirmed steering. No exactly-once external-effect guarantee
+not adopt their unconfirmed steering. Stopping while a steered call is in
+flight leaves its receipt uncertain; that attempt's structured history is
+not replayed into later Chat context. No exactly-once external-effect guarantee
 is implied.
+
+Upgrade every executor, client, transport peer and history consumer sharing
+a session **before** enabling these writers. Older tolerant readers preserve
+the new records but cannot display promoted text, replay that attempt's
+structured context or resume its checkpoint. Older executors do not consume
+Chat steering. There is no automatic peer negotiation; upgrade an old reader
+rather than rewriting history. See the [reader-first upgrade contract](../architecture/sessions.md#reader-first-wire-compatibility).
 
 ### Walkthrough: busy Chat and recovery
 

@@ -244,6 +244,7 @@ pub(crate) fn plan_job_wait_resume(
     let mut messages = Vec::new();
     let mut message_sequences = Vec::new();
     let mut input_ids = std::collections::HashSet::new();
+    let mut steering_pending = false;
     let mut metadata = Vec::new();
     let mut matrix_send_queued = false;
     let mut rate_limited_calls = Vec::new();
@@ -258,7 +259,8 @@ pub(crate) fn plan_job_wait_resume(
             inputs,
         } = &record.message
         {
-            if *sequence != model_sequence
+            if steering_pending
+                || *sequence != model_sequence
                 || !super::steering::validate_boundary(
                     inputs,
                     &checkpoint.attempt_id,
@@ -267,6 +269,7 @@ pub(crate) fn plan_job_wait_resume(
             {
                 return Err("steering boundary does not match the attempt/call");
             }
+            steering_pending = true;
             messages.extend(inputs.iter().map(|r| RuntimeMessage::User(r.text.clone())));
             message_sequences.extend(std::iter::repeat_n(*sequence, inputs.len()));
             continue;
@@ -288,6 +291,7 @@ pub(crate) fn plan_job_wait_resume(
         if *sequence > checkpoint.model_sequence {
             return Err("transcript advanced past the checkpoint");
         }
+        steering_pending = false;
         if tool_calls.is_empty() {
             if *sequence >= checkpoint.model_sequence {
                 return Err("checkpointed response has no calls");
