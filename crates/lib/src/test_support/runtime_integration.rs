@@ -1367,6 +1367,7 @@ async fn metadata_accumulator_sums_token_usage_across_calls() {
     }));
     mock.push_response(Ok(LLMResponse::Text {
         content: "done".into(),
+        provider_extra: Default::default(),
         metadata: Some(ResponseMetadata {
             model: "mock-model".into(),
             usage: TokenUsage {

@@ -614,7 +614,8 @@ pub struct Backend {
     pub max_retries: Option<u32>,
     /// Maximum output tokens per response (default: 8192). Required by the
     /// Anthropic-native backend (`type: anthropic`), whose API mandates an
-    /// explicit `max_tokens`; ignored by the OpenAI-compatible backend.
+    /// explicit `max_tokens`. Responses sends an explicitly configured value as
+    /// `max_output_tokens`; Chat Completions ignores this field.
     #[serde(default)]
     pub max_tokens: Option<u32>,
 }

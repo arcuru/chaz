@@ -69,6 +69,33 @@ impl SecretStore {
         }
     }
 
+    /// Opaque identity for a persisted session on this caller and connection.
+    /// Only the digest leaves the host; no credential, path or raw DB ID does.
+    pub(crate) fn session_cache_key(
+        &self,
+        session: &str,
+        caller: &str,
+        backend: &crate::config::Backend,
+    ) -> String {
+        let inline_credential = backend
+            .api_key
+            .as_ref()
+            .map(|key| blake3::hash(key.as_bytes()).to_hex().to_string());
+        let scope = serde_json::json!([
+            "chaz-responses-session-v1",
+            self.database.root_id().to_string(),
+            caller,
+            backend.get_name(),
+            backend.api_base,
+            backend.api_key_ref,
+            inline_credential,
+            session
+        ]);
+        blake3::hash(scope.to_string().as_bytes())
+            .to_hex()
+            .to_string()
+    }
+
     /// Look up a secret by reference ID. Sync — reads from in-memory cache.
     pub fn get(&self, id: &str) -> Option<String> {
         self.cache

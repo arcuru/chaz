@@ -510,6 +510,7 @@ impl OpenAI {
         // Final text response
         Ok(LLMResponse::Text {
             content: content.unwrap_or_default(),
+            provider_extra: Map::new(),
             metadata,
         })
     }
@@ -789,6 +790,13 @@ fn convert_runtime_messages(messages: &[RuntimeMessage]) -> Vec<ChatMessage> {
                 tool_call_id: None,
                 extra: Map::new(),
             },
+            RuntimeMessage::AssistantWithExtra { content, .. } => ChatMessage {
+                role: "assistant".to_string(),
+                content: content.clone().map(MessageContent::Text),
+                tool_calls: None,
+                tool_call_id: None,
+                extra: Map::new(),
+            },
             RuntimeMessage::AssistantToolCalls {
                 content,
                 tool_calls,
@@ -811,7 +819,11 @@ fn convert_runtime_messages(messages: &[RuntimeMessage]) -> Vec<ChatMessage> {
                         .collect(),
                 ),
                 tool_call_id: None,
-                extra: provider_extra.clone(),
+                extra: provider_extra
+                    .iter()
+                    .filter(|(key, _)| key.as_str() != crate::responses::OUTPUT_ITEMS)
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect(),
             },
             RuntimeMessage::ToolResult { call_id, content } => ChatMessage {
                 role: "tool".to_string(),

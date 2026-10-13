@@ -34,6 +34,7 @@ pub mod memory_bank_db;
 pub mod model_info_store;
 pub mod openai;
 pub mod prompt_store;
+pub mod responses;
 pub mod routine;
 pub mod runtime;
 pub mod security;

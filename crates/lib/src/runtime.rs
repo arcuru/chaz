@@ -178,6 +178,11 @@ pub enum RuntimeMessage {
     System(String),
     User(String),
     Assistant(String),
+    /// Complete terminal assistant output retained by a stateless transport.
+    AssistantWithExtra {
+        content: Option<String>,
+        provider_extra: serde_json::Map<String, serde_json::Value>,
+    },
     AssistantToolCalls {
         /// Host-assigned baseline message index for this exchange occurrence.
         /// Request-local only: not persisted or sent to the provider. Projectors
@@ -198,6 +203,22 @@ pub enum RuntimeMessage {
     },
 }
 
+impl RuntimeMessage {
+    pub(crate) fn assistant(
+        content: String,
+        provider_extra: serde_json::Map<String, serde_json::Value>,
+    ) -> Self {
+        if provider_extra.is_empty() {
+            Self::Assistant(content)
+        } else {
+            Self::AssistantWithExtra {
+                content: Some(content),
+                provider_extra,
+            }
+        }
+    }
+}
+
 /// A tool call requested by the LLM
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ToolCallRequest {
@@ -212,6 +233,7 @@ pub struct ToolCallRequest {
 pub enum LLMResponse {
     Text {
         content: String,
+        provider_extra: serde_json::Map<String, serde_json::Value>,
         metadata: Option<ResponseMetadata>,
     },
     ToolCalls {
@@ -1204,6 +1226,19 @@ async fn run_turn(
             return Err("no_reply requires a tool-capable model".into());
         }
     }
+    let session_id = tool_ctx
+        .session
+        .lock()
+        .await
+        .database()
+        .root_id()
+        .to_string();
+    let caller = match &tool_ctx.agent_identity {
+        Some(identity) => format!("agent-db:{}", identity.db_id),
+        None => format!("legacy-agent:{}", tool_ctx.agent_name),
+    };
+    let scoped_backend = backend.for_session(&session_id, &caller);
+    let backend = &scoped_backend;
     let resolved_model = backend.resolve_model_name(model);
     let max_retries = backend.max_retries_for_model(model);
     let mut acc = MetadataAccumulator::default();
@@ -1262,7 +1297,11 @@ async fn run_turn(
             };
             let response = response?.map_err(|e| e.to_string())?;
             match response {
-                LLMResponse::Text { content, metadata } if !content.trim().is_empty() => {
+                LLMResponse::Text {
+                    content,
+                    provider_extra,
+                    metadata,
+                } if !content.trim().is_empty() => {
                     let pending = input_boundary(&recorder, model_sequence + 1, true).await?;
                     record_runtime(
                         &recorder,
@@ -1270,7 +1309,7 @@ async fn run_turn(
                             model_sequence,
                             content: Some(content.clone()),
                             tool_calls: Vec::new(),
-                            provider_extra: Default::default(),
+                            provider_extra: provider_extra.clone(),
                             metadata: metadata.clone(),
                             terminal: pending.is_empty(),
                         },
@@ -1281,7 +1320,7 @@ async fn run_turn(
                     }
                     if !pending.is_empty() {
                         projector.note_exchange(messages.len(), model_sequence);
-                        messages.push(RuntimeMessage::Assistant(content));
+                        messages.push(RuntimeMessage::assistant(content, provider_extra));
                         projector.append_boundary_input(&mut messages, model_sequence + 1, pending);
                         model_sequence += 1;
                         continue;
@@ -1465,7 +1504,11 @@ async fn run_turn(
             {
                 return Err("opted-in turn returned empty text without calling no_reply".into());
             }
-            LLMResponse::Text { content, metadata } if !content.trim().is_empty() => {
+            LLMResponse::Text {
+                content,
+                provider_extra,
+                metadata,
+            } if !content.trim().is_empty() => {
                 let pending = input_boundary(&recorder, model_sequence + 1, true).await?;
                 record_runtime(
                     &recorder,
@@ -1473,7 +1516,7 @@ async fn run_turn(
                         model_sequence,
                         content: Some(content.clone()),
                         tool_calls: Vec::new(),
-                        provider_extra: Default::default(),
+                        provider_extra: provider_extra.clone(),
                         metadata: metadata.clone(),
                         terminal: pending.is_empty(),
                     },
@@ -1484,7 +1527,7 @@ async fn run_turn(
                 }
                 if !pending.is_empty() {
                     projector.note_exchange(messages.len(), model_sequence);
-                    messages.push(RuntimeMessage::Assistant(content));
+                    messages.push(RuntimeMessage::assistant(content, provider_extra));
                     projector.append_boundary_input(&mut messages, model_sequence + 1, pending);
                     model_sequence += 1;
                     continue;
@@ -1502,7 +1545,11 @@ async fn run_turn(
                 )
                 .await);
             }
-            LLMResponse::Text { metadata, .. } if iteration > 0 => {
+            LLMResponse::Text {
+                provider_extra,
+                metadata,
+                ..
+            } if iteration > 0 => {
                 let pending = input_boundary(&recorder, model_sequence + 1, true).await?;
                 record_runtime(
                     &recorder,
@@ -1510,7 +1557,7 @@ async fn run_turn(
                         model_sequence,
                         content: Some(String::new()),
                         tool_calls: Vec::new(),
-                        provider_extra: Default::default(),
+                        provider_extra: provider_extra.clone(),
                         metadata: metadata.clone(),
                         terminal: pending.is_empty(),
                     },
@@ -1572,7 +1619,7 @@ async fn run_turn(
                             model_sequence,
                             content: None,
                             tool_calls,
-                            provider_extra: Default::default(),
+                            provider_extra,
                             metadata: metadata.clone(),
                             terminal: true,
                         },

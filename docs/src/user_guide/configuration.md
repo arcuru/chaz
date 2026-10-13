@@ -370,9 +370,10 @@ backends:
         reasoning: { effort: none }
 ```
 
-Available levels, from least to most thinking: `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`. Setting `none` turns the extra thinking off, which keeps small prompts fast. Anything else is passed straight through to the provider, so only use levels your provider supports.
+Available levels, from least to most thinking: `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`. Setting `none` turns the extra thinking off, which keeps small prompts fast. Other levels are passed through to the selected API, except `max`, which the native Responses client rejects.
+Only use levels your provider and model support.
 
-When present, Chaz includes `reasoning` in the `/v1/chat/completions` request body, so this explicit choice takes precedence over a backend or provider default. Omit `reasoning` to leave that default unchanged. The setting applies only to the named model; models on the same backend may use different levels.
+When present, Chaz includes `reasoning` in the Chat Completions or Responses request body, so this explicit choice takes precedence over a backend or provider default. Omit `reasoning` to leave that default unchanged. The setting applies only to the named model; models on the same backend may use different levels.
 
 ## Choosing an API without renaming models
 
@@ -389,7 +390,8 @@ API values are `chat-completions`, `responses`, and `anthropic-messages`.
 Unknown values fail YAML parsing.
 OpenAI-compatible backends accept Chat Completions and Responses selection; Anthropic backends accept only Anthropic Messages.
 An incompatible selection fails with a configuration error before sending a request.
-**The Responses wire client is not implemented yet:** selecting `responses` reports an explicit error rather than silently sending Chat Completions.
+Responses uses a native stateless client; see [Native Responses conversations](#native-responses-conversations) for replay, reasoning and cache identity.
+Endpoint rejection is an error, never an automatic fallback to Chat Completions.
 
 Resolution is model override, then backend `api`, then the default for `type`.
 Chaz does not guess from names such as `gpt-*`, and `/models` metadata does not select or override the protocol.
@@ -423,18 +425,12 @@ Discovery continues through the backend type's catalog endpoint using the same c
    The IDs remain `example/chat-model` and `example/response-model`, not `proxy:example/chat-model`.
    Any additional IDs discovered from `/v1/models` also use Chat Completions unless explicitly overridden.
 
-3. Selecting `example/response-model` currently fails before HTTP with this error text:
-
-   ```text
-   Configuration error: Responses API client is not implemented; use api: chat-completions
-   ```
-
-   If the provider also supports that model through Chat Completions, change its override to `api: chat-completions` (or remove it) and restart.
-   Otherwise leave it unused until a Responses-capable client is available; there is no automatic fallback.
+3. Select `example/response-model` to send requests to `/v1/responses`.
+   Its model ID and credentials remain unchanged.
+   For a failure/recovery example, see the [native transport walkthrough](#example-one-connection-two-protocols).
 
 4. For a provider where most IDs require Responses, set `backends[].api: responses` instead and give Chat-compatible models an explicit `api: chat-completions` override.
    This also covers newly discovered and unknown IDs, without maintaining a complete YAML model list.
-   Until the Responses client is available, only those Chat overrides can execute.
 
 ## Agents
 
@@ -663,3 +659,86 @@ Chaz persists all data in the state directory:
 - Headjack session data (Matrix sync token, device keys)
 
 The state directory defaults to `$XDG_STATE_HOME/chaz`. Override with `state_dir` in config.
+
+## Native Responses conversations
+
+Select `api: responses` only for models whose configured endpoint supports the
+OpenAI Responses protocol.
+Chaz posts to `<api_base>/responses`; a rejected request never falls back to
+Chat Completions.
+Other models on the same connection keep their configured API or the backend
+family's default.
+
+| Setting or behavior                    | Responses transport                                                                                                                   |
+| -------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
+| `backends[].models[].api: responses`   | Select the native Responses client for this exact model ID.                                                                           |
+| `backends[].models[].reasoning.effort` | Send `none`, `minimal`, `low`, `medium`, `high` or `xhigh`; `max` is rejected before sending. Provider/model support may be narrower. |
+| `backends[].max_tokens`                | Send an optional `max_output_tokens` ceiling; omission leaves the provider default.                                                   |
+| Conversation storage                   | Use stateless requests (`store: false`) and replay retained output, including encrypted reasoning.                                    |
+| Cache identity                         | Send an opaque `prompt_cache_key` scoped to the caller, connection and persisted session.                                             |
+| Cache accounting                       | Record the returned `usage.input_tokens_details.cached_tokens`; zero is a reported miss, absence or malformed data is unknown.        |
+
+### What survives a restart
+
+The session holds complete ordered native output in its durable transcript;
+terminal text output also travels with the final entry's metadata.
+Chaz replays those items in order, followed by each tool's
+`function_call_output` using the original `call_id`.
+Reasoning items are not flattened into text or reconstructed from a summary.
+Existing context budgets and explicit compaction still determine which history
+is retained in a request.
+An interrupted tool batch stays held unless it meets the existing pending-wait
+recovery contract; Chaz does not invent a missing tool result.
+See [durable turn recovery](../architecture/sessions.md#durable-turn-recovery).
+
+Runtime calls in the same persisted session reuse the cache key across turns
+and restarts on the same caller and connection.
+New sessions, other callers and other connections use different keys, even
+with identical prompt text.
+Raw database IDs, local paths and credentials are not sent as the key.
+Standalone calls without a persisted-session scope omit it.
+A stable key is not evidence of a cache hit: only returned usage reports that.
+The existing usage ledger and TUI consume the normalized token counts.
+
+### Example: one connection, two protocols
+
+1. Configure both model IDs on one gateway that supports both endpoints:
+
+   ```yaml
+   backends:
+     - name: gateway
+       type: openaicompatible
+       api_base: https://gateway.example/v1
+       api_key: "${GATEWAY_API_KEY}"
+       models:
+         - name: conversational-model
+         - name: reasoning-model
+           api: responses
+           reasoning: { effort: high }
+   ```
+
+   `conversational-model` still uses Chat Completions.
+   `reasoning-model` uses Responses with the same gateway and credentials;
+   selecting it does not add a model-name prefix to a single-backend setup.
+
+2. Select `reasoning-model` in a persisted session and ask a question that uses
+   a tool.
+   Chaz sends the function schemas, then replays the returned reasoning and
+   function calls together with their results on the next request.
+   Reopen that session to continue with the same scoped key and retained
+   native items.
+
+3. If the model is configured with `reasoning: { effort: max }`, the turn fails
+   before HTTP with:
+
+   ```text
+   Configuration error: Responses reasoning effort 'max' is unsupported; configure a supported effort such as 'xhigh'
+   ```
+
+   Choose an effort supported by that endpoint/model, restart the executor
+   with the corrected configuration, and resend the question.
+   If a process stop instead left the turn interrupted, inspect
+   `/interrupted` before explicitly using `/retry <request_id>`.
+   If the gateway rejects `/responses` itself, correct the endpoint or the
+   model's explicit API setting; Chaz does not hide that rejection by sending
+   a Chat request.

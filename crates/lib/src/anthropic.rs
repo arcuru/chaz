@@ -468,6 +468,7 @@ impl Anthropic {
 
             return Ok(LLMResponse::Text {
                 content: content.unwrap_or_default(),
+                provider_extra: Map::new(),
                 metadata,
             });
         }
@@ -765,6 +766,10 @@ fn convert_runtime_messages(
             }
             RuntimeMessage::User(content) => ("user", vec![text_block(content.clone())]),
             RuntimeMessage::Assistant(content) => ("assistant", vec![text_block(content.clone())]),
+            RuntimeMessage::AssistantWithExtra { content, .. } => (
+                "assistant",
+                content.iter().cloned().map(text_block).collect(),
+            ),
             RuntimeMessage::AssistantToolCalls {
                 content,
                 tool_calls,
