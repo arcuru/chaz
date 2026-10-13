@@ -1167,6 +1167,7 @@ mod tests {
         backend.api_key = Some("test-key".into());
         backend.models = Some(vec![crate::config::Model {
             name: "test-model".into(),
+            api: None,
             reasoning: reasoning.map(|effort| ReasoningConfig { effort }),
             price_input: None,
             price_output: None,

@@ -9,7 +9,7 @@ use tracing::debug;
 
 use crate::{
     anthropic::Anthropic,
-    config::{Backend, BackendType},
+    config::{Backend, BackendType, ModelApi},
     error::LlmError,
     openai::OpenAI,
     runtime::{LLMResponse, RuntimeMessage},
@@ -17,7 +17,7 @@ use crate::{
     tool::ToolDefinition,
 };
 
-/// Per-backend LLM client, selected by [`BackendType`]. [`LLMBackend`] is not
+/// LLM client selected by the model's effective API. [`LLMBackend`] is not
 /// dyn-compatible (native `async fn` in trait), so dispatch is an explicit
 /// enum rather than a boxed trait object; each arm forwards to the concrete
 /// backend. Constructed fresh per call from a `&Backend` (cheap — both arms
@@ -29,10 +29,34 @@ enum BackendClient {
 }
 
 impl BackendClient {
+    /// Catalog discovery belongs to the provider family, not a model's API.
     fn new(backend: &Backend, secrets: &SecretStore) -> Self {
         match backend.backend_type {
             BackendType::OpenAICompatible => BackendClient::OpenAI(OpenAI::new(backend, secrets)),
             BackendType::Anthropic => BackendClient::Anthropic(Anthropic::new(backend, secrets)),
+        }
+    }
+
+    fn for_model(backend: &Backend, secrets: &SecretStore, model: &str) -> Result<Self, LlmError> {
+        let api = backend.api_for_model(model);
+        match (&backend.backend_type, api) {
+            (BackendType::OpenAICompatible, ModelApi::ChatCompletions) => {
+                Ok(Self::OpenAI(OpenAI::new(backend, secrets)))
+            }
+            (BackendType::Anthropic, ModelApi::AnthropicMessages) => {
+                Ok(Self::Anthropic(Anthropic::new(backend, secrets)))
+            }
+            (BackendType::OpenAICompatible, ModelApi::Responses) => Err(LlmError::Configuration {
+                message: "Responses API client is not implemented; use api: chat-completions"
+                    .into(),
+            }),
+            _ => Err(LlmError::Configuration {
+                message: format!(
+                    "API '{}' is incompatible with backend type {:?}",
+                    api.as_str(),
+                    backend.backend_type
+                ),
+            }),
         }
     }
 
@@ -547,7 +571,8 @@ impl BackendManager {
             });
         }
         let backend = self.select_backend(context);
-        BackendClient::new(backend, &self.secrets)
+        let model = self.resolve_model_name(context.model.as_deref());
+        BackendClient::for_model(backend, &self.secrets, &model)?
             .execute(context)
             .await
     }
@@ -561,7 +586,9 @@ impl BackendManager {
             return false;
         }
         let backend = self.select_backend_for_model(model);
-        BackendClient::new(backend, &self.secrets).supports_tools()
+        let resolved = self.resolve_model_name(model);
+        BackendClient::for_model(backend, &self.secrets, &resolved)
+            .is_ok_and(|client| client.supports_tools())
     }
 
     /// Resolve a model name: strip backend prefix, fall back to default.
@@ -633,7 +660,7 @@ impl BackendManager {
             });
         }
         let backend = self.select_backend_for_model(model);
-        BackendClient::new(backend, &self.secrets)
+        BackendClient::for_model(backend, &self.secrets, resolved_model)?
             .chat_with_cache(messages, tools, resolved_model, cache)
             .await
     }
@@ -666,6 +693,7 @@ mod tests {
                 .iter()
                 .map(|m| Model {
                     name: m.to_string(),
+                    api: None,
                     reasoning: None,
                     price_input: None,
                     price_output: None,
@@ -952,5 +980,314 @@ mod tests {
             Err(other) => panic!("expected Configuration, got {other}"),
             Ok(_) => panic!("expected Err, got Ok"),
         }
+    }
+
+    #[tokio::test]
+    async fn model_api_selects_clients_and_rejects_incompatible_families() {
+        let secrets = empty_secrets().await;
+        let mut b = backend("proxy", &["chat", "responses"]);
+        b.models.as_mut().unwrap()[1].api = Some(ModelApi::Responses);
+        assert!(matches!(
+            BackendClient::for_model(&b, &secrets, "chat"),
+            Ok(BackendClient::OpenAI(_))
+        ));
+        assert!(matches!(
+            BackendClient::for_model(&b, &secrets, "gpt-6-sol"),
+            Ok(BackendClient::OpenAI(_))
+        ));
+        assert!(matches!(
+            BackendClient::for_model(&b, &secrets, "responses"),
+            Err(LlmError::Configuration { .. })
+        ));
+        b.api = Some(ModelApi::AnthropicMessages);
+        assert!(matches!(
+            BackendClient::for_model(&b, &secrets, "chat"),
+            Err(LlmError::Configuration { .. })
+        ));
+        b.backend_type = BackendType::Anthropic;
+        b.api = None;
+        assert!(matches!(
+            BackendClient::for_model(&b, &secrets, "chat"),
+            Ok(BackendClient::Anthropic(_))
+        ));
+        for api in [ModelApi::ChatCompletions, ModelApi::Responses] {
+            b.api = Some(api);
+            assert!(matches!(
+                BackendClient::for_model(&b, &secrets, "chat"),
+                Err(LlmError::Configuration { .. })
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn incompatible_api_fails_on_legacy_and_runtime_paths() {
+        let secrets = empty_secrets().await;
+        for (family, api) in [
+            (BackendType::OpenAICompatible, ModelApi::AnthropicMessages),
+            (BackendType::Anthropic, ModelApi::ChatCompletions),
+            (BackendType::Anthropic, ModelApi::Responses),
+        ] {
+            for model_override in [false, true] {
+                let mut b = backend("proxy", &["model"]);
+                b.backend_type = family.clone();
+                if model_override {
+                    b.models.as_mut().unwrap()[0].api = Some(api);
+                } else {
+                    b.api = Some(api);
+                }
+                let mgr = BackendManager::new(&Some(vec![b]), secrets.clone());
+                let ctx = ChatContext {
+                    messages: vec![],
+                    model: None,
+                    system_prompt: None,
+                };
+                let legacy = mgr.execute(&ctx).await.unwrap_err();
+                let runtime = mgr
+                    .chat_with_tools_for_model(None, &[], &[], "model")
+                    .await
+                    .err()
+                    .expect("incompatible API must fail");
+                for error in [legacy, runtime] {
+                    assert!(matches!(error, LlmError::Configuration { message }
+                        if message.contains("is incompatible with backend type")
+                        && message.contains(api.as_str())));
+                }
+            }
+        }
+    }
+
+    fn assert_responses_unavailable(error: LlmError) {
+        match error {
+            LlmError::Configuration { message } => assert_eq!(
+                message,
+                "Responses API client is not implemented; use api: chat-completions"
+            ),
+            other => panic!("expected unavailable-client error, got {other}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn responses_api_fails_before_http_on_legacy_and_runtime_paths() {
+        let secrets = empty_secrets().await;
+        // No credentials: falling through to the chat client would fail with
+        // a different error. A configured Responses model must never do that.
+        let mut b = backend("proxy", &["response-model", "chat-model"]);
+        b.models.as_mut().unwrap()[0].api = Some(ModelApi::Responses);
+        let mgr = BackendManager::new(&Some(vec![b]), secrets);
+        assert_eq!(mgr.default_model().as_deref(), Some("response-model"));
+        for model in [None, Some("response-model"), Some("proxy:response-model")] {
+            let resolved = mgr.resolve_model_name(model);
+            assert_eq!(resolved, "response-model");
+            let ctx = ChatContext {
+                messages: vec![],
+                model: model.map(str::to_owned),
+                system_prompt: None,
+            };
+            assert_responses_unavailable(mgr.execute(&ctx).await.unwrap_err());
+            assert_responses_unavailable(
+                mgr.chat_with_tools_for_model(model, &[], &[], &resolved)
+                    .await
+                    .err()
+                    .expect("Responses must not fall through to Chat"),
+            );
+            assert_responses_unavailable(
+                mgr.chat_with_cache_for_model(
+                    model,
+                    &[],
+                    &[],
+                    &resolved,
+                    &crate::cache::CacheOptions::default(),
+                )
+                .await
+                .err()
+                .expect("Cache-aware calls must use the same API selection"),
+            );
+        }
+        assert!(mgr.supports_tools_for_model(Some("chat-model")));
+    }
+
+    #[tokio::test]
+    async fn live_discovery_inherits_api_without_changing_catalog_or_naming() {
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .and(header("Authorization", "Bearer catalog-key"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [
+                    {"id": "configured", "api": "chat-completions"},
+                    {"id": "new-model", "api": "guessed"}
+                ]
+            })))
+            .expect(3)
+            .mount(&server)
+            .await;
+        let secrets = empty_secrets().await;
+        let mut b = backend("proxy", &["configured", "not-discovered"]);
+        b.api_base = Some(format!("{}/v1", server.uri()));
+        b.api_key = Some("catalog-key".into());
+        b.api = Some(ModelApi::Responses);
+        b.models.as_mut().unwrap()[0].api = Some(ModelApi::ChatCompletions);
+        let mgr = BackendManager::new(&Some(vec![b.clone()]), secrets.clone());
+        let ids: Vec<_> = mgr
+            .fetch_models_with_info()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|m| m.id)
+            .collect();
+        assert_eq!(ids, ["configured", "new-model"]);
+        assert_eq!(mgr.list_known_models(), ["configured", "not-discovered"]);
+        // Discovery doesn't overwrite local settings or become an allowlist.
+        assert!(matches!(
+            BackendClient::for_model(&b, &secrets, &ids[0]),
+            Ok(BackendClient::OpenAI(_))
+        ));
+        for id in [&ids[1], "unknown", "not-discovered"] {
+            assert!(mgr.validate_model(id).is_ok());
+            assert_responses_unavailable(
+                mgr.chat_with_tools_for_model(Some(id), &[], &[], id)
+                    .await
+                    .err()
+                    .expect("unknown IDs must inherit the backend API"),
+            );
+        }
+
+        let mut other = b.clone();
+        other.name = Some("other".into());
+        other.api = None;
+        let multi = BackendManager::new(&Some(vec![b, other]), secrets);
+        let ids: Vec<_> = multi
+            .fetch_models_with_info()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|m| m.id)
+            .collect();
+        assert_eq!(
+            ids,
+            [
+                "proxy:configured",
+                "proxy:new-model",
+                "other:configured",
+                "other:new-model"
+            ]
+        );
+        assert_eq!(multi.default_model().as_deref(), Some("proxy:configured"));
+        assert!(multi.validate_model("proxy:unknown").is_ok());
+        assert!(multi.validate_model("unknown").is_err());
+        assert_eq!(
+            multi.resolve_model_name(Some("proxy:new-model")),
+            "new-model"
+        );
+        assert!(!multi.supports_tools_for_model(Some("proxy:new-model")));
+        assert!(multi.supports_tools_for_model(Some("other:new-model")));
+    }
+
+    #[tokio::test]
+    async fn anthropic_default_and_explicit_api_preserve_native_requests_and_cache() {
+        use crate::cache::{CacheAnchor, CacheOptions, CacheTtl};
+        use wiremock::matchers::{body_partial_json, header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .and(header("x-api-key", "native-key"))
+            .and(body_partial_json(
+                serde_json::json!({"model": "claude-test"}),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "content": [{"type": "text", "text": "native"}],
+                "stop_reason": "end_turn"
+            })))
+            .expect(4)
+            .mount(&server)
+            .await;
+        let secrets = empty_secrets().await;
+        secrets
+            .insert("backend:native".into(), "native-key".into())
+            .await;
+        let mut b = backend("native", &["claude-test"]);
+        b.backend_type = BackendType::Anthropic;
+        b.api_base = Some(format!("{}/v1", server.uri()));
+        b.api_key_ref = Some("backend:native".into());
+        for api in [None, Some(ModelApi::AnthropicMessages)] {
+            b.api = api;
+            let mgr = BackendManager::new(&Some(vec![b.clone()]), secrets.clone());
+            assert_eq!(mgr.default_model().as_deref(), Some("claude-test"));
+            assert!(mgr.supports_tools_for_model(None));
+            assert_eq!(mgr.list_known_models(), ["claude-test"]);
+            let ctx = ChatContext {
+                messages: vec![Message::new(MessageRole::User, "hi")],
+                model: None,
+                system_prompt: Some("be helpful".into()),
+            };
+            assert_eq!(mgr.execute(&ctx).await.unwrap(), "native");
+            let response = mgr
+                .chat_with_cache_for_model(
+                    None,
+                    &[
+                        RuntimeMessage::System("be helpful".into()),
+                        RuntimeMessage::User("hi".into()),
+                    ],
+                    &[],
+                    &mgr.resolve_model_name(None),
+                    &CacheOptions {
+                        anchors: vec![CacheAnchor::System],
+                        ttl: CacheTtl::OneHour,
+                    },
+                )
+                .await
+                .unwrap();
+            assert!(matches!(response, LLMResponse::Text { content, .. } if content == "native"));
+        }
+        let requests = server.received_requests().await.unwrap();
+        for request in [&requests[1], &requests[3]] {
+            let body: serde_json::Value = request.body_json().unwrap();
+            assert_eq!(body["system"][0]["cache_control"]["ttl"], "1h");
+        }
+    }
+
+    #[tokio::test]
+    async fn chat_override_uses_same_connection_and_credentials_on_both_paths() {
+        use wiremock::matchers::{body_partial_json, header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(header("Authorization", "Bearer stored-key"))
+            .and(body_partial_json(
+                serde_json::json!({"model": "chat-model"}),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{"message": {"role": "assistant", "content": "hello"}}]
+            })))
+            .expect(2)
+            .mount(&server)
+            .await;
+        let secrets = empty_secrets().await;
+        secrets
+            .insert("backend:proxy".into(), "stored-key".into())
+            .await;
+        let mut b = backend("proxy", &["chat-model"]);
+        b.api = Some(ModelApi::Responses);
+        b.models.as_mut().unwrap()[0].api = Some(ModelApi::ChatCompletions);
+        b.api_base = Some(format!("{}/v1", server.uri()));
+        b.api_key_ref = Some("backend:proxy".into());
+        let mgr = BackendManager::new(&Some(vec![b, backend("other", &["other-model"])]), secrets);
+        let selected = Some("proxy:chat-model");
+        assert!(mgr.supports_tools_for_model(selected));
+        let ctx = ChatContext {
+            messages: vec![Message::new(MessageRole::User, "hi")],
+            model: selected.map(str::to_owned),
+            system_prompt: None,
+        };
+        assert_eq!(mgr.execute(&ctx).await.unwrap(), "hello");
+        let response = mgr
+            .chat_with_tools_for_model(selected, &[], &[], &mgr.resolve_model_name(selected))
+            .await
+            .unwrap();
+        assert!(matches!(response, LLMResponse::Text { content, .. } if content == "hello"));
     }
 }

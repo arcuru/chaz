@@ -374,6 +374,68 @@ Available levels, from least to most thinking: `none`, `minimal`, `low`, `medium
 
 When present, Chaz includes `reasoning` in the `/v1/chat/completions` request body, so this explicit choice takes precedence over a backend or provider default. Omit `reasoning` to leave that default unchanged. The setting applies only to the named model; models on the same backend may use different levels.
 
+## Choosing an API without renaming models
+
+A backend is one provider connection: its URL, credentials, timeout and retries.
+The request API can differ by model on that connection without adding a second backend.
+`type: openaicompatible` still defaults to Chat Completions; `type: anthropic` still defaults to native Anthropic Messages.
+
+| Field                     | Default              | Meaning                                                                                   |
+| ------------------------- | -------------------- | ----------------------------------------------------------------------------------------- |
+| `backends[].api`          | Determined by `type` | Request API for models without an override, including live-discovered and unknown IDs.    |
+| `backends[].models[].api` | Backend's API        | Override for this exact `name`, written as the raw provider model ID (no backend prefix). |
+
+API values are `chat-completions`, `responses`, and `anthropic-messages`.
+Unknown values fail YAML parsing.
+OpenAI-compatible backends accept Chat Completions and Responses selection; Anthropic backends accept only Anthropic Messages.
+An incompatible selection fails with a configuration error before sending a request.
+**The Responses wire client is not implemented yet:** selecting `responses` reports an explicit error rather than silently sending Chat Completions.
+
+Resolution is model override, then backend `api`, then the default for `type`.
+Chaz does not guess from names such as `gpt-*`, and `/models` metadata does not select or override the protocol.
+The live catalog supplies picker entries and model information, not an allowlist: you can still request IDs absent from it.
+A model override works whether its ID appears in the live catalog or only in YAML.
+Models discovered without an override, or supplied manually, use the backend default.
+
+These settings live in the executor's YAML and take effect after restart.
+They do not change agent defaults stored in AgentDb, the model selected for a session, or model naming: one backend uses raw IDs, multiple backends still use `backend:model`.
+Discovery continues through the backend type's catalog endpoint using the same credentials, even when its request API is set to Responses.
+
+### Walkthrough: one connection, two API choices
+
+1. Keep a single provider connection and declare only the overrides you need:
+
+   ```yaml
+   backends:
+     - name: proxy
+       type: openaicompatible
+       api_base: http://127.0.0.1:18081/v1
+       api_key: "${PROXY_API_KEY}"
+       # api: chat-completions   # already the default
+       models:
+         - name: example/chat-model
+         - name: example/response-model
+           api: responses
+   ```
+
+2. Restart the executor and select `example/chat-model` as usual.
+   Its requests use `/v1/chat/completions`.
+   The IDs remain `example/chat-model` and `example/response-model`, not `proxy:example/chat-model`.
+   Any additional IDs discovered from `/v1/models` also use Chat Completions unless explicitly overridden.
+
+3. Selecting `example/response-model` currently fails before HTTP with this error text:
+
+   ```text
+   Configuration error: Responses API client is not implemented; use api: chat-completions
+   ```
+
+   If the provider also supports that model through Chat Completions, change its override to `api: chat-completions` (or remove it) and restart.
+   Otherwise leave it unused until a Responses-capable client is available; there is no automatic fallback.
+
+4. For a provider where most IDs require Responses, set `backends[].api: responses` instead and give Chat-compatible models an explicit `api: chat-completions` override.
+   This also covers newly discovered and unknown IDs, without maintaining a complete YAML model list.
+   Until the Responses client is available, only those Chat overrides can execute.
+
 ## Agents
 
 Each `agents:` entry seeds an Agent DB on first boot; subsequent edits live in the DB, not the YAML. See [Agents](agents.md) for the runtime model and live-edit commands. Per-agent fields:

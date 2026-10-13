@@ -862,6 +862,7 @@ async fn budget_model_falls_back_to_backend_default() {
     let mut b = crate::config::Backend::new(crate::config::BackendType::OpenAICompatible);
     b.name = Some("openrouter".to_string());
     b.models = Some(vec![crate::config::Model {
+        api: None,
         name: "deepseek/deepseek-v4-flash".to_string(),
         reasoning: None,
         price_input: None,
