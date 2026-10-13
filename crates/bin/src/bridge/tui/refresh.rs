@@ -800,6 +800,28 @@ mod tests {
                     screen.contains("12k/300 tok • 50% cached • $0.0300"),
                     "{screen}"
                 );
+                request_with(
+                    &mut app,
+                    "a",
+                    RefreshKind::Session,
+                    &tx,
+                    |ticket| async move {
+                        Refresh::Session {
+                            session_db_id: "a".into(),
+                            ticket,
+                            snapshot: Err("controlled telemetry read failure".into()),
+                        }
+                    },
+                );
+                let failed = rx.recv().await.unwrap();
+                assert!(apply(&mut app, failed, resolved).redraw);
+                let cached = draw_chat(&mut app, 180, 20).join("\n");
+                assert!(cached.contains("refresh failed"), "{cached}");
+                assert!(cached.contains(expected), "{cached}");
+                assert!(
+                    cached.contains("12k/300 tok • 50% cached • $0.0300"),
+                    "{cached}"
+                );
                 app.active_mut().effective_model = "other-model".into();
                 assert!(
                     draw_chat(&mut app, 180, 20)

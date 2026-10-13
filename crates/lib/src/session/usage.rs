@@ -626,7 +626,7 @@ mod tests {
         );
         // An interrupted or failed attempt's reported usage is not lost just
         // because it never acquired a final Message or still-live heartbeat.
-        let mut interrupted = call(0, Some(identity), 7, false);
+        let mut interrupted = call(0, Some(identity.clone()), 7, false);
         interrupted.attempt_id = "interrupted".into();
         interrupted.request_id = TurnRequestId::parse("interrupted-request");
         session
@@ -651,6 +651,32 @@ mod tests {
         let missing = telemetry_at_snapshot(&db, &now, &entries).await.unwrap();
         assert_eq!(missing.totals.prompt_tokens, 137);
         assert_eq!(missing.last_calls["host"].context_tokens, None);
+
+        // Competitors share an attempt and sequence, but each billed call has
+        // its own branch key. Re-observing one record must not add another call.
+        for (branch, prompt) in [("a", 11), ("b", 13)] {
+            let mut parallel = call(
+                0,
+                Some(TurnCallIdentity {
+                    execution_id: Some(branch.into()),
+                    ..identity.clone()
+                }),
+                prompt,
+                true,
+            );
+            parallel.attempt_id = "parallel-attempt".into();
+            for _ in 0..2 {
+                session
+                    .append_turn_transcript(parallel.clone(), Vec::new())
+                    .await
+                    .unwrap();
+            }
+        }
+        let now = db.snapshot().await.unwrap();
+        let retained = telemetry_at_snapshot(&db, &now, &entries).await.unwrap();
+        assert_eq!(retained.totals.prompt_tokens, 161);
+        assert_eq!(retained.totals.calls, 6);
+        assert_eq!(retained.last_calls["host"].context_tokens, Some(13));
     }
 
     #[test]

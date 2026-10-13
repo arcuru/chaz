@@ -1,6 +1,6 @@
 # ReAct Runtime
 
-The ReAct (Reason + Act) loop is the core agent execution model. The runtime takes a conversation context, calls an LLM, executes any requested tool calls, and feeds results back until the LLM produces a text response. The server records a durable turn attempt before entering this loop, awaits structured transcript commits at completed model/tool boundaries, and commits the terminal model response and final entry with completion; request recovery and explicit retry are described in [Session Model](sessions.md#durable-turn-recovery).
+The ReAct (Reason + Act) loop is the core agent execution model. The runtime takes a conversation context, calls an LLM, executes any requested tool calls, and feeds results back until the LLM produces a text response. The server records a durable turn attempt before entering this loop, awaits structured transcript commits at completed model/tool boundaries, and records terminal provider evidence before response hooks and reply preflight. The final entry and attempt completion still commit together; request recovery and explicit retry are described in [Session Model](sessions.md#durable-turn-recovery).
 
 ## Loop Flow
 
@@ -65,7 +65,7 @@ The runtime races cancellation against model requests (including retry backoff),
 It drops the losing work future, but never abandons transcript persistence.
 Every remaining call in a recorded native batch gets an awaited `ToolResultOutcome::Cancelled`, including calls not yet started.
 The runtime fires `agent_end` and returns `TurnError::Cancelled` with completed-call usage.
-The server commits the terminal cancellation record, visible `Error`, and attempt completion together, then releases the processing slot for the next request.
+The recorder persists cancellation before `agent_end`. The server then commits the same terminal record, visible `Error`, and attempt completion together, and releases the processing slot for the next request.
 Complete cancelled exchanges can replay; incomplete persistence leaves an interrupted attempt instead.
 
 On Unix the native shell host places each shell in its own process group and kills that group when its wait is dropped.

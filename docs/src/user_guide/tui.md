@@ -75,6 +75,8 @@ A requested alias and its returned wire model are distinct: a call requested
 as `gpt-sol-latest` can report `gpt-6.1-sol` without losing its occupancy count.
 Changing the requested model still invalidates the old numerator.
 Cache reads and cost come only from provider reports, never local tokenization.
+Scheduled turns still use the legacy event adapter; their usage appears when
+the final reply is recorded, not after each call.
 
 Counts use rounded `k`/`M` suffixes, omitting a redundant `.0`.
 The percentage is calculated from the unrounded counts and shown only when
