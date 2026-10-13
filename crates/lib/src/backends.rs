@@ -29,6 +29,21 @@ enum BackendClient {
     Responses(Responses),
 }
 
+// Keep concrete dispatch exhaustive in one place without boxing async calls.
+// Responses' cache call needs a different expression to carry the caller identity.
+macro_rules! with_backend {
+    ($client:expr, $backend:ident => $call:expr) => {
+        with_backend!($client, $backend => $call, responses => $call)
+    };
+    ($client:expr, $backend:ident => $call:expr, responses => $responses:expr) => {
+        match $client {
+            BackendClient::OpenAI($backend) => $call,
+            BackendClient::Anthropic($backend) => $call,
+            BackendClient::Responses($backend) => $responses,
+        }
+    };
+}
+
 impl BackendClient {
     /// Catalog discovery belongs to the provider family, not a model's API.
     fn new(backend: &Backend, secrets: &SecretStore) -> Self {
@@ -61,51 +76,27 @@ impl BackendClient {
     }
 
     fn list_models(&self) -> Vec<String> {
-        match self {
-            BackendClient::OpenAI(b) => b.list_models(),
-            BackendClient::Anthropic(b) => b.list_models(),
-            BackendClient::Responses(b) => b.list_models(),
-        }
+        with_backend!(self, b => b.list_models())
     }
 
     fn list_models_with_info(&self) -> Vec<ModelInfo> {
-        match self {
-            BackendClient::OpenAI(b) => b.list_models_with_info(),
-            BackendClient::Anthropic(b) => b.list_models_with_info(),
-            BackendClient::Responses(b) => b.list_models_with_info(),
-        }
+        with_backend!(self, b => b.list_models_with_info())
     }
 
     async fn fetch_models_from_api(&self) -> Result<Vec<ModelInfo>, LlmError> {
-        match self {
-            BackendClient::OpenAI(b) => b.fetch_models_from_api().await,
-            BackendClient::Anthropic(b) => b.fetch_models_from_api().await,
-            BackendClient::Responses(b) => b.fetch_models_from_api().await,
-        }
+        with_backend!(self, b => b.fetch_models_from_api().await)
     }
 
     fn default_model(&self) -> Option<String> {
-        match self {
-            BackendClient::OpenAI(b) => b.default_model(),
-            BackendClient::Anthropic(b) => b.default_model(),
-            BackendClient::Responses(b) => b.default_model(),
-        }
+        with_backend!(self, b => b.default_model())
     }
 
     async fn execute(&self, context: &ChatContext) -> Result<String, LlmError> {
-        match self {
-            BackendClient::OpenAI(b) => b.execute(context).await,
-            BackendClient::Anthropic(b) => b.execute(context).await,
-            BackendClient::Responses(b) => b.execute(context).await,
-        }
+        with_backend!(self, b => b.execute(context).await)
     }
 
     fn supports_tools(&self) -> bool {
-        match self {
-            BackendClient::OpenAI(b) => b.supports_tools(),
-            BackendClient::Anthropic(b) => b.supports_tools(),
-            BackendClient::Responses(b) => b.supports_tools(),
-        }
+        with_backend!(self, b => b.supports_tools())
     }
 
     async fn chat_with_cache(
@@ -116,14 +107,10 @@ impl BackendClient {
         cache: &crate::cache::CacheOptions,
         prompt_cache_key: Option<&str>,
     ) -> Result<LLMResponse, LlmError> {
-        match self {
-            BackendClient::OpenAI(b) => b.chat_with_cache(messages, tools, model, cache).await,
-            BackendClient::Anthropic(b) => b.chat_with_cache(messages, tools, model, cache).await,
-            BackendClient::Responses(b) => {
-                b.chat_with_tools(messages, tools, model, prompt_cache_key)
-                    .await
-            }
-        }
+        with_backend!(self,
+            b => b.chat_with_cache(messages, tools, model, cache).await,
+            responses => b.chat_with_tools(messages, tools, model, prompt_cache_key).await
+        )
     }
 }
 
@@ -788,6 +775,61 @@ mod tests {
                 .collect(),
         );
         b
+    }
+
+    #[tokio::test]
+    async fn client_facade_forwards_catalog_and_defaults_for_each_api() {
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{method, path},
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [{"id": "discovered"}]
+            })))
+            .expect(3)
+            .mount(&server)
+            .await;
+        let secrets = empty_secrets().await;
+        for (backend_type, api) in [
+            (BackendType::OpenAICompatible, ModelApi::ChatCompletions),
+            (BackendType::Anthropic, ModelApi::AnthropicMessages),
+            (BackendType::OpenAICompatible, ModelApi::Responses),
+        ] {
+            let mut b = backend("provider", &["configured", "second"]);
+            b.backend_type = backend_type;
+            b.api = Some(api);
+            b.api_base = Some(server.uri());
+            b.api_key = Some("test-key".into());
+            b.models.as_mut().unwrap()[0].price_input = Some(2.0);
+            let client = BackendClient::for_model(&b, &secrets, "configured").unwrap();
+            assert_eq!(client.list_models(), ["configured", "second"]);
+            assert_eq!(client.default_model().as_deref(), Some("configured"));
+            assert!(client.supports_tools());
+            assert_eq!(
+                client.list_models_with_info(),
+                vec![
+                    ModelInfo {
+                        id: "configured".into(),
+                        price_input: Some(2.0),
+                        ..Default::default()
+                    },
+                    ModelInfo {
+                        id: "second".into(),
+                        ..Default::default()
+                    },
+                ]
+            );
+            assert_eq!(
+                client.fetch_models_from_api().await.unwrap(),
+                vec![ModelInfo {
+                    id: "discovered".into(),
+                    ..Default::default()
+                }]
+            );
+        }
     }
 
     #[tokio::test]
