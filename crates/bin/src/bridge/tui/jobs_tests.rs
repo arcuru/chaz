@@ -346,3 +346,43 @@ async fn queued_old_jobs_completion_cannot_drop_replacement_after_disconnect() {
     apply_loaded(&mut app, rx.recv().await.unwrap());
     assert!(!app.jobs.loading && app.jobs.error.is_none());
 }
+
+#[tokio::test]
+async fn steering_pending_body_is_gray_in_real_frame() {
+    let mut tab = super::super::session_picker_tests::test_tab().await;
+    tab.job = Some(JobTab {
+        state: Some(JobState::StartedUnknown {
+            attempt_id: "attempt".into(),
+            activity_recent: true,
+        }),
+        details: false,
+    });
+    tab.live.inputs = vec![JobInput {
+        request: JobInputRequest::new(
+            "attempt".into(),
+            "pending body one\npending body two".into(),
+        ),
+        state: JobInputState::Queued,
+        incorporated: false,
+    }];
+    let mut app = App::new(HashSet::from(["chaz".into()]), tab);
+    let mut terminal = Terminal::new(TestBackend::new(100, 35)).unwrap();
+    terminal.draw(|f| view::ui_chat(f, &mut app, &[])).unwrap();
+    let buffer = terminal.backend().buffer();
+    for marker in ["pending body one", "pending body two"] {
+        let (x, y) = (0..35)
+            .find_map(|y| {
+                let row: String = (0..100).map(|x| buffer[(x, y)].symbol()).collect();
+                row.find(marker)
+                    .map(|x| (row[..x].chars().count() as u16, y))
+            })
+            .expect("entire multiline pending body must render");
+        for i in 0..marker.len() as u16 {
+            assert_eq!(
+                buffer[(x + i, y)].fg,
+                theme::DIM,
+                "pending body must not look incorporated"
+            );
+        }
+    }
+}

@@ -316,8 +316,8 @@ pub(super) fn apply(app: &mut App, completion: Completion) {
     }
     match result {
         Err(error) => {
-            if let Some(i) = target.filter(|&i| app.tabs[i].job.is_some()) {
-                app.tabs[i].job.as_mut().unwrap().feedback = error.clone();
+            if let Some(i) = target {
+                app.tabs[i].live.input_feedback = error.clone();
                 app.tabs[i].touch_transcript();
             }
             let qualifier = if pending.write {
@@ -380,8 +380,8 @@ pub(super) fn apply(app: &mut App, completion: Completion) {
         }
         Ok(Effect::Sent) => {}
         Ok(Effect::JobSent(feedback)) => {
-            if let Some(i) = target.filter(|&i| app.tabs[i].job.is_some()) {
-                app.tabs[i].job.as_mut().unwrap().feedback = feedback;
+            if let Some(i) = target {
+                app.tabs[i].live.input_feedback = feedback;
                 app.tabs[i].touch_transcript();
             }
         }
@@ -521,22 +521,6 @@ impl Context {
             CommandOutcome::Error(error) => Err(error),
             outcome => Ok(Effect::Outcome(outcome)),
         }
-    }
-    pub(super) async fn send(self, target: Target, text: String) -> Result<Effect, String> {
-        let mut session =
-            Session::new(chaz_core::types::ConversationId(target.id), target.db).await;
-        session
-            .add_entry(SessionEntry {
-                sender: "user".into(),
-                content: text,
-                timestamp: chrono::Utc::now(),
-                entry_type: EntryType::Message,
-                metadata: None,
-                routing: None,
-            })
-            .await
-            .map_err(|e| e.to_string())?;
-        Ok(Effect::Sent)
     }
 }
 

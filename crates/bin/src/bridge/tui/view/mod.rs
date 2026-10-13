@@ -868,6 +868,8 @@ pub(super) fn ui_chat(f: &mut ratatui::Frame, app: &mut App, ext_segments: &[Str
             .title(Span::styled(
                 if app.active().job.is_some() {
                     super::jobs::composer_title(app.active())
+                } else if app.active().active_turns > 0 {
+                    " > next-call input "
                 } else {
                     " > "
                 },
@@ -1098,7 +1100,7 @@ fn build_transcript(
         let dim = Style::default().fg(COLOR_DIM);
 
         match &entry.entry_type {
-            EntryType::Message => {
+            EntryType::Message | EntryType::TurnContext => {
                 let is_agent = agent_names.contains(&entry.sender);
                 let is_system = entry.sender == "system";
                 let sender_style = if is_system {
@@ -1363,7 +1365,7 @@ fn build_transcript(
             }
         }
     }
-    lines.extend(super::jobs::input_lines(tab));
+    lines.extend(super::jobs::input_lines(tab, debug_mode));
     (lines, pending_clicks)
 }
 
@@ -2177,18 +2179,17 @@ mod chat_frame_tests {
                 attempt_id: "diagnostic-attempt".into(),
                 activity_recent: true,
             }),
-            inputs: vec![JobInput {
-                request: JobInputRequest {
-                    id: "diagnostic-request".into(),
-                    attempt_id: "diagnostic-attempt".into(),
-                    text: "Use the smaller example".into(),
-                },
-                state: JobInputState::Dispatching { model_sequence: 1 },
-            }],
-            feedback: String::new(),
-            retry: Default::default(),
             details: false,
         });
+        app.active_mut().live.inputs = vec![JobInput {
+            request: JobInputRequest {
+                id: "diagnostic-request".into(),
+                attempt_id: "diagnostic-attempt".into(),
+                text: "Use the smaller example".into(),
+            },
+            state: JobInputState::Dispatching { model_sequence: 1 },
+            incorporated: false,
+        }];
         app.active_mut().active_turns = 1;
         for (w, h) in [(80, 24), (120, 35), (180, 45)] {
             let text = draw(&mut app, w, h).0.join("\n");
@@ -2222,7 +2223,7 @@ mod chat_frame_tests {
         assert!(text.contains("Finished job · view-only"));
         assert!(!text.contains("thinking..."));
         app.active_mut().job.as_mut().unwrap().state = None;
-        app.active_mut().job.as_mut().unwrap().feedback =
+        app.active_mut().live.input_feedback =
             "unavailable: native diagnostic-attempt query failed".into();
         let text = draw(&mut app, 80, 24).0.join("\n");
         assert!(text.contains("Unavailable · retained evidence is stale"));

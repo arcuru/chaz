@@ -74,7 +74,6 @@ struct SessionRuntimeRecorder {
     /// The session state this attempt's context was assembled from. Without
     /// it a wait cannot be reconstructed, so none is checkpointed.
     context_snapshot: Option<eidetica::Snapshot>,
-    job_input: bool,
     /// The job execution branch whose evidence this recorder writes.
     branch: Option<String>,
     #[cfg(test)]
@@ -89,9 +88,6 @@ impl runtime::RuntimeRecorder for SessionRuntimeRecorder {
     ) -> Pin<Box<dyn Future<Output = Result<Vec<runtime::RuntimeMessage>, String>> + Send + 'a>>
     {
         Box::pin(async move {
-            if !self.job_input {
-                return Ok(Vec::new());
-            }
             let session = self.session.lock().await;
             let mut messages: Vec<runtime::RuntimeMessage> =
                 crate::session::steering::input_boundary(
@@ -132,6 +128,36 @@ impl runtime::RuntimeRecorder for SessionRuntimeRecorder {
         })
     }
 
+    fn input_dispatch<'a>(
+        &'a self,
+        model_sequence: u64,
+        messages: &'a [runtime::RuntimeMessage],
+        baseline: &'a [runtime::RuntimeMessage],
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(async move {
+            let inputs = {
+                let session = self.session.lock().await;
+                crate::session::steering::dispatch_inputs(
+                    session.database(),
+                    &self.attempt_id,
+                    model_sequence,
+                    messages,
+                    baseline,
+                )
+                .await
+                .map_err(|e| format!("steering dispatch refused: {e}"))?
+            };
+            if !inputs.is_empty() {
+                self.record(runtime::RuntimeRecord::Steering {
+                    model_sequence,
+                    inputs,
+                })
+                .await?;
+            }
+            Ok(())
+        })
+    }
+
     fn record<'a>(
         &'a self,
         message: runtime::RuntimeRecord,
@@ -147,9 +173,7 @@ impl runtime::RuntimeRecorder for SessionRuntimeRecorder {
                     *value -= 1;
                 }
             }
-            if self.job_input
-                && let runtime::RuntimeRecord::ModelResponse { model_sequence, .. } = &message
-            {
+            if let runtime::RuntimeRecord::ModelResponse { model_sequence, .. } = &message {
                 let session = self.session.lock().await;
                 crate::session::steering::input_call_observed(
                     session.database(),
@@ -169,6 +193,13 @@ impl runtime::RuntimeRecorder for SessionRuntimeRecorder {
             );
             let sequence = self.sequence.fetch_add(1, Ordering::SeqCst) as u64;
             let message = match message {
+                runtime::RuntimeRecord::Steering {
+                    model_sequence,
+                    inputs,
+                } => TurnTranscriptMessage::Steering {
+                    model_sequence,
+                    inputs,
+                },
                 runtime::RuntimeRecord::Cancelled => TurnTranscriptMessage::Cancelled,
                 runtime::RuntimeRecord::ModelResponse {
                     model_sequence,
@@ -390,16 +421,40 @@ fn display_entries_for_record(
             outcome: runtime::ToolResultOutcome::Unknown { .. },
             ..
         } => Vec::new(),
-        TurnTranscriptMessage::ModelResponse { tool_calls, .. } => tool_calls
+        TurnTranscriptMessage::Steering { inputs, .. } => inputs
             .iter()
-            .map(|call| SessionEntry {
+            .map(|input| SessionEntry {
+                sender: "user".into(),
+                content: input.text.clone(),
+                timestamp: record.timestamp,
+                entry_type: EntryType::TurnContext,
+                metadata: None,
+                routing: None,
+            })
+            .collect(),
+        TurnTranscriptMessage::ModelResponse {
+            content,
+            tool_calls,
+            ..
+        } => content
+            .iter()
+            .filter(|t| !t.is_empty())
+            .map(|text| SessionEntry {
+                sender: agent_name.into(),
+                content: text.clone(),
+                timestamp: record.timestamp,
+                entry_type: EntryType::TurnContext,
+                metadata: None,
+                routing: None,
+            })
+            .chain(tool_calls.iter().map(|call| SessionEntry {
                 sender: agent_name.to_string(),
                 content: format!("{}({})", call.name, call.arguments),
                 timestamp: record.timestamp,
                 entry_type: EntryType::ToolCall,
                 metadata: None,
                 routing: None,
-            })
+            }))
             .collect(),
         TurnTranscriptMessage::ToolResult {
             name,
@@ -4056,7 +4111,6 @@ impl Server {
                 ),
                 agent_name: agent_name.clone(),
                 context_snapshot,
-                job_input: spawn.job_authority.is_some(),
                 branch: branch_id.clone(),
                 #[cfg(test)]
                 fail_after: transcript_fail_after,

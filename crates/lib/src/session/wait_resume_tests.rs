@@ -335,3 +335,66 @@ async fn newest_checkpoint_is_selected_and_rewrites_are_idempotent() {
         2
     );
 }
+
+#[tokio::test]
+async fn steering_and_nonterminal_text_keep_exact_call_sources_or_refuse() {
+    let checkpoint = checkpoint(2, 0, "w").await;
+    let mut rows = effect_then_partial_batch();
+    rows.truncate(2);
+    rows.push(model(2, 1, &[]));
+    let input = super::super::steering::JobInputRequest::new(
+        ATTEMPT.into(),
+        "continue with the small example".into(),
+    );
+    rows.push(record(
+        3,
+        TurnTranscriptMessage::Steering {
+            model_sequence: 2,
+            inputs: vec![input.clone()],
+        },
+    ));
+    rows.push(model(4, 2, &[("w", "job_wait")]));
+    let (resume, next) = plan_job_wait_resume(&checkpoint, &rows).unwrap();
+    assert_eq!(next, 5);
+    assert_eq!(resume.prior_model_sequences, [0, 0, 1, 2, 2]);
+    assert_eq!(
+        resume.prior_messages[2],
+        RuntimeMessage::Assistant("thinking 1".into())
+    );
+    assert_eq!(
+        resume.prior_messages[3],
+        RuntimeMessage::User(input.text.clone())
+    );
+    // Empty responses still advance the call sequence without adding text.
+    if let TurnTranscriptMessage::ModelResponse { content, .. } = &mut rows[2].message {
+        *content = Some(String::new());
+    }
+    let (resume, _) = plan_job_wait_resume(&checkpoint, &rows).unwrap();
+    assert_eq!(resume.prior_model_sequences, [0, 0, 2, 2]);
+    let raw = serde_json::to_value(&rows[3].message).unwrap();
+    assert_eq!(
+        serde_json::from_value::<TurnTranscriptMessage>(raw.clone()).unwrap(),
+        rows[3].message
+    );
+    for bad in ["wrong-attempt", "empty", "duplicate", "unknown"] {
+        let mut changed = rows.clone();
+        if let TurnTranscriptMessage::Steering { inputs, .. } = &mut changed[3].message {
+            match bad {
+                "wrong-attempt" => inputs[0].attempt_id = "another".into(),
+                "empty" => inputs[0].text.clear(),
+                "duplicate" => inputs.push(inputs[0].clone()),
+                _ => {}
+            }
+        }
+        if bad == "unknown" {
+            changed[3].message = TurnTranscriptMessage::Unknown {
+                kind: "FutureSteering".into(),
+                raw: serde_json::json!({"FutureSteering":raw}),
+            };
+        }
+        assert!(
+            plan_job_wait_resume(&checkpoint, &changed).is_err(),
+            "{bad} must hold, not partially resume"
+        );
+    }
+}

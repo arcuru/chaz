@@ -1773,6 +1773,7 @@ async fn injected_pre_turn_messages_prevent_wait_checkpoints_and_never_refire() 
         Some(&hub),
         None,
         crate::runtime::RuntimeResume {
+            prior_model_sequences: vec![0],
             prior_messages: vec![RuntimeMessage::AssistantToolCalls {
                 exchange_id: None,
                 content: None,

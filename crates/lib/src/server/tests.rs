@@ -9037,3 +9037,455 @@ async fn required_context_strategy_refuses_and_recovers_on_the_executor() {
 mod wait_resume;
 #[path = "worker_capacity_tests.rs"]
 mod worker_capacity_tests;
+
+#[tokio::test]
+async fn chat_steering_same_attempt_fifo_promotes_before_response_and_replays() {
+    use crate::runtime::RuntimeMessage;
+    use crate::session::steering::{JobInputRequest, JobInputState};
+    let (_instance, server, registry) = server_fixture().await;
+    let (sid, db) = registry.create_session(Some("tui")).await.unwrap();
+    let mock = Arc::new(crate::test_support::MockBackend::new().with_supports_tools(false));
+    mock.push_text("provisional");
+    mock.push_text("continued");
+    mock.push_text("later reply");
+    let first = mock.block_next_call();
+    let next = mock.block_next_call();
+    let backend = BackendManager::with_mock(
+        mock.clone(),
+        crate::security::SecretStore::new(registry.chaz_peer().clone()).await,
+    );
+    server
+        .register_session(&db, backend, Some("agent".into()), None)
+        .await
+        .unwrap();
+    write_user_message_with_content(&db, &sid.0, "original").await;
+    tokio::time::timeout(std::time::Duration::from_secs(5), first.wait_started())
+        .await
+        .unwrap();
+    let attempt = Session::active_turn_attempts(&db)
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    // Reverse UUID order deliberately: commit/publication order is FIFO.
+    for (id, text) in [
+        ("ffffffff-ffff-4fff-8fff-ffffffffffff", "first steer"),
+        ("00000000-0000-4000-8000-000000000000", "second steer"),
+    ] {
+        let txn = db.new_transaction().await.unwrap();
+        txn.get_store::<eidetica::store::Table<JobInputRequest>>("job_inputs")
+            .await
+            .unwrap()
+            .set(
+                id,
+                JobInputRequest {
+                    id: id.into(),
+                    attempt_id: attempt.clone(),
+                    text: text.into(),
+                },
+            )
+            .await
+            .unwrap();
+        txn.commit().await.unwrap();
+    }
+    assert_eq!(mock.recorded_calls().len(), 1);
+    first.release();
+    tokio::time::timeout(std::time::Duration::from_secs(5), next.wait_started())
+        .await
+        .expect("busy Chat must continue the SAME attempt, not finish or queue a turn");
+    let calls = mock.recorded_calls();
+    assert!(
+        !calls[0]
+            .messages
+            .iter()
+            .any(|m| matches!(m, RuntimeMessage::User(t) if t.contains("steer")))
+    );
+    assert_eq!(
+        &calls[1].messages[calls[1].messages.len() - 3..],
+        &[
+            RuntimeMessage::Assistant("provisional".into()),
+            RuntimeMessage::User("first steer".into()),
+            RuntimeMessage::User("second steer".into())
+        ]
+    );
+    let observed = Session::new(sid.clone(), db.clone()).await;
+    let visible: Vec<_> = observed
+        .entries()
+        .iter()
+        .filter(|e| ["provisional", "first steer", "second steer"].contains(&e.content.as_str()))
+        .map(|e| e.content.as_str())
+        .collect();
+    assert_eq!(
+        visible,
+        ["provisional", "first steer", "second steer"],
+        "promotion must precede next response"
+    );
+    let txn = db.new_transaction().await.unwrap();
+    let receipts = txn
+        .get_store::<eidetica::store::Table<JobInputState>>("job_input_receipts")
+        .await
+        .unwrap()
+        .search(|_| true)
+        .await
+        .unwrap();
+    assert!(
+        receipts
+            .iter()
+            .all(|(_, s)| matches!(s, JobInputState::Dispatching { model_sequence: 1 }))
+    );
+    next.release();
+    await_no_processing(&server, &sid.0).await;
+    let reopened = Session::new(sid.clone(), db.clone()).await;
+    assert_eq!(
+        reopened.attempts_for_test().await.len(),
+        1,
+        "one completed attempt, no extra turn"
+    );
+    write_user_message_with_content(&db, &sid.0, "later question").await;
+    await_call_count(&mock, 3).await;
+    await_no_processing(&server, &sid.0).await;
+    let later = &mock.recorded_calls()[2].messages;
+    for text in ["provisional", "first steer", "second steer"] {
+        assert_eq!(later.iter().filter(|m| matches!(m, RuntimeMessage::User(t) | RuntimeMessage::Assistant(t) if t == text)).count(), 1, "reopened context must retain {text} once: {later:?}");
+    }
+    assert_eq!(mock.recorded_calls().len(), 3);
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn steering_boundary_uses_publication_fifo_not_uuid_order() {
+    use crate::session::steering::JobInputRequest;
+    let (_instance, _server, registry) = server_fixture().await;
+    let (_, db) = registry.create_session(Some("tui")).await.unwrap();
+    for (id, text) in [
+        ("ffffffff-ffff-4fff-8fff-ffffffffffff", "first"),
+        ("00000000-0000-4000-8000-000000000000", "second"),
+    ] {
+        let txn = db.new_transaction().await.unwrap();
+        txn.get_store::<eidetica::store::Table<JobInputRequest>>("job_inputs")
+            .await
+            .unwrap()
+            .set(
+                id,
+                JobInputRequest {
+                    id: id.into(),
+                    attempt_id: "attempt".into(),
+                    text: text.into(),
+                },
+            )
+            .await
+            .unwrap();
+        txn.commit().await.unwrap();
+    }
+    assert_eq!(
+        crate::session::steering::input_boundary(&db, "attempt", 1, false)
+            .await
+            .unwrap(),
+        ["first", "second"]
+    );
+}
+
+struct SteeringEffect {
+    calls: Arc<AtomicUsize>,
+    started: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+}
+impl crate::tool::Tool for SteeringEffect {
+    fn descriptor(&self) -> crate::tool::ToolDescriptor {
+        crate::tool::ToolDescriptor {
+            name: "steering_effect".into(),
+            description: "offline counted effect".into(),
+            parameters: serde_json::json!({"type":"object","properties":{}}),
+        }
+    }
+    fn execute<'a>(
+        &'a self,
+        _: serde_json::Value,
+        _: &'a ToolContext,
+    ) -> Pin<Box<dyn Future<Output = Result<String, crate::tool::ToolError>> + Send + 'a>> {
+        Box::pin(async move {
+            let index = self.calls.fetch_add(1, Ordering::SeqCst);
+            if index == 0 {
+                self.started.notify_one();
+                self.release.notified().await;
+            }
+            Ok(format!("effect {index}"))
+        })
+    }
+}
+
+#[tokio::test]
+async fn chat_steering_blocked_full_batch_preserves_pairing_effects_and_prefix() {
+    use crate::{
+        runtime::{LLMResponse, RuntimeMessage, ToolCallRequest},
+        session::steering::JobInputRequest,
+    };
+    let (_instance, server, registry) = server_fixture().await;
+    let effects = Arc::new(AtomicUsize::new(0));
+    let started = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    server.tools.register(SteeringEffect {
+        calls: effects.clone(),
+        started: started.clone(),
+        release: release.clone(),
+    });
+    let (sid, db) = registry.create_session(Some("tui")).await.unwrap();
+    let mock = Arc::new(crate::test_support::MockBackend::new());
+    mock.push_response(Ok(LLMResponse::ToolCalls {
+        content: Some("tool plan".into()),
+        tool_calls: ["a", "b"]
+            .into_iter()
+            .map(|id| ToolCallRequest {
+                id: id.into(),
+                name: "steering_effect".into(),
+                arguments: "{}".into(),
+            })
+            .collect(),
+        provider_extra: Default::default(),
+        metadata: None,
+    }));
+    mock.push_text("batch complete");
+    let model_gate = mock.block_next_call();
+    let next_gate = mock.block_next_call();
+    let backend = BackendManager::with_mock(
+        mock.clone(),
+        crate::security::SecretStore::new(registry.chaz_peer().clone()).await,
+    );
+    server
+        .register_session(&db, backend, Some("agent".into()), None)
+        .await
+        .unwrap();
+    write_user_message_with_content(&db, &sid.0, "original task").await;
+    tokio::time::timeout(std::time::Duration::from_secs(5), model_gate.wait_started())
+        .await
+        .unwrap();
+    let session = Session::new(sid.clone(), db.clone()).await;
+    let attempt = Session::steering_attempts(&db)
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    let first = JobInputRequest {
+        id: "ffffffff-ffff-4fff-8fff-ffffffffffff".into(),
+        attempt_id: attempt.clone(),
+        text: "during model".into(),
+    };
+    session.submit_turn_input(first.clone()).await.unwrap();
+    session.submit_turn_input(first).await.unwrap();
+    model_gate.release();
+    tokio::time::timeout(std::time::Duration::from_secs(5), started.notified())
+        .await
+        .unwrap();
+    let second = JobInputRequest {
+        id: "00000000-0000-4000-8000-000000000000".into(),
+        attempt_id: attempt,
+        text: "during tools".into(),
+    };
+    session.submit_turn_input(second).await.unwrap();
+    assert_eq!(effects.load(Ordering::SeqCst), 1);
+    assert_eq!(mock.recorded_calls().len(), 1, "no call between tools");
+    assert!(
+        session
+            .turn_inputs()
+            .await
+            .unwrap()
+            .iter()
+            .all(|i| !i.incorporated)
+    );
+    release.notify_one();
+    tokio::time::timeout(std::time::Duration::from_secs(5), next_gate.wait_started())
+        .await
+        .unwrap();
+    assert_eq!(
+        effects.load(Ordering::SeqCst),
+        2,
+        "full batch executes exactly once"
+    );
+    let calls = mock.recorded_calls();
+    assert_eq!(calls[0].tools, calls[1].tools);
+    assert_eq!(calls[0].cache, calls[1].cache);
+    assert_eq!(
+        calls[0].messages[0], calls[1].messages[0],
+        "stable prompt prefix"
+    );
+    let end = &calls[1].messages[calls[1].messages.len() - 5..];
+    assert!(
+        matches!(&end[0], RuntimeMessage::AssistantToolCalls {content: Some(t), tool_calls, ..} if t == "tool plan" && tool_calls.len() == 2)
+    );
+    assert!(matches!(&end[1], RuntimeMessage::ToolResult {call_id, ..} if call_id == "a"));
+    assert!(matches!(&end[2], RuntimeMessage::ToolResult {call_id, ..} if call_id == "b"));
+    assert_eq!(
+        &end[3..],
+        &[
+            RuntimeMessage::User("during model".into()),
+            RuntimeMessage::User("during tools".into())
+        ]
+    );
+    assert!(
+        session
+            .turn_inputs()
+            .await
+            .unwrap()
+            .iter()
+            .all(|i| i.incorporated)
+    );
+    next_gate.release();
+    await_no_processing(&server, &sid.0).await;
+    let reopened = Session::new(sid.clone(), db).await;
+    assert_eq!(reopened.attempts_for_test().await.len(), 1);
+    assert_eq!(mock.recorded_calls().len(), 2);
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn chat_steering_budget_refusal_and_backend_uncertainty_do_not_replay() {
+    use crate::{
+        runtime::RuntimeMessage,
+        session::steering::{JobInputRequest, JobInputState},
+    };
+    for oversize in [true, false] {
+        let (_instance, server, registry) = server_fixture().await;
+        let (sid, db) = registry.create_session(Some("tui")).await.unwrap();
+        let mock = Arc::new(crate::test_support::MockBackend::new().with_supports_tools(false));
+        mock.push_text("provisional");
+        mock.push_err(crate::error::LlmError::Configuration {
+            message: "offline backend dispatch uncertain".into(),
+        });
+        let gate = mock.block_next_call();
+        let backend = BackendManager::with_mock(
+            mock.clone(),
+            crate::security::SecretStore::new(registry.chaz_peer().clone()).await,
+        );
+        server
+            .register_session(&db, backend, Some("agent".into()), None)
+            .await
+            .unwrap();
+        write_user_message_with_content(&db, &sid.0, "original").await;
+        tokio::time::timeout(std::time::Duration::from_secs(5), gate.wait_started())
+            .await
+            .unwrap();
+        let attempt = Session::steering_attempts(&db)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        let text = if oversize {
+            "over budget ".repeat(100_000)
+        } else {
+            "uncertain input".into()
+        };
+        let session = Session::new(sid.clone(), db.clone()).await;
+        session
+            .submit_turn_input(JobInputRequest::new(attempt, text.clone()))
+            .await
+            .unwrap();
+        gate.release();
+        await_no_processing(&server, &sid.0).await;
+        let input = session.turn_inputs().await.unwrap().pop().unwrap();
+        assert_eq!(mock.recorded_calls().len(), if oversize { 1 } else { 2 });
+        assert_eq!(
+            input.incorporated, !oversize,
+            "only actual post-gate incorporation promotes"
+        );
+        assert!(if oversize {
+            matches!(input.state, JobInputState::NotApplied { .. })
+        } else {
+            matches!(input.state, JobInputState::Uncertain { .. })
+        });
+        if !oversize {
+            mock.push_text("later");
+            write_user_message_with_content(&db, &sid.0, "next turn").await;
+            await_call_count(&mock, 3).await;
+            await_no_processing(&server, &sid.0).await;
+            assert!(
+                !mock.recorded_calls()[2]
+                    .messages
+                    .iter()
+                    .any(|m| matches!(m, RuntimeMessage::User(t) if t == &text)),
+                "unconfirmed inputs cannot leak through display rows into later context"
+            );
+        }
+        server.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn chat_steering_stop_preserves_unapplied_text_without_an_extra_turn() {
+    use crate::session::steering::{JobInputRequest, JobInputState};
+    let (_instance, server, registry) = server_fixture().await;
+    let (sid, db) = registry.create_session(Some("tui")).await.unwrap();
+    let mock = Arc::new(crate::test_support::MockBackend::new().with_supports_tools(false));
+    mock.push_text("must not return");
+    let gate = mock.block_next_call();
+    let backend = BackendManager::with_mock(
+        mock.clone(),
+        crate::security::SecretStore::new(registry.chaz_peer().clone()).await,
+    );
+    server
+        .register_session(&db, backend, Some("agent".into()), None)
+        .await
+        .unwrap();
+    write_user_message_with_content(&db, &sid.0, "original").await;
+    tokio::time::timeout(std::time::Duration::from_secs(5), gate.wait_started())
+        .await
+        .unwrap();
+    let mut session = Session::new(sid.clone(), db.clone()).await;
+    let attempt = Session::steering_attempts(&db)
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    session
+        .submit_turn_input(JobInputRequest::new(attempt, "recoverable text".into()))
+        .await
+        .unwrap();
+    assert!(session.request_stop("user").await.unwrap());
+    await_no_processing(&server, &sid.0).await;
+    let input = session.turn_inputs().await.unwrap().pop().unwrap();
+    assert_eq!(input.request.text, "recoverable text");
+    assert!(!input.incorporated);
+    assert!(matches!(input.state, JobInputState::NotApplied { .. }));
+    assert_eq!(mock.recorded_calls().len(), 1);
+    assert_eq!(
+        Session::new(sid, db).await.attempts_for_test().await.len(),
+        1
+    );
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn steering_dispatch_refuses_an_older_identical_match_after_projection() {
+    use crate::{runtime::RuntimeMessage, session::steering::JobInputRequest};
+    let (_instance, _server, registry) = server_fixture().await;
+    let (_, db) = registry.create_session(Some("tui")).await.unwrap();
+    let input = JobInputRequest::new("attempt".into(), "same text".into());
+    let txn = db.new_transaction().await.unwrap();
+    txn.get_store::<eidetica::store::Table<JobInputRequest>>("job_inputs")
+        .await
+        .unwrap()
+        .set(input.id.clone(), input)
+        .await
+        .unwrap();
+    txn.commit().await.unwrap();
+    crate::session::steering::input_boundary(&db, "attempt", 1, false)
+        .await
+        .unwrap();
+    let baseline = vec![
+        RuntimeMessage::User("same text".into()),
+        RuntimeMessage::Assistant("prior exchange".into()),
+        RuntimeMessage::User("same text".into()),
+    ];
+    assert!(
+        crate::session::steering::dispatch_inputs(&db, "attempt", 1, &baseline[..2], &baseline)
+            .await
+            .is_err(),
+        "an old identical message is not incorporation of the new input"
+    );
+    assert_eq!(
+        crate::session::steering::dispatch_inputs(&db, "attempt", 1, &baseline, &baseline)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+}

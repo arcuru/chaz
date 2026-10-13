@@ -282,6 +282,7 @@ async fn user_stop_pairs_calls_while_job_wait_yields_or_reacquires_capacity() {
                 Some(&cancel),
                 Some(capacity),
                 resumed.then(|| RuntimeResume {
+                    prior_model_sequences: vec![],
                     prior_messages: Vec::new(),
                     model_sequence: 0,
                     call_index: 1,

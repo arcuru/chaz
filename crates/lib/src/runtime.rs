@@ -57,6 +57,17 @@ pub trait RuntimeRecorder: Send + Sync {
         Box::pin(async { Ok(Vec::new()) })
     }
 
+    /// Local incorporation after required projection and budget checks, before
+    /// invoking the backend. This is intent, never proof of remote reception.
+    fn input_dispatch<'a>(
+        &'a self,
+        _model_sequence: u64,
+        _messages: &'a [RuntimeMessage],
+        _baseline: &'a [RuntimeMessage],
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(async { Ok(()) })
+    }
+
     fn record<'a>(
         &'a self,
         message: RuntimeRecord,
@@ -105,6 +116,8 @@ pub struct RuntimeResume {
     /// Completed tool groups plus the pending batch's assistant message and
     /// the results of calls before the wait.
     pub prior_messages: Vec<RuntimeMessage>,
+    /// Model sequence for each restored message, including steering boundaries.
+    pub prior_model_sequences: Vec<u64>,
     pub model_sequence: u64,
     pub call_index: usize,
     /// The pending call with its post-hook arguments.
@@ -120,6 +133,10 @@ pub struct RuntimeResume {
 
 #[derive(Clone, Debug)]
 pub enum RuntimeRecord {
+    Steering {
+        model_sequence: u64,
+        inputs: Vec<crate::session::steering::JobInputRequest>,
+    },
     /// Executor-observed user cancellation, not a fabricated model reply.
     Cancelled,
     ModelResponse {
@@ -979,12 +996,19 @@ impl<'a> RoundProjector<'a> {
         tools: &[ToolDefinition],
         model_round: u64,
         max_retries: u32,
+        recorder: &Option<Arc<dyn RuntimeRecorder>>,
     ) -> Result<Result<LLMResponse, LlmError>, String> {
+        let baseline = messages;
         let projected = self.project(messages, tools, model_round).await?;
         let (messages, tools) = match &projected {
             Some(request) => (request.messages.as_slice(), request.tools.as_slice()),
             None => (messages, tools),
         };
+        if let Some(recorder) = recorder {
+            recorder
+                .input_dispatch(model_round, messages, baseline)
+                .await?;
+        }
         Ok(llm_call_with_retry(
             backend,
             model,
@@ -1211,6 +1235,7 @@ async fn run_turn(
                     &[],
                     model_sequence,
                     max_retries,
+                    &recorder,
                 )),
             )
             .await
@@ -1303,12 +1328,15 @@ async fn run_turn(
         matrix_send_queued = resume.matrix_send_queued;
         // Restored exchanges keep current-attempt provenance so the next
         // projection can prune/recover them under the same scoped ceilings.
-        let mut restored_sequence = 0;
-        for message in resume.prior_messages {
-            if matches!(message, RuntimeMessage::AssistantToolCalls { .. }) {
-                projector.note_exchange(messages.len(), restored_sequence);
-                restored_sequence += 1;
-            }
+        if resume.prior_messages.len() != resume.prior_model_sequences.len() {
+            return Err("checkpointed messages have incomplete call provenance".into());
+        }
+        for (message, sequence) in resume
+            .prior_messages
+            .into_iter()
+            .zip(resume.prior_model_sequences)
+        {
+            projector.note_exchange(messages.len(), sequence);
             messages.push(message);
         }
         model_sequence = resume.model_sequence;
@@ -1394,6 +1422,7 @@ async fn run_turn(
                 &tool_defs,
                 model_sequence,
                 max_retries,
+                &recorder,
             )),
         )
         .await
@@ -1522,20 +1551,30 @@ async fn run_turn(
                     if matrix_send_queued {
                         return Err("no_reply cannot retract a queued Matrix send".into());
                     }
+                    let pending = input_boundary(&recorder, model_sequence + 1, true).await?;
                     record_runtime(
                         &recorder,
                         RuntimeRecord::ModelResponse {
                             model_sequence,
                             content: None,
-                            tool_calls,
+                            tool_calls: if pending.is_empty() {
+                                tool_calls
+                            } else {
+                                Vec::new()
+                            },
                             provider_extra: Default::default(),
                             metadata: metadata.clone(),
-                            terminal: true,
+                            terminal: pending.is_empty(),
                         },
                     )
                     .await?;
                     if let Some(m) = metadata {
                         acc.record(m);
+                    }
+                    if !pending.is_empty() {
+                        projector.append_boundary_input(&mut messages, model_sequence + 1, pending);
+                        model_sequence += 1;
+                        continue;
                     }
                     return Ok(finalize_outcome(
                         hub,
@@ -2025,7 +2064,7 @@ impl RuntimeRecorder for EventRecorder {
     ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
         Box::pin(async move {
             match message {
-                RuntimeRecord::Cancelled => {}
+                RuntimeRecord::Cancelled | RuntimeRecord::Steering { .. } => {}
                 RuntimeRecord::ModelResponse { tool_calls, .. } => {
                     for call in tool_calls {
                         if call.name == NO_REPLY_TOOL {

@@ -231,6 +231,7 @@ fn resume_fixture(
     let mut provider_extra = serde_json::Map::new();
     provider_extra.insert("reasoning".into(), "kept".into());
     RuntimeResume {
+        prior_model_sequences: vec![0, 0, 1],
         prior_messages: vec![
             RuntimeMessage::AssistantToolCalls {
                 exchange_id: None,

@@ -1098,14 +1098,12 @@ impl App {
 
     /// Open a conversation view and focus it with an empty composer.
     pub(super) fn push_tab(&mut self, mut tab: Tab) {
-        if let Some(job) = tab.job.as_mut() {
-            job.retry = self
-                .jobs
-                .publications
-                .entry(tab.session_db_id.clone())
-                .or_insert_with(|| job.retry.clone())
-                .clone();
-        }
+        tab.live.input_retry = self
+            .jobs
+            .publications
+            .entry(tab.session_db_id.clone())
+            .or_insert_with(|| tab.live.input_retry.clone())
+            .clone();
         self.refresh_ticket += 1;
         tab.live.incarnation = self.refresh_ticket;
         self.tabs.push(tab);
@@ -1880,7 +1878,12 @@ async fn build_tab(
             .resolve_model_for_agent(&agent.name)
             .map(str::to_string),
         expanded_entries: HashSet::new(),
-        live: refresh::TabLive::with_meta(meta),
+        live: {
+            let mut live = refresh::TabLive::with_meta(meta);
+            live.inputs = snapshot.inputs;
+            live.input_attempt = snapshot.input_attempt;
+            live
+        },
     })
 }
 
@@ -1959,17 +1962,20 @@ fn handle_chat_action(
             app.mode = TuiMode::Jobs;
         }
         ChatAction::SendMessage(text) => {
-            if let Some(tab) = app.current().filter(|tab| tab.job.is_some()) {
-                let db = tab.session_db.clone();
-                let retry = tab.job.as_ref().unwrap().retry.clone();
-                operations::submit(app, true, Some(text.clone()), jobs::send(db, retry, text));
-                return;
-            }
-            let Some(target) = operations::Target::capture(app) else {
+            let Some(tab) = app.current() else {
                 return;
             };
-            let ctx = operation_context(server, backend, secrets, approval_tx, notify_tx);
-            operations::submit(app, true, Some(text.clone()), ctx.send(target, text));
+            let db = tab.session_db.clone();
+            let retry = tab.live.input_retry.clone();
+            let is_job = tab.job.is_some();
+            let expected = tab.live.input_attempt.clone();
+            let busy = tab.active_turns > 0 || is_job;
+            operations::submit(
+                app,
+                true,
+                Some(text.clone()),
+                jobs::send(db, retry, text, is_job, expected, busy),
+            );
         }
         ChatAction::Dispatch(Command::Quit) => {
             app.should_quit = app.operations.request_exit();
@@ -2378,7 +2384,7 @@ mod session_picker_tests {
     use eidetica::backend::database::InMemory;
     use eidetica::{Instance, NewUser};
 
-    async fn test_tab() -> Tab {
+    pub(super) async fn test_tab() -> Tab {
         let (_instance, mut user) = Instance::create_backend(
             Box::new(InMemory::new()),
             NewUser::passwordless("lazy-picker"),
