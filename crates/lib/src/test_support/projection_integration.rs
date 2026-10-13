@@ -406,11 +406,25 @@ impl RuntimeRecorder for CollectingRecorder {
 struct BoundaryRecorder {
     records: CollectingRecorder,
     dispatches: Mutex<Vec<u64>>,
+    observations: Mutex<Vec<crate::session::usage::CallObservation>>,
     opening: Mutex<Option<String>>,
     closing: Mutex<Option<String>>,
 }
 
 impl RuntimeRecorder for BoundaryRecorder {
+    fn observe_call<'a>(
+        &'a self,
+        call: crate::session::usage::CallObservation,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+        assert_eq!(
+            self.dispatches.lock().unwrap().last().copied(),
+            Some(call.model_sequence),
+            "input incorporation must precede call observation"
+        );
+        self.observations.lock().unwrap().push(call);
+        Box::pin(async { Ok(()) })
+    }
+
     fn input_boundary<'a>(
         &'a self,
         _model_sequence: u64,
@@ -696,6 +710,7 @@ async fn projection_preserves_steering_boundaries_and_originals() {
         let recorder = Arc::new(BoundaryRecorder {
             records: CollectingRecorder::default(),
             dispatches: Mutex::new(Vec::new()),
+            observations: Mutex::new(Vec::new()),
             opening: Mutex::new(Some("steer-before".into())),
             closing: Mutex::new(Some("steer-after".into())),
         });
@@ -708,6 +723,19 @@ async fn projection_preserves_steering_boundaries_and_originals() {
         let final_round = if tool_exchange { 2 } else { 1 };
         assert_eq!(calls.len(), final_round + 1);
         assert_eq!(p.count(), calls.len());
+        let observations = recorder.observations.lock().unwrap();
+        assert_eq!(observations.len(), calls.len() * 2);
+        for (call, pair) in calls.iter().zip(observations.chunks_exact(2)) {
+            assert!(!pair[0].responded);
+            assert!(pair[1].responded);
+            assert_eq!(pair[0].model_sequence, pair[1].model_sequence);
+            assert_eq!(pair[0].timestamp, pair[1].timestamp);
+            assert_eq!(
+                pair[0].input_tokens,
+                crate::context::estimate_request_tokens(&call.messages, &call.tools) as u64,
+                "telemetry must count the projected request including steering"
+            );
+        }
         assert_eq!(
             echo_calls.load(Ordering::SeqCst),
             usize::from(tool_exchange)
@@ -792,6 +820,7 @@ async fn projection_refuses_steered_continuation_on_required_failure_or_budget()
             let recorder = Arc::new(BoundaryRecorder {
                 records: CollectingRecorder::default(),
                 dispatches: Mutex::new(Vec::new()),
+                observations: Mutex::new(Vec::new()),
                 opening: Mutex::new(None),
                 closing: Mutex::new(Some(if oversize {
                     "oversize steering ".repeat(10_000)
@@ -816,6 +845,15 @@ async fn projection_refuses_steered_continuation_on_required_failure_or_budget()
             assert_eq!(fx.calls().len(), 1, "invalid continuation reached backend");
             assert_eq!(echo_calls.load(Ordering::SeqCst), 0);
             assert_eq!(p.count(), 2);
+            assert_eq!(recorder.observations.lock().unwrap().len(), 2);
+            assert!(
+                recorder
+                    .observations
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .all(|c| c.model_sequence == 0)
+            );
             assert_eq!(
                 *recorder.dispatches.lock().unwrap(),
                 [0],
@@ -1957,6 +1995,7 @@ async fn steering_drains_before_terminal_silence_without_orphan_tool_history() {
     let recorder = Arc::new(BoundaryRecorder {
         records: CollectingRecorder::default(),
         dispatches: Mutex::new(Vec::new()),
+        observations: Mutex::new(Vec::new()),
         opening: Mutex::new(None),
         closing: Mutex::new(Some("reply after all".into())),
     });

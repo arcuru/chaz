@@ -808,6 +808,7 @@ async fn shared_steering_chat_and_job_frames_promote_before_response_refresh_and
             });
         }
         app.tabs[0] = pending;
+        assert_eq!(app.tabs[0].live.telemetry.as_ref().unwrap().totals.calls, 1);
         steering_frame(
             &mut app,
             &["frame steering one", "frame steering two"],
@@ -832,6 +833,8 @@ async fn shared_steering_chat_and_job_frames_promote_before_response_refresh_and
             context_budget: 32_000,
             roster: vec![],
         });
+        assert_eq!(app.tabs[0].live.telemetry.as_ref().unwrap().totals.calls, 2);
+        assert!(app.tabs[0].live.telemetry.as_ref().unwrap().last_calls["a"].context_estimated);
         let screen = steering_frame(
             &mut app,
             &[
@@ -855,6 +858,7 @@ async fn shared_steering_chat_and_job_frames_promote_before_response_refresh_and
                 .unwrap()
         };
         app.push_tab(reopened);
+        assert_eq!(app.tabs[0].live.telemetry.as_ref().unwrap().totals.calls, 2);
         steering_frame(
             &mut app,
             &[
@@ -912,6 +916,11 @@ async fn shared_steering_chat_and_job_frames_promote_before_response_refresh_and
             });
         }
         app.tabs[0] = final_tab;
+        assert_eq!(
+            app.tabs[0].live.telemetry.as_ref().unwrap().totals.calls,
+            2,
+            "steering display and terminal settlement cannot duplicate usage"
+        );
         let screen = steering_frame(
             &mut app,
             &["frame provisional", "frame steering one", "frame continued"],
