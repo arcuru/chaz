@@ -26,7 +26,9 @@ pub struct CallObservation {
 impl CallObservation {
     pub(crate) fn response(&mut self, response: &LLMResponse) {
         let (content, calls, metadata) = match response {
-            LLMResponse::Text { content, metadata } => (Some(content.as_str()), &[][..], metadata),
+            LLMResponse::Text {
+                content, metadata, ..
+            } => (Some(content.as_str()), &[][..], metadata),
             LLMResponse::ToolCalls {
                 content,
                 tool_calls,

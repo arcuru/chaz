@@ -234,6 +234,77 @@ fn usage_hit_zero_missing_and_malformed_are_distinct() {
     }
 }
 
+#[tokio::test]
+async fn native_usage_presence_preserves_telemetry_estimates_and_reported_zero() {
+    use crate::session::usage::{CallObservation, persist_call, telemetry_at_snapshot};
+
+    for items in [final_output(), output()] {
+        for (usage, prompt_reported, completion_reported) in [
+            (Value::Null, false, false),
+            (json!({}), false, false),
+            (json!({"input_tokens": 0, "output_tokens": 0}), true, true),
+            (json!({"input_tokens": 0}), true, false),
+            (json!({"output_tokens": 0}), false, true),
+            (
+                json!({"input_tokens": "invalid", "output_tokens": -1}),
+                false,
+                false,
+            ),
+            (
+                json!({"input_tokens": 4294967296u64, "output_tokens": 1.5}),
+                false,
+                false,
+            ),
+        ] {
+            let mut value = response(items.clone());
+            value["usage"] = usage;
+            value["chaz_usage_fields"] = json!({"prompt": true, "completion": true});
+            let parsed = parse(value).unwrap();
+            let mut call = CallObservation {
+                model_sequence: 0,
+                timestamp: chrono::Utc::now(),
+                requested_model: "test-model".into(),
+                request_budget_tokens: None,
+                input_tokens: 23,
+                output_tokens: None,
+                prices: None,
+                metadata: None,
+                responded: false,
+            };
+            call.response(&parsed);
+            let output_estimate = call.output_tokens.unwrap();
+            assert!(output_estimate > 0);
+            let (_instance, _user, db) = crate::session::test_helpers::test_session_db().await;
+            persist_call(&db, "native-call", None, "test-agent", call)
+                .await
+                .unwrap();
+            let snapshot = db.snapshot().await.unwrap();
+            let telemetry = telemetry_at_snapshot(&db, &snapshot, &[]).await.unwrap();
+            assert_eq!(telemetry.totals.calls, 1);
+            assert_eq!(
+                telemetry.totals.coverage.prompt_reported,
+                u32::from(prompt_reported)
+            );
+            assert_eq!(
+                telemetry.totals.coverage.completion_reported,
+                u32::from(completion_reported)
+            );
+            assert_eq!(
+                telemetry.totals.estimated.prompt_tokens,
+                if prompt_reported { 0 } else { 23 }
+            );
+            assert_eq!(
+                telemetry.totals.estimated.completion_tokens,
+                if completion_reported {
+                    0
+                } else {
+                    output_estimate
+                }
+            );
+        }
+    }
+}
+
 #[test]
 fn refusals_errors_truncation_and_malformed_calls() {
     let refusal = json!({"type":"message", "role":"assistant", "content":[{"type":"refusal", "refusal":"Cannot help"}]});

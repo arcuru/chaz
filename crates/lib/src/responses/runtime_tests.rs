@@ -112,6 +112,7 @@ impl RuntimeRecorder for Recorder {
                         attempt_id: self.attempt.attempt_id.clone(),
                         sequence,
                         timestamp: chrono::Utc::now(),
+                        identity: None,
                         message,
                     },
                     vec![],
@@ -374,6 +375,7 @@ async fn pending_change(change: &str) {
             attempt_id: attempt.attempt_id.clone(),
             sequence: 0,
             timestamp: now,
+            identity: None,
             message: TurnTranscriptMessage::ModelResponse {
                 model_sequence: 0,
                 content,
@@ -388,6 +390,7 @@ async fn pending_change(change: &str) {
             attempt_id: attempt.attempt_id.clone(),
             sequence: 1,
             timestamp: now,
+            identity: None,
             message: TurnTranscriptMessage::ToolResult {
                 model_sequence: 0,
                 call_index: 0,

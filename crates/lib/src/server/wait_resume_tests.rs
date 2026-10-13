@@ -1196,7 +1196,7 @@ async fn origin_pending_refusal_remains_interrupted_at_executor() {
     let attempt = session.start_turn_attempt(request.clone()).await.unwrap();
     let (_, _, arguments) = wait_call("missing-child", 30);
     session.append_turn_transcript(TurnTranscriptRecord { request_id: request.clone(),
-        attempt_id: attempt.attempt_id.clone(), sequence: 0, timestamp: Utc::now(),
+        attempt_id: attempt.attempt_id.clone(), sequence: 0, timestamp: Utc::now(), identity: None,
         message: TurnTranscriptMessage::ModelResponse { model_sequence: 0, content: None,
             tool_calls: vec![runtime::ToolCallRequest { id: "wait".into(), name: "job_wait".into(), arguments: arguments.clone() }],
             provider_extra: serde_json::Map::from_iter([(crate::responses::OUTPUT_ITEMS.into(), serde_json::json!([

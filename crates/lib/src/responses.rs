@@ -622,6 +622,11 @@ fn parse_response(response: Response, requested_model: &str) -> Result<LLMRespon
     let mut provider_extra = Map::new();
     provider_extra.insert(OUTPUT_ITEMS.into(), Value::Array(response.output));
     let mut extra = response.extra;
+    crate::session::usage::mark_usage_fields(
+        &mut extra,
+        usage_count(response.usage.as_ref(), "/input_tokens").is_some(),
+        usage_count(response.usage.as_ref(), "/output_tokens").is_some(),
+    );
     // Final entries already persist ResponseMetadata. Retain terminal output
     // there as well so context can recover it at the final entry's position.
     if calls.is_empty() {
@@ -650,13 +655,15 @@ fn parse_response(response: Response, requested_model: &str) -> Result<LLMRespon
     }
 }
 
+fn usage_count(usage: Option<&Value>, field: &str) -> Option<u32> {
+    usage
+        .and_then(|u| u.pointer(field))
+        .and_then(Value::as_u64)
+        .and_then(|v| u32::try_from(v).ok())
+}
+
 fn parse_usage(usage: Option<&Value>) -> TokenUsage {
-    let count = |field: &str| {
-        usage
-            .and_then(|u| u.pointer(field))
-            .and_then(Value::as_u64)
-            .and_then(|v| u32::try_from(v).ok())
-    };
+    let count = |field: &str| usage_count(usage, field);
     TokenUsage {
         prompt_tokens: count("/input_tokens").unwrap_or_default(),
         completion_tokens: count("/output_tokens").unwrap_or_default(),
