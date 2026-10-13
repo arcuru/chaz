@@ -380,6 +380,7 @@ impl RuntimeRecorder for CollectingRecorder {
                 .await
                 .append_turn_transcript(
                     TurnTranscriptRecord {
+                        identity: None,
                         request_id: TurnRequestId::parse("projection-test"),
                         attempt_id: "projection-test".into(),
                         sequence,

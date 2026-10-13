@@ -90,6 +90,7 @@ pub(super) struct TabLive {
     pub(super) error: Option<String>,
     errors: [Option<String>; 4],
     pub(super) meta: SessionMeta,
+    pub(super) telemetry: Option<chaz_core::session::usage::SessionTelemetry>,
     /// View-local command/error output is not stored in the session DB.
     local_entries: Vec<SessionEntry>,
     pub(super) incarnation: u64,
@@ -116,9 +117,13 @@ impl TabLive {
         self.rebind_task = None;
         self.rebind_ticket = None;
     }
-    pub(super) fn with_meta(meta: SessionMeta) -> Self {
+    pub(super) fn with_meta(
+        meta: SessionMeta,
+        telemetry: chaz_core::session::usage::SessionTelemetry,
+    ) -> Self {
         Self {
             meta,
+            telemetry: Some(telemetry),
             ..Default::default()
         }
     }
@@ -137,6 +142,7 @@ impl TabLive {
 /// What a session reload read from storage.
 pub(super) struct SessionSnapshot {
     pub(super) entries: Vec<SessionEntry>,
+    pub(super) telemetry: chaz_core::session::usage::SessionTelemetry,
     pub(super) meta: SessionMeta,
     pub(super) active_turns: Result<usize, String>,
 }
@@ -225,6 +231,7 @@ impl Tab {
         // retaining local command output between subsequent persisted rows.
         entries.sort_by_key(|e| e.timestamp);
         self.entries = entries;
+        self.live.telemetry = None;
         self.touch_transcript();
     }
 
@@ -236,6 +243,7 @@ impl Tab {
 
     pub(super) fn clear_view(&mut self) {
         self.entries.clear();
+        self.live.telemetry = None;
         self.live.local_entries.clear();
         self.scroll_offset = 0;
         self.expanded_entries.clear();
@@ -360,9 +368,12 @@ pub(super) async fn load_session_snapshot(
     async {
         let snapshot = db.snapshot().await?;
         let entries = Session::entries_at_snapshot(&db, &snapshot).await?;
+        let telemetry =
+            chaz_core::session::usage::telemetry_at_snapshot(&db, &snapshot, &entries).await?;
         let meta = chaz_core::session::try_read_meta_from_db(&db).await?;
         Ok::<_, anyhow::Error>(SessionSnapshot {
             entries,
+            telemetry,
             meta,
             active_turns: load_active_turns(&db).await,
         })
@@ -565,6 +576,7 @@ fn apply_session_snapshot(
 ) {
     let SessionSnapshot {
         entries,
+        telemetry,
         meta,
         active_turns,
     } = snapshot;
@@ -576,6 +588,7 @@ fn apply_session_snapshot(
 
     let tab = &mut app.tabs[idx];
     tab.set_entries(entries);
+    tab.live.telemetry = Some(telemetry);
     tab.session_name = meta.name.clone();
     tab.model_pin = meta
         .resolve_model_for_agent(&tab.current_agent)
@@ -701,6 +714,7 @@ mod tests {
             session_db_id: id.into(),
             ticket,
             snapshot: Ok(Box::new(SessionSnapshot {
+                telemetry: chaz_core::session::usage::SessionTelemetry::from_entries(&entries),
                 entries,
                 meta: SessionMeta {
                     name: Some("renamed".into()),
@@ -709,6 +723,101 @@ mod tests {
                 active_turns: Ok(turns),
             })),
         }
+    }
+
+    #[tokio::test]
+    async fn per_call_telemetry_refresh_renders_alias_missing_usage_and_multi_agent_totals() {
+        use chaz_core::runtime::{ResponseMetadata, TokenUsage};
+        use chaz_core::session::{
+            TurnCallIdentity, TurnRequestId, TurnTranscriptMessage, TurnTranscriptRecord,
+        };
+        let (_instance, mut app) = app_with_tabs(&["a"]).await;
+        let db = app.active().session_db.clone();
+        let session = Session::new(chaz_core::types::ConversationId("a".into()), db).await;
+        let (tx, mut rx) = mpsc::channel(8);
+        for (sequence, agent, prompt) in [
+            (0, "chaz", Some(1000)),
+            (1, "guest", Some(9000)),
+            (2, "chaz", Some(2000)),
+            (3, "chaz", None),
+            (4, "chaz", Some(0)),
+        ] {
+            session
+                .append_turn_transcript(
+                    TurnTranscriptRecord {
+                        request_id: TurnRequestId::parse("fixture-request"),
+                        attempt_id: "fixture-attempt".into(),
+                        sequence,
+                        timestamp: chrono::Utc::now(),
+                        identity: Some(TurnCallIdentity {
+                            agent: agent.into(),
+                            requested_model: "gpt-sol-latest".into(),
+                            execution_id: None,
+                        }),
+                        message: TurnTranscriptMessage::ModelResponse {
+                            model_sequence: sequence,
+                            content: None,
+                            tool_calls: Vec::new(),
+                            provider_extra: Default::default(),
+                            metadata: prompt.map(|prompt| ResponseMetadata {
+                                model: "gpt-6.1-sol".into(),
+                                usage: TokenUsage {
+                                    prompt_tokens: prompt,
+                                    completion_tokens: 100,
+                                    cached_tokens: Some(prompt / 2),
+                                    cost_usd: Some(0.01),
+                                    ..Default::default()
+                                },
+                                ..Default::default()
+                            }),
+                            terminal: false,
+                        },
+                    },
+                    Vec::new(),
+                )
+                .await
+                .unwrap();
+            request(&mut app, "a", RefreshKind::Session, &tx);
+            let msg = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            let applied = apply(&mut app, msg, |_, _| Resolved {
+                effective_model: "gpt-sol-latest".into(),
+                context_budget: 10_000,
+                roster: Vec::new(),
+            });
+            assert!(applied.redraw, "background telemetry must request a frame");
+            let screen = draw_chat(&mut app, 180, 20).join("\n");
+            let expected = match sequence {
+                0 | 1 => "ctx ~1k/10k (10.0%) tok",
+                2 => "ctx ~2k/10k (20.0%) tok",
+                _ => "ctx unknown/10k tok",
+            };
+            assert!(screen.contains(expected), "{screen}");
+            if sequence == 2 {
+                assert!(
+                    screen.contains("12k/300 tok • 50% cached • $0.0300"),
+                    "{screen}"
+                );
+                app.active_mut().effective_model = "other-model".into();
+                assert!(
+                    draw_chat(&mut app, 180, 20)
+                        .join("\n")
+                        .contains("ctx unknown/10k tok")
+                );
+            }
+        }
+        // Reopening/reconnecting reads the durable telemetry, not runtime memory.
+        let reopened = load_session_snapshot("a", app.active().session_db.clone())
+            .await
+            .unwrap();
+        assert_eq!(reopened.telemetry.totals.prompt_tokens, 12_000);
+        assert_eq!(reopened.telemetry.last_calls["chaz"].context_tokens, None);
+        assert_eq!(
+            reopened.telemetry.last_calls["guest"].context_tokens,
+            Some(9000)
+        );
     }
 
     /// Request a read whose result is held until the returned sender fires.

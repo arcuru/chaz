@@ -12,7 +12,14 @@ Each call to a configured `LLMBackend` returns a `TokenUsage` alongside the mode
 
 For OpenAI-compatible backends, chaz sends `usage: { include: true }` on the request. When chatting through OpenRouter that surfaces `cost_usd` directly — no extra reconciliation pass is needed. Providers that don't return a cost still produce token counts; the rollup distinguishes "no cost data" from "$0.00."
 
-Every assistant `Message` entry written to a session carries a `ResponseMetadata` field containing the model name, an optional provider/response ID, the `TokenUsage`, and any extra wire-format fields the backend chose to retain. Tool calls, tool results, acks, and errors are recorded as separate entry types and excluded from usage rollups — only `Message` entries count, which matches what was actually billed.
+Assistant `Message` entries carry optional `ResponseMetadata` containing the returned model name, an optional provider/response ID, turn-total `TokenUsage`, and extra wire-format fields the backend retained.
+A stopped turn's `Error` also carries its completed-call totals.
+`/costs` and `chaz usage` roll up those finalized summaries; tool-call/result and ack display entries are not additional billed calls.
+
+The [TUI status bar](tui.md#context-usage) also observes per-call metadata in the durable runtime transcript, so it updates while a turn is running.
+Its totals include reported calls even when a later call fails or the executor disconnects.
+The last-call input size is shown separately from cumulative usage, and finalized summaries are not added on top of the same calls.
+These are provider-reported observations, not a complete invoice: missing usage or cost is never locally estimated.
 
 ## `/costs` (TUI)
 
@@ -66,7 +73,7 @@ The JSON output preserves the per-session and per-model breakdowns, the applied 
 
 ## What Doesn't Roll Up
 
-- **Non-message entries** — `ToolCall`, `ToolResult`, `Ack`, and `Error` entries have no `ResponseMetadata` (no LLM call happened for them).
+- **Audit entries** — `ToolCall`, `ToolResult`, and `Ack` entries do not add usage. Ordinary errors have no metadata; a stopped turn's error can carry completed-call totals.
 - **Sessions chaz can't open** — corrupted or otherwise unreadable session DBs are logged via `warn!` and skipped.
 - **Costs that the provider didn't report** — token counts still aggregate, but the cost column stays at "no data" rather than silently summing to zero.
 

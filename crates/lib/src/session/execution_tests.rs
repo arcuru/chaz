@@ -18,6 +18,7 @@ fn branch(attempt: &TurnAttempt, id: &str, executor: &str) -> ExecutionStart {
 
 fn record(attempt: &TurnAttempt, text: &str) -> TurnTranscriptRecord {
     TurnTranscriptRecord {
+        identity: None,
         request_id: attempt.request_id.clone(),
         attempt_id: attempt.attempt_id.clone(),
         sequence: 0,

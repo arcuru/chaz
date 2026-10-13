@@ -649,6 +649,7 @@ fn build_metadata(
         provider: None,
         response_id: id,
         usage: usage.map(AnthUsage::into_token_usage).unwrap_or_default(),
+        turn_attempt_id: None,
         context_tokens: None,
         extra: Map::new(),
     })

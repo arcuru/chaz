@@ -53,7 +53,16 @@ See [ReAct Runtime → Cancellation](react.md#cancellation) and [TUI → Stoppin
 
 Every assistant `Message` entry carries an optional `ResponseMetadata`: the model name, an optional provider and response ID, a `TokenUsage` (prompt/completion/cached/cache_creation/reasoning tokens plus an optional `cost_usd`), and any extra wire-format fields the backend retained. This is populated from the `LLMResponse` returned by the configured `LLMBackend` at the moment the assistant turn is committed to the session DB — there is no separate billing log.
 
-`crates/lib/src/session/usage.rs` walks the session catalog and folds these per-entry metadata records into per-session, per-model, and total rollups. Two surfaces consume those rollups today: the `/costs` slash command (TUI) and the `chaz usage` CLI subcommand. See [Cost Tracking & Usage](../user_guide/usage.md) for the user-facing view.
+`crates/lib/src/session/usage.rs` walks the session catalog and folds these per-entry metadata records into per-session, per-model, and total rollups for `/costs` and `chaz usage`.
+The TUI status bar instead reads per-call `turn_transcript` telemetry at the same immutable snapshot as its entries.
+New transcript records carry the agent, requested model, and optional job execution branch separately from the returned wire model.
+Terminal calls are observable before end hooks and reply preflight; this publishes neither a final Message nor a completion or addressed send.
+The terminal record has the same attempt/branch/sequence key at atomic settlement, so it remains one call.
+Finalized metadata carries `turn_attempt_id`: the status bar uses the identified calls instead of adding that turn summary again.
+Older unmarked summaries remain readable, and a resumed identified attempt includes its earlier legacy raw calls.
+Missing usage clears that agent's context numerator without discarding previous totals; interrupted calls remain usage evidence, not replayable context or proof of completion.
+Session-write notifications use the existing bounded, owned, ticket-protected background refresh and redraw path.
+See [Cost Tracking & Usage](../user_guide/usage.md) and [TUI context usage](../user_guide/tui.md#context-usage).
 
 ## Metadata writes refuse unreadable state
 

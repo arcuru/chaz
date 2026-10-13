@@ -71,6 +71,7 @@ struct SessionRuntimeRecorder {
     terminal: std::sync::Mutex<Option<TurnTranscriptRecord>>,
     explicit_bridge_send: AtomicBool,
     agent_name: String,
+    requested_model: String,
     /// The session state this attempt's context was assembled from. Without
     /// it a wait cannot be reconstructed, so none is checkpointed.
     context_snapshot: Option<eidetica::Snapshot>,
@@ -206,6 +207,11 @@ impl runtime::RuntimeRecorder for SessionRuntimeRecorder {
                 attempt_id: self.attempt_id.clone(),
                 sequence,
                 timestamp: Utc::now(),
+                identity: Some(crate::session::TurnCallIdentity {
+                    agent: self.agent_name.clone(),
+                    requested_model: self.requested_model.clone(),
+                    execution_id: self.branch.clone(),
+                }),
                 message,
             };
             if matches!(
@@ -213,6 +219,18 @@ impl runtime::RuntimeRecorder for SessionRuntimeRecorder {
                 TurnTranscriptMessage::ModelResponse { terminal: true, .. }
                     | TurnTranscriptMessage::Cancelled
             ) {
+                // Usage is observable before response hooks or reply preflight
+                // finish. No final Message, completion or outbox is published.
+                self.session
+                    .lock()
+                    .await
+                    .append_turn_transcript_for_branch(
+                        record.clone(),
+                        Vec::new(),
+                        self.branch.as_deref(),
+                    )
+                    .await
+                    .map_err(|error| format!("failed to persist terminal telemetry: {error}"))?;
                 *self.terminal.lock().unwrap() = Some(record);
                 return Ok(());
             }
@@ -4055,6 +4073,7 @@ impl Server {
                     resume.as_ref().is_some_and(|plan| plan.runtime.matrix_send_queued),
                 ),
                 agent_name: agent_name.clone(),
+                requested_model: backend.resolve_model_name(effective_model.as_deref()),
                 context_snapshot,
                 job_input: spawn.job_authority.is_some(),
                 branch: branch_id.clone(),
@@ -4321,5 +4340,7 @@ impl Drop for ActivityHeartbeat {
     }
 }
 
+#[cfg(test)]
+mod telemetry_tests;
 #[cfg(test)]
 mod tests;

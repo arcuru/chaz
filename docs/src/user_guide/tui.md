@@ -61,13 +61,20 @@ An ordinary launch opens the [session hub](#session-hub) rather than any convers
 ## Context usage
 
 The status bar's `ctx ~57k/1M (5.7%) tok` pair is separate from the running
-prompt/completion totals. The numerator is the **host agent's final LLM call's
-reported prompt tokens**, not the sum of every tool-loop call.
+prompt/completion totals. The numerator is the **host agent's last observed LLM
+call's reported prompt tokens**, not the sum of every tool-loop call.
+It updates during tool iterations and when terminal provider usage arrives,
+even if the final reply is still pending. Token/cache/cost totals include
+reported calls from all agents; finalizing a turn does not count them again.
 `~` marks an estimate of current occupancy: the last call does not include
 subsequent messages or a freshly rebuilt system prompt.
 Chaz does not manufacture a count from a percentage or locally estimate a
 missing provider count. `unknown` means no usable count is available (including
-missing/zero usage or a last response from a different model).
+missing/zero usage or a last call requested through a different model).
+A requested alias and its returned wire model are distinct: a call requested
+as `gpt-sol-latest` can report `gpt-6.1-sol` without losing its occupancy count.
+Changing the requested model still invalidates the old numerator.
+Cache reads and cost come only from provider reports, never local tokenization.
 
 Counts use rounded `k`/`M` suffixes, omitting a redundant `.0`.
 The percentage is calculated from the unrounded counts and shown only when
@@ -84,13 +91,21 @@ For example:
 
 1. Select a model advertising a 1,050,000-token window via `/models` → select a scope → `Enter`.
    Before a response, the bar shows `ctx unknown/1.1M tok`.
-2. Send a message. If the final call reports 12,345 prompt tokens, it shows
-   `ctx ~12.3k/1.1M (1.2%) tok`, even if the turn's accumulated prompt total is larger.
+2. Send a message that uses tools. If a call reports 12,345 prompt tokens,
+   it shows `ctx ~12.3k/1.1M (1.2%) tok` while the turn is still running.
+   If the next call reports 20,000 input tokens, the pair becomes
+   `ctx ~20k/1.1M (1.9%) tok`; the session input total includes both calls.
+   No keystroke is needed to redraw, and the final reply does not add those
+   calls a second time.
 3. Switch to a 32,000-token model. Until that model replies, the old model's
    count is not reused: `ctx unknown/32k tok`.
 4. If the provider omits usage, it remains `unknown`; a later response with
    usage restores the numerator. An agent cap of 16,000 changes the denominator
    to `16k`, including after reopening the session.
+5. If a later call fails or you stop the turn, already reported usage remains
+   recorded. Reopening or reconnecting reloads it from the session; during a
+   failed background read the last-good display stays visible with
+   `⚠ refresh failed` until a successful refresh.
 
 ## Commands
 
@@ -596,7 +611,7 @@ remain authorized observers, never ordinary execution sessions.
 
 | Trigger / display                      | Behavior                                                                          |
 | -------------------------------------- | --------------------------------------------------------------------------------- |
-| Session write / Settings open          | Coalesced background transcript/meta/status refresh                               |
+| Session write / Settings open          | Coalesced background transcript/meta/telemetry/status refresh                     |
 | Every five seconds                     | Refresh activity; check service health and retry failed reads                     |
 | `⟳ refreshing (cached)`                | A read is pending; displayed data is the last successful read                     |
 | `⚠ refresh failed`                     | That read failed; last-good data remains, even if another read succeeds           |

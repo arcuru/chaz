@@ -234,6 +234,10 @@ pub struct ResponseMetadata {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub response_id: Option<String>,
     pub usage: TokenUsage,
+    /// Session attempt whose per-call transcript is the usage source. Present
+    /// only on finalized turn totals, so observers don't count both forms.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_attempt_id: Option<String>,
     /// Context-window occupancy: the input (prompt) token count of the
     /// **final** LLM call in the turn — i.e. how full the window was when the
     /// turn ended. Unlike `usage.prompt_tokens` (which the accumulator *sums*
@@ -340,6 +344,7 @@ impl MetadataAccumulator {
             provider: self.last_provider,
             response_id: self.last_response_id,
             usage: self.usage,
+            turn_attempt_id: None,
             context_tokens: Some(self.last_prompt_tokens),
             extra: self.last_extra,
         })
@@ -2291,6 +2296,7 @@ mod tests {
                 reasoning_tokens: Some(5),
                 cost_usd: Some(0.001),
             },
+            turn_attempt_id: None,
             context_tokens: None,
             extra: Default::default(),
         });
@@ -2307,6 +2313,7 @@ mod tests {
                 reasoning_tokens: None,
                 cost_usd: Some(0.002),
             },
+            turn_attempt_id: None,
             context_tokens: None,
             extra: Default::default(),
         });

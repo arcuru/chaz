@@ -105,6 +105,125 @@ impl UsageTotals {
     }
 }
 
+/// Last observed model call for one agent. The requested identity determines
+/// which input budget applies; the returned wire model remains provenance.
+#[derive(Debug, Clone)]
+pub struct LastCall {
+    pub requested_model: String,
+    pub wire_model: Option<String>,
+    pub context_tokens: Option<u32>,
+    pub timestamp: DateTime<Utc>,
+}
+
+/// Presentation telemetry reconstructed from the same snapshot as the entries.
+/// No activity lease or in-memory runtime is required, so interrupted calls and
+/// reconnects retain the usage that was actually reported.
+#[derive(Debug, Clone, Default)]
+pub struct SessionTelemetry {
+    pub totals: UsageTotals,
+    pub last_calls: BTreeMap<String, LastCall>,
+}
+
+impl SessionTelemetry {
+    /// Legacy turn summaries still count, but identified summaries are replaced
+    /// by their per-call transcript, never added on top of it.
+    pub fn from_entries(entries: &[SessionEntry]) -> Self {
+        let mut telemetry = Self::default();
+        for entry in entries {
+            if !matches!(entry.entry_type, EntryType::Message | EntryType::Error)
+                || entry
+                    .metadata
+                    .as_ref()
+                    .is_some_and(|m| m.turn_attempt_id.is_some())
+            {
+                continue;
+            }
+            if let Some(metadata) = &entry.metadata {
+                telemetry.totals.record(metadata);
+            }
+            if entry.entry_type == EntryType::Message {
+                let metadata = entry.metadata.as_ref();
+                telemetry.last_calls.insert(
+                    entry.sender.clone(),
+                    LastCall {
+                        requested_model: metadata.map(|m| m.model.clone()).unwrap_or_default(),
+                        wire_model: metadata.map(|m| m.model.clone()),
+                        context_tokens: metadata.and_then(|m| m.context_tokens).filter(|&n| n > 0),
+                        timestamp: entry.timestamp,
+                    },
+                );
+            }
+        }
+        telemetry
+    }
+}
+
+/// Observe completed provider calls, including tool iterations and a terminal
+/// call whose final Message is not yet published. Reads are pinned so a racing
+/// finalization cannot expose both a call and an unmarked turn summary.
+pub async fn telemetry_at_snapshot(
+    database: &eidetica::Database,
+    snapshot: &eidetica::Snapshot,
+    entries: &[SessionEntry],
+) -> anyhow::Result<SessionTelemetry> {
+    use super::{TURN_TRANSCRIPT_STORE, TurnTranscriptMessage, TurnTranscriptRecord};
+    use eidetica::store::Table;
+
+    let mut telemetry = SessionTelemetry::from_entries(entries);
+    let txn = database.new_transaction_at(snapshot).await?;
+    let mut records = txn
+        .get_store::<Table<TurnTranscriptRecord>>(TURN_TRANSCRIPT_STORE)
+        .await?
+        .search(|_| true)
+        .await?;
+    // A checkpoint may span an upgrade: once the attempt is identified, its
+    // earlier raw calls also replace the finalized aggregate's usage.
+    let identities: BTreeMap<_, _> = records
+        .iter()
+        .filter_map(|(_, record)| {
+            record
+                .identity
+                .as_ref()
+                .map(|identity| (record.attempt_id.clone(), identity.clone()))
+        })
+        .collect();
+    records.sort_by_key(|(_, record)| (record.timestamp, record.sequence));
+    for (_, record) in records {
+        let Some(identity) = record
+            .identity
+            .or_else(|| identities.get(&record.attempt_id).cloned())
+        else {
+            continue;
+        };
+        let TurnTranscriptMessage::ModelResponse { metadata, .. } = record.message else {
+            continue;
+        };
+        if let Some(metadata) = &metadata {
+            telemetry.totals.record(metadata);
+        }
+        // A missing usage response supersedes the old numerator, too.
+        if telemetry
+            .last_calls
+            .get(&identity.agent)
+            .is_none_or(|last| last.timestamp <= record.timestamp)
+        {
+            telemetry.last_calls.insert(
+                identity.agent,
+                LastCall {
+                    requested_model: identity.requested_model,
+                    wire_model: metadata.as_ref().map(|m| m.model.clone()),
+                    context_tokens: metadata
+                        .as_ref()
+                        .map(|m| m.usage.prompt_tokens)
+                        .filter(|&n| n > 0),
+                    timestamp: record.timestamp,
+                },
+            );
+        }
+    }
+    Ok(telemetry)
+}
+
 /// Walk every session in the catalog and aggregate `ResponseMetadata`.
 /// Unreadable sessions are logged and skipped rather than failing the whole
 /// rollup — the goal is "what we can see right now", not strict correctness.
@@ -370,6 +489,7 @@ mod tests {
                     reasoning_tokens: None,
                     cost_usd: cost,
                 },
+                turn_attempt_id: None,
                 context_tokens: None,
                 extra: Default::default(),
             }),
@@ -412,6 +532,125 @@ mod tests {
         assert_eq!(t.calls, 1);
         assert_eq!(t.prompt_tokens, 100);
         assert_eq!(t.cost_usd, 0.05);
+    }
+
+    #[tokio::test]
+    async fn telemetry_reconciles_legacy_resumed_and_interrupted_calls_at_pinned_snapshot() {
+        use crate::session::{
+            TurnCallIdentity, TurnRequestId, TurnTranscriptMessage, TurnTranscriptRecord,
+        };
+        let (_instance, _user, db) = crate::session::test_helpers::test_session_db().await;
+        let mut session =
+            Session::new(crate::types::ConversationId("telemetry".into()), db.clone()).await;
+        let mut legacy = mk_entry(Utc::now(), "legacy", Some(0.01));
+        legacy.sender = "host".into();
+        session.add_entry(legacy).await.unwrap();
+        let request = session
+            .add_entry(crate::session::SessionEntry {
+                sender: "user".into(),
+                content: "fixture".into(),
+                timestamp: Utc::now(),
+                entry_type: EntryType::Message,
+                metadata: None,
+                routing: None,
+            })
+            .await
+            .unwrap();
+        let attempt = session.start_turn_attempt(request).await.unwrap();
+        let call = |sequence, identity, prompt, terminal| TurnTranscriptRecord {
+            request_id: attempt.request_id.clone(),
+            attempt_id: attempt.attempt_id.clone(),
+            sequence,
+            timestamp: Utc::now(),
+            identity,
+            message: TurnTranscriptMessage::ModelResponse {
+                model_sequence: sequence,
+                content: None,
+                tool_calls: Vec::new(),
+                provider_extra: Default::default(),
+                metadata: Some(ResponseMetadata {
+                    model: "wire-model".into(),
+                    usage: TokenUsage {
+                        prompt_tokens: prompt,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                }),
+                terminal,
+            },
+        };
+        // First call predates identification; resumed call knows the request.
+        session
+            .append_turn_transcript(call(0, None, 10, false), Vec::new())
+            .await
+            .unwrap();
+        let identity = TurnCallIdentity {
+            agent: "host".into(),
+            requested_model: "alias".into(),
+            execution_id: None,
+        };
+        let terminal = call(1, Some(identity.clone()), 20, true);
+        session
+            .append_turn_transcript(terminal.clone(), Vec::new())
+            .await
+            .unwrap();
+        let before = db.snapshot().await.unwrap();
+        let before_entries = Session::entries_at_snapshot(&db, &before).await.unwrap();
+        let live = telemetry_at_snapshot(&db, &before, &before_entries)
+            .await
+            .unwrap();
+        assert_eq!(live.totals.prompt_tokens, 130);
+        let mut finalized = mk_entry(Utc::now(), "wire-model", Some(0.02));
+        finalized.metadata.as_mut().unwrap().usage.prompt_tokens = 30;
+        session
+            .complete_turn_attempt_with_transcript(&attempt, Some(finalized), Some(terminal))
+            .await
+            .unwrap();
+        let now = db.snapshot().await.unwrap();
+        let entries = Session::entries_at_snapshot(&db, &now).await.unwrap();
+        assert_eq!(
+            telemetry_at_snapshot(&db, &now, &entries)
+                .await
+                .unwrap()
+                .totals
+                .prompt_tokens,
+            130
+        );
+        assert_eq!(
+            telemetry_at_snapshot(&db, &before, &before_entries)
+                .await
+                .unwrap()
+                .totals
+                .prompt_tokens,
+            130
+        );
+        // An interrupted or failed attempt's reported usage is not lost just
+        // because it never acquired a final Message or still-live heartbeat.
+        let mut interrupted = call(0, Some(identity), 7, false);
+        interrupted.attempt_id = "interrupted".into();
+        interrupted.request_id = TurnRequestId::parse("interrupted-request");
+        session
+            .append_turn_transcript(interrupted.clone(), Vec::new())
+            .await
+            .unwrap();
+        let now = db.snapshot().await.unwrap();
+        let entries = Session::entries_at_snapshot(&db, &now).await.unwrap();
+        let retained = telemetry_at_snapshot(&db, &now, &entries).await.unwrap();
+        assert_eq!(retained.totals.prompt_tokens, 137);
+        assert_eq!(retained.last_calls["host"].context_tokens, Some(7));
+        interrupted.sequence = 1;
+        interrupted.timestamp = Utc::now();
+        if let TurnTranscriptMessage::ModelResponse { metadata, .. } = &mut interrupted.message {
+            *metadata = None;
+        }
+        session
+            .append_turn_transcript(interrupted, Vec::new())
+            .await
+            .unwrap();
+        let now = db.snapshot().await.unwrap();
+        let missing = telemetry_at_snapshot(&db, &now, &entries).await.unwrap();
+        assert_eq!(missing.totals.prompt_tokens, 137);
+        assert_eq!(missing.last_calls["host"].context_tokens, None);
     }
 
     #[test]

@@ -1880,7 +1880,7 @@ async fn build_tab(
             .resolve_model_for_agent(&agent.name)
             .map(str::to_string),
         expanded_entries: HashSet::new(),
-        live: refresh::TabLive::with_meta(meta),
+        live: refresh::TabLive::with_meta(meta, snapshot.telemetry),
     })
 }
 

@@ -62,17 +62,15 @@ fn model_slug(model: &str) -> &str {
 
 /// Last reported input size is an estimate of current occupancy, not a fresh
 /// tokenization of the transcript. Zero can also mean missing provider usage.
-fn context_segment(tab: &super::Tab) -> String {
-    let last = tab
-        .entries
-        .iter()
-        .rev()
-        .find(|e| e.sender == tab.current_agent && e.entry_type == EntryType::Message);
-    let used = last
-        .and_then(|e| e.metadata.as_ref())
-        .filter(|m| m.model == tab.effective_model)
-        .and_then(|m| m.context_tokens)
-        .filter(|&n| n > 0);
+fn context_segment(
+    tab: &super::Tab,
+    telemetry: &chaz_core::session::usage::SessionTelemetry,
+) -> String {
+    let used = telemetry
+        .last_calls
+        .get(&tab.current_agent)
+        .filter(|call| call.requested_model == tab.effective_model)
+        .and_then(|call| call.context_tokens);
     let percentage = match used {
         Some(n) if tab.context_budget > 0 => {
             format!(
@@ -610,26 +608,24 @@ pub(super) fn ui_chat(f: &mut ratatui::Frame, app: &mut App, ext_segments: &[Str
     let current_agent = tab.current_agent.clone();
     let effective_model = tab.effective_model.clone();
     let roster = tab.roster.clone();
-    // Aggregate this session's LLM usage for the status bar. Mirrors
-    // `commands::session::format_usage_summary`: only entries carrying
-    // response metadata count, and `cached` is the cache-read subset of
-    // prompt tokens.
-    let usage_segment = {
-        let (mut prompt, mut completion, mut cached) = (0u64, 0u64, 0u64);
-        let mut cost = 0.0f64;
-        let mut saw_cost = false;
-        let mut calls = 0u32;
-        for e in &tab.entries {
-            let Some(m) = &e.metadata else { continue };
-            calls += 1;
-            prompt += m.usage.prompt_tokens as u64;
-            completion += m.usage.completion_tokens as u64;
-            cached += m.usage.cached_tokens.unwrap_or(0) as u64;
-            if let Some(c) = m.usage.cost_usd {
-                cost += c;
-                saw_cost = true;
-            }
+    // Snapshot totals include observed calls even before the turn publishes a
+    // final Message. Legacy sessions still use their recorded turn summaries.
+    let legacy;
+    let telemetry = match &tab.live.telemetry {
+        Some(telemetry) => telemetry,
+        None => {
+            legacy = chaz_core::session::usage::SessionTelemetry::from_entries(&tab.entries);
+            &legacy
         }
+    };
+    let usage_segment = {
+        let totals = &telemetry.totals;
+        let (prompt, completion, cached) = (
+            totals.prompt_tokens,
+            totals.completion_tokens,
+            totals.cached_tokens,
+        );
+        let (cost, saw_cost, calls) = (totals.cost_usd, totals.cost_reported, totals.calls);
         if calls == 0 {
             String::new()
         } else {
@@ -650,9 +646,9 @@ pub(super) fn ui_chat(f: &mut ratatui::Frame, app: &mut App, ext_segments: &[Str
             )
         }
     };
-    // Only the host's latest message belongs with its effective input budget;
+    // Only the host's latest call belongs with its effective input budget;
     // aggregate prompt usage sums ReAct calls and is not context occupancy.
-    let ctx_segment = context_segment(tab);
+    let ctx_segment = context_segment(tab, telemetry);
     let approval_info = tab.pending_approval.as_ref().map(|ex| {
         (
             ex.info.name.clone(),
@@ -2250,6 +2246,7 @@ mod chat_frame_tests {
                     prompt_tokens: 9_999_999,
                     ..Default::default()
                 },
+                turn_attempt_id: None,
                 context_tokens: Some(12_345),
                 extra: Default::default(),
             }),

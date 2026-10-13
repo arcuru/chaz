@@ -306,8 +306,9 @@ fn build_metadata(
         provider,
         response_id,
         usage: usage.map(Usage::into_token_usage).unwrap_or_default(),
-        // Per-call metadata; the turn's context high-water mark is set when
-        // the ReAct accumulator finalizes (see `MetadataAccumulator`).
+        turn_attempt_id: None,
+        // Per-call occupancy comes from usage. The accumulator sets the
+        // finalized turn's last-call context_tokens separately.
         context_tokens: None,
         extra,
     })

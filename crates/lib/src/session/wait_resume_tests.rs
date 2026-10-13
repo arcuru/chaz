@@ -11,6 +11,7 @@ fn request() -> TurnRequestId {
 
 fn record(sequence: u64, message: TurnTranscriptMessage) -> TurnTranscriptRecord {
     TurnTranscriptRecord {
+        identity: None,
         request_id: request(),
         attempt_id: ATTEMPT.into(),
         sequence,
