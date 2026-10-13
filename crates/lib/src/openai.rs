@@ -1033,21 +1033,7 @@ pub(crate) async fn serialize_cache_fixture(
     );
     let secrets = crate::test_support::empty_secrets().await;
     let adapter = OpenAI::new(&backend, &secrets);
-    let mut wire_messages = convert_runtime_messages(messages);
-    let mut wire_tools = convert_tool_definitions(tools);
-    apply_cache_options(
-        &mut wire_messages,
-        &mut wire_tools,
-        model,
-        &backend,
-        options,
-    );
-    serde_json::to_value(adapter.chat_request(
-        model,
-        wire_messages,
-        (!wire_tools.is_empty()).then_some(wire_tools),
-    ))
-    .unwrap()
+    serde_json::to_value(adapter.build_chat_request(messages, tools, model, options)).unwrap()
 }
 
 #[cfg(test)]
