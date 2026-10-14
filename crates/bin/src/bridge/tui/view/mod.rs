@@ -1215,9 +1215,8 @@ fn build_transcript(
 
                 lines.push(Line::from(vec![Span::styled(label, sender_style)]));
 
-                for line in content::markdown(&entry.content) {
-                    let body: String = line.spans.iter().map(|span| span.content.as_ref()).collect();
-                    sources.push((lines.len(), body.strip_prefix("  ").unwrap_or(&body).to_owned()));
+                for (line, body) in content::markdown(&entry.content) {
+                    sources.push((lines.len(), body));
                     lines.push(line);
                 }
                 lines.push(Line::from(""));
@@ -1257,8 +1256,9 @@ fn build_transcript(
                 )]));
                 if let Some(body) = entry.bridge_body() {
                     for content_line in body.lines() {
-                        sources.push((lines.len(), content_line.to_owned()));
-                        lines.push(Line::from(format!("  {content_line}")));
+                        let safe = content::safe_line(content_line);
+                        sources.push((lines.len(), content::copy_line(content_line, &safe)));
+                        lines.push(Line::from(format!("  {safe}")));
                     }
                 }
                 lines.push(Line::from(""));
@@ -2982,6 +2982,106 @@ mod transcript_tests {
             .map(|row| row.trim_end())
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    #[tokio::test]
+    async fn markdown_selection_tracks_styled_wrapped_and_code_body_cells() {
+        use crate::bridge::tui::input::{MouseOutcome, handle_mouse};
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+
+        for width in [24, 40, 80] {
+            for (message, first, last, expected) in [
+                (
+                    "# Report\n\n**Styled** café 界 e\u{301} done.",
+                    "Styled",
+                    "done.",
+                    "Styled café 界 e\u{301} done.",
+                ),
+                (
+                    "```rust\nfn main() {\n    call();\n}\n```",
+                    "fn main() {",
+                    "}",
+                    "fn main() {\n    call();\n}",
+                ),
+                (
+                    "```text\nstart\n\twide 界 e\u{301}\nend\n```",
+                    "start",
+                    "end",
+                    "start\n\twide 界 e\u{301}\nend",
+                ),
+                (
+                    "```text\nstart \u{1b}[31m\nend\n```",
+                    "start",
+                    "end",
+                    "start �[31m\nend",
+                ),
+                (
+                    "one two three four five six seven eight nine ten",
+                    "one",
+                    "ten",
+                    "one two three four five six seven eight nine ten",
+                ),
+            ] {
+                let (_instance, mut app) =
+                    app_with(vec![entry("chaz", message, EntryType::Message)]).await;
+                app.active_mut().active_turns = 0;
+                let mut terminal = Terminal::new(TestBackend::new(width, 32)).unwrap();
+                terminal.draw(|f| ui_chat(f, &mut app, &[])).unwrap();
+                let drawn = rows(&terminal, 0, 32);
+                let position = |fragment: &str, end: bool| {
+                    drawn
+                        .iter()
+                        .enumerate()
+                        .find_map(|(y, line)| {
+                            let byte = line.find(fragment)?;
+                            let buffer = terminal.backend().buffer();
+                            let mut consumed = 0;
+                            let column = (0..width).find(|&x| {
+                                if consumed == byte {
+                                    return true;
+                                }
+                                consumed += buffer[(x, y as u16)].symbol().len();
+                                false
+                            })?;
+                            Some((
+                                column + if end { fragment.len() as u16 - 1 } else { 0 },
+                                y as u16,
+                            ))
+                        })
+                        .unwrap_or_else(|| {
+                            panic!("missing {fragment:?} at width {width}: {drawn:?}")
+                        })
+                };
+                let from = position(first, false);
+                let to = position(last, true);
+                let mouse = |kind, (column, row)| MouseEvent {
+                    kind,
+                    column,
+                    row,
+                    modifiers: KeyModifiers::NONE,
+                };
+                assert!(
+                    handle_mouse(
+                        &mut app,
+                        mouse(MouseEventKind::Down(MouseButton::Left), from)
+                    )
+                    .is_none()
+                );
+                assert!(
+                    handle_mouse(&mut app, mouse(MouseEventKind::Drag(MouseButton::Left), to))
+                        .is_none()
+                );
+                terminal.draw(|f| ui_chat(f, &mut app, &[])).unwrap();
+                assert_eq!(terminal.backend().buffer()[from].bg, Color::Blue);
+                let Some(MouseOutcome::Copy(copied)) =
+                    handle_mouse(&mut app, mouse(MouseEventKind::Up(MouseButton::Left), to))
+                else {
+                    panic!("rendered body must remain selectable at width {width}");
+                };
+                assert_eq!(copied, expected, "width {width}: {message}");
+                assert_eq!(app.active().entries[0].content, message);
+            }
+        }
     }
 
     #[tokio::test]

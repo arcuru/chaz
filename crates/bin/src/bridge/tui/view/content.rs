@@ -5,6 +5,7 @@ use pulldown_cmark::{Event, LinkType, Parser, Tag, TagEnd};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use serde_json::Value;
+use unicode_normalization::UnicodeNormalization;
 
 use super::theme;
 
@@ -19,6 +20,16 @@ pub(super) fn safe_line(text: &str) -> String {
         usize::MAX,
     )
     .text
+}
+
+/// Preserve source spelling for normalization/tab-only display changes. Other
+/// quarantine changes must also reach the clipboard, not reveal hidden controls.
+pub(super) fn copy_line(text: &str, safe: &str) -> String {
+    if text.replace('\t', "    ").nfc().collect::<String>() == safe {
+        text.to_owned()
+    } else {
+        safe.to_owned()
+    }
 }
 
 /// A complete JSON value is a serialization boundary. Decode string values
@@ -73,8 +84,9 @@ fn write_value(value: &Value, depth: usize, output: &mut String) {
 
 #[derive(Default)]
 struct MarkdownLines {
-    lines: Vec<Line<'static>>,
+    lines: Vec<(Line<'static>, String)>,
     spans: Vec<Span<'static>>,
+    copy: String,
     indent: String,
 }
 
@@ -87,14 +99,20 @@ impl MarkdownLines {
             if !part.is_empty() {
                 if self.spans.is_empty() {
                     self.spans.push(Span::raw(self.indent.clone()));
+                    self.copy.push_str(&self.indent);
                 }
-                self.spans.push(Span::styled(safe_line(part), style));
+                let safe = safe_line(part);
+                self.copy.push_str(&copy_line(part, &safe));
+                self.spans.push(Span::styled(safe, style));
             }
         }
     }
 
     fn newline(&mut self) {
-        self.lines.push(Line::from(std::mem::take(&mut self.spans)));
+        self.lines.push((
+            Line::from(std::mem::take(&mut self.spans)),
+            std::mem::take(&mut self.copy),
+        ));
     }
 
     fn finish_line(&mut self) {
@@ -105,15 +123,19 @@ impl MarkdownLines {
 
     fn block_break(&mut self) {
         self.finish_line();
-        if self.lines.last().is_some_and(|line| !line.spans.is_empty()) {
-            self.lines.push(Line::default());
+        if self
+            .lines
+            .last()
+            .is_some_and(|(line, _)| !line.spans.is_empty())
+        {
+            self.lines.push((Line::default(), String::new()));
         }
     }
 }
 
 /// CommonMark events become existing theme styles and Ratatui spans. Wrapping,
 /// viewport caching and scrolling remain the transcript renderer's job.
-pub(super) fn markdown(content: &str) -> Vec<Line<'static>> {
+pub(super) fn markdown(content: &str) -> Vec<(Line<'static>, String)> {
     let mut out = MarkdownLines::default();
     let mut styles = vec![Style::default()];
     let mut lists: Vec<Option<u64>> = Vec::new();
@@ -236,10 +258,14 @@ pub(super) fn markdown(content: &str) -> Vec<Line<'static>> {
         }
     }
     out.finish_line();
-    while out.lines.last().is_some_and(|line| line.spans.is_empty()) {
+    while out
+        .lines
+        .last()
+        .is_some_and(|(line, _)| line.spans.is_empty())
+    {
         out.lines.pop();
     }
-    for line in &mut out.lines {
+    for (line, _) in &mut out.lines {
         if !line.spans.is_empty() {
             line.spans.insert(0, Span::raw("  "));
         }

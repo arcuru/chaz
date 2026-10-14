@@ -106,7 +106,7 @@ default_agents: [chaz]
                                check=True, timeout=20, capture_output=True)
                 command = [BINARY, "--config", config, "--session", "selection"]
                 if multiplexed:
-                    socket_dir = Path(os.environ.get("AVA_TMUX_SOCKET_DIR", "/tmp/ava-tmux-sockets"))
+                    socket_dir = Path(os.environ.get("TUI_TMUX_SOCKET_DIR", "/tmp/chaz-tmux-sockets"))
                     socket_dir.mkdir(parents=True, exist_ok=True)
                     socket = socket_dir / ("chaz-copy-" + str(time.time_ns()) + ".sock")
                     tmux = shutil.which("tmux")

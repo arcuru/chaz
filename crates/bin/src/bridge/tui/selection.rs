@@ -10,6 +10,7 @@ use ratatui::{
     style::Color,
     widgets::{Paragraph, Widget, Wrap},
 };
+use unicode_normalization::UnicodeNormalization;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
@@ -74,7 +75,20 @@ impl CopyText {
             return Vec::new();
         }
         let decorated = format!("  {text}");
-        let paragraph = Paragraph::new(decorated.as_str()).wrap(Wrap { trim: false });
+        // Map display-normalized graphemes back to original source bytes. Only
+        // touched lines allocate this map, retaining lazy viewport-sized work.
+        let mut display = String::new();
+        let mut glyphs = BTreeMap::new();
+        for (byte, glyph) in decorated.grapheme_indices(true) {
+            let start = display.len();
+            if glyph == "\t" {
+                display.push_str("    ");
+            } else {
+                display.extend(glyph.nfc());
+            }
+            glyphs.insert(start, byte..byte + glyph.len());
+        }
+        let paragraph = Paragraph::new(display.as_str()).wrap(Wrap { trim: false });
         let height = paragraph.line_count(width).min(u16::MAX as usize) as u16;
         let area = Rect::new(0, 0, width, height);
         let mut buffer = Buffer::empty(area);
@@ -97,19 +111,20 @@ impl CopyText {
             for glyph in rendered.graphemes(true) {
                 // Wrapping omits break whitespace and zero-width controls
                 // (such as tabs). Walk forward through the original source.
-                let Some(skipped) = decorated[byte..].find(glyph) else {
+                let Some(skipped) = display[byte..].find(glyph) else {
                     continue;
                 };
                 byte += skipped;
                 let next = byte + glyph.len();
+                let source = glyphs.range(..=byte).next_back().unwrap().1;
                 let cell = Cell {
                     start: Point {
                         line,
-                        byte: byte.saturating_sub(2).min(text.len()),
+                        byte: source.start.saturating_sub(2).min(text.len()),
                     },
                     end: Point {
                         line,
-                        byte: next.saturating_sub(2).min(text.len()),
+                        byte: source.end.saturating_sub(2).min(text.len()),
                     },
                 };
                 cells.extend(std::iter::repeat_n(cell, glyph.width().max(1)));
@@ -123,7 +138,12 @@ impl CopyText {
                 byte: if y + 1 == height {
                     text.len()
                 } else {
-                    byte.saturating_sub(2).min(text.len())
+                    glyphs
+                        .range(..byte)
+                        .next_back()
+                        .map_or(0, |(_, source)| source.end)
+                        .saturating_sub(2)
+                        .min(text.len())
                 },
             };
             cells.resize(width as usize, Cell { start: end, end });
