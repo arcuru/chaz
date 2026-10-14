@@ -7083,378 +7083,403 @@ async fn client_submission_publishes_one_child_then_executor_runs_it() {
 
     let dir = tempfile::tempdir().unwrap();
     let socket = dir.path().join("client-submit.sock");
-    let (owner, mut user) = Instance::create_backend(
-        Box::new(InMemory::new()),
-        NewAccount::passwordless("submitter"),
-    )
-    .await
-    .unwrap();
-    let (agent_db, pubkey) = create_agent_db(
-        &mut user,
-        "default",
-        &AgentDbConfig::default(),
-        &AgentMeta {
-            display_name: Some("default".into()),
-            ..Default::default()
-        },
-    )
-    .await
-    .unwrap();
-    let agent = DbEntry {
-        db_id: agent_db.id(),
-        display_name: "default".into(),
-        pubkey,
-    };
-    let (_, foreign_home) = create_agent_db(
-        &mut user,
-        "foreign",
-        &AgentDbConfig::default(),
-        &AgentMeta {
-            display_name: Some("foreign".into()),
-            ..Default::default()
-        },
-    )
-    .await
-    .unwrap();
-    let service = ServiceServer::bind(owner, &socket).await.unwrap();
-    let (shutdown, receiver) = watch::channel(());
-    let task = tokio::spawn(service.run(receiver));
-    let settings = crate::config::EideticaConfig {
-        connection: format!("unix://{}", socket.display()),
-        login: crate::config::EideticaLoginConfig {
-            username: "submitter".into(),
-            password: None,
-            passwordless: true,
-        },
-        sync: None,
-    };
-    let agents = Arc::new(AgentRegistry::with_default_agent());
-    let client = crate::instance::connect_with(&settings, crate::config::ExecutionRole::Client)
-        .await
-        .unwrap();
-    let registry = Arc::new(
-        crate::session::SessionRegistry::new(client.instance, client.user, agents.clone())
-            .await
-            .unwrap(),
-    );
-    let (parent_id, _) = registry.create_session(Some("cli")).await.unwrap();
-    registry
-        .attach_agent_to_session(&parent_id.0, &agent)
-        .await
-        .unwrap();
-    let client = client_server_fixture_from_registry(registry.clone()).await;
-    assert!(!client.is_executor_authorized());
-    // Discard the reply as if the caller lost the publication acknowledgement.
-    client
-        .submit_agent_job(&parent_id.0, "default", "one task")
-        .await
-        .unwrap();
-    let jobs: Vec<_> = registry
-        .list_sessions()
-        .await
-        .unwrap()
-        .into_iter()
-        .filter(|row| {
-            row.source
-                .as_deref()
-                .is_some_and(|s| s.starts_with("job-stage:"))
-        })
-        .collect();
-    assert_eq!(
-        jobs.len(),
-        1,
-        "inspection must recover the sole published handle"
-    );
-    let id = &jobs[0].session_db_id;
-    assert_eq!(
-        client.job_status(id).await.unwrap().state,
-        crate::session::jobs::JobState::Pending
-    );
-    let (_, child) = registry.open_session(id).await.unwrap();
-    assert_eq!(
-        Session::new(ConversationId(id.clone()), child.clone())
-            .await
-            .entries()
-            .iter()
-            .filter(|entry| entry.entry_type == EntryType::Directive)
-            .count(),
-        1
-    );
-    assert!(client.register_accepted_job(&child).await.is_err());
-    assert!(!client.is_watching_session(id).await);
-
-    let agent_for_narrow = agent.clone();
-    let (executor, mock) = published_executor_with_mock(&settings, agents, agent).await;
-    let finished = tokio::time::timeout(
-        std::time::Duration::from_secs(15),
-        client.wait_job(id, std::time::Duration::from_secs(14)),
-    )
-    .await
-    .expect("executor should run the prewritten Directive")
-    .unwrap();
-    assert_eq!(
-        finished.state,
-        crate::session::jobs::JobState::Succeeded {
-            text: Some("finished".into())
-        }
-    );
-    assert_eq!(client.job_status(id).await.unwrap(), finished);
-    assert_eq!(
-        mock.recorded_calls().len(),
-        1,
-        "one mock model execution, none on client"
-    );
-    assert_eq!(
-        registry
-            .list_sessions()
-            .await
-            .unwrap()
-            .iter()
-            .filter(|row| row
-                .source
-                .as_deref()
-                .is_some_and(|s| s.starts_with("job-stage:")))
-            .count(),
-        1
-    );
-    assert_eq!(
-        Session::new(ConversationId(id.clone()), child)
-            .await
-            .entries()
-            .iter()
-            .filter(|entry| entry.entry_type == EntryType::Directive)
-            .count(),
-        1
-    );
-    let invalid = client
-        .submit_agent_job(&parent_id.0, "not-hosted", "invalid")
-        .await
-        .unwrap();
-    let (narrow_id, narrow_db) = registry.create_session(Some("cli")).await.unwrap();
-    registry
-        .attach_agent_to_session(&narrow_id.0, &agent_for_narrow)
-        .await
-        .unwrap();
-    Session::new(narrow_id.clone(), narrow_db)
-        .await
-        .update_meta(|meta| {
-            meta.capabilities.shell = Some(crate::grants::ShellGrant {
-                allow: crate::grants::Allowlist::Only(vec![]),
-                ..Default::default()
-            });
-        })
-        .await
-        .unwrap();
-    let narrow = client
-        .submit_agent_job(&narrow_id.0, "default", "narrow")
-        .await
-        .unwrap();
-    for rejected in [&invalid, &narrow] {
-        let status = tokio::time::timeout(
-            std::time::Duration::from_secs(15),
-            client.wait_job(rejected, std::time::Duration::from_secs(14)),
+    // Keep setup, publication and execution in separate poll frames for the default debug stack.
+    let (owner, agent, foreign_home) = Box::pin(async {
+        let (owner, mut user) = Instance::create_backend(
+            Box::new(InMemory::new()),
+            NewAccount::passwordless("submitter"),
         )
         .await
-        .expect("executor must reject invalid request")
         .unwrap();
-        assert!(
-            matches!(
-                status.state,
-                crate::session::jobs::JobState::Rejected { .. }
-            ),
-            "{status:?}"
-        );
-    }
-    assert_eq!(
-        mock.recorded_calls().len(),
-        1,
-        "rejected children cannot execute"
-    );
-    // An old-style staged marker plus a Directive cannot enter ordinary or
-    // published-job execution, even when its ID appears in the catalog.
-    let obsolete = registry
-        .prepare_agent_job(&parent_id.0, "default", "obsolete")
+        let (agent_db, pubkey) = create_agent_db(
+            &mut user,
+            "default",
+            &AgentDbConfig::default(),
+            &AgentMeta {
+                display_name: Some("default".into()),
+                ..Default::default()
+            },
+        )
         .await
         .unwrap();
-    let obsolete_id = obsolete.db.root_id().to_string();
-    crate::db_kind::write_marker(
-        &obsolete.db,
-        crate::db_kind::KIND_SESSION,
-        "job-stage:obsolete",
-    )
-    .await
-    .unwrap();
-    registry.publish_agent_job(obsolete).await.unwrap();
-    assert!(
-        !executor
-            .register_accepted_job(&registry.open_session(&obsolete_id).await.unwrap().1)
+        let agent = DbEntry {
+            db_id: agent_db.id(),
+            display_name: "default".into(),
+            pubkey,
+        };
+        let (_, foreign_home) = create_agent_db(
+            &mut user,
+            "foreign",
+            &AgentDbConfig::default(),
+            &AgentMeta {
+                display_name: Some("foreign".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        (owner, agent, foreign_home)
+    })
+    .await;
+    let (client, registry, parent_id, settings, agents, shutdown, task, id, child) =
+        Box::pin(async {
+            let service = ServiceServer::bind(owner, &socket).await.unwrap();
+            let (shutdown, receiver) = watch::channel(());
+            let task = tokio::spawn(service.run(receiver));
+            let settings = crate::config::EideticaConfig {
+                connection: format!("unix://{}", socket.display()),
+                login: crate::config::EideticaLoginConfig {
+                    username: "submitter".into(),
+                    password: None,
+                    passwordless: true,
+                },
+                sync: None,
+            };
+            let agents = Arc::new(AgentRegistry::with_default_agent());
+            let client =
+                crate::instance::connect_with(&settings, crate::config::ExecutionRole::Client)
+                    .await
+                    .unwrap();
+            let registry = Arc::new(
+                crate::session::SessionRegistry::new(client.instance, client.user, agents.clone())
+                    .await
+                    .unwrap(),
+            );
+            let (parent_id, _) = registry.create_session(Some("cli")).await.unwrap();
+            registry
+                .attach_agent_to_session(&parent_id.0, &agent)
+                .await
+                .unwrap();
+            let client = client_server_fixture_from_registry(registry.clone()).await;
+            assert!(!client.is_executor_authorized());
+            // Discard the reply as if the caller lost the publication acknowledgement.
+            client
+                .submit_agent_job(&parent_id.0, "default", "one task")
+                .await
+                .unwrap();
+            let jobs: Vec<_> = registry
+                .list_sessions()
+                .await
+                .unwrap()
+                .into_iter()
+                .filter(|row| {
+                    row.source
+                        .as_deref()
+                        .is_some_and(|s| s.starts_with("job-stage:"))
+                })
+                .collect();
+            assert_eq!(
+                jobs.len(),
+                1,
+                "inspection must recover the sole published handle"
+            );
+            let id = &jobs[0].session_db_id;
+            assert_eq!(
+                client.job_status(id).await.unwrap().state,
+                crate::session::jobs::JobState::Pending
+            );
+            let (_, child) = registry.open_session(id).await.unwrap();
+            assert_eq!(
+                Session::new(ConversationId(id.clone()), child.clone())
+                    .await
+                    .entries()
+                    .iter()
+                    .filter(|entry| entry.entry_type == EntryType::Directive)
+                    .count(),
+                1
+            );
+            assert!(client.register_accepted_job(&child).await.is_err());
+            assert!(!client.is_watching_session(id).await);
+            (
+                client,
+                registry,
+                parent_id,
+                settings,
+                agents,
+                shutdown,
+                task,
+                id.clone(),
+                child,
+            )
+        })
+        .await;
+
+    Box::pin(async {
+        let id = &id;
+        let agent_for_narrow = agent.clone();
+        let (executor, mock) = published_executor_with_mock(&settings, agents, agent).await;
+        let finished = tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            client.wait_job(id, std::time::Duration::from_secs(14)),
+        )
+        .await
+        .expect("executor should run the prewritten Directive")
+        .unwrap();
+        assert_eq!(
+            finished.state,
+            crate::session::jobs::JobState::Succeeded {
+                text: Some("finished".into())
+            }
+        );
+        assert_eq!(client.job_status(id).await.unwrap(), finished);
+        assert_eq!(
+            mock.recorded_calls().len(),
+            1,
+            "one mock model execution, none on client"
+        );
+        assert_eq!(
+            registry
+                .list_sessions()
+                .await
+                .unwrap()
+                .iter()
+                .filter(|row| row
+                    .source
+                    .as_deref()
+                    .is_some_and(|s| s.starts_with("job-stage:")))
+                .count(),
+            1
+        );
+        assert_eq!(
+            Session::new(ConversationId(id.clone()), child)
+                .await
+                .entries()
+                .iter()
+                .filter(|entry| entry.entry_type == EntryType::Directive)
+                .count(),
+            1
+        );
+        let invalid = client
+            .submit_agent_job(&parent_id.0, "not-hosted", "invalid")
             .await
-            .unwrap()
-    );
-    assert!(!executor.is_watching_session(&obsolete_id).await);
-    assert!(
-        executor
-            .register_session(
-                &registry.open_session(&obsolete_id).await.unwrap().1,
-                executor.default_backend.clone(),
-                None,
-                None
+            .unwrap();
+        let (narrow_id, narrow_db) = registry.create_session(Some("cli")).await.unwrap();
+        registry
+            .attach_agent_to_session(&narrow_id.0, &agent_for_narrow)
+            .await
+            .unwrap();
+        Session::new(narrow_id.clone(), narrow_db)
+            .await
+            .update_meta(|meta| {
+                meta.capabilities.shell = Some(crate::grants::ShellGrant {
+                    allow: crate::grants::Allowlist::Only(vec![]),
+                    ..Default::default()
+                });
+            })
+            .await
+            .unwrap();
+        let narrow = client
+            .submit_agent_job(&narrow_id.0, "default", "narrow")
+            .await
+            .unwrap();
+        for rejected in [&invalid, &narrow] {
+            let status = tokio::time::timeout(
+                std::time::Duration::from_secs(15),
+                client.wait_job(rejected, std::time::Duration::from_secs(14)),
             )
             .await
-            .is_err()
-    );
-    assert_eq!(mock.recorded_calls().len(), 1);
-
-    // A published, accepted job waits for capacity without a Started attempt.
-    let permits = executor
-        .semaphore
-        .clone()
-        .acquire_many_owned(MAX_CONCURRENT_LLM_CALLS as u32)
-        .await
-        .unwrap();
-    mock.push_text("after capacity");
-    let queued = client
-        .submit_agent_job(&parent_id.0, "default", "queued")
-        .await
-        .unwrap();
-    tokio::time::timeout(std::time::Duration::from_secs(15), async {
-        while !executor.processing.lock().await.contains(&queued) {
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            .expect("executor must reject invalid request")
+            .unwrap();
+            assert!(
+                matches!(
+                    status.state,
+                    crate::session::jobs::JobState::Rejected { .. }
+                ),
+                "{status:?}"
+            );
         }
+        assert_eq!(
+            mock.recorded_calls().len(),
+            1,
+            "rejected children cannot execute"
+        );
+        // An old-style staged marker plus a Directive cannot enter ordinary or
+        // published-job execution, even when its ID appears in the catalog.
+        let obsolete = registry
+            .prepare_agent_job(&parent_id.0, "default", "obsolete")
+            .await
+            .unwrap();
+        let obsolete_id = obsolete.db.root_id().to_string();
+        crate::db_kind::write_marker(
+            &obsolete.db,
+            crate::db_kind::KIND_SESSION,
+            "job-stage:obsolete",
+        )
+        .await
+        .unwrap();
+        registry.publish_agent_job(obsolete).await.unwrap();
+        assert!(
+            !executor
+                .register_accepted_job(&registry.open_session(&obsolete_id).await.unwrap().1)
+                .await
+                .unwrap()
+        );
+        assert!(!executor.is_watching_session(&obsolete_id).await);
+        assert!(
+            executor
+                .register_session(
+                    &registry.open_session(&obsolete_id).await.unwrap().1,
+                    executor.default_backend.clone(),
+                    None,
+                    None
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(mock.recorded_calls().len(), 1);
+
+        // A published, accepted job waits for capacity without a Started attempt.
+        let permits = executor
+            .semaphore
+            .clone()
+            .acquire_many_owned(MAX_CONCURRENT_LLM_CALLS as u32)
+            .await
+            .unwrap();
+        mock.push_text("after capacity");
+        let queued = client
+            .submit_agent_job(&parent_id.0, "default", "queued")
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            while !executor.processing.lock().await.contains(&queued) {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("published job must wait for a runtime permit");
+        let (_, queued_db) = registry.open_session(&queued).await.unwrap();
+        assert_eq!(
+            client.job_status(&queued).await.unwrap().state,
+            crate::session::jobs::JobState::Queued
+        );
+        assert!(
+            queued_db
+                .new_transaction()
+                .await
+                .unwrap()
+                .get_store::<eidetica::store::Table<crate::session::TurnAttempt>>("turn_attempts")
+                .await
+                .unwrap()
+                .search(|_| true)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(mock.recorded_calls().len(), 1);
+        let queued_tips = queued_db.snapshot().await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(4500)).await;
+        assert_eq!(
+            queued_db.snapshot().await.unwrap(),
+            queued_tips,
+            "queued participation has zero timer writes beyond the former TTL"
+        );
+        assert_eq!(
+            crate::session::execution::participants(&queued_db)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        drop(permits);
+        assert_eq!(
+            client
+                .wait_job(&queued, std::time::Duration::from_secs(14))
+                .await
+                .unwrap()
+                .state,
+            crate::session::jobs::JobState::Succeeded {
+                text: Some("after capacity".into())
+            }
+        );
+
+        // Kill an attempt after the mock recorded a call, then reopen the same ID.
+        mock.push_text("effect may have happened");
+        let gate = mock.block_next_call();
+        let held = client
+            .submit_agent_job(&parent_id.0, "default", "interrupted")
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(15), gate.wait_started())
+            .await
+            .expect("job attempt must start");
+        executor.shutdown().await;
+        tokio::time::timeout(std::time::Duration::from_secs(5), gate.wait_stopped())
+            .await
+            .expect("shutdown must cancel the model call");
+        let (_, held_db) = registry.open_session(&held).await.unwrap();
+        let directive_id = crate::session::jobs::read_accepted_job(&held_db)
+            .await
+            .unwrap()
+            .unwrap()
+            .directive_id;
+        assert!(matches!(
+            client.job_status(&held).await.unwrap().state,
+            crate::session::jobs::JobState::StartedUnknown { .. }
+        ));
+        let (restarted, next_mock) = published_executor_with_mock(
+            &settings,
+            Arc::new(AgentRegistry::with_default_agent()),
+            agent_for_narrow,
+        )
+        .await;
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            while !restarted.is_watching_session(&held).await {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("restart must adopt held job");
+        assert!(
+            next_mock.recorded_calls().is_empty(),
+            "uncertain attempt must not auto-replay"
+        );
+        assert!(matches!(
+            restarted.job_status(&held).await.unwrap().state,
+            crate::session::jobs::JobState::Interrupted { .. }
+        ));
+        restarted
+            .retry_interrupted_turn(&held, &crate::session::TurnRequestId::parse(directive_id))
+            .await
+            .unwrap();
+        assert_eq!(
+            client
+                .wait_job(&held, std::time::Duration::from_secs(14))
+                .await
+                .unwrap()
+                .state,
+            crate::session::jobs::JobState::Succeeded {
+                text: Some("finished".into())
+            }
+        );
+        assert_eq!(next_mock.recorded_calls().len(), 1);
+        let (_, foreign_parent) = registry.open_session(&parent_id.0).await.unwrap();
+        Session::new(parent_id.clone(), foreign_parent)
+            .await
+            .update_meta(|meta| meta.agents[0].home_pubkey = Some(foreign_home.to_string()))
+            .await
+            .unwrap();
+        let refused = client
+            .submit_agent_job(&parent_id.0, "default", "foreign parent home")
+            .await
+            .unwrap();
+        let refused_status = client
+            .wait_job(&refused, std::time::Duration::from_secs(2))
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                refused_status.state,
+                crate::session::jobs::JobState::Rejected { .. }
+            ),
+            "{refused_status:?}"
+        );
+        assert_eq!(next_mock.recorded_calls().len(), 1);
+        restarted.shutdown().await;
+        client.shutdown().await;
+        drop(shutdown);
+        task.await.unwrap().unwrap();
     })
-    .await
-    .expect("published job must wait for a runtime permit");
-    let (_, queued_db) = registry.open_session(&queued).await.unwrap();
-    assert_eq!(
-        client.job_status(&queued).await.unwrap().state,
-        crate::session::jobs::JobState::Queued
-    );
-    assert!(
-        queued_db
-            .new_transaction()
-            .await
-            .unwrap()
-            .get_store::<eidetica::store::Table<crate::session::TurnAttempt>>("turn_attempts")
-            .await
-            .unwrap()
-            .search(|_| true)
-            .await
-            .unwrap()
-            .is_empty()
-    );
-    assert_eq!(mock.recorded_calls().len(), 1);
-    let queued_tips = queued_db.snapshot().await.unwrap();
-    tokio::time::sleep(std::time::Duration::from_millis(4500)).await;
-    assert_eq!(
-        queued_db.snapshot().await.unwrap(),
-        queued_tips,
-        "queued participation has zero timer writes beyond the former TTL"
-    );
-    assert_eq!(
-        crate::session::execution::participants(&queued_db)
-            .await
-            .unwrap()
-            .len(),
-        1
-    );
-    drop(permits);
-    assert_eq!(
-        client
-            .wait_job(&queued, std::time::Duration::from_secs(14))
-            .await
-            .unwrap()
-            .state,
-        crate::session::jobs::JobState::Succeeded {
-            text: Some("after capacity".into())
-        }
-    );
-
-    // Kill an attempt after the mock recorded a call, then reopen the same ID.
-    mock.push_text("effect may have happened");
-    let gate = mock.block_next_call();
-    let held = client
-        .submit_agent_job(&parent_id.0, "default", "interrupted")
-        .await
-        .unwrap();
-    tokio::time::timeout(std::time::Duration::from_secs(15), gate.wait_started())
-        .await
-        .expect("job attempt must start");
-    executor.shutdown().await;
-    tokio::time::timeout(std::time::Duration::from_secs(5), gate.wait_stopped())
-        .await
-        .expect("shutdown must cancel the model call");
-    let (_, held_db) = registry.open_session(&held).await.unwrap();
-    let directive_id = crate::session::jobs::read_accepted_job(&held_db)
-        .await
-        .unwrap()
-        .unwrap()
-        .directive_id;
-    assert!(matches!(
-        client.job_status(&held).await.unwrap().state,
-        crate::session::jobs::JobState::StartedUnknown { .. }
-    ));
-    let (restarted, next_mock) = published_executor_with_mock(
-        &settings,
-        Arc::new(AgentRegistry::with_default_agent()),
-        agent_for_narrow,
-    )
     .await;
-    tokio::time::timeout(std::time::Duration::from_secs(15), async {
-        while !restarted.is_watching_session(&held).await {
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .expect("restart must adopt held job");
-    assert!(
-        next_mock.recorded_calls().is_empty(),
-        "uncertain attempt must not auto-replay"
-    );
-    assert!(matches!(
-        restarted.job_status(&held).await.unwrap().state,
-        crate::session::jobs::JobState::Interrupted { .. }
-    ));
-    restarted
-        .retry_interrupted_turn(&held, &crate::session::TurnRequestId::parse(directive_id))
-        .await
-        .unwrap();
-    assert_eq!(
-        client
-            .wait_job(&held, std::time::Duration::from_secs(14))
-            .await
-            .unwrap()
-            .state,
-        crate::session::jobs::JobState::Succeeded {
-            text: Some("finished".into())
-        }
-    );
-    assert_eq!(next_mock.recorded_calls().len(), 1);
-    let (_, foreign_parent) = registry.open_session(&parent_id.0).await.unwrap();
-    Session::new(parent_id.clone(), foreign_parent)
-        .await
-        .update_meta(|meta| meta.agents[0].home_pubkey = Some(foreign_home.to_string()))
-        .await
-        .unwrap();
-    let refused = client
-        .submit_agent_job(&parent_id.0, "default", "foreign parent home")
-        .await
-        .unwrap();
-    let refused_status = client
-        .wait_job(&refused, std::time::Duration::from_secs(2))
-        .await
-        .unwrap();
-    assert!(
-        matches!(
-            refused_status.state,
-            crate::session::jobs::JobState::Rejected { .. }
-        ),
-        "{refused_status:?}"
-    );
-    assert_eq!(next_mock.recorded_calls().len(), 1);
-    restarted.shutdown().await;
-    client.shutdown().await;
-    drop(shutdown);
-    task.await.unwrap().unwrap();
 }
 
 #[tokio::test]
