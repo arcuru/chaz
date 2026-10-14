@@ -65,9 +65,30 @@ class JobPtyProcess(PtyProcess):
         svg.append('</g></svg>')
         (dest / "screen.svg").write_text("\n".join(svg))
 
+    def resize_jobs(self, columns, rows):
+        self.resize(columns, rows)
+        deadline = time.monotonic() + 5
+        # pyte immediately resizes the old screen. Its retained text is not
+        # proof the TUI consumed SIGWINCH: wait for the Details/Task box's
+        # bottom-right corner at the new geometry before sending another key.
+        while self.screen.buffer[rows - 2][columns - 1].data != "╯":
+            self.drain(0.05)
+            if self.child.poll() is not None or time.monotonic() >= deadline:
+                raise AssertionError("Jobs did not repaint the resized viewport")
+
+    def resize_observer(self, columns, rows):
+        self.resize(columns, rows)
+        deadline = time.monotonic() + 5
+        # The observer's composer is on the last row (Jobs has a footer).
+        # Wait for the new geometry before F2/input can share a Resize batch.
+        while self.screen.buffer[rows - 1][columns - 1].data != "╯":
+            self.drain(0.05)
+            if self.child.poll() is not None or time.monotonic() >= deadline:
+                raise AssertionError("Observer did not repaint the resized viewport")
+
     def readability_sizes(self, evidence, phase, status, result=None):
         for cols, rows in [(80, 24), (120, 35), (180, 45)]:
-            self.resize(cols, rows)
+            self.resize_jobs(cols, rows)
             self.expect("original job task")
             self.expect(status)
             self.expect("1 jobs")
@@ -78,7 +99,7 @@ class JobPtyProcess(PtyProcess):
                 if hidden in screen:
                     raise AssertionError(f"default leaked {hidden}: {screen}")
             self.screen_capture(evidence, f"{phase}-{cols}x{rows}")
-        self.resize(110, 35)
+        self.resize_jobs(110, 35)
         self.expect(status)
 
     def expect_absent(self, text, timeout=20):
@@ -221,6 +242,7 @@ context:
                 process = JobPtyProcess([BINARY, "--config", configs["client"]], env, home)
                 process.resize(110, 35)
                 process.expect("New session")
+                process.expect("No saved sessions yet")  # Backend/catalog ready, not just the first frame.
                 process.send("\x07")  # Jobs also works with no conversation open.
                 process.expect("Tasks")
                 time.sleep(5.2)  # Exercise the activity tick with no active tab.
@@ -252,21 +274,21 @@ context:
                 process.expect("Started · recent activity")
                 process.expect("original job task")
                 process.readability_sizes(evidence, "started", "Started · recent activity")
-                process.resize(80, 24)
+                process.resize_jobs(80, 24)
                 process.expect("Started · recent activity")
                 process.send("d")
                 process.expect("Session:")
                 process.expect("bafyr4i")
                 process.expect("Attempt:")
                 process.screen_capture(evidence, "started-details")
-                process.resize(40, 16)  # Force overflow of the real diagnostic fields.
+                process.resize_jobs(40, 16)  # Force overflow of the real diagnostic fields.
                 process.send("\x1b[F")  # End reads to the diagnostic tail, not the tree.
                 process.expect("Source:")
                 process.expect_absent("Session:")
                 process.screen_capture(evidence, "started-details-scrolled-40x16")
                 process.send("\x1b[H")
                 process.expect("Session:")
-                process.resize(80, 24)
+                process.resize_jobs(80, 24)
                 process.send("d")
                 process.expect("Task · Started · recent activity")
                 process.expect_absent("Session:")
@@ -298,7 +320,7 @@ context:
                                  "hub acquired ordinary session registration for the job")
                 process.screen_capture(evidence, "job-hub-reopened")
                 print("JOB HUB CONTRACT: PASS; authorized observer reopened without ordinary registration or model calls")
-                process.resize(80, 24)
+                process.resize_observer(80, 24)
                 process.expect("Started · recent activity")
                 process.screen_capture(evidence, "observer-started-80x24")
                 process.send("\x1bOQ")  # F2: observer diagnostics, not a typed job message.
@@ -340,13 +362,13 @@ context:
                 self.assertNotIn("continued job terminal", "\n".join(process.screen.display))
                 # Incorporated input lives in the transcript; receipts remain
                 # inspectable in details while the response is still blocked.
-                process.resize(110, 35)
+                process.resize_observer(110, 35)
                 process.send("\x1bOQ")
                 process.expect("Accepted · dispatch recorded")
                 process.expect("inclusion unconfirmed")
                 process.screen_capture(evidence, "observer-dispatch-details-110x35")
                 process.send("\x1bOQ")
-                process.resize(80, 24)
+                process.resize_observer(80, 24)
                 process.expect_absent("Observer details")
                 # Refresh/navigation/close while the continued resident call is blocked.
                 process.send("\x07r")  # overview and refresh
@@ -377,6 +399,7 @@ context:
                 process = JobPtyProcess([BINARY, "--config", configs["client"], "inspect-only"], env, home)
                 process.resize(110, 35)
                 process.expect("inspect-only")
+                process.expect("Ctrl+S settings")  # Prefill is visible before the session is ready.
                 process.send("\x07")
                 process.expect("Tasks")
                 process.expect("Context · not a job")
@@ -390,12 +413,12 @@ context:
                 process.send("\r")
                 process.expect("Job observer")
                 process.expect("continued job terminal")
-                process.resize(110, 35)
+                process.resize_observer(110, 35)
                 process.send("\x1bOQ")
                 process.expect("Included · call 1 returned")
                 process.screen_capture(evidence, "observer-included-details-110x35")
                 process.send("\x1bOQ")
-                process.resize(80, 24)
+                process.resize_observer(80, 24)
                 process.expect("continued job terminal")
                 process.screen_capture(evidence, "observer-completed-80x24")
                 process.send("must not reopen\r")

@@ -82,6 +82,18 @@ Bridges are transport-specific but the server is transport-agnostic. Adding a ne
 
 ### TUI backend boundary
 
+The terminal owner draws the first frame before starting the connector and
+runtime builder.
+An owned, supervised startup worker uses the connector capabilities and
+`BuildOptions`, including targeted service-client loading and the executor
+startup gate.
+A named launch resolves and hydrates its session in that worker; the UI holds
+only a local draft/loading label until a real database-backed tab is ready.
+It does not fabricate a session handle or submit the prefilled prompt.
+On exit, including terminal input/draw errors, restoration precedes joining
+construction and launch work; only the connection-read phase is cancellable.
+The initialized runtime then enters the existing reconnect-generation loop.
+
 The TUI's input routers and completion application are synchronous. They mutate
 `App`/`Tab`, enqueue accepted actions, or request presentation reads; storage
 awaits belong to owned workers. One bounded FIFO preserves accepted command and

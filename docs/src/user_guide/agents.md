@@ -357,7 +357,7 @@ schedules have no room binding. See the [migration walkthrough](matrix.md#migrat
 Routines are created two ways, both compiling to the same `Routine` rows fired by the one engine:
 
 - **Interactive** — `/schedule add|modify|remove|list` and the `schedule_add|modify|remove|list` / `schedule_once` tools (this section and [Tools](./tools.md)).
-- **Static config** — the `schedules:` block in the chaz config ([Configuration](./configuration.md)), translated into session-scoped routines at startup.
+- **Static config** — the `schedules:` block in the chaz config ([Configuration](./configuration.md)), imported as agent-owned schedules at executor startup.
 
 ### When rules fire
 

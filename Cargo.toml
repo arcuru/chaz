@@ -18,6 +18,7 @@ eidetica = { git = "https://github.com/arcuru/eidetica", rev = "548243300faafebd
 
 # Shared third-party deps.
 anyhow = "1"
+async-trait = "0.1"
 thiserror = "2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "process", "io-util", "time"] }
 tracing = "0.1"

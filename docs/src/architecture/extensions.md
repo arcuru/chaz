@@ -471,6 +471,18 @@ so it round-trips through eidetica.
 | `crates/lib/src/extensions/path_normalizer.rs`   | `tool_call` hook stripping trailing `/` from path args                                                                                                    |
 | `crates/lib/src/extensions/security_warnings.rs` | `tool_result` hook scanning for prompt-injection patterns                                                                                                 |
 
+## Non-executing frontends
+
+The shared server builder uses `ExtensionHub::install_commands` for a client
+role. It validates and registers the same extension manifests, but instantiates
+only global providers declaring `HookKind::Command`. It drains their commands
+through the usual attribution and reserved-name checks, not their tools, hooks
+or routine handlers. Runtime-only extensions remain in the catalog so clients
+can edit session activation/settings without loading an executor runtime.
+The memory and skills command providers do not require an embedder; embedding
+and web-search setup belong to the executor. Reconnect constructs a new hub
+under the same role, rather than upgrading a client hub to execution authority.
+
 ## Built-in extensions
 
 | Extension           | Scopes                 | Declared hooks    | Routine | What it provides                                                            |

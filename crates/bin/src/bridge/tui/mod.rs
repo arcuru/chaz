@@ -11,7 +11,7 @@
 //! - `view`  — ratatui rendering
 
 use chaz_core::backends::{BackendManager, ModelInfo};
-use chaz_core::bridge::{ApprovalExchange, Bridge};
+use chaz_core::bridge::ApprovalExchange;
 use chaz_core::commands::{self, Command, CommandContext, CommandOutcome, SessionInfo};
 use chaz_core::config::Config;
 use chaz_core::security::SecretStore;
@@ -40,9 +40,12 @@ mod bridge_impl;
 mod input;
 mod jobs;
 mod operations;
+#[cfg(test)]
+mod readiness_tests;
 mod reconnect;
 mod refresh;
 mod selection;
+mod startup;
 mod supervised;
 mod theme;
 #[cfg(test)]
@@ -53,46 +56,6 @@ mod widgets;
 pub struct TuiBridge {
     config: Config,
     secrets: SecretStore,
-    /// Optional text to pre-fill the composer with on launch, unsent. Mirrors
-    /// claude/pi: `chaz "hello"` opens a conversation with "hello" already in
-    /// the composer so the user can review and hit Enter. Without `session`,
-    /// launch creates one new conversation for it instead of showing the hub.
-    initial_prompt: Option<String>,
-    /// `--session NAME`: open that named session (creating it when absent)
-    /// instead of the hub.
-    session: Option<String>,
-    runtime: Option<(chaz_core::server::BuiltServer, std::path::PathBuf)>,
-}
-
-impl TuiBridge {
-    pub fn new(config: Config, secrets: SecretStore) -> Self {
-        Self {
-            config,
-            secrets,
-            initial_prompt: None,
-            session: None,
-            runtime: None,
-        }
-    }
-
-    pub fn with_runtime(
-        mut self,
-        runtime: chaz_core::server::BuiltServer,
-        path: std::path::PathBuf,
-    ) -> Self {
-        self.runtime = Some((runtime, path));
-        self
-    }
-
-    pub fn with_initial_prompt(mut self, prompt: String) -> Self {
-        self.initial_prompt = Some(prompt);
-        self
-    }
-
-    pub fn with_session(mut self, name: String) -> Self {
-        self.session = Some(name);
-        self
-    }
 }
 
 /// Approval routed from the server through a per-tab forwarder, tagged with
@@ -1675,6 +1638,10 @@ fn open_session_picker(
     if app.session_list_fresh {
         return;
     }
+    if app.operations.is_creating_session() {
+        app.session_catalog_loading = true;
+        return;
+    }
 
     // Retain the previous catalog while an explicit retry is pending.
     app.session_catalog_loading = true;
@@ -1695,7 +1662,14 @@ where
     let cancel = Arc::new(AtomicBool::new(false));
     let worker_cancel = cancel.clone();
     let task = supervised::Task(tokio::spawn(async move {
+        let started = std::time::Instant::now();
         let result = supervised::read(load).await;
+        tracing::info!(
+            generation,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            success = result.is_ok(),
+            "TUI session catalog completed"
+        );
         if !worker_cancel.load(Ordering::Relaxed) {
             let _ = tx.send(SessionLoad::Catalog { generation, result }).await;
         }
@@ -1783,6 +1757,9 @@ fn request_session_metadata(
     server: &Arc<Server>,
     session_rows_tx: &mpsc::Sender<SessionLoad>,
 ) {
+    if app.operations.is_creating_session() {
+        return;
+    }
     let requested = app.requested_session_indices();
     if requested.is_empty() {
         return;
@@ -2014,8 +1991,8 @@ fn handle_chat_action(
             app.should_quit = app.operations.request_exit();
         }
         ChatAction::Dispatch(cmd) => {
-            if matches!(cmd, Command::NewSession(_)) {
-                app.session_list_fresh = false;
+            if matches!(cmd, Command::NewSession(_)) && !operations::begin_creation(app) {
+                return;
             }
             let target = operations::Target::capture(app);
             let write = !operations::command_is_read(&cmd);
@@ -2090,6 +2067,9 @@ fn dispatch_picker_selection(
         return;
     }
     let cmd = if selected == "__new__" {
+        if !operations::begin_creation(app) {
+            return;
+        }
         Command::NewSession(None)
     } else {
         Command::SwitchSession(selected)

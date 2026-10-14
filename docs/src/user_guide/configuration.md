@@ -49,6 +49,14 @@ index and runs them; the client process remains an observer and never calls the
 model or tools. This local handoff does not mark the session as exposed on a
 Matrix or Discord login.
 
+Client startup loads the session registry, selected agent references, backend
+credentials and command providers. It does not initialize web-search or
+embedding credentials, tool handlers, MCP processes or YAML schedules.
+Backend credentials are still needed for the model picker's catalog requests;
+cached model-window metadata warms in the background. `/memory`, `/skills`
+and `/schedule` commands remain available, with their usual permissions and
+per-session activation. The executor runs the resulting agent work.
+
 Long-running service-mode daemons monitor the connection. A transient daemon
 restart tears down the old Chaz runtime before bounded-backoff reconnect,
 re-login, database reopen, hook installation, and persisted-state
@@ -190,7 +198,7 @@ mcp_servers:
 #       "filesystem.*": summary
 #       shell: full
 
-# Scheduled tasks — imported at startup as agent-owned schedules in the
+# Scheduled tasks — imported at executor startup as agent-owned schedules in the
 # owning agent's DB (Pinned to the resolved session), fired by the same
 # RoutineEngine as the /schedule command. Bootstrap YAML schedules are
 # cron-only; runtime /schedule commands and schedule tools also support
@@ -578,7 +586,7 @@ External tools via the Model Context Protocol. See [MCP External Tools](mcp.md) 
 
 ## Schedules
 
-Cron-driven agent wakes. Each entry is imported at startup as an **agent-owned schedule** (see [Agents — Schedules](agents.md#schedules)) in the owning agent's DB, Pinned to the resolved session. On fire, the owning agent's turn runs directly with `task` as the wake prompt — no `Directive` is written to the session. `agent:` names the owner (display name or DB id); omit it to use the peer's default agent. `session:` is referenced by name or eidetica DB root ID. Responses are delivered to every Matrix room attached to that session (see [Matrix: channel attachment](matrix.md#session-attachment)).
+Cron-driven agent wakes. Each entry is imported at executor startup as an **agent-owned schedule** (see [Agents — Schedules](agents.md#schedules)) in the owning agent's DB, Pinned to the resolved session. On fire, the owning agent's turn runs directly with `task` as the wake prompt — no `Directive` is written to the session. `agent:` names the owner (display name or DB id); omit it to use the peer's default agent. `session:` is referenced by name or eidetica DB root ID. Responses are delivered to every Matrix room attached to that session (see [Matrix: channel attachment](matrix.md#session-attachment)).
 
 Optional lifecycle bounds mirror the `schedule_add` tool: `max_fires:` (retire after N fires) and `expires_at:` (RFC 3339 instant after which it stops). Whichever is hit first retires the schedule; omit both for an unbounded cron. Example — wake hourly for a day then stop:
 
