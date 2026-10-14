@@ -179,6 +179,39 @@ impl SecretStore {
     }
 }
 
+/// Warn once for a loaded bridge config containing literal secrets and Unix
+/// group/other access bits. This is diagnostic only: never change permissions
+/// or resolve environment references. Metadata follows symlinks to the source
+/// file, while the warning names the path the operator supplied.
+/// Call once at config load, not on each credential resolution or reseed.
+/// On non-Unix platforms (or unavailable metadata), there is no mode check.
+pub fn warn_literal_secret_permissions<'a>(path: &Path, secrets: impl Iterator<Item = &'a str>) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut secrets = secrets;
+        let has_literal = secrets.any(|raw| {
+            let trimmed = raw.trim();
+            // Match resolve_env's $VAR and ${VAR} handling, including a bare
+            // dollar sign being a literal. Empty fields carry no secret.
+            !raw.is_empty() && (!trimmed.starts_with('$') || trimmed == "$")
+        });
+        if has_literal && let Ok(metadata) = std::fs::metadata(path) {
+            let mode = metadata.permissions().mode() & 0o7777;
+            if mode & 0o077 != 0 {
+                tracing::warn!(
+                    config = %path.display(),
+                    mode = %format_args!("{mode:04o}"),
+                    "Bridge config contains literal secrets and permits group/other access"
+                );
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = (path, secrets);
+}
+
 impl std::fmt::Debug for SecretStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let count = self.cache.read().map(|s| s.len()).unwrap_or(0);

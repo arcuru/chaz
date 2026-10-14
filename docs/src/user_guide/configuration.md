@@ -10,6 +10,10 @@ requires an explicit Eidetica connection, existing login, and execution role.
 `client` can observe, submit messages, approve requests, and use ordinary data
 commands without executing agent work.
 
+Debug output masks password-bearing connection URL userinfo and the values of
+`user`, `password`, and `sslpassword` query parameters. Other query parameters
+and fragments stay visible; the connection string used by Eidetica is unchanged.
+
 Direct ownership keeps Eidetica in this process:
 
 ```yaml

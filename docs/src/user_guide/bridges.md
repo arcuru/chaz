@@ -211,6 +211,47 @@ itself never has to hold a plaintext secret. The resolved credentials are sealed
 into the bridge's encrypted settings DB on first run and re-sealed (idempotently)
 on every boot, so editing the config and restarting is how you rotate them.
 
+## Literal secrets and file permissions
+
+| Config diagnostic                                                    | Behavior                                                                                                 |
+| -------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------- |
+| Literal `unlock_password`, Matrix `password`, or Discord `bot_token` | On Unix, warn once at bridge startup if the source file has any group/other read, write, or execute bit. |
+| `${ENV}` or `$ENV` reference; absent/empty credential                | Does not trigger the literal-secret warning.                                                             |
+| Symlink config                                                       | Check the target file's mode; log the supplied config path and octal mode.                               |
+
+The encrypted credential database does not protect secrets written literally
+in the YAML beside it.
+This warning is a reminder, not an access gate: the bridge never changes the
+file's permissions or refuses startup because of its mode.
+It logs no secret values or resolved environment contents, and credential
+resolution/reseeding does not repeat the warning.
+There is no Unix-mode check on other platforms or when metadata is unavailable.
+The diagnostic covers bridge-only secret fields, not every runtime key in the
+same file; a silent startup is not a complete security audit.
+
+For example, recover from a broadly accessible config:
+
+1. Start `chaz-matrix --config /etc/chaz/matrix-bridge.yaml` with a literal
+   password in a file of mode `0644`.
+   Startup emits one diagnostic even if several bridge fields are literal
+   (timestamp and log target omitted here):
+
+   ```text
+   WARN Bridge config contains literal secrets and permits group/other access config=/etc/chaz/matrix-bridge.yaml mode=0644
+   ```
+
+   Startup continues normally; ordinary connection or credential errors can
+   still fail it.
+
+2. Stop the bridge and either restrict the source file yourself
+   (`chmod 600 /etc/chaz/matrix-bridge.yaml`) or replace the literals with
+   `${ENV}` references and supply those variables in the bridge's environment.
+   For a symlink, restrict the target file, not the link's mode.
+3. Restart with the same command.
+   A `0600` literal config or `0644` config containing only env references
+   emits no literal-secret permission warning.
+   Keep the environment's secret source protected too.
+
 ## Setup
 
 This is the flow for a bridge running as its own Eidetica peer. A service
@@ -372,8 +413,8 @@ credential store and re-bootstraps access (a no-op once approved).
 
 The bridge's settings database is an eidetica `PasswordStore<DocStore>` —
 encrypted at rest and on the wire. Only ciphertext ever syncs; the
-`unlock_password` lives in the bridge's environment and never enters any synced
-database. A wrong password makes the store refuse to open (reads error rather
+`unlock_password` comes from the bridge's config or environment and never enters
+any synced database. A wrong password makes the store refuse to open (reads error rather
 than leaking plaintext), and losing it makes the stored credentials
 unrecoverable — re-seed from config. The daemon never holds the unlock password
 and never reads this database; it only ever sees the non-secret `LoginRef`
