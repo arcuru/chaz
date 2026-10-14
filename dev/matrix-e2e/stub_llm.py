@@ -10,6 +10,9 @@ reaches the room; normal finals remain local.
 
 To cover the ReAct loop, the stub branches on the request body:
 
+- The current user asks for twelve native tool rounds → validates matched
+  calculate call/result pairs and native definitions, then returns a distinct
+  final only after twelve real results.
 - The request carries a ``role: tool`` result → returns the fixed reply text.
 - A user message asks for a tool call → returns a ``tool_calls`` response,
   simulating the model deciding to call ``compact``.
@@ -38,6 +41,90 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 # Only the latest actual user message triggers a tool call; otherwise an
 # earlier ReAct prompt in the same room's context would trigger every turn.
 TOOL_CALL_TRIGGER = "react test"
+MULTI_ROUND_TRIGGER = "native tools twelve rounds"
+MULTI_ROUND_SUFFIX = " twelve-round-complete"
+
+
+def calculate_call(round_number):
+    return {
+        "id": f"call_stub_calculate_{round_number}",
+        "type": "function",
+        "function": {
+            "name": "calculate",
+            "arguments": json.dumps({"expression": f"{round_number} + 100"}),
+        },
+    }
+
+
+def multi_round_response(request, reply):
+    """Validate this turn's call/result prefix before advancing one round."""
+    # Memory recall adds a synthetic user message after the actual prompt,
+    # just as in the single-round scenario's _react_requested check.
+    messages = [
+        msg
+        for msg in request.get("messages", [])
+        if not (
+            msg.get("role") == "user"
+            and isinstance(msg.get("content"), str)
+            and msg["content"].startswith("## Relevant Memories")
+        )
+    ]
+    user_index = next(
+        (
+            i
+            for i in range(len(messages) - 1, -1, -1)
+            if messages[i].get("role") == "user"
+        ),
+        None,
+    )
+    if user_index is None or MULTI_ROUND_TRIGGER not in Handler._user_text(
+        [messages[user_index]]
+    ):
+        return None
+
+    # Historical results cannot advance this scenario. Each round uses distinct
+    # arguments so the runtime's repeated-call detector remains meaningful.
+    turn = messages[user_index + 1 :]
+    completed = 0
+    while turn:
+        round_number = completed + 1
+        call_id = f"call_stub_calculate_{round_number}"
+        call = calculate_call(round_number)
+        if len(turn) < 2 or turn[0].get("tool_calls") != [call]:
+            raise ValueError(f"round {round_number}: missing or mismatched call")
+        result = turn[1]
+        if (
+            result.get("role") != "tool"
+            or result.get("tool_call_id") != call_id
+            or result.get("content")
+            != (f'<tool_output tool="calculate">\n{round_number + 100}\n</tool_output>')
+        ):
+            raise ValueError(
+                f"round {round_number}: missing or incorrect calculate result"
+            )
+        completed += 1
+        turn = turn[2:]
+
+    if completed > 12:
+        raise ValueError("more than twelve tool rounds")
+    if not any(
+        tool.get("function", {}).get("name") == "calculate"
+        for tool in request.get("tools", [])
+    ):
+        raise ValueError(
+            f"after round {completed}: native calculate definition withdrawn"
+        )
+    sys.stderr.write(
+        f"stub_llm: twelve-round: validated {completed} results; calculate offered\n"
+    )
+    if completed == 12:
+        return {"role": "assistant", "content": reply + MULTI_ROUND_SUFFIX}
+    round_number = completed + 1
+    return {
+        "role": "assistant",
+        "content": None,
+        "tool_calls": [calculate_call(round_number)],
+    }
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -203,6 +290,24 @@ class Handler(BaseHTTPRequestHandler):
                             if isinstance(msg, dict) and msg.get("role") == "user"
                             and isinstance(msg.get("content"), str)
                             and not msg["content"].startswith("## Relevant Memories")), "")
+        try:
+            multi_round = multi_round_response(request, self.server.reply)
+        except ValueError as error:
+            sys.stderr.write(f"stub_llm: twelve-round: FAIL: {error}\n")
+            # Only disposable fixture traffic reaches this stub. Preserve the
+            # rejected request, not merely the symptom, before harness cleanup.
+            sys.stderr.write("stub_llm: twelve-round: rejected request: " + json.dumps(request) + "\n")
+            self._send({"error": str(error)}, status=400)
+            return
+        if multi_round is not None:
+            self._fixture_reply(
+                content=multi_round.get("content"),
+                name="calculate" if "tool_calls" in multi_round else None,
+                arguments=json.loads(multi_round["tool_calls"][0]["function"]["arguments"])
+                    if "tool_calls" in multi_round else None,
+                call_id=multi_round["tool_calls"][0]["id"] if "tool_calls" in multi_round else None,
+            )
+            return
         if self._schedule_fixture(messages, tools):
             return
         if "participation after restart" in latest_user:
@@ -243,6 +348,15 @@ class Handler(BaseHTTPRequestHandler):
                 "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
             })
         elif has_tool_result:
+            if self._react_requested(messages):
+                result = messages[-1]
+                if not (result.get("role") == "tool"
+                        and result.get("tool_call_id") == "call_stub_compact_1"
+                        and str(result.get("content", "")).startswith(
+                            '<tool_output tool="compact">\nContext compacted. Summary written')):
+                    self._send({"error": "current compact result missing"}, status=400)
+                    return
+                sys.stderr.write("stub_llm: compact: matched current result\n")
             sys.stderr.write(
                 "stub_llm: detected tool result in request, returning local final\n"
             )

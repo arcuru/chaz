@@ -34,9 +34,9 @@ kind and is active on the session.
 
 2. **Approval gate**: Checks the tool's `ApprovalRequirement` against the `SecurityContext`. If approval is needed, sends an `ApprovalExchange` over `SecurityContext.approval_callback` and blocks on the decision (`Approve`, `Deny`, `ApproveAll`); `ApproveAll` skips approval for the rest of the turn. What consumes that channel depends on the session: an interactive TUI prompts inline; a bridge-exposed session's daemon proxies the request over the session DB to the bridge (see [Dumb Transport Bridges → Tool approvals](../design/transport_bridges.md#tool-approvals-over-the-session-db)); a session with no approval channel **denies** (fail-closed).
 
-3. **`tool_call` extension hook**: Extensions can mutate the arguments or return `ToolCallDecision::Block { reason }` to short-circuit the call (e.g. `path_normalizer` strips trailing `/` from path args; `security_warnings` is `tool_result`-only).
+3. **`tool_call` extension hook**: Extensions can mutate the arguments or return `ToolCallDecision::Block { reason }` to short-circuit the call (e.g. `path_normalizer` strips trailing `/` from path args; `security_warnings` is `tool_result`-only). A decision-hook panic during construction or polling blocks the call and skips subsequent decision hooks, even if arguments were partially mutated.
 
-4. **Timeout + retry**: Execution runs under `tokio::time::timeout(policy.timeout)`. Network errors retry once after 500ms; `Timeout` is never retried (partial work may have succeeded).
+4. **Timeout, without automatic resubmission**: Execution runs once under `tokio::time::timeout(policy.timeout)`. Network failures and timeouts can follow completed effects, so they return tool errors rather than authorizing another invocation. MCP connection recovery does not replay a failed `tools/call`; explicit rejection of an expired HTTP session with 404 remains a separate one-shot recovery.
 
 5. **Leak detection**: Tool output is scanned against 12 secret regex patterns (`security/leak_detector.rs`). Detected secrets are redacted (`LeakPolicy::Redact`, default) or the call returns an error (`Block`).
 

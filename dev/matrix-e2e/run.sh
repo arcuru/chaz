@@ -20,13 +20,16 @@
 #
 # Usage:
 #   dev/matrix-e2e/run.sh [--keep] [--timeout SECONDS] [--verbose]
-#                         [--transport http|iroh]
+#                         [--transport http|iroh] [--legacy-max-iterations N]
 #
 #   --keep      leave the workspace in place and print its path
 #   --timeout   seconds to wait for the reply (default 120)
 #   --verbose   stream component logs to stderr as they are written
 #   --transport eidetica sync transport between the two peers (default http).
 #               `iroh` reaches public relay infrastructure — see above.
+#
+#   --legacy-max-iterations render the retired agent config key for regression
+#                          discrimination; current Chaz ignores it, not a cap.
 #
 # Requires `synapse_homeserver`, `register_new_matrix_user`, `curl`, `jq`, and
 # `python3` on PATH — `just e2e` supplies them. Binaries default to
@@ -38,6 +41,7 @@ KEEP=0
 VERBOSE=0
 REPLY_TIMEOUT=120
 TRANSPORT="http"
+LEGACY_MAX_ITERATIONS=""
 while [[ $# -gt 0 ]]; do
 	case "$1" in
 	--) ;; # `just` passes -- to separate its flags from ours; fall through to outer shift
@@ -56,6 +60,14 @@ while [[ $# -gt 0 ]]; do
 			echo "--timeout requires a whole number of seconds, got: $REPLY_TIMEOUT" >&2
 			exit 2
 		fi
+		shift
+		;;
+	--legacy-max-iterations)
+		[[ $# -ge 2 && $2 =~ ^[0-9]+$ ]] || {
+			echo "--legacy-max-iterations requires a whole number" >&2
+			exit 2
+		}
+		LEGACY_MAX_ITERATIONS="$2"
 		shift
 		;;
 	--transport)
@@ -97,12 +109,19 @@ for tool in synapse_homeserver register_new_matrix_user curl jq sqlite3 python3;
 	}
 done
 
+# Check the stub's rejection paths as well as the happy transport path.
+python3 "$HERE/test_stub_llm.py"
+
 WORKSPACE="$(mktemp -d -t chaz-matrix-e2e-XXXXXX)"
 PIDS=()
 
 log() { printf '\033[1;35m==>\033[0m %s\n' "$*" >&2; }
 fail() {
 	printf '\033[1;31mFAIL:\033[0m %s\n' "$*" >&2
+	# Preserve fixture rejection details even when default cleanup removes it.
+	if [[ -f $WORKSPACE/stub-llm.log ]]; then
+		grep -E '^stub_llm: twelve-round: (FAIL:|rejected request:)' "$WORKSPACE/stub-llm.log" >&2 || true
+	fi
 	exit 1
 }
 
@@ -164,7 +183,7 @@ wait_for() {
 # Must be backgrounded by the caller. It `exec`s, so the wrapper does not linger
 # as an extra process and `$!` names the command itself.
 with_pdeathsig() {
-	exec python3 -c '
+	HOME="$FIXTURE_HOME" exec python3 -c '
 import ctypes, os, signal, sys
 
 PR_SET_PDEATHSIG = 1
@@ -236,11 +255,12 @@ PUPPET_PASSWORD="$(head -c 18 /dev/urandom | base64)"
 STRANGER_PASSWORD="$(head -c 18 /dev/urandom | base64)"
 
 export XDG_CONFIG_HOME="$WORKSPACE/xdg-config"
-mkdir -p "$XDG_CONFIG_HOME"
+FIXTURE_HOME="$WORKSPACE/home"
+mkdir -p "$XDG_CONFIG_HOME" "$FIXTURE_HOME"
 
 log "workspace: $WORKSPACE"
 log "synapse :$SYNAPSE_PORT  stub-llm :$STUB_PORT  daemon-sync :$DAEMON_SYNC_PORT  bridge-sync :$BRIDGE_SYNC_PORT"
-log "transport: $TRANSPORT"
+log "transport: $TRANSPORT; legacy max_iterations: ${LEGACY_MAX_ITERATIONS:-absent} (ignored by current config)"
 
 # Both peers are direct Eidetica owners with explicit connector settings. In
 # http mode the bridge binds only loopback HTTP, so the run stays hermetic; in
@@ -385,6 +405,7 @@ backends:
 agents:
   - name: chaz
     model: "stub"
+${LEGACY_MAX_ITERATIONS:+    max_iterations: $LEGACY_MAX_ITERATIONS}
     system_prompt: |
       You are a test fixture.
 
@@ -431,11 +452,11 @@ BRIDGE_KEY="$("$CHAZ_MATRIX_BIN" --config "$BRIDGE_CONFIG" --print-pubkey 2>>"$W
 log "bridge key: $BRIDGE_KEY"
 
 log "pre-authorizing the bridge on the daemon"
-"$CHAZ_BIN" --config "$DAEMON_CONFIG" cmd "/agent invite chaz $BRIDGE_KEY write" \
+HOME="$FIXTURE_HOME" "$CHAZ_BIN" --config "$DAEMON_CONFIG" cmd "/agent invite chaz $BRIDGE_KEY write" \
 	>>"$WORKSPACE/bringup.log" 2>&1 || fail "/agent invite failed (see $WORKSPACE/bringup.log)"
 
 log "minting the access ticket"
-TICKET="$({ "$CHAZ_BIN" --config "$DAEMON_CONFIG" cmd '/agent share chaz' 2>>"$WORKSPACE/bringup.log" || true; } |
+TICKET="$({ HOME="$FIXTURE_HOME" "$CHAZ_BIN" --config "$DAEMON_CONFIG" cmd '/agent share chaz' 2>>"$WORKSPACE/bringup.log" || true; } |
 	grep -o 'eidetica:[^[:space:]]*' | head -1)"
 [[ -n $TICKET ]] || fail "/agent share produced no ticket (see $WORKSPACE/bringup.log)"
 
@@ -644,6 +665,19 @@ completed_attempts() {
      from store_state_namespaces n join store_state_records r on n.namespace_id=r.namespace_id
      where n.database_id='$DM_SESSION_ID' and n.store_name='turn_attempts'
      and json_extract(cast(r.record_value as text),'\$.status')='Completed'"
+}
+# Scope completion to the exact request, not earlier replies or tool results.
+completed_request() {
+    sqlite3 -readonly "$WORKSPACE/state-daemon/eidetica.db" \
+    "select count(distinct a.record_key)
+     from store_state_namespaces en join store_state_records e on en.namespace_id=e.namespace_id
+     join store_state_namespaces an on an.database_id=en.database_id
+     join store_state_records a on an.namespace_id=a.namespace_id
+     where en.database_id='$DM_SESSION_ID' and en.store_name='entries'
+     and an.store_name='turn_attempts'
+     and json_extract(cast(e.record_value as text),'\$.content')='$1'
+     and json_extract(cast(a.record_value as text),'\$.request_id')=cast(e.record_key as text)
+     and json_extract(cast(a.record_value as text),'\$.status')='Completed';" | grep -qx 1
 }
 first_dm_completed_on_bridge() { [[ "$(completed_attempts bridge)" -eq 1 ]]; }
 wait_for "first DM attempt completed and synced to the bridge" 60 first_dm_completed_on_bridge
@@ -1011,14 +1045,47 @@ TXN="e2e-$(date +%s%N)"
 mx PUT "/_matrix/client/v3/rooms/$(jq -rn --arg r "$ROOM_ID" '$r|@uri')/send/m.room.message/$TXN" \
 	"$PUPPET_TOKEN" "$(jq -nc '{msgtype:"m.text",body:"react test"}')" >/dev/null
 
-wait_for "ReAct tool result" "$REPLY_TIMEOUT" \
-	grep -q "detected tool result" "$WORKSPACE/stub-llm.log"
+wait_for "current ReAct compact result" "$REPLY_TIMEOUT" \
+	grep -q "stub_llm: compact: matched current result" "$WORKSPACE/stub-llm.log"
+# A prior send result is not evidence for this turn, and a model reply can
+# precede its terminal transaction. Do not enqueue the next fixture early.
+wait_for "ReAct compact attempt completed" 60 completed_request "react test"
 # A ReAct tool result ends with a local final; it must not be delivered to Matrix.
 if replies_at_least 6 >/dev/null; then
     fail "ReAct local final leaked to the Matrix room"
 fi
 
 printf '\033[1;32mPASS\033[0m — ReAct case passed (tool-call cycle completed)\n' >&2
+
+# --------------------------------------------------- twelve-round ReAct case ---
+# Reuse the direct room after the compact case: its historical tool result must
+# not count as a result for this new turn. A distinct terminal reply cannot be
+# satisfied by any earlier canned reply or a premature no-tools summary.
+log "Twelve-round ReAct case: requesting twelve native calculate calls"
+TXN="e2e-$(date +%s%N)"
+mx PUT "/_matrix/client/v3/rooms/$(jq -rn --arg r "$ROOM_ID" '$r|@uri')/send/m.room.message/$TXN" \
+	"$PUPPET_TOKEN" "$(jq -nc '{msgtype:"m.text",body:"native tools twelve rounds"}')" >/dev/null
+
+MULTI_ROUND_MARKER="$MARKER twelve-round-complete"
+multi_round_reply_arrived() {
+	mx GET "/_matrix/client/v3/rooms/$(jq -rn --arg r "$ROOM_ID" '$r|@uri')/messages?dir=b&limit=200" \
+		"$PUPPET_TOKEN" |
+		jq -e --arg a "$AGENT_MXID" --arg m "$MULTI_ROUND_MARKER" \
+			'[.chunk[] | select(.type == "m.room.message" and .sender == $a and .content.body == $m)] | length == 1'
+}
+wait_for "twelve-round terminal reply" "$REPLY_TIMEOUT" multi_round_reply_arrived
+for round in $(seq 0 12); do
+	grep -qF "stub_llm: twelve-round: validated $round results; calculate offered" "$WORKSPACE/stub-llm.log" ||
+		fail "twelve-round case did not validate round $round with native tools still offered"
+done
+if grep -F "stub_llm: twelve-round: FAIL:" "$WORKSPACE/stub-llm.log" >&2; then
+	fail "twelve-round stub rejected call/result history or withdrawn tools"
+fi
+wait_for "twelve-round durable completion" 60 completed_request "native tools twelve rounds"
+# Retain the exact downstream delivery assertion for later verification.
+mx GET "/_matrix/client/v3/rooms/$(jq -rn --arg r "$ROOM_ID" '$r|@uri')/messages?dir=b&limit=200" \
+    "$PUPPET_TOKEN" >"$WORKSPACE/twelve-round-matrix.json"
+printf '\033[1;32mPASS\033[0m — twelve-round ReAct: all 12 real results matched, native tools stayed offered, terminal reply crossed Matrix\n' >&2
 
 # ------------------------------------------------------ encrypted cases ---
 # An encrypted DM driven by e2ee_probe, a real Olm/Megolm client. The puppet's
@@ -1257,7 +1324,7 @@ mx PUT "/_matrix/client/v3/rooms/$ROOM_URI/send/m.room.message/$TXN" \
     "$PUPPET_TOKEN" "$(jq -nc --arg b "$REJOIN_PROMPT" '{msgtype:"m.text",body:$b}')" >/dev/null
 wait_for "rejoin prompt to reach the model" "$REPLY_TIMEOUT" \
     grep -qF "$REJOIN_PROMPT" "$WORKSPACE/stub-llm.log"
-wait_for "sixth explicit send after rejoin" "$REPLY_TIMEOUT" replies_at_least 6
+wait_for "seventh DM reply after rejoin" "$REPLY_TIMEOUT" replies_at_least 7
 [[ "$(stub_requests)" -eq $((TURNS_BEFORE_REJOIN + 1)) ]] ||
     fail "rejoin history triggered a model turn"
 REJOIN_CONTEXT="$(grep '^stub_llm: turn:' "$WORKSPACE/stub-llm.log" | grep -F "$REJOIN_PROMPT")"
@@ -1268,12 +1335,12 @@ REJOIN_CONTEXT="$(grep '^stub_llm: turn:' "$WORKSPACE/stub-llm.log" | grep -F "$
 DM_OUTBOUND="$(mx GET "/_matrix/client/v3/rooms/$ROOM_URI/messages?dir=b&limit=200" \
     "$PUPPET_TOKEN" | jq --arg a "$AGENT_MXID" --arg m "$MARKER" \
     '[.chunk[] | select(.type == "m.room.message" and .sender == $a) | select(.content.body // "" | contains($m))] | length')"
-[[ "$DM_OUTBOUND" == 6 ]] || fail "expected six explicit Matrix sends across the DM lifecycle; found $DM_OUTBOUND"
+[[ "$DM_OUTBOUND" == 7 ]] || fail "expected six explicit sends and one twelve-round final across the DM lifecycle; found $DM_OUTBOUND"
 
 # The first completion was preserved on the bridge before copied-state
-# recovery. Require all seven attempts in the daemon's room-scoped projection.
-seven_completed_attempts() { [[ "$(completed_attempts)" -ge 7 ]]; }
-wait_for "seven durable completed DM attempts" 60 seven_completed_attempts
+# recovery. Require all eight attempts in the daemon's room-scoped projection.
+eight_completed_attempts() { [[ "$(completed_attempts)" -ge 8 ]]; }
+wait_for "eight durable completed DM attempts" 60 eight_completed_attempts
 COMPLETED="$(completed_attempts)"
 printf '\033[1;32mPASS\033[0m — rejoin and durable delivery: %s DM sends, %s completed attempts\n' \
     "$DM_OUTBOUND" "$COMPLETED" >&2

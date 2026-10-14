@@ -21,21 +21,21 @@ trait Tool: Send + Sync {
 
 ## ToolError
 
-Tool execution failures are classified by a typed `ToolError` enum so the runtime can make retry/re-prompt decisions:
+Tool execution failures are classified by a typed `ToolError` enum for the result returned to the model:
 
 <!-- Code block ignored: enum definition for illustration -->
 
 ```rust,ignore
 enum ToolError {
-    Timeout { secs: u64 },       // retryable; runtime-enforced timeout fired
+    Timeout { secs: u64 },       // timeout; work may have completed
     ApprovalDenied,              // user/gate rejected the call
-    Network(String),             // retryable; transport-level failure
+    Network(String),             // transport failure; effect may have completed
     InvalidArgument(String),     // LLM supplied bad input
     Execution(String),           // generic operation failure
 }
 ```
 
-`From<String>` and `From<&str>` are implemented so tools that produce untyped errors (e.g. via `?` on helpers returning `Result<_, String>`) auto-convert to `Execution`. `ToolError::is_retryable()` returns true for `Timeout` and `Network`; the runtime retries `Network` errors once with a 500ms backoff (`Timeout` is deliberately NOT retried because the partial work may have succeeded). The built-in MCP wrapper classifies transport-origin errors (HTTP connection failures, subprocess pipe breakage) as `Network`; `web_fetch` does the same for reqwest send/body failures.
+`From<String>` and `From<&str>` are implemented so tools that produce untyped errors (e.g. via `?` on helpers returning `Result<_, String>`) auto-convert to `Execution`. `ToolError::is_retryable()` returns true for `Timeout` and `Network`, meaning a later call might succeed, not that repeating the effect is safe. The runtime invokes each admitted tool once under its total policy timeout and surfaces failure without automatic resubmission. The built-in MCP wrapper classifies transport-origin errors (HTTP connection failures, subprocess pipe breakage) as `Network`; `web_fetch` does the same for reqwest send/body failures. MCP stdio recovery prepares the connection for later calls without resubmitting the failed call. Explicit HTTP 404 session rejection still reinitializes and retries once; MCP tool annotations do not grant retry permission.
 
 ## Tool Policy
 

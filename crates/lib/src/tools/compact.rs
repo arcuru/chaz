@@ -17,7 +17,7 @@ impl Tool for Compact {
     fn descriptor(&self) -> ToolDescriptor {
         ToolDescriptor {
             name: "compact".to_string(),
-            description: "Compact conversation history by writing a summary. Call this when the conversation is getting long to preserve context window space. Provide a thorough summary of the conversation so far — everything before this summary will be excluded from future context. Include key facts, decisions, ongoing tasks, and any state the agent needs to continue working.".to_string(),
+            description: "Compact conversation history by writing a summary. Call this when the conversation is getting long to preserve context window space. Provide a thorough summary of the conversation so far. Answered history before it is excluded from future context; the current request and still-queued requests remain visible. Include key facts, decisions, ongoing tasks, and any state the agent needs to continue working.".to_string(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {

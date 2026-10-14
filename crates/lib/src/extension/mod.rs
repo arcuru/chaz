@@ -11,13 +11,11 @@
 //! Modeled after pi's `ExtensionAPI` (TypeScript). Hot reload / WASM-loaded
 //! extensions are deliberately out of scope for v1 — see `extension_api_version`.
 //!
-//! Panic safety: hook handlers should not panic, but if one does the
-//! `ExtensionHub::fire_*` paths wrap each handler invocation in
-//! `FutureExt::catch_unwind`. A panic is logged with the offending
-//! extension's name and hook kind, and the firing loop continues with
-//! a per-hook default (empty injection list, `Continue`, untransformed
-//! tool result, etc.). A panic in handler `A` will not skip handler
-//! `B` or tear down the agent turn.
+//! Panic safety: notification hook polling panics are logged and use a
+//! per-hook default (empty injection list, untransformed tool result, etc.).
+//! A `tool_call` decision hook panic, during construction or polling, instead
+//! blocks that call and skips subsequent decision hooks. It cannot authorize
+//! execution with partially mutated arguments or tear down the agent turn.
 
 pub mod agent_state;
 pub mod caps;
@@ -1505,9 +1503,8 @@ impl ExtensionHub {
     // The active set is computed from the session's `extensions` event log
     // and cached on `Server`; see `Server::active_extensions`.
     //
-    // Each handler invocation is wrapped in `FutureExt::catch_unwind`.
-    // A panicking handler is logged via `log_hook_panic` and the firing
-    // loop continues with a per-hook default.
+    // Notification hook polling panics use a per-hook default. A failed
+    // tool_call decision blocks the call, including construction-time panic.
 
     /// Fire `before_agent_start` for every active handler. Each handler
     /// may append messages, which are flattened into a single vector
@@ -1528,7 +1525,7 @@ impl ExtensionHub {
     }
 
     /// Fire `tool_call` for every active handler. Args are mutated in
-    /// place. First `Block` short-circuits the rest.
+    /// place. First `Block` or panic short-circuits the rest.
     pub async fn fire_tool_call(
         &self,
         ctx: &HookContext,
@@ -1539,13 +1536,24 @@ impl ExtensionHub {
             if !ctx.active_extensions.contains(reg.owner) {
                 continue;
             }
-            let fut = AssertUnwindSafe(reg.hook.on_tool_call(ctx, tool_name, args));
+            // Construct inside the caught future so synchronous handler
+            // failures have the same blocked outcome as polling failures.
+            let fut = AssertUnwindSafe(async { reg.hook.on_tool_call(ctx, tool_name, args).await });
             match fut.catch_unwind().await {
                 Ok(ToolCallDecision::Continue) => {}
                 Ok(ToolCallDecision::Block { reason }) => {
                     return ToolCallDecision::Block { reason };
                 }
-                Err(_) => log_hook_panic(reg.owner, "tool_call"),
+                Err(_) => {
+                    warn!(
+                        extension = reg.owner,
+                        hook = "tool_call",
+                        "extension decision hook panicked; blocking tool call"
+                    );
+                    return ToolCallDecision::Block {
+                        reason: format!("Extension '{}' tool_call hook panicked", reg.owner),
+                    };
+                }
             }
         }
         ToolCallDecision::Continue

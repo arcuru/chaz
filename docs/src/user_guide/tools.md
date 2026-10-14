@@ -37,6 +37,53 @@ Every built-in is owned by an [extension](extensions.md); disabling an extension
 
 Built-in tools are grouped by extension. External tools from [MCP servers](mcp.md) plug in under the same policy layer and show up here too, namespaced as `<server>__<tool>` (matches the Anthropic Agent SDK / Claude Code `mcp__server__tool` convention so OpenAI-compatible providers, which reject dots in function names, accept them).
 
+## Errors do not undo effects
+
+A missing reply does not mean an operation failed to happen.
+A POST may have been accepted, or an MCP process may have written a file before dying.
+Chaz invokes each admitted tool once under its total policy timeout; it does not automatically repeat the call on network failure or timeout.
+The model still receives the error and can issue a new call, so this is not an exactly-once guarantee.
+Inspect the operation's state before asking it to repeat an effect.
+
+| Failure                                     | What happens                                                                                  |
+| ------------------------------------------- | --------------------------------------------------------------------------------------------- |
+| Network error or timeout                    | A tool error is recorded and returned; the runtime does not resubmit the call.                |
+| Active `tool_call` decision hook panics     | Execution is blocked, even after partial argument mutation; later decision hooks are skipped. |
+| MCP stdio process dies                      | Connection recovery prepares later calls without replaying the failed call.                   |
+| MCP HTTP rejects an issued session with 404 | Reinitialize and retry once; no-session 404 and lost send/body replies remain errors.         |
+
+Approval, grants, and MCP tool hints do not prove an effect is safe to repeat.
+Interrupted-turn recovery and the narrow checkpointed `job_wait` exception are unchanged; see [Durable turn recovery](../architecture/sessions.md#durable-turn-recovery).
+
+### Walkthrough: a committed write with a lost MCP reply
+
+This model-free regression uses a disposable local MCP process, not a live service:
+
+```bash
+nix run .#test -- -E 'test(mcp_stdio_process_death_is_not_replayed_by_either_layer)'
+```
+
+1. The mock `local__mutate` tool writes and flushes one effect, then exits before returning its reply.
+   The first call returns this tool-result text (before XML wrapping):
+
+   ```text
+   Tool error: network error: MCP server 'local' closed stdout
+   ```
+
+   There is one effect, not two; reconnecting has not repeated the write.
+
+2. Inspect the destination or the service's operation log before repeating a real mutation.
+   If the effect already exists, keep it and do not ask the model to run it again.
+   The failed result stays in history rather than being presented as a success.
+3. A new, separately issued call can use the recovered connection.
+   The regression issues that second call and receives:
+
+   ```text
+   ok
+   ```
+
+   It now has two effects because two calls were issued, not because the first was retried.
+
 ## Your runtime-local view
 
 The builtin `chaz` tool is a read-only mirror of the calling runtime, not a peer-wide catalog.
@@ -265,7 +312,16 @@ Returns the full description and JSON Schema for any registered tool. Useful whe
 
 ### compact
 
-Summarizes the conversation history via an LLM call and writes a `Summary` entry. The context builder treats the most recent Summary as the conversation start boundary, including for earlier tool calls.
+Writes the agent-provided summary as a `Summary` entry. The context builder treats the most recent Summary as the conversation start boundary, including for earlier tool calls.
+
+A summary covers only work that has already run. Requests that have not been answered yet stay visible after the boundary: the request a turn is answering (including a `/retry` target) and any request still queued. Answered requests stay compacted. An interrupted request also stays behind the boundary until you retry it. `/compact` follows the same rule. See [Compaction](../architecture/sessions.md#compaction).
+
+Walkthrough: a request queued behind a compacting turn.
+
+1. You send `REQUEST-1`. While the agent is working on it, you send `REQUEST-2`, which waits in the queue.
+2. The agent calls `compact` during `REQUEST-1` and then replies `FINAL-1`.
+3. The turn for `REQUEST-2` sees `summary | REQUEST-2 | FINAL-1`. `REQUEST-1` is covered by the summary, but `REQUEST-2` is not, because no turn has answered it yet.
+4. Failure and recovery: if the process stops after `compact` but before `FINAL-1`, `/interrupted` lists `REQUEST-1`. Later turns do not show it. `/retry <request_id>` makes it current again, so the retried turn sees `summary | REQUEST-1` rather than the summary alone.
 
 ### spawn_agent
 

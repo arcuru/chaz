@@ -314,6 +314,21 @@ its timestamp sorts before command completion. Successive compactions read the
 prior virtual boundary through the same snapshot-backed context path. No
 covered-entry list or parallel Chaz ancestry graph is stored.
 
+A summary describes only work that has already run, so neither boundary hides
+a request that has not been answered. When the executor builds context for a
+turn (`Session::turn_context_view_at`), it keeps two kinds of
+request row after the boundary, in session order: the request this turn
+answers, including an explicit `/retry` target, and any request with no
+attempt yet (queued). A snapshot-covered row of either kind is kept rather
+than dropped. A row before a positional `Summary` moves directly after it.
+Requests whose turn completed stay compacted. Interrupted requests also
+follow the boundary until a retry makes one current, so an abandoned request
+cannot pin itself into every later context. Agent replies and other non-request
+rows are never kept this way. Without this rule, a request written while an
+earlier turn called the `compact` tool reached its own turn as only
+`summary | previous reply`, and a request retried after its own turn
+compacted saw only the summary.
+
 ## Eidetica Sync
 
 Because each session is a standalone eidetica database, sessions can be synced between chaz instances. The `/share` command generates a `DatabaseTicket` URL, and `/sync` pulls a remote session. Eidetica handles the Merkle-CRDT synchronization protocol.

@@ -6,6 +6,9 @@ mod job_monitor_tests;
 #[path = "native_steering_tests.rs"]
 mod native_steering_tests;
 
+#[path = "compaction_tests.rs"]
+mod compaction_tests;
+
 use super::*;
 
 #[tokio::test]

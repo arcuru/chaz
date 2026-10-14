@@ -106,9 +106,11 @@ If a **stdio** MCP server process crashes (detected via IO errors when calling a
 - **Exponential backoff**: 1s, 2s, 4s, 8s, 16s between attempts
 - **Max attempts**: 5 consecutive restarts before giving up
 - **Counter reset**: The restart counter resets to zero after a successful tool call
-- **Re-initialization**: After restart, the MCP handshake and tool discovery are repeated
+- **Re-initialization**: After restart, the MCP handshake is repeated
 
-This means transient subprocess crashes are handled transparently — the tool call that triggered the restart is retried after a successful restart. HTTP transport has no equivalent — chaz just surfaces the error to the caller.
+Recovery prepares the connection for a later call; it does **not** repeat the failed `tools/call`. The original error reaches the model even if recovery fails. HTTP send/body failures also surface without resubmission. A 404 rejecting an issued HTTP session is different: chaz reinitializes and retries once because the server rejected the request before running it. A 404 without an issued session is an ordinary error.
+
+Neither approval nor `readOnlyHint`/`idempotentHint` authorizes replay after a lost tool reply. See [Errors do not undo effects](tools.md#errors-do-not-undo-effects) before repeating an operation.
 
 Both transports honour the spec's `notifications/tools/list_changed`: when a server signals its tool set has changed, chaz lazily re-fetches `tools/list` before the next call. There's no need to restart chaz to pick up new tools.
 
