@@ -242,7 +242,7 @@ Replace exact text in a file. The tool validates that each `old_text` appears **
 
 ### web_fetch
 
-Performs HTTP requests. Subject to network policy (endpoint allowlisting, SSRF protection).
+Performs HTTP requests. Subject to network policy (endpoint allowlisting, SSRF protection). Redirects are not followed: a 3xx response reports its `Location` URL, and fetching that URL is a new request checked against the grant (see [Redirects are never followed](security.md#redirects-are-never-followed)).
 
 ```json
 {"url": "https://api.example.com/data", "method": "GET"}

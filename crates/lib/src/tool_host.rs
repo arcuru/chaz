@@ -130,7 +130,8 @@ pub trait ToolHost: Send + Sync {
 ///
 /// - **Shell**: allowlist/denylist from [`ShellGrant`]
 /// - **Network**: endpoint patterns, method restrictions, private-IP
-///   blocking from [`NetworkGrant`]
+///   blocking from [`NetworkGrant`]. Redirects are never followed; a 3xx
+///   response is returned as-is with its `Location` header.
 /// - **Filesystem**: read/write path restrictions from [`FsGrant`]
 ///
 /// No sandboxing beyond grant checks — the tool has full access to
@@ -405,8 +406,14 @@ async fn exec_http(
 
     tracing::info!(%method, %url, "HTTP request via NativeToolHost");
 
+    // Never follow redirects: the grant was checked against `url` only, and a
+    // 3xx `Location` may name a path, host, or private address the grant does
+    // not cover. The 3xx status and its `Location` header are returned to the
+    // caller; a follow-up request is a new capability request and passes the
+    // grant check like any other.
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|e| ToolError::Execution(format!("Failed to create HTTP client: {e}")))?;
 
@@ -677,6 +684,143 @@ mod tests {
         };
         let p = build_network_policy(Some(&grant));
         assert!(p.check("http://127.0.0.1/", "GET").is_ok());
+    }
+
+    // ── Redirect containment (live loopback listeners) ──
+
+    type Requests = std::sync::Arc<std::sync::Mutex<Vec<String>>>;
+
+    /// Disposable HTTP/1.1 listener on 127.0.0.1. Records every request line
+    /// it receives and answers each with `respond(path)` (status, extra headers).
+    async fn listener(
+        respond: impl Fn(&str) -> (u16, Vec<(&'static str, String)>) + Send + Sync + 'static,
+    ) -> (std::net::SocketAddr, Requests) {
+        let respond = std::sync::Arc::new(respond);
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let sock = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = sock.local_addr().unwrap();
+        let seen: Requests = Default::default();
+        let log = seen.clone();
+        tokio::spawn(async move {
+            while let Ok((mut conn, _)) = sock.accept().await {
+                let log = log.clone();
+                let respond = respond.clone();
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 1024];
+                    while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match conn.read(&mut chunk).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                        }
+                    }
+                    let head = String::from_utf8_lossy(&buf);
+                    let line = head.lines().next().unwrap_or("").to_string();
+                    let path = line.split_whitespace().nth(1).unwrap_or("").to_string();
+                    log.lock().unwrap().push(line);
+                    let (status, headers) = respond(&path);
+                    let mut resp = format!(
+                        "HTTP/1.1 {status} X\r\nContent-Length: 4\r\nConnection: close\r\n"
+                    );
+                    for (k, v) in headers {
+                        resp.push_str(&format!("{k}: {v}\r\n"));
+                    }
+                    resp.push_str("\r\nbody");
+                    let _ = conn.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+        (addr, seen)
+    }
+
+    fn loopback_grant(path_prefix: &str) -> Grants {
+        Grants {
+            network: Some(NetworkGrant {
+                endpoints: Allowlist::Only(vec![EndpointPattern {
+                    host: "127.0.0.1".into(),
+                    path_prefix: Some(path_prefix.into()),
+                    methods: None,
+                }]),
+                allow_private: true,
+            }),
+            ..Grants::default()
+        }
+    }
+
+    async fn get(url: String, grants: &Grants) -> Result<CapabilityResult, ToolError> {
+        NativeToolHost::new()
+            .request(
+                &Capability::HttpRequest {
+                    url,
+                    method: "GET".into(),
+                    headers: HashMap::new(),
+                    body: None,
+                },
+                grants,
+            )
+            .await
+    }
+
+    fn http(result: Result<CapabilityResult, ToolError>) -> HttpResponse {
+        match result {
+            Ok(CapabilityResult::HttpResponse(r)) => r,
+            other => panic!("expected HTTP response, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_http_authorized_request_returns_response() {
+        let (addr, seen) = listener(|_| (200, vec![])).await;
+        let r = http(get(format!("http://{addr}/ok/a"), &loopback_grant("/ok")).await);
+        assert_eq!(r.status, 200);
+        assert_eq!(r.body, b"body");
+        assert_eq!(*seen.lock().unwrap(), vec!["GET /ok/a HTTP/1.1"]);
+    }
+
+    #[tokio::test]
+    async fn test_http_direct_denial_sends_nothing() {
+        let (addr, seen) = listener(|_| (200, vec![])).await;
+        let err = get(format!("http://{addr}/secret"), &loopback_grant("/ok"))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("Network policy denied"), "{err}");
+        assert!(seen.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_http_same_host_redirect_outside_path_is_not_followed() {
+        let (addr, seen) = listener(|path| match path {
+            "/ok" => (302, vec![("Location", "/secret".to_string())]),
+            _ => (200, vec![]),
+        })
+        .await;
+        let r = http(get(format!("http://{addr}/ok"), &loopback_grant("/ok")).await);
+        assert_eq!(r.status, 302);
+        assert_eq!(
+            r.headers.get("location").map(String::as_str),
+            Some("/secret")
+        );
+        // Give a (buggy) follow-up request time to land before asserting.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(*seen.lock().unwrap(), vec!["GET /ok HTTP/1.1"]);
+    }
+
+    #[tokio::test]
+    async fn test_http_cross_host_private_redirect_is_not_followed() {
+        // Forbidden target: a different host (`localhost`) that is outside the
+        // endpoint allowlist and is an internal hostname.
+        let (target, target_seen) = listener(|_| (200, vec![])).await;
+        let forbidden = format!("http://localhost:{}/admin", target.port());
+        assert!(get(forbidden.clone(), &loopback_grant("/")).await.is_err());
+
+        let location = forbidden.clone();
+        let (addr, seen) = listener(move |_| (301, vec![("Location", location.clone())])).await;
+        let r = http(get(format!("http://{addr}/go"), &loopback_grant("/")).await);
+        assert_eq!(r.status, 301);
+        assert_eq!(r.headers.get("location"), Some(&forbidden));
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(*seen.lock().unwrap(), vec!["GET /go HTTP/1.1"]);
+        assert!(target_seen.lock().unwrap().is_empty());
     }
 
     // ── NativeToolHost name ──

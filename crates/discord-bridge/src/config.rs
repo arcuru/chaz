@@ -6,7 +6,7 @@
 //! `${ENV}` reference (or literal, or left to the `DISCORD_TOKEN` env var) and
 //! resolved via
 //! [`SecretStore::resolve_env`](chaz_core::security::SecretStore::resolve_env)
-//! at seed time, so the file never carries a plaintext secret.
+//! at seed time. Literal secrets in broadly accessible files warn at startup.
 //!
 //! [`DiscordBridgeConfig::seed_into`] resolves every login and writes its
 //! [`DiscordCredentials`] into the bridge settings DB; it's idempotent, so the
@@ -138,6 +138,18 @@ impl DiscordLoginConfig {
 }
 
 impl DiscordBridgeConfig {
+    /// Emit at most one permission warning for this file at startup.
+    pub fn warn_literal_secret_permissions(&self, path: &std::path::Path) {
+        chaz_core::security::secrets::warn_literal_secret_permissions(
+            path,
+            std::iter::once(self.unlock_password.as_str()).chain(
+                self.logins
+                    .iter()
+                    .filter_map(|entry| entry.bot_token.as_deref()),
+            ),
+        );
+    }
+
     /// Resolve the settings-DB unlock password (expanding a `${ENV}` ref).
     pub fn resolve_unlock_password(&self) -> anyhow::Result<String> {
         SecretStore::resolve_env(&self.unlock_password).map_err(|e| anyhow::anyhow!(e))
@@ -176,6 +188,74 @@ logins:
     allowed_users: [123, 456]
 "#
         )
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn literal_secret_permission_warning() {
+        use std::os::unix::fs::PermissionsExt;
+
+        for (mode, unlock, token, warnings) in [
+            (0o644, "fixture-unlock", Some("fixture-token"), 1),
+            (0o600, "fixture-unlock", Some("fixture-token"), 0),
+            (0o644, "${MISSING_UNLOCK}", Some("${MISSING_TOKEN}"), 0),
+            (0o644, "$MISSING_UNLOCK", Some("$MISSING_TOKEN"), 0),
+            (0o644, "${PATH}", Some("$PATH"), 0),
+            (0o644, "${MISSING_UNLOCK}", Some("fixture-token"), 1),
+            (0o644, "fixture-unlock", None, 1),
+            (0o644, "${MISSING_UNLOCK}", None, 0),
+            (0o644, "${MISSING_UNLOCK}", Some(""), 0),
+        ] {
+            let config_file = tempfile::NamedTempFile::new().unwrap();
+            let path = config_file.path();
+            let mut yaml =
+                sample_with("MISSING_UNLOCK", "MISSING_TOKEN").replace("${MISSING_UNLOCK}", unlock);
+            if let Some(token) = token {
+                yaml = yaml.replace("${MISSING_TOKEN}", &format!("\"{token}\""));
+            } else {
+                yaml = yaml.replace("    bot_token: ${MISSING_TOKEN}\n", "");
+            }
+            std::fs::write(path, &yaml).unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+            let cfg: DiscordBridgeConfig =
+                serde_yaml::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+            let log = tempfile::NamedTempFile::new().unwrap();
+            let subscriber = tracing_subscriber::fmt()
+                .without_time()
+                .with_ansi(false)
+                .with_writer(log.reopen().unwrap())
+                .finish();
+            tracing::subscriber::with_default(subscriber, || {
+                cfg.warn_literal_secret_permissions(path);
+                cfg.warn_literal_secret_permissions(&path.with_extension("missing"));
+                for _ in 0..2 {
+                    let _ = cfg.resolve_unlock_password();
+                    if token.is_some_and(|token| !token.is_empty()) {
+                        let _ = cfg.logins[0].to_credentials();
+                    }
+                }
+            });
+            let output = std::fs::read_to_string(log.path()).unwrap();
+            assert_eq!(output.lines().count(), warnings, "{mode:04o}: {output}");
+            if warnings == 1 {
+                assert!(output.contains(&path.display().to_string()));
+                assert!(output.contains(&format!("mode={mode:04o}")));
+            }
+            for secret in [
+                "fixture-unlock",
+                "fixture-token",
+                "MISSING_UNLOCK",
+                "MISSING_TOKEN",
+            ] {
+                assert!(!output.contains(secret), "{output}");
+            }
+            assert!(!output.contains(&std::env::var("PATH").unwrap()));
+            assert_eq!(std::fs::read_to_string(path).unwrap(), yaml);
+            assert_eq!(
+                std::fs::metadata(path).unwrap().permissions().mode() & 0o7777,
+                mode
+            );
+        }
     }
 
     #[test]

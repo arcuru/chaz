@@ -5,7 +5,7 @@
 //! [`MatrixBridgeConfig`] is that file's shape. Secret fields are given as
 //! `${ENV}` references (or literals) and resolved via
 //! [`SecretStore::resolve_env`](chaz_core::security::SecretStore::resolve_env)
-//! at seed time, so the file never carries a plaintext password.
+//! at seed time. Literal secrets in broadly accessible files warn at startup.
 //!
 //! [`MatrixBridgeConfig::seed_into`] resolves every reference and writes each
 //! login's [`MatrixCredentials`] into the bridge settings DB; it's idempotent,
@@ -123,6 +123,15 @@ impl MatrixLoginConfig {
 }
 
 impl MatrixBridgeConfig {
+    /// Emit at most one permission warning for this file at startup.
+    pub fn warn_literal_secret_permissions(&self, path: &std::path::Path) {
+        chaz_core::security::secrets::warn_literal_secret_permissions(
+            path,
+            std::iter::once(self.unlock_password.as_str())
+                .chain(self.logins.iter().filter_map(|entry| entry.login.secret())),
+        );
+    }
+
     /// Resolve the settings-DB unlock password (expanding a `${ENV}` ref).
     pub fn resolve_unlock_password(&self) -> anyhow::Result<String> {
         SecretStore::resolve_env(&self.unlock_password).map_err(|e| anyhow::anyhow!(e))
@@ -182,6 +191,74 @@ logins:
     allow_list: "@patrick:example"
 "#
         )
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn literal_secret_permission_warning() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        for (mode, unlock, password, warnings) in [
+            (0o644, "fixture-unlock", "fixture-password", 1),
+            (0o600, "fixture-unlock", "fixture-password", 0),
+            (0o644, "${MISSING_UNLOCK}", "${MISSING_PASSWORD}", 0),
+            (0o644, " $MISSING_UNLOCK ", "$MISSING_PASSWORD", 0),
+            (0o644, "${PATH}", "$PATH", 0),
+            (0o644, "${MISSING_UNLOCK}", "fixture-password", 1),
+            (0o644, "fixture-unlock", "${MISSING_PASSWORD}", 1),
+            (0o610, "fixture-unlock", "${MISSING_PASSWORD}", 1),
+            (0o602, "fixture-unlock", "${MISSING_PASSWORD}", 1),
+            (0o601, "fixture-unlock", "${MISSING_PASSWORD}", 1),
+            (0o644, "$", "${MISSING_PASSWORD}", 1),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("bridge.yaml");
+            let yaml = sample_with("MISSING_UNLOCK", "MISSING_PASSWORD")
+                .replace("${MISSING_UNLOCK}", &format!("\"{unlock}\""))
+                .replace("${MISSING_PASSWORD}", &format!("\"{password}\""));
+            std::fs::write(&path, &yaml).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+            let cfg: MatrixBridgeConfig =
+                serde_yaml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            let source = dir.path().join("config-link.yaml");
+            symlink(&path, &source).unwrap();
+            let log = tempfile::NamedTempFile::new().unwrap();
+            let subscriber = tracing_subscriber::fmt()
+                .without_time()
+                .with_ansi(false)
+                .with_writer(log.reopen().unwrap())
+                .finish();
+            tracing::subscriber::with_default(subscriber, || {
+                cfg.warn_literal_secret_permissions(&source);
+                cfg.warn_literal_secret_permissions(&dir.path().join("missing.yaml"));
+                // Resolution is independent of the load-time warning. Even
+                // repeated secret use must not emit it again or leak values.
+                for _ in 0..2 {
+                    let _ = cfg.resolve_unlock_password();
+                    let _ = cfg.logins[0].to_credentials();
+                }
+            });
+            let output = std::fs::read_to_string(log.path()).unwrap();
+            assert_eq!(output.lines().count(), warnings, "{mode:04o}: {output}");
+            if warnings == 1 {
+                assert!(output.contains(&source.display().to_string()));
+                assert!(output.contains(&format!("mode={mode:04o}")));
+            }
+            for secret in [
+                "fixture-unlock",
+                "fixture-password",
+                "MISSING_UNLOCK",
+                "MISSING_PASSWORD",
+            ] {
+                assert!(!output.contains(secret), "{output}");
+            }
+            assert!(!output.contains(&std::env::var("PATH").unwrap()));
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), yaml);
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o7777,
+                mode
+            );
+        }
     }
 
     #[test]

@@ -867,6 +867,7 @@ dependencies = [
  "serde",
  "serde_yaml",
  "serenity",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",

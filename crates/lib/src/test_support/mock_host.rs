@@ -60,6 +60,15 @@ impl MockHost {
     }
 
     pub fn push_http(&self, status: u16, body: impl Into<Vec<u8>>) {
+        self.push_http_with_headers(status, Default::default(), body);
+    }
+
+    pub fn push_http_with_headers(
+        &self,
+        status: u16,
+        headers: std::collections::HashMap<String, String>,
+        body: impl Into<Vec<u8>>,
+    ) {
         self.state
             .lock()
             .unwrap()
@@ -67,7 +76,7 @@ impl MockHost {
             .push_back(Ok(CapabilityResult::HttpResponse(
                 crate::tool_host::HttpResponse {
                     status,
-                    headers: Default::default(),
+                    headers,
                     body: body.into(),
                 },
             )));

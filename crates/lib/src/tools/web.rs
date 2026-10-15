@@ -16,7 +16,9 @@ impl Tool for WebFetch {
         ToolDescriptor {
             name: "web_fetch".to_string(),
             description:
-                "Fetch a URL via HTTP and return the response body. Supports GET and POST methods."
+                "Fetch a URL via HTTP and return the response body. Supports GET and POST methods. \
+                 Redirects are not followed: a 3xx response reports its Location URL, which you \
+                 may fetch with a new call."
                     .to_string(),
             parameters: serde_json::json!({
                 "type": "object",
@@ -77,7 +79,7 @@ impl Tool for WebFetch {
                 .host()
                 .request(
                     &Capability::HttpRequest {
-                        url,
+                        url: url.clone(),
                         method,
                         headers: HashMap::new(),
                         body,
@@ -95,7 +97,13 @@ impl Tool for WebFetch {
                         "HTTP response received"
                     );
 
-                    let mut formatted = format!("[{}]\n{body}", response.status);
+                    let mut formatted = format!("[{}]\n", response.status);
+                    if let Some(location) = redirect_location(&url, &response) {
+                        formatted.push_str(&format!(
+                            "Location: {location}\n(redirect not followed; fetch the Location URL to continue)\n"
+                        ));
+                    }
+                    formatted.push_str(&body);
 
                     // Truncate very long responses
                     if formatted.len() > 50000 {
@@ -111,6 +119,27 @@ impl Tool for WebFetch {
             }
         })
     }
+}
+
+/// The `Location` target of a 3xx response, resolved against the request URL
+/// when relative. The host never follows redirects, so the model sees where the
+/// server pointed and may issue a new, separately authorized request.
+fn redirect_location(url: &str, response: &crate::tool_host::HttpResponse) -> Option<String> {
+    if !(300..400).contains(&response.status) {
+        return None;
+    }
+    let raw = response
+        .headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("location"))
+        .map(|(_, v)| v.as_str())
+        .filter(|v| !v.is_empty())?;
+    Some(
+        url::Url::parse(url)
+            .and_then(|base| base.join(raw))
+            .map(|u| u.to_string())
+            .unwrap_or_else(|_| raw.to_string()),
+    )
 }
 
 #[cfg(test)]
@@ -210,6 +239,45 @@ mod tests {
             .unwrap();
         assert!(out.starts_with("[418]"), "got: {out}");
         assert!(out.contains("i am a teapot"));
+    }
+
+    #[tokio::test]
+    async fn redirect_surfaces_resolved_location_without_following() {
+        let host = Arc::new(MockHost::new());
+        host.push_http_with_headers(
+            302,
+            [("location".to_string(), "/secret".to_string())].into(),
+            b"moved".to_vec(),
+        );
+        let (_i, c) = ctx_with(host.clone()).await;
+        let out = WebFetch
+            .execute(serde_json::json!({ "url": "http://h.test/ok/x" }), &c)
+            .await
+            .unwrap();
+        assert!(
+            out.starts_with("[302]\nLocation: http://h.test/secret\n"),
+            "got: {out}"
+        );
+        assert!(out.contains("redirect not followed"));
+        assert!(out.ends_with("moved"));
+        // Exactly one host request: the tool never issues the redirected one.
+        assert_eq!(host.recorded_calls().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn location_on_non_redirect_is_not_announced() {
+        let host = Arc::new(MockHost::new());
+        host.push_http_with_headers(
+            201,
+            [("location".to_string(), "/new".to_string())].into(),
+            b"created".to_vec(),
+        );
+        let (_i, c) = ctx_with(host).await;
+        let out = WebFetch
+            .execute(serde_json::json!({ "url": "http://h.test/" }), &c)
+            .await
+            .unwrap();
+        assert_eq!(out, "[201]\ncreated");
     }
 
     #[tokio::test]

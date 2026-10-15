@@ -77,6 +77,7 @@ async fn main() -> anyhow::Result<()> {
     // section (label, unlock_password, logins).
     let mut config: Config = serde_yaml::from_str(&contents)?;
     let bridge_cfg: DiscordBridgeConfig = serde_yaml::from_str(&contents)?;
+    bridge_cfg.warn_literal_secret_permissions(&config_path);
 
     // Warn about unrecognised YAML keys — the known set is the union of
     // Config + bridge fields, so the double-parse doesn't produce

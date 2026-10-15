@@ -117,6 +117,8 @@ pub enum ExecutionRole {
 pub struct EideticaConfig {
     /// Native Eidetica connection URL (`sqlite:`, `postgres:`, `memory:`, or
     /// `unix:`). Eidetica validates the scheme and compiled feature support.
+    /// Debug redacts password-bearing userinfo and `user`, `password`, and
+    /// `sslpassword` query values without changing the connection string.
     pub connection: String,
     /// Existing Eidetica user to log in as. Connecting never provisions it.
     pub login: EideticaLoginConfig,
@@ -143,14 +145,34 @@ fn redact_connection_url(connection: &str) -> String {
     let (authority, suffix) = rest.split_at(authority_end);
     // The last authority `@` handles raw password `@` without treating path,
     // query, or fragment characters as userinfo delimiters.
-    let Some((userinfo, endpoint)) = authority.rsplit_once('@') else {
-        return connection.to_string();
+    let redacted = match authority.rsplit_once('@') {
+        Some((userinfo, endpoint)) if userinfo.contains(':') => {
+            format!("{scheme}://<redacted>@{endpoint}{suffix}")
+        }
+        _ => connection.to_string(),
     };
-    if userinfo.contains(':') {
-        format!("{scheme}://<redacted>@{endpoint}{suffix}")
-    } else {
-        connection.to_string()
-    }
+    // Inspect only the query, not the fragment, and preserve non-credential
+    // parameters verbatim. SQLx decodes query keys before matching them.
+    let fragment_start = redacted.find('#').unwrap_or(redacted.len());
+    let (before_fragment, fragment) = redacted.split_at(fragment_start);
+    let Some((base, query)) = before_fragment.split_once('?') else {
+        return redacted;
+    };
+    let query = query
+        .split('&')
+        .map(|parameter| {
+            let credential = url::form_urlencoded::parse(parameter.as_bytes())
+                .any(|(key, _)| matches!(key.as_ref(), "password" | "sslpassword" | "user"));
+            if credential {
+                let key = parameter.split_once('=').map_or(parameter, |(key, _)| key);
+                format!("{key}=<redacted>")
+            } else {
+                parameter.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("&");
+    format!("{base}?{query}{fragment}")
 }
 
 /// Login credentials for an existing Eidetica user.
@@ -2145,6 +2167,44 @@ eidetica:
     }
 
     #[test]
+    fn connection_redaction_hides_query_credentials() {
+        for (connection, expected) in [
+            (
+                "postgres://host/db?password=secret",
+                "postgres://host/db?password=<redacted>",
+            ),
+            (
+                "postgres://u:p@ss@host/db?user=alice&password=secret&application_name=a@b#f@b",
+                "postgres://<redacted>@host/db?user=<redacted>&password=<redacted>&application_name=a@b#f@b",
+            ),
+            (
+                "postgres://host/db?pass%77ord=secret&password=second&sslpassword=third",
+                "postgres://host/db?pass%77ord=<redacted>&password=<redacted>&sslpassword=<redacted>",
+            ),
+            (
+                "postgres://host?user=alice&password=&password&application_name=a%40b&&sslmode=require",
+                "postgres://host?user=<redacted>&password=<redacted>&password=<redacted>&application_name=a%40b&&sslmode=require",
+            ),
+        ] {
+            let config = EideticaConfig {
+                connection: connection.into(),
+                login: EideticaLoginConfig {
+                    username: "chaz".into(),
+                    password: None,
+                    passwordless: true,
+                },
+                sync: None,
+            };
+            let rendered = format!("{config:?}");
+            assert!(
+                rendered.contains(&format!("connection: {expected:?}")),
+                "input: {connection}\noutput: {rendered}"
+            );
+            assert_eq!(config.connection, connection);
+        }
+    }
+
+    #[test]
     fn connection_redaction_preserves_no_password_urls() {
         for connection in [
             "memory://",
@@ -2155,6 +2215,8 @@ eidetica:
             "postgres://u@h:5432/d@b",
             "postgres://h:5432?application_name=a@b",
             "postgres://h:5432#f@b",
+            "postgres://h/db?application_name=a%40b&&sslmode=require#password=not-a-query",
+            "postgres://h/db#fragment?password=not-a-query",
             "sqlite:local.db",
         ] {
             assert_eq!(redact_connection_url(connection), connection);

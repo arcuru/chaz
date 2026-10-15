@@ -165,6 +165,20 @@ security:
 
 Private IP addresses (RFC 1918, loopback, link-local) are always blocked unless `allow_private: true`. Wildcard hosts (`"*.example.com"`) are supported.
 
+#### Redirects are never followed
+
+The grant is checked against the URL the tool asked for, so the host does not follow HTTP redirects: a server answering `302 Location: /admin` could otherwise steer an allowed request to a path, host, or private address the grant never covered. A 3xx response comes back as-is, and `web_fetch` reports where it points:
+
+```text
+[302]
+Location: https://api.example.com/admin
+(redirect not followed; fetch the Location URL to continue)
+```
+
+The agent can fetch that `Location` with a new `web_fetch` call, which is checked against the grant like any other request. Above, `/admin` is outside the `/v1` prefix and is denied.
+
+Grant checks look at the URL text, not the address the hostname resolves to. A public hostname whose DNS answer is a private address (DNS rebinding) is not caught by `allow_private: false`; that needs the sandboxed host's network boundary.
+
 > **Deprecated**: `security.allowed_endpoints` is a legacy field. It still works but is converted to a network grant at startup with a deprecation warning. Use `tool_policies.web_fetch.grants.network.endpoints` for new configs.
 
 ### Filesystem grants

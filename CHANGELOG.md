@@ -41,6 +41,11 @@ All notable changes to this project will be documented in this file.
 - Renamed `max_iterations` to `max_spawn_depth` in config, commands, and
   `spawn_worker`. The old config field is ignored, with no alias or migration;
   set `max_spawn_depth` explicitly to retain a non-default ceiling.
+- Tool HTTP requests (`web_fetch` and WASM tools) no longer follow redirects.
+  Following one bypassed the network grant: an allowed URL answering `302`
+  could send the request to a path, host, or private address the grant
+  denies. A 3xx response is now returned as-is; `web_fetch` reports its
+  `Location`, and fetching that URL is a new request checked against the grant.
 
 ## [0.3.0](https://github.com/arcuru/chaz/compare/v0.2.0...v0.3.0) - 2024-10-25
 
