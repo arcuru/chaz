@@ -6,7 +6,7 @@ name: "Deps: Hold Gate"
 
 on:
   pull_request:
-    branches: ["main"]
+    branches: ["main", "ci/cache-cost-trials-20261015"]
     types: [opened, synchronize, reopened, labeled, unlabeled]
   # Required checks must also report on a merge group or the queue stalls. The
   # gate passes there on its own: a merge group has no head_ref, so the
