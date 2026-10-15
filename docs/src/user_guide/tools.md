@@ -10,7 +10,7 @@ Every built-in is owned by an [extension](extensions.md); disabling an extension
 | ------------------- | ---------- | ------ | ------------------ | ---------------------------------------------------------------------- |
 | `get_time`          | `system`   | Low    | Never              | Returns the current UTC time                                           |
 | `calculate`         | `system`   | Low    | Never              | Evaluates math expressions (via meval)                                 |
-| `describe_tool`     | `system`   | Low    | Never              | Returns full description/schema for a tool (discovery)                 |
+| `describe_tool`     | `system`   | Low    | Never              | Returns a tool's description and parameter summary                     |
 | `chaz`              | `core`     | Low    | Never              | Query this runtime's session, identity, callable tools, or usage       |
 | `compact`           | `core`     | Low    | Never              | Summarize and compact conversation context                             |
 | `spawn_agent`       | `core`     | Medium | UnlessAutoApproved | Submits a durable Agent job and returns its DB handle immediately      |
@@ -110,7 +110,7 @@ Enums use their normal lowercase encodings: presentation is `full`, `brief`, `su
 `rate_limit` is the configured calls-per-minute limit or null, not remaining quota.
 `approval` reports the resolved requirement, not a guarantee that a future call will execute automatically.
 A Hidden tool is still callable and appears here as `hidden`; removing it from `allowed_tools` revokes access, while disabling its extension also removes it from this view.
-Use `describe_tool` (when permitted) for full descriptions and schemas.
+Use `describe_tool` (when permitted) for descriptions and parameter summaries.
 
 Usage periods are the current **UTC calendar** day, Monday-start week, or month, not rolling windows or local time.
 Entries exactly at the boundary are included.
@@ -304,10 +304,12 @@ Lists the memory banks this agent has been granted access to, with the permissio
 
 ### describe_tool
 
-Returns the full description and JSON Schema for any registered tool. Useful when tool profiles hide details (Brief or Summary mode) and the agent needs the full specification.
+Returns a tool's description and a text summary of its parameters, within the calling agent's tool scope. Useful when Brief or Summary profiles hide those details.
+
+Each parameter lists its type, required/optional marker, and description. Type alternatives appear in schema order, such as `integer | null` for `read_file`'s `offset` and `limit`. Missing, malformed, or unknown types appear as `any`. This is not the raw JSON Schema: constraints such as enums and nested properties are not listed separately.
 
 ```json
-{ "tool": "filesystem__read_file" }
+{ "name": "read_file" }
 ```
 
 ### compact
