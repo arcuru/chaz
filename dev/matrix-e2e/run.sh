@@ -1030,17 +1030,18 @@ wait_for "default address gate restored" 60 gate_dropped_more_than "$DROPS_BEFOR
 printf '\033[1;32mPASS\033[0m — opt-in group participation: terminal no_reply, ordinary final reply, explicit send without duplicate, authorization and off\n' >&2
 
 # -------------------------------------------------------- ReAct case ---
-# The stub answers a request whose user messages ask for a tool call with a
-# tool_calls response, and returns text only once a follow-up request carries
-# the result. If chaz's ReAct loop is broken — it doesn't process tool calls,
-# doesn't send results back, or hits an iteration limit — the stub never
-# returns the MARKER and this case times out.
+# The stub calls compact, validates its result, explicitly sends a room reply,
+# then returns a distinct local final after the send result. A compact-only
+# Matrix-origin turn would instead auto-post its final; compact is not a send.
+# Both real results and durable completion are required before the next turn.
 #
 # The trigger is the message body, not a request counter: a counter would hand
 # the tool call to the first turn of the run, which is the cold-boot case, and
 # leave this assertion matching a log line written before this case ran.
 
 log "ReAct case: sending message to trigger tool-call cycle"
+REACT_SEND_MARKER="$MARKER react-send"
+REACT_LOCAL_FINAL="$MARKER react-local-final"
 TXN="e2e-$(date +%s%N)"
 mx PUT "/_matrix/client/v3/rooms/$(jq -rn --arg r "$ROOM_ID" '$r|@uri')/send/m.room.message/$TXN" \
 	"$PUPPET_TOKEN" "$(jq -nc '{msgtype:"m.text",body:"react test"}')" >/dev/null
@@ -1050,12 +1051,16 @@ wait_for "current ReAct compact result" "$REPLY_TIMEOUT" \
 # A prior send result is not evidence for this turn, and a model reply can
 # precede its terminal transaction. Do not enqueue the next fixture early.
 wait_for "ReAct compact attempt completed" 60 completed_request "react test"
-# A ReAct tool result ends with a local final; it must not be delivered to Matrix.
-if replies_at_least 6 >/dev/null; then
-    fail "ReAct local final leaked to the Matrix room"
-fi
-
-printf '\033[1;32mPASS\033[0m — ReAct case passed (tool-call cycle completed)\n' >&2
+grep -q "stub_llm: ReAct: explicit send completed, returning local final" "$WORKSPACE/stub-llm.log" ||
+    fail "ReAct explicit send did not complete"
+[[ "$(sqlite3 -readonly "$WORKSPACE/state-daemon/eidetica.db" \
+    "select count(distinct r.record_key)
+     from store_state_namespaces n join store_state_records r on n.namespace_id=r.namespace_id
+     where n.database_id='$DM_SESSION_ID' and n.store_name='entries'
+     and json_extract(cast(r.record_value as text),'\$.entry_type')='Message'
+     and json_extract(cast(r.record_value as text),'\$.content')='$REACT_LOCAL_FINAL';")" == 1 ]] ||
+    fail "ReAct local final was not persisted locally"
+# Check room non-delivery only after the next turn's reply crosses the bridge.
 
 # --------------------------------------------------- twelve-round ReAct case ---
 # Reuse the direct room after the compact case: its historical tool result must
@@ -1085,6 +1090,17 @@ wait_for "twelve-round durable completion" 60 completed_request "native tools tw
 # Retain the exact downstream delivery assertion for later verification.
 mx GET "/_matrix/client/v3/rooms/$(jq -rn --arg r "$ROOM_ID" '$r|@uri')/messages?dir=b&limit=200" \
     "$PUPPET_TOKEN" >"$WORKSPACE/twelve-round-matrix.json"
+# This later reply is a causal delivery barrier in the same session/binding:
+# async sync cannot let a missing or delayed earlier post pass a negative check.
+jq -e --arg a "$AGENT_MXID" --arg m "$REACT_LOCAL_FINAL" \
+    '[.chunk[] | select(.type == "m.room.message" and .sender == $a and .content.body == $m)] | length == 0' \
+    "$WORKSPACE/twelve-round-matrix.json" >/dev/null ||
+    fail "ReAct local final leaked to the Matrix room"
+jq -e --arg a "$AGENT_MXID" --arg m "$REACT_SEND_MARKER" \
+    '[.chunk[] | select(.type == "m.room.message" and .sender == $a and .content.body == $m)] | length == 1' \
+    "$WORKSPACE/twelve-round-matrix.json" >/dev/null ||
+    fail "ReAct explicit send did not reach Matrix exactly once"
+printf '\033[1;32mPASS\033[0m — ReAct: compact and explicit send completed; distinct final persisted locally, never posted\n' >&2
 printf '\033[1;32mPASS\033[0m — twelve-round ReAct: all 12 real results matched, native tools stayed offered, terminal reply crossed Matrix\n' >&2
 
 # ------------------------------------------------------ encrypted cases ---
@@ -1324,7 +1340,7 @@ mx PUT "/_matrix/client/v3/rooms/$ROOM_URI/send/m.room.message/$TXN" \
     "$PUPPET_TOKEN" "$(jq -nc --arg b "$REJOIN_PROMPT" '{msgtype:"m.text",body:$b}')" >/dev/null
 wait_for "rejoin prompt to reach the model" "$REPLY_TIMEOUT" \
     grep -qF "$REJOIN_PROMPT" "$WORKSPACE/stub-llm.log"
-wait_for "seventh DM reply after rejoin" "$REPLY_TIMEOUT" replies_at_least 7
+wait_for "eighth DM reply after rejoin" "$REPLY_TIMEOUT" replies_at_least 8
 [[ "$(stub_requests)" -eq $((TURNS_BEFORE_REJOIN + 1)) ]] ||
     fail "rejoin history triggered a model turn"
 REJOIN_CONTEXT="$(grep '^stub_llm: turn:' "$WORKSPACE/stub-llm.log" | grep -F "$REJOIN_PROMPT")"
@@ -1335,7 +1351,7 @@ REJOIN_CONTEXT="$(grep '^stub_llm: turn:' "$WORKSPACE/stub-llm.log" | grep -F "$
 DM_OUTBOUND="$(mx GET "/_matrix/client/v3/rooms/$ROOM_URI/messages?dir=b&limit=200" \
     "$PUPPET_TOKEN" | jq --arg a "$AGENT_MXID" --arg m "$MARKER" \
     '[.chunk[] | select(.type == "m.room.message" and .sender == $a) | select(.content.body // "" | contains($m))] | length')"
-[[ "$DM_OUTBOUND" == 7 ]] || fail "expected six explicit sends and one twelve-round final across the DM lifecycle; found $DM_OUTBOUND"
+[[ "$DM_OUTBOUND" == 8 ]] || fail "expected seven explicit sends and one twelve-round final across the DM lifecycle; found $DM_OUTBOUND"
 
 # The first completion was preserved on the bridge before copied-state
 # recovery. Require all eight attempts in the daemon's room-scoped projection.

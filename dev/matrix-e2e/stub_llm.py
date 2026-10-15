@@ -5,8 +5,8 @@ The Matrix end-to-end test exercises transport: a message enters over Matrix,
 crosses into a session database, syncs to the agent peer, and a model-called Matrix send travels back the same way. A real model would add an API key, a network dependency, a
 per-run cost, and non-determinism to a test that asserts on none of that.
 
-The tool call is canned, and the assertion is that only this explicit send
-reaches the room; normal finals remain local.
+Tool calls are canned. Finals after an explicit send remain local;
+ordinary Matrix-origin finals without an explicit send are room replies.
 
 To cover the ReAct loop, the stub branches on the request body:
 
@@ -14,10 +14,10 @@ To cover the ReAct loop, the stub branches on the request body:
   calculate call/result pairs and native definitions, then returns a distinct
   final only after twelve real results.
 - The request carries a ``role: tool`` result → returns the fixed reply text.
-- A user message asks for a tool call → returns a ``tool_calls`` response,
-  simulating the model deciding to call ``compact``.
+- A user message asks for a tool call → calls ``compact``, then explicitly
+  sends a distinct Matrix reply before returning a local-only final.
 - Most initial turns → call ``matrix__send`` with the fixed marker.
-- A local-final test → return text only, with no Matrix post.
+- The ordinary-final test → return text only, for automatic Matrix delivery.
 
 Every request logs the user messages it was given, and the tool-result branch
 logs "detected tool result". Between them the harness can assert that the ReAct
@@ -59,7 +59,7 @@ def calculate_call(round_number):
 def multi_round_response(request, reply):
     """Validate this turn's call/result prefix before advancing one round."""
     # Memory recall adds a synthetic user message after the actual prompt,
-    # just as in the single-round scenario's _react_requested check.
+    # just as in the compact/send scenario's _react_requested check.
     messages = [
         msg
         for msg in request.get("messages", [])
@@ -350,13 +350,25 @@ class Handler(BaseHTTPRequestHandler):
         elif has_tool_result:
             if self._react_requested(messages):
                 result = messages[-1]
-                if not (result.get("role") == "tool"
+                if (result.get("role") == "tool"
                         and result.get("tool_call_id") == "call_stub_compact_1"
                         and str(result.get("content", "")).startswith(
                             '<tool_output tool="compact">\nContext compacted. Summary written')):
-                    self._send({"error": "current compact result missing"}, status=400)
-                    return
-                sys.stderr.write("stub_llm: compact: matched current result\n")
+                    sys.stderr.write("stub_llm: compact: matched current result\n")
+                    if "matrix__send" not in tools:
+                        self._send({"error": "matrix__send unavailable after compact"}, status=400)
+                        return
+                    self._fixture_reply(name="matrix__send", call_id="call_stub_react_send",
+                                        arguments={"body": self.server.reply + " react-send"})
+                elif (result.get("role") == "tool"
+                        and result.get("tool_call_id") == "call_stub_react_send"
+                        and str(result.get("content", "")).startswith(
+                            '<tool_output tool="matrix__send">\nMatrix send queued (')):
+                    sys.stderr.write("stub_llm: ReAct: explicit send completed, returning local final\n")
+                    self._fixture_reply(content=self.server.reply + " react-local-final")
+                else:
+                    self._send({"error": "current ReAct tool result missing or unsuccessful"}, status=400)
+                return
             sys.stderr.write(
                 "stub_llm: detected tool result in request, returning local final\n"
             )

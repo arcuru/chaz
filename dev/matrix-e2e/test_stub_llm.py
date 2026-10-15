@@ -81,9 +81,11 @@ class MultiRoundTests(unittest.TestCase):
             stub_llm.multi_round_response(request, "reply")
 
     def test_compact_barrier_rejects_history_and_denied_current_result(self):
-        def handle(messages):
+        def handle(messages, tools=None):
+            if tools is None:
+                tools = [{"type": "function", "function": {"name": "matrix__send"}}]
             handler = object.__new__(stub_llm.Handler)
-            body = json.dumps({"messages": messages, "tools": []}).encode()
+            body = json.dumps({"messages": messages, "tools": tools}).encode()
             handler.headers = {"Content-Length": str(len(body))}
             handler.rfile = io.BytesIO(body)
             handler.path = "/v1/chat/completions"
@@ -108,8 +110,28 @@ class MultiRoundTests(unittest.TestCase):
         self.assertNotIn("compact: matched current result", log)
         (response, status), log = handle(messages + [result])
         self.assertEqual(status, 200)
-        self.assertEqual(response["choices"][0]["message"]["content"], "reply")
+        send = response["choices"][0]["message"]
+        self.assertIsNone(send["content"])
+        self.assertEqual(send["tool_calls"][0], {
+            "id": "call_stub_react_send", "type": "function", "function": {
+                "name": "matrix__send", "arguments": json.dumps({"body": "reply react-send"}),
+            },
+        })
         self.assertIn("compact: matched current result", log)
+        (_, status), _ = handle(messages + [result], tools=[])
+        self.assertEqual(status, 400)
+
+        sent = {"role": "tool", "tool_call_id": "call_stub_react_send",
+                "content": '<tool_output tool="matrix__send">\nMatrix send queued (fixture-id); a separate bridge confirms delivery.\n</tool_output>'}
+        for rejected in [dict(sent, content="denied"), dict(sent, tool_call_id="old")]:
+            with self.subTest(result=rejected):
+                (_, status), log = handle(messages + [result, send, rejected])
+                self.assertEqual(status, 400)
+                self.assertNotIn("explicit send completed", log)
+        (response, status), log = handle(messages + [result, send, sent])
+        self.assertEqual(status, 200)
+        self.assertEqual(response["choices"][0]["message"]["content"], "reply react-local-final")
+        self.assertIn("explicit send completed, returning local final", log)
 
     def test_tools_withdrawn_after_ten_results_is_not_success(self):
         request = self.request()
