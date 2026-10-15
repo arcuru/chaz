@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import resource
+import signal
 import subprocess
 import sys
 import threading
@@ -77,7 +78,21 @@ def run(script):
     started = time.monotonic()
     try:
         # Match the original unspecified Linux shell, including errexit.
-        rc = subprocess.call(["bash", "-e", script])
+        with subprocess.Popen(["bash", "-e", script], start_new_session=True) as command:
+            def forward(signum, _frame):
+                # The runner signals the wrapper first. Let the whole command
+                # group run its existing traps before the runner's hard kill.
+                try:
+                    os.killpg(command.pid, signum)
+                except ProcessLookupError:
+                    pass
+
+            previous = {sig: signal.signal(sig, forward) for sig in (signal.SIGINT, signal.SIGTERM)}
+            try:
+                rc = command.wait()
+            finally:
+                for sig, handler in previous.items():
+                    signal.signal(sig, handler)
     finally:
         done.set()
         sampler.join(timeout=1)

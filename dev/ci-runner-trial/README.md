@@ -39,7 +39,9 @@ parallelism, skipped check, or disk cleanup to manufacture a fit. Matrix
 
 The trial shell invokes each original run script with `bash -e`, matching
 GitHub's unspecified Linux shell. It preserves exit status, including the
-harness's exit-2 diagnostic, and streams JSON lines prefixed `runner-trial`:
+harness's exit-2 diagnostic, and forwards cancellation signals to the command's
+process group so its cleanup traps can run. It streams JSON lines prefixed
+`runner-trial`:
 
 - Event head/base/merge identities, flake hashes, runner image, CPU count and attempt.
 - Filesystem available bytes/inodes, RAM/swap, per-CPU counters, load, network

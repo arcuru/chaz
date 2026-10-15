@@ -50,11 +50,16 @@ class WorkflowTests(unittest.TestCase):
     def test_original_commands_actions_deadlines_and_concurrency(self):
         self.assertEqual(self.ci["concurrency"], self.old["concurrency"])
         self.assertEqual(self.ci["permissions"], self.old["permissions"])
+        # No aggregate may hide an alternative runner's failure behind the control.
+        self.assertEqual(set(self.ci["jobs"]), set(self.old["jobs"]))
         for name, old in self.old["jobs"].items():
             job = self.ci["jobs"][name]
             self.assertEqual(job["timeout-minutes"], old["timeout-minutes"])
             self.assertEqual(job.get("if"), old.get("if"))
             self.assertNotIn("continue-on-error", job)
+            self.assertNotIn("needs", job)
+            self.assertEqual(job["runs-on"], "${{ matrix.runner }}")
+            self.assertEqual(set(job["strategy"]["matrix"]), {"runner"})
             self.assertNotIn("max-parallel", job["strategy"])
             self.assertEqual(job["strategy"]["fail-fast"], "false")
             current = {step["name"]: step for step in job["steps"]}
@@ -62,10 +67,18 @@ class WorkflowTests(unittest.TestCase):
                 actual = dict(current[step["name"]])
                 if step["name"] == "Cache E2E dependencies":
                     prefix = actual["with"].pop("prefix-key")
-                    self.assertIn("format('v0-rust-runner-trial-{0}', matrix.runner)", prefix)
-                    self.assertTrue(prefix.endswith("|| 'v0-rust' }}"))
+                    self.assertEqual(prefix, "${{ github.base_ref == '" + PARENT + "' && " +
+                                     "format('v0-rust-runner-trial-{0}', matrix.runner) || 'v0-rust' }}")
                 self.assertEqual(actual, step)
-            self.assertIn("|| 'bash -e {0}' }}", job["defaults"]["run"]["shell"])
+            self.assertEqual(job["defaults"]["run"]["shell"], "${{ github.base_ref == '" + PARENT +
+                             "' && 'python3 dev/ci-runner-trial/telemetry.py run {0}' || 'bash -e {0}' }}")
+            added = {"Validate runner trial", "Runner disk footprint (logs only)"}
+            self.assertEqual([step for step in current if step not in added],
+                             [step["name"] for step in old["steps"]])
+            footprint = current["Runner disk footprint (logs only)"]
+            self.assertEqual(footprint["if"], f"always() && github.base_ref == '{PARENT}'")
+            self.assertEqual(footprint["timeout-minutes"], "1")
+            self.assertEqual(footprint["continue-on-error"], "true")
             self.assertEqual(current["Validate runner trial"]["if"], f"github.base_ref == '{PARENT}'")
             self.assertNotIn("continue-on-error", current["Validate runner trial"])
 
