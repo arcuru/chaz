@@ -14,15 +14,26 @@ on:
     branches: ["main"]
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   push-cache:
     name: Push to cache
     environment: publish
     runs-on: ubicloud-standard-8
     timeout-minutes: 60
+    # A fork PR can also use a branch named main. Check the triggering event
+    # and source repository before checking out its SHA with publish secrets.
     if: |
       github.repository_owner == 'arcuru' &&
-      (github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success')
+      ((github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main') ||
+       (github.event_name == 'workflow_run' &&
+        github.event.workflow_run.conclusion == 'success' &&
+        github.event.workflow_run.head_branch == 'main' &&
+        (github.event.workflow_run.event == 'push' ||
+         github.event.workflow_run.event == 'workflow_dispatch') &&
+        github.event.workflow_run.head_repository.full_name == github.repository))
     permissions:
       contents: read
     env:
@@ -33,6 +44,7 @@ jobs:
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+          persist-credentials: false
 
       - name: Setup Nix
         uses: ./.github/actions/setup-nix
