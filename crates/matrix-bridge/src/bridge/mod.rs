@@ -380,7 +380,7 @@ async fn attach_typing_watcher(session_db: &eidetica::Database, room: Room) -> a
 fn is_transient_matrix_send_error(error: &matrix_sdk::Error) -> bool {
     match error {
         matrix_sdk::Error::Http(http) => match http.as_ref() {
-            matrix_sdk::HttpError::Reqwest(error) => error.is_connect(),
+            matrix_sdk::HttpError::Reqwest(error) => error.is_connect() || error.is_timeout(),
             matrix_sdk::HttpError::Api(_) => http
                 .as_client_api_error()
                 .is_some_and(|error| is_transient_outbound_status(error.status_code.as_u16())),
@@ -2013,5 +2013,90 @@ mod tests {
         let error = client.get("http://127.0.0.1:1/").send().await.unwrap_err();
         let error = MatrixSdkError::Http(Box::new(HttpError::Reqwest(error)));
         assert!(is_transient_matrix_send_error(&error));
+    }
+
+    #[tokio::test]
+    async fn a_reqwest_request_timeout_is_transient() {
+        // A stalled response is a request timeout, not a connect failure.
+        // Generate a real error, then wrap it in the SDK's transport variant.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("local address");
+        // Hold the accepted connection open without ever responding.
+        tokio::spawn(async move {
+            let (_socket, _) = listener.accept().await.expect("accept");
+            std::future::pending::<()>().await;
+        });
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_millis(100))
+            .build()
+            .expect("test client");
+        let error = client
+            .get(format!("http://{addr}/"))
+            .send()
+            .await
+            .expect_err("a stalled send must hit the request timeout");
+        assert!(
+            error.is_timeout(),
+            "expected a request timeout, got: {error:?}"
+        );
+        assert!(!error.is_connect(), "must exercise the timeout-only arm");
+        let error = MatrixSdkError::Http(Box::new(HttpError::Reqwest(error)));
+        assert!(is_transient_matrix_send_error(&error));
+    }
+
+    #[tokio::test]
+    async fn other_reqwest_transport_errors_stay_permanent() {
+        // A denied redirect is a real transport-level `reqwest::Error` that is
+        // neither a connect failure nor a request timeout. It must stay
+        // permanent so the retry budget is spent only on failures a bounded
+        // retry can actually fix.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("local address");
+        tokio::spawn(serve_redirect(listener));
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .redirect(reqwest::redirect::Policy::limited(0))
+            .build()
+            .expect("test client");
+        let error = client
+            .get(format!("http://{addr}/"))
+            .send()
+            .await
+            .expect_err("a denied redirect must fail the request");
+        assert!(
+            error.is_redirect(),
+            "expected a redirect error, got: {error:?}"
+        );
+        let error = MatrixSdkError::Http(Box::new(HttpError::Reqwest(error)));
+        assert!(!is_transient_matrix_send_error(&error));
+    }
+
+    /// Serve one canned `302 Found` with a `Location` header, then close.
+    ///
+    /// reqwest follows redirects by default, so a client configured to deny
+    /// them fails this real request with a `reqwest::Error` whose kind is
+    /// neither connect nor timeout.
+    async fn serve_redirect(listener: tokio::net::TcpListener) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (mut socket, _) = listener.accept().await.expect("accept");
+        // Drain the request head so the response cannot race the request.
+        let mut head = Vec::new();
+        let mut chunk = [0u8; 512];
+        loop {
+            let read = socket.read(&mut chunk).await.expect("read request");
+            head.extend_from_slice(&chunk[..read]);
+            if read == 0 || head.windows(4).any(|window| window == b"\r\n\r\n") {
+                break;
+            }
+        }
+        socket
+            .write_all(b"HTTP/1.1 302 Found\r\nLocation: /elsewhere\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            .await
+            .expect("write redirect response");
+        let _ = socket.shutdown().await;
     }
 }
