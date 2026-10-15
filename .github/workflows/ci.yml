@@ -14,6 +14,12 @@ on:
 permissions:
   contents: read
 
+# Only newer runs of the same PR supersede each other. Non-PR runs get unique
+# groups so main, manual, and merge-queue runs never cancel or evict one another.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   ci:
     name: CI
@@ -71,6 +77,23 @@ jobs:
 
       - name: Setup Nix
         uses: ./.github/actions/setup-nix
+
+      # rust-cache must inspect the same compiler that nix develop uses, not
+      # the runner's preinstalled Rust. Only expose that toolchain's bin path.
+      - name: Expose Nix Rust toolchain
+        run: |
+          nix develop .# --command sh <<'SH'
+          dirname "$(command -v cargo)" >> "$GITHUB_PATH"
+          SH
+
+      # Keep this dependency/target cache separate from release jobs, and
+      # invalidate even restore prefixes when the Nix environment changes.
+      # GitHub's normal branch/PR cache scope still applies; no Nix store paths.
+      - name: Cache E2E dependencies
+        uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+        with:
+          key: matrix-e2e-${{ hashFiles('flake.nix', 'flake.lock') }}
+          cache-bin: false
 
       # Debug binaries, matching what `just e2e` builds locally. Split from the
       # harness step so a slow cold compile does not eat the harness budget.
