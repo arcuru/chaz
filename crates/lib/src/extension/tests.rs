@@ -8,6 +8,9 @@ use eidetica::backend::database::InMemory;
 use eidetica::crdt::Doc;
 use eidetica::{Instance, NewUser};
 
+#[path = "tool_call_failure_tests.rs"]
+mod tool_call_failure_tests;
+
 #[test]
 fn builtin_ref_carries_binary_version() {
     let r = ExtensionRef::builtin("heartbeat");

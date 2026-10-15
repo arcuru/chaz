@@ -467,7 +467,8 @@ impl McpServer {
         Ok(())
     }
 
-    /// Call a tool on the MCP server, with auto-restart on process death.
+    /// Call a tool once. Recover the connection after process death, but
+    /// never resubmit a call whose effect may already have completed.
     pub async fn call_tool(&self, name: &str, arguments: Value) -> Result<String, String> {
         // Lazy refresh: if the server signaled tools/list_changed, re-discover before calling
         if self.tools_changed.load(Ordering::Relaxed)
@@ -484,10 +485,18 @@ impl McpServer {
         let result = match self.send_request("tools/call", params.clone()).await {
             Ok(r) => r,
             Err(e) if self.transport.is_process_dead_error(&e) => {
-                self.transport.restart(&self.name).await?;
-                self.initialize().await?;
-                info!("MCP server '{}' restarted successfully", self.name);
-                self.send_request("tools/call", params).await?
+                // Recovery prepares later, distinct calls; it is not permission
+                // to replay this one. Preserve its original uncertain error even
+                // if restarting fails.
+                if let Err(recovery_error) = async {
+                    self.transport.restart(&self.name).await?;
+                    self.initialize().await
+                }
+                .await
+                {
+                    warn!(server = %self.name, error = %recovery_error, "MCP connection recovery failed");
+                }
+                return Err(e);
             }
             Err(e) if self.transport.is_session_expired_error(&e) => {
                 // HTTP server told us our session is gone (spec
@@ -1112,7 +1121,7 @@ pub fn build_capability_tools(server: Arc<McpServer>, server_name: &str) -> Vec<
 /// The transport layer still returns `Result<_, String>` (MCP-internal
 /// protocol errors are heterogeneous enough that keeping them as strings
 /// is pragmatic). This shim maps transport-origin substrings to the
-/// retryable `Network` variant so the runtime can back off on transient
+/// `Network` variant so callers can distinguish transient
 /// HTTP/DNS/socket failures, and keeps everything else as `Execution`.
 fn classify_mcp_error(msg: String) -> crate::tool::ToolError {
     use crate::tool::ToolError;

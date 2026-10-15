@@ -106,6 +106,32 @@ stranger, and the agent all joined:
   addressing gate, so `allow_list` is the only thing left that can produce
   silence. A bare message here would prove nothing Case 1a does not.
 
+### Native tool rounds
+
+After the single-round `compact` case, the same direct room asks for
+`native tools twelve rounds`. The stub issues twelve distinct `calculate`
+calls, checking each call ID, arguments, and real wrapped arithmetic result
+before advancing. Only call/result pairs after the current user message count;
+historical results cannot skip rounds. Native `calculate` definitions must
+remain offered on every request, including after rounds 10, 11, and 12.
+
+The harness requires the exact distinct `twelve-round-complete` terminal reply
+in Matrix and validates all thirteen request stages in the stub log. A forced
+no-tools summary or early canned reply cannot satisfy it. Stub contract tests
+run before the disposable services start, including wrong/denied results and
+withdrawn tools; run them alone with `python3 dev/matrix-e2e/test_stub_llm.py`.
+
+The twelve-round ordinary Matrix-origin final uses the current outbox path;
+other explicit-send/local-final, encryption, approval and allow-list cases
+remain unchanged. The harness also waits for the durable completed attempt.
+Before starting it, the single-round compact case must receive its own matched
+compact result and durably finish; an older Matrix-send result is not a barrier.
+Spawned processes and administration use a disposable HOME so host-global
+skills do not enter the model fixture.
+Use `just e2e --legacy-max-iterations 10` to render the retired config key in
+a disposable agent. It must still finish twelve rounds: `max_iterations` is
+ignored by current YAML and AgentDb config, not an active turn cap.
+
 ### Encrypted rooms
 
 A cross-signed puppet device opens an encrypted DM with the agent. A second,
@@ -373,7 +399,7 @@ every green run.
 
 The barrier's answer has to be distinguishable from the forbidden one, or the
 assertion fires on whichever landed first and passes for the wrong reason.
-Every model reply carries the same fixed string, so two model replies cannot be
+Ordinary model replies carry the same fixed string, so those replies cannot be
 told apart in the room. For the model path, wait on `stub-llm.log` — it logs
 one `request:` line per turn with the user messages that turn was given — and
 assert on how many turns ran. For the `!chaz` path, pick two commands whose

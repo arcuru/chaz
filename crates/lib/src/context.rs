@@ -3,6 +3,8 @@
 //! The required selected extension chooses history/layout through scoped item
 //! references. Core never substitutes an old selection algorithm on failure.
 //! The per-model-call gate validates the complete projected request budget.
+//! - The turn context loader keeps the current and still-queued requests after
+//!   compaction boundaries before entries reach this builder.
 
 use crate::config::ContextConfig;
 use crate::extension::ExtensionHub;

@@ -4,7 +4,9 @@
 //! `SecurityContext`, and `ToolContext` an integration test can drive
 //! `runtime::execute` with. Everything is in-memory and ephemeral.
 
-use std::sync::Arc;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::{Arc, Mutex};
 
 use eidetica::backend::database::InMemory;
 use eidetica::user::User;
@@ -15,11 +17,28 @@ use tokio::task::JoinHandle;
 
 use crate::agent::AgentRegistry;
 use crate::bridge::{ApprovalDecision, ApprovalExchange};
+use crate::runtime::{RuntimeRecord, RuntimeRecorder};
 use crate::security::{LeakDetector, LeakPolicy, SecretStore, SecurityContext};
 use crate::session::{Session, SessionRegistry};
 use crate::tool::{ScopedTools, ToolContext, ToolProfile, ToolRegistry};
 use crate::tool_host::{NativeToolHost, ToolHost};
 use crate::types::ConversationId;
+
+/// Collect the runtime's original requests and outcomes without persisting them.
+#[derive(Default)]
+pub(crate) struct RecordingRuntime {
+    pub records: Mutex<Vec<RuntimeRecord>>,
+}
+
+impl RuntimeRecorder for RecordingRuntime {
+    fn record<'a>(
+        &'a self,
+        record: RuntimeRecord,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+        self.records.lock().unwrap().push(record);
+        Box::pin(async { Ok(()) })
+    }
+}
 
 /// Open a fresh in-memory eidetica instance with one logged-in user.
 pub(crate) async fn fresh_eidetica() -> (Instance, User) {

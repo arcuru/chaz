@@ -100,7 +100,7 @@ When the `memory` extension is active, chaz automatically searches the agent's o
 
 ### How it works
 
-1. The last 5 conversation messages are joined, tokenized, and stopwords removed to form a query.
+1. Up to 5 recent conversation messages are joined newest-first, tokenized, and stopwords removed. The first 10 remaining tokens form the query, giving the current prompt priority.
 2. The agent's own `memory` store is searched with BM25 + cosine hybrid ranking.
 3. Every attached bank (via `/memory attach` or `default_memory_banks`) is searched the same way.
 4. Up to 3 results per store (configurable) are formatted and appended.

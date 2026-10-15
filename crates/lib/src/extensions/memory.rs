@@ -442,9 +442,10 @@ impl ContextTail for MemoryContextTail {
 }
 
 fn extract_query(recent_message_text: &[String]) -> String {
+    // ContextBuilder supplies newest-first text; preserve it so the current
+    // prompt takes priority within both the message and token limits.
     let combined: String = recent_message_text
         .iter()
-        .rev()
         .take(5)
         .map(|s| s.as_str())
         .collect::<Vec<_>>()
@@ -2228,6 +2229,26 @@ mod tests {
         assert_text(
             run("config show --agent alpha").await,
             "auto_recall_max_entries = 4",
+        );
+    }
+
+    #[test]
+    fn extract_query_prefers_newest_messages() {
+        // ContextBuilder supplies message text newest-first.
+        let recent_message_text = [
+            "zebra newest prompt",
+            "msgsix",
+            "msgfive",
+            "msgfour",
+            "msgthree",
+            "msgtwo",
+            "alpha oldest",
+        ]
+        .map(String::from);
+
+        assert_eq!(
+            extract_query(&recent_message_text),
+            "zebra newest prompt msgsix msgfive msgfour msgthree"
         );
     }
 

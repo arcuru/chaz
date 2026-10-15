@@ -873,16 +873,45 @@ impl Session {
         database: Database,
         snapshot: Snapshot,
     ) -> anyhow::Result<Vec<SessionEntry>> {
-        Ok(Self::context_entries_with_ids_at(database, snapshot)
-            .await?
-            .into_iter()
-            .map(|(_, entry)| entry)
-            .collect())
+        Ok(
+            Self::context_entries_with_ids_at(database, snapshot, &|_, _| false)
+                .await?
+                .into_iter()
+                .map(|(_, entry)| entry)
+                .collect(),
+        )
     }
 
+    /// `pending` marks rows a summary must not hide: a native summary keeps
+    /// them although its snapshot covers them, and a positional `Summary` row
+    /// keeps them by moving them directly after itself in session order.
     async fn context_entries_with_ids_at(
         database: Database,
         snapshot: Snapshot,
+        pending: &(dyn Fn(&TurnRequestId, &SessionEntry) -> bool + Sync),
+    ) -> anyhow::Result<Vec<(Option<TurnRequestId>, SessionEntry)>> {
+        let mut rows = Self::compacted_rows_at(database, snapshot, pending).await?;
+        if let Some(boundary) = rows
+            .iter()
+            .rposition(|(_, entry)| entry.entry_type == EntryType::Summary)
+        {
+            let after = rows.split_off(boundary);
+            let (rescued, hidden): (Vec<_>, Vec<_>) = rows
+                .into_iter()
+                .partition(|(id, entry)| id.as_ref().is_some_and(|id| pending(id, entry)));
+            let mut after = after.into_iter();
+            rows = hidden;
+            rows.extend(after.next());
+            rows.extend(rescued);
+            rows.extend(after);
+        }
+        Ok(rows)
+    }
+
+    async fn compacted_rows_at(
+        database: Database,
+        snapshot: Snapshot,
+        pending: &(dyn Fn(&TurnRequestId, &SessionEntry) -> bool + Sync),
     ) -> anyhow::Result<Vec<(Option<TurnRequestId>, SessionEntry)>> {
         let txn = database.new_transaction_at(&snapshot).await?;
         let results = txn
@@ -943,7 +972,7 @@ impl Session {
             Self::entries_with_ids_at_snapshot(&database, &snapshot)
                 .await?
                 .into_iter()
-                .filter(|(id, _)| !covered_ids.contains(id))
+                .filter(|(id, entry)| !covered_ids.contains(id) || pending(id, entry))
                 .map(|(id, entry)| (Some(id), entry)),
         );
         Ok(entries)
@@ -958,17 +987,42 @@ impl Session {
         Ok((view.entries, view.tool_history))
     }
 
+    /// Compacted context for the request this turn answers, including a retry.
+    pub async fn turn_context_with_tool_history(
+        &self,
+        current: &TurnRequestId,
+        is_agent: impl Fn(&str) -> bool + Sync,
+    ) -> anyhow::Result<(Vec<SessionEntry>, Vec<Vec<TurnTranscriptRecord>>)> {
+        let view = self
+            .turn_context_view_at(self.database.snapshot().await?, current, is_agent)
+            .await?;
+        Ok((view.entries, view.tool_history))
+    }
+
+    /// Keep the current and still-queued requests visible after a summary,
+    /// using the same immutable view as the rest of the turn context.
+    pub async fn turn_context_view_at(
+        &self,
+        snapshot: Snapshot,
+        current: &TurnRequestId,
+        is_agent: impl Fn(&str) -> bool + Sync,
+    ) -> anyhow::Result<SessionContextView> {
+        self.context_view_at_for(snapshot, Some(current), &is_agent)
+            .await
+    }
+
     /// Read every selected-context store at the supplied immutable snapshot.
     /// A failed read is an error, never an in-memory transcript fallback.
     pub async fn context_view_at(&self, snapshot: Snapshot) -> anyhow::Result<SessionContextView> {
-        let rows: Vec<_> =
-            Self::context_entries_with_ids_at(self.database.clone(), snapshot.clone())
-                .await?
-                .into_iter()
-                .filter(|(_, entry)| entry.entry_type != EntryType::TurnContext)
-                .collect();
-        let contributions =
-            crate::extension::durable_context::read_at(&self.database, &snapshot).await?;
+        self.context_view_at_for(snapshot, None, &|_| true).await
+    }
+
+    async fn context_view_at_for(
+        &self,
+        snapshot: Snapshot,
+        current: Option<&TurnRequestId>,
+        is_agent: &(dyn Fn(&str) -> bool + Sync),
+    ) -> anyhow::Result<SessionContextView> {
         let txn = self.database.new_transaction_at(&snapshot).await?;
         let attempts = txn
             .get_store::<Table<TurnAttempt>>(TURN_ATTEMPTS_STORE)
@@ -978,6 +1032,31 @@ impl Session {
         #[cfg(test)]
         let attempt_volume = (attempts.len(), serde_json::to_vec(&attempts)?.len());
         let states = index_attempt_states(attempts, &HashSet::new());
+        let baseline = match current {
+            Some(_) => {
+                read_turn_baseline_from(&txn.get_store::<DocStore>(META_STORE).await?).await?
+            }
+            None => HashSet::new(),
+        };
+        // Same request classification as turn_requests_with_attempts. An
+        // interrupted request stays compacted until explicitly retried.
+        let pending = |id: &TurnRequestId, entry: &SessionEntry| {
+            current.is_some_and(|current| {
+                id == current
+                    || ((entry.entry_type == EntryType::Directive
+                        || (entry.entry_type == EntryType::Message && !is_agent(&entry.sender)))
+                        && !baseline.contains(id.as_str())
+                        && !states.contains_key(id))
+            })
+        };
+        let rows: Vec<_> =
+            Self::context_entries_with_ids_at(self.database.clone(), snapshot.clone(), &pending)
+                .await?
+                .into_iter()
+                .filter(|(_, entry)| entry.entry_type != EntryType::TurnContext)
+                .collect();
+        let contributions =
+            crate::extension::durable_context::read_at(&self.database, &snapshot).await?;
         let selected: HashMap<_, _> = states
             .into_iter()
             .filter_map(|(id, state)| {

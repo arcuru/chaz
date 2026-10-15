@@ -3830,6 +3830,7 @@ impl Server {
             .active_extensions_for_agent(&session_db_id, &agent_name)
             .await;
         let live_attempts = self.live_attempts.clone();
+        let agents = self.agents.clone();
         let notify_tx = self.notify_tx.clone();
         let shutting_down = self.shutting_down.clone();
         #[cfg(test)]
@@ -4040,7 +4041,8 @@ impl Server {
                     },
                 };
                 match snapshot {
-                    Ok(snapshot) => s.context_view_at(snapshot.clone()).await.map(|view| (view, Some(snapshot))),
+                    Ok(snapshot) => s.turn_context_view_at(snapshot.clone(), &attempt.request_id, |name| agents.get(name).is_some())
+                        .await.map(|view| (view, Some(snapshot))),
                     Err(error) => Err(error),
                 }
             };

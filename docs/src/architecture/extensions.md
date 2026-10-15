@@ -190,6 +190,12 @@ extensions this becomes the manifest the host inspects before loading),
 efficiency (the hub skips extensions that don't handle a kind), and
 inspection (`/extensions list`).
 
+`tool_call` handlers run in registration order and may mutate arguments.
+The first `Block`, or a panic while constructing or polling a handler, stops the remaining decision hooks and blocks execution.
+On panic, the runtime records the existing `Blocked` result with the extension's name and hook kind; partially mutated arguments are never executed.
+The recorded model request retains its original arguments.
+This does not change notification/result-hook defaults or move the unconditional approval and grant checks.
+
 ## Capabilities
 
 Caps are the typed services that cross the extension boundary
