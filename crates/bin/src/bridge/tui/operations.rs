@@ -346,9 +346,12 @@ pub(super) fn apply(app: &mut App, completion: Completion) {
     let Completion { pending, result } = completion;
     let nav_valid = pending.origin.navigation_valid(app);
     let target = pending.origin.tab_index(app);
-    if app.operations.creation_ticket == Some(pending.ticket)
-        && !(nav_valid && matches!(&result, Ok(Effect::Open(_))))
-    {
+    // Creation stays admitted only while its accepted action continues below
+    // (a new destination still preparing); every other settlement releases it.
+    let continues = nav_valid
+        && matches!(&result, Ok(Effect::Open(open))
+            if app.tab_index_for(&open.switch.session_db_id).is_none());
+    if app.operations.creation_ticket == Some(pending.ticket) && !continues {
         app.operations.creation_ticket = None;
         app.session_catalog_loading = false;
         app.session_list_fresh = false;
