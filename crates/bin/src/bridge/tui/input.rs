@@ -702,23 +702,11 @@ pub(super) fn handle_chat_key(app: &mut App, key: KeyEvent) -> Option<ChatAction
         return None;
     }
 
+    if edit_draft(app, key) {
+        return None;
+    }
+
     match key.code {
-        // Hard line break. `Alt+Enter` is the portable binding: without the
-        // keyboard-enhancement protocol a terminal sends bare `\r` for
-        // `Shift+Enter`, so it is indistinguishable from send (same reason
-        // there's no `Ctrl+M` binding). `Alt+Enter` arrives as `ESC \r`, which
-        // does carry a modifier. `Shift+Enter` is still accepted for terminals
-        // that do negotiate the enhanced protocol.
-        KeyCode::Enter
-            if key
-                .modifiers
-                .intersects(KeyModifiers::ALT | KeyModifiers::SHIFT) =>
-        {
-            app.input.insert(app.cursor, '\n');
-            app.cursor += 1;
-            app.completion_dismissed = false;
-            recompute_completion(app);
-        }
         KeyCode::Enter => {
             // With the popup open, Enter completes the highlighted command
             // while there's still more of it to type. Once it's fully typed
@@ -744,14 +732,27 @@ pub(super) fn handle_chat_key(app: &mut App, key: KeyEvent) -> Option<ChatAction
                     Some(ChatAction::Dispatch(_) | ChatAction::SendMessage(_)) => true,
                     _ => false,
                 };
-                if backend_action && (!app.backend_ready() || !app.operations.has_capacity()) {
+                let creation_pending = matches!(
+                    &action,
+                    Some(ChatAction::Dispatch(
+                        chaz_core::commands::Command::NewSession(_)
+                    ))
+                ) && app.operations.is_creating_session();
+                if backend_action
+                    && (!app.backend_ready() || !app.operations.has_capacity() || creation_pending)
+                {
                     app.input = text;
                     app.cursor = cursor;
                     app.completion = completion;
                     app.completion_dismissed = dismissed;
                     app.command_input = None;
                     app.operations.notice = Some(
-                        "Backend unavailable or action queue full — draft not submitted".into(),
+                        if creation_pending {
+                            "Session creation already pending — draft not submitted"
+                        } else {
+                            "Backend unavailable or action queue full — draft not submitted"
+                        }
+                        .into(),
                     );
                     return None;
                 }
@@ -778,6 +779,65 @@ pub(super) fn handle_chat_key(app: &mut App, key: KeyEvent) -> Option<ChatAction
                     c.selected = (c.selected + n - 1) % n;
                 }
             }
+        }
+        KeyCode::Up => {
+            // When the completion popup is open, arrows move the selection;
+            // otherwise they scroll the chat history as before.
+            if let Some(c) = app.completion.as_mut() {
+                let n = c.matches.len();
+                if n > 0 {
+                    c.selected = (c.selected + n - 1) % n;
+                }
+            } else {
+                let off = &mut app.active_mut().scroll_offset;
+                *off = off.saturating_add(3);
+            }
+        }
+        KeyCode::Down => {
+            if let Some(c) = app.completion.as_mut() {
+                let n = c.matches.len();
+                if n > 0 {
+                    c.selected = (c.selected + 1) % n;
+                }
+            } else {
+                let off = &mut app.active_mut().scroll_offset;
+                *off = off.saturating_sub(3);
+            }
+        }
+        KeyCode::PageUp => {
+            let off = &mut app.active_mut().scroll_offset;
+            *off = off.saturating_add(20);
+        }
+        KeyCode::PageDown => {
+            let off = &mut app.active_mut().scroll_offset;
+            *off = off.saturating_sub(20);
+        }
+        KeyCode::F(1) => {
+            app.overlay = Some(Overlay::Help { scroll: 0 });
+        }
+        _ => {}
+    }
+    None
+}
+
+/// Shared local editing before and after the launch has a database handle.
+pub(super) fn edit_draft(app: &mut App, key: KeyEvent) -> bool {
+    match key.code {
+        // Hard line break. `Alt+Enter` is the portable binding: without the
+        // keyboard-enhancement protocol a terminal sends bare `\r` for
+        // `Shift+Enter`, so it is indistinguishable from send (same reason
+        // there's no `Ctrl+M` binding). `Alt+Enter` arrives as `ESC \r`, which
+        // does carry a modifier. `Shift+Enter` is still accepted for terminals
+        // that do negotiate the enhanced protocol.
+        KeyCode::Enter
+            if key
+                .modifiers
+                .intersects(KeyModifiers::ALT | KeyModifiers::SHIFT) =>
+        {
+            app.input.insert(app.cursor, '\n');
+            app.cursor += 1;
+            app.completion_dismissed = false;
+            recompute_completion(app);
         }
         KeyCode::Char(c) => {
             app.input.insert(app.cursor, c);
@@ -822,44 +882,9 @@ pub(super) fn handle_chat_key(app: &mut App, key: KeyEvent) -> Option<ChatAction
         KeyCode::End => {
             app.cursor = app.input.len();
         }
-        KeyCode::Up => {
-            // When the completion popup is open, arrows move the selection;
-            // otherwise they scroll the chat history as before.
-            if let Some(c) = app.completion.as_mut() {
-                let n = c.matches.len();
-                if n > 0 {
-                    c.selected = (c.selected + n - 1) % n;
-                }
-            } else {
-                let off = &mut app.active_mut().scroll_offset;
-                *off = off.saturating_add(3);
-            }
-        }
-        KeyCode::Down => {
-            if let Some(c) = app.completion.as_mut() {
-                let n = c.matches.len();
-                if n > 0 {
-                    c.selected = (c.selected + 1) % n;
-                }
-            } else {
-                let off = &mut app.active_mut().scroll_offset;
-                *off = off.saturating_sub(3);
-            }
-        }
-        KeyCode::PageUp => {
-            let off = &mut app.active_mut().scroll_offset;
-            *off = off.saturating_add(20);
-        }
-        KeyCode::PageDown => {
-            let off = &mut app.active_mut().scroll_offset;
-            *off = off.saturating_sub(20);
-        }
-        KeyCode::F(1) => {
-            app.overlay = Some(Overlay::Help { scroll: 0 });
-        }
-        _ => {}
+        _ => return false,
     }
-    None
+    true
 }
 
 fn parse_chat_line(app: &mut App, text: &str) -> Option<ChatAction> {

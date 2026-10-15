@@ -15,8 +15,58 @@ chaz --config config.yaml
 
 A prompt is never sent for you; review it and press `Enter`. `--session` takes a
 session name, not an ID. If the name exists but its session cannot be opened,
-chaz exits with the error instead of opening or creating another conversation.
+chaz shows a startup error instead of opening or creating another conversation.
+Exit with `Ctrl+C`; no failed launch is automatically retried.
 `-p`/`--print` and `cmd` are unchanged.
+
+## Connecting before the session is ready
+
+After local configuration validation, the TUI draws before connecting to
+Eidetica or building the runtime.
+A bare launch shows the hub; a named-session or prompt launch shows a loading
+view with an editable, unsent draft.
+The loading view is not a new database or a second conversation.
+It becomes the real session view only after resolution, observation setup and
+transcript loading succeed.
+
+| Startup display         | What is happening                                      |
+| ----------------------- | ------------------------------------------------------ |
+| `Connecting…`           | Connecting and logging in with the configured identity |
+| `Initializing runtime…` | Building the runtime for the configured execution role |
+| `Loading session…`      | Opening/creating the selected session and loading it   |
+| `Startup failed: …`     | Launch failed; no fallback session or automatic retry  |
+
+`F1` help and `Ctrl+C` work during startup.
+In a loading conversation, you can edit the draft, but `Enter` cannot submit it
+until the session is ready.
+Hub actions and backend settings are unavailable until initialization finishes.
+Quit restores the terminal immediately.
+A pending connection read is cancelled; write-capable runtime construction or
+session creation stays owned and is joined after restoration.
+The process can therefore remain alive until that work settles.
+Quitting does not roll back a session that was already created.
+
+A first frame is not a ready backend.
+The TUI log records `first_frame_ms` separately from `time_to_gateway_ms` and
+`usable_session_ms` (the loaded launch view).
+These clocks start after config/log setup; the existing runtime startup gate
+still controls agent processing.
+
+### Walkthrough: a delayed named launch
+
+1. Run `chaz --session work "Review this draft"` while the configured service
+   is slow.
+   The loading tab shows `work · loading`, `Connecting…`, and the draft.
+   Edit it while the connection or transcript read is pending; `Enter` leaves
+   it unsent.
+2. Once the session loads, the conversation toolbar and transcript appear.
+   Your edited draft remains in the composer.
+   Review it, then press `Enter` to submit it.
+3. If login or session loading fails, the same view shows `Startup failed: …`
+   and retains the draft.
+   Use `Ctrl+C`, fix the reported cause, and relaunch with the same name.
+   An existing named session that cannot be opened is never replaced with a
+   new one.
 
 ## Interface Layout
 
@@ -437,7 +487,7 @@ The session hub is the TUI's home: the list of this peer's sessions plus a pinne
 | ---------------- | ----------------------------------------------------------------------------------------------- |
 | `↑` / `↓`, wheel | Move the selection (the wheel moves three rows)                                                 |
 | `Enter`, click   | Open the selected session, or create one on **New session** (click selects, second click opens) |
-| `n`              | Create a session and open it                                                                    |
+| `n`              | Create a session and open it; repeated requests while creation is pending are not accepted      |
 | `r`              | Rename the selected session                                                                     |
 | `s` / `Ctrl+S`   | [Peer Settings](#settings); `Esc` there returns to the hub                                      |
 | `Esc`            | Back to the open conversation; stays in the hub when none is open                               |
@@ -460,6 +510,19 @@ A **session** is stored data: its transcript, roster and name live in the peer's
 
 The list reads registry metadata only: root ID, name, bridge, agent, age and status. It never scans transcripts for counts, previews or costs, and `/costs` scans usage explicitly. The catalog loads in the background, so navigation, New and Peer Settings work while it loads. _Loading sessions…_, _No saved sessions yet_ and _Failed to load sessions: … — Ctrl+P retries._ are distinct states; a failure is never shown as an empty list. A failed open or create stays in the hub with the error in the footer until the next key.
 
+Creating a session cancels the hub's historical catalog and row reads before
+starting the write. Those reads stay paused until creation settles, so a slow
+historical metadata open cannot hold up New through the shared registry lock.
+Creation uses the current peer defaults (or the group selected by `/new <group>`),
+not the highlighted historical row. The composer opens only after the new
+session's metadata and observation are ready. Returning to the hub reloads its
+catalog, including the new session; results from before creation are ignored.
+Leaving the hub cancels presentation reads, not an accepted creation write.
+There is no automatic create retry after an uncertain result.
+A repeated `/new` while creation is pending keeps the command in the composer
+rather than submitting it again.
+Cancelling these presentation reads does not resolve backend-wide storage stalls.
+
 ### Walkthrough: from the hub and back
 
 1. On a fresh install, run `chaz --config config.yaml`. The hub shows only **New session**, followed by `No saved sessions yet — select "New session" above.` Nothing has been stored.
@@ -468,16 +531,29 @@ The list reads registry metadata only: root ID, name, bridge, agent, age and sta
 4. Press `Ctrl+W`. The view closes and the hub returns, still listing the session; its history is intact. Select it and press `Enter` to reopen it.
 5. Press `s` in the hub, read a Peer Settings page, and press `Esc` to come back to the hub. No conversation needed to be open.
 6. Quit with `Ctrl+C` and run `chaz --config config.yaml --session work "draft the agenda"`. A session named `work` is created and opened, with `draft the agenda` waiting unsent. Run the same command again: `work` reopens, and no second session appears.
-7. Failure: if the session index names `work` but its database can no longer be opened, chaz neither opens another conversation nor creates a replacement:
+7. Failure: if the session index names `work` but its database can no longer be opened, the loading view stays open with the draft and an error:
 
    ```text
-   Error: Failed to open session 'work'
-
-   Caused by:
-       …
+   Startup failed: Failed to open session 'work': …
    ```
 
-   Inside the hub, a stale row that cannot be opened behaves the same way: the footer shows `Failed to switch session: …` and you stay in the hub.
+   Exit with `Ctrl+C`, repair the cause, and relaunch; chaz never creates a replacement for that unreadable session. Inside the hub, a stale row that cannot be opened shows `Failed to switch session: …` in the footer and you stay in the hub.
+
+### Walkthrough: create while history is loading
+
+1. Launch into the hub. If the historical catalog is slow, it shows
+   `Loading sessions…`; **New session** remains selectable.
+2. Press `n`. The footer shows `action(s) pending` while creation runs.
+   Historical reads are paused. Pressing `n` again during that wait reports
+   `Session creation already pending — not accepted again` instead of queuing
+   another session. Once the composer appears, type a draft; its agent is the
+   first current peer default.
+3. Return with `Ctrl+P`. The reloaded catalog contains the new session once.
+   If it reports `Failed to load sessions: … — Ctrl+P retries.`, New still works;
+   `Ctrl+P` retries the catalog without repeating the creation.
+4. If you visited Peer Settings while creation was pending, it stays in front
+   when creation completes. Press `Esc` to return to the hub and open the newly
+   stored session. Navigation does not undo the write or steal focus back.
 
 ## Settings
 

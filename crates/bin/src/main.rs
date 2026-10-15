@@ -264,6 +264,19 @@ async fn main() -> anyhow::Result<()> {
     // Whole-startup wall clock: time from here to the gateway taking over.
     let startup_start = Instant::now();
 
+    // The TUI owns its terminal before connecting or constructing runtime state.
+    // One-shot and daemon startup retain their existing synchronous path.
+    if !daemon_mode && cmd_args.is_none() && !args.print {
+        return bridge::tui::TuiBridge::start(
+            config,
+            config_path,
+            args.session,
+            args.prompt,
+            startup_start,
+        )
+        .await;
+    }
+
     let t = Instant::now();
     let connected = instance::connect(&config).await?;
     let capabilities = connected.capabilities;
@@ -328,18 +341,12 @@ async fn main() -> anyhow::Result<()> {
             .or(options.targeted_session);
         options
     } else {
-        let mut options = server::BuildOptions::local(
+        server::BuildOptions::local(
             config_path.clone(),
             capabilities,
             extra_auto_approved_tools,
             server::McpReadiness::Deferred,
-        );
-        // A service-client TUI targets the session it will open, if named;
-        // the hub alone needs only the configured defaults.
-        if options.targeted_session.is_some() && !daemon_mode {
-            options.targeted_session = Some(args.session.clone().unwrap_or_default());
-        }
-        options
+        )
     };
     let mut built = Some(
         server::build(
@@ -398,15 +405,7 @@ async fn main() -> anyhow::Result<()> {
         let bridge = bridge::cli::CliBridge::new(config, secret_store, prompt, args.session);
         bridge.run(server).await
     } else {
-        let mut tui_bridge = bridge::tui::TuiBridge::new(config, secret_store)
-            .with_runtime(built.take().unwrap(), config_path.clone());
-        if let Some(prompt) = args.prompt {
-            tui_bridge = tui_bridge.with_initial_prompt(prompt);
-        }
-        if let Some(name) = args.session {
-            tui_bridge = tui_bridge.with_session(name);
-        }
-        tui_bridge.run(server).await
+        unreachable!("interactive startup is owned by the TUI")
     };
 
     // Propagate rather than swallow: the exit code is the only signal a calling

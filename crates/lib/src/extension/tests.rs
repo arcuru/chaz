@@ -1217,6 +1217,94 @@ async fn duplicate_extension_command_keeps_first() {
 // install_all coverage
 // -----------------------------------------------------------------
 
+#[tokio::test]
+async fn command_install_does_not_wait_for_executor_extensions_or_drain_tools() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    struct HeldRuntime {
+        entered: Arc<AtomicUsize>,
+        release: Arc<tokio::sync::Semaphore>,
+    }
+    impl Extension for HeldRuntime {
+        fn name(&self) -> &'static str {
+            "held_runtime"
+        }
+        fn supported_hooks(&self) -> &[HookKind] {
+            &[HookKind::Tool]
+        }
+        fn instantiate<'a>(&'a self, _: ScopeCtx<'a>) -> instance::InstantiateFuture<'a> {
+            Box::pin(async move {
+                self.entered.fetch_add(1, Ordering::SeqCst);
+                self.release.acquire().await.unwrap().forget();
+                Ok(Arc::new(TestInstance {
+                    manifest: self.manifest(),
+                    parts: TestParts::default(),
+                }) as Arc<dyn ExtensionInstance>)
+            })
+        }
+    }
+    let entered = Arc::new(AtomicUsize::new(0));
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    let runtime: Arc<dyn Extension> = Arc::new(HeldRuntime {
+        entered: entered.clone(),
+        release: release.clone(),
+    });
+    let mut command = TestExt::new("command_provider")
+        .command("data", Arc::new(DummyCmd))
+        .before_agent_start(Arc::new(CountingHook {
+            calls: Arc::new(AtomicUsize::new(0)),
+        }));
+    command.supported.push(HookKind::Tool);
+    command.parts.tools.push(Arc::new(crate::tools::ShellExec));
+    let mut client = test_hub().await;
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        client.install_commands(vec![runtime.clone(), Arc::new(command)]),
+    )
+    .await
+    .expect("client must not instantiate the held runtime")
+    .unwrap();
+    assert_eq!(entered.load(Ordering::SeqCst), 0);
+    assert!(client.extension_names().contains(&"held_runtime"));
+    assert!(!client.global_instances.contains_key("held_runtime"));
+    assert_eq!(client.command_owner("data"), Some("command_provider"));
+    let ctx = fixture_ctx_with_active(all_active(&["command_provider"])).await;
+    assert!(matches!(
+        client.try_dispatch_command("data", "", &ctx).await,
+        Some(ExtensionCommandOutcome::Text(_))
+    ));
+    let mut inactive = ctx;
+    inactive.active_extensions.clear();
+    assert!(
+        client
+            .try_dispatch_command("data", "", &inactive)
+            .await
+            .is_none()
+    );
+    assert!(client.tools_for_registry().is_empty());
+    assert_eq!(
+        client.hooks_for("command_provider"),
+        HashSet::from([HookKind::Command])
+    );
+
+    // The same held component really does block executor installation.
+    let mut executor = test_hub().await;
+    let install = executor.install_all(vec![runtime]);
+    tokio::pin!(install);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(30), install.as_mut())
+            .await
+            .is_err()
+    );
+    assert_eq!(entered.load(Ordering::SeqCst), 1);
+    release.add_permits(1);
+    tokio::time::timeout(Duration::from_secs(1), install)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
 /// Extension with no scopes-relevant contribution: default
 /// `instantiate` yields a no-op `LegacyInstance`, so it registers
 /// nothing through the drain.

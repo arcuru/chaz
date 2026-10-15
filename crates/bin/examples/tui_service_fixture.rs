@@ -104,6 +104,14 @@ async fn main() -> anyhow::Result<()> {
                 .await?;
                 println!("META {}", command);
             }
+            "sessions" => {
+                println!("SESSIONS {}", registry.list_sessions().await?.len());
+            }
+            "entries" => {
+                let (conv, db) = registry.open_session(&id).await?;
+                let snapshot = Session::try_new(conv, db).await?;
+                println!("ENTRIES {}", snapshot.entries().len());
+            }
             "name" => {
                 println!(
                     "NAME {}",

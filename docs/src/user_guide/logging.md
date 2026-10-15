@@ -22,6 +22,39 @@ Transport bridges are separate processes and log on their own stderr.
 
 `state_dir` comes from `state_dir:` in the config or the platform XDG state dir (typically `~/.local/state/chaz`). The startup banner prints the exact log path for the TUI/print cases. Tail with `tail -f <state_dir>/chaz-tui.log`.
 
+## Startup phase timings
+
+At `info` level, `Startup:` records separate `elapsed_ms` values for selected
+agent references, peer defaults, hosted indices, stored secrets, backend
+credentials, web search, embedding, security policies, extension dependencies
+and server settings. Extension installation and tool registration have their
+own timings. Session-registry logs further separate group/peer database setup
+and callback installation. `critical_path_ms` measures the whole server build;
+`time_to_gateway_ms` also includes connection setup.
+
+For a slow client launch:
+
+1. Find that launch's `Session registry initialized` and `Startup:` records
+   in the TUI log. Compare phases from the same launch, not different loads.
+2. Check `executor_components=false` on web search, embedding and extension
+   installation. These execution phases are skipped for clients, while
+   backend credentials and command-provider installation still run.
+3. Identify the slow phase before changing configuration. A slow registry
+   lookup is not extension installation; rendering readiness also does not
+   establish that the separate executor is ready to answer.
+
+A client launch might show these fields (timestamps omitted; timings vary):
+
+```text
+Startup: web search configured elapsed_ms=0 executor_components=false
+Startup: embedding configured elapsed_ms=0 executor_components=false
+Extensions installed elapsed_ms=3 executor_components=false mcp_servers=0
+```
+
+The zero execution-phase timings do not mean the whole launch is instant.
+If the registry phase dominates, inspect its group/peer database timings
+rather than disabling command providers or changing executor credentials.
+
 ## Controlling Verbosity
 
 Set the `RUST_LOG` environment variable:
@@ -52,6 +85,28 @@ At the default level you'll see:
 - **Tool execution**: shell commands run, files written, web fetches initiated
 - **Security**: approval decisions (approve/deny/approve-all), MCP server restarts
 - **Scheduling**: schedule fires, manual triggers
+
+### TUI readiness milestones
+
+Use these separate `info` events to distinguish startup, historical loading and
+an explicit creation request:
+
+| Event                                 | Meaning                                                                                     |
+| ------------------------------------- | ------------------------------------------------------------------------------------------- |
+| `Session registry callback installed` | Registry initialization is complete; `total_elapsed_ms` covers registry setup only          |
+| `TUI first frame drawn`               | The loading view is painted before connection/build; includes `first_frame_ms`              |
+| `TUI launch ready`                    | Connection/build and any selected-session hydration succeeded; includes `usable_session_ms` |
+| `TUI ready frame drawn`               | The ready loop has painted the hub or loaded conversation                                   |
+| `TUI session catalog completed`       | A historical catalog attempt finished; includes its generation, elapsed time and success    |
+| `TUI new session requested`           | A creation was accepted; includes the action ticket                                         |
+| `TUI session composer ready`          | The observed session tab is ready for input; includes ticket, session ID and agent          |
+
+Compare request and composer timestamps for the same ticket. The interval from
+startup or gateway readiness to a later user request includes user think time,
+so it is not creation latency. A completed catalog attempt may be obsolete;
+its generation must still match the hub before its rows can be applied.
+The first-frame event does not claim that the backend is ready or that a named
+session has finished loading.
 
 ### warn
 

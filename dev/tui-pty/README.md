@@ -7,6 +7,21 @@ nix develop .# -c just tui-pty
 ```
 
 The recipe builds the actual `chaz` binary and disposable store/service fixtures.
+`test_startup.py` puts a test-only Unix-socket relay between the TUI and a
+throwaway service owner.
+It holds a handshake, a constructor read, or a named transcript read before
+forwarding the request.
+The first frame, local help/draft editing and quit must work while the gate is
+positively held.
+Connection quit exits without releasing the gate; write-capable construction
+and launch quit restore the terminal before joined work settles.
+Login/session errors retain the live view and draft until exit.
+The fixture checks persisted session/entry counts and records first-frame and
+usable-session timing separately, including the deliberately imposed delay.
+It does not claim production latency or a faster storage backend.
+`TUI_EVIDENCE` selects the directory for raw PTY, decoded screen, held request,
+log and timing artifacts.
+
 Python's standard-library PTY facilities drive a 40×16 terminal, submit a
 Unicode prompt (`café`, a wide character, and a combining accent), check that
 the existing loopback model stub received it and that its final reply rendered,

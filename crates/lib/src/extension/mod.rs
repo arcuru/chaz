@@ -1675,6 +1675,25 @@ impl ExtensionHub {
     /// don't surface). The host wires `peer_handles` after constructing
     /// the hub but before opening any session.
     pub async fn install_all(&mut self, extensions: Vec<Arc<dyn Extension>>) -> anyhow::Result<()> {
+        self.install(extensions, false).await
+    }
+
+    /// Register the same extension catalog, but instantiate only global command
+    /// providers for a non-executing frontend. Tools, hooks and routine handlers
+    /// belong to the executor; command registration keeps its normal validation
+    /// and attribution. Runtime-only extensions remain discoverable by name.
+    pub async fn install_commands(
+        &mut self,
+        extensions: Vec<Arc<dyn Extension>>,
+    ) -> anyhow::Result<()> {
+        self.install(extensions, true).await
+    }
+
+    async fn install(
+        &mut self,
+        extensions: Vec<Arc<dyn Extension>>,
+        commands_only: bool,
+    ) -> anyhow::Result<()> {
         let manifests: Vec<manifest::ExtensionManifest> =
             extensions.iter().map(|e| e.manifest()).collect();
         for m in &manifests {
@@ -1698,6 +1717,9 @@ impl ExtensionHub {
             .iter()
             .filter_map(|ext| {
                 if !ext.scopes().contains(&instance::Scope::Global) {
+                    return None;
+                }
+                if commands_only && !ext.supported_hooks().contains(&HookKind::Command) {
                     return None;
                 }
                 let name = ext.manifest().name;
@@ -1727,7 +1749,13 @@ impl ExtensionHub {
         for (name, result) in results {
             match result {
                 Ok(Ok(inst)) => {
-                    self.drain_global_instance(&name, &inst);
+                    if commands_only {
+                        for (command, handler) in inst.commands() {
+                            self.register_command_attributed_arc(&name, command, handler);
+                        }
+                    } else {
+                        self.drain_global_instance(&name, &inst);
+                    }
                     self.install_failures.remove(&name);
                     self.global_instances.insert(name, inst);
                 }

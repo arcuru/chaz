@@ -404,7 +404,7 @@ fn centered_rect(area: Rect, percent_x: u16, percent_y: u16) -> Rect {
     }
 }
 
-fn ui_overlay(f: &mut ratatui::Frame, app: &mut App) {
+pub(super) fn ui_overlay(f: &mut ratatui::Frame, app: &mut App) {
     match &app.overlay {
         Some(Overlay::Help { scroll }) => {
             let scroll = *scroll;
@@ -920,8 +920,23 @@ pub(super) fn ui_chat(f: &mut ratatui::Frame, app: &mut App, ext_segments: &[Str
     );
     f.render_widget(status, chunks[4]);
 
-    let visible_h = chunks[5].height.saturating_sub(2) as usize;
-    // Keep the cursor visible while the draft exceeds its available height.
+    render_composer(
+        f,
+        chunks[5],
+        &composer,
+        if app.active().job.is_some() {
+            super::jobs::composer_title(app.active())
+        } else if app.active().active_turns > 0 {
+            " > next-call input "
+        } else {
+            " > "
+        },
+    );
+    render_completion_popup(f, app, chunks[1], chunks[5]);
+}
+
+fn render_composer(f: &mut ratatui::Frame, area: Rect, composer: &composer::Composer, title: &str) {
+    let visible_h = area.height.saturating_sub(2) as usize;
     let start = composer
         .cursor_row
         .saturating_sub(visible_h.saturating_sub(1));
@@ -929,29 +944,44 @@ pub(super) fn ui_chat(f: &mut ratatui::Frame, app: &mut App, ext_segments: &[Str
         Block::bordered()
             .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(COLOR_DIM))
-            .title(Span::styled(
-                if app.active().job.is_some() {
-                    super::jobs::composer_title(app.active())
-                } else if app.active().active_turns > 0 {
-                    " > next-call input "
-                } else {
-                    " > "
-                },
-                Style::default().fg(COLOR_ACCENT),
-            )),
+            .title(Span::styled(title, Style::default().fg(COLOR_ACCENT))),
     );
-    f.render_widget(input, chunks[5]);
-
-    // Completion popup floats just above the input box, over the bottom of
-    // the transcript. Drawn after the transcript so it sits on top.
-    render_completion_popup(f, app, chunks[1], chunks[5]);
-
+    f.render_widget(input, area);
     if visible_h > 0 {
         f.set_cursor_position((
-            chunks[5].x + composer.cursor_col + 1,
-            chunks[5].y + (composer.cursor_row - start) as u16 + 1,
+            area.x + composer.cursor_col + 1,
+            area.y + (composer.cursor_row - start) as u16 + 1,
         ));
     }
+}
+
+/// Render the loading draft without a database-backed tab.
+pub(super) fn ui_loading(f: &mut ratatui::Frame, app: &App, label: &str, status: &str) {
+    let composer = composer::layout(&app.input, app.cursor, f.area().width.saturating_sub(2));
+    let height = (composer
+        .lines
+        .len()
+        .saturating_add(2)
+        .min(u16::MAX as usize) as u16)
+        .min(f.area().height.saturating_sub(3).max(3));
+    let chunks = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Min(1),
+        Constraint::Length(1),
+        Constraint::Length(height),
+    ])
+    .split(f.area());
+    widgets::status_strip(f, chunks[0], &format!(" {label} · loading"));
+    f.render_widget(
+        Paragraph::new(status).wrap(Wrap { trim: false }).block(
+            Block::bordered()
+                .border_type(BorderType::Rounded)
+                .title(" Chaz "),
+        ),
+        chunks[1],
+    );
+    widgets::status_strip(f, chunks[2], "Draft not submitted · Ctrl+C quit");
+    render_composer(f, chunks[3], &composer, " > ");
 }
 
 /// Slash-command completion dropdown. Anchored to the bottom-left of the input

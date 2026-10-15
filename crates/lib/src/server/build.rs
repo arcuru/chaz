@@ -1,16 +1,11 @@
 //! Assembling a fully-wired [`Server`] from a [`Config`] — the shared bootstrap
 //! path for every chaz binary.
 //!
-//! The `chaz` binary and any standalone bridge binary (e.g. a Discord bridge)
-//! need the *same* runtime behind their transport: eidetica opened, the session
-//! registry built, per-agent DBs bootstrapped, the secret store + extension hub
-//! assembled, the [`Server`] constructed with the spawn-tool cell wired, agent
-//! configs reconciled, YAML schedules materialized, and the routine engine
-//! spawned. That sequence is load-bearing (notably the replaceable server slot
-//! must be populated after `Server::new`, and the extension hub must be
-//! `install_all`'d before it) and historically lived inline in the `chaz`
-//! binary's `main`. [`build`] is the single shared implementation so external
-//! bridge binaries don't copy-paste it.
+//! All entry points share connection-backed session registries, backend model
+//! metadata, command providers and a [`Server`]. Only executor-role processes
+//! initialize tool credentials, embedding, runtime extensions and deferred
+//! agent/schedule work. Clients retain the extension catalog and command
+//! surface without installing those execution facilities.
 //!
 //! The caller opens eidetica (choosing the backend/path) and hands in the
 //! `Instance` + `User`; [`build`] does everything else and returns the wired
@@ -232,6 +227,81 @@ mod build_options_tests {
         assert!(!options.run_routine_engine);
         assert!(!options.bootstrap_agents_from_config);
     }
+
+    #[tokio::test]
+    async fn client_deferred_startup_does_not_materialize_executor_schedules() {
+        let (instance, mut user) = crate::test_support::fresh_eidetica().await;
+        let agent_db = agent_db::ensure_agent_db(&mut user, "chaz")
+            .await
+            .unwrap()
+            .db;
+        let mut config: Config = serde_yaml::from_str(
+            r#"
+execution: client
+eidetica:
+  connection: sqlite:///tmp/unused-fixture.db
+  login: { username: test, passwordless: true }
+"#,
+        )
+        .unwrap();
+        let built = build(
+            &mut config,
+            instance,
+            user,
+            BuildOptions {
+                config_path: PathBuf::from("config.yaml"),
+                run_routine_engine: false,
+                bootstrap_agents_from_config: false,
+                run_agent_loop: false,
+                extra_auto_approved_tools: Vec::new(),
+                mcp_readiness: McpReadiness::Deferred,
+                targeted_session: None,
+            },
+        )
+        .await
+        .unwrap();
+        let (_, db) = built
+            .registry
+            .create_session(Some("fixture"))
+            .await
+            .unwrap();
+        config.schedules = Some(vec![config::ScheduleConfig {
+            name: "executor-schedule".into(),
+            cron: "0 0 0 1 1 *".into(),
+            session: db.root_id().to_string(),
+            agent: Some("chaz".into()),
+            task: "executor-only".into(),
+            enabled: true,
+            max_fires: None,
+            expires_at: None,
+        }]);
+        // Await the actual deferred path, rather than infer completion from
+        // the processing gate (which intentionally opens before schedules).
+        for execution in [ExecutionRole::Client, ExecutionRole::Executor] {
+            config.execution = Some(execution);
+            run_deferred_startup(
+                built.server.clone(),
+                built.registry.clone(),
+                config.clone(),
+                backends::BackendManager::new(&None, built.secret_store.clone()),
+                false,
+                false,
+                false,
+                McpReadiness::Deferred,
+                built.server.mcp_registry().clone(),
+            )
+            .await;
+            assert_eq!(
+                agent_db
+                    .find_schedule("executor-schedule")
+                    .await
+                    .unwrap()
+                    .is_some(),
+                execution == ExecutionRole::Executor
+            );
+        }
+        built.shutdown().await;
+    }
 }
 
 /// When MCP tools have to exist, relative to the first turn.
@@ -288,9 +358,9 @@ impl BuiltServer {
 /// Assemble a fully-wired [`Server`] from `config` and an opened eidetica
 /// `instance`/`user`. See the module docs for the invariants this preserves.
 ///
-/// `config` is taken by `&mut` because backend / web-search / embedding API
-/// keys are resolved out of it into the secret store and replaced with secret
-/// refs; the caller keeps ownership and sees those edits.
+/// `config` is taken by `&mut` because backend API keys are moved into the
+/// secret store and replaced with refs. Executors also resolve web-search and
+/// embedding keys; clients leave those settings untouched.
 pub async fn build(
     config: &mut Config,
     instance: eidetica::Instance,
@@ -299,7 +369,8 @@ pub async fn build(
 ) -> anyhow::Result<BuiltServer> {
     let mut tasks = Vec::new();
     let execution = crate::instance::required_settings(config)?.1;
-    if execution != crate::config::ExecutionRole::Executor
+    let executor_components = execution == crate::config::ExecutionRole::Executor;
+    if !executor_components
         && (opts.run_agent_loop || opts.run_routine_engine || opts.bootstrap_agents_from_config)
     {
         anyhow::bail!(
@@ -311,12 +382,14 @@ pub async fn build(
     // gateway-blocking prefix so regressions are visible in the log.
     let build_start = Instant::now();
 
+    let t = Instant::now();
     let agent_registry = std::sync::Arc::new(agent::AgentRegistry::from_config(config));
     if agent_registry.is_empty() {
         agent_registry.register_default_chaz(config)?;
     }
     info!(
         agents = agent_registry.names().len(),
+        elapsed_ms = t.elapsed().as_millis() as u64,
         "Agent registry initialized"
     );
 
@@ -360,6 +433,7 @@ pub async fn build(
     // walking eidetica's tracked-DBs list. Each entry's `meta.kind` marker
     // classifies it. `/agent new`, `/memory new`, `/agent delete`, etc.
     // mutate these caches at runtime.
+    let t = Instant::now();
     let targeted_agents = if let Some(identifier) = opts
         .targeted_session
         .as_deref()
@@ -387,12 +461,22 @@ pub async fn build(
     } else {
         Vec::new()
     };
+    info!(
+        elapsed_ms = t.elapsed().as_millis() as u64,
+        "Startup: selected-session agent references loaded"
+    );
+    let t = Instant::now();
     let peer_default_agents = registry.load_peer_default_agents().await;
     let configured_defaults = peer_default_agents
         .clone()
         .or_else(|| config.default_agents.clone())
         .filter(|names| !names.is_empty())
         .unwrap_or_else(|| vec![agent_registry.default_agent().name]);
+    info!(
+        elapsed_ms = t.elapsed().as_millis() as u64,
+        "Startup: peer defaults loaded"
+    );
+    let t = Instant::now();
     let (agent_index_store, memory_bank_index_store, skill_bank_index_store) = {
         let user = registry.user_lock().await;
         if opts.targeted_session.is_some() {
@@ -403,6 +487,10 @@ pub async fn build(
             hosted_index::build_from_user(&user).await?
         }
     };
+    info!(
+        elapsed_ms = t.elapsed().as_millis() as u64,
+        "Startup: hosted indices loaded"
+    );
 
     // Surface pre-existing co-owned agents/sessions whose `home_pubkey` is
     // still unset (legacy default). These keep working as before — any
@@ -493,8 +581,16 @@ pub async fn build(
             }
         }
     }
-    // Build secret store backed by the chaz_peer DB.
+    // Frontends still need backend credentials for explicit model-catalog
+    // requests. Keep their hydration here; web search and embedding below are
+    // execution-only and must not delay a client or write its tool credentials.
+    let t = Instant::now();
     let secret_store = security::SecretStore::new(chaz_peer.clone()).await;
+    info!(
+        elapsed_ms = t.elapsed().as_millis() as u64,
+        "Startup: stored secrets loaded"
+    );
+    let t = Instant::now();
     if let Some(backends) = &mut config.backends {
         for backend in backends.iter_mut() {
             if let Some(raw_key) = backend.api_key.take() {
@@ -511,14 +607,29 @@ pub async fn build(
             }
         }
     }
+    info!(
+        elapsed_ms = t.elapsed().as_millis() as u64,
+        "Startup: backend credentials resolved"
+    );
 
     // Resolve the web_search API key (if any) into the secret store, same
     // `${VAR}` handling as LLM backend keys.
-    let web_search_backends = build_web_search_backends(config, &secret_store).await;
+    let t = Instant::now();
+    let web_search_backends = if executor_components {
+        build_web_search_backends(config, &secret_store).await
+    } else {
+        Vec::new()
+    };
+    info!(
+        elapsed_ms = t.elapsed().as_millis() as u64,
+        executor_components, "Startup: web search configured"
+    );
+    let t = Instant::now();
 
     // Same env-resolution dance for the embedding API key, then build the
     // shared `Arc<dyn Embedder>` (None when no embedding section configured).
-    if let Some(emb) = &mut config.embedding
+    if executor_components
+        && let Some(emb) = &mut config.embedding
         && let Some(raw_key) = emb.api_key.take()
     {
         let resolved = security::SecretStore::resolve_env(&raw_key).unwrap_or_else(|e| {
@@ -529,16 +640,25 @@ pub async fn build(
         secret_store.insert(ref_id.clone(), resolved).await;
         emb.api_key_ref = Some(ref_id);
     }
-    let embedder = match embedding::build_embedder(config.embedding.as_ref(), &secret_store) {
-        Ok(e) => e,
-        Err(err) => {
-            tracing::warn!("Embedding config invalid; falling back to lexical-only: {err}");
-            None
+    let embedder = if executor_components {
+        match embedding::build_embedder(config.embedding.as_ref(), &secret_store) {
+            Ok(e) => e,
+            Err(err) => {
+                tracing::warn!("Embedding config invalid; falling back to lexical-only: {err}");
+                None
+            }
         }
+    } else {
+        None
     };
     if let Some(e) = embedder.as_ref() {
         info!(model_id = %e.model_id(), "Embedder configured");
     }
+    info!(
+        elapsed_ms = t.elapsed().as_millis() as u64,
+        executor_components, "Startup: embedding configured"
+    );
+    let t = Instant::now();
 
     // Build security context from config
     let sec = config.security.clone().unwrap_or_default();
@@ -569,6 +689,11 @@ pub async fn build(
     let policy_overrides =
         grants::merge_legacy_security(sec.tool_policies.clone().unwrap_or_default(), &sec);
     let policies = std::sync::Arc::new(tool::ToolPolicyRegistry::new(policy_overrides));
+    info!(
+        elapsed_ms = t.elapsed().as_millis() as u64,
+        "Startup: security policies configured"
+    );
+    let t = Instant::now();
 
     let registry = std::sync::Arc::new(registry);
 
@@ -594,9 +719,11 @@ pub async fn build(
     // MCP extensions can register tools asynchronously off the critical
     // path via their `PeerHandles::tool_registry` handle.
     let tool_registry = Arc::new(tool::ToolRegistry::new());
-    tool_registry.register(crate::tools::MatrixSend {
-        registry: registry.clone(),
-    });
+    if executor_components {
+        tool_registry.register(crate::tools::MatrixSend {
+            registry: registry.clone(),
+        });
+    }
 
     // Set up extension hub infrastructure before install_all.
     // Tools and commands flow through per-extension caps;
@@ -669,12 +796,21 @@ pub async fn build(
         }
     }
 
-    let t = Instant::now();
-    extension_hub.install_all(extensions).await?;
     info!(
         elapsed_ms = t.elapsed().as_millis() as u64,
+        "Startup: extension dependencies constructed"
+    );
+    let t = Instant::now();
+    if executor_components {
+        extension_hub.install_all(extensions).await?;
+    } else {
+        extension_hub.install_commands(extensions).await?;
+    }
+    info!(
+        elapsed_ms = t.elapsed().as_millis() as u64,
+        executor_components,
         mcp_servers = mcp_configs.len(),
-        "Extensions installed (MCP servers starting in background)"
+        "Extensions installed"
     );
     let extension_names = extension_hub.extension_names();
     if !extension_names.is_empty() {
@@ -684,13 +820,18 @@ pub async fn build(
     // Drain extension-contributed tools (builtins) into the shared
     // ToolRegistry. MCP tools register asynchronously via background
     // tasks spawned by McpExtension::instantiate.
+    let t = Instant::now();
     for (owner, _name, tool) in extension_hub.tools_for_registry() {
         tool_registry.register_arc_owned(tool, Some(owner));
     }
 
     let extension_hub = std::sync::Arc::new(extension_hub);
 
-    info!("Tool registry initialized");
+    info!(
+        elapsed_ms = t.elapsed().as_millis() as u64,
+        "Tool registry initialized"
+    );
+    let t = Instant::now();
 
     // Build tool profiles from config
     let tool_profiles: std::collections::HashMap<String, tool::ToolProfile> = config
@@ -743,7 +884,9 @@ pub async fn build(
     // Close the processing gate before the first await below can schedule the
     // resident session-adoption watcher. On restart that watcher scans durable
     // queued turns immediately; none may run until agent config is reconciled.
-    server.mark_startup_pending();
+    if executor_components {
+        server.mark_startup_pending();
+    }
     server_slot.set(server.clone());
 
     // Apply operator multi-agent tuning before the bridge starts
@@ -830,6 +973,10 @@ pub async fn build(
     // reconcile via `mark_startup_pending`/`mark_startup_ready` so a turn
     // never executes against half-reconciled agent config.
     info!(
+        elapsed_ms = t.elapsed().as_millis() as u64,
+        "Startup: server and frontend settings configured"
+    );
+    info!(
         critical_path_ms = build_start.elapsed().as_millis() as u64,
         "Critical-path build complete; deferring at-startup work to background"
     );
@@ -879,7 +1026,8 @@ pub async fn build(
 
 /// The deferred at-startup work, run in a background task off the
 /// critical path so the gateway draws/serves immediately (see the
-/// fast-start block at the end of [`build`]). Order matters:
+/// fast-start block at the end of [`build`]). Clients stop after step 1;
+/// the remaining steps belong to executors. Order matters:
 ///
 /// 1. `warm_model_windows` — best-effort; the per-turn budget falls back
 ///    to the static default until this lands, so a miss is tolerated.
@@ -915,6 +1063,13 @@ async fn run_deferred_startup(
         elapsed_ms = t.elapsed().as_millis() as u64,
         "Deferred: warmed model windows"
     );
+
+    // Model-window metadata is also presentation data. Clients warm it in the
+    // background, but never reconcile agents, materialize schedules or open an
+    // executor readiness gate. Their command/observation surface is ready now.
+    if config.execution == Some(crate::config::ExecutionRole::Client) {
+        return;
+    }
 
     // 2. Reconcile each agent's DB config from yaml, then open the gate.
     //    `/agent reload` runs this same path on demand.

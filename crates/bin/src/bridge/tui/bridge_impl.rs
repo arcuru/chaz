@@ -1,4 +1,4 @@
-//! `Bridge` trait implementation for the TUI. Extracted from `mod.rs`.
+//! Ready-state TUI loop and owned runtime teardown.
 //!
 //! Child module of `tui` so the impl retains access to `TuiBridge`/`App`
 //! private state and the module-level render/terminal helpers via
@@ -11,12 +11,23 @@ use crossterm::event::MouseEventKind;
 /// still repaints regularly.
 const MAX_ACTIONS_PER_FRAME: usize = 64;
 
-impl Bridge for TuiBridge {
-    async fn run(mut self, mut server: Arc<Server>) -> anyhow::Result<()> {
-        let (mut runtime, runtime_path) = match self.runtime.take() {
-            Some((built, path)) => (Some(built), Some(path)),
-            None => (None, None),
-        };
+impl TuiBridge {
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn run_ready(
+        mut self,
+        built: chaz_core::server::BuiltServer,
+        runtime_path: std::path::PathBuf,
+        terminal: &mut Terminal<ratatui::backend::CrosstermBackend<io::Stdout>>,
+        events: &mut EventStream,
+        app: App,
+        terminal_owner: supervised::TerminalGuard,
+        approval_tx: mpsc::Sender<TaggedApproval>,
+        mut approval_rx: mpsc::Receiver<TaggedApproval>,
+        notify_tx: mpsc::Sender<String>,
+        mut notify_rx: mpsc::Receiver<String>,
+    ) -> anyhow::Result<()> {
+        let mut server = built.server.clone();
+        let mut runtime = Some(built);
         let (connection_tx, mut connection_rx) = mpsc::channel(1);
         let mut probe_task: Option<supervised::Task<()>> = None;
         let mut runtime_task: Option<supervised::Task<()>> = None;
@@ -29,8 +40,19 @@ impl Bridge for TuiBridge {
                 &mut connection_rx,
                 &mut probe_task,
                 &mut runtime_task,
+                terminal,
+                events,
+                app,
+                &approval_tx,
+                &mut approval_rx,
+                &notify_tx,
+                &mut notify_rx,
             )
             .await;
+        drop(terminal_owner);
+        if let Ok(Some(report)) = &result {
+            eprintln!("{report}");
+        }
         if let Some(mut task) = probe_task.take() {
             task.0.abort();
             let _ = (&mut task.0).await;
@@ -59,7 +81,7 @@ impl Bridge for TuiBridge {
         if let Some(built) = runtime {
             built.shutdown().await;
         }
-        result
+        result.map(|_| ())
     }
 }
 
@@ -70,15 +92,22 @@ impl TuiBridge {
         &mut self,
         server: &mut Arc<Server>,
         runtime: &mut Option<chaz_core::server::BuiltServer>,
-        runtime_path: Option<std::path::PathBuf>,
+        runtime_path: std::path::PathBuf,
         connection_tx: &mpsc::Sender<reconnect::ResultMessage>,
         connection_rx: &mut mpsc::Receiver<reconnect::ResultMessage>,
         probe_task: &mut Option<supervised::Task<()>>,
         runtime_task: &mut Option<supervised::Task<()>>,
-    ) -> anyhow::Result<()> {
+        terminal: &mut Terminal<ratatui::backend::CrosstermBackend<io::Stdout>>,
+        events: &mut EventStream,
+        app: App,
+        approval_tx: &mpsc::Sender<TaggedApproval>,
+        approval_rx: &mut mpsc::Receiver<TaggedApproval>,
+        notify_tx: &mpsc::Sender<String>,
+        notify_rx: &mut mpsc::Receiver<String>,
+    ) -> anyhow::Result<Option<String>> {
         let mut reconnect_allowed = true;
-        let (approval_tx, mut approval_rx) = mpsc::channel::<TaggedApproval>(8);
-        let (notify_tx, mut notify_rx) = mpsc::channel::<String>(64);
+        let mut app = app;
+        let mut backend = BackendManager::new(&self.config.backends, self.secrets.clone());
         // One-shot-style delivery of background model catalog fetches.
         // Buffered so a force-refresh kicked off mid-render doesn't block.
         let (models_tx, mut models_rx) = mpsc::channel::<ModelCatalog>(4);
@@ -88,65 +117,6 @@ impl TuiBridge {
         // counts). Tasks are owned by their tab's slots; the channel adds
         // bounded backpressure when many open tabs finish together.
         let (refresh_tx, mut refresh_rx) = mpsc::channel::<refresh::Refresh>(64);
-
-        // Resolve any directly opened conversation before touching the
-        // terminal, so a bad `--session` surfaces as a plain error.
-        let launch = launch_session(
-            server,
-            self.session.as_deref(),
-            self.initial_prompt.is_some(),
-        )
-        .await?;
-
-        let mut backend = BackendManager::new(&self.config.backends, self.secrets.clone());
-
-        let agent_names: HashSet<String> = server
-            .agents()
-            .names()
-            .into_iter()
-            .map(|s| s.to_string())
-            .collect();
-
-        let mut app = App::hub(agent_names);
-        if let Some(session_db) = launch {
-            let tab = if chaz_core::session::jobs::is_job_session(&session_db).await {
-                jobs::open_tab(
-                    server,
-                    &backend,
-                    &session_db.root_id().to_string(),
-                    notify_tx.clone(),
-                )
-                .await
-                .map_err(anyhow::Error::msg)?
-            } else {
-                let observation = setup_session(
-                    server,
-                    &session_db,
-                    backend.clone(),
-                    approval_tx.clone(),
-                    notify_tx.clone(),
-                )
-                .await?;
-                let session_db_id = session_db.root_id().to_string();
-                let mut tab = build_tab(server, &backend, session_db, session_db_id)
-                    .await
-                    .map_err(anyhow::Error::msg)?;
-                tab.live.observation = Some(observation);
-                tab
-            };
-            app.push_tab(tab);
-            app.mode = TuiMode::Chat;
-            // Prefill, never send: the user reviews the prompt first.
-            if let Some(prompt) = self.initial_prompt.as_ref() {
-                app.input = prompt.clone();
-                app.cursor = app.input.len();
-            }
-        }
-
-        supervised::install_panic_hook();
-        let _terminal_owner = supervised::TerminalGuard;
-        let mut terminal = init_terminal()?;
-        let mut events = EventStream::new();
 
         // An ordinary launch opens the hub — even on an empty install — and
         // creates nothing. The catalog loads in the background.
@@ -169,6 +139,7 @@ impl TuiBridge {
         );
 
         let mut activity_tick = tokio::time::interval(std::time::Duration::from_secs(5));
+        let mut first_ready_frame = true;
         let mut needs_draw = true;
         'run: loop {
             operations::cancel_closed_reads(&mut app);
@@ -176,20 +147,23 @@ impl TuiBridge {
                 && reconnect_allowed
                 && runtime_task.is_none()
                 && !app.operations.is_pending()
-                && let Some(path) = runtime_path.clone()
             {
                 *runtime_task = Some(reconnect::spawn_rebuild(
                     runtime.take(),
                     self.config.clone(),
-                    path,
+                    runtime_path.clone(),
                     &app,
-                    &approval_tx,
-                    &notify_tx,
+                    approval_tx,
+                    notify_tx,
                     connection_tx,
                 ));
             }
             if needs_draw {
                 terminal.draw(|f| view::ui(f, &mut app, server, &backend, &self.config))?;
+                if first_ready_frame {
+                    tracing::info!("TUI ready frame drawn");
+                    first_ready_frame = false;
+                }
                 // Use this frame's viewport, not the previous frame's cursor or size.
                 if matches!(app.mode, TuiMode::SessionPicker) {
                     request_session_metadata(&mut app, server, &session_rows_tx);
@@ -248,11 +222,11 @@ impl TuiBridge {
                                 jobs::refresh(&mut app, server, &jobs_tx);
                             }
                             reconnect::request_tabs(
-                                &mut app, server, &backend, &approval_tx, &notify_tx, connection_tx,
+                                &mut app, server, &backend, approval_tx, notify_tx, connection_tx,
                             );
                             refresh::request_tick(&mut app, &refresh_tx);
                         }
-                        if app.backend_available && runtime_path.is_some() && probe_task.is_none()
+                        if app.backend_available && probe_task.is_none()
                             && server.registry().instance().remote_connection().is_some()
                         {
                             *probe_task = Some(reconnect::spawn_probe(server, connection_tx));
@@ -341,8 +315,8 @@ impl TuiBridge {
                                         server,
                                         &backend,
                                         &self.secrets,
-                                        &approval_tx,
-                                        &notify_tx,
+                                        approval_tx,
+                                        notify_tx,
                                         &models_tx,
                                         &session_rows_tx,
                                     );
@@ -370,8 +344,8 @@ impl TuiBridge {
                                         server,
                                         &backend,
                                         &self.secrets,
-                                        &approval_tx,
-                                        &notify_tx,
+                                        approval_tx,
+                                        notify_tx,
                                         &models_tx,
                                         &session_rows_tx,
                                     );
@@ -414,7 +388,7 @@ impl TuiBridge {
                             }
                             match app.mode {
                                 TuiMode::Jobs => jobs::handle_key(
-                                    &mut app, key, server, &backend, &notify_tx, &jobs_tx,
+                                    &mut app, key, server, &backend, notify_tx, &jobs_tx,
                                 ),
                                 TuiMode::Chat => {
                                     if let Some(chat_action) = input::handle_chat_key(&mut app, key)
@@ -425,8 +399,8 @@ impl TuiBridge {
                                             server,
                                             &backend,
                                             &self.secrets,
-                                            &approval_tx,
-                                            &notify_tx,
+                                            approval_tx,
+                                            notify_tx,
                                             &models_tx,
                                             &session_rows_tx,
                                         );
@@ -440,8 +414,8 @@ impl TuiBridge {
                                             &mut app,
                                             server,
                                             &backend,
-                                            &approval_tx,
-                                            &notify_tx,
+                                            approval_tx,
+                                            notify_tx,
                                         );
                                     }
                                 }
@@ -454,8 +428,8 @@ impl TuiBridge {
                                                 server,
                                                 &backend,
                                                 &self.secrets,
-                                                &approval_tx,
-                                                &notify_tx,
+                                                approval_tx,
+                                                notify_tx,
                                             );
                                         }
                                         input::ModelPickerKey::Refresh => {
@@ -480,8 +454,8 @@ impl TuiBridge {
                                         server,
                                         &backend,
                                         &self.secrets,
-                                        &approval_tx,
-                                        &notify_tx,
+                                        approval_tx,
+                                        notify_tx,
                                         &models_tx,
                                         &session_rows_tx,
                                     );
@@ -505,8 +479,8 @@ impl TuiBridge {
                                         &mut app,
                                         server,
                                         &backend,
-                                        &approval_tx,
-                                        &notify_tx,
+                                        approval_tx,
+                                        notify_tx,
                                     );
                                 }
                                 input::MouseOutcome::TabActivate(i) => {
@@ -525,8 +499,8 @@ impl TuiBridge {
                                             server,
                                             &backend,
                                             &self.secrets,
-                                            &approval_tx,
-                                            &notify_tx,
+                                            approval_tx,
+                                            notify_tx,
                                         );
                                     }
                                 }
@@ -749,11 +723,6 @@ impl TuiBridge {
 
         let exit_report = app.operations.exit_report();
         drop(app);
-        drop(terminal);
-        drop(_terminal_owner);
-        if let Some(report) = exit_report {
-            eprintln!("{report}");
-        }
-        Ok::<(), anyhow::Error>(())
+        Ok(exit_report)
     }
 }

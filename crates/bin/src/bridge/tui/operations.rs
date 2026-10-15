@@ -85,6 +85,7 @@ pub(super) struct Operations {
     next_ticket: u64,
     current_ticket: Option<u64>,
     current_origin: Option<Origin>,
+    creation_ticket: Option<u64>,
 }
 impl Default for Operations {
     fn default() -> Self {
@@ -105,6 +106,7 @@ impl Default for Operations {
             next_ticket: 0,
             current_ticket: None,
             current_origin: None,
+            creation_ticket: None,
         }
     }
 }
@@ -140,6 +142,9 @@ impl Operations {
     }
     pub(super) fn has_capacity(&self) -> bool {
         self.queue.len() + usize::from(self.task.is_some()) < CAPACITY
+    }
+    pub(super) fn is_creating_session(&self) -> bool {
+        self.creation_ticket.is_some()
     }
     pub(super) fn is_pending(&self) -> bool {
         self.task.is_some() || !self.queue.is_empty()
@@ -287,6 +292,29 @@ pub(super) fn cancel_closed_reads(app: &mut App) {
     }
 }
 
+/// Prioritize the accepted creation over historical presentation reads. A
+/// metadata open can hold the same User lock that database creation needs.
+pub(super) fn begin_creation(app: &mut App) -> bool {
+    if app.operations.is_creating_session() {
+        app.operations.notice =
+            Some("Session creation already pending — not accepted again".into());
+        return false;
+    }
+    if !app.backend_ready() || !app.operations.has_capacity() {
+        app.operations.notice =
+            Some("Backend unavailable or action queue full — creation not accepted".into());
+        return false;
+    }
+    app.cancel_session_fill();
+    app.session_list_fresh = false;
+    // The catalog reload is deferred until the accepted action settles.
+    app.session_catalog_loading = true;
+    let ticket = app.operations.next_ticket + 1;
+    app.operations.creation_ticket = Some(ticket);
+    tracing::info!(ticket, "TUI new session requested");
+    true
+}
+
 pub(super) fn submit(
     app: &mut App,
     write: bool,
@@ -318,6 +346,16 @@ pub(super) fn apply(app: &mut App, completion: Completion) {
     let Completion { pending, result } = completion;
     let nav_valid = pending.origin.navigation_valid(app);
     let target = pending.origin.tab_index(app);
+    // Creation stays admitted only while its accepted action continues below
+    // (a new destination still preparing); every other settlement releases it.
+    let continues = nav_valid
+        && matches!(&result, Ok(Effect::Open(open))
+            if app.tab_index_for(&open.switch.session_db_id).is_none());
+    if app.operations.creation_ticket == Some(pending.ticket) && !continues {
+        app.operations.creation_ticket = None;
+        app.session_catalog_loading = false;
+        app.session_list_fresh = false;
+    }
     if pending.write
         && let Some(i) = target
     {
@@ -374,6 +412,8 @@ pub(super) fn apply(app: &mut App, completion: Completion) {
         Ok(Effect::Opened(tab)) => {
             app.session_list_fresh = false;
             if nav_valid {
+                tracing::info!(ticket = pending.ticket, session_db_id = %tab.session_db_id,
+                    agent = %tab.current_agent, "TUI session composer ready");
                 if let Some(i) = app.tab_index_for(&tab.session_db_id) {
                     app.set_active_tab(i);
                 } else {

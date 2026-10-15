@@ -244,7 +244,7 @@ class Lifecycle(unittest.TestCase):
             home = Path(directory)
             # Deliberately do not inherit provider keys, proxy variables or user paths.
             env = {"PATH": str(home / "bin"), "HOME": directory, "TERM": "xterm-256color",
-                   "LANG": "C.UTF-8", "RUST_LOG": "warn"}
+                   "LANG": "C.UTF-8", "RUST_LOG": "info"}
             for name in ["CONFIG", "DATA", "STATE", "CACHE", "RUNTIME"]:
                 path = home / name.lower()
                 path.mkdir(mode=0o700)
@@ -335,6 +335,8 @@ default_agents: [chaz]
 
                 launch()
                 process.expect("New session")
+                # The first hub frame now precedes connection/build readiness.
+                process.expect("yet — select")
                 process.send("n")
                 # New opens a conversation immediately: its tab bar and composer.
                 process.expect("Ctrl+P sessions")
@@ -478,6 +480,37 @@ default_agents: [chaz]
                 quit_cleanly()
                 created = sessions()
                 self.assertEqual(len(created), 2, created)
+                # These are distinct readiness boundaries, not one startup-to-
+                # create duration that also includes time spent by the user.
+                logs = "\n".join(log.read_text() for log in sorted((home / "state").glob("chaz-tui*.log*")))
+                milestones = ["Session registry callback installed", "TUI first frame drawn",
+                              "TUI session catalog completed", "TUI new session requested",
+                              "TUI session composer ready", "TUI launch ready", "TUI ready frame drawn"]
+                for event in milestones:
+                    self.assertIn(event, logs)
+                # Each launch paints before registry work, then hands off to
+                # the ready loop. Neither frame implies executor readiness.
+                positions = [[i for i, line in enumerate(logs.splitlines()) if event in line]
+                             for event in [milestones[1], milestones[0], milestones[5], milestones[6]]]
+                for events in positions:
+                    self.assertEqual(len(events), 2, positions)
+                for first, registry, launch_ready, ready_frame in zip(*positions):
+                    self.assertLess(first, registry)
+                    self.assertLess(registry, launch_ready)
+                    self.assertLess(launch_ready, ready_frame)
+                self.assertLess(logs.index(milestones[3]), logs.index(milestones[4]))
+                requests_logged = [line for line in logs.splitlines() if milestones[3] in line]
+                composers_logged = [line for line in logs.splitlines() if milestones[4] in line]
+                self.assertEqual(len(requests_logged), 2)
+                self.assertEqual(len(composers_logged), 2)
+                for request, composer in zip(requests_logged, composers_logged):
+                    self.assertEqual(re.search(r"ticket=(\d+)", request)[1],
+                                     re.search(r"ticket=(\d+)", composer)[1])
+                    self.assertIn("agent=chaz", composer)
+                out = Path(os.environ.get("TUI_EVIDENCE", ROOT / "target/tui-pty-readiness")) / str(time.time_ns())
+                out.mkdir(parents=True, exist_ok=True)
+                (out / "readiness.log").write_text(logs)
+                print(f"READINESS MILESTONES: PASS; distinct events and paired create/composer tickets; {out}")
 
                 # Relaunching with an existing session still opens the hub and
                 # creates nothing.
@@ -499,6 +532,7 @@ default_agents: [chaz]
                 launch("--session", "pty-work", "pty-named-prefill")
                 process.expect("pty-named-prefill")
                 process.expect("pty-work")
+                process.expect("Ctrl+P sessions")
                 assert_no_request()
                 quit_cleanly()
                 named = sessions()
@@ -506,6 +540,7 @@ default_agents: [chaz]
                 self.assertEqual(sum("\tpty-work\t" in row for row in named), 1, named)
                 launch("--session", "pty-work")
                 process.expect("pty-work")
+                process.expect("Ctrl+P sessions")
                 process.send("pty-quit-busy\r")
                 process.request(received)
                 quit_cleanly()
