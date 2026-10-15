@@ -1,0 +1,42 @@
+---
+source: crates/bin/src/bridge/tui/view/mod.rs
+expression: snapshot_rows(&terminal)
+---
+ render-demo ×  Ctrl+P sessions · Ctrl+S settings · Ctrl+W close
+╭ Chaz ────────────────────────────────────────────────────────╮
+│  ▾ shell                                                     │
+│      first line                                              │
+│        indented line                                         │
+│      keep \n and C:\new\file                                 │
+│  ▾ query                                                     │
+│      {                                                       │
+│        "empty": ""                                           │
+│        "items": [                                            │
+│          {                                                   │
+│            "count": 2                                        │
+│            "text": one                                       │
+│            two                                               │
+│          }                                                   │
+│          {}                                                  │
+│        ]                                                     │
+│        "missing": null                                       │
+│      }                                                       │
+│  ▾ text                                                      │
+│      quoted                                                  │
+│        text and literal \n                                   │
+│  ▾ empty                                                     │
+│                                                              │
+│                                                              │
+│  ✗ query                                                     │
+│      {                                                       │
+│        "reason": failed                                      │
+│          retry later                                         │
+│      }                                                       │
+│  ▾ clipped                                                   │
+│      {"text":"not decoded\n…                                 │
+│                                                              │
+╰──────────────────────────────────────────────────────────────╯
+ render-demo | ctx unknown/unknown tok | agent: chaz | model: —
+╭ > ───────────────────────────────────────────────────────────╮
+│                                                              │
+╰──────────────────────────────────────────────────────────────╯

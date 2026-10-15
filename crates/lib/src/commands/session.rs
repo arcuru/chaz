@@ -57,6 +57,7 @@ pub async fn try_load_session_metadata(
         session_db_id: index.session_db_id,
         agent_name: meta.agent_name,
         name: meta.name.or(index.name),
+        description: meta.description,
         bridge: index.bridge,
         created_at: index.created_at,
         status: index.status,
@@ -202,6 +203,13 @@ pub(super) async fn info(ctx: &CommandContext<'_>) -> CommandOutcome {
         Some(n) => format!("\nName: {n}"),
         None => String::new(),
     };
+    // Lenient read: a browse-only line must not make `/info` itself fail
+    // on a session whose other metadata fields are malformed.
+    let description_line = crate::session::read_meta_from_db(ctx.session_db)
+        .await
+        .description
+        .map(|d| format!("\nDescription: {d}"))
+        .unwrap_or_default();
     let channels = match ctx
         .server
         .registry()
@@ -219,7 +227,7 @@ pub(super) async fn info(ctx: &CommandContext<'_>) -> CommandOutcome {
     };
     let usage_line = format_usage_summary(entries);
     CommandOutcome::Text(format!(
-        "Session: {}{name_line}\nAgent: {}{channels_line}\nTotal entries: {}\nMessages: {msg_count} | Directives: {directive_count} | Tool calls: {tool_count} | Errors: {error_count}{usage_line}",
+        "Session: {}{name_line}{description_line}\nAgent: {}{channels_line}\nTotal entries: {}\nMessages: {msg_count} | Directives: {directive_count} | Tool calls: {tool_count} | Errors: {error_count}{usage_line}",
         ctx.session_db_id,
         ctx.current_agent,
         entries.len(),
@@ -313,6 +321,20 @@ pub(super) async fn clear_session_name(ctx: &CommandContext<'_>) -> CommandOutco
     {
         Ok(()) => CommandOutcome::Text("Session name cleared.".to_string()),
         Err(e) => CommandOutcome::Error(format!("Failed to clear name: {e}")),
+    }
+}
+
+/// Set (`Some`) or clear (`None`) the browse-only description through the
+/// shared validated path, using the caller's own session handle so the
+/// session's write authorization applies.
+pub(super) async fn set_description(
+    description: Option<&str>,
+    ctx: &CommandContext<'_>,
+) -> CommandOutcome {
+    match crate::session::set_session_description(ctx.session_db, description).await {
+        Ok(Some(text)) => CommandOutcome::Text(format!("Session description set: {text}")),
+        Ok(None) => CommandOutcome::Text("Session description cleared.".to_string()),
+        Err(e) => CommandOutcome::Error(format!("Failed to update description: {e}")),
     }
 }
 
@@ -847,6 +869,10 @@ pub(super) async fn list_backends(ctx: &CommandContext<'_>) -> CommandOutcome {
     );
     CommandOutcome::Text(msg)
 }
+
+#[cfg(test)]
+#[path = "description_tests.rs"]
+mod description_tests;
 
 #[cfg(test)]
 mod listing_tests {

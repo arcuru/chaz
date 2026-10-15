@@ -58,6 +58,67 @@ The TUI has four main pieces:
 
 An ordinary launch opens the [session hub](#session-hub) rather than any conversation; there is no built-in default session.
 
+## Reading messages and tool output
+
+| Content                  | Display                                                                                                   |
+| ------------------------ | --------------------------------------------------------------------------------------------------------- |
+| Message Markdown         | Headings, bold/italic emphasis, ordered/nested lists and readable links                                   |
+| Inline and fenced code   | Accent text on a dark background; code indentation and literal escapes are retained                       |
+| Collapsed tool entry     | One-line preview, capped at 90 characters plus an ellipsis                                                |
+| Expanded tool result     | Indented plain text, with line breaks; complete JSON becomes an indented outline with decoded text values |
+| Click the `▸` / `▾` icon | Expand or collapse that entry                                                                             |
+| `Ctrl+T` or `/expand`    | Toggle expansion for all tool entries and directives                                                      |
+
+## Formatting is a view, not a rewrite
+
+Messages use Markdown styling automatically. Links show their label and target;
+they do not launch a browser. Tool output is **not** Markdown, so shell syntax,
+asterisks and code remain text. Both wrap to the pane's width and use the same
+history scrolling as other entries.
+
+The TUI decodes a tool result only when its body is a complete JSON value.
+JSON string values become text with real line breaks; an intentionally literal
+backslash-n stays literal. It does not decode nested JSON inside a text value,
+or guess at escapes in ordinary text. Empty strings, objects and arrays remain
+visible in structured output. The outline is for reading, not for copying as
+valid JSON. Terminal controls are quarantined after decoding.
+
+Stored entries, wire payloads and output limits do not change. A successful tool
+result's stored display preview can already be clipped at 500 characters.
+If clipping makes JSON incomplete, the TUI shows that preview as plain text,
+including its escapes and truncation marker, rather than guessing the missing
+structure. `/raw` still shows the stored entry representation.
+
+### Walkthrough: read an escaped result
+
+1. Send a message containing `# Report`, `**bold**`, `*italic*` and an inline
+   code span. The message shows a styled heading and emphasis; code such as
+   `C:\new\file` keeps its backslashes.
+2. Suppose a tool returns this complete JSON body:
+
+   ```json
+   { "text": "one\n  two", "literal": "keep \\n" }
+   ```
+
+   The collapsed row starts with `▸ query` and a short preview. Click its icon,
+   or press `Ctrl+T`. The body reads:
+
+   ```text
+     ▾ query
+         {
+           "literal": keep \n
+           "text": one
+             two
+         }
+   ```
+
+   `two` occupies a separate line, while `keep \n` remains on one line.
+
+3. If the preview ends midway through JSON, for example
+   `{"text":"one\n…`, expansion cannot recover the missing bytes. Ask the tool
+   for a smaller page or shorter result and expand the next complete result.
+   Merely toggling expansion does not repair clipped JSON or rerun the tool.
+
 ## Context usage
 
 The status bar's `ctx 57k/1M (5.7%) tok` pair is separate from running
@@ -117,26 +178,28 @@ The TUI catalogs every built-in slash command in its inline completion popup —
 
 ### Session
 
-| Command           | Description                                                            |
-| ----------------- | ---------------------------------------------------------------------- |
-| `/help`, `/?`     | Open the help overlay (also `F1`)                                      |
-| `/sessions`, `/s` | Open the session hub (also `Ctrl+P`)                                   |
-| `/new`            | Create a new session and switch to it                                  |
-| `/new <group>`    | Create a new session with a named agent group attached                 |
-| `/groups`         | List the configured agent groups                                       |
-| `/join <ref>`     | Switch to a session by name or eidetica DB ID                          |
-| `/name <alias>`   | Set a human-friendly alias for the current session (also `/rename`)    |
-| `/name`           | Clear the session alias                                                |
-| `/info`           | Show current session details (name, DB ID, entry counts)               |
-| `/costs`          | Aggregate LLM usage and cost across all sessions ([details](usage.md)) |
-| `/interrupted`    | List turns that require an explicit retry decision                     |
-| `/retry <id>`     | Ask the executor to retry the currently observed interrupted attempt   |
-| `/channels`       | List Matrix rooms currently attached to this session                   |
-| `/share`          | Generate a shareable ticket URL for the current session                |
-| `/sync <ticket>`  | Sync a remote session via a ticket URL                                 |
-| `/compact`        | Ask the executor to compact the current immutable session snapshot     |
-| `/print`          | Dump the transcript                                                    |
-| `/stop`           | Stop the active turn in this session; idle sessions are unchanged      |
+| Command               | Description                                                            |
+| --------------------- | ---------------------------------------------------------------------- |
+| `/help`, `/?`         | Open the help overlay (also `F1`)                                      |
+| `/sessions`, `/s`     | Open the session hub (also `Ctrl+P`)                                   |
+| `/new`                | Create a new session and switch to it                                  |
+| `/new <group>`        | Create a new session with a named agent group attached                 |
+| `/groups`             | List the configured agent groups                                       |
+| `/join <ref>`         | Switch to a session by name or eidetica DB ID                          |
+| `/name <alias>`       | Set a human-friendly alias for the current session (also `/rename`)    |
+| `/name`               | Clear the session alias                                                |
+| `/description <text>` | Set a browse-only description (up to 200 characters)                   |
+| `/description`        | Clear the session description                                          |
+| `/info`               | Show current session details (name, DB ID, entry counts)               |
+| `/costs`              | Aggregate LLM usage and cost across all sessions ([details](usage.md)) |
+| `/interrupted`        | List turns that require an explicit retry decision                     |
+| `/retry <id>`         | Ask the executor to retry the currently observed interrupted attempt   |
+| `/channels`           | List Matrix rooms currently attached to this session                   |
+| `/share`              | Generate a shareable ticket URL for the current session                |
+| `/sync <ticket>`      | Sync a remote session via a ticket URL                                 |
+| `/compact`            | Ask the executor to compact the current immutable session snapshot     |
+| `/print`              | Dump the transcript                                                    |
+| `/stop`               | Stop the active turn in this session; idle sessions are unchanged      |
 
 ### Living Agents
 
@@ -270,6 +333,76 @@ Approval prompts accept `y` to approve, `n` to deny, and `a` to approve all rema
 ### Mouse
 
 Mouse capture is enabled. Click on completion rows, help-overlay command rows, approval buttons, hub and picker rows, tab titles, or tab close `×` widgets to act on them. The scroll wheel scrolls the help overlay when it is open; in the session hub and model picker it moves the selection three rows. In Settings, it selects over the visible list rows and reads over the visible content body (see [Reading Settings details](#reading-settings-details)); headers, the category rail, and the status strip swallow it. Other overlays swallow it; otherwise it scrolls history.
+
+### Copy conversation text
+
+| Input                                       | Action                                                       |
+| ------------------------------------------- | ------------------------------------------------------------ |
+| Left drag over a message body, then release | Highlight and request clipboard copy automatically           |
+| Wheel / PageUp before selecting             | Read earlier conversation text and select there              |
+| Wheel while dragging                        | Extend the same selection into earlier/later visible history |
+| Click elsewhere or press any key            | Clear the highlight; leave the clipboard unchanged           |
+
+Mouse capture sends ordinary drags to Chaz rather than the terminal's native
+selection. Chaz selects **message bodies**, including multiline code and external
+bridge message bodies. Sender labels, timestamps, borders, separators, tool audit
+rows and live activity are not copied. Selection follows the displayed message
+body: Markdown delimiters and code fences are omitted, while code indentation,
+source Unicode spelling and line breaks remain. Visual soft wraps do not add
+newlines. Quarantined terminal controls stay neutralized when copied.
+Select after scrolling to an older message, or hold the drag and use the wheel
+before releasing. There is no edge-hover auto-scroll. A plain click does not copy.
+Resizing, refreshing the transcript, switching views or opening an overlay clears
+the selection rather than using stale coordinates. Approval controls and other
+click targets still work, and keyboard bindings (including Ctrl+C **quit**) are
+unchanged.
+
+On release, Chaz sends an **OSC 52 clipboard-write request** to the terminal. This
+works over SSH without a clipboard utility on the remote host. The terminal must
+support and allow OSC 52 writes; Chaz cannot read back or confirm your desktop
+clipboard. Some terminals limit the size or disable remote clipboard access.
+Inside tmux, application writes require `set-clipboard on` (not `external`) and
+an OSC 52-capable outer terminal/terminfo. tmux can also keep the copied text in
+its paste buffer. These are terminal settings, not Chaz configuration.
+
+If your clipboard does not change, paste into a scratch document to check, then
+check the terminal's OSC 52 permissions and tmux's `set-clipboard` setting.
+A fallback is your terminal's mouse-capture override (often **Shift+drag**) and
+its normal Copy action. That selects screen cells, not Chaz source text: it may
+include borders/indentation and visual wrap newlines, and only covers visible
+text. Chaz does not claim automatic clipboard copy on terminals that reject
+OSC 52.
+
+#### Walkthrough: copy a reply and code from history
+
+1. With OSC 52 writes allowed, drag over `A short reply.` in a message body
+   and release. Paste into a scratch document. It should contain exactly:
+
+   ```text
+   A short reply.
+   ```
+
+2. Scroll up with the wheel or PageUp to a reply containing code. Start at
+   the first `f` and drag through the closing `}` of:
+
+   ```rust
+   fn main() {
+       println!("hello");
+   }
+   ```
+
+   Release and paste. The clipboard should contain those three source lines,
+   including the four-space code indentation, without the sender label or
+   Chaz's two-space message margin. A soft-wrapped long line remains one
+   source line. To select beyond the viewport, keep holding the mouse button
+   and wheel until the last line is visible, then release there.
+
+3. If the highlight appears but pasting still yields the previous clipboard,
+   the terminal may have refused OSC 52. Allow clipboard writes in that
+   terminal; with tmux, check `tmux show -s set-clipboard` and enable
+   `set-clipboard on` if desired. Retry the short reply and paste again.
+   If writes cannot be enabled, use the terminal-native override and Copy,
+   accounting for its screen-cell limitations above.
 
 ## Debug Mode
 
@@ -412,15 +545,15 @@ These tables list every category in sidebar order. Read-only pages are inspector
 Action letters such as `a`, `d`, and `r`, and Defaults' `Ctrl+Up`/`Ctrl+Down`
 reordering keep their existing selected-row targets. Prompts, pickers, diffs,
 and approval input take precedence over the reader. A pending tool approval
-shows the same request and buttons as chat, preserving any Settings draft and
+shows the same request and buttons as chat at supported sizes, preserving any Settings draft and
 reading position until it is answered. Wheeling or clicking a covered Settings
 list cannot move its selection or the hidden chat.
 
 #### Selection is not reading position
 
-An agent's workers are decorative list rows, not selectable agents. If the
-whole agent-and-workers group fits the list's current row budget, it stays
-expanded. Otherwise its agent row shows `[20 workers → details]` (with the
+An agent's workers are decorative list rows, not selectable agents. In the
+normal layout, a group that fits the list's row budget stays expanded.
+Compact lists always summarize workers. A summarized agent row shows `[20 workers → details]` (with the
 actual count). The existing body still contains every worker's fields.
 
 When a body overflows, a pinned row identifies the selected entity and shows
@@ -435,7 +568,8 @@ leaving Settings resets it too. Focus changes and opening/canceling a model
 picker or diff preserve it. Resizing rewraps the body and clamps the numeric
 wrapped-line offset. It does not preserve a semantic text anchor or remember
 separate positions for previously visited entities. A body that fits again
-returns to its ordinary, unscrolled layout.
+returns to its ordinary, unscrolled layout in normal Settings. Compact Content
+keeps its pinned identity row. See [Small-terminal Settings](#small-terminal-settings).
 
 #### Read an overflowing worker group
 
@@ -489,6 +623,66 @@ For example:
    adds nothing. Reopen with `a`, or remove the filter with `Backspace` before
    accepting, or press `Esc` to cancel.
 
+## Small-terminal Settings
+
+Settings chooses its layout from the terminal's current width and height:
+
+| Size                                                       | Layout                                                                |
+| ---------------------------------------------------------- | --------------------------------------------------------------------- |
+| Width ≥64 **and** height ≥14                               | Normal category rail, with list and body together on Agents/MCP.      |
+| Width ≥40 **and** height ≥8, below either normal threshold | Compact: header, category breadcrumb, one content pane, status strip. |
+| Width <40 **or** height <8                                 | Too-small message; no page or modal actions.                          |
+
+Compact uses the [same navigation and reader](#reading-settings-details), not a
+separate selection. The breadcrumb shows the category, ordinal and focus:
+`‹ Agents 1/9 ›  LIST`. Click `‹` or `›` to cycle categories; click the category
+label to focus Category. Tab, Shift+Tab and number keys still work.
+
+Peer Agents/MCP show the list until Content owns focus. Right replaces it with
+the selected entity's body; Left restores the same list selection and window.
+Only the visible pane receives clicks or wheel events. Breadcrumbs, headers
+and the status strip swallow the wheel. Static and empty pages use the full
+content slot. Lists prioritize selected rows over decoration; Models drops
+explanatory continuation rows without changing the selected model scope.
+
+Resizing preserves focus, selection and drafts. A visible body rewraps and
+clamps its numeric reading offset before drawing. Below 40×8, Settings and its
+open modals are hidden without discarding their state. Typing, navigation,
+scrolling, actions, submissions and confirmations are paused. Esc backs out
+of the current modal (denying an approval), or leaves Settings when no modal
+owns input. Ctrl+C still quits. Resize back to resume before submitting.
+
+### Resize while reading
+
+1. Open Peer Settings → Agents in an 80×24 terminal. Select `alpha`, with
+   twenty workers, then focus List and resize to 40×8. The breadcrumb and
+   summarized row read:
+
+   ```text
+   ‹ Agents 1/9 ›  LIST
+   > [20 workers → details] alpha
+   ```
+
+2. Press Right. The list disappears and the breadcrumb reads
+   `‹ Agents 1/9 ›  READ`. Down/PageDown reads the body; End reaches its
+   final fields. At 40×8, the pinned identity leaves four reading rows,
+   so longer worker blocks take multiple pages. Left returns to `alpha`
+   in the list; it does not change the model action's target.
+3. Resize to 39×7. The page is replaced by:
+
+   ```text
+   Peer Settings
+   Too small: need 40×8
+   Resize or Esc back
+   ```
+
+   Enter and action keys do nothing. If a prompt or picker was open, its
+   draft/filter remains intact; nothing is submitted invisibly.
+
+4. Resize back to 40×8 or 80×24. The same owner and selection return; the
+   visible reader's offset clamps to the new wrapping. Use Home to start
+   reading again, or Esc to cancel/return to the caller.
+
 ## Named Sessions
 
 Give sessions human-friendly names instead of opaque IDs:
@@ -516,6 +710,79 @@ This also applies to bridge participation settings and runtime, agent and job
 metadata updates. On a transport failure, restore the connection before editing
 again. Malformed stored metadata stays write-blocking; reopening the TUI or
 retrying another edit does not repair it. There is no automatic reset policy.
+
+## Session Descriptions
+
+A description is one short line that helps you recognize a session while browsing. The [name](#named-sessions) is a unique handle you type (`/join planning`); the description is free text you read. It appears beneath the session's row in the [session hub](#session-hub) and as a `Description:` line in `/info`.
+
+| Command               | Effect                                                     |
+| --------------------- | ---------------------------------------------------------- |
+| `/description <text>` | Set or replace the description                             |
+| `/description`        | Clear it (as bare `/name` clears the name)                 |
+| `/info`               | Show it, after `Name:`; no line when none is set           |
+| `!chaz description …` | The same commands from a Matrix room attached to a session |
+
+What to keep in mind:
+
+- **It is for people, not models.** A description is never a system instruction, never a compaction summary, and never part of any model request. Agents cannot read or change it and get no tool for it, so describing a session costs no tokens and cannot steer a reply.
+- **It is not an identifier.** It need not be unique, and `/join`, `--session` and other session references never match it. Setting or clearing it leaves the name and its lookups untouched.
+- **It travels with the session.** It lives in the session's own metadata, so every peer that syncs the session sees the same text. Older sessions simply have none.
+- **Writing it needs write access.** The edit is signed with your key on that session; a participant holding only read access is refused and the stored text is unchanged.
+- **Input is checked, not rewritten.** Surrounding whitespace is trimmed. Text must be a single line of at most 200 characters, with no newlines, tabs or other control characters; anything else is refused and the previous description stays.
+
+It is set by hand today. Extensions may set it through the same validated, permission-checked path the command uses.
+
+### Walkthrough: describing a session
+
+1. Open the session you want to describe, here one named `planning`, and set a description:
+
+   ```text
+   /description Q3 budget review with finance
+   ```
+
+   The transcript shows:
+
+   ```text
+   Session description set: Q3 budget review with finance
+   ```
+
+2. Check it with `/info`. The description follows the name:
+
+   ```text
+   Session: <session DB id>
+   Name: planning
+   Description: Q3 budget review with finance
+   Agent: chaz
+   ```
+
+3. Press `Ctrl+P`. The hub row shows the description on its second line, dimmed, and cut short with `…` when the pane is narrow:
+
+   ```text
+   +--[ Sessions ]-------------------------------------------+
+   |                                                         |
+   | > + New session                                         |
+   |                                                         |
+   |   "planning" * [tui] chaz • 2h ago                      |
+   |     Q3 budget review with finance                       |
+   +---------------------------------------------------------+
+   ```
+
+4. A description that is too long, or that spans lines, is refused and the old text stays. From a script:
+
+   ```text
+   $ chaz cmd --session planning "/description $(printf 'x%.0s' {1..231})"
+   Error: Failed to update description: Description is 231 characters; the limit is 200
+   ```
+
+   Shorten it and run `/description` again. A pasted multi-line description reports `Description must be a single line without control characters`.
+
+5. Clear it with a bare `/description`:
+
+   ```text
+   Session description cleared.
+   ```
+
+   The hub row returns to a blank second line, `/info` drops the `Description:` line, and the name `planning` still works with `/join`.
 
 ## Model Picker
 

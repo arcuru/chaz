@@ -42,6 +42,7 @@ mod jobs;
 mod operations;
 mod reconnect;
 mod refresh;
+mod selection;
 mod supervised;
 mod theme;
 #[cfg(test)]
@@ -168,6 +169,27 @@ pub(super) enum SettingsFocus {
     Category,
     List,
     Content,
+}
+
+/// Geometry shared by Settings rendering and input, including its model picker.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) enum SettingsLayout {
+    #[default]
+    Normal,
+    Compact,
+    TooSmall,
+}
+
+impl SettingsLayout {
+    fn for_size(width: u16, height: u16) -> Self {
+        if width < 40 || height < 8 {
+            Self::TooSmall
+        } else if width < 64 || height < 14 {
+            Self::Compact
+        } else {
+            Self::Normal
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -654,6 +676,7 @@ pub(super) struct ListScroll {
 
 pub(super) struct App {
     jobs: jobs::JobsView,
+    selection: selection::Selection,
     pub(super) mode: TuiMode,
     pub(super) overlay: Option<Overlay>,
     pub(super) click_regions: Vec<ClickRegion>,
@@ -843,6 +866,7 @@ pub(super) struct App {
     /// Reset to `Category` on `open_settings`; flipped by Right / Enter,
     /// Left, or a click that lands inside the corresponding region.
     pub(super) settings_focus: SettingsFocus,
+    pub(super) settings_layout: SettingsLayout,
     pub(super) settings_reader: SettingsReader,
     /// Actual visible row slots, excluding the list header and footer.
     pub(super) settings_list_area: Option<ratatui::layout::Rect>,
@@ -862,6 +886,7 @@ impl App {
     fn hub(agent_names: HashSet<String>) -> Self {
         Self {
             jobs: jobs::JobsView::default(),
+            selection: selection::Selection::default(),
             mode: TuiMode::SessionPicker,
             overlay: None,
             click_regions: Vec::new(),
@@ -928,9 +953,17 @@ impl App {
             settings_status: None,
             model_picker_caller: TuiMode::Chat,
             settings_focus: SettingsFocus::Category,
+            settings_layout: SettingsLayout::default(),
             settings_reader: SettingsReader::default(),
             settings_list_area: None,
         }
+    }
+
+    pub(super) fn settings_too_small(&self) -> bool {
+        self.settings_layout == SettingsLayout::TooSmall
+            && (matches!(self.mode, TuiMode::Settings(_))
+                || (self.mode == TuiMode::ModelPicker
+                    && matches!(self.model_picker_caller, TuiMode::Settings(_))))
     }
 
     /// Enter Settings in `scope`, remembering `from` so Esc returns there.

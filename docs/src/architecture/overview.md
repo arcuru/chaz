@@ -211,7 +211,7 @@ crates/lib/src/
     usage.rs           Per-session/model/total cost rollups from assistant ResponseMetadata
   commands/            Transport-neutral session commands
     mod.rs             Command, CommandContext, CommandOutcome, dispatch, CoOwnerPermission
-    session.rs         /sessions, /info, /name, /share, /sync, etc.
+    session.rs         /sessions, /info, /name, /description, /share, /sync, etc.
     agent.rs           /agent add|remove|list|host|new|set|delete|share|import|invite|revoke-peer|rehost|home-status
     sharing.rs         /sharing queue handlers (bootstrap requests across agents/banks/sessions)
     extensions.rs      /extensions list|add|remove (session/agent scope split)

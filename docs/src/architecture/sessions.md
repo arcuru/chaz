@@ -285,6 +285,16 @@ See [Matrix Bot](../user_guide/matrix.md#attached-rooms-and-reply-routing).
 
 Sessions can be given human-friendly names via `set_session_name()` (TUI: `/name <alias>`). Names are persisted in the registry's `session_names` index and mirrored into the session's `meta` doc. `resolve_session()` tries name → DB ID, so names work everywhere a session identifier is accepted (`/join`, schedules, etc.).
 
+### Session Descriptions
+
+`SessionMeta.description` is browse-only presentation text, stored under the `description` key of the session's own `meta` DocStore. There is no registry index and no second store: it syncs with the session, and an absent key (every older session) reads as `None`.
+
+All writers go through `session::set_session_description(&Database, Option<&str>)`, which applies `validate_session_description` (trimmed, non-empty, at most `MAX_SESSION_DESCRIPTION_CHARS` = 200 characters, no control characters) and then `update_meta_on_db`. It inherits that helper's strict-read refusal. It writes with the caller's own database handle, so the session's AuthSettings decide authorization: a Read-only key's commit fails Eidetica entry validation. `/description` passes `CommandContext.session_db`; an extension can call the same function.
+
+Session listings carry the value in `SessionInfo.description`, read by `try_load_session_metadata` from `meta` without materializing the transcript. The TUI patches its cached hub row from a successful description command, as it does after a rename.
+
+The description is deliberately outside model input. `ContextBuilder`, system prompt assembly and compaction never read it, and no tool exposes it. A server test asserts the text is absent from a recorded mocked model request.
+
 ## Context Building
 
 `ContextBuilder` (in `context.rs`) renders a coherent host-owned view. The required

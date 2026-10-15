@@ -44,7 +44,16 @@ pub(super) enum Effect {
     Open(Box<Open>),
     Sent,
     JobSent(String),
-    Renamed { id: String, name: Option<String> },
+    Renamed {
+        id: String,
+        name: Option<String>,
+    },
+    /// A description command committed; patch the cached picker row.
+    Described {
+        id: String,
+        description: Option<String>,
+        text: String,
+    },
     Settings(String),
     Diff(AgentDiffView),
 }
@@ -394,6 +403,16 @@ pub(super) fn apply(app: &mut App, completion: Completion) {
                 row.name = name;
             }
         }
+        Ok(Effect::Described {
+            id,
+            description,
+            text,
+        }) => {
+            if let Some(row) = app.session_list.iter_mut().find(|s| s.session_db_id == id) {
+                row.description = description;
+            }
+            show_text(app, target, text);
+        }
         Ok(Effect::Settings(text)) => {
             if nav_valid {
                 app.settings_status = Some(text);
@@ -411,24 +430,28 @@ pub(super) fn apply(app: &mut App, completion: Completion) {
                 app.should_quit = app.operations.request_exit();
             }
             CommandOutcome::Text(text) | CommandOutcome::Error(text) => {
-                if let Some(i) = target {
-                    let tab = &mut app.tabs[i];
-                    tab.add_local(SessionEntry {
-                        sender: "system".into(),
-                        content: text,
-                        timestamp: chrono::Utc::now(),
-                        entry_type: EntryType::Message,
-                        metadata: None,
-                        routing: None,
-                    });
-                } else {
-                    app.operations.notice = Some(text);
-                }
+                show_text(app, target, text);
             }
             _ => unreachable!("backend outcome must be prepared before application"),
         },
     }
     app.operations.start();
+}
+
+/// Show a command result in its originating view, or as a notice without one.
+fn show_text(app: &mut App, target: Option<usize>, text: String) {
+    if let Some(i) = target {
+        app.tabs[i].add_local(SessionEntry {
+            sender: "system".into(),
+            content: text,
+            timestamp: chrono::Utc::now(),
+            entry_type: EntryType::Message,
+            metadata: None,
+            routing: None,
+        });
+    } else {
+        app.operations.notice = Some(text);
+    }
 }
 
 #[derive(Clone)]
@@ -464,6 +487,16 @@ impl Context {
         target: Option<Target>,
         selected_info: Option<ModelInfo>,
     ) -> Result<Effect, String> {
+        // The value a successful description command stored, so the cached
+        // picker row can be patched like a rename instead of going stale.
+        let described = match &cmd {
+            Command::DescribeSession(text) => {
+                Some(chaz_core::session::validate_session_description(text).ok())
+            }
+            Command::ClearSessionDescription => Some(None),
+            _ => None,
+        };
+        let target_id = target.as_ref().map(|t| t.id.clone());
         let outcome = if matches!(cmd, Command::SwitchSession(_)) {
             let server = self.server.clone();
             supervised::read(async move {
@@ -500,6 +533,15 @@ impl Context {
         };
         if let Some(info) = selected_info {
             self.server.cache_model_info(&info).await;
+        }
+        if let (Some(description), Some(id), CommandOutcome::Text(text)) =
+            (described, target_id, &outcome)
+        {
+            return Ok(Effect::Described {
+                id,
+                description,
+                text: text.clone(),
+            });
         }
         self.prepare(outcome).await
     }

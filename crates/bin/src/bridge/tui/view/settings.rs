@@ -4,7 +4,56 @@
 //! plus per-category Peer/Session detail renderers. Child module of `view`
 //! so it can use the parent's render helpers via `use super::*`.
 
+use super::super::{SettingsFocus, SettingsLayout};
 use super::*;
+
+/// No hidden page or modal publishes actions below the supported floor.
+pub(super) fn ui_too_small(f: &mut ratatui::Frame, app: &App) {
+    let scope = match app.mode {
+        TuiMode::Settings(scope) => scope,
+        _ => match app.model_picker_caller {
+            TuiMode::Settings(scope) => scope,
+            _ => return,
+        },
+    };
+    let title = match scope {
+        SettingsScope::Peer => "Peer Settings",
+        SettingsScope::Session => "Session Settings",
+    };
+    f.render_widget(
+        Paragraph::new(vec![
+            Line::from(title),
+            Line::from("Too small: need 40×8"),
+            Line::from("Resize or Esc back"),
+        ]),
+        f.area(),
+    );
+}
+
+/// Compact lists spend only one row on their title, not blank/dash decoration.
+fn list_header(lines: &mut Vec<Line<'static>>, compact: bool) -> usize {
+    if compact {
+        lines.remove(0);
+        lines.truncate(1);
+    }
+    lines.len()
+}
+
+/// Compact swaps list and body instead of creating a second reader.
+fn list_content_areas(area: Rect, app: &App, nonempty: bool) -> (Rect, Rect) {
+    if app.settings_layout == SettingsLayout::Compact {
+        if nonempty && app.settings_focus != SettingsFocus::Content {
+            (area, Rect::default())
+        } else {
+            (Rect::default(), area)
+        }
+    } else {
+        let list_h = ((area.height as usize / 3).max(3) as u16).min(area.height.saturating_sub(2));
+        let chunks =
+            Layout::vertical([Constraint::Length(list_h.max(1)), Constraint::Min(1)]).split(area);
+        (chunks[0], chunks[1])
+    }
+}
 
 /// Reserve hints where feasible, but give the selected row precedence when
 /// the post-header space cannot hold both. An oversized row may still clip.
@@ -39,7 +88,8 @@ fn render_content(
         return;
     }
     let paragraph = Paragraph::new(lines.clone()).wrap(Wrap { trim: false });
-    let overflow = paragraph.line_count(area.width) > area.height as usize;
+    let compact = app.settings_layout == SettingsLayout::Compact;
+    let overflow = compact || paragraph.line_count(area.width) > area.height as usize;
     let header = header.min(lines.len());
     let header_rows = if overflow {
         1
@@ -66,18 +116,23 @@ fn render_content(
         reader.offset = reader.offset.min(reader.max_offset);
         let start = reader.offset as usize + 1;
         let end = (reader.offset as usize + body_area.height as usize).min(count);
-        let focused = app.settings_focus == super::super::SettingsFocus::Content;
-        let cue = Line::from(vec![
-            Span::styled(
-                format!("DETAILS [{start}–{end}/{count}] · "),
-                if focused {
-                    theme::selected()
-                } else {
-                    theme::accent()
-                },
-            ),
-            Span::styled(label.to_string(), theme::accent_bold()),
-        ]);
+        let range_style = if app.settings_focus == SettingsFocus::Content {
+            theme::selected()
+        } else {
+            theme::accent()
+        };
+        let range = format!("DETAILS [{start}–{end}/{count}]");
+        let cue = if compact {
+            Line::from(vec![
+                Span::styled(format!("{label} · "), theme::accent_bold()),
+                Span::styled(range, range_style),
+            ])
+        } else {
+            Line::from(vec![
+                Span::styled(format!("{range} · "), range_style),
+                Span::styled(label.to_string(), theme::accent_bold()),
+            ])
+        };
         f.render_widget(Paragraph::new(cue), Rect { height: 1, ..area });
         f.render_widget(body.scroll((reader.offset, 0)), body_area);
     } else {
@@ -123,8 +178,7 @@ pub(super) fn ui_settings(
 
     widgets::header(f, chunks[0], title, subtitle.as_deref(), Some("[Esc back]"));
 
-    let (sidebar_area, detail_area) =
-        widgets::sidebar_detail_layout(chunks[1], super::super::SETTINGS_SIDEBAR_W);
+    let compact = app.settings_layout == SettingsLayout::Compact;
     let selected = app.settings_index(scope);
     let labels: Vec<&str> = match scope {
         SettingsScope::Peer => PeerSettingsCategory::ALL
@@ -136,19 +190,58 @@ pub(super) fn ui_settings(
             .map(|c| c.label())
             .collect(),
     };
-    let sidebar_focused = matches!(app.settings_focus, super::super::SettingsFocus::Category);
-    widgets::sidebar(f, sidebar_area, &labels, selected, sidebar_focused);
-    // Click regions for each sidebar row so users can mouse-switch
-    // categories. One terminal line per item, starting at sidebar_area.y.
-    for i in 0..labels.len().min(sidebar_area.height as usize) {
-        app.click_regions.push(ClickRegion {
-            x: sidebar_area.x,
-            y: sidebar_area.y + i as u16,
-            w: sidebar_area.width,
-            h: 1,
-            target: ClickTarget::SettingsSidebarItem(i),
-        });
-    }
+    let detail_area = if compact {
+        let band = Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).split(chunks[1]);
+        let label = format!(" {} {}/{} ", labels[selected], selected + 1, labels.len());
+        let label_width = Line::from(label.clone()).width() as u16;
+        let focus = match app.settings_focus {
+            SettingsFocus::Category => "CATEGORY",
+            SettingsFocus::List => "LIST",
+            SettingsFocus::Content => "READ",
+        };
+        f.render_widget(
+            Paragraph::new(format!("‹{label}›  {focus}")).style(theme::accent()),
+            band[0],
+        );
+        for (x, w, index) in [
+            (band[0].x, 1, (selected + labels.len() - 1) % labels.len()),
+            (band[0].x + 1, label_width, selected),
+            (
+                band[0].x + 1 + label_width,
+                1,
+                (selected + 1) % labels.len(),
+            ),
+        ] {
+            app.click_regions.push(ClickRegion {
+                x,
+                y: band[0].y,
+                w,
+                h: 1,
+                target: ClickTarget::SettingsSidebarItem(index),
+            });
+        }
+        band[1]
+    } else {
+        let (sidebar_area, detail_area) =
+            widgets::sidebar_detail_layout(chunks[1], super::super::SETTINGS_SIDEBAR_W);
+        widgets::sidebar(
+            f,
+            sidebar_area,
+            &labels,
+            selected,
+            app.settings_focus == SettingsFocus::Category,
+        );
+        for i in 0..labels.len().min(sidebar_area.height as usize) {
+            app.click_regions.push(ClickRegion {
+                x: sidebar_area.x,
+                y: sidebar_area.y + i as u16,
+                w: sidebar_area.width,
+                h: 1,
+                target: ClickTarget::SettingsSidebarItem(i),
+            });
+        }
+        detail_area
+    };
 
     match scope {
         SettingsScope::Peer => {
@@ -267,6 +360,22 @@ pub(super) fn ui_settings(
 /// by focus so the user sees which keys are live right now.
 fn settings_status_hint(app: &App, scope: SettingsScope) -> &'static str {
     let cur = app.settings_index(scope);
+    if app.settings_layout == SettingsLayout::Compact {
+        return match app.settings_focus {
+            SettingsFocus::Content if scope == SettingsScope::Peer && cur == 0 => {
+                " ↑↓/Pg read · ← list · Enter model · Esc "
+            }
+            SettingsFocus::Content => " ↑↓ read · Pg page · ← back · Esc ",
+            SettingsFocus::Category => " ↑↓/Tab cat · → open · 1-9 · Esc ",
+            SettingsFocus::List => match (scope, cur) {
+                (SettingsScope::Peer, 0 | 5) => " ↑↓ select · → read · Tab cat · Esc ",
+                (SettingsScope::Peer, 2) => " ↑↓ select · a/d · Ctrl+↑↓ · Esc ",
+                (SettingsScope::Session, 1) => " ↑↓ select · a/d · Tab cat · Esc ",
+                (SettingsScope::Session, 2) => " ↑↓ scope · Enter model · Tab cat · Esc ",
+                _ => " ← category · Tab cat · Esc ",
+            },
+        };
+    }
     if app.settings_focus == super::super::SettingsFocus::Content {
         return if scope == SettingsScope::Peer && cur == 0 {
             " ↑↓ read · PgUp/Dn · Home/End · Enter model · ← list · Tab category · Esc "
@@ -370,16 +479,18 @@ fn render_peer_defaults(f: &mut ratatui::Frame, area: Rect, app: &mut App, serve
         Line::from(""),
     ];
 
+    let compact = app.settings_layout == SettingsLayout::Compact;
+    let header = list_header(&mut lines, compact);
     let window = ListWindow::uniform(
         defaults_count,
         1,
         Some(cursor),
-        list_row_budget(area.height, 4, 3, 1),
+        list_row_budget(area.height, header, if compact { 0 } else { 3 }, 1),
         app.scroll.peer_defaults,
     );
     app.scroll.peer_defaults = window.offset;
     if defaults_count > 0 {
-        app.settings_list_area = list_viewport(area, 4, window.rows().len());
+        app.settings_list_area = list_viewport(area, header as u16, window.rows().len());
     }
     if app.peer_defaults.is_empty() {
         lines.push(Line::from(vec![Span::styled(
@@ -423,14 +534,13 @@ fn render_peer_defaults(f: &mut ratatui::Frame, area: Rect, app: &mut App, serve
     )]));
 
     if defaults_count == 0 {
-        render_content(f, area, app, "Default agents", lines, 4);
+        render_content(f, area, app, "Default agents", lines, header);
     } else {
         f.render_widget(Paragraph::new(lines), area);
     }
 
-    // Per-row click regions. Header is 4 lines (blank, title, dashes,
-    // blank); each default is one line after that.
-    let rows_y0 = area.y.saturating_add(4);
+    // Each default is one line below the actual title/decorations.
+    let rows_y0 = area.y.saturating_add(header as u16);
     for i in window.rows() {
         let y = rows_y0.saturating_add((i - window.first) as u16);
         if y >= area.y.saturating_add(area.height) {
@@ -584,10 +694,8 @@ fn render_peer_agents(
 
     let cursor = app.peer_agents_cursor.min(names.len().saturating_sub(1));
 
-    // List rows take ~1/3 of the right pane, detail gets the rest.
-    let list_h = ((area.height as usize / 3).max(3) as u16).min(area.height.saturating_sub(2));
-    let chunks =
-        Layout::vertical([Constraint::Length(list_h.max(1)), Constraint::Min(1)]).split(area);
+    let compact = app.settings_layout == SettingsLayout::Compact;
+    let (list_area, content_area) = list_content_areas(area, app, !names.is_empty());
 
     let mut lines: Vec<Line> = Vec::with_capacity(names.len() + 3);
     lines.push(Line::from(""));
@@ -608,17 +716,24 @@ fn render_peer_agents(
     // worker nesting.
     let mut agent_line_offsets: Vec<u16> = Vec::with_capacity(names.len());
 
-    let budget = chunks[0].height.saturating_sub(3) as usize;
-    app.settings_list_area = list_viewport(chunks[0], 3, budget);
+    let header = list_header(&mut lines, compact) as u16;
+    let budget = list_area.height.saturating_sub(header) as usize;
+    app.settings_list_area = list_viewport(list_area, header, budget);
     let heights: Vec<usize> = names
         .iter()
         .map(|n| {
             let height = server.agents().get(n).map_or(1, |a| 1 + a.workers.len());
-            if height > budget { 1 } else { height }
+            if compact || height > budget {
+                1
+            } else {
+                height
+            }
         })
         .collect();
     let window = ListWindow::new(&heights, Some(cursor), budget, app.scroll.peer_agents);
-    app.scroll.peer_agents = window.offset;
+    if list_area.height > 0 {
+        app.scroll.peer_agents = window.offset;
+    }
     if names.is_empty() {
         lines.push(Line::from(vec![Span::styled(
             "  (no agents configured)",
@@ -647,20 +762,20 @@ fn render_peer_agents(
             let worker_count = agent.as_ref().map(|a| a.workers.len()).unwrap_or(0);
             let worker_badge = if worker_count == 0 {
                 String::new()
-            } else if 1 + worker_count > budget {
+            } else if compact || 1 + worker_count > budget {
                 format!("[{worker_count} workers → details]")
             } else {
                 format!("  [{worker_count} workers]")
             };
             agent_line_offsets.push(lines.len() as u16);
             lines.push(Line::from(vec![Span::styled(
-                if worker_count > 0 && 1 + worker_count > budget {
+                if worker_count > 0 && (compact || 1 + worker_count > budget) {
                     // The overflow cue wins space over the model or a long name.
                     format!(
                         "{marker}{worker_badge} {}",
                         ellipsize(
                             name,
-                            chunks[0]
+                            list_area
                                 .width
                                 .saturating_sub(worker_badge.len() as u16 + 3)
                                 as usize
@@ -673,7 +788,7 @@ fn render_peer_agents(
             )]));
             // Render Workers as nested decorative rows. Cursor still indexes
             // Agents only — these don't move the selection.
-            if let Some(agent) = agent.filter(|a| a.workers.len() < budget) {
+            if let Some(agent) = agent.filter(|a| !compact && a.workers.len() < budget) {
                 let mut worker_names: Vec<&str> =
                     agent.workers.keys().map(String::as_str).collect();
                 worker_names.sort_unstable();
@@ -687,21 +802,21 @@ fn render_peer_agents(
         }
     }
 
-    f.render_widget(Paragraph::new(lines), chunks[0]);
+    f.render_widget(Paragraph::new(lines), list_area);
 
     // Per-agent click regions. Skip rows that fall outside the list pane
     // (the Paragraph clips them too — no point in a hit region you can't
     // see).
-    let list_bottom = chunks[0].y.saturating_add(chunks[0].height);
+    let list_bottom = list_area.bottom();
     for (i, offset) in window.rows().zip(agent_line_offsets.iter()) {
-        let y = chunks[0].y.saturating_add(*offset);
+        let y = list_area.y.saturating_add(*offset);
         if y >= list_bottom {
             break;
         }
         app.click_regions.push(ClickRegion {
-            x: chunks[0].x,
+            x: list_area.x,
             y,
-            w: chunks[0].width,
+            w: list_area.width,
             h: 1,
             target: ClickTarget::SettingsDetailRow(i),
         });
@@ -725,7 +840,7 @@ fn render_peer_agents(
     )]));
     render_content(
         f,
-        chunks[1],
+        content_area,
         app,
         names.get(cursor).map(String::as_str).unwrap_or("Agents"),
         detail,
@@ -990,9 +1105,8 @@ fn render_peer_mcp(f: &mut ratatui::Frame, area: Rect, app: &mut App) {
     let servers = app.peer_mcp_servers.clone();
     let cursor = app.peer_mcp_cursor.min(servers.len().saturating_sub(1));
 
-    let list_h = ((area.height as usize / 3).max(3) as u16).min(area.height.saturating_sub(2));
-    let chunks =
-        Layout::vertical([Constraint::Length(list_h.max(1)), Constraint::Min(1)]).split(area);
+    let compact = app.settings_layout == SettingsLayout::Compact;
+    let (list_area, content_area) = list_content_areas(area, app, !servers.is_empty());
 
     let running = servers
         .iter()
@@ -1022,18 +1136,24 @@ fn render_peer_mcp(f: &mut ratatui::Frame, area: Rect, app: &mut App) {
         Style::default().fg(theme::DIM),
     )]));
 
+    let header = list_header(&mut lines, compact) as u16;
     let mut row_offsets: Vec<u16> = Vec::with_capacity(servers.len());
 
     let window = ListWindow::uniform(
         servers.len(),
         1,
         Some(cursor),
-        chunks[0].height.saturating_sub(3) as usize,
+        list_area.height.saturating_sub(header) as usize,
         app.scroll.peer_mcp,
     );
-    app.scroll.peer_mcp = window.offset;
-    app.settings_list_area =
-        list_viewport(chunks[0], 3, chunks[0].height.saturating_sub(3) as usize);
+    if list_area.height > 0 {
+        app.scroll.peer_mcp = window.offset;
+    }
+    app.settings_list_area = list_viewport(
+        list_area,
+        header,
+        list_area.height.saturating_sub(header) as usize,
+    );
     if servers.is_empty() {
         lines.push(Line::from(vec![Span::styled(
             "  (no MCP servers configured)",
@@ -1068,19 +1188,19 @@ fn render_peer_mcp(f: &mut ratatui::Frame, area: Rect, app: &mut App) {
         }
     }
 
-    f.render_widget(Paragraph::new(lines), chunks[0]);
+    f.render_widget(Paragraph::new(lines), list_area);
 
     // Per-server click regions; same clamp pattern as Peer → Agents.
-    let list_bottom = chunks[0].y.saturating_add(chunks[0].height);
+    let list_bottom = list_area.bottom();
     for (i, offset) in window.rows().zip(row_offsets.iter()) {
-        let y = chunks[0].y.saturating_add(*offset);
+        let y = list_area.y.saturating_add(*offset);
         if y >= list_bottom {
             break;
         }
         app.click_regions.push(ClickRegion {
-            x: chunks[0].x,
+            x: list_area.x,
             y,
-            w: chunks[0].width,
+            w: list_area.width,
             h: 1,
             target: ClickTarget::SettingsDetailRow(i),
         });
@@ -1106,7 +1226,7 @@ fn render_peer_mcp(f: &mut ratatui::Frame, area: Rect, app: &mut App) {
     )]));
     render_content(
         f,
-        chunks[1],
+        content_area,
         app,
         servers
             .get(cursor)
@@ -1334,6 +1454,11 @@ fn render_session_agents(
     app: &mut App,
     backend: &BackendManager,
 ) {
+    let compact = app.settings_layout == SettingsLayout::Compact;
+    if compact && app.settings_picker.is_some() {
+        render_session_agents_picker(f, area, app);
+        return;
+    }
     // If a picker is open, carve the bottom of the detail area for it.
     // The agents list renders into the top region.
     let (list_area, picker_area) = if app.settings_picker.is_some() {
@@ -1390,16 +1515,17 @@ fn render_session_agents(
         Line::from(""),
     ];
 
+    let header = list_header(&mut lines, compact);
     let window = ListWindow::uniform(
         agent_count,
         1,
         Some(cursor),
-        list_row_budget(area.height, 4, 2, 1),
+        list_row_budget(area.height, header, if compact { 0 } else { 2 }, 1),
         app.scroll.session_agents,
     );
     app.scroll.session_agents = window.offset;
     if agent_count > 0 {
-        app.settings_list_area = list_viewport(area, 4, window.rows().len());
+        app.settings_list_area = list_viewport(area, header as u16, window.rows().len());
     }
     if snapshot.agents.is_empty() {
         lines.push(Line::from(vec![Span::styled(
@@ -1446,14 +1572,13 @@ fn render_session_agents(
     )]));
 
     if agent_count == 0 {
-        render_content(f, area, app, "Agents", lines, 4);
+        render_content(f, area, app, "Agents", lines, header);
     } else {
         f.render_widget(Paragraph::new(lines), area);
     }
 
-    // One click region per agent row (header is 4 lines: blank, title,
-    // dashes, blank). Click focuses the detail pane and moves the cursor.
-    let rows_y0 = area.y.saturating_add(4);
+    // Click focuses the list and moves the cursor; decoration is not a row.
+    let rows_y0 = area.y.saturating_add(header as u16);
     for i in window.rows() {
         let y = rows_y0.saturating_add((i - window.first) as u16);
         if y >= area.y.saturating_add(area.height) {
@@ -1601,9 +1726,13 @@ pub(super) fn render_session_models(
         Line::from(""),
     ];
 
+    let compact = app.settings_layout == SettingsLayout::Compact;
+    let header = list_header(&mut lines, compact);
     let heights: Vec<usize> = (0..total_rows)
         .map(|i| {
-            if i == 0 {
+            if compact {
+                1
+            } else if i == 0 {
                 3 + usize::from(snapshot.agents.is_empty())
             } else if i == 1 {
                 2
@@ -1615,11 +1744,17 @@ pub(super) fn render_session_models(
     let window = ListWindow::new(
         &heights,
         Some(cursor),
-        list_row_budget(area.height, 4, 2, heights[cursor]),
+        list_row_budget(
+            area.height,
+            header,
+            if compact { 0 } else { 2 },
+            heights[cursor],
+        ),
         app.scroll.session_models,
     );
     app.scroll.session_models = window.offset;
-    app.settings_list_area = list_viewport(area, 4, window.rows().map(|i| heights[i]).sum());
+    app.settings_list_area =
+        list_viewport(area, header as u16, window.rows().map(|i| heights[i]).sum());
     let mut row_offsets = Vec::new();
     // Row 0 — Session pin. Selection marker + resolved-to suffix so the
     // user sees what the pin maps to without flipping to /agents.
@@ -1640,11 +1775,13 @@ pub(super) fn render_session_models(
             ),
             session_style,
         )]));
-        lines.push(Line::from(vec![Span::styled(
-            format!("      resolves to {session_resolved}"),
-            Style::default().fg(theme::DIM),
-        )]));
-        lines.push(Line::from(""));
+        if !compact {
+            lines.push(Line::from(vec![Span::styled(
+                format!("      resolves to {session_resolved}"),
+                Style::default().fg(theme::DIM),
+            )]));
+            lines.push(Line::from(""));
+        }
     }
     // Rows 1..n — per-agent overrides. Display the override id when set
     // or "(uses session pin)" otherwise.
@@ -1654,7 +1791,7 @@ pub(super) fn render_session_models(
             Style::default().fg(theme::DIM),
         )]));
     } else {
-        if window.first <= 1 && window.end > 1 {
+        if !compact && window.first <= 1 && window.end > 1 {
             lines.push(Line::from(vec![Span::styled(
                 "  Per-agent overrides",
                 Style::default().fg(theme::DIM),

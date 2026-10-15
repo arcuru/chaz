@@ -84,6 +84,8 @@ pub fn parse(input: &str) -> Parsed {
         "/groups" => return Parsed::Command(Command::ListAgentGroups),
         // No-arg `/name` (and `/rename`) clears the alias.
         "/name" | "/rename" => return Parsed::Command(Command::ClearSessionName),
+        // No-arg `/description` clears it, mirroring `/name`; `/info` shows it.
+        "/description" => return Parsed::Command(Command::ClearSessionDescription),
         "/role" => return Parsed::Command(Command::Role(None)),
         "/model" => return Parsed::Command(Command::Model(None)),
         "/channels" => return Parsed::Command(Command::ListChannels),
@@ -408,6 +410,16 @@ pub fn parse(input: &str) -> Parsed {
             Parsed::Command(Command::NameSession(name.to_string()))
         };
     }
+    if let Some(arg) = text.strip_prefix("/description ") {
+        let description = arg.trim();
+        // Validation (length, control characters) belongs to the shared
+        // mutation path so extension callers get the same rules.
+        return if description.is_empty() {
+            Parsed::Command(Command::ClearSessionDescription)
+        } else {
+            Parsed::Command(Command::DescribeSession(description.to_string()))
+        };
+    }
     if let Some(arg) = text.strip_prefix("/sync ") {
         let ticket = arg.trim();
         return if ticket.is_empty() {
@@ -541,6 +553,26 @@ mod tests {
             other => panic!("expected NewSession(Some), got {other:?}"),
         }
         assert!(matches!(cmd("/groups"), Command::ListAgentGroups));
+    }
+
+    #[test]
+    fn description_set_and_clear() {
+        assert!(matches!(
+            cmd("/description"),
+            Command::ClearSessionDescription
+        ));
+        // Trailing-space-only arg clears, matching the no-arg form.
+        assert!(matches!(
+            cmd("/description   "),
+            Command::ClearSessionDescription
+        ));
+        // Text keeps inner spacing; surrounding whitespace is trimmed.
+        match cmd("/description  Q3 planning,  with finance  ") {
+            Command::DescribeSession(d) => assert_eq!(d, "Q3 planning,  with finance"),
+            other => panic!("expected DescribeSession, got {other:?}"),
+        }
+        // No prefix collision: `/descriptions` stays an extension lookup.
+        assert!(matches!(cmd("/descriptions"), Command::Extension { .. }));
     }
 
     #[test]

@@ -1,0 +1,36 @@
+---
+source: crates/bin/src/bridge/tui/view/mod.rs
+expression: snapshot_rows(&terminal)
+---
+ render-demo ×  Ctrl+P sessions · Ctrl+S settings · Ctrl+W close
+╭ Chaz ────────────────────────────────────────────────────────╮
+│chaz [local]:                                                 │
+│  Report                                                      │
+│                                                              │
+│  Bold and italic with x\n                                    │
+│                                                              │
+│  • first item                                                │
+│  • Guide (https://example.org)                               │
+│    • nested item                                             │
+│                                                              │
+│  3. ordered                                                  │
+│  4. next                                                     │
+│                                                              │
+│    let path = r"C:\new\file";                                │
+│                                                              │
+│    // 日  🦀  and literal \n                                   │
+│                                                              │
+│  │ quoted text                                               │
+│                                                              │
+│                                                              │
+│                                                              │
+│                                                              │
+│                                                              │
+│                                                              │
+│                                                              │
+│                                                              │
+╰──────────────────────────────────────────────────────────────╯
+ render-demo | ctx unknown/unknown tok | agent: chaz | model: —
+╭ > ───────────────────────────────────────────────────────────╮
+│                                                              │
+╰──────────────────────────────────────────────────────────────╯

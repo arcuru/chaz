@@ -14,7 +14,7 @@ use std::sync::Arc;
 /// End-to-end fixture: Server + SessionRegistry + one open session +
 /// SecretStore/BackendManager suitable for running commands::dispatch.
 /// Returns (instance, server, registry, secrets, backend, session_db_id, session_db).
-async fn fixture() -> (
+pub(in crate::commands) async fn fixture() -> (
     Instance,
     Arc<Server>,
     Arc<crate::session::SessionRegistry>,
@@ -76,7 +76,7 @@ async fn fixture() -> (
     )
 }
 
-fn cmd_ctx<'a>(
+pub(in crate::commands) fn cmd_ctx<'a>(
     server: &'a Arc<Server>,
     secrets: &'a SecretStore,
     backend: &'a BackendManager,

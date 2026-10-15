@@ -38,6 +38,10 @@ pub(super) fn command_catalog() -> Vec<(&'static str, &'static str)> {
         ("/join ", "switch to session by name or DB ID"),
         ("/name ", "set (or clear) a session alias"),
         ("/rename ", "alias for /name"),
+        (
+            "/description ",
+            "set (or clear) a browse-only session description",
+        ),
         ("/info", "show current session info"),
         ("/costs", "aggregate LLM usage + cost across all sessions"),
         ("/interrupted", "list turns requiring an explicit retry"),
@@ -254,6 +258,9 @@ pub(super) enum OverlayKey {
 /// `handle_chat_key` / picker handling so overlays intercept input before the
 /// underlying mode sees it.
 pub(super) fn handle_overlay_key(app: &mut App, key: KeyEvent) -> OverlayKey {
+    if app.settings_too_small() && key.code != KeyCode::Esc {
+        return OverlayKey::Consumed;
+    }
     let backend_ready = app.backend_ready();
     let Some(overlay) = app.overlay.as_mut() else {
         return OverlayKey::NotConsumed;
@@ -344,6 +351,7 @@ pub(super) fn handle_overlay_key(app: &mut App, key: KeyEvent) -> OverlayKey {
 /// its own because they need cross-module context (command dispatch, session
 /// switching, etc.). None for the common no-op path.
 pub(super) enum MouseOutcome {
+    Copy(String),
     /// Open the currently selected session picker row — equivalent to
     /// pressing Enter.
     PickerOpenSelected,
@@ -357,19 +365,50 @@ pub(super) enum MouseOutcome {
 }
 
 /// Whether `handle_mouse` can do anything with `m`. The run loop drops every
-/// other report (motion, drags, releases, other buttons) before it costs a
-/// handler pass or a redraw — with mouse capture on, a terminal reports every
-/// pointer move.
+/// other report before it costs a handler pass or a redraw. Left drags and
+/// releases implement conversation selection; idle pointer motion stays ignored.
 pub(super) fn mouse_is_actionable(m: &MouseEvent) -> bool {
     matches!(
         m.kind,
         MouseEventKind::ScrollUp
             | MouseEventKind::ScrollDown
             | MouseEventKind::Down(MouseButton::Left)
+            | MouseEventKind::Drag(MouseButton::Left)
+            | MouseEventKind::Up(MouseButton::Left)
     )
 }
 
 pub(super) fn handle_mouse(app: &mut App, m: MouseEvent) -> Option<MouseOutcome> {
+    if app.settings_too_small() {
+        return None;
+    }
+    let selectable = app.mode == TuiMode::Chat
+        && app.overlay.is_none()
+        && !app.has_pending_approval()
+        && app.completion.is_none();
+    if !selectable {
+        app.selection.clear();
+    } else if let Some(tab) = app.tabs.get(app.active_tab) {
+        let text = &tab.live.render.copy_text;
+        match m.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                if app.selection.begin(text, m.column, m.row) {
+                    return None;
+                }
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                app.selection.drag(text, m.column, m.row);
+                return None;
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                return app
+                    .selection
+                    .finish(text, m.column, m.row)
+                    .map(MouseOutcome::Copy);
+            }
+            _ => {}
+        }
+    }
     // Route the wheel to the visible cursor list; never scroll chat behind it.
     match m.kind {
         MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
@@ -904,6 +943,9 @@ pub(super) enum ModelPickerKey {
 /// ambiguous with Enter on terminals without keyboard-enhancement
 /// support, which makes a key binding unreliable through tmux + ssh).
 pub(super) fn handle_model_picker_key(app: &mut App, key: KeyEvent) -> ModelPickerKey {
+    if app.settings_too_small() && key.code != KeyCode::Esc {
+        return ModelPickerKey::None;
+    }
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let alt = key.modifiers.contains(KeyModifiers::ALT);
 
@@ -1025,6 +1067,15 @@ pub(super) fn handle_settings_key(
     key: KeyEvent,
     scope: SettingsScope,
 ) -> SettingsKey {
+    if app.settings_too_small() {
+        if key.code != KeyCode::Esc {
+            return SettingsKey::None;
+        }
+        if app.active().pending_approval.is_some() && app.overlay.is_none() {
+            apply_approval(app, ApprovalDecision::Deny);
+            return SettingsKey::None;
+        }
+    }
     if app.overlay.is_some() || handle_approval_key(app, key) {
         return SettingsKey::None;
     }
@@ -1744,7 +1795,7 @@ mod tests {
     use std::collections::HashSet;
 
     /// Only reports `handle_mouse` acts on survive the run loop's filter;
-    /// pointer motion and drags never reach a handler or a redraw.
+    /// idle pointer motion never reaches a handler or a redraw.
     #[test]
     fn only_actionable_mouse_reports_pass_the_filter() {
         use super::{MouseButton, MouseEvent, MouseEventKind, mouse_is_actionable};
@@ -1758,13 +1809,13 @@ mod tests {
             MouseEventKind::ScrollUp,
             MouseEventKind::ScrollDown,
             MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Drag(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
         ] {
             assert!(mouse_is_actionable(&at(kind)), "{kind:?}");
         }
         for kind in [
             MouseEventKind::Moved,
-            MouseEventKind::Drag(MouseButton::Left),
-            MouseEventKind::Up(MouseButton::Left),
             MouseEventKind::Down(MouseButton::Right),
             MouseEventKind::ScrollLeft,
         ] {

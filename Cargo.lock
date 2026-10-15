@@ -787,6 +787,7 @@ name = "chaz"
 version = "0.3.0"
 dependencies = [
  "anyhow",
+ "base64",
  "chaz-core",
  "chrono",
  "clap",
@@ -797,6 +798,7 @@ dependencies = [
  "insta",
  "matrix-sdk",
  "nucleo-matcher",
+ "pulldown-cmark",
  "ratatui",
  "regex",
  "serde",
@@ -808,6 +810,7 @@ dependencies = [
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
+ "unicode-normalization",
  "unicode-segmentation",
  "unicode-width 0.2.0",
 ]
