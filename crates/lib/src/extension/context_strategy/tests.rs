@@ -128,6 +128,11 @@ impl ContextStrategy for Synthetic {
             match self.mode {
                 "duplicate" => plan.items.push(ContextItem::Entry(latest)),
                 "foreign" => plan.items.push(ContextItem::Entry(usize::MAX)),
+                "foreign-date" => plan.items.extend([
+                    ContextItem::Date(usize::MAX),
+                    ContextItem::Entry(usize::MAX),
+                ]),
+                "detached-date" => plan.items.push(ContextItem::Date(latest)),
                 "detached-exchange" => plan.items.extend([
                     ContextItem::Tail,
                     ContextItem::Exchange {
@@ -276,6 +281,8 @@ async fn required_strategy_replacement_absence_failure_and_optional_recall() {
         "panic",
         "timeout",
         "foreign",
+        "foreign-date",
+        "detached-date",
         "duplicate",
         "detached-exchange",
         "empty",

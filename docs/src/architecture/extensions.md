@@ -626,9 +626,16 @@ before each logical call; transport retries reuse the accepted request/options.
 `ContextStrategyCall` carries identity, budget, the instance's current session
 settings and a read-only `ScopedContext`. Its public selection/hydration methods
 expose only host-selected rows. `ContextPlan` chooses instructions, entry indices,
-bounded native exchanges, ephemeral tail and committed contribution references.
-Core rejects duplicates, foreign indices, reordered entries and non-adjacent
-exchanges; it owns rendering, provider echo, stable provenance and final budgets.
+stored-date boundaries, bounded native exchanges, ephemeral tail and committed
+contribution references. `ScopedContext::entry_date` reads the selected row's UTC
+date. `ContextItem::Date(index)` renders only that metadata and must immediately
+precede `Entry(index)`; its `DateBoundary` provenance does not expose the row body.
+The baseline strategy includes the first retained date and each date change,
+reserving their exact costs before allocating native replay. Custom strategies
+can select date boundaries through the same scoped facilities.
+Core rejects duplicates, foreign indices, reordered entries, detached dates and
+non-adjacent exchanges; it owns rendering, provider echo, stable provenance and
+final budgets.
 The built-in `BaselineContext` uses only this public facility. Its algorithm no
 longer lives in `ContextBuilder`.
 

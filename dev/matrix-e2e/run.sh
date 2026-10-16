@@ -625,6 +625,7 @@ agent_joined() {
 wait_for "the agent to join the room" 90 agent_joined
 
 log "sending the prompt"
+PROMPT_DATE_BEFORE="$(date -u +%F)"
 TXN="e2e-$(date +%s%N)"
 mx PUT "/_matrix/client/v3/rooms/$(jq -rn --arg r "$ROOM_ID" '$r|@uri')/send/m.room.message/$TXN" \
 	"$PUPPET_TOKEN" "$(jq -nc --arg b "$PROMPT" '{msgtype:"m.text",body:$b}')" >/dev/null
@@ -649,7 +650,11 @@ replies_at_least() {
 }
 wait_for "the agent's reply in the room" "$REPLY_TIMEOUT" reply_arrived
 
-printf '\033[1;32mPASS\033[0m — cold boot: the reply crossed Matrix, sync, the agent, and came back\n' >&2
+PROMPT_DATE_AFTER="$(date -u +%F)"
+grep -Fxq "stub_llm: timeline current_date verified: $PROMPT_DATE_BEFORE timezone: UTC" "$WORKSPACE/stub-llm.log" ||
+	grep -Fxq "stub_llm: timeline current_date verified: $PROMPT_DATE_AFTER timezone: UTC" "$WORKSPACE/stub-llm.log" ||
+	fail "cold boot: model context did not contain the stored UTC date in its timeline"
+printf '\033[1;32mPASS\033[0m — cold boot: the reply crossed Matrix with stored-date timeline context\n' >&2
 
 # The explicit send can reach Matrix before the turn's terminal transaction,
 # and local completion only queues async sync. Preserve that terminal fact on

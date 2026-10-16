@@ -261,20 +261,26 @@ async fn equivalent_reload_preserves_request_prefix_and_native_pairs() {
     println!("RELOAD_BASELINE {before}");
     println!("RELOAD_REOPEN {after}");
     let messages = after["messages"].as_array().unwrap();
-    assert_eq!(messages.len(), 9);
-    assert_eq!(messages[1]["content"], "Earlier work summarized");
-    assert_eq!(messages[2]["content"], "look up both keys");
-    assert_eq!(messages[3]["reasoning_content"], "compare both keys");
-    assert_eq!(messages[3]["reasoning_details"][0]["data"], "opaque");
+    assert_eq!(messages.len(), 10); // Includes one initial timeline date.
+    assert!(
+        messages[1]["content"]
+            .as_str()
+            .unwrap()
+            .starts_with("current_date: ")
+    );
+    assert_eq!(messages[2]["content"], "Earlier work summarized");
+    assert_eq!(messages[3]["content"], "look up both keys");
+    assert_eq!(messages[4]["reasoning_content"], "compare both keys");
+    assert_eq!(messages[4]["reasoning_details"][0]["data"], "opaque");
     for (index, id) in ["selected-first", "selected-second"].iter().enumerate() {
-        assert_eq!(messages[3]["tool_calls"][index]["id"], *id);
+        assert_eq!(messages[4]["tool_calls"][index]["id"], *id);
         assert_eq!(
-            messages[3]["tool_calls"][index]["function"]["arguments"],
+            messages[4]["tool_calls"][index]["function"]["arguments"],
             json!({"key": if index == 0 { "first" } else { "second" }}).to_string()
         );
-        assert_eq!(messages[4 + index]["tool_call_id"], *id);
+        assert_eq!(messages[5 + index]["tool_call_id"], *id);
         assert_eq!(
-            messages[4 + index]["content"],
+            messages[5 + index]["content"],
             crate::runtime::wrap_tool_output(
                 "lookup",
                 &format!("selected result {index} <untrusted>")
@@ -282,9 +288,9 @@ async fn equivalent_reload_preserves_request_prefix_and_native_pairs() {
         );
     }
     // Selection suppresses superseded native records, not already-visible answers.
-    assert_eq!(messages[6]["content"], "superseded answer");
-    assert_eq!(messages[7]["content"], "selected answer");
-    assert_eq!(messages[8]["content"][0]["text"], "unfinished");
+    assert_eq!(messages[7]["content"], "superseded answer");
+    assert_eq!(messages[8]["content"], "selected answer");
+    assert_eq!(messages[9]["content"][0]["text"], "unfinished");
     assert!(!after.to_string().contains("covered result"));
     assert!(!after.to_string().contains("superseded result"));
     assert!(!after.to_string().contains("interrupted result"));

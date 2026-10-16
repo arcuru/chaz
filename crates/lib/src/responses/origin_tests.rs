@@ -188,7 +188,7 @@ async fn completed_change(change: &str) {
     let input = body["input"].as_array().unwrap();
     if change == "same" {
         assert_eq!(
-            &input[1..6],
+            &input[2..7],
             output(),
             "exact ordered call output after reopen"
         );

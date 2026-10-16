@@ -123,6 +123,7 @@ The `ContextBuilder` assembles session entries into `RuntimeMessage` vectors wit
 
 ```text
 RuntimeMessage::System(role prompt)
+RuntimeMessage::User(current_date: 2026-10-06, timezone: UTC)
 RuntimeMessage::User(message 1)
 RuntimeMessage::Assistant(message 2)
 RuntimeMessage::User(message 3)
@@ -131,6 +132,18 @@ RuntimeMessage::AssistantToolCalls(calls)
 RuntimeMessage::ToolResult(result)
 ...
 ```
+
+The default context strategy inserts a date marker before the first retained
+entry and before later entries whose stored UTC dates differ. Markers are derived
+from `SessionEntry.timestamp`, not the executing peer's clock. They are ordinary
+user-context metadata with host-assigned `DateBoundary` provenance, not mutable
+system instructions or persisted entries. Appending a later-day entry appends a
+marker and leaves the earlier context prefix unchanged, provided selection and
+other inputs remain unchanged. Replay is deterministic; compaction or truncation
+seeds the retained timeline again at its first entry. Empty history has no date.
+Marker costs are reserved during selection and counted in the complete request.
+Markers precede entry boundaries and cannot split a native exchange. Exact time
+remains available through `get_time`.
 
 Before each model call the runtime runs the operator-granted context projection chain over a copy of this vector plus the current attempt's completed exchanges; see [Context projection](extensions.md#context-projection). The projected request is sent (and resent unchanged on transport retries); the local vector and the recorded transcript keep the originals. With no `context_projection` grants the vector is sent as-is.
 
