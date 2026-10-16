@@ -116,8 +116,17 @@ stranger, and the agent all joined:
 
 ### Native tool rounds
 
-After the single-round `compact` case, the same direct room asks for
-`native tools twelve rounds`. The stub issues twelve distinct `calculate`
+The `react test` turn first calls `compact`, then `matrix__send` with a distinct
+`react-send` marker, then returns a `react-local-final` marker.
+The explicit send makes that final local-only; a compact-only Matrix-origin
+turn would post its ordinary final to the room.
+The harness requires both real tool results, durable completion, and the local
+final in the session database.
+It checks that the room contains exactly one explicit send and no local final
+only after the next turn's reply crosses the same bridge binding.
+Checking immediately after daemon completion would race asynchronous delivery.
+
+Next, the same direct room asks for `native tools twelve rounds`. The stub issues twelve distinct `calculate`
 calls, checking each call ID, arguments, and real wrapped arithmetic result
 before advancing. Only call/result pairs after the current user message count;
 historical results cannot skip rounds. Native `calculate` definitions must
@@ -129,11 +138,10 @@ no-tools summary or early canned reply cannot satisfy it. Stub contract tests
 run before the disposable services start, including wrong/denied results and
 withdrawn tools; run them alone with `python3 dev/matrix-e2e/test_stub_llm.py`.
 
-The twelve-round ordinary Matrix-origin final uses the current outbox path;
-other explicit-send/local-final, encryption, approval and allow-list cases
-remain unchanged. The harness also waits for the durable completed attempt.
-Before starting it, the single-round compact case must receive its own matched
-compact result and durably finish; an older Matrix-send result is not a barrier.
+The twelve-round ordinary Matrix-origin final uses the current outbox path.
+The harness also waits for its durable completed attempt.
+Before starting it, the compact/send case must receive its own matched results
+and durably finish; an older Matrix-send result is not a barrier.
 Spawned processes and administration use a disposable HOME so host-global
 skills do not enter the model fixture.
 Use `just e2e --legacy-max-iterations 10` to render the retired config key in
