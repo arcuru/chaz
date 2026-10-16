@@ -110,6 +110,10 @@ impl TuiBridge {
                             _ => continue,
                         }
                     }
+                    else => return match &error {
+                        Some(e) => Err(anyhow::anyhow!(e.clone())),
+                        None => Ok(None),
+                    },
                 }
                 let status = error.as_deref().unwrap_or(*stage_rx.borrow());
                 draw(&mut terminal, &mut app, label.as_deref(), status)?;
