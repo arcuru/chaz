@@ -641,6 +641,7 @@ async fn extension_selected_cache_serializes_supported_and_unsupported_providers
         let wire =
             crate::openai::serialize_cache_fixture(&messages, &[], &built.cache, openrouter, model)
                 .await;
+        assert!(wire.get("tools").is_none());
         assert_eq!(wire.to_string().contains("cache_control"), supported);
         if supported {
             assert_eq!(

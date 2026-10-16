@@ -223,10 +223,13 @@ async fn wire(call: &RecordedCall) -> Value {
     backend.api_base = Some("https://openrouter.ai/api/v1".into());
     let secrets = empty_secrets().await;
     let backend = OpenAI::new(&backend, &secrets);
-    let mut messages = convert_runtime_messages(&call.messages);
-    let mut tools = convert_tool_definitions(&call.tools);
-    apply_anthropic_cache_control(&mut messages, &mut tools, &call.model, &backend.backend);
-    serde_json::to_value(backend.chat_request(&call.model, messages, Some(tools))).unwrap()
+    serde_json::to_value(backend.build_chat_request(
+        &call.messages,
+        &call.tools,
+        &call.model,
+        &call.cache,
+    ))
+    .unwrap()
 }
 
 async fn reopen(session: &Session) -> Session {
