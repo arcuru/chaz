@@ -1038,15 +1038,11 @@ impl Session {
             }
             None => HashSet::new(),
         };
-        // Same request classification as turn_requests_with_attempts. An
-        // interrupted request stays compacted until explicitly retried.
+        // An interrupted request stays compacted until explicitly retried.
         let pending = |id: &TurnRequestId, entry: &SessionEntry| {
             current.is_some_and(|current| {
                 id == current
-                    || ((entry.entry_type == EntryType::Directive
-                        || (entry.entry_type == EntryType::Message && !is_agent(&entry.sender)))
-                        && !baseline.contains(id.as_str())
-                        && !states.contains_key(id))
+                    || (is_turn_request(id, entry, &baseline, is_agent) && !states.contains_key(id))
             })
         };
         let rows: Vec<_> =
@@ -1251,11 +1247,7 @@ impl Session {
             .entries
             .iter()
             .zip(&self.entry_ids)
-            .filter(|entry| {
-                entry.0.entry_type == EntryType::Directive
-                    || (entry.0.entry_type == EntryType::Message && !is_agent(&entry.0.sender))
-            })
-            .filter(|(_, id)| !baseline.contains(id.as_str()))
+            .filter(|(entry, id)| is_turn_request(id, entry, &baseline, &is_agent))
             .map(|(entry, id)| {
                 let entry = entry.clone();
                 let id = id.clone();
@@ -2149,6 +2141,17 @@ fn sort_persisted_entries(
             (TurnRequestId::parse(id), entry)
         })
         .unzip()
+}
+
+fn is_turn_request(
+    id: &TurnRequestId,
+    entry: &SessionEntry,
+    baseline: &HashSet<String>,
+    is_agent: &dyn Fn(&str) -> bool,
+) -> bool {
+    (entry.entry_type == EntryType::Directive
+        || (entry.entry_type == EntryType::Message && !is_agent(&entry.sender)))
+        && !baseline.contains(id.as_str())
 }
 
 async fn read_turn_baseline_from(store: &DocStore) -> anyhow::Result<HashSet<String>> {
