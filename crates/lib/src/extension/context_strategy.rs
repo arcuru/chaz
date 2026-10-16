@@ -31,10 +31,18 @@ impl Default for ContextStrategyGrant {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum ContextItem {
     Instructions,
+    /// A rendered UTC date boundary derived from the following entry.
+    Date(usize),
     Entry(usize),
-    Exchange { entry: usize, budget: usize },
+    Exchange {
+        entry: usize,
+        budget: usize,
+    },
     Tail,
-    Durable { row: usize, message: usize },
+    Durable {
+        row: usize,
+        message: usize,
+    },
 }
 #[derive(Clone, Debug, Default)]
 pub struct ContextPlan {
@@ -59,6 +67,15 @@ impl ScopedContext<'_> {
             .enumerate()
             .filter(|(_, e)| crate::context::is_context_entry(e))
             .map(|(i, e)| (i, e.entry_type.clone()))
+    }
+    /// Date metadata of an eligible retained row, never the executor's clock.
+    pub fn entry_date(&self, index: usize) -> anyhow::Result<chrono::NaiveDate> {
+        self.builder
+            .entries
+            .get(index)
+            .filter(|entry| crate::context::is_context_entry(entry))
+            .map(|entry| entry.timestamp.date_naive())
+            .ok_or_else(|| anyhow::anyhow!("foreign context entry"))
     }
     pub fn has_instructions(&self) -> bool {
         !self.system.is_empty()

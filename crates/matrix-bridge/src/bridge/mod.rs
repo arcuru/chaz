@@ -1737,6 +1737,51 @@ async fn resolve_pending_approval(
 #[cfg(test)]
 mod tests {
     #[test]
+    fn command_dispatch_futures_stay_bounded() {
+        fn future_size<F: std::future::Future>(
+            _: impl FnOnce(
+                super::Command,
+                matrix_sdk::Room,
+                std::sync::Arc<chaz_core::server::Server>,
+                std::sync::Arc<chaz_core::config::Config>,
+                chaz_core::security::SecretStore,
+                &'static str,
+                &'static str,
+            ) -> F,
+        ) -> usize {
+            std::mem::size_of::<F>()
+        }
+
+        fn dispatch_size<F: std::future::Future>(
+            _: impl FnOnce(super::Command, &'static chaz_core::commands::CommandContext<'static>) -> F,
+        ) -> usize {
+            std::mem::size_of::<F>()
+        }
+        // Measure both the actual room -> dispatch -> render composition and
+        // its shared dispatch child, without constructing or polling either.
+        // Rust 1.96 / x86_64: 27,112 and 6,304 bytes respectively. Removing
+        // command arm boxing grows the child to 21,824 bytes, but leaves the
+        // parent's layout unchanged (another await dominates its state size).
+        // These ceilings leave ~21% / ~30% headroom, not a poll-stack safety
+        // guarantee. Keep Box::pin and default-stack transport tests as well.
+        let dispatch_bytes = dispatch_size(super::shared_commands::dispatch);
+        eprintln!("Shared command dispatch future: {dispatch_bytes} bytes");
+        assert!(
+            dispatch_bytes <= 8 * 1024,
+            "Shared command dispatch future grew to {dispatch_bytes} bytes (limit: 8192); \
+             inspect command arm boxing before raising the measured ceiling"
+        );
+
+        let bytes = future_size(super::dispatch_in_room);
+        eprintln!("Matrix command dispatch future: {bytes} bytes");
+        assert!(
+            bytes <= 32 * 1024,
+            "Matrix command dispatch future grew to {bytes} bytes (limit: 32768); \
+             inspect shared command arm boxing before raising the measured ceiling"
+        );
+    }
+
+    #[test]
     fn group_eligibility_uses_joined_members_not_sync_summary() {
         let group = super::classify_room;
         use super::RoomKind;

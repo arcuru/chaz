@@ -605,6 +605,51 @@ schedules:
 
 Token budgeting for the LLM context window. Uses tiktoken (cl100k_base) for accurate token counting. `max_context_tokens` sets the total budget, `reserved_output_tokens` is subtracted for the LLM's response. Per-agent overrides via `max_context_tokens` on agent definitions.
 
+### Dates follow the conversation
+
+The default context strategy adds date markers to the model's conversation log
+from existing stored entry timestamps. This is automatic for local, bridge and
+scheduled inputs. There is no new setting or stored date-reminder entry.
+
+| Marker field   | Meaning                                           |
+| -------------- | ------------------------------------------------- |
+| `current_date` | UTC date of the following retained session entry. |
+| `timezone`     | `UTC`, the timezone of stored entry timestamps.   |
+
+One marker precedes the first retained entry. Another is added when a later
+entry's date differs; same-day entries do not repeat it. New days extend the
+log rather than replacing a date in the earlier system prompt. Replaying the
+same history produces the same date markers, even on a different day or peer.
+Entries stay in their stored order; historical or delayed inputs retain their
+own dates. These markers date the conversation, not the wall clock at execution.
+Use `get_time` for the actual current time.
+
+For example, continuing an old conversation:
+
+1. On October 6, the model sees this marker followed by the conversation:
+
+   ```text
+   current_date: 2026-10-06
+   timezone: UTC
+   ```
+
+2. A message stored on October 13 appends a new marker before that message:
+
+   ```text
+   …October 6 conversation remains unchanged…
+   current_date: 2026-10-13
+   timezone: UTC
+   …October 13 message…
+   ```
+
+3. Reopen the session: the same stored history produces the same sequence.
+   After compaction or budget truncation removes older entries, the retained
+   log starts with the first retained entry's date instead. A summary can still
+   mention earlier dates without changing its stored timestamp or the markers.
+   If a historical date is mistaken for now, ask the agent to use `get_time`;
+   rebuilding context does not silently redate historical messages. With no
+   retained entries there is no date to infer, so no marker is invented.
+
 ## Multi-agent rooms
 
 Tuning for chat-room sessions where multiple agents are active. Currently a single knob:

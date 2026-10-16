@@ -135,6 +135,22 @@ async fn service_steering(
         other => panic!("expected observable start, got {other:?}"),
     };
     assert!(!client.is_watching_session(&id).await);
+    // The observation deadline expires while the actual child call is gated.
+    // Later release/settlement below must still use this same job and attempt.
+    let bounded = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        client.wait_job(&id, std::time::Duration::from_millis(20)),
+    )
+    .await
+    .expect("job observation must be bounded")
+    .unwrap();
+    assert!(matches!(
+        bounded.state,
+        JobState::StartedUnknown { attempt_id: ref observed, .. } if observed == &attempt_id
+    ));
+    assert_eq!(bounded.session_db_id, id);
+    assert!(futures::poll!(Box::pin(gate.wait_stopped()).as_mut()).is_pending());
+    assert_eq!(mock.recorded_calls().len(), 1);
     // Fixture-only provisioning: a separate login holds Write, never the
     // submitter/executor's Admin key. Production observation grants nothing.
     let mut observer_settings = settings.clone();

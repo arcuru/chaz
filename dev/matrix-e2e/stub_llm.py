@@ -286,6 +286,28 @@ class Handler(BaseHTTPRequestHandler):
         if not has_tool_result:
             sys.stderr.write("stub_llm: turn: " + user_text + "\n")
 
+        # Date markers belong to the conversation, never the mutable system
+        # prefix. They are derived by the host from stored entry timestamps.
+        dates = [match.group(1) for msg in messages
+                 if isinstance(msg, dict) and msg.get("role") == "user"
+                 and isinstance(msg.get("content"), str)
+                 and (match := re.fullmatch(r"current_date: (\d{4}-\d{2}-\d{2})\ntimezone: UTC", msg["content"]))]
+        incoming = False
+        for msg in messages:
+            if isinstance(msg, dict) and msg.get("role") == "user":
+                try:
+                    envelope = json.loads(msg.get("content", ""))
+                except (ValueError, TypeError):
+                    continue
+                if isinstance(envelope, dict) and envelope.get("kind") in ("transport_message", "matrix_message"):
+                    incoming = True
+        if incoming:
+            if not dates or any("current_date:" in msg.get("content", "")
+                                for msg in messages if isinstance(msg, dict) and msg.get("role") == "system"):
+                self._send({"error": "missing timeline date or mutable system date"}, status=400)
+                return
+            sys.stderr.write(f"stub_llm: timeline current_date verified: {dates[-1]} timezone: UTC\n")
+
         latest_user = next((msg.get("content") for msg in reversed(messages)
                             if isinstance(msg, dict) and msg.get("role") == "user"
                             and isinstance(msg.get("content"), str)
