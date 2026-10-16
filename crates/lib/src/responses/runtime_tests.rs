@@ -273,19 +273,19 @@ async fn native_runtime_persists_full_replay_usage_and_identity_across_reopen() 
     let payload = client
         .request(&after, &ctx.definitions(), "test-model", Some(&key))
         .unwrap();
-    assert_eq!(&payload.input[1..6], output());
-    assert_eq!(payload.input[6]["call_id"], "call1");
+    assert_eq!(&payload.input[2..7], output());
+    assert_eq!(payload.input[7]["call_id"], "call1");
     assert!(
-        payload.input[6]["output"]
+        payload.input[7]["output"]
             .as_str()
             .unwrap()
             .contains("first failed")
     );
-    assert_eq!(payload.input[7]["call_id"], "call2");
-    assert_eq!(&payload.input[8..10], final_output());
+    assert_eq!(payload.input[8]["call_id"], "call2");
+    assert_eq!(&payload.input[9..11], final_output());
     assert_eq!(
         payload.input.len(),
-        10,
+        11,
         "terminal message is not flattened or duplicated"
     );
     let reopened = Arc::new(AsyncMutex::new(reopened));
@@ -312,9 +312,9 @@ async fn native_runtime_persists_full_replay_usage_and_identity_across_reopen() 
     assert_eq!(requests.len(), 3);
     let bodies: Vec<Value> = requests.iter().map(|r| r.body_json().unwrap()).collect();
     assert!(bodies.iter().all(|r| r["prompt_cache_key"] == key));
-    assert_eq!(&bodies[1]["input"].as_array().unwrap()[1..6], output());
+    assert_eq!(&bodies[1]["input"].as_array().unwrap()[2..7], output());
     assert_eq!(
-        &bodies[2]["input"].as_array().unwrap()[8..10],
+        &bodies[2]["input"].as_array().unwrap()[9..11],
         final_output()
     );
     assert!(
@@ -662,7 +662,7 @@ async fn native_final_replay_keeps_bridge_provenance() {
         .messages;
         let request = client.request(&messages, &[], "test-model", None).unwrap();
         assert_eq!(
-            &request.input[1..3],
+            &request.input[2..4],
             final_output(),
             "native items stay unchanged"
         );
@@ -749,14 +749,14 @@ async fn native_silence_and_tool_free_turns_keep_terminal_items_and_scoped_ident
         let messages = context(&*session.lock().await).await;
         let client = Responses::new(&config, &secrets);
         let replay = client.request(&messages, &[], "test-model", None).unwrap();
-        assert_eq!(&replay.input[1..3], items);
+        assert_eq!(&replay.input[2..4], items);
         if silent {
             assert_eq!(
-                replay.input[3],
+                replay.input[4],
                 json!({"type":"function_call_output", "call_id":"silent-call", "output":""})
             );
         } else {
-            assert_eq!(replay.input.len(), 3);
+            assert_eq!(replay.input.len(), 4);
         }
         let requests = server.received_requests().await.unwrap();
         let payload: Value = requests[0].body_json().unwrap();

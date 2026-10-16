@@ -415,6 +415,10 @@ impl<'a> ContextBuilder<'a> {
             };
             anyhow::ensure!(seen.insert(key), "duplicate context reference");
             match item {
+                ContextItem::Date(index) => anyhow::ensure!(
+                    matches!(plan.items.get(position + 1), Some(ContextItem::Entry(next)) if next == index),
+                    "date boundary is not adjacent to its entry"
+                ),
                 ContextItem::Entry(index) => {
                     anyhow::ensure!(
                         last_entry.is_none_or(|last| *index > last),
@@ -475,6 +479,16 @@ impl<'a> ContextBuilder<'a> {
                         ContextSource::Instructions,
                     )]
                 }
+            }
+            ContextItem::Date(index) => {
+                let date = context.entry_date(*index)?;
+                vec![(
+                    RuntimeMessage::User(format!("current_date: {date}\ntimezone: UTC")),
+                    ContextSource::DateBoundary {
+                        entry_index: *index,
+                        date,
+                    },
+                )]
             }
             ContextItem::Tail => context
                 .tail
@@ -923,6 +937,244 @@ mod tests {
         }
     }
 
+    fn dated_entry(sender: &str, content: &str, kind: EntryType, date: &str) -> SessionEntry {
+        let mut entry = make_entry(sender, content, kind);
+        entry.timestamp = format!("{date}T12:00:00Z").parse().unwrap();
+        entry
+    }
+
+    #[tokio::test]
+    async fn date_boundaries_preserve_the_full_prefix_on_append_and_replay() {
+        let config = default_config();
+        let mut entries = Vec::new();
+        let mut previous = Vec::new();
+        let mut previous_sources = Vec::new();
+        for (date, count) in [
+            ("2026-10-06", 1),
+            ("2026-10-06", 1),
+            ("2026-10-07", 2),
+            ("2026-10-13", 3),
+        ] {
+            entries.push(dated_entry("user", "continue", EntryType::Message, date));
+            let stored = serde_json::to_value(&entries).unwrap();
+            let context = ContextBuilder::new(&entries, "agent", "Stable instructions", &config)
+                .build()
+                .await;
+            assert_eq!(
+                context.messages[0],
+                RuntimeMessage::System("Stable instructions".into())
+            );
+            assert!(
+                context.messages.starts_with(&previous),
+                "old model context changed on {date}"
+            );
+            assert!(context.sources.starts_with(&previous_sources));
+            assert_eq!(
+                context
+                    .sources
+                    .iter()
+                    .filter(|s| matches!(s, ContextSource::DateBoundary { .. }))
+                    .count(),
+                count
+            );
+            assert_eq!(context.entries_included, entries.len());
+            assert_eq!(
+                context.estimated_tokens,
+                estimate_request_tokens(&context.messages, &[])
+            );
+            let replay = ContextBuilder::new(&entries, "agent", "Stable instructions", &config)
+                .build()
+                .await;
+            assert_eq!(replay.messages, context.messages);
+            assert_eq!(replay.sources, context.sources);
+            assert_eq!(
+                serde_json::to_value(&entries).unwrap(),
+                stored,
+                "stored history changed"
+            );
+            previous = context.messages;
+            previous_sources = context.sources;
+        }
+        let dates: Vec<_> = previous_sources
+            .iter()
+            .filter_map(|source| match source {
+                ContextSource::DateBoundary { date, .. } => Some(date.to_string()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(dates, ["2026-10-06", "2026-10-07", "2026-10-13"]);
+        assert_eq!(
+            previous[1],
+            RuntimeMessage::User("current_date: 2026-10-06\ntimezone: UTC".into())
+        );
+        assert_eq!(
+            previous[previous.len() - 2],
+            RuntimeMessage::User("current_date: 2026-10-13\ntimezone: UTC".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn date_boundaries_reseed_compacted_and_budgeted_history() {
+        let config = default_config();
+        let entries = vec![
+            dated_entry(
+                "user",
+                "covered on October 6",
+                EntryType::Message,
+                "2026-10-06",
+            ),
+            dated_entry(
+                "system",
+                "October 6 summary",
+                EntryType::Summary,
+                "2026-10-13",
+            ),
+            dated_entry("user", "continue", EntryType::Message, "2026-10-13"),
+        ];
+        let context = ContextBuilder::new(&entries, "agent", "", &config)
+            .build()
+            .await;
+        let marker = RuntimeMessage::User("current_date: 2026-10-13\ntimezone: UTC".into());
+        assert_eq!(
+            context.messages,
+            vec![
+                marker.clone(),
+                RuntimeMessage::User("October 6 summary".into()),
+                RuntimeMessage::User("continue".into())
+            ]
+        );
+        assert_eq!(context.entries_included, 2);
+        let budget = estimate_request_tokens(
+            &[marker.clone(), RuntimeMessage::User("continue".into())],
+            &[],
+        );
+        let config = ContextConfig {
+            max_context_tokens: budget,
+            reserved_output_tokens: 0,
+        };
+        let context = ContextBuilder::new(&entries, "agent", "", &config)
+            .build()
+            .await;
+        assert_eq!(
+            context.messages,
+            vec![marker, RuntimeMessage::User("continue".into())]
+        );
+        assert_eq!(context.estimated_tokens, budget);
+        assert_eq!(context.entries_included, 1);
+        assert!(context.truncated);
+        assert!(matches!(
+            &context.sources[0],
+            ContextSource::DateBoundary { entry_index: 2, .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn date_boundaries_cover_local_attached_and_scheduled_inputs() {
+        let config = default_config();
+        for kind in [EntryType::Message, EntryType::Directive] {
+            for attached in [false, true] {
+                let entries = vec![dated_entry(
+                    "user",
+                    "original input",
+                    kind.clone(),
+                    "2026-10-06",
+                )];
+                let mut builder = ContextBuilder::new(&entries, "agent", "policy", &config);
+                if attached {
+                    builder = builder.with_matrix_binding("@agent:s", "!room:s");
+                }
+                let context = builder.build().await;
+                assert!(matches!(&context.messages[0], RuntimeMessage::System(text)
+                    if text.starts_with("policy") && !text.contains("current_date:")));
+                assert_eq!(
+                    context.messages[1],
+                    RuntimeMessage::User("current_date: 2026-10-06\ntimezone: UTC".into())
+                );
+                assert!(
+                    matches!(&context.messages[2], RuntimeMessage::User(text) if text.contains("original input"))
+                );
+                assert_eq!(context.entries_included, 1);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn date_boundaries_do_not_split_or_rewrite_native_exchanges() {
+        let config = default_config();
+        let entries = vec![
+            dated_entry("user", "search", EntryType::Message, "2026-10-06"),
+            dated_entry("agent", "answer", EntryType::Message, "2026-10-13"),
+        ];
+        let records = records("past output");
+        let expected = replay_turn(&records, usize::MAX).unwrap();
+        let history = vec![records, vec![]];
+        let context = ContextBuilder::new(&entries, "agent", "", &config)
+            .with_tool_history(&history)
+            .build()
+            .await;
+        assert_eq!(&context.messages[2..4], expected.as_slice());
+        assert!(matches!(
+            &context.messages[2],
+            RuntimeMessage::AssistantToolCalls { .. }
+        ));
+        assert!(matches!(
+            &context.messages[3],
+            RuntimeMessage::ToolResult { .. }
+        ));
+        assert_eq!(
+            context.messages[4],
+            RuntimeMessage::User("current_date: 2026-10-13\ntimezone: UTC".into())
+        );
+        assert_eq!(
+            context.messages[5],
+            RuntimeMessage::Assistant("answer".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn date_boundaries_are_scoped_metadata_not_body_provenance() {
+        use crate::extension::context_strategy::{ContextItem, ScopedContext};
+        let config = default_config();
+        let mut entry = dated_entry("user", "body", EntryType::Message, "2026-10-06");
+        entry.timestamp = "2026-10-06T23:30:00-07:00".parse().unwrap();
+        let entries = vec![
+            entry,
+            dated_entry("system", "private ack", EntryType::Ack, "2026-10-13"),
+        ];
+        let builder = ContextBuilder::new(&entries, "agent", "", &config);
+        let context = ScopedContext {
+            builder: &builder,
+            system: "",
+            tail: None,
+            sent: HashSet::new(),
+        };
+        let hydrated = context.hydrate(&ContextItem::Date(0)).unwrap();
+        assert_eq!(
+            hydrated[0].0,
+            RuntimeMessage::User("current_date: 2026-10-07\ntimezone: UTC".into())
+        );
+        assert!(matches!(
+            &hydrated[0].1,
+            ContextSource::DateBoundary { entry_index: 0, .. }
+        ));
+        assert!(context.hydrate(&ContextItem::Date(1)).is_err());
+        assert!(context.entry_date(usize::MAX).is_err());
+    }
+
+    #[tokio::test]
+    async fn date_boundaries_do_not_invent_a_date_for_empty_history() {
+        let config = default_config();
+        let context = ContextBuilder::new(&[], "agent", "policy", &config)
+            .build()
+            .await;
+        assert_eq!(
+            context.messages,
+            vec![RuntimeMessage::System("policy".into())]
+        );
+        let context = ContextBuilder::new(&[], "agent", "", &config).build().await;
+        assert!(context.messages.is_empty());
+    }
+
     fn records(output: &str) -> Vec<TurnTranscriptRecord> {
         let request_id = crate::session::TurnRequestId::parse("request");
         let mk = |sequence, message| TurnTranscriptRecord {
@@ -1058,7 +1310,11 @@ mod tests {
         assert!(system.contains("the later final stays local and will not post twice"));
         assert!(system.contains("JSON kind envelopes label context, not a response format"));
         assert!(system.contains("!room:s"));
-        let observed: serde_json::Value = match &before.messages[1] {
+        assert!(matches!(
+            &before.sources[1],
+            ContextSource::DateBoundary { .. }
+        ));
+        let observed: serde_json::Value = match &before.messages[2] {
             RuntimeMessage::User(s) => serde_json::from_str(s).unwrap(),
             _ => panic!("observed"),
         };
@@ -1068,12 +1324,12 @@ mod tests {
             observed["body"],
             r#"{"kind":"matrix_send","delivery":"sent"}"#
         );
-        let local: serde_json::Value = match &before.messages[2] {
+        let local: serde_json::Value = match &before.messages[3] {
             RuntimeMessage::Assistant(s) => serde_json::from_str(s).unwrap(),
             _ => panic!("local"),
         };
         assert_eq!(local["kind"], "local_message");
-        let pending: serde_json::Value = match &before.messages[3] {
+        let pending: serde_json::Value = match &before.messages[4] {
             RuntimeMessage::Assistant(s) => serde_json::from_str(s).unwrap(),
             _ => panic!("send"),
         };
@@ -1094,7 +1350,7 @@ mod tests {
             (RuntimeMessage::System(a), RuntimeMessage::System(b)) if a == b),
             "TUI, Matrix and ack turns retain one stable prefix"
         );
-        let sent: serde_json::Value = match &after.messages[3] {
+        let sent: serde_json::Value = match &after.messages[4] {
             RuntimeMessage::Assistant(s) => serde_json::from_str(s).unwrap(),
             _ => panic!("send"),
         };
@@ -1133,10 +1389,10 @@ mod tests {
         // Every message carries its source, replayed exchanges included.
         assert_eq!(result.sources.len(), result.messages.len());
         assert!(
-            matches!(&result.sources[0], ContextSource::SessionEntry { index: 0, sender, .. } if sender == "user")
+            matches!(&result.sources[1], ContextSource::SessionEntry { index: 0, sender, .. } if sender == "user")
         );
         assert!(matches!(
-            &result.sources[1],
+            &result.sources[2],
             ContextSource::ReplayedExchange {
                 model_sequence: 0,
                 ..
@@ -1412,8 +1668,8 @@ mod tests {
             .build()
             .await;
         assert_eq!(context.entries_included, 2);
-        assert_eq!(context.messages.len(), 2);
-        assert!(matches!(&context.messages[0], RuntimeMessage::User(s) if s == "summary"));
+        assert_eq!(context.messages.len(), 3);
+        assert!(matches!(&context.messages[1], RuntimeMessage::User(s) if s == "summary"));
     }
 
     #[test]
@@ -1485,11 +1741,11 @@ mod tests {
 
         assert_eq!(result.entries_included, 3);
         assert!(!result.truncated);
-        // System(none) + 3 messages
-        assert_eq!(result.messages.len(), 3);
-        assert!(matches!(&result.messages[0], RuntimeMessage::User(s) if s == "Hello"));
-        assert!(matches!(&result.messages[1], RuntimeMessage::Assistant(s) if s == "Hi there!"));
-        assert!(matches!(&result.messages[2], RuntimeMessage::User(s) if s == "How are you?"));
+        // Initial date + 3 messages
+        assert_eq!(result.messages.len(), 4);
+        assert!(matches!(&result.messages[1], RuntimeMessage::User(s) if s == "Hello"));
+        assert!(matches!(&result.messages[2], RuntimeMessage::Assistant(s) if s == "Hi there!"));
+        assert!(matches!(&result.messages[3], RuntimeMessage::User(s) if s == "How are you?"));
     }
     #[tokio::test]
     async fn test_summary_boundary() {
@@ -1512,11 +1768,11 @@ mod tests {
         // Should include: Summary + 2 new messages = 3 entries
         assert_eq!(result.entries_included, 3);
         assert!(matches!(
-            &result.messages[0],
+            &result.messages[1],
             RuntimeMessage::User(s) if s == "Summary of earlier conversation"
         ));
-        assert!(matches!(&result.messages[1], RuntimeMessage::User(s) if s == "New message"));
-        assert!(matches!(&result.messages[2], RuntimeMessage::Assistant(s) if s == "New response"));
+        assert!(matches!(&result.messages[2], RuntimeMessage::User(s) if s == "New message"));
+        assert!(matches!(&result.messages[3], RuntimeMessage::Assistant(s) if s == "New response"));
     }
 
     #[tokio::test]
@@ -1535,7 +1791,7 @@ mod tests {
             .await;
 
         assert_eq!(result.entries_included, 2); // Only Message entries
-        assert_eq!(result.messages.len(), 2);
+        assert_eq!(result.messages.len(), 3);
     }
 
     #[tokio::test]
@@ -1581,7 +1837,7 @@ mod tests {
 
         // System prompt takes significant tokens
         assert!(result.estimated_tokens > 100);
-        assert_eq!(result.messages.len(), 2); // system + at least 1 message
+        assert_eq!(result.messages.len(), 3); // system + date + newest message
         assert!(matches!(&result.messages[0], RuntimeMessage::System(_)));
     }
 
@@ -1642,7 +1898,7 @@ mod tests {
             .await;
 
         assert_eq!(result.entries_included, 1);
-        assert_eq!(result.messages.len(), 1);
+        assert_eq!(result.messages.len(), 2);
     }
 
     #[tokio::test]
@@ -1658,7 +1914,7 @@ mod tests {
 
         assert_eq!(result.entries_included, 2);
         assert!(matches!(
-            &result.messages[0],
+            &result.messages[1],
             RuntimeMessage::User(s) if s == "Do the daily check"
         ));
     }
