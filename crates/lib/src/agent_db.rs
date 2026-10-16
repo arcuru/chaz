@@ -19,6 +19,9 @@
 // allow dead_code to keep the API surface stable.
 #![allow(dead_code)]
 
+mod providers;
+pub use providers::{ProviderRef, select_providers};
+
 use crate::config::{AgentConfig, AgentPreset, Config, WorkerConfig};
 use crate::grants::Grants;
 use crate::routine::Trigger;
@@ -59,6 +62,8 @@ pub const LOGINS_STORE: &str = "logins";
 pub const SESSIONS_STORE: &str = "sessions";
 /// Executor databases belonging to this Agent, indexed by stable peer key.
 pub const EXECUTORS_STORE: &str = "executors";
+/// Metadata-only catalog of known Provider DB roots. Membership grants no access.
+pub const PROVIDERS_STORE: &str = "providers";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ExecutorRef {
@@ -136,6 +141,11 @@ pub struct AgentDbConfig {
     /// Skill banks to auto-attach at agent bootstrap. Mirrors [`AgentConfig::default_skill_banks`].
     #[serde(default)]
     pub default_skill_banks: Vec<String>,
+    /// Provider DB roots for future selection, not session attachments or grants.
+    /// Missing on older configs means none. Use [`AgentDb::set_default_providers`]
+    /// to validate catalog membership before persisting an update.
+    #[serde(default)]
+    pub default_providers: Vec<String>,
 }
 
 /// Serializable Worker template. Mirrors [`WorkerConfig`].
@@ -299,6 +309,7 @@ impl AgentDbConfig {
             grants: cfg.grants.clone().unwrap_or_default(),
             default_memory_banks: cfg.default_memory_banks.clone().unwrap_or_default(),
             default_skill_banks: cfg.default_skill_banks.clone().unwrap_or_default(),
+            default_providers: Vec::new(),
         }
     }
 }
@@ -570,6 +581,7 @@ impl AgentDb {
         txn.get_store::<Table<LoginRef>>(LOGINS_STORE).await?;
         txn.get_store::<Table<SessionRef>>(SESSIONS_STORE).await?;
         txn.get_store::<Table<ExecutorRef>>(EXECUTORS_STORE).await?;
+        txn.get_store::<Table<ProviderRef>>(PROVIDERS_STORE).await?;
         txn.commit().await?;
         Ok(())
     }
@@ -1477,6 +1489,480 @@ mod tests {
             Some(77),
             "yaml should not overwrite existing DB config"
         );
+    }
+
+    // -------------------------------------------------------------------------
+    // Provider catalog (metadata only)
+    // -------------------------------------------------------------------------
+
+    const PROVIDER_A: &str = "bafyreibog4r3zw5d53sv5u72tms2vz5ye5eudvmqc7tfpn2bjfyebqtqzm";
+    const PROVIDER_B: &str = "bafyreibog4r3zw5d53sv5u72tms2vz5ye5eudvmqc7tfpn2bjfyebqtqzi";
+
+    fn provider(db_id: &str) -> ProviderRef {
+        ProviderRef {
+            db_id: db_id.into(),
+            display_name: "environment".into(),
+            peer_pubkey: None,
+            sync_addresses: vec![],
+        }
+    }
+
+    #[test]
+    fn provider_schema_and_old_config_compatibility() {
+        assert_eq!(PROVIDERS_STORE, "providers");
+        let minimal = format!(r#"{{"db_id":"{PROVIDER_A}","display_name":"environment"}}"#);
+        assert_eq!(
+            serde_json::to_string(&provider(PROVIDER_A)).unwrap(),
+            minimal
+        );
+        assert_eq!(
+            serde_json::from_str::<ProviderRef>(&minimal).unwrap(),
+            provider(PROVIDER_A)
+        );
+        let routed = ProviderRef {
+            peer_pubkey: Some("routing-only".into()),
+            sync_addresses: vec![("http".into(), "http://localhost:8080".into())],
+            ..provider(PROVIDER_A)
+        };
+        assert_eq!(
+            serde_json::to_string(&routed).unwrap(),
+            format!(
+                r#"{{"db_id":"{PROVIDER_A}","display_name":"environment","peer_pubkey":"routing-only","sync_addresses":[["http","http://localhost:8080"]]}}"#
+            )
+        );
+        let old: AgentDbConfig =
+            serde_json::from_str(r#"{"model":"local","tools":["get_time"]}"#).unwrap();
+        assert!(old.default_providers.is_empty());
+        let mut encoded = serde_json::to_value(&old).unwrap();
+        assert_eq!(encoded["default_providers"], serde_json::json!([]));
+        encoded["default_providers"] = serde_json::json!([PROVIDER_A]);
+        let new: AgentDbConfig = serde_json::from_value(encoded.clone()).unwrap();
+        assert_eq!(new.default_providers, vec![PROVIDER_A]);
+        assert_eq!(serde_json::to_value(new).unwrap(), encoded);
+    }
+
+    #[test]
+    fn provider_selection_is_explicit_deduplicated_and_deterministic() {
+        let a = provider(PROVIDER_A);
+        let b = provider(PROVIDER_B); // Same label is not the same identity.
+        let catalog = vec![a.clone(), b.clone(), a.clone()];
+        let defaults = vec![PROVIDER_A.into(), PROVIDER_A.into()];
+        assert_eq!(
+            select_providers(&catalog, &defaults, None).unwrap(),
+            vec![a.clone()]
+        );
+        assert!(select_providers(&catalog, &[], None).unwrap().is_empty());
+        assert!(
+            select_providers(&catalog, &defaults, Some(&[]))
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            select_providers(&catalog, &defaults, Some(&[PROVIDER_B.into()])).unwrap(),
+            vec![b]
+        );
+        let ids = vec![PROVIDER_A.into(), PROVIDER_B.into(), PROVIDER_A.into()];
+        let expected = select_providers(&catalog, &ids, None).unwrap();
+        assert_eq!(
+            expected
+                .iter()
+                .map(|r| r.db_id.as_str())
+                .collect::<Vec<_>>(),
+            vec![PROVIDER_B, PROVIDER_A]
+        );
+        let mut reversed = catalog.clone();
+        reversed.reverse();
+        assert_eq!(
+            select_providers(&reversed, &ids.into_iter().rev().collect::<Vec<_>>(), None).unwrap(),
+            expected
+        );
+    }
+
+    #[test]
+    fn provider_selection_refuses_invalid_unknown_and_conflicting_ids() {
+        let a = provider(PROVIDER_A);
+        for id in ["", "environment", "invalid", PROVIDER_B] {
+            let error = select_providers(std::slice::from_ref(&a), &[id.into()], None).unwrap_err();
+            assert!(
+                error.to_string().contains(if id == PROVIDER_B {
+                    "unknown Provider DB ID"
+                } else {
+                    "invalid Provider DB ID"
+                }),
+                "{error:#}"
+            );
+        }
+        assert!(select_providers(&[provider("")], &[], Some(&[])).is_err());
+        assert!(
+            select_providers(&[provider(&PROVIDER_A.to_uppercase())], &[], None)
+                .unwrap_err()
+                .to_string()
+                .contains("noncanonical Provider DB ID")
+        );
+        let conflicting = ProviderRef {
+            peer_pubkey: Some("other-route".into()),
+            ..a.clone()
+        };
+        for catalog in [vec![a.clone(), conflicting.clone()], vec![conflicting, a]] {
+            let error = select_providers(&catalog, &[PROVIDER_A.into()], None).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("conflicting Provider catalog entries")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_catalog_write_read_permissions_and_existing_session_are_preserved() {
+        use eidetica::auth::{AuthKey, SigKey, types::Permission};
+        let (_instance, registry) = crate::test_support::fresh_session_registry().await;
+        let (admin, admin_key) = registry
+            .create_new_agent_db("catalog", &AgentDbConfig::default(), &AgentMeta::default())
+            .await
+            .unwrap();
+        let (_, session) = registry.create_session(Some("existing")).await.unwrap();
+        registry
+            .attach_agent_to_session(
+                &session.root_id().to_string(),
+                &crate::hosted_index::DbEntry {
+                    db_id: admin.id(),
+                    display_name: "catalog".into(),
+                    pubkey: admin_key,
+                },
+            )
+            .await
+            .unwrap();
+        let session_before = session.snapshot().await.unwrap();
+        let refs_before = admin.list_session_refs().await.unwrap();
+        let keys_before;
+        let mut actors = Vec::new();
+        {
+            let mut user = registry.user_for_tests().await;
+            for (label, permission) in [
+                ("writer", Permission::Write(0)),
+                ("reader", Permission::Read),
+            ] {
+                let key = user.add_private_key(Some(label)).await.unwrap();
+                let txn = admin.database().new_transaction().await.unwrap();
+                txn.get_settings()
+                    .unwrap()
+                    .set_auth_key(&key, AuthKey::active(Some(label), permission))
+                    .await
+                    .unwrap();
+                txn.commit().await.unwrap();
+                user.map_key(&key, &admin.id(), SigKey::from_pubkey(&key))
+                    .await
+                    .unwrap();
+                let db = user
+                    .open_database_with_key(&admin.id(), &key)
+                    .await
+                    .unwrap();
+                assert_eq!(db.current_permission().await.unwrap(), permission);
+                actors.push(AgentDb::from_database(db));
+            }
+            keys_before = user.list_keys().unwrap().len();
+        }
+        let writer = &actors[0];
+        let reader = &actors[1];
+        let auth_before = serde_json::to_value(
+            admin
+                .database()
+                .get_settings()
+                .await
+                .unwrap()
+                .auth_snapshot()
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(reader.list_providers().await.unwrap().is_empty());
+        writer.upsert_provider(provider(PROVIDER_A)).await.unwrap();
+        writer.upsert_provider(provider(PROVIDER_B)).await.unwrap();
+        writer
+            .set_default_providers(&[PROVIDER_A.into(), PROVIDER_A.into()])
+            .await
+            .unwrap();
+        let edited = ProviderRef {
+            display_name: "renamed".into(),
+            peer_pubkey: Some("routing-only".into()),
+            sync_addresses: vec![("http".into(), "http://localhost:9090".into())],
+            ..provider(PROVIDER_A)
+        };
+        writer.upsert_provider(edited.clone()).await.unwrap();
+        assert_eq!(
+            reader.find_provider(PROVIDER_A).await.unwrap(),
+            Some(edited.clone())
+        );
+        let catalog = reader.list_providers().await.unwrap();
+        assert_eq!(catalog, vec![provider(PROVIDER_B), edited.clone()]);
+        let txn = reader.database().new_transaction().await.unwrap();
+        let raw_rows = txn
+            .get_store::<Table<serde_json::Value>>(PROVIDERS_STORE)
+            .await
+            .unwrap()
+            .search(|row| row["db_id"] == PROVIDER_A)
+            .await
+            .unwrap();
+        assert_eq!(raw_rows.len(), 1);
+        assert_eq!(
+            raw_rows[0].1,
+            serde_json::json!({"db_id":PROVIDER_A, "display_name":"renamed", "peer_pubkey":"routing-only", "sync_addresses":[["http","http://localhost:9090"]]})
+        );
+        assert_eq!(
+            select_providers(
+                &catalog,
+                &reader.read_config().await.unwrap().default_providers,
+                None
+            )
+            .unwrap(),
+            vec![edited]
+        );
+        // Every failed native mutation uses valid data and leaves both stores unchanged.
+        for error in [
+            reader
+                .upsert_provider(provider(PROVIDER_A))
+                .await
+                .unwrap_err(),
+            reader
+                .set_default_providers(&[PROVIDER_B.into()])
+                .await
+                .unwrap_err(),
+            reader.remove_provider(PROVIDER_A).await.unwrap_err(),
+        ] {
+            assert!(
+                error.downcast_ref::<eidetica::Error>().is_some(),
+                "{error:#}"
+            );
+        }
+        assert_eq!(reader.list_providers().await.unwrap(), catalog);
+        assert_eq!(
+            reader.read_config().await.unwrap().default_providers,
+            vec![PROVIDER_A]
+        );
+        writer.set_default_providers(&[]).await.unwrap();
+        assert!(
+            reader
+                .read_config()
+                .await
+                .unwrap()
+                .default_providers
+                .is_empty()
+        );
+        writer
+            .set_default_providers(&[PROVIDER_A.into()])
+            .await
+            .unwrap();
+        assert!(writer.remove_provider(PROVIDER_A).await.unwrap());
+        assert!(reader.find_provider(PROVIDER_A).await.unwrap().is_none());
+        assert!(
+            reader
+                .read_config()
+                .await
+                .unwrap()
+                .default_providers
+                .is_empty()
+        );
+        assert_eq!(
+            reader.list_providers().await.unwrap(),
+            vec![provider(PROVIDER_B)]
+        );
+        assert_eq!(admin.list_session_refs().await.unwrap(), refs_before);
+        assert_eq!(
+            session.snapshot().await.unwrap(),
+            session_before,
+            "catalog edits must not write any session metadata, attachments or native auth"
+        );
+        assert_eq!(
+            serde_json::to_value(
+                admin
+                    .database()
+                    .get_settings()
+                    .await
+                    .unwrap()
+                    .auth_snapshot()
+                    .await
+                    .unwrap()
+            )
+            .unwrap(),
+            auth_before
+        );
+        assert_eq!(
+            registry.user_for_tests().await.list_keys().unwrap().len(),
+            keys_before
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_remove_prunes_defaults_in_one_entry_preserving_config_and_reopens() {
+        let (user, db) = peer_with_agent_db().await;
+        db.upsert_provider(provider(PROVIDER_A)).await.unwrap();
+        db.upsert_provider(provider(PROVIDER_B)).await.unwrap();
+        let mut raw = serde_json::json!({"model":"local", "tools":["get_time"], "future_setting":{"keep":[1,2]}, "default_providers":[PROVIDER_A, PROVIDER_B, PROVIDER_A]});
+        write_blob(db.database(), CONFIG_STORE, &raw).await.unwrap();
+        db.set_default_providers(&[PROVIDER_B.into(), PROVIDER_A.into(), PROVIDER_B.into()])
+            .await
+            .unwrap();
+        raw["default_providers"] = serde_json::json!([PROVIDER_B, PROVIDER_A]);
+        assert_eq!(
+            read_blob::<serde_json::Value>(db.database(), CONFIG_STORE)
+                .await
+                .unwrap(),
+            raw
+        );
+        // Simulate repeated IDs from an external config writer before removal.
+        raw["default_providers"] = serde_json::json!([PROVIDER_A, PROVIDER_B, PROVIDER_A]);
+        write_blob(db.database(), CONFIG_STORE, &raw).await.unwrap();
+        let before = db.database().snapshot().await.unwrap();
+        assert!(db.remove_provider(PROVIDER_A).await.unwrap());
+        let after = db.database().snapshot().await.unwrap();
+        assert_eq!(after.tips().len(), 1);
+        let entry = db
+            .database()
+            .get_entry(after.tips()[0].clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            entry.parents().unwrap(),
+            before.tips(),
+            "no intervening default-only or catalog-only commit"
+        );
+        // The only new commit contains both edits, observable at that exact frontier.
+        assert_ne!(after, before);
+        raw["default_providers"] = serde_json::json!([PROVIDER_B]);
+        assert_eq!(
+            read_blob::<serde_json::Value>(db.database(), CONFIG_STORE)
+                .await
+                .unwrap(),
+            raw
+        );
+        assert_eq!(
+            db.list_providers().await.unwrap(),
+            vec![provider(PROVIDER_B)]
+        );
+        assert!(!db.remove_provider(PROVIDER_A).await.unwrap());
+        let reopened = AgentDb::from_database(user.open_database(&db.id()).await.unwrap());
+        assert_eq!(
+            reopened.list_providers().await.unwrap(),
+            vec![provider(PROVIDER_B)]
+        );
+        assert_eq!(
+            reopened.read_config().await.unwrap().default_providers,
+            vec![PROVIDER_B]
+        );
+        assert_eq!(
+            read_blob::<serde_json::Value>(reopened.database(), CONFIG_STORE)
+                .await
+                .unwrap(),
+            raw
+        );
+        // A post-sync dangling default is an error, not an optional provider or fallback.
+        raw["default_providers"] = serde_json::json!([PROVIDER_A]);
+        write_blob(db.database(), CONFIG_STORE, &raw).await.unwrap();
+        assert!(
+            select_providers(
+                &db.list_providers().await.unwrap(),
+                &db.read_config().await.unwrap().default_providers,
+                None
+            )
+            .is_err()
+        );
+        assert!(!db.remove_provider(PROVIDER_A).await.unwrap());
+        assert!(db.read_config().await.unwrap().default_providers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn provider_invalid_updates_and_unreadable_config_never_partially_commit() {
+        let (_user, db) = peer_with_agent_db().await;
+        db.upsert_provider(provider(PROVIDER_A)).await.unwrap();
+        db.set_default_providers(&[PROVIDER_A.into()])
+            .await
+            .unwrap();
+        let before = db.database().snapshot().await.unwrap();
+        assert!(
+            db.set_default_providers(&[PROVIDER_B.into()])
+                .await
+                .is_err()
+        );
+        assert!(db.upsert_provider(provider("environment")).await.is_err());
+        assert_eq!(db.database().snapshot().await.unwrap(), before);
+        for bad in [
+            serde_json::json!(42),
+            serde_json::json!("{"),
+            serde_json::json!(r#"{"default_providers":null}"#),
+            serde_json::json!(r#"{"tools":42}"#),
+        ] {
+            let txn = db.database().new_transaction().await.unwrap();
+            let store = txn.get_store::<DocStore>(CONFIG_STORE).await.unwrap();
+            if let Some(text) = bad.as_str() {
+                store.set_string(BLOB_KEY, text).await.unwrap();
+            } else {
+                store.set(BLOB_KEY, 42i64).await.unwrap();
+            }
+            txn.commit().await.unwrap();
+            let before = db.database().snapshot().await.unwrap();
+            assert!(db.read_config().await.is_err());
+            assert!(db.set_default_providers(&[]).await.is_err());
+            assert!(db.remove_provider(PROVIDER_A).await.is_err());
+            assert_eq!(db.database().snapshot().await.unwrap(), before);
+            assert_eq!(
+                db.find_provider(PROVIDER_A).await.unwrap(),
+                Some(provider(PROVIDER_A))
+            );
+        }
+        // Concurrent equal rows deduplicate; conflicting rows refuse list/find/default updates.
+        write_blob(db.database(), CONFIG_STORE, &AgentDbConfig::default())
+            .await
+            .unwrap();
+        let txn = db.database().new_transaction().await.unwrap();
+        let table = txn
+            .get_store::<Table<ProviderRef>>(PROVIDERS_STORE)
+            .await
+            .unwrap();
+        table.insert(provider(PROVIDER_A)).await.unwrap();
+        txn.commit().await.unwrap();
+        assert_eq!(
+            db.list_providers().await.unwrap(),
+            vec![provider(PROVIDER_A)]
+        );
+        let txn = db.database().new_transaction().await.unwrap();
+        txn.get_store::<Table<ProviderRef>>(PROVIDERS_STORE)
+            .await
+            .unwrap()
+            .insert(ProviderRef {
+                display_name: "conflict".into(),
+                ..provider(PROVIDER_A)
+            })
+            .await
+            .unwrap();
+        txn.commit().await.unwrap();
+        let before = db.database().snapshot().await.unwrap();
+        assert!(db.list_providers().await.is_err());
+        assert!(db.find_provider(PROVIDER_A).await.is_err());
+        assert!(
+            db.set_default_providers(&[PROVIDER_A.into()])
+                .await
+                .is_err()
+        );
+        assert_eq!(db.database().snapshot().await.unwrap(), before);
+        db.upsert_provider(provider(PROVIDER_A)).await.unwrap(); // Explicit same-root repair.
+        assert_eq!(
+            db.list_providers().await.unwrap(),
+            vec![provider(PROVIDER_A)]
+        );
+        // Typed scans must propagate malformed persisted rows, not skip them.
+        let txn = db.database().new_transaction().await.unwrap();
+        txn.get_store::<Table<serde_json::Value>>(PROVIDERS_STORE)
+            .await
+            .unwrap()
+            .insert(serde_json::json!({"db_id": 42, "display_name": "bad"}))
+            .await
+            .unwrap();
+        txn.commit().await.unwrap();
+        let before = db.database().snapshot().await.unwrap();
+        assert!(db.list_providers().await.is_err());
+        assert!(db.set_default_providers(&[]).await.is_err());
+        assert_eq!(db.database().snapshot().await.unwrap(), before);
     }
 
     // -------------------------------------------------------------------------
