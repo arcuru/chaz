@@ -4,6 +4,12 @@
 # cache.nixos.org (bypassing our own cache to prevent poisoning), signs
 # the results, and pushes them to s3://cache-eidetica-dev. Subsequent
 # CI runs and local builds then download instead of recompiling.
+#
+# Dev publishes after main CI are coalesced: one runs, at most one waits, and
+# a newer arrival replaces the waiting one. A running publish is never
+# cancelled. The guard job then builds the newest CI-verified main commit, so
+# an older CI run that finishes late cannot overwrite newer output. Manual
+# dispatch publishes main as before, outside that queue.
 
 name: Publish
 
@@ -17,23 +23,77 @@ on:
 permissions:
   contents: read
 
+# Only a trusted dev publish joins the shared group; anything else (a failed
+# or untrusted CI run, a manual dispatch) gets its own group. A skipped run in
+# the shared group would replace a real waiting publish.
+concurrency:
+  group: >-
+    ${{ (github.repository_owner == 'arcuru' &&
+         github.event_name == 'workflow_run' &&
+         github.event.workflow_run.conclusion == 'success' &&
+         github.event.workflow_run.head_branch == 'main' &&
+         (github.event.workflow_run.event == 'push' ||
+          github.event.workflow_run.event == 'workflow_dispatch') &&
+         github.event.workflow_run.head_repository.full_name == github.repository)
+        && 'publish-dev' || format('publish-{0}', github.run_id) }}
+  cancel-in-progress: false
+
 jobs:
+  # Picks the commit a dev publish builds. Holds no secret: it reads the
+  # Actions API and main's history, and its answer is a CI-verified SHA.
+  guard:
+    name: Select dev revision
+    runs-on: ubicloud-standard-2
+    timeout-minutes: 10
+    # A fork PR can also use a branch named main. Check the triggering event
+    # and source repository before any commit is checked out with publish
+    # secrets; the guard re-checks the same through the API.
+    if: |
+      github.repository_owner == 'arcuru' &&
+      github.event_name == 'workflow_run' &&
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.head_branch == 'main' &&
+      (github.event.workflow_run.event == 'push' ||
+       github.event.workflow_run.event == 'workflow_dispatch') &&
+      github.event.workflow_run.head_repository.full_name == github.repository
+    permissions:
+      # Read-only: confirms the triggering CI run and finds newer green runs.
+      actions: read
+      contents: read
+    outputs:
+      publish: ${{ steps.select.outputs.publish }}
+      sha: ${{ steps.select.outputs.sha }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Select revision
+        id: select
+        run: python3 .github/scripts/publish_guard.py
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          TRIGGER_RUN_ID: ${{ github.event.workflow_run.id }}
+          TRIGGER_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+
   push-cache:
     name: Push to cache
+    needs: guard
     environment: publish
     runs-on: ubicloud-standard-8
     timeout-minutes: 60
-    # A fork PR can also use a branch named main. Check the triggering event
-    # and source repository before checking out its SHA with publish secrets.
+    # Dev publishes run only on the guard's verdict, which exists only for a
+    # trusted CI run; manual dispatch keeps its main-only check.
     if: |
+      !cancelled() &&
       github.repository_owner == 'arcuru' &&
       ((github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main') ||
        (github.event_name == 'workflow_run' &&
-        github.event.workflow_run.conclusion == 'success' &&
-        github.event.workflow_run.head_branch == 'main' &&
-        (github.event.workflow_run.event == 'push' ||
-         github.event.workflow_run.event == 'workflow_dispatch') &&
-        github.event.workflow_run.head_repository.full_name == github.repository))
+        needs.guard.result == 'success' &&
+        needs.guard.outputs.publish == 'true' &&
+        needs.guard.outputs.sha != ''))
     permissions:
       contents: read
     env:
@@ -43,7 +103,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
-          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+          ref: ${{ github.event_name == 'workflow_run' && needs.guard.outputs.sha || github.sha }}
           persist-credentials: false
 
       - name: Setup Nix

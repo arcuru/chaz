@@ -242,6 +242,23 @@
             src = ./.;
           });
 
+        # Offline regressions for which CI and Publish work each event selects,
+        # and for the dev Publish revision guard.
+        chaz-ci-policy =
+          pkgs.runCommand "chaz-ci-policy" {
+            nativeBuildInputs = [
+              pkgs.git
+              (pkgs.python3.withPackages (ps: [ps.pyyaml]))
+            ];
+          } ''
+            cp -r ${./.github} .github
+            cp ${./flake.nix} flake.nix
+            chmod -R u+w .
+            export HOME=$TMPDIR PYTHONDONTWRITEBYTECODE=1
+            python3 -m unittest discover -s .github/scripts -p 'test_*.py'
+            touch $out
+          '';
+
         # Helper to create aggregate packages
         mkAggregate = name: packages:
           pkgs.symlinkJoin {
@@ -315,6 +332,7 @@
           test = chaz-test;
           lint = mkAggregate "lint" lintDefaults;
           doc = chaz-doc;
+          ci-policy = chaz-ci-policy;
         };
 
         # Formatting via treefmt
