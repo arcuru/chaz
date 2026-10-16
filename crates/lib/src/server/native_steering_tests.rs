@@ -252,7 +252,7 @@ async fn blocked_model_and_batch(api: ModelApi) {
         .collect();
     assert_eq!(results.len(), 2);
     if api == ModelApi::Responses {
-        assert_eq!(&next[1..5], items);
+        assert_eq!(&next[2..6], items);
         assert_eq!(results[0]["call_id"], "a");
         assert_eq!(results[1]["call_id"], "b");
     }
@@ -277,7 +277,7 @@ async fn blocked_model_and_batch(api: ModelApi) {
     reply.send(response(api, &provisional)).unwrap();
     let (third, reply) = wire.next().await;
     if api == ModelApi::Responses {
-        assert_eq!(&input(&third, api)[9..11], provisional);
+        assert_eq!(&input(&third, api)[10..12], provisional);
     }
     assert_eq!(
         user_text(input(&third, api).last().unwrap(), api),
@@ -301,9 +301,9 @@ async fn blocked_model_and_batch(api: ModelApi) {
     let (later, reply) = wire.next().await;
     if api == ModelApi::Responses {
         let retained = input(&later, api);
-        assert_eq!(&retained[1..5], items);
-        assert_eq!(&retained[9..11], provisional);
-        assert_eq!(&retained[12..14], final_items);
+        assert_eq!(&retained[2..6], items);
+        assert_eq!(&retained[10..12], provisional);
+        assert_eq!(&retained[13..15], final_items);
         assert_eq!(later["prompt_cache_key"], first["prompt_cache_key"]);
         assert!(
             !later.to_string().contains(REPLAY_ORIGIN),
@@ -776,13 +776,13 @@ async fn responses_steering_silence_preserves_native_call_and_empty_output() {
     });
     let (body, reply) = wire.next().await;
     let sent = input(&body, ModelApi::Responses);
-    assert_eq!(&sent[1..3], items);
+    assert_eq!(&sent[2..4], items);
     assert_eq!(
-        sent[3],
+        sent[4],
         json!({"type":"function_call_output","call_id":"silent-call","output":""})
     );
     assert_eq!(
-        user_text(&sent[4], ModelApi::Responses),
+        user_text(&sent[5], ModelApi::Responses),
         Some("reply instead")
     );
     reply

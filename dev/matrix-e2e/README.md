@@ -88,6 +88,14 @@ Both cases use `replies_at_least <n>` rather than `reply_arrived`, because
 `reply_arrived` checks `length > 0` and would pass instantly on the first
 reply without testing the restart.
 
+An explicit `matrix__send` can arrive before its turn's final and durable
+completion. Before resetting the daemon to its pre-session snapshot, the
+harness waits for the cold turn's `Completed` record on the surviving bridge,
+so recovery can pull it back. Before the later daemon restart it waits for four
+completed DM attempts on the daemon. Waiting only for room replies can interrupt
+a turn or discard its unsynced completion; the final durable-completion check
+cannot recover a record that was lost during reset.
+
 ### Group rooms and allow_list
 
 A third room holds the cases about who the bridge answers, with the puppet, the

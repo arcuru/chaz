@@ -73,18 +73,18 @@ When agent A spawns agent B, B's tools are computed as the intersection of A's c
 ```rust,ignore
 struct ScopedTools {
     registry: Arc<ToolRegistry>,
-    allowed: Option<Vec<String>>,  // None = all tools; supports globs like "namespace.*"
+    allowed: Option<Vec<String>>,  // None = all tools; supports globs like "namespace__*"
 }
 
 impl ScopedTools {
     fn narrow(&self, child_allowed: Option<&[String]>) -> ScopedTools {
         // Intersects parent's allowed with child's allowed
-        // Glob patterns (e.g., "filesystem.*") are expanded against the registry
+        // Glob patterns (e.g., "filesystem__*") are expanded against the registry
     }
 }
 ```
 
-Allowlist entries support glob patterns: `"filesystem.*"` matches all tools with that namespace prefix (requires a dot after the prefix). This is useful for MCP tool namespaces. Glob patterns work across all ScopedTools operations: `definitions()`, `get()`, `is_empty()`, and `narrow()`.
+Allowlist entries support exact tool names and namespace globs ending in `__*`. `filesystem__*` matches `filesystem__read_file` and `filesystem__write`, but not `filesystem`, `filesystemx`, or `github__pr`. Patterns without the `__*` suffix are exact-name matches. Namespace globs are useful for MCP tool namespaces. They work across all ScopedTools operations: `definitions()`, `get()`, `is_empty()`, and `narrow()`.
 
 ## ToolHost
 

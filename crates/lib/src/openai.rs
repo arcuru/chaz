@@ -381,6 +381,35 @@ impl OpenAI {
         }
     }
 
+    /// Pure construction shared with persisted-reload request parity tests.
+    fn build_chat_request<'a>(
+        &'a self,
+        messages: &[RuntimeMessage],
+        tools: &[ToolDefinition],
+        model: &'a str,
+        cache: &CacheOptions,
+    ) -> ChatRequest<'a> {
+        let mut openai_messages = convert_runtime_messages(messages);
+        let mut openai_tools = convert_tool_definitions(tools);
+        apply_cache_options(
+            &mut openai_messages,
+            &mut openai_tools,
+            model,
+            &self.backend,
+            cache,
+        );
+
+        self.chat_request(
+            model,
+            openai_messages,
+            if openai_tools.is_empty() {
+                None
+            } else {
+                Some(openai_tools)
+            },
+        )
+    }
+
     /// Execute a single LLM call with tool definitions, returning a structured response.
     ///
     /// This is called by the runtime's ReAct loop. It converts RuntimeMessages
@@ -413,25 +442,7 @@ impl OpenAI {
             })?;
         let client = self.build_client()?;
 
-        let mut openai_messages = convert_runtime_messages(messages);
-        let mut openai_tools = convert_tool_definitions(tools);
-        apply_cache_options(
-            &mut openai_messages,
-            &mut openai_tools,
-            model,
-            &self.backend,
-            cache,
-        );
-
-        let request = self.chat_request(
-            model,
-            openai_messages,
-            if openai_tools.is_empty() {
-                None
-            } else {
-                Some(openai_tools)
-            },
-        );
+        let request = self.build_chat_request(messages, tools, model, cache);
 
         let timeout = self.backend.request_timeout();
         let response: ChatResponse = tokio::time::timeout(
@@ -1022,21 +1033,7 @@ pub(crate) async fn serialize_cache_fixture(
     );
     let secrets = crate::test_support::empty_secrets().await;
     let adapter = OpenAI::new(&backend, &secrets);
-    let mut wire_messages = convert_runtime_messages(messages);
-    let mut wire_tools = convert_tool_definitions(tools);
-    apply_cache_options(
-        &mut wire_messages,
-        &mut wire_tools,
-        model,
-        &backend,
-        options,
-    );
-    serde_json::to_value(adapter.chat_request(
-        model,
-        wire_messages,
-        (!wire_tools.is_empty()).then_some(wire_tools),
-    ))
-    .unwrap()
+    serde_json::to_value(adapter.build_chat_request(messages, tools, model, options)).unwrap()
 }
 
 #[cfg(test)]

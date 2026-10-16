@@ -134,6 +134,11 @@ pub(crate) fn invocation_order(grants: &[ContextProjectionGrant]) -> Vec<Context
 pub enum ContextSource {
     /// Host instructions: system prompt, augmentation, invocation prompt.
     Instructions,
+    /// Host-derived timeline metadata, not access to the entry's body.
+    DateBoundary {
+        entry_index: usize,
+        date: chrono::NaiveDate,
+    },
     /// A session entry selected into context, by its position in the
     /// session's entry list at assembly time.
     SessionEntry {

@@ -1442,3 +1442,5 @@ async fn origin_pending_refusal_remains_interrupted_at_executor() {
     assert_eq!(checkpoints(&db).await, vec![checkpoint]);
     process.server.shutdown().await;
 }
+#[path = "timer_example.rs"]
+mod timer_example;

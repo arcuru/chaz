@@ -69,10 +69,8 @@ impl ContextStrategy for BaselineContext {
             if ctx.has_tail() {
                 fixed.push(ContextItem::Tail);
             }
-            // Keep the predecessor's selected-history allocation unchanged.
-            // Durable text is appended below; the complete-request gate counts
-            // it and refuses overflow. Reserving extra history space here would
-            // change which original rows this migration selects.
+            // Reserve dated history before native replay. Durable text remains
+            // counted by the final complete-request gate below.
             let used = fixed
                 .iter()
                 .try_fold(0, |sum, item| ctx.cost(item).map(|cost| sum + cost))?
@@ -86,13 +84,21 @@ impl ContextStrategy for BaselineContext {
             let candidates = &all[start..];
             let mut selected = Vec::new();
             let mut tokens = 0;
+            let mut oldest_date = None;
             for (index, kind) in candidates.iter().rev() {
-                let cost = ctx.cost(&ContextItem::Entry(*index))?;
+                let date = ctx.entry_date(*index)?;
+                let cost = ctx.cost(&ContextItem::Entry(*index))?
+                    + if oldest_date == Some(date) {
+                        0
+                    } else {
+                        ctx.cost(&ContextItem::Date(*index))?
+                    };
                 if tokens + cost > remaining && !selected.is_empty() {
                     break;
                 }
                 tokens += cost;
                 selected.push(*index);
+                oldest_date = Some(date);
                 if *kind == EntryType::Summary {
                     break;
                 }
@@ -115,7 +121,13 @@ impl ContextStrategy for BaselineContext {
             if ctx.has_instructions() {
                 plan.items.push(ContextItem::Instructions);
             }
+            let mut previous_date = None;
             for index in selected {
+                let date = ctx.entry_date(index)?;
+                if previous_date != Some(date) {
+                    plan.items.push(ContextItem::Date(index));
+                }
+                previous_date = Some(date);
                 plan.items.push(ContextItem::Entry(index));
                 if let Some(item) = replay.remove(&index) {
                     plan.items.push(item);
