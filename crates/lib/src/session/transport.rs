@@ -553,9 +553,27 @@ mod tests {
         let (_cv, db) = reg.create_session(Some("local")).await.unwrap();
         bind_transport(&db, "matrix", "@a:s", "!a:s").await.unwrap();
         bind_transport(&db, "matrix", "@a:s", "!a:s").await.unwrap();
-        assert!(bind_transport(&db, "matrix", "@b:s", "!a:s").await.is_err());
-        assert!(bind_transport(&db, "matrix", "@a:s", "!b:s").await.is_err());
-        assert!(bind_transport(&db, "discord", "bot", "room").await.is_err());
+        assert_eq!(
+            bind_transport(&db, "matrix", "@b:s", "!a:s")
+                .await
+                .unwrap_err()
+                .to_string(),
+            "session has a different or conflicting external attachment; detach or migrate explicitly"
+        );
+        assert_eq!(
+            bind_transport(&db, "matrix", "@a:s", "!b:s")
+                .await
+                .unwrap_err()
+                .to_string(),
+            "session has a different or conflicting external attachment; detach or migrate explicitly"
+        );
+        assert_eq!(
+            bind_transport(&db, "discord", "bot", "room")
+                .await
+                .unwrap_err()
+                .to_string(),
+            "session has a different or conflicting external attachment; detach or migrate explicitly"
+        );
         let current = session_attachment(&db).await.unwrap().unwrap();
         assert!(current.conversational_replies);
         let txn = db.new_transaction().await.unwrap();
@@ -566,7 +584,10 @@ mod tests {
             .await
             .unwrap();
         txn.commit().await.unwrap();
-        assert!(session_attachment(&db).await.is_err());
+        assert_eq!(
+            session_attachment(&db).await.unwrap_err().to_string(),
+            "session has multiple external bindings; detach or migrate explicitly"
+        );
         let txn = db.new_transaction().await.unwrap();
         txn.get_store::<DocStore>(STORE_TRANSPORT_BINDINGS)
             .await
@@ -575,12 +596,26 @@ mod tests {
             .await
             .unwrap();
         txn.commit().await.unwrap();
-        assert!(is_bound(&db, "matrix", "@a:s", "!a:s").await.is_err());
-        assert!(bind_transport(&db, "matrix", "@a:s", "!a:s").await.is_err());
-        assert!(
+        assert_eq!(
+            is_bound(&db, "matrix", "@a:s", "!a:s")
+                .await
+                .unwrap_err()
+                .to_string(),
+            "conflicting legacy Matrix bindings; explicit migration required"
+        );
+        assert_eq!(
+            bind_transport(&db, "matrix", "@a:s", "!a:s")
+                .await
+                .unwrap_err()
+                .to_string(),
+            "session has a different or conflicting external attachment; detach or migrate explicitly"
+        );
+        assert_eq!(
             unbind_transport(&db, "matrix", "@a:s", "!a:s")
                 .await
-                .is_err()
+                .unwrap_err()
+                .to_string(),
+            "conflicting legacy Matrix bindings; explicit migration required"
         );
     }
 
