@@ -43,6 +43,7 @@ def run(sha, run_id, **overrides):
         "head_repository": {"full_name": REPO},
         "status": "completed",
         "conclusion": "success",
+        "run_attempt": 1,
     }
     record.update(overrides)
     return record
@@ -51,8 +52,9 @@ def run(sha, run_id, **overrides):
 class FakeApi:
     """Serves run lookups and per-SHA run lists, applying the server-side filters."""
 
-    def __init__(self, runs, fail_on=None, truncate=False):
+    def __init__(self, runs, fail_on=None, truncate=False, attempts=()):
         self.runs = runs
+        self.attempts = {(r["id"], r["run_attempt"]): r for r in attempts}
         self.fail_on = fail_on
         self.truncate = truncate
         self.calls = []
@@ -65,17 +67,19 @@ class FakeApi:
         assert path.startswith(prefix), path
         rest = path[len(prefix) :]
         if rest.startswith("runs/"):
-            run_id = int(rest.split("/")[1])
+            parts = rest.split("/")
+            run_id = int(parts[1])
+            if len(parts) == 4 and parts[2] == "attempts":
+                return self.attempts[run_id, int(parts[3])]
             return next(r for r in self.runs if r["id"] == run_id)
         endpoint, query = rest.split("?")
         assert endpoint == "workflows/ci.yml/runs", endpoint
         params = dict(urllib.parse.parse_qsl(query))
-        assert params["status"] == "success" and params["branch"] == "main"
+        assert "status" not in params and params["branch"] == "main"
         matched = [
             r
             for r in self.runs
             if r["head_sha"] == params["head_sha"]
-            and r["conclusion"] == "success"
             and r["head_branch"] == "main"
             and r["event"] != "pull_request"
         ]
@@ -119,6 +123,54 @@ class GuardTest(unittest.TestCase):
         c0, c3 = self.shas[0], self.shas[3]
         api = FakeApi([run(c0, 1, run_attempt=2), run(c3, 4)])
         self.assertEqual(self.select(api, 1, c0), (True, c3))
+
+    def test_newer_success_survives_a_failed_or_running_rerun(self):
+        c2, c3 = self.shas[2:]
+        for status, conclusion in (("completed", "failure"), ("in_progress", None)):
+            with self.subTest(status=status):
+                api = FakeApi(
+                    [
+                        run(c2, 3),
+                        run(c3, 4, status=status, conclusion=conclusion, run_attempt=3),
+                    ],
+                    attempts=[run(c3, 4), run(c3, 4, run_attempt=2, conclusion="failure")],
+                )
+                self.assertEqual(self.select(api, 3, c2), (True, c3))
+
+    def test_reruns_without_any_success_fall_back_to_the_trigger(self):
+        c2, c3 = self.shas[2:]
+        api = FakeApi(
+            [run(c2, 3), run(c3, 4, run_attempt=3, conclusion="failure")],
+            attempts=[
+                run(c3, 4, run_attempt=2, conclusion="cancelled"),
+                run(c3, 4, conclusion="failure"),
+            ],
+        )
+        self.assertEqual(self.select(api, 3, c2), (True, c2))
+
+    def test_rerun_history_uncertainty_fails_closed(self):
+        c2, c3 = self.shas[2:]
+        runs = [run(c2, 3), run(c3, 4, run_attempt=2, conclusion="failure")]
+        cases = {
+            "missing attempt": FakeApi(runs, fail_on="attempts/1"),
+            "malformed attempt": FakeApi(
+                [run(c2, 3), run(c3, 4, run_attempt=None, conclusion="failure")]
+            ),
+        }
+        for label, overrides in {
+            "different run": {"id": 40},
+            "different attempt": {"run_attempt": 2},
+            "different commit": {"head_sha": c2},
+            "fork": {"head_repository": {"full_name": "mallory/chaz"}},
+            "PR": {"event": "pull_request"},
+        }.items():
+            api = FakeApi(runs)
+            api.attempts[4, 1] = run(c3, 4, **overrides)
+            cases[label] = api
+        for label, api in cases.items():
+            with self.subTest(label):
+                with self.assertRaises(guard.GuardError):
+                    self.select(api, 3, c2)
 
     def test_newest_green_wins_when_the_tip_failed(self):
         c1, c2, c3 = self.shas[1:]

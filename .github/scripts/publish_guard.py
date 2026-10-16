@@ -13,8 +13,10 @@ through the API, then walks main's first-parent history above that commit,
 newest first, and selects the newest descendant that also has a successful
 trusted CI run. Only when none exists does it select the triggering commit
 itself, so a failed or still-running newer CI never blocks the newest green
-commit. Every selected commit passed trusted main CI; the guard never picks
-"whatever main is now".
+commit. Earlier successful attempts still count if the same CI run is rerun;
+otherwise a failed rerun could hide a revision that already published. Every
+selected commit passed trusted main CI; the guard never picks "whatever main
+is now".
 
 Trusted CI means: the CI workflow file in this repository, triggered by a push
 or a manual dispatch on main, from this repository, completed successfully.
@@ -57,14 +59,21 @@ def _field(obj, *path):
     return obj
 
 
-def is_trusted_ci_run(run, repository, sha):
-    """Whether `run` is a successful trusted main CI run of `sha`."""
+def is_main_ci_run(run, repository, sha):
+    """Whether `run` has trusted main CI provenance for `sha`."""
     return (
         _field(run, "path") == CI_WORKFLOW_PATH
         and _field(run, "head_sha") == sha
         and _field(run, "head_branch") == MAIN
         and _field(run, "event") in TRUSTED_EVENTS
         and _field(run, "head_repository", "full_name") == repository
+    )
+
+
+def is_trusted_ci_run(run, repository, sha):
+    """Whether `run` is a successful trusted main CI run of `sha`."""
+    return (
+        is_main_ci_run(run, repository, sha)
         and _field(run, "status") == "completed"
         and _field(run, "conclusion") == "success"
     )
@@ -75,7 +84,6 @@ def has_trusted_ci_success(api_get, repository, sha):
         {
             "head_sha": sha,
             "branch": MAIN,
-            "status": "success",
             "exclude_pull_requests": "true",
             "per_page": "100",
         }
@@ -87,8 +95,25 @@ def has_trusted_ci_success(api_get, repository, sha):
     total = _field(page, "total_count")
     if not isinstance(runs, list) or not isinstance(total, int):
         raise GuardError(f"malformed run list for {sha}")
-    if any(is_trusted_ci_run(run, repository, sha) for run in runs):
-        return True
+    for run in runs:
+        if not is_main_ci_run(run, repository, sha):
+            continue
+        if is_trusted_ci_run(run, repository, sha):
+            return True
+        # The run list exposes only the latest attempt, not its earlier success.
+        run_id, attempt = _field(run, "id"), _field(run, "run_attempt")
+        if not isinstance(attempt, int) or attempt < 1:
+            raise GuardError(f"malformed attempt for run {run_id}")
+        for number in range(attempt - 1, 0, -1):
+            previous = api_get(f"/repos/{repository}/actions/runs/{run_id}/attempts/{number}")
+            if (
+                _field(previous, "id") != run_id
+                or _field(previous, "run_attempt") != number
+                or not is_main_ci_run(previous, repository, sha)
+            ):
+                raise GuardError(f"API returned a different run attempt for {run_id}")
+            if is_trusted_ci_run(previous, repository, sha):
+                return True
     if total > len(runs):
         raise GuardError(f"run list for {sha} was truncated")
     return False
