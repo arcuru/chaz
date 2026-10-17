@@ -615,6 +615,7 @@ mod tests {
         };
         for name in [
             "core",
+            "context",
             "fs",
             "system",
             "web",

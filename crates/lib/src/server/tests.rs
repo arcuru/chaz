@@ -9905,3 +9905,6 @@ async fn api_override_preserves_default_and_actual_compact_target_after_discover
     );
     assert_eq!(manager.resolve_model_name(None), "reasoner");
 }
+
+#[path = "context_tests.rs"]
+mod context_tests;

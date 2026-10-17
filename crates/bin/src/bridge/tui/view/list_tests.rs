@@ -22,6 +22,13 @@ pub(super) async fn fixture() -> (Instance, Arc<Server>, BackendManager, App) {
 async fn fixture_with_backends(
     backends: Option<Vec<chaz_core::config::Backend>>,
 ) -> (Instance, Arc<Server>, BackendManager, App) {
+    fixture_with_extensions(backends, Vec::new()).await
+}
+
+pub(super) async fn fixture_with_extensions(
+    backends: Option<Vec<chaz_core::config::Backend>>,
+    extensions: Vec<Arc<dyn chaz_core::extension::Extension>>,
+) -> (Instance, Arc<Server>, BackendManager, App) {
     let (instance, user) = Instance::create_backend(
         Box::new(InMemory::new()),
         NewAccount::passwordless("list-frames"),
@@ -59,6 +66,22 @@ async fn fixture_with_backends(
     for i in 0..30 {
         mcp.insert_starting(format!("mcp-{i:02}"));
     }
+    let mut hub = chaz_core::extension::ExtensionHub::new();
+    if !extensions.is_empty() {
+        hub.set_peer_handles(Arc::new(chaz_core::extension::PeerHandles {
+            registry: registry.clone(),
+            agent_index: HostedIndex::empty("agent"),
+            memory_bank_index: HostedIndex::empty("bank"),
+            skill_bank_index: HostedIndex::empty("skill_bank"),
+            embedder: None,
+            secrets: None,
+            server_slot: Default::default(),
+            mcp_registry: mcp.clone(),
+            agent_state_allowlist: HashMap::new(),
+            tool_registry: Arc::new(chaz_core::tool::ToolRegistry::new()),
+        }));
+        hub.install_all(extensions).await.unwrap();
+    }
     let server = Server::new(
         registry,
         agents,
@@ -75,7 +98,7 @@ async fn fixture_with_backends(
         HashMap::new(),
         Default::default(),
         Arc::new(chaz_core::tool_host::NativeToolHost::new()),
-        Arc::new(chaz_core::extension::ExtensionHub::new()),
+        Arc::new(hub),
         backend.clone(),
         mcp,
         None,

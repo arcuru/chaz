@@ -491,6 +491,7 @@ so it round-trips through eidetica.
 | `crates/lib/src/extension/hook_bridge.rs`        | Adapters bridging instance hook handlers into the fire vecs                                                                                               |
 | `crates/lib/src/extension/hooks.rs`              | Per-kind hook trait definitions + `HookKind`                                                                                                              |
 | `crates/lib/src/extensions/mod.rs`               | `all_builtins` + `BuiltinDeps` — wires the built-in set                                                                                                   |
+| `crates/lib/src/extensions/context_report.rs`    | `/context` report and its one-shot snapshot context tail                                                                                                  |
 | `crates/lib/src/extensions/core.rs`              | `shell`, `compact`, `spawn_agent`, `job_status`, `job_wait`, `spawn_worker`                                                                               |
 | `crates/lib/src/extensions/fs.rs`                | `read_file`, `write_file`, `edit_file`                                                                                                                    |
 | `crates/lib/src/extensions/system.rs`            | `get_time`, `calculate`, `describe_tool`                                                                                                                  |
@@ -524,6 +525,7 @@ under the same role, rather than upgrading a client hub to execution authority.
 | `fs`                | `Global`               | `Tool`            | —       | `read_file`, `write_file`, `edit_file`                                      |
 | `system`            | `Global`               | `Tool`            | —       | `get_time`, `calculate`, `describe_tool`                                    |
 | `web`               | `Global`               | `Tool`            | —       | `web_fetch`, `web_search`                                                   |
+| `context`           | `Global`, `PerSession` | `Command`         | —       | `/context` + one-shot per-session context tail carrying the snapshot        |
 | `memory`            | `Global`, `PerSession` | `Tool`, `Command` | —       | memory tools + `/memory` + per-session recall context tail                  |
 | `skills`            | `Global`, `PerSession` | `Tool`, `Command` | —       | skill tools + `/skills` + prompt augmentation                               |
 | `schedule`          | `Global`               | `Tool`, `Command` | yes     | schedule tools + `/schedule`                                                |
@@ -531,6 +533,16 @@ under the same role, rather than upgrading a client hub to execution authority.
 | `path_normalizer`   | `Global`               | `ToolCall`        | —       | strips trailing `/` from filesystem-tool path args                          |
 | `session_naming`    | `Global`               | `TurnComplete`    | —       | Opt-in, one-shot naming via a bounded auxiliary completion                  |
 | `security_warnings` | `Global`               | `ToolResult`      | —       | logs prompt-injection patterns in tool output                               |
+
+The `context` diagnostic command stores the latest snapshot per agent in
+`context_reports` on the session DB. Its per-session tail records the delivered
+report ID in a separate `context_report_deliveries` store, so an acknowledgement
+cannot overwrite a newer report. Session/agent activation filters delivery.
+The tail opens the registry's current authorized session handle each time;
+retaining a handle across turns would also retain its pinned delegation identity.
+`Server::context_budget` exposes existing budget resolution with provenance; it
+does not fetch model information or change runtime budgets. The required
+`baseline_context` strategy remains separate from this optional diagnostic tail.
 
 MCP servers are data-driven, not compile-time: `main.rs` pushes one
 `McpExtension` (`Global`) per configured server, sharing the same

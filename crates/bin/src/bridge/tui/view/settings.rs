@@ -151,10 +151,9 @@ fn render_content(
     }
 }
 
-/// Stage 1+ Settings page — sidebar of categories + per-category detail.
+/// Settings page — sidebar of categories + per-category detail.
 /// Composition style A (pure functions over the shared widget primitives).
-/// Each category routes to its own renderer; categories that haven't been
-/// implemented yet fall through to the `(coming soon)` placeholder.
+/// Peer inspectors and existing controls share the same Content reader.
 pub(super) fn ui_settings(
     f: &mut ratatui::Frame,
     app: &mut App,
@@ -429,9 +428,7 @@ fn settings_status_hint(app: &App, scope: SettingsScope) -> &'static str {
     }
 }
 
-/// Right-pane router for Peer categories. Categories without a real
-/// renderer fall through to the `(coming soon)` placeholder so navigation
-/// stays linear even on partially-implemented stages.
+/// Right-pane router for all Peer categories.
 fn render_peer_category(
     f: &mut ratatui::Frame,
     area: Rect,
@@ -448,7 +445,15 @@ fn render_peer_category(
         PeerSettingsCategory::Bridges => render_peer_bridges(f, area, app, config),
         PeerSettingsCategory::Defaults => render_peer_defaults(f, area, app, server),
         PeerSettingsCategory::Mcp => render_peer_mcp(f, area, app),
-        _ => render_settings_detail_placeholder(f, area, app, category.label()),
+        PeerSettingsCategory::Extensions
+        | PeerSettingsCategory::Groups
+        | PeerSettingsCategory::Identity => {
+            let lines = super::super::peer_pages::lines(category, app.peer_pages.snapshot.as_ref())
+                .into_iter()
+                .map(Line::from)
+                .collect();
+            render_content(f, area, app, category.label(), lines, 1);
+        }
     }
 }
 

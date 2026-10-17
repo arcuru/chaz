@@ -705,6 +705,54 @@ fn clamp_budget_to_window(agent_cap: Option<usize>, window: Option<usize>) -> Op
     }
 }
 
+/// Which input decided a resolved context budget. Mirrors the branches of
+/// `clamp_budget_to_window` plus the builder's configured fallback, so a
+/// diagnostic surface can say *why* the budget is what it is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContextBudgetSource {
+    /// The model's known context window (no lower per-agent cap).
+    ModelWindow,
+    /// The agent's explicit `max_context_tokens` (below the window, or the
+    /// window is unknown).
+    AgentCap,
+    /// Neither a window nor a cap is known: the configured
+    /// `context.max_context_tokens` default.
+    ConfiguredDefault,
+}
+
+/// A context budget with its provenance, as the runtime would resolve it for
+/// the next turn on this peer. `tokens` is the same value
+/// [`Server::effective_context_budget`] returns.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContextBudget {
+    /// Model id the budget was resolved for (`None` when no model is pinned
+    /// and the backend has no default).
+    pub model: Option<String>,
+    pub tokens: usize,
+    pub source: ContextBudgetSource,
+    /// The model's known context window, if any.
+    pub model_window: Option<usize>,
+    /// The agent's explicit cap, if any.
+    pub agent_cap: Option<usize>,
+    /// Tokens the context builder holds back for the reply.
+    pub reserved_output_tokens: usize,
+}
+
+/// Pure budget resolution with provenance. Agrees with
+/// `clamp_budget_to_window(agent_cap, window).unwrap_or(configured_default)`.
+fn resolve_budget_source(
+    agent_cap: Option<usize>,
+    window: Option<usize>,
+    configured_default: usize,
+) -> (usize, ContextBudgetSource) {
+    match (window, agent_cap) {
+        (Some(w), Some(cap)) if cap < w => (cap, ContextBudgetSource::AgentCap),
+        (Some(w), _) => (w, ContextBudgetSource::ModelWindow),
+        (None, Some(cap)) => (cap, ContextBudgetSource::AgentCap),
+        (None, None) => (configured_default, ContextBudgetSource::ConfiguredDefault),
+    }
+}
+
 /// The model id used for context-window budgeting and the learn-on-first-use
 /// window fetch: the session/agent pin when present, else the backend's
 /// resolved default. The fallback mirrors the model the actual LLM call lands
@@ -1982,6 +2030,36 @@ impl Server {
     pub fn effective_context_budget(&self, model: &str, agent_cap: Option<usize>) -> usize {
         resolve_context_max_tokens(&self.default_backend, Some(model), agent_cap)
             .unwrap_or(self.context_config.max_context_tokens)
+    }
+
+    /// The budget the next turn of `agent` would target, with its
+    /// provenance. Resolves the model the same way the turn path does
+    /// (session/agent pin, else the backend default) and windows through
+    /// the server's own `default_backend`, like
+    /// [`Self::effective_context_budget`].
+    pub fn context_budget(
+        &self,
+        session_model: Option<&str>,
+        agent_default_model: Option<&str>,
+        agent_cap: Option<usize>,
+    ) -> ContextBudget {
+        let model = budget_model_id(&self.default_backend, session_model, agent_default_model);
+        let model_window = model
+            .as_deref()
+            .and_then(|m| self.default_backend.context_window(m));
+        let (tokens, source) = resolve_budget_source(
+            agent_cap,
+            model_window,
+            self.context_config.max_context_tokens,
+        );
+        ContextBudget {
+            model,
+            tokens,
+            source,
+            model_window,
+            agent_cap,
+            reserved_output_tokens: self.context_config.reserved_output_tokens,
+        }
     }
 
     /// Persist a model's pulled info into the in-use [`ModelInfoStore`] and

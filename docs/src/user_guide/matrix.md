@@ -208,6 +208,7 @@ Commands are sent as Matrix messages. Session ops go through the same transport-
 | `!chaz unshare`              | Stop sharing the current session                                                             |
 | `!chaz sync <ticket>`        | Sync a remote session via ticket URL                                                         |
 | `!chaz compact`              | Summarize and compact conversation history                                                   |
+| `!chaz context`              | Context-window usage for this room's agent                                                   |
 | `!chaz print`                | Print the current conversation context                                                       |
 | `!chaz stop`                 | Stop the turn running in this session ([details](tui.md#stopping-a-running-turn))            |
 

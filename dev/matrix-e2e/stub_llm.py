@@ -308,6 +308,21 @@ class Handler(BaseHTTPRequestHandler):
                 return
             sys.stderr.write(f"stub_llm: timeline current_date verified: {dates[-1]} timezone: UTC\n")
 
+        # Snapshot probes return ordinary finals so the harness can compare
+        # the exact user-visible report with one subsequent model request.
+        probe = next((msg.get("content", "") for msg in reversed(messages)
+                      if isinstance(msg, dict) and msg.get("role") == "user"
+                      and any(marker in str(msg.get("content", ""))
+                              for marker in ("context-probe-once", "context-probe-after"))), "")
+        if probe:
+            marker = "context-probe-after" if "context-probe-after" in probe else "context-probe-once"
+            tails = [msg["content"] for msg in messages if isinstance(msg, dict)
+                     and isinstance(msg.get("content"), str)
+                     and msg["content"].startswith("[/context diagnostic snapshot")]
+            sys.stderr.write("stub_llm: context probe: " + json.dumps({"marker": marker, "tails": tails}) + "\n")
+            self._fixture_reply(content=self.server.reply + " " + marker)
+            return
+
         latest_user = next((msg.get("content") for msg in reversed(messages)
                             if isinstance(msg, dict) and msg.get("role") == "user"
                             and isinstance(msg.get("content"), str)

@@ -1374,3 +1374,49 @@ wait_for "eight durable completed DM attempts" 60 eight_completed_attempts
 COMPLETED="$(completed_attempts)"
 printf '\033[1;32mPASS\033[0m — rejoin and durable delivery: %s DM sends, %s completed attempts\n' \
     "$DM_OUTBOUND" "$COMPLETED" >&2
+
+# /context is a bridge-local command, not an agent request. Its persisted
+# report must cross the peer boundary and reach exactly the next model turn.
+log "context snapshot: bridge report, no wake, next-turn delivery"
+CONTEXT_TURNS_BEFORE="$(stub_requests)"
+TXN="e2e-$(date +%s%N)"
+mx PUT "/_matrix/client/v3/rooms/$ROOM_URI/send/m.room.message/$TXN" \
+    "$PUPPET_TOKEN" '{"msgtype":"m.text","body":"!chaz context"}' >/dev/null
+context_report_arrived() {
+    mx GET "/_matrix/client/v3/rooms/$ROOM_URI/messages?dir=b&limit=200" "$PUPPET_TOKEN" |
+        jq -er --arg a "$AGENT_MXID" \
+        '[.chunk[] | select(.sender == $a) | .content.body // "" |
+          select(contains("Context for agent") and contains("will see this snapshot on its next turn"))][0]' \
+        >"$WORKSPACE/context-shown.txt"
+}
+wait_for "user-visible context report in Matrix" "$REPLY_TIMEOUT" context_report_arrived
+[[ "$(stub_requests)" -eq "$CONTEXT_TURNS_BEFORE" ]] || fail "/context woke a model"
+context_probe_arrived() {
+    mx GET "/_matrix/client/v3/rooms/$ROOM_URI/messages?dir=b&limit=200" "$PUPPET_TOKEN" |
+        jq -e --arg a "$AGENT_MXID" --arg marker "$1" \
+        '[.chunk[] | select(.sender == $a) | select(.content.body // "" | contains($marker))] | length > 0'
+}
+for probe in context-probe-once context-probe-after; do
+    TXN="e2e-$(date +%s%N)"
+    mx PUT "/_matrix/client/v3/rooms/$ROOM_URI/send/m.room.message/$TXN" \
+        "$PUPPET_TOKEN" "$(jq -nc --arg b "$probe" '{msgtype:"m.text",body:$b}')" >/dev/null
+    wait_for "$probe reply" "$REPLY_TIMEOUT" context_probe_arrived "$probe"
+done
+[[ "$(stub_requests)" -eq $((CONTEXT_TURNS_BEFORE + 2)) ]] || fail "context command created an extra model turn"
+uv run --no-project --offline python - "$WORKSPACE" <<'PY'
+import json
+from pathlib import Path
+import sys
+root = Path(sys.argv[1])
+report = (root / "context-shown.txt").read_text().split("\n\n(")[0]
+probes = [json.loads(line.removeprefix("stub_llm: context probe: "))
+          for line in (root / "stub-llm.log").read_text().splitlines()
+          if line.startswith("stub_llm: context probe: ")]
+assert [p["marker"] for p in probes] == ["context-probe-once", "context-probe-after"], probes
+assert len(probes[0]["tails"]) == 1, probes
+delivered = probes[0]["tails"][0].split("\n", 1)[1]
+# Other enabled extensions can share the same user-role tail message.
+assert delivered == report or delivered.startswith(report + "\n\n"), probes
+assert probes[1]["tails"] == [], probes
+print("PASS — Matrix /context: exact shown snapshot delivered once; no command-triggered model call")
+PY
