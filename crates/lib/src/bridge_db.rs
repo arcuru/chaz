@@ -19,12 +19,12 @@
 // daemon; keep the API surface stable without per-item churn.
 #![allow(dead_code)]
 
+use eidetica::AccountSession;
 use eidetica::Database;
 use eidetica::auth::crypto::PublicKey;
 use eidetica::crdt::Doc;
 use eidetica::entry::ID;
 use eidetica::store::{DocStore, PasswordStore};
-use eidetica::user::User;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tracing::info;
@@ -51,7 +51,7 @@ pub struct BridgeDb {
 
 impl BridgeDb {
     /// Wrap an existing database as a `BridgeDb`. Use when the caller already
-    /// opened the DB (e.g. via `User::open_database`).
+    /// opened the DB (e.g. via `AccountSession::open_database`).
     pub fn from_database(database: Database) -> Self {
         Self { database }
     }
@@ -131,7 +131,7 @@ pub fn bridge_db_name(label: &str) -> String {
 /// can't exist until the unlock password initializes its encryption). Returns
 /// the DB handle alongside the owning pubkey.
 pub async fn create_bridge_db(
-    user: &mut User,
+    user: &mut AccountSession,
     label: &str,
 ) -> anyhow::Result<(BridgeDb, PublicKey)> {
     let key = user
@@ -152,10 +152,10 @@ pub async fn create_bridge_db(
     Ok((bridge, key))
 }
 
-/// Look up an existing bridge settings DB by label on this peer's `User`.
+/// Look up an existing bridge settings DB by label on this peer's `AccountSession`.
 /// Returns `(BridgeDb, pubkey)` where pubkey is the key this user holds for
 /// the DB. `None` if no bridge DB with that label is tracked.
-pub async fn find_bridge_db(user: &User, label: &str) -> Option<(BridgeDb, PublicKey)> {
+pub async fn find_bridge_db(user: &AccountSession, label: &str) -> Option<(BridgeDb, PublicKey)> {
     let name = bridge_db_name(label);
     let database = user.find_database(&name).await.ok()?.into_iter().next()?;
     let pubkey = user.find_key(database.root_id()).ok().flatten()?;
@@ -168,7 +168,7 @@ mod tests {
     use serde::Deserialize;
 
     use eidetica::backend::database::InMemory;
-    use eidetica::{Instance, NewUser};
+    use eidetica::{Instance, NewAccount};
 
     /// Stand-in for whatever shape a real bridge stores — chaz-core is
     /// schema-agnostic, so the test brings its own type.
@@ -178,10 +178,10 @@ mod tests {
         secret: String,
     }
 
-    async fn test_user() -> User {
+    async fn test_user() -> AccountSession {
         let backend = InMemory::new();
         let (_instance, user) =
-            Instance::create_backend(Box::new(backend), NewUser::passwordless("test"))
+            Instance::create_backend(Box::new(backend), NewAccount::passwordless("test"))
                 .await
                 .unwrap();
         user
@@ -196,7 +196,7 @@ mod tests {
 
     /// Build a fresh peer + create one bridge DB. The `user` must outlive the
     /// `db` (eidetica's Instance drops with it).
-    async fn peer_with_bridge_db() -> (User, BridgeDb) {
+    async fn peer_with_bridge_db() -> (AccountSession, BridgeDb) {
         let mut user = test_user().await;
         let (db, _) = create_bridge_db(&mut user, "matrix").await.unwrap();
         (user, db)

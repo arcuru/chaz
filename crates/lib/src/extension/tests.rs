@@ -6,7 +6,7 @@ use crate::tool::ToolRegistry;
 use crate::types::ConversationId;
 use eidetica::backend::database::InMemory;
 use eidetica::crdt::Doc;
-use eidetica::{Instance, NewUser};
+use eidetica::{Instance, NewAccount};
 
 #[path = "tool_call_failure_tests.rs"]
 mod tool_call_failure_tests;
@@ -311,9 +311,10 @@ fn test_peer_handles(registry: Arc<SessionRegistry>) -> Arc<instance::PeerHandle
 async fn test_hub() -> ExtensionHub {
     use crate::agent::AgentRegistry;
     let backend = InMemory::new();
-    let (inst, user) = Instance::create_backend(Box::new(backend), NewUser::passwordless("test"))
-        .await
-        .unwrap();
+    let (inst, user) =
+        Instance::create_backend(Box::new(backend), NewAccount::passwordless("test"))
+            .await
+            .unwrap();
     let agents = Arc::new(AgentRegistry::with_default_agent());
     let registry = Arc::new(SessionRegistry::new(inst, user, agents).await.unwrap());
     let mut hub = ExtensionHub::new();
@@ -325,7 +326,7 @@ async fn test_hub() -> ExtensionHub {
 async fn make_session_db() -> (Instance, Database) {
     let backend = InMemory::new();
     let (instance, mut user) =
-        Instance::create_backend(Box::new(backend), NewUser::passwordless("test"))
+        Instance::create_backend(Box::new(backend), NewAccount::passwordless("test"))
             .await
             .unwrap();
     let key = user.get_default_key().unwrap();
@@ -992,7 +993,7 @@ async fn fixture_ctx_with_active(active: HashSet<String>) -> HookContext {
 async fn fixture_ctx() -> HookContext {
     let backend = InMemory::new();
     let (_instance, mut user) =
-        Instance::create_backend(Box::new(backend), NewUser::passwordless("test"))
+        Instance::create_backend(Box::new(backend), NewAccount::passwordless("test"))
             .await
             .unwrap();
     let key = user.get_default_key().unwrap();

@@ -7,7 +7,7 @@ use chaz_core::{
     hosted_index::DbEntry,
     session::{EntryType, Session, SessionEntry, SessionRegistry},
 };
-use eidetica::{Instance, NewUser, backend::database::InMemory, service::ServiceServer};
+use eidetica::{Instance, NewAccount, backend::database::InMemory, service::ServiceServer};
 use std::{collections::BTreeMap, sync::Arc};
 use tokio::{
     io::{AsyncBufReadExt, BufReader},
@@ -19,7 +19,7 @@ async fn main() -> anyhow::Result<()> {
     let socket = std::env::args().nth(1).expect("socket path required");
     let (owner, mut user) = Instance::create_backend(
         Box::new(InMemory::new()),
-        NewUser::passwordless("pty-service"),
+        NewAccount::passwordless("pty-service"),
     )
     .await?;
     let (agent_db, pubkey) = create_agent_db(

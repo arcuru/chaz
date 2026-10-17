@@ -47,8 +47,8 @@ pub struct NewSessionEvent {
 /// - `schedule_state`      (Table)     — scheduler last_run state
 pub struct SessionRegistry {
     pub(super) instance: eidetica::Instance,
-    /// User for creating new session databases (behind Mutex since create_database needs &mut)
-    pub(super) user: Arc<Mutex<eidetica::user::User>>,
+    /// AccountSession for creating new session databases (behind Mutex since create_database needs &mut)
+    pub(super) user: Arc<Mutex<eidetica::AccountSession>>,
     /// Group-level routing/metadata DB for this chaz instance.
     pub(super) chaz_group: Database,
     /// Peer-runtime state DB (credentials, cron timestamps, schedule state).
@@ -106,7 +106,7 @@ const KEY_DEFAULT_AGENTS: &str = "default_agents";
 impl SessionRegistry {
     pub async fn new(
         instance: eidetica::Instance,
-        mut user: eidetica::user::User,
+        mut user: eidetica::AccountSession,
         agents: Arc<AgentRegistry>,
     ) -> anyhow::Result<Self> {
         let started = Instant::now();
@@ -284,7 +284,7 @@ impl SessionRegistry {
             "job target and task are required"
         );
         let parent_root = eidetica::entry::ID::parse(parent_id)?;
-        // An adopted same-service parent may postdate this User's key-map
+        // An adopted same-service parent may postdate this AccountSession's key-map
         // snapshot. Reuse its registry-bound, service-validated identity.
         let (_, parent) = self.open_session(parent_id).await?;
         let db = {
@@ -543,8 +543,8 @@ impl SessionRegistry {
 
     /// Open a session created through this daemon's local Eidetica service.
     ///
-    /// The client records the new per-database key mapping in its own `User`
-    /// handle, so the daemon's older handle cannot use `User::open_database`.
+    /// The client records the new per-database key mapping in its own `AccountSession`
+    /// handle, so the daemon's older handle cannot use `AccountSession::open_database`.
     /// Local client sessions use the shared user's default key; resolve that
     /// key against the session's auth settings and bind the proven identity.
     /// This refuses bridge-owned sessions whose trees do not authorize that
@@ -1172,16 +1172,18 @@ mod tests {
     #[tokio::test]
     async fn client_prepares_then_publishes_one_inert_child_on_shared_service() {
         use eidetica::backend::database::InMemory;
-        use eidetica::instance::{Instance, NewUser};
+        use eidetica::instance::{Instance, NewAccount};
         use eidetica::service::ServiceServer;
         use tokio::sync::watch;
 
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("job.sock");
-        let (owner, _) =
-            Instance::create_backend(Box::new(InMemory::new()), NewUser::passwordless("job-test"))
-                .await
-                .unwrap();
+        let (owner, _) = Instance::create_backend(
+            Box::new(InMemory::new()),
+            NewAccount::passwordless("job-test"),
+        )
+        .await
+        .unwrap();
         let service = ServiceServer::bind(owner, &socket).await.unwrap();
         let (shutdown, receiver) = watch::channel(());
         let task = tokio::spawn(service.run(receiver));

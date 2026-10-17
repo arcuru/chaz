@@ -64,7 +64,7 @@ async fn description_persists_and_clears_without_touching_the_name() {
     assert_eq!(set, "Session description set: Q3 budget with finance");
 
     // Persisted canonically: a separate login opens a fresh handle.
-    let reloaded_user = instance.login_user("test", None).await.unwrap();
+    let reloaded_user = instance.login_account("test", None).await.unwrap();
     let reopened = reloaded_user.open_database(sdb.root_id()).await.unwrap();
     let meta = try_read_meta_from_db(&reopened).await.unwrap();
     assert_eq!(meta.description.as_deref(), Some("Q3 budget with finance"));
@@ -150,15 +150,15 @@ async fn read_only_participant_cannot_write_a_description() {
     text(dispatch(Command::DescribeSession("owner text".into()), &ctx).await);
 
     // A separate user holding only a Read key on this session.
-    let owner = instance.login_user("test", None).await.unwrap();
+    let owner = instance.login_account("test", None).await.unwrap();
     owner
         .admin()
         .await
         .unwrap()
-        .create_user(eidetica::NewUser::passwordless("reader"))
+        .create_account(eidetica::NewAccount::passwordless("reader"))
         .await
         .unwrap();
-    let mut reader = instance.login_user("reader", None).await.unwrap();
+    let mut reader = instance.login_account("reader", None).await.unwrap();
     let read_key = reader.add_private_key(Some("reader")).await.unwrap();
     let txn = sdb.new_transaction().await.unwrap();
     txn.get_settings()

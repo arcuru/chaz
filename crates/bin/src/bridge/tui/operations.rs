@@ -293,7 +293,7 @@ pub(super) fn cancel_closed_reads(app: &mut App) {
 }
 
 /// Prioritize the accepted creation over historical presentation reads. A
-/// metadata open can hold the same User lock that database creation needs.
+/// metadata open can hold the same account-session lock that database creation needs.
 pub(super) fn begin_creation(app: &mut App) -> bool {
     if app.operations.is_creating_session() {
         app.operations.notice =
@@ -689,7 +689,7 @@ mod tests {
     async fn app() -> App {
         let (_instance, mut user) = eidetica::Instance::create_backend(
             Box::new(eidetica::backend::database::InMemory::new()),
-            eidetica::NewUser::passwordless("actions"),
+            eidetica::NewAccount::passwordless("actions"),
         )
         .await
         .unwrap();

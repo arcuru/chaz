@@ -951,11 +951,11 @@ mod tests {
     use crate::tool::ToolRegistry;
     use eidetica::backend::database::InMemory;
     use eidetica::crdt::Doc;
-    use eidetica::{Instance, NewUser};
+    use eidetica::{Instance, NewAccount};
 
     async fn fixture_db() -> (Instance, Database) {
         let (instance, mut user) =
-            Instance::create_backend(Box::new(InMemory::new()), NewUser::passwordless("test"))
+            Instance::create_backend(Box::new(InMemory::new()), NewAccount::passwordless("test"))
                 .await
                 .unwrap();
         let key = user.get_default_key().unwrap();
@@ -1542,7 +1542,7 @@ mod tests {
         // The Global-instance drain only runs when peer_handles is
         // wired, so stand up a minimal SessionRegistry-backed peer bag.
         let (inst, user) =
-            Instance::create_backend(Box::new(InMemory::new()), NewUser::passwordless("test"))
+            Instance::create_backend(Box::new(InMemory::new()), NewAccount::passwordless("test"))
                 .await
                 .unwrap();
         let agents = Arc::new(crate::agent::AgentRegistry::with_default_agent());
@@ -1649,13 +1649,13 @@ mod tests {
     /// Instance isn't dropped while the AgentDb is still in use.
     async fn agent_fixture() -> (
         Instance,
-        eidetica::user::User,
+        eidetica::AccountSession,
         Database,
         crate::agent_db::AgentDb,
     ) {
         use crate::agent_db::{AgentDbConfig, AgentMeta, create_agent_db};
         let (instance, mut user) =
-            Instance::create_backend(Box::new(InMemory::new()), NewUser::passwordless("t"))
+            Instance::create_backend(Box::new(InMemory::new()), NewAccount::passwordless("t"))
                 .await
                 .unwrap();
         let key = user.get_default_key().unwrap();

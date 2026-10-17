@@ -1,7 +1,7 @@
 //! Ordered UI transitions against disposable, non-executing backend state.
 use super::*;
 use chaz_core::server::{BuildOptions, BuiltServer, McpReadiness};
-use eidetica::{Instance, NewUser, backend::database::InMemory};
+use eidetica::{Instance, NewAccount, backend::database::InMemory};
 use tokio::sync::oneshot;
 
 fn steering_backend(port: u16) -> Vec<chaz_core::config::Backend> {
@@ -15,7 +15,7 @@ async fn runtime(dir: &std::path::Path) -> BuiltServer {
 async fn runtime_with_stub(dir: &std::path::Path, stub_port: Option<u16>) -> BuiltServer {
     let (instance, user) = Instance::create_backend(
         Box::new(InMemory::new()),
-        NewUser::passwordless("ui-transitions"),
+        NewAccount::passwordless("ui-transitions"),
     )
     .await
     .unwrap();

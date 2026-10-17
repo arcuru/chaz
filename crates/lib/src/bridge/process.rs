@@ -428,16 +428,18 @@ eidetica:
     ) {
         use eidetica::backend::database::InMemory;
         use eidetica::service::ServiceServer;
-        use eidetica::{Instance, NewUser};
+        use eidetica::{Instance, NewAccount};
         use std::os::unix::fs::PermissionsExt;
 
         let dir = tempfile::tempdir().unwrap();
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let socket = dir.path().join("service.sock");
-        let (owner, _) =
-            Instance::create_backend(Box::new(InMemory::new()), NewUser::passwordless("shared"))
-                .await
-                .unwrap();
+        let (owner, _) = Instance::create_backend(
+            Box::new(InMemory::new()),
+            NewAccount::passwordless("shared"),
+        )
+        .await
+        .unwrap();
         let server = ServiceServer::bind(owner, &socket).await.unwrap();
         let (shutdown, receiver) = tokio::sync::watch::channel(());
         let task = tokio::spawn(server.run(receiver));
@@ -457,10 +459,12 @@ eidetica:
         .await
         .unwrap();
         let snapshot = dir.path().join("direct.json");
-        let (direct_owner, _) =
-            Instance::create_backend(Box::new(InMemory::new()), NewUser::passwordless("shared"))
-                .await
-                .unwrap();
+        let (direct_owner, _) = Instance::create_backend(
+            Box::new(InMemory::new()),
+            NewAccount::passwordless("shared"),
+        )
+        .await
+        .unwrap();
         direct_owner.snapshot_to_path(&snapshot).unwrap();
         let direct = instance::connect_with(
             &settings(format!("memory://{}", snapshot.display())),

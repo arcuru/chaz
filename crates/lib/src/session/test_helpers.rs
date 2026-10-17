@@ -9,16 +9,16 @@ use crate::agent_db::{AgentDbConfig, AgentMeta, create_agent_db};
 use crate::config::{AgentConfig, Config};
 use crate::hosted_index::{DbEntry, HostedIndex};
 use eidetica::backend::database::InMemory;
-use eidetica::{Instance, NewUser};
+use eidetica::{Instance, NewAccount};
 use std::sync::Arc;
 
 /// Fresh in-memory peer with one database ready for SessionMeta round-trip
-/// tests. Returns Instance+User so they stay alive while the Database is in
+/// tests. Returns Instance+AccountSession so they stay alive while the Database is in
 /// use (dropping the Instance closes the backend and invalidates the handle).
-pub(crate) async fn test_session_db() -> (Instance, eidetica::user::User, eidetica::Database) {
+pub(crate) async fn test_session_db() -> (Instance, eidetica::AccountSession, eidetica::Database) {
     let backend = InMemory::new();
     let (instance, mut user) =
-        Instance::create_backend(Box::new(backend), NewUser::passwordless("test"))
+        Instance::create_backend(Box::new(backend), NewAccount::passwordless("test"))
             .await
             .unwrap();
     let key = user.get_default_key().unwrap();
@@ -54,7 +54,7 @@ pub(crate) fn agent_cfg(name: &str) -> AgentConfig {
 pub(crate) async fn make_registry() -> (Instance, Arc<SessionRegistry>) {
     let backend = InMemory::new();
     let (instance, user) =
-        Instance::create_backend(Box::new(backend), NewUser::passwordless("test"))
+        Instance::create_backend(Box::new(backend), NewAccount::passwordless("test"))
             .await
             .unwrap();
     let agents = Arc::new(AgentRegistry::with_default_agent());
@@ -71,7 +71,7 @@ pub(crate) async fn make_registry() -> (Instance, Arc<SessionRegistry>) {
 pub(crate) async fn make_registry_with_sync() -> (Instance, Arc<SessionRegistry>) {
     let backend = InMemory::new();
     let (instance, user) =
-        Instance::create_backend(Box::new(backend), NewUser::passwordless("test"))
+        Instance::create_backend(Box::new(backend), NewAccount::passwordless("test"))
             .await
             .unwrap();
     instance.enable_sync().await.unwrap();
@@ -88,7 +88,7 @@ pub(crate) async fn make_registry_with_alpha_agent() -> (Instance, Arc<SessionRe
 {
     let backend = InMemory::new();
     let (instance, user) =
-        Instance::create_backend(Box::new(backend), NewUser::passwordless("test"))
+        Instance::create_backend(Box::new(backend), NewAccount::passwordless("test"))
             .await
             .unwrap();
 
@@ -111,7 +111,7 @@ pub(crate) async fn make_registry_with_two_agents() -> (Instance, Arc<SessionReg
 {
     let backend = InMemory::new();
     let (instance, user) =
-        Instance::create_backend(Box::new(backend), NewUser::passwordless("test"))
+        Instance::create_backend(Box::new(backend), NewAccount::passwordless("test"))
             .await
             .unwrap();
 

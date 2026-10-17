@@ -1,6 +1,6 @@
 //! Provision only the disposable store used by the local PTY test.
 use eidetica::{
-    Instance, NewUser,
+    Instance, NewAccount,
     backend::database::{InMemory, Sqlite},
 };
 
@@ -11,11 +11,14 @@ async fn main() -> anyhow::Result<()> {
     // owner lives across client/executor disconnects and restarts. The
     // existing direct-owner lifecycle fixture still uses its SQLite file.
     let (instance, user) = if std::env::args().nth(2).is_some() {
-        Instance::create_backend(Box::new(InMemory::new()), NewUser::passwordless("pty-test"))
-            .await?
+        Instance::create_backend(
+            Box::new(InMemory::new()),
+            NewAccount::passwordless("pty-test"),
+        )
+        .await?
     } else {
         let backend = Sqlite::connect(&format!("sqlite://{path}?mode=rwc")).await?;
-        Instance::create_backend(Box::new(backend), NewUser::passwordless("pty-test")).await?
+        Instance::create_backend(Box::new(backend), NewAccount::passwordless("pty-test")).await?
     };
     drop(user);
     if let Some(socket) = std::env::args().nth(2) {

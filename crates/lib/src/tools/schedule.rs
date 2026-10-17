@@ -749,7 +749,7 @@ mod tests {
     use crate::types::ConversationId;
     use eidetica::backend::database::InMemory;
     use eidetica::store::DocStore;
-    use eidetica::{Instance, NewUser};
+    use eidetica::{Instance, NewAccount};
     use std::sync::Arc;
     use tokio::sync::Mutex as TokioMutex;
 
@@ -770,7 +770,7 @@ mod tests {
     ) {
         let backend = InMemory::new();
         let (instance, user) =
-            Instance::create_backend(Box::new(backend), NewUser::passwordless("test"))
+            Instance::create_backend(Box::new(backend), NewAccount::passwordless("test"))
                 .await
                 .unwrap();
         let agents_reg = Arc::new(AgentRegistry::with_default_agent());

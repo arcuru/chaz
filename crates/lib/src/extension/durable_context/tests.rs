@@ -615,7 +615,7 @@ async fn durable_context_compaction_legacy_and_budget_preserve_originals() {
 #[tokio::test]
 async fn durable_context_pinned_view_and_peer_update_reconstruct_coherently() {
     use eidetica::{
-        Instance, NewUser,
+        Instance, NewAccount,
         auth::{Permission, types::AuthKey},
         backend::database::InMemory,
         sync::{Address, transports::http::HttpTransport},
@@ -639,7 +639,7 @@ async fn durable_context_pinned_view_and_peer_update_reconstruct_coherently() {
     sync.accept_connections().await.unwrap();
     let address = Address::http(sync.get_server_address_for("http").await.unwrap());
     let (peer, mut user) =
-        Instance::create_backend(Box::new(InMemory::new()), NewUser::passwordless("peer"))
+        Instance::create_backend(Box::new(InMemory::new()), NewAccount::passwordless("peer"))
             .await
             .unwrap();
     peer.enable_sync().await.unwrap();
@@ -887,7 +887,7 @@ async fn durable_context_agent_scope_and_current_optout_attenuate_writes() {
 
 #[tokio::test]
 async fn durable_context_sqlite_reopen_with_fresh_host_reuses_committed_receipt() {
-    use eidetica::{Instance, NewUser, backend::database::Sqlite, crdt::Doc};
+    use eidetica::{Instance, NewAccount, backend::database::Sqlite, crdt::Doc};
     let dir = tempfile::tempdir().unwrap();
     let url = format!(
         "sqlite://{}?mode=rwc",
@@ -896,7 +896,7 @@ async fn durable_context_sqlite_reopen_with_fresh_host_reuses_committed_receipt(
     let (root, before, messages, sources) = {
         let (instance, mut user) = Instance::create_backend(
             Box::new(Sqlite::connect(&url).await.unwrap()),
-            NewUser::passwordless("durable"),
+            NewAccount::passwordless("durable"),
         )
         .await
         .unwrap();
@@ -944,7 +944,7 @@ async fn durable_context_sqlite_reopen_with_fresh_host_reuses_committed_receipt(
         )
     };
     let instance = Instance::connect(&url).await.unwrap();
-    let user = instance.login_user("durable", None).await.unwrap();
+    let user = instance.login_account("durable", None).await.unwrap();
     let db = user.open_database(&root).await.unwrap();
     let mut fresh = Fixture::new(true, "ok").await;
     fresh.session = Arc::new(tokio::sync::Mutex::new(

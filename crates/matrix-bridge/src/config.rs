@@ -10,7 +10,7 @@
 //! [`MatrixBridgeConfig::seed_into`] resolves every reference and writes each
 //! login's [`MatrixCredentials`] into the bridge settings DB; it's idempotent,
 //! so the bridge can run it on every boot. Standing up the bridge's eidetica
-//! `User`, bootstrapping access, and registering the public `LoginRef` pointer
+//! `AccountSession`, bootstrapping access, and registering the public `LoginRef` pointer
 //! are the binary's job (chaz-core `bridge_identity`); this module stops at
 //! "the encrypted creds are in the bridge DB".
 
@@ -158,14 +158,14 @@ impl MatrixBridgeConfig {
 mod tests {
     use super::*;
     use chaz_core::bridge_db::{BridgeDb, create_bridge_db};
+    use eidetica::AccountSession;
     use eidetica::backend::database::InMemory;
-    use eidetica::user::User;
-    use eidetica::{Instance, NewUser};
+    use eidetica::{Instance, NewAccount};
 
-    async fn test_bridge_db() -> (User, BridgeDb) {
+    async fn test_bridge_db() -> (AccountSession, BridgeDb) {
         let backend = InMemory::new();
         let (_instance, mut user) =
-            Instance::create_backend(Box::new(backend), NewUser::passwordless("test"))
+            Instance::create_backend(Box::new(backend), NewAccount::passwordless("test"))
                 .await
                 .unwrap();
         let (db, _) = create_bridge_db(&mut user, "matrix").await.unwrap();

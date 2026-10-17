@@ -20,12 +20,12 @@
 #![allow(dead_code)]
 
 use crate::agent_db::{Skill, read_blob, write_blob};
+use eidetica::AccountSession;
 use eidetica::Database;
 use eidetica::auth::crypto::PublicKey;
 use eidetica::crdt::Doc;
 use eidetica::entry::ID;
 use eidetica::store::{DocStore, Table};
-use eidetica::user::User;
 use serde::{Deserialize, Serialize};
 use tracing::info;
 
@@ -88,7 +88,7 @@ pub fn skill_bank_db_name(display_name: &str) -> String {
 /// the DB signed by that key with `name: skill:<display_name>` in
 /// settings, populates `meta`, and initializes the `skills` store.
 pub async fn create_skill_bank(
-    user: &mut User,
+    user: &mut AccountSession,
     display_name: &str,
     meta: &SkillBankMeta,
 ) -> anyhow::Result<(SkillBankDb, PublicKey)> {
@@ -118,9 +118,12 @@ pub async fn create_skill_bank(
 }
 
 /// Look up an existing Skill Bank DB by display name on this peer's
-/// `User`. Returns `(SkillBankDb, pubkey)` where pubkey is the key this
+/// `AccountSession`. Returns `(SkillBankDb, pubkey)` where pubkey is the key this
 /// user holds for the DB. `None` if no bank with that name is tracked.
-pub async fn find_skill_bank(user: &User, display_name: &str) -> Option<(SkillBankDb, PublicKey)> {
+pub async fn find_skill_bank(
+    user: &AccountSession,
+    display_name: &str,
+) -> Option<(SkillBankDb, PublicKey)> {
     let name = skill_bank_db_name(display_name);
     let database = user.find_database(&name).await.ok()?.into_iter().next()?;
     let pubkey = user.find_key(database.root_id()).ok().flatten()?;
@@ -132,12 +135,12 @@ mod tests {
     use super::*;
     use chrono::Utc;
     use eidetica::backend::database::InMemory;
-    use eidetica::{Instance, NewUser};
+    use eidetica::{Instance, NewAccount};
 
-    async fn test_user() -> User {
+    async fn test_user() -> AccountSession {
         let backend = InMemory::new();
         let (_instance, user) =
-            Instance::create_backend(Box::new(backend), NewUser::passwordless("test"))
+            Instance::create_backend(Box::new(backend), NewAccount::passwordless("test"))
                 .await
                 .unwrap();
         user

@@ -2395,12 +2395,12 @@ mod session_picker_tests {
     use super::*;
     use chaz_core::session::{BridgeKind, SessionStatus};
     use eidetica::backend::database::InMemory;
-    use eidetica::{Instance, NewUser};
+    use eidetica::{Instance, NewAccount};
 
     pub(super) async fn test_tab() -> Tab {
         let (_instance, mut user) = Instance::create_backend(
             Box::new(InMemory::new()),
-            NewUser::passwordless("lazy-picker"),
+            NewAccount::passwordless("lazy-picker"),
         )
         .await
         .unwrap();
@@ -2467,10 +2467,12 @@ mod session_picker_tests {
     async fn tab_activity_follows_persisted_claim_not_old_ack() {
         // Keep the backend alive: the picker fixture normally drops it because
         // picker tests only inspect tab metadata, not session DB writes.
-        let (_instance, mut user) =
-            Instance::create_backend(Box::new(InMemory::new()), NewUser::passwordless("live-tab"))
-                .await
-                .unwrap();
+        let (_instance, mut user) = Instance::create_backend(
+            Box::new(InMemory::new()),
+            NewAccount::passwordless("live-tab"),
+        )
+        .await
+        .unwrap();
         let key = user.get_default_key().unwrap();
         let db = user
             .create_database(eidetica::crdt::Doc::new(), &key)
@@ -2539,7 +2541,7 @@ mod session_picker_tests {
         // Unlike metadata-only picker tests, activity refresh needs a live DB.
         let (_instance, mut user) = Instance::create_backend(
             Box::new(InMemory::new()),
-            NewUser::passwordless("approval-tab"),
+            NewAccount::passwordless("approval-tab"),
         )
         .await
         .unwrap();

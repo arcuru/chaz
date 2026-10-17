@@ -261,7 +261,7 @@ pub(crate) async fn status_from_db(
 pub async fn require_observer_write(
     db: &eidetica::Database,
 ) -> anyhow::Result<eidetica::auth::types::Permission> {
-    // The pinned native resolver needs a local backend for delegated handles.
+    // The native current-permission resolver still needs a local backend for delegation.
     // Do not panic, guess authority, or substitute another key on service reads.
     anyhow::ensure!(
         !(db.instance()?.remote_connection().is_some()
@@ -287,7 +287,7 @@ pub async fn observer_status(db: &eidetica::Database) -> anyhow::Result<JobStatu
 
 impl SessionRegistry {
     /// Open a locally indexed job created by another same-login service
-    /// process after this client's User key-map snapshot was loaded.
+    /// process after this client's AccountSession key-map snapshot was loaded.
     /// Mapping a key is only a lookup hint; the service still verifies the
     /// key against the child DB's auth settings on every operation.
     pub async fn open_job_session(

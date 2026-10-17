@@ -904,7 +904,7 @@ use crate::agent::AgentRegistry;
 use crate::agent_db::{AgentDbConfig, AgentMeta, create_agent_db};
 use crate::hosted_index::DbEntry;
 use eidetica::backend::database::InMemory;
-use eidetica::{Instance, NewUser};
+use eidetica::{Instance, NewAccount};
 
 /// Build a Server with the minimum wiring needed to exercise hydration.
 async fn server_fixture() -> (Instance, Arc<Server>, Arc<crate::session::SessionRegistry>) {
@@ -931,7 +931,7 @@ pub(super) async fn server_fixture_backend(
 ) -> (Instance, Arc<Server>, Arc<crate::session::SessionRegistry>) {
     let backend = InMemory::new();
     let (instance, user) =
-        Instance::create_backend(Box::new(backend), NewUser::passwordless("test"))
+        Instance::create_backend(Box::new(backend), NewAccount::passwordless("test"))
             .await
             .unwrap();
     let agents = Arc::new(AgentRegistry::with_default_agent());
@@ -4847,7 +4847,7 @@ async fn crash_after_completed_relation_does_not_reexecute() {
 
 #[tokio::test]
 async fn shared_service_clients_observe_durable_attempt_completion() {
-    use eidetica::NewUser;
+    use eidetica::NewAccount;
     use eidetica::backend::database::InMemory;
     use eidetica::crdt::Doc;
     use eidetica::service::ServiceServer;
@@ -4855,10 +4855,12 @@ async fn shared_service_clients_observe_durable_attempt_completion() {
 
     let dir = tempfile::tempdir().unwrap();
     let socket = dir.path().join("eidetica.sock");
-    let (owner, mut owner_user) =
-        Instance::create_backend(Box::new(InMemory::new()), NewUser::passwordless("shared"))
-            .await
-            .unwrap();
+    let (owner, mut owner_user) = Instance::create_backend(
+        Box::new(InMemory::new()),
+        NewAccount::passwordless("shared"),
+    )
+    .await
+    .unwrap();
     let key = owner_user.get_default_key().unwrap();
     let db = owner_user.create_database(Doc::new(), &key).await.unwrap();
     crate::session::Session::initialize_turn_schema(&db)
@@ -5040,17 +5042,19 @@ async fn shared_service_clients_observe_durable_attempt_completion() {
 
 #[tokio::test]
 async fn populated_service_targeted_indices_resume_and_create_without_history_opens() {
-    use eidetica::NewUser;
+    use eidetica::NewAccount;
     use eidetica::backend::database::InMemory;
     use eidetica::service::ServiceServer;
     use tokio::sync::watch;
 
     let dir = tempfile::tempdir().unwrap();
     let socket = dir.path().join("eidetica-targeted.sock");
-    let (owner, mut owner_user) =
-        Instance::create_backend(Box::new(InMemory::new()), NewUser::passwordless("targeted"))
-            .await
-            .unwrap();
+    let (owner, mut owner_user) = Instance::create_backend(
+        Box::new(InMemory::new()),
+        NewAccount::passwordless("targeted"),
+    )
+    .await
+    .unwrap();
     let (selected_agent, _) = crate::agent_db::create_agent_db(
         &mut owner_user,
         "selected",
@@ -5136,13 +5140,15 @@ async fn populated_service_targeted_indices_resume_and_create_without_history_op
 
 #[tokio::test]
 async fn targeted_service_client_expands_peer_discovery_only_on_demand() {
-    use eidetica::NewUser;
+    use eidetica::NewAccount;
     use eidetica::backend::database::InMemory;
 
-    let (instance, mut user) =
-        Instance::create_backend(Box::new(InMemory::new()), NewUser::passwordless("targeted"))
-            .await
-            .unwrap();
+    let (instance, mut user) = Instance::create_backend(
+        Box::new(InMemory::new()),
+        NewAccount::passwordless("targeted"),
+    )
+    .await
+    .unwrap();
     for name in ["selected", "unrelated"] {
         crate::agent_db::create_agent_db(
             &mut user,
@@ -5192,17 +5198,19 @@ async fn targeted_service_client_expands_peer_discovery_only_on_demand() {
 
 #[tokio::test]
 async fn resident_executor_adopts_and_processes_local_client_session() {
-    use eidetica::NewUser;
+    use eidetica::NewAccount;
     use eidetica::backend::database::InMemory;
     use eidetica::service::ServiceServer;
     use tokio::sync::watch;
 
     let dir = tempfile::tempdir().unwrap();
     let socket = dir.path().join("resident-executor.sock");
-    let (owner, mut owner_user) =
-        Instance::create_backend(Box::new(InMemory::new()), NewUser::passwordless("resident"))
-            .await
-            .unwrap();
+    let (owner, mut owner_user) = Instance::create_backend(
+        Box::new(InMemory::new()),
+        NewAccount::passwordless("resident"),
+    )
+    .await
+    .unwrap();
     let (agent_db, agent_pubkey) = create_agent_db(
         &mut owner_user,
         "default",
@@ -5323,17 +5331,19 @@ async fn resident_executor_adopts_and_processes_local_client_session() {
 
 #[tokio::test]
 async fn service_restart_reopens_and_reconciles_persisted_work() {
-    use eidetica::NewUser;
+    use eidetica::NewAccount;
     use eidetica::backend::database::InMemory;
     use eidetica::service::ServiceServer;
     use tokio::sync::watch;
 
     let dir = tempfile::tempdir().unwrap();
     let socket = dir.path().join("eidetica-restart.sock");
-    let (owner, _owner_user) =
-        Instance::create_backend(Box::new(InMemory::new()), NewUser::passwordless("restart"))
-            .await
-            .unwrap();
+    let (owner, _owner_user) = Instance::create_backend(
+        Box::new(InMemory::new()),
+        NewAccount::passwordless("restart"),
+    )
+    .await
+    .unwrap();
     let start_service = |instance: Instance| async {
         let service = ServiceServer::bind(instance, &socket).await.unwrap();
         let (shutdown, receiver) = watch::channel(());
@@ -5515,7 +5525,7 @@ async fn direct_peer_sync_preserves_request_identity_and_completion_with_stop_re
     use eidetica::sync::transports::http::HttpTransport;
 
     let (owner, mut owner_user) =
-        Instance::create_backend(Box::new(InMemory::new()), NewUser::passwordless("owner"))
+        Instance::create_backend(Box::new(InMemory::new()), NewAccount::passwordless("owner"))
             .await
             .unwrap();
     owner.enable_sync().await.unwrap();
@@ -5542,7 +5552,7 @@ async fn direct_peer_sync_preserves_request_identity_and_completion_with_stop_re
     let address = Address::http(owner_sync.get_server_address_for("http").await.unwrap());
 
     let (peer, mut peer_user) =
-        Instance::create_backend(Box::new(InMemory::new()), NewUser::passwordless("peer"))
+        Instance::create_backend(Box::new(InMemory::new()), NewAccount::passwordless("peer"))
             .await
             .unwrap();
     peer.enable_sync().await.unwrap();
@@ -5818,7 +5828,7 @@ async fn auto_attach_honours_the_selected_agent_group() {
 #[tokio::test]
 async fn shared_login_transport_and_observer_frontends_keep_independent_progress() {
     use crate::bridge::delivery::{DeliveryBinding, DeliveryReconciler, DeliveryStore};
-    use eidetica::NewUser;
+    use eidetica::NewAccount;
     use eidetica::backend::database::InMemory;
     use eidetica::crdt::Doc;
     use eidetica::service::ServiceServer;
@@ -5826,10 +5836,12 @@ async fn shared_login_transport_and_observer_frontends_keep_independent_progress
 
     let dir = tempfile::tempdir().unwrap();
     let socket = dir.path().join("eidetica.sock");
-    let (owner, mut owner_user) =
-        Instance::create_backend(Box::new(InMemory::new()), NewUser::passwordless("shared"))
-            .await
-            .unwrap();
+    let (owner, mut owner_user) = Instance::create_backend(
+        Box::new(InMemory::new()),
+        NewAccount::passwordless("shared"),
+    )
+    .await
+    .unwrap();
     let key = owner_user.get_default_key().unwrap();
     let db = owner_user.create_database(Doc::new(), &key).await.unwrap();
     crate::session::Session::initialize_turn_schema(&db)
@@ -6187,10 +6199,12 @@ async fn published_job_is_adopted_without_creating_another_child() {
     Box::pin(async {
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("published.sock");
-        let (owner, mut user) =
-            Instance::create_backend(Box::new(InMemory::new()), NewUser::passwordless("job-test"))
-                .await
-                .unwrap();
+        let (owner, mut user) = Instance::create_backend(
+            Box::new(InMemory::new()),
+            NewAccount::passwordless("job-test"),
+        )
+        .await
+        .unwrap();
         let restricted = crate::grants::Grants {
             shell: Some(crate::grants::ShellGrant {
                 allow: crate::grants::Allowlist::Only(vec![]),
@@ -6607,7 +6621,7 @@ async fn accepted_job_restart_uses_agent_db_depth_not_yaml() {
         let socket = dir.path().join("job-depth.sock");
         let (owner, mut user) = Instance::create_backend(
             Box::new(InMemory::new()),
-            NewUser::passwordless("job-depth"),
+            NewAccount::passwordless("job-depth"),
         )
         .await
         .unwrap();
@@ -6809,7 +6823,7 @@ async fn client_submission_publishes_one_child_then_executor_runs_it() {
     let socket = dir.path().join("client-submit.sock");
     let (owner, mut user) = Instance::create_backend(
         Box::new(InMemory::new()),
-        NewUser::passwordless("submitter"),
+        NewAccount::passwordless("submitter"),
     )
     .await
     .unwrap();
@@ -7931,7 +7945,7 @@ async fn sole_job_settles_after_former_claim_ttl_without_ownership_writes() {
     let socket = dir.path().join("delayed-settlement.sock");
     let (owner, mut user) = Instance::create_backend(
         Box::new(InMemory::new()),
-        NewUser::passwordless("delayed-settlement"),
+        NewAccount::passwordless("delayed-settlement"),
     )
     .await
     .unwrap();
@@ -8160,7 +8174,7 @@ async fn running_job_branch_gets_one_parallel_notice_and_still_delivers() {
     let socket = dir.path().join("parallel-notice.sock");
     let (owner, mut user) = Instance::create_backend(
         Box::new(InMemory::new()),
-        NewUser::passwordless("parallel-notice"),
+        NewAccount::passwordless("parallel-notice"),
     )
     .await
     .unwrap();
@@ -8359,7 +8373,7 @@ async fn ten_job_wait_parents_yield_capacity_and_reacquire_before_continuing() {
     let socket = dir.path().join("wait-capacity.sock");
     let (owner, mut user) = Instance::create_backend(
         Box::new(InMemory::new()),
-        NewUser::passwordless("wait-capacity"),
+        NewAccount::passwordless("wait-capacity"),
     )
     .await
     .unwrap();

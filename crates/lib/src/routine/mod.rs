@@ -94,12 +94,12 @@ mod tests {
     use crate::routine::{RoutineId, RoutineTarget, Trigger};
     use eidetica::backend::database::InMemory;
     use eidetica::crdt::Doc;
-    use eidetica::{Instance, NewUser};
+    use eidetica::{Instance, NewAccount};
     use std::time::Duration;
 
     async fn fixture_db() -> (Instance, Database) {
         let (instance, mut user) =
-            Instance::create_backend(Box::new(InMemory::new()), NewUser::passwordless("test"))
+            Instance::create_backend(Box::new(InMemory::new()), NewAccount::passwordless("test"))
                 .await
                 .unwrap();
         let key = user.get_default_key().unwrap();

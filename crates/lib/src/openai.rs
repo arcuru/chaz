@@ -1169,7 +1169,7 @@ mod tests {
     async fn openai_for(reasoning: Option<ReasoningEffort>) -> OpenAI {
         let (_instance, mut user) = eidetica::Instance::create_backend(
             Box::new(eidetica::backend::database::InMemory::new()),
-            eidetica::NewUser::passwordless("t"),
+            eidetica::NewAccount::passwordless("t"),
         )
         .await
         .unwrap();

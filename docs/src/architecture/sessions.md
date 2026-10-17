@@ -425,6 +425,16 @@ privileged identity are introduced. A service session handle whose native
 permission query cannot resolve delegation stays explicitly unavailable rather
 than guessing authority or falling back to another key.
 
+Historical entry verification is a separate native operation:
+`Database::verify_entry_signature` validates the entry's pinned authentication,
+including delegation, through either an embedded instance or the service.
+The service handle's acting identity needs current Read on the session and
+each delegated proof database. A true verdict is not current Write authority
+or concrete signer attribution; verify the Entry against the operating public
+key rather than trusting a label or an ambiguous key-name hint.
+The service's `current_permission()` still cannot resolve a delegated identity
+without a local backend, so the delegated-service observer guard remains.
+
 ### Shared active-turn steering
 
 Chat and Job observers publish the same `JobInputRequest` through Session's

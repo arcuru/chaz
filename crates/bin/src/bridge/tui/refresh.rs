@@ -657,7 +657,7 @@ fn apply_session_snapshot(
 mod tests {
     use super::*;
     use eidetica::backend::database::InMemory;
-    use eidetica::{Instance, NewUser};
+    use eidetica::{Instance, NewAccount};
     use ratatui::backend::TestBackend;
     use std::sync::atomic::AtomicUsize;
     use std::time::Duration;
@@ -668,7 +668,7 @@ mod tests {
     async fn app_with_tabs(ids: &[&str]) -> (Instance, App) {
         let (instance, mut user) = Instance::create_backend(
             Box::new(InMemory::new()),
-            NewUser::passwordless("tab-refresh"),
+            NewAccount::passwordless("tab-refresh"),
         )
         .await
         .unwrap();
@@ -1237,7 +1237,7 @@ mod tests {
         let socket = dir.path().join("fixture.sock");
         let (owner, mut user) = Instance::create_backend(
             Box::new(InMemory::new()),
-            NewUser::passwordless("failure-fixture"),
+            NewAccount::passwordless("failure-fixture"),
         )
         .await
         .unwrap();

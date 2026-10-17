@@ -1,13 +1,13 @@
 //! Bridge identity + access bootstrap (core flow; live P2P behind a seam).
 //!
-//! A standalone bridge runs its **own** eidetica `User` and holds its **own**
+//! A standalone bridge runs its **own** eidetica `AccountSession` and holds its **own**
 //! key — it is not chaz's peer key. This module covers the bridge's
 //! agent-facing bring-up:
 //!
 //! 1. [`ensure_bridge_key`] — self-generate and persist that key on first run,
 //!    reuse it thereafter (stable identity across restarts).
 //! 2. [`AccessBootstrap`] — the seam over eidetica's ticket-based access
-//!    request. The live [`SyncBootstrap`] drives `User::request_database_access`
+//!    request. The live [`SyncBootstrap`] drives `AccountSession::request_database_access`
 //!    against the peer addresses carried in a [`DatabaseTicket`] (the same
 //!    path `/agent share` → `/agent import` uses); tests substitute a stub so
 //!    the orchestration is exercised without standing up P2P sync. The request
@@ -42,11 +42,11 @@
 
 use crate::agent_db::{AgentDb, LoginRef};
 use crate::session::BootstrapOutcome;
+use eidetica::AccountSession;
 use eidetica::auth::crypto::PublicKey;
 use eidetica::auth::types::Permission;
 use eidetica::crdt::Doc;
 use eidetica::sync::{DatabaseTicket, Sync, SyncError};
-use eidetica::user::User;
 use std::sync::Arc;
 use tracing::{info, warn};
 
@@ -62,7 +62,10 @@ const BRIDGE_WRITE_PRIORITY: u32 = 10;
 /// persisting one on first run. Idempotent: an existing key with `key_name`
 /// is reused, so the bridge keeps a stable identity across restarts rather
 /// than minting a fresh pubkey (and needing re-approval) every boot.
-pub async fn ensure_bridge_key(user: &mut User, key_name: &str) -> anyhow::Result<PublicKey> {
+pub async fn ensure_bridge_key(
+    user: &mut AccountSession,
+    key_name: &str,
+) -> anyhow::Result<PublicKey> {
     if let Some(existing) = user.find_keys_by_display_name(key_name).into_iter().next() {
         return Ok(existing);
     }
@@ -72,7 +75,7 @@ pub async fn ensure_bridge_key(user: &mut User, key_name: &str) -> anyhow::Resul
 }
 
 /// Seam over eidetica's ticket-based access request. The real implementation
-/// ([`SyncBootstrap`]) drives `User::request_database_access`; tests provide a
+/// ([`SyncBootstrap`]) drives `AccountSession::request_database_access`; tests provide a
 /// stub so [`establish_login`] can be exercised without P2P sync.
 #[allow(async_fn_in_trait)]
 pub trait AccessBootstrap {
@@ -84,7 +87,7 @@ pub trait AccessBootstrap {
     /// request first. Errors only on transport/protocol failure.
     async fn request_access(
         &self,
-        user: &mut User,
+        user: &mut AccountSession,
         ticket: &DatabaseTicket,
         key: &PublicKey,
         permission: Permission,
@@ -93,7 +96,7 @@ pub trait AccessBootstrap {
 }
 
 /// Live `AccessBootstrap` over an eidetica `Sync` handle. Drives
-/// `User::request_database_access`; the owner-side approval is the existing
+/// `AccountSession::request_database_access`; the owner-side approval is the existing
 /// chaz `/sharing` flow. Retry-until-approved is the caller/binary's concern
 /// (the request stays queued on the owner, and a `Pending` outcome tells the
 /// binary to come back later).
@@ -124,7 +127,7 @@ impl SyncBootstrap {
 impl AccessBootstrap for SyncBootstrap {
     async fn request_access(
         &self,
-        user: &mut User,
+        user: &mut AccountSession,
         ticket: &DatabaseTicket,
         key: &PublicKey,
         permission: Permission,
@@ -262,7 +265,7 @@ async fn reap_superseded_peer(sync: &Sync, identifier: &str, old: Option<&str>, 
 /// The secret details were already seeded into the bridge's own DB (the
 /// bridge manages that); the pointer published here is non-secret.
 pub async fn establish_login<B: AccessBootstrap>(
-    user: &mut User,
+    user: &mut AccountSession,
     bootstrap: &B,
     sync: &Sync,
     identity: &BridgeIdentity<'_>,
@@ -310,7 +313,7 @@ pub async fn establish_login<B: AccessBootstrap>(
         .track_database(
             agent_db_id.clone(),
             identity.key,
-            eidetica::user::types::SyncSettings::on_commit(),
+            eidetica::account::types::SyncSettings::on_commit(),
         )
         .await
     {
@@ -385,18 +388,18 @@ mod tests {
     use crate::agent_db::{AgentDbConfig, AgentMeta, create_agent_db};
     use crate::bridge_db::create_bridge_db;
     use eidetica::backend::database::InMemory;
-    use eidetica::{Instance, NewUser};
+    use eidetica::{Instance, NewAccount};
 
     /// A fresh in-memory instance plus its admin user. Split out so tests that
     /// need a [`Sync`] handle can enable sync on the same instance.
-    async fn test_instance() -> (Instance, User) {
+    async fn test_instance() -> (Instance, AccountSession) {
         let backend = InMemory::new();
-        Instance::create_backend(Box::new(backend), NewUser::passwordless("test"))
+        Instance::create_backend(Box::new(backend), NewAccount::passwordless("test"))
             .await
             .unwrap()
     }
 
-    async fn test_user() -> User {
+    async fn test_user() -> AccountSession {
         test_instance().await.1
     }
 
@@ -404,7 +407,7 @@ mod tests {
     /// Mirrors the [`Cluster`](eidetica::testing::Cluster) bring-up: the
     /// in-memory backend supports sync, so `enable_sync` + `sync()` yields a
     /// live handle with no transport registered.
-    async fn test_user_with_sync() -> (Instance, User, Arc<Sync>) {
+    async fn test_user_with_sync() -> (Instance, AccountSession, Arc<Sync>) {
         let (instance, user) = test_instance().await;
         instance.enable_sync().await.unwrap();
         let sync = instance
@@ -431,7 +434,7 @@ mod tests {
     impl AccessBootstrap for GrantedBootstrap {
         async fn request_access(
             &self,
-            _user: &mut User,
+            _user: &mut AccountSession,
             _ticket: &DatabaseTicket,
             _key: &PublicKey,
             permission: Permission,
@@ -450,7 +453,7 @@ mod tests {
     impl AccessBootstrap for PendingBootstrap {
         async fn request_access(
             &self,
-            _user: &mut User,
+            _user: &mut AccountSession,
             _ticket: &DatabaseTicket,
             _key: &PublicKey,
             _permission: Permission,
@@ -469,7 +472,7 @@ mod tests {
     impl AccessBootstrap for DeniedBootstrap {
         async fn request_access(
             &self,
-            _user: &mut User,
+            _user: &mut AccountSession,
             _ticket: &DatabaseTicket,
             _key: &PublicKey,
             _permission: Permission,

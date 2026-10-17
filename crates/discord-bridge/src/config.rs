@@ -10,7 +10,7 @@
 //!
 //! [`DiscordBridgeConfig::seed_into`] resolves every login and writes its
 //! [`DiscordCredentials`] into the bridge settings DB; it's idempotent, so the
-//! bridge can run it on every boot. Standing up the bridge's eidetica `User`,
+//! bridge can run it on every boot. Standing up the bridge's eidetica `AccountSession`,
 //! bootstrapping access, and registering the public `LoginRef` pointer are the
 //! binary's job (chaz-core `bridge_identity`); this module stops at "the
 //! encrypted creds are in the bridge DB".
