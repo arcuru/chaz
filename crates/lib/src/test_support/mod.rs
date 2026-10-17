@@ -4,11 +4,8 @@
 //! This module is `pub(crate)` and only used by `#[cfg(test)]` integration
 //! modules. The infrastructure intentionally lives in the crate (rather than
 //! `tests/`) so it can reach `pub(crate)` items without forcing a
-//! binary→library refactor. Helpers are intentionally over-provided — items
-//! used by only one current test are still part of the harness API for
-//! future tests, so dead_code is silenced module-wide.
-
-#![allow(dead_code)]
+//! binary→library refactor. Helpers with no current caller are deleted
+//! rather than kept; nothing here is dead-code-silenced module-wide.
 
 pub(crate) mod harness;
 pub(crate) mod mock_backend;

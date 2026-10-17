@@ -2159,4 +2159,7 @@ impl instance::CapResolver for HubCapResolver {
 }
 
 #[cfg(test)]
+pub(crate) mod test_doubles;
+
+#[cfg(test)]
 mod tests;

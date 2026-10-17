@@ -5,12 +5,12 @@ use crate::{
     config::ContextConfig,
     context::{AssembledContext, ContextBuilder},
     extension::{
-        Extension, ExtensionInstance, ExtensionRef, HookKind, Scope, ScopeCtx,
-        caps::{CapabilityKind, ContextTail, ContextTailCall},
+        Scope,
+        caps::{ContextTail, ContextTailCall},
         durable_context::{
             ContextContribution, DurableContextCall, DurableContextContributor, DurableContextGrant,
         },
-        manifest::ExtensionManifest,
+        test_doubles::TestExt,
     },
     runtime::{self, ModelCallScope, RuntimeMessage},
     session::{EntryType, Session, SessionEntry, TurnRequestId},
@@ -30,7 +30,6 @@ struct Synthetic {
     selections: AtomicUsize,
     recalls: AtomicUsize,
     tail: Mutex<String>,
-    declares: bool,
 }
 impl Synthetic {
     fn new(mode: &'static str) -> Arc<Self> {
@@ -39,68 +38,18 @@ impl Synthetic {
             selections: AtomicUsize::new(0),
             recalls: AtomicUsize::new(0),
             tail: Mutex::new(String::new()),
-            declares: true,
         })
     }
 }
-struct Ext(Arc<Synthetic>);
-struct Inst {
-    manifest: ExtensionManifest,
-    endpoint: Arc<Synthetic>,
-}
-impl Extension for Ext {
-    fn name(&self) -> &'static str {
-        "synthetic_context"
-    }
-    fn supported_hooks(&self) -> &[HookKind] {
-        &[]
-    }
-    fn scopes(&self) -> &[Scope] {
-        &[Scope::PerSession]
-    }
-    fn manifest(&self) -> ExtensionManifest {
-        ExtensionManifest {
-            name: self.name().into(),
-            extension_ref: ExtensionRef::builtin(self.name()),
-            supported_hooks: vec![],
-            required_capabilities: vec![],
-            requested_capabilities: vec![],
-            provides_capabilities: if self.0.declares {
-                vec![
-                    CapabilityKind::ContextStrategy,
-                    CapabilityKind::ContextTail,
-                    CapabilityKind::DurableContext,
-                ]
-            } else {
-                vec![]
-            },
-        }
-    }
-    fn instantiate<'a>(
-        &'a self,
-        _: ScopeCtx<'a>,
-    ) -> crate::extension::instance::InstantiateFuture<'a> {
-        Box::pin(async {
-            Ok(Arc::new(Inst {
-                manifest: self.manifest(),
-                endpoint: self.0.clone(),
-            }) as Arc<dyn ExtensionInstance>)
-        })
-    }
-}
-impl ExtensionInstance for Inst {
-    fn manifest(&self) -> &ExtensionManifest {
-        &self.manifest
-    }
-    fn context_strategy(&self) -> Option<Arc<dyn ContextStrategy>> {
-        Some(self.endpoint.clone())
-    }
-    fn context_tail(&self) -> Option<Arc<dyn ContextTail>> {
-        Some(self.endpoint.clone())
-    }
-    fn durable_context_contributor(&self) -> Option<Arc<dyn DurableContextContributor>> {
-        Some(self.endpoint.clone())
-    }
+/// The synthetic context endpoint wrapped in the shared builder
+/// extension: PerSession scope, with the strategy, tail and durable
+/// endpoints published — and declared — from the one `Arc<Synthetic>`.
+fn synthetic_ext(endpoint: Arc<Synthetic>) -> TestExt {
+    TestExt::new("synthetic_context")
+        .scopes(vec![Scope::PerSession])
+        .context_strategy(endpoint.clone())
+        .context_tail(endpoint.clone())
+        .durable_context(endpoint)
 }
 impl ContextStrategy for Synthetic {
     fn select<'a>(&'a self, call: &'a ContextStrategyCall<'a>) -> CapFuture<'a, ContextPlan> {
@@ -304,19 +253,16 @@ async fn required_strategy_replacement_absence_failure_and_optional_recall() {
             .add_entry(row("user", "current-input", EntryType::Message))
             .await
             .unwrap();
-        let endpoint = if mode == "undeclared" {
-            Arc::new(Synthetic {
-                declares: false,
-                ..Arc::try_unwrap(Synthetic::new(mode)).ok().unwrap()
-            })
-        } else {
-            Synthetic::new(mode)
-        };
+        let endpoint = Synthetic::new(mode);
         let mut hub = context_hub().await;
         if mode != "absent" {
-            hub.install_all(vec![Arc::new(Ext(endpoint.clone()))])
-                .await
-                .unwrap();
+            let mut ext = synthetic_ext(endpoint.clone());
+            if mode == "undeclared" {
+                // Endpoints published but nothing declared: the host must
+                // still refuse the strategy grant.
+                ext = ext.provides_capabilities(vec![]);
+            }
+            hub.install_all(vec![Arc::new(ext)]).await.unwrap();
         }
         hub.set_context_strategy_grant(&ContextStrategyGrant {
             extension: "synthetic_context".into(),
@@ -392,7 +338,7 @@ async fn ephemeral_recall_reopen_settings_and_live_required_revocation() {
     let db = session.lock().await.database().clone();
     let endpoint = Synthetic::new("baseline");
     let mut hub = context_hub().await;
-    hub.install_all(vec![Arc::new(Ext(endpoint.clone()))])
+    hub.install_all(vec![Arc::new(synthetic_ext(endpoint.clone()))])
         .await
         .unwrap();
     hub.record_active(&db).await.unwrap();
@@ -498,7 +444,7 @@ async fn explicit_synthetic_durable_recall_dedups_retry_reopen_and_new_requests(
     let db = session.lock().await.database().clone();
     let endpoint = Synthetic::new("durable");
     let mut hub = context_hub().await;
-    hub.install_all(vec![Arc::new(Ext(endpoint))])
+    hub.install_all(vec![Arc::new(synthetic_ext(endpoint))])
         .await
         .unwrap();
     hub.set_durable_context_grants(&[DurableContextGrant {
@@ -616,7 +562,7 @@ async fn extension_selected_cache_serializes_supported_and_unsupported_providers
     let db = session.lock().await.database().clone();
     let endpoint = Synthetic::new("replacement");
     let mut hub = context_hub().await;
-    hub.install_all(vec![Arc::new(Ext(endpoint))])
+    hub.install_all(vec![Arc::new(synthetic_ext(endpoint))])
         .await
         .unwrap();
     hub.set_context_strategy_grant(&ContextStrategyGrant {

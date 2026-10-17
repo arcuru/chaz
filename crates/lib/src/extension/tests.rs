@@ -1,12 +1,10 @@
 //! Unit tests for the extension framework. Extracted from `mod.rs`.
 
+use super::test_doubles::*;
 use super::*;
 use crate::runtime::RuntimeMessage;
 use crate::tool::ToolRegistry;
 use crate::types::ConversationId;
-use eidetica::backend::database::InMemory;
-use eidetica::crdt::Doc;
-use eidetica::{Instance, NewAccount};
 
 #[path = "tool_call_failure_tests.rs"]
 mod tool_call_failure_tests;
@@ -81,282 +79,6 @@ fn extension_ref_serde_round_trips_with_tag() {
     assert!(json.contains("\"kind\":\"git\""), "got: {json}");
     let parsed: ExtensionRef = serde_json::from_str(&json).unwrap();
     assert_eq!(parsed, original);
-}
-
-struct NamedExt(&'static str);
-impl Extension for NamedExt {
-    fn name(&self) -> &'static str {
-        self.0
-    }
-    fn supported_hooks(&self) -> &[HookKind] {
-        &[]
-    }
-}
-
-// ── Instance-model test helpers ─────────────────────────────────
-//
-// The hub no longer has a legacy `install()` path — every
-// extension publishes its tools / commands / hook handlers through
-// an `ExtensionInstance` drained at `install_all`. These helpers
-// let tests build a Global extension from a bag of `Arc`-d
-// handlers without spelling out a bespoke `Extension` +
-// `ExtensionInstance` pair each time.
-
-#[derive(Default, Clone)]
-struct TestParts {
-    tool_call: Option<Arc<dyn handler::HookHandlerToolCall>>,
-    before_agent_start: Option<Arc<dyn handler::HookHandlerBeforeAgentStart>>,
-    tool_result: Option<Arc<dyn handler::HookHandlerToolResult>>,
-    agent_end: Option<Arc<dyn handler::HookHandlerAgentEnd>>,
-    session_start: Option<Arc<dyn handler::HookHandlerSessionStart>>,
-    session_shutdown: Option<Arc<dyn handler::HookHandlerSessionShutdown>>,
-    routine_handler: Option<Arc<dyn handler::RoutineHandler>>,
-    prompt_augmentation: Option<Arc<dyn caps::PromptAugmentation>>,
-    context_tail: Option<Arc<dyn caps::ContextTail>>,
-    status_segment: Option<Arc<dyn caps::StatusSegment>>,
-    tools: Vec<Arc<dyn Tool>>,
-    commands: Vec<(String, Arc<dyn ExtensionCommand>)>,
-}
-
-struct TestExt {
-    name: &'static str,
-    supported: Vec<HookKind>,
-    scopes: Vec<instance::Scope>,
-    parts: TestParts,
-    instantiations: Option<Arc<std::sync::atomic::AtomicUsize>>,
-    fail_instantiate: bool,
-    panic_instantiate: bool,
-}
-
-impl TestExt {
-    fn new(name: &'static str) -> Self {
-        Self {
-            name,
-            supported: Vec::new(),
-            scopes: vec![instance::Scope::Global],
-            parts: TestParts::default(),
-            instantiations: None,
-            fail_instantiate: false,
-            panic_instantiate: false,
-        }
-    }
-    /// Bump `counter` on every `instantiate` call, so tests can assert
-    /// how many instances the hub actually built.
-    fn instantiation_counter(mut self, counter: Arc<std::sync::atomic::AtomicUsize>) -> Self {
-        self.instantiations = Some(counter);
-        self
-    }
-    /// Fail `instantiate` *after* the parts are configured, so tests
-    /// can assert that the parts a successful instantiation would have
-    /// published never reach the hub's registries.
-    fn fails_instantiate(mut self) -> Self {
-        self.fail_instantiate = true;
-        self
-    }
-    /// Panic inside `instantiate` (not just an Err return) so the
-    /// `catch_unwind` path in `install_all` is exercised.
-    fn panics_instantiate(mut self) -> Self {
-        self.panic_instantiate = true;
-        self
-    }
-    fn scopes(mut self, scopes: Vec<instance::Scope>) -> Self {
-        self.scopes = scopes;
-        self
-    }
-    fn prompt_augmentation(mut self, p: Arc<dyn caps::PromptAugmentation>) -> Self {
-        self.parts.prompt_augmentation = Some(p);
-        self
-    }
-    fn context_tail(mut self, tail: Arc<dyn caps::ContextTail>) -> Self {
-        self.parts.context_tail = Some(tail);
-        self
-    }
-    fn status_segment(mut self, s: Arc<dyn caps::StatusSegment>) -> Self {
-        self.parts.status_segment = Some(s);
-        self
-    }
-    fn tool_call(mut self, h: Arc<dyn handler::HookHandlerToolCall>) -> Self {
-        self.supported.push(HookKind::ToolCall);
-        self.parts.tool_call = Some(h);
-        self
-    }
-    fn before_agent_start(mut self, h: Arc<dyn handler::HookHandlerBeforeAgentStart>) -> Self {
-        self.supported.push(HookKind::BeforeAgentStart);
-        self.parts.before_agent_start = Some(h);
-        self
-    }
-    fn routine_handler(mut self, h: Arc<dyn handler::RoutineHandler>) -> Self {
-        self.parts.routine_handler = Some(h);
-        self
-    }
-    fn command(mut self, name: &str, h: Arc<dyn ExtensionCommand>) -> Self {
-        self.supported.push(HookKind::Command);
-        self.parts.commands.push((name.to_string(), h));
-        self
-    }
-}
-
-impl Extension for TestExt {
-    fn name(&self) -> &'static str {
-        self.name
-    }
-    fn supported_hooks(&self) -> &[HookKind] {
-        &self.supported
-    }
-    fn scopes(&self) -> &[instance::Scope] {
-        &self.scopes
-    }
-    fn manifest(&self) -> manifest::ExtensionManifest {
-        manifest::ExtensionManifest {
-            name: self.name().into(),
-            extension_ref: self.extension_ref(),
-            supported_hooks: self.supported.clone(),
-            required_capabilities: vec![],
-            requested_capabilities: vec![],
-            provides_capabilities: if self.parts.context_tail.is_some() {
-                vec![caps::CapabilityKind::ContextTail]
-            } else {
-                vec![]
-            },
-        }
-    }
-    fn instantiate<'a>(
-        &'a self,
-        _scope_ctx: instance::ScopeCtx<'a>,
-    ) -> instance::InstantiateFuture<'a> {
-        let manifest = self.manifest();
-        let parts = self.parts.clone();
-        let instantiations = self.instantiations.clone();
-        let fail = self.fail_instantiate;
-        let do_panic = self.panic_instantiate;
-        Box::pin(async move {
-            if let Some(counter) = instantiations {
-                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            }
-            if do_panic {
-                panic!("intentional panic for catch_unwind test");
-            }
-            if fail {
-                return Err(anyhow::anyhow!("simulated instantiation failure"));
-            }
-            Ok(Arc::new(TestInstance { manifest, parts }) as Arc<dyn instance::ExtensionInstance>)
-        })
-    }
-}
-
-struct TestInstance {
-    manifest: manifest::ExtensionManifest,
-    parts: TestParts,
-}
-impl instance::ExtensionInstance for TestInstance {
-    fn manifest(&self) -> &manifest::ExtensionManifest {
-        &self.manifest
-    }
-    fn tools(&self) -> Vec<Arc<dyn Tool>> {
-        self.parts.tools.clone()
-    }
-    fn commands(&self) -> Vec<(String, Arc<dyn ExtensionCommand>)> {
-        self.parts.commands.clone()
-    }
-    fn tool_call_hook(&self) -> Option<Arc<dyn handler::HookHandlerToolCall>> {
-        self.parts.tool_call.clone()
-    }
-    fn tool_result_hook(&self) -> Option<Arc<dyn handler::HookHandlerToolResult>> {
-        self.parts.tool_result.clone()
-    }
-    fn before_agent_start_hook(&self) -> Option<Arc<dyn handler::HookHandlerBeforeAgentStart>> {
-        self.parts.before_agent_start.clone()
-    }
-    fn agent_end_hook(&self) -> Option<Arc<dyn handler::HookHandlerAgentEnd>> {
-        self.parts.agent_end.clone()
-    }
-    fn session_start_hook(&self) -> Option<Arc<dyn handler::HookHandlerSessionStart>> {
-        self.parts.session_start.clone()
-    }
-    fn session_shutdown_hook(&self) -> Option<Arc<dyn handler::HookHandlerSessionShutdown>> {
-        self.parts.session_shutdown.clone()
-    }
-    fn routine_handler(&self) -> Option<Arc<dyn handler::RoutineHandler>> {
-        self.parts.routine_handler.clone()
-    }
-    fn prompt_augmentation(&self) -> Option<Arc<dyn caps::PromptAugmentation>> {
-        self.parts.prompt_augmentation.clone()
-    }
-    fn context_tail(&self) -> Option<Arc<dyn caps::ContextTail>> {
-        self.parts.context_tail.clone()
-    }
-    fn status_segment(&self) -> Option<Arc<dyn caps::StatusSegment>> {
-        self.parts.status_segment.clone()
-    }
-}
-
-fn test_peer_handles(registry: Arc<SessionRegistry>) -> Arc<instance::PeerHandles> {
-    Arc::new(instance::PeerHandles {
-        registry,
-        agent_index: HostedIndex::empty("agent"),
-        memory_bank_index: HostedIndex::empty("bank"),
-        skill_bank_index: HostedIndex::empty("skill_bank"),
-        embedder: None,
-        secrets: None,
-        server_slot: crate::instance::ServerSlot::default(),
-        mcp_registry: Arc::new(crate::mcp::McpRegistry::new()),
-        agent_state_allowlist: Default::default(),
-        tool_registry: Arc::new(ToolRegistry::new()),
-    })
-}
-
-/// Hub with `session_registry` + `peer_handles` wired, so
-/// `install_all` runs the Global-instance drain (tools, commands,
-/// hooks, routine handlers all surface).
-async fn test_hub() -> ExtensionHub {
-    use crate::agent::AgentRegistry;
-    let backend = InMemory::new();
-    let (inst, user) =
-        Instance::create_backend(Box::new(backend), NewAccount::passwordless("test"))
-            .await
-            .unwrap();
-    let agents = Arc::new(AgentRegistry::with_default_agent());
-    let registry = Arc::new(SessionRegistry::new(inst, user, agents).await.unwrap());
-    let mut hub = ExtensionHub::new();
-    hub.set_session_registry(registry.clone());
-    hub.set_peer_handles(test_peer_handles(registry));
-    hub
-}
-
-async fn make_session_db() -> (Instance, Database) {
-    let backend = InMemory::new();
-    let (instance, mut user) =
-        Instance::create_backend(Box::new(backend), NewAccount::passwordless("test"))
-            .await
-            .unwrap();
-    let key = user.get_default_key().unwrap();
-    let mut s = Doc::new();
-    s.set("name", "session");
-    let db = user.create_database(s, &key).await.unwrap();
-    (instance, db)
-}
-
-struct FixedAug(&'static str);
-impl caps::PromptAugmentation for FixedAug {
-    fn augment_system_prompt<'a>(
-        &'a self,
-        _agent_name: &'a str,
-        _recent: &'a [String],
-        _available_tool_names: &'a [String],
-    ) -> caps::CapFuture<'a, Option<String>> {
-        let text = self.0.to_string();
-        Box::pin(async move { Ok(Some(text)) })
-    }
-}
-
-impl caps::ContextTail for FixedAug {
-    fn context_tail<'a>(
-        &'a self,
-        _call: &'a caps::ContextTailCall<'a>,
-    ) -> caps::CapFuture<'a, Option<String>> {
-        let text = self.0.to_string();
-        Box::pin(async move { Ok(Some(text)) })
-    }
 }
 
 #[tokio::test]
@@ -479,17 +201,6 @@ async fn context_augmentation_order_is_stable_and_filtered() {
     );
     peer.server_slot.clear();
     server.shutdown().await;
-}
-
-struct FixedStatus(&'static str, &'static str);
-impl caps::StatusSegment for FixedStatus {
-    fn status_segments<'a>(
-        &'a self,
-        _agent_name: &'a str,
-    ) -> caps::CapFuture<'a, BTreeMap<String, String>> {
-        let (k, v) = (self.0.to_string(), self.1.to_string());
-        Box::pin(async move { Ok(BTreeMap::from([(k, v)])) })
-    }
 }
 
 #[tokio::test]
@@ -897,23 +608,6 @@ async fn record_active_writes_new_event_when_version_bumps() {
     assert_eq!(active[0].version(), "sha2");
 }
 
-/// Always-`Continue` tool-call hook used by registration-tracking
-/// tests.
-struct PassToolCall;
-impl handler::HookHandlerToolCall for PassToolCall {
-    fn on_tool_call<'a>(
-        &'a self,
-        _: &'a str,
-        _: &'a mut serde_json::Value,
-    ) -> handler::HandlerFuture<'a, ToolCallDecision> {
-        Box::pin(async { ToolCallDecision::Continue })
-    }
-}
-
-fn tool_call_ext(name: &'static str) -> Arc<dyn Extension> {
-    Arc::new(TestExt::new(name).tool_call(Arc::new(PassToolCall)))
-}
-
 #[tokio::test]
 async fn hub_records_owner_for_each_hook_registration() {
     let mut hub = test_hub().await;
@@ -976,61 +670,6 @@ async fn hub_extension_refs_returns_one_per_extension_in_order() {
     }
 }
 
-/// Test-only ctx that pretends *every* extension name is active so
-/// fire_* tests can exercise handler dispatch without manually
-/// listing owners. Production code always builds a real per-session
-/// set via `Server::active_extensions_for`.
-fn all_active(names: &[&'static str]) -> HashSet<String> {
-    names.iter().map(|s| s.to_string()).collect()
-}
-
-async fn fixture_ctx_with_active(active: HashSet<String>) -> HookContext {
-    let mut ctx = fixture_ctx().await;
-    ctx.active_extensions = active;
-    ctx
-}
-
-async fn fixture_ctx() -> HookContext {
-    let backend = InMemory::new();
-    let (_instance, mut user) =
-        Instance::create_backend(Box::new(backend), NewAccount::passwordless("test"))
-            .await
-            .unwrap();
-    let key = user.get_default_key().unwrap();
-    let mut s = Doc::new();
-    s.set("name", "session");
-    let db = user.create_database(s, &key).await.unwrap();
-    let session = Session::new(ConversationId("conv".into()), db).await;
-    HookContext {
-        agent_name: "test_agent".into(),
-        model: None,
-        call_depth: 0,
-        session: Arc::new(Mutex::new(session)),
-        active_extensions: HashSet::new(),
-        routine_engine: None,
-    }
-}
-
-struct CountingHook {
-    calls: Arc<std::sync::atomic::AtomicUsize>,
-}
-impl handler::HookHandlerBeforeAgentStart for CountingHook {
-    fn on_before_agent_start<'a>(&'a self) -> handler::HandlerFuture<'a, Vec<RuntimeMessage>> {
-        let calls = self.calls.clone();
-        Box::pin(async move {
-            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            vec![RuntimeMessage::System("injected".into())]
-        })
-    }
-}
-
-fn counting_ext(
-    name: &'static str,
-    calls: Arc<std::sync::atomic::AtomicUsize>,
-) -> Arc<dyn Extension> {
-    Arc::new(TestExt::new(name).before_agent_start(Arc::new(CountingHook { calls })))
-}
-
 #[tokio::test]
 async fn before_agent_start_runs_in_registration_order() {
     let mut hub = test_hub().await;
@@ -1061,48 +700,6 @@ async fn inactive_extension_does_not_fire_hooks() {
     let ctx = fixture_ctx_with_active(all_active(&["a"])).await;
     hub.fire_before_agent_start(&ctx).await;
     assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
-}
-
-struct BlockingHook;
-impl handler::HookHandlerToolCall for BlockingHook {
-    fn on_tool_call<'a>(
-        &'a self,
-        name: &'a str,
-        _args: &'a mut serde_json::Value,
-    ) -> handler::HandlerFuture<'a, ToolCallDecision> {
-        Box::pin(async move {
-            if name == "shell" {
-                ToolCallDecision::Block {
-                    reason: "blocked by test".into(),
-                }
-            } else {
-                ToolCallDecision::Continue
-            }
-        })
-    }
-}
-
-struct MutatingHook;
-impl handler::HookHandlerToolCall for MutatingHook {
-    fn on_tool_call<'a>(
-        &'a self,
-        _name: &'a str,
-        args: &'a mut serde_json::Value,
-    ) -> handler::HandlerFuture<'a, ToolCallDecision> {
-        Box::pin(async move {
-            if let Some(obj) = args.as_object_mut() {
-                obj.insert("touched".into(), serde_json::Value::Bool(true));
-            }
-            ToolCallDecision::Continue
-        })
-    }
-}
-
-struct PanickingBeforeAgentStartHook;
-impl handler::HookHandlerBeforeAgentStart for PanickingBeforeAgentStartHook {
-    fn on_before_agent_start<'a>(&'a self) -> handler::HandlerFuture<'a, Vec<RuntimeMessage>> {
-        Box::pin(async move { panic!("intentional panic for catch_unwind test") })
-    }
 }
 
 #[tokio::test]
@@ -1149,24 +746,6 @@ async fn tool_call_block_short_circuits_and_mutation_propagates() {
         decision2,
         ToolCallDecision::Block { ref reason } if reason == "blocked by test"
     ));
-}
-
-struct DummyCmd;
-impl ExtensionCommand for DummyCmd {
-    fn description(&self) -> &'static str {
-        "test command"
-    }
-    fn invoke<'a>(
-        &'a self,
-        args: &'a str,
-        _ctx: &'a HookContext,
-    ) -> Pin<Box<dyn Future<Output = ExtensionCommandOutcome> + Send + 'a>> {
-        Box::pin(async move { ExtensionCommandOutcome::Text(format!("got: {args}")) })
-    }
-}
-
-fn cmd_ext(name: &'static str, cmd: &'static str) -> Arc<dyn Extension> {
-    Arc::new(TestExt::new(name).command(cmd, Arc::new(DummyCmd)))
 }
 
 #[tokio::test]
@@ -1251,13 +830,12 @@ async fn command_install_does_not_wait_for_executor_extensions_or_drain_tools() 
         entered: entered.clone(),
         release: release.clone(),
     });
-    let mut command = TestExt::new("command_provider")
+    let command = TestExt::new("command_provider")
         .command("data", Arc::new(DummyCmd))
         .before_agent_start(Arc::new(CountingHook {
             calls: Arc::new(AtomicUsize::new(0)),
-        }));
-    command.supported.push(HookKind::Tool);
-    command.parts.tools.push(Arc::new(crate::tools::ShellExec));
+        }))
+        .tool(Arc::new(crate::tools::ShellExec));
     let mut client = test_hub().await;
     tokio::time::timeout(
         Duration::from_secs(1),
@@ -1306,23 +884,10 @@ async fn command_install_does_not_wait_for_executor_extensions_or_drain_tools() 
         .unwrap();
 }
 
-/// Extension with no scopes-relevant contribution: default
-/// `instantiate` yields a no-op `LegacyInstance`, so it registers
-/// nothing through the drain.
-struct MinimalCapExt(&'static str);
-impl Extension for MinimalCapExt {
-    fn name(&self) -> &'static str {
-        self.0
-    }
-    fn supported_hooks(&self) -> &[HookKind] {
-        &[]
-    }
-}
-
 #[tokio::test]
 async fn install_all_minimal_extension_is_a_noop() {
     let mut hub = test_hub().await;
-    hub.install_all(vec![Arc::new(MinimalCapExt("solo"))])
+    hub.install_all(vec![Arc::new(NamedExt("solo"))])
         .await
         .unwrap();
     // Registered, but nothing drained: no routine handler, no
@@ -1337,7 +902,7 @@ async fn install_all_minimal_extension_is_a_noop() {
 #[tokio::test]
 async fn install_all_is_idempotent() {
     let mut hub = test_hub().await;
-    let ext: Arc<dyn Extension> = Arc::new(MinimalCapExt("solo"));
+    let ext: Arc<dyn Extension> = Arc::new(NamedExt("solo"));
     hub.install_all(vec![ext.clone()]).await.unwrap();
     hub.install_all(vec![ext]).await.unwrap();
     // Re-installing the same Global extension doesn't double its
@@ -1540,23 +1105,6 @@ async fn install_all_instantiates_global_extensions_concurrently() {
 // dispatch_routine coverage
 // -----------------------------------------------------------------
 
-/// Routine handler that records every payload it receives.
-struct Recorder {
-    seen: std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
-}
-impl handler::RoutineHandler for Recorder {
-    fn on_fire<'a>(
-        &'a self,
-        payload: serde_json::Value,
-    ) -> handler::HandlerFuture<'a, anyhow::Result<()>> {
-        let seen = self.seen.clone();
-        Box::pin(async move {
-            seen.lock().unwrap().push(payload);
-            Ok(())
-        })
-    }
-}
-
 #[tokio::test]
 async fn dispatch_routine_invokes_registered_handler() {
     let mut hub = test_hub().await;
@@ -1594,7 +1142,7 @@ async fn dispatch_routine_unknown_extension_errors() {
 async fn dispatch_routine_extension_without_handler_errors() {
     // A minimal extension publishes no routine handler.
     let mut hub = test_hub().await;
-    hub.install_all(vec![Arc::new(MinimalCapExt("solo"))])
+    hub.install_all(vec![Arc::new(NamedExt("solo"))])
         .await
         .unwrap();
     let err = hub
@@ -1630,6 +1178,9 @@ async fn dispatch_routine_handler_error_propagates() {
 
 /// Publishes a no-op Messenger through the instance `messenger()`
 /// endpoint. Used by `cap_resolver_walks_instance_published_caps`.
+/// Messenger is not part of `TestExt`'s derived `provides_capabilities`,
+/// so this publishes the endpoint without declaring it — same manifest
+/// as the one-off double it replaced.
 fn instance_messenger_ext() -> Arc<dyn Extension> {
     struct NoopMessenger;
     impl caps::Messenger for NoopMessenger {
@@ -1641,37 +1192,7 @@ fn instance_messenger_ext() -> Arc<dyn Extension> {
             Box::pin(async { Ok(()) })
         }
     }
-    struct MessengerInstance {
-        manifest: manifest::ExtensionManifest,
-    }
-    impl instance::ExtensionInstance for MessengerInstance {
-        fn manifest(&self) -> &manifest::ExtensionManifest {
-            &self.manifest
-        }
-        fn messenger(&self) -> Option<Arc<dyn caps::Messenger>> {
-            Some(Arc::new(NoopMessenger))
-        }
-    }
-    struct MessengerExt;
-    impl Extension for MessengerExt {
-        fn name(&self) -> &'static str {
-            "inst-messenger"
-        }
-        fn supported_hooks(&self) -> &[HookKind] {
-            &[]
-        }
-        fn instantiate<'a>(
-            &'a self,
-            _scope_ctx: instance::ScopeCtx<'a>,
-        ) -> instance::InstantiateFuture<'a> {
-            let manifest = self.manifest();
-            Box::pin(async move {
-                Ok(Arc::new(MessengerInstance { manifest })
-                    as Arc<dyn instance::ExtensionInstance>)
-            })
-        }
-    }
-    Arc::new(MessengerExt)
+    Arc::new(TestExt::new("inst-messenger").messenger(Arc::new(NoopMessenger)))
 }
 
 #[tokio::test]
@@ -1797,9 +1318,7 @@ async fn injected_pre_turn_messages_prevent_wait_checkpoints_and_never_refire() 
     let fired = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let recorder = Arc::new(Intents::default());
     let observations = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let mut result_ext = TestExt::new("result");
-    result_ext.supported.push(HookKind::ToolResult);
-    result_ext.parts.tool_result = Some(Arc::new(ResultHook {
+    let result_ext = TestExt::new("result").tool_result(Arc::new(ResultHook {
         recorder: recorder.clone(),
         observations: observations.clone(),
     }));
