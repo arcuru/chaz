@@ -147,7 +147,9 @@ immediately.
    daemon's store and login explicitly using Eidetica's CLI; start the service.
    Configure exactly one Chaz `execution: executor` process against its
    `unix://` endpoint, with the same login as the clients. Check its startup
-   log and ensure no second executor is running for those sessions.
+   log and ensure no second executor is running for those sessions. Start it
+   before the clients: it initializes the login's
+   [bookkeeping roots](configuration.md#bookkeeping-roots), which clients only open.
 3. Configure CLI/TUI and each Matrix/Discord bridge with `execution: client`,
    the same service endpoint and login, and **no** `eidetica.sync` or login
    `ticket`. Provision fresh bridge settings/identities deliberately; old

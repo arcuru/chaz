@@ -22,6 +22,7 @@ async fn service_steering(
     )
     .await
     .unwrap();
+    crate::test_support::provision_roots(&mut user).await;
     for name in ["monitor-observer", "monitor-reader"] {
         user.admin()
             .await
@@ -195,6 +196,16 @@ async fn service_steering(
             eidetica::auth::types::Permission::Write(0)
         );
     }
+    // The observer shares the submitter's group only by an explicit
+    // reference; tracking a database named `chaz_group` selects nothing.
+    crate::session::roots::record(
+        &observer_connection.user,
+        crate::session::roots::RootKind::Group,
+        registry.chaz_group().root_id(),
+    )
+    .await
+    .unwrap();
+    crate::test_support::provision_roots(&mut observer_connection.user).await;
     let observer_registry = Arc::new(
         crate::session::SessionRegistry::new(
             observer_connection.instance,
