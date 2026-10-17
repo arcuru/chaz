@@ -265,14 +265,16 @@ A session is identified solely by the root ID of its own eidetica `Database`. Th
 `chaz_group` and `chaz_peer` are opened by ID from references in the login's Eidetica Account, not by searching tracked databases for their display names (`session/roots.rs`).
 The `chaz` reference namespace holds `group` and `peer-<login id>`.
 The peer reference is keyed by the instance-local login record, not the Account ID, so a pointer written by another installation of the same Account cannot select this installation's peer runtime state; processes sharing one service login share one peer, as before.
-Opening reads those two references and opens two databases, so its cost does not depend on how many other databases the login tracks; renaming either database does not change what is opened.
+Opening reads those two references and opens two databases without scanning unrelated databases; renaming either database does not change what is opened.
+Eidetica's verification checks over the Account's own history can still grow as the Account tracks more databases; this is not a constant-time startup guarantee.
 
 A missing reference is created only by the designated writer: a direct owner, which holds its storage exclusively, or the executor of a service login, of which there is exactly one.
 Initializers in one process serialize on a lock; across processes the designated-writer rule does, and Chaz does not claim distributed uniqueness.
 Service clients and `chaz usage` require existing roots.
 A present reference whose value or target cannot be read, opened or authorized is an error and is never replaced.
 Before creating a root, the initializer refuses if the login already tracks an unreferenced database with the root's display name (state from an older Chaz, or a root whose reference write failed) and asks for `chaz roots --group|--peer <ID>`.
-That check is the only remaining name search and runs only on the initialization path.
+That check is the only root-discovery name search and runs only on the initialization path.
+It stops if a tracked database cannot be opened or its name cannot be read, rather than treating that failure as proof that no old root exists.
 
 The canonical per-session configuration (name, agent, model, role, backend) lives in each session's own DB under a `meta` DocStore as a `SessionMeta`. Because it lives in the session, it syncs with the session via eidetica — sharing a session also shares its config.
 

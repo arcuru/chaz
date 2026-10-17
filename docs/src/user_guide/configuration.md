@@ -100,6 +100,7 @@ Repair the database or its access rather than deleting the reference.
 
 **Upgrades and interrupted setup.** Before creating a root, the writer checks whether the login already tracks a database with that root's name but no reference: state from a Chaz version that found its roots by name, or a root whose reference write failed.
 If it finds one, it creates nothing and prints the IDs to record.
+If a tracked database cannot be inspected, setup stops with its ID; repair its data or access before retrying.
 Record them with `chaz roots`, with no other Chaz process using the login:
 
 | Command                   | Effect                                                                                   |

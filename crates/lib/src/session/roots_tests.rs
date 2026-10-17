@@ -40,6 +40,11 @@ async fn assert_no_roots_created(user: &AccountSession) {
 #[tokio::test]
 async fn designated_writer_initializes_once_then_reopens_by_reference() {
     let (instance, mut user) = instance().await;
+    // Unnamed application databases are valid and cannot be old named roots.
+    let key = user.get_default_key().unwrap();
+    user.create_database(eidetica::crdt::Doc::new(), &key)
+        .await
+        .unwrap();
     let first = roots::open(&mut user, RootSetup::Initialize).await.unwrap();
     assert_eq!(
         roots::referenced(&user, RootKind::Group).await.unwrap(),
@@ -381,14 +386,22 @@ async fn another_installations_peer_reference_never_selects_this_peer() {
 /// contrast, opens every tracked database.
 #[tokio::test]
 async fn root_lookup_is_independent_of_unrelated_tracked_databases() {
-    const ACCOUNT_HISTORY: &str = "get_verification_status";
     let probe = BackendProbe::default();
-    let (instance, mut user) = Instance::create_backend(
+    let (instance, user) = Instance::create_backend(
         Box::new(CountingBackend::new(InMemory::new(), probe.clone())),
         NewAccount::passwordless("chaz"),
     )
     .await
     .unwrap();
+    assert_bounded_lookup(&instance, user, &probe).await;
+}
+
+async fn assert_bounded_lookup(
+    instance: &Instance,
+    mut user: AccountSession,
+    probe: &BackendProbe,
+) {
+    const ACCOUNT_HISTORY: &str = "get_verification_status";
     let initialized = roots::open(&mut user, RootSetup::Initialize).await.unwrap();
     let expected_trees: std::collections::BTreeSet<ID> = [
         user.account().id().clone(),
@@ -410,7 +423,7 @@ async fn root_lookup_is_independent_of_unrelated_tracked_databases() {
                     .clone(),
             );
         }
-        let mut restarted = relogin(&instance).await;
+        let mut restarted = relogin(instance).await;
         // Warm derived store state so each window measures a steady read.
         roots::open(&mut restarted, RootSetup::RequireExisting)
             .await
@@ -420,7 +433,10 @@ async fn root_lookup_is_independent_of_unrelated_tracked_databases() {
         let opened = roots::open(&mut restarted, RootSetup::RequireExisting)
             .await
             .unwrap();
-        let (lookup_ops, trees) = probe.stop();
+        let (lookup_ops, mut trees) = probe.stop();
+        // RemoteBackend::get uses an empty request-root sentinel; the service
+        // authorizes the actual owning tree after fetching the entry.
+        trees.remove(&ID::default());
         let mut methods = probe.methods();
         assert_eq!(opened.group.root_id(), initialized.group.root_id());
         assert_eq!(opened.peer.root_id(), initialized.peer.root_id());
@@ -453,7 +469,13 @@ async fn service_client_opens_owner_initialized_roots() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     let socket = dir.path().join("service.sock");
-    let (owner, _) = instance().await;
+    let probe = BackendProbe::default();
+    let (owner, _) = Instance::create_backend(
+        Box::new(CountingBackend::new(InMemory::new(), probe.clone())),
+        NewAccount::passwordless("chaz"),
+    )
+    .await
+    .unwrap();
     let server = ServiceServer::bind(owner.clone(), &socket).await.unwrap();
     let (shutdown, receiver) = tokio::sync::watch::channel(());
     let task = tokio::spawn(server.run(receiver));
@@ -487,7 +509,270 @@ async fn service_client_opens_owner_initialized_roots() {
     assert_eq!(opened.peer.root_id(), initialized.peer.root_id());
     assert_eq!(late.login_id(), local.login_id());
 
-    drop((early, late, client));
+    // Count actual owner backend operations reached through the Unix service,
+    // not just a second execution of the embedded reference code.
+    assert_bounded_lookup(&client, late, &probe).await;
+
+    // A held mapping without target data is pending, not an absent reference.
+    let mut pending = relogin(&client).await;
+    let absent = ID::from_bytes("not-yet-synced");
+    let key = pending.get_default_key().unwrap();
+    pending
+        .map_key(&key, &absent, eidetica::auth::SigKey::from_pubkey(&key))
+        .await
+        .unwrap();
+    pending
+        .set_reference(REFERENCE_NAMESPACE, "group", &absent)
+        .await
+        .unwrap();
+    let before = owner
+        .backend()
+        .local_engine()
+        .unwrap()
+        .all_roots()
+        .await
+        .unwrap();
+    assert!(
+        matches!(roots::open(&mut pending, RootSetup::Initialize).await,
+        Err(RootsError::Unavailable { source: eidetica::Error::Account(e), .. })
+            if matches!(e.as_ref(), eidetica::account::AccountError::DatabaseAccessPending { .. }))
+    );
+    assert_eq!(
+        roots::referenced(&pending, RootKind::Group).await.unwrap(),
+        Some(absent)
+    );
+    assert_eq!(
+        owner
+            .backend()
+            .local_engine()
+            .unwrap()
+            .all_roots()
+            .await
+            .unwrap(),
+        before
+    );
+
+    // A mapping to a held key that the target does not authorize is denied
+    // by the real service, rather than mistaken for pending bootstrap.
+    local
+        .admin()
+        .await
+        .unwrap()
+        .create_account(NewAccount::passwordless("stranger"))
+        .await
+        .unwrap();
+    let mut stranger = owner.login_account("stranger", None).await.unwrap();
+    let private = named(&mut stranger, "private").await.root_id().clone();
+    pending
+        .map_key(&key, &private, eidetica::auth::SigKey::from_pubkey(&key))
+        .await
+        .unwrap();
+    pending
+        .set_reference(REFERENCE_NAMESPACE, "group", &private)
+        .await
+        .unwrap();
+    let before = owner
+        .backend()
+        .local_engine()
+        .unwrap()
+        .all_roots()
+        .await
+        .unwrap();
+    let error = roots::open(&mut pending, RootSetup::Initialize)
+        .await
+        .err()
+        .unwrap();
+    assert!(
+        matches!(&error, RootsError::Unavailable { source: eidetica::Error::Io(e), .. }
+        if e.to_string().contains("PermissionDenied")),
+        "{error}"
+    );
+    assert_eq!(
+        roots::referenced(&pending, RootKind::Group).await.unwrap(),
+        Some(private)
+    );
+    assert_eq!(
+        owner
+            .backend()
+            .local_engine()
+            .unwrap()
+            .all_roots()
+            .await
+            .unwrap(),
+        before
+    );
+
     shutdown.send(()).unwrap();
     task.await.unwrap().unwrap();
+    // A disconnected transport is an error even when initialization is allowed.
+    let error = roots::open(&mut pending, RootSetup::Initialize)
+        .await
+        .err()
+        .unwrap();
+    assert!(
+        matches!(
+            error,
+            RootsError::Unavailable {
+                source: eidetica::Error::Io(_),
+                ..
+            }
+        ),
+        "{error}"
+    );
+    assert_eq!(
+        owner
+            .backend()
+            .local_engine()
+            .unwrap()
+            .all_roots()
+            .await
+            .unwrap(),
+        before
+    );
+    drop((early, pending, client));
+}
+
+#[tokio::test]
+async fn initialization_stops_when_a_tracked_root_cannot_be_inspected() {
+    let probe = BackendProbe::default();
+    let (_instance, mut user) = Instance::create_backend(
+        Box::new(CountingBackend::new(InMemory::new(), probe.clone())),
+        NewAccount::passwordless("chaz"),
+    )
+    .await
+    .unwrap();
+    let group = named(&mut user, "chaz_group").await.root_id().clone();
+    probe.fail_get(Some(group.clone()));
+    let error = roots::open(&mut user, RootSetup::Initialize)
+        .await
+        .err()
+        .unwrap();
+    assert!(
+        matches!(&error, RootsError::Inspect { id, .. } if id == &group),
+        "{error}"
+    );
+    assert!(error.to_string().contains(&group.to_string()));
+    probe.fail_get(None);
+    assert_eq!(tracked_named(&user, "chaz_group").await, vec![group]);
+    assert!(tracked_named(&user, "chaz_peer").await.is_empty());
+    assert_eq!(
+        roots::referenced(&user, RootKind::Group).await.unwrap(),
+        None
+    );
+}
+
+#[tokio::test]
+async fn failed_reference_write_reports_created_id_and_retry_requires_repair() {
+    let probe = BackendProbe::default();
+    let (instance, mut user) = Instance::create_backend(
+        Box::new(CountingBackend::new(InMemory::new(), probe.clone())),
+        NewAccount::passwordless("chaz"),
+    )
+    .await
+    .unwrap();
+    // Root creation's tracking write succeeds; publication of its reference fails.
+    probe.fail_put(user.account().id().clone(), 1);
+    let error = roots::open(&mut user, RootSetup::Initialize)
+        .await
+        .err()
+        .unwrap();
+    let id = match &error {
+        RootsError::PartialInitialization {
+            kind: RootKind::Group,
+            id,
+            ..
+        } => id.clone(),
+        other => panic!("expected partial initialization, got {other}"),
+    };
+    assert!(
+        error
+            .to_string()
+            .contains(&format!("chaz roots --group {id}")),
+        "{error}"
+    );
+    let mut restarted = relogin(&instance).await;
+    assert!(
+        matches!(roots::open(&mut restarted, RootSetup::Initialize).await,
+        Err(RootsError::Unreferenced { found }) if found == vec![(RootKind::Group, vec![id.clone()])])
+    );
+    assert_eq!(
+        tracked_named(&restarted, "chaz_group").await,
+        vec![id.clone()]
+    );
+    roots::record(&restarted, RootKind::Group, &id)
+        .await
+        .unwrap();
+    let opened = roots::open(&mut restarted, RootSetup::Initialize)
+        .await
+        .unwrap();
+    assert_eq!(opened.group.root_id(), &id);
+}
+
+#[tokio::test]
+async fn creation_tracking_failure_must_not_leave_an_undiscoverable_root() {
+    let probe = BackendProbe::default();
+    let (instance, mut user) = Instance::create_backend(
+        Box::new(CountingBackend::new(InMemory::new(), probe.clone())),
+        NewAccount::passwordless("chaz"),
+    )
+    .await
+    .unwrap();
+    let before = instance
+        .backend()
+        .local_engine()
+        .unwrap()
+        .all_roots()
+        .await
+        .unwrap();
+    probe.fail_put(user.account().id().clone(), 0);
+    let error = roots::open(&mut user, RootSetup::Initialize)
+        .await
+        .err()
+        .unwrap();
+    let after = instance
+        .backend()
+        .local_engine()
+        .unwrap()
+        .all_roots()
+        .await
+        .unwrap();
+    let orphan: Vec<_> = after
+        .iter()
+        .filter(|id| !before.contains(id))
+        .cloned()
+        .collect();
+    eprintln!(
+        "creation failure: {error}; orphan roots: {orphan:?}; tracked roots: {:?}",
+        user.databases().await.unwrap()
+    );
+    let mut restarted = relogin(&instance).await;
+    let retry = roots::open(&mut restarted, RootSetup::Initialize)
+        .await
+        .map(|roots| (roots.group.root_id().clone(), roots.peer.root_id().clone()));
+    eprintln!("retry result: {retry:?}");
+    // Rollback is fine. If creation persisted, the error must identify the
+    // existing target and retry must refuse to create anything else.
+    for id in &orphan {
+        assert!(
+            error.to_string().contains(&id.to_string()),
+            "partial creation must report committed root {id} for explicit repair: {error}"
+        );
+    }
+    if !orphan.is_empty() {
+        assert!(
+            retry.is_err(),
+            "retry must require explicit repair: {retry:?}"
+        );
+        let mut after_retry = instance
+            .backend()
+            .local_engine()
+            .unwrap()
+            .all_roots()
+            .await
+            .unwrap();
+        let mut after = after;
+        after_retry.sort();
+        after.sort();
+        assert_eq!(after_retry, after, "retry created additional roots");
+    }
 }

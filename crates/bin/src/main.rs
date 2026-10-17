@@ -487,10 +487,7 @@ async fn supervise_daemon_service(
     .await
 }
 
-/// `chaz usage` — open the eidetica DB read-only, walk the user-central
-/// session catalog, aggregate deduplicated call evidence and legacy summaries, print either
-/// human-readable text or JSON, then exit. Skips all bridge/sync/scheduler
-/// setup since we never serve a session here.
+/// Show or explicitly record bookkeeping-root IDs without starting the runtime.
 async fn run_roots_subcommand(args: RootsArgs, config: &Config) -> anyhow::Result<()> {
     use session::roots::{self, RootKind};
     let requested = [(RootKind::Group, args.group), (RootKind::Peer, args.peer)]
@@ -522,6 +519,8 @@ async fn run_roots_subcommand(args: RootsArgs, config: &Config) -> anyhow::Resul
     Ok(())
 }
 
+/// Aggregate deduplicated call evidence and legacy summaries from the session
+/// catalog, then print the rollup without bridge, sync or scheduler setup.
 async fn run_usage_subcommand(args: UsageArgs, config: &Config) -> anyhow::Result<()> {
     let bridge_filter = match args.bridge.as_deref() {
         Some(s) => Some(session::BridgeKind::from_filter_str(s).ok_or_else(|| {

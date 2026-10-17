@@ -22,7 +22,8 @@ pub(crate) struct BackendProbe {
     operations: Arc<AtomicUsize>,
     trees: Arc<Mutex<BTreeSet<ID>>>,
     methods: Arc<Mutex<BTreeMap<&'static str, usize>>>,
-    current: Arc<Mutex<Option<ID>>>,
+    fail_get: Arc<Mutex<Option<ID>>>,
+    fail_put: Arc<Mutex<Option<(ID, usize)>>>,
 }
 
 impl BackendProbe {
@@ -46,6 +47,16 @@ impl BackendProbe {
     /// Per-method operation counts in the last window.
     pub(crate) fn methods(&self) -> BTreeMap<&'static str, usize> {
         self.methods.lock().unwrap().clone()
+    }
+
+    /// Fail reads of one entry until cleared.
+    pub(crate) fn fail_get(&self, id: Option<ID>) {
+        *self.fail_get.lock().unwrap() = id;
+    }
+
+    /// Fail one write to a tree after `skip` matching writes succeed.
+    pub(crate) fn fail_put(&self, tree: ID, skip: usize) {
+        *self.fail_put.lock().unwrap() = Some((tree, skip));
     }
 
     fn op(&self, method: &'static str) {
@@ -148,6 +159,12 @@ impl<B: BackendImpl> BackendImpl for CountingBackend<B> {
 
     async fn get(&self, id: &ID) -> Result<Entry> {
         self.probe.op("get");
+        if self.probe.fail_get.lock().unwrap().as_ref() == Some(id) {
+            return Err(eidetica::backend::BackendError::StateInconsistency {
+                reason: "injected root read failure".into(),
+            }
+            .into());
+        }
         let entry = self.inner.get(id).await?;
         self.probe.entry(&entry);
         Ok(entry)
@@ -161,6 +178,21 @@ impl<B: BackendImpl> BackendImpl for CountingBackend<B> {
     async fn put(&self, entry: Entry) -> Result<()> {
         self.probe.op("put");
         self.probe.entry(&entry);
+        {
+            let mut failure = self.probe.fail_put.lock().unwrap();
+            if let Some((tree, skip)) = failure.as_mut()
+                && entry.root().as_ref() == Some(tree)
+            {
+                if *skip == 0 {
+                    *failure = None;
+                    return Err(eidetica::backend::BackendError::StateInconsistency {
+                        reason: "injected root write failure".into(),
+                    }
+                    .into());
+                }
+                *skip -= 1;
+            }
+        }
         self.inner.put(entry).await
     }
 

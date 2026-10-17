@@ -48,6 +48,7 @@ pub struct NewSessionEvent {
 /// - `schedule_state`      (Table)     — scheduler last_run state
 pub struct SessionRegistry {
     pub(super) instance: eidetica::Instance,
+    /// AccountSession for creating new session databases (behind Mutex since create_database needs &mut)
     pub(super) user: Arc<Mutex<eidetica::AccountSession>>,
     /// Group-level routing/metadata DB for this chaz instance.
     pub(super) chaz_group: Database,
