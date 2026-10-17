@@ -38,13 +38,18 @@ jobs:
             -f '.#checks.x86_64-linux.lint'
           nix-fast-build --skip-cached --no-nom --no-link \
             -f '.#checks.x86_64-linux.treefmt'
+          nix-fast-build --skip-cached --no-nom --no-link \
+            -f '.#checks.x86_64-linux.ci-policy'
 
       - name: Test
         run: |
           nix-fast-build --skip-cached --no-nom --no-link \
             -f '.#checks.x86_64-linux.test'
 
+      # Rustdoc is full coverage only. Pull requests and the merge queue keep
+      # lint, format, cargo test (doctests included) and the build.
       - name: Doc
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
         run: |
           nix-fast-build --skip-cached --no-nom --no-link \
             -f '.#checks.x86_64-linux.doc'
@@ -58,16 +63,18 @@ jobs:
   # pulls Synapse into the closure and stands up four processes, neither of which
   # the fast checks should wait on. Needs no secrets — the homeserver, the
   # accounts, and the model are all throwaway and local to the runner.
+  #
+  # Full coverage only: it runs for pushes to main and for a manual dispatch on
+  # any branch, and reports as skipped on pull requests and the merge queue.
   e2e:
     name: Matrix E2E
     runs-on: ubicloud-standard-8
     # Fenced to the upstream repository, whose runner label this is: a fork
     # running its own copy of this workflow would queue forever rather than
-    # fail. A pull request from a fork still schedules the job, because the
-    # check reads the owner of the base repository — which is fine, since
-    # `pull_request` hands fork code a read-only token and this job reads no
-    # secret.
-    if: github.repository_owner == 'arcuru'
+    # fail.
+    if: |
+      github.repository_owner == 'arcuru' &&
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
     # The two steps below budget 30 minutes between them. The rest is headroom
     # for the checkout, the nix installer, and pulling the Synapse closure.
     timeout-minutes: 45

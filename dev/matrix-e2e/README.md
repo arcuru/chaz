@@ -16,7 +16,10 @@ start.
 
 CI runs the default `http` transport as the `Matrix E2E` job in
 `.github/workflows/ci.yml`, separate from the fast checks because it pulls
-Synapse into the closure. It needs no secrets.
+Synapse into the closure. It needs no secrets. The job runs on every push to
+`main` and on a manual `workflow_dispatch` of CI for any branch; pull requests
+and the merge queue report it as skipped, so run `just e2e` locally, or
+dispatch CI on the branch, before merging a bridge or sync change.
 
 ## What it covers
 
