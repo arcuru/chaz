@@ -1458,6 +1458,12 @@ log "true reset: reject, leave and forget"
     fail "true-reset execute failed"
 grep -qF 'summary: rejected 1, left 1, failed 0, forgot 2, forget-failed 0' "$WORKSPACE/true-reset-execute.log" ||
     fail "true-reset summary did not confirm both rooms were handled"
+# Initial /sync responses are cached per device. Use a fresh observer so the
+# post-reset check cannot replay the preview's pre-reset invite snapshot.
+AGENT_TOKEN="$(mx POST /_matrix/client/v3/login "" "$(jq -nc \
+    --arg u "$AGENT_MXID" --arg p "$AGENT_PASSWORD" \
+    '{type:"m.login.password",identifier:{type:"m.id.user",user:$u},password:$p}')" |
+    jq -er '.access_token // empty')" || fail "could not log in the reset observer"
 mx GET /_matrix/client/v3/joined_rooms "$AGENT_TOKEN" | jq -e '.joined_rooms == []' >/dev/null ||
     fail "true reset left joined rooms"
 mx GET '/_matrix/client/v3/sync?timeout=0' "$AGENT_TOKEN" |
