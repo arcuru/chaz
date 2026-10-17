@@ -3081,6 +3081,28 @@ mod tests {
             .unwrap();
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].id, new_id);
+
+        let summary_id = legacy
+            .add_entry(SessionEntry {
+                entry_type: EntryType::Summary,
+                ..entry_at("user", -1, None)
+            })
+            .await
+            .unwrap();
+        // Compaction must not resurrect baseline history as queued requests.
+        let view = legacy
+            .turn_context_view_at(db.snapshot().await.unwrap(), &new_id, |_| false)
+            .await
+            .unwrap();
+        let boundary = view
+            .entry_ids
+            .iter()
+            .position(|id| id.as_ref() == Some(&summary_id))
+            .unwrap();
+        assert_eq!(
+            &view.entry_ids[boundary..],
+            &[Some(summary_id), Some(new_id)]
+        );
     }
 
     #[tokio::test]

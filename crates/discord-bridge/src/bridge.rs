@@ -992,17 +992,11 @@ mod tests {
 
     #[tokio::test]
     async fn a_reqwest_request_timeout_is_transient() {
-        // A stalled response is a request timeout, not a connect failure.
-        // Generate a real error, then wrap it in the SDK's transport variant.
+        // TCP can connect to the listener, but no HTTP response will arrive.
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind");
         let addr = listener.local_addr().expect("local address");
-        // Hold the accepted connection open without ever responding.
-        tokio::spawn(async move {
-            let (_socket, _) = listener.accept().await.expect("accept");
-            std::future::pending::<()>().await;
-        });
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_millis(100))
             .build()
@@ -1023,25 +1017,25 @@ mod tests {
 
     #[tokio::test]
     async fn other_reqwest_transport_errors_stay_permanent() {
-        // A denied redirect is a real transport-level `reqwest::Error` that is
-        // neither a connect failure nor a request timeout. It must stay
-        // permanent so the retry budget is spent only on failures a bounded
-        // retry can actually fix.
+        // Redirect-policy failures must not consume the transient retry budget.
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind");
         let addr = listener.local_addr().expect("local address");
-        tokio::spawn(serve_redirect(listener));
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(5))
             .redirect(reqwest::redirect::Policy::limited(0))
             .build()
             .expect("test client");
-        let error = client
-            .get(format!("http://{addr}/"))
-            .send()
-            .await
-            .expect_err("a denied redirect must fail the request");
+        let (response, ()) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::join!(
+                client.get(format!("http://{addr}/")).send(),
+                serve_redirect(listener)
+            )
+        })
+        .await
+        .expect("loopback redirect exchange must finish");
+        let error = response.expect_err("a denied redirect must fail the request");
         assert!(
             error.is_redirect(),
             "expected a redirect error, got: {error:?}"
@@ -1050,11 +1044,7 @@ mod tests {
         assert!(!is_transient_discord_send_error(&error));
     }
 
-    /// Serve one canned `302 Found` with a `Location` header, then close.
-    ///
-    /// reqwest follows redirects by default, so a client configured to deny
-    /// them fails this real request with a `reqwest::Error` whose kind is
-    /// neither connect nor timeout.
+    /// Serve one redirect for the permanent-error check.
     async fn serve_redirect(listener: tokio::net::TcpListener) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let (mut socket, _) = listener.accept().await.expect("accept");
