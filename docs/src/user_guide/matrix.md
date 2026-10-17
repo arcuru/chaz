@@ -192,6 +192,52 @@ run: forget behavior varies by server — those that already forget on leave
 and forget support outside Synapse is unverified. The exit code reflects the
 membership operations only.
 
+#### Walkthrough: resetting a bot account
+
+1. Stop the `chaz-matrix` bridge process so its auto-joiner cannot race the
+   reset.
+2. Preview. Nothing changes, and invites are listed before joined rooms:
+
+   ```text
+   $ chaz-matrix --config matrix-bridge.yaml rooms leave-all --reset
+   config: matrix-bridge.yaml
+   login: @chaz:example
+   agent: chaz
+   account: @chaz:example
+   homeserver: https://matrix.example
+   mode: dry-run (reset)
+   pending invite !invited:example
+   joined !general:example
+   joined !ops:example
+   1 pending invite(s) to reject, 2 joined room(s) to leave and forget; nothing was changed (dry-run)
+   re-run `rooms leave-all --execute --reset` for a true reset (stop the bridge first)
+   ```
+
+3. Execute. Each invite is rejected, then each joined room is left, and every
+   successful leave is followed by a forget. Here one leave keeps failing after
+   all its retries, and the server refuses one forget:
+
+   ```text
+   $ chaz-matrix --config matrix-bridge.yaml rooms leave-all --reset --execute
+   ...
+   mode: execute (reset: reject invites, forget after leave) (retries=3, delay=250ms)
+   rejected invite !invited:example
+   forgot !invited:example
+   left !general:example
+   warning: forget failed for !general:example (3 attempts): ...
+   FAILED !ops:example (3 attempts): ...
+   summary: rejected 1, left 1, failed 1, forgot 1, forget-failed 1
+   $ echo $?
+   1
+   ```
+
+4. Recover by re-running the same command. The new run enumerates only what is
+   still joined or invited, so `!ops:example` is retried and the rooms already
+   handled are not touched again. A room whose forget failed is already left and
+   does not reappear, so this command will not retry its forget; its history
+   stays readable to the account until it is forgotten some other way.
+5. Start the bridge again once a run exits `0`.
+
 Exit codes: `0` for a successful run, an empty room list, or a dry-run; `1`
 when one or more rooms failed to leave or invites failed to reject; `2` for a
 setup failure — no or ambiguous login, an unresolved password, a failed login,

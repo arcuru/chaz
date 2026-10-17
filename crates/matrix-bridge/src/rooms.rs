@@ -15,10 +15,13 @@
 //! history access. The bridge's invite auto-joiner will rejoin any invite it
 //! sees, so the bridge must be stopped for the duration of a reset run.
 //!
-//! This path must stay crypto-free: the throwaway login never enables
-//! encryption or uploads keys, which is what keeps the ephemeral device
-//! invisible to other clients' device lists. Do not add a crypto store or
-//! cross-signing here, even once the bridge itself gains E2EE.
+//! This path must stay crypto-free. The throwaway login shares the bridge's
+//! E2EE-capable client builder, but its crypto store lives in the throwaway
+//! state dir and nothing here ever publishes key material: requests go through
+//! raw `Client::send` rather than an SDK sync (which would upload device and
+//! one-time keys), and cross-signing is never bootstrapped. That is what keeps
+//! the ephemeral device invisible to other clients' device lists. Do not add an
+//! SDK sync, key upload, or cross-signing here.
 
 use std::io::Write;
 use std::path::Path;
@@ -936,6 +939,133 @@ mod tests {
         let mut ep = fake_reset(vec!["!a:example".into()], vec!["!inv:example".into()]);
         let (_, out) = run(&reset_exec_cfg(), &secret, &mut ep).await;
         assert!(!out.contains("<sentinel-secret>"), "output: {out}");
+    }
+
+    /// Drive the real `run_rooms` path — throwaway login, enumeration, reset,
+    /// logout — against a mock homeserver. The rooms login shares the bridge's
+    /// E2EE-capable client builder, so this pins down that a reset run still
+    /// publishes no device, one-time, or cross-signing keys, syncs with
+    /// offline presence, rejects the invite and leaves the joined room each
+    /// before forgetting it, and logs the throwaway device out.
+    #[tokio::test]
+    async fn reset_run_against_a_homeserver_uploads_no_keys_and_forgets_after_leave() {
+        use wiremock::matchers::{method, path, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let ok = |body: serde_json::Value| ResponseTemplate::new(200).set_body_json(body);
+        Mock::given(method("GET"))
+            .and(path("/_matrix/client/versions"))
+            .respond_with(ok(serde_json::json!({ "versions": ["v1.11"] })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/_matrix/client/v3/login"))
+            .respond_with(ok(serde_json::json!({
+                "user_id": "@chaz:example",
+                "access_token": "disposable",
+                "device_id": "THROWAWAY"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/_matrix/client/v3/joined_rooms"))
+            .respond_with(ok(
+                serde_json::json!({ "joined_rooms": ["!joined:example"] }),
+            ))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/_matrix/client/v3/sync"))
+            .respond_with(ok(serde_json::json!({
+                "next_batch": "s1",
+                "rooms": { "invite": { "!invited:example": { "invite_state": { "events": [] } } } }
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(
+                r"^/_matrix/client/v3/rooms/[^/]+/(leave|forget)$",
+            ))
+            .respond_with(ok(serde_json::json!({})))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/_matrix/client/v3/logout"))
+            .respond_with(ok(serde_json::json!({})))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let bridge_state = tempfile::tempdir().unwrap();
+        let cfg: MatrixBridgeConfig = serde_yaml::from_str(&format!(
+            r#"
+state_dir: {}
+unlock_password: fixture-unlock
+logins:
+  - agent: chaz
+    type: matrix
+    homeserver_url: {}
+    username: "@chaz:example"
+    password: fixture-password
+"#,
+            bridge_state.path().display(),
+            server.uri()
+        ))
+        .unwrap();
+
+        let code = run_rooms(Path::new("/tmp/bridge.yaml"), &cfg, None, true, true, 1, 0).await;
+        assert_eq!(code, 0);
+
+        let requests = server.received_requests().await.unwrap();
+        let calls: Vec<String> = requests
+            .iter()
+            .map(|r| {
+                let p = r.url.path();
+                format!("{} {}", r.method, p.replace("%21", "!").replace("%3A", ":"))
+            })
+            .collect();
+        assert!(
+            !calls.iter().any(|c| c.contains("/keys/upload")
+                || c.contains("/keys/device_signing/upload")
+                || c.contains("/keys/signatures/upload")
+                || (c.starts_with("PUT") && c.contains("/room_keys/"))),
+            "a rooms run must not publish key material: {calls:?}"
+        );
+
+        let sync = requests
+            .iter()
+            .find(|r| r.url.path() == "/_matrix/client/v3/sync")
+            .expect("reset enumerates invites with one sync");
+        assert!(
+            sync.url
+                .query_pairs()
+                .any(|(k, v)| k == "set_presence" && v == "offline"),
+            "sync must not flip presence online: {}",
+            sync.url
+        );
+
+        let membership: Vec<&String> = calls
+            .iter()
+            .filter(|c| c.ends_with("/leave") || c.ends_with("/forget"))
+            .collect();
+        assert_eq!(
+            membership,
+            [
+                "POST /_matrix/client/v3/rooms/!invited:example/leave",
+                "POST /_matrix/client/v3/rooms/!invited:example/forget",
+                "POST /_matrix/client/v3/rooms/!joined:example/leave",
+                "POST /_matrix/client/v3/rooms/!joined:example/forget",
+            ]
+        );
+        assert_eq!(
+            calls.last().map(String::as_str),
+            Some("POST /_matrix/client/v3/logout")
+        );
+
+        // The bridge's own state dir is never used for the throwaway device.
+        assert_eq!(std::fs::read_dir(bridge_state.path()).unwrap().count(), 0);
     }
 
     #[tokio::test]
