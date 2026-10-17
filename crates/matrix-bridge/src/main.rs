@@ -102,8 +102,8 @@ struct LeaveAllArgs {
     execute: bool,
 
     /// True reset: also reject every pending invite and forget each room
-    /// after leaving it. Stop the bridge first — its invite auto-joiner
-    /// otherwise undoes the reset on the next bridge start.
+    /// after leaving it. Stop the bridge first so its invite auto-joiner
+    /// cannot race the reset.
     #[arg(long)]
     reset: bool,
 

@@ -160,18 +160,23 @@ to tune.
 
 ### True reset: `--reset`
 
-Plain `leave-all` is only a _membership_ reset. Pending invitations survive it,
-left rooms keep their history, and re-entering an invite-only room needs just
-one more invite. Add `--reset` for a true account-level reset — the flag works
-on both the dry-run preview and `--execute`, and closes those gaps in the same
-run:
+Plain `leave-all` leaves joined rooms but keeps pending invitations and access
+to left-room history. Add `--reset` to also reject pending invites and forget
+each successfully left or rejected room. Like plain `leave-all`, it previews
+without changing membership unless you pass `--execute`.
 
-- **Pending invites are rejected.** Leaving a room you are invited to but not
-  joined in rejects the invite, per spec. `--reset` enumerates the invite list
-  (via a one-shot sync) and rejects each one, so no invite survives the run.
-- **Each room is forgotten after leaving it.** Forget drops the account's
-  history access to the room; once every local user has forgotten a room it
-  becomes eligible for deletion from the homeserver.
+| Flag           | Effect                                                                                                       |
+| -------------- | ------------------------------------------------------------------------------------------------------------ |
+| `--reset`      | Include pending invites in the preview; with `--execute`, reject them and forget each room after leaving it. |
+| `--execute`    | Perform the previewed membership changes, plus forgetting when `--reset` is set.                             |
+| `--retries N`  | Attempt each leave or forget up to N times (default 3, range 1–10).                                          |
+| `--delay-ms N` | Wait N milliseconds between rooms (default 250, range 100–60000).                                            |
+
+Leaving an invited room rejects its invite. Forgetting a left room drops this
+account's server-side history access; it does not erase other users' copies,
+local history, or the bridge's Chaz sessions. The command handles only rooms
+joined or invited at enumeration time, not rooms left by an earlier run. A new
+invite can still join the account to the room after the bridge restarts.
 
 ```bash
 chaz-matrix --config matrix-bridge.yaml rooms leave-all --reset            # preview
@@ -236,7 +241,8 @@ membership operations only.
    handled are not touched again. A room whose forget failed is already left and
    does not reappear, so this command will not retry its forget; its history
    stays readable to the account until it is forgotten some other way.
-5. Start the bridge again once a run exits `0`.
+5. Check the summary and any forget warnings before restarting the bridge.
+   Exit `0` means membership changes succeeded, not that every forget succeeded.
 
 Exit codes: `0` for a successful run, an empty room list, or a dry-run; `1`
 when one or more rooms failed to leave or invites failed to reject; `2` for a

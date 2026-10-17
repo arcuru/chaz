@@ -403,24 +403,17 @@ async fn run_reset<E: RoomEndpoint>(
         }
         Mode::Execute => {
             let mut stats = ExecuteStats::default();
-            // Invites first: each rejection is one less invite the bridge's
-            // auto-joiner could act on if it were started mid-reset.
-            let mut first_target = true;
-            if cfg.reset {
-                for invite in &invites {
-                    if !first_target {
-                        sleep(cfg.inter_room_delay).await;
-                    }
-                    first_target = false;
-                    execute_target(endpoint, cfg, invite, Target::Invited, out, &mut stats).await;
-                }
-            }
-            for room in &rooms {
-                if !first_target {
+            // Reject invites before leaving joined rooms. Plain leave-all
+            // never enumerates invites, so its first iterator is empty.
+            let targets = invites
+                .iter()
+                .map(|room| (room, Target::Invited))
+                .chain(rooms.iter().map(|room| (room, Target::Joined)));
+            for (i, (room, target)) in targets.enumerate() {
+                if i > 0 {
                     sleep(cfg.inter_room_delay).await;
                 }
-                first_target = false;
-                execute_target(endpoint, cfg, room, Target::Joined, out, &mut stats).await;
+                execute_target(endpoint, cfg, room, target, out, &mut stats).await;
             }
             if cfg.reset {
                 let _ = writeln!(
@@ -570,30 +563,21 @@ mod tests {
     fn exec_cfg() -> EngineConfig {
         EngineConfig {
             mode: Mode::Execute,
-            reset: false,
-            retries: 3,
-            retry_backoff: Duration::ZERO,
-            inter_room_delay: Duration::ZERO,
+            ..dry_cfg()
         }
     }
 
     fn reset_dry_cfg() -> EngineConfig {
         EngineConfig {
-            mode: Mode::DryRun,
             reset: true,
-            retries: 3,
-            retry_backoff: Duration::ZERO,
-            inter_room_delay: Duration::ZERO,
+            ..dry_cfg()
         }
     }
 
     fn reset_exec_cfg() -> EngineConfig {
         EngineConfig {
-            mode: Mode::Execute,
             reset: true,
-            retries: 3,
-            retry_backoff: Duration::ZERO,
-            inter_room_delay: Duration::ZERO,
+            ..exec_cfg()
         }
     }
 
@@ -829,25 +813,27 @@ mod tests {
     #[tokio::test]
     async fn reset_execute_continues_past_failures() {
         let mut ep = fake_reset(
-            vec!["!a:example".into(), "!bad:example".into()],
-            vec!["!inv:example".into()],
+            vec!["!bad:example".into(), "!z:example".into()],
+            vec!["!i-bad:example".into(), "!i-ok:example".into()],
         );
         ep.always_fail.insert("!bad:example".into());
+        ep.always_fail.insert("!i-bad:example".into());
         let (code, out) = run(&reset_exec_cfg(), &creds(), &mut ep).await;
         assert_eq!(code, 1);
         assert!(out.contains("FAILED !bad:example"), "output: {out}");
+        assert!(out.contains("FAILED !i-bad:example"), "output: {out}");
         assert!(
-            out.contains("rejected invite !inv:example"),
+            out.contains("rejected invite !i-ok:example"),
             "output: {out}"
         );
-        assert!(out.contains("left !a:example"), "output: {out}");
-        // A room whose leave failed is never forgotten (spec requires leaving
-        // first); the others are.
-        assert_eq!(ep.forget_attempts.len(), 2);
-        assert_eq!(ep.rooms, vec!["!bad:example".to_string()]);
-        assert!(ep.invited.is_empty());
+        assert!(out.contains("left !z:example"), "output: {out}");
+        // Both kinds of failed leave are skipped for forgetting, and neither
+        // stops the next target from being handled.
+        assert_eq!(ep.forget_attempts, vec!["!i-ok:example", "!z:example"]);
+        assert_eq!(ep.rooms, vec!["!bad:example"]);
+        assert_eq!(ep.invited, vec!["!i-bad:example"]);
         assert!(
-            out.contains("summary: rejected 1, left 1, failed 1, forgot 2, forget-failed 0"),
+            out.contains("summary: rejected 1, left 1, failed 2, forgot 2, forget-failed 0"),
             "output: {out}"
         );
     }
