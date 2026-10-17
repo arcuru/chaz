@@ -2,7 +2,7 @@
 use super::*;
 use chaz_core::server::{BuildOptions, BuiltServer, McpReadiness};
 use eidetica::{
-    Instance, NewUser,
+    Instance, NewAccount,
     backend::{
         BackendImpl, InstanceMetadata, InstanceSecrets, RecordMutations, RecordPage, RecordRange,
         RecordView, StagingToken, StoreStateRequest, VerificationStatus, database::InMemory,
@@ -210,7 +210,7 @@ async fn runtime(dir: &std::path::Path, probe: Arc<Probe>) -> BuiltServer {
             inner: InMemory::new(),
             probe,
         }),
-        NewUser::passwordless("session-readiness"),
+        NewAccount::passwordless("session-readiness"),
     )
     .await
     .unwrap();
@@ -317,7 +317,7 @@ async fn new_session_preempts_a_blocked_historical_open_without_history_growth()
         let mut app = App::hub(HashSet::new());
         apply_session_catalog(&mut app, indices.clone());
         // The same production metadata loader enters the real open_session I/O,
-        // while holding the User mutex that create_session will need.
+        // while holding the account-session mutex that create_session will need.
         *probe.blocked.lock().unwrap() = Some(ID::parse(&blocked).unwrap());
         let (tx, mut rx) = mpsc::channel(128);
         let registry = server.registry_arc();

@@ -8,7 +8,7 @@ use crate::session::{Session, SessionRegistry};
 use crate::tool::{ScopedTools, ToolContext, ToolProfile, ToolRegistry};
 use crate::types::ConversationId;
 use eidetica::backend::database::InMemory;
-use eidetica::{Instance, NewUser};
+use eidetica::{Instance, NewAccount};
 use std::sync::Arc;
 use tokio::sync::Mutex as TokioMutex;
 
@@ -24,7 +24,7 @@ async fn fixture(
 ) {
     let backend = InMemory::new();
     let (instance, user) =
-        Instance::create_backend(Box::new(backend), NewUser::passwordless("test"))
+        Instance::create_backend(Box::new(backend), NewAccount::passwordless("test"))
             .await
             .unwrap();
     let agents_reg = Arc::new(AgentRegistry::with_default_agent());

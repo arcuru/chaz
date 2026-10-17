@@ -131,12 +131,12 @@ mod tests {
     use crate::agent::AgentRegistry;
     use crate::agent_db::{AgentDbConfig, AgentMeta, create_agent_db};
     use eidetica::backend::database::InMemory;
-    use eidetica::{Instance, NewUser};
+    use eidetica::{Instance, NewAccount};
 
     async fn fixture(agent_names: Vec<String>) -> (Arc<SessionRegistry>, HostedIndex) {
         let backend = InMemory::new();
         let (instance, user) =
-            Instance::create_backend(Box::new(backend), NewUser::passwordless("test"))
+            Instance::create_backend(Box::new(backend), NewAccount::passwordless("test"))
                 .await
                 .unwrap();
         let agents_reg = Arc::new(AgentRegistry::with_default_agent());

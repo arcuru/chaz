@@ -8,9 +8,9 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
+use eidetica::AccountSession;
 use eidetica::backend::database::InMemory;
-use eidetica::user::User;
-use eidetica::{Instance, NewUser};
+use eidetica::{Instance, NewAccount};
 use tokio::sync::Mutex as TokioMutex;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -41,9 +41,9 @@ impl RuntimeRecorder for RecordingRuntime {
 }
 
 /// Open a fresh in-memory eidetica instance with one logged-in user.
-pub(crate) async fn fresh_eidetica() -> (Instance, User) {
+pub(crate) async fn fresh_eidetica() -> (Instance, AccountSession) {
     let (instance, user) =
-        Instance::create_backend(Box::new(InMemory::new()), NewUser::passwordless("test"))
+        Instance::create_backend(Box::new(InMemory::new()), NewAccount::passwordless("test"))
             .await
             .unwrap();
     (instance, user)

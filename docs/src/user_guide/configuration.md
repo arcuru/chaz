@@ -10,6 +10,13 @@ requires an explicit Eidetica connection, existing login, and execution role.
 `client` can observe, submit messages, approve requests, and use ordinary data
 commands without executing agent work.
 
+Chaz logs into the configured Eidetica account with `Instance::login_account`
+and keeps the returned `AccountSession`. The upstream API replaces `User` /
+`NewUser` with `AccountSession` / `NewAccount`; the YAML `login` fields and
+stored Chaz data names are unchanged. Database operations still use that
+account's selected per-database key and native identity, not a host-admin fallback.
+This dependency update performs no account or production-state conversion.
+
 Debug output masks password-bearing connection URL userinfo and the values of
 `user`, `password`, and `sslpassword` query parameters. Other query parameters
 and fragments stay visible; the connection string used by Eidetica is unchanged.

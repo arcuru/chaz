@@ -8,7 +8,7 @@
 //! surface without installing those execution facilities.
 //!
 //! The caller opens eidetica (choosing the backend/path) and hands in the
-//! `Instance` + `User`; [`build`] does everything else and returns the wired
+//! `Instance` + `AccountSession`; [`build`] does everything else and returns the wired
 //! [`Server`] plus the handles a bridge needs alongside it ([`BuiltServer`]).
 //! Mode-specific behavior the config can't express is passed via
 //! [`BuildOptions`].
@@ -137,12 +137,12 @@ mod build_options_tests {
 
     #[tokio::test]
     async fn missing_role_cannot_reach_runtime_build() {
-        use eidetica::NewUser;
+        use eidetica::NewAccount;
         use eidetica::backend::database::InMemory;
 
         let (instance, user) = eidetica::Instance::create_backend(
             Box::new(InMemory::new()),
-            NewUser::passwordless("fixture"),
+            NewAccount::passwordless("fixture"),
         )
         .await
         .unwrap();
@@ -364,7 +364,7 @@ impl BuiltServer {
 pub async fn build(
     config: &mut Config,
     instance: eidetica::Instance,
-    mut user: eidetica::user::User,
+    mut user: eidetica::AccountSession,
     opts: BuildOptions,
 ) -> anyhow::Result<BuiltServer> {
     let mut tasks = Vec::new();

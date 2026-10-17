@@ -2607,7 +2607,7 @@ pub fn trailing_agent_message_burst(
 
 /// Find or create a named eidetica database for a user.
 async fn find_or_create_db(
-    user: &mut eidetica::user::User,
+    user: &mut eidetica::AccountSession,
     name: &str,
 ) -> anyhow::Result<Database> {
     match user.find_database(name).await {

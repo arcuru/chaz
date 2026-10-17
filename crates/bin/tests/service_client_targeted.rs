@@ -7,7 +7,7 @@ use chaz_core::hosted_index::DbEntry;
 use chaz_core::session::SessionRegistry;
 use eidetica::backend::database::InMemory;
 use eidetica::service::ServiceServer;
-use eidetica::{Instance, NewUser};
+use eidetica::{Instance, NewAccount};
 use tokio::sync::watch;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -16,7 +16,7 @@ async fn repeated_catalog_commands_do_not_create_sessions_and_agents_stay_sessio
     let socket = dir.path().join("eidetica.sock");
     let (owner, mut user) = Instance::create_backend(
         Box::new(InMemory::new()),
-        NewUser::passwordless("targeted-cli"),
+        NewAccount::passwordless("targeted-cli"),
     )
     .await
     .unwrap();

@@ -68,15 +68,15 @@ impl PromptStore {
 mod tests {
     use super::*;
     use eidetica::backend::database::InMemory;
-    use eidetica::{Instance, NewUser};
+    use eidetica::{Instance, NewAccount};
 
-    // Returns the `Instance`/`User` alongside the DB so callers keep them alive
+    // Returns the `Instance`/`AccountSession` alongside the DB so callers keep them alive
     // — the `Database` borrows the instance backend, which is dropped (and the
     // DB invalidated: "Instance has been dropped") if they fall. Mirrors
     // `model_info_store`'s fixture.
-    async fn fresh_db() -> (Instance, eidetica::user::User, Database) {
+    async fn fresh_db() -> (Instance, eidetica::AccountSession, Database) {
         let (instance, mut user) =
-            Instance::create_backend(Box::new(InMemory::new()), NewUser::passwordless("t"))
+            Instance::create_backend(Box::new(InMemory::new()), NewAccount::passwordless("t"))
                 .await
                 .unwrap();
         let key = user.get_default_key().unwrap();

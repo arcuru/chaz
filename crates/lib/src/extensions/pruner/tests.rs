@@ -531,7 +531,7 @@ async fn pruner_exact_pages_true_sqlite_reopen_and_native_compaction() {
                     .await
                     .unwrap(),
             ),
-            eidetica::NewUser::passwordless("history"),
+            eidetica::NewAccount::passwordless("history"),
         )
         .await
         .unwrap();
@@ -575,7 +575,7 @@ async fn pruner_exact_pages_true_sqlite_reopen_and_native_compaction() {
         // All instance/user/db/session/tool/extension handles leave this scope.
     };
     let instance = Instance::connect(&url).await.unwrap();
-    let user = instance.login_user("history", None).await.unwrap();
+    let user = instance.login_account("history", None).await.unwrap();
     let db = user.open_database(&root).await.unwrap();
     let fx = Fixture::new(db, vec![], vec![grant("context_prune", false)]).await;
     assert_eq!(reference, fx.reference("old-0").await);

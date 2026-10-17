@@ -24,12 +24,12 @@ use crate::grants::Grants;
 use crate::routine::Trigger;
 use crate::routine::types::next_interval_fire;
 use chrono::{DateTime, Utc};
+use eidetica::AccountSession;
 use eidetica::Database;
 use eidetica::auth::crypto::PublicKey;
 use eidetica::crdt::Doc;
 use eidetica::entry::ID;
 use eidetica::store::{DocStore, Table};
-use eidetica::user::User;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use tracing::info;
@@ -519,7 +519,7 @@ pub struct AgentDb {
 
 impl AgentDb {
     /// Wrap an existing database as an `AgentDb`. Use when the caller already
-    /// opened the DB (e.g. via `User::open_database`).
+    /// opened the DB (e.g. via `AccountSession::open_database`).
     pub fn from_database(database: Database) -> Self {
         Self { database }
     }
@@ -1025,7 +1025,7 @@ pub fn agent_db_name(display_name: &str) -> String {
 /// the DB handle alongside the fresh pubkey so the caller can register it
 /// in the agents-I-host index.
 pub async fn create_agent_db(
-    user: &mut User,
+    user: &mut AccountSession,
     display_name: &str,
     agent_cfg: &AgentDbConfig,
     meta: &AgentMeta,
@@ -1063,7 +1063,10 @@ pub async fn create_agent_db(
 /// Look up an existing Agent DB by display name. Returns `(AgentDb, pubkey)`
 /// where pubkey is the key this user holds for the DB. Returns `None` if no
 /// DB with the given display name is tracked by this user.
-pub async fn find_agent_db(user: &User, display_name: &str) -> Option<(AgentDb, PublicKey)> {
+pub async fn find_agent_db(
+    user: &AccountSession,
+    display_name: &str,
+) -> Option<(AgentDb, PublicKey)> {
     let name = agent_db_name(display_name);
     // `find_database` returns `Err(DatabaseNotFoundByName)` when no matches —
     // collapse any lookup error to None; real errors surface on subsequent
@@ -1089,7 +1092,7 @@ pub struct BootstrappedAgent {
 /// alone doesn't cover it — `main.rs` calls this for every registry entry
 /// after bootstrap.
 pub async fn ensure_agent_db(
-    user: &mut User,
+    user: &mut AccountSession,
     display_name: &str,
 ) -> anyhow::Result<BootstrappedAgent> {
     if let Some((db, pubkey)) = find_agent_db(user, display_name).await {
@@ -1113,7 +1116,7 @@ pub async fn ensure_agent_db(
 /// from other peers survive restarts. AgentDb is the source of truth
 /// post-bootstrap (live hydration reads config per-message).
 pub async fn bootstrap_from_config(
-    user: &mut User,
+    user: &mut AccountSession,
     config: &Config,
 ) -> anyhow::Result<HashMap<String, BootstrappedAgent>> {
     let mut out = HashMap::new();
@@ -1166,14 +1169,14 @@ mod tests {
     use super::*;
     use crate::config::{AgentConfig, Config};
     use eidetica::backend::database::InMemory;
-    use eidetica::{Instance, NewUser};
+    use eidetica::{Instance, NewAccount};
 
     /// Test-only fixture: build a fresh in-memory `Instance` and return a
-    /// logged-in `User` session against it. Each test gets an isolated peer.
-    async fn test_peer_user() -> User {
+    /// logged-in account session against it. Each test gets an isolated peer.
+    async fn test_peer_user() -> AccountSession {
         let backend = InMemory::new();
         let (_instance, user) =
-            Instance::create_backend(Box::new(backend), NewUser::passwordless("test"))
+            Instance::create_backend(Box::new(backend), NewAccount::passwordless("test"))
                 .await
                 .unwrap();
         user
@@ -1486,7 +1489,7 @@ mod tests {
     /// Helper: build a fresh peer + create one AgentDb. Returns `(user,
     /// db)` — the `user` must outlive the `db` or eidetica's Instance
     /// drops and subsequent reads fail with "Instance has been dropped".
-    async fn peer_with_agent_db() -> (User, AgentDb) {
+    async fn peer_with_agent_db() -> (AccountSession, AgentDb) {
         let mut user = test_peer_user().await;
         let (db, _) = create_agent_db(
             &mut user,

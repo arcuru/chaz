@@ -11,7 +11,7 @@ use chaz_core::hosted_index::HostedIndex;
 use chaz_core::security::{LeakDetector, LeakPolicy, SecretStore, SecurityContext};
 use chaz_core::session::{AgentRef, SessionRegistry};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
-use eidetica::{Instance, NewUser, backend::database::InMemory};
+use eidetica::{Instance, NewAccount, backend::database::InMemory};
 use ratatui::{Terminal, backend::TestBackend};
 use std::collections::{HashMap, HashSet};
 
@@ -24,7 +24,7 @@ async fn fixture_with_backends(
 ) -> (Instance, Arc<Server>, BackendManager, App) {
     let (instance, user) = Instance::create_backend(
         Box::new(InMemory::new()),
-        NewUser::passwordless("list-frames"),
+        NewAccount::passwordless("list-frames"),
     )
     .await
     .unwrap();

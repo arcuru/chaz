@@ -8,7 +8,7 @@
 use eidetica::sync::DatabaseTicket;
 use eidetica::sync::transports::http::HttpTransport;
 use eidetica::sync::transports::iroh::IrohTransport;
-use eidetica::{Instance, user::User};
+use eidetica::{AccountSession, Instance};
 
 use crate::config::{Config, EideticaConfig, EideticaLoginConfig, ExecutionRole};
 
@@ -133,7 +133,7 @@ pub(crate) fn capabilities_for_test(
 /// A strictly connected Eidetica instance and its existing logged-in user.
 pub struct ConnectedInstance {
     pub instance: Instance,
-    pub user: User,
+    pub user: AccountSession,
     pub capabilities: InstanceCapabilities,
 }
 
@@ -462,9 +462,12 @@ fn is_service_connection(connection: &str) -> bool {
         .is_some_and(|(scheme, _)| scheme.eq_ignore_ascii_case("unix"))
 }
 
-async fn login(instance: &Instance, config: &EideticaLoginConfig) -> Result<User, ConnectError> {
+async fn login(
+    instance: &Instance,
+    config: &EideticaLoginConfig,
+) -> Result<AccountSession, ConnectError> {
     instance
-        .login_user(&config.username, config.password.as_deref())
+        .login_account(&config.username, config.password.as_deref())
         .await
         .map_err(|source| ConnectError::Login {
             username: config.username.clone(),
@@ -511,7 +514,7 @@ async fn configure_sync(
 mod tests {
     use std::os::unix::fs::PermissionsExt;
 
-    use eidetica::NewUser;
+    use eidetica::NewAccount;
     use eidetica::backend::database::InMemory;
     use eidetica::crdt::Doc;
     use eidetica::service::ServiceServer;
@@ -536,10 +539,12 @@ mod tests {
     async fn populated_snapshot(username: &str) -> (tempfile::TempDir, String, String) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("eidetica.json");
-        let (instance, mut user) =
-            Instance::create_backend(Box::new(InMemory::new()), NewUser::passwordless(username))
-                .await
-                .unwrap();
+        let (instance, mut user) = Instance::create_backend(
+            Box::new(InMemory::new()),
+            NewAccount::passwordless(username),
+        )
+        .await
+        .unwrap();
         let identity = user.get_default_key().unwrap().to_string();
         let named_key = user.add_private_key(Some("agent-key")).await.unwrap();
         let mut db_settings = Doc::new();
@@ -570,10 +575,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let socket = dir.path().join("service.sock");
-        let (instance, _) =
-            Instance::create_backend(Box::new(InMemory::new()), NewUser::passwordless(username))
-                .await
-                .unwrap();
+        let (instance, _) = Instance::create_backend(
+            Box::new(InMemory::new()),
+            NewAccount::passwordless(username),
+        )
+        .await
+        .unwrap();
         let server = ServiceServer::bind(instance.clone(), &socket)
             .await
             .unwrap();
@@ -743,7 +750,7 @@ eidetica:
             .await
             .unwrap();
         let (created, user) =
-            Instance::create_backend(Box::new(backend), NewUser::passwordless("legacy-chaz"))
+            Instance::create_backend(Box::new(backend), NewAccount::passwordless("legacy-chaz"))
                 .await
                 .unwrap();
         let identity = user.get_default_key().unwrap();
@@ -836,7 +843,7 @@ eidetica:
     #[tokio::test]
     async fn service_clients_share_login_and_open_per_database_keys() {
         let (_dir, shutdown, task, server, url) = service_fixture("shared-chaz").await;
-        let mut owner_user = server.login_user("shared-chaz", None).await.unwrap();
+        let mut owner_user = server.login_account("shared-chaz", None).await.unwrap();
         let key = owner_user.add_private_key(Some("agent-key")).await.unwrap();
         let db = owner_user.create_database(Doc::new(), &key).await.unwrap();
         let root = db.root_id().clone();
@@ -921,7 +928,7 @@ eidetica:
         assert!(error.to_string().contains("owner-only"));
         assert_eq!(server.id(), before_identity);
         server
-            .login_user("shared-chaz", None)
+            .login_account("shared-chaz", None)
             .await
             .expect("rejected client settings must leave the daemon usable");
         assert!(
@@ -1008,7 +1015,7 @@ eidetica:
         let socket = dir.path().join("service.sock");
         let (owner, _) = Instance::create_backend(
             Box::new(InMemory::new()),
-            NewUser::passwordless("shared-chaz"),
+            NewAccount::passwordless("shared-chaz"),
         )
         .await
         .unwrap();
@@ -1192,10 +1199,12 @@ eidetica:
         // Bring the daemon back on the same socket and the replacement lands.
         let socket = dir.path().join("service.sock");
         let _ = std::fs::remove_file(&socket);
-        let (instance, _) =
-            Instance::create_backend(Box::new(InMemory::new()), NewUser::passwordless("shared"))
-                .await
-                .unwrap();
+        let (instance, _) = Instance::create_backend(
+            Box::new(InMemory::new()),
+            NewAccount::passwordless("shared"),
+        )
+        .await
+        .unwrap();
         let server = ServiceServer::bind(instance, &socket).await.unwrap();
         let (shutdown, receiver) = watch::channel(());
         let task = tokio::spawn(server.run(receiver));

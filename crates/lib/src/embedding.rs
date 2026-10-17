@@ -429,9 +429,9 @@ mod tests {
     /// same pattern as `backends::tests::empty_secrets`.
     async fn empty_secret_store() -> SecretStore {
         use eidetica::backend::database::InMemory;
-        use eidetica::{Instance, NewUser};
+        use eidetica::{Instance, NewAccount};
         let (_instance, mut user) =
-            Instance::create_backend(Box::new(InMemory::new()), NewUser::passwordless("t"))
+            Instance::create_backend(Box::new(InMemory::new()), NewAccount::passwordless("t"))
                 .await
                 .unwrap();
         let key = user.get_default_key().unwrap();

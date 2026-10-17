@@ -633,7 +633,7 @@ mod tests {
     use crate::types::ConversationId;
     use eidetica::backend::database::InMemory;
     use eidetica::crdt::Doc;
-    use eidetica::{Instance, NewUser};
+    use eidetica::{Instance, NewAccount};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     struct Fixture {
@@ -645,7 +645,7 @@ mod tests {
 
     async fn fixture() -> Fixture {
         let (instance, mut user) =
-            Instance::create_backend(Box::new(InMemory::new()), NewUser::passwordless("peer"))
+            Instance::create_backend(Box::new(InMemory::new()), NewAccount::passwordless("peer"))
                 .await
                 .unwrap();
         let key = user.get_default_key().unwrap();

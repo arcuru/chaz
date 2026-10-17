@@ -2228,7 +2228,7 @@ mod chat_frame_tests {
 
     use super::super::{App, Tab};
     use eidetica::backend::database::InMemory;
-    use eidetica::{Instance, NewUser};
+    use eidetica::{Instance, NewAccount};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use std::collections::HashSet;
@@ -2236,7 +2236,7 @@ mod chat_frame_tests {
     async fn test_app(input: &str, cursor: usize) -> App {
         let (_instance, mut user) = Instance::create_backend(
             Box::new(InMemory::new()),
-            NewUser::passwordless("composer-frame"),
+            NewAccount::passwordless("composer-frame"),
         )
         .await
         .unwrap();
@@ -2296,7 +2296,7 @@ mod chat_frame_tests {
         let mut app = test_app("", 0).await;
         let (_instance, mut user) = Instance::create_backend(
             Box::new(InMemory::new()),
-            NewUser::passwordless("observer-frame"),
+            NewAccount::passwordless("observer-frame"),
         )
         .await
         .unwrap();
@@ -2845,7 +2845,7 @@ mod transcript_tests {
     use super::*;
     use chaz_core::session::SessionEntry;
     use eidetica::backend::database::InMemory;
-    use eidetica::{Instance, NewUser};
+    use eidetica::{Instance, NewAccount};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
@@ -2896,7 +2896,7 @@ mod transcript_tests {
     async fn app_with(entries: Vec<SessionEntry>) -> (Instance, App) {
         let (instance, mut user) = Instance::create_backend(
             Box::new(InMemory::new()),
-            NewUser::passwordless("transcript-frame"),
+            NewAccount::passwordless("transcript-frame"),
         )
         .await
         .unwrap();

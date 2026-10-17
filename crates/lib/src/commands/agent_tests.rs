@@ -8,7 +8,7 @@ use crate::hosted_index::HostedIndex;
 use crate::security::SecretStore;
 use crate::server::Server;
 use eidetica::backend::database::InMemory;
-use eidetica::{Instance, NewUser};
+use eidetica::{Instance, NewAccount};
 use std::sync::Arc;
 
 /// End-to-end fixture: Server + SessionRegistry + one open session +
@@ -25,7 +25,7 @@ pub(in crate::commands) async fn fixture() -> (
 ) {
     let backend = InMemory::new();
     let (instance, user) =
-        Instance::create_backend(Box::new(backend), NewUser::passwordless("test"))
+        Instance::create_backend(Box::new(backend), NewAccount::passwordless("test"))
             .await
             .unwrap();
     let agents = Arc::new(AgentRegistry::with_default_agent());

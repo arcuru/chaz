@@ -507,7 +507,7 @@ mod tests {
     use crate::security::SecretStore;
     use crate::server::Server;
     use eidetica::backend::database::InMemory;
-    use eidetica::{Instance, NewUser};
+    use eidetica::{Instance, NewAccount};
     use std::sync::Arc;
 
     /// Fixture matches `commands/agent.rs::tests::fixture` but takes a
@@ -526,7 +526,7 @@ mod tests {
     ) {
         let backend = InMemory::new();
         let (instance, user) =
-            Instance::create_backend(Box::new(backend), NewUser::passwordless("test"))
+            Instance::create_backend(Box::new(backend), NewAccount::passwordless("test"))
                 .await
                 .unwrap();
         if sync_enabled {

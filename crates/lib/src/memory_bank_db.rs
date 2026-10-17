@@ -19,12 +19,12 @@
 #![allow(dead_code)]
 
 use crate::agent_db::{MemoryEntry, read_blob, write_blob};
+use eidetica::AccountSession;
 use eidetica::Database;
 use eidetica::auth::crypto::PublicKey;
 use eidetica::crdt::Doc;
 use eidetica::entry::ID;
 use eidetica::store::{DocStore, Table};
-use eidetica::user::User;
 use serde::{Deserialize, Serialize};
 use tracing::info;
 
@@ -87,7 +87,7 @@ pub fn memory_bank_db_name(display_name: &str) -> String {
 /// the DB signed by that key with `name: memory:<display_name>` in
 /// settings, populates `meta`, and initializes the `memory` store.
 pub async fn create_memory_bank(
-    user: &mut User,
+    user: &mut AccountSession,
     display_name: &str,
     meta: &MemoryBankMeta,
 ) -> anyhow::Result<(MemoryBankDb, PublicKey)> {
@@ -112,10 +112,10 @@ pub async fn create_memory_bank(
 }
 
 /// Look up an existing Memory Bank DB by display name on this peer's
-/// `User`. Returns `(MemoryBankDb, pubkey)` where pubkey is the key this
+/// `AccountSession`. Returns `(MemoryBankDb, pubkey)` where pubkey is the key this
 /// user holds for the DB. `None` if no bank with that name is tracked.
 pub async fn find_memory_bank(
-    user: &User,
+    user: &AccountSession,
     display_name: &str,
 ) -> Option<(MemoryBankDb, PublicKey)> {
     let name = memory_bank_db_name(display_name);
@@ -129,12 +129,12 @@ mod tests {
     use super::*;
     use chrono::Utc;
     use eidetica::backend::database::InMemory;
-    use eidetica::{Instance, NewUser};
+    use eidetica::{Instance, NewAccount};
 
-    async fn test_user() -> User {
+    async fn test_user() -> AccountSession {
         let backend = InMemory::new();
         let (_instance, user) =
-            Instance::create_backend(Box::new(backend), NewUser::passwordless("test"))
+            Instance::create_backend(Box::new(backend), NewAccount::passwordless("test"))
                 .await
                 .unwrap();
         user

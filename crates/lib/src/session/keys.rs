@@ -1,5 +1,5 @@
 //! Agent DB helpers + ephemeral key lifecycle. Everything that goes through
-//! the registry's `User` to manipulate keys or agent DBs.
+//! the registry's `AccountSession` to manipulate keys or agent DBs.
 
 use eidetica::auth::types::{AuthKey, Permission};
 use eidetica::sync::{BootstrapRequest, DatabaseTicket, SyncError};
@@ -144,21 +144,21 @@ impl SessionRegistry {
     /// fixtures call `create_agent_db` directly without duplicating the
     /// user-mutex plumbing.
     #[cfg(test)]
-    pub async fn user_for_tests(&self) -> tokio::sync::MutexGuard<'_, eidetica::user::User> {
+    pub async fn user_for_tests(&self) -> tokio::sync::MutexGuard<'_, eidetica::AccountSession> {
         self.user.lock().await
     }
 
     /// Lock the internal user mutex and return a guard. Used by
     /// `hosted_index::build_from_user` at startup to walk
-    /// `User::databases()`. Outside that path, prefer the more focused
+    /// `AccountSession::databases()`. Outside that path, prefer the more focused
     /// helpers (`open_agent_db`, `find_key_for_db`, etc.) so the lock scope
     /// stays narrow and well-known.
-    pub async fn user_lock(&self) -> tokio::sync::MutexGuard<'_, eidetica::user::User> {
+    pub async fn user_lock(&self) -> tokio::sync::MutexGuard<'_, eidetica::AccountSession> {
         self.user.lock().await
     }
 
     /// Look up the first pubkey this peer holds for a database. Thin wrapper
-    /// around `User::find_key` so callers don't need direct access to the
+    /// around `AccountSession::find_key` so callers don't need direct access to the
     /// user mutex.
     pub async fn find_key_for_db(
         &self,
@@ -168,7 +168,7 @@ impl SessionRegistry {
         Ok(user.find_key(db_id)?)
     }
 
-    /// Generate a fresh ephemeral keypair on this peer's `User` and return the
+    /// Generate a fresh ephemeral keypair on this peer's `AccountSession` and return the
     /// pubkey. Intended for one-shot signers that get authorized on a child
     /// session, run, then are revoked — the DB retains their signatures as an
     /// audit record but no new writes can be made under the key. Not currently
@@ -427,7 +427,7 @@ impl SessionRegistry {
     /// `db_id`, so the source peer actually serves the DB to ticket holders
     /// (and the receiver picks up subsequent writes after import).
     ///
-    /// `User::create_database` and `sync_with_ticket` both default tracked
+    /// `AccountSession::create_database` and `sync_with_ticket` both default tracked
     /// DBs to `SyncSettings::disabled()`. Without this flip, `/share`
     /// produces a valid-looking ticket but the source peer refuses to serve,
     /// and imported DBs go stale after the initial fetch.
@@ -435,7 +435,7 @@ impl SessionRegistry {
     /// Reuses the recorded signing key and errors with `DatabaseNotTracked`
     /// for DBs this user doesn't track.
     pub async fn enable_sync_for(&self, db_id: &eidetica::entry::ID) -> anyhow::Result<()> {
-        use eidetica::user::types::SyncSettings;
+        use eidetica::account::types::SyncSettings;
         let mut user = self.user.lock().await;
         // Push on every commit, not just the periodic interval, so cross-process
         // peers (the standalone bridges) see writes immediately — `share`
@@ -461,7 +461,7 @@ impl SessionRegistry {
         db_id: &eidetica::entry::ID,
         key_id: &eidetica::auth::crypto::PublicKey,
     ) -> anyhow::Result<()> {
-        use eidetica::user::types::SyncSettings;
+        use eidetica::account::types::SyncSettings;
         let mut user = self.user.lock().await;
         user.track_database(db_id.clone(), key_id, SyncSettings::on_commit())
             .await?;
@@ -587,7 +587,7 @@ impl SessionRegistry {
     /// instead of the instance device key.
     pub(crate) async fn tracked_databases(
         &self,
-    ) -> anyhow::Result<Vec<eidetica::user::types::TrackedDatabase>> {
+    ) -> anyhow::Result<Vec<eidetica::account::types::TrackedDatabase>> {
         let user = self.user.lock().await;
         Ok(user.databases().await?)
     }
@@ -912,8 +912,8 @@ mod tests {
 
     #[tokio::test]
     async fn sharing_preserves_preferences_and_requires_a_transport() {
+        use eidetica::account::types::SyncSettings;
         use eidetica::sync::transports::http::HttpTransport;
-        use eidetica::user::types::SyncSettings;
 
         let (instance, registry) = make_registry_with_sync().await;
         let (_, db) = registry.create_session(Some("sharing")).await.unwrap();
@@ -973,8 +973,8 @@ mod tests {
 
     #[tokio::test]
     async fn bootstrap_requires_approval_and_preserves_retry_preferences() {
+        use eidetica::account::types::SyncSettings;
         use eidetica::sync::transports::http::HttpTransport;
-        use eidetica::user::types::SyncSettings;
 
         let (owner, source) = make_registry_with_sync().await;
         let (receiver, target) = make_registry_with_sync().await;

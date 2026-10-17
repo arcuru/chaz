@@ -2,6 +2,7 @@
 //! The session DB remains authoritative for attempt and terminal receipt.
 use crate::agent_db::{AgentDb, ExecutorRef};
 use crate::session::jobs::{AcceptedAgentJob, JobState, status_from_db};
+use eidetica::AccountSession;
 use eidetica::Database;
 use eidetica::auth::SigKey;
 use eidetica::auth::crypto::PublicKey;
@@ -10,7 +11,6 @@ use eidetica::auth::types::{
 };
 use eidetica::entry::ID;
 use eidetica::store::Table;
-use eidetica::user::User;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
@@ -89,14 +89,14 @@ pub async fn record(db: &Database, row: ExecutorJob) -> anyhow::Result<()> {
 /// name is present. The peer key owns writes; Agent keyholders inherit Admin
 /// through Eidetica delegation, not through copied key material.
 pub async fn ensure(
-    user: &mut User,
+    user: &mut AccountSession,
     agent: &AgentDb,
     agent_key: &PublicKey,
 ) -> anyhow::Result<(Database, PublicKey)> {
     let peer = user.get_default_key()?;
     let name = format!("executor:{}:{peer}", agent.database().root_id());
     // Always select the peer's direct owner key. A client may have mapped
-    // the Agent's delegated key on this DB in the shared User key map;
+    // the Agent's delegated key on this DB in the shared AccountSession key map;
     // find_database chooses an arbitrary mapping, which is unsafe on a
     // remote service and can fail to discover an existing DB.
     // Concurrent incarnations of one peer participate in the same jobs and
@@ -112,7 +112,7 @@ pub async fn ensure(
     references.dedup_by(|a, b| a.db_id == b.db_id);
     let mut matches = Vec::new();
     if let Some(reference) = references.first() {
-        // Another incarnation may have created it after this User's key-map
+        // Another incarnation may have created it after this AccountSession's key-map
         // snapshot was loaded; map the peer's own key, as job sessions do.
         let root = ID::parse(&reference.db_id)?;
         user.map_key(&peer, &root, SigKey::from_pubkey(&peer))
@@ -189,7 +189,7 @@ pub async fn ensure(
 }
 
 pub async fn open_for_agent(
-    user: &mut User,
+    user: &mut AccountSession,
     agent: &AgentDb,
     reference: &ExecutorRef,
     agent_key: &PublicKey,
@@ -249,12 +249,12 @@ pub(crate) async fn reconcile_job(
 mod tests {
     use super::*;
     use eidetica::backend::database::InMemory;
-    use eidetica::{Instance, NewUser};
+    use eidetica::{Instance, NewAccount};
 
     #[tokio::test]
     async fn stable_queue_adopts_orphan_and_agent_key_can_read() {
         let (_instance, mut user) =
-            Instance::create_backend(Box::new(InMemory::new()), NewUser::passwordless("q"))
+            Instance::create_backend(Box::new(InMemory::new()), NewAccount::passwordless("q"))
                 .await
                 .unwrap();
         let (parent_agent, _) = crate::agent_db::create_agent_db(
@@ -320,12 +320,12 @@ mod tests {
 
     /// Two find-before-create incarnations can publish different Executor DBs.
     /// Every subsequent reader chooses the same verified lower ID, including
-    /// a User whose key-map snapshot predates both creations.
+    /// an AccountSession whose key-map snapshot predates both creations.
     #[tokio::test]
     async fn raced_incarnations_converge_and_reject_a_wrong_identity() {
         let (instance, mut user) = Instance::create_backend(
             Box::new(InMemory::new()),
-            NewUser::passwordless("executor-race"),
+            NewAccount::passwordless("executor-race"),
         )
         .await
         .unwrap();
@@ -337,7 +337,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let mut stale = instance.login_user("executor-race", None).await.unwrap();
+        let mut stale = instance.login_account("executor-race", None).await.unwrap();
         let peer = user.get_default_key().unwrap();
         let name = format!("executor:{}:{peer}", agent.database().root_id());
         let mut settings = eidetica::crdt::Doc::new();
@@ -422,7 +422,7 @@ mod tests {
     #[tokio::test]
     async fn no_pointer_to_wrong_kind_or_pending_row() {
         let (_instance, mut user) =
-            Instance::create_backend(Box::new(InMemory::new()), NewUser::passwordless("q"))
+            Instance::create_backend(Box::new(InMemory::new()), NewAccount::passwordless("q"))
                 .await
                 .unwrap();
         let (agent, key) = crate::agent_db::create_agent_db(

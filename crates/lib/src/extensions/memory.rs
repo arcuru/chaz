@@ -1528,7 +1528,7 @@ mod tests {
     use crate::hosted_index::DbEntry;
     use crate::session::SessionRegistry;
     use eidetica::backend::database::InMemory;
-    use eidetica::{Instance, NewUser};
+    use eidetica::{Instance, NewAccount};
 
     /// Build a MemoryCommand wired to an in-memory eidetica instance plus
     /// empty hosted indices. Returns the command and the registry so
@@ -1536,7 +1536,7 @@ mod tests {
     async fn fixture() -> (Instance, Arc<SessionRegistry>, MemoryCommand) {
         let backend = InMemory::new();
         let (instance, user) =
-            Instance::create_backend(Box::new(backend), NewUser::passwordless("test"))
+            Instance::create_backend(Box::new(backend), NewAccount::passwordless("test"))
                 .await
                 .unwrap();
         let agents = Arc::new(AgentRegistry::with_default_agent());

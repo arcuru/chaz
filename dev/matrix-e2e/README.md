@@ -263,47 +263,15 @@ sequence exists to protect.
   longer gets to run. `PR_SET_PDEATHSIG` is Linux-only; on other platforms the
   wrapper is a plain exec and an abrupt kill leaks as it always did.
 
-## Unpublished dependency: local acceptance only
+## Pinned dependency and fresh-state acceptance
 
-The E2EE dependency pin is Eidetica
-`94c2624c7793c798847240c3287ff06280420eed` (sqlx 0.9). It is not yet
-published at the public Git URL. The manifest and lock name that final revision;
-**a fresh public checkout cannot build until it is published**. Do not substitute
-the old pin with a sqlx backport: that tests a different API and source tree.
-
-With a local Git repository containing that exact commit, create an immutable
-copy and a disposable consumer snapshot. Only the snapshot's dependency URL is
-rewritten; no path patch or file URL belongs in the committed consumer:
-
-```bash
-# Run from a committed Chaz checkout; set this to the local Eidetica repository.
-EIDETICA_REPO=/path/to/eidetica
-REV=94c2624c7793c798847240c3287ff06280420eed
-WORK=$(mktemp -d -p /tmp)
-git clone --no-hardlinks "$EIDETICA_REPO" "$WORK/eidetica"
-git -C "$WORK/eidetica" checkout --detach "$REV"
-test "$(git -C "$WORK/eidetica" rev-parse HEAD)" = "$REV"
-test -z "$(git -C "$WORK/eidetica" status --porcelain)"
-chmod -R a-w "$WORK/eidetica"
-mkdir "$WORK/chaz"
-git archive HEAD | tar -x -C "$WORK/chaz"
-sed -i "s|https://github.com/arcuru/eidetica|file://$WORK/eidetica|g" \
-    "$WORK/chaz/Cargo.toml" "$WORK/chaz/Cargo.lock"
-cd "$WORK/chaz"
-export CARGO_TARGET_DIR="$WORK/target"
-export CHAZ_BIN="$CARGO_TARGET_DIR/debug/chaz"
-export CHAZ_MATRIX_BIN="$CARGO_TARGET_DIR/debug/chaz-matrix"
-export E2EE_PROBE_BIN="$CARGO_TARGET_DIR/debug/examples/e2ee_probe"
-export EIDETICA_FLAKE="git+file://$WORK/eidetica?rev=$REV"
-CI=1 nix develop .# -c just nix full
-nix develop .# -c just e2e --keep --timeout 60
-```
-
-`EIDETICA_FLAKE` controls the CLI that provisions both disposable peer stores;
-it must point to the same revision as the consumer. Without the override the
-harness derives the public pin from `Cargo.toml`. Keep the logs and both source
-revisions when reporting results. An overlay pass establishes local integration,
-not publication, deployment, or compatibility of an existing production database.
+The harness derives the Eidetica provisioning CLI's immutable revision from
+`Cargo.toml`, matching the consumer's Cargo lock. It provisions fresh peer
+stores and uses only the local stub model. No local dependency overlay is
+needed for the accepted upstream revision. `EIDETICA_FLAKE` is an explicit
+provisioning override; leave it unset for normal exact-pin acceptance.
+Keep the consumer revision, dependency identity and component logs with results.
+A fresh-state pass does not establish compatibility of a production database.
 
 When upgrading an existing Eidetica database across verification-rule changes,
 follow Eidetica's [offline trust-reset procedure](https://github.com/arcuru/eidetica/blob/main/docs/src/design/verification.md#explicit-trust-reset-on-verification-rule-upgrades)

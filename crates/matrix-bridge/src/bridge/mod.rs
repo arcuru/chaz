@@ -1823,11 +1823,11 @@ mod tests {
         use chaz_core::session::{Session, TurnRequestId};
         use chaz_core::types::ConversationId;
         use eidetica::backend::database::InMemory;
-        use eidetica::{Instance, NewUser};
+        use eidetica::{Instance, NewAccount};
 
         let (_instance, mut user) = Instance::create_backend(
             Box::new(InMemory::new()),
-            NewUser::passwordless("typing-test"),
+            NewAccount::passwordless("typing-test"),
         )
         .await
         .unwrap();

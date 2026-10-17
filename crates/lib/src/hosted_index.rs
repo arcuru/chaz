@@ -1,7 +1,7 @@
 //! In-memory peer-local indices of hosted Agent and Memory Bank DBs.
 //!
 //! Derived in-memory cache built once at startup by walking
-//! `eidetica::user::User::databases()` — eidetica's authoritative list of
+//! `eidetica::AccountSession::databases()` — eidetica's authoritative list of
 //! every DB the user holds keys for. Each entry's `meta.kind` marker (see
 //! [`crate::db_kind`]) tells the walker which bucket the entry belongs in.
 //!
@@ -17,9 +17,9 @@
 //! restarting. Cross-peer sync of *new* keys mid-runtime is not handled
 //! here — same gap as the prior `DbRegistry` mirror.
 
+use eidetica::AccountSession;
 use eidetica::auth::crypto::PublicKey;
 use eidetica::entry::ID;
-use eidetica::user::User;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -158,7 +158,7 @@ impl HostedIndex {
 /// `properties` map so we read everything off the user's own catalog
 /// without opening each DB.
 pub async fn build_from_user(
-    user: &User,
+    user: &AccountSession,
 ) -> anyhow::Result<(HostedIndex, HostedIndex, HostedIndex)> {
     let agents = HostedIndex::empty("agent");
     let memory_banks = HostedIndex::empty("memory_bank");
@@ -222,7 +222,7 @@ pub async fn build_from_user(
 /// its `agent:<name>` key to a DB id; selected-session references already carry
 /// their ids and skip even that catalog read.
 pub async fn build_targeted(
-    user: &User,
+    user: &AccountSession,
     explicit_agents: &[(ID, String)],
     agent_names: &[String],
 ) -> anyhow::Result<(HostedIndex, HostedIndex, HostedIndex, TargetedBuildStats)> {
@@ -247,7 +247,7 @@ pub async fn build_targeted(
 /// the server and extensions, so the selected session becomes usable without
 /// rebuilding from every tracked DB.
 pub async fn extend_targeted(
-    user: &User,
+    user: &AccountSession,
     explicit_agents: &[(ID, String)],
     agent_names: &[String],
     agents: &HostedIndex,
@@ -337,11 +337,11 @@ mod tests {
     use crate::agent_db::{AgentDbConfig, AgentMeta, create_agent_db};
     use crate::memory_bank_db::{MemoryBankMeta, create_memory_bank};
     use eidetica::backend::database::InMemory;
-    use eidetica::{Instance, NewUser};
+    use eidetica::{Instance, NewAccount};
 
-    async fn fresh_user() -> (Instance, eidetica::user::User) {
+    async fn fresh_user() -> (Instance, eidetica::AccountSession) {
         let (instance, user) =
-            Instance::create_backend(Box::new(InMemory::new()), NewUser::passwordless("t"))
+            Instance::create_backend(Box::new(InMemory::new()), NewAccount::passwordless("t"))
                 .await
                 .unwrap();
         (instance, user)

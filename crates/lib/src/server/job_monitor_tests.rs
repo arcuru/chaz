@@ -16,15 +16,17 @@ async fn service_steering(
     use eidetica::service::ServiceServer;
     let dir = tempfile::tempdir().unwrap();
     let socket = dir.path().join("monitor.sock");
-    let (owner, mut user) =
-        Instance::create_backend(Box::new(InMemory::new()), NewUser::passwordless("monitor"))
-            .await
-            .unwrap();
+    let (owner, mut user) = Instance::create_backend(
+        Box::new(InMemory::new()),
+        NewAccount::passwordless("monitor"),
+    )
+    .await
+    .unwrap();
     for name in ["monitor-observer", "monitor-reader"] {
         user.admin()
             .await
             .unwrap()
-            .create_user(NewUser::passwordless(name))
+            .create_account(NewAccount::passwordless(name))
             .await
             .unwrap();
     }

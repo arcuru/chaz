@@ -14,7 +14,7 @@ use chaz_core::{
     server::{self, BuildOptions, McpReadiness},
     session::SessionRegistry,
 };
-use eidetica::{Instance, NewUser, backend::database::InMemory, service::ServiceServer};
+use eidetica::{Instance, NewAccount, backend::database::InMemory, service::ServiceServer};
 use tokio::sync::watch;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -23,10 +23,12 @@ async fn client_readiness_skips_delayed_executor_credentials_and_schedule_bootst
     let dir = tempfile::tempdir().unwrap();
     let socket = dir.path().join("owner.sock");
     let proxy_socket = dir.path().join("proxy.sock");
-    let (owner, mut user) =
-        Instance::create_backend(Box::new(InMemory::new()), NewUser::passwordless("startup"))
-            .await
-            .unwrap();
+    let (owner, mut user) = Instance::create_backend(
+        Box::new(InMemory::new()),
+        NewAccount::passwordless("startup"),
+    )
+    .await
+    .unwrap();
     let (agent_db, pubkey) = create_agent_db(
         &mut user,
         "selected",
