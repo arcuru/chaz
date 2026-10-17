@@ -80,6 +80,7 @@ async fn proof() -> anyhow::Result<()> {
             )
             .await?;
     }
+    // Explicit Read grants are proof fixtures, not Provider membership policy.
     for key in [&reader, &target_only] {
         tx.get_settings()?
             .set_auth_key(&key.public_key(), AuthKey::active(None, Permission::Read))
@@ -131,10 +132,16 @@ async fn proof() -> anyhow::Result<()> {
     let running = tokio::spawn(service.run(receiver));
     let remote = Instance::connect(format!("unix://{}", socket.display())).await?;
     let login = remote.login_account("reader", None).await?;
-    assert!(login.admin().await.is_err(), "reader is not a host admin");
+    let admin_error = login.admin().await.expect_err("reader is not a host admin");
     assert!(
-        Database::open(&remote, session.root_id()).await.is_err(),
-        "login alone grants no session access"
+        admin_error.to_string().contains("[auth::PermissionDenied]"),
+        "non-admin must be denied by authorization: {admin_error}"
+    );
+    assert_read_denied(
+        Database::open(&remote, session.root_id())
+            .await
+            .unwrap_err(),
+        session.root_id(),
     );
     // Register proof of possession for the per-database actors, not extra grants.
     for key in [&reader, &target_only, &delegated] {
@@ -171,9 +178,6 @@ async fn proof() -> anyhow::Result<()> {
         assert!(verify_entry_signature(&forged, &direct.public_key()).is_err());
         assert!(verify_entry_signature(&forged, &delegated.public_key()).is_err());
     }
-    println!(
-        "PROVED: verified-frontier direct/service entry parity, direct-key Provider association, valid-writer forged-label rejection"
-    );
 
     // Native delegation resolves to an actual operating key, not a trusted hint.
     let entry = session.get_entry(&delegated_id).await?;
@@ -190,9 +194,6 @@ async fn proof() -> anyhow::Result<()> {
     assert_eq!(signers.len(), 1);
     assert_eq!(signers[0].public_key, delegated.public_key());
     assert!(signers[0].effective_permission.can_write());
-    println!(
-        "PROVED: direct native delegated identity resolves and authenticates the Provider operating key"
-    );
 
     // The historical verdict runs natively on the service using the bound Read
     // actor. Neither a shared name nor a provider label is signer attribution.
@@ -216,11 +217,11 @@ async fn proof() -> anyhow::Result<()> {
         .verify_entry_signature(&delegated_id)
         .await
         .unwrap_err();
-    assert!(
-        proof_error.to_string().contains("not permitted for Read"),
-        "session Read does not grant delegated-proof Read: {proof_error}"
+    assert_read_denied(proof_error, provider.root_id());
+    assert_read_denied(
+        open_as(&remote, &provider, &target_only).await.unwrap_err(),
+        provider.root_id(),
     );
-    assert!(open_as(&remote, &provider, &target_only).await.is_err());
     assert!(
         remote_session
             .clone()
@@ -229,21 +230,24 @@ async fn proof() -> anyhow::Result<()> {
             .await?,
         "attached key must not replace the service handle's bound reader"
     );
+    let unregistered_error = remote
+        .remote_connection()
+        .unwrap()
+        .verify_entry_signature(
+            session.root_id().clone(),
+            SigKey::from_pubkey(&PrivateKey::generate().public_key()),
+            delegated_id.clone(),
+        )
+        .await
+        .unwrap_err();
     assert!(
-        remote
-            .remote_connection()
-            .unwrap()
-            .verify_entry_signature(
-                session.root_id().clone(),
-                SigKey::from_pubkey(&PrivateKey::generate().public_key()),
-                delegated_id.clone()
-            )
-            .await
-            .is_err(),
-        "unregistered actor is denied"
-    );
-    println!(
-        "PROVED: service historical delegated verification with non-admin Read actor; per-database proof Read and Write denials"
+        unregistered_error
+            .to_string()
+            .contains("[auth::SigningKeyMismatch]")
+            && unregistered_error
+                .to_string()
+                .contains("not in the session keyset"),
+        "unregistered actor must fail proof of possession: {unregistered_error}"
     );
 
     // Historical service verification does not add a remote current-permission
@@ -287,13 +291,21 @@ async fn proof() -> anyhow::Result<()> {
             .to_string()
             .contains("native permission query is unsupported")
     );
-    println!(
-        "CONFIRMED: delegated service current_permission unsupported; observer guard retained"
-    );
 
     drop(shutdown);
     running.await??;
     Ok(())
+}
+
+fn assert_read_denied(error: eidetica::Error, tree: &ID) {
+    // Service auth errors retain their discriminant in an I/O envelope.
+    let message = error.to_string();
+    assert!(
+        message.contains("[auth::PermissionDenied]")
+            && message.contains(&tree.to_string())
+            && message.contains("not permitted for Read"),
+        "expected Read denial on {tree}: {error}"
+    );
 }
 
 async fn open_as(remote: &Instance, db: &Database, key: &PrivateKey) -> eidetica::Result<Database> {

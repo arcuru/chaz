@@ -1172,7 +1172,7 @@ mod tests {
     use eidetica::{Instance, NewAccount};
 
     /// Test-only fixture: build a fresh in-memory `Instance` and return a
-    /// logged-in `AccountSession` session against it. Each test gets an isolated peer.
+    /// logged-in account session against it. Each test gets an isolated peer.
     async fn test_peer_user() -> AccountSession {
         let backend = InMemory::new();
         let (_instance, user) =
