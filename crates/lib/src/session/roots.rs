@@ -179,6 +179,16 @@ pub enum RootsError {
         existing: ID,
         requested: ID,
     },
+    /// A tracked database could be an old root, but could not be inspected.
+    #[error(
+        "could not inspect tracked database {id} before initializing Chaz {kind}: {source}. Nothing was created; repair its data or access before retrying"
+    )]
+    Inspect {
+        kind: RootKind,
+        id: ID,
+        #[source]
+        source: eidetica::Error,
+    },
     /// Any other failure while checking for or creating a root.
     #[error("could not initialize Chaz {kind}: {source}")]
     Initialize {
@@ -253,18 +263,36 @@ pub async fn open(user: &mut AccountSession, setup: RootSetup) -> Result<Roots, 
 /// This is the only name search left, and it runs only when a designated
 /// writer is about to create a root.
 async fn unreferenced(user: &AccountSession, kind: RootKind) -> Result<Vec<ID>, RootsError> {
-    match user.find_database(kind.display_name()).await {
-        Ok(found) => Ok(found.iter().map(|db| db.root_id().clone()).collect()),
-        Err(eidetica::Error::Account(error))
-            if matches!(
-                *error,
-                eidetica::account::AccountError::DatabaseNotFoundByName { .. }
-            ) =>
-        {
-            Ok(Vec::new())
+    let tracked = user
+        .databases()
+        .await
+        .map_err(|source| RootsError::Initialize { kind, source })?;
+    let mut found = Vec::new();
+    for tracked in tracked {
+        // find_database skips failed opens and name reads. Setup must prove
+        // absence rather than create a replacement for an unreadable old root.
+        let matches = async {
+            let db = user.open_database(&tracked.database_id).await?;
+            match db.get_name().await {
+                Ok(name) => Ok(name == kind.display_name()),
+                // An absent name proves this is not a legacy named root.
+                Err(eidetica::Error::Store(error))
+                    if matches!(error.as_ref(), eidetica::store::StoreError::KeyNotFound { store, key }
+                        if store == "_settings" && key == "name") => Ok(false),
+                Err(error) => Err(error),
+            }
         }
-        Err(source) => Err(RootsError::Initialize { kind, source }),
+        .await
+        .map_err(|source| RootsError::Inspect {
+            kind,
+            id: tracked.database_id.clone(),
+            source,
+        })?;
+        if matches {
+            found.push(tracked.database_id);
+        }
     }
+    Ok(found)
 }
 
 async fn create(user: &mut AccountSession, kind: RootKind) -> Result<Database, RootsError> {
