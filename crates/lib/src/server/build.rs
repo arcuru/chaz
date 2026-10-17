@@ -422,7 +422,11 @@ pub async fn build(
     }
 
     let t = Instant::now();
-    let registry = session::SessionRegistry::new(instance, user, agent_registry.clone()).await?;
+    // The executor of a service login, or a direct owner, is the designated
+    // writer that may initialize absent bookkeeping roots.
+    let root_setup = session::roots::RootSetup::for_connection(&instance, executor_components);
+    let registry =
+        session::SessionRegistry::open(instance, user, agent_registry.clone(), root_setup).await?;
     info!(
         elapsed_ms = t.elapsed().as_millis() as u64,
         "Session registry initialized"

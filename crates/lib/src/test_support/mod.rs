@@ -4,6 +4,7 @@
 //! This module is compiled only for tests. It lives in the crate rather than
 //! `tests/` so tests can reach `pub(crate)` items.
 
+pub(crate) mod counting_backend;
 pub(crate) mod harness;
 pub(crate) mod mock_backend;
 pub(crate) mod mock_host;

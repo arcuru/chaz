@@ -111,6 +111,7 @@ impl Fixture {
             Instance::create_backend(Box::new(InMemory::new()), NewAccount::passwordless(name))
                 .await
                 .unwrap();
+        crate::test_support::provision_roots(&mut user).await;
         let (agent_db, pubkey) = create_agent_db(
             &mut user,
             "default",

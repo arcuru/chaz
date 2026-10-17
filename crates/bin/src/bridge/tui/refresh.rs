@@ -1245,6 +1245,13 @@ mod tests {
         )
         .await
         .unwrap();
+        // The owner initializes the login's roots before any client starts.
+        chaz_core::session::roots::open(
+            &mut user,
+            chaz_core::session::roots::RootSetup::Initialize,
+        )
+        .await
+        .unwrap();
         let key = user.get_default_key().unwrap();
         let db = user
             .create_database(eidetica::crdt::Doc::new(), &key)

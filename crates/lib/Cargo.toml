@@ -44,6 +44,7 @@ uuid.workspace = true
 wasmtime.workspace = true
 
 [dev-dependencies]
+async-trait.workspace = true
 # `testing` exposes `Instance::demote_to_unverified`, which lets a test drive
 # the same ingest-then-verify path sync uses and observe a `WriteSource::Remote`
 # callback without standing up a second peer.
