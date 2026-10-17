@@ -38,6 +38,56 @@ impl crate::tool::Tool for Effect {
     }
 }
 
+#[derive(Clone)]
+struct ResultCounter {
+    count: Arc<AtomicUsize>,
+    manifest: crate::extension::manifest::ExtensionManifest,
+}
+
+impl crate::extension::Extension for ResultCounter {
+    fn name(&self) -> &'static str {
+        "result-counter"
+    }
+
+    fn supported_hooks(&self) -> &[crate::extension::HookKind] {
+        &self.manifest.supported_hooks
+    }
+
+    fn instantiate<'a>(
+        &'a self,
+        _: crate::extension::ScopeCtx<'a>,
+    ) -> crate::extension::instance::InstantiateFuture<'a> {
+        Box::pin(async move {
+            Ok(Arc::new(self.clone()) as Arc<dyn crate::extension::ExtensionInstance>)
+        })
+    }
+}
+
+impl crate::extension::ExtensionInstance for ResultCounter {
+    fn manifest(&self) -> &crate::extension::manifest::ExtensionManifest {
+        &self.manifest
+    }
+
+    fn tool_result_hook(
+        &self,
+    ) -> Option<Arc<dyn crate::extension::handler::HookHandlerToolResult>> {
+        Some(Arc::new(self.clone()))
+    }
+}
+
+impl crate::extension::handler::HookHandlerToolResult for ResultCounter {
+    fn on_tool_result<'a>(
+        &'a self,
+        _: &'a str,
+        output: String,
+    ) -> crate::extension::handler::HandlerFuture<'a, String> {
+        Box::pin(async move {
+            self.count.fetch_add(1, Ordering::SeqCst);
+            output
+        })
+    }
+}
+
 struct Fixture {
     _dir: tempfile::TempDir,
     settings: crate::config::EideticaConfig,
@@ -105,12 +155,42 @@ impl Fixture {
         self.start_with(mock).await
     }
 
+    async fn start_counting_results(&self, results: Arc<AtomicUsize>) -> Process {
+        let mut hub = crate::test_support::context_hub().await;
+        hub.install_all(vec![Arc::new(ResultCounter {
+            count: results,
+            manifest: crate::extension::manifest::ExtensionManifest {
+                name: "result-counter".into(),
+                extension_ref: crate::extension::ExtensionRef::builtin("result-counter"),
+                supported_hooks: vec![crate::extension::HookKind::ToolResult],
+                required_capabilities: vec![],
+                requested_capabilities: vec![],
+                provides_capabilities: vec![],
+            },
+        })])
+        .await
+        .unwrap();
+        let mock = Arc::new(MockBackend::new());
+        mock.push_text("finished");
+        self.start_with_hub(mock, Arc::new(hub)).await
+    }
+
     async fn start_with(&self, mock: Arc<MockBackend>) -> Process {
-        let (server, child_mock) = published_executor_using_mock(
+        self.start_with_hub(mock, Arc::new(crate::test_support::context_hub().await))
+            .await
+    }
+
+    async fn start_with_hub(
+        &self,
+        mock: Arc<MockBackend>,
+        hub: Arc<crate::extension::ExtensionHub>,
+    ) -> Process {
+        let (server, child_mock) = published_executor_using_mock_and_hub(
             &self.settings,
             Arc::new(AgentRegistry::with_default_agent()),
             self.agent.clone(),
             mock,
+            hub,
         )
         .await;
         let slot = crate::instance::ServerSlot::default();
@@ -491,6 +571,287 @@ async fn restart_resumes_only_the_same_wait_and_survives_a_second_crash() {
     c.server.shutdown().await;
 }
 
+/// Capture authoritative signed history, not heartbeats or extension-status
+/// observations that a restarted executor may legitimately publish.
+async fn wait_history(db: &eidetica::Database) -> std::collections::BTreeMap<String, Vec<u8>> {
+    let mut pending = db.snapshot().await.unwrap().into_tips();
+    let mut seen = std::collections::HashSet::new();
+    let mut entries = std::collections::BTreeMap::new();
+    while let Some(id) = pending.pop() {
+        if !seen.insert(id.clone()) {
+            continue;
+        }
+        let entry = db.get_entry(id.clone()).await.unwrap();
+        pending.extend(entry.parents().unwrap());
+        if [
+            "entries",
+            "turn_attempts",
+            "turn_transcript",
+            JOB_WAIT_CHECKPOINTS_STORE,
+            "execution_starts_v1",
+            "execution_transcript_v1",
+            "execution_outcomes_v1",
+        ]
+        .iter()
+        .any(|store| entry.in_subtree(store))
+        {
+            assert_eq!(entry.id(), id);
+            entries.insert(id.to_string(), entry.to_dagcbor().unwrap());
+        }
+    }
+    entries
+}
+
+/// Raw rows go through the same typed Table reads as restart adoption. A
+/// successful continuation is the positive control for all three held forms.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn persisted_checkpoint_versions_gate_restart_recovery() {
+    use eidetica::store::Table;
+    use serde_json::{Value, json};
+
+    for (case, version, decode_error) in [
+        ("supported", Some(json!(1)), None),
+        ("future", Some(json!(2)), None),
+        ("missing", None, Some("missing field `version`")),
+        ("wrong-type", Some(json!("1")), Some("invalid type")),
+    ] {
+        let fx = Fixture::new(case).await;
+        let mut crashed = crash_while_waiting(&fx, 240, ChildAtCrash::Unpublished).await;
+        let checkpoint = &crashed.checkpoint;
+        let original = Session::new(ConversationId(crashed.sid.clone()), crashed.db.clone()).await;
+        let attempts = original.attempts_for_test().await;
+        let transcript = original
+            .turn_transcript(&checkpoint.attempt_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            transcript.len(),
+            3,
+            "effect and its result, then pending wait"
+        );
+        let mut raw = serde_json::to_value(checkpoint).unwrap();
+        raw.as_object_mut().unwrap().remove("version");
+        if let Some(version) = version {
+            raw["version"] = version;
+        }
+        let txn = crashed.db.new_transaction().await.unwrap();
+        txn.get_store::<Table<Value>>(JOB_WAIT_CHECKPOINTS_STORE)
+            .await
+            .unwrap()
+            .set(checkpoint.key(), raw.clone())
+            .await
+            .unwrap();
+        txn.commit().await.unwrap();
+        let history = wait_history(&crashed.db).await;
+        assert!(!history.is_empty());
+        let results = Arc::new(AtomicUsize::new(0));
+
+        // Both negative reloads use fresh service connections and fresh server
+        // reconciliation caches; no serialized fixture or planner-only shortcut.
+        for _ in 0..if case == "supported" { 1 } else { 2 } {
+            let process = fx.start_counting_results(results.clone()).await;
+            let (sid, db) = process
+                .server
+                .registry
+                .open_session(&crashed.sid)
+                .await
+                .unwrap();
+            let session = Session::new(sid, db.clone()).await;
+            let loaded = session
+                .latest_job_wait_checkpoint(&checkpoint.attempt_id)
+                .await;
+            if let Some(message) = decode_error {
+                let error = format!("{:#}", loaded.unwrap_err());
+                assert!(
+                    error.contains(message),
+                    "{case}: typed Table decode: {error}"
+                );
+            } else {
+                let loaded = loaded.unwrap().unwrap();
+                assert_eq!(serde_json::to_value(&loaded).unwrap(), raw);
+            }
+            let secrets =
+                crate::security::SecretStore::new(process.server.registry.chaz_peer().clone())
+                    .await;
+            let registration = process
+                .server
+                .register_session(
+                    &db,
+                    crate::backends::BackendManager::with_mock(process.child_mock.clone(), secrets),
+                    None,
+                    None,
+                )
+                .await;
+            // watch_session's initial checkpoint scan also decodes the typed
+            // row. Adoption may already have installed that watcher, so a
+            // repeated registration can instead return Ok without rescanning.
+            if let Err(error) = registration {
+                let error = format!("{error:#}");
+                assert!(
+                    decode_error.is_some_and(|message| error.contains(message)),
+                    "{case}: {error}"
+                );
+            }
+
+            if case == "supported" {
+                await_resumed(&process, &checkpoint.attempt_id).await;
+                assert!(
+                    process.child_mock.recorded_calls().is_empty(),
+                    "same pending child"
+                );
+                assert_eq!(
+                    results.load(Ordering::SeqCst),
+                    0,
+                    "no result hook before observation"
+                );
+                process.child_mock.push_text("version continuation");
+                crashed
+                    .registry
+                    .publish_agent_job(crashed.prepared.take().unwrap())
+                    .await
+                    .unwrap();
+                await_calls(&process.child_mock, 2).await;
+                await_no_processing(&process.server, &crashed.sid).await;
+                let calls = process.child_mock.recorded_calls();
+                assert_eq!(calls.len(), 2, "one child and one parent continuation");
+                assert!(wait_result(&calls[1]).contains("Succeeded"));
+                assert_eq!(
+                    results.load(Ordering::SeqCst),
+                    1,
+                    "the wait result hook really runs"
+                );
+                assert_eq!(job_count(&process.server).await, 1, "no replacement child");
+                assert_eq!(
+                    checkpoints(&db).await,
+                    [finished_checkpoint(checkpoint.clone())],
+                    "same request/attempt/call/child/deadline"
+                );
+                let completed = Session::new(ConversationId(crashed.sid.clone()), db.clone()).await;
+                assert_eq!(
+                    completed.latest_entry().unwrap().content,
+                    "version continuation"
+                );
+                let records = completed
+                    .turn_transcript(&checkpoint.attempt_id)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    &records[..3],
+                    transcript.as_slice(),
+                    "prior transcript untouched"
+                );
+                assert_eq!(records.len(), 5);
+                assert!(
+                    matches!(&records[3].message, TurnTranscriptMessage::ToolResult { model_sequence: 1, call_index: 0, call_id, name, .. } if call_id == &checkpoint.call_id && name == "job_wait")
+                );
+                assert!(matches!(
+                    &records[4].message,
+                    TurnTranscriptMessage::ModelResponse {
+                        model_sequence: 2,
+                        terminal: true,
+                        ..
+                    }
+                ));
+                let attempts = completed.attempts_for_test().await;
+                assert!(
+                    attempts
+                        .iter()
+                        .all(|attempt| attempt.attempt_id == checkpoint.attempt_id
+                            && attempt.request_id == checkpoint.request_id)
+                );
+                assert!(
+                    attempts
+                        .iter()
+                        .any(|attempt| attempt.status
+                            == crate::session::TurnAttemptStatus::Completed)
+                );
+                let (_, paired) = completed.context_with_tool_history().await.unwrap();
+                assert_eq!(paired.iter().map(Vec::len).max(), Some(5));
+                let after = wait_history(&db).await;
+                for (id, bytes) in &history {
+                    assert_eq!(after.get(id), Some(bytes), "original Entry {id} preserved");
+                }
+            } else {
+                for _ in 0..3 {
+                    assert_eq!(
+                        process.server.process_session(&crashed.sid).await.unwrap(),
+                        None
+                    );
+                }
+                assert_eq!(
+                    process
+                        .server
+                        .interrupted_turns(&crashed.sid)
+                        .await
+                        .unwrap(),
+                    vec![InterruptedTurn {
+                        request_id: checkpoint.request_id.clone(),
+                        attempt_id: checkpoint.attempt_id.clone(),
+                    }],
+                    "{case} stays explicitly interrupted, not live or completed"
+                );
+                assert!(
+                    !process
+                        .server
+                        .live_attempts
+                        .lock()
+                        .await
+                        .contains(&checkpoint.attempt_id)
+                );
+                assert!(
+                    process.child_mock.recorded_calls().is_empty(),
+                    "{case}: no continuation/model replay"
+                );
+                assert_eq!(results.load(Ordering::SeqCst), 0, "{case}: no result hook");
+                assert_eq!(
+                    job_count(&process.server).await,
+                    0,
+                    "{case}: no child publication"
+                );
+                assert_eq!(
+                    session.attempts_for_test().await,
+                    attempts,
+                    "{case}: no replacement/completion"
+                );
+                assert_eq!(
+                    session
+                        .turn_transcript(&checkpoint.attempt_id)
+                        .await
+                        .unwrap(),
+                    transcript
+                );
+                let txn = db.new_transaction().await.unwrap();
+                assert_eq!(
+                    txn.get_store::<Table<Value>>(JOB_WAIT_CHECKPOINTS_STORE)
+                        .await
+                        .unwrap()
+                        .get(checkpoint.key())
+                        .await
+                        .unwrap(),
+                    raw,
+                    "{case}: raw checkpoint unchanged"
+                );
+                assert_eq!(
+                    wait_history(&db).await,
+                    history,
+                    "{case}: no new or rewritten authoritative Entry/branch/receipt"
+                );
+            }
+            assert_eq!(
+                crashed.first_mock.recorded_calls().len(),
+                2,
+                "no earlier model replay"
+            );
+            assert_eq!(
+                fx.effects.load(Ordering::SeqCst),
+                1,
+                "no earlier tool effect replay"
+            );
+            process.server.shutdown().await;
+        }
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn downtime_counts_against_the_original_deadline() {
     let fx = Fixture::new("wait-deadline").await;
@@ -714,7 +1075,8 @@ async fn crash_before_checkpoint_or_after_result_stays_held() {
 async fn failure_after_observation_before_result_stays_held_after_restart() {
     let fx = Fixture::new("wait-result-failure").await;
     let crashed = crash_while_waiting(&fx, 240, ChildAtCrash::Unpublished).await;
-    let b = fx.start().await;
+    let results = Arc::new(AtomicUsize::new(0));
+    let b = fx.start_counting_results(results.clone()).await;
     await_resumed(&b, &crashed.checkpoint.attempt_id).await;
     // Fail the next record: the wait result, after a read-only observation.
     *b.server.transcript_fail_after.lock().unwrap() = Some(0);
@@ -734,11 +1096,21 @@ async fn failure_after_observation_before_result_stays_held_after_restart() {
     b.server.shutdown().await;
     drop(b);
 
-    let c = fx.start().await;
+    assert_eq!(
+        results.load(Ordering::SeqCst),
+        1,
+        "hook ran before failed result commit"
+    );
+    let c = fx.start_counting_results(results.clone()).await;
     for _ in 0..3 {
         c.server.process_session(&crashed.sid).await.unwrap();
     }
     tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        results.load(Ordering::SeqCst),
+        1,
+        "interrupted result hook is never repeated"
+    );
     assert!(
         c.child_mock.recorded_calls().is_empty(),
         "no automatic continuation after the result boundary"
