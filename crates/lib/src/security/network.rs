@@ -203,7 +203,13 @@ mod tests {
         policy
             .check("https://en.wikipedia.org/wiki/Rust", "GET")
             .expect("public endpoint should be allowed");
-        assert_eq!(policy.check("https://en.wikipedia.org/wiki/Rust", "POST"), Err("Network policy denied: POST https://en.wikipedia.org/wiki/Rust not in allowed endpoints".into()));
+        assert_eq!(
+            policy.check("https://en.wikipedia.org/wiki/Rust", "POST"),
+            Err(
+                "Network policy denied: POST https://en.wikipedia.org/wiki/Rust not in allowed endpoints"
+                    .into()
+            )
+        );
         assert_eq!(
             policy.check("https://evil.com", "GET"),
             Err("Network policy denied: GET https://evil.com not in allowed endpoints".into())

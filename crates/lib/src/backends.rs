@@ -1020,7 +1020,11 @@ mod tests {
         mgr.validate_model("openai:new-model")
             .expect("model should be accepted with this backend configuration");
         // Unprefixed unknown model fails.
-        assert_eq!(mgr.validate_model("random-model"), Err("Multiple backends exist, please specify the model name with the backend prepended, e.g. openrouter:model-name".into()));
+        assert_eq!(
+            mgr.validate_model("random-model"),
+            Err("Multiple backends exist, please specify the model name with the backend prepended, e.g. openrouter:model-name"
+                .into())
+        );
     }
 
     // ================================================================
@@ -1300,7 +1304,11 @@ mod tests {
         multi
             .validate_model("proxy:unknown")
             .expect("model should be accepted with this backend configuration");
-        assert_eq!(multi.validate_model("unknown"), Err("Multiple backends exist, please specify the model name with the backend prepended, e.g. openrouter:model-name".into()));
+        assert_eq!(
+            multi.validate_model("unknown"),
+            Err("Multiple backends exist, please specify the model name with the backend prepended, e.g. openrouter:model-name"
+                .into())
+        );
         assert_eq!(
             multi.resolve_model_name(Some("proxy:new-model")),
             "new-model"
