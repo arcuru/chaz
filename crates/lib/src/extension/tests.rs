@@ -1238,32 +1238,34 @@ async fn install_all_validates_manifests_before_instantiation() {
     assert!(err.to_string().contains("name"), "got: {err}");
 }
 
+struct CheckpointWait;
+
+impl Tool for CheckpointWait {
+    fn descriptor(&self) -> crate::tool::ToolDescriptor {
+        crate::tool::ToolDescriptor {
+            name: "job_wait".into(),
+            description: "test wait".into(),
+            parameters: serde_json::json!({"type": "object", "properties": {}}),
+        }
+    }
+    fn execute<'a>(
+        &'a self,
+        _: serde_json::Value,
+        _: &'a crate::tool::ToolContext,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<String, crate::tool::ToolError>> + Send + 'a>,
+    > {
+        Box::pin(async { Ok("observed".into()) })
+    }
+}
+
 /// Injected pre-turn messages are not persisted, so a wait in that turn is
 /// never checkpointed; a resumed turn never fires `before_agent_start` again.
 #[tokio::test]
 async fn injected_pre_turn_messages_prevent_wait_checkpoints_and_never_refire() {
     use crate::runtime::{JobWaitIntent, RuntimeRecord, RuntimeRecorder};
-    use crate::tool::{ToolDescriptor, ToolError};
     use std::future::Future;
     use std::pin::Pin;
-
-    struct Wait;
-    impl Tool for Wait {
-        fn descriptor(&self) -> ToolDescriptor {
-            ToolDescriptor {
-                name: "job_wait".into(),
-                description: "test wait".into(),
-                parameters: serde_json::json!({"type": "object", "properties": {}}),
-            }
-        }
-        fn execute<'a>(
-            &'a self,
-            _: serde_json::Value,
-            _: &'a crate::tool::ToolContext,
-        ) -> Pin<Box<dyn Future<Output = Result<String, ToolError>> + Send + 'a>> {
-            Box::pin(async { Ok("observed".into()) })
-        }
-    }
 
     #[derive(Default)]
     struct Intents(std::sync::Mutex<usize>, std::sync::atomic::AtomicUsize);
@@ -1327,7 +1329,7 @@ async fn injected_pre_turn_messages_prevent_wait_checkpoints_and_never_refire() 
     .unwrap();
     let (_instance, session) = crate::test_support::fresh_session().await;
     let tools = Arc::new(ToolRegistry::new());
-    tools.register(Wait);
+    tools.register(CheckpointWait);
     let mut ctx = crate::test_support::tool_context(session, tools);
     ctx.active_extensions = all_active(&["inject", "result"]);
     let arguments =
@@ -1413,4 +1415,85 @@ async fn injected_pre_turn_messages_prevent_wait_checkpoints_and_never_refire() 
         [1, 2],
         "both live and resumed waits retire before result hooks"
     );
+}
+
+#[tokio::test]
+async fn active_turn_hooks_keep_checkpointed_job_waits_resident() {
+    struct Recorder;
+    impl crate::runtime::RuntimeRecorder for Recorder {
+        fn can_suspend_job_wait(&self) -> bool {
+            true
+        }
+        fn record<'a>(
+            &'a self,
+            _: crate::runtime::RuntimeRecord,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>>
+        {
+            Box::pin(async { Ok(()) })
+        }
+    }
+    let mut hub = test_hub().await;
+    hub.install_all(vec![tool_call_ext("turn-state")])
+        .await
+        .unwrap();
+    for case in ["inactive", "active", "unreadable"] {
+        let tools = Arc::new(ToolRegistry::new());
+        tools.register(CheckpointWait);
+        let (_instance, session) = crate::test_support::fresh_session().await;
+        let mut ctx = crate::test_support::tool_context(session, tools);
+        if case == "active" {
+            ctx.active_extensions = all_active(&["turn-state"]);
+        } else if case == "unreadable" {
+            let db = ctx.session.lock().await.database().clone();
+            let txn = db.new_transaction().await.unwrap();
+            txn.get_store::<eidetica::store::Table<serde_json::Value>>(EXTENSIONS_STORE)
+                .await
+                .unwrap()
+                .insert(serde_json::json!({"malformed":"event"}))
+                .await
+                .unwrap();
+            txn.commit().await.unwrap();
+            assert!(
+                read_active(&db).await.is_err(),
+                "the fixture must really be unreadable"
+            );
+            assert!(
+                ctx.active_extensions.is_empty(),
+                "empty fallback cannot authorize unloading"
+            );
+        }
+        let mock = Arc::new(crate::test_support::MockBackend::new());
+        mock.push_tool_calls([(
+            "w".into(),
+            "job_wait".into(),
+            serde_json::json!({"session_db_id":"child", "timeout_seconds":30}).to_string(),
+        )]);
+        mock.push_text("done");
+        let backend = crate::backends::BackendManager::with_mock(
+            mock.clone(),
+            crate::test_support::empty_secrets().await,
+        );
+        let result = crate::runtime::execute_cancellable_with_recorder(
+            None,
+            vec![RuntimeMessage::User("go".into())],
+            &backend,
+            &crate::test_support::permissive_security(),
+            &ctx,
+            &crate::tool::ToolPolicyRegistry::empty(),
+            Some(Arc::new(Recorder)),
+            Some(&hub),
+            None,
+            None,
+            crate::runtime::ModelCallScope::default(),
+        )
+        .await;
+        if case != "inactive" {
+            assert_eq!(result.unwrap().body, "done", "{case}");
+        } else {
+            assert!(matches!(
+                result,
+                Err(crate::runtime::TurnError::Suspended { .. })
+            ));
+        }
+    }
 }

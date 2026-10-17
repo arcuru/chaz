@@ -6213,6 +6213,246 @@ async fn published_executor_using_mock_and_hub(
     (server, mock)
 }
 
+// Pause a native metadata read while another adopter attaches the Agent.
+// A valid pre-attachment snapshot must not be compared with a later snapshot.
+#[tokio::test]
+async fn published_job_admission_uses_one_scope_snapshot_during_attachment() {
+    use eidetica::service::ServiceServer;
+    use eidetica::service::protocol::{DatabaseOp, ServiceRequest, read_frame, write_frame};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use tokio::net::{UnixListener, UnixStream};
+    use tokio::sync::{Notify, oneshot, watch};
+
+    tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        Box::pin(async {
+            let dir = tempfile::tempdir().unwrap();
+            let socket = dir.path().join("owner.sock");
+            let proxy_socket = dir.path().join("reader.sock");
+            let (owner, local_server, registry) = server_fixture().await;
+            local_server.shutdown().await;
+            let (agent, _) = seed_agent(&local_server, &registry, "default").await;
+            let (parent_id, _) = registry.create_session(Some("cli")).await.unwrap();
+            registry
+                .attach_agent_to_session(&parent_id.0, &agent)
+                .await
+                .unwrap();
+            let prepared = registry
+                .prepare_agent_job(&parent_id.0, "default", "one task")
+                .await
+                .unwrap();
+            let id = prepared.db.root_id().to_string();
+            let child = prepared.db.clone();
+            let service = ServiceServer::bind(owner, &socket).await.unwrap();
+            let (shutdown, receiver) = watch::channel(());
+            let service_task = tokio::spawn(service.run(receiver));
+            let listener = UnixListener::bind(&proxy_socket).unwrap();
+            let armed = Arc::new(AtomicBool::new(false));
+            let release = Arc::new(Notify::new());
+            let (paused_tx, paused_rx) = oneshot::channel();
+            let proxy_task = tokio::spawn({
+                let socket = socket.clone();
+                let id = id.clone();
+                let armed = armed.clone();
+                let release = release.clone();
+                async move {
+                    let (client, _) = listener.accept().await.unwrap();
+                    let upstream = UnixStream::connect(socket).await.unwrap();
+                    let (mut client_read, mut client_write) = client.into_split();
+                    let (mut upstream_read, mut upstream_write) = upstream.into_split();
+                    let requests = async move {
+                        let mut meta_reads = 0;
+                        let mut paused_tx = Some(paused_tx);
+                        while let Some(frame) = read_frame::<_, serde_json::Value>(&mut client_read)
+                            .await
+                            .unwrap()
+                        {
+                            if armed.load(Ordering::Acquire)
+                                && let Ok(ServiceRequest::AuthenticatedDb(request)) =
+                                    serde_json::from_value(frame.clone())
+                                && request.root_id.to_string() == id
+                                && let DatabaseOp::ResolveStoreState { request } = request.op
+                                && request.store == "meta"
+                            {
+                                meta_reads += 1;
+                                // Two marker fields and inspect_published_job's marker
+                                // read precede the scope read in register_accepted_job.
+                                if meta_reads == 4 {
+                                    paused_tx.take().unwrap().send(()).unwrap();
+                                    release.notified().await;
+                                }
+                            }
+                            write_frame(&mut upstream_write, &frame).await.unwrap();
+                        }
+                    };
+                    let responses = tokio::io::copy(&mut upstream_read, &mut client_write);
+                    tokio::join!(requests, responses)
+                }
+            });
+            let settings = crate::config::EideticaConfig {
+                connection: format!("unix://{}", proxy_socket.display()),
+                login: crate::config::EideticaLoginConfig {
+                    username: "test".into(),
+                    password: None,
+                    passwordless: true,
+                },
+                sync: None,
+            };
+            let agents = local_server.agents_arc();
+            let (executor, mock) =
+                published_executor_with_mock(&settings, agents.clone(), agent.clone()).await;
+            // Keep the observed interleaving independent of watcher scheduling.
+            executor.shutdown().await;
+            registry.publish_agent_job(prepared).await.unwrap();
+            let (_, remote_child) = executor.registry.open_session(&id).await.unwrap();
+            armed.store(true, Ordering::Release);
+            let adoption = tokio::spawn({
+                let executor = executor.clone();
+                async move { executor.register_accepted_job(&remote_child).await }
+            });
+            paused_rx
+                .await
+                .expect("scope read must reach the native pause");
+            assert!(
+                crate::session::try_read_meta_from_db(&child)
+                    .await
+                    .unwrap()
+                    .agents
+                    .is_empty()
+            );
+            registry.attach_agent_to_session(&id, &agent).await.unwrap();
+            assert_eq!(
+                crate::session::try_read_meta_from_db(&child)
+                    .await
+                    .unwrap()
+                    .agents
+                    .len(),
+                1
+            );
+            release.notify_one();
+            assert!(adoption.await.unwrap().unwrap());
+            let rejection = crate::session::jobs::read_job_rejection(&child)
+                .await
+                .unwrap();
+            assert!(
+                mock.recorded_calls().is_empty(),
+                "admission does not run a model"
+            );
+            proxy_task.abort();
+            let _ = proxy_task.await;
+            assert!(
+                rejection.is_none(),
+                "valid concurrent attachment was rejected: {rejection:?}"
+            );
+            assert!(
+                executor.is_watching_session(&id).await,
+                "the original published child must be watched"
+            );
+            let settings = crate::config::EideticaConfig {
+                connection: format!("unix://{}", socket.display()),
+                ..settings
+            };
+            let restarted = published_executor(&settings, agents, agent).await;
+            while !restarted.is_watching_session(&id).await {
+                tokio::task::yield_now().await;
+            }
+            assert!(
+                restarted
+                    .validate_accepted_job(&child)
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+            assert_eq!(
+                registry
+                    .list_sessions()
+                    .await
+                    .unwrap()
+                    .iter()
+                    .filter(|row| row
+                        .source
+                        .as_deref()
+                        .is_some_and(|source| source.starts_with("job-stage:")))
+                    .count(),
+                1
+            );
+            assert_eq!(
+                Session::new(ConversationId(id.clone()), child.clone())
+                    .await
+                    .entries()
+                    .iter()
+                    .filter(|entry| entry.entry_type == EntryType::Directive)
+                    .count(),
+                1
+            );
+            restarted.shutdown().await;
+            drop(shutdown);
+            service_task.await.unwrap().unwrap();
+        }),
+    )
+    .await
+    .expect("concurrent admission and restart must finish");
+}
+
+#[tokio::test]
+async fn published_job_admission_rejects_malformed_or_untrusted_scope() {
+    let (_owner, server, registry) = server_fixture().await;
+    server.shutdown().await;
+    let (agent, _) = seed_agent(&server, &registry, "default").await;
+    let (parent_id, _) = registry.create_session(Some("cli")).await.unwrap();
+    registry
+        .attach_agent_to_session(&parent_id.0, &agent)
+        .await
+        .unwrap();
+    let other_agent = serde_json::to_string(&vec![make_agent_ref("other-agent", None)]).unwrap();
+    let narrow = serde_json::to_string(&crate::grants::Grants {
+        shell: Some(crate::grants::ShellGrant {
+            allow: crate::grants::Allowlist::Only(vec![]),
+            ..Default::default()
+        }),
+        ..Default::default()
+    })
+    .unwrap();
+    for (field, value) in [
+        ("agents", "not-json"),
+        ("capabilities", "not-json"),
+        ("host_agent_db_id", "other-agent"),
+        ("agents", other_agent.as_str()),
+        ("capabilities", narrow.as_str()),
+    ] {
+        let prepared = registry
+            .prepare_agent_job(&parent_id.0, "default", "one task")
+            .await
+            .unwrap();
+        let child = prepared.db.clone();
+        let txn = child.new_transaction().await.unwrap();
+        txn.get_store::<eidetica::store::DocStore>("meta")
+            .await
+            .unwrap()
+            .set_string(field, value)
+            .await
+            .unwrap();
+        txn.commit().await.unwrap();
+        let id = registry.publish_agent_job(prepared).await.unwrap();
+        assert!(server.register_accepted_job(&child).await.unwrap());
+        assert!(
+            crate::session::jobs::read_job_rejection(&child)
+                .await
+                .unwrap()
+                .is_some(),
+            "{field}={value} must be rejected"
+        );
+        assert!(
+            crate::session::jobs::read_accepted_job(&child)
+                .await
+                .unwrap()
+                .is_none(),
+            "{field}={value} must not authorize execution"
+        );
+        assert!(!server.is_watching_session(&id.0).await, "{field}={value}");
+    }
+}
+
 // The published DB ID is the handle; neither watcher creates a replacement.
 #[tokio::test]
 async fn published_job_is_adopted_without_creating_another_child() {
