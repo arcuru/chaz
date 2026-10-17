@@ -161,6 +161,7 @@ impl Fixture {
         )
         .await
         .unwrap();
+        crate::test_support::provision_roots(&mut user).await;
         let (agent_db, pubkey) = create_agent_db(
             &mut user,
             "default",

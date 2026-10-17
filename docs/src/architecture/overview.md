@@ -57,7 +57,7 @@ graph TD
     HI -.->|classify by meta.kind| MB
 ```
 
-**Three peer-local layers, none synced:** `user.databases()` (eidetica's catalog of every DB this peer holds keys for) is the source of truth for "which DBs do we host"; `HostedIndex` is an in-memory cache derived from it at startup; `chaz_group` holds local routing, name indices and the session catalog; `chaz_peer` holds credentials, peer defaults and runtime bookkeeping. Sync-ful state lives in per-session, per-agent, and per-bank DBs.
+**Three peer-local layers, none synced:** `user.databases()` (eidetica's catalog of every DB this peer holds keys for) is the source of truth for "which DBs do we host"; `HostedIndex` is an in-memory cache derived from it at startup; `chaz_group` holds local routing, name indices and the session catalog; `chaz_peer` holds credentials, peer defaults and runtime bookkeeping. The registry opens the two bookkeeping DBs by ID from references in the login's Eidetica Account (see [Finding the registry's roots](sessions.md#finding-the-registrys-roots)). Sync-ful state lives in per-session, per-agent, and per-bank DBs.
 
 ## Key Components
 
@@ -238,6 +238,7 @@ crates/lib/src/
   session/             SessionRegistry, Session, EntryType, SessionMeta
     mod.rs             Public types (EntryType, SessionEntry, AgentRef, SessionMeta) + helpers
     registry.rs        SessionRegistry struct, chaz_group/chaz_peer accessors, session CRUD
+    roots.rs           chaz_group/chaz_peer Account references: open, initialize, record
     transport.rs         Session attachment and addressed delivery
     agents.rs          attach/detach + turn-taking resolve_agent (home_pubkey set on attach)
     keys.rs            agent DB helpers, ephemeral keys, user_lock accessor
