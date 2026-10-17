@@ -41,9 +41,7 @@ impl Synthetic {
         })
     }
 }
-/// The synthetic context endpoint wrapped in the shared builder
-/// extension: PerSession scope, with the strategy, tail and durable
-/// endpoints published — and declared — from the one `Arc<Synthetic>`.
+/// Session-scoped selection, recall and retention share one endpoint.
 fn synthetic_ext(endpoint: Arc<Synthetic>) -> TestExt {
     TestExt::new("synthetic_context")
         .scopes(vec![Scope::PerSession])

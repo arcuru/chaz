@@ -1176,11 +1176,8 @@ async fn dispatch_routine_handler_error_propagates() {
     assert!(err.to_string().contains("simulated"), "got: {err}");
 }
 
-/// Publishes a no-op Messenger through the instance `messenger()`
-/// endpoint. Used by `cap_resolver_walks_instance_published_caps`.
-/// Messenger is not part of `TestExt`'s derived `provides_capabilities`,
-/// so this publishes the endpoint without declaring it — same manifest
-/// as the one-off double it replaced.
+/// Publishes an undeclared Messenger endpoint to exercise instance-based
+/// resolution independently of operator-granted context capabilities.
 fn instance_messenger_ext() -> Arc<dyn Extension> {
     struct NoopMessenger;
     impl caps::Messenger for NoopMessenger {

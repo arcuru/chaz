@@ -1,32 +1,23 @@
-//! Shared test doubles for extension-framework tests.
+//! Extension builders and endpoints shared by the framework tests.
 //!
-//! One small, explicit set of doubles instead of per-file one-off impls:
-//! a configurable builder extension ([`TestExt`]) that publishes exactly
-//! the handlers it was given, a minimal name-only extension
-//! ([`NamedExt`]), fixed-value capability endpoints, and hook handlers
-//! with distinct observable behaviour (pass, count, block, mutate,
-//! panic, record). Doubles whose behaviour is unique to one scenario
-//! stay next to the tests that use them.
-//!
-//! `tool_call_failure_tests`, `context_strategy::tests` and
-//! `durable_context::tests` build their scenarios from this module; the
-//! framework's own `tests.rs` uses it directly.
+//! `TestExt` publishes the configured handlers at each requested scope.
+//! Scenario-specific behavior stays beside its tests.
 
 use super::context_strategy::ContextStrategy;
 use super::durable_context::DurableContextContributor;
 use super::*;
 use crate::runtime::RuntimeMessage;
+use crate::test_support::{fresh_eidetica, fresh_session_registry};
 use crate::tool::ToolRegistry;
 use crate::types::ConversationId;
-use eidetica::backend::database::InMemory;
+use eidetica::Instance;
 use eidetica::crdt::Doc;
-use eidetica::{Instance, NewUser};
 
 /// Minimal extension: a name and nothing else. The default
 /// `instantiate` yields a no-op instance, so it registers nothing
 /// through the drain — useful for registration/event-log tests that
 /// only care that an extension exists.
-pub(crate) struct NamedExt(pub(crate) &'static str);
+pub(super) struct NamedExt(pub(super) &'static str);
 impl Extension for NamedExt {
     fn name(&self) -> &'static str {
         self.0
@@ -36,43 +27,28 @@ impl Extension for NamedExt {
     }
 }
 
-// ── Instance-model test helpers ─────────────────────────────────
-//
-// The hub no longer has a legacy `install()` path — every
-// extension publishes its tools / commands / hook handlers through
-// an `ExtensionInstance` drained at `install_all`. These helpers
-// let tests build a Global extension from a bag of `Arc`-d
-// handlers without spelling out a bespoke `Extension` +
-// `ExtensionInstance` pair each time.
-
 #[derive(Default, Clone)]
-pub(crate) struct TestParts {
-    pub(crate) tool_call: Option<Arc<dyn handler::HookHandlerToolCall>>,
-    pub(crate) before_agent_start: Option<Arc<dyn handler::HookHandlerBeforeAgentStart>>,
-    pub(crate) tool_result: Option<Arc<dyn handler::HookHandlerToolResult>>,
-    pub(crate) agent_end: Option<Arc<dyn handler::HookHandlerAgentEnd>>,
-    pub(crate) session_start: Option<Arc<dyn handler::HookHandlerSessionStart>>,
-    pub(crate) session_shutdown: Option<Arc<dyn handler::HookHandlerSessionShutdown>>,
-    pub(crate) routine_handler: Option<Arc<dyn handler::RoutineHandler>>,
-    pub(crate) prompt_augmentation: Option<Arc<dyn caps::PromptAugmentation>>,
-    pub(crate) context_tail: Option<Arc<dyn caps::ContextTail>>,
-    pub(crate) context_strategy: Option<Arc<dyn ContextStrategy>>,
-    pub(crate) durable_context: Option<Arc<dyn DurableContextContributor>>,
-    pub(crate) messenger: Option<Arc<dyn caps::Messenger>>,
-    pub(crate) status_segment: Option<Arc<dyn caps::StatusSegment>>,
-    pub(crate) tools: Vec<Arc<dyn Tool>>,
-    pub(crate) commands: Vec<(String, Arc<dyn ExtensionCommand>)>,
+pub(super) struct TestParts {
+    pub(super) tool_call: Option<Arc<dyn handler::HookHandlerToolCall>>,
+    pub(super) before_agent_start: Option<Arc<dyn handler::HookHandlerBeforeAgentStart>>,
+    pub(super) tool_result: Option<Arc<dyn handler::HookHandlerToolResult>>,
+    pub(super) routine_handler: Option<Arc<dyn handler::RoutineHandler>>,
+    pub(super) prompt_augmentation: Option<Arc<dyn caps::PromptAugmentation>>,
+    pub(super) context_tail: Option<Arc<dyn caps::ContextTail>>,
+    pub(super) context_strategy: Option<Arc<dyn ContextStrategy>>,
+    pub(super) durable_context: Option<Arc<dyn DurableContextContributor>>,
+    pub(super) messenger: Option<Arc<dyn caps::Messenger>>,
+    pub(super) status_segment: Option<Arc<dyn caps::StatusSegment>>,
+    pub(super) tools: Vec<Arc<dyn Tool>>,
+    pub(super) commands: Vec<(String, Arc<dyn ExtensionCommand>)>,
 }
 
-pub(crate) struct TestExt {
+pub(super) struct TestExt {
     name: &'static str,
     supported: Vec<HookKind>,
     scopes: Vec<instance::Scope>,
     parts: TestParts,
-    /// Explicit `provides_capabilities` override. When `None` the
-    /// manifest derives the declaration from whichever capability
-    /// endpoints are configured — the host enforces that declaration,
-    /// so it must track the published endpoints.
+    /// Context capabilities are declared by default; override for undeclared-endpoint tests.
     provides: Option<Vec<caps::CapabilityKind>>,
     instantiations: Option<Arc<std::sync::atomic::AtomicUsize>>,
     fail_instantiate: bool,
@@ -80,7 +56,7 @@ pub(crate) struct TestExt {
 }
 
 impl TestExt {
-    pub(crate) fn new(name: &'static str) -> Self {
+    pub(super) fn new(name: &'static str) -> Self {
         Self {
             name,
             supported: Vec::new(),
@@ -94,7 +70,7 @@ impl TestExt {
     }
     /// Bump `counter` on every `instantiate` call, so tests can assert
     /// how many instances the hub actually built.
-    pub(crate) fn instantiation_counter(
+    pub(super) fn instantiation_counter(
         mut self,
         counter: Arc<std::sync::atomic::AtomicUsize>,
     ) -> Self {
@@ -104,72 +80,72 @@ impl TestExt {
     /// Fail `instantiate` *after* the parts are configured, so tests
     /// can assert that the parts a successful instantiation would have
     /// published never reach the hub's registries.
-    pub(crate) fn fails_instantiate(mut self) -> Self {
+    pub(super) fn fails_instantiate(mut self) -> Self {
         self.fail_instantiate = true;
         self
     }
     /// Panic inside `instantiate` (not just an Err return) so the
     /// `catch_unwind` path in `install_all` is exercised.
-    pub(crate) fn panics_instantiate(mut self) -> Self {
+    pub(super) fn panics_instantiate(mut self) -> Self {
         self.panic_instantiate = true;
         self
     }
-    pub(crate) fn scopes(mut self, scopes: Vec<instance::Scope>) -> Self {
+    pub(super) fn scopes(mut self, scopes: Vec<instance::Scope>) -> Self {
         self.scopes = scopes;
         self
     }
     /// Override `manifest().provides_capabilities` outright. Pass
     /// `vec![]` to model an extension that publishes an endpoint
     /// without declaring the capability.
-    pub(crate) fn provides_capabilities(mut self, kinds: Vec<caps::CapabilityKind>) -> Self {
+    pub(super) fn provides_capabilities(mut self, kinds: Vec<caps::CapabilityKind>) -> Self {
         self.provides = Some(kinds);
         self
     }
-    pub(crate) fn prompt_augmentation(mut self, p: Arc<dyn caps::PromptAugmentation>) -> Self {
+    pub(super) fn prompt_augmentation(mut self, p: Arc<dyn caps::PromptAugmentation>) -> Self {
         self.parts.prompt_augmentation = Some(p);
         self
     }
-    pub(crate) fn context_tail(mut self, tail: Arc<dyn caps::ContextTail>) -> Self {
+    pub(super) fn context_tail(mut self, tail: Arc<dyn caps::ContextTail>) -> Self {
         self.parts.context_tail = Some(tail);
         self
     }
-    pub(crate) fn context_strategy(mut self, strategy: Arc<dyn ContextStrategy>) -> Self {
+    pub(super) fn context_strategy(mut self, strategy: Arc<dyn ContextStrategy>) -> Self {
         self.parts.context_strategy = Some(strategy);
         self
     }
-    pub(crate) fn durable_context(
+    pub(super) fn durable_context(
         mut self,
         contributor: Arc<dyn DurableContextContributor>,
     ) -> Self {
         self.parts.durable_context = Some(contributor);
         self
     }
-    pub(crate) fn messenger(mut self, messenger: Arc<dyn caps::Messenger>) -> Self {
+    pub(super) fn messenger(mut self, messenger: Arc<dyn caps::Messenger>) -> Self {
         self.parts.messenger = Some(messenger);
         self
     }
-    pub(crate) fn status_segment(mut self, s: Arc<dyn caps::StatusSegment>) -> Self {
+    pub(super) fn status_segment(mut self, s: Arc<dyn caps::StatusSegment>) -> Self {
         self.parts.status_segment = Some(s);
         self
     }
-    pub(crate) fn tool_call(mut self, h: Arc<dyn handler::HookHandlerToolCall>) -> Self {
+    pub(super) fn tool_call(mut self, h: Arc<dyn handler::HookHandlerToolCall>) -> Self {
         self.supported.push(HookKind::ToolCall);
         self.parts.tool_call = Some(h);
         self
     }
     /// Publish a tool through the instance drain. Tools count as the
     /// `Tool` hook kind in the declaration.
-    pub(crate) fn tool(mut self, tool: Arc<dyn Tool>) -> Self {
+    pub(super) fn tool(mut self, tool: Arc<dyn Tool>) -> Self {
         self.supported.push(HookKind::Tool);
         self.parts.tools.push(tool);
         self
     }
-    pub(crate) fn tool_result(mut self, h: Arc<dyn handler::HookHandlerToolResult>) -> Self {
+    pub(super) fn tool_result(mut self, h: Arc<dyn handler::HookHandlerToolResult>) -> Self {
         self.supported.push(HookKind::ToolResult);
         self.parts.tool_result = Some(h);
         self
     }
-    pub(crate) fn before_agent_start(
+    pub(super) fn before_agent_start(
         mut self,
         h: Arc<dyn handler::HookHandlerBeforeAgentStart>,
     ) -> Self {
@@ -177,11 +153,11 @@ impl TestExt {
         self.parts.before_agent_start = Some(h);
         self
     }
-    pub(crate) fn routine_handler(mut self, h: Arc<dyn handler::RoutineHandler>) -> Self {
+    pub(super) fn routine_handler(mut self, h: Arc<dyn handler::RoutineHandler>) -> Self {
         self.parts.routine_handler = Some(h);
         self
     }
-    pub(crate) fn command(mut self, name: &str, h: Arc<dyn ExtensionCommand>) -> Self {
+    pub(super) fn command(mut self, name: &str, h: Arc<dyn ExtensionCommand>) -> Self {
         self.supported.push(HookKind::Command);
         self.parts.commands.push((name.to_string(), h));
         self
@@ -244,9 +220,9 @@ impl Extension for TestExt {
     }
 }
 
-pub(crate) struct TestInstance {
-    pub(crate) manifest: manifest::ExtensionManifest,
-    pub(crate) parts: TestParts,
+pub(super) struct TestInstance {
+    pub(super) manifest: manifest::ExtensionManifest,
+    pub(super) parts: TestParts,
 }
 impl instance::ExtensionInstance for TestInstance {
     fn manifest(&self) -> &manifest::ExtensionManifest {
@@ -266,15 +242,6 @@ impl instance::ExtensionInstance for TestInstance {
     }
     fn before_agent_start_hook(&self) -> Option<Arc<dyn handler::HookHandlerBeforeAgentStart>> {
         self.parts.before_agent_start.clone()
-    }
-    fn agent_end_hook(&self) -> Option<Arc<dyn handler::HookHandlerAgentEnd>> {
-        self.parts.agent_end.clone()
-    }
-    fn session_start_hook(&self) -> Option<Arc<dyn handler::HookHandlerSessionStart>> {
-        self.parts.session_start.clone()
-    }
-    fn session_shutdown_hook(&self) -> Option<Arc<dyn handler::HookHandlerSessionShutdown>> {
-        self.parts.session_shutdown.clone()
     }
     fn routine_handler(&self) -> Option<Arc<dyn handler::RoutineHandler>> {
         self.parts.routine_handler.clone()
@@ -299,7 +266,7 @@ impl instance::ExtensionInstance for TestInstance {
     }
 }
 
-pub(crate) fn test_peer_handles(registry: Arc<SessionRegistry>) -> Arc<instance::PeerHandles> {
+pub(super) fn test_peer_handles(registry: Arc<SessionRegistry>) -> Arc<instance::PeerHandles> {
     Arc::new(instance::PeerHandles {
         registry,
         agent_index: HostedIndex::empty("agent"),
@@ -317,26 +284,16 @@ pub(crate) fn test_peer_handles(registry: Arc<SessionRegistry>) -> Arc<instance:
 /// Hub with `session_registry` + `peer_handles` wired, so
 /// `install_all` runs the Global-instance drain (tools, commands,
 /// hooks, routine handlers all surface).
-pub(crate) async fn test_hub() -> ExtensionHub {
-    use crate::agent::AgentRegistry;
-    let backend = InMemory::new();
-    let (inst, user) = Instance::create_backend(Box::new(backend), NewUser::passwordless("test"))
-        .await
-        .unwrap();
-    let agents = Arc::new(AgentRegistry::with_default_agent());
-    let registry = Arc::new(SessionRegistry::new(inst, user, agents).await.unwrap());
+pub(super) async fn test_hub() -> ExtensionHub {
+    let (_instance, registry) = fresh_session_registry().await;
     let mut hub = ExtensionHub::new();
     hub.set_session_registry(registry.clone());
     hub.set_peer_handles(test_peer_handles(registry));
     hub
 }
 
-pub(crate) async fn make_session_db() -> (Instance, Database) {
-    let backend = InMemory::new();
-    let (instance, mut user) =
-        Instance::create_backend(Box::new(backend), NewUser::passwordless("test"))
-            .await
-            .unwrap();
+pub(super) async fn make_session_db() -> (Instance, Database) {
+    let (instance, mut user) = fresh_eidetica().await;
     let key = user.get_default_key().unwrap();
     let mut s = Doc::new();
     s.set("name", "session");
@@ -344,7 +301,7 @@ pub(crate) async fn make_session_db() -> (Instance, Database) {
     (instance, db)
 }
 
-pub(crate) struct FixedAug(pub(crate) &'static str);
+pub(super) struct FixedAug(pub(super) &'static str);
 impl caps::PromptAugmentation for FixedAug {
     fn augment_system_prompt<'a>(
         &'a self,
@@ -367,7 +324,7 @@ impl caps::ContextTail for FixedAug {
     }
 }
 
-pub(crate) struct FixedStatus(pub(crate) &'static str, pub(crate) &'static str);
+pub(super) struct FixedStatus(pub(super) &'static str, pub(super) &'static str);
 impl caps::StatusSegment for FixedStatus {
     fn status_segments<'a>(
         &'a self,
@@ -380,7 +337,7 @@ impl caps::StatusSegment for FixedStatus {
 
 /// Always-`Continue` tool-call hook used by registration-tracking
 /// tests.
-pub(crate) struct PassToolCall;
+pub(super) struct PassToolCall;
 impl handler::HookHandlerToolCall for PassToolCall {
     fn on_tool_call<'a>(
         &'a self,
@@ -391,12 +348,12 @@ impl handler::HookHandlerToolCall for PassToolCall {
     }
 }
 
-pub(crate) fn tool_call_ext(name: &'static str) -> Arc<dyn Extension> {
+pub(super) fn tool_call_ext(name: &'static str) -> Arc<dyn Extension> {
     Arc::new(TestExt::new(name).tool_call(Arc::new(PassToolCall)))
 }
 
-pub(crate) struct CountingHook {
-    pub(crate) calls: Arc<std::sync::atomic::AtomicUsize>,
+pub(super) struct CountingHook {
+    pub(super) calls: Arc<std::sync::atomic::AtomicUsize>,
 }
 impl handler::HookHandlerBeforeAgentStart for CountingHook {
     fn on_before_agent_start<'a>(&'a self) -> handler::HandlerFuture<'a, Vec<RuntimeMessage>> {
@@ -408,14 +365,14 @@ impl handler::HookHandlerBeforeAgentStart for CountingHook {
     }
 }
 
-pub(crate) fn counting_ext(
+pub(super) fn counting_ext(
     name: &'static str,
     calls: Arc<std::sync::atomic::AtomicUsize>,
 ) -> Arc<dyn Extension> {
     Arc::new(TestExt::new(name).before_agent_start(Arc::new(CountingHook { calls })))
 }
 
-pub(crate) struct BlockingHook;
+pub(super) struct BlockingHook;
 impl handler::HookHandlerToolCall for BlockingHook {
     fn on_tool_call<'a>(
         &'a self,
@@ -434,7 +391,7 @@ impl handler::HookHandlerToolCall for BlockingHook {
     }
 }
 
-pub(crate) struct MutatingHook;
+pub(super) struct MutatingHook;
 impl handler::HookHandlerToolCall for MutatingHook {
     fn on_tool_call<'a>(
         &'a self,
@@ -450,14 +407,14 @@ impl handler::HookHandlerToolCall for MutatingHook {
     }
 }
 
-pub(crate) struct PanickingBeforeAgentStartHook;
+pub(super) struct PanickingBeforeAgentStartHook;
 impl handler::HookHandlerBeforeAgentStart for PanickingBeforeAgentStartHook {
     fn on_before_agent_start<'a>(&'a self) -> handler::HandlerFuture<'a, Vec<RuntimeMessage>> {
         Box::pin(async move { panic!("intentional panic for catch_unwind test") })
     }
 }
 
-pub(crate) struct DummyCmd;
+pub(super) struct DummyCmd;
 impl ExtensionCommand for DummyCmd {
     fn description(&self) -> &'static str {
         "test command"
@@ -471,13 +428,13 @@ impl ExtensionCommand for DummyCmd {
     }
 }
 
-pub(crate) fn cmd_ext(name: &'static str, cmd: &'static str) -> Arc<dyn Extension> {
+pub(super) fn cmd_ext(name: &'static str, cmd: &'static str) -> Arc<dyn Extension> {
     Arc::new(TestExt::new(name).command(cmd, Arc::new(DummyCmd)))
 }
 
 /// Routine handler that records every payload it receives.
-pub(crate) struct Recorder {
-    pub(crate) seen: std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+pub(super) struct Recorder {
+    pub(super) seen: std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
 }
 impl handler::RoutineHandler for Recorder {
     fn on_fire<'a>(
@@ -492,30 +449,19 @@ impl handler::RoutineHandler for Recorder {
     }
 }
 
-/// Test-only ctx that pretends *every* extension name is active so
-/// fire_* tests can exercise handler dispatch without manually
-/// listing owners. Production code always builds a real per-session
-/// set via `Server::active_extensions_for`.
-pub(crate) fn all_active(names: &[&'static str]) -> HashSet<String> {
+/// Active owners for dispatch tests that do not exercise the activation log.
+pub(super) fn all_active(names: &[&'static str]) -> HashSet<String> {
     names.iter().map(|s| s.to_string()).collect()
 }
 
-pub(crate) async fn fixture_ctx_with_active(active: HashSet<String>) -> HookContext {
+pub(super) async fn fixture_ctx_with_active(active: HashSet<String>) -> HookContext {
     let mut ctx = fixture_ctx().await;
     ctx.active_extensions = active;
     ctx
 }
 
-pub(crate) async fn fixture_ctx() -> HookContext {
-    let backend = InMemory::new();
-    let (_instance, mut user) =
-        Instance::create_backend(Box::new(backend), NewUser::passwordless("test"))
-            .await
-            .unwrap();
-    let key = user.get_default_key().unwrap();
-    let mut s = Doc::new();
-    s.set("name", "session");
-    let db = user.create_database(s, &key).await.unwrap();
+pub(super) async fn fixture_ctx() -> HookContext {
+    let (_instance, db) = make_session_db().await;
     let session = Session::new(ConversationId("conv".into()), db).await;
     HookContext {
         agent_name: "test_agent".into(),
