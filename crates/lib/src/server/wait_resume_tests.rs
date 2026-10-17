@@ -574,29 +574,22 @@ async fn restart_resumes_only_the_same_wait_and_survives_a_second_crash() {
 /// Capture authoritative signed history, not heartbeats or extension-status
 /// observations that a restarted executor may legitimately publish.
 async fn wait_history(db: &eidetica::Database) -> std::collections::BTreeMap<String, Vec<u8>> {
-    let mut pending = db.snapshot().await.unwrap().into_tips();
-    let mut seen = std::collections::HashSet::new();
+    let snapshot = db.snapshot().await.unwrap();
     let mut entries = std::collections::BTreeMap::new();
-    while let Some(id) = pending.pop() {
-        if !seen.insert(id.clone()) {
-            continue;
-        }
-        let entry = db.get_entry(id.clone()).await.unwrap();
-        pending.extend(entry.parents().unwrap());
-        if [
-            "entries",
-            "turn_attempts",
-            "turn_transcript",
-            JOB_WAIT_CHECKPOINTS_STORE,
-            "execution_starts_v1",
-            "execution_transcript_v1",
-            "execution_outcomes_v1",
-        ]
-        .iter()
-        .any(|store| entry.in_subtree(store))
+    for store in [
+        "entries",
+        "turn_attempts",
+        "turn_transcript",
+        JOB_WAIT_CHECKPOINTS_STORE,
+        "execution_starts_v1",
+        "execution_transcript_v1",
+        "execution_outcomes_v1",
+    ] {
+        for entry in crate::session::execution::store_entries_at(db, store, &snapshot)
+            .await
+            .unwrap()
         {
-            assert_eq!(entry.id(), id);
-            entries.insert(id.to_string(), entry.to_dagcbor().unwrap());
+            entries.insert(entry.id().to_string(), entry.to_dagcbor().unwrap());
         }
     }
     entries
