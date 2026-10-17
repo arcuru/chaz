@@ -4,7 +4,7 @@ on:
   push:
     branches: ["main"]
   pull_request:
-    branches: ["main"]
+    branches: ["main", "ci/cache-cost-trials-20261015"]
   # A merge queue runs its checks against a synthetic branch and reports them
   # under this event. A required check that does not subscribe to it never
   # reports at all, which stalls the queue rather than failing it.
@@ -22,12 +22,36 @@ concurrency:
 
 jobs:
   ci:
-    name: CI
-    runs-on: ubicloud-standard-8
+    # Keep the control's existing status context; alternatives are trial-only.
+    name: ${{ matrix.runner == 'ubicloud-standard-8' && 'CI' || format('CI (trial {0})', matrix.runner) }}
+    strategy:
+      # Resource failures on one runner must not cancel the other measurements.
+      fail-fast: false
+      matrix:
+        runner: ${{ fromJSON(github.event_name == 'pull_request' &&
+          github.repository == 'arcuru/chaz' &&
+          github.event.pull_request.head.repo.full_name == github.repository &&
+          github.head_ref == 'ci/runner-comparison-20261015' &&
+          github.base_ref == 'ci/cache-cost-trials-20261015' &&
+          github.event.pull_request.base.sha == '654a25be1d95d471948e3cb4a85ebd3bc4faccb0' &&
+          '["ubicloud-standard-8","ubicloud-standard-4","ubuntu-24.04"]' ||
+          '["ubicloud-standard-8"]') }}
+    runs-on: ${{ matrix.runner }}
+    defaults:
+      run:
+        # Stream samples during commands, even if a deadline prevents cleanup.
+        # Ordinary runs keep GitHub's implicit Linux bash invocation.
+        shell: ${{ github.base_ref == 'ci/cache-cost-trials-20261015' && 'python3 dev/ci-runner-trial/telemetry.py run {0}' || 'bash -e {0}' }}
     timeout-minutes: 30
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      # Only the stacked trial gets telemetry. Refuse an unexpected parent tip
+      # or head rather than reporting a skipped, apparently green control.
+      - name: Validate runner trial
+        if: github.base_ref == 'ci/cache-cost-trials-20261015'
+        run: python3 dev/ci-runner-trial/telemetry.py check
 
       - name: Setup Nix
         uses: ./.github/actions/setup-nix
@@ -54,13 +78,38 @@ jobs:
           nix-fast-build --skip-cached --no-nom --no-link \
             -f '.#checks.x86_64-linux.build'
 
+      - name: Runner disk footprint (logs only)
+        timeout-minutes: 1
+        if: always() && github.base_ref == 'ci/cache-cost-trials-20261015'
+        continue-on-error: true
+        run: |
+          du -sk /nix/store target 2>/dev/null || true
+
   # The Matrix bridge end-to-end test. Separate from the checks above because it
   # pulls Synapse into the closure and stands up four processes, neither of which
   # the fast checks should wait on. Needs no secrets — the homeserver, the
   # accounts, and the model are all throwaway and local to the runner.
   e2e:
-    name: Matrix E2E
-    runs-on: ubicloud-standard-8
+    # Keep the control's existing status context; alternatives are trial-only.
+    name: ${{ matrix.runner == 'ubicloud-standard-8' && 'Matrix E2E' || format('Matrix E2E (trial {0})', matrix.runner) }}
+    strategy:
+      # Resource failures on one runner must not cancel the other measurements.
+      fail-fast: false
+      matrix:
+        runner: ${{ fromJSON(github.event_name == 'pull_request' &&
+          github.repository == 'arcuru/chaz' &&
+          github.event.pull_request.head.repo.full_name == github.repository &&
+          github.head_ref == 'ci/runner-comparison-20261015' &&
+          github.base_ref == 'ci/cache-cost-trials-20261015' &&
+          github.event.pull_request.base.sha == '654a25be1d95d471948e3cb4a85ebd3bc4faccb0' &&
+          '["ubicloud-standard-8","ubicloud-standard-4","ubuntu-24.04"]' ||
+          '["ubicloud-standard-8"]') }}
+    runs-on: ${{ matrix.runner }}
+    defaults:
+      run:
+        # Stream samples during commands, even if a deadline prevents cleanup.
+        # Ordinary runs keep GitHub's implicit Linux bash invocation.
+        shell: ${{ github.base_ref == 'ci/cache-cost-trials-20261015' && 'python3 dev/ci-runner-trial/telemetry.py run {0}' || 'bash -e {0}' }}
     # Fenced to the upstream repository, whose runner label this is: a fork
     # running its own copy of this workflow would queue forever rather than
     # fail. A pull request from a fork still schedules the job, because the
@@ -74,6 +123,12 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      # Only the stacked trial gets telemetry. Refuse an unexpected parent tip
+      # or head rather than reporting a skipped, apparently green control.
+      - name: Validate runner trial
+        if: github.base_ref == 'ci/cache-cost-trials-20261015'
+        run: python3 dev/ci-runner-trial/telemetry.py check
 
       - name: Setup Nix
         uses: ./.github/actions/setup-nix
@@ -93,6 +148,9 @@ jobs:
         uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
         with:
           key: matrix-e2e-${{ hashFiles('flake.nix', 'flake.lock') }}
+          # Isolate cold/warm trial arms, including fallback restore prefixes.
+          # Outside this stack, use the action's unchanged default prefix.
+          prefix-key: ${{ github.base_ref == 'ci/cache-cost-trials-20261015' && format('v0-rust-runner-trial-{0}', matrix.runner) || 'v0-rust' }}
           cache-bin: false
 
       # Debug binaries, matching what `just e2e` builds locally. Split from the
@@ -121,3 +179,10 @@ jobs:
           fi
           exit "$rc"
         timeout-minutes: 10
+
+      - name: Runner disk footprint (logs only)
+        timeout-minutes: 1
+        if: always() && github.base_ref == 'ci/cache-cost-trials-20261015'
+        continue-on-error: true
+        run: |
+          du -sk /nix/store target 2>/dev/null || true
