@@ -43,8 +43,8 @@ pub enum McpServerStatus {
     /// configured server is a visible row from the first frame instead of
     /// appearing out of nowhere once it connects.
     ///
-    /// Not a failure. A server can sit here for as long as its configured
-    /// startup timeout allows.
+    /// Not a failure. Handshake/discovery use the configured startup timeout;
+    /// failure cleanup then has its separate bounded child-cleanup allowance.
     Starting,
     /// Server started and its tools are in the tool registry. Capability +
     /// tool metadata live on `server`; cloning the `Arc` is cheap and lets
@@ -62,8 +62,8 @@ pub enum McpServerStatus {
         discovery_error: Option<String>,
     },
     /// Server could not be started, or did not settle within its startup
-    /// timeout. The error string is the message from [`McpServer::start`]
-    /// or a timeout description.
+    /// timeout. The error describes spawn, initialization, timeout, or
+    /// incomplete cleanup.
     Failed { error: String },
 }
 

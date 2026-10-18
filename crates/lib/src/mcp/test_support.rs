@@ -1,4 +1,5 @@
 //! Disposable subprocess fixtures; no configured servers or model backends.
+use super::server::McpServer;
 use crate::config::McpServerConfig;
 use std::path::Path;
 use std::time::Duration;
@@ -43,6 +44,15 @@ impl Fixture {
             .lines()
             .count()
     }
+}
+
+pub(crate) async fn start_initialized(config: &McpServerConfig) -> Result<McpServer, String> {
+    let server = McpServer::start(config)?;
+    if let Err(error) = server.initialize().await {
+        server.shutdown().await?;
+        return Err(error);
+    }
+    Ok(server)
 }
 
 pub(crate) async fn wait_file(path: &Path) {

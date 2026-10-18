@@ -4,6 +4,7 @@
 //! still compiled as the `tests` submodule (module path unchanged).
 
 use super::*;
+use crate::mcp::test_support::start_initialized;
 use crate::tool::ToolError;
 
 // ================================================================
@@ -1601,15 +1602,6 @@ async fn http_build_capability_tools_adds_resource_and_prompt_wrappers() {
     assert!(names.contains(&"fakefs__read_resource".to_string()));
     assert!(names.contains(&"fakefs__list_prompts".to_string()));
     assert!(names.contains(&"fakefs__get_prompt".to_string()));
-}
-
-async fn start_initialized(config: &McpServerConfig) -> Result<McpServer, String> {
-    let server = McpServer::start(config)?;
-    if let Err(error) = server.initialize().await {
-        server.shutdown().await?;
-        return Err(error);
-    }
-    Ok(server)
 }
 
 #[tokio::test]

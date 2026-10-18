@@ -2,7 +2,7 @@
 use super::*;
 use crate::config::McpServerConfig;
 use crate::grants::{Allowlist, Grants, NetworkGrant};
-use crate::mcp::server::McpServer;
+use crate::mcp::{server::McpServer, test_support::start_initialized};
 use crate::test_support::{
     MockBackend, RecordingRuntime, empty_secrets, fresh_session, tool_context,
 };
@@ -491,12 +491,4 @@ async fn mcp_stdio_failed_recovery_preserves_the_original_call_error() {
     assert_eq!(line_count(&directory.path().join("called")), 1);
     assert_eq!(line_count(&directory.path().join("effects")), 1);
     server.shutdown().await.unwrap();
-}
-
-async fn start_initialized(
-    config: &crate::config::McpServerConfig,
-) -> Result<crate::mcp::server::McpServer, String> {
-    let server = crate::mcp::server::McpServer::start(config)?;
-    server.initialize().await?;
-    Ok(server)
 }

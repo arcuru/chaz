@@ -413,49 +413,69 @@ impl StdioTransport {
     ) -> Result<Value, String> {
         let mut interrupted = self.interrupt.subscribe();
         self.ensure_open()?;
+        let response = async {
+            let mut generation = self.generation.lock().await;
+            self.ensure_open()?;
+            let g = generation
+                .as_mut()
+                .ok_or_else(|| format!("MCP server '{server_name}' closed stdout"))?;
+            Self::write_frame(g, server_name, request).await?;
+            let mut line = String::new();
+            loop {
+                line.clear();
+                let bytes_read = g
+                    .stdout
+                    .read_line(&mut line)
+                    .await
+                    .map_err(|e| format!("MCP '{server_name}' read error: {e}"))?;
+                if bytes_read == 0 {
+                    return Err(format!("MCP server '{server_name}' closed stdout"));
+                }
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                let parsed: Value = match serde_json::from_str(trimmed) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        warn!("MCP '{server_name}' non-JSON line: {e}");
+                        continue;
+                    }
+                };
+                debug!("MCP '{server_name}' ← {trimmed}");
+                let resp_id = match parsed.get("id") {
+                    Some(id_val) => id_val.as_u64(),
+                    None => {
+                        let method = parsed.get("method").and_then(|m| m.as_str()).unwrap_or("");
+                        if method == "notifications/tools/list_changed" {
+                            info!("MCP '{server_name}' signaled tools/list_changed");
+                            tools_changed.store(true, Ordering::Relaxed);
+                        } else {
+                            debug!("MCP '{server_name}' notification: {trimmed}");
+                        }
+                        continue;
+                    }
+                };
+                if resp_id == Some(id) {
+                    if let Some(err) = parsed.get("error") {
+                        let msg = err
+                            .get("message")
+                            .and_then(|m| m.as_str())
+                            .unwrap_or("unknown error");
+                        return Err(format!("MCP '{server_name}' error: {msg}"));
+                    }
+                    return parsed
+                        .get("result")
+                        .cloned()
+                        .ok_or_else(|| format!("MCP '{server_name}': response missing result"));
+                }
+                warn!("MCP '{server_name}' unexpected response id {resp_id:?} (expected {id})");
+            }
+        };
         tokio::select! {
             biased;
             _ = interrupted.changed() => Err(format!("MCP server '{server_name}' I/O interrupted")),
-            result = async {
-                let mut generation = self.generation.lock().await;
-                self.ensure_open()?;
-                let g = generation.as_mut().ok_or_else(|| format!("MCP server '{server_name}' closed stdout"))?;
-                Self::write_frame(g, server_name, request).await?;
-                let mut line = String::new();
-                loop {
-                    line.clear();
-                    let bytes_read = g.stdout.read_line(&mut line).await
-                        .map_err(|e| format!("MCP '{server_name}' read error: {e}"))?;
-                    if bytes_read == 0 { return Err(format!("MCP server '{server_name}' closed stdout")) }
-                    let trimmed = line.trim();
-                    if trimmed.is_empty() { continue }
-                    let parsed: Value = match serde_json::from_str(trimmed) {
-                        Ok(v) => v,
-                        Err(e) => { warn!("MCP '{server_name}' non-JSON line: {e}"); continue }
-                    };
-                    debug!("MCP '{server_name}' ← {trimmed}");
-                    let resp_id = match parsed.get("id") {
-                        Some(id_val) => id_val.as_u64(),
-                        None => {
-                            let method = parsed.get("method").and_then(|m| m.as_str()).unwrap_or("");
-                            if method == "notifications/tools/list_changed" {
-                                info!("MCP '{server_name}' signaled tools/list_changed");
-                                tools_changed.store(true, Ordering::Relaxed);
-                            } else { debug!("MCP '{server_name}' notification: {trimmed}"); }
-                            continue;
-                        }
-                    };
-                    if resp_id == Some(id) {
-                        if let Some(err) = parsed.get("error") {
-                            let msg = err.get("message").and_then(|m| m.as_str()).unwrap_or("unknown error");
-                            return Err(format!("MCP '{server_name}' error: {msg}"));
-                        }
-                        return parsed.get("result").cloned()
-                            .ok_or_else(|| format!("MCP '{server_name}': response missing result"));
-                    }
-                    warn!("MCP '{server_name}' unexpected response id {resp_id:?} (expected {id})");
-                }
-            } => result,
+            result = response => result,
         }
     }
 
@@ -466,15 +486,18 @@ impl StdioTransport {
     ) -> Result<(), String> {
         let mut interrupted = self.interrupt.subscribe();
         self.ensure_open()?;
+        let write = async {
+            let mut generation = self.generation.lock().await;
+            self.ensure_open()?;
+            let g = generation
+                .as_mut()
+                .ok_or_else(|| format!("MCP server '{server_name}' closed stdout"))?;
+            Self::write_frame(g, server_name, notification).await
+        };
         tokio::select! {
             biased;
             _ = interrupted.changed() => Err(format!("MCP server '{server_name}' I/O interrupted")),
-            result = async {
-                let mut generation = self.generation.lock().await;
-                self.ensure_open()?;
-                let g = generation.as_mut().ok_or_else(|| format!("MCP server '{server_name}' closed stdout"))?;
-                Self::write_frame(g, server_name, notification).await
-            } => result,
+            result = write => result,
         }
     }
 }
