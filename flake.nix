@@ -242,6 +242,17 @@
             src = ./.;
           });
 
+        # Small offline checks of the actual CI coverage and publish boundaries.
+        chaz-ci-policy =
+          pkgs.runCommand "chaz-ci-policy" {
+            nativeBuildInputs = [(pkgs.python3.withPackages (ps: [ps.pyyaml]))];
+          } ''
+            cp -r ${./.github} .github
+            export PYTHONDONTWRITEBYTECODE=1
+            python3 -m unittest discover -s .github/scripts -p 'test_*.py'
+            touch $out
+          '';
+
         # Helper to create aggregate packages
         mkAggregate = name: packages:
           pkgs.symlinkJoin {
@@ -315,6 +326,7 @@
           test = chaz-test;
           lint = mkAggregate "lint" lintDefaults;
           doc = chaz-doc;
+          ci-policy = chaz-ci-policy;
         };
 
         # Formatting via treefmt

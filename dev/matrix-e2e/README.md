@@ -15,8 +15,14 @@ Exit status is the result: `0` passed, `1` failed, `2` the harness could not
 start.
 
 CI runs the default `http` transport as the `Matrix E2E` job in
-`.github/workflows/ci.yml`, separate from the fast checks because it pulls
-Synapse into the closure. It needs no secrets.
+`.github/workflows/ci.yml` on main pushes and manual runs of a selected branch,
+not on pull requests or merge-queue entries. It stays separate from the fast
+checks because it pulls Synapse into the closure, and needs no secrets.
+Main CI and its cache publisher share native workflow concurrency: the running
+pipeline finishes and GitHub keeps one replaceable pending pipeline. Publishing
+waits for both normal CI and Matrix E2E to succeed, then rebuilds that run's SHA
+from trusted source. It does not select a different historically green revision.
+Manual Publish remains independent; a main-only manual CI run includes publishing.
 
 ## What it covers
 

@@ -1,17 +1,14 @@
 # Publish workflow — pushes built artifacts to the eidetica Nix cache.
 #
-# Triggers after every successful CI run on main. Builds clean from
-# cache.nixos.org (bypassing our own cache to prevent poisoning), signs
-# the results, and pushes them to s3://cache-eidetica-dev. Subsequent
-# CI runs and local builds then download instead of recompiling.
+# Called after all main CI jobs succeed, within CI's native concurrency group.
+# Manual publication stays independent. Builds clean from cache.nixos.org
+# (bypassing our own cache to prevent poisoning), signs the results, and pushes
+# them to s3://cache-eidetica-dev. No PR artifacts enter the publisher.
 
 name: Publish
 
 on:
-  workflow_run:
-    workflows: ["CI"]
-    types: [completed]
-    branches: ["main"]
+  workflow_call:
   workflow_dispatch:
 
 permissions:
@@ -23,17 +20,11 @@ jobs:
     environment: publish
     runs-on: ubicloud-standard-8
     timeout-minutes: 60
-    # A fork PR can also use a branch named main. Check the triggering event
-    # and source repository before checking out its SHA with publish secrets.
+    # Reusable workflows retain the caller's event/ref. PR and nonmain calls
+    # cannot enter the protected publishing environment.
     if: |
-      github.repository_owner == 'arcuru' &&
-      ((github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main') ||
-       (github.event_name == 'workflow_run' &&
-        github.event.workflow_run.conclusion == 'success' &&
-        github.event.workflow_run.head_branch == 'main' &&
-        (github.event.workflow_run.event == 'push' ||
-         github.event.workflow_run.event == 'workflow_dispatch') &&
-        github.event.workflow_run.head_repository.full_name == github.repository))
+      github.repository_owner == 'arcuru' && github.ref == 'refs/heads/main' &&
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
     permissions:
       contents: read
     env:
@@ -43,7 +34,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
-          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+          ref: ${{ github.sha }}
           persist-credentials: false
 
       - name: Setup Nix
@@ -52,8 +43,9 @@ jobs:
         with:
           signing-key: ${{ secrets.NIX_CACHE_SIGNING_KEY }}
 
-      # Build the binary clean from source, bypassing our own cache to
-      # prevent cache poisoning from affecting published artifacts.
+      # Build clean from source, bypassing our cache. push-args comes from our
+      # checked-out setup action and carries pre-quoted store flags; shell env
+      # expansion would not re-parse those quotes, so it must expand inline.
       - name: Build and push artifacts
         run: |
           nix-fast-build --skip-cached --no-nom --no-link \
