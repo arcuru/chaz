@@ -52,6 +52,8 @@ struct ChatRequest<'a> {
     /// reasoning tokens). Unknown to vanilla OpenAI/DeepSeek but ignored
     /// silently per the spec, so we always set it.
     usage: UsageOpts,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_completion_tokens: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize)]
@@ -378,6 +380,7 @@ impl OpenAI {
             tools,
             reasoning: self.reasoning_for_model(model),
             usage: UsageOpts { include: true },
+            max_completion_tokens: None,
         }
     }
 
@@ -425,15 +428,17 @@ impl OpenAI {
             tools,
             model,
             &crate::extensions::context::default_cache_options(),
+            None,
         )
         .await
     }
-    async fn chat_with_cache_impl(
+    pub(crate) async fn chat_with_cache_impl(
         &self,
         messages: &[RuntimeMessage],
         tools: &[ToolDefinition],
         model: &str,
         cache: &CacheOptions,
+        max_output_tokens: Option<u32>,
     ) -> Result<LLMResponse, LlmError> {
         cache
             .validate(messages)
@@ -442,8 +447,8 @@ impl OpenAI {
             })?;
         let client = self.build_client()?;
 
-        let request = self.build_chat_request(messages, tools, model, cache);
-
+        let mut request = self.build_chat_request(messages, tools, model, cache);
+        request.max_completion_tokens = max_output_tokens;
         let timeout = self.backend.request_timeout();
         let response: ChatResponse = tokio::time::timeout(
             timeout,
@@ -723,7 +728,7 @@ impl LLMBackend for OpenAI {
         model: &str,
         cache: &CacheOptions,
     ) -> Result<LLMResponse, LlmError> {
-        self.chat_with_cache_impl(messages, tools, model, cache)
+        self.chat_with_cache_impl(messages, tools, model, cache, None)
             .await
     }
     async fn chat_with_tools(

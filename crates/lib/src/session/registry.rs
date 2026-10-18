@@ -56,6 +56,8 @@ pub struct SessionRegistry {
     pub agents: Arc<AgentRegistry>,
     pub(super) new_session_tx: mpsc::Sender<NewSessionEvent>,
     new_session_rx: Mutex<Option<mpsc::Receiver<NewSessionEvent>>>,
+    /// Serialize local explicit renames with extension fill-if-unnamed writes.
+    name_lock: Mutex<()>,
     /// Sessions created by a local service client may predate the daemon's
     /// in-memory per-DB key mapping. Keep the already-keyed daemon handle so
     /// later opens use the same signing identity.
@@ -171,6 +173,7 @@ impl SessionRegistry {
             agents,
             new_session_tx,
             new_session_rx: Mutex::new(Some(new_session_rx)),
+            name_lock: Mutex::new(()),
             local_client_sessions: Mutex::new(std::collections::HashMap::new()),
             locally_created_sessions: Mutex::new(std::collections::HashSet::new()),
             channel_create_locks: Mutex::new(std::collections::HashMap::new()),
@@ -817,6 +820,37 @@ impl SessionRegistry {
     /// Associate a human-friendly name with a session. Fails if the name is taken
     /// by a different session.
     pub async fn set_session_name(&self, session_db_id: &str, name: String) -> anyhow::Result<()> {
+        let _guard = self.name_lock.lock().await;
+        let (_conv_id, db) = self.open_session(session_db_id).await?;
+        self.write_session_name(session_db_id, &db, name).await
+    }
+
+    /// Fill an unnamed session only. Rechecks after a model call so an explicit
+    /// local rename made while that call was in flight always wins.
+    pub async fn set_session_name_if_unnamed(
+        &self,
+        session_db_id: &str,
+        name: String,
+    ) -> anyhow::Result<bool> {
+        let _guard = self.name_lock.lock().await;
+        let (_conv_id, db) = self.open_session(session_db_id).await?;
+        if super::read_session_name_from_db(&db).await?.is_some() {
+            return Ok(false);
+        }
+        self.write_session_name(session_db_id, &db, name).await?;
+        Ok(true)
+    }
+
+    async fn write_session_name(
+        &self,
+        session_db_id: &str,
+        db: &Database,
+        name: String,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            db.current_permission().await?.can_write(),
+            "Session {session_db_id} is read-only"
+        );
         {
             let txn = self.chaz_group.new_transaction().await?;
             let store = txn.get_store::<DocStore>(STORE_SESSION_NAMES).await?;
@@ -830,13 +864,13 @@ impl SessionRegistry {
         }
 
         // Mirror into the session's own meta
-        let (_conv_id, db) = self.open_session(session_db_id).await?;
-        update_meta_on_db(&db, |m| m.name = Some(name.clone())).await?;
+        update_meta_on_db(db, |m| m.name = Some(name.clone())).await?;
 
         Ok(())
     }
 
     pub async fn clear_session_name(&self, session_db_id: &str) -> anyhow::Result<()> {
+        let _guard = self.name_lock.lock().await;
         // Fetch current name from meta so we can find the index entry
         let (_conv_id, db) = self.open_session(session_db_id).await?;
         let current = read_meta_from_db(&db).await;

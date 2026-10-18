@@ -108,7 +108,7 @@ empty / `None`:
   and the TypeId-keyed escape hatch `extension_cap(type_id)`
 - **Hook handlers** — `before_agent_start_hook()`, `tool_call_hook()`,
   `tool_result_hook()`, `agent_end_hook()`, `session_start_hook()`,
-  `session_shutdown_hook()`
+  `session_shutdown_hook()`, `turn_complete_hook()`
 - **Selection** — `context_strategy()` (required operator-selected endpoint)
 - **Routine** — `routine_handler()`
 - **Lifecycle** — `shutdown()` (async; not yet triggered)
@@ -172,6 +172,38 @@ trait CapResolver: Send + Sync {
 }
 ```
 
+### Successful-turn observation
+
+`TurnComplete` is a live-instance endpoint, not part of the Global hook drain.
+After a successful runtime response, before returning the reply and firing `AgentEnd`, the runtime dispatches it to the composed Global/PerAgent/PerSession instance set (session wins by name).
+Only instances declaring `HookKind::TurnComplete` and present in the effective session-minus-agent active set run; session and agent revocations are rechecked at dispatch.
+Dispatch requires the current session to be openable by the registry's keys, sorts by extension name, and isolates each invocation's errors, panics and 15-second deadline.
+Dispatch is awaited inline, so an endpoint's work delays that reply (never its content) up to the deadline.
+It does not fire on runtime errors.
+
+`extension::turn::TurnCompleteContext` supplies a read-only public copy of the final accepted model request, the final reply and that request's tool definitions.
+The runtime retains the last accepted projection instead of projecting again or exposing its unprojected baseline.
+Assembled system content, selected history/summaries, replayed tool exchanges, injected pre-turn messages and current tool exchanges reflect the accepted request.
+All opaque assistant provider fields are removed from this projection; the main model's continuation still receives them unchanged.
+Excluded history/audit entries and other sessions are never fetched for the endpoint.
+This seam does not transform requests or persisted history.
+
+The context's host operations are scoped by private fields: `name()`, `set_name_if_unnamed()`, the invoking extension's `settings()`/`update_settings()`, and `complete()`.
+There is no public database, backend or registry handle and no target-session argument.
+Names use `SessionRegistry`'s canonical name index and session meta writes; local explicit/conditional renames serialize under the same registry lock, with a fresh name check after inference.
+Names and settings retain their existing sync/peer-local semantics; this is not distributed compare-and-swap or a new naming store.
+Settings reads use the checked host facility; corrupt or unavailable settings are errors, not permission to overwrite them with defaults.
+Native Rust extensions remain trusted code, not a sandbox.
+
+`complete()` accepts one instruction and an optional model override, sends the entire public context plus tool definitions as reference data, and routes through `BackendManager` with no executable tools.
+It allows one call per endpoint invocation, 1–512 output tokens, a 10-second deadline and no runtime hooks or retries.
+The selected model API is preserved: Chat Completions uses `max_completion_tokens`, Anthropic Messages uses `max_tokens` with output-budget raising disabled, and Responses uses `max_output_tokens`.
+The auxiliary request does not replay native reasoning items or inherit the main Responses prompt-cache key.
+Model reasoning configuration is preserved, so reasoning can consume the output budget and leave no usable name.
+A known undersized model window refuses the call instead of shortening context.
+Response metadata extras are removed; normalized usage remains available to the extension.
+The built-in `session_naming` demonstrates this API with a persisted one-attempt marker and a 128-token cap; see [its configuration and walkthrough](../user_guide/extensions.md#model-assisted-session-names).
+
 ## Hook kinds
 
 Every registration is tagged with a `HookKind`, and every extension
@@ -179,7 +211,7 @@ declares in `supported_hooks()` which kinds it intends to use:
 
 ```rust,ignore
 enum HookKind {
-    BeforeAgentStart, ToolCall, ToolResult, AgentEnd,
+    BeforeAgentStart, ToolCall, ToolResult, AgentEnd, TurnComplete,
     SessionStart, SessionShutdown,
     Tool, Command,
 }
@@ -497,6 +529,7 @@ under the same role, rather than upgrading a client hub to execution authority.
 | `schedule`          | `Global`               | `Tool`, `Command` | yes     | schedule tools + `/schedule`                                                |
 | `agent_schedule`    | `Global`               | —                 | yes     | routine handler for agent-owned schedule fires                              |
 | `path_normalizer`   | `Global`               | `ToolCall`        | —       | strips trailing `/` from filesystem-tool path args                          |
+| `session_naming`    | `Global`               | `TurnComplete`    | —       | Opt-in, one-shot naming via a bounded auxiliary completion                  |
 | `security_warnings` | `Global`               | `ToolResult`      | —       | logs prompt-injection patterns in tool output                               |
 
 MCP servers are data-driven, not compile-time: `main.rs` pushes one

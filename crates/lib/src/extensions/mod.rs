@@ -16,6 +16,7 @@ pub mod path_normalizer;
 pub mod pruner;
 pub mod schedule;
 pub mod security_warnings;
+pub mod session_naming;
 pub mod skills;
 pub mod system;
 pub mod web;
@@ -63,6 +64,7 @@ pub fn all_builtins(deps: BuiltinDeps) -> Vec<Arc<dyn crate::extension::Extensio
             deps.tool_policies,
         )),
         Arc::new(path_normalizer::PathNormalizer),
+        Arc::new(session_naming::SessionNaming),
         Arc::new(security_warnings::SecurityWarnings),
         Arc::new(fs::FsExtension),
         Arc::new(system::SystemExtension),

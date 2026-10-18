@@ -83,7 +83,7 @@ impl ContextProjector for FnProjector {
 }
 
 /// A Global-scope extension publishing one projector.
-struct ProjectingExt {
+pub(crate) struct ProjectingExt {
     name: &'static str,
     declares: bool,
     projector: Arc<FnProjector>,
@@ -172,14 +172,14 @@ impl Extension for ProjectingExt {
     }
 }
 
-struct Probe {
+pub(crate) struct Probe {
     invocations: Arc<AtomicUsize>,
     seen: Arc<Mutex<Vec<SeenCall>>>,
-    ext: Arc<ProjectingExt>,
+    pub(crate) ext: Arc<ProjectingExt>,
 }
 
 impl Probe {
-    fn count(&self) -> usize {
+    pub(crate) fn count(&self) -> usize {
         self.invocations.load(Ordering::SeqCst)
     }
     fn seen(&self) -> Vec<SeenCall> {
@@ -187,7 +187,7 @@ impl Probe {
     }
 }
 
-fn probe(
+pub(crate) fn probe(
     name: &'static str,
     edit: impl Fn(&ProjectionCall<'_>, ProjectedRequest) -> anyhow::Result<ProjectedRequest>
     + Send

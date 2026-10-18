@@ -2202,6 +2202,18 @@ fn index_attempt_states(
         .collect()
 }
 
+/// Read the canonical name without treating a failed read as an unnamed session.
+pub(crate) async fn read_session_name_from_db(
+    database: &Database,
+) -> anyhow::Result<Option<String>> {
+    let txn = database.new_transaction().await?;
+    let store = txn.get_store::<DocStore>(META_STORE).await?;
+    let doc = store.get_all().await?;
+    doc.get("name")
+        .map(|value| value.try_into().map_err(anyhow::Error::from))
+        .transpose()
+}
+
 /// Read the meta DocStore of a session DB. Returns default on any error.
 pub async fn read_meta_from_db(database: &Database) -> SessionMeta {
     let Ok(txn) = database.new_transaction().await else {

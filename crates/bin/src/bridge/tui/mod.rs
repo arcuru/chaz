@@ -2665,6 +2665,73 @@ mod session_picker_tests {
             .collect()
     }
 
+    #[tokio::test]
+    async fn session_meta_name_refreshes_tab_picker_and_catalog_together() {
+        let mut app = App::new(HashSet::new(), test_tab().await);
+        let id = app.active().session_db_id.clone();
+        let mut current = index(0);
+        current.session_db_id = id.clone();
+        apply_session_catalog(&mut app, vec![current, index(1)]);
+        app.mode = TuiMode::SessionPicker;
+        let (tx, mut rx) = tokio::sync::mpsc::channel(2);
+        for name in [Some("Migration diagnosis"), None] {
+            let loaded_id = id.clone();
+            refresh::request_with(
+                &mut app,
+                &id,
+                refresh::RefreshKind::Session,
+                &tx,
+                move |ticket| async move {
+                    refresh::Refresh::Session {
+                        session_db_id: loaded_id,
+                        ticket,
+                        snapshot: Ok(Box::new(refresh::SessionSnapshot {
+                            input_attempt: None,
+                            inputs: vec![],
+                            entries: vec![],
+                            telemetry: Default::default(),
+                            meta: SessionMeta {
+                                name: name.map(str::to_owned),
+                                ..Default::default()
+                            },
+                            active_turns: Ok(0),
+                        })),
+                    }
+                },
+            );
+            let snapshot = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                refresh::apply(&mut app, snapshot, |_, _| refresh::Resolved {
+                    effective_model: "test-model".into(),
+                    context_budget: 0,
+                    roster: vec![],
+                })
+                .redraw
+            );
+            assert_eq!(app.active().session_name.as_deref(), name);
+            assert_eq!(app.session_indices[&id].name.as_deref(), name);
+            assert_eq!(
+                app.session_list
+                    .iter()
+                    .find(|r| r.session_db_id == id)
+                    .unwrap()
+                    .name
+                    .as_deref(),
+                name
+            );
+            assert_eq!(
+                draw_picker(&mut app, 100, 13)
+                    .join("\n")
+                    .contains("Migration diagnosis"),
+                name.is_some()
+            );
+            assert!(app.session_indices["session-1"].name.is_none());
+        }
+    }
+
     fn visible_ids(app: &App) -> HashSet<String> {
         app.click_regions
             .iter()

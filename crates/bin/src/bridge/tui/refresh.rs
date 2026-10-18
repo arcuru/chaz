@@ -640,6 +640,10 @@ fn apply_session_snapshot(
         s.entry_count = entry_count;
     }
 
+    if let Some(index) = app.session_indices.get_mut(&db_id) {
+        index.name = meta.name.clone();
+    }
+
     // Keep mutable row metadata in lock-step without deriving transcript
     // summaries for the picker.
     if let Some(row) = app
