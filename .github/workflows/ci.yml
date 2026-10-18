@@ -14,10 +14,15 @@ on:
 permissions:
   contents: read
 
-# Only newer runs of the same PR supersede each other. Non-PR runs get unique
-# groups so main, manual, and merge-queue runs never cancel or evict one another.
+# Queue main CI and its dependent publisher together: finish the running pipeline
+# and keep one replaceable pending pipeline. PRs only supersede their own checks;
+# other branches and merge-queue runs cannot displace main.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.run_id }}
+  group: >-
+    ${{ github.repository_owner == 'arcuru' && github.ref == 'refs/heads/main' &&
+        (github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
+        'ci-dev-main' ||
+        format('ci-{0}-{1}', github.event_name, github.event.pull_request.number || github.run_id) }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
@@ -28,6 +33,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
 
       - name: Setup Nix
         uses: ./.github/actions/setup-nix
@@ -38,13 +45,17 @@ jobs:
             -f '.#checks.x86_64-linux.lint'
           nix-fast-build --skip-cached --no-nom --no-link \
             -f '.#checks.x86_64-linux.treefmt'
+          nix-fast-build --skip-cached --no-nom --no-link \
+            -f '.#checks.x86_64-linux.ci-policy'
 
       - name: Test
         run: |
           nix-fast-build --skip-cached --no-nom --no-link \
             -f '.#checks.x86_64-linux.test'
 
+      # PRs retain normal Cargo tests (including doctests), lint and build.
       - name: Doc
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
         run: |
           nix-fast-build --skip-cached --no-nom --no-link \
             -f '.#checks.x86_64-linux.doc'
@@ -61,19 +72,19 @@ jobs:
   e2e:
     name: Matrix E2E
     runs-on: ubicloud-standard-8
-    # Fenced to the upstream repository, whose runner label this is: a fork
-    # running its own copy of this workflow would queue forever rather than
-    # fail. A pull request from a fork still schedules the job, because the
-    # check reads the owner of the base repository — which is fine, since
-    # `pull_request` hands fork code a read-only token and this job reads no
-    # secret.
-    if: github.repository_owner == 'arcuru'
+    # Full coverage runs on main pushes or a manually selected branch, not on
+    # PRs/merge groups. The custom runner only exists in the upstream repository.
+    if: |
+      github.repository_owner == 'arcuru' &&
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
     # The two steps below budget 30 minutes between them. The rest is headroom
     # for the checkout, the nix installer, and pulling the Synapse closure.
     timeout-minutes: 45
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
 
       - name: Setup Nix
         uses: ./.github/actions/setup-nix
@@ -121,3 +132,19 @@ jobs:
           fi
           exit "$rc"
         timeout-minutes: 10
+
+  publish:
+    name: Publish
+    needs: [ci, e2e]
+    if: |
+      github.repository_owner == 'arcuru' && github.ref == 'refs/heads/main' &&
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    uses: ./.github/workflows/publish.yml
+    permissions:
+      contents: read
+    # Reusable workflows require the names even for environment-scoped secrets;
+    # their values are resolved in the callee's protected publishing job.
+    secrets:
+      NIX_CACHE_ACCESS_KEY_ID: ${{ secrets.NIX_CACHE_ACCESS_KEY_ID }}
+      NIX_CACHE_SECRET_ACCESS_KEY: ${{ secrets.NIX_CACHE_SECRET_ACCESS_KEY }}
+      NIX_CACHE_SIGNING_KEY: ${{ secrets.NIX_CACHE_SIGNING_KEY }}
