@@ -340,18 +340,19 @@ impl ServiceGeneration for BridgeGeneration {
         }
     }
 
-    async fn shutdown(self) {
+    async fn shutdown(&mut self) -> Result<(), String> {
         self.shutdown.notify_waiters();
-        for mut task in self.tasks {
-            if tokio::time::timeout(TRANSPORT_SHUTDOWN_GRACE, &mut task)
+        while let Some(task) = self.tasks.last_mut() {
+            if tokio::time::timeout(TRANSPORT_SHUTDOWN_GRACE, &mut *task)
                 .await
                 .is_err()
             {
                 task.abort();
                 let _ = task.await;
             }
+            self.tasks.pop();
         }
-        self.built.shutdown().await;
+        self.built.try_shutdown().await
     }
 }
 
@@ -366,7 +367,7 @@ pub async fn run_direct(mut generation: BridgeGeneration) -> anyhow::Result<()> 
         }
         result = generation.finished() => result,
     };
-    generation.shutdown().await;
+    generation.shutdown_complete().await;
     result
 }
 

@@ -338,7 +338,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let ownership = connected.capabilities.ownership();
-    let generation = build_generation(
+    let mut generation = build_generation(
         &mut config,
         &config_path,
         connected,
@@ -359,7 +359,7 @@ async fn main() -> anyhow::Result<()> {
                 ready,
             });
             instance::supervise_service(
-                generation,
+                &mut generation,
                 move || {
                     let context = context.clone();
                     async move {

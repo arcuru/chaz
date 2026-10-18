@@ -203,7 +203,7 @@ async fn mcp_http_lost_replies_never_resubmit_even_with_idempotent_hints() {
         for fault in ["none", "headers", "body", "always-body", "execution"] {
             let (url, effects, handle) = peer(true, fault, idempotent).await;
             let server = Arc::new(
-                McpServer::start(&mcp_config(Some(url), vec![]))
+                start_initialized(&mcp_config(Some(url), vec![]))
                     .await
                     .unwrap(),
             );
@@ -290,7 +290,7 @@ for line in sys.stdin:
     print(json.dumps({'jsonrpc': '2.0', 'id': req['id'], 'result': result}), flush=True)
 "#;
     Arc::new(
-        McpServer::start(&mcp_config(
+        start_initialized(&mcp_config(
             None,
             vec![
                 "-u".into(),
@@ -357,7 +357,7 @@ async fn mcp_stdio_process_death_is_not_replayed_by_either_layer() {
             line_count(&directory.path().join("effects")),
             usize::from(!before_effect) + 1
         );
-        server.shutdown().await;
+        server.shutdown().await.unwrap();
     }
 }
 
@@ -381,7 +381,7 @@ async fn mcp_stdio_single_execute_does_not_resubmit_after_lost_reply() {
     );
     assert_eq!(line_count(&directory.path().join("effects")), 1);
     assert_eq!(line_count(&directory.path().join("called")), 1);
-    server.shutdown().await;
+    server.shutdown().await.unwrap();
 }
 
 #[tokio::test]
@@ -490,5 +490,13 @@ async fn mcp_stdio_failed_recovery_preserves_the_original_call_error() {
     );
     assert_eq!(line_count(&directory.path().join("called")), 1);
     assert_eq!(line_count(&directory.path().join("effects")), 1);
-    server.shutdown().await;
+    server.shutdown().await.unwrap();
+}
+
+async fn start_initialized(
+    config: &crate::config::McpServerConfig,
+) -> Result<crate::mcp::server::McpServer, String> {
+    let server = crate::mcp::server::McpServer::start(config)?;
+    server.initialize().await?;
+    Ok(server)
 }

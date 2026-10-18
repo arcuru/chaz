@@ -269,15 +269,11 @@ for line in sys.stdin:
         default_policy: None,
         startup_timeout_secs: 5,
     };
-    let mcp = Arc::new(
-        tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            chaz_core::mcp::server::McpServer::start(&cfg),
-        )
+    let mcp = Arc::new(chaz_core::mcp::server::McpServer::start(&cfg).unwrap());
+    tokio::time::timeout(std::time::Duration::from_secs(5), mcp.initialize())
         .await
         .unwrap()
-        .unwrap(),
-    );
+        .unwrap();
     tokio::time::timeout(
         std::time::Duration::from_secs(5),
         mcp.discover_and_wrap_tools("a-tools"),
@@ -822,7 +818,7 @@ async fn settings_static_empty_and_degenerate_frames_have_safe_regions() {
             }
         }
     }
-    server.mcp_registry().shutdown().await;
+    server.mcp_registry().shutdown().await.unwrap();
     for name in server.agents().names() {
         server.agents().unregister(&name);
     }
@@ -972,7 +968,7 @@ async fn settings_compact_empty_missing_and_static_pages_use_full_content_slot()
         server.agents().unregister(&name);
     }
     server.set_default_agents(Vec::new());
-    server.mcp_registry().shutdown().await;
+    server.mcp_registry().shutdown().await.unwrap();
     for missing in [false, true] {
         app.session_settings_snapshot = (!missing).then(|| super::super::SessionMetaSnapshot {
             session_db_id: app.active().session_db_id.clone(),

@@ -229,6 +229,78 @@ mod build_options_tests {
     }
 
     #[tokio::test]
+    async fn incomplete_mcp_cleanup_keeps_built_generation_and_blocks_reconnect() {
+        use crate::mcp::{McpServerStatus, test_support::Fixture};
+        let f = Fixture::new("eof");
+        let (instance, user) = crate::test_support::fresh_eidetica().await;
+        let mut config: Config = serde_yaml::from_str("execution: executor\neidetica:\n  connection: sqlite:///tmp/unused-fixture.db\n  login: {username: test, passwordless: true}\n").unwrap();
+        config.mcp_servers = Some(vec![f.config.clone()]);
+        let mut built = build(
+            &mut config,
+            instance,
+            user,
+            BuildOptions {
+                config_path: f.dir.path().join("config.yaml"),
+                run_routine_engine: false,
+                bootstrap_agents_from_config: false,
+                run_agent_loop: true,
+                extra_auto_approved_tools: Vec::new(),
+                mcp_readiness: McpReadiness::Deferred,
+                targeted_session: None,
+            },
+        )
+        .await
+        .unwrap();
+        built.server.mcp_registry().wait_ready().await;
+        let server = match &built.server.mcp_registry().snapshot()[0].status {
+            McpServerStatus::Running { server, .. } => server.clone(),
+            _ => panic!("fixture did not run"),
+        };
+        let pid = server.process_id().await;
+        server.inject_cleanup_failure(1);
+        assert!(
+            built
+                .try_shutdown()
+                .await
+                .unwrap_err()
+                .contains("incomplete")
+        );
+        assert_eq!(server.process_id().await, pid);
+        assert_eq!(built.server.mcp_registry().snapshot().len(), 1);
+        let reconnected = std::sync::atomic::AtomicBool::new(false);
+        {
+            let replacement = crate::instance::replace_service_generation(&mut built, || async {
+                assert!(
+                    server.process_id().await.is_none(),
+                    "old child must be reaped before reconnect"
+                );
+                reconnected.store(true, std::sync::atomic::Ordering::SeqCst);
+                anyhow::bail!("fixture reconnect stopped")
+            });
+            tokio::pin!(replacement);
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(50), &mut replacement)
+                    .await
+                    .is_err()
+            );
+            assert!(!reconnected.load(std::sync::atomic::Ordering::SeqCst));
+            // Cancelling the owner-borrowing operation leaves built intact.
+        }
+        assert_eq!(built.server.mcp_registry().snapshot().len(), 1);
+        server.inject_cleanup_failure(0);
+        let result = crate::instance::replace_service_generation(&mut built, || async {
+            assert!(server.process_id().await.is_none());
+            reconnected.store(true, std::sync::atomic::Ordering::SeqCst);
+            anyhow::bail!("fixture reconnect stopped")
+        })
+        .await;
+        assert!(result.is_err());
+        assert!(reconnected.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(built.server.mcp_registry().snapshot().is_empty());
+        built.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn client_deferred_startup_does_not_materialize_executor_schedules() {
         let (instance, mut user) = crate::test_support::fresh_eidetica().await;
         let agent_db = agent_db::ensure_agent_db(&mut user, "chaz")
@@ -330,27 +402,41 @@ pub struct BuiltServer {
     pub server: Arc<Server>,
     pub registry: Arc<session::SessionRegistry>,
     pub secret_store: security::SecretStore,
-    tasks: Vec<tokio::task::JoinHandle<()>>,
+    tasks: Vec<tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
     server_slot: crate::instance::ServerSlot,
 }
 
 impl BuiltServer {
-    /// Stop every task owned by this application runtime, then release all
-    /// hooks/subscriptions by dropping the server and its Instance graph.
-    /// Call this to completion before replacing a service connection.
-    pub async fn shutdown(mut self) {
+    /// Stop this runtime without consuming its cleanup ownership. Incomplete
+    /// MCP cleanup is observable and retryable; replacement must not proceed.
+    pub async fn try_shutdown(&self) -> Result<(), String> {
+        self.server.mcp_registry().begin_close()?;
         self.server_slot.clear();
         let sessions = self.server.registered_session_ids().await;
         for session in sessions {
             self.server.deregister_session(&session).await;
         }
         self.server.shutdown().await;
-        self.server.mcp_registry().shutdown().await;
-        for task in &self.tasks {
-            task.abort();
+        for slot in &self.tasks {
+            let mut slot = slot.lock().await;
+            if let Some(task) = slot.as_mut() {
+                task.abort();
+                let _ = task.await;
+                slot.take();
+            }
         }
-        for task in self.tasks.drain(..) {
-            let _ = task.await;
+        self.server.mcp_registry().shutdown().await?;
+        info!("Runtime cleanup complete");
+        Ok(())
+    }
+
+    /// Terminal callers keep this generation in place until explicit cleanup
+    /// succeeds. Child cleanup attempts each have a bounded budget, not an
+    /// overall runtime deadline; no detached reaper takes ownership.
+    pub async fn shutdown(&self) {
+        while let Err(error) = self.try_shutdown().await {
+            warn!(%error, "Runtime cleanup incomplete; retaining generation for retry");
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         }
     }
 }
@@ -1019,7 +1105,10 @@ pub async fn build(
         server,
         registry,
         secret_store,
-        tasks,
+        tasks: tasks
+            .into_iter()
+            .map(|task| tokio::sync::Mutex::new(Some(task)))
+            .collect(),
         server_slot,
     })
 }

@@ -1,43 +1,34 @@
-//! Process-level directory of configured MCP servers, keyed by the
-//! configured server name (`McpServerConfig.name`, *not* the
-//! `mcp-<name>` extension name).
-//!
-//! Populated by [`crate::extensions::mcp::McpExtension`]. Every configured
-//! server appears here as `Starting` from the moment its extension is
-//! instantiated, and reaches exactly one terminal state: `Running` once its
-//! tools have been registered, or `Failed` if it could not be started in
-//! time. Nothing is ever silently absent, which is what lets a caller tell
-//! "still coming" apart from "not configured".
-//!
-//! Because server startup runs off the boot path, the directory also owns
-//! the bookkeeping that makes that safe: it counts how many servers are
-//! still `Starting` ([`McpRegistry::wait_ready`]) and retains the join
-//! handles of the background tasks so they remain cancellable
-//! ([`McpRegistry::abort_pending_tasks`]) rather than detached.
-//!
-//! Read off the hot path (TUI Peer→MCP settings page snapshots it once
-//! per frame); the inner [`RwLock`] is uncontended in practice.
+//! Peer-local directory and cleanup owner for MCP startup and running servers.
+//! A failed or cancelled close never drains away the only retryable handle.
 
 use super::server::McpServer;
+use super::transport::CloseBudget;
+use crate::tool::{Tool, ToolRegistry};
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, RwLock};
-use tokio::sync::Notify;
+use std::sync::{Arc, RwLock};
+use tokio::sync::{Mutex, Notify};
 use tokio::task::JoinHandle;
+use tokio::time::timeout_at;
 
-/// Per-process MCP server directory.
 #[derive(Default)]
 pub struct McpRegistry {
-    entries: RwLock<HashMap<String, McpRegistryEntry>>,
-    /// Wakes [`McpRegistry::wait_ready`] waiters whenever a server reaches
-    /// a terminal state. The entry map is the source of truth; this only
-    /// avoids a poll loop.
+    state: RwLock<RegistryState>,
     settled: Notify,
-    /// Background startup tasks, retained so shutdown can abort them
-    /// rather than leaving a detached `tokio::spawn` to outlive the peer.
-    tasks: Mutex<Vec<JoinHandle<()>>>,
 }
 
-/// One registered server's name + status.
+#[derive(Default)]
+struct RegistryState {
+    closing: bool,
+    entries: HashMap<String, OwnedEntry>,
+}
+
+struct OwnedEntry {
+    entry: McpRegistryEntry,
+    /// Present before initialization, and retained even if startup/close fails.
+    server: Option<Arc<McpServer>>,
+    /// Awaited by reference; cancellation cannot detach the join handle.
+    startup: Arc<Mutex<Option<JoinHandle<()>>>>,
+}
 #[derive(Clone)]
 pub struct McpRegistryEntry {
     pub name: String,
@@ -89,152 +80,251 @@ impl McpRegistry {
         Self::default()
     }
 
-    /// Announce a configured server before its startup task begins.
-    ///
-    /// Must be called synchronously, before the spawn, by every server that
-    /// will later settle. [`Self::wait_ready`] reads "nothing is
-    /// `Starting`" as "everything has settled", so a server announced after
-    /// a waiter has already sampled the map would not be waited for.
     pub fn insert_starting(&self, name: String) {
-        let mut entries = self.entries.write().expect("McpRegistry lock poisoned");
-        entries.insert(
-            name.clone(),
-            McpRegistryEntry {
-                name,
-                status: McpServerStatus::Starting,
-            },
-        );
+        let mut state = self.state.write().expect("McpRegistry lock poisoned");
+        if !state.closing {
+            state
+                .entries
+                .entry(name.clone())
+                .or_insert_with(|| OwnedEntry {
+                    entry: McpRegistryEntry {
+                        name,
+                        status: McpServerStatus::Starting,
+                    },
+                    server: None,
+                    startup: Arc::new(Mutex::new(None)),
+                });
+        }
     }
 
-    /// Record a server as up, with its tools already registered.
-    /// `discovery_error` carries a `tools/list` failure on an otherwise
-    /// healthy server.
+    /// Spawn and retain the transport/task in the same synchronous admission
+    /// section. Close cannot race between spawn and ownership registration.
+    pub(crate) fn launch(
+        &self,
+        name: String,
+        create: impl FnOnce() -> Result<(Arc<McpServer>, JoinHandle<()>), String>,
+    ) -> bool {
+        let mut state = self.state.write().expect("McpRegistry lock poisoned");
+        if state.closing || state.entries.contains_key(&name) {
+            return false;
+        }
+        let (status, server, startup) = match create() {
+            Ok((server, handle)) => (McpServerStatus::Starting, Some(server), Some(handle)),
+            Err(error) => {
+                tracing::warn!(server = %name, %error, "MCP server failed to spawn — skipping its tools");
+                (McpServerStatus::Failed { error }, None, None)
+            }
+        };
+        let launched = startup.is_some();
+        state.entries.insert(
+            name.clone(),
+            OwnedEntry {
+                entry: McpRegistryEntry { name, status },
+                server,
+                startup: Arc::new(Mutex::new(startup)),
+            },
+        );
+        self.settled.notify_waiters();
+        launched
+    }
+
+    /// Publication is synchronous under the close-admission gate: either all
+    /// tools and Running appear before close, or none appear after it.
+    pub(crate) fn publish(
+        &self,
+        name: &str,
+        server: Arc<McpServer>,
+        discovery_error: Option<String>,
+        tools: Vec<Arc<dyn Tool>>,
+        tool_registry: &ToolRegistry,
+        owner: &'static str,
+    ) -> bool {
+        let mut state = self.state.write().expect("McpRegistry lock poisoned");
+        if state.closing {
+            return false;
+        }
+        let Some(entry) = state.entries.get_mut(name) else {
+            return false;
+        };
+        for tool in tools {
+            tool_registry.register_arc_owned(tool, Some(owner));
+        }
+        entry.entry.status = McpServerStatus::Running {
+            server,
+            discovery_error,
+        };
+        self.settled.notify_waiters();
+        true
+    }
+
     pub fn insert_running(
         &self,
         name: String,
         server: Arc<McpServer>,
         discovery_error: Option<String>,
     ) {
-        self.settle(
-            name,
-            McpServerStatus::Running {
-                server,
-                discovery_error,
+        let mut state = self.state.write().expect("McpRegistry lock poisoned");
+        if state.closing {
+            server.begin_close();
+            return;
+        }
+        state.entries.insert(
+            name.clone(),
+            OwnedEntry {
+                entry: McpRegistryEntry {
+                    name,
+                    status: McpServerStatus::Running {
+                        server: server.clone(),
+                        discovery_error,
+                    },
+                },
+                server: Some(server),
+                startup: Arc::new(Mutex::new(None)),
             },
         );
+        self.settled.notify_waiters();
     }
 
     pub fn insert_failed(&self, name: String, error: String) {
-        self.settle(name, McpServerStatus::Failed { error });
-    }
-
-    /// Write a terminal status and wake anyone waiting on quiescence.
-    fn settle(&self, name: String, status: McpServerStatus) {
-        {
-            let mut entries = self.entries.write().expect("McpRegistry lock poisoned");
-            entries.insert(name.clone(), McpRegistryEntry { name, status });
+        let mut state = self.state.write().expect("McpRegistry lock poisoned");
+        if state.closing {
+            return;
+        }
+        match state.entries.get_mut(&name) {
+            Some(entry) => entry.entry.status = McpServerStatus::Failed { error },
+            None => {
+                state.entries.insert(
+                    name.clone(),
+                    OwnedEntry {
+                        entry: McpRegistryEntry {
+                            name,
+                            status: McpServerStatus::Failed { error },
+                        },
+                        server: None,
+                        startup: Arc::new(Mutex::new(None)),
+                    },
+                );
+            }
         }
         self.settled.notify_waiters();
     }
 
-    /// All registered entries, sorted by name. Cheap snapshot — callers
-    /// don't hold the lock past the call.
     pub fn snapshot(&self) -> Vec<McpRegistryEntry> {
-        let entries = self.entries.read().expect("McpRegistry lock poisoned");
-        let mut out: Vec<_> = entries.values().cloned().collect();
+        let state = self.state.read().expect("McpRegistry lock poisoned");
+        let mut out: Vec<_> = state.entries.values().map(|e| e.entry.clone()).collect();
         out.sort_by(|a, b| a.name.cmp(&b.name));
         out
     }
 
-    /// Number of servers that have not settled yet.
     pub fn pending_count(&self) -> usize {
-        self.entries
-            .read()
-            .expect("McpRegistry lock poisoned")
+        let state = self.state.read().expect("McpRegistry lock poisoned");
+        if state.closing {
+            return 0;
+        }
+        state
+            .entries
             .values()
-            .filter(|e| !e.status.is_settled())
+            .filter(|e| !e.entry.status.is_settled())
             .count()
     }
 
-    /// Park until every announced server has settled.
-    ///
-    /// Returns immediately when nothing is pending — the common case, and
-    /// the whole case when no MCP servers are configured. Uses the same
-    /// lost-wakeup-safe `Notify` pattern as the server's startup gate:
-    /// register interest, re-check the condition, then await.
-    ///
-    /// Each server's own startup timeout bounds how long this can take, so
-    /// there is no separate deadline here; a hung server settles as
-    /// `Failed` and releases the wait.
     pub async fn wait_ready(&self) {
-        if self.pending_count() == 0 {
-            return;
-        }
         loop {
             let notified = self.settled.notified();
             tokio::pin!(notified);
-            // Enable the waiter before the re-check so a `notify_waiters`
-            // landing between the two is not lost.
             notified.as_mut().enable();
             if self.pending_count() == 0 {
                 return;
             }
             notified.await;
-            if self.pending_count() == 0 {
-                return;
+        }
+    }
+
+    /// Stop startup/publication and interrupt I/O before peer teardown awaits.
+    pub(crate) fn begin_close(&self) -> Result<(), String> {
+        let mut state = self
+            .state
+            .write()
+            .map_err(|_| "incomplete MCP cleanup: registry poisoned")?;
+        state.closing = true;
+        for entry in state.entries.values() {
+            if let Some(server) = &entry.server {
+                server.begin_close();
             }
         }
+        self.settled.notify_waiters();
+        Ok(())
     }
 
-    /// Take ownership of a background startup task, so the spawn is
-    /// retained rather than detached. Finished handles are reaped on each
-    /// call, so a long-lived peer does not accumulate them.
-    pub fn track_task(&self, handle: JoinHandle<()>) {
-        let mut tasks = self.tasks.lock().expect("McpRegistry tasks lock poisoned");
-        tasks.retain(|h| !h.is_finished());
-        tasks.push(handle);
-    }
-
-    /// Abort every in-flight startup task. Idempotent.
-    ///
-    /// The peer has no teardown hook today — every mode ends by exiting the
-    /// process, which reclaims the tasks with the runtime — so nothing
-    /// calls this yet. It exists so that when one is added, cancelling MCP
-    /// startup is a call rather than a redesign: the alternative, a
-    /// detached `tokio::spawn`, cannot be cancelled at all.
-    pub fn abort_pending_tasks(&self) {
-        let Ok(mut tasks) = self.tasks.lock() else {
-            // Poisoned only if a startup task panicked mid-push. Nothing
-            // useful to abort, and a shutdown path is the worst place to
-            // raise a second panic.
-            return;
+    /// Close sequentially with one budget per child, not a constant peer-wide
+    /// deadline. Ownership is removed only after BOTH explicit reap and join.
+    pub async fn shutdown(&self) -> Result<(), String> {
+        self.begin_close()?;
+        let names = {
+            let state = self
+                .state
+                .read()
+                .map_err(|_| "incomplete MCP cleanup: registry poisoned")?;
+            let mut names: Vec<_> = state.entries.keys().cloned().collect();
+            names.sort();
+            names
         };
-        for handle in tasks.drain(..) {
-            handle.abort();
-        }
-    }
-
-    /// Drain running entries and await any owned stdio subprocesses.
-    pub async fn shutdown(&self) {
-        self.abort_pending_tasks();
-        let servers = {
-            let Ok(mut entries) = self.entries.write() else {
-                return;
+        let mut failures = Vec::new();
+        for name in names {
+            let budget = CloseBudget::new();
+            // Retain the entry itself across awaits, without holding the map's
+            // synchronous lock. Concurrent/double close shares its join slot.
+            let entry = {
+                let state = self
+                    .state
+                    .read()
+                    .map_err(|_| "incomplete MCP cleanup: registry poisoned")?;
+                state
+                    .entries
+                    .get(&name)
+                    .map(|e| (e.server.clone(), e.startup.clone()))
             };
-            entries
-                .drain()
-                .filter_map(|(_, entry)| match entry.status {
-                    McpServerStatus::Running { server, .. } => Some(server),
-                    _ => None,
-                })
-                .collect::<Vec<_>>()
-        };
-        for server in servers {
-            server.shutdown().await;
+            let Some((server, startup)) = entry else {
+                continue;
+            };
+            let result = async {
+                let mut startup = timeout_at(budget.end, startup.lock())
+                    .await
+                    .map_err(|_| "incomplete MCP cleanup: startup lock timed out".to_string())?;
+                if let Some(handle) = startup.as_mut() {
+                    handle.abort();
+                    let result = timeout_at(budget.end, handle).await.map_err(|_| {
+                        "incomplete MCP cleanup: startup join timed out".to_string()
+                    })?;
+                    startup.take();
+                    result
+                        .or_else(|e| if e.is_cancelled() { Ok(()) } else { Err(e) })
+                        .map_err(|e| format!("incomplete MCP cleanup: startup join failed: {e}"))?;
+                }
+                if let Some(server) = &server {
+                    server.shutdown_with_budget(budget).await?;
+                }
+                Ok::<(), String>(())
+            }
+            .await;
+            match result {
+                Ok(()) => {
+                    self.state
+                        .write()
+                        .map_err(|_| "incomplete MCP cleanup: registry poisoned")?
+                        .entries
+                        .remove(&name);
+                }
+                Err(error) => failures.push(format!("{name}: {error}")),
+            }
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(failures.join("; "))
         }
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -270,11 +360,12 @@ for line in sys.stdin:
             startup_timeout_secs: crate::config::default_mcp_startup_timeout_secs(),
         };
         let registry = McpRegistry::new();
-        let server = Arc::new(McpServer::start(&config).await.unwrap());
+        let server = Arc::new(McpServer::start(&config).unwrap());
+        server.initialize().await.unwrap();
         let pid = server.process_id().await.unwrap();
         assert!(std::path::Path::new(&format!("/proc/{pid}")).exists());
         registry.insert_running("sentinel".into(), server, None);
-        registry.shutdown().await;
+        registry.shutdown().await.unwrap();
         assert!(!std::path::Path::new(&format!("/proc/{pid}")).exists());
         assert!(registry.snapshot().is_empty());
     }
@@ -330,5 +421,37 @@ for line in sys.stdin:
             "settling replaces, it does not duplicate"
         );
         assert!(snapshot[0].status.is_settled());
+    }
+}
+
+#[cfg(test)]
+mod join_tests {
+    use super::*;
+    use crate::mcp::test_support::Fixture;
+
+    #[tokio::test]
+    async fn panicked_startup_reports_incomplete_without_losing_retryable_transport() {
+        let registry = McpRegistry::new();
+        let f = Fixture::new("eof");
+        let server = Arc::new(McpServer::start(&f.config).unwrap());
+        registry.launch("fixture".into(), || {
+            Ok((
+                server.clone(),
+                tokio::spawn(async { panic!("fixture startup panic") }),
+            ))
+        });
+        f.wait("ready").await;
+        assert!(
+            registry
+                .shutdown()
+                .await
+                .unwrap_err()
+                .contains("startup join failed")
+        );
+        assert_eq!(registry.snapshot().len(), 1);
+        assert!(server.process_id().await.is_some());
+        registry.shutdown().await.unwrap();
+        assert!(server.process_id().await.is_none());
+        assert!(registry.snapshot().is_empty());
     }
 }

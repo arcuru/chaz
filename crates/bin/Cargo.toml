@@ -46,3 +46,4 @@ unicode-width.workspace = true
 async-trait.workspace = true
 insta = "1.41"
 tempfile.workspace = true
+wiremock = "0.6"

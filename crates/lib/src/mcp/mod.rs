@@ -227,3 +227,6 @@ mcp_server_dir: "/etc/chaz/mcp.d"
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+
+#[cfg(test)]
+pub(crate) mod test_support;
