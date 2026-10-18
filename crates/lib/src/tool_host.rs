@@ -504,8 +504,10 @@ mod tests {
 
     #[test]
     fn test_fs_no_allowlist_is_permissive() {
-        assert!(check_fs_path("/etc/passwd", None, "read").is_ok());
-        assert!(check_fs_path("/etc/passwd", Some(&Allowlist::Permissive), "read").is_ok());
+        check_fs_path("/etc/passwd", None, "read")
+            .expect("path should be permitted by the filesystem grant");
+        check_fs_path("/etc/passwd", Some(&Allowlist::Permissive), "read")
+            .expect("path should be permitted by the filesystem grant");
     }
 
     #[test]
@@ -519,9 +521,12 @@ mod tests {
     #[test]
     fn test_fs_within_allowed_root_ok() {
         let allow = only(&["/work"]);
-        assert!(check_fs_path("/work/file.txt", Some(&allow), "write").is_ok());
-        assert!(check_fs_path("/work/sub/dir/x", Some(&allow), "write").is_ok());
-        assert!(check_fs_path("/work", Some(&allow), "write").is_ok());
+        check_fs_path("/work/file.txt", Some(&allow), "write")
+            .expect("path should be permitted by the filesystem grant");
+        check_fs_path("/work/sub/dir/x", Some(&allow), "write")
+            .expect("path should be permitted by the filesystem grant");
+        check_fs_path("/work", Some(&allow), "write")
+            .expect("path should be permitted by the filesystem grant");
     }
 
     #[test]
@@ -538,20 +543,23 @@ mod tests {
         // `..` escapes the allowed root → denied.
         assert!(check_fs_path("/work/../etc/passwd", Some(&allow), "read").is_err());
         // `..` that stays within is fine.
-        assert!(check_fs_path("/work/sub/../file", Some(&allow), "write").is_ok());
+        check_fs_path("/work/sub/../file", Some(&allow), "write")
+            .expect("path should be permitted by the filesystem grant");
     }
 
     // ── Shell grant checks ──
 
     #[test]
     fn test_shell_no_grant_is_permissive() {
-        assert!(check_shell_command("rm -rf /", None).is_ok());
+        check_shell_command("rm -rf /", None)
+            .expect("command should be permitted by the shell grant");
     }
 
     #[test]
     fn test_shell_empty_grant_is_permissive() {
         let g = ShellGrant::default();
-        assert!(check_shell_command("git status", Some(&g)).is_ok());
+        check_shell_command("git status", Some(&g))
+            .expect("command should be permitted by the shell grant");
     }
 
     #[test]
@@ -560,9 +568,14 @@ mod tests {
             allow: only(&["git", "ls"]),
             deny: vec![],
         };
-        assert!(check_shell_command("git status", Some(&g)).is_ok());
-        assert!(check_shell_command("ls -la", Some(&g)).is_ok());
-        assert!(check_shell_command("rm -rf /", Some(&g)).is_err());
+        check_shell_command("git status", Some(&g))
+            .expect("command should be permitted by the shell grant");
+        check_shell_command("ls -la", Some(&g))
+            .expect("command should be permitted by the shell grant");
+        assert_eq!(
+            check_shell_command("rm -rf /", Some(&g)),
+            Err("Command 'rm' is not in the allowed commands list".into())
+        );
     }
 
     #[test]
@@ -572,8 +585,14 @@ mod tests {
             allow: Allowlist::Only(vec![]),
             deny: vec![],
         };
-        assert!(check_shell_command("ls", Some(&g)).is_err());
-        assert!(check_shell_command("git status", Some(&g)).is_err());
+        assert_eq!(
+            check_shell_command("ls", Some(&g)),
+            Err("Command 'ls' is not in the allowed commands list".into())
+        );
+        assert_eq!(
+            check_shell_command("git status", Some(&g)),
+            Err("Command 'git' is not in the allowed commands list".into())
+        );
     }
 
     #[test]
@@ -582,8 +601,12 @@ mod tests {
             allow: Allowlist::Permissive,
             deny: vec!["rm".into()],
         };
-        assert!(check_shell_command("ls", Some(&g)).is_ok());
-        assert!(check_shell_command("rm -rf /", Some(&g)).is_err());
+        check_shell_command("ls", Some(&g))
+            .expect("command should be permitted by the shell grant");
+        assert_eq!(
+            check_shell_command("rm -rf /", Some(&g)),
+            Err("Command 'rm' is denied by security policy".into())
+        );
     }
 
     #[test]
@@ -592,7 +615,10 @@ mod tests {
             allow: only(&["rm"]),
             deny: vec!["rm".into()],
         };
-        assert!(check_shell_command("rm foo", Some(&g)).is_err());
+        assert_eq!(
+            check_shell_command("rm foo", Some(&g)),
+            Err("Command 'rm' is denied by security policy".into())
+        );
     }
 
     #[test]
@@ -601,8 +627,12 @@ mod tests {
             allow: only(&["cat"]),
             deny: vec![],
         };
-        assert!(check_shell_command("cat file.txt", Some(&g)).is_ok());
-        assert!(check_shell_command("cat file.txt | grep foo", Some(&g)).is_err());
+        check_shell_command("cat file.txt", Some(&g))
+            .expect("command should be permitted by the shell grant");
+        assert_eq!(
+            check_shell_command("cat file.txt | grep foo", Some(&g)),
+            Err("Command 'grep' is not in the allowed commands list".into())
+        );
     }
 
     // ── extract_command_binaries ──
@@ -645,8 +675,12 @@ mod tests {
     #[test]
     fn test_network_no_grant_blocks_private_ips_allows_public() {
         let p = build_network_policy(None);
-        assert!(p.check("https://example.com/", "GET").is_ok());
-        assert!(p.check("http://127.0.0.1/", "GET").is_err());
+        p.check("https://example.com/", "GET")
+            .expect("endpoint should be permitted by the network grant");
+        assert_eq!(
+            p.check("http://127.0.0.1/", "GET"),
+            Err("SSRF protection: private IP 127.0.0.1 not allowed".into())
+        );
     }
 
     #[test]
@@ -660,9 +694,19 @@ mod tests {
             allow_private: false,
         };
         let p = build_network_policy(Some(&grant));
-        assert!(p.check("https://api.example.com/foo", "GET").is_ok());
-        assert!(p.check("https://api.example.com/foo", "POST").is_err());
-        assert!(p.check("https://evil.com/", "GET").is_err());
+        p.check("https://api.example.com/foo", "GET")
+            .expect("endpoint should be permitted by the network grant");
+        assert_eq!(
+            p.check("https://api.example.com/foo", "POST"),
+            Err(
+                "Network policy denied: POST https://api.example.com/foo not in allowed endpoints"
+                    .into()
+            )
+        );
+        assert_eq!(
+            p.check("https://evil.com/", "GET"),
+            Err("Network policy denied: GET https://evil.com/ not in allowed endpoints".into())
+        );
     }
 
     #[test]
@@ -673,7 +717,10 @@ mod tests {
             allow_private: false,
         };
         let p = build_network_policy(Some(&grant));
-        assert!(p.check("https://example.com/", "GET").is_err());
+        assert_eq!(
+            p.check("https://example.com/", "GET"),
+            Err("Network policy denied: GET https://example.com/ not in allowed endpoints".into())
+        );
     }
 
     #[test]
@@ -683,7 +730,8 @@ mod tests {
             allow_private: true,
         };
         let p = build_network_policy(Some(&grant));
-        assert!(p.check("http://127.0.0.1/", "GET").is_ok());
+        p.check("http://127.0.0.1/", "GET")
+            .expect("endpoint should be permitted by the network grant");
     }
 
     // ── Redirect containment (live loopback listeners) ──
@@ -811,7 +859,15 @@ mod tests {
         // endpoint allowlist and is an internal hostname.
         let (target, target_seen) = listener(|_| (200, vec![])).await;
         let forbidden = format!("http://localhost:{}/admin", target.port());
-        assert!(get(forbidden.clone(), &loopback_grant("/")).await.is_err());
+        let err = get(forbidden.clone(), &loopback_grant("/"))
+            .await
+            .expect_err("localhost is outside the loopback IP allowlist");
+        assert!(
+            matches!(err, ToolError::Execution(ref message) if message == &format!(
+                "Network policy denied: GET {forbidden} not in allowed endpoints"
+            )),
+            "expected endpoint denial, got {err:?}"
+        );
 
         let location = forbidden.clone();
         let (addr, seen) = listener(move |_| (301, vec![("Location", location.clone())])).await;

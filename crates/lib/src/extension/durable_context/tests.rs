@@ -1,8 +1,6 @@
 use super::*;
-use crate::extension::{
-    Extension, ExtensionEvent, ExtensionInstance, HookKind, PeerHandles, ScopeCtx, append_event,
-    manifest::ExtensionManifest,
-};
+use crate::extension::test_doubles::TestExt;
+use crate::extension::{ExtensionEvent, append_event, test_doubles::test_peer_handles};
 use crate::test_support::*;
 use crate::{
     backends::BackendManager,
@@ -56,57 +54,6 @@ impl DurableContextContributor for Stub {
         })
     }
 }
-struct StubExt {
-    stub: Arc<Stub>,
-    declares: bool,
-    scopes: Vec<Scope>,
-}
-struct StubInstance {
-    manifest: ExtensionManifest,
-    stub: Arc<Stub>,
-}
-impl ExtensionInstance for StubInstance {
-    fn manifest(&self) -> &ExtensionManifest {
-        &self.manifest
-    }
-    fn durable_context_contributor(&self) -> Option<Arc<dyn DurableContextContributor>> {
-        Some(self.stub.clone())
-    }
-}
-impl Extension for StubExt {
-    fn name(&self) -> &'static str {
-        "synthetic"
-    }
-    fn supported_hooks(&self) -> &[HookKind] {
-        &[]
-    }
-    fn scopes(&self) -> &[Scope] {
-        &self.scopes
-    }
-    fn manifest(&self) -> ExtensionManifest {
-        ExtensionManifest {
-            name: "synthetic".into(),
-            extension_ref: super::super::ExtensionRef::builtin("synthetic"),
-            supported_hooks: vec![],
-            required_capabilities: vec![],
-            requested_capabilities: vec![],
-            provides_capabilities: if self.declares {
-                vec![super::super::caps::CapabilityKind::DurableContext]
-            } else {
-                vec![]
-            },
-        }
-    }
-    fn instantiate<'a>(&'a self, _: ScopeCtx<'a>) -> super::super::instance::InstantiateFuture<'a> {
-        Box::pin(async move {
-            Ok(Arc::new(StubInstance {
-                manifest: self.manifest(),
-                stub: self.stub.clone(),
-            }) as Arc<dyn ExtensionInstance>)
-        })
-    }
-}
-
 struct Fixture {
     _instance: eidetica::Instance,
     _registry_instance: eidetica::Instance,
@@ -133,30 +80,21 @@ impl Fixture {
             mode,
         });
         let mut hub = ExtensionHub::new();
-        hub.set_peer_handles(Arc::new(PeerHandles {
-            registry,
-            agent_index: crate::hosted_index::HostedIndex::empty("agent"),
-            memory_bank_index: crate::hosted_index::HostedIndex::empty("bank"),
-            skill_bank_index: crate::hosted_index::HostedIndex::empty("skill_bank"),
-            embedder: None,
-            secrets: None,
-            server_slot: Default::default(),
-            mcp_registry: Arc::new(crate::mcp::McpRegistry::new()),
-            agent_state_allowlist: Default::default(),
-            tool_registry: Arc::new(ToolRegistry::new()),
-        }));
+        hub.set_peer_handles(test_peer_handles(registry));
         hub.set_durable_context_grants(&[DurableContextGrant {
             extension: "synthetic".into(),
             required,
         }])
         .unwrap();
-        hub.install_all(vec![Arc::new(StubExt {
-            stub: stub.clone(),
-            declares,
-            scopes,
-        })])
-        .await
-        .unwrap();
+        // `declares: false` models a contributor that publishes the
+        // endpoint without declaring the capability.
+        let mut ext = TestExt::new("synthetic")
+            .scopes(scopes)
+            .durable_context(stub.clone());
+        if !declares {
+            ext = ext.provides_capabilities(vec![]);
+        }
+        hub.install_all(vec![Arc::new(ext)]).await.unwrap();
         let db = session.lock().await.database().clone();
         hub.record_active(&db).await.unwrap();
         Self {

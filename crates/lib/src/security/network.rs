@@ -161,12 +161,12 @@ mod tests {
     #[test]
     fn test_permissive_allows_all() {
         let policy = NetworkPolicy::permissive();
-        assert!(policy.check("https://example.com/foo", "GET").is_ok());
-        assert!(
-            policy
-                .check("https://api.openai.com/v1/chat", "POST")
-                .is_ok()
-        );
+        policy
+            .check("https://example.com/foo", "GET")
+            .expect("public endpoint should be allowed");
+        policy
+            .check("https://api.openai.com/v1/chat", "POST")
+            .expect("public endpoint should be allowed");
     }
 
     #[test]
@@ -179,8 +179,15 @@ mod tests {
             }]),
             true,
         );
-        assert!(policy.check("https://api.example.com/foo", "GET").is_ok());
-        assert!(policy.check("https://evil.com/steal", "GET").is_err());
+        policy
+            .check("https://api.example.com/foo", "GET")
+            .expect("public endpoint should be allowed");
+        assert_eq!(
+            policy.check("https://evil.com/steal", "GET"),
+            Err(
+                "Network policy denied: GET https://evil.com/steal not in allowed endpoints".into()
+            )
+        );
     }
 
     #[test]
@@ -193,17 +200,20 @@ mod tests {
             }]),
             true,
         );
-        assert!(
-            policy
-                .check("https://en.wikipedia.org/wiki/Rust", "GET")
-                .is_ok()
+        policy
+            .check("https://en.wikipedia.org/wiki/Rust", "GET")
+            .expect("public endpoint should be allowed");
+        assert_eq!(
+            policy.check("https://en.wikipedia.org/wiki/Rust", "POST"),
+            Err(
+                "Network policy denied: POST https://en.wikipedia.org/wiki/Rust not in allowed endpoints"
+                    .into()
+            )
         );
-        assert!(
-            policy
-                .check("https://en.wikipedia.org/wiki/Rust", "POST")
-                .is_err()
+        assert_eq!(
+            policy.check("https://evil.com", "GET"),
+            Err("Network policy denied: GET https://evil.com not in allowed endpoints".into())
         );
-        assert!(policy.check("https://evil.com", "GET").is_err());
     }
 
     #[test]
@@ -216,40 +226,66 @@ mod tests {
             }]),
             true,
         );
-        assert!(
-            policy
-                .check("https://api.example.com/api/v1/data", "GET")
-                .is_ok()
-        );
-        assert!(
-            policy
-                .check("https://api.example.com/admin", "GET")
-                .is_err()
+        policy
+            .check("https://api.example.com/api/v1/data", "GET")
+            .expect("public endpoint should be allowed");
+        assert_eq!(
+            policy.check("https://api.example.com/admin", "GET"),
+            Err(
+                "Network policy denied: GET https://api.example.com/admin not in allowed endpoints"
+                    .into()
+            )
         );
     }
 
     #[test]
     fn test_ssrf_blocks_private_ips() {
         let policy = NetworkPolicy::permissive();
-        assert!(policy.check("http://127.0.0.1/admin", "GET").is_err());
-        assert!(policy.check("http://10.0.0.1/internal", "GET").is_err());
-        assert!(policy.check("http://192.168.1.1/router", "GET").is_err());
-        assert!(policy.check("http://172.16.0.1/secret", "GET").is_err());
-        assert!(policy.check("http://[::1]/foo", "GET").is_err());
-        assert!(policy.check("http://0.0.0.0/foo", "GET").is_err());
+        assert_eq!(
+            policy.check("http://127.0.0.1/admin", "GET"),
+            Err("SSRF protection: private IP 127.0.0.1 not allowed".into())
+        );
+        assert_eq!(
+            policy.check("http://10.0.0.1/internal", "GET"),
+            Err("SSRF protection: private IP 10.0.0.1 not allowed".into())
+        );
+        assert_eq!(
+            policy.check("http://192.168.1.1/router", "GET"),
+            Err("SSRF protection: private IP 192.168.1.1 not allowed".into())
+        );
+        assert_eq!(
+            policy.check("http://172.16.0.1/secret", "GET"),
+            Err("SSRF protection: private IP 172.16.0.1 not allowed".into())
+        );
+        assert_eq!(
+            policy.check("http://[::1]/foo", "GET"),
+            Err("SSRF protection: private IP ::1 not allowed".into())
+        );
+        assert_eq!(
+            policy.check("http://0.0.0.0/foo", "GET"),
+            Err("SSRF protection: private IP 0.0.0.0 not allowed".into())
+        );
     }
 
     #[test]
     fn test_ssrf_blocks_internal_hostnames() {
         let policy = NetworkPolicy::permissive();
-        assert!(policy.check("http://localhost/admin", "GET").is_err());
-        assert!(
-            policy
-                .check("http://metadata.google.internal/", "GET")
-                .is_err()
+        assert_eq!(
+            policy.check("http://localhost/admin", "GET"),
+            Err("SSRF protection: internal hostname 'localhost' not allowed".into())
         );
-        assert!(policy.check("http://foo.internal/bar", "GET").is_err());
-        assert!(policy.check("http://printer.local/status", "GET").is_err());
+        assert_eq!(
+            policy.check("http://metadata.google.internal/", "GET"),
+            Err("SSRF protection: internal hostname 'metadata.google.internal' not allowed".into())
+        );
+        assert_eq!(
+            policy.check("http://foo.internal/bar", "GET"),
+            Err("SSRF protection: internal hostname 'foo.internal' not allowed".into())
+        );
+        assert_eq!(
+            policy.check("http://printer.local/status", "GET"),
+            Err("SSRF protection: internal hostname 'printer.local' not allowed".into())
+        );
     }
 
     #[test]
@@ -257,7 +293,13 @@ mod tests {
         // The new capability: an empty allowlist denies all egress (whereas
         // Permissive would allow it).
         let policy = NetworkPolicy::new(Allowlist::Only(vec![]), true);
-        assert!(policy.check("https://example.com/foo", "GET").is_err());
+        assert_eq!(
+            policy.check("https://example.com/foo", "GET"),
+            Err(
+                "Network policy denied: GET https://example.com/foo not in allowed endpoints"
+                    .into()
+            )
+        );
     }
 
     #[test]
@@ -271,7 +313,11 @@ mod tests {
             true,
         );
         // *.example.com should match both sub.example.com and example.com
-        assert!(policy.check("https://example.com/foo", "GET").is_ok());
-        assert!(policy.check("https://sub.example.com/foo", "GET").is_ok());
+        policy
+            .check("https://example.com/foo", "GET")
+            .expect("public endpoint should be allowed");
+        policy
+            .check("https://sub.example.com/foo", "GET")
+            .expect("public endpoint should be allowed");
     }
 }

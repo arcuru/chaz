@@ -173,7 +173,6 @@ impl Extension for ProjectingExt {
 }
 
 struct Probe {
-    name: &'static str,
     invocations: Arc<AtomicUsize>,
     seen: Arc<Mutex<Vec<SeenCall>>>,
     ext: Arc<ProjectingExt>,
@@ -214,7 +213,6 @@ fn probe_declaring(
         seen: seen.clone(),
     });
     Probe {
-        name,
         invocations,
         seen,
         ext: Arc::new(ProjectingExt {

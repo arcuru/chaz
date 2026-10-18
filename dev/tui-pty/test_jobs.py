@@ -351,7 +351,10 @@ context:
                 process.screen_capture(evidence, "observer-stalled-publication")
                 service.send_signal(signal.SIGCONT)
                 process.expect("Queued · published, awaiting acceptance")
-                process.send("\x15")  # Clear the unsent next draft, never publish it.
+                # The composer has no Ctrl+U binding. Use its supported deletion
+                # key and prove the unsent draft is gone before observing the job.
+                process.send("\x7f" * len("queued-next-draft"))
+                process.expect_absent("queued-next-draft")
                 process.screen_capture(evidence, "observer-queued-80x24")
                 self.assertEqual(len(job_calls), 1, "viewer/steering must not run or interrupt a job")
                 release.set()
@@ -368,11 +371,15 @@ context:
                 process.expect("inclusion unconfirmed")
                 process.screen_capture(evidence, "observer-dispatch-details-110x35")
                 process.send("\x1bOQ")
-                process.resize_observer(80, 24)
+                # Consume F2 before SIGWINCH; a resize/input batch can strand
+                # crossterm input even if the viewport subsequently repaints.
                 process.expect_absent("Observer details")
+                process.resize_observer(80, 24)
                 # Refresh/navigation/close while the continued resident call is blocked.
-                process.send("\x07r")  # overview and refresh
+                process.send("\x07")
                 process.expect("Tasks")
+                process.send("r")
+                process.expect("original job task")
                 process.send("\x1b")
                 process.expect("Job observer")
                 process.send("\x17")  # Close only the observer view.
@@ -418,6 +425,7 @@ context:
                 process.expect("Included · call 1 returned")
                 process.screen_capture(evidence, "observer-included-details-110x35")
                 process.send("\x1bOQ")
+                process.expect_absent("Observer details")
                 process.resize_observer(80, 24)
                 process.expect("continued job terminal")
                 process.screen_capture(evidence, "observer-completed-80x24")
@@ -461,7 +469,9 @@ context:
                 process.expect_absent("Unavailable", timeout=35)
                 process.screen_capture(evidence, "observer-generation-recovered")
                 self.assertEqual(len(job_calls), 2, "observer recovery executed a job")
-                process.send("\x15\x03")
+                process.send("\x7f" * len("offline-cached-draft"))
+                process.expect_absent("offline-cached-draft")
+                process.send("\x03")
                 self.assertEqual(process.child.wait(timeout=10), 0)
                 print("JOB MONITOR INTEGRATION CONTRACT: PASS; cached navigation/typing, queued steering/exit, receipts, observer generation recovery, no extra model calls")
             finally:
