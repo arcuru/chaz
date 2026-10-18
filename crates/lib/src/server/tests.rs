@@ -6148,6 +6148,23 @@ async fn published_executor_using_mock(
     agent: DbEntry,
     mock: Arc<crate::test_support::MockBackend>,
 ) -> (Arc<Server>, Arc<crate::test_support::MockBackend>) {
+    published_executor_using_mock_and_hub(
+        settings,
+        agents,
+        agent,
+        mock,
+        Arc::new(crate::test_support::context_hub().await),
+    )
+    .await
+}
+
+async fn published_executor_using_mock_and_hub(
+    settings: &crate::config::EideticaConfig,
+    agents: Arc<AgentRegistry>,
+    agent: DbEntry,
+    mock: Arc<crate::test_support::MockBackend>,
+    hub: Arc<crate::extension::ExtensionHub>,
+) -> (Arc<Server>, Arc<crate::test_support::MockBackend>) {
     let connection =
         crate::instance::connect_with(settings, crate::config::ExecutionRole::Executor)
             .await
@@ -6183,7 +6200,7 @@ async fn published_executor_using_mock(
         HashMap::new(),
         Default::default(),
         Arc::new(crate::tool_host::NativeToolHost::new()),
-        Arc::new(crate::test_support::context_hub().await),
+        hub,
         backend,
         Arc::new(crate::mcp::McpRegistry::new()),
         Some(crate::instance::ExecutorCapability::for_test()),
