@@ -1,4 +1,5 @@
 """Actual CLI + loopback Synapse acceptance. All accounts/state are disposable."""
+import hashlib
 import http.client
 import http.server
 import json
@@ -108,13 +109,20 @@ threading.Thread(target=server.serve_forever, daemon=True).start()
 PROXIED = "http://127.0.0.1:" + str(server.server_port)
 
 
+def login_dir(login_id):
+    """v1 per-login dir name, computed independently of the Rust code."""
+    legacy = "".join(c if (c.isascii() and c.isalnum()) or c in "-_" else "_" for c in login_id)
+    tag = hashlib.sha256(b"chaz-matrix-login-state-v1\0" + login_id.encode()).hexdigest()[:32]
+    return legacy.lower()[:48] + "-" + tag
+
+
 def config(name, hs=PROXIED):
     base = WORK / name
     base.mkdir(mode=0o700)
     cfg = base / "config.yaml"
     cfg.write_text(json.dumps({"state_dir": str(base / "state"), "unlock_password": "unused-maintenance-no-eidetica", "logins": [{"agent": "fixture", "type": "matrix", "homeserver_url": hs, "username": USER, "password": "${KEY_TEST_PASSWORD}"}]}))
     cfg.chmod(0o600)
-    return cfg, base / "state/matrix/_manager_keys_test"
+    return cfg, base / "state/matrix" / login_dir(USER)
 
 
 CFG, ROOT = config("original")
@@ -414,10 +422,12 @@ tilde_config["state_dir"] = "~/state"
 TILDE_CFG.write_text(json.dumps(tilde_config))
 tilde_env = dict(os.environ, HOME=str(fake_home))
 cli("status", cfg=TILDE_CFG, env=tilde_env)
-TILDE_ROOT = fake_home / "state/matrix/_manager_keys_test"
+TILDE_ROOT = fake_home / "state/matrix" / login_dir(USER)
 tilde_device = session(TILDE_ROOT)["user_session"]["device_id"]
 tilde_status = cli("status", cfg=TILDE_CFG, env=tilde_env)
 check("Account:" in tilde_status and "New Matrix device" not in tilde_status and session(TILDE_ROOT)["user_session"]["device_id"] == tilde_device, "maintenance resolves tilde state paths exactly like the bridge, without provisioning another login")
+marker = TILDE_ROOT / "login-id"
+check(marker.read_bytes() == b"chaz-matrix-login-state-v1\n" + USER.encode() and marker.stat().st_mode & 0o777 == 0o600 and sorted(p.name for p in TILDE_ROOT.parent.iterdir()) == [login_dir(USER)], "maintenance provisions only the v1-named login dir and marks it privately")
 
 # REVIEW stale-backup regression: another device's current backup is not our local version.
 probe(FRESH, "rotate-backup")

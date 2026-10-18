@@ -139,6 +139,7 @@ pub async fn run_rooms(
         },
         Some(&state_dir),
         "chaz-matrix-rooms",
+        None,
     )
     .await
     {

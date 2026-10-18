@@ -54,11 +54,9 @@ pub struct MatrixBridge {
     /// before this bridge is built. One bridge runs per login.
     creds: MatrixCredentials,
     /// Resolved on-disk state directory for this login's matrix client
-    /// (sync token, session). For explicit `logins:` entries this is
-    /// `{base}/matrix/{login_id}` so logins never collide on disk; for the
-    /// legacy synthesized login it is the historical location (verbatim
-    /// `config.state_dir`, or the per-name default when unset) so existing
-    /// installs keep their session.
+    /// (sync token, session): the per-login directory under
+    /// `{base}/matrix/` that [`crate::login_state`] resolved for this login,
+    /// so logins never collide on disk.
     state_dir: Option<String>,
     /// Broader bot configuration (backends, limits) shared across all logins.
     /// The matrix *identity* comes from `creds`, not here.
@@ -793,7 +791,8 @@ impl Bridge for MatrixBridge {
             username: creds.username.clone(),
             password: creds.password.clone(),
         };
-        let mut mc = MatrixClient::login(&login, state_dir.as_deref(), "chaz").await?;
+        let mut mc =
+            MatrixClient::login(&login, state_dir.as_deref(), "chaz", Some(&login_id)).await?;
         mc.ensure_cross_signed(&login).await?;
 
         mc.install_autojoin(allow_list.clone(), room_size_limit);

@@ -893,15 +893,17 @@ pub async fn run(config: &MatrixBridgeConfig, args: &KeysArgs) -> anyhow::Result
             "other-user verification is forbidden"
         );
     }
-    let base = config
-        .state_dir
-        .as_ref()
-        .map(|path| PathBuf::from(crate::bridge::client::expand_tilde(path)))
-        .or_else(|| dirs::state_dir().map(|d| d.join("chaz-matrix")))
-        .context("no state directory")?;
-    let root = base
-        .join("matrix")
-        .join(crate::config::sanitize_login_id(&login_id));
+    // The same whole-config resolution the bridge runs at startup, so both
+    // always agree on the directory (and both refuse an ambiguous one).
+    let index = config
+        .logins
+        .iter()
+        .position(|l| l.login.login_id() == login_id)
+        .context("selected login missing from configuration")?;
+    let root = config.login_state_dirs()?[index]
+        .path()
+        .context("login state directory refused")?
+        .to_path_buf();
     if !root.join("session").exists() {
         ensure!(
             !matches!(
@@ -914,6 +916,7 @@ pub async fn run(config: &MatrixBridgeConfig, args: &KeysArgs) -> anyhow::Result
             &login,
             Some(root.to_str().context("non-UTF8 state path")?),
             "chaz",
+            Some(&login_id),
         )
         .await.map_err(|_| anyhow::anyhow!("cannot provision Matrix login/store; stop other writers and check configured authentication; no identity reset performed"))?;
         ensure!(
@@ -942,6 +945,7 @@ pub async fn run(config: &MatrixBridgeConfig, args: &KeysArgs) -> anyhow::Result
             && full.client_session.homeserver == login.homeserver_url,
         "saved account/homeserver differs from configuration; refusing maintenance"
     );
+    crate::login_state::claim(&root, &login_id)?;
     lease.lock_store(&full.client_session.db_path)?;
     if root.join("pending-reset.json").exists() {
         let mut pending = load_pending(&root)?;

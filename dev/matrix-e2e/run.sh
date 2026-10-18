@@ -534,6 +534,8 @@ BRIDGE_LOG="$WORKSPACE/bridge.log"
 # empty crypto store path and passphrase, for a device that never uploaded
 # keys. Start this run from one, so the first bridge start takes the upgrade
 # path a real deployment takes rather than the fresh-login path.
+# The directory uses the name earlier releases gave it, so the bridge must
+# adopt it in place rather than start a new device under the v1 name.
 LOGIN_STATE_DIR="$WORKSPACE/state-bridge/matrix/_agent_e2e_test"
 log "seeding a pre-encryption bridge session"
 LEGACY_LOGIN="$(curl -sS --max-time "$CURL_MAX_TIME" -X POST -H 'Content-Type: application/json' \
@@ -575,6 +577,13 @@ grep -q "Upgrading pre-encryption Matrix session" "$WORKSPACE/bridge.log" ||
 	fail "session file or login state dir is readable by others"
 AGENT_DEVICE_KEY="$(jq -r '.client_session.device_ed25519_key // empty' "$LOGIN_STATE_DIR/session")"
 [[ -n $AGENT_DEVICE_KEY ]] || fail "upgraded session did not record the device key"
+[[ $(printf 'chaz-matrix-login-state-v1\n%s' "$AGENT_MXID" | sha256sum) == $(sha256sum <"$LOGIN_STATE_DIR/login-id") && $(stat -c %a "$LOGIN_STATE_DIR/login-id") == 600 ]] ||
+	fail "adopted legacy login dir has no private login-id marker for the agent"
+[[ $(find "$WORKSPACE/state-bridge/matrix" -mindepth 1 -maxdepth 1 | wc -l) == 1 ]] ||
+	fail "bridge created another login dir instead of adopting the legacy one in place"
+grep -q "using legacy-named directory in place" "$WORKSPACE/bridge.log" ||
+	fail "bridge did not report adopting the legacy login dir"
+printf '\033[1;32mPASS\033[0m — legacy login dir adopted in place and marked\n' >&2
 
 # Preserve the daemon's pre-conversation state. Restoring it below models the
 # observed failure: the daemon's copied state knows the agent and bridge but
