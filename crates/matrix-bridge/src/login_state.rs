@@ -42,6 +42,8 @@ const MARKER_HEADER: &str = "chaz-matrix-login-state-v1\n";
 const TAG_DOMAIN: &[u8] = b"chaz-matrix-login-state-v1\0";
 const PREFIX_MAX: usize = 48;
 const TAG_HEX: usize = 32;
+/// Longest file name a filesystem accepts; no legacy directory exceeds it.
+const NAME_MAX: usize = 255;
 /// Bounds the bytes read from a marker or session during resolution.
 const READ_LIMIT: u64 = 1 << 20;
 
@@ -267,7 +269,8 @@ fn try_resolve(
     );
     let matrix = base.join("matrix");
     let new = matrix.join(login_dir_name(login.id));
-    let legacy = matrix.join(legacy_dir_name(login.id));
+    let legacy_name = legacy_dir_name(login.id);
+    let legacy = matrix.join(&legacy_name);
 
     // 1. The v1 directory exists: it must be this id's.
     if matches!(entry(&new)?, Entry::Dir) {
@@ -293,8 +296,9 @@ fn try_resolve(
         return Ok(Resolution::New(new));
     }
 
-    // 2. No legacy directory either: a fresh login.
-    if matches!(entry(&legacy)?, Entry::Absent) {
+    // 2. No legacy directory either: a fresh login. A legacy name longer
+    // than NAME_MAX could never have been created, so it is not inspected.
+    if legacy_name.len() > NAME_MAX || matches!(entry(&legacy)?, Entry::Absent) {
         return Ok(Resolution::New(new));
     }
 
@@ -312,7 +316,6 @@ fn try_resolve(
     // because a case-insensitive filesystem maps `_Bot_hs` and `_bot_hs` to
     // one directory; on a case-sensitive one this only adds claimants, which
     // can make resolution stricter but never looser.
-    let legacy_name = legacy_dir_name(login.id);
     let claimants: Vec<&Claimant<'_>> = all
         .iter()
         .filter(|other| legacy_dir_name(other.id).eq_ignore_ascii_case(&legacy_name))
@@ -769,6 +772,21 @@ mod tests {
         assert_eq!(
             resolve(base.path(), &[claimant("@a:hs", "@a:hs")]),
             vec![Resolution::New(new)]
+        );
+    }
+
+    #[test]
+    fn id_too_long_for_a_legacy_name_resolves_to_the_new_name() {
+        // No earlier release could have created a legacy directory whose name
+        // exceeds NAME_MAX, so such an id is simply a fresh login.
+        let base = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(base.path().join("matrix")).unwrap();
+        let long = format!("@{}:hs", "a".repeat(300));
+        let logins = [claimant(&long, &long), claimant("@a:hs", "@a:hs")];
+        let resolved = resolve(base.path(), &logins);
+        assert_eq!(
+            resolved[0],
+            Resolution::New(base.path().join("matrix").join(login_dir_name(&long)))
         );
     }
 
