@@ -9,6 +9,13 @@ name: Publish
 
 on:
   workflow_call:
+    secrets:
+      NIX_CACHE_ACCESS_KEY_ID:
+        required: true
+      NIX_CACHE_SECRET_ACCESS_KEY:
+        required: true
+      NIX_CACHE_SIGNING_KEY:
+        required: true
   workflow_dispatch:
 
 permissions:

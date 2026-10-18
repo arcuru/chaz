@@ -142,3 +142,9 @@ jobs:
     uses: ./.github/workflows/publish.yml
     permissions:
       contents: read
+    # Reusable workflows require the names even for environment-scoped secrets;
+    # their values are resolved in the callee's protected publishing job.
+    secrets:
+      NIX_CACHE_ACCESS_KEY_ID: ${{ secrets.NIX_CACHE_ACCESS_KEY_ID }}
+      NIX_CACHE_SECRET_ACCESS_KEY: ${{ secrets.NIX_CACHE_SECRET_ACCESS_KEY }}
+      NIX_CACHE_SIGNING_KEY: ${{ secrets.NIX_CACHE_SIGNING_KEY }}

@@ -78,10 +78,20 @@ class Workflows(unittest.TestCase):
         self.assertEqual(job["environment"], "publish")
         self.assertEqual(job["permissions"], {"contents": "read"})
 
-    def test_ci_does_not_receive_publishing_secrets(self):
-        self.assertNotIn("secrets.", self.ci_text)
+    def test_ci_checks_do_not_receive_publishing_secrets(self):
+        for name in ("ci", "e2e"):
+            self.assertNotIn("secrets.", yaml.safe_dump(self.ci["jobs"][name]))
         self.assertEqual(self.ci["permissions"], {"contents": "read"})
         self.assertEqual(self.publish["permissions"], {"contents": "read"})
+        names = {"NIX_CACHE_ACCESS_KEY_ID", "NIX_CACHE_SECRET_ACCESS_KEY", "NIX_CACHE_SIGNING_KEY"}
+        self.assertEqual(
+            self.ci["jobs"]["publish"]["secrets"],
+            {name: "${{ secrets." + name + " }}" for name in names},
+        )
+        self.assertEqual(
+            self.publish["on"]["workflow_call"]["secrets"],
+            {name: {"required": "true"} for name in names},
+        )
         steps = self.publish["jobs"]["push-cache"]["steps"]
         setup = next(s for s in steps if s["name"] == "Setup Nix")
         self.assertEqual(setup["with"]["signing-key"], "${{ secrets.NIX_CACHE_SIGNING_KEY }}")
