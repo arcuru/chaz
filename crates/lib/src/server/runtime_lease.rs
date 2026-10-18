@@ -108,7 +108,9 @@ mod tests {
     #[test]
     fn first_claim_wins_second_owner_refused() {
         let lease = LocalRuntimeLease::new();
-        assert!(lease.try_claim("s1", "owner-a").is_ok());
+        lease
+            .try_claim("s1", "owner-a")
+            .expect("free slot or same-owner reclaim should succeed");
         match lease.try_claim("s1", "owner-b") {
             Err(LeaseError::Held(h)) => assert_eq!(h, "owner-a"),
             other => panic!("expected Held(owner-a), got {other:?}"),
@@ -118,26 +120,38 @@ mod tests {
     #[test]
     fn same_owner_reclaim_is_idempotent() {
         let lease = LocalRuntimeLease::new();
-        assert!(lease.try_claim("s1", "owner-a").is_ok());
-        assert!(lease.try_claim("s1", "owner-a").is_ok());
+        lease
+            .try_claim("s1", "owner-a")
+            .expect("free slot or same-owner reclaim should succeed");
+        lease
+            .try_claim("s1", "owner-a")
+            .expect("free slot or same-owner reclaim should succeed");
         assert_eq!(lease.owner_of("s1").as_deref(), Some("owner-a"));
     }
 
     #[test]
     fn release_frees_the_slot() {
         let lease = LocalRuntimeLease::new();
-        assert!(lease.try_claim("s1", "owner-a").is_ok());
+        lease
+            .try_claim("s1", "owner-a")
+            .expect("free slot or same-owner reclaim should succeed");
         lease.release("s1");
         assert_eq!(lease.owner_of("s1"), None);
         // A different owner can now claim.
-        assert!(lease.try_claim("s1", "owner-b").is_ok());
+        lease
+            .try_claim("s1", "owner-b")
+            .expect("free slot or same-owner reclaim should succeed");
     }
 
     #[test]
     fn distinct_sessions_are_independent() {
         let lease = LocalRuntimeLease::new();
-        assert!(lease.try_claim("s1", "owner-a").is_ok());
-        assert!(lease.try_claim("s2", "owner-b").is_ok());
+        lease
+            .try_claim("s1", "owner-a")
+            .expect("free slot or same-owner reclaim should succeed");
+        lease
+            .try_claim("s2", "owner-b")
+            .expect("free slot or same-owner reclaim should succeed");
         assert_eq!(lease.owner_of("s1").as_deref(), Some("owner-a"));
         assert_eq!(lease.owner_of("s2").as_deref(), Some("owner-b"));
     }

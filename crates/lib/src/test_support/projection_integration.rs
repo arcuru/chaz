@@ -214,7 +214,6 @@ fn probe_declaring(
         seen: seen.clone(),
     });
     Probe {
-        name,
         invocations,
         seen,
         ext: Arc::new(ProjectingExt {

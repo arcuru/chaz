@@ -100,9 +100,18 @@ mod tests {
     fn contention_and_release() {
         let dir = tempfile::tempdir().unwrap();
         let first = StoreLock::acquire(dir.path()).unwrap();
-        assert!(StoreLock::acquire(dir.path()).is_err());
+        let err = StoreLock::acquire(dir.path())
+            .err()
+            .expect("second owner must contend");
+        assert!(
+            matches!(
+                err.downcast_ref::<std::fs::TryLockError>(),
+                Some(std::fs::TryLockError::WouldBlock)
+            ),
+            "expected lock contention, got {err:?}"
+        );
         drop(first);
-        assert!(StoreLock::acquire(dir.path()).is_ok());
+        StoreLock::acquire(dir.path()).expect("released lock should be available");
     }
     #[test]
     fn a_commit_pointer_already_on_the_pending_store_can_relock_it() {
@@ -111,7 +120,14 @@ mod tests {
         let store = dir.path().join("store");
         lease.lock_store(&store).unwrap();
         lease.lock_store(&store).unwrap();
-        assert!(lock(&store.join("ownership.lock")).is_err());
+        let err = lock(&store.join("ownership.lock")).expect_err("store is already locked");
+        assert!(
+            matches!(
+                err.downcast_ref::<std::fs::TryLockError>(),
+                Some(std::fs::TryLockError::WouldBlock)
+            ),
+            "expected lock contention, got {err:?}"
+        );
     }
     #[test]
     fn a_symlinked_crypto_database_cannot_bypass_store_ownership() {
@@ -122,7 +138,10 @@ mod tests {
         std::fs::create_dir(&store).unwrap();
         std::os::unix::fs::symlink(other, store.join("matrix-sdk-crypto.sqlite3")).unwrap();
         let mut lease = StoreLock::acquire(dir.path()).unwrap();
-        assert!(lease.lock_store(&store).is_err());
+        assert_eq!(
+            lease.lock_store(&store).unwrap_err().to_string(),
+            "nonregular entry in Matrix store; refusing unsafe store access"
+        );
     }
     #[test]
     fn distinct_roots_cannot_open_the_same_physical_store() {
@@ -131,9 +150,21 @@ mod tests {
         let mut child = StoreLock::acquire(&dir.path().join("login")).unwrap();
         let store = child.root.join("store");
         ancestor.lock_store(&store).unwrap();
-        assert!(child.lock_store(&store).is_err());
+        let err = child
+            .lock_store(&store)
+            .expect_err("ancestor already owns the same store");
+        assert!(
+            matches!(
+                err.downcast_ref::<std::fs::TryLockError>(),
+                Some(std::fs::TryLockError::WouldBlock)
+            ),
+            "expected lock contention, got {err:?}"
+        );
         let outside = ancestor.root.join("other-login/store");
-        assert!(child.lock_store(&outside).is_err());
+        assert_eq!(
+            child.lock_store(&outside).unwrap_err().to_string(),
+            "Matrix store lies outside this login's private directory; move the session and store together"
+        );
         assert!(!outside.exists());
         drop(ancestor);
         child.lock_store(&store).unwrap();
@@ -143,13 +174,21 @@ mod tests {
     fn rejects_symlink_locks_and_escaping_stores() {
         let dir = tempfile::tempdir().unwrap();
         std::os::unix::fs::symlink("elsewhere", dir.path().join("store.lock")).unwrap();
-        assert!(StoreLock::acquire(dir.path()).is_err());
+        let err = StoreLock::acquire(dir.path())
+            .err()
+            .expect("symlinked lock must be refused");
+        assert_eq!(
+            err.to_string(),
+            "symlink in private state path; refusing access"
+        );
         std::fs::remove_file(dir.path().join("store.lock")).unwrap();
         let mut lease = StoreLock::acquire(dir.path()).unwrap();
-        assert!(
+        assert_eq!(
             lease
                 .lock_store(Path::new("/tmp/outside-matrix-store"))
-                .is_err()
+                .unwrap_err()
+                .to_string(),
+            "Matrix store lies outside this login's private directory; move the session and store together"
         );
     }
 }

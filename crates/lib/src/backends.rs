@@ -1040,9 +1040,11 @@ mod tests {
         let secrets = empty_secrets().await;
         let backends = Some(vec![backend("openai", &["gpt-4"])]);
         let mgr = BackendManager::new(&backends, secrets);
-        assert!(mgr.validate_model("gpt-4").is_ok());
+        mgr.validate_model("gpt-4")
+            .expect("model should be accepted with this backend configuration");
         // Single backend is permissive: unknown model names pass too.
-        assert!(mgr.validate_model("mystery-model").is_ok());
+        mgr.validate_model("mystery-model")
+            .expect("model should be accepted with this backend configuration");
     }
 
     #[tokio::test]
@@ -1054,11 +1056,17 @@ mod tests {
         ]);
         let mgr = BackendManager::new(&backends, secrets);
         // Known prefixed model passes.
-        assert!(mgr.validate_model("openai:gpt-4").is_ok());
+        mgr.validate_model("openai:gpt-4")
+            .expect("model should be accepted with this backend configuration");
         // Unknown-but-prefixed passes (allows caller to use new models).
-        assert!(mgr.validate_model("openai:new-model").is_ok());
+        mgr.validate_model("openai:new-model")
+            .expect("model should be accepted with this backend configuration");
         // Unprefixed unknown model fails.
-        assert!(mgr.validate_model("random-model").is_err());
+        assert_eq!(
+            mgr.validate_model("random-model"),
+            Err("Multiple backends exist, please specify the model name with the backend prepended, e.g. openrouter:model-name"
+                .into())
+        );
     }
 
     // ================================================================
@@ -1420,7 +1428,8 @@ mod tests {
             Ok(BackendClient::OpenAI(_))
         ));
         for id in [&ids[1], "unknown", "not-discovered"] {
-            assert!(mgr.validate_model(id).is_ok());
+            mgr.validate_model(id)
+                .expect("model should be accepted with this backend configuration");
             assert!(
                 matches!(
                     BackendClient::for_model(&b, &secrets, id),
@@ -1451,8 +1460,14 @@ mod tests {
             ]
         );
         assert_eq!(multi.default_model().as_deref(), Some("proxy:configured"));
-        assert!(multi.validate_model("proxy:unknown").is_ok());
-        assert!(multi.validate_model("unknown").is_err());
+        multi
+            .validate_model("proxy:unknown")
+            .expect("model should be accepted with this backend configuration");
+        assert_eq!(
+            multi.validate_model("unknown"),
+            Err("Multiple backends exist, please specify the model name with the backend prepended, e.g. openrouter:model-name"
+                .into())
+        );
         assert_eq!(
             multi.resolve_model_name(Some("proxy:new-model")),
             "new-model"
