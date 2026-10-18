@@ -173,7 +173,6 @@ impl Extension for ProjectingExt {
 }
 
 pub(crate) struct Probe {
-    name: &'static str,
     invocations: Arc<AtomicUsize>,
     seen: Arc<Mutex<Vec<SeenCall>>>,
     pub(crate) ext: Arc<ProjectingExt>,
