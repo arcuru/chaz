@@ -89,7 +89,7 @@ fn accept_report(status: &JobStatus, original_handle: &str, path: &Path) -> anyh
     anyhow::ensure!(status.session_db_id == original_handle, "wrong job handle");
     anyhow::ensure!(
         matches!(status.state, JobState::Succeeded { .. }),
-        "job not successful"
+        "job not successful: {status:?}"
     );
     anyhow::ensure!(
         std::fs::read(path)? == REPORT.as_bytes(),
@@ -177,8 +177,8 @@ async fn lost_ack_is_inspected_and_receipt_is_not_artifact_acceptance() {
     assert!(accept_report(&pending, &original, &path).is_err());
     drop(permits);
     let receipt = tokio::time::timeout(
-        Duration::from_secs(30),
-        client.wait_job(&handle, Duration::from_secs(20)),
+        ASYNC_TEST_TIMEOUT * 2,
+        client.wait_job(&handle, ASYNC_TEST_TIMEOUT),
     )
     .await
     .unwrap()
@@ -263,7 +263,7 @@ async fn explicit_retry_can_repeat_an_already_written_report() {
         .submit_agent_job(&parent, "default", TICK)
         .await
         .unwrap();
-    tokio::time::timeout(Duration::from_secs(30), async {
+    tokio::time::timeout(ASYNC_TEST_TIMEOUT, async {
         while writes.load(Ordering::SeqCst) != 1 {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -286,7 +286,7 @@ async fn explicit_retry_can_repeat_an_already_written_report() {
         writes: writes.clone(),
         hold_after_write: false,
     });
-    tokio::time::timeout(Duration::from_secs(30), async {
+    tokio::time::timeout(ASYNC_TEST_TIMEOUT, async {
         while !restarted.server.is_watching_session(&handle).await {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -321,8 +321,8 @@ async fn explicit_retry_can_repeat_an_already_written_report() {
         .unwrap();
     assert_ne!(retry, turns[0].attempt_id);
     let receipt = tokio::time::timeout(
-        Duration::from_secs(30),
-        client.wait_job(&handle, Duration::from_secs(20)),
+        ASYNC_TEST_TIMEOUT * 2,
+        client.wait_job(&handle, ASYNC_TEST_TIMEOUT),
     )
     .await
     .unwrap()

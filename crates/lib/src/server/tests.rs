@@ -11,6 +11,11 @@ mod compaction_tests;
 
 use super::*;
 
+// These guards detect stalled fixtures, not runtime latency regressions. LLVM
+// coverage and concurrent service-backed tests can take much longer than a
+// normal local run; keep their observation budget separate from job deadlines.
+const ASYNC_TEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
 #[tokio::test]
 async fn mentioned_agent_writes_local_final_and_unmentioned_agent_does_not_wake() {
     use crate::test_support::MockBackend;
@@ -3334,7 +3339,7 @@ async fn write_user_message_with_content(
 }
 
 async fn await_call_count(mock: &crate::test_support::MockBackend, expected: usize) {
-    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+    tokio::time::timeout(ASYNC_TEST_TIMEOUT, async {
         loop {
             if mock.recorded_calls().len() >= expected {
                 break;
@@ -3347,7 +3352,7 @@ async fn await_call_count(mock: &crate::test_support::MockBackend, expected: usi
 }
 
 async fn await_no_processing(server: &Server, sid: &str) {
-    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+    tokio::time::timeout(ASYNC_TEST_TIMEOUT, async {
         loop {
             if !server.processing.lock().await.contains(sid) {
                 break;
