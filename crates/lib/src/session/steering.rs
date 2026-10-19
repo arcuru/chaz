@@ -325,6 +325,22 @@ async fn ordered_inputs_at(
     db: &Database,
     snapshot: &eidetica::Snapshot,
 ) -> anyhow::Result<Vec<JobInputRequest>> {
+    // Read the snapshot's materialized input Table before reconstructing
+    // order. With no visible input there is nothing to order, so skip the
+    // store-frontier walk: it reads every main Entry when the store is
+    // absent, one service round trip each.
+    if snapshot.tips().is_empty()
+        || db
+            .new_transaction_at(snapshot)
+            .await?
+            .get_store::<Table<JobInputRequest>>(INPUTS)
+            .await?
+            .search(|_: &JobInputRequest| true)
+            .await?
+            .is_empty()
+    {
+        return Ok(Vec::new());
+    }
     let entries = super::execution::store_entries_at(db, INPUTS, snapshot).await?;
     let mut seen = std::collections::HashSet::new();
     let mut ordered = Vec::new();
@@ -537,3 +553,7 @@ pub(crate) fn validate_boundary(
                 && seen.insert(input.id.clone())
         })
 }
+
+#[cfg(test)]
+#[path = "steering_tests.rs"]
+mod tests;

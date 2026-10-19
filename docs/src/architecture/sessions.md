@@ -441,7 +441,10 @@ Chat and Job observers publish the same `JobInputRequest` through Session's
 steering API. Existing `job_inputs`, `job_input_receipts` and `job_input_closed`
 wire names remain unchanged. The native signed input-store DAG orders
 publications, including encrypted stores; random Table keys and publisher
-clocks do not rank inputs. One request is published per commit. The latest
+clocks do not rank inputs. Readers first check the snapshot's materialized
+input Table; with no visible input they skip order reconstruction, whose
+store-frontier search otherwise reads main-history Entries one at a time back
+to the latest input publication. One request is published per commit. The latest
 attempt generation plus recent activity is required; an old heartbeat cannot
 authorize input for a superseded attempt. Jobs additionally require their
 accepted Directive's attempt and retain their terminal view-only restriction.

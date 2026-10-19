@@ -849,6 +849,7 @@ version = "0.3.0"
 dependencies = [
  "anyhow",
  "async-openai",
+ "async-trait",
  "base64",
  "blake3",
  "chrono",
