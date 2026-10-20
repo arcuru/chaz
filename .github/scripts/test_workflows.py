@@ -81,7 +81,7 @@ class Workflows(unittest.TestCase):
                 result, args = self.run_checks(event)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 expected = [
-                    "build", "--no-link", "--keep-going", "--max-jobs", "2", "--cores", "4",
+                    "build", "--no-link", "--keep-going", "--max-jobs", "2", "--cores", "0",
                     ".#checks.x86_64-linux.lint",
                     ".#checks.x86_64-linux.treefmt",
                     ".#checks.x86_64-linux.ci-policy",
