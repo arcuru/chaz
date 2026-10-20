@@ -60,9 +60,12 @@ jobs:
             --option substituters 'https://cache.nixos.org' \
             -f '.#packages.x86_64-linux.default'
 
-      # Warm the cache with all check outputs (lint, test, doc, build) so
-      # subsequent CI runs and dev shells download instead of recompiling.
+      # Publish check results and their reusable test outputs explicitly: the
+      # successful test check is only a marker and does not retain its inputs.
       - name: Warm CI cache
         run: |
           nix-fast-build --skip-cached --no-nom --no-link \
             ${{ steps.nix.outputs.push-args }}
+          nix-fast-build --skip-cached --no-nom --no-link \
+            ${{ steps.nix.outputs.push-args }} \
+            -f '.#legacyPackages.x86_64-linux.test'

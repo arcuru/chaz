@@ -40,31 +40,32 @@ class Workflows(unittest.TestCase):
         cls.publish = yaml.load(cls.publish_text, Loader=yaml.BaseLoader)
         cls.e2e = yaml.load(cls.e2e_text, Loader=yaml.BaseLoader)
 
-    def run_checks(self, event, exit_code=0):
-        step = next(s for s in self.ci["jobs"]["ci"]["steps"] if s["name"] == "Checks")
-        self.assertNotIn("if", step)
-        self.assertEqual(step["env"]["CI_EVENT_NAME"], "${{ github.event_name }}")
+    def run_script(self, script, command="nix", env=None, exit_code=0, fail_call=1):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            stub = root / "nix"
+            stub = root / command
             stub.write_text(
                 f"#!{sys.executable}\n"
                 "import json, os, sys\n"
                 "with open(os.environ['NIX_CALLS'], 'a') as calls:\n"
                 "    calls.write(json.dumps(sys.argv[1:]) + '\\n')\n"
-                "sys.exit(int(os.environ['NIX_EXIT']))\n"
+                "with open(os.environ['NIX_CALLS']) as calls:\n"
+                "    call_count = sum(1 for _ in calls)\n"
+                "sys.exit(int(os.environ['NIX_EXIT']) if call_count == "
+                "int(os.environ['NIX_FAIL_CALL']) else 0)\n"
             )
             stub.chmod(0o755)
             calls = root / "calls.jsonl"
             result = subprocess.run(
-                [shutil.which("bash"), "-euo", "pipefail", "-c", step["run"]],
+                [shutil.which("bash"), "-euo", "pipefail", "-c", script],
                 cwd=ROOT,
                 env={
                     **os.environ,
                     "PATH": f"{root}{os.pathsep}{os.environ['PATH']}",
-                    "CI_EVENT_NAME": event,
                     "NIX_CALLS": str(calls),
                     "NIX_EXIT": str(exit_code),
+                    "NIX_FAIL_CALL": str(fail_call),
+                    **(env or {}),
                 },
                 capture_output=True,
                 text=True,
@@ -72,8 +73,49 @@ class Workflows(unittest.TestCase):
             )
             self.assertTrue(calls.exists(), result.stderr)
             invocations = [json.loads(line) for line in calls.read_text().splitlines()]
+        return result, invocations
+
+    def run_checks(self, event, exit_code=0):
+        step = next(s for s in self.ci["jobs"]["ci"]["steps"] if s["name"] == "Checks")
+        self.assertNotIn("if", step)
+        self.assertEqual(step["env"]["CI_EVENT_NAME"], "${{ github.event_name }}")
+        result, invocations = self.run_script(
+            step["run"], env={"CI_EVENT_NAME": event}, exit_code=exit_code
+        )
         self.assertEqual(len(invocations), 1)
         return result, invocations[0]
+
+    def run_warm_cache(self, exit_code=0, fail_call=1):
+        step = next(
+            s for s in self.publish["jobs"]["push-cache"]["steps"]
+            if s["name"] == "Warm CI cache"
+        )
+        self.assertNotIn("if", step)
+        script = step["run"].replace(
+            "${{ steps.nix.outputs.push-args }}", "--copy-to file:///unused-cache"
+        )
+        return self.run_script(
+            script, command="nix-fast-build", exit_code=exit_code, fail_call=fail_call
+        )
+
+    def test_publisher_exports_reusable_test_artifacts(self):
+        result, invocations = self.run_warm_cache()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        common = [
+            "--skip-cached", "--no-nom", "--no-link",
+            "--copy-to", "file:///unused-cache",
+        ]
+        self.assertEqual(invocations, [
+            common,
+            common + ["-f", ".#legacyPackages.x86_64-linux.test"],
+        ])
+
+    def test_publisher_propagates_each_warm_failure(self):
+        for fail_call in (1, 2):
+            with self.subTest(fail_call=fail_call):
+                result, invocations = self.run_warm_cache(exit_code=42, fail_call=fail_call)
+                self.assertEqual(result.returncode, 42, result.stderr)
+                self.assertEqual(len(invocations), fail_call)
 
     def test_checks_share_one_bounded_build_graph(self):
         for event in ("pull_request", "merge_group", "push", "workflow_dispatch"):
