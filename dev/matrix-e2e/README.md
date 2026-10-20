@@ -8,6 +8,7 @@ explicit `matrix__send` delivery to the attached room.
 just e2e                        # from inside `nix develop`
 just e2e --keep                 # leave the workspace behind to poke at
 just e2e --verbose              # stream component logs while it runs
+just e2e --threaded-only        # iterate on the threaded phase with a fresh fixture
 just e2e -- --transport iroh    # exercise P2P transport path
 ```
 
@@ -170,6 +171,19 @@ unsigned puppet device shares the room:
   no new cross-signing identity is created, and the room still works.
 - **E6** — the server's copy of the room holds only `m.room.encrypted` events
   from the agent, never a plaintext `m.room.message`.
+
+### Threaded sessions
+
+A full run also starts a fresh two-peer fixture for `threaded-sessions`:
+
+- Two top-level messages produce distinct session IDs and replies with the correct thread relations.
+- A loopback proxy duplicates SDK sync events; root and reply redelivery must not produce extra turns.
+- Commands and simultaneous approvals stay local to their threads. Unauthorized senders and non-text events cannot open threads.
+- Enabling the mode detaches the old room-wide session, including pending approvals and later output. Switching back to normal preserves existing threads.
+- Bridge restart delivers a response written while the bridge was offline. Bridge and daemon restart retain thread identity, and old approval expiries are not announced again.
+
+`--threaded-only` skips the ordinary-room restart and ReAct cases for iteration.
+Both phases are required for the full gate.
 
 ### Room reset
 

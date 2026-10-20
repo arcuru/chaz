@@ -21,7 +21,11 @@
 # Usage:
 #   dev/matrix-e2e/run.sh [--keep] [--timeout SECONDS] [--verbose]
 #                         [--transport http|iroh] [--legacy-max-iterations N]
+#                         [--threaded-only]
 #
+#   --threaded-only
+#               run only the threaded-sessions phase on a fresh fixture
+#               (a full run invokes it after the main phase)
 #   --keep      leave the workspace in place and print its path
 #   --timeout   seconds to wait for the reply (default 120)
 #   --verbose   stream component logs to stderr as they are written
@@ -42,8 +46,10 @@ VERBOSE=0
 REPLY_TIMEOUT=120
 TRANSPORT="http"
 LEGACY_MAX_ITERATIONS=""
+THREADS=0
 while [[ $# -gt 0 ]]; do
 	case "$1" in
+	--threaded-only) THREADS=1 ;;
 	--) ;; # `just` passes -- to separate its flags from ours; fall through to outer shift
 	--keep) KEEP=1 ;;
 	--verbose) VERBOSE=1 ;;
@@ -240,6 +246,9 @@ retire_pid() {
 
 SERVER_NAME="e2e.test"
 SYNAPSE_PORT="$(free_port)"
+PROXY_PORT="$(free_port)"
+# Seconds the daemon waits for a tool-approval decision before timing it out.
+APPROVAL_TIMEOUT=90
 STUB_PORT="$(free_port)"
 DAEMON_SYNC_PORT="$(free_port)"
 BRIDGE_SYNC_PORT="$(free_port)"
@@ -365,6 +374,11 @@ log "starting synapse"
 spawn synapse synapse_homeserver --config-path "$SYNAPSE_DIR/homeserver.yaml"
 wait_for "synapse" 120 curl -sf --max-time "$CURL_MAX_TIME" "$HOMESERVER/_matrix/client/versions"
 
+# Deliver each bridge timeline event twice, proving the root/reply dedupe path
+# under real SDK sync rather than merely repeating a homeserver transaction.
+spawn duplicate-sync python3 "$HERE/duplicate_sync.py" "$PROXY_PORT" "$SYNAPSE_PORT"
+wait_for "sync proxy" 30 curl -sf --max-time "$CURL_MAX_TIME" "http://127.0.0.1:$PROXY_PORT/_matrix/client/versions"
+
 log "registering accounts"
 for pair in "agent:$AGENT_PASSWORD" "puppet:$PUPPET_PASSWORD" "stranger:$STRANGER_PASSWORD"; do
 	user="${pair%%:*}"
@@ -384,6 +398,12 @@ STRANGER_MXID="@stranger:$SERVER_NAME"
 DAEMON_CONFIG="$WORKSPACE/daemon.yaml"
 BRIDGE_CONFIG="$WORKSPACE/bridge.yaml"
 
+# The threaded phase exercises in-thread approvals of `calculate`; the
+# ordinary phase's twelve-round case runs it unattended.
+THREADED_APPROVALS=""
+if [[ $THREADS -eq 1 ]]; then
+	THREADED_APPROVALS="security:\n  tool_policies:\n    calculate:\n      approval: always"
+fi
 cat >"$DAEMON_CONFIG" <<EOF
 state_dir: "$WORKSPACE/state-daemon"
 execution: executor
@@ -410,6 +430,9 @@ ${LEGACY_MAX_ITERATIONS:+    max_iterations: $LEGACY_MAX_ITERATIONS}
       You are a test fixture.
 
 default_agents: [chaz]
+approvals:
+  timeout: $APPROVAL_TIMEOUT
+$(printf '%b' "$THREADED_APPROVALS")
 EOF
 
 mkdir -p "$WORKSPACE/state-daemon" "$WORKSPACE/state-bridge"
@@ -504,7 +527,7 @@ logins:
   - agent: chaz
     ticket: "$TICKET"
     type: matrix
-    homeserver_url: "$HOMESERVER"
+    homeserver_url: "http://127.0.0.1:$PROXY_PORT"
     username: "$AGENT_MXID"
     password: "$AGENT_PASSWORD"
     allow_list: "$PUPPET_MXID"
@@ -590,6 +613,7 @@ printf '\033[1;32mPASS\033[0m — legacy login dir adopted in place and marked\n
 # predates the room session, while the bridge retains that existing session.
 # The next Matrix event must make the bridge re-publish the session or the
 # restored daemon can never discover and pull its tree.
+if [[ $THREADS -eq 0 ]]; then
 DAEMON_PRE_SESSION_STATE="$WORKSPACE/state-daemon-pre-session"
 log "snapshotting daemon state before the first channel session"
 kill -TERM "$DAEMON_PID"
@@ -599,6 +623,8 @@ cp -a "$WORKSPACE/state-daemon" "$DAEMON_PRE_SESSION_STATE"
 spawn daemon "$CHAZ_BIN" --config "$DAEMON_CONFIG" daemon
 DAEMON_PID="$SPAWNED_PID"
 wait_for "daemon after state snapshot" 120 grep -q "daemon ready" "$WORKSPACE/daemon.log"
+
+fi
 
 # --------------------------------------------------------------- puppet ------
 mx() {
@@ -700,6 +726,7 @@ wait_for "first DM attempt completed and synced to the bridge" 60 first_dm_compl
 # next message resolves the existing channel session on the bridge, rather
 # than creating a new one. It must refresh session sync and exposure so the
 # recovered daemon observes and pulls it.
+if [[ $THREADS -eq 0 ]]; then
 log "restoring daemon pre-session state"
 kill -TERM "$DAEMON_PID"
 wait_for "daemon to exit before restoring state" 30 sh -c "! kill -0 $DAEMON_PID 2>/dev/null"
@@ -776,6 +803,8 @@ mx PUT "/_matrix/client/v3/rooms/$(jq -rn --arg r "$ROOM_ID" '$r|@uri')/send/m.r
 wait_for "fifth reply" "$REPLY_TIMEOUT" replies_at_least 5
 
 printf '\033[1;32mPASS\033[0m — all restart cases passed (bridge + daemon)\n' >&2
+
+fi
 
 # -------------------------------------------------------- group-room cases ---
 # Case 1a — a bare message in a group room is observed, not executed
@@ -1043,6 +1072,7 @@ group_send "$PUPPET_TOKEN" '{"msgtype":"m.text","body":"bare again after partici
 wait_for "default address gate restored" 60 gate_dropped_more_than "$DROPS_BEFORE"
 printf '\033[1;32mPASS\033[0m — opt-in group participation: terminal no_reply, ordinary final reply, explicit send without duplicate, authorization and off\n' >&2
 
+if [[ $THREADS -eq 0 ]]; then
 # -------------------------------------------------------- ReAct case ---
 # The stub calls compact, validates its result, explicitly sends a room reply,
 # then returns a distinct local final after the send result. A compact-only
@@ -1274,6 +1304,384 @@ for mode in send silent; do
 done
 printf '\033[1;32mPASS\033[0m — pinned scheduled E2EE: explicit send posts exactly once; both normal finals local; no-send zero posts after completion/barrier\n' >&2
 
+fi
+
+if [[ $THREADS -eq 1 ]]; then
+# ------------------------------------------------- threaded-sessions cases ---
+# The dedicated-room mode: one durable session per Matrix thread, in the group
+# room the cases above already gave a room-wide session. That is deliberate —
+# enabling the mode has to detach that binding without deleting the session.
+#
+# Every assertion here is on the *thread relation* of the agent's events, not
+# merely on their text: a build that answered in the right room but on the main
+# timeline would pass a text-only check while losing the whole feature. The
+# main-timeline count is held fixed across the phase for the same reason, so a
+# reply that escapes its thread fails a case rather than going unnoticed.
+
+# Send a top-level group-room message and return its event id, which is the
+# root of the thread it opens.
+group_send_id() {
+	local token="$1" body="$2"
+	TXN="e2e-$(date +%s%N)"
+	mx PUT "/_matrix/client/v3/rooms/$GROUP_URI/send/m.room.message/$TXN" \
+		"$token" "$body" | jq -r '.event_id // empty'
+}
+
+# Send a message inside the thread rooted at $2, the way a Matrix client does.
+thread_send() {
+	local token="$1" root="$2" body="$3"
+	TXN="e2e-$(date +%s%N)"
+	mx PUT "/_matrix/client/v3/rooms/$GROUP_URI/send/m.room.message/$TXN" \
+		"$token" "$(jq -nc --arg b "$body" --arg r "$root" \
+			'{msgtype:"m.text",body:$b,"m.relates_to":{rel_type:"m.thread",event_id:$r,is_falling_back:true}}')" \
+		>/dev/null
+}
+
+# Count agent messages that are threaded onto root $1 and contain $2.
+thread_agent_said() {
+	mx GET "/_matrix/client/v3/rooms/$GROUP_URI/messages?dir=b&limit=400" \
+		"$PUPPET_TOKEN" |
+		jq --arg a "$AGENT_MXID" --arg r "$1" --arg s "$2" \
+			'[.chunk[]
+			  | select(.type == "m.room.message")
+			  | select(.sender == $a)
+			  | select(.content["m.relates_to"].rel_type == "m.thread")
+			  | select(.content["m.relates_to"].event_id == $r)
+			  | select(.content.body // "" | contains($s))] | length'
+}
+
+thread_said_at_least() {
+	local got
+	got="$(thread_agent_said "$1" "$2")"
+	[[ $got =~ ^[0-9]+$ ]] && [[ $got -ge $3 ]]
+}
+
+thread_said_count_is() {
+	local got
+	got="$(thread_agent_said "$1" "$2")"
+	[[ $got =~ ^[0-9]+$ ]] || fail "could not count the agent's messages in thread $1"
+	[[ $got -eq $3 ]] || fail "$4 (expected $3 in thread $1, found $got)"
+}
+
+# Agent replies carrying the stub's marker that are NOT in any thread. Held
+# fixed across this phase: a thread reply that lands here has leaked.
+timeline_marker_count() {
+	mx GET "/_matrix/client/v3/rooms/$GROUP_URI/messages?dir=b&limit=400" \
+		"$PUPPET_TOKEN" |
+		jq --arg a "$AGENT_MXID" --arg m "${1:-$MARKER}" \
+			'[.chunk[]
+			  | select(.type == "m.room.message")
+			  | select(.sender == $a)
+			  | select(.content["m.relates_to"] == null)
+			  | select(.content.body // "" | contains($m))] | length'
+}
+
+timeline_markers_are() {
+	local got
+	got="$(timeline_marker_count)"
+	[[ $got =~ ^[0-9]+$ ]] || fail "could not count main-timeline replies"
+	[[ $got -eq $1 ]] || fail "$2 (expected $1 main-timeline replies, found $got)"
+}
+
+# The session id the newest in-thread `!chaz info` reported for thread $1.
+# `dir=b` returns newest first, so `.[0]` is the latest answer.
+session_id_in_thread() {
+	mx GET "/_matrix/client/v3/rooms/$GROUP_URI/messages?dir=b&limit=400" \
+		"$PUPPET_TOKEN" |
+		jq -r --arg a "$AGENT_MXID" --arg r "$1" \
+			'[.chunk[]
+			  | select(.type == "m.room.message")
+			  | select(.sender == $a)
+			  | select(.content["m.relates_to"].event_id == $r)
+			  | select(.content.body // "" | startswith("Session: "))]
+			 | .[0].content.body // ""' |
+		sed -n '1s/^Session: \([^[:space:]]*\).*/\1/p'
+}
+
+# Restart the bridge for a threaded case. Its HTTP sync listener must come back
+# on the same port, so wait for the old process's socket to be released first.
+restart_bridge() {
+	local name="$1"
+	kill -TERM "$BRIDGE_PID" 2>/dev/null || true
+	wait_for "bridge to exit" 30 sh -c "! kill -0 $BRIDGE_PID 2>/dev/null"
+	retire_pid "$BRIDGE_PID"
+	if [[ $TRANSPORT == "http" ]]; then
+		# SO_REUSEADDR as the bridge's listener sets it: TIME_WAIT is fine,
+		# another live socket on the port is not.
+		wait_for "bridge sync port to be released" 60 python3 -c \
+			"import socket as s; k = s.socket(); k.setsockopt(s.SOL_SOCKET, s.SO_REUSEADDR, 1); k.bind(('127.0.0.1', $BRIDGE_SYNC_PORT)); k.listen()"
+	fi
+	spawn "$name" env RUST_LOG="$BRIDGE_RUST_LOG" "$CHAZ_MATRIX_BIN" --config "$BRIDGE_CONFIG"
+	BRIDGE_PID="$SPAWNED_PID"
+	BRIDGE_LOG="$WORKSPACE/$name.log"
+}
+
+TIMELINE_MARKERS="$(timeline_marker_count)"
+[[ $TIMELINE_MARKERS =~ ^[0-9]+$ ]] || fail "could not baseline main-timeline replies"
+log "threaded-sessions: main-timeline reply baseline is $TIMELINE_MARKERS"
+
+# Leave an approval pending on the old room-wide session. Detaching must stop
+# its existing callbacks too, not just remove the persisted binding.
+log "threaded-sessions: leaving an approval pending on the room-wide session"
+group_send "$PUPPET_TOKEN" "$(jq -nc --arg a "$AGENT_MXID" \
+	'{msgtype:"m.text",body:"approval thread detached room session","m.mentions":{user_ids:[$a]}}')"
+wait_for "room-wide approval prompt" "$REPLY_TIMEOUT" group_said_at_least "Tool approval required" 1
+
+log "threaded-sessions: enabling the dedicated-room mode"
+group_send "$PUPPET_TOKEN" \
+	"$(jq -nc '{msgtype:"m.text",body:"!chaz room mode threaded-sessions"}')"
+wait_for "the room-mode confirmation" "$REPLY_TIMEOUT" \
+	group_said_at_least 'Room mode set to `threaded-sessions`' 1
+# The room already had a room-wide session, and enabling the mode must detach
+# that binding rather than delete the session.
+group_said_count_is "Detached the room-wide session" 1 \
+	"enabling threaded-sessions did not report detaching the existing room binding"
+
+log "threaded-sessions: the mode is reported on query"
+group_send "$STRANGER_TOKEN" "$(jq -nc '{msgtype:"m.text",body:"!chaz room mode normal"}')"
+group_send "$PUPPET_TOKEN" "$(jq -nc '{msgtype:"m.text",body:"!chaz room mode"}')"
+wait_for "the room-mode report" "$REPLY_TIMEOUT" \
+	group_said_at_least "This room's mode is \`threaded-sessions\`" 1
+
+# Case T1 — two top-level messages, two threads, two sessions. Neither message
+# mentions the bot: a dedicated room needs no mention, and asserting that here
+# is what distinguishes the mode from the @-mention path above.
+log "Case T1: two top-level messages open two independent threads"
+FORBIDDEN_ROOT="$(group_send_id "$STRANGER_TOKEN" '{"msgtype":"m.text","body":"unauthorized thread opener"}')"
+NOTICE_ROOT="$(group_send_id "$PUPPET_TOKEN" '{"msgtype":"m.notice","body":"non-text thread opener"}')"
+ROOT_A="$(group_send_id "$PUPPET_TOKEN" "$(jq -nc '{msgtype:"m.text",body:"thread alpha opener"}')")"
+[[ -n $ROOT_A ]] || fail "could not send the first top-level message"
+wait_for "the reply inside thread alpha" "$REPLY_TIMEOUT" \
+	thread_said_at_least "$ROOT_A" "$MARKER" 1
+
+ROOT_B="$(group_send_id "$PUPPET_TOKEN" "$(jq -nc '{msgtype:"m.text",body:"thread beta opener"}')")"
+[[ -n $ROOT_B ]] || fail "could not send the second top-level message"
+[[ $ROOT_A != "$ROOT_B" ]] || fail "the homeserver returned the same event id twice"
+wait_for "the reply inside thread beta" "$REPLY_TIMEOUT" \
+	thread_said_at_least "$ROOT_B" "$MARKER" 1
+
+thread_said_count_is "$FORBIDDEN_ROOT" "" 0 "unauthorized text opened a thread"
+thread_said_count_is "$NOTICE_ROOT" "" 0 "non-text event opened a thread"
+! grep '^stub_llm: request:' "$WORKSPACE/stub-llm.log" | grep -qE 'unauthorized thread opener|non-text thread opener' ||
+	fail "an ineligible event entered the model context"
+
+# Case T2 — a thread-local session command answers in its own thread, about its
+# own session. This is both the command-routing case and how the two sessions
+# are proved distinct: the ids come from the sessions themselves.
+log "Case T2: thread-local !chaz info answers in-thread about that thread's session"
+thread_send "$PUPPET_TOKEN" "$ROOT_A" "!chaz info"
+wait_for "thread alpha's info reply" "$REPLY_TIMEOUT" \
+	thread_said_at_least "$ROOT_A" "Session: " 1
+thread_send "$PUPPET_TOKEN" "$ROOT_B" "!chaz info"
+wait_for "thread beta's info reply" "$REPLY_TIMEOUT" \
+	thread_said_at_least "$ROOT_B" "Session: " 1
+
+SESSION_A="$(session_id_in_thread "$ROOT_A")"
+SESSION_B="$(session_id_in_thread "$ROOT_B")"
+[[ -n $SESSION_A ]] || fail "thread alpha's info reply named no session"
+[[ -n $SESSION_B ]] || fail "thread beta's info reply named no session"
+[[ $SESSION_A != "$SESSION_B" ]] ||
+	fail "both threads resolved to the same session ($SESSION_A) — context is shared"
+log "threaded-sessions: alpha=$SESSION_A beta=$SESSION_B"
+
+# Each session's binding is keyed by its own root event, so the channel `info`
+# reports carries that root. A room-keyed binding would not. Dumped first so a
+# failure here is diagnosable from a --keep workspace rather than only from the
+# assertion's name.
+mx GET "/_matrix/client/v3/rooms/$GROUP_URI/messages?dir=b&limit=400" \
+	"$PUPPET_TOKEN" >"$WORKSPACE/group-messages.json"
+thread_info_names_root() { thread_said_at_least "$1" "$1" 1; }
+wait_for "thread alpha's info to name its own root event" 30 \
+	thread_info_names_root "$ROOT_A"
+wait_for "thread beta's info to name its own root event" 30 \
+	thread_info_names_root "$ROOT_B"
+
+log "Case T2b: a mutating command is local to alpha"
+thread_send "$PUPPET_TOKEN" "$ROOT_A" "!chaz name alpha-work"
+wait_for "thread alpha's rename" "$REPLY_TIMEOUT" thread_said_at_least "$ROOT_A" "Session named 'alpha-work'" 1
+thread_said_count_is "$ROOT_B" "alpha-work" 0 "alpha's name command leaked to beta"
+thread_send "$PUPPET_TOKEN" "$ROOT_A" "!chaz send unrelated room history"
+wait_for "whole-room send refusal" "$REPLY_TIMEOUT" thread_said_at_least "$ROOT_A" "unavailable in thread contexts" 1
+# The proxy positively proves both roots were redelivered; each still ran once.
+for root in "$ROOT_A" "$ROOT_B"; do
+	grep -qF "redelivered: $root" "$WORKSPACE/duplicate-sync.log" || fail "proxy did not redeliver root $root"
+	thread_said_count_is "$root" "$MARKER" 1 "duplicate root delivery ran a second turn"
+done
+
+# Case T3 — a reply inside a thread continues that session instead of forking a
+# third one, and the other thread is untouched.
+log "Case T3: a thread reply continues its own session"
+BETA_REPLIES_BEFORE="$(thread_agent_said "$ROOT_B" "$MARKER")"
+thread_send "$PUPPET_TOKEN" "$ROOT_A" "still talking in alpha"
+wait_for "the second reply inside thread alpha" "$REPLY_TIMEOUT" \
+	thread_said_at_least "$ROOT_A" "$MARKER" 2
+thread_send "$PUPPET_TOKEN" "$ROOT_A" "!chaz info"
+wait_for "thread alpha's second info reply" "$REPLY_TIMEOUT" \
+	thread_said_at_least "$ROOT_A" "Session: " 2
+[[ "$(session_id_in_thread "$ROOT_A")" == "$SESSION_A" ]] ||
+	fail "a reply in thread alpha forked a new session"
+thread_said_count_is "$ROOT_B" "$MARKER" "$BETA_REPLIES_BEFORE" \
+	"a reply in thread alpha produced a reply in thread beta"
+timeline_markers_are "$TIMELINE_MARKERS" "a thread's reply leaked onto the main timeline"
+
+ALPHA_TURNS="$(grep '^stub_llm: request:' "$WORKSPACE/stub-llm.log" | grep -c 'thread alpha opener' || true)"
+[[ $ALPHA_TURNS -eq 2 ]] || fail "redelivered root/reply produced $ALPHA_TURNS alpha turns, expected 2"
+! grep '^stub_llm: request:' "$WORKSPACE/stub-llm.log" | grep 'thread alpha opener' | grep -q 'thread beta opener' || fail "sibling history leaked into alpha"
+
+# Tool prompts in two simultaneous threads. A text decision cannot reach its
+# sibling, and a reaction resolves by its prompt event ID, not the room.
+log "Case T4a: simultaneous approvals are isolated by thread"
+APPROVAL_A="$(group_send_id "$PUPPET_TOKEN" "$(jq -nc '{msgtype:"m.text",body:"approval thread alpha"}')")"
+APPROVAL_B="$(group_send_id "$PUPPET_TOKEN" "$(jq -nc '{msgtype:"m.text",body:"approval thread beta"}')")"
+wait_for "alpha approval prompt" "$REPLY_TIMEOUT" thread_said_at_least "$APPROVAL_A" "Tool approval required" 1
+wait_for "beta approval prompt" "$REPLY_TIMEOUT" thread_said_at_least "$APPROVAL_B" "Tool approval required" 1
+# A top-level decision is not allowed to resolve either child.
+group_send "$PUPPET_TOKEN" "$(jq -nc '{msgtype:"m.text",body:"!chaz approve"}')"
+wait_for "top-level approval refusal" "$REPLY_TIMEOUT" group_said_at_least "No pending approval requests" 1
+thread_said_count_is "$APPROVAL_A" "$MARKER" 0 "top-level approve resolved alpha"
+thread_said_count_is "$APPROVAL_B" "$MARKER" 0 "top-level approve resolved beta"
+thread_send "$PUPPET_TOKEN" "$APPROVAL_A" "!chaz approve"
+wait_for "alpha approval acknowledgement" "$REPLY_TIMEOUT" thread_said_at_least "$APPROVAL_A" "✅ Approved" 1
+wait_for "alpha approved result" "$REPLY_TIMEOUT" thread_said_at_least "$APPROVAL_A" "$MARKER" 1
+thread_said_count_is "$APPROVAL_B" "$MARKER" 0 "alpha approve resolved beta"
+PROMPT_B="$(mx GET "/_matrix/client/v3/rooms/$GROUP_URI/messages?dir=b&limit=400" "$PUPPET_TOKEN" |
+	jq -r --arg a "$AGENT_MXID" --arg r "$APPROVAL_B" '[.chunk[] | select(.sender==$a and .content["m.relates_to"].event_id==$r) | select(.content.body // "" | contains("Tool approval required"))][0].event_id')"
+mx PUT "/_matrix/client/v3/rooms/$GROUP_URI/send/m.reaction/e2e-$(date +%s%N)" "$PUPPET_TOKEN" \
+	"$(jq -nc --arg e "$PROMPT_B" '{"m.relates_to":{rel_type:"m.annotation",event_id:$e,key:"❌"}}')" >/dev/null
+wait_for "beta reaction denial result" "$REPLY_TIMEOUT" thread_said_at_least "$APPROVAL_B" "$MARKER" 1
+# Exercise the complementary text deny and reaction approve paths too.
+APPROVAL_C="$(group_send_id "$PUPPET_TOKEN" "$(jq -nc '{msgtype:"m.text",body:"approval thread text-deny"}')")"
+wait_for "text-deny prompt" "$REPLY_TIMEOUT" thread_said_at_least "$APPROVAL_C" "Tool approval required" 1
+thread_send "$PUPPET_TOKEN" "$APPROVAL_C" "!chaz deny"
+wait_for "text-deny acknowledgement" "$REPLY_TIMEOUT" thread_said_at_least "$APPROVAL_C" "❌ Denied" 1
+wait_for "text-deny result" "$REPLY_TIMEOUT" thread_said_at_least "$APPROVAL_C" "$MARKER" 1
+
+# Case T4 — the room-wide verbs are refused rather than silently doing the
+# room-wide thing, at the top level and inside a thread alike.
+log "Case T4: attach/detach and top-level session commands are refused"
+group_send "$PUPPET_TOKEN" "$(jq -nc '{msgtype:"m.text",body:"!chaz detach"}')"
+wait_for "the top-level detach refusal" "$REPLY_TIMEOUT" \
+	group_said_at_least "so \`attach\`/\`detach\` are refused here" 1
+thread_send "$PUPPET_TOKEN" "$ROOT_A" "!chaz detach"
+wait_for "the in-thread detach refusal" "$REPLY_TIMEOUT" \
+	thread_said_at_least "$ROOT_A" "are refused inside a thread" 1
+group_send "$PUPPET_TOKEN" "$(jq -nc '{msgtype:"m.text",body:"!chaz sessions"}')"
+wait_for "the top-level session-command refusal" "$REPLY_TIMEOUT" \
+	group_said_at_least "no room-wide session for a session command to act on" 1
+
+# A request that expires must be announced inside its own thread.
+EXPIRY_ROOT="$(group_send_id "$PUPPET_TOKEN" "$(jq -nc '{msgtype:"m.text",body:"approval thread expiry"}')")"
+wait_for "expiry prompt" "$REPLY_TIMEOUT" thread_said_at_least "$EXPIRY_ROOT" "Tool approval required" 1
+# The notice cannot appear before the daemon's approval timeout elapses.
+wait_for "in-thread expiry notice" "$((APPROVAL_TIMEOUT + REPLY_TIMEOUT))" \
+	thread_said_at_least "$EXPIRY_ROOT" "expired with no answer" 1
+thread_send "$PUPPET_TOKEN" "$EXPIRY_ROOT" "!chaz approve"
+wait_for "no expired pending approval" "$REPLY_TIMEOUT" thread_said_at_least "$EXPIRY_ROOT" "No pending approval requests" 1
+
+# The old room-wide request has also expired by this barrier. Neither its
+# final answer nor its expiry notice may reach the detached main timeline.
+timeline_markers_are "$TIMELINE_MARKERS" "a detached room-wide session still delivered a reply"
+[[ "$(timeline_marker_count 'expired with no answer')" -eq 0 ]] ||
+	fail "a detached room-wide session still delivered an approval expiry"
+
+# Case T6 — back to `normal`. New top-level traffic uses the room-wide session
+# again, and the threads opened under the old mode are not stranded.
+log "Case T6: reverting to normal keeps existing threads working"
+group_send "$PUPPET_TOKEN" "$(jq -nc '{msgtype:"m.text",body:"!chaz room mode normal"}')"
+wait_for "the revert confirmation" "$REPLY_TIMEOUT" \
+	group_said_at_least 'Room mode set to `normal`' 1
+
+group_send "$PUPPET_TOKEN" "$(jq -nc --arg a "$AGENT_MXID" \
+	--arg b "top level after reverting to normal" \
+	'{msgtype:"m.text",body:$b} + {"m.mentions":{user_ids:[$a]}}')"
+timeline_markers_above() {
+	local got
+	got="$(timeline_marker_count)"
+	[[ $got =~ ^[0-9]+$ ]] && [[ $got -gt $1 ]]
+}
+wait_for "a main-timeline reply after the revert" "$REPLY_TIMEOUT" \
+	timeline_markers_above "$TIMELINE_MARKERS"
+
+thread_send "$PUPPET_TOKEN" "$ROOT_A" "alpha after reverting to normal"
+wait_for "the third reply inside thread alpha" "$REPLY_TIMEOUT" \
+	thread_said_at_least "$ROOT_A" "$MARKER" 3
+thread_send "$PUPPET_TOKEN" "$ROOT_A" "!chaz info"
+wait_for "thread alpha's info reply after the revert" "$REPLY_TIMEOUT" \
+	thread_said_at_least "$ROOT_A" "Session: " 3
+[[ "$(session_id_in_thread "$ROOT_A")" == "$SESSION_A" ]] ||
+	fail "reverting the room to normal stranded thread alpha onto a different session"
+
+# Case T6b — re-enable the mode. The room-wide session the revert created is
+# detached in turn, still without deleting anything, and the restart cases below
+# run in a dedicated room again.
+log "Case T6b: re-enabling threaded-sessions detaches the new room-wide session"
+group_send "$PUPPET_TOKEN" \
+	"$(jq -nc '{msgtype:"m.text",body:"!chaz room mode threaded-sessions"}')"
+wait_for "the second detach confirmation" "$REPLY_TIMEOUT" \
+	group_said_at_least "Detached the room-wide session" 2
+# The revert's main-timeline reply is legitimate; nothing after this may add one.
+TIMELINE_MARKERS="$(timeline_marker_count)"
+
+# Restarts come last: they must keep existing threads and a response that was
+# in flight working, and every session they touch was created beforehand.
+# Queue a delayed response, stop the bridge before it returns, then make
+# startup reattachment deliver it without another inbound thread event.
+log "Case T4b: delayed response while the bridge is offline"
+DELAYED_ROOT="$(group_send_id "$PUPPET_TOKEN" "$(jq -nc '{msgtype:"m.text",body:"delayed thread response"}')")"
+wait_for "delayed model request" "$REPLY_TIMEOUT" grep -q "delaying thread response" "$WORKSPACE/stub-llm.log"
+kill -TERM "$BRIDGE_PID"
+wait_for "bridge to exit" 30 sh -c "! kill -0 $BRIDGE_PID 2>/dev/null"
+curl -sf --max-time "$CURL_MAX_TIME" "http://127.0.0.1:$STUB_PORT/release-delayed" >/dev/null
+wait_for "delayed model response" "$REPLY_TIMEOUT" grep -q "released thread response" "$WORKSPACE/stub-llm.log"
+restart_bridge bridge-delayed
+wait_for "delayed thread delivery after restart" "$REPLY_TIMEOUT" thread_said_at_least "$DELAYED_ROOT" "$MARKER" 1
+timeline_markers_are "$TIMELINE_MARKERS" "a delayed reply leaked onto the main timeline"
+
+# Case T5 — restart the bridge. A thread's routing lives in the session's
+# durable binding, so the restarted bridge must reattach it from that binding
+# and keep answering in-thread. Waiting for the startup-attach line first makes
+# this a test of the reattachment path rather than of the inbound path
+# re-deriving it.
+log "Case T5: restarting the bridge mid-thread"
+restart_bridge bridge-threaded
+wait_for "bridge to come back online" 120 grep -q "The client is ready" "$BRIDGE_LOG"
+wait_for "the bridge to reattach its thread channels at startup" 120 \
+	grep -qF "$ROOT_A" "$BRIDGE_LOG"
+
+thread_send "$PUPPET_TOKEN" "$ROOT_A" "alpha after the bridge restart"
+wait_for "the fourth reply inside thread alpha" "$REPLY_TIMEOUT" \
+	thread_said_at_least "$ROOT_A" "$MARKER" 4
+timeline_markers_are "$TIMELINE_MARKERS" \
+	"a thread's reply leaked onto the main timeline after restart"
+
+log "Case T5b: restarting the daemon preserves thread beta"
+kill -TERM "$DAEMON_PID"
+wait_for "daemon to exit" 30 sh -c "! kill -0 $DAEMON_PID 2>/dev/null"
+retire_pid "$DAEMON_PID"
+spawn daemon-threaded "$CHAZ_BIN" --config "$DAEMON_CONFIG" daemon
+DAEMON_PID="$SPAWNED_PID"
+wait_for "daemon restart in threaded mode" 120 grep -q "daemon ready" "$WORKSPACE/daemon-threaded.log"
+thread_send "$PUPPET_TOKEN" "$ROOT_B" "beta after daemon restart"
+# A restarted daemon re-adopts its sessions one at a time, and this phase has
+# created about a dozen, so adoption gets its own budget. The message above was
+# still sent mid-startup and must be answered once beta is adopted.
+beta_adopted() {
+	grep -F "$SESSION_B" "$WORKSPACE/daemon-threaded.log" | grep -q "registered bridge-exposed session"
+}
+wait_for "the restarted daemon to adopt thread beta" 300 beta_adopted
+wait_for "beta response after daemon restart" "$REPLY_TIMEOUT" thread_said_at_least "$ROOT_B" "$MARKER" 2
+thread_send "$PUPPET_TOKEN" "$ROOT_B" "!chaz info"
+wait_for "beta info after daemon restart" "$REPLY_TIMEOUT" thread_said_at_least "$ROOT_B" "Session: " 2
+[[ "$(session_id_in_thread "$ROOT_B")" == "$SESSION_B" ]] || fail "daemon restart changed beta's session"
+# Two bridge restarts have reattached the expiry thread by now; an approval
+# that expired before them is history, not a new event to announce.
+thread_said_count_is "$EXPIRY_ROOT" "expired with no answer" 1 \
+	"a bridge restart re-announced an old approval expiry"
+
+printf '\033[1;32mPASS\033[0m — threaded sessions: per-thread sessions, duplicate sync delivery, isolated commands/approvals, delayed replies, bridge/daemon restarts, and mode-switch compatibility\n' >&2
+
+fi
+
 # ----------------------------------------------------------- room reset ---
 # The `chaz-matrix rooms` maintenance command, run against the same throwaway
 # homeserver and bridge config. It signs in with a fresh throwaway device —
@@ -1323,6 +1731,9 @@ done
 
 printf '\033[1;32mPASS\033[0m — room reset passed (dry-run lists, --execute leaves, re-run idempotent, no secret leaked)\n' >&2
 
+# The rejoin and context cases count the ordinary phase's DM replies, so the
+# threaded-only fixture skips them.
+if [[ $THREADS -eq 0 ]]; then
 # Rejoining the same room imports only messages between joins. In particular,
 # the old live prompts and bot replies must not be backfilled a second time.
 log "rejoin: inviting the bridge back into the DM"
@@ -1420,3 +1831,14 @@ assert delivered == report or delivered.startswith(report + "\n\n"), probes
 assert probes[1]["tails"] == [], probes
 print("PASS — Matrix /context: exact shown snapshot delivered once; no command-triggered model call")
 PY
+
+fi
+
+# A fresh two-peer fixture keeps threaded cases independent of the deliberate
+# copied-state rollback above. Both phases remain mandatory for `just e2e`.
+if [[ $THREADS -eq 0 ]]; then
+	options=(--threaded-only --timeout "$REPLY_TIMEOUT" --transport "$TRANSPORT")
+	[[ $KEEP -eq 0 ]] || options+=(--keep)
+	[[ $VERBOSE -eq 0 ]] || options+=(--verbose)
+	"$HERE/run.sh" "${options[@]}"
+fi

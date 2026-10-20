@@ -224,7 +224,14 @@ impl MatrixClient {
     /// One sync pass, persisting the new next-batch token to the session file.
     async fn sync_once(&mut self) -> anyhow::Result<()> {
         let filter = FilterDefinition::with_lazy_loading();
-        let mut settings = SyncSettings::default().filter(filter.into());
+        // `full_state`: the client store is in-memory, so a restored session
+        // knows no rooms until a sync names them. An incremental sync only
+        // names rooms with new activity; full state names every joined room,
+        // which startup reattachment needs to deliver to a quiet room. The
+        // timeline stays incremental, and no handler is installed yet.
+        let mut settings = SyncSettings::default()
+            .filter(filter.into())
+            .full_state(true);
         if let Some(token) = &self.sync_token {
             settings = settings.token(token);
         }

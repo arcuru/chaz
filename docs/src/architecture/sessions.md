@@ -281,6 +281,22 @@ A Matrix-origin final enters that outbox atomically with its local copy; TUI, sc
 Startup reconciliation and per-binding progress retry queued sends even when the agent is offline.
 See [Matrix Bot](../user_guide/matrix.md#attached-rooms-and-reply-routing).
 
+### Matrix room modes and per-thread channels
+
+chaz-core treats a channel binding's `channel` component as an **opaque string** — it is the third element of the `(transport, login_id, channel)` triple and nothing in the lib parses it. The Matrix bridge uses this to bind one session per Matrix thread without changing the session model:
+
+- **`normal` room** — `channel` is the bare room ID, byte-for-byte what every existing install has on disk.
+- **`threaded-sessions` room** — `channel` is `thread:<esc(room_id)>#<esc(root_event_id)>`, so the durable session identity is `(login, room, thread root)`. Both halves escape `%` and `#`. The `thread:` prefix distinguishes composite channels from bare room IDs, whose opaque localpart may contain `#` or `$`. The encode/decode pair lives in `crates/matrix-bridge/src/bridge/threads.rs`.
+
+The room ID stays the transport _destination_; the thread root travels beside it in the bridge's `RoomTarget`, which every outbound path (agent replies, command output, approval prompts, expiry notices, acknowledgements) sends through. Startup reattachment decodes the stored channel, so a thread's delayed replies still land in their thread after a restart rather than on the main timeline.
+
+Two consequences worth holding in mind when reading the bridge:
+
+- **Session idempotency is inherited, message idempotency is durable.** `get_or_create_conversational_channel_session` already serialises per channel across the lookup and the create, so duplicate sync delivery or two near-simultaneous replies to a brand-new root produce one session. An inbound message is recorded only if no existing entry carries the same Matrix event as its source, so a redelivery after a restart does not run a second turn. Each thread session is the single conversational attachment for its composite channel, and its replies use the same durable `DeliveryReconciler` as a room-wide session: progress is keyed by `(matrix, login, composite channel, session)` in `chaz_peer`, and each chunk carries a stable homeserver transaction ID, so a response written while the bridge was offline is still posted into its thread after reattachment.
+- **Mode is bridge state, not session state.** The per-`(login, room)` mode lives in the bridge DB's unencrypted `settings` store (`BridgeDb::get_setting`/`set_setting`), never in a session's LLM context. That is also why a thread opened under one mode keeps working after the mode changes: routing comes from the durable binding, not from the current mode.
+
+The user-facing behavior, including what a mode switch does to an existing room-wide session, is in [Matrix → Room Modes](../user_guide/matrix.md#room-modes-one-session-per-thread).
+
 ### Named Sessions
 
 Sessions can be given human-friendly names via `set_session_name()` (TUI: `/name <alias>`). Names are persisted in the registry's `session_names` index and mirrored into the session's `meta` doc. `resolve_session()` tries name → DB ID, so names work everywhere a session identifier is accepted (`/join`, schedules, etc.).
