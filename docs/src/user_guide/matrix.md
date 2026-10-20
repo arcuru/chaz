@@ -387,15 +387,18 @@ The bridge reads and answers encrypted rooms. There is nothing to configure: eve
 Matrix login keeps a persistent encryption device, and the bridge decides which other
 devices it trusts from Matrix cross-signing alone.
 
-| What                   | Behavior                                                                                                             |
-| ---------------------- | -------------------------------------------------------------------------------------------------------------------- |
-| Device store           | `{state_dir}/matrix/{login_id}/store/`, a passphrase-encrypted SQLite store holding the device's keys and room state |
-| Store passphrase       | Generated on first start, kept in `{state_dir}/matrix/{login_id}/session` (mode `0600`, directory `0700`)            |
-| Bot device             | Signed with the account's cross-signing identity on first start; the identity is created if the account has none     |
-| Outbound room keys     | Shared only with devices their owner has cross-signed (MSC4153)                                                      |
-| Inbound messages       | Decrypted only from cross-signed devices; anything else is logged and ignored                                        |
-| Command authorization  | Unchanged: `allow_list`, approvals, and command rules apply exactly as in plaintext rooms                            |
-| Pre-encryption session | Upgraded in place on first start: same device, new store                                                             |
+| What                   | Behavior                                                                                                         |
+| ---------------------- | ---------------------------------------------------------------------------------------------------------------- |
+| Device store           | `{login dir}/store/`, a passphrase-encrypted SQLite store holding the device's keys and room state               |
+| Store passphrase       | Generated on first start, kept in `{login dir}/session` (mode `0600`, directory `0700`)                          |
+| Bot device             | Signed with the account's cross-signing identity on first start; the identity is created if the account has none |
+| Outbound room keys     | Shared only with devices their owner has cross-signed (MSC4153)                                                  |
+| Inbound messages       | Decrypted only from cross-signed devices; anything else is logged and ignored                                    |
+| Command authorization  | Unchanged: `allow_list`, approvals, and command rules apply exactly as in plaintext rooms                        |
+| Pre-encryption session | Upgraded in place on first start: same device, new store                                                         |
+
+`{login dir}` is the login's own directory under `{state_dir}/matrix/`; see
+[Per-login state directories](#per-login-state-directories).
 
 ### How encrypted-room trust works
 
@@ -461,6 +464,113 @@ out of the conversation. It does not keep the conversation out of chaz or the mo
 ## Limitations
 
 - **Text only.** The Matrix bridge currently ingests only text messages. Image, file, and other non-text Matrix events are skipped on both the live path and during history backfill. Multimodal models will not see attached images sent in the room. Restoring multimodal ingestion is tracked as a TODO in `crates/matrix-bridge/src/bridge/commands.rs` and `crates/matrix-bridge/src/bridge/history.rs`.
+
+## Per-login state directories
+
+Each configured login keeps its Matrix device in its own directory under
+`{state_dir}/matrix/`: the `session` file, the encrypted `store/`, the store lock,
+and any pending key-reset journal. Two logins that shared a directory would share
+one device and its keys, so the bridge makes sure each raw login id (the `id:`, or
+the `username:` when `id:` is unset) gets a directory that no other id can reach.
+
+| Item                   | Behavior                                                                                                                                         |
+| ---------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
+| New directory name     | `<prefix>-<tag>`: the id with characters outside `[A-Za-z0-9_-]` replaced by `_`, lowercased, cut to 48 characters, then a 32-hex-character tag  |
+| Tag                    | First 32 hex characters of SHA-256 of `chaz-matrix-login-state-v1`, a NUL byte, and the raw id. The id is not trimmed, normalized or case-folded |
+| `login-id` marker      | In every login directory, mode `0600`: `chaz-matrix-login-state-v1`, a newline, then the raw id. Written under the store lock                    |
+| Legacy directory       | Name from earlier releases: the replaced-characters id, not lowercased, with no tag. Used in place when it unambiguously belongs to the login    |
+| Ambiguous directory    | The whole bridge (and `keys` maintenance) refuses to start and writes nothing                                                                    |
+| Empty or duplicate id  | Rejected when the config is loaded                                                                                                               |
+| Moved or renamed files | Never. No directory is renamed, copied or deleted, and no device, store or cross-signing identity is regenerated by path resolution              |
+
+### Why names changed, and what happens to an existing directory
+
+Earlier releases named the directory by replacing every character outside
+`[A-Za-z0-9_-]` with `_`. Different ids can map to the same name that way:
+`@chaz:example` and `@chaz_example` both become `_chaz_example`, and on a
+case-insensitive filesystem so do `@Bot:hs` and `@bot:hs`. The tag in the new name
+differs for every raw id, and the lowercase prefix keeps names apart even where
+the filesystem ignores case. The prefix is only there so you can recognize the
+directory; the marker records exactly which id owns it, and a marker naming a
+different id refuses rather than letting two logins share state.
+
+On start, before it connects anywhere, the bridge resolves every configured login
+together, using the same code `chaz-matrix keys` uses:
+
+1. If the new-name directory exists, it is used. Its marker must name this login.
+   A legacy directory that also exists is left untouched.
+2. If neither exists, the new-name directory is created (mode `0700`) with a marker.
+3. A legacy directory with a marker belongs to the id it names. Any other login
+   that maps to the same legacy name gets a new-name directory.
+4. An unmarked legacy directory that only one configured login maps to is used in
+   place, provided its saved `session` (if there is one) is for that login's
+   account and homeserver. A different saved account refuses, as before.
+5. If several configured logins map to one unmarked legacy directory, the saved
+   session decides: the one login whose account and homeserver match uses it, and
+   the others get new-name directories. They could never have started from it.
+6. Anything else refuses: several logins match the saved account (two `id:`
+   aliases of one account), none does, or there is no session to decide by.
+
+An adopted legacy directory keeps its name for good. The `session` file records
+the store's absolute path, and a pending key reset records its staged store, so
+moving the directory would break both. Symlinks anywhere in the path, a marker or
+session that is a symlink or not a regular file, and an unreadable session are
+refused too. Errors never print session contents.
+
+**Repair.** A refusal lists every blocked login and the directory in question. Stop
+the bridge, then either remove the login that should not own the directory from
+`logins:`, or write the marker for the login that does, for example:
+
+```sh
+printf 'chaz-matrix-login-state-v1\n%s' '@chaz:example' > /var/lib/chaz-matrix/matrix/_chaz_example/login-id
+chmod 600 /var/lib/chaz-matrix/matrix/_chaz_example/login-id
+```
+
+Write the raw id byte for byte, with no trailing newline. The other logins that
+mapped to that directory then start fresh devices under new-name directories.
+
+### Walkthrough: upgrading with two logins that shared a legacy name
+
+A bridge config has two logins whose ids both map to the legacy name
+`_chaz_example`, and an earlier release left that directory without a `session`:
+
+```yaml
+logins:
+  - agent: chaz
+    type: matrix
+    homeserver_url: https://matrix.example
+    username: "@chaz:example"
+  - agent: helper
+    id: "@chaz_example"
+    type: matrix
+    homeserver_url: https://matrix.example
+    username: "@helper:example"
+```
+
+1. Start the upgraded bridge. Neither login can be shown to own the directory, so
+   nothing starts and nothing on disk changes:
+
+   ```text
+   INFO chaz_matrix: Starting chaz-matrix config=/var/lib/chaz-matrix-demo/config.yaml label=matrix
+   Error: refusing to start any Matrix login; per-login state is ambiguous or unsafe. Nothing was written, moved or regenerated.
+     login "@chaz:example": legacy directory /var/lib/chaz-matrix-demo/state/matrix/_chaz_example has no saved session to tell its claimants apart ("@chaz:example", "@chaz_example"); write a login-id marker naming the owner, or remove the extra logins
+     login "@chaz_example": legacy directory /var/lib/chaz-matrix-demo/state/matrix/_chaz_example has no saved session to tell its claimants apart ("@chaz:example", "@chaz_example"); write a login-id marker naming the owner, or remove the extra logins
+   ```
+
+   `chaz-matrix keys --login @chaz:example status` refuses with the same message.
+
+2. The directory was `@chaz:example`'s, so write its marker as shown under
+   **Repair** above, and start again. The first login uses the legacy directory in
+   place; the second gets its own new-name directory:
+
+   ```text
+   INFO chaz_matrix: Matrix login state: using legacy-named directory in place login=@chaz:example dir=/var/lib/chaz-matrix-demo/state/matrix/_chaz_example
+   INFO chaz_matrix: Matrix login state login=@chaz_example dir=/var/lib/chaz-matrix-demo/state/matrix/_chaz_example-2697f116dea2c15f91519f3371162faf
+   ```
+
+3. When the legacy directory does hold a `session`, no repair is needed: the login
+   whose account matches it keeps it, and the bridge writes the marker itself the
+   first time that login starts.
 
 ## Key maintenance: one store, one owner
 

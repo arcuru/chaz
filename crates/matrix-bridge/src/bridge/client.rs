@@ -78,7 +78,17 @@ impl MatrixClient {
     /// device apart in the account's session list: the bridge signs in as
     /// `chaz`, while the `rooms` maintenance command's throwaway device shows
     /// as `chaz-matrix-rooms`.
-    pub async fn login(login: &Login, state_dir: Option<&str>, name: &str) -> anyhow::Result<Self> {
+    ///
+    /// `owner` is the raw login id that owns a persistent per-login state
+    /// directory. Once the store lock is held and any saved session matches
+    /// the configured account, its `login-id` marker is verified or written
+    /// (see [`crate::login_state`]). A throwaway directory passes `None`.
+    pub async fn login(
+        login: &Login,
+        state_dir: Option<&str>,
+        name: &str,
+        owner: Option<&str>,
+    ) -> anyhow::Result<Self> {
         let state_dir = match state_dir {
             Some(s) => PathBuf::from(expand_tilde(s)),
             None => dirs::state_dir()
@@ -108,6 +118,9 @@ impl MatrixClient {
         } else {
             state_dir.join("store")
         };
+        if let Some(owner) = owner {
+            crate::login_state::claim(&state_dir, owner)?;
+        }
         if store.exists() {
             lease.lock_store(&store)?;
         }

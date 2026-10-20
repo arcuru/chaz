@@ -28,6 +28,7 @@ use chaz_core::config::Config;
 use chaz_core::instance::{self, ConnectedInstance, InstanceOwnership};
 use chaz_core::server;
 
+use chaz_matrix_bridge::login_state::Resolution;
 use chaz_matrix_bridge::{MatrixBridge, MatrixBridgeConfig, MatrixCredentials};
 
 use clap::Parser;
@@ -143,6 +144,8 @@ fn parse_delay_ms(s: &str) -> Result<u64, String> {
 struct ReadyLogin {
     spec: LoginSpec,
     creds: MatrixCredentials,
+    /// This login's resolved per-login Matrix state directory.
+    state_dir: PathBuf,
 }
 
 #[tokio::main]
@@ -224,6 +227,24 @@ async fn main() -> anyhow::Result<()> {
 
     info!(config = %config_path.display(), label = %bridge_cfg.label, "Starting chaz-matrix");
 
+    // Resolve every login's Matrix state directory before anything else
+    // touches disk. An ambiguous or unsafe directory refuses the whole bridge
+    // here, having written nothing.
+    let state_dirs = bridge_cfg.login_state_dirs()?;
+    for (entry, resolution) in bridge_cfg.logins.iter().zip(&state_dirs) {
+        match resolution {
+            Resolution::New(path) => {
+                info!(login = %entry.login.login_id(), dir = %path.display(), "Matrix login state")
+            }
+            Resolution::Adopted(path) => info!(
+                login = %entry.login.login_id(),
+                dir = %path.display(),
+                "Matrix login state: using legacy-named directory in place"
+            ),
+            Resolution::Refused(_) => unreachable!("login_state_dirs refuses as a whole"),
+        }
+    }
+
     // The bridge's own state dir: the Matrix client's sync token and session
     // live here, and a direct owner's legacy store is expected at
     // `<state_dir>/eidetica.db`.
@@ -273,7 +294,7 @@ async fn main() -> anyhow::Result<()> {
         key_name: BRIDGE_KEY_NAME,
     };
     let mut ready: Vec<ReadyLogin> = Vec::new();
-    for entry in &bridge_cfg.logins {
+    for (entry, resolution) in bridge_cfg.logins.iter().zip(&state_dirs) {
         let spec = LoginSpec {
             login_id: entry.login.login_id().to_string(),
             agent: entry.agent.clone(),
@@ -296,7 +317,15 @@ async fn main() -> anyhow::Result<()> {
                     .ok_or_else(|| {
                         anyhow::anyhow!("no seeded credentials found for login {}", spec.login_id)
                     })?;
-                ready.push(ReadyLogin { spec, creds });
+                let state_dir = resolution
+                    .path()
+                    .expect("resolved state directory")
+                    .to_path_buf();
+                ready.push(ReadyLogin {
+                    spec,
+                    creds,
+                    state_dir,
+                });
             }
             LoginOutcome::Pending(_) => {}
         }
@@ -312,7 +341,6 @@ async fn main() -> anyhow::Result<()> {
     let generation = build_generation(
         &mut config,
         &config_path,
-        &base,
         connected,
         &bridge_key,
         &bridge_db_id,
@@ -326,7 +354,6 @@ async fn main() -> anyhow::Result<()> {
             let context = Arc::new(RebuildContext {
                 config,
                 config_path,
-                base,
                 bridge_key,
                 bridge_db_id,
                 ready,
@@ -341,7 +368,6 @@ async fn main() -> anyhow::Result<()> {
                         build_generation(
                             &mut config,
                             &context.config_path,
-                            &context.base,
                             connected,
                             &context.bridge_key,
                             &context.bridge_db_id,
@@ -363,7 +389,6 @@ async fn main() -> anyhow::Result<()> {
 struct RebuildContext {
     config: Config,
     config_path: PathBuf,
-    base: PathBuf,
     bridge_key: PublicKey,
     bridge_db_id: String,
     ready: Vec<ReadyLogin>,
@@ -375,7 +400,6 @@ struct RebuildContext {
 async fn build_generation(
     config: &mut Config,
     config_path: &Path,
-    base: &Path,
     connected: ConnectedInstance,
     bridge_key: &PublicKey,
     bridge_db_id: &str,
@@ -420,11 +444,7 @@ async fn build_generation(
     }
 
     for login in ready {
-        let login_state_dir = base
-            .join("matrix")
-            .join(sanitize_login_id(&login.spec.login_id))
-            .to_string_lossy()
-            .into_owned();
+        let login_state_dir = login.state_dir.to_string_lossy().into_owned();
         let bridge = MatrixBridge::new(
             login.creds.clone(),
             login.spec.login_id.clone(),
@@ -439,12 +459,6 @@ async fn build_generation(
         generation.spawn(async move { bridge.run(server).await });
     }
     Ok(generation)
-}
-
-/// Per-login matrix-client state-dir component: keep it filesystem-safe by
-/// replacing anything outside `[A-Za-z0-9_-]` (MXIDs carry `@` and `:`).
-fn sanitize_login_id(login_id: &str) -> String {
-    chaz_matrix_bridge::config::sanitize_login_id(login_id)
 }
 
 /// Resolve the bridge config path: explicit `--config`, else
