@@ -39,31 +39,24 @@ jobs:
       - name: Setup Nix
         uses: ./.github/actions/setup-nix
 
-      - name: Lint
+      # One graph shares dependency work and lets independent checks overlap.
+      # Two builds at four cores each bound CPU use on the eight-core runner.
+      - name: Checks
+        env:
+          CI_EVENT_NAME: ${{ github.event_name }}
         run: |
-          nix-fast-build --skip-cached --no-nom --no-link \
-            -f '.#checks.x86_64-linux.lint'
-          nix-fast-build --skip-cached --no-nom --no-link \
-            -f '.#checks.x86_64-linux.treefmt'
-          nix-fast-build --skip-cached --no-nom --no-link \
-            -f '.#checks.x86_64-linux.ci-policy'
-
-      - name: Test
-        run: |
-          nix-fast-build --skip-cached --no-nom --no-link \
-            -f '.#checks.x86_64-linux.test'
-
-      # PRs retain normal Cargo tests (including doctests), lint and build.
-      - name: Doc
-        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
-        run: |
-          nix-fast-build --skip-cached --no-nom --no-link \
-            -f '.#checks.x86_64-linux.doc'
-
-      - name: Build
-        run: |
-          nix-fast-build --skip-cached --no-nom --no-link \
-            -f '.#checks.x86_64-linux.build'
+          checks=(
+            '.#checks.x86_64-linux.lint'
+            '.#checks.x86_64-linux.treefmt'
+            '.#checks.x86_64-linux.ci-policy'
+            '.#checks.x86_64-linux.test'
+            '.#checks.x86_64-linux.build'
+          )
+          # PRs retain normal Cargo tests, including doctests.
+          if [[ "$CI_EVENT_NAME" == push || "$CI_EVENT_NAME" == workflow_dispatch ]]; then
+            checks+=('.#checks.x86_64-linux.doc')
+          fi
+          nix build --no-link --keep-going --max-jobs 2 --cores 4 "${checks[@]}"
 
   # The Matrix bridge end-to-end test. Separate from the checks above because it
   # pulls Synapse into the closure and stands up four processes, neither of which
