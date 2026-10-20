@@ -227,6 +227,12 @@ impl RoutineEngine {
         let mut state = self.state.lock().await;
         for r in routines {
             if !r.enabled {
+                state.insert(RoutineEntry {
+                    routine: r,
+                    scope: RoutineScope::Session(session_db_id.to_string()),
+                    next_fire: DateTime::<Utc>::MAX_UTC,
+                    incarnation: 0,
+                });
                 continue;
             }
             let last = last_fired.get(r.id.as_str()).copied();
@@ -281,11 +287,12 @@ impl RoutineEngine {
     }
 
     /// Register an agent's schedules with the engine. Reads the owning
-    /// agent's `schedules` store, converts each enabled [`Schedule`] into the
+    /// agent's `schedules` store, converts each [`Schedule`] into the
     /// engine's in-memory [`Routine`] form (dispatched to the
     /// `agent_schedule` extension), and seeds the heap with
     /// [`RoutineScope::Agent`]. Mirrors [`Self::register_session`] —
     /// persistence stays in the Agent DB; the engine only schedules.
+    /// Disabled/retired rows remain visible in inventory but never enter the heap.
     ///
     /// [`Schedule`]: crate::agent_db::Schedule
     pub async fn register_agent(
@@ -296,7 +303,6 @@ impl RoutineEngine {
         let schedules = agent_db.list_schedules().await?;
         let routines: Vec<_> = schedules
             .into_iter()
-            .filter(|schedule| schedule.enabled)
             .filter_map(|schedule| match schedule_to_routine(agent_db_id, &schedule) {
                 Ok(routine) => Some((schedule, routine)),
                 Err(e) => {
@@ -315,7 +321,7 @@ impl RoutineEngine {
         .await;
         let mut state = self.state.lock().await;
         let now = Utc::now();
-        for (schedule, routine) in routines {
+        for (schedule, mut routine) in routines {
             // A schedule past its expiry / fire-count bound is never
             // seeded — a restart must not resurrect a retired schedule.
             // The authoritative enable=false write happens in the fire
@@ -326,6 +332,17 @@ impl RoutineEngine {
                     schedule = %schedule.id,
                     "skipping retired schedule at load: {reason}"
                 );
+                routine.enabled = false;
+            }
+            // Keep inert rows visible to /jobs without putting them on the
+            // firing heap. Permanent does not revive disabled/bounded work.
+            if !routine.enabled {
+                state.insert(RoutineEntry {
+                    routine,
+                    scope: RoutineScope::Agent(agent_db_id.to_string()),
+                    next_fire: DateTime::<Utc>::MAX_UTC,
+                    incarnation: 0,
+                });
                 continue;
             }
             let last = last_fired.get(routine.id.as_str()).copied();
@@ -378,7 +395,7 @@ impl RoutineEngine {
             state
                 .routines
                 .iter()
-                .filter(|(_, entry)| entry.scope == scope)
+                .filter(|(_, entry)| entry.scope == scope && entry.routine.enabled)
                 .filter_map(|(id, entry)| match entry.routine.trigger {
                     Trigger::Interval { .. } => Some((id.clone(), entry.clone())),
                     _ => None,
@@ -400,6 +417,7 @@ impl RoutineEngine {
         let mut state = self.state.lock().await;
         for (id, prior) in prior_intervals {
             if let Some(entry) = state.routines.get_mut(&id)
+                && entry.routine.enabled
                 && entry.routine.trigger == prior.routine.trigger
             {
                 entry.next_fire = prior.next_fire;
@@ -801,6 +819,7 @@ fn schedule_to_routine(
             payload: serde_json::to_value(payload)?,
         },
         enabled: t.enabled,
+        permanent: t.permanent,
         max_failures: t.max_failures,
         consecutive_failures: t.consecutive_failures,
         last_error: t.last_error.clone(),
@@ -1329,11 +1348,35 @@ mod tests {
         .await
         .unwrap();
 
+        let mut disabled = Routine::interval(
+            RoutineId::new("disabled-session"),
+            "disabled",
+            std::time::Duration::from_secs(1),
+            target("heartbeat"),
+        );
+        disabled.enabled = false;
+        disabled.permanent = true;
+        upsert_routine(&sess, SESSION_ROUTINES_STORE, &disabled)
+            .await
+            .unwrap();
+
         let engine = RoutineEngine::new(peer, None).await.unwrap();
         engine.register_session("sess-1", &sess).await.unwrap();
         let listed = engine.list_routines().await;
-        assert_eq!(listed.len(), 1);
-        assert!(matches!(listed[0].0, RoutineScope::Session(ref s) if s == "sess-1"));
+        assert_eq!(listed.len(), 2);
+        assert!(
+            listed
+                .iter()
+                .all(|(scope, _)| matches!(scope, RoutineScope::Session(s) if s == "sess-1"))
+        );
+        assert_eq!(listed[0].1, disabled);
+        assert_eq!(engine.state.lock().await.heap.len(), 1);
+        let restarted = RoutineEngine::new(engine.chaz_peer.clone(), None)
+            .await
+            .unwrap();
+        restarted.register_session("sess-1", &sess).await.unwrap();
+        assert_eq!(restarted.list_routines().await, listed);
+        assert_eq!(restarted.state.lock().await.heap.len(), 1);
     }
 
     #[tokio::test]
@@ -1709,7 +1752,9 @@ mod tests {
         engine.register_agent(&owner, &adb).await.unwrap();
 
         let listed = engine.list_routines().await;
-        assert_eq!(listed.len(), 1, "disabled schedule must be skipped");
+        assert_eq!(listed.len(), 2, "disabled schedule remains visible");
+        assert!(!listed[1].1.enabled);
+        assert_eq!(engine.state.lock().await.heap.len(), 1);
         let (scope, routine) = &listed[0];
         assert_eq!(*scope, RoutineScope::Agent(owner.clone()));
         assert_eq!(routine.id, RoutineId::new(format!("agent:{owner}:daily")));
@@ -1728,8 +1773,9 @@ mod tests {
         .unwrap();
         engine.reload_agent(&owner, &adb).await.unwrap();
         let listed = engine.list_routines().await;
-        assert_eq!(listed.len(), 1);
+        assert_eq!(listed.len(), 2);
         assert_eq!(listed[0].1.name, "nightly");
+        assert_eq!(engine.state.lock().await.heap.len(), 1);
 
         // deregister clears in-memory state.
         engine.deregister_agent(&owner).await;
@@ -1988,6 +2034,51 @@ mod tests {
             agent_interval_next_fire(&engine, &owner, "poll").await
                 >= before + chrono::Duration::seconds(59)
         );
+    }
+
+    #[tokio::test]
+    async fn permanent_disabled_and_retired_intervals_stay_visible_but_inert() {
+        use crate::agent_db::{Schedule, ScheduleTarget};
+        let (_inst, _user, peer, adb) = agent_fixture().await;
+        let owner = adb.id().to_string();
+        let mut schedule = Schedule::new(
+            "poll",
+            Trigger::Interval {
+                period: std::time::Duration::from_secs(300),
+            },
+            "check",
+            ScheduleTarget::Fresh,
+        );
+        schedule.permanent = true;
+        adb.upsert_schedule(schedule.clone()).await.unwrap();
+        let engine = RoutineEngine::new(peer.clone(), None).await.unwrap();
+        engine.register_agent(&owner, &adb).await.unwrap();
+        assert_eq!(engine.state.lock().await.heap.len(), 1);
+
+        schedule.enabled = false;
+        adb.upsert_schedule(schedule.clone()).await.unwrap();
+        engine.reload_agent(&owner, &adb).await.unwrap();
+        assert!(
+            engine.state.lock().await.heap.is_empty(),
+            "reload cannot restore a disabled interval's old slot"
+        );
+
+        schedule.enabled = true;
+        schedule.max_fires = Some(1);
+        schedule.fire_count = 1;
+        adb.upsert_schedule(schedule.clone()).await.unwrap();
+        engine.reload_agent(&owner, &adb).await.unwrap();
+        assert!(engine.state.lock().await.heap.is_empty());
+        schedule.max_fires = None;
+        schedule.expires_at = Some(Utc::now() - chrono::Duration::seconds(1));
+        adb.upsert_schedule(schedule).await.unwrap();
+        let restarted = RoutineEngine::new(peer, None).await.unwrap();
+        restarted.register_agent(&owner, &adb).await.unwrap();
+        let rows = restarted.list_routines().await;
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].1.permanent);
+        assert!(!rows[0].1.enabled);
+        assert!(restarted.state.lock().await.heap.is_empty());
     }
 
     #[tokio::test]

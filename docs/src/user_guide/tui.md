@@ -228,28 +228,29 @@ The TUI catalogs every built-in slash command in its inline completion popup —
 
 ### Session
 
-| Command               | Description                                                            |
-| --------------------- | ---------------------------------------------------------------------- |
-| `/help`, `/?`         | Open the help overlay (also `F1`)                                      |
-| `/sessions`, `/s`     | Open the session hub (also `Ctrl+P`)                                   |
-| `/new`                | Create a new session and switch to it                                  |
-| `/new <group>`        | Create a new session with a named agent group attached                 |
-| `/groups`             | List the configured agent groups                                       |
-| `/join <ref>`         | Switch to a session by name or eidetica DB ID                          |
-| `/name <alias>`       | Set a human-friendly alias for the current session (also `/rename`)    |
-| `/name`               | Clear the session alias                                                |
-| `/description <text>` | Set a browse-only description (up to 200 characters)                   |
-| `/description`        | Clear the session description                                          |
-| `/info`               | Show current session details (name, DB ID, entry counts)               |
-| `/costs`              | Aggregate LLM usage and cost across all sessions ([details](usage.md)) |
-| `/interrupted`        | List turns that require an explicit retry decision                     |
-| `/retry <id>`         | Ask the executor to retry the currently observed interrupted attempt   |
-| `/channels`           | List Matrix rooms currently attached to this session                   |
-| `/share`              | Generate a shareable ticket URL for the current session                |
-| `/sync <ticket>`      | Sync a remote session via a ticket URL                                 |
-| `/compact`            | Ask the executor to compact the current immutable session snapshot     |
-| `/print`              | Dump the transcript                                                    |
-| `/stop`               | Stop the active turn in this session; idle sessions are unchanged      |
+| Command               | Description                                                                                                                                                                               |
+| --------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `/help`, `/?`         | Open the help overlay (also `F1`)                                                                                                                                                         |
+| `/sessions`, `/s`     | Open the session hub (also `Ctrl+P`)                                                                                                                                                      |
+| `/new`                | Create a new session and switch to it                                                                                                                                                     |
+| `/new <group>`        | Create a new session with a named agent group attached                                                                                                                                    |
+| `/groups`             | List the configured agent groups                                                                                                                                                          |
+| `/join <ref>`         | Switch to a session by name or eidetica DB ID                                                                                                                                             |
+| `/name <alias>`       | Set a human-friendly alias for the current session (also `/rename`)                                                                                                                       |
+| `/name`               | Clear the session alias                                                                                                                                                                   |
+| `/description <text>` | Set a browse-only description (up to 200 characters)                                                                                                                                      |
+| `/description`        | Clear the session description                                                                                                                                                             |
+| `/info`               | Show current session details (name, DB ID, entry counts)                                                                                                                                  |
+| `/costs`              | Aggregate LLM usage and cost across all sessions ([details](usage.md))                                                                                                                    |
+| `/jobs`               | Show this executor's loaded schedules across all scopes, including permanent flags ([model and walkthrough](agents.md#permanent-schedules)). Unavailable on a client or one-shot process. |
+| `/interrupted`        | List turns that require an explicit retry decision                                                                                                                                        |
+| `/retry <id>`         | Ask the executor to retry the currently observed interrupted attempt                                                                                                                      |
+| `/channels`           | List Matrix rooms currently attached to this session                                                                                                                                      |
+| `/share`              | Generate a shareable ticket URL for the current session                                                                                                                                   |
+| `/sync <ticket>`      | Sync a remote session via a ticket URL                                                                                                                                                    |
+| `/compact`            | Ask the executor to compact the current immutable session snapshot                                                                                                                        |
+| `/print`              | Dump the transcript                                                                                                                                                                       |
+| `/stop`               | Stop the active turn in this session; idle sessions are unchanged                                                                                                                         |
 
 ### Living Agents
 

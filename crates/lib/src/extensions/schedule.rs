@@ -174,6 +174,7 @@ async fn open_agent_db_for_cmd(
 /// Format one schedule row.
 fn fmt_schedule_line(t: &Schedule) -> String {
     let state = if t.enabled { "" } else { " (disabled)" };
+    let permanent = if t.permanent { " (permanent)" } else { "" };
     let when = match &t.trigger {
         Trigger::Cron { expr } => expr.clone(),
         Trigger::Interval { period } => format!("every {period:?}"),
@@ -201,7 +202,7 @@ fn fmt_schedule_line(t: &Schedule) -> String {
         String::new()
     };
     format!(
-        "  {} [{when}]{state}{bounds}{fired} → {target_label} — {}",
+        "  {} [{when}]{state}{permanent}{bounds}{fired} → {target_label} — {}",
         t.id, t.prompt
     )
 }
@@ -688,6 +689,28 @@ mod tests {
         };
         assert!(out.contains("five-min"), "list missing id: {out}");
         assert!(out.contains("every 300s"), "list missing interval: {out}");
+    }
+
+    #[tokio::test]
+    async fn chat_command_cannot_set_permanent_marker() {
+        let (_instance, index, registry, ctx) = fixture().await;
+        let c = cmd(registry.clone(), index.clone());
+        assert!(matches!(
+            c.invoke("add interval poll 300 alpha --permanent check", &ctx)
+                .await,
+            ExtensionCommandOutcome::Text(_)
+        ));
+        let adb = c
+            .agent_state
+            .open_agent_db(&index.find_by_name("alpha").unwrap())
+            .await
+            .unwrap();
+        assert!(!adb.find_schedule("poll").await.unwrap().unwrap().permanent);
+        assert!(matches!(
+            c.invoke("modify poll permanent true", &ctx).await,
+            ExtensionCommandOutcome::Error(_)
+        ));
+        assert!(!adb.find_schedule("poll").await.unwrap().unwrap().permanent);
     }
 
     #[tokio::test]
