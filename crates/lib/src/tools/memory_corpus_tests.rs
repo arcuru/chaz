@@ -30,7 +30,7 @@ use crate::agent_db::{MEMORY_STORE, MemoryEntry};
 use crate::embedding::test_support::MockEmbedder;
 use crate::memory_bank_db::{MemoryBankMeta, create_memory_bank};
 use eidetica::backend::database::InMemory;
-use eidetica::{Instance, NewUser};
+use eidetica::{Instance, NewAccount};
 use serde::Deserialize;
 
 const CORPUS_JSON: &str = include_str!("testdata/memory_corpus.json");
@@ -66,10 +66,12 @@ async fn load_corpus(
     entries: &[CorpusEntry],
     embedder: Option<&dyn Embedder>,
 ) -> (Instance, eidetica::Database) {
-    let (instance, mut user) =
-        Instance::create_backend(Box::new(InMemory::new()), NewUser::passwordless("corpus"))
-            .await
-            .unwrap();
+    let (instance, mut user) = Instance::create_backend(
+        Box::new(InMemory::new()),
+        NewAccount::passwordless("corpus"),
+    )
+    .await
+    .unwrap();
     let (bank, _pk) = create_memory_bank(&mut user, "corpus", &MemoryBankMeta::default())
         .await
         .unwrap();
@@ -527,10 +529,12 @@ async fn live_hybrid_vs_bm25() {
     let provider = std::env::var("CHAZ_EMBED_PROVIDER").unwrap_or_else(|_| "openai".to_string());
 
     let secrets = {
-        let (_instance, mut user) =
-            Instance::create_backend(Box::new(InMemory::new()), NewUser::passwordless("secrets"))
-                .await
-                .unwrap();
+        let (_instance, mut user) = Instance::create_backend(
+            Box::new(InMemory::new()),
+            NewAccount::passwordless("secrets"),
+        )
+        .await
+        .unwrap();
         let key = user.get_default_key().unwrap();
         let mut s = eidetica::crdt::Doc::new();
         s.set("name", "central");
