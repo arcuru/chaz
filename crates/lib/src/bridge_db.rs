@@ -39,6 +39,11 @@ use tracing::info;
 /// never syncs.
 pub const CREDENTIALS_STORE: &str = "credentials";
 
+/// Durable, unencrypted bridge settings, separate from [`CREDENTIALS_STORE`]
+/// and from session context. Keys and values are opaque to chaz-core; the
+/// Matrix bridge stores per-room modes here. Do not store secrets here.
+pub const SETTINGS_STORE: &str = "settings";
+
 /// Handle over the eidetica `Database` a bridge fully owns and manages. Holds
 /// the bridge's encrypted, transport-specific details; the only thing that
 /// crosses into the shared world is the [`LoginRef`](crate::agent_db::LoginRef)
@@ -113,6 +118,30 @@ impl BridgeDb {
         store.open(unlock_password)?;
         match store.inner().await?.get_string(login_id).await {
             Ok(json) => Ok(Some(serde_json::from_str(&json)?)),
+            Err(e) if e.is_not_found() => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Write (or overwrite) an unencrypted operator setting in
+    /// [`SETTINGS_STORE`]. Idempotent; `key` and `value` are opaque to
+    /// chaz-core.
+    pub async fn set_setting(&self, key: &str, value: &str) -> anyhow::Result<()> {
+        let txn = self.database.new_transaction().await?;
+        let store = txn.get_store::<DocStore>(SETTINGS_STORE).await?;
+        store.set_string(key, value).await?;
+        txn.commit().await?;
+        Ok(())
+    }
+
+    /// Read an unencrypted operator setting. `Ok(None)` when the key was never
+    /// written; a read error is a real failure (a broken store), which callers
+    /// must not silently read as "unset".
+    pub async fn get_setting(&self, key: &str) -> anyhow::Result<Option<String>> {
+        let txn = self.database.new_transaction().await?;
+        let store = txn.get_store::<DocStore>(SETTINGS_STORE).await?;
+        match store.get_string(key).await {
+            Ok(value) => Ok(Some(value)),
             Err(e) if e.is_not_found() => Ok(None),
             Err(e) => Err(e.into()),
         }
@@ -283,6 +312,44 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(got.secret, "new");
+    }
+
+    #[tokio::test]
+    async fn settings_round_trip_unencrypted_and_default_to_absent() {
+        let (_user, db) = peer_with_bridge_db().await;
+        assert_eq!(db.get_setting("room_mode:!r:s").await.unwrap(), None);
+
+        db.set_setting("room_mode:!r:s", "threaded-sessions")
+            .await
+            .unwrap();
+        assert_eq!(
+            db.get_setting("room_mode:!r:s").await.unwrap(),
+            Some("threaded-sessions".to_string())
+        );
+
+        // Overwriting is the documented way to change a setting, and an
+        // unrelated key is unaffected.
+        db.set_setting("room_mode:!r:s", "normal").await.unwrap();
+        db.set_setting("room_mode:!other:s", "threaded-sessions")
+            .await
+            .unwrap();
+        assert_eq!(
+            db.get_setting("room_mode:!r:s").await.unwrap(),
+            Some("normal".to_string())
+        );
+        assert_eq!(
+            db.get_setting("room_mode:!other:s").await.unwrap(),
+            Some("threaded-sessions".to_string())
+        );
+
+        // Settings need no unlock password — they are not in the credentials
+        // store, and a bridge reads them on the inbound message path.
+        assert_eq!(
+            db.read_credentials::<TestCreds>("room_mode:!r:s", "any-pw")
+                .await
+                .unwrap(),
+            None
+        );
     }
 
     #[tokio::test]

@@ -30,7 +30,8 @@ Usage: stub_llm.py <port> <reply-text>
 import json
 import re
 import sys
-from http.server import BaseHTTPRequestHandler, HTTPServer
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 # The phrase that asks for a tool call. Branching on the request content rather
 # than on a request counter keeps the tool call attached to the turn that asked
@@ -125,6 +126,7 @@ def multi_round_response(request, reply):
         "content": None,
         "tool_calls": [calculate_call(round_number)],
     }
+RELEASE_DELAYED = threading.Event()
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -237,6 +239,10 @@ class Handler(BaseHTTPRequestHandler):
         return False
 
     def do_GET(self):
+        if self.path == "/release-delayed":
+            RELEASE_DELAYED.set()
+            self._send({"released": True})
+            return
         # Some clients probe the model list before their first completion.
         if self.path.rstrip("/").endswith("/models"):
             self._send(
@@ -285,6 +291,14 @@ class Handler(BaseHTTPRequestHandler):
         sys.stderr.write("stub_llm: request: " + user_text + "\n")
         if not has_tool_result:
             sys.stderr.write("stub_llm: turn: " + user_text + "\n")
+
+        if "delayed thread response" in user_text and not RELEASE_DELAYED.is_set():
+            sys.stderr.write("stub_llm: delaying thread response\n")
+            if not RELEASE_DELAYED.wait(60):
+                self._send({"error": "delay fixture not released"}, status=500)
+                return
+            sys.stderr.write("stub_llm: released thread response\n")
+        approval = "approval thread" in user_text
 
         # Date markers belong to the conversation, never the mutable system
         # prefix. They are derived by the host from stored entry timestamps.
@@ -429,7 +443,7 @@ class Handler(BaseHTTPRequestHandler):
                     },
                 }
             )
-        elif self._react_requested(messages):
+        elif self._react_requested(messages) or approval:
             sys.stderr.write("stub_llm: returning a tool call\n")
             self._send(
                 {
@@ -448,8 +462,8 @@ class Handler(BaseHTTPRequestHandler):
                                         "id": "call_stub_compact_1",
                                         "type": "function",
                                         "function": {
-                                            "name": "compact",
-                                            "arguments": '{"summary":"stub tool call"}',
+                                            "name": "calculate" if approval else "compact",
+                                            "arguments": '{"expression":"6 * 7"}' if approval else '{"summary":"stub tool call"}',
                                         },
                                     }
                                 ],
@@ -496,7 +510,7 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    server = HTTPServer(("127.0.0.1", int(sys.argv[1])), Handler)
+    server = ThreadingHTTPServer(("127.0.0.1", int(sys.argv[1])), Handler)
     server.reply = sys.argv[2]
     server.matrix_sends = True
     server.serve_forever()

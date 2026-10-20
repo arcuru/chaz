@@ -406,6 +406,15 @@ async fn build_generation(
     ready: &[ReadyLogin],
 ) -> anyhow::Result<BridgeGeneration> {
     let capabilities = connected.capabilities;
+    // Room modes live in the bridge's own settings DB; open it on this
+    // generation's connection so a service rebuild never reuses a torn-down
+    // handle.
+    let bridge_db = chaz_core::bridge_db::BridgeDb::from_database(
+        connected
+            .user
+            .open_database(&eidetica::entry::ID::parse(bridge_db_id)?)
+            .await?,
+    );
     // The explicit execution role decides whether this process runs agents;
     // the bridge binary neither assumes nor forces client mode.
     let built = server::build(
@@ -452,6 +461,7 @@ async fn build_generation(
             Some(login_state_dir),
             config.clone(),
             secret_store.clone(),
+            bridge_db.clone(),
             shutdown.clone(),
         )?;
         let server = server.clone();
