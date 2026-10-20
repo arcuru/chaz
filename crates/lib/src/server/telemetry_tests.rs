@@ -50,6 +50,7 @@ async fn terminal_telemetry_precedes_publication_and_settles_once() {
         explicit_bridge_send: AtomicBool::new(false),
         agent_name: "host".into(),
         requested_model: "gpt-sol-latest".into(),
+        can_suspend: false,
         context_snapshot: None,
         branch: None,
         fail_after: Default::default(),

@@ -310,19 +310,15 @@ impl Server {
             );
             return Ok(());
         }
-        let meta = Session::new(ConversationId(id.clone()), db.clone())
+        // Another adopter may attach the Agent between reads. Validate one
+        // strict snapshot, not a fallback view against a newer strict view.
+        let meta = crate::session::try_read_meta_from_db(db)
             .await
-            .read_meta()
-            .await;
-        let agents = strict_session_agents(db)
-            .await
-            .map_err(|error| anyhow::anyhow!("invalid published job: agents: {error}"))?;
+            .map_err(|error| anyhow::anyhow!("invalid published job: metadata: {error}"))?;
         anyhow::ensure!(
-            meta.agents == agents
-                && meta
-                    .host_agent_db_id
-                    .as_deref()
-                    .is_none_or(|home| home == target.db_id.to_string()),
+            meta.host_agent_db_id
+                .as_deref()
+                .is_none_or(|home| home == target.db_id.to_string()),
             "invalid published job: malformed Agent/home scope"
         );
         anyhow::ensure!(
@@ -332,8 +328,8 @@ impl Server {
                     && meta.agents[0].display_name == target.display_name
                     && meta.agents[0].home_pubkey.as_deref()
                         == Some(target.pubkey.to_string().as_str())))
-                && (strict_session_capabilities(db).await? == Grants::default()
-                    || strict_session_capabilities(db).await? == definition.capability_ceiling),
+                && (meta.capabilities == Grants::default()
+                    || meta.capabilities == definition.capability_ceiling),
             "invalid published job: includes untrusted execution scope"
         );
         if meta.agents.is_empty() {

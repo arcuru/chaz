@@ -91,6 +91,12 @@ pub trait RuntimeRecorder: Send + Sync {
         Box::pin(async { Ok(()) })
     }
 
+    /// Only the resident executor can keep a suspended turn's reservation.
+    /// Standalone recorders continue observing in their live runtime.
+    fn can_suspend_job_wait(&self) -> bool {
+        false
+    }
+
     /// Retire a wait checkpoint before result hooks or persistence can have
     /// effects. Failure stops the turn without running those effects.
     fn finish_job_wait<'a>(
@@ -531,6 +537,9 @@ impl TurnCancel {
 /// Why a turn ended without an outcome.
 #[derive(Debug)]
 pub enum TurnError {
+    /// A persisted read-only wait, not a terminal error. The executor must
+    /// drop this turn and keep its processing reservation until readmission.
+    Suspended { wait: JobWaitIntent },
     /// The turn failed; the message says why.
     Failed(String),
     /// A native continuation cannot run on this target. Keep its attempt and
@@ -560,6 +569,7 @@ impl std::fmt::Display for TurnError {
                 f.write_str(message)
             }
             TurnError::Cancelled { .. } => f.write_str("turn cancelled"),
+            TurnError::Suspended { .. } => f.write_str("turn suspended on a checkpointed job wait"),
         }
     }
 }
@@ -683,6 +693,30 @@ async fn cancelled_outcome(
     TurnError::Cancelled {
         metadata: acc.finalize(),
     }
+}
+
+/// Settle a stop at an unloaded wait without starting a tool, model or hook.
+/// The call was already recorded, so cancellation must still pair it.
+pub(crate) async fn cancel_suspended_wait(
+    recorder: Arc<dyn RuntimeRecorder>,
+    resume: RuntimeResume,
+) -> Result<Option<ResponseMetadata>, String> {
+    let recorder = Some(recorder);
+    record_tool_result(
+        &recorder,
+        resume.model_sequence,
+        resume.call_index,
+        &resume.call,
+        TOOL_CANCELLED_OUTPUT,
+        ToolResultOutcome::Cancelled,
+    )
+    .await?;
+    record_runtime(&recorder, RuntimeRecord::Cancelled).await?;
+    let mut acc = MetadataAccumulator::default();
+    for metadata in resume.metadata {
+        acc.record(metadata);
+    }
+    Ok(acc.finalize())
 }
 
 /// Run the agent runtime for a single turn.
@@ -1382,9 +1416,11 @@ async fn run_turn(
 
     let tool_defs = tool_ctx.definitions();
     let mut messages = initial_messages;
-    // Injected pre-turn messages are not persisted, so a turn that has any
-    // cannot be reconstructed and never checkpoints a wait.
+    // Pre-turn injections are not persisted. Boundary input is checkpointed
+    // by the executor, but arbitrary recorders may not restore it: keep such
+    // live turns resident without disabling their existing restart checkpoint.
     let mut hooks_injected = false;
+    let mut boundary_input_seen = false;
 
     // Hook: before_agent_start — append extension-injected messages.
     if resume.is_none()
@@ -1498,11 +1534,9 @@ async fn run_turn(
         iteration = model_sequence as usize;
     }
     loop {
-        projector.append_boundary_input(
-            &mut messages,
-            model_sequence,
-            input_boundary(&recorder, model_sequence, false).await?,
-        );
+        let pending_input = input_boundary(&recorder, model_sequence, false).await?;
+        boundary_input_seen |= !pending_input.is_empty();
+        projector.append_boundary_input(&mut messages, model_sequence, pending_input);
         // Project a fresh copy of the derived baseline for this logical
         // call; transport retries reuse the accepted request.
         let Some(response) = until_cancelled(
@@ -1566,6 +1600,7 @@ async fn run_turn(
                 if !pending.is_empty() {
                     projector.note_exchange(messages.len(), model_sequence);
                     messages.push(RuntimeMessage::assistant(content, provider_extra));
+                    boundary_input_seen = true;
                     projector.append_boundary_input(&mut messages, model_sequence + 1, pending);
                     model_sequence += 1;
                     continue;
@@ -1611,6 +1646,7 @@ async fn run_turn(
                 // Return the last tool result as the response.
                 info!("Empty response after tool calls, using last tool result");
                 if !pending.is_empty() {
+                    boundary_input_seen = true;
                     projector.append_boundary_input(&mut messages, model_sequence + 1, pending);
                     model_sequence += 1;
                     continue;
@@ -1957,20 +1993,71 @@ async fn run_turn(
                                     && !approve_all
                                     && !hooks_injected
                                     && let Some(recorder) = &recorder
-                                    && let Err(error) = recorder
-                                        .checkpoint_job_wait(JobWaitIntent {
-                                            model_sequence,
-                                            call_index,
-                                            call_id: call.id.clone(),
-                                            arguments: args.to_string(),
-                                            child_session_db_id: child,
-                                            checkpointed_at,
-                                            deadline,
-                                            policy_timeout_seconds: timeout.as_secs(),
-                                        })
-                                        .await
                                 {
-                                    warn!(%error, "Could not checkpoint job wait; it will not resume after restart");
+                                    let wait = JobWaitIntent {
+                                        model_sequence,
+                                        call_index,
+                                        call_id: call.id.clone(),
+                                        arguments: args.to_string(),
+                                        child_session_db_id: child,
+                                        checkpointed_at,
+                                        deadline,
+                                        policy_timeout_seconds: timeout.as_secs(),
+                                    };
+                                    match recorder.checkpoint_job_wait(wait.clone()).await {
+                                        Err(error) => {
+                                            warn!(%error, "Could not checkpoint job wait; keeping the turn resident")
+                                        }
+                                        Ok(())
+                                            if recorder.can_suspend_job_wait()
+                                                && !boundary_input_seen =>
+                                        {
+                                            // Hook closures can hold arbitrary turn-local
+                                            // state. No carryover contract exists for them.
+                                            let has_turn_hooks = if let Some(hub) = hub {
+                                                let db = tool_ctx
+                                                    .session
+                                                    .lock()
+                                                    .await
+                                                    .database()
+                                                    .clone();
+                                                // An empty fallback active set is not proof
+                                                // that no hook retained turn-local state.
+                                                match crate::extension::read_active(&db).await {
+                                                    Err(error) => {
+                                                        warn!(%error, "Keeping checkpointed job wait resident: active hook state is unreadable");
+                                                        true
+                                                    }
+                                                    Ok(_) => tool_ctx.active_extensions.iter().any(|name| {
+                                                        hub.hooks_for(name).iter().any(|kind| {
+                                                            matches!(kind,
+                                                            crate::extension::HookKind::BeforeAgentStart
+                                                            | crate::extension::HookKind::ToolCall
+                                                            | crate::extension::HookKind::ToolResult
+                                                            | crate::extension::HookKind::AgentEnd)
+                                                        })
+                                                    }),
+                                                }
+                                            } else {
+                                                false
+                                            };
+                                            if has_turn_hooks {
+                                                info!(
+                                                    "Keeping checkpointed job wait resident: extension turn state has no restore contract"
+                                                );
+                                            } else if !cancel.is_some_and(TurnCancel::is_cancelled)
+                                            {
+                                                return Err(TurnError::Suspended { wait });
+                                            }
+                                        }
+                                        Ok(()) => info!(
+                                            "Keeping checkpointed job wait resident: caller or boundary input requires the live turn"
+                                        ),
+                                    }
+                                } else {
+                                    info!(
+                                        "Keeping job wait resident: pending batch, approval scope or injected turn input cannot be restored"
+                                    );
                                 }
                             }
                             let Some(result) = invoke_tool(

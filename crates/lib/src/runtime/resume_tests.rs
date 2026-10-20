@@ -14,10 +14,24 @@ use tokio::sync::Semaphore;
 struct Recorder {
     intents: Mutex<Vec<JobWaitIntent>>,
     records: Mutex<Vec<RuntimeRecord>>,
+    input: Mutex<Vec<RuntimeMessage>>,
     fail_finish: bool,
+    suspend: bool,
 }
 
 impl RuntimeRecorder for Recorder {
+    fn can_suspend_job_wait(&self) -> bool {
+        self.suspend
+    }
+
+    fn input_boundary<'a>(
+        &'a self,
+        _: u64,
+        _: bool,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<RuntimeMessage>, String>> + Send + 'a>> {
+        Box::pin(async move { Ok(std::mem::take(&mut *self.input.lock().unwrap())) })
+    }
+
     fn record<'a>(
         &'a self,
         message: RuntimeRecord,
@@ -142,7 +156,13 @@ fn wait_args(seconds: u64) -> String {
 
 #[tokio::test]
 async fn only_a_final_wait_in_a_restorable_turn_is_checkpointed() {
-    for case in ["final", "not-final", "approve-all", "invalid"] {
+    for case in [
+        "final",
+        "not-final",
+        "approve-all",
+        "invalid",
+        "boundary-input",
+    ] {
         let deadlines = Arc::new(Mutex::new(Vec::new()));
         let effects = Arc::new(AtomicUsize::new(0));
         let tools = Arc::new(ToolRegistry::new());
@@ -174,9 +194,17 @@ async fn only_a_final_wait_in_a_restorable_turn_is_checkpointed() {
             _ => mock.push_tool_calls([wait]),
         }
         mock.push_text("done");
-        let backend = BackendManager::with_mock(mock, empty_secrets().await);
+        let backend = BackendManager::with_mock(mock.clone(), empty_secrets().await);
         let (security, _approver) = security_with_decision(ApprovalDecision::ApproveAll);
-        let recorder = Arc::new(Recorder::default());
+        let recorder = Arc::new(Recorder {
+            input: Mutex::new(if case == "boundary-input" {
+                vec![RuntimeMessage::User("steering input".into())]
+            } else {
+                Vec::new()
+            }),
+            suspend: case == "boundary-input",
+            ..Default::default()
+        });
         let outcome = execute_with_recorder(
             None,
             vec![RuntimeMessage::User("go".into())],
@@ -215,6 +243,17 @@ async fn only_a_final_wait_in_a_restorable_turn_is_checkpointed() {
             "not-final" | "approve-all" => {
                 assert!(intents.is_empty(), "{case} must not checkpoint");
                 assert!(deadlines[0].is_some(), "{case} still uses a fixed deadline");
+            }
+            "boundary-input" => {
+                assert_eq!(intents.len(), 1, "durable steering still checkpoints");
+                assert_eq!(
+                    deadlines,
+                    [Some(intents[0].deadline)],
+                    "boundary input keeps the live turn resident"
+                );
+                assert!(mock.recorded_calls()[0].messages.iter().any(|message| {
+                    matches!(message, RuntimeMessage::User(text) if text == "steering input")
+                }));
             }
             _ => {
                 assert!(intents.is_empty());
@@ -549,4 +588,94 @@ async fn resumed_wait_obeys_a_shorter_current_policy_timeout() {
     .unwrap();
     assert!(mock.recorded_calls()[0].messages.iter().any(|message| matches!(message,
         RuntimeMessage::ToolResult { content, .. } if content.contains("Tool timed out after 1 seconds"))));
+}
+
+#[tokio::test]
+async fn suspension_waits_for_approval_and_never_drops_approve_all_scope() {
+    for approve_all in [false, true] {
+        let deadlines = Arc::new(Mutex::new(Vec::new()));
+        let tools = Arc::new(ToolRegistry::new());
+        tools.register(Wait {
+            deadlines: deadlines.clone(),
+            capacity: None,
+            hang: false,
+        });
+        tools.register(Effect {
+            calls: Default::default(),
+            approval: true,
+            rate_limit: None,
+        });
+        let (_instance, session) = fresh_session().await;
+        let ctx = tool_context(session, tools);
+        let mock = Arc::new(MockBackend::new());
+        mock.push_tool_calls([
+            ("e".into(), "effect".into(), "{}".into()),
+            ("w".into(), "job_wait".into(), wait_args(30)),
+        ]);
+        mock.push_text("done");
+        let backend = BackendManager::with_mock(mock.clone(), empty_secrets().await);
+        let (tx, mut rx) = mpsc::channel(1);
+        let security = SecurityContext {
+            approval_callback: Some(tx),
+            ..permissive_security()
+        };
+        let recorder = Arc::new(Recorder {
+            suspend: true,
+            ..Default::default()
+        });
+        let policies = ToolPolicyRegistry::empty();
+        let (result, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(
+                run_turn(
+                    None,
+                    vec![RuntimeMessage::User("go".into())],
+                    &backend,
+                    &security,
+                    &ctx,
+                    &policies,
+                    Some(recorder.clone()),
+                    None,
+                    None,
+                    None,
+                    None,
+                    ModelCallScope::default()
+                ),
+                async {
+                    let exchange = rx.recv().await.unwrap();
+                    assert!(
+                        recorder.intents.lock().unwrap().is_empty(),
+                        "pending approval cannot unload"
+                    );
+                    assert!(deadlines.lock().unwrap().is_empty());
+                    exchange
+                        .decision_tx
+                        .send(if approve_all {
+                            ApprovalDecision::ApproveAll
+                        } else {
+                            ApprovalDecision::Approve
+                        })
+                        .unwrap();
+                }
+            )
+        })
+        .await
+        .unwrap();
+        if approve_all {
+            assert_eq!(result.unwrap().body, "done");
+            assert!(recorder.intents.lock().unwrap().is_empty());
+            assert_eq!(
+                deadlines.lock().unwrap().len(),
+                1,
+                "wait stays resident and observes"
+            );
+        } else {
+            assert!(matches!(result, Err(TurnError::Suspended { .. })));
+            assert_eq!(recorder.intents.lock().unwrap().len(), 1);
+            assert!(
+                deadlines.lock().unwrap().is_empty(),
+                "no live observation after suspension"
+            );
+            assert_eq!(mock.recorded_calls().len(), 1);
+        }
+    }
 }

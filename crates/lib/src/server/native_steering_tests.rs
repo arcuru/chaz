@@ -353,6 +353,7 @@ fn recorder(
         explicit_bridge_send: AtomicBool::new(false),
         agent_name: "test-agent".into(),
         requested_model: "stub".into(),
+        can_suspend: false,
         context_snapshot: Some(snapshot),
         branch: None,
         fail_after: Arc::new(std::sync::Mutex::new(None)),
