@@ -514,7 +514,7 @@ impl Handler {
 fn is_transient_discord_send_error(error: &serenity::Error) -> bool {
     match error {
         serenity::Error::Http(http) => match http {
-            serenity::http::HttpError::Request(error) => error.is_connect(),
+            serenity::http::HttpError::Request(error) => error.is_connect() || error.is_timeout(),
             _ => http
                 .status_code()
                 .is_some_and(|status| is_transient_outbound_status(status.as_u16())),
@@ -988,5 +988,80 @@ mod tests {
         let error = reqwest::get("http://127.0.0.1:1/").await.unwrap_err();
         let error = serenity::Error::Http(SerenityHttpError::Request(error));
         assert!(is_transient_discord_send_error(&error));
+    }
+
+    #[tokio::test]
+    async fn a_reqwest_request_timeout_is_transient() {
+        // TCP can connect to the listener, but no HTTP response will arrive.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("local address");
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_millis(100))
+            .build()
+            .expect("test client");
+        let error = client
+            .get(format!("http://{addr}/"))
+            .send()
+            .await
+            .expect_err("a stalled send must hit the request timeout");
+        assert!(
+            error.is_timeout(),
+            "expected a request timeout, got: {error:?}"
+        );
+        assert!(!error.is_connect(), "must exercise the timeout-only arm");
+        let error = serenity::Error::Http(SerenityHttpError::Request(error));
+        assert!(is_transient_discord_send_error(&error));
+    }
+
+    #[tokio::test]
+    async fn other_reqwest_transport_errors_stay_permanent() {
+        // Redirect-policy failures must not consume the transient retry budget.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("local address");
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .redirect(reqwest::redirect::Policy::limited(0))
+            .build()
+            .expect("test client");
+        let (response, ()) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::join!(
+                client.get(format!("http://{addr}/")).send(),
+                serve_redirect(listener)
+            )
+        })
+        .await
+        .expect("loopback redirect exchange must finish");
+        let error = response.expect_err("a denied redirect must fail the request");
+        assert!(
+            error.is_redirect(),
+            "expected a redirect error, got: {error:?}"
+        );
+        let error = serenity::Error::Http(SerenityHttpError::Request(error));
+        assert!(!is_transient_discord_send_error(&error));
+    }
+
+    /// Serve one redirect for the permanent-error check.
+    async fn serve_redirect(listener: tokio::net::TcpListener) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (mut socket, _) = listener.accept().await.expect("accept");
+        // Drain the request head so the response cannot race the request.
+        let mut head = Vec::new();
+        let mut chunk = [0u8; 512];
+        loop {
+            let read = socket.read(&mut chunk).await.expect("read request");
+            head.extend_from_slice(&chunk[..read]);
+            if read == 0 || head.windows(4).any(|window| window == b"\r\n\r\n") {
+                break;
+            }
+        }
+        socket
+            .write_all(b"HTTP/1.1 302 Found\r\nLocation: /elsewhere\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            .await
+            .expect("write redirect response");
+        let _ = socket.shutdown().await;
     }
 }

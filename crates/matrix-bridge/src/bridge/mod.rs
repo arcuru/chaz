@@ -380,7 +380,7 @@ async fn attach_typing_watcher(session_db: &eidetica::Database, room: Room) -> a
 fn is_transient_matrix_send_error(error: &matrix_sdk::Error) -> bool {
     match error {
         matrix_sdk::Error::Http(http) => match http.as_ref() {
-            matrix_sdk::HttpError::Reqwest(error) => error.is_connect(),
+            matrix_sdk::HttpError::Reqwest(error) => error.is_connect() || error.is_timeout(),
             matrix_sdk::HttpError::Api(_) => http
                 .as_client_api_error()
                 .is_some_and(|error| is_transient_outbound_status(error.status_code.as_u16())),
@@ -2013,5 +2013,60 @@ mod tests {
         let error = client.get("http://127.0.0.1:1/").send().await.unwrap_err();
         let error = MatrixSdkError::Http(Box::new(HttpError::Reqwest(error)));
         assert!(is_transient_matrix_send_error(&error));
+    }
+
+    #[tokio::test]
+    async fn a_reqwest_request_timeout_is_transient() {
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(wiremock::matchers::method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_delay(std::time::Duration::from_secs(1)))
+            .mount(&server)
+            .await;
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_millis(100))
+            .build()
+            .expect("test client");
+        let error = client
+            .get(server.uri())
+            .send()
+            .await
+            .expect_err("a stalled send must hit the request timeout");
+        assert!(
+            error.is_timeout(),
+            "expected a request timeout, got: {error:?}"
+        );
+        assert!(!error.is_connect(), "must exercise the timeout-only arm");
+        let error = MatrixSdkError::Http(Box::new(HttpError::Reqwest(error)));
+        assert!(is_transient_matrix_send_error(&error));
+    }
+
+    #[tokio::test]
+    async fn other_reqwest_transport_errors_stay_permanent() {
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // Redirect-policy failures must not consume the transient retry budget.
+        let server = MockServer::start().await;
+        Mock::given(wiremock::matchers::method("GET"))
+            .respond_with(ResponseTemplate::new(302).insert_header("Location", "/elsewhere"))
+            .mount(&server)
+            .await;
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .redirect(reqwest::redirect::Policy::limited(0))
+            .build()
+            .expect("test client");
+        let error = client
+            .get(server.uri())
+            .send()
+            .await
+            .expect_err("a denied redirect must fail the request");
+        assert!(
+            error.is_redirect(),
+            "expected a redirect error, got: {error:?}"
+        );
+        let error = MatrixSdkError::Http(Box::new(HttpError::Reqwest(error)));
+        assert!(!is_transient_matrix_send_error(&error));
     }
 }
