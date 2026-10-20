@@ -39,103 +39,29 @@ jobs:
       - name: Setup Nix
         uses: ./.github/actions/setup-nix
 
-      - name: Lint
+      # One graph shares dependency work and lets independent checks overlap.
+      # Two builds at four cores each bound CPU use on the eight-core runner.
+      - name: Checks
+        env:
+          CI_EVENT_NAME: ${{ github.event_name }}
         run: |
-          nix-fast-build --skip-cached --no-nom --no-link \
-            -f '.#checks.x86_64-linux.lint'
-          nix-fast-build --skip-cached --no-nom --no-link \
-            -f '.#checks.x86_64-linux.treefmt'
-          nix-fast-build --skip-cached --no-nom --no-link \
-            -f '.#checks.x86_64-linux.ci-policy'
-
-      - name: Test
-        run: |
-          nix-fast-build --skip-cached --no-nom --no-link \
-            -f '.#checks.x86_64-linux.test'
-
-      # PRs retain normal Cargo tests (including doctests), lint and build.
-      - name: Doc
-        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
-        run: |
-          nix-fast-build --skip-cached --no-nom --no-link \
-            -f '.#checks.x86_64-linux.doc'
-
-      - name: Build
-        run: |
-          nix-fast-build --skip-cached --no-nom --no-link \
-            -f '.#checks.x86_64-linux.build'
-
-  # The Matrix bridge end-to-end test. Separate from the checks above because it
-  # pulls Synapse into the closure and stands up four processes, neither of which
-  # the fast checks should wait on. Needs no secrets — the homeserver, the
-  # accounts, and the model are all throwaway and local to the runner.
-  e2e:
-    name: Matrix E2E
-    runs-on: ubicloud-standard-8
-    # Full coverage runs on main pushes or a manually selected branch, not on
-    # PRs/merge groups. The custom runner only exists in the upstream repository.
-    if: |
-      github.repository_owner == 'arcuru' &&
-      (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
-    # The two steps below budget 30 minutes between them. The rest is headroom
-    # for the checkout, the nix installer, and pulling the Synapse closure.
-    timeout-minutes: 45
-    steps:
-      - name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with:
-          persist-credentials: false
-
-      - name: Setup Nix
-        uses: ./.github/actions/setup-nix
-
-      # rust-cache must inspect the same compiler that nix develop uses, not
-      # the runner's preinstalled Rust. Only expose that toolchain's bin path.
-      - name: Expose Nix Rust toolchain
-        run: |
-          nix develop .# --command sh <<'SH'
-          dirname "$(command -v cargo)" >> "$GITHUB_PATH"
-          SH
-
-      # Keep this dependency/target cache separate from release jobs, and
-      # invalidate even restore prefixes when the Nix environment changes.
-      # GitHub's normal branch/PR cache scope still applies; no Nix store paths.
-      - name: Cache E2E dependencies
-        uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
-        with:
-          key: matrix-e2e-${{ hashFiles('flake.nix', 'flake.lock') }}
-          cache-bin: false
-
-      # Debug binaries, matching what `just e2e` builds locally. Split from the
-      # harness step so a slow cold compile does not eat the harness budget.
-      - name: Build binaries
-        run: |
-          nix develop .# --command cargo build --bin chaz --bin chaz-matrix --example e2ee_probe
-        timeout-minutes: 20
-
-      # Every wait inside run.sh is bounded, so a passing run finishes in about a
-      # minute. This ceiling is the backstop for a Synapse that comes up wedged
-      # and never satisfies any of them. `--verbose` streams the component logs
-      # into the job output, because the harness deletes its workspace on exit
-      # and there is nothing to collect afterwards.
-      # Exit 2 means the harness never got far enough to test anything — a
-      # missing binary, a tool absent from the shell, a homeserver that would
-      # not start. That is a different problem from a failing assertion, and
-      # the job UI shows both as a red X, so say which one it was.
-      - name: Matrix E2E
-        run: |
-          set +e
-          nix develop .#e2e --command dev/matrix-e2e/run.sh --verbose
-          rc=$?
-          if [ "$rc" -eq 2 ]; then
-            echo "::error::harness could not start (exit 2) — see the log above"
+          checks=(
+            '.#checks.x86_64-linux.lint'
+            '.#checks.x86_64-linux.treefmt'
+            '.#checks.x86_64-linux.ci-policy'
+            '.#checks.x86_64-linux.test'
+            '.#checks.x86_64-linux.build'
+          )
+          # PRs retain normal Cargo tests, including doctests.
+          if [[ "$CI_EVENT_NAME" == push || "$CI_EVENT_NAME" == workflow_dispatch ]]; then
+            checks+=('.#checks.x86_64-linux.doc')
           fi
-          exit "$rc"
-        timeout-minutes: 10
+          nix build --no-link --keep-going --max-jobs 2 --cores 4 "${checks[@]}"
 
   publish:
     name: Publish
-    needs: [ci, e2e]
+    # Matrix E2E is independent and can be disabled without blocking publishing.
+    needs: [ci]
     if: |
       github.repository_owner == 'arcuru' && github.ref == 'refs/heads/main' &&
       (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
