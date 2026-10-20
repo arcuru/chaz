@@ -115,7 +115,7 @@ impl Fixture {
             registry: Arc::downgrade(&self.registry),
             agent: self.agent.clone(),
             login_id: LOGIN.into(),
-            room_id: ROOM.into(),
+            channel: ROOM.into(),
             session_db_id: db.root_id().to_string(),
             active: Mutex::new(true),
             stop,
@@ -323,7 +323,13 @@ async fn outbound_route_refuses_both_ambiguities_and_explicit_detach_restores_or
         {
             let route = route.clone();
             let room = room.clone();
-            move |chunk| Box::pin(send_response_chunk(room.clone(), route.clone(), chunk))
+            move |chunk| {
+                Box::pin(send_response_chunk(
+                    RoomTarget::timeline(room.clone()),
+                    route.clone(),
+                    chunk,
+                ))
+            }
         },
     )
     .await
@@ -404,7 +410,7 @@ async fn approval_observation_never_blocks_the_committing_writer_on_its_route_ga
     let pending = Arc::new(ApprovalRelay {
         slots: Mutex::new(HashMap::new()),
     });
-    let watcher = attach_approval_watcher(&db, room, pending, route.clone())
+    let watcher = attach_approval_watcher(&db, RoomTarget::timeline(room), pending, route.clone())
         .await
         .unwrap();
     let gate = route.guard().await.unwrap();
@@ -442,9 +448,14 @@ async fn detach_stops_delivery_and_approval_observers_without_history_replay() {
     let pending = Arc::new(ApprovalRelay {
         slots: Mutex::new(HashMap::new()),
     });
-    let approval = attach_approval_watcher(&db, room.clone(), pending.clone(), route.clone())
-        .await
-        .unwrap();
+    let approval = attach_approval_watcher(
+        &db,
+        RoomTarget::timeline(room.clone()),
+        pending.clone(),
+        route.clone(),
+    )
+    .await
+    .unwrap();
     let reconciler = DeliveryReconciler::attach(
         db.clone(),
         DeliveryStore::new(fx.registry.chaz_peer().clone()),
@@ -455,7 +466,13 @@ async fn detach_stops_delivery_and_approval_observers_without_history_replay() {
         {
             let route = route.clone();
             let room = room.clone();
-            move |chunk| Box::pin(send_response_chunk(room.clone(), route.clone(), chunk))
+            move |chunk| {
+                Box::pin(send_response_chunk(
+                    RoomTarget::timeline(room.clone()),
+                    route.clone(),
+                    chunk,
+                ))
+            }
         },
     )
     .await
@@ -482,14 +499,19 @@ async fn detach_stops_delivery_and_approval_observers_without_history_replay() {
     // The deferred watcher must not deadlock that commit.
     tokio::time::timeout(
         std::time::Duration::from_secs(2),
-        resolve_pending_approval(&pending, &room, "@human:example.com", false),
+        resolve_pending_approval(
+            &pending,
+            &RoomTarget::timeline(room.clone()),
+            "@human:example.com",
+            false,
+        ),
     )
     .await
     .unwrap();
     assert!(pending.slots.lock().await.is_empty());
     assert_eq!(sent(&http).await.len(), 2);
     let channel = AttachedChannel {
-        _room: Arc::new(room.clone()),
+        _target: Arc::new(RoomTarget::timeline(room.clone())),
         delivery: reconciler.clone(),
         approval,
         route: route.clone(),
@@ -634,9 +656,14 @@ async fn detach_cancels_an_inflight_approval_post_before_draining_its_route() {
     let pending = Arc::new(ApprovalRelay {
         slots: Mutex::new(HashMap::new()),
     });
-    let approval = attach_approval_watcher(&db, room.clone(), pending, route.clone())
-        .await
-        .unwrap();
+    let approval = attach_approval_watcher(
+        &db,
+        RoomTarget::timeline(room.clone()),
+        pending,
+        route.clone(),
+    )
+    .await
+    .unwrap();
     let delivery = DeliveryReconciler::attach(
         db.clone(),
         DeliveryStore::new(fx.registry.chaz_peer().clone()),
@@ -649,7 +676,7 @@ async fn detach_cancels_an_inflight_approval_post_before_draining_its_route() {
     .await
     .unwrap();
     let channel = AttachedChannel {
-        _room: Arc::new(room.clone()),
+        _target: Arc::new(RoomTarget::timeline(room.clone())),
         delivery,
         approval,
         typing: typing::attach(&db, room, route.stop.subscribe())
@@ -689,7 +716,7 @@ async fn reattach_waits_for_the_old_observers_to_finish() {
     attach_once(
         &attached,
         &db,
-        room.clone(),
+        RoomTarget::timeline(room.clone()),
         &server,
         LOGIN,
         "default",
@@ -733,7 +760,18 @@ async fn reattach_waits_for_the_old_observers_to_finish() {
         let room = room.clone();
         let server = server.clone();
         let attached = attached.clone();
-        async move { handle_attach(&sid, room, server, LOGIN, "default", attached, pending).await }
+        async move {
+            handle_attach(
+                &sid,
+                &RoomTarget::timeline(room),
+                server,
+                LOGIN,
+                "default",
+                attached,
+                pending,
+            )
+            .await
+        }
     });
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         while !chaz_core::session::is_bound(&db, "matrix", LOGIN, ROOM)
@@ -871,7 +909,7 @@ async fn room_watcher_shutdown_drains_sends_and_releases_the_client_lease() {
         attach_once(
             &attached,
             &db,
-            room.clone(),
+            RoomTarget::timeline(room.clone()),
             &server,
             LOGIN,
             "default",
