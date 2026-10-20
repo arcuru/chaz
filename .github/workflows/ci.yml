@@ -19,59 +19,146 @@ permissions:
 # other branches and merge-queue runs cannot displace main.
 concurrency:
   group: >-
-    ${{ github.repository_owner == 'arcuru' && github.ref == 'refs/heads/main' &&
+    ${{ github.repository == 'arcuru/chaz' && github.repository_owner == 'arcuru' && github.ref == 'refs/heads/main' &&
         (github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
         'ci-dev-main' ||
         format('ci-{0}-{1}', github.event_name, github.event.pull_request.number || github.run_id) }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  # Only the selected job is named CI. Its skipped counterpart has a distinct
+  # name, so a skipped success cannot satisfy the required CI status.
   ci:
-    name: CI
+    name: ${{ github.repository == 'arcuru/chaz' && github.repository_owner == 'arcuru' && github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && 'Checks (inactive)' || 'CI' }}
+    if: >-
+      !(github.repository == 'arcuru/chaz' && github.repository_owner == 'arcuru' && github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch'))
     runs-on: ubicloud-standard-8
     timeout-minutes: 30
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
+          ref: ${{ github.sha }}
           persist-credentials: false
 
       - name: Setup Nix
         uses: ./.github/actions/setup-nix
 
-      # One graph shares dependency work and lets independent checks overlap.
-      # Allow two builds at once, each using all cores so a dependency build
-      # running alone can use the whole runner.
-      - name: Checks
-        env:
-          CI_EVENT_NAME: ${{ github.event_name }}
-        run: |
-          checks=(
-            '.#checks.x86_64-linux.lint'
-            '.#checks.x86_64-linux.treefmt'
-            '.#checks.x86_64-linux.ci-policy'
-            '.#checks.x86_64-linux.test'
-            '.#checks.x86_64-linux.build'
-          )
-          # PRs retain normal Cargo tests, including doctests.
-          if [[ "$CI_EVENT_NAME" == push || "$CI_EVENT_NAME" == workflow_dispatch ]]; then
-            checks+=('.#checks.x86_64-linux.doc')
-          fi
-          nix build --no-link --keep-going --max-jobs 2 --cores 0 "${checks[@]}"
+      - name: Dependency identity
+        id: identity
+        shell: bash
+        run: bash .github/scripts/deps-cache.sh resolve
 
-  publish:
-    name: Publish
-    # Matrix E2E is independent and can be disabled without blocking publishing.
-    needs: [ci]
-    if: |
-      github.repository_owner == 'arcuru' && github.ref == 'refs/heads/main' &&
-      (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
-    uses: ./.github/workflows/publish.yml
-    permissions:
-      contents: read
-    # Reusable workflows require the names even for environment-scoped secrets;
-    # their values are resolved in the callee's protected publishing job.
-    secrets:
-      NIX_CACHE_ACCESS_KEY_ID: ${{ secrets.NIX_CACHE_ACCESS_KEY_ID }}
-      NIX_CACHE_SECRET_ACCESS_KEY: ${{ secrets.NIX_CACHE_SECRET_ACCESS_KEY }}
-      NIX_CACHE_SIGNING_KEY: ${{ secrets.NIX_CACHE_SIGNING_KEY }}
+      - name: Prefer signed main dependencies
+        id: trusted
+        shell: bash
+        run: bash .github/scripts/deps-cache.sh trusted
+
+      # Ubicloud Transparent Cache implements the standard Actions cache protocol.
+      # No restore keys: scope + exact derivation/output + system + payload schema.
+      - name: Restore PR dependencies
+        id: restore
+        if: github.event_name == 'pull_request' && steps.trusted.outputs.available != 'true'
+        continue-on-error: true
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ${{ runner.temp }}/chaz-deps-cache
+          key: ${{ steps.identity.outputs.key }}
+        env:
+          SEGMENT_DOWNLOAD_TIMEOUT_MINS: "2"
+
+      - name: Import PR dependencies
+        if: github.event_name == 'pull_request' && steps.trusted.outputs.available != 'true' && steps.restore.outputs.cache-hit == 'true'
+        shell: bash
+        run: bash .github/scripts/deps-cache.sh import
+
+      # Always realize the exact dependency output, even after a cache miss/error.
+      - name: Build dependencies
+        shell: bash
+        run: bash .github/scripts/deps-cache.sh build
+
+      - name: Export PR dependencies
+        id: export
+        if: github.event_name == 'pull_request' && steps.trusted.outputs.available != 'true' && steps.restore.outputs.cache-hit != 'true'
+        continue-on-error: true
+        shell: bash
+        run: bash .github/scripts/deps-cache.sh export
+
+      # Save now, not in a post-job hook gated on unrelated project tests.
+      - name: Save PR dependencies
+        if: github.event_name == 'pull_request' && steps.export.outcome == 'success'
+        continue-on-error: true
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ${{ runner.temp }}/chaz-deps-cache
+          key: ${{ steps.identity.outputs.key }}
+
+      - name: Checks
+        run: bash .github/scripts/checks.sh
+
+  main:
+    name: ${{ github.repository == 'arcuru/chaz' && github.repository_owner == 'arcuru' && github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && 'CI' || 'Main (inactive)' }}
+    if: >-
+      github.repository == 'arcuru/chaz' && github.repository_owner == 'arcuru' && github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    environment: publish
+    runs-on: ubicloud-standard-8
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Setup Nix
+        uses: ./.github/actions/setup-nix
+
+      - name: Dependency identity
+        id: identity
+        shell: bash
+        run: bash .github/scripts/deps-cache.sh resolve
+
+      - name: Prefer signed main dependencies
+        id: trusted
+        shell: bash
+        run: bash .github/scripts/deps-cache.sh trusted
+
+      # Always realize the exact dependency output, even after a cache miss/error.
+      - name: Build dependencies
+        shell: bash
+        run: bash .github/scripts/deps-cache.sh build
+
+      - name: Publish dependencies
+        id: publish-deps
+        # A cache outage must not skip checks; fail explicitly after they run.
+        continue-on-error: true
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.NIX_CACHE_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.NIX_CACHE_SECRET_ACCESS_KEY }}
+          NIX_CACHE_SIGNING_KEY: ${{ secrets.NIX_CACHE_SIGNING_KEY }}
+        run: bash .github/scripts/publish-cache.sh deps
+
+      - name: Checks
+        run: bash .github/scripts/checks.sh
+
+      - name: Require dependency publication
+        if: steps.publish-deps.outcome == 'failure'
+        run: |
+          echo 'Dependency publication failed; see Publish dependencies.' >&2
+          exit 1
+
+      # Reuse the checked workspace/test outputs in this same store. Only the
+      # wrapper and optional portable archive remain; no clean workspace rebuild.
+      - name: Prepare final outputs
+        run: |
+          nix build --fallback --no-link --max-jobs 2 --cores 0 --json \
+            '.#packages.x86_64-linux.default' \
+            '.#test.deps' '.#test.artifacts' '.#test.archive' \
+            > "$RUNNER_TEMP/chaz-final.json"
+
+      - name: Publish successful outputs
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.NIX_CACHE_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.NIX_CACHE_SECRET_ACCESS_KEY }}
+          NIX_CACHE_SIGNING_KEY: ${{ secrets.NIX_CACHE_SIGNING_KEY }}
+        run: bash .github/scripts/publish-cache.sh final

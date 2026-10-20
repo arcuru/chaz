@@ -1,10 +1,5 @@
-# Publish workflow — pushes built artifacts to the eidetica Nix cache.
-#
-# Called after all main CI jobs succeed, within CI's native concurrency group.
-# Manual publication stays independent. Builds clean from cache.nixos.org
-# (bypassing our own cache to prevent poisoning), signs the results, and pushes
-# them to s3://cache-eidetica-dev. No PR artifacts enter the publisher.
-
+# Supported manual/reusable entry point. Deliberately independent of CI's queue,
+# as before. Run the same staged checks/publication without a second clean build.
 name: Publish
 
 on:
@@ -24,19 +19,13 @@ permissions:
 jobs:
   push-cache:
     name: Push to cache
+    if: >-
+      github.repository == 'arcuru/chaz' && github.repository_owner == 'arcuru' && github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
     environment: publish
-    runs-on: ubicloud-standard-8
-    timeout-minutes: 60
-    # Reusable workflows retain the caller's event/ref. PR and nonmain calls
-    # cannot enter the protected publishing environment.
-    if: |
-      github.repository_owner == 'arcuru' && github.ref == 'refs/heads/main' &&
-      (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
     permissions:
       contents: read
-    env:
-      AWS_ACCESS_KEY_ID: ${{ secrets.NIX_CACHE_ACCESS_KEY_ID }}
-      AWS_SECRET_ACCESS_KEY: ${{ secrets.NIX_CACHE_SECRET_ACCESS_KEY }}
+    runs-on: ubicloud-standard-8
+    timeout-minutes: 60
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -46,26 +35,53 @@ jobs:
 
       - name: Setup Nix
         uses: ./.github/actions/setup-nix
-        id: nix
-        with:
-          signing-key: ${{ secrets.NIX_CACHE_SIGNING_KEY }}
 
-      # Build clean from source, bypassing our cache. push-args comes from our
-      # checked-out setup action and carries pre-quoted store flags; shell env
-      # expansion would not re-parse those quotes, so it must expand inline.
-      - name: Build and push artifacts
-        run: |
-          nix-fast-build --skip-cached --no-nom --no-link \
-            ${{ steps.nix.outputs.push-args }} \
-            --option substituters 'https://cache.nixos.org' \
-            -f '.#packages.x86_64-linux.default'
+      - name: Dependency identity
+        id: identity
+        shell: bash
+        run: bash .github/scripts/deps-cache.sh resolve
 
-      # Publish check results and their reusable test outputs explicitly: the
-      # successful test check is only a marker and does not retain its inputs.
-      - name: Warm CI cache
+      - name: Prefer signed main dependencies
+        id: trusted
+        shell: bash
+        run: bash .github/scripts/deps-cache.sh trusted
+
+      # Always realize the exact dependency output, even after a cache miss/error.
+      - name: Build dependencies
+        shell: bash
+        run: bash .github/scripts/deps-cache.sh build
+
+      - name: Publish dependencies
+        id: publish-deps
+        # A cache outage must not skip checks; fail explicitly after they run.
+        continue-on-error: true
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.NIX_CACHE_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.NIX_CACHE_SECRET_ACCESS_KEY }}
+          NIX_CACHE_SIGNING_KEY: ${{ secrets.NIX_CACHE_SIGNING_KEY }}
+        run: bash .github/scripts/publish-cache.sh deps
+
+      - name: Checks
+        run: bash .github/scripts/checks.sh
+
+      - name: Require dependency publication
+        if: steps.publish-deps.outcome == 'failure'
         run: |
-          nix-fast-build --skip-cached --no-nom --no-link \
-            ${{ steps.nix.outputs.push-args }}
-          nix-fast-build --skip-cached --no-nom --no-link \
-            ${{ steps.nix.outputs.push-args }} \
-            -f '.#legacyPackages.x86_64-linux.test'
+          echo 'Dependency publication failed; see Publish dependencies.' >&2
+          exit 1
+
+      # Reuse the checked workspace/test outputs in this same store. Only the
+      # wrapper and optional portable archive remain; no clean workspace rebuild.
+      - name: Prepare final outputs
+        run: |
+          nix build --fallback --no-link --max-jobs 2 --cores 0 --json \
+            '.#packages.x86_64-linux.default' \
+            '.#test.deps' '.#test.artifacts' '.#test.archive' \
+            > "$RUNNER_TEMP/chaz-final.json"
+
+      - name: Publish successful outputs
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.NIX_CACHE_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.NIX_CACHE_SECRET_ACCESS_KEY }}
+          NIX_CACHE_SIGNING_KEY: ${{ secrets.NIX_CACHE_SIGNING_KEY }}
+        run: bash .github/scripts/publish-cache.sh final
