@@ -34,9 +34,11 @@ class Workflows(unittest.TestCase):
     def setUpClass(cls):
         cls.ci_text = (ROOT / ".github/workflows/ci.yml").read_text()
         cls.publish_text = (ROOT / ".github/workflows/publish.yml").read_text()
+        cls.e2e_text = (ROOT / ".github/workflows/matrix-e2e.yml").read_text()
         # BaseLoader preserves the YAML key `on` and expression strings.
         cls.ci = yaml.load(cls.ci_text, Loader=yaml.BaseLoader)
         cls.publish = yaml.load(cls.publish_text, Loader=yaml.BaseLoader)
+        cls.e2e = yaml.load(cls.e2e_text, Loader=yaml.BaseLoader)
 
     def run_checks(self, event, exit_code=0):
         step = next(s for s in self.ci["jobs"]["ci"]["steps"] if s["name"] == "Checks")
@@ -96,13 +98,38 @@ class Workflows(unittest.TestCase):
 
     def test_full_coverage_is_push_or_manual_only(self):
         self.assertEqual(
-            expression(self.ci["jobs"]["e2e"]["if"]),
+            expression(self.e2e["jobs"]["e2e"]["if"]),
             f"github.repository_owner == 'arcuru' && ({FULL_COVERAGE})",
         )
         self.assertEqual(
             set(self.ci["on"]), {"push", "pull_request", "merge_group", "workflow_dispatch"}
         )
         self.assertEqual(self.ci["on"]["push"]["branches"], ["main"])
+        self.assertEqual(set(self.e2e["on"]), {"push", "workflow_dispatch"})
+        self.assertEqual(self.e2e["on"]["push"]["branches"], ["main"])
+
+    def test_matrix_e2e_is_independent_with_unchanged_budgets(self):
+        self.assertEqual(set(self.ci["jobs"]), {"ci", "publish"})
+        self.assertEqual(set(self.e2e["jobs"]), {"e2e"})
+        self.assertEqual(self.e2e["name"], "Matrix E2E")
+        self.assertEqual(
+            expression(self.e2e["concurrency"]["group"]),
+            "${{ github.ref == 'refs/heads/main' && 'matrix-e2e-main' || "
+            "format('matrix-e2e-{0}', github.run_id) }}",
+        )
+        self.assertEqual(self.e2e["concurrency"]["cancel-in-progress"], "false")
+        job = self.e2e["jobs"]["e2e"]
+        self.assertNotIn("needs", job)
+        self.assertEqual(job["runs-on"], "ubicloud-standard-8")
+        self.assertEqual(job["timeout-minutes"], "45")
+        steps = {step["name"]: step for step in job["steps"]}
+        self.assertEqual(steps["Build binaries"]["timeout-minutes"], "20")
+        self.assertEqual(steps["Matrix E2E"]["timeout-minutes"], "10")
+        self.assertIn(
+            "cargo build --bin chaz --bin chaz-matrix --example e2ee_probe",
+            steps["Build binaries"]["run"],
+        )
+        self.assertIn("dev/matrix-e2e/run.sh --verbose", steps["Matrix E2E"]["run"])
 
     def test_native_main_queue_covers_ci_and_publish(self):
         self.assertEqual(expression(self.ci["concurrency"]["group"]), MAIN_QUEUE)
@@ -114,9 +141,9 @@ class Workflows(unittest.TestCase):
         for job in self.ci["jobs"].values():
             self.assertNotIn("concurrency", job)
 
-    def test_publish_requires_all_successful_main_ci_jobs(self):
+    def test_publish_requires_successful_ordinary_main_ci_only(self):
         job = self.ci["jobs"]["publish"]
-        self.assertEqual(job["needs"], ["ci", "e2e"])
+        self.assertEqual(job["needs"], ["ci"])
         self.assertEqual(expression(job["if"]), TRUSTED_MAIN)
         self.assertEqual(job["uses"], "./.github/workflows/publish.yml")
         self.assertEqual(job["permissions"], {"contents": "read"})
@@ -131,9 +158,10 @@ class Workflows(unittest.TestCase):
         self.assertEqual(job["permissions"], {"contents": "read"})
 
     def test_ci_checks_do_not_receive_publishing_secrets(self):
-        for name in ("ci", "e2e"):
-            self.assertNotIn("secrets.", yaml.safe_dump(self.ci["jobs"][name]))
+        for job in (self.ci["jobs"]["ci"], self.e2e["jobs"]["e2e"]):
+            self.assertNotIn("secrets.", yaml.safe_dump(job))
         self.assertEqual(self.ci["permissions"], {"contents": "read"})
+        self.assertEqual(self.e2e["permissions"], {"contents": "read"})
         self.assertEqual(self.publish["permissions"], {"contents": "read"})
         names = {"NIX_CACHE_ACCESS_KEY_ID", "NIX_CACHE_SECRET_ACCESS_KEY", "NIX_CACHE_SIGNING_KEY"}
         self.assertEqual(
