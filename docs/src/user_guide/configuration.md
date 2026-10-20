@@ -77,6 +77,97 @@ client before mutation and direct the operator to run them on the Eidetica
 owner. Ordinary session, agent, approval, and user-level sync-preference data
 operations continue through the service API.
 
+## Bookkeeping roots
+
+Every Chaz login has two peer-local bookkeeping databases: `chaz_group` (the session index and session names) and `chaz_peer` (credentials, peer defaults, schedule state, delivery progress and cached model metadata).
+Chaz opens them by ID from references stored in the login's Eidetica Account, under the `chaz` namespace:
+
+| Reference           | Opens        | Notes                                                                       |
+| ------------------- | ------------ | --------------------------------------------------------------------------- |
+| `chaz.group`        | `chaz_group` | One per Account.                                                            |
+| `chaz.peer-<login>` | `chaz_peer`  | Keyed by the instance-local login record, so each installation has its own. |
+
+Display names play no part in finding them: renaming either database does not change what opens, and another database that happens to be called `chaz_group` is never selected.
+Startup reads the two references and opens two databases, however many other databases the login tracks.
+
+**Who creates them.** Only the designated writer creates an absent root: a direct owner (it holds its storage exclusively) or the executor of a service login (there must be exactly one).
+Service clients and `chaz usage` never create roots; on a login whose roots do not exist yet they stop with `Chaz bookkeeping roots are not initialized for this login`, so start the executor or direct owner first.
+Initializers in one process take turns; Chaz does not claim uniqueness across processes beyond that designated-writer rule.
+
+**What is never replaced.** A reference that exists but cannot be read, or whose database cannot be opened or is not authorized for this login, is an error.
+Chaz reports it and does not create a substitute.
+Repair the database or its access rather than deleting the reference.
+
+**Upgrades and interrupted setup.** Before creating a root, the writer checks whether the login already tracks a database with that root's name but no reference: state from a Chaz version that found its roots by name, or a root whose reference write failed.
+If it finds one, it creates nothing and prints the IDs to record.
+If a tracked database cannot be inspected, setup stops with its ID; repair its data or access before retrying.
+Record them with `chaz roots`, with no other Chaz process using the login:
+
+| Command                   | Effect                                                                                   |
+| ------------------------- | ---------------------------------------------------------------------------------------- |
+| `chaz roots`              | Print both reference IDs, or `not initialized`.                                          |
+| `chaz roots --group <ID>` | Record an existing `chaz_group` for an absent reference. No-op if it already names `ID`. |
+| `chaz roots --peer <ID>`  | Same for this login's `chaz_peer`.                                                       |
+
+`chaz roots` never changes a present reference to a different ID, and refuses an ID this login cannot open.
+
+### Walkthrough: upgrading state written by an older Chaz
+
+This store was created by a Chaz that found `chaz_group` and `chaz_peer` by name, and holds a session named `upgrade-demo`.
+
+1. Check the references. An older store has none:
+
+   ```console
+   $ chaz roots
+   chaz_group  not initialized  (chaz.group)
+   chaz_peer  not initialized  (chaz.peer-1baac76e-c998-4b42-a5e0-ce90954477a8)
+   ```
+
+2. Starting Chaz finds the old roots and refuses to create replacements that would hide them:
+
+   ```console
+   $ chaz cmd --session upgrade-demo /info
+   Error: found unreferenced Chaz root database(s): chaz_group bafyr4iatnvs2qwp7jfq7q53gihoio36zu7zsmjnjrypmyjnzyu27xofnwa; chaz_peer bafyr4ic3awr6un4osopyudzsb4aklvzidid2vfexgbi7siu7h46sow7rha; nothing was created. With no other Chaz process running for this login, record the intended IDs with `chaz roots --group bafyr4iatnvs2qwp7jfq7q53gihoio36zu7zsmjnjrypmyjnzyu27xofnwa --peer bafyr4ic3awr6un4osopyudzsb4aklvzidid2vfexgbi7siu7h46sow7rha`
+   ```
+
+3. Record the IDs it printed:
+
+   ```console
+   $ chaz roots --group bafyr4iatnvs2qwp7jfq7q53gihoio36zu7zsmjnjrypmyjnzyu27xofnwa --peer bafyr4ic3awr6un4osopyudzsb4aklvzidid2vfexgbi7siu7h46sow7rha
+   chaz_group  bafyr4iatnvs2qwp7jfq7q53gihoio36zu7zsmjnjrypmyjnzyu27xofnwa  (chaz.group)
+   chaz_peer  bafyr4ic3awr6un4osopyudzsb4aklvzidid2vfexgbi7siu7h46sow7rha  (chaz.peer-1baac76e-c998-4b42-a5e0-ce90954477a8)
+   ```
+
+4. The existing session is back, under the same ID:
+
+   ```console
+   $ chaz cmd --session upgrade-demo /info
+   Session: bafyr4iev3nsu2p4c64bxgngyzomv63ro5ydsdq4xab4eikydnhudc2uyuu
+   Name: upgrade-demo
+   Agent: chaz
+   Total entries: 0
+   Messages: 0 | Directives: 0 | Tool calls: 0 | Errors: 0
+   ```
+
+5. A mistaken second record is refused rather than redirecting the peer:
+
+   ```console
+   $ chaz roots --peer bafyr4iatnvs2qwp7jfq7q53gihoio36zu7zsmjnjrypmyjnzyu27xofnwa
+   Error: Chaz chaz_peer reference already names bafyr4ic3awr6un4osopyudzsb4aklvzidid2vfexgbi7siu7h46sow7rha; it was not changed to bafyr4iatnvs2qwp7jfq7q53gihoio36zu7zsmjnjrypmyjnzyu27xofnwa
+   ```
+
+On a newly provisioned store there is nothing to adopt. A read-only command stops, and the first direct-owner or executor start creates both roots:
+
+```console
+$ chaz usage
+Error: Chaz bookkeeping roots are not initialized for this login (missing: chaz_group, chaz_peer). Start the direct owner or the login's executor first; it initializes them
+$ chaz cmd /pubkey
+ed25519:rTCqCb+ERmum5teiL+cUM+jELScTuOzW2mqbxRxXd/s=
+$ chaz roots
+chaz_group  bafyr4ibn7hmxax34hryz7kh6bbytmnfy5mnmc5y25kt2ri2457exfkvxtu  (chaz.group)
+chaz_peer  bafyr4igkwcaocqreuco7hxe36my4r42io26onkhqlfvkqh2g5ovn6fspjm  (chaz.peer-fb49b7b3-5c51-4303-8f5c-0217c18c7fd1)
+```
+
 ## Full Example
 
 ```yaml
@@ -739,7 +830,7 @@ cli:
 
 Chaz persists all data in the state directory:
 
-- `eidetica.db` — SQLite database backing every chaz eidetica DB: per-session DBs, per-agent DBs, per-bank DBs, plus the peer-local `chaz_group` (sessions/channels/names) and `chaz_peer` (credentials/schedule_last_fired/schedule_state) bookkeeping DBs
+- `eidetica.db` — SQLite database backing every chaz eidetica DB: per-session DBs, per-agent DBs, per-bank DBs, plus the peer-local `chaz_group` (sessions/channels/names) and `chaz_peer` (credentials/schedule_last_fired/schedule_state) bookkeeping DBs, opened by reference (see [Bookkeeping roots](#bookkeeping-roots))
 - Headjack session data (Matrix sync token, device keys)
 
 The state directory defaults to `$XDG_STATE_HOME/chaz`. Override with `state_dir` in config.

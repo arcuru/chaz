@@ -4866,6 +4866,7 @@ async fn shared_service_clients_observe_durable_attempt_completion() {
     )
     .await
     .unwrap();
+    crate::test_support::provision_roots(&mut owner_user).await;
     let key = owner_user.get_default_key().unwrap();
     let db = owner_user.create_database(Doc::new(), &key).await.unwrap();
     crate::session::Session::initialize_turn_schema(&db)
@@ -5216,6 +5217,7 @@ async fn resident_executor_adopts_and_processes_local_client_session() {
     )
     .await
     .unwrap();
+    crate::test_support::provision_roots(&mut owner_user).await;
     let (agent_db, agent_pubkey) = create_agent_db(
         &mut owner_user,
         "default",
@@ -5343,12 +5345,13 @@ async fn service_restart_reopens_and_reconciles_persisted_work() {
 
     let dir = tempfile::tempdir().unwrap();
     let socket = dir.path().join("eidetica-restart.sock");
-    let (owner, _owner_user) = Instance::create_backend(
+    let (owner, mut owner_user) = Instance::create_backend(
         Box::new(InMemory::new()),
         NewAccount::passwordless("restart"),
     )
     .await
     .unwrap();
+    crate::test_support::provision_roots(&mut owner_user).await;
     let start_service = |instance: Instance| async {
         let service = ServiceServer::bind(instance, &socket).await.unwrap();
         let (shutdown, receiver) = watch::channel(());
@@ -5847,6 +5850,7 @@ async fn shared_login_transport_and_observer_frontends_keep_independent_progress
     )
     .await
     .unwrap();
+    crate::test_support::provision_roots(&mut owner_user).await;
     let key = owner_user.get_default_key().unwrap();
     let db = owner_user.create_database(Doc::new(), &key).await.unwrap();
     crate::session::Session::initialize_turn_schema(&db)
@@ -6174,10 +6178,17 @@ async fn published_executor_using_mock_and_hub(
         crate::instance::connect_with(settings, crate::config::ExecutionRole::Executor)
             .await
             .unwrap();
+    // The login's executor is the designated root initializer.
+    let setup = crate::session::roots::RootSetup::for_connection(&connection.instance, true);
     let registry = Arc::new(
-        crate::session::SessionRegistry::new(connection.instance, connection.user, agents.clone())
-            .await
-            .unwrap(),
+        crate::session::SessionRegistry::open(
+            connection.instance,
+            connection.user,
+            agents.clone(),
+            setup,
+        )
+        .await
+        .unwrap(),
     );
     let index = HostedIndex::empty("agent");
     index.register(agent.clone());
@@ -6227,6 +6238,7 @@ async fn published_job_is_adopted_without_creating_another_child() {
         )
         .await
         .unwrap();
+        crate::test_support::provision_roots(&mut user).await;
         let restricted = crate::grants::Grants {
             shell: Some(crate::grants::ShellGrant {
                 allow: crate::grants::Allowlist::Only(vec![]),
@@ -6865,6 +6877,7 @@ async fn client_submission_publishes_one_child_then_executor_runs_it() {
         display_name: "default".into(),
         pubkey,
     };
+    crate::test_support::provision_roots(&mut user).await;
     let (_, foreign_home) = create_agent_db(
         &mut user,
         "foreign",
@@ -7221,7 +7234,19 @@ async fn client_submission_publishes_one_child_then_executor_runs_it() {
 async fn chaz_query_reports_persisted_agent_job_tool_ceilings() {
     use crate::runtime::RuntimeMessage;
     use crate::test_support::MockBackend;
-    let (_instance, fixture, registry) = server_fixture().await;
+    // Only this test's executor may watch the registry: a second server
+    // would race it for the one new-session subscription.
+    let (_instance, user) =
+        Instance::create_backend(Box::new(InMemory::new()), NewAccount::passwordless("test"))
+            .await
+            .unwrap();
+    let agents = Arc::new(AgentRegistry::with_default_agent());
+    let registry = Arc::new(
+        crate::session::SessionRegistry::new(_instance.clone(), user, agents.clone())
+            .await
+            .unwrap(),
+    );
+    let agent_index = HostedIndex::empty("agent");
     let mock = Arc::new(MockBackend::new());
     mock.push_tool_calls(vec![(
         "query-tools".into(),
@@ -7243,8 +7268,8 @@ async fn chaz_query_reports_persisted_agent_job_tool_ceilings() {
     );
     let server = Server::new(
         registry.clone(),
-        fixture.agents.clone(),
-        fixture.agent_index.clone(),
+        agents,
+        agent_index,
         HostedIndex::empty("bank"),
         HostedIndex::empty("skill_bank"),
         tools,
@@ -7258,7 +7283,6 @@ async fn chaz_query_reports_persisted_agent_job_tool_ceilings() {
         Arc::new(crate::mcp::McpRegistry::new()),
         Some(crate::instance::ExecutorCapability::for_test()),
     );
-    fixture.shutdown().await;
     let (parent, parent_db) = seed_agent(&server, &registry, "parent").await;
     let mut parent_cfg = parent_db.read_config().await.unwrap();
     parent_cfg.tools = Some(vec!["calculate".into(), "chaz".into()]);

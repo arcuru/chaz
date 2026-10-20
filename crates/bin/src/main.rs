@@ -61,6 +61,15 @@ enum Subcommand {
     /// on one backend do not observe each other's writes.
     Cmd(CmdArgs),
 
+    /// Show or explicitly record this login's bookkeeping-root references.
+    ///
+    /// Without flags, prints the `chaz_group` and `chaz_peer` IDs this login
+    /// references. `--group`/`--peer` record an existing database ID for an
+    /// absent reference: state from an older Chaz, or a root whose reference
+    /// write failed. A present reference is never changed. Run it with no
+    /// other Chaz process using this login.
+    Roots(RootsArgs),
+
     /// Run the agent peer with no user interface, until terminated.
     ///
     /// Same runtime as the TUI — sync, schedules, the routine engine, and the
@@ -84,6 +93,17 @@ struct CmdArgs {
     /// address anything but a fresh throwaway session.
     #[arg(long, value_name = "NAME")]
     session: Option<String>,
+}
+
+#[derive(clap::Args)]
+struct RootsArgs {
+    /// Existing `chaz_group` database ID to record.
+    #[arg(long, value_name = "ID")]
+    group: Option<String>,
+
+    /// Existing `chaz_peer` database ID to record for this login.
+    #[arg(long, value_name = "ID")]
+    peer: Option<String>,
 }
 
 #[derive(clap::Args)]
@@ -200,6 +220,15 @@ async fn main() -> anyhow::Result<()> {
                     .with_writer(std::io::stderr)
                     .init();
                 return run_usage_subcommand(usage_args, &config).await;
+            }
+            Subcommand::Roots(roots_args) => {
+                let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn"));
+                tracing_subscriber::fmt()
+                    .with_env_filter(filter)
+                    .with_writer(std::io::stderr)
+                    .init();
+                return run_roots_subcommand(roots_args, &config).await;
             }
             Subcommand::Cmd(a) => cmd_args = Some(a),
         }
@@ -458,10 +487,40 @@ async fn supervise_daemon_service(
     .await
 }
 
-/// `chaz usage` — open the eidetica DB read-only, walk the user-central
-/// session catalog, aggregate deduplicated call evidence and legacy summaries, print either
-/// human-readable text or JSON, then exit. Skips all bridge/sync/scheduler
-/// setup since we never serve a session here.
+/// Show or explicitly record bookkeeping-root IDs without starting the runtime.
+async fn run_roots_subcommand(args: RootsArgs, config: &Config) -> anyhow::Result<()> {
+    use session::roots::{self, RootKind};
+    let requested = [(RootKind::Group, args.group), (RootKind::Peer, args.peer)]
+        .into_iter()
+        .filter_map(|(kind, id)| id.map(|id| (kind, id)))
+        .map(|(kind, id)| {
+            eidetica::entry::ID::parse(&id)
+                .map(|id| (kind, id))
+                .map_err(|e| anyhow::anyhow!("invalid {} ID `{id}`: {e}", kind.flag()))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+
+    let connected = instance::connect(config).await?;
+    let user = &connected.user;
+    for (kind, id) in &requested {
+        roots::record(user, *kind, id).await?;
+    }
+    for kind in [RootKind::Group, RootKind::Peer] {
+        let reference = format!(
+            "{}.{}",
+            roots::REFERENCE_NAMESPACE,
+            kind.reference_name(user)
+        );
+        match roots::referenced(user, kind).await? {
+            Some(id) => println!("{kind}  {id}  ({reference})"),
+            None => println!("{kind}  not initialized  ({reference})"),
+        }
+    }
+    Ok(())
+}
+
+/// Aggregate deduplicated call evidence and legacy summaries from the session
+/// catalog, then print the rollup without bridge, sync or scheduler setup.
 async fn run_usage_subcommand(args: UsageArgs, config: &Config) -> anyhow::Result<()> {
     let bridge_filter = match args.bridge.as_deref() {
         Some(s) => Some(session::BridgeKind::from_filter_str(s).ok_or_else(|| {
@@ -478,8 +537,14 @@ async fn run_usage_subcommand(args: UsageArgs, config: &Config) -> anyhow::Resul
     if agent_registry.is_empty() {
         agent_registry.register_default_chaz(config)?;
     }
-    let registry =
-        session::SessionRegistry::new(connected.instance, connected.user, agent_registry).await?;
+    // A read-only utility never initializes bookkeeping roots.
+    let registry = session::SessionRegistry::open(
+        connected.instance,
+        connected.user,
+        agent_registry,
+        session::roots::RootSetup::RequireExisting,
+    )
+    .await?;
 
     let filter = session::usage::UsageFilter {
         since: None,

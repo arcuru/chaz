@@ -15,9 +15,10 @@ use std::time::Instant;
 use tokio::sync::{Mutex, mpsc};
 use tracing::{info, warn};
 
+use super::roots::{self, RootSetup};
 use super::{
-    BridgeKind, SessionCatalogEntry, SessionIndex, SessionStatus, find_or_create_db,
-    read_meta_from_db, update_meta_on_db,
+    BridgeKind, SessionCatalogEntry, SessionIndex, SessionStatus, read_meta_from_db,
+    update_meta_on_db,
 };
 
 /// Notification emitted when a new session is indexed in the registry.
@@ -106,25 +107,38 @@ const STORE_PEER_DEFAULTS: &str = "peer_defaults";
 const KEY_DEFAULT_AGENTS: &str = "default_agents";
 
 impl SessionRegistry {
+    /// Open the registry, initializing absent bookkeeping roots only when
+    /// this connection is a direct owner of its storage. A service client
+    /// requires roots its executor already initialized; use
+    /// [`Self::open`] to state the setup role explicitly.
     pub async fn new(
+        instance: eidetica::Instance,
+        user: eidetica::AccountSession,
+        agents: Arc<AgentRegistry>,
+    ) -> anyhow::Result<Self> {
+        let setup = RootSetup::for_connection(&instance, false);
+        Self::open(instance, user, agents, setup).await
+    }
+
+    /// Open the registry's `chaz_group` and `chaz_peer` by their Account
+    /// references (see [`super::roots`]). Only `RootSetup::Initialize`
+    /// creates absent roots; no error path creates a replacement.
+    pub async fn open(
         instance: eidetica::Instance,
         mut user: eidetica::AccountSession,
         agents: Arc<AgentRegistry>,
+        setup: RootSetup,
     ) -> anyhow::Result<Self> {
         let started = Instant::now();
-        let stage = Instant::now();
-        let chaz_group = find_or_create_db(&mut user, "chaz_group").await?;
+        let roots::Roots {
+            group: chaz_group,
+            peer: chaz_peer,
+        } = roots::open(&mut user, setup).await?;
         info!(
-            elapsed_ms = stage.elapsed().as_millis() as u64,
-            total_elapsed_ms = started.elapsed().as_millis() as u64,
-            "Session registry chaz_group ready"
-        );
-        let stage = Instant::now();
-        let chaz_peer = find_or_create_db(&mut user, "chaz_peer").await?;
-        info!(
-            elapsed_ms = stage.elapsed().as_millis() as u64,
-            total_elapsed_ms = started.elapsed().as_millis() as u64,
-            "Session registry chaz_peer ready"
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            chaz_group = %chaz_group.root_id(),
+            chaz_peer = %chaz_peer.root_id(),
+            "Session registry roots opened by reference"
         );
         let (new_session_tx, new_session_rx) = mpsc::channel(64);
 
@@ -1212,12 +1226,13 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("job.sock");
-        let (owner, _) = Instance::create_backend(
+        let (owner, mut owner_user) = Instance::create_backend(
             Box::new(InMemory::new()),
             NewAccount::passwordless("job-test"),
         )
         .await
         .unwrap();
+        crate::test_support::provision_roots(&mut owner_user).await;
         let service = ServiceServer::bind(owner, &socket).await.unwrap();
         let (shutdown, receiver) = watch::channel(());
         let task = tokio::spawn(service.run(receiver));
