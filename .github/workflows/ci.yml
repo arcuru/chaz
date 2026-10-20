@@ -40,7 +40,8 @@ jobs:
         uses: ./.github/actions/setup-nix
 
       # One graph shares dependency work and lets independent checks overlap.
-      # Two builds at four cores each bound CPU use on the eight-core runner.
+      # Allow two builds at once, each using all cores so a dependency build
+      # running alone can use the whole runner.
       - name: Checks
         env:
           CI_EVENT_NAME: ${{ github.event_name }}
@@ -56,7 +57,7 @@ jobs:
           if [[ "$CI_EVENT_NAME" == push || "$CI_EVENT_NAME" == workflow_dispatch ]]; then
             checks+=('.#checks.x86_64-linux.doc')
           fi
-          nix build --no-link --keep-going --max-jobs 2 --cores 4 "${checks[@]}"
+          nix build --no-link --keep-going --max-jobs 2 --cores 0 "${checks[@]}"
 
   publish:
     name: Publish
