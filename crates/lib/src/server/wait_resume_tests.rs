@@ -56,6 +56,38 @@ struct ResultCounter {
     manifest: crate::extension::manifest::ExtensionManifest,
 }
 
+type WaitDeadlines = Arc<std::sync::Mutex<Vec<Option<chrono::DateTime<Utc>>>>>;
+
+/// Observe the runtime's actual deadline without replacing the real wait tool.
+struct ObservedJobWait {
+    inner: crate::tools::JobWaitTool,
+    deadlines: WaitDeadlines,
+}
+
+impl crate::tool::Tool for ObservedJobWait {
+    fn descriptor(&self) -> crate::tool::ToolDescriptor {
+        crate::tool::Tool::descriptor(&self.inner)
+    }
+
+    fn default_policy(&self) -> crate::tool::ToolPolicy {
+        crate::tool::Tool::default_policy(&self.inner)
+    }
+
+    fn execute<'a>(
+        &'a self,
+        arguments: serde_json::Value,
+        ctx: &'a ToolContext,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<String, crate::tool::ToolError>> + Send + 'a>,
+    > {
+        self.deadlines
+            .lock()
+            .unwrap()
+            .push(ctx.observation_deadline);
+        crate::tool::Tool::execute(&self.inner, arguments, ctx)
+    }
+}
+
 impl crate::extension::Extension for ResultCounter {
     fn name(&self) -> &'static str {
         "result-counter"
@@ -108,6 +140,7 @@ struct Fixture {
     sessions: Arc<std::sync::Mutex<Vec<std::sync::Weak<Mutex<Session>>>>>,
     retain: Arc<std::sync::Mutex<Option<Arc<Mutex<Session>>>>>,
     keep: Arc<AtomicBool>,
+    wait_deadlines: Option<WaitDeadlines>,
     _shutdown: watch::Sender<()>,
     _service: tokio::task::JoinHandle<eidetica::Result<()>>,
 }
@@ -160,6 +193,7 @@ impl Fixture {
             sessions: Default::default(),
             retain: Default::default(),
             keep: Default::default(),
+            wait_deadlines: None,
             _shutdown: shutdown,
             _service: service,
         }
@@ -213,9 +247,17 @@ impl Fixture {
         .await;
         let slot = crate::instance::ServerSlot::default();
         slot.set(server.clone());
-        server.tools.register(crate::tools::JobWaitTool {
+        let wait_tool = crate::tools::JobWaitTool {
             server: slot.clone(),
-        });
+        };
+        if let Some(deadlines) = &self.wait_deadlines {
+            server.tools.register(ObservedJobWait {
+                inner: wait_tool,
+                deadlines: deadlines.clone(),
+            });
+        } else {
+            server.tools.register(wait_tool);
+        }
         server.tools.register(Effect {
             calls: self.effects.clone(),
             sessions: self.sessions.clone(),
@@ -2091,7 +2133,9 @@ async fn unloaded_drop_probe_detects_a_retained_strong_reference() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn unloaded_deadline_expires_without_reset_or_child_cancellation() {
-    let fx = Fixture::new("unload-deadline").await;
+    let mut fx = Fixture::new("unload-deadline").await;
+    let deadlines = WaitDeadlines::default();
+    fx.wait_deadlines = Some(deadlines.clone());
     let parent = waiting_parent(&fx, 2, false, true).await;
     await_unloaded(&parent).await;
     assert_parent_dropped(&fx);
@@ -2108,12 +2152,15 @@ async fn unloaded_deadline_expires_without_reset_or_child_cancellation() {
         .unwrap_or_default();
     tokio::time::sleep(remaining + Duration::from_millis(150)).await;
     assert_eq!(parent.mock.recorded_calls().len(), 1);
+    assert!(deadlines.lock().unwrap().is_empty());
     assert_parent_dropped(&fx); // capacity waiter is also context-free
-    let start = std::time::Instant::now();
     drop(all_capacity);
     await_no_processing(&parent.process.server, &parent.sid).await;
-    assert!(
-        start.elapsed() < Duration::from_secs(1),
+    // Observe the deadline passed to the real tool, not the latency of admission,
+    // database writes, and cleanup on a loaded runner.
+    assert_eq!(
+        *deadlines.lock().unwrap(),
+        [Some(parent.checkpoint.deadline)],
         "deadline reset on readmission"
     );
     assert!(wait_result(&parent.mock.recorded_calls()[1]).contains("Pending"));
