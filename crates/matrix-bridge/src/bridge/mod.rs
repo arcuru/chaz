@@ -620,6 +620,7 @@ fn help_text() -> String {
         "**chaz commands** (prefix with `!chaz `):",
         "",
         "`sessions` · `info` · `print` · `compact` · `name [<alias>]` — session ops",
+        "`context` — context-window usage, shared with the agent's next turn",
         "`groups` — named agent rosters a new session can start with",
         "`agents` · `agent <add|remove|host|new|delete|share|import|set|reload|invite|rehost> …` — living agents",
         "`model [<id>|<agent> <id>]` · `role [<name> [prompt]]` · `backend <name> <url> <key>` · `backends` — LLM config",

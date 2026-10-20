@@ -105,7 +105,7 @@ pub(crate) fn mark_usage_fields(
     );
 }
 
-pub(super) fn reported_fields(metadata: Option<&ResponseMetadata>) -> (bool, bool) {
+pub(crate) fn reported_fields(metadata: Option<&ResponseMetadata>) -> (bool, bool) {
     let Some(metadata) = metadata else {
         return (false, false);
     };

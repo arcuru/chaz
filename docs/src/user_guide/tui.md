@@ -228,28 +228,29 @@ The TUI catalogs every built-in slash command in its inline completion popup —
 
 ### Session
 
-| Command               | Description                                                            |
-| --------------------- | ---------------------------------------------------------------------- |
-| `/help`, `/?`         | Open the help overlay (also `F1`)                                      |
-| `/sessions`, `/s`     | Open the session hub (also `Ctrl+P`)                                   |
-| `/new`                | Create a new session and switch to it                                  |
-| `/new <group>`        | Create a new session with a named agent group attached                 |
-| `/groups`             | List the configured agent groups                                       |
-| `/join <ref>`         | Switch to a session by name or eidetica DB ID                          |
-| `/name <alias>`       | Set a human-friendly alias for the current session (also `/rename`)    |
-| `/name`               | Clear the session alias                                                |
-| `/description <text>` | Set a browse-only description (up to 200 characters)                   |
-| `/description`        | Clear the session description                                          |
-| `/info`               | Show current session details (name, DB ID, entry counts)               |
-| `/costs`              | Aggregate LLM usage and cost across all sessions ([details](usage.md)) |
-| `/interrupted`        | List turns that require an explicit retry decision                     |
-| `/retry <id>`         | Ask the executor to retry the currently observed interrupted attempt   |
-| `/channels`           | List Matrix rooms currently attached to this session                   |
-| `/share`              | Generate a shareable ticket URL for the current session                |
-| `/sync <ticket>`      | Sync a remote session via a ticket URL                                 |
-| `/compact`            | Ask the executor to compact the current immutable session snapshot     |
-| `/print`              | Dump the transcript                                                    |
-| `/stop`               | Stop the active turn in this session; idle sessions are unchanged      |
+| Command               | Description                                                                                       |
+| --------------------- | ------------------------------------------------------------------------------------------------- |
+| `/help`, `/?`         | Open the help overlay (also `F1`)                                                                 |
+| `/sessions`, `/s`     | Open the session hub (also `Ctrl+P`)                                                              |
+| `/new`                | Create a new session and switch to it                                                             |
+| `/new <group>`        | Create a new session with a named agent group attached                                            |
+| `/groups`             | List the configured agent groups                                                                  |
+| `/join <ref>`         | Switch to a session by name or eidetica DB ID                                                     |
+| `/name <alias>`       | Set a human-friendly alias for the current session (also `/rename`)                               |
+| `/name`               | Clear the session alias                                                                           |
+| `/description <text>` | Set a browse-only description (up to 200 characters)                                              |
+| `/description`        | Clear the session description                                                                     |
+| `/info`               | Show current session details (name, DB ID, entry counts)                                          |
+| `/costs`              | Aggregate LLM usage and cost across all sessions ([details](usage.md))                            |
+| `/interrupted`        | List turns that require an explicit retry decision                                                |
+| `/retry <id>`         | Ask the executor to retry the currently observed interrupted attempt                              |
+| `/channels`           | List Matrix rooms currently attached to this session                                              |
+| `/share`              | Generate a shareable ticket URL for the current session                                           |
+| `/sync <ticket>`      | Sync a remote session via a ticket URL                                                            |
+| `/compact`            | Ask the executor to compact the current immutable session snapshot                                |
+| `/context`            | Context-window usage for the current agent ([details](usage.md#context-window-snapshots-context)) |
+| `/print`              | Dump the transcript                                                                               |
+| `/stop`               | Stop the active turn in this session; idle sessions are unchanged                                 |
 
 ### Living Agents
 
@@ -571,7 +572,7 @@ A model picker returns to its Settings page on selection or `Esc`; canceling wri
 
 ### Shipped pages and controls
 
-These tables list every category in sidebar order. Read-only pages are inspectors, not editors waiting for an apply key. The six **coming soon** pages are placeholders and have no settings controls.
+These tables list every category in sidebar order. Read-only pages are inspectors, not editors waiting for an apply key. The three Session **coming soon** pages are placeholders and have no settings controls.
 
 | Peer category | Current behavior                                                                                                                                                                                                                                                                                                                                                                |
 | ------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -579,10 +580,10 @@ These tables list every category in sidebar order. Read-only pages are inspector
 | Backends      | Read-only backend names, API base URLs, and configured/known model counts; no credential editor.                                                                                                                                                                                                                                                                                |
 | Defaults      | Edit the ordered agents attached to new sessions; the first is the routing host. `a` opens an add prompt, `d` removes the selected row, and `Ctrl+↑` / `Ctrl+↓` reorder it. Changes persist in the peer DB, not YAML, and do not change existing session rosters. Accepted edits apply in order to the latest defaults; a pending add is not lost by a later remove or reorder. |
 | Bridges       | Read-only status: TUI active, CLI available, Matrix/Discord external binaries.                                                                                                                                                                                                                                                                                                  |
-| Extensions    | **Coming soon.**                                                                                                                                                                                                                                                                                                                                                                |
+| Extensions    | Read-only current-process registration catalog: names, reference kind/version, registered hooks/tools/commands, and recorded Global install failures. Not an active-instance count; MCP runtime stays on MCP.                                                                                                                                                                   |
 | MCP           | Read-only server list and selected-server status, tools, and failure details.                                                                                                                                                                                                                                                                                                   |
-| Groups        | **Coming soon.**                                                                                                                                                                                                                                                                                                                                                                |
-| Identity      | **Coming soon.**                                                                                                                                                                                                                                                                                                                                                                |
+| Groups        | Read-only loaded new-session roster templates, ordered members, and current default roster. Not live groups or existing session membership.                                                                                                                                                                                                                                     |
+| Identity      | Read-only connected account default public key and fingerprint, as in `/pubkey`. No credentials, private keys or key editing.                                                                                                                                                                                                                                                   |
 | About         | Read-only version, state directory, in-process bridges, and configuration/count summary.                                                                                                                                                                                                                                                                                        |
 
 | Session category | Current behavior                                                                                                                               |
@@ -593,6 +594,59 @@ These tables list every category in sidebar order. Read-only pages are inspector
 | Routing          | **Coming soon.**                                                                                                                               |
 | History          | **Coming soon.**                                                                                                                               |
 | Sharing          | **Coming soon.**                                                                                                                               |
+
+### Peer inspectors are snapshots, not runtime verdicts
+
+Extensions, Groups and Identity use the same scrollable Content pane as other
+read-only pages. Extensions and Groups take process snapshots on category entry;
+Identity dates each successful local query. Leave and re-enter a category to
+refresh it. Moving focus, scrolling or editing a config file does not
+refresh it. These pages have no mutation keys or clickable command actions.
+
+**Extensions** describes what this process registered, not which Global,
+agent or session instances are active. Registered hooks are actual handlers, not
+declared supported hooks. A missing Global failure record means only “No recorded
+Global install failure,” not healthy or enabled. A client may omit executor-side
+extensions; MCP server runtime status remains on Peer MCP. `/extensions list`
+inspects the current session/responding agent instead of this process catalog.
+
+**Groups** lists loaded creation templates and the current Defaults cache, which
+may differ from YAML. Members retain their configured order, even when an agent
+is not loaded; they are not guaranteed attachments or a running session roster.
+An empty default roster may use the legacy default at session creation. An
+explicitly empty named template attaches no agents. `/groups` lists templates;
+`/new <group>` creates a session and therefore mutates state. The inspector does
+neither and does not hot-reload configuration.
+
+**Identity** reads only the connected Eidetica account's default public key, with a
+fingerprint derived from that same key. Agent/session keys may differ; this is
+not a transport peer ID or an effective session signer. The page never reads
+private key material. It shows Loading while the single local query runs, times
+out after five seconds, and withholds diagnostic text on failure. No local key
+means unavailable, not an authorization refusal. Loading, unavailable and failed
+reads have no capture timestamp; a timestamp describes only a successful public-key
+snapshot, not synchronization or network health.
+
+### Example: inspect extensions and recover a failed identity read
+
+1. In the hub, press `s`, then `5` for Extensions and `Right` for Content. Read
+   `Scope: this process registration catalog`, then use `End` to reach the
+   catalog-versus-effective-activation explanation. An empty catalog says
+   `No registered extensions in this process`; it does not mean zero MCP servers.
+2. To inspect session-specific activation, press `Esc`, return to a conversation,
+   and type `/extensions list` deliberately. No command runs merely by reading
+   its guidance on the Settings page.
+3. Open Peer Settings again, press `7` for Groups, and read ordered template
+   members and `Current default new-session roster`. To inspect without creating
+   a session, leave Settings and use `/groups`, not `/new <group>`.
+4. Press `8` for Identity. For a failed read the body says
+   `Failed to read default public key; diagnostic text withheld`, or
+   `Timed out reading default public key`. No old key is retained as current and
+   no key is generated or imported to fill the page.
+5. Leave/reopen Identity to retry. For an independent inspection, leave Settings
+   and type `/pubkey`; its result may help diagnose the read, but is not an
+   automatic repair. On success, the full public key and `Fingerprint` are
+   reachable in Content, including at 40×8.
 
 ### Example: session override, then peer inspection
 

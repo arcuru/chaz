@@ -238,6 +238,7 @@ crates/lib/src/
     hooks.rs           Per-kind hook trait definitions + HookKind
   extensions/          Built-in extensions (each declares scopes + caps + endpoints)
     mod.rs             all_builtins, BuiltinDeps
+    context_report.rs  /context report + one-shot snapshot context tail
     core.rs            shell, compact, spawn_agent, job_status, job_wait, spawn_worker
     fs.rs              read_file, write_file, edit_file
     system.rs          get_time, calculate, describe_tool

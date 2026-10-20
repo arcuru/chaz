@@ -112,6 +112,7 @@ impl TuiBridge {
         // Buffered so a force-refresh kicked off mid-render doesn't block.
         let (models_tx, mut models_rx) = mpsc::channel::<ModelCatalog>(4);
         let (session_rows_tx, mut session_rows_rx) = mpsc::channel::<SessionLoad>(128);
+        let (peer_pages_tx, mut peer_pages_rx) = mpsc::channel(1);
         let (jobs_tx, mut jobs_rx) = mpsc::channel::<jobs::Loaded>(1);
         // Background tab reads (session reloads, status strip, live-turn
         // counts). Tasks are owned by their tab's slots; the channel adds
@@ -143,6 +144,7 @@ impl TuiBridge {
         let mut needs_draw = true;
         'run: loop {
             operations::cancel_closed_reads(&mut app);
+            peer_pages::update(&mut app, server, &peer_pages_tx);
             if !app.backend_available
                 && reconnect_allowed
                 && runtime_task.is_none()
@@ -215,6 +217,7 @@ impl TuiBridge {
                     Some(msg) = approval_rx.recv() => Action::ApprovalRequest(msg),
                     Some(res) = models_rx.recv() => Action::ModelsFetched(res),
                     Some(load) = session_rows_rx.recv() => Action::SessionLoad(load),
+                    Some(loaded) = peer_pages_rx.recv() => Action::PeerPage(loaded),
                     Some(loaded) = jobs_rx.recv() => Action::JobsLoaded(loaded),
                     _ = activity_tick.tick() => {
                         if app.backend_available {
@@ -660,6 +663,7 @@ impl TuiBridge {
                                 .send(chaz_core::bridge::ApprovalDecision::Deny);
                         }
                     }
+                    Action::PeerPage(loaded) => peer_pages::apply(&mut app, loaded),
                     Action::JobsLoaded(loaded) => jobs::apply_loaded(&mut app, loaded),
                     Action::ModelsFetched(res) => {
                         apply_model_catalog(&mut app, res);
@@ -677,6 +681,8 @@ impl TuiBridge {
                         }
                     },
                 }
+
+                peer_pages::update(&mut app, server, &peer_pages_tx);
 
                 let navigation_after = (
                     app.mode,

@@ -24,6 +24,7 @@ others are runtime hooks that fire around each agent turn.
 | `system`            | Tool                         | `get_time`, `calculate`, `describe_tool`. Small dependency-free helpers.                                                                             |
 | `fs`                | Tool                         | `read_file`, `write_file`, `edit_file`.                                                                                                              |
 | `web`               | Tool                         | `web_fetch`, `web_search`.                                                                                                                           |
+| `context`           | Command                      | `/context`: context-window usage, shared with the agent's next turn. See [Usage](usage.md#context-window-snapshots-context).                         |
 | `memory`            | Command, Tool                | `/memory` + `remember` / `recall` / `list_memory_banks`. See [Memory](memory.md).                                                                    |
 | `skills`            | Command, Tool                | `/skills` + `skill_list` / `skill_search` / `skill_show`, plus the per-session catalog prompt injection.                                             |
 | `schedule`          | Command, Tool                | `/schedule` + `schedule_add` / `schedule_modify` / `schedule_remove` / `schedule_list` / `schedule_once`.                                            |

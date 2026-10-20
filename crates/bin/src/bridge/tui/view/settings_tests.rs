@@ -1022,6 +1022,7 @@ async fn settings_compact_empty_missing_and_static_pages_use_full_content_slot()
                         (SettingsScope::Peer, 0) => "yaml",
                         (SettingsScope::Peer, 2) => "restart.",
                         (SettingsScope::Peer, 8) => "agent groups",
+                        (SettingsScope::Peer, 4 | 6 | 7) => "result",
                         (SettingsScope::Peer, 1 | 3 | 5) => "view-only in v1",
                         (SettingsScope::Session, 0) => "agent)",
                         (SettingsScope::Session, 1) if !missing => "selected",
@@ -1514,6 +1515,641 @@ async fn settings_static_populated_unicode_content_reaches_last_fields_after_ref
             assert_eq!(app.settings_reader.offset, app.settings_reader.max_offset);
             assert_regions(&app, width, height);
         }
+    }
+    server.shutdown().await;
+}
+
+fn peer_snapshot(
+    category: PeerSettingsCategory,
+    data: super::super::peer_pages::Data,
+) -> super::super::peer_pages::Snapshot {
+    super::super::peer_pages::Snapshot { category, data }
+}
+
+/// Walk every wrapped body row in real frames, not a standalone Paragraph.
+fn peer_read_all(
+    terminal: &mut Terminal<TestBackend>,
+    app: &mut App,
+    server: &Arc<Server>,
+    backend: &BackendManager,
+) -> String {
+    key(app, KeyCode::Home);
+    let mut seen = String::new();
+    loop {
+        draw(terminal, app, server, backend);
+        let viewport = app.settings_reader.viewport.unwrap();
+        let end = if app.settings_reader.offset == app.settings_reader.max_offset {
+            viewport.bottom()
+        } else {
+            viewport.y + 1
+        };
+        for y in viewport.y..end {
+            for x in viewport.x..viewport.right() {
+                seen.push_str(terminal.backend().buffer()[(x, y)].symbol());
+            }
+            seen.push('\n');
+        }
+        let before = app.settings_reader.offset;
+        key(app, KeyCode::Down);
+        if app.settings_reader.offset == before {
+            break;
+        }
+    }
+    seen
+}
+
+#[tokio::test]
+async fn settings_peer_inspector_full_frames_states_scopes_and_redaction() {
+    use super::super::peer_pages::{Data, Extension, ReadFailure};
+    let (_instance, server, backend, mut app) = fixture().await;
+    let public = server.registry().default_pubkey().await.unwrap();
+    let public_text = public.to_prefixed_string();
+    let fingerprint = chaz_core::security::approval_display::pubkey_fingerprint(&public);
+    // These excluded fields must not leak through a page or its display snapshot.
+    app.active_mut()
+        .entries
+        .push(chaz_core::session::SessionEntry {
+            content: "SECRET_TRANSCRIPT".into(),
+            sender: "SECRET_SENDER".into(),
+            timestamp: chrono::Utc::now(),
+            entry_type: EntryType::Message,
+            metadata: None,
+            routing: None,
+        });
+    let cases = vec![
+        (
+            4,
+            Data::Extensions(vec![
+                Extension {
+                    name: "core".into(),
+                    reference: Some(("Builtin", "v-test".into())),
+                    hooks: vec!["ToolCall".into()],
+                    tools: vec!["FINAL_E_TOOL".into()],
+                    commands: vec!["FINAL_E_COMMAND".into()],
+                    global_failed: true,
+                },
+                Extension {
+                    name: "memory".into(),
+                    reference: None,
+                    hooks: vec![],
+                    tools: vec![],
+                    commands: vec![],
+                    global_failed: false,
+                },
+            ]),
+            vec![
+                "Registered extensions: 2",
+                "Reference: Builtin",
+                "FINAL_E_TOOL",
+                "FINAL_E_COMMAND",
+                "Reference unavailable",
+                "No recorded Global install failure",
+                "Global install failed",
+                "Catalog only.",
+                "not process-wide activity",
+            ],
+        ),
+        (
+            4,
+            Data::Extensions(vec![]),
+            vec![
+                "Registered extensions: 0",
+                "No registered extensions in this process",
+            ],
+        ),
+        (
+            6,
+            Data::Groups {
+                templates: vec![
+                    (
+                        "research".into(),
+                        Some(vec!["alpha".into(), "not-loaded".into()]),
+                    ),
+                    ("quiet".into(), Some(vec![])),
+                    ("missing".into(), None),
+                ],
+                defaults: vec!["cache-not-yaml".into()],
+            },
+            vec![
+                "Named templates: 3",
+                "1. alpha",
+                "2. not-loaded",
+                "Empty roster template",
+                "Roster template unavailable",
+                "cache-not-yaml",
+                "not live groups or the current session roster",
+            ],
+        ),
+        (
+            6,
+            Data::Groups {
+                templates: vec![],
+                defaults: vec![],
+            },
+            vec!["No named groups loaded", "creation may use legacy default"],
+        ),
+        (
+            7,
+            Data::Identity(Ok(public.into())),
+            vec![
+                "Default public key:",
+                "Fingerprint:",
+                "Default account public key;",
+                "agent/session keys may differ.",
+            ],
+        ),
+        (
+            7,
+            Data::Identity(Err(ReadFailure::Unavailable)),
+            vec![
+                "Default public key unavailable: no local key",
+                "Fingerprint unavailable",
+            ],
+        ),
+        (
+            7,
+            Data::Identity(Err(ReadFailure::Failed)),
+            vec![
+                "Failed to read default public key",
+                "Fingerprint unavailable",
+            ],
+        ),
+        (
+            7,
+            Data::Identity(Err(ReadFailure::Timeout)),
+            vec![
+                "Timed out reading default public key",
+                "Fingerprint unavailable",
+            ],
+        ),
+        (7, Data::Loading, vec!["Loading default public key"]),
+    ];
+    for (index, data, required) in cases {
+        let successful = matches!(
+            &data,
+            Data::Extensions(_) | Data::Groups { .. } | Data::Identity(Ok(_))
+        );
+        let category = PeerSettingsCategory::ALL[index];
+        app.peer_pages.snapshot = Some(peer_snapshot(category, data));
+        for (w, h) in [(80, 24), (64, 14), (40, 8), (120, 40)] {
+            open(&mut app, SettingsScope::Peer, index);
+            let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+            draw(&mut terminal, &mut app, &server, &backend);
+            key(&mut app, KeyCode::Right);
+            assert_eq!(app.settings_focus, SettingsFocus::Content);
+            let seen = peer_read_all(&mut terminal, &mut app, &server, &backend);
+            // Removing wrapping whitespace also checks long labels at width40.
+            let flat = seen.split_whitespace().collect::<Vec<_>>().join(" ");
+            for label in &required {
+                assert!(flat.contains(label), "{index}/{w} missing {label}: {flat}");
+            }
+            let scope = match index {
+                4 => "Scope: this process registration catalog",
+                6 => "Scope: loaded new-session roster templates",
+                7 => "Scope: connected account default public key",
+                _ => unreachable!(),
+            };
+            assert!(flat.contains(scope), "{index}/{w}: {flat}");
+            if successful {
+                let freshness = if index == 7 {
+                    "Freshness: local query snapshot at"
+                } else {
+                    "Freshness: process snapshot"
+                };
+                assert!(flat.contains(freshness), "{index}/{w}: {flat}");
+                assert!(flat.contains("reopen to refresh"), "{index}/{w}: {flat}");
+            } else {
+                assert!(!flat.contains("snapshot at"), "{index}/{w}: {flat}");
+                assert!(!flat.contains("2026-01-01"), "{index}/{w}: {flat}");
+            }
+            assert!(flat.contains("existing command's result"));
+            assert!(!flat.contains("coming soon"));
+            for secret in ["SECRET_TRANSCRIPT", "SECRET_SENDER"] {
+                assert!(!seen.contains(secret));
+            }
+            assert_regions(&app, w, h);
+            assert!(
+                !app.click_regions
+                    .iter()
+                    .any(|r| matches!(r.target, ClickTarget::SettingsDetailRow(_)))
+            );
+            for code in [
+                KeyCode::Enter,
+                KeyCode::Char('a'),
+                KeyCode::Char('d'),
+                KeyCode::Char('r'),
+                KeyCode::Char('R'),
+            ] {
+                assert!(
+                    matches!(key(&mut app, code), input::SettingsKey::None),
+                    "read-only {index}: {code:?}"
+                );
+                assert!(
+                    app.settings_prompt.is_none()
+                        && app.settings_picker.is_none()
+                        && app.agent_diff.is_none()
+                );
+            }
+        }
+        if let Some(super::super::peer_pages::Snapshot {
+            data: Data::Identity(Ok(identity)),
+            ..
+        }) = &app.peer_pages.snapshot
+        {
+            assert_eq!(identity.key, public_text);
+            assert_eq!(identity.fingerprint, fingerprint);
+        }
+    }
+    // Missing and mismatched page snapshots are unavailable, never zero/healthy.
+    for index in [4, 6, 7] {
+        for wrong in [false, true] {
+            app.peer_pages.snapshot =
+                wrong.then(|| peer_snapshot(PeerSettingsCategory::About, Data::Loading));
+            open(&mut app, SettingsScope::Peer, index);
+            let mut terminal = Terminal::new(TestBackend::new(40, 8)).unwrap();
+            draw(&mut terminal, &mut app, &server, &backend);
+            key(&mut app, KeyCode::Right);
+            let seen = peer_read_all(&mut terminal, &mut app, &server, &backend);
+            assert!(seen.contains("Page snapshot unavailable"));
+            assert!(!seen.contains("Registered extensions: 0") && !seen.contains("coming soon"));
+        }
+    }
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn settings_peer_inspector_long_fields_wheel_resize_and_modal_ownership() {
+    use super::super::peer_pages::{Data, Extension};
+    let (_instance, server, backend, mut app) = fixture().await;
+    let public = server.registry().default_pubkey().await.unwrap();
+    let public_text = public.to_prefixed_string();
+    let fingerprint = chaz_core::security::approval_display::pubkey_fingerprint(&public);
+    let cases = vec![
+        (
+            4,
+            Data::Extensions(vec![Extension {
+                name: "core".into(),
+                reference: None,
+                hooks: vec!["ToolCall".into()],
+                tools: (0..100)
+                    .map(|i| format!("tool-{i:03}"))
+                    .chain(["FINAL_E_TOOL".into()])
+                    .collect(),
+                commands: vec!["FINAL_E_COMMAND".into()],
+                global_failed: true,
+            }]),
+            vec![
+                "FINAL_E_TOOL".to_string(),
+                "FINAL_E_COMMAND".into(),
+                "Global install failed".into(),
+            ],
+        ),
+        (
+            6,
+            Data::Groups {
+                templates: vec![(
+                    "research".into(),
+                    Some(
+                        (0..100)
+                            .map(|i| format!("member-{i:03}"))
+                            .chain(["FINAL_G_MEMBER".into()])
+                            .collect(),
+                    ),
+                )],
+                defaults: vec!["FINAL_G_DEFAULT".into()],
+            },
+            vec!["FINAL_G_MEMBER".into(), "FINAL_G_DEFAULT".into()],
+        ),
+        (
+            7,
+            Data::Identity(Ok(public.into())),
+            vec![public_text.clone(), fingerprint],
+        ),
+    ];
+    for (index, data, required) in cases {
+        open(&mut app, SettingsScope::Peer, index);
+        app.peer_pages.snapshot = Some(peer_snapshot(PeerSettingsCategory::ALL[index], data));
+        app.settings_focus = SettingsFocus::Content;
+        app.input = "preserved draft".into();
+        app.active_mut().scroll_offset = 7;
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        for (w, h) in [
+            (80, 24),
+            (40, 8),
+            (39, 7),
+            (120, 40),
+            (80, 24),
+            (0, 0),
+            (1, 1),
+            (15, 8),
+            (16, 8),
+            (17, 8),
+            (64, 14),
+        ] {
+            terminal.backend_mut().resize(w, h);
+            terminal.resize(Rect::new(0, 0, w, h)).unwrap();
+            let before = app.settings_reader.offset;
+            draw(&mut terminal, &mut app, &server, &backend);
+            if w < 40 || h < 8 {
+                assert!(app.click_regions.is_empty() && app.settings_reader.viewport.is_none());
+                for code in [KeyCode::Enter, KeyCode::Down, KeyCode::End] {
+                    assert!(matches!(key(&mut app, code), input::SettingsKey::None));
+                }
+                assert_eq!(app.settings_reader.offset, before);
+            } else {
+                let seen = peer_read_all(&mut terminal, &mut app, &server, &backend);
+                // Keys/fingerprints may split mid-word; concatenate cells without whitespace.
+                let compact = seen.split_whitespace().collect::<String>();
+                for field in &required {
+                    assert!(
+                        compact.contains(&field.split_whitespace().collect::<String>()),
+                        "{index}/{w} missing {field}"
+                    );
+                }
+                assert_eq!(app.settings_reader.offset, app.settings_reader.max_offset);
+                let tail = draw(&mut terminal, &mut app, &server, &backend);
+                assert!(contains(&tail, "result"));
+                key(&mut app, KeyCode::PageUp);
+                assert!(
+                    app.settings_reader.max_offset == 0
+                        || app.settings_reader.offset < app.settings_reader.max_offset
+                );
+                key(&mut app, KeyCode::PageDown);
+                assert_eq!(app.settings_reader.offset, app.settings_reader.max_offset);
+                key(&mut app, KeyCode::Home);
+                draw(&mut terminal, &mut app, &server, &backend);
+                let viewport = app.settings_reader.viewport.unwrap();
+                for y in [viewport.y, viewport.bottom() - 1] {
+                    for _ in 0..(app.settings_reader.max_offset + 1) {
+                        send_mouse(&mut app, MouseEventKind::ScrollDown, viewport.x, y);
+                    }
+                    draw(&mut terminal, &mut app, &server, &backend);
+                    assert_eq!(app.settings_reader.offset, app.settings_reader.max_offset);
+                    key(&mut app, KeyCode::Home);
+                }
+            }
+            assert_regions(&app, w, h);
+            assert_eq!(app.peer_settings_index, index);
+            assert_eq!(app.active().scroll_offset, 7);
+            assert_eq!(app.input, "preserved draft");
+        }
+        // A visible approval retains input ownership over the read-only page.
+        let rx = approval(&mut app);
+        draw(&mut terminal, &mut app, &server, &backend);
+        deny(&mut app, false, rx).await;
+        key(&mut app, KeyCode::Tab);
+        assert_eq!(app.settings_reader.offset, 0);
+    }
+    server.shutdown().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn settings_peer_inspector_entry_queries_cancel_timeout_and_reject_old_results() {
+    use super::super::peer_pages::{self, Data};
+    let (_instance, server, backend, mut app) = fixture().await;
+    let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+    open(&mut app, SettingsScope::Peer, 7);
+    peer_pages::update(&mut app, &server, &tx);
+    assert!(matches!(
+        app.peer_pages.snapshot.as_ref().unwrap().data,
+        Data::Loading
+    ));
+    let old = rx.recv().await.unwrap();
+    // A category change invalidates the old read even after returning to Identity.
+    app.set_settings_index(SettingsScope::Peer, 4);
+    peer_pages::update(&mut app, &server, &tx);
+    assert!(matches!(
+        app.peer_pages.snapshot.as_ref().unwrap().data,
+        Data::Extensions(_)
+    ));
+    app.set_settings_index(SettingsScope::Peer, 7);
+    peer_pages::update(&mut app, &server, &tx);
+    peer_pages::apply(&mut app, old);
+    assert!(matches!(
+        app.peer_pages.snapshot.as_ref().unwrap().data,
+        Data::Loading
+    ));
+    peer_pages::apply(&mut app, rx.recv().await.unwrap());
+    assert!(matches!(
+        app.peer_pages.snapshot.as_ref().unwrap().data,
+        Data::Identity(Ok(_))
+    ));
+    // Render, focus and scroll events issue no queries.
+    let mut terminal = Terminal::new(TestBackend::new(40, 8)).unwrap();
+    for _ in 0..20 {
+        draw(&mut terminal, &mut app, &server, &backend);
+        key(&mut app, KeyCode::Right);
+        key(&mut app, KeyCode::Down);
+        peer_pages::update(&mut app, &server, &tx);
+    }
+    tokio::task::yield_now().await;
+    assert!(rx.try_recv().is_err());
+    // Block the existing user lock, not an invented backend: one read times out.
+    app.close_settings();
+    peer_pages::update(&mut app, &server, &tx);
+    let registry = server.registry_arc();
+    let guard = registry.user_lock().await;
+    open(&mut app, SettingsScope::Peer, 7);
+    peer_pages::update(&mut app, &server, &tx);
+    tokio::task::yield_now().await;
+    tokio::time::advance(std::time::Duration::from_secs(5)).await;
+    peer_pages::apply(&mut app, rx.recv().await.unwrap());
+    assert!(matches!(
+        app.peer_pages.snapshot.as_ref().unwrap().data,
+        Data::Identity(Err(peer_pages::ReadFailure::Timeout))
+    ));
+    // No retry until re-entry, even with a burst of matching notifications.
+    for _ in 0..20 {
+        peer_pages::update(&mut app, &server, &tx);
+    }
+    assert!(rx.try_recv().is_err());
+    app.close_settings();
+    peer_pages::update(&mut app, &server, &tx);
+    open(&mut app, SettingsScope::Peer, 7);
+    peer_pages::update(&mut app, &server, &tx);
+    app.close_settings();
+    peer_pages::update(&mut app, &server, &tx);
+    drop(guard);
+    tokio::task::yield_now().await;
+    assert!(rx.try_recv().is_err());
+    // Server replacement at the same category invalidates a completed result.
+    open(&mut app, SettingsScope::Peer, 7);
+    peer_pages::update(&mut app, &server, &tx);
+    let old = rx.recv().await.unwrap();
+    let (_instance2, server2, _backend2, _app2) = fixture().await;
+    peer_pages::update(&mut app, &server2, &tx);
+    peer_pages::apply(&mut app, old);
+    assert!(matches!(
+        app.peer_pages.snapshot.as_ref().unwrap().data,
+        Data::Loading
+    ));
+    peer_pages::apply(&mut app, rx.recv().await.unwrap());
+    assert!(matches!(
+        app.peer_pages.snapshot.as_ref().unwrap().data,
+        Data::Identity(Ok(_))
+    ));
+    server.shutdown().await;
+    server2.shutdown().await;
+}
+
+#[tokio::test]
+async fn settings_peer_inspector_collects_actual_catalog_and_loaded_templates_only() {
+    use super::super::peer_pages::{self, Data};
+    use chaz_core::extension::{
+        Extension, ExtensionRef, HookKind, Scope, ScopeCtx, instance::InstantiateFuture,
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    struct CatalogExt {
+        name: &'static str,
+        calls: Arc<AtomicUsize>,
+        global: bool,
+    }
+    impl Extension for CatalogExt {
+        fn name(&self) -> &'static str {
+            self.name
+        }
+        fn supported_hooks(&self) -> &[HookKind] {
+            &[HookKind::Tool]
+        }
+        fn extension_ref(&self) -> ExtensionRef {
+            ExtensionRef::Git {
+                name: self.name.into(),
+                repo: "SECRET_TICKET_URL".into(),
+                sha: "v-public".into(),
+            }
+        }
+        fn default_settings(&self) -> serde_json::Value {
+            serde_json::json!({"api_token":"SECRET_TOKEN","private_key":"SECRET_PRIVATE_KEY"})
+        }
+        fn scopes(&self) -> &[Scope] {
+            if self.global {
+                &[Scope::Global]
+            } else {
+                &[Scope::PerAgent]
+            }
+        }
+        fn instantiate<'a>(&'a self, _ctx: ScopeCtx<'a>) -> InstantiateFuture<'a> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Err(anyhow::anyhow!("SECRET_INSTALL_ERROR")) })
+        }
+    }
+    let calls = Arc::new(AtomicUsize::new(0));
+    let (_instance, server, backend, mut app) = super::list_tests::fixture_with_extensions(
+        None,
+        vec![
+            Arc::new(CatalogExt {
+                name: "z_lazy",
+                calls: calls.clone(),
+                global: false,
+            }),
+            Arc::new(CatalogExt {
+                name: "a_failed",
+                calls: calls.clone(),
+                global: true,
+            }),
+            Arc::new(chaz_core::extensions::system::SystemExtension),
+        ],
+    )
+    .await;
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    server.set_agent_groups(std::collections::HashMap::from([
+        (
+            "research".into(),
+            vec!["beta".into(), "alpha".into(), "not-loaded".into()],
+        ),
+        ("quiet".into(), vec![]),
+    ]));
+    server.set_default_agents(vec!["cache-not-yaml".into()]);
+    let config: Config = serde_yaml::from_str(
+        "backends:\n  - type: openaicompatible\n    api_key: SECRET_TOKEN\n    api_base: SECRET_URL\n    config_dir: SECRET_PRIVATE_KEY\ndefault_agents: [yaml-not-cache]\n",
+    ).unwrap();
+    let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+    for index in [4, 6, 7] {
+        open(&mut app, SettingsScope::Peer, index);
+        peer_pages::update(&mut app, &server, &tx);
+        if index == 7 {
+            peer_pages::apply(&mut app, rx.recv().await.unwrap());
+        }
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        draw(&mut terminal, &mut app, &server, &backend);
+        app.settings_focus = SettingsFocus::Content;
+        let seen = peer_read_all(&mut terminal, &mut app, &server, &backend);
+        match &app.peer_pages.snapshot.as_ref().unwrap().data {
+            Data::Extensions(entries) => {
+                assert_eq!(
+                    entries.iter().map(|e| e.name.as_str()).collect::<Vec<_>>(),
+                    ["a_failed", "system", "z_lazy"]
+                );
+                assert!(entries[0].global_failed);
+                assert!(!entries[1].global_failed && !entries[2].global_failed);
+                for entry in [&entries[0], &entries[2]] {
+                    assert!(entry.hooks.is_empty() && entry.tools.is_empty());
+                }
+                assert_eq!(entries[1].hooks, ["Tool"]);
+                assert_eq!(entries[1].tools, ["calculate", "describe_tool", "get_time"]);
+                assert!(seen.contains("Registered extensions: 3"));
+                assert!(seen.contains("No registered hooks") && seen.contains("get_time"));
+            }
+            Data::Groups {
+                templates,
+                defaults,
+            } => {
+                assert_eq!(templates[0], ("quiet".into(), Some(vec![])));
+                assert_eq!(
+                    templates[1].1,
+                    Some(vec!["beta".into(), "alpha".into(), "not-loaded".into()])
+                );
+                assert_eq!(defaults, &["cache-not-yaml"]);
+                assert!(
+                    seen.split_whitespace()
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                        .contains("not live groups or the current session roster")
+                );
+            }
+            Data::Identity(Ok(_)) => assert!(seen.contains("Default public key:")),
+            other => panic!("unexpected {other:?}"),
+        }
+        let snapshot = format!("{:?}", app.peer_pages.snapshot.as_ref().unwrap().data);
+        for secret in [
+            "SECRET_TOKEN",
+            "SECRET_PRIVATE_KEY",
+            "SECRET_TICKET_URL",
+            "SECRET_INSTALL_ERROR",
+        ] {
+            assert!(!snapshot.contains(secret));
+        }
+        key(&mut app, KeyCode::Home);
+        // Render with actual secret-bearing excluded config, not an absent sentinel.
+        loop {
+            terminal
+                .draw(|f| ui(f, &mut app, &server, &backend, &config))
+                .unwrap();
+            let rendered = format!("{:?}", terminal.backend().buffer());
+            for secret in [
+                "SECRET_TOKEN",
+                "SECRET_PRIVATE_KEY",
+                "SECRET_TICKET_URL",
+                "SECRET_INSTALL_ERROR",
+                "SECRET_URL",
+            ] {
+                assert!(!rendered.contains(secret));
+            }
+            let before = app.settings_reader.offset;
+            key(&mut app, KeyCode::Down);
+            if before == app.settings_reader.offset {
+                break;
+            }
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "inspecting must not instantiate"
+        );
+        // A responding-agent/cache change does not turn the process catalog into an active set.
+        app.active_mut().current_agent = "other-agent".into();
+        peer_pages::update(&mut app, &server, &tx);
+        assert!(rx.try_recv().is_err());
     }
     server.shutdown().await;
 }

@@ -13,7 +13,8 @@ use crate::runtime::ResponseMetadata;
 use crate::session::{
     BridgeKind, EntryType, Session, SessionEntry, SessionRegistry, SessionStatus,
 };
-use calls::{CallEvidence, estimated_cost, reported_fields};
+pub(crate) use calls::reported_fields;
+use calls::{CallEvidence, estimated_cost};
 pub use calls::{CallObservation, EstimatedUsage, UsageCoverage};
 pub(crate) use calls::{SUMMARY_ID, mark_usage_fields, persist as persist_call};
 use chrono::{DateTime, Utc};

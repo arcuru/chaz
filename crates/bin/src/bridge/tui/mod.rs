@@ -40,6 +40,7 @@ mod bridge_impl;
 mod input;
 mod jobs;
 mod operations;
+mod peer_pages;
 #[cfg(test)]
 mod readiness_tests;
 mod reconnect;
@@ -73,6 +74,7 @@ enum Action {
     /// list (already merged with cache); `Err` carries a display message.
     ModelsFetched(ModelCatalog),
     SessionLoad(SessionLoad),
+    PeerPage(peer_pages::Loaded),
     JobsLoaded(jobs::Loaded),
     /// A background tab read finished (see [`refresh`]).
     Refresh(refresh::Refresh),
@@ -183,8 +185,7 @@ impl SettingsReader {
 }
 
 /// Categories listed in the Peer Settings sidebar. Ordering here is the
-/// display order. Stage 1 leaves every category as a `(coming soon)`
-/// placeholder; subsequent stages fill in the detail panes.
+/// display order; read-only inspectors share the Content reader.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum PeerSettingsCategory {
     Agents,
@@ -751,6 +752,7 @@ pub(super) struct App {
     /// active tab). Lets the Session-side category renderers read the meta
     /// without doing async work mid-frame. `None` outside Session Settings.
     pub(super) session_settings_snapshot: Option<SessionMetaSnapshot>,
+    peer_pages: peer_pages::Pages,
     /// Sub-cursor inside the Peer → Agents list. Cycles with ↑↓ while
     /// that category is selected; clamped each frame to the live agent
     /// count. Persists across category switches so the user lands back
@@ -896,6 +898,7 @@ impl App {
             model_picker_scope: ModelPickerScope::Session,
             model_picker_current_pin: None,
             session_settings_snapshot: None,
+            peer_pages: peer_pages::Pages::default(),
             settings_return: None,
             peer_settings_index: 0,
             session_settings_index: 0,
