@@ -3,6 +3,9 @@
 #[path = "job_monitor_tests.rs"]
 mod job_monitor_tests;
 
+#[path = "job_authority_tests.rs"]
+mod job_authority_tests;
+
 #[path = "native_steering_tests.rs"]
 mod native_steering_tests;
 
