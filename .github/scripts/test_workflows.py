@@ -117,22 +117,51 @@ class Workflows(unittest.TestCase):
                 self.assertEqual(result.returncode, 42, result.stderr)
                 self.assertEqual(len(invocations), fail_call)
 
-    def test_checks_share_one_bounded_build_graph(self):
+    def test_checks_share_one_build_graph_per_platform(self):
         for event in ("pull_request", "merge_group", "push", "workflow_dispatch"):
             with self.subTest(event=event):
                 result, args = self.run_checks(event)
                 self.assertEqual(result.returncode, 0, result.stderr)
-                expected = [
-                    "build", "--no-link", "--keep-going", "--max-jobs", "2", "--cores", "0",
-                    ".#checks.x86_64-linux.lint",
-                    ".#checks.x86_64-linux.treefmt",
-                    ".#checks.x86_64-linux.ci-policy",
-                    ".#checks.x86_64-linux.test",
-                    ".#checks.x86_64-linux.build",
-                ]
-                if event in ("push", "workflow_dispatch"):
-                    expected.append(".#checks.x86_64-linux.doc")
-                self.assertEqual(args, expected)
+                main = event in ("push", "workflow_dispatch")
+                system = "x86_64-linux" if main else "aarch64-linux"
+                names = ["lint", "treefmt", "ci-policy", "test", "build"]
+                if main:
+                    names.append("doc")
+                limits = ["--max-jobs", "2", "--cores", "0"] if main else []
+                self.assertEqual(args, [
+                    "build", "--no-link", "--keep-going", *limits,
+                    *(f".#checks.{system}.{name}" for name in names),
+                ])
+
+    def test_pull_requests_check_on_the_persistent_arm_runner(self):
+        # GitHub evaluates these; pin the main/other split and both platforms.
+        job = self.ci["jobs"]["ci"]
+        self.assertEqual(
+            expression(job["runs-on"]),
+            f"${{{{ fromJSON(({FULL_COVERAGE}) && "
+            "'\"ubicloud-standard-8\"' || "
+            "'[\"self-hosted\", \"Linux\", \"ARM64\", \"zinc\", \"nix\"]') }}",
+        )
+        self.assertEqual(
+            expression(job["timeout-minutes"]),
+            f"${{{{ ({FULL_COVERAGE}) && 30 || 60 }}}}",
+        )
+        # The ARM runner's preinstalled daemon and store are reused as an
+        # untrusted client: only hosted main installs Nix.
+        steps = {step["name"]: step for step in job["steps"]}
+        self.assertEqual(list(steps), ["Checkout", "Setup Nix", "Checks"])
+        self.assertEqual(steps["Checkout"]["with"]["persist-credentials"], "false")
+        self.assertEqual(steps["Setup Nix"]["if"], FULL_COVERAGE)
+        self.assertEqual(steps["Setup Nix"]["uses"], "./.github/actions/setup-nix")
+        self.assertNotIn("with", steps["Setup Nix"])
+        for forbidden in ("sudo", "--option"):
+            self.assertNotIn(forbidden, steps["Checks"]["run"])
+
+    def test_publishing_stays_on_hosted_x86_runners(self):
+        publish = self.publish["jobs"]["push-cache"]
+        self.assertEqual(publish["runs-on"], "ubicloud-standard-8")
+        self.assertIn(".#packages.x86_64-linux.default", yaml.safe_dump(publish))
+        self.assertEqual(self.e2e["jobs"]["e2e"]["runs-on"], "ubicloud-standard-8")
 
     def test_checks_propagate_build_failure(self):
         result, _ = self.run_checks("pull_request", exit_code=42)

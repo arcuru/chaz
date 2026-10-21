@@ -28,36 +28,52 @@ concurrency:
 jobs:
   ci:
     name: CI
-    runs-on: ubicloud-standard-8
-    timeout-minutes: 30
+    # Pull requests and merge-queue runs check on the native ARM64 runner. Its
+    # one Nix store persists across jobs, so unchanged outputs are reused rather
+    # than rebuilt or restored; its preinstalled daemon owns substituters and
+    # build limits, and jobs are untrusted clients with no publishing
+    # credentials. Main (push or manual) checks stay on hosted x86_64 runners
+    # ahead of Publish, which builds and caches that platform.
+    runs-on: >-
+      ${{ fromJSON((github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
+          '"ubicloud-standard-8"' ||
+          '["self-hosted", "Linux", "ARM64", "zinc", "nix"]') }}
+    # The ARM runner needs room for a cold store; later runs reuse its outputs.
+    timeout-minutes: >-
+      ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && 30 || 60 }}
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
 
+      # The ARM runner provides Nix; hosted runners install it fresh.
       - name: Setup Nix
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
         uses: ./.github/actions/setup-nix
 
       # One graph shares dependency work and lets independent checks overlap.
-      # Allow two builds at once, each using all cores so a dependency build
-      # running alone can use the whole runner.
+      # Hosted main allows two builds at once, each using all cores so a
+      # dependency build running alone can use the whole runner. The ARM
+      # runner's Nix configuration sets concurrency for its memory instead.
       - name: Checks
         env:
           CI_EVENT_NAME: ${{ github.event_name }}
         run: |
-          checks=(
-            '.#checks.x86_64-linux.lint'
-            '.#checks.x86_64-linux.treefmt'
-            '.#checks.x86_64-linux.ci-policy'
-            '.#checks.x86_64-linux.test'
-            '.#checks.x86_64-linux.build'
-          )
+          system=aarch64-linux
+          limits=()
+          names=(lint treefmt ci-policy test build)
           # PRs retain normal Cargo tests, including doctests.
           if [[ "$CI_EVENT_NAME" == push || "$CI_EVENT_NAME" == workflow_dispatch ]]; then
-            checks+=('.#checks.x86_64-linux.doc')
+            system=x86_64-linux
+            limits=(--max-jobs 2 --cores 0)
+            names+=(doc)
           fi
-          nix build --no-link --keep-going --max-jobs 2 --cores 0 "${checks[@]}"
+          checks=()
+          for name in "${names[@]}"; do
+            checks+=(".#checks.$system.$name")
+          done
+          nix build --no-link --keep-going "${limits[@]}" "${checks[@]}"
 
   publish:
     name: Publish
