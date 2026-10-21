@@ -4,6 +4,7 @@
 //! still compiled as the `tests` submodule (module path unchanged).
 
 use super::*;
+use crate::mcp::test_support::start_initialized;
 use crate::tool::ToolError;
 
 // ================================================================
@@ -120,6 +121,7 @@ fn make_test_server(name: &str) -> McpServer {
     McpServer {
         name: name.to_string(),
         transport: Transport::new_http("http://unused"),
+        closed: AtomicBool::new(false),
         next_id: AtomicU64::new(1),
         default_policy: None,
         tools_changed: AtomicBool::new(false),
@@ -877,7 +879,7 @@ while True:
     };
 
     // Start the server (runs initialize handshake)
-    let server = McpServer::start(&config)
+    let server = start_initialized(&config)
         .await
         .expect("Failed to start MCP server");
 
@@ -960,7 +962,7 @@ while True:
         startup_timeout_secs: crate::config::default_mcp_startup_timeout_secs(),
     };
 
-    let server = McpServer::start(&config)
+    let server = start_initialized(&config)
         .await
         .expect("Failed to start MCP server");
     // Populate metadata so call_tool can find the tool
@@ -1012,7 +1014,7 @@ while True:
         startup_timeout_secs: crate::config::default_mcp_startup_timeout_secs(),
     };
 
-    let server = McpServer::start(&config).await.unwrap();
+    let server = start_initialized(&config).await.unwrap();
     // Next request should fail with a process-death error
     let err = server
         .send_request("tools/list", json!({}))
@@ -1098,7 +1100,7 @@ async fn http_post_init_carries_mcp_protocol_version_header() {
         .mount(&mock)
         .await;
 
-    let _server = McpServer::start(&http_config(&mock.uri())).await.unwrap();
+    let _server = start_initialized(&http_config(&mock.uri())).await.unwrap();
     // wiremock's Drop verifies each Mock's `.expect(1)`.
 
     // Also confirm chaz actually sent some `MCP-Protocol-Version`
@@ -1180,7 +1182,7 @@ async fn http_404_on_tool_call_triggers_reinit_and_retry() {
         .mount(&mock)
         .await;
 
-    let server = McpServer::start(&http_config(&mock.uri())).await.unwrap();
+    let server = start_initialized(&http_config(&mock.uri())).await.unwrap();
 
     // Seed a session ID so the 404 path triggers (drop-session
     // logic only fires when a session was previously cached;
@@ -1231,7 +1233,7 @@ async fn http_404_without_session_propagates_as_plain_error() {
         .mount(&mock)
         .await;
 
-    let server = McpServer::start(&http_config(&mock.uri())).await.unwrap();
+    let server = start_initialized(&http_config(&mock.uri())).await.unwrap();
     // No session seeding — should NOT recover from this 404.
     let err = server.call_tool("echo", json!({})).await.unwrap_err();
     assert!(
@@ -1301,7 +1303,7 @@ async fn http_initialize_captures_advertised_capabilities() {
         .mount(&mock)
         .await;
 
-    let server = McpServer::start(&http_config(&mock.uri())).await.unwrap();
+    let server = start_initialized(&http_config(&mock.uri())).await.unwrap();
     let caps = server.capabilities();
     assert!(caps.tools, "server advertised tools");
     assert!(caps.resources, "server advertised resources");
@@ -1355,7 +1357,7 @@ async fn http_resources_list_parses_server_response() {
         .mount(&mock)
         .await;
 
-    let server = McpServer::start(&http_config(&mock.uri())).await.unwrap();
+    let server = start_initialized(&http_config(&mock.uri())).await.unwrap();
     let got = server.list_resources().await.unwrap();
     assert_eq!(got.len(), 2);
     assert_eq!(got[0].uri, "file:///etc/hosts");
@@ -1408,7 +1410,7 @@ async fn http_resources_read_concatenates_text_and_describes_blobs() {
         .mount(&mock)
         .await;
 
-    let server = McpServer::start(&http_config(&mock.uri())).await.unwrap();
+    let server = start_initialized(&http_config(&mock.uri())).await.unwrap();
     let out = server.read_resource("file:///a").await.unwrap();
     assert!(out.contains("first line"));
     assert!(out.contains("second line"));
@@ -1466,7 +1468,7 @@ async fn http_prompts_list_parses_arguments() {
         .mount(&mock)
         .await;
 
-    let server = McpServer::start(&http_config(&mock.uri())).await.unwrap();
+    let server = start_initialized(&http_config(&mock.uri())).await.unwrap();
     let got = server.list_prompts().await.unwrap();
     assert_eq!(got.len(), 1);
     assert_eq!(got[0].name, "summarize");
@@ -1524,7 +1526,7 @@ async fn http_prompts_get_renders_messages() {
         .mount(&mock)
         .await;
 
-    let server = McpServer::start(&http_config(&mock.uri())).await.unwrap();
+    let server = start_initialized(&http_config(&mock.uri())).await.unwrap();
     let out = server
         .get_prompt("summarize", serde_json::Map::new())
         .await
@@ -1559,7 +1561,7 @@ async fn http_build_capability_tools_skips_unavailable_primitives() {
         .mount(&mock)
         .await;
 
-    let server = Arc::new(McpServer::start(&http_config(&mock.uri())).await.unwrap());
+    let server = Arc::new(start_initialized(&http_config(&mock.uri())).await.unwrap());
     let extras = build_capability_tools(server, "fakefs");
     assert!(
         extras.is_empty(),
@@ -1593,11 +1595,41 @@ async fn http_build_capability_tools_adds_resource_and_prompt_wrappers() {
         .mount(&mock)
         .await;
 
-    let server = Arc::new(McpServer::start(&http_config(&mock.uri())).await.unwrap());
+    let server = Arc::new(start_initialized(&http_config(&mock.uri())).await.unwrap());
     let extras = build_capability_tools(server, "fakefs");
     let names: Vec<String> = extras.iter().map(|t| t.descriptor().name).collect();
     assert!(names.contains(&"fakefs__list_resources".to_string()));
     assert!(names.contains(&"fakefs__read_resource".to_string()));
     assert!(names.contains(&"fakefs__list_prompts".to_string()));
     assert!(names.contains(&"fakefs__get_prompt".to_string()));
+}
+
+#[tokio::test]
+async fn cancelled_recovery_handshake_keeps_the_new_child_owned_but_terminal() {
+    use crate::mcp::test_support::Fixture;
+    let f = Fixture::new("restart-hang-init");
+    let server = Arc::new(McpServer::start(&f.config).unwrap());
+    server.initialize().await.unwrap();
+    server.discover_and_wrap_tools("fixture").await.unwrap();
+    {
+        let call = server.call_tool("echo", json!({}));
+        tokio::pin!(call);
+        tokio::select! {
+            result = &mut call => panic!("call settled before the recovery handshake barrier: {result:?}"),
+            _ = f.wait("reinitialize") => {}
+        }
+    }
+    assert_eq!(f.spawns(), 2);
+    assert!(server.process_id().await.is_some());
+    assert!(
+        server
+            .call_tool("echo", json!({}))
+            .await
+            .unwrap_err()
+            .contains("closed")
+    );
+    server.shutdown().await.unwrap();
+    assert!(server.process_id().await.is_none());
+    assert!(f.has("eof"));
+    assert_eq!(f.spawns(), 2);
 }

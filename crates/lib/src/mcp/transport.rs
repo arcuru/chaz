@@ -1,67 +1,98 @@
-//! Transport layer for MCP. Two concrete variants — stdio subprocess and
-//! Streamable HTTP — each owning its own I/O state and read/write logic.
-//! `McpServer` treats them uniformly via the `Transport` enum facade.
+//! Transport layer for MCP. Each stdio transport retains its complete I/O
+//! generation until explicit reap, including when close or restart is cancelled.
 
 use crate::config::McpServerConfig;
 use crate::security::SecretStore;
 
 use serde_json::Value;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, watch};
+use tokio::time::{Duration, Instant, timeout_at};
 use tracing::{debug, info, warn};
 
 use super::parse::{parse_jsonrpc_response, parse_sse_body};
 
-/// Maximum restart attempts before giving up (stdio transport).
 const MAX_RESTART_ATTEMPTS: u8 = 5;
-
-/// Base backoff delay in milliseconds (doubles each attempt: 1s, 2s, 4s, 8s, 16s).
 const BASE_BACKOFF_MS: u64 = 1000;
+const CLOSE_PHASE: Duration = Duration::from_secs(2);
 
-/// Transport for communicating with an MCP server.
-///
-/// Two variants, each wrapping its own I/O state. All request/notification
-/// handling lives on the variant types (`StdioTransport`, `HttpTransport`)
-/// so `McpServer` stays focused on protocol + tool logic.
+/// One monotonic per-child budget, including startup joins and lock acquisition.
+#[derive(Clone, Copy)]
+pub(crate) struct CloseBudget {
+    eof: Instant,
+    #[cfg(unix)]
+    term: Instant,
+    pub(crate) end: Instant,
+}
+
+impl CloseBudget {
+    pub(crate) fn new() -> Self {
+        let start = Instant::now();
+        Self {
+            eof: start + CLOSE_PHASE,
+            #[cfg(unix)]
+            term: start + CLOSE_PHASE * 2,
+            end: start + CLOSE_PHASE * if cfg!(unix) { 3 } else { 2 },
+        }
+    }
+}
+
 pub(super) enum Transport {
     Stdio(StdioTransport),
     Http(HttpTransport),
 }
 
-/// JSON-RPC over subprocess stdin/stdout.
-pub(super) struct StdioTransport {
-    stdin: Mutex<ChildStdin>,
-    stdout: Mutex<BufReader<ChildStdout>>,
-    _child: Box<Mutex<Child>>,
-    config: Box<McpServerConfig>,
-    restart_attempts: AtomicU8,
+/// Child and pipes are installed together, without an await at publication.
+struct StdioGeneration {
+    child: Child,
+    stdin: Option<ChildStdin>,
+    stdout: BufReader<ChildStdout>,
 }
 
-/// Streamable HTTP transport (POST requests, JSON or SSE responses).
+pub(super) struct StdioTransport {
+    generation: Box<Mutex<Option<StdioGeneration>>>,
+    /// Serializes the synchronous spawn/publication boundary with terminal close.
+    closed: std::sync::Mutex<bool>,
+    /// Interrupt readers/writers *before* close/restart waits for their lock.
+    interrupt: watch::Sender<u64>,
+    restarting: Mutex<()>,
+    generation_id: AtomicU64,
+    config: Box<McpServerConfig>,
+    restart_attempts: AtomicU8,
+    #[cfg(test)]
+    failure: AtomicU8,
+    #[cfg(test)]
+    exit_success: AtomicBool,
+}
+
+/// Cancellation during replacement is terminal, never a half-installed generation.
+struct RestartGuard<'a> {
+    transport: &'a StdioTransport,
+    complete: bool,
+}
+
+impl Drop for RestartGuard<'_> {
+    fn drop(&mut self) {
+        if !self.complete {
+            self.transport.begin_close();
+        }
+    }
+}
+
 pub(super) struct HttpTransport {
     url: String,
     client: reqwest::Client,
-    /// MCP session ID returned by the server (tracked across requests).
-    /// Exposed at `super` visibility so integration tests can seed it
-    /// without bouncing through a real initialize handshake — there's
-    /// no other lever for "pretend we have a session" against a fake.
     pub(super) session_id: Mutex<Option<String>>,
-    /// Protocol version negotiated during the initialize handshake.
-    /// `None` before initialize completes; `Some(version)` after, at
-    /// which point every subsequent request carries an
-    /// `MCP-Protocol-Version` header per the Streamable HTTP spec.
     protocol_version: Mutex<Option<String>>,
 }
 
 impl Transport {
-    /// Create a stdio transport by spawning a subprocess.
     pub(super) fn new_stdio(config: &McpServerConfig) -> Result<Self, String> {
         Ok(Transport::Stdio(StdioTransport::spawn(config)?))
     }
 
-    /// Create an HTTP transport targeting the given URL.
     pub(super) fn new_http(url: &str) -> Self {
         Transport::Http(HttpTransport {
             url: url.to_string(),
@@ -71,15 +102,12 @@ impl Transport {
         })
     }
 
-    /// Store the negotiated MCP protocol version. Called once per session
-    /// after the `initialize` handshake completes. No-op for stdio.
     pub(super) async fn set_protocol_version(&self, version: &str) {
         if let Transport::Http(h) = self {
             *h.protocol_version.lock().await = Some(version.to_string());
         }
     }
 
-    /// Dispatch a JSON-RPC request to the concrete transport.
     pub(super) async fn send_request(
         &self,
         server_name: &str,
@@ -96,7 +124,6 @@ impl Transport {
         }
     }
 
-    /// Dispatch a JSON-RPC notification (no response expected) to the transport.
     pub(super) async fn send_notification(
         &self,
         server_name: &str,
@@ -108,7 +135,6 @@ impl Transport {
         }
     }
 
-    /// Check if an error indicates the subprocess has died (stdio only).
     pub(super) fn is_process_dead_error(&self, error: &str) -> bool {
         matches!(self, Transport::Stdio(_))
             && (error.contains("closed stdout")
@@ -117,15 +143,10 @@ impl Transport {
                 || error.contains("Broken pipe"))
     }
 
-    /// Check if an error indicates the MCP session has been terminated by
-    /// the server (HTTP only). When this fires the transport has already
-    /// dropped its cached session ID; the caller re-initializes and
-    /// retries.
     pub(super) fn is_session_expired_error(&self, error: &str) -> bool {
         matches!(self, Transport::Http(_)) && error.contains("session expired (HTTP 404)")
     }
 
-    /// Attempt to restart the subprocess (stdio only). No-op for HTTP.
     pub(super) async fn restart(&self, name: &str) -> Result<(), String> {
         match self {
             Transport::Stdio(s) => s.restart(name).await,
@@ -133,46 +154,70 @@ impl Transport {
         }
     }
 
-    /// Reset restart counter (stdio only). Called on successful request.
     pub(super) fn reset_restart_counter(&self) {
         if let Transport::Stdio(s) = self {
             s.restart_attempts.store(0, Ordering::Relaxed);
         }
     }
 
-    /// Stop a running stdio child and wait for process exit. HTTP transports
-    /// have no local process to tear down.
-    pub(super) async fn shutdown(&self) {
-        if let Transport::Stdio(transport) = self {
-            let mut child = transport._child.lock().await;
-            let _ = child.kill().await;
-            let _ = child.wait().await;
+    pub(super) fn begin_close(&self) {
+        if let Transport::Stdio(s) = self {
+            s.begin_close();
+        }
+    }
+
+    /// A bounded return is not proof of cleanup. On error the generation stays
+    /// owned here, closed to requests/replacement, for a subsequent close attempt.
+    pub(super) async fn shutdown(&self, budget: CloseBudget) -> Result<(), String> {
+        if let Transport::Stdio(s) = self {
+            s.begin_close();
+            let mut generation = timeout_at(budget.end, s.generation.lock())
+                .await
+                .map_err(|_| "incomplete MCP cleanup: I/O generation lock timed out".to_string())?;
+            s.reap(&mut generation, budget).await?;
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(super) fn inject_cleanup_failure(&self, failure: u8) {
+        if let Transport::Stdio(s) = self {
+            s.failure.store(failure, Ordering::Relaxed);
         }
     }
 
     #[cfg(test)]
     pub(super) async fn process_id(&self) -> Option<u32> {
         match self {
-            Transport::Stdio(transport) => transport._child.lock().await.id(),
+            Transport::Stdio(s) => s
+                .generation
+                .lock()
+                .await
+                .as_ref()
+                .and_then(|g| g.child.id()),
             Transport::Http(_) => None,
         }
     }
 }
 
 impl StdioTransport {
-    /// Spawn a subprocess for stdio transport.
     fn spawn(config: &McpServerConfig) -> Result<Self, String> {
-        let (child, stdin, stdout) = Self::spawn_process(config)?;
-        Ok(StdioTransport {
-            stdin: Mutex::new(stdin),
-            stdout: Mutex::new(BufReader::new(stdout)),
-            _child: Box::new(Mutex::new(child)),
+        Ok(Self {
+            generation: Box::new(Mutex::new(Some(Self::spawn_process(config)?))),
+            closed: std::sync::Mutex::new(false),
+            interrupt: watch::channel(0).0,
+            restarting: Mutex::new(()),
+            generation_id: AtomicU64::new(0),
             config: Box::new(config.clone()),
             restart_attempts: AtomicU8::new(0),
+            #[cfg(test)]
+            failure: AtomicU8::new(0),
+            #[cfg(test)]
+            exit_success: AtomicBool::new(false),
         })
     }
 
-    fn spawn_process(config: &McpServerConfig) -> Result<(Child, ChildStdin, ChildStdout), String> {
+    fn spawn_process(config: &McpServerConfig) -> Result<StdioGeneration, String> {
         let mut cmd = tokio::process::Command::new(&config.command);
         if let Some(args) = &config.args {
             let resolved: Vec<String> = args
@@ -191,49 +236,158 @@ impl StdioTransport {
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::null());
         cmd.kill_on_drop(true);
-
         let mut child = cmd
             .spawn()
             .map_err(|e| format!("Failed to spawn MCP server '{}': {e}", config.name))?;
+        // Both pipes were requested above; no fallible/awaited step may lose a
+        // successfully spawned child before it is installed in its owner.
+        let stdin = child.stdin.take().expect("piped MCP stdin");
+        let stdout = child.stdout.take().expect("piped MCP stdout");
+        Ok(StdioGeneration {
+            child,
+            stdin: Some(stdin),
+            stdout: BufReader::new(stdout),
+        })
+    }
 
-        let stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| format!("No stdin for MCP server '{}'", config.name))?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| format!("No stdout for MCP server '{}'", config.name))?;
+    fn begin_close(&self) {
+        *self.closed.lock().unwrap_or_else(|p| p.into_inner()) = true;
+        self.interrupt.send_modify(|epoch| *epoch += 1);
+    }
 
-        Ok((child, stdin, stdout))
+    fn ensure_open(&self) -> Result<(), String> {
+        if *self.closed.lock().unwrap_or_else(|p| p.into_inner()) {
+            Err(format!("MCP server '{}' is closed", self.config.name))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn reaped(&self, generation: &mut Option<StdioGeneration>, status: std::process::ExitStatus) {
+        debug!(server = %self.config.name, %status, "MCP direct child reaped");
+        #[cfg(test)]
+        self.exit_success.store(status.success(), Ordering::Relaxed);
+        *generation = None;
+    }
+
+    /// Reap only the direct child. Never wait for stdout EOF: wrappers may
+    /// leave descendants holding those pipes, outside this transport's scope.
+    async fn reap(
+        &self,
+        generation: &mut Option<StdioGeneration>,
+        budget: CloseBudget,
+    ) -> Result<(), String> {
+        let Some(g) = generation.as_mut() else {
+            return Ok(());
+        };
+        g.stdin.take();
+        #[cfg(test)]
+        if self.failure.load(Ordering::Relaxed) == 1 {
+            return Err("incomplete MCP cleanup: injected wait error".into());
+        }
+        let wait_error = |e| format!("incomplete MCP cleanup: wait failed: {e}");
+        if let Some(status) = g.child.try_wait().map_err(wait_error)? {
+            self.reaped(generation, status);
+            return Ok(());
+        }
+        if let Ok(result) = timeout_at(budget.eof, g.child.wait()).await {
+            self.reaped(generation, result.map_err(wait_error)?);
+            return Ok(());
+        }
+        #[cfg(unix)]
+        {
+            #[cfg(test)]
+            if self.failure.load(Ordering::Relaxed) == 2 {
+                return Err("incomplete MCP cleanup: injected TERM error".into());
+            }
+            if let Some(pid) = g.child.id() {
+                // The unreaped Child retains this PID; signal only that child,
+                // not a guessed process group or any wrapper descendants.
+                // SAFETY: kill accepts an integer PID and has no memory preconditions.
+                if unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) } != 0 {
+                    return Err(format!(
+                        "incomplete MCP cleanup: TERM failed: {}",
+                        std::io::Error::last_os_error()
+                    ));
+                }
+            }
+            if let Ok(result) = timeout_at(budget.term, g.child.wait()).await {
+                self.reaped(generation, result.map_err(wait_error)?);
+                return Ok(());
+            }
+        }
+        g.child
+            .start_kill()
+            .map_err(|e| format!("incomplete MCP cleanup: forced kill failed: {e}"))?;
+        let status = timeout_at(budget.end, g.child.wait())
+            .await
+            .map_err(|_| "incomplete MCP cleanup: forced reap timed out".to_string())?
+            .map_err(wait_error)?;
+        self.reaped(generation, status);
+        Ok(())
     }
 
     async fn restart(&self, name: &str) -> Result<(), String> {
+        let observed = self.generation_id.load(Ordering::Acquire);
+        let mut interrupted = self.interrupt.subscribe();
+        self.ensure_open()?;
+        let _restart = tokio::select! {
+            biased;
+            _ = interrupted.changed() => return Err(format!("MCP server '{name}' recovery interrupted")),
+            guard = self.restarting.lock() => guard,
+        };
+        self.ensure_open()?;
+        if observed != self.generation_id.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let mut guard = RestartGuard {
+            transport: self,
+            complete: false,
+        };
         let attempt = self.restart_attempts.fetch_add(1, Ordering::Relaxed);
         if attempt >= MAX_RESTART_ATTEMPTS {
             return Err(format!(
                 "MCP server '{name}' exceeded max restart attempts ({MAX_RESTART_ATTEMPTS})"
             ));
         }
+        self.interrupt.send_modify(|epoch| *epoch += 1);
+        interrupted.borrow_and_update();
+        let budget = CloseBudget::new();
+        let mut generation = timeout_at(budget.end, self.generation.lock())
+            .await
+            .map_err(|_| "incomplete MCP cleanup: restart I/O lock timed out".to_string())?;
+        self.reap(&mut generation, budget).await?;
 
         let backoff_ms = BASE_BACKOFF_MS * (1u64 << attempt.min(5));
         warn!(
             "MCP server '{name}' restarting (attempt {}/{MAX_RESTART_ATTEMPTS}, backoff {backoff_ms}ms)",
             attempt + 1
         );
-        tokio::time::sleep(tokio::time::Duration::from_millis(backoff_ms)).await;
-
-        let (child, new_stdin, new_stdout) = Self::spawn_process(&self.config)?;
-        *self._child.lock().await = child;
-        *self.stdin.lock().await = new_stdin;
-        *self.stdout.lock().await = BufReader::new(new_stdout);
-
+        tokio::select! {
+            biased;
+            _ = interrupted.changed() => return Err(format!("MCP server '{name}' recovery interrupted")),
+            _ = tokio::time::sleep(Duration::from_millis(backoff_ms)) => {}
+        }
+        // No await between admission, spawn, and publication of ALL the pipes.
+        let closed = self.closed.lock().unwrap_or_else(|p| p.into_inner());
+        if *closed {
+            return Err(format!("MCP server '{name}' is closed"));
+        }
+        *generation = Some(Self::spawn_process(&self.config)?);
+        self.generation_id.fetch_add(1, Ordering::Release);
+        guard.complete = true;
         Ok(())
     }
 
-    /// Write a JSON-RPC message to stdin with trailing newline + flush.
-    async fn write_frame(&self, server_name: &str, payload: &Value) -> Result<(), String> {
-        let mut stdin = self.stdin.lock().await;
+    async fn write_frame(
+        g: &mut StdioGeneration,
+        server_name: &str,
+        payload: &Value,
+    ) -> Result<(), String> {
+        let stdin = g
+            .stdin
+            .as_mut()
+            .ok_or_else(|| format!("MCP server '{server_name}' closed stdout"))?;
         let payload_str = serde_json::to_string(payload).map_err(|e| e.to_string())?;
         debug!("MCP '{server_name}' → {payload_str}");
         stdin
@@ -247,8 +401,7 @@ impl StdioTransport {
         stdin
             .flush()
             .await
-            .map_err(|e| format!("MCP '{server_name}' flush error: {e}"))?;
-        Ok(())
+            .map_err(|e| format!("MCP '{server_name}' flush error: {e}"))
     }
 
     async fn send_request(
@@ -258,66 +411,71 @@ impl StdioTransport {
         id: u64,
         tools_changed: &AtomicBool,
     ) -> Result<Value, String> {
-        self.write_frame(server_name, request).await?;
-
-        let mut stdout = self.stdout.lock().await;
-        let mut line = String::new();
-        loop {
-            line.clear();
-            let bytes_read = stdout
-                .read_line(&mut line)
-                .await
-                .map_err(|e| format!("MCP '{server_name}' read error: {e}"))?;
-
-            if bytes_read == 0 {
-                return Err(format!("MCP server '{server_name}' closed stdout"));
-            }
-
-            let trimmed = line.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
-
-            let parsed: Value = match serde_json::from_str(trimmed) {
-                Ok(v) => v,
-                Err(e) => {
-                    warn!("MCP '{server_name}' non-JSON line: {e}");
+        let mut interrupted = self.interrupt.subscribe();
+        self.ensure_open()?;
+        let response = async {
+            let mut generation = self.generation.lock().await;
+            self.ensure_open()?;
+            let g = generation
+                .as_mut()
+                .ok_or_else(|| format!("MCP server '{server_name}' closed stdout"))?;
+            Self::write_frame(g, server_name, request).await?;
+            let mut line = String::new();
+            loop {
+                line.clear();
+                let bytes_read = g
+                    .stdout
+                    .read_line(&mut line)
+                    .await
+                    .map_err(|e| format!("MCP '{server_name}' read error: {e}"))?;
+                if bytes_read == 0 {
+                    return Err(format!("MCP server '{server_name}' closed stdout"));
+                }
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
                     continue;
                 }
-            };
-
-            debug!("MCP '{server_name}' ← {trimmed}");
-
-            // Handle notifications (no id field)
-            let resp_id = match parsed.get("id") {
-                Some(id_val) => id_val.as_u64(),
-                None => {
-                    let method = parsed.get("method").and_then(|m| m.as_str()).unwrap_or("");
-                    if method == "notifications/tools/list_changed" {
-                        info!("MCP '{server_name}' signaled tools/list_changed");
-                        tools_changed.store(true, Ordering::Relaxed);
-                    } else {
-                        debug!("MCP '{server_name}' notification: {trimmed}");
+                let parsed: Value = match serde_json::from_str(trimmed) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        warn!("MCP '{server_name}' non-JSON line: {e}");
+                        continue;
                     }
-                    continue;
+                };
+                debug!("MCP '{server_name}' ← {trimmed}");
+                let resp_id = match parsed.get("id") {
+                    Some(id_val) => id_val.as_u64(),
+                    None => {
+                        let method = parsed.get("method").and_then(|m| m.as_str()).unwrap_or("");
+                        if method == "notifications/tools/list_changed" {
+                            info!("MCP '{server_name}' signaled tools/list_changed");
+                            tools_changed.store(true, Ordering::Relaxed);
+                        } else {
+                            debug!("MCP '{server_name}' notification: {trimmed}");
+                        }
+                        continue;
+                    }
+                };
+                if resp_id == Some(id) {
+                    if let Some(err) = parsed.get("error") {
+                        let msg = err
+                            .get("message")
+                            .and_then(|m| m.as_str())
+                            .unwrap_or("unknown error");
+                        return Err(format!("MCP '{server_name}' error: {msg}"));
+                    }
+                    return parsed
+                        .get("result")
+                        .cloned()
+                        .ok_or_else(|| format!("MCP '{server_name}': response missing result"));
                 }
-            };
-
-            if resp_id == Some(id) {
-                if let Some(err) = parsed.get("error") {
-                    let msg = err
-                        .get("message")
-                        .and_then(|m| m.as_str())
-                        .unwrap_or("unknown error");
-                    return Err(format!("MCP '{server_name}' error: {msg}"));
-                }
-                return parsed
-                    .get("result")
-                    .cloned()
-                    .ok_or_else(|| format!("MCP '{server_name}': response missing result"));
+                warn!("MCP '{server_name}' unexpected response id {resp_id:?} (expected {id})");
             }
-
-            warn!("MCP '{server_name}' unexpected response id {resp_id:?} (expected {id})");
+        };
+        tokio::select! {
+            biased;
+            _ = interrupted.changed() => Err(format!("MCP server '{server_name}' I/O interrupted")),
+            result = response => result,
         }
     }
 
@@ -326,10 +484,23 @@ impl StdioTransport {
         server_name: &str,
         notification: &Value,
     ) -> Result<(), String> {
-        self.write_frame(server_name, notification).await
+        let mut interrupted = self.interrupt.subscribe();
+        self.ensure_open()?;
+        let write = async {
+            let mut generation = self.generation.lock().await;
+            self.ensure_open()?;
+            let g = generation
+                .as_mut()
+                .ok_or_else(|| format!("MCP server '{server_name}' closed stdout"))?;
+            Self::write_frame(g, server_name, notification).await
+        };
+        tokio::select! {
+            biased;
+            _ = interrupted.changed() => Err(format!("MCP server '{server_name}' I/O interrupted")),
+            result = write => result,
+        }
     }
 }
-
 impl HttpTransport {
     /// Build a POST request carrying a JSON-RPC payload + the optional
     /// session header + the negotiated `MCP-Protocol-Version` (post-init).
@@ -455,3 +626,7 @@ mod tests {
         assert!(!transport.is_process_dead_error("Broken pipe"));
     }
 }
+
+#[cfg(test)]
+#[path = "transport_tests.rs"]
+mod lifecycle_tests;

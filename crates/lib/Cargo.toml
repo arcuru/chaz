@@ -52,3 +52,6 @@ eidetica = { workspace = true, features = ["testing"] }
 tempfile.workspace = true
 wat.workspace = true
 wiremock = "0.6"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

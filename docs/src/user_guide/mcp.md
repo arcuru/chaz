@@ -72,7 +72,7 @@ Tools become available as their server finishes. A turn's tool list is assembled
 
 If the model calls a tool whose server is still starting — from a resumed conversation, say, where the name appears earlier in the transcript — it is told the server is still starting and that the call is worth retrying, rather than being told the tool does not exist.
 
-`startup_timeout_secs` (default `30`) bounds one server's handshake and discovery. A server that overruns it is marked failed and contributes no tools; it does not hold anything else up.
+`startup_timeout_secs` (default `30`) bounds one server's handshake and discovery. A server that overruns it contributes no tools. Chaz explicitly closes its transport before marking startup failed; this cleanup attempt has the separate per-child budget below. Other servers continue starting concurrently.
 
 **One-shot runs are the exception.** `chaz --print` gets exactly one turn, so it waits for every server to settle before running it — deferring a load that single turn needs would produce an answer with no MCP tools rather than a faster one. This costs no more than blocking startup used to, since servers start concurrently. `chaz cmd` runs no turn at all and never waits.
 
@@ -98,6 +98,36 @@ If a server only advertises `tools`, none of these wrappers appear. There's no p
 ### Prompts as tool results
 
 `get_prompt` returns the rendered template as a tool result (each message tagged `[role] body`). It does NOT replace the agent's system prompt — the model decides what to do with the content. Use this for parameterized prompt libraries the server exposes (`summarize`, `explain-code`, etc.).
+
+## Direct-child shutdown
+
+Chaz owns the process it spawns, including while initialization is still pending. Shutdown stops new requests, joins startup, and closes the actual subprocess stdin before escalating:
+
+| Phase                                    | Maximum allowance per child |
+| ---------------------------------------- | --------------------------- |
+| Close stdin and wait for EOF-driven exit | 2 seconds                   |
+| Send POSIX TERM and wait                 | 2 seconds, on POSIX only    |
+| Native forced kill and reap              | 2 seconds                   |
+
+These are fixed allowances, not configuration fields. One monotonic deadline includes startup cancellation, joins, and I/O-lock acquisition; time spent coordinating leaves less grace time. Non-POSIX platforms skip TERM and use Tokio's native forced kill after EOF grace.
+
+Close is terminal: a retained tool handle cannot restart a closed server. Replacement reaps the previous direct child before spawning another, and cancellation cannot install a new child with old pipes. A server whose startup times out never publishes tools later.
+
+An `incomplete MCP cleanup` error means cleanup was **not confirmed**, not that the child exited. Chaz keeps the cleanup handle and retries; service reconnection cannot build a replacement generation until the old cleanup succeeds. There is no detached reaper. Closing several servers is sequential: a cleanup attempt can take up to 6 seconds per child on POSIX, or 4 seconds elsewhere. Retries and other peer teardown work add time; this is not a constant peer shutdown deadline.
+
+**Wrapper descendants are excluded.** Commands such as `npx` and `uvx` remain supported, but Chaz only signals and reaps its direct child. It neither kills process groups nor waits for descendants holding inherited stdout open. A wrapper that starts other processes must manage them itself. Abrupt termination of Chaz is also outside explicit shutdown's guarantee; `kill_on_drop` is only a best-effort fallback.
+
+### Shutdown walkthrough
+
+1. Run a one-shot prompt with an MCP server configured, or exit an interactive peer normally. A cooperative server receives stdin EOF and exits without a signal. A successful one-shot returns exit code `0` only after its MCP cleanup completes; its log contains `Runtime cleanup complete`. A failed prompt still cleans up and keeps its original nonzero exit status.
+2. If the child ignores EOF, POSIX shutdown tries TERM after the EOF allowance, then forced kill if necessary. No MCP protocol shutdown message is sent. A child ignoring EOF and TERM normally needs about four seconds before forced reap; more configured children can add their own allowances.
+3. If a lock, signal, or wait cannot complete, inspect the log for the named server and the failure stage. For example, the error text can be:
+
+   ```text
+   fixture: incomplete MCP cleanup: I/O generation lock timed out
+   ```
+
+   Chaz reports `Runtime cleanup incomplete; retaining generation for retry` (or `Generation cleanup incomplete; retaining ownership for retry` under service supervision). It does not reconnect over that child. When the underlying failure clears, a later cleanup attempt reaps the retained child and shutdown or reconnection can finish. Repeated messages mean cleanup remains unresolved, not that replacement servers are being started.
 
 ## Auto-Restart (stdio only)
 

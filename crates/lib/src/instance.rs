@@ -188,59 +188,52 @@ pub async fn probe_service(instance: &Instance) -> Result<(), ConnectError> {
         .map_err(ConnectError::Connection)
 }
 
-/// One application generation supervised over a service connection: the
-/// runtime built on one connected [`Instance`], torn down whole before a
-/// replacement is connected.
+/// One application generation, retained by its caller across incomplete cleanup.
 #[allow(async_fn_in_trait)]
 pub trait ServiceGeneration: Sized {
     /// The connection this generation was built on; probed for liveness.
     fn instance(&self) -> Instance;
 
-    /// Resolves when the generation ends on its own — a transport task
-    /// exiting, for example. A generation that only ends on request stays
-    /// pending forever.
+    /// Resolves when transport work ends; request-only generations stay pending.
     async fn finished(&mut self) -> anyhow::Result<()>;
 
-    /// Stop every task, hook, and subscription this generation owns. Runs to
-    /// completion before a replacement is constructed.
-    async fn shutdown(self);
+    /// Bounded MCP cleanup failure leaves this generation available for retry.
+    async fn shutdown(&mut self) -> Result<(), String>;
+
+    /// The existing supervisor remains the owner while retrying, never a
+    /// detached reaper. A replacement cannot start on an incomplete result.
+    async fn shutdown_complete(&mut self) {
+        while let Err(error) = self.shutdown().await {
+            tracing::warn!(%error, "Generation cleanup incomplete; retaining ownership for retry");
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
+    }
 }
 
 impl ServiceGeneration for crate::server::BuiltServer {
     fn instance(&self) -> Instance {
         self.registry.instance().clone()
     }
-
     async fn finished(&mut self) -> anyhow::Result<()> {
         std::future::pending().await
     }
-
-    async fn shutdown(self) {
-        crate::server::BuiltServer::shutdown(self).await;
+    async fn shutdown(&mut self) -> Result<(), String> {
+        self.try_shutdown().await
     }
 }
 
-/// Whether a rebuild failure is worth another bounded-backoff attempt. Only
-/// transport-level service failures are; a configuration, login, or
-/// capability error surfaces to the operator instead of looping.
+/// Only service transport failures warrant another reconnect attempt, not
+/// configuration, login, or capability failures.
 fn is_transient_rebuild_error(error: &anyhow::Error) -> bool {
     error
         .downcast_ref::<ConnectError>()
         .is_some_and(ConnectError::is_transient_service)
 }
 
-/// Supervise a service-connected application generation until shutdown.
-///
-/// The connection is probed periodically. On a transient service failure the
-/// current generation is shut down completely, then `rebuild` is retried with
-/// [`service_reconnect_delay`] between attempts until it yields a replacement
-/// that reconnected, re-logged-in, reopened its databases, reinstalled its
-/// hooks, and reconciled persisted state. `shutdown` resolves when the process
-/// is asked to stop; it is honoured while probing and while waiting to
-/// reconnect. A generation that finishes on its own ends supervision with its
-/// result after its own teardown.
+/// Supervise a borrowed generation. Terminal/error exits and reconnection all
+/// settle its cleanup first; cancellation leaves ownership with the caller.
 pub async fn supervise_service<G, Rebuild, RebuildFuture, Shutdown, ShutdownFuture>(
-    mut generation: G,
+    generation: &mut G,
     mut rebuild: Rebuild,
     shutdown: Shutdown,
 ) -> anyhow::Result<()>
@@ -261,64 +254,62 @@ where
         };
         tokio::select! {
             _ = shutdown() => {
-                generation.shutdown().await;
+                generation.shutdown_complete().await;
                 return Ok(());
             }
             result = generation.finished() => {
-                generation.shutdown().await;
+                generation.shutdown_complete().await;
                 return result;
             }
             result = probe => match result {
                 Ok(()) => reconnect_attempt = 0,
                 Err(error) if error.is_transient_service() => {
                     tracing::warn!(%error, "Eidetica service disconnected; tearing down runtime before reconnect");
-                    generation = replace_service_generation(
-                        generation,
-                        |old| async move { old.shutdown().await },
-                        || async {
-                            loop {
-                                let delay = service_reconnect_delay(reconnect_attempt);
-                                reconnect_attempt = reconnect_attempt.saturating_add(1);
-                                tokio::select! {
-                                    _ = shutdown() => anyhow::bail!("shutdown requested"),
-                                    _ = tokio::time::sleep(delay) => {}
-                                }
-                                match rebuild().await {
-                                    Ok(replacement) => {
-                                        tracing::info!("Eidetica service reconnected; runtime reopened and reconciled");
-                                        return Ok(replacement);
-                                    }
-                                    Err(next) if is_transient_rebuild_error(&next) => {
-                                        tracing::warn!(error = %next, "Eidetica service reconnect failed");
-                                    }
-                                    Err(next) => return Err(next),
-                                }
+                    replace_service_generation(generation, || async {
+                        loop {
+                            let delay = service_reconnect_delay(reconnect_attempt);
+                            reconnect_attempt = reconnect_attempt.saturating_add(1);
+                            tokio::select! {
+                                _ = shutdown() => anyhow::bail!("shutdown requested"),
+                                _ = tokio::time::sleep(delay) => {}
                             }
-                        },
-                    )
-                    .await?;
+                            match rebuild().await {
+                                Ok(replacement) => {
+                                    tracing::info!("Eidetica service reconnected; runtime reopened and reconciled");
+                                    return Ok(replacement);
+                                }
+                                Err(next) if is_transient_rebuild_error(&next) => {
+                                    tracing::warn!(error = %next, "Eidetica service reconnect failed");
+                                }
+                                Err(next) => return Err(next),
+                            }
+                        }
+                    }).await?;
                 }
-                Err(error) => return Err(error.into()),
+                Err(error) => {
+                    generation.shutdown_complete().await;
+                    return Err(error.into());
+                }
             }
         }
     }
 }
 
-/// Shut the old generation down to completion, then construct its
-/// replacement. Split out so the ordering is testable without a service.
-pub async fn replace_service_generation<T, Shutdown, ShutdownFuture, Reconnect, ReconnectFuture>(
-    generation: T,
-    shutdown: Shutdown,
+/// No replacement over unresolved old ownership. The borrow survives cancelled
+/// close/reconnect futures; the old generation is replaced only after success.
+pub async fn replace_service_generation<G, Reconnect, ReconnectFuture>(
+    generation: &mut G,
     reconnect: Reconnect,
-) -> anyhow::Result<T>
+) -> anyhow::Result<()>
 where
-    Shutdown: FnOnce(T) -> ShutdownFuture,
-    ShutdownFuture: std::future::Future<Output = ()>,
+    G: ServiceGeneration,
     Reconnect: FnOnce() -> ReconnectFuture,
-    ReconnectFuture: std::future::Future<Output = anyhow::Result<T>>,
+    ReconnectFuture: std::future::Future<Output = anyhow::Result<G>>,
 {
-    shutdown(generation).await;
-    reconnect().await
+    generation.shutdown_complete().await;
+    let replacement = reconnect().await?;
+    *generation = replacement;
+    Ok(())
 }
 
 /// Block until the process is asked to stop. Ctrl-C covers foreground and
@@ -1045,24 +1036,34 @@ eidetica:
     #[tokio::test]
     async fn replacement_waits_for_shutdown_before_reconnect() {
         let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let shutdown_events = events.clone();
+        let (instance, _) = crate::test_support::fresh_eidetica().await;
+        let mut generation = FinishingGeneration {
+            instance: instance.clone(),
+            finish: None,
+            events: events.clone(),
+            cleanup_failures: 1,
+        };
         let reconnect_events = events.clone();
-        let replacement = replace_service_generation(
-            1,
-            move |_| async move {
-                shutdown_events.lock().unwrap().push("shutdown-complete");
-            },
-            move || async move {
-                reconnect_events.lock().unwrap().push("reconnected");
-                Ok(2)
-            },
-        )
-        .await
-        .unwrap();
-        assert_eq!(replacement, 2);
+        let replacement = replace_service_generation(&mut generation, || async move {
+            reconnect_events.lock().unwrap().push("reconnected");
+            Ok(FinishingGeneration {
+                instance,
+                finish: None,
+                events: reconnect_events,
+                cleanup_failures: 0,
+            })
+        });
+        tokio::pin!(replacement);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut replacement)
+                .await
+                .is_err()
+        );
+        assert_eq!(events.lock().unwrap().as_slice(), ["incomplete"]);
+        replacement.await.unwrap();
         assert_eq!(
             events.lock().unwrap().as_slice(),
-            ["shutdown-complete", "reconnected"]
+            ["incomplete", "shutdown", "reconnected"]
         );
     }
 
@@ -1072,6 +1073,7 @@ eidetica:
         instance: Instance,
         finish: Option<tokio::sync::oneshot::Receiver<anyhow::Result<()>>>,
         events: std::sync::Arc<std::sync::Mutex<Vec<&'static str>>>,
+        cleanup_failures: u8,
     }
 
     impl ServiceGeneration for FinishingGeneration {
@@ -1086,8 +1088,14 @@ eidetica:
             }
         }
 
-        async fn shutdown(self) {
+        async fn shutdown(&mut self) -> Result<(), String> {
+            if self.cleanup_failures > 0 {
+                self.cleanup_failures -= 1;
+                self.events.lock().unwrap().push("incomplete");
+                return Err("injected incomplete cleanup".into());
+            }
             self.events.lock().unwrap().push("shutdown");
+            Ok(())
         }
     }
 
@@ -1099,21 +1107,25 @@ eidetica:
             .unwrap();
         let (finish_tx, finish_rx) = tokio::sync::oneshot::channel();
         let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let generation = FinishingGeneration {
+        let mut generation = FinishingGeneration {
             instance: connected.instance,
             finish: Some(finish_rx),
+            cleanup_failures: 0,
             events: events.clone(),
         };
         let rebuilds = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let rebuild_count = rebuilds.clone();
-        let supervisor = tokio::spawn(supervise_service(
-            generation,
-            move || {
-                rebuild_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                async { anyhow::bail!("not expected") }
-            },
-            std::future::pending::<()>,
-        ));
+        let supervisor = tokio::spawn(async move {
+            supervise_service(
+                &mut generation,
+                move || {
+                    rebuild_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    async { anyhow::bail!("not expected") }
+                },
+                std::future::pending::<()>,
+            )
+            .await
+        });
         finish_tx
             .send(Err(anyhow::anyhow!("transport exited")))
             .unwrap();
@@ -1135,9 +1147,10 @@ eidetica:
             .await
             .unwrap();
         let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let generation = FinishingGeneration {
+        let mut generation = FinishingGeneration {
             instance: connected.instance,
             finish: None,
+            cleanup_failures: 0,
             events: events.clone(),
         };
         let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
@@ -1147,36 +1160,40 @@ eidetica:
         let rebuild_url = url.clone();
         let (finish_tx, finish_rx) = tokio::sync::oneshot::channel();
         let finish_rx = std::sync::Arc::new(std::sync::Mutex::new(Some(finish_rx)));
-        let supervisor = tokio::spawn(supervise_service(
-            generation,
-            move || {
-                let events = rebuild_events.clone();
-                let url = rebuild_url.clone();
-                let rebuilt = rebuilt_slot.clone();
-                let finish_rx = finish_rx.clone();
-                async move {
-                    events.lock().unwrap().push("rebuild-attempt");
-                    let connected =
-                        connect_with(&settings(url, "shared"), ExecutionRole::Client).await?;
-                    *rebuilt.lock().unwrap() = Some(());
-                    Ok(FinishingGeneration {
-                        instance: connected.instance,
-                        finish: finish_rx.lock().unwrap().take(),
-                        events,
-                    })
-                }
-            },
-            move || {
-                let mut stop_rx = stop_rx.clone();
-                async move {
-                    while !*stop_rx.borrow() {
-                        if stop_rx.changed().await.is_err() {
-                            return;
+        let supervisor = tokio::spawn(async move {
+            supervise_service(
+                &mut generation,
+                move || {
+                    let events = rebuild_events.clone();
+                    let url = rebuild_url.clone();
+                    let rebuilt = rebuilt_slot.clone();
+                    let finish_rx = finish_rx.clone();
+                    async move {
+                        events.lock().unwrap().push("rebuild-attempt");
+                        let connected =
+                            connect_with(&settings(url, "shared"), ExecutionRole::Client).await?;
+                        *rebuilt.lock().unwrap() = Some(());
+                        Ok(FinishingGeneration {
+                            instance: connected.instance,
+                            finish: finish_rx.lock().unwrap().take(),
+                            cleanup_failures: 0,
+                            events,
+                        })
+                    }
+                },
+                move || {
+                    let mut stop_rx = stop_rx.clone();
+                    async move {
+                        while !*stop_rx.borrow() {
+                            if stop_rx.changed().await.is_err() {
+                                return;
+                            }
                         }
                     }
-                }
-            },
-        ));
+                },
+            )
+            .await
+        });
 
         // Kill the daemon: the first generation must be torn down before any
         // rebuild attempt, and rebuilds keep failing while the socket is gone.
