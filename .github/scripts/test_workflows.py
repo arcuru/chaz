@@ -25,7 +25,6 @@ MAIN_QUEUE = (
     "format('ci-{0}-{1}', github.event_name, "
     "github.event.pull_request.number || github.run_id) }}"
 )
-CACHE_ACTION = "actions/cache/{operation}@0057852bfaa89a56745cba8c7296529d2fc39830"
 STORE_PATH = "/nix/store/" + "a" * 32 + "-test-output"
 
 
@@ -37,8 +36,7 @@ def evaluate(value, context):
     """Evaluate only the boolean/string subset used by the role/name expressions."""
     value = expression(value).removeprefix("${{ ").removesuffix(" }}")
     for key, item in context.items():
-        name = key if key.startswith("steps.") else "github." + key
-        value = re.sub(re.escape(name) + r"\b", repr(item), value)
+        value = re.sub(re.escape("github." + key) + r"\b", repr(item), value)
     value = value.replace("&&", " and ").replace("||", " or ")
     value = re.sub(r"!(?!=)", "not ", value)
     # No functions, attributes, indexing or unknown identifiers in this subset.
@@ -190,50 +188,25 @@ class Workflows(unittest.TestCase):
                 else:
                     self.assertNotIn("if", step)  # default success(), no always() override
             self.assertNotIn("needs", job)
-        steps = self.steps(self.ci["jobs"]["ci"])
-        for name in ("Dependency identity", "Prefer signed main dependencies", "Build dependencies", "Checks"):
-            self.assertNotIn("if", steps[name])
-            self.assertNotIn("continue-on-error", steps[name])
+        step = self.steps(self.ci["jobs"]["ci"])["Checks"]
+        self.assertNotIn("if", step)
+        self.assertNotIn("continue-on-error", step)
 
-    def test_pr_cache_is_exact_key_early_and_optional(self):
-        job = self.ci["jobs"]["ci"]
-        steps = self.steps(job)
-        names = list(steps)
-        self.assertLess(names.index("Build dependencies"), names.index("Save PR dependencies"))
-        self.assertLess(names.index("Save PR dependencies"), names.index("Checks"))
-        for name, operation in (("Restore PR dependencies", "restore"), ("Save PR dependencies", "save")):
-            step = steps[name]
-            self.assertEqual(step["uses"], CACHE_ACTION.format(operation=operation))
-            self.assertEqual(step["continue-on-error"], "true")
-            self.assertEqual(step["with"], {
-                "path": "${{ runner.temp }}/chaz-deps-cache",
-                "key": "${{ steps.identity.outputs.key }}",
-            })
-            self.assertIn("github.event_name == 'pull_request'", step["if"])
-        self.assertIn("steps.trusted.outputs.available != 'true'", steps["Restore PR dependencies"]["if"])
-        self.assertIn("steps.restore.outputs.cache-hit == 'true'", steps["Import PR dependencies"]["if"])
-        self.assertIn("steps.restore.outputs.cache-hit != 'true'", steps["Export PR dependencies"]["if"])
-        self.assertEqual(steps["Save PR dependencies"]["if"], "github.event_name == 'pull_request' && steps.export.outcome == 'success'")
-        self.assertNotIn("continue-on-error", steps["Import PR dependencies"])
-        for name in ("Dependency identity", "Prefer signed main dependencies", "Build dependencies", "Import PR dependencies", "Export PR dependencies"):
-            self.assertIn("bash .github/scripts/deps-cache.sh ", steps[name]["run"])
+    def test_pr_uses_only_native_checks_and_signed_substitution(self):
+        self.assertEqual(list(self.steps(self.ci["jobs"]["ci"])), ["Checkout", "Setup Nix", "Checks"])
+        for text in (self.ci_text, self.publish_text):
+            self.assertNotIn("actions/cache", text)
+            self.assertNotIn("deps-cache.sh", text)
+            self.assertNotIn("--no-check-sigs", text)
 
-    def test_pr_cache_hit_miss_error_and_foreign_event_truth_table(self):
-        steps = self.steps(self.ci["jobs"]["ci"])
-        for event in ("pull_request", "push", "merge_group", "workflow_dispatch"):
-            for trusted in ("true", "false"):
-                for hit in ("true", "false", ""):
-                    ctx = {"event_name": event, "steps.trusted.outputs.available": trusted,
-                           "steps.restore.outputs.cache-hit": hit, "steps.export.outcome": "success"}
-                    pr_miss = event == "pull_request" and trusted != "true"
-                    self.assertEqual(bool(evaluate(steps["Restore PR dependencies"]["if"], ctx)), pr_miss)
-                    self.assertEqual(bool(evaluate(steps["Import PR dependencies"]["if"], ctx)), pr_miss and hit == "true")
-                    export = bool(evaluate(steps["Export PR dependencies"]["if"], ctx))
-                    self.assertEqual(export, pr_miss and hit != "true")
-                    for outcome in ("success", "failure", "skipped"):
-                        ctx["steps.export.outcome"] = outcome
-                        save = bool(evaluate(steps["Save PR dependencies"]["if"], ctx))
-                        self.assertEqual(save, event == "pull_request" and outcome == "success")
+    def test_main_dependency_stage_is_native_nix_and_failure_is_fatal(self):
+        for job in (self.ci["jobs"]["main"], self.publish["jobs"]["push-cache"]):
+            step = self.steps(job)["Build dependencies"]
+            result, calls = self.run_script(step["run"])
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(calls, [["build", "--fallback", "--no-link", "--max-jobs", "2", "--cores", "0", "--json", ".#test.deps"]])
+            result, _ = self.run_script(step["run"], exit_code=42)
+            self.assertEqual(result.returncode, 42, result.stderr)
 
     def test_full_coverage_is_push_or_manual_only(self):
         self.assertEqual(expression(self.e2e["jobs"]["e2e"]["if"]), f"github.repository_owner == 'arcuru' && ({FULL_COVERAGE})")

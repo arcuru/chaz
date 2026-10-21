@@ -10,7 +10,7 @@ set -euo pipefail
 }
 
 case "${1:?expected deps or final}" in
-  deps) jq -er '[.root]' "$RUNNER_TEMP/chaz-deps/identity.json" > "$RUNNER_TEMP/chaz-publish.json" ;;
+  deps) jq -e '[.[] | .outputs[]]' "$RUNNER_TEMP/chaz-deps.json" > "$RUNNER_TEMP/chaz-publish.json" ;;
   final) jq -es '[.[][] | .outputs[]] | unique' "$RUNNER_TEMP/chaz-checks.json" "$RUNNER_TEMP/chaz-final.json" > "$RUNNER_TEMP/chaz-publish.json" ;;
   *) exit 2 ;;
 esac

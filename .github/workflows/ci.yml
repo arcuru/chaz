@@ -44,55 +44,6 @@ jobs:
       - name: Setup Nix
         uses: ./.github/actions/setup-nix
 
-      - name: Dependency identity
-        id: identity
-        shell: bash
-        run: bash .github/scripts/deps-cache.sh resolve
-
-      - name: Prefer signed main dependencies
-        id: trusted
-        shell: bash
-        run: bash .github/scripts/deps-cache.sh trusted
-
-      # Ubicloud Transparent Cache implements the standard Actions cache protocol.
-      # No restore keys: scope + exact derivation/output + system + payload schema.
-      - name: Restore PR dependencies
-        id: restore
-        if: github.event_name == 'pull_request' && steps.trusted.outputs.available != 'true'
-        continue-on-error: true
-        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
-        with:
-          path: ${{ runner.temp }}/chaz-deps-cache
-          key: ${{ steps.identity.outputs.key }}
-        env:
-          SEGMENT_DOWNLOAD_TIMEOUT_MINS: "2"
-
-      - name: Import PR dependencies
-        if: github.event_name == 'pull_request' && steps.trusted.outputs.available != 'true' && steps.restore.outputs.cache-hit == 'true'
-        shell: bash
-        run: bash .github/scripts/deps-cache.sh import
-
-      # Always realize the exact dependency output, even after a cache miss/error.
-      - name: Build dependencies
-        shell: bash
-        run: bash .github/scripts/deps-cache.sh build
-
-      - name: Export PR dependencies
-        id: export
-        if: github.event_name == 'pull_request' && steps.trusted.outputs.available != 'true' && steps.restore.outputs.cache-hit != 'true'
-        continue-on-error: true
-        shell: bash
-        run: bash .github/scripts/deps-cache.sh export
-
-      # Save now, not in a post-job hook gated on unrelated project tests.
-      - name: Save PR dependencies
-        if: github.event_name == 'pull_request' && steps.export.outcome == 'success'
-        continue-on-error: true
-        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
-        with:
-          path: ${{ runner.temp }}/chaz-deps-cache
-          key: ${{ steps.identity.outputs.key }}
-
       - name: Checks
         run: bash .github/scripts/checks.sh
 
@@ -113,20 +64,10 @@ jobs:
       - name: Setup Nix
         uses: ./.github/actions/setup-nix
 
-      - name: Dependency identity
-        id: identity
-        shell: bash
-        run: bash .github/scripts/deps-cache.sh resolve
-
-      - name: Prefer signed main dependencies
-        id: trusted
-        shell: bash
-        run: bash .github/scripts/deps-cache.sh trusted
-
-      # Always realize the exact dependency output, even after a cache miss/error.
       - name: Build dependencies
-        shell: bash
-        run: bash .github/scripts/deps-cache.sh build
+        run: |
+          nix build --fallback --no-link --max-jobs 2 --cores 0 --json \
+            '.#test.deps' > "$RUNNER_TEMP/chaz-deps.json"
 
       - name: Publish dependencies
         id: publish-deps

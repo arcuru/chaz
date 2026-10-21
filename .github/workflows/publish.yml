@@ -36,20 +36,10 @@ jobs:
       - name: Setup Nix
         uses: ./.github/actions/setup-nix
 
-      - name: Dependency identity
-        id: identity
-        shell: bash
-        run: bash .github/scripts/deps-cache.sh resolve
-
-      - name: Prefer signed main dependencies
-        id: trusted
-        shell: bash
-        run: bash .github/scripts/deps-cache.sh trusted
-
-      # Always realize the exact dependency output, even after a cache miss/error.
       - name: Build dependencies
-        shell: bash
-        run: bash .github/scripts/deps-cache.sh build
+        run: |
+          nix build --fallback --no-link --max-jobs 2 --cores 0 --json \
+            '.#test.deps' > "$RUNNER_TEMP/chaz-deps.json"
 
       - name: Publish dependencies
         id: publish-deps
