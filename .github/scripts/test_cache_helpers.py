@@ -1,7 +1,7 @@
 """Exercise cache/publication helpers without keys, models or remote writers.
 
-Run explicitly with python -m unittest discover -s .github/scripts -p 'check_*.py'.
-These tests need jq; the existing Nix ci-policy check needs only Python/PyYAML.
+Run with the workflow tests through the Nix ci-policy check, which supplies jq
+and Python/PyYAML. All Nix operations use executable stubs.
 """
 
 import json
