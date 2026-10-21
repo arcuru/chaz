@@ -1420,3 +1420,67 @@ assert delivered == report or delivered.startswith(report + "\n\n"), probes
 assert probes[1]["tails"] == [], probes
 print("PASS — Matrix /context: exact shown snapshot delivered once; no command-triggered model call")
 PY
+
+# -------------------------------------------------------- invite + forget ---
+# Stop the auto-joiner before creating the invite. Reuse this homeserver and
+# the bridge's token for independent membership/history checks.
+log "true reset: stopping the bridge and creating a pending invite"
+kill -TERM "$BRIDGE_PID"
+wait_for "bridge to exit before reset" 30 sh -c "! kill -0 $BRIDGE_PID 2>/dev/null"
+retire_pid "$BRIDGE_PID"
+AGENT_TOKEN="$(jq -r '.user_session.access_token' "$LOGIN_STATE_DIR/session")"
+INVITED_ROOM="$(mx POST /_matrix/client/v3/createRoom "$PUPPET_TOKEN" "$(jq -nc \
+    --arg agent "$AGENT_MXID" '{preset:"trusted_private_chat",invite:[$agent]}')" |
+    jq -r '.room_id // empty')"
+[[ -n $INVITED_ROOM ]] || fail "could not create the reset invite"
+GROUP_URI="$(jq -rn --arg r "$GROUP_ROOM_ID" '$r|@uri')"
+mx GET "/_matrix/client/v3/rooms/$ROOM_URI/state" "$AGENT_TOKEN" | jq -e 'type == "array"' >/dev/null ||
+    fail "joined DM history was not readable before reset"
+mx GET "/_matrix/client/v3/rooms/$GROUP_URI/state" "$AGENT_TOKEN" | jq -e 'type == "array"' >/dev/null ||
+    fail "plain leave-all unexpectedly removed group history access"
+
+log "true reset: preview leaves membership unchanged"
+"$CHAZ_MATRIX_BIN" --config "$BRIDGE_CONFIG" rooms leave-all --reset >"$WORKSPACE/true-reset-preview.log" 2>&1 ||
+    fail "true-reset preview failed"
+grep -qF "pending invite $INVITED_ROOM" "$WORKSPACE/true-reset-preview.log" ||
+    fail "true-reset preview omitted the invite"
+grep -qF "joined $ROOM_ID" "$WORKSPACE/true-reset-preview.log" ||
+    fail "true-reset preview omitted the joined DM"
+mx GET /_matrix/client/v3/joined_rooms "$AGENT_TOKEN" |
+    jq -e --arg room "$ROOM_ID" '.joined_rooms == [$room]' >/dev/null ||
+    fail "true-reset preview changed joined rooms"
+mx GET '/_matrix/client/v3/sync?timeout=0' "$AGENT_TOKEN" |
+    jq -e --arg room "$INVITED_ROOM" '(.rooms.invite | keys) == [$room]' >/dev/null ||
+    fail "true-reset preview changed pending invites"
+
+log "true reset: reject, leave and forget"
+"$CHAZ_MATRIX_BIN" --config "$BRIDGE_CONFIG" rooms leave-all --reset --execute >"$WORKSPACE/true-reset-execute.log" 2>&1 ||
+    fail "true-reset execute failed"
+grep -qF 'summary: rejected 1, left 1, failed 0, forgot 2, forget-failed 0' "$WORKSPACE/true-reset-execute.log" ||
+    fail "true-reset summary did not confirm both rooms were handled"
+# Initial /sync responses are cached per device. Use a fresh observer so the
+# post-reset check cannot replay the preview's pre-reset invite snapshot.
+AGENT_TOKEN="$(mx POST /_matrix/client/v3/login "" "$(jq -nc \
+    --arg u "$AGENT_MXID" --arg p "$AGENT_PASSWORD" \
+    '{type:"m.login.password",identifier:{type:"m.id.user",user:$u},password:$p}')" |
+    jq -er '.access_token // empty')" || fail "could not log in the reset observer"
+mx GET /_matrix/client/v3/joined_rooms "$AGENT_TOKEN" | jq -e '.joined_rooms == []' >/dev/null ||
+    fail "true reset left joined rooms"
+mx GET '/_matrix/client/v3/sync?timeout=0' "$AGENT_TOKEN" |
+    jq -e '(.rooms.invite // {} | length) == 0' >/dev/null ||
+    fail "true reset left pending invites"
+mx GET "/_matrix/client/v3/rooms/$ROOM_URI/state" "$AGENT_TOKEN" |
+    jq -e '.errcode == "M_FORBIDDEN"' >/dev/null ||
+    fail "true reset did not remove DM history access"
+mx GET "/_matrix/client/v3/rooms/$GROUP_URI/state" "$AGENT_TOKEN" | jq -e 'type == "array"' >/dev/null ||
+    fail "true reset changed the already-left control room"
+
+"$CHAZ_MATRIX_BIN" --config "$BRIDGE_CONFIG" rooms leave-all --reset --execute >"$WORKSPACE/true-reset-empty.log" 2>&1 ||
+    fail "true-reset rerun failed"
+grep -qF 'nothing to do (no joined rooms, no pending invites)' "$WORKSPACE/true-reset-empty.log" ||
+    fail "true-reset rerun was not empty"
+for out in true-reset-preview true-reset-execute true-reset-empty; do
+    ! grep -qF "$AGENT_PASSWORD" "$WORKSPACE/$out.log" ||
+        fail "agent password leaked into $out"
+done
+printf '\033[1;32mPASS\033[0m — true reset: nonmutating preview, invite rejected, joined room left, both forgotten, control readable, rerun empty, no secret leaked\n' >&2
