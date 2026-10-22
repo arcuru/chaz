@@ -647,19 +647,18 @@ impl Open {
         let backend = self.backend.clone();
         let db = self.switch.db.clone();
         let id = self.switch.session_db_id.clone();
+        let observation = setup_session(
+            &self.server,
+            &self.switch.db,
+            self.backend,
+            self.approval_tx,
+            self.notify_tx,
+        )
+        .await
+        .map_err(|e| e.to_string())?;
         let mut tab =
             supervised::read(async move { build_tab(&server, &backend, db, id).await }).await?;
-        tab.live.observation = Some(
-            setup_session(
-                &self.server,
-                &self.switch.db,
-                self.backend,
-                self.approval_tx,
-                self.notify_tx,
-            )
-            .await
-            .map_err(|e| e.to_string())?,
-        );
+        tab.live.observation = Some(observation);
         Ok(Effect::Opened(Box::new(tab)))
     }
 }

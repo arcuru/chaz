@@ -914,6 +914,7 @@ dependencies = [
  "clap",
  "dirs",
  "eidetica",
+ "futures",
  "getrandom 0.3.4",
  "libc",
  "matrix-sdk",

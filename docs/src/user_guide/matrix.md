@@ -14,7 +14,9 @@ configuration and behavior.
 
 The bridge only observes the per-turn claim; it does not run the agent or infer
 activity from a room binding, an old acknowledgement, or session runtime
-ownership. Typing is renewed every three seconds while the claim remains
+ownership. Session writes refresh the activity evidence; the renewal timer
+ages that evidence locally without rereading unchanged activity tables.
+Typing is renewed every three seconds while the claim remains
 fresh, with a ten-second server timeout, avoiding gaps if a renewal is delayed. On release it sends
 a cancellation. A missing executor heartbeat times out instead of showing
 permanent typing after a crash; network or sync lag can delay observation.
@@ -28,7 +30,7 @@ Example with a shared room:
    the bridge remains connected to the room. A second message starts a new turn.
 3. If the executor crashes, the typing notice expires and the bridge stops
    renewing it when the last heartbeat ages out (within 45 seconds plus sync
-   and polling delay). The turn is interrupted; inspect `/interrupted` from a
+   and renewal-timer delay). The turn is interrupted; inspect `/interrupted` from a
    client and use `/retry <request_id>` only after checking for external effects.
 
 ## Setup
