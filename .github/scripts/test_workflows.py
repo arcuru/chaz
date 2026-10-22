@@ -51,6 +51,9 @@ class Workflows(unittest.TestCase):
                 "    calls.write(json.dumps(sys.argv[1:]) + '\\n')\n"
                 "with open(os.environ['NIX_CALLS']) as calls:\n"
                 "    call_count = sum(1 for _ in calls)\n"
+                "if sys.argv[1] == 'log':\n"
+                "    print('retained check output')\n"
+                "    sys.exit(int(os.environ.get('NIX_LOG_EXIT', '0')))\n"
                 "sys.exit(int(os.environ['NIX_EXIT']) if call_count == "
                 "int(os.environ['NIX_FAIL_CALL']) else 0)\n"
             )
@@ -75,14 +78,32 @@ class Workflows(unittest.TestCase):
             invocations = [json.loads(line) for line in calls.read_text().splitlines()]
         return result, invocations
 
-    def run_checks(self, event, exit_code=0):
-        step = next(s for s in self.ci["jobs"]["ci"]["steps"] if s["name"] == "Checks")
+    def run_checks(self, event, exit_code=0, log_exit=0, job="ci"):
+        step = next(s for s in self.ci["jobs"][job]["steps"] if s["name"] == "Checks")
         self.assertNotIn("if", step)
-        self.assertEqual(step["env"]["CI_EVENT_NAME"], "${{ github.event_name }}")
+        if job == "ci":
+            self.assertEqual(step["env"]["CI_EVENT_NAME"], "${{ github.event_name }}")
         result, invocations = self.run_script(
-            step["run"], env={"CI_EVENT_NAME": event}, exit_code=exit_code
+            step["run"],
+            env={"CI_EVENT_NAME": event, "NIX_LOG_EXIT": str(log_exit)},
+            exit_code=exit_code,
         )
-        self.assertEqual(len(invocations), 1)
+        main = job == "ci" and event in ("push", "workflow_dispatch")
+        system = "x86_64-linux" if main else "aarch64-linux"
+        names = ["lint", "treefmt", "ci-policy", "test", "build"]
+        if main:
+            names.append("doc")
+        self.assertEqual(invocations[1:], [
+            ["log", f".#legacyPackages.{system}.lint.chaz-clippy"
+             if name == "lint" else f".#checks.{system}.{name}"]
+            for name in names
+        ])
+        for name in names:
+            self.assertIn(
+                f"::group::{name} — replaying stored derivation log; "
+                "checks are not being rerun", result.stdout
+            )
+        self.assertEqual(result.stdout.count("::endgroup::"), len(names))
         return result, invocations[0]
 
     def run_warm_cache(self, exit_code=0, fail_call=1):
@@ -117,26 +138,118 @@ class Workflows(unittest.TestCase):
                 self.assertEqual(result.returncode, 42, result.stderr)
                 self.assertEqual(len(invocations), fail_call)
 
-    def test_checks_share_one_bounded_build_graph(self):
+    def test_checks_share_one_build_graph_per_platform(self):
         for event in ("pull_request", "merge_group", "push", "workflow_dispatch"):
             with self.subTest(event=event):
                 result, args = self.run_checks(event)
                 self.assertEqual(result.returncode, 0, result.stderr)
-                expected = [
-                    "build", "--no-link", "--keep-going", "--max-jobs", "2", "--cores", "0",
-                    ".#checks.x86_64-linux.lint",
-                    ".#checks.x86_64-linux.treefmt",
-                    ".#checks.x86_64-linux.ci-policy",
-                    ".#checks.x86_64-linux.test",
-                    ".#checks.x86_64-linux.build",
-                ]
-                if event in ("push", "workflow_dispatch"):
-                    expected.append(".#checks.x86_64-linux.doc")
-                self.assertEqual(args, expected)
+                main = event in ("push", "workflow_dispatch")
+                system = "x86_64-linux" if main else "aarch64-linux"
+                names = ["lint", "treefmt", "ci-policy", "test", "build"]
+                if main:
+                    names.append("doc")
+                limits = ["--max-jobs", "2", "--cores", "0"] if main else []
+                self.assertEqual(args, [
+                    "build", "-L", "--no-link", "--keep-going", *limits,
+                    *(f".#checks.{system}.{name}" for name in names),
+                ])
+
+    def test_pull_requests_check_on_the_persistent_arm_runner(self):
+        # GitHub evaluates these; pin the main/other split and both platforms.
+        job = self.ci["jobs"]["ci"]
+        self.assertEqual(
+            expression(job["runs-on"]),
+            f"${{{{ fromJSON(({FULL_COVERAGE}) && "
+            "'\"ubicloud-standard-8\"' || "
+            "'[\"self-hosted\", \"Linux\", \"ARM64\", \"zinc\", \"nix\"]') }}",
+        )
+        self.assertEqual(
+            expression(job["timeout-minutes"]),
+            f"${{{{ ({FULL_COVERAGE}) && 30 || 60 }}}}",
+        )
+        # The ARM runner's preinstalled daemon and store are reused as an
+        # untrusted client: only hosted main installs Nix.
+        steps = {step["name"]: step for step in job["steps"]}
+        self.assertEqual(list(steps), ["Checkout", "Setup Nix", "Checks"])
+        self.assertEqual(steps["Checkout"]["with"]["persist-credentials"], "false")
+        self.assertEqual(steps["Setup Nix"]["if"], FULL_COVERAGE)
+        self.assertEqual(steps["Setup Nix"]["uses"], "./.github/actions/setup-nix")
+        self.assertNotIn("with", steps["Setup Nix"])
+        for forbidden in ("sudo", "--option"):
+            self.assertNotIn(forbidden, steps["Checks"]["run"])
+
+    def test_main_adds_arm_without_changing_required_pr_status(self):
+        self.assertEqual(self.ci["jobs"]["ci"]["name"], "CI")
+        self.assertNotIn("strategy", self.ci["jobs"]["ci"])
+        self.assertNotIn("needs", self.ci["jobs"]["ci"])
+        arm = self.ci["jobs"]["ci-arm"]
+        self.assertEqual(expression(arm["if"]), TRUSTED_MAIN)
+        self.assertEqual(arm["runs-on"], ["self-hosted", "Linux", "ARM64", "zinc", "nix"])
+        self.assertEqual(arm["timeout-minutes"], "60")
+        self.assertNotIn("needs", arm)  # Parallel platforms, one workflow revision.
+        self.assertEqual([s["name"] for s in arm["steps"]], ["Checkout", "Checks"])
+        for job in (self.ci["jobs"]["ci"], arm):
+            checkout = job["steps"][0]
+            self.assertEqual(checkout["with"], {
+                "ref": "${{ github.sha }}", "persist-credentials": "false",
+            })
+        checks = arm["steps"][1]
+        self.assertNotIn("if", checks)
+        for code in (0, 42):
+            result, args = self.run_checks("push", exit_code=code, job="ci-arm")
+            self.assertEqual(result.returncode, code, result.stderr)
+            self.assertEqual(args, [
+                "build", "-L", "--no-link", "--keep-going",
+                *(f".#checks.aarch64-linux.{name}" for name in
+                  ("lint", "treefmt", "ci-policy", "test", "build")),
+            ])
+
+    def test_main_arm_replays_logs_and_preserves_build_status(self):
+        for event in ("push", "workflow_dispatch"):
+            for build_status in (0, 1, 42, 100):
+                for log_status in (0, 17):
+                    with self.subTest(event=event, build=build_status, log=log_status):
+                        result, _ = self.run_checks(
+                            event, exit_code=build_status,
+                            log_exit=log_status, job="ci-arm",
+                        )
+                        self.assertEqual(result.returncode, build_status, result.stderr)
+                        if log_status:
+                            self.assertEqual(result.stdout.count("::warning::"), 5)
+                            self.assertIn("no test result inferred", result.stdout)
+                        else:
+                            self.assertEqual(result.stdout.count("retained check output"), 5)
+                            self.assertNotIn("::warning::", result.stdout)
+
+    def test_publishing_stays_on_hosted_x86_runners(self):
+        publish = self.publish["jobs"]["push-cache"]
+        self.assertEqual(publish["runs-on"], "ubicloud-standard-8")
+        self.assertIn(".#packages.x86_64-linux.default", yaml.safe_dump(publish))
+        self.assertEqual(self.e2e["jobs"]["e2e"]["runs-on"], "ubicloud-standard-8")
 
     def test_checks_propagate_build_failure(self):
-        result, _ = self.run_checks("pull_request", exit_code=42)
-        self.assertEqual(result.returncode, 42, result.stderr)
+        for event in ("pull_request", "merge_group", "push", "workflow_dispatch"):
+            with self.subTest(event=event):
+                result, _ = self.run_checks(event, exit_code=42)
+                self.assertEqual(result.returncode, 42, result.stderr)
+
+    def test_missing_logs_warn_without_changing_build_status(self):
+        for build_status in (0, 1, 42, 100):
+            with self.subTest(build_status=build_status):
+                result, _ = self.run_checks(
+                    "pull_request", exit_code=build_status, log_exit=17
+                )
+                self.assertEqual(result.returncode, build_status, result.stderr)
+                self.assertEqual(result.stdout.count("::warning::"), 5)
+                self.assertIn("no test result inferred", result.stdout)
+
+    def test_stored_logs_are_visible_after_success_and_failure(self):
+        for build_status in (0, 42):
+            with self.subTest(build_status=build_status):
+                result, _ = self.run_checks("push", exit_code=build_status)
+                self.assertEqual(result.returncode, build_status, result.stderr)
+                self.assertEqual(result.stdout.count("retained check output"), 6)
+                self.assertNotIn("::warning::", result.stdout)
 
     def test_full_coverage_is_push_or_manual_only(self):
         self.assertEqual(
@@ -151,7 +264,7 @@ class Workflows(unittest.TestCase):
         self.assertEqual(self.e2e["on"]["push"]["branches"], ["main"])
 
     def test_matrix_e2e_is_independent_with_unchanged_budgets(self):
-        self.assertEqual(set(self.ci["jobs"]), {"ci", "publish"})
+        self.assertEqual(set(self.ci["jobs"]), {"ci", "ci-arm", "publish"})
         self.assertEqual(set(self.e2e["jobs"]), {"e2e"})
         self.assertEqual(self.e2e["name"], "Matrix E2E")
         self.assertEqual(
@@ -185,22 +298,29 @@ class Workflows(unittest.TestCase):
 
     def test_publish_requires_successful_ordinary_main_ci_only(self):
         job = self.ci["jobs"]["publish"]
-        self.assertEqual(job["needs"], ["ci"])
+        self.assertEqual(job["needs"], ["ci", "ci-arm"])
         self.assertEqual(expression(job["if"]), TRUSTED_MAIN)
         self.assertEqual(job["uses"], "./.github/workflows/publish.yml")
         self.assertEqual(job["permissions"], {"contents": "read"})
-        # No status override: GitHub's default success() gates the dependency.
-        self.assertNotIn("always()", job["if"])
+        # Exact guard has no status override: default success() requires BOTH
+        # dependencies to succeed. Failure, cancellation, skip and missing
+        # results therefore cannot enter the reusable publishing workflow.
+        self.assertNotIn("continue-on-error", job)
+        for dependency in job["needs"]:
+            check = self.ci["jobs"][dependency]
+            self.assertNotIn("continue-on-error", check)
+            for step in check["steps"]:
+                self.assertNotIn("continue-on-error", step)
 
-    def test_publisher_is_reusable_with_independent_manual_entry(self):
-        self.assertEqual(set(self.publish["on"]), {"workflow_call", "workflow_dispatch"})
+    def test_publisher_has_no_manual_bypass(self):
+        self.assertEqual(set(self.publish["on"]), {"workflow_call"})
         job = self.publish["jobs"]["push-cache"]
         self.assertEqual(expression(job["if"]), TRUSTED_MAIN)
         self.assertEqual(job["environment"], "publish")
         self.assertEqual(job["permissions"], {"contents": "read"})
 
     def test_ci_checks_do_not_receive_publishing_secrets(self):
-        for job in (self.ci["jobs"]["ci"], self.e2e["jobs"]["e2e"]):
+        for job in (self.ci["jobs"]["ci"], self.ci["jobs"]["ci-arm"], self.e2e["jobs"]["e2e"]):
             self.assertNotIn("secrets.", yaml.safe_dump(job))
         self.assertEqual(self.ci["permissions"], {"contents": "read"})
         self.assertEqual(self.e2e["permissions"], {"contents": "read"})

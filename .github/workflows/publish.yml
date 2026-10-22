@@ -1,7 +1,7 @@
 # Publish workflow — pushes built artifacts to the eidetica Nix cache.
 #
 # Called after all main CI jobs succeed, within CI's native concurrency group.
-# Manual publication stays independent. Builds clean from cache.nixos.org
+# Manual runs enter through CI so both platforms must pass. Builds from cache.nixos.org
 # (bypassing our own cache to prevent poisoning), signs the results, and pushes
 # them to s3://cache-eidetica-dev. No PR artifacts enter the publisher.
 
@@ -16,7 +16,6 @@ on:
         required: true
       NIX_CACHE_SIGNING_KEY:
         required: true
-  workflow_dispatch:
 
 permissions:
   contents: read

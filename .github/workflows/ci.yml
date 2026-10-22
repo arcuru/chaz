@@ -28,41 +28,115 @@ concurrency:
 jobs:
   ci:
     name: CI
-    runs-on: ubicloud-standard-8
-    timeout-minutes: 30
+    # Pull requests and merge-queue runs check on the native ARM64 runner. Its
+    # one Nix store persists across jobs, so unchanged outputs are reused rather
+    # than rebuilt or restored; its preinstalled daemon owns substituters and
+    # build limits, and jobs are untrusted clients with no publishing
+    # credentials. Main (push or manual) also checks ARM below, alongside
+    # hosted x86_64 checks; Publish waits for both platforms.
+    runs-on: >-
+      ${{ fromJSON((github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
+          '"ubicloud-standard-8"' ||
+          '["self-hosted", "Linux", "ARM64", "zinc", "nix"]') }}
+    # The ARM runner needs room for a cold store; later runs reuse its outputs.
+    timeout-minutes: >-
+      ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && 30 || 60 }}
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
+          ref: ${{ github.sha }}
           persist-credentials: false
 
+      # The ARM runner provides Nix; hosted runners install it fresh.
       - name: Setup Nix
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
         uses: ./.github/actions/setup-nix
 
       # One graph shares dependency work and lets independent checks overlap.
-      # Allow two builds at once, each using all cores so a dependency build
-      # running alone can use the whole runner.
+      # Hosted main allows two builds at once, each using all cores so a
+      # dependency build running alone can use the whole runner. The ARM
+      # runner's Nix configuration sets concurrency for its memory instead.
       - name: Checks
         env:
           CI_EVENT_NAME: ${{ github.event_name }}
         run: |
-          checks=(
-            '.#checks.x86_64-linux.lint'
-            '.#checks.x86_64-linux.treefmt'
-            '.#checks.x86_64-linux.ci-policy'
-            '.#checks.x86_64-linux.test'
-            '.#checks.x86_64-linux.build'
-          )
+          system=aarch64-linux
+          limits=()
+          names=(lint treefmt ci-policy test build)
           # PRs retain normal Cargo tests, including doctests.
           if [[ "$CI_EVENT_NAME" == push || "$CI_EVENT_NAME" == workflow_dispatch ]]; then
-            checks+=('.#checks.x86_64-linux.doc')
+            system=x86_64-linux
+            limits=(--max-jobs 2 --cores 0)
+            names+=(doc)
           fi
-          nix build --no-link --keep-going --max-jobs 2 --cores 0 "${checks[@]}"
+          checks=()
+          for name in "${names[@]}"; do
+            checks+=(".#checks.$system.$name")
+          done
+          build_status=0
+          nix build -L --no-link --keep-going "${limits[@]}" "${checks[@]}" || build_status=$?
+          # Report even after failure or a cache hit. Reading a stored log does
+          # not rerun a check, and unavailable logs do not change build status.
+          for name in "${names[@]}"; do
+            log=".#checks.$system.$name"
+            # lint is a symlinkJoin with no own log; read Clippy itself.
+            if [[ "$name" == lint ]]; then
+              log=".#legacyPackages.$system.lint.chaz-clippy"
+            fi
+            echo "::group::$name — replaying stored derivation log; checks are not being rerun"
+            if ! nix log "$log"; then
+              echo "::warning::Stored log unavailable for $log (local store or configured binary caches); no test result inferred"
+            fi
+            echo '::endgroup::'
+          done
+          exit "$build_status"
+
+  # Keep the required PR status `CI` unchanged above. Main adds a second
+  # native platform, using the same single zinc listener and persistent store.
+  ci-arm:
+    name: Main ARM64
+    if: |
+      github.repository_owner == 'arcuru' && github.ref == 'refs/heads/main' &&
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    runs-on: [self-hosted, Linux, ARM64, zinc, nix]
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      # No installer or client build-limit overrides: zinc's daemon owns both.
+      - name: Checks
+        run: |
+          system=aarch64-linux
+          names=(lint treefmt ci-policy test build)
+          checks=()
+          for name in "${names[@]}"; do
+            checks+=(".#checks.$system.$name")
+          done
+          build_status=0
+          nix build -L --no-link --keep-going "${checks[@]}" || build_status=$?
+          # The main ARM path needs the same retained results as PR checks.
+          for name in "${names[@]}"; do
+            log=".#checks.$system.$name"
+            if [[ "$name" == lint ]]; then
+              log=".#legacyPackages.$system.lint.chaz-clippy"
+            fi
+            echo "::group::$name — replaying stored derivation log; checks are not being rerun"
+            if ! nix log "$log"; then
+              echo "::warning::Stored log unavailable for $log (local store or configured binary caches); no test result inferred"
+            fi
+            echo '::endgroup::'
+          done
+          exit "$build_status"
 
   publish:
     name: Publish
     # Matrix E2E is independent and can be disabled without blocking publishing.
-    needs: [ci]
+    needs: [ci, ci-arm]
     if: |
       github.repository_owner == 'arcuru' && github.ref == 'refs/heads/main' &&
       (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
