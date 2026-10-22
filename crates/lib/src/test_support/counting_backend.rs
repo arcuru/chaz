@@ -2,8 +2,9 @@
 //!
 //! Every method delegates to the native `InMemory` backend unchanged, including
 //! the methods with trait defaults, so the fixture keeps native cached-state and
-//! traversal behavior. Only `get` is observed: on a service connection each one
-//! is a separate `GetEntry` round trip, so read paths must not scale it with
+//! traversal behavior. `get` and activity-table view resolutions are observed.
+//! On a service connection each raw get is a separate RPC, so
+//! read paths must not scale raw gets with
 //! session history.
 
 use std::sync::Arc;
@@ -21,9 +22,13 @@ use eidetica::{
 };
 
 #[derive(Clone, Default)]
-pub(crate) struct EntryReads(Arc<AtomicUsize>);
+pub(crate) struct EntryReads(Arc<AtomicUsize>, Arc<AtomicUsize>);
 
 impl EntryReads {
+    pub(crate) fn activity_tables(&self) -> usize {
+        self.1.load(Ordering::SeqCst)
+    }
+
     pub(crate) fn count(&self) -> usize {
         self.0.load(Ordering::SeqCst)
     }
@@ -162,6 +167,9 @@ impl BackendImpl for Counting {
         &self,
         request: &StoreStateRequest,
     ) -> eidetica::Result<Option<RecordView>> {
+        if matches!(request.store.as_str(), "turn_attempts" | "turn_activity") {
+            self.reads.1.fetch_add(1, Ordering::SeqCst);
+        }
         self.inner.resolve_store_state(request).await
     }
     async fn begin_store_state_staging(

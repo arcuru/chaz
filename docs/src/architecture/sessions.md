@@ -136,7 +136,15 @@ by the executor every ten seconds while an agent turn is alive, including
 semaphore waits and tool approval. Clients treat a start as visible only for
 45 seconds after its last heartbeat (or its original start), and completion
 wins even over a late synced heartbeat. Matrix renews its ten-second typing
-lease on a three-second timer; the TUI refreshes every five seconds. This
+lease on a three-second timer; the TUI ages activity every five seconds.
+Both retain timestamped activity evidence between session write callbacks,
+rereading the native Verified view only on invalidation, initial load or a
+failed-read retry. Timers still expire orphaned claims without any write;
+future timestamps remain invisible until the local clock reaches them.
+Subscriptions precede initial observation, and writes during a read leave one
+coalesced follow-up. Event cursor tips are invalidation hints, not read views
+or authorization. Matrix observers are owned by their bridge generation and
+cancel pending reads on shutdown before the next generation is installed. This
 bounded presentation lease is not the session-wide `claim_runtime` lease and
 has no effect on reconciliation or retry safety.
 

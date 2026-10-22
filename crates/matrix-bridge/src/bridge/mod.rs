@@ -1,6 +1,7 @@
 pub(crate) mod client;
 mod commands;
 mod history;
+mod typing;
 
 use chaz_core::bridge::delivery::{DeliveryBinding, DeliveryReconciler, DeliveryStore};
 use chaz_core::bridge::outbound::{
@@ -218,7 +219,32 @@ async fn backfill_joined_room(
 /// `(room_id, session_db_id)` — the binding delivery progress is persisted
 /// under. A session bound to several rooms gets one reconciler per room, each
 /// with its own progress.
-type AttachedChannels = Arc<Mutex<HashMap<(String, String), Arc<DeliveryReconciler>>>>;
+struct AttachedChannel {
+    delivery: Arc<DeliveryReconciler>,
+    typing: typing::Watcher,
+}
+struct Channels {
+    bindings: Mutex<Option<HashMap<(String, String), AttachedChannel>>>,
+    stopped: tokio::sync::watch::Receiver<bool>,
+    typing_tasks: Arc<std::sync::Mutex<Vec<tokio::task::AbortHandle>>>,
+}
+type AttachedChannels = Arc<Channels>;
+
+/// Also stops observers if the bridge future is cancelled during teardown.
+struct TypingLifetime {
+    stop: tokio::sync::watch::Sender<bool>,
+    tasks: Arc<std::sync::Mutex<Vec<tokio::task::AbortHandle>>>,
+}
+impl Drop for TypingLifetime {
+    fn drop(&mut self) {
+        self.stop.send_replace(true);
+        // Forced generation teardown cannot await async cleanup. Abort owned
+        // observers too, so an old final release cannot race a new lease.
+        for task in self.tasks.lock().unwrap().drain(..) {
+            task.abort();
+        }
+    }
+}
 
 /// Install durable outbound delivery and the approval watcher for a Matrix
 /// room.
@@ -239,7 +265,6 @@ async fn attach_response_callback(
     owning_agent: String,
     pending: PendingApprovals,
 ) -> anyhow::Result<Arc<DeliveryReconciler>> {
-    attach_typing_watcher(session_db, room.clone()).await?;
     // Same session DB, two watchers: deliver agent replies, and surface tool
     // approval prompts the daemon proxied here.
     attach_approval_watcher(session_db, room.clone(), pending).await?;
@@ -316,9 +341,7 @@ async fn send_turn_typing(room: &Room, active: bool) -> matrix_sdk::Result<()> {
         .map_err(Into::into)
 }
 
-/// Observe the executor's per-turn claim through session sync. Timer reads
-/// both renew Matrix's short typing timeout and expire orphaned starts if a
-/// remote executor dies without a final write.
+/// True renews the lease; false releases it once, retrying failed sends.
 async fn update_typing<E, F, Fut>(typing: &mut bool, active: bool, send: F) -> Result<(), E>
 where
     F: FnOnce(bool) -> Fut,
@@ -329,51 +352,6 @@ where
         send(active).await?;
         *typing = active;
     }
-    Ok(())
-}
-
-async fn attach_typing_watcher(session_db: &eidetica::Database, room: Room) -> anyhow::Result<()> {
-    let db = session_db.clone();
-    let changed = Arc::new(Notify::new());
-    let wake = changed.clone();
-    session_db
-        .on_write(move |_, _| {
-            let wake = wake.clone();
-            Box::pin(async move {
-                wake.notify_one();
-                Ok(())
-            })
-        })
-        .await?
-        .detach();
-    tokio::spawn(async move {
-        let mut tick = tokio::time::interval(TYPING_RENEWAL);
-        let mut typing = false;
-        loop {
-            tokio::select! {
-                _ = tick.tick() => {},
-                _ = changed.notified() => {},
-            }
-            if room.state() != RoomState::Joined {
-                break;
-            }
-            let active = match Session::active_turn_attempts(&db).await {
-                Ok(attempts) => !attempts.is_empty(),
-                Err(error) => {
-                    error!(%error, "Could not read Matrix turn activity");
-                    continue;
-                }
-            };
-            if let Err(error) =
-                update_typing(&mut typing, active, |state| send_turn_typing(&room, state)).await
-            {
-                error!(%error, "Could not update Matrix typing notice");
-            }
-        }
-        if typing {
-            let _ = send_turn_typing(&room, false).await;
-        }
-    });
     Ok(())
 }
 
@@ -892,7 +870,17 @@ impl Bridge for MatrixBridge {
 
         // Rooms with outbound delivery installed, and the reconciler that
         // owns each one's persisted progress.
-        let attached_channels: AttachedChannels = Arc::new(Mutex::new(HashMap::new()));
+        let (typing_stop, stopped) = tokio::sync::watch::channel(false);
+        let typing_tasks = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let typing_lifetime = TypingLifetime {
+            stop: typing_stop,
+            tasks: typing_tasks.clone(),
+        };
+        let attached_channels: AttachedChannels = Arc::new(Channels {
+            bindings: Mutex::new(Some(HashMap::new())),
+            stopped,
+            typing_tasks,
+        });
 
         // Posted tool-approval prompts awaiting a reaction/command, keyed by the
         // prompt's event id. Shared across the startup attach, the message
@@ -1360,16 +1348,16 @@ impl Bridge for MatrixBridge {
                 biased;
                 _ = shutdown.notified() => {
                     info!("Matrix bridge received shutdown signal");
-                    return Ok(());
+                    break;
                 }
                 res = mc.run_sync_loop() => match res {
-                    Ok(()) => return Ok(()),
+                    Ok(()) => break,
                     Err(e) => {
                         error!("Matrix sync error (retrying in 5s): {e}");
                         tokio::select! {
                             _ = shutdown.notified() => {
                                 info!("Matrix bridge received shutdown signal during backoff");
-                                return Ok(());
+                                break;
                             }
                             _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {}
                         }
@@ -1377,6 +1365,23 @@ impl Bridge for MatrixBridge {
                 }
             }
         }
+        typing_lifetime.stop.send_replace(true);
+        // Close admission before draining: late event handlers cannot install
+        // observers onto a retired generation.
+        let bindings = attached_channels
+            .bindings
+            .lock()
+            .await
+            .take()
+            .unwrap_or_default();
+        // Release concurrently: one slow homeserver send must not stretch
+        // shutdown to one lease per room.
+        let finishes = bindings.into_values().map(|channel| {
+            channel.delivery.stop();
+            channel.typing.finish()
+        });
+        futures::future::join_all(finishes).await;
+        Ok(())
     }
 }
 
@@ -1394,9 +1399,21 @@ async fn attach_once(
     pending: PendingApprovals,
 ) -> anyhow::Result<()> {
     let key = (room.room_id().to_string(), session_db.root_id().to_string());
-    let mut attached = attached.lock().await;
-    if attached.contains_key(&key) {
+    let mut guard = attached.bindings.lock().await;
+    let attached_bindings = guard
+        .as_mut()
+        .ok_or_else(|| anyhow::anyhow!("Matrix generation stopped"))?;
+    anyhow::ensure!(!*attached.stopped.borrow(), "Matrix generation stopped");
+    if attached_bindings.contains_key(&key) {
         return Ok(());
+    }
+    let typing = typing::attach(session_db, room.clone(), attached.stopped.clone()).await?;
+    {
+        // Registration and forced cancellation share this lock. A handler
+        // completing subscribe after teardown must not leave a new observer.
+        let mut tasks = attached.typing_tasks.lock().unwrap();
+        anyhow::ensure!(!*attached.stopped.borrow(), "Matrix generation stopped");
+        tasks.push(typing.abort_handle());
     }
     let reconciler = attach_response_callback(
         session_db,
@@ -1412,7 +1429,13 @@ async fn attach_once(
         room_id = %key.0,
         "Matrix outbound delivery installed"
     );
-    attached.insert(key, reconciler);
+    attached_bindings.insert(
+        key,
+        AttachedChannel {
+            delivery: reconciler,
+            typing,
+        },
+    );
     Ok(())
 }
 

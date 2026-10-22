@@ -19,6 +19,7 @@
 //! overwriting newer state or landing on another session.
 
 use super::*;
+use chaz_core::session::TurnActivity;
 
 /// One kind of background read for one tab: at most one in flight, plus a
 /// dirty bit that coalesces every request made while it runs.
@@ -81,12 +82,13 @@ pub(super) struct TabLive {
     pub(super) reload: RefreshSlot,
     /// Extension status strip read.
     pub(super) status: RefreshSlot,
-    /// Live-turn claim count, polled on the activity tick.
+    /// Activity evidence read only on invalidation, initial load or retry.
     pub(super) activity: RefreshSlot,
     pub(super) job: RefreshSlot,
     /// Ticket of the newest read whose `active_turns` has been applied, so a
     /// slow tick can't overwrite a newer reload's count (or vice versa).
     activity_applied: u64,
+    pub(super) activity_evidence: Option<TurnActivity>,
     /// Last extension status segments read for this session. Shown as-is
     /// while a refresh is pending; never borrowed from another tab.
     pub(super) status_segments: Vec<String>,
@@ -151,7 +153,7 @@ pub(super) struct SessionSnapshot {
     pub(super) entries: Vec<SessionEntry>,
     pub(super) telemetry: chaz_core::session::usage::SessionTelemetry,
     pub(super) meta: SessionMeta,
-    pub(super) active_turns: Result<usize, String>,
+    pub(super) active_turns: Result<TurnActivity, String>,
 }
 
 /// A completed background read, routed back to the run loop.
@@ -174,7 +176,7 @@ pub(super) enum Refresh {
     Activity {
         session_db_id: String,
         ticket: u64,
-        active_turns: Result<usize, String>,
+        active_turns: Result<TurnActivity, String>,
     },
 }
 
@@ -197,8 +199,9 @@ pub(super) struct Applied {
     pub(super) follow_up: Option<(String, RefreshKind)>,
 }
 
-/// Retry failed presentation reads and poll activity on the existing tick.
-pub(super) fn request_tick(app: &mut App, tx: &mpsc::Sender<Refresh>) {
+/// Retry failed reads; unchanged ordinary sessions only age retained evidence.
+pub(super) fn request_tick(app: &mut App, tx: &mpsc::Sender<Refresh>) -> bool {
+    let redraw = age_activity(app, chrono::Utc::now());
     let requests: Vec<_> = app
         .tabs
         .iter()
@@ -209,13 +212,51 @@ pub(super) fn request_tick(app: &mut App, tx: &mpsc::Sender<Refresh>) {
                 RefreshKind::Activity,
             ]
             .into_iter()
-            .filter(|kind| *kind == RefreshKind::Activity || tab.live.failed(*kind))
+            .filter(|kind| {
+                if tab.job.is_some() {
+                    // Job polling belongs to the job-observation path.
+                    return *kind == RefreshKind::Activity || tab.live.failed(*kind);
+                }
+                if *kind == RefreshKind::Activity {
+                    return tab.live.reload.in_flight.is_none()
+                        && (tab.live.activity_evidence.is_none()
+                            || tab.live.failed(*kind)
+                            // A transcript/meta failure must not prevent a
+                            // healthy activity read from observing completion.
+                            || tab.live.failed(RefreshKind::Session));
+                }
+                tab.live.failed(*kind)
+            })
             .map(|kind| (tab.session_db_id.clone(), kind))
         })
         .collect();
     for (id, kind) in requests {
         request(app, &id, kind, tx);
     }
+    redraw
+}
+
+pub(super) fn age_activity(app: &mut App, now: chrono::DateTime<chrono::Utc>) -> bool {
+    let mut redraw = false;
+    for tab in &mut app.tabs {
+        if tab.job.is_none()
+            && !tab.live.unbound
+            && let Some(evidence) = &tab.live.activity_evidence
+        {
+            let n = evidence.active_at(now).count();
+            redraw |= tab.active_turns != n;
+            tab.active_turns = n;
+            if tab
+                .pending_approval
+                .as_ref()
+                .is_some_and(|ex| ex.decision_tx.is_closed())
+            {
+                tab.pending_approval = None;
+                redraw = true;
+            }
+        }
+    }
+    redraw
 }
 
 impl App {
@@ -400,11 +441,8 @@ pub(super) async fn load_session_snapshot(
     .map_err(|e| e.to_string())
 }
 
-pub(super) async fn load_active_turns(db: &eidetica::Database) -> Result<usize, String> {
-    Session::active_turn_attempts(db)
-        .await
-        .map(|claims| claims.len())
-        .map_err(|e| e.to_string())
+pub(super) async fn load_active_turns(db: &eidetica::Database) -> Result<TurnActivity, String> {
+    Session::turn_activity(db).await.map_err(|e| e.to_string())
 }
 
 /// Flatten every extension's status map from the session's
@@ -437,13 +475,19 @@ pub(super) fn sync_error(tab: &mut Tab) {
         .or_else(|| tab.live.errors.iter().find_map(Clone::clone));
 }
 
-fn apply_active_turns(tab: &mut Tab, ticket: u64, active_turns: Result<usize, String>) -> bool {
+fn apply_active_turns(
+    tab: &mut Tab,
+    ticket: u64,
+    active_turns: Result<TurnActivity, String>,
+) -> bool {
     if ticket < tab.live.activity_applied {
         return false;
     }
     tab.live.activity_applied = ticket;
     match active_turns {
-        Ok(n) => {
+        Ok(evidence) => {
+            let n = evidence.active_at(chrono::Utc::now()).count();
+            tab.live.activity_evidence = Some(evidence);
             let approval_closed = tab
                 .pending_approval
                 .as_ref()
@@ -660,6 +704,7 @@ fn apply_session_snapshot(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chaz_core::session::TurnActivity;
     use eidetica::backend::database::InMemory;
     use eidetica::{Instance, NewAccount};
     use ratatui::backend::TestBackend;
@@ -669,7 +714,7 @@ mod tests {
 
     /// App with one tab per id. Every tab shares one live in-memory DB:
     /// loaders are injected, so the handle is never read.
-    async fn app_with_tabs(ids: &[&str]) -> (Instance, App) {
+    pub(super) async fn app_with_tabs(ids: &[&str]) -> (Instance, App) {
         let (instance, mut user) = Instance::create_backend(
             Box::new(InMemory::new()),
             NewAccount::passwordless("tab-refresh"),
@@ -688,7 +733,7 @@ mod tests {
         (instance, app)
     }
 
-    fn tab(id: &str, db: eidetica::Database) -> Tab {
+    pub(super) fn tab(id: &str, db: eidetica::Database) -> Tab {
         Tab {
             job: None,
             session_db_id: id.to_string(),
@@ -719,7 +764,7 @@ mod tests {
         }
     }
 
-    fn resolved(_: &str, _: &SessionMeta) -> Resolved {
+    pub(super) fn resolved(_: &str, _: &SessionMeta) -> Resolved {
         Resolved {
             effective_model: "test-model".into(),
             context_budget: 0,
@@ -735,7 +780,7 @@ mod tests {
         }
     }
 
-    fn snapshot(id: &str, ticket: u64, entries: Vec<SessionEntry>, turns: usize) -> Refresh {
+    fn snapshot(id: &str, ticket: u64, entries: Vec<SessionEntry>, turns: TurnActivity) -> Refresh {
         Refresh::Session {
             session_db_id: id.into(),
             ticket,
@@ -915,8 +960,18 @@ mod tests {
         let release_status = request_gated(&mut app, "a", RefreshKind::Status, &tx, |t| {
             status("a", t, "fresh-status")
         });
-        let release_reload = request_gated(&mut app, "a", RefreshKind::Session, &tx, |t| {
-            snapshot("a", t, vec![message("reloaded")], 1)
+        let session = Session::new(
+            chaz_core::types::ConversationId("a".into()),
+            app.active().session_db.clone(),
+        )
+        .await;
+        session
+            .start_turn_attempt(chaz_core::session::TurnRequestId::parse("live"))
+            .await
+            .unwrap();
+        let activity = load_active_turns(session.database()).await.unwrap();
+        let release_reload = request_gated(&mut app, "a", RefreshKind::Session, &tx, move |t| {
+            snapshot("a", t, vec![message("reloaded")], activity)
         });
         assert!(app.active().live.status.is_pending());
         assert!(app.active().live.reload.is_pending());
@@ -976,7 +1031,7 @@ mod tests {
                 spawned.fetch_add(1, Ordering::SeqCst);
                 async move {
                     let _ = gate.await;
-                    snapshot("a", t, vec![message("first")], 0)
+                    snapshot("a", t, vec![message("first")], TurnActivity::default())
                 }
             });
         }
@@ -992,7 +1047,12 @@ mod tests {
         );
 
         let release = request_gated(&mut app, "a", RefreshKind::Session, &tx, |t| {
-            snapshot("a", t, vec![message("first"), message("second")], 0)
+            snapshot(
+                "a",
+                t,
+                vec![message("first"), message("second")],
+                TurnActivity::default(),
+            )
         });
         release.send(()).unwrap();
         let applied = apply(&mut app, rx.recv().await.unwrap(), resolved);
@@ -1038,7 +1098,7 @@ mod tests {
 
         // Closed tab: its reload is discarded and touches nothing else.
         let release = request_gated(&mut app, "b", RefreshKind::Session, &tx, |t| {
-            snapshot("b", t, vec![message("ghost")], 0)
+            snapshot("b", t, vec![message("ghost")], TurnActivity::default())
         });
         release.send(()).unwrap();
         // A result already queued before close still needs the identity guard.
@@ -1049,7 +1109,7 @@ mod tests {
 
         // Closed then reopened: the new tab never asked for the old read.
         let release = request_gated(&mut app, "a", RefreshKind::Session, &tx, |t| {
-            snapshot("a", t, vec![message("old tab")], 0)
+            snapshot("a", t, vec![message("old tab")], TurnActivity::default())
         });
         release.send(()).unwrap();
         let late = rx.recv().await.unwrap();
@@ -1070,7 +1130,7 @@ mod tests {
         let (_instance, mut app) = app_with_tabs(&["a", "b"]).await;
         let (tx, _rx) = mpsc::channel(8);
         let closed = request_gated(&mut app, "a", RefreshKind::Session, &tx, |t| {
-            snapshot("a", t, Vec::new(), 0)
+            snapshot("a", t, Vec::new(), TurnActivity::default())
         });
         let exiting = request_gated(&mut app, "b", RefreshKind::Status, &tx, |t| {
             status("b", t, "unused")
@@ -1094,15 +1154,25 @@ mod tests {
     async fn older_activity_poll_cannot_roll_back_a_newer_reload_and_errors_show() {
         let (_instance, mut app) = app_with_tabs(&["a"]).await;
         let (tx, mut rx) = mpsc::channel(8);
-        let poll = request_gated(&mut app, "a", RefreshKind::Activity, &tx, |t| {
+        let session = Session::new(
+            chaz_core::types::ConversationId("a".into()),
+            app.active().session_db.clone(),
+        )
+        .await;
+        session
+            .start_turn_attempt(chaz_core::session::TurnRequestId::parse("live"))
+            .await
+            .unwrap();
+        let activity = load_active_turns(session.database()).await.unwrap();
+        let poll = request_gated(&mut app, "a", RefreshKind::Activity, &tx, move |t| {
             Refresh::Activity {
                 session_db_id: "a".into(),
                 ticket: t,
-                active_turns: Ok(3),
+                active_turns: Ok(activity),
             }
         });
         let reload = request_gated(&mut app, "a", RefreshKind::Session, &tx, |t| {
-            snapshot("a", t, Vec::new(), 0)
+            snapshot("a", t, Vec::new(), TurnActivity::default())
         });
         reload.send(()).unwrap();
         apply(&mut app, rx.recv().await.unwrap(), resolved);
@@ -1129,7 +1199,7 @@ mod tests {
             Refresh::Activity {
                 session_db_id: "a".into(),
                 ticket: t,
-                active_turns: Ok(0),
+                active_turns: Ok(TurnActivity::default()),
             }
         });
         recovered.send(()).unwrap();
@@ -1207,7 +1277,7 @@ mod tests {
                 Refresh::Activity {
                     session_db_id: "a".into(),
                     ticket,
-                    active_turns: Ok(0),
+                    active_turns: Ok(TurnActivity::default()),
                 }
             },
         );
@@ -1527,5 +1597,203 @@ mod tests {
         assert!(app.active().entries.is_empty());
         app.active_mut().set_entries(Vec::new());
         assert!(app.active().entries.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod activity_regressions {
+    use super::tests::{resolved, tab};
+    use super::*;
+    use chaz_core::session::{TurnAttempt, TurnAttemptStatus, TurnRequestId};
+    use eidetica::store::Table;
+
+    #[tokio::test]
+    async fn unchanged_ordinary_activity_ticks_do_not_read_tables() {
+        let (_instance, mut user, reads) =
+            super::super::activity_backend::counting_eidetica().await;
+        let key = user.get_default_key().unwrap();
+        let mut tabs = Vec::new();
+        for i in 0..16 {
+            let db = user
+                .create_database(eidetica::crdt::Doc::new(), &key)
+                .await
+                .unwrap();
+            let tx = db.new_transaction().await.unwrap();
+            let attempts = tx
+                .get_store::<Table<TurnAttempt>>("turn_attempts")
+                .await
+                .unwrap();
+            for n in 0..1024 {
+                let id = format!("old-{n}");
+                attempts
+                    .set(
+                        &id,
+                        TurnAttempt {
+                            attempt_id: id.clone(),
+                            request_id: TurnRequestId::parse(&id),
+                            started_at: chrono::Utc::now(),
+                            completed_at: Some(chrono::Utc::now()),
+                            generation: 1,
+                            status: TurnAttemptStatus::Completed,
+                        },
+                    )
+                    .await
+                    .unwrap();
+            }
+            tx.commit().await.unwrap();
+            let mut tab = tab(&format!("tab-{i}"), db);
+            let before = reads.activity_tables();
+            tab.live.activity_evidence = Some(load_active_turns(&tab.session_db).await.unwrap());
+            assert!(
+                reads.activity_tables() > before,
+                "reader must detect positive table control"
+            );
+            tabs.push(tab);
+        }
+        for service_mode in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let socket = dir.path().join("service.sock");
+            let (shutdown, receiver) = tokio::sync::watch::channel(());
+            let service_task = if service_mode {
+                let service = eidetica::service::ServiceServer::bind(_instance.clone(), &socket)
+                    .await
+                    .unwrap();
+                Some(tokio::spawn(service.run(receiver)))
+            } else {
+                None
+            };
+            let client = if service_mode {
+                Some(
+                    eidetica::Instance::connect(format!("unix://{}", socket.display()))
+                        .await
+                        .unwrap(),
+                )
+            } else {
+                None
+            };
+            let mut observed = Vec::new();
+            for original in &tabs {
+                let db = if let Some(client) = &client {
+                    client
+                        .login_account("test", None)
+                        .await
+                        .unwrap()
+                        .open_database(original.session_db.root_id())
+                        .await
+                        .unwrap()
+                } else {
+                    original.session_db.clone()
+                };
+                let mut tab = tab(&original.session_db_id, db);
+                tab.live.activity_evidence =
+                    Some(load_active_turns(&tab.session_db).await.unwrap());
+                observed.push(tab);
+            }
+            let mut tabs = observed.into_iter();
+            let mut app = App::new(HashSet::new(), tabs.next().unwrap());
+            app.tabs.extend(tabs);
+            let (tx, mut rx) = mpsc::channel(64);
+            let before = (reads.count(), reads.activity_tables());
+            tokio::time::pause();
+            for _ in 0..10 {
+                tokio::time::advance(std::time::Duration::from_secs(5)).await;
+                request_tick(&mut app, &tx);
+                tokio::task::yield_now().await;
+                assert!(
+                    !app.tabs.iter().any(|t| t.live.pending()),
+                    "unchanged tick launched storage work"
+                );
+            }
+            tokio::time::resume();
+            assert!(rx.try_recv().is_err());
+            assert_eq!((reads.count(), reads.activity_tables()), before);
+            eprintln!(
+                "TUI candidate service={service_mode} sessions=16 history=1024 ticks=10 activity_tables=0 raw_entries=0"
+            );
+            // A failed activity read is retried, and an unrelated successful read
+            // must not clear its error or replace its last-good evidence.
+            app.active_mut().live.errors[RefreshKind::Activity as usize] =
+                Some("read failed".into());
+            request_tick(&mut app, &tx);
+            apply(&mut app, rx.recv().await.unwrap(), resolved);
+            assert!(reads.activity_tables() > before.1);
+            assert!(!app.active().live.failed(RefreshKind::Activity));
+            drop(app);
+            drop(client);
+            drop(shutdown);
+            if let Some(task) = service_task {
+                task.await.unwrap().unwrap();
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn activity_clock_ages_retained_evidence_without_clearing_errors() {
+        let (_instance, mut app) = super::tests::app_with_tabs(&["a"]).await;
+        let db = app.active().session_db.clone();
+        let session = Session::new(chaz_core::types::ConversationId("a".into()), db.clone()).await;
+        let mut attempt = session
+            .start_turn_attempt(TurnRequestId::parse("future"))
+            .await
+            .unwrap();
+        let now = chrono::Utc::now();
+        attempt.started_at = now + chrono::Duration::seconds(3);
+        let tx = db.new_transaction().await.unwrap();
+        tx.get_store::<Table<TurnAttempt>>("turn_attempts")
+            .await
+            .unwrap()
+            .set(&attempt.attempt_id, attempt.clone())
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        app.active_mut().live.activity_evidence = Some(load_active_turns(&db).await.unwrap());
+        app.active_mut().live.errors[RefreshKind::Activity as usize] = Some("stale".into());
+        sync_error(app.active_mut());
+        assert!(!age_activity(&mut app, now));
+        tokio::time::advance(std::time::Duration::from_secs(3)).await;
+        assert!(age_activity(&mut app, now + chrono::Duration::seconds(3)));
+        assert_eq!(app.active().active_turns, 1);
+        assert!(app.active().live.failed(RefreshKind::Activity));
+        tokio::time::advance(std::time::Duration::from_secs(45)).await;
+        assert!(age_activity(&mut app, now + chrono::Duration::seconds(48)));
+        assert_eq!(app.active().active_turns, 0);
+    }
+    #[tokio::test]
+    async fn failed_transcript_reload_does_not_strand_activity_evidence() {
+        let (_instance, mut app) = super::tests::app_with_tabs(&["a"]).await;
+        let db = app.active().session_db.clone();
+        let mut session =
+            Session::new(chaz_core::types::ConversationId("a".into()), db.clone()).await;
+        let attempt = session
+            .start_turn_attempt(TurnRequestId::parse("active"))
+            .await
+            .unwrap();
+        app.active_mut().live.activity_evidence = Some(load_active_turns(&db).await.unwrap());
+        age_activity(&mut app, chrono::Utc::now());
+        assert_eq!(app.active().active_turns, 1);
+        db.with_transaction(|tx| async move {
+            tx.get_store::<eidetica::store::DocStore>("meta")
+                .await?
+                .set_string("agents", "not-json")
+                .await
+        })
+        .await
+        .unwrap();
+        session.complete_turn_attempt(&attempt, None).await.unwrap();
+        let (tx, mut rx) = mpsc::channel(8);
+        request(&mut app, "a", RefreshKind::Session, &tx);
+        apply(&mut app, rx.recv().await.unwrap(), resolved);
+        assert!(app.active().live.failed(RefreshKind::Session));
+        request_tick(&mut app, &tx);
+        for _ in 0..2 {
+            apply(&mut app, rx.recv().await.unwrap(), resolved);
+        }
+        assert_eq!(
+            app.active().active_turns,
+            0,
+            "failed transcript hid completion"
+        );
+        assert!(app.active().live.failed(RefreshKind::Session));
+        assert!(!app.active().live.failed(RefreshKind::Activity));
     }
 }

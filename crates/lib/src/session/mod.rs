@@ -28,6 +28,8 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::{HashMap, HashSet};
 use tracing::{error, info, warn};
 
+#[cfg(test)]
+mod activity_tests;
 mod agents;
 mod bridge_event;
 pub mod execution;
@@ -661,32 +663,57 @@ fn fresh_activity(at: DateTime<Utc>, now: DateTime<Utc>) -> bool {
     age >= chrono::Duration::zero() && age < TURN_ACTIVITY_TIMEOUT
 }
 
+/// Disposable presentation evidence from one native Verified read. This is not
+/// authorization or execution ownership; refresh it after any session write.
+/// Retaining timestamps (including future ones) lets timers age the view without
+/// rereading historical tables. Completed attempts are discarded before caching.
+#[derive(Clone, Debug, Default)]
+pub struct TurnActivity {
+    starts: Vec<(String, DateTime<Utc>)>,
+}
+
+impl TurnActivity {
+    fn from_rows(attempts: Vec<TurnAttempt>, heartbeats: &HashMap<String, DateTime<Utc>>) -> Self {
+        // A late heartbeat cannot resurrect a completed attempt.
+        let completed: HashSet<_> = attempts
+            .iter()
+            .filter(|a| a.status == TurnAttemptStatus::Completed)
+            .map(|a| a.attempt_id.as_str())
+            .collect();
+        let starts = attempts
+            .iter()
+            .filter(|a| {
+                a.status == TurnAttemptStatus::Started && !completed.contains(a.attempt_id.as_str())
+            })
+            .map(|a| {
+                (
+                    a.attempt_id.clone(),
+                    heartbeats
+                        .get(&a.attempt_id)
+                        .copied()
+                        .unwrap_or(a.started_at),
+                )
+            })
+            .collect();
+        Self { starts }
+    }
+
+    pub fn active_at(&self, now: DateTime<Utc>) -> impl Iterator<Item = &str> {
+        self.starts
+            .iter()
+            .filter(move |(_, at)| fresh_activity(*at, now))
+            .map(|(id, _)| id.as_str())
+    }
+}
+
 fn visible_attempts(
     attempts: Vec<TurnAttempt>,
     heartbeats: &HashMap<String, DateTime<Utc>>,
     now: DateTime<Utc>,
 ) -> Vec<String> {
-    // A late heartbeat cannot resurrect a completed attempt.
-    let completed: HashSet<_> = attempts
-        .iter()
-        .filter(|a| a.status == TurnAttemptStatus::Completed)
-        .map(|a| a.attempt_id.clone())
-        .collect();
-    attempts
-        .into_iter()
-        .filter(|a| {
-            a.status == TurnAttemptStatus::Started && !completed.contains(a.attempt_id.as_str())
-        })
-        .filter(|a| {
-            fresh_activity(
-                heartbeats
-                    .get(&a.attempt_id)
-                    .copied()
-                    .unwrap_or(a.started_at),
-                now,
-            )
-        })
-        .map(|a| a.attempt_id)
+    TurnActivity::from_rows(attempts, heartbeats)
+        .active_at(now)
+        .map(str::to_owned)
         .collect()
 }
 
@@ -1873,8 +1900,18 @@ impl Session {
     }
 
     /// Visible, unexpired per-turn claims. Never infer activity from Ack or
-    /// session-level runtime ownership. Clients re-read this on sync and timer.
+    /// session-level runtime ownership. Action callers always read fresh evidence;
+    /// presentation clients may retain [`TurnActivity`] between write callbacks.
     pub async fn active_turn_attempts(database: &Database) -> anyhow::Result<Vec<String>> {
+        Ok(Self::turn_activity(database)
+            .await?
+            .active_at(Utc::now())
+            .map(str::to_owned)
+            .collect())
+    }
+
+    /// Read activity using this handle's identity and the native Verified view.
+    pub async fn turn_activity(database: &Database) -> anyhow::Result<TurnActivity> {
         let txn = database.new_transaction().await?;
         let attempts = txn
             .get_store::<Table<TurnAttempt>>(TURN_ATTEMPTS_STORE)
@@ -1891,7 +1928,7 @@ impl Session {
             .await?
             .into_iter()
             .collect();
-        Ok(visible_attempts(attempts, &heartbeats, Utc::now()))
+        Ok(TurnActivity::from_rows(attempts, &heartbeats))
     }
 
     /// Record a user stop for the one visibly active turn. No active turn is
