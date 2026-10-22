@@ -28,12 +28,16 @@ concurrency:
 jobs:
   ci:
     name: CI
+    if: >-
+      ${{ !(github.repository == 'arcuru/chaz' && github.repository_owner == 'arcuru' &&
+        github.ref == 'refs/heads/main' &&
+        (github.event_name == 'push' || github.event_name == 'workflow_dispatch')) }}
     # Pull requests and merge-queue runs check on the native ARM64 runner. Its
     # one Nix store persists across jobs, so unchanged outputs are reused rather
     # than rebuilt or restored; its preinstalled daemon owns substituters and
     # build limits, and jobs are untrusted clients with no publishing
-    # credentials. Main (push or manual) also checks ARM below, alongside
-    # hosted x86_64 checks; Publish waits for both platforms.
+    # credentials. Nonmain manual checks stay unprivileged. Trusted main runs
+    # ARM first, then checks and publishes x86 outputs from one hosted store.
     runs-on: >-
       ${{ fromJSON((github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
           '"ubicloud-standard-8"' ||
@@ -60,7 +64,7 @@ jobs:
       - name: Checks
         env:
           CI_EVENT_NAME: ${{ github.event_name }}
-        run: |
+        run: &checks |
           system=aarch64-linux
           limits=()
           names=(lint treefmt ci-policy test build)
@@ -76,6 +80,9 @@ jobs:
           done
           build_status=0
           nix build -L --no-link --keep-going "${limits[@]}" "${checks[@]}" || build_status=$?
+          if ((build_status == 0)); then
+            nix path-info "${checks[@]}" > "$RUNNER_TEMP/chaz-checks-paths" || build_status=$?
+          fi
           # Report even after failure or a cache hit. Reading a stored log does
           # not rerun a check, and unavailable logs do not change build status.
           for name in "${names[@]}"; do
@@ -97,7 +104,8 @@ jobs:
   ci-arm:
     name: Main ARM64
     if: |
-      github.repository_owner == 'arcuru' && github.ref == 'refs/heads/main' &&
+      github.repository == 'arcuru/chaz' && github.repository_owner == 'arcuru' &&
+      github.ref == 'refs/heads/main' &&
       (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
     runs-on: [self-hosted, Linux, ARM64, zinc, nix]
     timeout-minutes: 60
@@ -133,19 +141,51 @@ jobs:
           done
           exit "$build_status"
 
-  publish:
-    name: Publish
-    # Matrix E2E is independent and can be disabled without blocking publishing.
-    needs: [ci, ci-arm]
+  main:
+    name: Main x86 and publish
+    # Wait before allocating a hosted runner; no polling or store handoff.
+    # Default success() prevents failed, skipped or cancelled ARM publication.
+    needs: [ci-arm]
     if: |
-      github.repository_owner == 'arcuru' && github.ref == 'refs/heads/main' &&
+      github.repository == 'arcuru/chaz' && github.repository_owner == 'arcuru' &&
+      github.ref == 'refs/heads/main' &&
       (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
-    uses: ./.github/workflows/publish.yml
+    environment: publish
+    runs-on: ubicloud-standard-8
+    timeout-minutes: 60
     permissions:
       contents: read
-    # Reusable workflows require the names even for environment-scoped secrets;
-    # their values are resolved in the callee's protected publishing job.
-    secrets:
-      NIX_CACHE_ACCESS_KEY_ID: ${{ secrets.NIX_CACHE_ACCESS_KEY_ID }}
-      NIX_CACHE_SECRET_ACCESS_KEY: ${{ secrets.NIX_CACHE_SECRET_ACCESS_KEY }}
-      NIX_CACHE_SIGNING_KEY: ${{ secrets.NIX_CACHE_SIGNING_KEY }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Setup Nix
+        uses: ./.github/actions/setup-nix
+
+      # Share the exact check graph and retained-log reporting above.
+      - name: Checks
+        timeout-minutes: 30
+        env:
+          CI_EVENT_NAME: ${{ github.event_name }}
+        run: *checks
+
+      # Tests already compiled these artifacts. Only wrappers/archive remain.
+      # Resolve paths before secrets enter the environment; publication only copies.
+      - name: Prepare final outputs
+        run: |
+          nix build -L --no-link --max-jobs 2 --cores 0 --print-out-paths \
+            '.#packages.x86_64-linux.default' \
+            '.#legacyPackages.x86_64-linux.test.deps' \
+            '.#legacyPackages.x86_64-linux.test.artifacts' \
+            '.#legacyPackages.x86_64-linux.test.archive' \
+            > "$RUNNER_TEMP/chaz-final-paths"
+
+      - name: Publish successful outputs
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.NIX_CACHE_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.NIX_CACHE_SECRET_ACCESS_KEY }}
+          NIX_CACHE_SIGNING_KEY: ${{ secrets.NIX_CACHE_SIGNING_KEY }}
+        run: bash .github/scripts/publish-cache.sh

@@ -15,11 +15,13 @@ import yaml
 ROOT = Path(__file__).resolve().parents[2]
 FULL_COVERAGE = "github.event_name == 'push' || github.event_name == 'workflow_dispatch'"
 TRUSTED_MAIN = (
-    "github.repository_owner == 'arcuru' && github.ref == 'refs/heads/main' && "
+    "github.repository == 'arcuru/chaz' && github.repository_owner == 'arcuru' && "
+    "github.ref == 'refs/heads/main' && "
     f"({FULL_COVERAGE})"
 )
 MAIN_QUEUE = (
-    f"${{{{ {TRUSTED_MAIN} && 'ci-dev-main' || "
+    "${{ github.repository_owner == 'arcuru' && github.ref == 'refs/heads/main' && "
+    f"({FULL_COVERAGE}) && 'ci-dev-main' || "
     "format('ci-{0}-{1}', github.event_name, "
     "github.event.pull_request.number || github.run_id) }}"
 )
@@ -33,11 +35,9 @@ class Workflows(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.ci_text = (ROOT / ".github/workflows/ci.yml").read_text()
-        cls.publish_text = (ROOT / ".github/workflows/publish.yml").read_text()
         cls.e2e_text = (ROOT / ".github/workflows/matrix-e2e.yml").read_text()
         # BaseLoader preserves the YAML key `on` and expression strings.
         cls.ci = yaml.load(cls.ci_text, Loader=yaml.BaseLoader)
-        cls.publish = yaml.load(cls.publish_text, Loader=yaml.BaseLoader)
         cls.e2e = yaml.load(cls.e2e_text, Loader=yaml.BaseLoader)
 
     def run_script(self, script, command="nix", env=None, exit_code=0, fail_call=1):
@@ -51,6 +51,9 @@ class Workflows(unittest.TestCase):
                 "    calls.write(json.dumps(sys.argv[1:]) + '\\n')\n"
                 "with open(os.environ['NIX_CALLS']) as calls:\n"
                 "    call_count = sum(1 for _ in calls)\n"
+                "if sys.argv[1] == 'path-info':\n"
+                "    print('/nix/store/' + 'a' * 32 + '-checked')\n"
+                "    sys.exit(int(os.environ.get('NIX_PATH_EXIT', '0')))\n"
                 "if sys.argv[1] == 'log':\n"
                 "    print('retained check output')\n"
                 "    sys.exit(int(os.environ.get('NIX_LOG_EXIT', '0')))\n"
@@ -68,6 +71,7 @@ class Workflows(unittest.TestCase):
                     "NIX_CALLS": str(calls),
                     "NIX_EXIT": str(exit_code),
                     "NIX_FAIL_CALL": str(fail_call),
+                    "RUNNER_TEMP": str(root),
                     **(env or {}),
                 },
                 capture_output=True,
@@ -78,22 +82,28 @@ class Workflows(unittest.TestCase):
             invocations = [json.loads(line) for line in calls.read_text().splitlines()]
         return result, invocations
 
-    def run_checks(self, event, exit_code=0, log_exit=0, job="ci"):
+    def run_checks(self, event, exit_code=0, log_exit=0, job="ci", info_exit=0):
         step = next(s for s in self.ci["jobs"][job]["steps"] if s["name"] == "Checks")
         self.assertNotIn("if", step)
-        if job == "ci":
+        if job in ("ci", "main"):
             self.assertEqual(step["env"]["CI_EVENT_NAME"], "${{ github.event_name }}")
         result, invocations = self.run_script(
             step["run"],
-            env={"CI_EVENT_NAME": event, "NIX_LOG_EXIT": str(log_exit)},
+            env={"CI_EVENT_NAME": event, "NIX_LOG_EXIT": str(log_exit),
+                 "NIX_PATH_EXIT": str(info_exit)},
             exit_code=exit_code,
         )
-        main = job == "ci" and event in ("push", "workflow_dispatch")
+        main = job != "ci-arm" and event in ("push", "workflow_dispatch")
         system = "x86_64-linux" if main else "aarch64-linux"
         names = ["lint", "treefmt", "ci-policy", "test", "build"]
         if main:
             names.append("doc")
-        self.assertEqual(invocations[1:], [
+        logs = invocations[1:]
+        if job != "ci-arm" and not exit_code:
+            self.assertEqual(logs.pop(0), [
+                "path-info", *(f".#checks.{system}.{name}" for name in names),
+            ])
+        self.assertEqual(logs, [
             ["log", f".#legacyPackages.{system}.lint.chaz-clippy"
              if name == "lint" else f".#checks.{system}.{name}"]
             for name in names
@@ -106,37 +116,28 @@ class Workflows(unittest.TestCase):
         self.assertEqual(result.stdout.count("::endgroup::"), len(names))
         return result, invocations[0]
 
-    def run_warm_cache(self, exit_code=0, fail_call=1):
-        step = next(
-            s for s in self.publish["jobs"]["push-cache"]["steps"]
-            if s["name"] == "Warm CI cache"
-        )
-        self.assertNotIn("if", step)
-        script = step["run"].replace(
-            "${{ steps.nix.outputs.push-args }}", "--copy-to file:///unused-cache"
-        )
-        return self.run_script(
-            script, command="nix-fast-build", exit_code=exit_code, fail_call=fail_call
-        )
-
-    def test_publisher_exports_reusable_test_artifacts(self):
-        result, invocations = self.run_warm_cache()
-        self.assertEqual(result.returncode, 0, result.stderr)
-        common = [
-            "--skip-cached", "--no-nom", "--no-link",
-            "--copy-to", "file:///unused-cache",
-        ]
-        self.assertEqual(invocations, [
-            common,
-            common + ["-f", ".#legacyPackages.x86_64-linux.test"],
+    def test_prepare_reuses_check_and_test_outputs_before_secrets(self):
+        steps = self.ci["jobs"]["main"]["steps"]
+        self.assertEqual([s["name"] for s in steps], [
+            "Checkout", "Setup Nix", "Checks", "Prepare final outputs",
+            "Publish successful outputs",
         ])
+        self.assertEqual(steps[2]["run"], self.ci["jobs"]["ci"]["steps"][2]["run"])
+        self.assertEqual(steps[2]["timeout-minutes"], "30")
+        for status in (0, 42):
+            result, calls = self.run_script(steps[3]["run"], exit_code=status)
+            self.assertEqual(result.returncode, status, result.stderr)
+            self.assertEqual(calls, [[
+                "build", "-L", "--no-link", "--max-jobs", "2", "--cores", "0",
+                "--print-out-paths", ".#packages.x86_64-linux.default",
+                *(f".#legacyPackages.x86_64-linux.test.{name}"
+                  for name in ("deps", "artifacts", "archive")),
+            ]])
 
-    def test_publisher_propagates_each_warm_failure(self):
-        for fail_call in (1, 2):
-            with self.subTest(fail_call=fail_call):
-                result, invocations = self.run_warm_cache(exit_code=42, fail_call=fail_call)
-                self.assertEqual(result.returncode, 42, result.stderr)
-                self.assertEqual(len(invocations), fail_call)
+    def test_path_listing_failure_remains_fatal_after_log_replay(self):
+        result, _ = self.run_checks("push", job="main", info_exit=42)
+        self.assertEqual(result.returncode, 42, result.stderr)
+        self.assertEqual(result.stdout.count("::endgroup::"), 6)
 
     def test_checks_share_one_build_graph_per_platform(self):
         for event in ("pull_request", "merge_group", "push", "workflow_dispatch"):
@@ -186,7 +187,7 @@ class Workflows(unittest.TestCase):
         self.assertEqual(expression(arm["if"]), TRUSTED_MAIN)
         self.assertEqual(arm["runs-on"], ["self-hosted", "Linux", "ARM64", "zinc", "nix"])
         self.assertEqual(arm["timeout-minutes"], "60")
-        self.assertNotIn("needs", arm)  # Parallel platforms, one workflow revision.
+        self.assertNotIn("needs", arm)  # ARM succeeds before the hosted job starts.
         self.assertEqual([s["name"] for s in arm["steps"]], ["Checkout", "Checks"])
         for job in (self.ci["jobs"]["ci"], arm):
             checkout = job["steps"][0]
@@ -222,9 +223,9 @@ class Workflows(unittest.TestCase):
                             self.assertNotIn("::warning::", result.stdout)
 
     def test_publishing_stays_on_hosted_x86_runners(self):
-        publish = self.publish["jobs"]["push-cache"]
-        self.assertEqual(publish["runs-on"], "ubicloud-standard-8")
-        self.assertIn(".#packages.x86_64-linux.default", yaml.safe_dump(publish))
+        main = self.ci["jobs"]["main"]
+        self.assertEqual(main["runs-on"], "ubicloud-standard-8")
+        self.assertIn(".#packages.x86_64-linux.default", yaml.safe_dump(main))
         self.assertEqual(self.e2e["jobs"]["e2e"]["runs-on"], "ubicloud-standard-8")
 
     def test_checks_propagate_build_failure(self):
@@ -264,7 +265,7 @@ class Workflows(unittest.TestCase):
         self.assertEqual(self.e2e["on"]["push"]["branches"], ["main"])
 
     def test_matrix_e2e_is_independent_with_unchanged_budgets(self):
-        self.assertEqual(set(self.ci["jobs"]), {"ci", "ci-arm", "publish"})
+        self.assertEqual(set(self.ci["jobs"]), {"ci", "ci-arm", "main"})
         self.assertEqual(set(self.e2e["jobs"]), {"e2e"})
         self.assertEqual(self.e2e["name"], "Matrix E2E")
         self.assertEqual(
@@ -292,61 +293,60 @@ class Workflows(unittest.TestCase):
             self.ci["concurrency"]["cancel-in-progress"],
             "${{ github.event_name == 'pull_request' }}",
         )
-        self.assertNotIn("concurrency", self.publish)
         for job in self.ci["jobs"].values():
             self.assertNotIn("concurrency", job)
 
-    def test_publish_requires_successful_ordinary_main_ci_only(self):
-        job = self.ci["jobs"]["publish"]
-        self.assertEqual(job["needs"], ["ci", "ci-arm"])
-        self.assertEqual(expression(job["if"]), TRUSTED_MAIN)
-        self.assertEqual(job["uses"], "./.github/workflows/publish.yml")
-        self.assertEqual(job["permissions"], {"contents": "read"})
-        # Exact guard has no status override: default success() requires BOTH
-        # dependencies to succeed. Failure, cancellation, skip and missing
-        # results therefore cannot enter the reusable publishing workflow.
-        self.assertNotIn("continue-on-error", job)
-        for dependency in job["needs"]:
-            check = self.ci["jobs"][dependency]
-            self.assertNotIn("continue-on-error", check)
-            for step in check["steps"]:
-                self.assertNotIn("continue-on-error", step)
-
-    def test_publisher_has_no_manual_bypass(self):
-        self.assertEqual(set(self.publish["on"]), {"workflow_call"})
-        job = self.publish["jobs"]["push-cache"]
+    def test_main_requires_successful_arm_before_any_hosted_step(self):
+        job = self.ci["jobs"]["main"]
+        self.assertEqual(job["needs"], ["ci-arm"])
         self.assertEqual(expression(job["if"]), TRUSTED_MAIN)
         self.assertEqual(job["environment"], "publish")
         self.assertEqual(job["permissions"], {"contents": "read"})
+        self.assertEqual(job["timeout-minutes"], "60")
+        # No always()/status override: failed, skipped or cancelled ARM cannot
+        # start x86. Ordinary step success then gates final preparation and copy.
+        for check in (job, self.ci["jobs"]["ci-arm"]):
+            self.assertNotIn("continue-on-error", check)
+            for step in check["steps"]:
+                self.assertNotIn("continue-on-error", step)
+                self.assertNotIn("if", step)
+        condition = self.ci["jobs"]["ci"]["if"]
+        self.assertEqual(condition, condition.strip())
+        self.assertEqual(expression(condition), f"${{{{ !({TRUSTED_MAIN}) }}}}")
+
+    def test_publisher_has_no_separate_manual_or_artifact_bypass(self):
+        self.assertFalse((ROOT / ".github/workflows/publish.yml").exists())
+        self.assertNotIn("workflow_call", self.ci["on"])
+        self.assertNotIn("workflow_run", self.ci["on"])
+        self.assertNotIn("download-artifact", self.ci_text)
+        steps = self.ci["jobs"]["main"]["steps"]
+        self.assertEqual(steps[0]["with"], {
+            "ref": "${{ github.sha }}", "persist-credentials": "false",
+        })
+        self.assertEqual(steps[-1]["run"], "bash .github/scripts/publish-cache.sh")
 
     def test_ci_checks_do_not_receive_publishing_secrets(self):
         for job in (self.ci["jobs"]["ci"], self.ci["jobs"]["ci-arm"], self.e2e["jobs"]["e2e"]):
             self.assertNotIn("secrets.", yaml.safe_dump(job))
+            self.assertNotIn("environment", job)
         self.assertEqual(self.ci["permissions"], {"contents": "read"})
         self.assertEqual(self.e2e["permissions"], {"contents": "read"})
-        self.assertEqual(self.publish["permissions"], {"contents": "read"})
-        names = {"NIX_CACHE_ACCESS_KEY_ID", "NIX_CACHE_SECRET_ACCESS_KEY", "NIX_CACHE_SIGNING_KEY"}
-        self.assertEqual(
-            self.ci["jobs"]["publish"]["secrets"],
-            {name: "${{ secrets." + name + " }}" for name in names},
+        main = self.ci["jobs"]["main"]
+        self.assertNotIn("env", main)
+        for step in main["steps"][:-1]:
+            self.assertNotIn("secrets.", yaml.safe_dump(step))
+        self.assertEqual(main["steps"][-1]["env"], {
+            "AWS_ACCESS_KEY_ID": "${{ secrets.NIX_CACHE_ACCESS_KEY_ID }}",
+            "AWS_SECRET_ACCESS_KEY": "${{ secrets.NIX_CACHE_SECRET_ACCESS_KEY }}",
+            "NIX_CACHE_SIGNING_KEY": "${{ secrets.NIX_CACHE_SIGNING_KEY }}",
+        })
+        setup = yaml.load(
+            (ROOT / ".github/actions/setup-nix/action.yml").read_text(),
+            Loader=yaml.BaseLoader,
         )
-        self.assertEqual(
-            self.publish["on"]["workflow_call"]["secrets"],
-            {name: {"required": "true"} for name in names},
-        )
-        steps = self.publish["jobs"]["push-cache"]["steps"]
-        setup = next(s for s in steps if s["name"] == "Setup Nix")
-        self.assertEqual(setup["with"]["signing-key"], "${{ secrets.NIX_CACHE_SIGNING_KEY }}")
-
-    def test_publisher_rebuilds_the_checked_revision_from_trusted_source(self):
-        steps = self.publish["jobs"]["push-cache"]["steps"]
-        checkout = next(s for s in steps if s["name"] == "Checkout")
-        self.assertEqual(checkout["with"]["ref"], "${{ github.sha }}")
-        self.assertEqual(checkout["with"]["persist-credentials"], "false")
-        build = next(s for s in steps if s["name"] == "Build and push artifacts")
-        self.assertIn("--option substituters 'https://cache.nixos.org'", build["run"])
-        self.assertNotIn("download-artifact", self.publish_text)
-        self.assertNotIn("workflow_run", self.publish_text)
+        self.assertNotIn("inputs", setup)
+        self.assertNotIn("outputs", setup)
+        self.assertNotIn("secrets.", yaml.safe_dump(setup))
 
 
 if __name__ == "__main__":
