@@ -78,6 +78,10 @@ context budget; returned wire identity selects response price provenance. Reads
 need no provider call. Interrupted requests may retain input-only estimates,
 which are not proof of a sent/billed/completed call.
 Session-write notifications use the existing bounded, owned, ticket-protected background refresh and redraw path.
+TUI rebuilds hydrate the transcript once and read metadata, telemetry and steering evidence at the same Verified snapshot.
+A fresh native permission check and snapshot equality can suppress a rebuild of an already-covered view; event cursors are not read snapshots.
+A failed or partial read never advances that coverage, and reconnect discards it.
+Job observers reuse the pinned transcript for status reconstruction and age retained timestamps without transcript reads on unchanged ticks.
 See [Cost Tracking & Usage](../user_guide/usage.md) and [TUI context usage](../user_guide/tui.md#context-usage).
 
 ## Metadata writes refuse unreadable state

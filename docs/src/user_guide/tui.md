@@ -1007,8 +1007,15 @@ happens to be focused. Closing and reopening a tab cannot apply its old results.
 A delayed open does not take focus after newer local navigation. Ordinary opens
 resolve their destination before installing observation: `/join` to an open
 tab reuses its live approval receiver. New destinations finish observation
-setup before exposing their composer. Jobs opened from either Jobs or the hub
-remain authorized observers, never ordinary execution sessions.
+setup before reading their initial transcript and exposing their composer.
+A post-insertion check covers notifications delivered while the tab was opening.
+Jobs opened from either Jobs or the hub remain authorized observers, never ordinary execution sessions.
+
+Transcript, metadata, telemetry and steering evidence share one Verified database snapshot.
+A notification is only an invalidation hint: the TUI obtains a fresh native snapshot and checks current authority before reusing an already-covered view.
+Changed snapshots rebuild conservatively, even when only a heartbeat changed; duplicate or delayed notifications do not rehydrate the same transcript.
+Job-tab ticks check for changes without rereading unchanged transcripts or telemetry, and age retained activity and steering timestamps locally.
+Read-only local actions leave other tabs alone; session writes check their originating tab, while agent/global changes retain cross-tab refreshes.
 
 | Trigger / display                      | Behavior                                                                          |
 | -------------------------------------- | --------------------------------------------------------------------------------- |

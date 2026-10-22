@@ -617,24 +617,9 @@ impl TuiBridge {
                         }
                     },
                     Action::Operation(msg) => {
-                        operations::apply(&mut app, msg);
+                        let invalidation = operations::apply(&mut app, msg);
                         if app.backend_available {
-                            let ids: Vec<_> =
-                                app.tabs.iter().map(|t| t.session_db_id.clone()).collect();
-                            for id in ids {
-                                refresh::request(
-                                    &mut app,
-                                    &id,
-                                    refresh::RefreshKind::Session,
-                                    &refresh_tx,
-                                );
-                                refresh::request(
-                                    &mut app,
-                                    &id,
-                                    refresh::RefreshKind::Status,
-                                    &refresh_tx,
-                                );
-                            }
+                            operations::refresh_after(&mut app, invalidation, &refresh_tx);
                         }
                     }
                     Action::Refresh(msg) => {

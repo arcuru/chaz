@@ -160,3 +160,92 @@ async fn concurrent_inputs_use_native_canonical_order() {
     assert_eq!(ids(&ordered_at(&db, vec![first]).await), [FIRST]);
     assert_eq!(ids(&ordered_at(&db, vec![second]).await), [SECOND]);
 }
+
+#[tokio::test]
+async fn pinned_hydration_and_steering_age_without_reloading_transcript() {
+    use crate::session::{
+        EntryType, SessionEntry, TurnRequestId, TurnTranscriptMessage, TurnTranscriptRecord,
+    };
+    use crate::types::ConversationId;
+    use chrono::{Duration, Utc};
+    let (_owner, db, reads) = session_db().await;
+    let mut live = Session::try_new(ConversationId("fixture".into()), db.clone())
+        .await
+        .unwrap();
+    live.add_entry(SessionEntry {
+        sender: "user".into(),
+        content: "before".into(),
+        timestamp: Utc::now(),
+        entry_type: EntryType::Message,
+        metadata: None,
+        routing: None,
+    })
+    .await
+    .unwrap();
+    let request_id = live.entries_with_ids().next().unwrap().0.clone();
+    let attempt = live.start_turn_attempt(request_id.clone()).await.unwrap();
+    let input = JobInputRequest::new(attempt.attempt_id.clone(), "causal input".into());
+    live.submit_turn_input(input.clone()).await.unwrap();
+    let pinned = db.snapshot().await.unwrap();
+    let pinned_view = Session::steering_view_at(&db, &pinned).await.unwrap();
+    let at = attempt.started_at;
+    assert_eq!(
+        pinned_view.attempts_at(at).as_slice(),
+        std::slice::from_ref(&attempt.attempt_id)
+    );
+    assert_eq!(pinned_view.inputs_at(at)[0].state, JobInputState::Queued);
+    let before = reads.tables();
+    assert!(
+        pinned_view
+            .attempts_at(at - Duration::milliseconds(1))
+            .is_empty(),
+        "future starts are not yet visible"
+    );
+    assert_eq!(pinned_view.active_at(at + Duration::seconds(44)).count(), 1);
+    assert_eq!(pinned_view.active_at(at + Duration::seconds(45)).count(), 0);
+    assert!(matches!(
+        pinned_view.inputs_at(at + Duration::seconds(45))[0].state,
+        JobInputState::Uncertain { .. }
+    ));
+    assert_eq!(reads.tables(), before, "ageing is in-memory only");
+    live.append_turn_transcript(
+        TurnTranscriptRecord {
+            request_id: TurnRequestId::parse(request_id.as_str()),
+            attempt_id: attempt.attempt_id.clone(),
+            sequence: 0,
+            timestamp: Utc::now(),
+            identity: None,
+            message: TurnTranscriptMessage::Steering {
+                model_sequence: 0,
+                inputs: vec![input.clone()],
+            },
+        },
+        vec![],
+    )
+    .await
+    .unwrap();
+    live.complete_turn_attempt(&attempt, None).await.unwrap();
+    live.update_meta(|m| m.name = Some("after".into()))
+        .await
+        .unwrap();
+    let historical = Session::try_new_at(ConversationId("fixture".into()), db.clone(), &pinned)
+        .await
+        .unwrap();
+    assert_eq!(historical.entries().len(), 1);
+    assert!(
+        super::super::try_read_meta_at(&db, &pinned)
+            .await
+            .unwrap()
+            .name
+            .is_none()
+    );
+    let old = historical.turn_inputs_at(&pinned).await.unwrap();
+    assert_eq!(old[0].state, JobInputState::Queued);
+    assert!(
+        !old[0].incorporated,
+        "later boundary must not leak into history"
+    );
+    let current = live.turn_inputs().await.unwrap();
+    assert!(matches!(current[0].state, JobInputState::Uncertain { .. }));
+    assert!(current[0].incorporated);
+}

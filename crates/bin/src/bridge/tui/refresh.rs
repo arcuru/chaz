@@ -73,6 +73,8 @@ impl RefreshSlot {
 /// `Tab` literal only needs `live: TabLive::default()`.
 #[derive(Default)]
 pub(super) struct TabLive {
+    pub(super) covered: Option<eidetica::Snapshot>,
+    pub(super) steering: Option<chaz_core::session::steering::SteeringView>,
     pub(super) input_attempt: Option<String>,
     pub(super) inputs: Vec<chaz_core::session::steering::JobInput>,
     pub(super) input_feedback: String,
@@ -121,6 +123,7 @@ impl TabLive {
         self.status = RefreshSlot::default();
         self.activity = RefreshSlot::default();
         self.job = RefreshSlot::default();
+        self.covered = None;
         self.rebind_task = None;
         self.rebind_ticket = None;
     }
@@ -148,6 +151,8 @@ impl TabLive {
 
 /// What a session reload read from storage.
 pub(super) struct SessionSnapshot {
+    pub(super) tips: eidetica::Snapshot,
+    pub(super) steering: Option<chaz_core::session::steering::SteeringView>,
     pub(super) input_attempt: Option<String>,
     pub(super) inputs: Vec<chaz_core::session::steering::JobInput>,
     pub(super) entries: Vec<SessionEntry>,
@@ -158,6 +163,11 @@ pub(super) struct SessionSnapshot {
 
 /// A completed background read, routed back to the run loop.
 pub(super) enum Refresh {
+    Unchanged {
+        session_db_id: String,
+        ticket: u64,
+        kind: RefreshKind,
+    },
     Job {
         session_db_id: String,
         ticket: u64,
@@ -199,9 +209,11 @@ pub(super) struct Applied {
     pub(super) follow_up: Option<(String, RefreshKind)>,
 }
 
-/// Retry failed reads; unchanged ordinary sessions only age retained evidence.
+/// Retry failed reads and age retained activity and steering evidence.
 pub(super) fn request_tick(app: &mut App, tx: &mpsc::Sender<Refresh>) -> bool {
-    let redraw = age_activity(app, chrono::Utc::now());
+    let now = chrono::Utc::now();
+    let mut redraw = age_activity(app, now);
+    redraw |= age_steering(app, now);
     let requests: Vec<_> = app
         .tabs
         .iter()
@@ -376,25 +388,66 @@ pub(super) fn request(
         kind
     };
     let db = app.tabs[idx].session_db.clone();
+    // A partial/failed view is never eligible for equality suppression.
+    let covered = (!app.tabs[idx].live.failed(kind)
+        && !app.tabs[idx].live.failed(RefreshKind::Activity))
+    .then(|| app.tabs[idx].live.covered.clone())
+    .flatten();
     let id = session_db_id.to_string();
     request_with(app, session_db_id, kind, tx, move |ticket| async move {
+        if matches!(kind, RefreshKind::Session | RefreshKind::Job) {
+            let result = async {
+                // Authorization is fresh even when only the display is retained.
+                chaz_core::session::jobs::require_observer_write(&db)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                let tips = db.snapshot().await.map_err(|e| e.to_string())?;
+                if covered.as_ref() == Some(&tips) {
+                    return Ok(Refresh::Unchanged {
+                        session_db_id: id.clone(),
+                        ticket,
+                        kind,
+                    });
+                }
+                Ok(if kind == RefreshKind::Job {
+                    Refresh::Job {
+                        snapshot: jobs::snapshot_at(&db, tips).await.map(Box::new),
+                        session_db_id: id.clone(),
+                        ticket,
+                    }
+                } else {
+                    Refresh::Session {
+                        snapshot: load_session_snapshot_at(&db, tips).await.map(Box::new),
+                        session_db_id: id.clone(),
+                        ticket,
+                    }
+                })
+            };
+            let result = if kind == RefreshKind::Job {
+                tokio::time::timeout(std::time::Duration::from_secs(2), result)
+                    .await
+                    .unwrap_or_else(|_| Err("refresh timed out; retained evidence is stale".into()))
+            } else {
+                result.await
+            };
+            return result.unwrap_or_else(|error| {
+                if kind == RefreshKind::Job {
+                    Refresh::Job {
+                        session_db_id: id,
+                        ticket,
+                        snapshot: Err(error),
+                    }
+                } else {
+                    Refresh::Session {
+                        session_db_id: id,
+                        ticket,
+                        snapshot: Err(error),
+                    }
+                }
+            });
+        }
         match kind {
-            RefreshKind::Job => Refresh::Job {
-                snapshot: tokio::time::timeout(
-                    std::time::Duration::from_secs(2),
-                    jobs::snapshot(&db),
-                )
-                .await
-                .unwrap_or_else(|_| Err("refresh timed out; retained evidence is stale".into()))
-                .map(Box::new),
-                session_db_id: id,
-                ticket,
-            },
-            RefreshKind::Session => Refresh::Session {
-                snapshot: load_session_snapshot(&id, db).await.map(Box::new),
-                session_db_id: id,
-                ticket,
-            },
+            RefreshKind::Job | RefreshKind::Session => unreachable!("handled above"),
             RefreshKind::Status => Refresh::Status {
                 segments: load_status_segments(&db).await,
                 session_db_id: id,
@@ -413,32 +466,89 @@ pub(super) async fn load_session_snapshot(
     _session_db_id: &str,
     db: eidetica::Database,
 ) -> Result<SessionSnapshot, String> {
+    let tips = db.snapshot().await.map_err(|e| e.to_string())?;
+    load_session_snapshot_at(&db, tips).await
+}
+
+async fn load_session_snapshot_at(
+    db: &eidetica::Database,
+    tips: eidetica::Snapshot,
+) -> Result<SessionSnapshot, String> {
     async {
-        let snapshot = db.snapshot().await?;
-        let entries = Session::entries_at_snapshot(&db, &snapshot).await?;
-        let telemetry =
-            chaz_core::session::usage::telemetry_at_snapshot(&db, &snapshot, &entries).await?;
-        let meta = chaz_core::session::try_read_meta_from_db(&db).await?;
-        let session = Session::try_new(
+        let session = Session::try_new_at(
             chaz_core::types::ConversationId(db.root_id().to_string()),
             db.clone(),
+            &tips,
         )
         .await?;
-        let attempts = Session::steering_attempts_at(&db, &snapshot).await?;
-        Ok::<_, anyhow::Error>(SessionSnapshot {
-            input_attempt: match attempts.as_slice() {
-                [id] => Some(id.clone()),
-                _ => None,
-            },
-            inputs: session.turn_inputs_at(&snapshot).await?,
-            entries,
-            telemetry,
-            meta,
-            active_turns: load_active_turns(&db).await,
-        })
+        snapshot_from_session(&session, db, tips).await
     }
     .await
     .map_err(|e| e.to_string())
+}
+
+pub(super) async fn snapshot_from_session(
+    session: &Session,
+    db: &eidetica::Database,
+    tips: eidetica::Snapshot,
+) -> anyhow::Result<SessionSnapshot> {
+    let entries = session.entries().to_vec();
+    let telemetry = chaz_core::session::usage::telemetry_at_snapshot(db, &tips, &entries).await?;
+    let meta = chaz_core::session::try_read_meta_at(db, &tips).await?;
+    let steering = Session::steering_view_at(db, &tips).await?;
+    let now = chrono::Utc::now();
+    let attempts = steering.attempts_at(now);
+    Ok::<_, anyhow::Error>(SessionSnapshot {
+        input_attempt: match attempts.as_slice() {
+            [id] => Some(id.clone()),
+            _ => None,
+        },
+        inputs: steering.inputs_at(now),
+        active_turns: Ok(steering.activity().clone()),
+        steering: Some(steering),
+        tips,
+        entries,
+        telemetry,
+        meta,
+    })
+}
+
+/// Expiry has no write. Age only disposable display evidence; actions still
+/// check native current authority and current attempt state independently.
+pub(super) fn age_steering(app: &mut App, now: chrono::DateTime<chrono::Utc>) -> bool {
+    let mut redraw = false;
+    for tab in &mut app.tabs {
+        if tab.live.unbound {
+            continue;
+        }
+        if let Some(view) = &tab.live.steering {
+            let attempts = view.attempts_at(now);
+            let attempt = if let Some(job) = &tab.job {
+                jobs::attempt_id(job.state.as_ref()).map(str::to_owned)
+            } else {
+                match attempts.as_slice() {
+                    [id] => Some(id.clone()),
+                    _ => None,
+                }
+            };
+            let inputs = view.inputs_at(now);
+            redraw |= tab.live.input_attempt != attempt || tab.live.inputs != inputs;
+            tab.live.input_attempt = attempt;
+            tab.live.inputs = inputs;
+            if let Some(job) = &mut tab.job
+                && let Some(chaz_core::session::jobs::JobState::StartedUnknown {
+                    attempt_id,
+                    activity_recent,
+                }) = &mut job.state
+            {
+                let recent = view.active_at(now).any(|id| id == attempt_id);
+                redraw |= *activity_recent != recent;
+                *activity_recent = recent;
+                tab.active_turns = usize::from(*activity_recent);
+            }
+        }
+    }
+    redraw
 }
 
 pub(super) async fn load_active_turns(db: &eidetica::Database) -> Result<TurnActivity, String> {
@@ -516,6 +626,11 @@ pub(super) fn apply(
     resolve: impl FnOnce(&str, &SessionMeta) -> Resolved,
 ) -> Applied {
     let (session_db_id, ticket, kind) = match &msg {
+        Refresh::Unchanged {
+            session_db_id,
+            ticket,
+            kind,
+        } => (session_db_id.clone(), *ticket, *kind),
         Refresh::Job {
             session_db_id,
             ticket,
@@ -554,10 +669,20 @@ pub(super) fn apply(
     let follow_up = again.then(|| (session_db_id.clone(), kind));
 
     let redraw = match msg {
+        Refresh::Unchanged { .. } => {
+            age_steering(app, chrono::Utc::now());
+            is_active
+        }
         Refresh::Job { snapshot, .. } => {
             let tab = &mut app.tabs[idx];
             record_error(tab, kind, snapshot.as_ref().err().cloned());
-            jobs::apply_snapshot(tab, snapshot.map(|snapshot| *snapshot));
+            match snapshot {
+                Ok(snapshot) => {
+                    apply_session_snapshot(app, idx, ticket, snapshot.session, resolve);
+                    jobs::apply_state(&mut app.tabs[idx], snapshot.state);
+                }
+                Err(error) => jobs::apply_error(tab, error),
+            }
             true
         }
         Refresh::Status { segments, .. } => {
@@ -574,7 +699,10 @@ pub(super) fn apply(
                     record_error(&mut app.tabs[idx], kind, None);
                     apply_session_snapshot(app, idx, ticket, *snapshot, resolve);
                 }
-                Err(e) => record_error(&mut app.tabs[idx], kind, Some(e)),
+                Err(e) => {
+                    app.tabs[idx].live.covered = None;
+                    record_error(&mut app.tabs[idx], kind, Some(e));
+                }
             }
             // The tab title and picker rows are visible from every tab.
             true
@@ -637,6 +765,8 @@ fn apply_session_snapshot(
     resolve: impl FnOnce(&str, &SessionMeta) -> Resolved,
 ) {
     let SessionSnapshot {
+        tips,
+        steering,
         input_attempt,
         inputs,
         entries,
@@ -651,6 +781,8 @@ fn apply_session_snapshot(
     } = resolve(&app.tabs[idx].current_agent, &meta);
 
     let tab = &mut app.tabs[idx];
+    tab.live.covered = active_turns.is_ok().then_some(tips);
+    tab.live.steering = steering;
     tab.live.input_attempt = input_attempt;
     tab.live.inputs = inputs;
     tab.set_entries(entries);
@@ -700,6 +832,10 @@ fn apply_session_snapshot(
         row.loaded = true;
     }
 }
+
+#[cfg(test)]
+#[path = "hydration_tests.rs"]
+mod hydration_tests;
 
 #[cfg(test)]
 mod tests {
@@ -785,6 +921,8 @@ mod tests {
             session_db_id: id.into(),
             ticket,
             snapshot: Ok(Box::new(SessionSnapshot {
+                tips: eidetica::Snapshot::EMPTY,
+                steering: None,
                 input_attempt: None,
                 inputs: vec![],
                 telemetry: chaz_core::session::usage::SessionTelemetry::from_entries(&entries),

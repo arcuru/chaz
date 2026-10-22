@@ -809,7 +809,16 @@ impl Session {
         database: Database,
     ) -> anyhow::Result<Self> {
         let snapshot = database.snapshot().await?;
-        let (entry_ids, entries) = Self::load_entries_at(&database, "entries", &snapshot).await?;
+        Self::try_new_at(conversation_id, database, &snapshot).await
+    }
+
+    /// Open one pinned transcript; helpers must not hydrate a second live view.
+    pub async fn try_new_at(
+        conversation_id: ConversationId,
+        database: Database,
+        snapshot: &Snapshot,
+    ) -> anyhow::Result<Self> {
+        let (entry_ids, entries) = Self::load_entries_at(&database, "entries", snapshot).await?;
         Ok(Self {
             conversation_id,
             database,
@@ -1269,7 +1278,19 @@ impl Session {
         attempts: Vec<(String, TurnAttempt)>,
         baseline: HashSet<String>,
     ) -> anyhow::Result<Vec<TurnRequest>> {
-        let states = index_attempt_states(attempts, live_attempts);
+        self.turn_requests_with_states(
+            is_agent,
+            index_attempt_states(attempts, live_attempts),
+            baseline,
+        )
+    }
+
+    fn turn_requests_with_states(
+        &self,
+        is_agent: impl Fn(&str) -> bool,
+        states: HashMap<TurnRequestId, TurnRequestState>,
+        baseline: HashSet<String>,
+    ) -> anyhow::Result<Vec<TurnRequest>> {
         Ok(self
             .entries
             .iter()
@@ -2321,7 +2342,15 @@ pub async fn read_meta_from_db(database: &Database) -> SessionMeta {
 /// Read session metadata without confusing absent fields with storage failures.
 /// Presentation clients use this when replacing a last-good cached snapshot.
 pub async fn try_read_meta_from_db(database: &Database) -> anyhow::Result<SessionMeta> {
-    let txn = database.new_transaction().await?;
+    try_read_meta_at(database, &database.snapshot().await?).await
+}
+
+/// Strict metadata from the same pinned view as the displayed transcript.
+pub async fn try_read_meta_at(
+    database: &Database,
+    snapshot: &Snapshot,
+) -> anyhow::Result<SessionMeta> {
+    let txn = database.new_transaction_at(snapshot).await?;
     let doc = txn
         .get_store::<DocStore>(META_STORE)
         .await?

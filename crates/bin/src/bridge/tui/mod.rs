@@ -1857,11 +1857,21 @@ async fn build_tab(
     session_db: eidetica::Database,
     session_db_id: String,
 ) -> Result<Tab, String> {
+    let snapshot = refresh::load_session_snapshot(&session_db_id, session_db.clone()).await?;
+    tab_from_snapshot(server, backend, session_db, session_db_id, snapshot).await
+}
+
+async fn tab_from_snapshot(
+    server: &Server,
+    backend: &BackendManager,
+    session_db: eidetica::Database,
+    session_db_id: String,
+    snapshot: refresh::SessionSnapshot,
+) -> Result<Tab, String> {
     let agent = server
         .registry()
         .resolve_agent(&session_db_id, None, server.agent_index())
         .await;
-    let snapshot = refresh::load_session_snapshot(&session_db_id, session_db.clone()).await?;
     let meta = snapshot.meta;
     let roster = build_roster(server, backend, &meta);
     let session_name = meta.name.clone();
@@ -1898,6 +1908,8 @@ async fn build_tab(
         live: {
             let mut live = refresh::TabLive::with_meta(meta, snapshot.telemetry);
             live.activity_evidence = Some(evidence);
+            live.covered = Some(snapshot.tips);
+            live.steering = snapshot.steering;
             live.inputs = snapshot.inputs;
             live.input_attempt = snapshot.input_attempt;
             live
@@ -2702,6 +2714,8 @@ mod session_picker_tests {
                         session_db_id: loaded_id,
                         ticket,
                         snapshot: Ok(Box::new(refresh::SessionSnapshot {
+                            tips: eidetica::Snapshot::EMPTY,
+                            steering: None,
                             input_attempt: None,
                             inputs: vec![],
                             entries: vec![],
