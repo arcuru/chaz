@@ -157,6 +157,32 @@ class Workflows(unittest.TestCase):
         for forbidden in ("sudo", "--option"):
             self.assertNotIn(forbidden, steps["Checks"]["run"])
 
+    def test_main_adds_arm_without_changing_required_pr_status(self):
+        self.assertEqual(self.ci["jobs"]["ci"]["name"], "CI")
+        self.assertNotIn("strategy", self.ci["jobs"]["ci"])
+        self.assertNotIn("needs", self.ci["jobs"]["ci"])
+        arm = self.ci["jobs"]["ci-arm"]
+        self.assertEqual(expression(arm["if"]), TRUSTED_MAIN)
+        self.assertEqual(arm["runs-on"], ["self-hosted", "Linux", "ARM64", "zinc", "nix"])
+        self.assertEqual(arm["timeout-minutes"], "60")
+        self.assertNotIn("needs", arm)  # Parallel platforms, one workflow revision.
+        self.assertEqual([s["name"] for s in arm["steps"]], ["Checkout", "Checks"])
+        for job in (self.ci["jobs"]["ci"], arm):
+            checkout = job["steps"][0]
+            self.assertEqual(checkout["with"], {
+                "ref": "${{ github.sha }}", "persist-credentials": "false",
+            })
+        checks = arm["steps"][1]
+        self.assertNotIn("if", checks)
+        for code in (0, 42):
+            result, invocations = self.run_script(checks["run"], exit_code=code)
+            self.assertEqual(result.returncode, code, result.stderr)
+            self.assertEqual(invocations, [[
+                "build", "--no-link", "--keep-going",
+                *(f".#checks.aarch64-linux.{name}" for name in
+                  ("lint", "treefmt", "ci-policy", "test", "build")),
+            ]])
+
     def test_publishing_stays_on_hosted_x86_runners(self):
         publish = self.publish["jobs"]["push-cache"]
         self.assertEqual(publish["runs-on"], "ubicloud-standard-8")
@@ -164,8 +190,10 @@ class Workflows(unittest.TestCase):
         self.assertEqual(self.e2e["jobs"]["e2e"]["runs-on"], "ubicloud-standard-8")
 
     def test_checks_propagate_build_failure(self):
-        result, _ = self.run_checks("pull_request", exit_code=42)
-        self.assertEqual(result.returncode, 42, result.stderr)
+        for event in ("pull_request", "merge_group", "push", "workflow_dispatch"):
+            with self.subTest(event=event):
+                result, _ = self.run_checks(event, exit_code=42)
+                self.assertEqual(result.returncode, 42, result.stderr)
 
     def test_full_coverage_is_push_or_manual_only(self):
         self.assertEqual(
@@ -180,7 +208,7 @@ class Workflows(unittest.TestCase):
         self.assertEqual(self.e2e["on"]["push"]["branches"], ["main"])
 
     def test_matrix_e2e_is_independent_with_unchanged_budgets(self):
-        self.assertEqual(set(self.ci["jobs"]), {"ci", "publish"})
+        self.assertEqual(set(self.ci["jobs"]), {"ci", "ci-arm", "publish"})
         self.assertEqual(set(self.e2e["jobs"]), {"e2e"})
         self.assertEqual(self.e2e["name"], "Matrix E2E")
         self.assertEqual(
@@ -214,22 +242,29 @@ class Workflows(unittest.TestCase):
 
     def test_publish_requires_successful_ordinary_main_ci_only(self):
         job = self.ci["jobs"]["publish"]
-        self.assertEqual(job["needs"], ["ci"])
+        self.assertEqual(job["needs"], ["ci", "ci-arm"])
         self.assertEqual(expression(job["if"]), TRUSTED_MAIN)
         self.assertEqual(job["uses"], "./.github/workflows/publish.yml")
         self.assertEqual(job["permissions"], {"contents": "read"})
-        # No status override: GitHub's default success() gates the dependency.
-        self.assertNotIn("always()", job["if"])
+        # Exact guard has no status override: default success() requires BOTH
+        # dependencies to succeed. Failure, cancellation, skip and missing
+        # results therefore cannot enter the reusable publishing workflow.
+        self.assertNotIn("continue-on-error", job)
+        for dependency in job["needs"]:
+            check = self.ci["jobs"][dependency]
+            self.assertNotIn("continue-on-error", check)
+            for step in check["steps"]:
+                self.assertNotIn("continue-on-error", step)
 
-    def test_publisher_is_reusable_with_independent_manual_entry(self):
-        self.assertEqual(set(self.publish["on"]), {"workflow_call", "workflow_dispatch"})
+    def test_publisher_has_no_manual_bypass(self):
+        self.assertEqual(set(self.publish["on"]), {"workflow_call"})
         job = self.publish["jobs"]["push-cache"]
         self.assertEqual(expression(job["if"]), TRUSTED_MAIN)
         self.assertEqual(job["environment"], "publish")
         self.assertEqual(job["permissions"], {"contents": "read"})
 
     def test_ci_checks_do_not_receive_publishing_secrets(self):
-        for job in (self.ci["jobs"]["ci"], self.e2e["jobs"]["e2e"]):
+        for job in (self.ci["jobs"]["ci"], self.ci["jobs"]["ci-arm"], self.e2e["jobs"]["e2e"]):
             self.assertNotIn("secrets.", yaml.safe_dump(job))
         self.assertEqual(self.ci["permissions"], {"contents": "read"})
         self.assertEqual(self.e2e["permissions"], {"contents": "read"})

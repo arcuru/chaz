@@ -32,8 +32,8 @@ jobs:
     # one Nix store persists across jobs, so unchanged outputs are reused rather
     # than rebuilt or restored; its preinstalled daemon owns substituters and
     # build limits, and jobs are untrusted clients with no publishing
-    # credentials. Main (push or manual) checks stay on hosted x86_64 runners
-    # ahead of Publish, which builds and caches that platform.
+    # credentials. Main (push or manual) also checks ARM below, alongside
+    # hosted x86_64 checks; Publish waits for both platforms.
     runs-on: >-
       ${{ fromJSON((github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
           '"ubicloud-standard-8"' ||
@@ -45,6 +45,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
+          ref: ${{ github.sha }}
           persist-credentials: false
 
       # The ARM runner provides Nix; hosted runners install it fresh.
@@ -75,10 +76,32 @@ jobs:
           done
           nix build --no-link --keep-going "${limits[@]}" "${checks[@]}"
 
+  # Keep the required PR status `CI` unchanged above. Main adds a second
+  # native platform, using the same single zinc listener and persistent store.
+  ci-arm:
+    name: Main ARM64
+    if: |
+      github.repository_owner == 'arcuru' && github.ref == 'refs/heads/main' &&
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    runs-on: [self-hosted, Linux, ARM64, zinc, nix]
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      # No installer or client build-limit overrides: zinc's daemon owns both.
+      - name: Checks
+        run: |
+          nix build --no-link --keep-going \
+            .#checks.aarch64-linux.{lint,treefmt,ci-policy,test,build}
+
   publish:
     name: Publish
     # Matrix E2E is independent and can be disabled without blocking publishing.
-    needs: [ci]
+    needs: [ci, ci-arm]
     if: |
       github.repository_owner == 'arcuru' && github.ref == 'refs/heads/main' &&
       (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
