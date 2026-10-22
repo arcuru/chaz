@@ -74,7 +74,23 @@ jobs:
           for name in "${names[@]}"; do
             checks+=(".#checks.$system.$name")
           done
-          nix build --no-link --keep-going "${limits[@]}" "${checks[@]}"
+          build_status=0
+          nix build -L --no-link --keep-going "${limits[@]}" "${checks[@]}" || build_status=$?
+          # Report even after failure or a cache hit. Reading a stored log does
+          # not rerun a check, and unavailable logs do not change build status.
+          for name in "${names[@]}"; do
+            log=".#checks.$system.$name"
+            # lint is a symlinkJoin with no own log; read Clippy itself.
+            if [[ "$name" == lint ]]; then
+              log=".#legacyPackages.$system.lint.chaz-clippy"
+            fi
+            echo "::group::$name — replaying stored derivation log; checks are not being rerun"
+            if ! nix log "$log"; then
+              echo "::warning::Stored log unavailable for $log (local store or configured binary caches); no test result inferred"
+            fi
+            echo '::endgroup::'
+          done
+          exit "$build_status"
 
   # Keep the required PR status `CI` unchanged above. Main adds a second
   # native platform, using the same single zinc listener and persistent store.

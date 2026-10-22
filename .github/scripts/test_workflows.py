@@ -51,6 +51,9 @@ class Workflows(unittest.TestCase):
                 "    calls.write(json.dumps(sys.argv[1:]) + '\\n')\n"
                 "with open(os.environ['NIX_CALLS']) as calls:\n"
                 "    call_count = sum(1 for _ in calls)\n"
+                "if sys.argv[1] == 'log':\n"
+                "    print('retained check output')\n"
+                "    sys.exit(int(os.environ.get('NIX_LOG_EXIT', '0')))\n"
                 "sys.exit(int(os.environ['NIX_EXIT']) if call_count == "
                 "int(os.environ['NIX_FAIL_CALL']) else 0)\n"
             )
@@ -75,14 +78,31 @@ class Workflows(unittest.TestCase):
             invocations = [json.loads(line) for line in calls.read_text().splitlines()]
         return result, invocations
 
-    def run_checks(self, event, exit_code=0):
+    def run_checks(self, event, exit_code=0, log_exit=0):
         step = next(s for s in self.ci["jobs"]["ci"]["steps"] if s["name"] == "Checks")
         self.assertNotIn("if", step)
         self.assertEqual(step["env"]["CI_EVENT_NAME"], "${{ github.event_name }}")
         result, invocations = self.run_script(
-            step["run"], env={"CI_EVENT_NAME": event}, exit_code=exit_code
+            step["run"],
+            env={"CI_EVENT_NAME": event, "NIX_LOG_EXIT": str(log_exit)},
+            exit_code=exit_code,
         )
-        self.assertEqual(len(invocations), 1)
+        main = event in ("push", "workflow_dispatch")
+        system = "x86_64-linux" if main else "aarch64-linux"
+        names = ["lint", "treefmt", "ci-policy", "test", "build"]
+        if main:
+            names.append("doc")
+        self.assertEqual(invocations[1:], [
+            ["log", f".#legacyPackages.{system}.lint.chaz-clippy"
+             if name == "lint" else f".#checks.{system}.{name}"]
+            for name in names
+        ])
+        for name in names:
+            self.assertIn(
+                f"::group::{name} — replaying stored derivation log; "
+                "checks are not being rerun", result.stdout
+            )
+        self.assertEqual(result.stdout.count("::endgroup::"), len(names))
         return result, invocations[0]
 
     def run_warm_cache(self, exit_code=0, fail_call=1):
@@ -129,7 +149,7 @@ class Workflows(unittest.TestCase):
                     names.append("doc")
                 limits = ["--max-jobs", "2", "--cores", "0"] if main else []
                 self.assertEqual(args, [
-                    "build", "--no-link", "--keep-going", *limits,
+                    "build", "-L", "--no-link", "--keep-going", *limits,
                     *(f".#checks.{system}.{name}" for name in names),
                 ])
 
@@ -194,6 +214,24 @@ class Workflows(unittest.TestCase):
             with self.subTest(event=event):
                 result, _ = self.run_checks(event, exit_code=42)
                 self.assertEqual(result.returncode, 42, result.stderr)
+
+    def test_missing_logs_warn_without_changing_build_status(self):
+        for build_status in (0, 1, 42, 100):
+            with self.subTest(build_status=build_status):
+                result, _ = self.run_checks(
+                    "pull_request", exit_code=build_status, log_exit=17
+                )
+                self.assertEqual(result.returncode, build_status, result.stderr)
+                self.assertEqual(result.stdout.count("::warning::"), 5)
+                self.assertIn("no test result inferred", result.stdout)
+
+    def test_stored_logs_are_visible_after_success_and_failure(self):
+        for build_status in (0, 42):
+            with self.subTest(build_status=build_status):
+                result, _ = self.run_checks("push", exit_code=build_status)
+                self.assertEqual(result.returncode, build_status, result.stderr)
+                self.assertEqual(result.stdout.count("retained check output"), 6)
+                self.assertNotIn("::warning::", result.stdout)
 
     def test_full_coverage_is_push_or_manual_only(self):
         self.assertEqual(
