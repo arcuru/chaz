@@ -78,16 +78,17 @@ class Workflows(unittest.TestCase):
             invocations = [json.loads(line) for line in calls.read_text().splitlines()]
         return result, invocations
 
-    def run_checks(self, event, exit_code=0, log_exit=0):
-        step = next(s for s in self.ci["jobs"]["ci"]["steps"] if s["name"] == "Checks")
+    def run_checks(self, event, exit_code=0, log_exit=0, job="ci"):
+        step = next(s for s in self.ci["jobs"][job]["steps"] if s["name"] == "Checks")
         self.assertNotIn("if", step)
-        self.assertEqual(step["env"]["CI_EVENT_NAME"], "${{ github.event_name }}")
+        if job == "ci":
+            self.assertEqual(step["env"]["CI_EVENT_NAME"], "${{ github.event_name }}")
         result, invocations = self.run_script(
             step["run"],
             env={"CI_EVENT_NAME": event, "NIX_LOG_EXIT": str(log_exit)},
             exit_code=exit_code,
         )
-        main = event in ("push", "workflow_dispatch")
+        main = job == "ci" and event in ("push", "workflow_dispatch")
         system = "x86_64-linux" if main else "aarch64-linux"
         names = ["lint", "treefmt", "ci-policy", "test", "build"]
         if main:
@@ -195,13 +196,30 @@ class Workflows(unittest.TestCase):
         checks = arm["steps"][1]
         self.assertNotIn("if", checks)
         for code in (0, 42):
-            result, invocations = self.run_script(checks["run"], exit_code=code)
+            result, args = self.run_checks("push", exit_code=code, job="ci-arm")
             self.assertEqual(result.returncode, code, result.stderr)
-            self.assertEqual(invocations, [[
-                "build", "--no-link", "--keep-going",
+            self.assertEqual(args, [
+                "build", "-L", "--no-link", "--keep-going",
                 *(f".#checks.aarch64-linux.{name}" for name in
                   ("lint", "treefmt", "ci-policy", "test", "build")),
-            ]])
+            ])
+
+    def test_main_arm_replays_logs_and_preserves_build_status(self):
+        for event in ("push", "workflow_dispatch"):
+            for build_status in (0, 1, 42, 100):
+                for log_status in (0, 17):
+                    with self.subTest(event=event, build=build_status, log=log_status):
+                        result, _ = self.run_checks(
+                            event, exit_code=build_status,
+                            log_exit=log_status, job="ci-arm",
+                        )
+                        self.assertEqual(result.returncode, build_status, result.stderr)
+                        if log_status:
+                            self.assertEqual(result.stdout.count("::warning::"), 5)
+                            self.assertIn("no test result inferred", result.stdout)
+                        else:
+                            self.assertEqual(result.stdout.count("retained check output"), 5)
+                            self.assertNotIn("::warning::", result.stdout)
 
     def test_publishing_stays_on_hosted_x86_runners(self):
         publish = self.publish["jobs"]["push-cache"]

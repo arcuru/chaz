@@ -111,8 +111,27 @@ jobs:
       # No installer or client build-limit overrides: zinc's daemon owns both.
       - name: Checks
         run: |
-          nix build --no-link --keep-going \
-            .#checks.aarch64-linux.{lint,treefmt,ci-policy,test,build}
+          system=aarch64-linux
+          names=(lint treefmt ci-policy test build)
+          checks=()
+          for name in "${names[@]}"; do
+            checks+=(".#checks.$system.$name")
+          done
+          build_status=0
+          nix build -L --no-link --keep-going "${checks[@]}" || build_status=$?
+          # The main ARM path needs the same retained results as PR checks.
+          for name in "${names[@]}"; do
+            log=".#checks.$system.$name"
+            if [[ "$name" == lint ]]; then
+              log=".#legacyPackages.$system.lint.chaz-clippy"
+            fi
+            echo "::group::$name — replaying stored derivation log; checks are not being rerun"
+            if ! nix log "$log"; then
+              echo "::warning::Stored log unavailable for $log (local store or configured binary caches); no test result inferred"
+            fi
+            echo '::endgroup::'
+          done
+          exit "$build_status"
 
   publish:
     name: Publish
