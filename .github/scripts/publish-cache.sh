@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Defense in depth behind the job's exact event/ref and protected environment.
+# Defense in depth behind the protected job's exact main/event guard.
 [[ "$GITHUB_REPOSITORY" == arcuru/chaz && "$GITHUB_REPOSITORY_OWNER" == arcuru &&
   "$GITHUB_REF" == refs/heads/main &&
   ("$GITHUB_EVENT_NAME" == push || "$GITHUB_EVENT_NAME" == workflow_dispatch) ]] || {
@@ -9,14 +9,18 @@ set -euo pipefail
   exit 1
 }
 
-case "${1:?expected deps or final}" in
-  deps) jq -e '[.[] | .outputs[]]' "$RUNNER_TEMP/chaz-deps.json" > "$RUNNER_TEMP/chaz-publish.json" ;;
-  final) jq -es '[.[][] | .outputs[]] | unique' "$RUNNER_TEMP/chaz-checks.json" "$RUNNER_TEMP/chaz-final.json" > "$RUNNER_TEMP/chaz-publish.json" ;;
-  *) exit 2 ;;
-esac
-jq -e 'length > 0 and all(.[]; test("^/nix/store/[a-z0-9]{32}-[a-zA-Z0-9+._?=-]+$"))' "$RUNNER_TEMP/chaz-publish.json" >/dev/null
-mapfile -t paths < <(jq -r '.[]' "$RUNNER_TEMP/chaz-publish.json")
-# Publication only copies realized outputs. Never evaluate/build with keys present.
+# Native path listings come only from this job's successful checks/builds.
+[[ -s "$RUNNER_TEMP/chaz-checks-paths" && -s "$RUNNER_TEMP/chaz-final-paths" ]] || exit 1
+sort -u "$RUNNER_TEMP/chaz-checks-paths" "$RUNNER_TEMP/chaz-final-paths" > "$RUNNER_TEMP/chaz-publish-paths"
+mapfile -t paths < "$RUNNER_TEMP/chaz-publish-paths"
+((${#paths[@]} > 0)) || exit 1
+for path in "${paths[@]}"; do
+  [[ "$path" =~ ^/nix/store/[a-z0-9]{32}-[a-zA-Z0-9+._?=-]+$ ]] || {
+    echo 'Invalid publication store path' >&2
+    exit 1
+  }
+done
+# Explicit store paths cannot trigger evaluation or a second workspace build.
 nix path-info "${paths[@]}" >/dev/null
 umask 077
 key=$(mktemp "$RUNNER_TEMP/chaz-cache-key.XXXXXX")

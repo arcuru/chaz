@@ -136,7 +136,15 @@ by the executor every ten seconds while an agent turn is alive, including
 semaphore waits and tool approval. Clients treat a start as visible only for
 45 seconds after its last heartbeat (or its original start), and completion
 wins even over a late synced heartbeat. Matrix renews its ten-second typing
-lease on a three-second timer; the TUI refreshes every five seconds. This
+lease on a three-second timer; the TUI ages activity every five seconds.
+Both retain timestamped activity evidence between session write callbacks,
+rereading the native Verified view only on invalidation, initial load or a
+failed-read retry. Timers still expire orphaned claims without any write;
+future timestamps remain invisible until the local clock reaches them.
+Subscriptions precede initial observation, and writes during a read leave one
+coalesced follow-up. Event cursor tips are invalidation hints, not read views
+or authorization. Matrix observers are owned by their bridge generation and
+cancel pending reads on shutdown before the next generation is installed. This
 bounded presentation lease is not the session-wide `claim_runtime` lease and
 has no effect on reconciliation or retry safety.
 
@@ -371,6 +379,8 @@ Agent jobs are admitted only for Agents hosted by the local executor. Their chil
 ## Agent jobs and Worker children
 
 `spawn_agent` submits one durable Agent job, not a workflow graph. The submitter prepares one child session DB with parent delegation, a request record and exactly one Directive before publishing its ID to the existing watched catalog. An unpublished child is inert; a published child is `Pending` until an executor checks its parent, hosted target/home and broad scope, then pins inherited per-tool grants, capability and depth ceilings and records acceptance in the **same** DB. Invalid requests become `Rejected` without running. Submission returns the DB ID after publication, not after acceptance or execution. A lost creation response requires inspecting the indexed jobs before another submission; there is no stable parent request key or automatic submission retry. Same-login local clients can create and observe jobs but cannot admit or execute them. Narrow, workspace and private scopes are rejected in v1.
+
+Admission and accepted-chain revalidation read the current hosted parent and target AgentDb configs. An unreadable config (open, read, type or decode failure) holds retryably, without falling back to YAML or a cached Agent snapshot. A genuinely absent config payload on an existing hosted Agent retains native defaults; a missing hosted Agent is not that case. Recovery rechecks the original accepted authority and child identity rather than rewriting grants or creating a replacement child.
 
 After `Pending` admission or `Rejected` refusal, job status comes from the accepted Directive's attempt and typed terminal receipt: queued, running, started-unknown (a client cannot prove liveness), interrupted (executor sees a start without completion), succeeded, or failed. At most ten turns hold runtime permits for actual execution; accepted jobs wait **queued before starting an attempt** when capacity is full. An in-Agent `job_wait` yields its permit during observation without releasing its processing reservation, attempt, or execution branch. It reacquires before result hooks, further tools, or model requests, including after tool errors and timeouts. The execution branch's yield watcher covers observation and reacquisition; a fresh ordering check after reacquisition prevents continuation once an earlier branch has been observed. Cancellation drops the turn's permit or pending acquisition. After restart, queued jobs are adopted; a started attempt without completion is not replayed automatically. Inspect it and explicitly retry if appropriate, since effects may already have occurred. `job_wait` only observes and a timeout does not cancel.
 

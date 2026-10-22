@@ -19,21 +19,32 @@ permissions:
 # other branches and merge-queue runs cannot displace main.
 concurrency:
   group: >-
-    ${{ github.repository == 'arcuru/chaz' && github.repository_owner == 'arcuru' && github.ref == 'refs/heads/main' &&
+    ${{ github.repository_owner == 'arcuru' && github.ref == 'refs/heads/main' &&
         (github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
         'ci-dev-main' ||
         format('ci-{0}-{1}', github.event_name, github.event.pull_request.number || github.run_id) }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  # Only the selected job is named CI. Its skipped counterpart has a distinct
-  # name, so a skipped success cannot satisfy the required CI status.
   ci:
-    name: ${{ github.repository == 'arcuru/chaz' && github.repository_owner == 'arcuru' && github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && 'Checks (inactive)' || 'CI' }}
+    name: CI
     if: >-
-      !(github.repository == 'arcuru/chaz' && github.repository_owner == 'arcuru' && github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch'))
-    runs-on: ubicloud-standard-8
-    timeout-minutes: 30
+      ${{ !(github.repository == 'arcuru/chaz' && github.repository_owner == 'arcuru' &&
+        github.ref == 'refs/heads/main' &&
+        (github.event_name == 'push' || github.event_name == 'workflow_dispatch')) }}
+    # Pull requests and merge-queue runs check on the native ARM64 runner. Its
+    # one Nix store persists across jobs, so unchanged outputs are reused rather
+    # than rebuilt or restored; its preinstalled daemon owns substituters and
+    # build limits, and jobs are untrusted clients with no publishing
+    # credentials. Nonmain manual checks stay unprivileged. Trusted main runs
+    # ARM first, then checks and publishes x86 outputs from one hosted store.
+    runs-on: >-
+      ${{ fromJSON((github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
+          '"ubicloud-standard-8"' ||
+          '["self-hosted", "Linux", "ARM64", "zinc", "nix"]') }}
+    # The ARM runner needs room for a cold store; later runs reuse its outputs.
+    timeout-minutes: >-
+      ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && 30 || 60 }}
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -41,19 +52,109 @@ jobs:
           ref: ${{ github.sha }}
           persist-credentials: false
 
+      # The ARM runner provides Nix; hosted runners install it fresh.
       - name: Setup Nix
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
         uses: ./.github/actions/setup-nix
 
+      # One graph shares dependency work and lets independent checks overlap.
+      # Hosted main allows two builds at once, each using all cores so a
+      # dependency build running alone can use the whole runner. The ARM
+      # runner's Nix configuration sets concurrency for its memory instead.
       - name: Checks
-        run: bash .github/scripts/checks.sh
+        env:
+          CI_EVENT_NAME: ${{ github.event_name }}
+        run: &checks |
+          system=aarch64-linux
+          limits=()
+          names=(lint treefmt ci-policy test build)
+          # PRs retain normal Cargo tests, including doctests.
+          if [[ "$CI_EVENT_NAME" == push || "$CI_EVENT_NAME" == workflow_dispatch ]]; then
+            system=x86_64-linux
+            limits=(--max-jobs 2 --cores 0)
+            names+=(doc)
+          fi
+          checks=()
+          for name in "${names[@]}"; do
+            checks+=(".#checks.$system.$name")
+          done
+          build_status=0
+          nix build -L --no-link --keep-going "${limits[@]}" "${checks[@]}" || build_status=$?
+          if ((build_status == 0)); then
+            nix path-info "${checks[@]}" > "$RUNNER_TEMP/chaz-checks-paths" || build_status=$?
+          fi
+          # Report even after failure or a cache hit. Reading a stored log does
+          # not rerun a check, and unavailable logs do not change build status.
+          for name in "${names[@]}"; do
+            log=".#checks.$system.$name"
+            # lint is a symlinkJoin with no own log; read Clippy itself.
+            if [[ "$name" == lint ]]; then
+              log=".#legacyPackages.$system.lint.chaz-clippy"
+            fi
+            echo "::group::$name — replaying stored derivation log; checks are not being rerun"
+            if ! nix log "$log"; then
+              echo "::warning::Stored log unavailable for $log (local store or configured binary caches); no test result inferred"
+            fi
+            echo '::endgroup::'
+          done
+          exit "$build_status"
+
+  # Keep the required PR status `CI` unchanged above. Main adds a second
+  # native platform, using the same single zinc listener and persistent store.
+  ci-arm:
+    name: Main ARM64
+    if: |
+      github.repository == 'arcuru/chaz' && github.repository_owner == 'arcuru' &&
+      github.ref == 'refs/heads/main' &&
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    runs-on: [self-hosted, Linux, ARM64, zinc, nix]
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      # No installer or client build-limit overrides: zinc's daemon owns both.
+      - name: Checks
+        run: |
+          system=aarch64-linux
+          names=(lint treefmt ci-policy test build)
+          checks=()
+          for name in "${names[@]}"; do
+            checks+=(".#checks.$system.$name")
+          done
+          build_status=0
+          nix build -L --no-link --keep-going "${checks[@]}" || build_status=$?
+          # The main ARM path needs the same retained results as PR checks.
+          for name in "${names[@]}"; do
+            log=".#checks.$system.$name"
+            if [[ "$name" == lint ]]; then
+              log=".#legacyPackages.$system.lint.chaz-clippy"
+            fi
+            echo "::group::$name — replaying stored derivation log; checks are not being rerun"
+            if ! nix log "$log"; then
+              echo "::warning::Stored log unavailable for $log (local store or configured binary caches); no test result inferred"
+            fi
+            echo '::endgroup::'
+          done
+          exit "$build_status"
 
   main:
-    name: ${{ github.repository == 'arcuru/chaz' && github.repository_owner == 'arcuru' && github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && 'CI' || 'Main (inactive)' }}
-    if: >-
-      github.repository == 'arcuru/chaz' && github.repository_owner == 'arcuru' && github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    name: Main x86 and publish
+    # Wait before allocating a hosted runner; no polling or store handoff.
+    # Default success() prevents failed, skipped or cancelled ARM publication.
+    needs: [ci-arm]
+    if: |
+      github.repository == 'arcuru/chaz' && github.repository_owner == 'arcuru' &&
+      github.ref == 'refs/heads/main' &&
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
     environment: publish
     runs-on: ubicloud-standard-8
-    timeout-minutes: 30
+    timeout-minutes: 60
+    permissions:
+      contents: read
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -64,42 +165,27 @@ jobs:
       - name: Setup Nix
         uses: ./.github/actions/setup-nix
 
-      - name: Build dependencies
-        run: |
-          nix build --fallback --no-link --max-jobs 2 --cores 0 --json \
-            '.#test.deps' > "$RUNNER_TEMP/chaz-deps.json"
-
-      - name: Publish dependencies
-        id: publish-deps
-        # A cache outage must not skip checks; fail explicitly after they run.
-        continue-on-error: true
-        env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.NIX_CACHE_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.NIX_CACHE_SECRET_ACCESS_KEY }}
-          NIX_CACHE_SIGNING_KEY: ${{ secrets.NIX_CACHE_SIGNING_KEY }}
-        run: bash .github/scripts/publish-cache.sh deps
-
+      # Share the exact check graph and retained-log reporting above.
       - name: Checks
-        run: bash .github/scripts/checks.sh
+        timeout-minutes: 30
+        env:
+          CI_EVENT_NAME: ${{ github.event_name }}
+        run: *checks
 
-      - name: Require dependency publication
-        if: steps.publish-deps.outcome == 'failure'
-        run: |
-          echo 'Dependency publication failed; see Publish dependencies.' >&2
-          exit 1
-
-      # Reuse the checked workspace/test outputs in this same store. Only the
-      # wrapper and optional portable archive remain; no clean workspace rebuild.
+      # Tests already compiled these artifacts. Only wrappers/archive remain.
+      # Resolve paths before secrets enter the environment; publication only copies.
       - name: Prepare final outputs
         run: |
-          nix build --fallback --no-link --max-jobs 2 --cores 0 --json \
+          nix build -L --no-link --max-jobs 2 --cores 0 --print-out-paths \
             '.#packages.x86_64-linux.default' \
-            '.#test.deps' '.#test.artifacts' '.#test.archive' \
-            > "$RUNNER_TEMP/chaz-final.json"
+            '.#legacyPackages.x86_64-linux.test.deps' \
+            '.#legacyPackages.x86_64-linux.test.artifacts' \
+            '.#legacyPackages.x86_64-linux.test.archive' \
+            > "$RUNNER_TEMP/chaz-final-paths"
 
       - name: Publish successful outputs
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.NIX_CACHE_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.NIX_CACHE_SECRET_ACCESS_KEY }}
           NIX_CACHE_SIGNING_KEY: ${{ secrets.NIX_CACHE_SIGNING_KEY }}
-        run: bash .github/scripts/publish-cache.sh final
+        run: bash .github/scripts/publish-cache.sh

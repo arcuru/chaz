@@ -1,5 +1,5 @@
 name: Setup Nix
-description: Install Nix with the signed binary cache
+description: Install Nix and tooling with the configured signed binary cache
 
 runs:
   using: composite

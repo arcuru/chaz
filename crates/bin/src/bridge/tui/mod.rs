@@ -36,6 +36,9 @@ use tokio::sync::{Semaphore, mpsc};
 use tokio::task::JoinSet;
 use tokio_stream::StreamExt;
 
+#[cfg(test)]
+#[path = "../../../../lib/src/test_support/counting_backend.rs"]
+mod activity_backend;
 mod bridge_impl;
 mod input;
 mod jobs;
@@ -1873,7 +1876,8 @@ async fn build_tab(
         .unwrap_or_default();
     let context_budget = server.effective_context_budget(&context_model, agent.max_context_tokens);
     let entries = snapshot.entries;
-    let active_turns = snapshot.active_turns?;
+    let evidence = snapshot.active_turns?;
+    let active_turns = evidence.active_at(chrono::Utc::now()).count();
     Ok(Tab {
         job: None,
         session_db_id,
@@ -1893,6 +1897,7 @@ async fn build_tab(
         expanded_entries: HashSet::new(),
         live: {
             let mut live = refresh::TabLive::with_meta(meta, snapshot.telemetry);
+            live.activity_evidence = Some(evidence);
             live.inputs = snapshot.inputs;
             live.input_attempt = snapshot.input_attempt;
             live
@@ -2493,7 +2498,11 @@ mod session_picker_tests {
             .start_turn_attempt(chaz_core::session::TurnRequestId::parse("tui-message"))
             .await
             .unwrap();
-        tab.active_turns = refresh::load_active_turns(&tab.session_db).await.unwrap();
+        tab.active_turns = refresh::load_active_turns(&tab.session_db)
+            .await
+            .unwrap()
+            .active_at(chrono::Utc::now())
+            .count();
         assert_eq!(tab.active_turns, 1);
         assert!(view::turn_activity_line(tab.active_turns).is_some());
         session.complete_turn_attempt(&attempt, None).await.unwrap();
@@ -2508,7 +2517,11 @@ mod session_picker_tests {
             })
             .await
             .unwrap();
-        tab.active_turns = refresh::load_active_turns(&tab.session_db).await.unwrap();
+        tab.active_turns = refresh::load_active_turns(&tab.session_db)
+            .await
+            .unwrap()
+            .active_at(chrono::Utc::now())
+            .count();
         assert_eq!(tab.active_turns, 0);
         assert!(view::turn_activity_line(tab.active_turns).is_none());
     }
@@ -2697,7 +2710,7 @@ mod session_picker_tests {
                                 name: name.map(str::to_owned),
                                 ..Default::default()
                             },
-                            active_turns: Ok(0),
+                            active_turns: Ok(chaz_core::session::TurnActivity::default()),
                         })),
                     }
                 },

@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use tracing::{info, warn};
 
-use super::transport::Transport;
+use super::transport::{CloseBudget, Transport};
 
 /// Maximum tool output size (100 KB).
 const MAX_OUTPUT_BYTES: usize = 100 * 1024;
@@ -36,6 +36,7 @@ const PROTOCOL_VERSION: &str = "2025-11-25";
 pub struct McpServer {
     name: String,
     transport: Transport,
+    closed: AtomicBool,
     next_id: AtomicU64,
     default_policy: Option<ToolPolicy>,
     /// Set when the server sends `notifications/tools/list_changed`.
@@ -59,12 +60,25 @@ pub struct McpServerCapabilities {
     pub prompts: bool,
 }
 
+/// A cancelled re-initialization cannot leave a published but uninitialized
+/// connection available to later calls. Its transport still owns cleanup.
+struct RecoveryGuard<'a> {
+    server: &'a McpServer,
+    complete: bool,
+}
+
+impl Drop for RecoveryGuard<'_> {
+    fn drop(&mut self) {
+        if !self.complete {
+            self.server.begin_close();
+        }
+    }
+}
+
 impl McpServer {
-    /// Start an MCP server using the configured transport.
-    ///
-    /// For stdio: spawns a subprocess. For HTTP: connects to the URL.
-    /// Both perform the initialize handshake and are ready for tool discovery.
-    pub async fn start(config: &McpServerConfig) -> Result<Self, String> {
+    /// Own the transport before starting any cancellable handshake/discovery.
+    /// The caller must retain this handle and explicitly close it on failure.
+    pub fn start(config: &McpServerConfig) -> Result<Self, String> {
         let transport = if let Some(ref url) = config.url {
             info!("MCP server '{}': connecting via HTTP to {url}", config.name);
             Transport::new_http(url)
@@ -72,18 +86,16 @@ impl McpServer {
             Transport::new_stdio(config)?
         };
 
-        let server = Self {
+        Ok(Self {
             name: config.name.clone(),
             transport,
+            closed: AtomicBool::new(false),
             next_id: AtomicU64::new(1),
             default_policy: config.default_policy.clone(),
             tools_changed: AtomicBool::new(false),
             tool_metadata: RwLock::new(HashMap::new()),
             capabilities: RwLock::new(McpServerCapabilities::default()),
-        };
-
-        server.initialize().await?;
-        Ok(server)
+        })
     }
 
     /// Snapshot the server-advertised capabilities. Caller decides
@@ -112,8 +124,25 @@ impl McpServer {
         names
     }
 
-    pub async fn shutdown(&self) {
-        self.transport.shutdown().await;
+    /// Terminal admission stop, also interrupting outstanding stdio I/O.
+    pub(crate) fn begin_close(&self) {
+        self.closed.store(true, Ordering::Release);
+        self.transport.begin_close();
+    }
+
+    /// Explicit bounded close. An error retains the transport for retry.
+    pub async fn shutdown(&self) -> Result<(), String> {
+        self.shutdown_with_budget(CloseBudget::new()).await
+    }
+
+    pub(crate) async fn shutdown_with_budget(&self, budget: CloseBudget) -> Result<(), String> {
+        self.begin_close();
+        self.transport.shutdown(budget).await
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_cleanup_failure(&self, failure: u8) {
+        self.transport.inject_cleanup_failure(failure);
     }
 
     #[cfg(test)]
@@ -127,7 +156,7 @@ impl McpServer {
     /// and hand it to the transport so subsequent HTTP requests carry the
     /// `MCP-Protocol-Version` header the spec requires (Streamable HTTP
     /// §Protocol Version Header). Stdio transport ignores the value.
-    async fn initialize(&self) -> Result<(), String> {
+    pub async fn initialize(&self) -> Result<(), String> {
         let result = self
             .send_request(
                 "initialize",
@@ -490,7 +519,13 @@ impl McpServer {
                 // if restarting fails.
                 if let Err(recovery_error) = async {
                     self.transport.restart(&self.name).await?;
-                    self.initialize().await
+                    let mut recovery = RecoveryGuard {
+                        server: self,
+                        complete: false,
+                    };
+                    self.initialize().await?;
+                    recovery.complete = true;
+                    Ok::<(), String>(())
                 }
                 .await
                 {
@@ -538,6 +573,9 @@ impl McpServer {
 
     /// Send a JSON-RPC request and wait for the response.
     async fn send_request(&self, method: &str, params: Value) -> Result<Value, String> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(format!("MCP server '{}' is closed", self.name));
+        }
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let request = json!({
             "jsonrpc": "2.0",
@@ -552,6 +590,9 @@ impl McpServer {
 
     /// Send a JSON-RPC notification (no response expected).
     async fn send_notification(&self, method: &str, params: Value) -> Result<(), String> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(format!("MCP server '{}' is closed", self.name));
+        }
         let notification = json!({
             "jsonrpc": "2.0",
             "method": method,

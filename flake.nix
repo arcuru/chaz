@@ -255,7 +255,7 @@
         # Small offline checks of the actual CI coverage and publish boundaries.
         chaz-ci-policy =
           pkgs.runCommand "chaz-ci-policy" {
-            nativeBuildInputs = [pkgs.jq (pkgs.python3.withPackages (ps: [ps.pyyaml]))];
+            nativeBuildInputs = [(pkgs.python3.withPackages (ps: [ps.pyyaml]))];
           } ''
             cp -r ${./.github} .github
             export PYTHONDONTWRITEBYTECODE=1

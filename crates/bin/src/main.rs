@@ -385,8 +385,7 @@ async fn main() -> anyhow::Result<()> {
     let result = if daemon_mode {
         // No bridge: the server is already running sync, schedules, the
         // routine engine, and the agent loop. Hold the process open so that
-        // work continues, and let the runtime shut down through the same
-        // `Drop` path any other mode uses.
+        // work continues, then explicitly settle the owned runtime below.
         info!("chaz daemon ready; waiting for shutdown signal");
         if capabilities.ownership() == instance::InstanceOwnership::Service {
             supervise_daemon_service(config.clone(), config_path.clone(), built.take().unwrap())
@@ -400,7 +399,7 @@ async fn main() -> anyhow::Result<()> {
         let bridge = bridge::cmd::CommandBridge::new(config, secret_store, a.command, a.session);
         bridge.run(server).await
     } else if args.print {
-        // One-shot: no background bridges, no shutdown plumbing needed.
+        // One-shot: no background bridges; MCP cleanup still runs below.
         let prompt = args.prompt.clone().expect("--print requires PROMPT");
         let bridge = bridge::cli::CliBridge::new(config, secret_store, prompt, args.session);
         bridge.run(server).await
@@ -410,25 +409,23 @@ async fn main() -> anyhow::Result<()> {
 
     // Propagate rather than swallow: the exit code is the only signal a calling
     // script gets, and a bridge that failed did not do the work it was asked to.
-    if let Err(e) = result {
+    if let Err(e) = &result {
         error!("Bridge error: {e}");
-        return Err(e);
     }
-
     if let Some(built) = built {
         built.shutdown().await;
     }
-    Ok(())
+    result
 }
 
 async fn supervise_daemon_service(
     config: Config,
     config_path: PathBuf,
-    built: server::BuiltServer,
+    mut built: server::BuiltServer,
 ) -> anyhow::Result<()> {
     let config = Arc::new(config);
     instance::supervise_service(
-        built,
+        &mut built,
         move || {
             let config = config.clone();
             let config_path = config_path.clone();

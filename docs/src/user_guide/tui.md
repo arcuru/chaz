@@ -1013,7 +1013,7 @@ remain authorized observers, never ordinary execution sessions.
 | Trigger / display                      | Behavior                                                                          |
 | -------------------------------------- | --------------------------------------------------------------------------------- |
 | Session write / Settings open          | Coalesced background transcript/meta/telemetry/status refresh                     |
-| Every five seconds                     | Refresh activity; check service health and retry failed reads                     |
+| Every five seconds                     | Age retained activity; check service health and retry failed reads                |
 | `⟳ refreshing (cached)`                | A read is pending; displayed data is the last successful read                     |
 | `⚠ refresh failed`                     | That read failed; last-good data remains, even if another read succeeds           |
 | `action(s) pending`                    | Accepted backend actions execute in order, one at a time                          |
@@ -1031,7 +1031,7 @@ completion popup still consumes the first Esc without arming quit.
 Reads have a bounded wait and supervised panic/cancellation handling. A failed
 read releases its slot for recovery without clearing cached data or restoring
 an otherwise live terminal. Errors are tracked separately for transcript/meta,
-status and activity; a successful activity poll cannot hide a failed transcript
+status and activity; a successful activity read cannot hide a failed transcript
 read. Catalog failures likewise retain prior rows and mark their metadata stale.
 Errors are logged at `warn`; worker panics are logged at `error`.
 

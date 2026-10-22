@@ -173,11 +173,17 @@ unsigned puppet device shares the room:
 
 ### Room reset
 
-The `chaz-matrix rooms` maintenance command runs last, against the same
-throwaway homeserver: `rooms list` lists every room the agent is joined to,
-`rooms leave-all` previews the reset, `rooms leave-all --execute` leaves them
-all, and a final list reports nothing to do — the reset is idempotent, and the
-agent's password never appears in the command's output.
+The `chaz-matrix rooms` maintenance command runs against the same throwaway
+homeserver. Plain `leave-all` previews without leaving, `--execute` leaves the
+joined rooms, and a final list reports nothing to do. The bridge then rejoins
+the DM for the history and delivery checks.
+
+After those checks, the harness stops the bridge and creates a pending invite.
+`leave-all --reset` must preview both the invite and joined DM without changing
+either. With `--execute`, it must reject the invite, leave the DM and forget
+both. Server queries require zero joined rooms and invites, and denied DM
+history access, while the group room left by plain `leave-all` stays readable.
+A second reset has nothing to do. Neither path may print the agent's password.
 
 ## Transport
 

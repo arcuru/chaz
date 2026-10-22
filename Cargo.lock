@@ -841,6 +841,7 @@ dependencies = [
  "unicode-normalization",
  "unicode-segmentation",
  "unicode-width 0.2.0",
+ "wiremock",
 ]
 
 [[package]]
@@ -860,6 +861,7 @@ dependencies = [
  "futures",
  "getrandom 0.3.4",
  "lazy_static",
+ "libc",
  "matrix-sdk",
  "meval",
  "regex",
@@ -912,6 +914,7 @@ dependencies = [
  "clap",
  "dirs",
  "eidetica",
+ "futures",
  "getrandom 0.3.4",
  "libc",
  "matrix-sdk",

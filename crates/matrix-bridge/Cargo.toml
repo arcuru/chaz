@@ -22,6 +22,7 @@ clap.workspace = true
 dirs.workspace = true
 eidetica.workspace = true
 getrandom.workspace = true
+futures.workspace = true
 matrix-sdk.workspace = true
 matrix-sdk-base.workspace = true
 matrix-sdk-sqlite = { version = "0.18", default-features = false, features = ["crypto-store"] }
