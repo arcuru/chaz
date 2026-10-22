@@ -1374,10 +1374,13 @@ impl Bridge for MatrixBridge {
             .await
             .take()
             .unwrap_or_default();
-        for (_, channel) in bindings {
+        // Release concurrently: one slow homeserver send must not stretch
+        // shutdown to one lease per room.
+        let finishes = bindings.into_values().map(|channel| {
             channel.delivery.stop();
-            channel.typing.finish().await;
-        }
+            channel.typing.finish()
+        });
+        futures::future::join_all(finishes).await;
         Ok(())
     }
 }
