@@ -7,11 +7,33 @@ use crate::session::jobs::{AcceptedAgentJob, StagedAgentDefinition, read_accepte
 use crate::session::{EntryType, Session};
 use crate::tool::ScopedTools;
 use crate::types::ConversationId;
+use anyhow::Context as _;
 use eidetica::entry::ID;
 use eidetica::store::DocStore;
 use std::collections::BTreeMap;
 
 impl Server {
+    /// Job authority cannot use the permissive per-turn hydrator: an unreadable
+    /// DB must retry, not fall back to YAML or a previously hydrated snapshot.
+    async fn read_job_authority(
+        &self,
+        entry: &crate::hosted_index::DbEntry,
+    ) -> anyhow::Result<crate::agent::Agent> {
+        let unavailable = || format!("job authority unavailable for Agent {}", entry.display_name);
+        let db = self
+            .registry
+            .open_agent_db(&entry.db_id, Some(&entry.pubkey))
+            .await
+            .with_context(unavailable)?
+            .with_context(unavailable)?;
+        // read_config defaults only for a genuinely absent payload. Open, read,
+        // type and decode errors stay unprefixed so adoption holds retryably.
+        let config = db.read_config().await.with_context(unavailable)?;
+        Ok(self
+            .agents
+            .build_from_db_config(&entry.display_name, &config))
+    }
+
     /// Derive authority from the parent and hosted target. Only the executor validates jobs.
     async fn derive_job_definition(
         &self,
@@ -65,13 +87,9 @@ impl Server {
             "job parent requires exactly one hosted Agent"
         );
         let parent_name = &meta.agents[0].display_name;
-        let parent_agent = self
-            .agents
+        self.agents
             .get(parent_name)
             .ok_or_else(|| anyhow::anyhow!("parent Agent not hosted"))?;
-        // Admission and restart validation precede per-turn hydration. Use the
-        // Living Agent config here too, rather than a YAML-built snapshot.
-        let parent_agent = Box::pin(self.hydrate_agent_from_db(parent_agent)).await;
         let parent_host = self
             .agent_index
             .find_by_name(parent_name)
@@ -82,6 +100,7 @@ impl Server {
                     == Some(parent_host.pubkey.to_string().as_str()),
             "invalid published job: parent Agent is not home on executor"
         );
+        let parent_agent = self.read_job_authority(&parent_host).await?;
         let strict_capabilities = strict_session_capabilities(&parent_db).await?;
         anyhow::ensure!(
             meta.capabilities == strict_capabilities
@@ -102,11 +121,10 @@ impl Server {
             })
             .ok_or_else(|| anyhow::anyhow!("target Agent not hosted on executor"))?;
         let target_name = target.display_name.clone();
-        let target_agent = self
-            .agents
+        self.agents
             .get(&target_name)
             .ok_or_else(|| anyhow::anyhow!("target Agent runtime unavailable"))?;
-        let target_agent = Box::pin(self.hydrate_agent_from_db(target_agent)).await;
+        let target_agent = self.read_job_authority(&target).await?;
         let parent_active = self
             .active_extensions_for_agent(parent_id, parent_name)
             .await;
