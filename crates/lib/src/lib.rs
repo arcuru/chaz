@@ -50,3 +50,6 @@ pub mod wasm_host;
 
 #[cfg(test)]
 pub mod test_support;
+
+#[cfg(test)]
+mod routing_guard;

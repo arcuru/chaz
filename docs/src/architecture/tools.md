@@ -112,7 +112,9 @@ The host enforces grants at the capability boundary — the tool says what it wa
 | `NativeToolHost`     | Native     | In-process, grant enforcement only                                       | The only host wired in today — used for every built-in tool.                                              |
 | `BubblewrapToolHost` | OS sandbox | Wraps `Shell` capability invocations in `bwrap`; other caps pass through | Implemented in `crates/lib/src/bubblewrap_host.rs` but not yet config-selectable (`#[allow(dead_code)]`). |
 
-Tools (shell, web, file) call `ctx.host().request()` against the trait, so swapping host implementations needs no tool-code changes; what's missing is the config plumbing to choose anything other than `NativeToolHost`.
+Tools (shell, web_fetch, web_search, file) call `ctx.host().request()` against the trait, so swapping host implementations needs no tool-code changes; what's missing is the config plumbing to choose anything other than `NativeToolHost`.
+
+A source-scan test (`crates/lib/src/routing_guard.rs`) keeps it that way for session-time code: it fails when non-test code under `src/tools/` or `src/extensions/` names a direct OS/network API (`std`/`tokio` `fs`/`process`/`net`, `reqwest`, `File::open`/`create`, `Command::new`). Exemptions name a file, a function and an API, each with a reason, and an exemption that no longer matches fails the test. The only exemptions are the two startup skill-catalog functions in `extensions/skills.rs`. The guard catches accidental regressions; it matches source text, so it is not a sandbox. Grant enforcement is the host's, and daemon infrastructure outside those trees (model providers, embedding, MCP transport, config, secrets) is deliberately not scanned.
 
 A separate WASM-tools path (`crates/lib/src/wasm_host.rs`: `WasmEngine` + `WasmTool`) lets a tool itself live in a Wasmtime sandbox while still routing its capability requests through whichever `ToolHost` chaz is using. The engine is wired but the config-driven loader is future work (the module is `#[allow(dead_code)]` today).
 
