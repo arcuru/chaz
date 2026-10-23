@@ -10,7 +10,7 @@
 //! |------|------|-----------|--------|
 //! | Native | [`NativeToolHost`] | Grant enforcement only | ✅ |
 //! | WASM | (future) | VM-enforced sandbox, capability tokens | ☐ |
-//! | Bubblewrap | (future) | OS-level sandboxing via bwrap | ☐ |
+//! | Bubblewrap | [`BubblewrapToolHost`] | OS-level sandboxing via bwrap | ✅ |
 //!
 //! # Adding a new capability
 //!
@@ -135,8 +135,8 @@ pub trait ToolHost: Send + Sync {
 /// - **Filesystem**: read/write path restrictions from [`FsGrant`]
 ///
 /// No sandboxing beyond grant checks — the tool has full access to
-/// whatever the grants permit. For stronger isolation, use a WASM or
-/// bubblewrap host (future).
+/// whatever the grants permit. For stronger isolation, use the
+/// bubblewrap host (`tool_host: bubblewrap`) or a future WASM host.
 pub struct NativeToolHost;
 
 impl Default for NativeToolHost {

@@ -36,7 +36,7 @@ Two more orthogonal layers wrap everything:
 - **Secret store** keeps API keys out of LLM context entirely — they're resolved at the HTTP client boundary, never quoted to the model.
 - **Agent-level controls** (`allowed_tools`, per-Agent `workers:` list, depth caps) shrink which layers even get a chance to run for a given Agent.
 
-The capability boundary is the **`ToolHost`** trait. The default `NativeToolHost` runs in-process and enforces grants; future hosts (WASM, bubblewrap) will swap in stronger isolation without any tool-code changes. Tools never call OS APIs directly — they request a `Capability::Shell|FileRead|FileWrite|HttpRequest` from the host.
+The capability boundary is the **`ToolHost`** trait. The default `NativeToolHost` runs in-process and enforces grants; the opt-in `BubblewrapToolHost` (`tool_host: bubblewrap`) runs shell commands in OS-level namespaces without any tool-code changes, and a WASM host is planned. Tools never call OS APIs directly — they request a `Capability::Shell|FileRead|FileWrite|HttpRequest` from the host.
 
 ## Tool Approval
 
@@ -86,7 +86,7 @@ An answer that arrives after the expiry does not revive the request. The daemon 
 
 ## Capability Grants
 
-Tools access system resources through the **ToolHost** trait — a sandboxed capability boundary. Grants configure _what_ each tool is allowed to do; the host enforces those grants at execution time. The default `NativeToolHost` enforces grants in-process; future hosts (WASM, bubblewrap) will add stronger sandboxing without changing any tool code.
+Tools access system resources through the **ToolHost** trait — a sandboxed capability boundary. Grants configure _what_ each tool is allowed to do; the host enforces those grants at execution time. The default `NativeToolHost` enforces grants in-process; the opt-in `BubblewrapToolHost` (`tool_host: bubblewrap`) adds OS-level shell sandboxing, and a WASM host is planned — both without changing any tool code.
 
 ### Capability tiers and attenuation
 
@@ -200,7 +200,7 @@ security:
 
 Paths are normalized lexically before the check — `.`/`..` are resolved and the match is on path boundaries, so `/work` permits `/work/sub/x` but **not** `/workother/x` or `/work/../etc/passwd`.
 
-> This is **advisory** confinement: symlinks are not followed, so a symlink under an allowed root can still point outside it. True confinement (a process that physically cannot see other paths) is the job of a sandboxed host — bubblewrap mounts or WASI preopens — which is planned. Until then, treat fs grants as a guardrail against accidental writes, not a boundary against a hostile tool.
+> This is **advisory** confinement: symlinks are not followed, so a symlink under an allowed root can still point outside it. True confinement (a process that physically cannot see other paths) is the job of a sandboxed host — the `BubblewrapToolHost` (`tool_host: bubblewrap`) provides it for `shell` commands, which run in a mount namespace with only the system directories, `/tmp`, and the working directory present. Until then, treat fs grants as a guardrail against accidental writes, not a boundary against a hostile tool.
 
 ### Agent and session ceilings
 
@@ -228,7 +228,43 @@ The session ceiling lives on the session itself (`SessionMeta.capabilities`) rat
 >     endpoints: [] # deny-all egress
 > ```
 >
-> This is an in-process check, so it blocks the `web_fetch` capability but a determined `shell` tool could still shell out to `curl`. For a hard guarantee that an agent _cannot_ reach the network regardless of tool, the enforcement point has to be the OS boundary (a network namespace with no interface) — that lands with the sandboxed host. Pair the `endpoints: []` ceiling with a `shell` denylist (or no `shell` tool) until then.
+> This is an in-process check, so it blocks the `web_fetch` capability but a determined `shell` tool could still shell out to `curl`. For a hard guarantee that a shell command _cannot_ reach the network regardless of tool, the enforcement point has to be the OS boundary — the `BubblewrapToolHost` (`tool_host: bubblewrap`) runs every shell command with `--unshare-net`, so there is no interface beyond loopback inside the namespace. File and HTTP capabilities still run in-process under their grants, so pair the `endpoints: []` ceiling with a `shell` denylist (or no `shell` tool) to cover those paths too.
+
+## The bubblewrap tool host
+
+Setting `tool_host: bubblewrap` routes shell commands through
+[bubblewrap](https://github.com/containers/bubblewrap) (`bwrap`), which gives each command its own Linux namespaces using unprivileged user namespaces — no root, no setuid. Inside the sandbox a shell command gets:
+
+- **No network** (`--unshare-net`) — loopback only, no external interfaces.
+- **A private PID namespace** (`--unshare-pid`) — host PIDs are unaddressable, so a same-UID host process cannot be signalled or inspected.
+- **No `/proc`** — mounting a procfs for the new PID namespace is refused by some hardened kernels, and its absence is stronger confinement anyway: no host process list, no `/proc/<pid>/root`. This has a practical cost: with no procfs, `/dev/fd` is a dangling symlink, so shell constructs that depend on it fail — bash process substitution, for example, errors with `cat: /dev/fd/63: No such file or directory`. Tools that read `/proc` directly will not work either.
+- **An empty environment** (`--clearenv`) restored with fixed `PATH`, `HOME=/tmp`, and `LANG` — provider API keys and other host secrets never reach a shell command.
+- **Read-only system directories**: `/usr`, `/bin`, `/lib`, `/lib64`, `/nix/store`, and `/run/current-system`. Only `/nix/store` is bound — not all of `/nix` — because a read-only mount still allows connecting to the Nix daemon's Unix socket under `/nix/var/nix`.
+- **Ephemeral `/tmp`** (tmpfs) and a minimal `/dev`.
+
+File read/write and HTTP capabilities are not namespaced; they run on the native host's grant-checked path exactly as before.
+
+### Writable working directories
+
+By default **nothing on the host is writable from inside the sandbox** — commands run against the ephemeral `/tmp`. To let a command work in a real directory, list approved roots:
+
+```yaml
+tool_host_writable_roots:
+  - /srv/work
+  - /tmp/agent-scratch
+```
+
+A requested working directory must canonicalize (symlinks and `..` resolved) to a directory inside one of these roots; anything else — including `/`, `/home`, or a symlink pointing outside — is refused before `bwrap` runs. A root that canonicalizes to `/` is itself refused at startup: it would mount the entire host filesystem read-write, so chaz refuses to start rather than run with the sandbox nullified. The read-only system binds above are applied after the writable working-dir bind, so they always win even if a working directory overlaps an ancestor of one of them.
+
+### Fail-closed selection
+
+Selecting `bubblewrap` requires a working sandbox: at startup chaz probes `bwrap` by actually creating a namespace, and if that fails the server refuses to start rather than silently running unsandboxed. If you genuinely want to degrade to native execution when `bwrap` is unavailable, say so explicitly:
+
+```yaml
+tool_host: bubblewrap-unsafe-fallback
+```
+
+That logs a prominent warning and runs shell commands natively (grant checks only). The unsafe fallback is always opt-in; plain `bubblewrap` fails closed.
 
 ## Leak Detection
 

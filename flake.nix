@@ -57,6 +57,12 @@
         rustSrc = fenixStable.rust-src;
         toolChain = fenixStable.completeToolchain;
 
+        # bubblewrap is the optional runtime sandbox for the shell tool. It is
+        # Linux-only; on Darwin the list is empty and chaz simply never finds
+        # `bwrap` on PATH (`tool_host: bubblewrap` then fails closed; only
+        # `bubblewrap-unsafe-fallback` degrades to native execution).
+        bwrapInputs = lib.optionals pkgs.stdenv.isLinux [pkgs.bubblewrap];
+
         # Use the toolchain with the crane helper functions
         craneLib = (inputs.crane.mkLib pkgs).overrideToolchain toolChain;
 
@@ -86,12 +92,14 @@
           LD_LIBRARY_PATH = lib.makeLibraryPath [pkgs.openssl];
         };
 
-        # Test-only extras: subprocess tests spawn python3, and tests that
-        # touch $HOME need it to point at a writable path inside the sandbox.
+        # Test-only extras: subprocess tests spawn python3, tests that touch
+        # $HOME need it to point at a writable path inside the sandbox, and the
+        # bubblewrap host's integration tests need bwrap on PATH (they
+        # hard-fail without a working sandbox on Linux).
         testArgs =
           buildArgs
           // {
-            nativeBuildInputs = buildArgs.nativeBuildInputs or [] ++ [pkgs.python3];
+            nativeBuildInputs = buildArgs.nativeBuildInputs or [] ++ [pkgs.python3] ++ bwrapInputs;
             # matrix-sdk builds a TLS client even for loopback HTTP mock tests.
             SSL_CERT_FILE = "${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt";
             preCheck = ''
@@ -118,7 +126,7 @@
             mkdir -p $out/bin
             cp ${chaz-unwrapped}/bin/chaz $out/bin
             wrapProgram $out/bin/chaz \
-              --prefix PATH : ${lib.makeBinPath [pkgs.aichat]} \
+              --prefix PATH : ${lib.makeBinPath ([pkgs.aichat] ++ bwrapInputs)} \
               --prefix LD_LIBRARY_PATH : ${lib.makeLibraryPath [pkgs.openssl]}
           '';
 
@@ -134,7 +142,7 @@
             mkdir -p $out/bin
             cp ${chaz-unwrapped}/bin/chaz-discord $out/bin
             wrapProgram $out/bin/chaz-discord \
-              --prefix PATH : ${lib.makeBinPath [pkgs.aichat]} \
+              --prefix PATH : ${lib.makeBinPath ([pkgs.aichat] ++ bwrapInputs)} \
               --prefix LD_LIBRARY_PATH : ${lib.makeLibraryPath [pkgs.openssl]}
           '';
 
@@ -150,7 +158,7 @@
             mkdir -p $out/bin
             cp ${chaz-unwrapped}/bin/chaz-matrix $out/bin
             wrapProgram $out/bin/chaz-matrix \
-              --prefix PATH : ${lib.makeBinPath [pkgs.aichat]} \
+              --prefix PATH : ${lib.makeBinPath ([pkgs.aichat] ++ bwrapInputs)} \
               --prefix LD_LIBRARY_PATH : ${lib.makeLibraryPath [pkgs.openssl]}
           '';
 
@@ -199,7 +207,7 @@
 
         chaz-test-runner = pkgs.writeShellApplication {
           name = "chaz-test-runner";
-          runtimeInputs = [pkgs.cargo-nextest pkgs.python3 pkgs.coreutils];
+          runtimeInputs = [pkgs.cargo-nextest pkgs.python3 pkgs.coreutils] ++ bwrapInputs;
           text = ''
             if [[ ! -f ./Cargo.toml ]]; then
               echo "Run nix run .#test from the Chaz workspace root." >&2
@@ -388,20 +396,22 @@
             chaz-clippy
           ];
 
-          nativeBuildInputs = with pkgs; [
-            alejandra
-            cargo-deny
-            cargo-nextest
-            cargo-tarpaulin
-            deadnix
-            git-cliff
-            just
-            mdbook
-            prettier
-            nix-fast-build
-            statix
-            config.treefmt.build.wrapper
-          ];
+          nativeBuildInputs = with pkgs;
+            [
+              alejandra
+              cargo-deny
+              cargo-nextest
+              cargo-tarpaulin
+              deadnix
+              git-cliff
+              just
+              mdbook
+              prettier
+              nix-fast-build
+              statix
+              config.treefmt.build.wrapper
+            ]
+            ++ bwrapInputs;
 
           RUST_SRC_PATH = "${rustSrc}/lib/rustlib/src/rust/library";
 

@@ -17,14 +17,15 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
+use anyhow::bail;
 use tracing::{error, info, warn};
 
 use crate::config::{self, Config};
 use crate::server::Server;
 use crate::{
-    agent, agent_db, backends, commands, db_kind, embedding, extension, extensions, grants,
-    hosted_index, keyed_sync, mcp, memory_bank_db, routine, security, session, tool, tool_host,
-    tools,
+    agent, agent_db, backends, bubblewrap_host, commands, db_kind, embedding, extension,
+    extensions, grants, hosted_index, keyed_sync, mcp, memory_bank_db, routine, security, session,
+    tool, tool_host, tools,
 };
 
 /// Knobs [`build`] can't infer from [`Config`] — behavior a one-shot CLI run and
@@ -939,8 +940,24 @@ pub async fn build(
 
     // Create the callback-driven server
     let context_config = config.context.clone().unwrap_or_default();
-    let tool_host = std::sync::Arc::new(tool_host::NativeToolHost::new())
-        as std::sync::Arc<dyn tool_host::ToolHost>;
+    let tool_host: std::sync::Arc<dyn tool_host::ToolHost> = {
+        let tool_host_cfg = config.tool_host.unwrap_or_default();
+        // Construct (and probe) the bubblewrap host up front so its
+        // availability can drive the selection below; root-canonicalization
+        // errors (e.g. a writable root of `/`) surface here, before the
+        // probe, rather than being masked by a fallback.
+        let bwrap_host = match tool_host_cfg {
+            config::ToolHostConfig::Bubblewrap
+            | config::ToolHostConfig::BubblewrapUnsafeFallback => Some(
+                bubblewrap_host::BubblewrapToolHost::with_roots(
+                    config.tool_host_writable_roots.clone(),
+                )
+                .map_err(anyhow::Error::msg)?,
+            ),
+            _ => None,
+        };
+        select_tool_host(tool_host_cfg, &config.tool_host_writable_roots, bwrap_host)?
+    };
 
     let executor = if opts.run_agent_loop {
         Some(crate::instance::executor_for_role(execution)?)
@@ -1111,6 +1128,85 @@ pub async fn build(
             .collect(),
         server_slot,
     })
+}
+
+/// Choose the concrete tool host for a `tool_host` config, emitting the
+/// info/warn messages that pair with each choice. `bwrap_host` carries the
+/// already-constructed (and probed) bubblewrap host for the bwrap variants;
+/// `None` under native selection, where it is never needed.
+///
+/// Split from [`build`] so the selection and its warnings are unit-testable
+/// without a real sandbox.
+fn select_tool_host(
+    tool_host: config::ToolHostConfig,
+    writable_roots: &[PathBuf],
+    bwrap_host: Option<bubblewrap_host::BubblewrapToolHost>,
+) -> anyhow::Result<std::sync::Arc<dyn tool_host::ToolHost>> {
+    match tool_host {
+        config::ToolHostConfig::Native => {
+            warn_ignored_writable_roots(
+                writable_roots,
+                "tool_host: native runs shell commands in-process, so the configured \
+                 writable roots are never mounted. Set tool_host: bubblewrap to mount \
+                 them read-write inside the sandbox.",
+            );
+            info!("Tool host: native (in-process, grant checks only)");
+            Ok(std::sync::Arc::new(tool_host::NativeToolHost::new()))
+        }
+        config::ToolHostConfig::Bubblewrap => {
+            let host = bwrap_host.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "internal error: bubblewrap host not constructed for bubblewrap config"
+                )
+            })?;
+            if !host.is_available() {
+                bail!(
+                    "tool_host: bubblewrap requires a working bwrap sandbox, but the probe \
+                     failed (bwrap missing or unprivileged user namespaces unavailable). \
+                     Install bubblewrap, or set tool_host: bubblewrap-unsafe-fallback to \
+                     explicitly accept native execution without OS-level sandboxing."
+                );
+            }
+            info!("Tool host: bubblewrap (OS-level shell sandboxing)");
+            Ok(std::sync::Arc::new(host))
+        }
+        config::ToolHostConfig::BubblewrapUnsafeFallback => {
+            let host = bwrap_host.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "internal error: bubblewrap host not constructed for bubblewrap config"
+                )
+            })?;
+            if host.is_available() {
+                info!("Tool host: bubblewrap (OS-level shell sandboxing)");
+                Ok(std::sync::Arc::new(host))
+            } else {
+                warn_ignored_writable_roots(
+                    writable_roots,
+                    "no working bwrap sandbox is available, so execution falls back to \
+                     native and the configured writable roots are never mounted.",
+                );
+                warn!(
+                    "Tool host: bubblewrap-unsafe-fallback selected and no working bwrap \
+                     sandbox is available — running shell commands natively WITHOUT \
+                     OS-level sandboxing (explicitly acknowledged in config)."
+                );
+                Ok(std::sync::Arc::new(tool_host::NativeToolHost::new()))
+            }
+        }
+    }
+}
+
+/// Warn when `tool_host_writable_roots` is configured but the effective
+/// host never mounts them (native execution, or fallback after a failed
+/// probe) — a configured root that silently does nothing is a surprise
+/// waiting for an operator to trip over.
+fn warn_ignored_writable_roots(roots: &[PathBuf], why: &str) {
+    if !roots.is_empty() {
+        warn!(
+            roots = ?roots,
+            "tool_host_writable_roots is configured but is ignored: {why}"
+        );
+    }
 }
 
 /// The deferred at-startup work, run in a background task off the
@@ -2247,6 +2343,156 @@ async fn adopt_published_bridge_addresses(
             peer = %pubkey,
             published = published.len(),
             "Adopted a bridge's published sync addresses"
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A test subscriber that records the message of every event, so the
+    /// selection warnings can be asserted rather than eyeballed. Plain
+    /// `tracing` only — no subscriber crate needed.
+    #[derive(Clone, Default)]
+    struct CaptureEvents {
+        messages: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl tracing::Subscriber for CaptureEvents {
+        fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn register_callsite(
+            &self,
+            _metadata: &tracing::Metadata<'_>,
+        ) -> tracing::subscriber::Interest {
+            tracing::subscriber::Interest::always()
+        }
+        fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn clone_span(&self, _old: &tracing::span::Id) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            struct MessageVisitor {
+                message: Option<String>,
+            }
+            impl tracing::field::Visit for MessageVisitor {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    if field.name() == "message" {
+                        self.message = Some(format!("{value:?}"));
+                    }
+                }
+            }
+            let mut visitor = MessageVisitor { message: None };
+            event.record(&mut visitor);
+            if let Some(message) = visitor.message {
+                self.messages.lock().unwrap().push(message);
+            }
+        }
+        fn enter(&self, _span: &tracing::span::Id) {}
+        fn exit(&self, _span: &tracing::span::Id) {}
+        fn try_close(&self, _id: tracing::span::Id) -> bool {
+            true
+        }
+    }
+
+    /// Run `f` with [`CaptureEvents`] installed and return the event
+    /// messages it emitted on this thread.
+    fn captured(f: impl FnOnce()) -> Vec<String> {
+        let subscriber = CaptureEvents::default();
+        let messages = subscriber.messages.clone();
+        tracing::subscriber::with_default(subscriber, f);
+        messages.lock().unwrap().clone()
+    }
+
+    fn bwrap_host(available: bool) -> bubblewrap_host::BubblewrapToolHost {
+        bubblewrap_host::BubblewrapToolHost::test_host(available)
+    }
+
+    fn roots(rs: &[&str]) -> Vec<PathBuf> {
+        rs.iter().map(PathBuf::from).collect()
+    }
+
+    #[test]
+    fn native_with_roots_warns_roots_ignored() {
+        let messages = captured(|| {
+            let host =
+                select_tool_host(config::ToolHostConfig::Native, &roots(&["/srv/work"]), None)
+                    .unwrap();
+            assert_eq!(host.name(), "native");
+        });
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.contains("tool_host_writable_roots") && m.contains("ignored")),
+            "expected an ignored-roots warning, got: {messages:?}"
+        );
+    }
+
+    #[test]
+    fn native_without_roots_does_not_warn() {
+        let messages = captured(|| {
+            select_tool_host(config::ToolHostConfig::Native, &[], None).unwrap();
+        });
+        assert!(
+            messages
+                .iter()
+                .all(|m| !m.contains("tool_host_writable_roots")),
+            "unexpected roots warning: {messages:?}"
+        );
+    }
+
+    #[test]
+    fn fallback_with_failed_probe_warns_roots_ignored_and_selects_native() {
+        let messages = captured(|| {
+            let host = select_tool_host(
+                config::ToolHostConfig::BubblewrapUnsafeFallback,
+                &roots(&["/srv/work"]),
+                Some(bwrap_host(false)),
+            )
+            .unwrap();
+            assert_eq!(host.name(), "native");
+        });
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.contains("tool_host_writable_roots") && m.contains("ignored")),
+            "expected an ignored-roots warning, got: {messages:?}"
+        );
+    }
+
+    #[test]
+    fn fallback_with_working_probe_selects_bubblewrap() {
+        let host = select_tool_host(
+            config::ToolHostConfig::BubblewrapUnsafeFallback,
+            &roots(&["/srv/work"]),
+            Some(bwrap_host(true)),
+        )
+        .unwrap();
+        assert_eq!(host.name(), "bwrap");
+    }
+
+    #[test]
+    fn bubblewrap_with_failed_probe_bails() {
+        let err = select_tool_host(
+            config::ToolHostConfig::Bubblewrap,
+            &[],
+            Some(bwrap_host(false)),
+        )
+        .err()
+        .expect("a failed probe under tool_host: bubblewrap must refuse startup");
+        assert!(
+            err.to_string().contains("requires a working bwrap sandbox"),
+            "{err}"
         );
     }
 }
