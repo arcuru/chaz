@@ -86,7 +86,7 @@ bridge/tui/          TuiBridge — ratatui-based local interactive surface (defa
 
 ## Key Invariants
 
-- **AgentDb is the runtime source of truth.** YAML `agents:` is a first-boot template only; `bootstrap_from_config` does not overwrite existing AgentDb config. Use `/agent set` for live edits.
+- **AgentDb is the runtime source of truth.** YAML `agents:` only seeds a new Agent DB; startup, restart and `/agent reload` never write yaml values into an existing agent (startup only resolves a freshly seeded agent's prompt). Use `/agent set` for live edits; the TUI yaml diff (pick / confirmed reseed) is the only path that copies yaml into an existing agent.
 - **Two peer-local DBs, both never sync.** `chaz_group` holds group-level routing/metadata (`sessions`, `matrix_channels`, `session_names`); `chaz_peer` holds peer-runtime state (`credentials`, `schedule_state`). Sync-ful state lives in per-entity DBs.
 - **Hosted-agent / hosted-bank lookups are in-memory only.** `hosted_index::HostedIndex` is built at startup by walking eidetica's `user.databases()` and reading each DB's `meta.kind` marker. No persistent mirror — eidetica's key store is the single source of truth for "which DBs does this peer host."
 - **Authorization = key possession.** Session participation is gated by AuthSettings on the session DB; memory bank access is gated by AuthSettings on the bank DB. No capability flags.

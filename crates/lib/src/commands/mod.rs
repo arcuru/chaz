@@ -174,11 +174,10 @@ pub enum Command {
         field: String,
         value: String,
     },
-    /// Re-read the on-disk chaz yaml and re-run the hash-gated agent
-    /// reconcile. `Some(ref)` scopes to one agent; `None` reloads every
-    /// declared agent. Same semantics as the startup reconcile — yaml fields
-    /// and the resolved system prompt refresh into the DB, live `/agent set`
-    /// edits survive when yaml is unchanged.
+    /// Re-read the on-disk chaz yaml and report how each declared agent
+    /// compares with its Agent DB. `Some(ref)` scopes to one agent; `None`
+    /// covers every declared agent. Read-only: yaml seeds new agents at
+    /// startup, and an existing agent's DB config stays authoritative.
     AgentReload(Option<String>),
     /// Print this peer's default pubkey so an agent owner can paste it
     /// into `/agent invite` on their peer.

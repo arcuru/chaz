@@ -382,7 +382,7 @@ pub(super) struct AgentDiffView {
     /// workers are display-only and not cursorable).
     pub cursor: usize,
     /// Per-row accept flags for `[a]` pick mode. `picks.len() == diff.rows.len()`.
-    /// Seeded to the changed rows so Enter-without-toggling applies the drift.
+    /// Seeded to the changed rows; nothing is written until Enter in pick mode.
     pub picks: Vec<bool>,
 }
 

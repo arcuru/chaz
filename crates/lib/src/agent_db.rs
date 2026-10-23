@@ -78,8 +78,9 @@ pub struct AgentMeta {
 }
 
 /// Serializable agent definition. Mirrors the runtime-relevant fields of
-/// [`AgentConfig`]. What used to live in yaml will live here once yaml is
-/// downgraded to bootstrap sugar.
+/// [`AgentConfig`]. A yaml `agents:` entry seeds this once, when the Agent DB
+/// is created; afterwards this stored config is authoritative and yaml edits
+/// reach it only through an explicit user action.
 ///
 /// Workers declared under an Agent are mirrored into [`Self::workers`].
 /// Workers do NOT get their own AgentDb rows; they're configured tools
@@ -94,20 +95,19 @@ pub struct AgentDbConfig {
     pub system_prompt_files: Vec<String>,
     /// Pointer to the *resolved* system prompt (files read + inline) in the
     /// [`crate::prompt_store`] blob store on `chaz_peer`: an eidetica
-    /// [`Snapshot`](eidetica::Snapshot) of the commit that wrote it. Set by
-    /// reconcile; the runtime fetches the resolved text by reading at this
-    /// snapshot rather than re-reading the files each turn. Stored as a tip
-    /// (CID) rather than a recomputed hash so the exact prompt version is
-    /// reproducible. `None` until first reconcile (or for an inline-only agent
-    /// created via `/agent new`).
+    /// [`Snapshot`](eidetica::Snapshot) of the commit that wrote it. Set when
+    /// startup finishes seeding the agent and whenever `/agent set` (or an
+    /// explicit yaml merge) changes a prompt field; the runtime fetches the
+    /// resolved text by reading at this snapshot rather than re-reading the
+    /// files each turn. Stored as a tip (CID) rather than a recomputed hash so
+    /// the exact prompt version is reproducible. `None` until then — the
+    /// runtime reads the files directly in that case.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub system_prompt_ref: Option<eidetica::Snapshot>,
-    /// Reconcile gate: hash of the yaml-derived config last applied to this DB
-    /// (including the resolved prompt ref). Startup/`/agent reload` re-applies
-    /// the yaml definition only when this differs from the current yaml's hash,
-    /// so a live `/agent set` edit survives restarts as long as the yaml block
-    /// and prompt files are unchanged. `None` for agents never reconciled from
-    /// yaml (e.g. created purely via `/agent new`).
+    /// Legacy bookkeeping: hash of the yaml-derived config an older chaz last
+    /// re-applied to this DB. Nothing reads or writes it any more — yaml only
+    /// seeds new agents — but an existing value is preserved untouched on
+    /// every config write so old databases keep their stored data.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub applied_config_hash: Option<String>,
     pub model: Option<String>,
@@ -178,8 +178,8 @@ impl WorkerDbConfig {
 ///
 /// This is what lets any peer enumerate which logins an agent has and locate
 /// the bridge that manages each, without being able to authenticate as them.
-/// It is a separate store (not a field on [`AgentDbConfig`]) so chaz's yaml
-/// reconcile never clobbers a registered login.
+/// It is a separate store (not a field on [`AgentDbConfig`]) so an explicit
+/// yaml merge into the agent config never clobbers a registered login.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct LoginRef {
     /// Transport kind (`"matrix"`, `"discord"`, …).
@@ -279,8 +279,9 @@ impl AgentDbConfig {
         Self {
             system_prompt: cfg.system_prompt.clone().unwrap_or_default(),
             system_prompt_files: cfg.system_prompt_files.clone().unwrap_or_default(),
-            // Resolved by reconcile (Server::reconcile_agent_from_yaml), which
-            // reads the files, stores the blob, and fills these in.
+            // Resolved when startup finishes the seed
+            // (Server::complete_agent_seed), which reads the files and stores
+            // the blob.
             system_prompt_ref: None,
             applied_config_hash: None,
             model: cfg.model.clone(),

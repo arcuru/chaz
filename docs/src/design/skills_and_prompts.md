@@ -14,6 +14,7 @@
 > - `PromptAugmentation` shipped as an extension-providable cap (`crates/lib/src/extension/caps.rs`) and is wired through `ContextBuilder::build`.
 > - **Divergence:** the `SystemPromptSnapshot` entry type / `SystemPromptSnapshotPayload` / observational audit log were **not** built; `PersonaSnapshot` was simply removed from `EntryType`. There is no per-turn snapshot today — every turn assembles fresh and the contributions are not persisted.
 > - **Divergence:** `/agent reload <ref>` shipped as `agent_reload` (re-reads yaml + hash-gated reconcile), not as the narrower file-only re-read described in the original § `/agent reload command` below.
+> - **Superseded (yaml seeds agents):** the hash-gated reconcile is gone. Yaml seeds a new Agent DB only; startup finishes that seed by resolving the prompt once, and `/agent reload` is a read-only yaml↔DB comparison. Prompt-file contents are re-read by `/agent set <ref> system_prompt_files <paths>`. See [YAML seeds, the Agent DB decides](../user_guide/agents.md#yaml-seeds-the-agent-db-decides).
 
 ## Summary
 
@@ -335,12 +336,12 @@ drives no behavior.
 /agent reload [ref]
 ```
 
-Re-reads the chaz yaml from disk, then runs `reconcile_agent_from_yaml` for
-each agent (or the named agent) — the same hash-gated reconcile path used at
-startup. When the yaml-derived config differs from what was last applied, the
-agent's DB is rewritten with the refreshed declarative config, including
-re-resolved `system_prompt_files`. A live `/agent set` edit survives when the
-yaml block and prompt files are unchanged.
+Re-reads the chaz yaml from disk and reports, for each agent (or the named
+agent), which declarative fields differ from its Agent DB config and which
+entries have no Agent DB yet. It writes nothing: yaml only seeds new agents,
+and an existing agent's DB config is authoritative. (An earlier version ran a
+hash-gated reconcile here that rewrote the DB whenever the yaml block or
+prompt files changed.)
 
 Errors when no config path is set or the yaml cannot be read or parsed.
 

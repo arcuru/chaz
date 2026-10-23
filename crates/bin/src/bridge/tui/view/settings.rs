@@ -1090,7 +1090,9 @@ fn render_agent_diff(f: &mut ratatui::Frame, area: Rect, view: &AgentDiffView) {
 
     // ── hints ───────────────────────────────────────────────────────
     let hint_text = match view.mode {
-        AgentDiffMode::View => "[r] bring drift back  [R] reseed all  [a] pick fields  [Esc] close",
+        AgentDiffMode::View => {
+            "[a] pick fields  [R] reseed all  [Esc] close  (DB is authoritative; nothing applies until you choose)"
+        }
         AgentDiffMode::Pick => "[Space] toggle  [Enter] apply picked  [Esc] back",
         AgentDiffMode::ConfirmReseed => "[y] confirm reseed  [n] cancel",
     };

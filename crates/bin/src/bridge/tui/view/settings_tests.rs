@@ -2149,3 +2149,67 @@ async fn settings_peer_inspector_collects_actual_catalog_and_loaded_templates_on
     }
     server.shutdown().await;
 }
+
+/// The yaml diff is a read-only view: no single keypress applies yaml to an
+/// existing agent. `r` (the retired "bring drift back") does nothing, `R` only
+/// arms a confirmation, and a pick applies exactly the chosen fields.
+#[tokio::test]
+async fn agent_diff_view_applies_nothing_without_pick_or_confirmed_reseed() {
+    use chaz_core::agent_diff::{AgentField, AgentMergeMode};
+    let (_instance, server, _backend, mut app) = fixture().await;
+    open(&mut app, SettingsScope::Peer, 0);
+    app.settings_focus = SettingsFocus::Content;
+    let yaml = AgentDbConfig {
+        model: Some("opus".into()),
+        autonomous: true,
+        ..Default::default()
+    };
+    let diff = chaz_core::agent_diff::diff_agent(&yaml, &AgentDbConfig::default());
+    let picks = diff
+        .rows
+        .iter()
+        .map(|r| r.field == AgentField::Model)
+        .collect();
+    app.agent_diff = Some(AgentDiffView {
+        agent_name: "agent-00".into(),
+        diff,
+        mode: AgentDiffMode::View,
+        cursor: 0,
+        picks,
+    });
+
+    for code in [KeyCode::Char('r'), KeyCode::Enter, KeyCode::Char('y')] {
+        assert!(matches!(key(&mut app, code), input::SettingsKey::None));
+        assert_eq!(app.agent_diff.as_ref().unwrap().mode, AgentDiffMode::View);
+    }
+
+    assert!(matches!(
+        key(&mut app, KeyCode::Char('R')),
+        input::SettingsKey::None
+    ));
+    assert_eq!(
+        app.agent_diff.as_ref().unwrap().mode,
+        AgentDiffMode::ConfirmReseed
+    );
+    assert!(matches!(
+        key(&mut app, KeyCode::Char('n')),
+        input::SettingsKey::None
+    ));
+    assert_eq!(app.agent_diff.as_ref().unwrap().mode, AgentDiffMode::View);
+
+    assert!(matches!(
+        key(&mut app, KeyCode::Char('a')),
+        input::SettingsKey::None
+    ));
+    match key(&mut app, KeyCode::Enter) {
+        input::SettingsKey::ApplyAgentMerge {
+            name,
+            mode: AgentMergeMode::Pick(fields),
+        } => {
+            assert_eq!(name, "agent-00");
+            assert_eq!(fields, vec![AgentField::Model]);
+        }
+        _ => panic!("pick mode Enter should apply only the picked field"),
+    }
+    server.shutdown().await;
+}
