@@ -2,10 +2,10 @@
 //!
 //! Every method delegates to the native `InMemory` backend unchanged, including
 //! the methods with trait defaults, so the fixture keeps native cached-state and
-//! traversal behavior. `get` and activity-table view resolutions are observed.
-//! On a service connection each raw get is a separate RPC, so
-//! read paths must not scale raw gets with
-//! session history.
+//! traversal behavior. Raw `get` calls, activity-table reads and per-store view
+//! resolutions are observed separately: a resolution can reuse native
+//! materialization without reading raw history. Service tests count
+//! authenticated RPC frames as well.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -22,11 +22,19 @@ use eidetica::{
 };
 
 #[derive(Clone, Default)]
-pub(crate) struct EntryReads(Arc<AtomicUsize>, Arc<AtomicUsize>);
+pub(crate) struct EntryReads(
+    Arc<AtomicUsize>,
+    Arc<AtomicUsize>,
+    Arc<std::sync::Mutex<std::collections::BTreeMap<String, usize>>>,
+);
 
 impl EntryReads {
     pub(crate) fn activity_tables(&self) -> usize {
         self.1.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn tables(&self) -> std::collections::BTreeMap<String, usize> {
+        self.2.lock().unwrap().clone()
     }
 
     pub(crate) fn count(&self) -> usize {
@@ -170,6 +178,13 @@ impl BackendImpl for Counting {
         if matches!(request.store.as_str(), "turn_attempts" | "turn_activity") {
             self.reads.1.fetch_add(1, Ordering::SeqCst);
         }
+        *self
+            .reads
+            .2
+            .lock()
+            .unwrap()
+            .entry(request.store.clone())
+            .or_default() += 1;
         self.inner.resolve_store_state(request).await
     }
     async fn begin_store_state_staging(

@@ -3,7 +3,7 @@ use super::*;
 use chaz_core::server::{JobMonitor, JobMonitorNode};
 use chaz_core::session::{
     jobs::JobState,
-    steering::{JobInput, JobInputRequest, JobInputState},
+    steering::{JobInputRequest, JobInputState},
 };
 use ratatui::{
     layout::{Constraint, Layout},
@@ -144,13 +144,14 @@ pub(super) async fn open_tab(
         .await
         .map_err(|e| e.to_string())?;
     let observation = observe(&db, tx).await.map_err(|e| e.to_string())?;
-    let mut tab = build_tab(server, backend, db.clone(), id.into()).await?;
+    let snapshot = snapshot(&db).await?;
+    let mut tab = tab_from_snapshot(server, backend, db, id.into(), snapshot.session).await?;
     tab.job = Some(JobTab {
         state: None,
         details: false,
     });
     tab.live.observation = Some(observation);
-    apply_snapshot(&mut tab, snapshot(&db).await);
+    apply_state(&mut tab, snapshot.state);
     Ok(tab)
 }
 
@@ -177,78 +178,79 @@ pub(super) fn open(
 }
 
 pub(super) struct Snapshot {
-    entries: Vec<SessionEntry>,
-    telemetry: chaz_core::session::usage::SessionTelemetry,
-    state: JobState,
-    inputs: Result<Vec<JobInput>, String>,
+    pub(super) session: refresh::SessionSnapshot,
+    pub(super) state: JobState,
 }
 
 pub(super) async fn snapshot(db: &eidetica::Database) -> Result<Snapshot, String> {
+    let tips = db.snapshot().await.map_err(|e| e.to_string())?;
+    snapshot_at(db, tips).await
+}
+
+pub(super) async fn snapshot_at(
+    db: &eidetica::Database,
+    tips: eidetica::Snapshot,
+) -> Result<Snapshot, String> {
     async {
         chaz_core::session::jobs::require_observer_write(db).await?;
-        let tips = db.snapshot().await?;
-        let entries = Session::entries_at_snapshot(db, &tips).await?;
-        let telemetry =
-            chaz_core::session::usage::telemetry_at_snapshot(db, &tips, &entries).await?;
-        let state = chaz_core::session::jobs::observer_status(db).await?.state;
-        let session = Session::new(
+        let session = Session::try_new_at(
             chaz_core::types::ConversationId(db.root_id().to_string()),
             db.clone(),
+            &tips,
         )
-        .await;
+        .await?;
+        let loaded = refresh::snapshot_from_session(&session, db, tips.clone()).await?;
+        let state = session
+            .observer_status_at(
+                &tips,
+                loaded
+                    .steering
+                    .as_ref()
+                    .expect("native snapshot includes steering"),
+            )
+            .await?
+            .state;
         Ok::<_, anyhow::Error>(Snapshot {
-            entries,
-            telemetry,
+            session: loaded,
             state,
-            inputs: session
-                .turn_inputs_at(&tips)
-                .await
-                .map_err(|e| e.to_string()),
         })
     }
     .await
     .map_err(|e| e.to_string())
 }
 
-pub(super) fn apply_snapshot(tab: &mut Tab, result: Result<Snapshot, String>) {
-    match result {
-        Ok(snapshot) => {
-            tab.set_entries(snapshot.entries);
-            tab.live.telemetry = Some(snapshot.telemetry);
-            tab.active_turns = usize::from(matches!(
-                snapshot.state,
-                JobState::StartedUnknown {
-                    activity_recent: true,
-                    ..
-                }
-            ));
-            let job = tab.job.as_mut().expect("job snapshot belongs to observer");
-            tab.live.input_attempt = attempt_id(Some(&snapshot.state)).map(str::to_owned);
-            job.state = Some(snapshot.state);
-            match snapshot.inputs {
-                Ok(inputs) => {
-                    tab.live.inputs = inputs;
-                    if tab.live.input_feedback.starts_with("unavailable")
-                        || tab
-                            .live
-                            .input_feedback
-                            .starts_with("input evidence unavailable")
-                    {
-                        tab.live.input_feedback.clear();
-                    }
-                }
-                Err(error) => {
-                    tab.live.input_feedback = format!("input evidence unavailable: {error}")
-                }
-            }
+pub(super) fn apply_state(tab: &mut Tab, state: JobState) {
+    tab.active_turns = usize::from(matches!(
+        state,
+        JobState::StartedUnknown {
+            activity_recent: true,
+            ..
         }
-        Err(error) => {
-            let job = tab.job.as_mut().expect("job snapshot belongs to observer");
-            job.state = None;
-            tab.live.input_feedback = format!("unavailable; retained evidence is stale: {error}");
-            tab.touch_transcript();
-        }
+    ));
+    tab.live.input_attempt = attempt_id(Some(&state)).map(str::to_owned);
+    tab.job
+        .as_mut()
+        .expect("job snapshot belongs to observer")
+        .state = Some(state);
+    if tab.live.input_feedback.starts_with("unavailable")
+        || tab
+            .live
+            .input_feedback
+            .starts_with("input evidence unavailable")
+    {
+        tab.live.input_feedback.clear();
     }
+}
+
+pub(super) fn apply_error(tab: &mut Tab, error: String) {
+    tab.live.covered = None;
+    tab.live.steering = None;
+    tab.job
+        .as_mut()
+        .expect("job snapshot belongs to observer")
+        .state = None;
+    tab.live.input_feedback = format!("unavailable; retained evidence is stale: {error}");
+    tab.touch_transcript();
 }
 
 pub(super) async fn send(
@@ -541,7 +543,7 @@ pub(super) fn input_lines(tab: &Tab, debug: bool) -> Vec<Line<'static>> {
     lines
 }
 
-fn attempt_id(state: Option<&JobState>) -> Option<&str> {
+pub(super) fn attempt_id(state: Option<&JobState>) -> Option<&str> {
     match state {
         Some(
             JobState::Running { attempt_id }

@@ -2,6 +2,7 @@
 use super::*;
 use chaz_core::server::{JobMonitor, JobMonitorNode};
 use chaz_core::session::jobs::{JobState, JobWait};
+use chaz_core::session::steering::JobInput;
 use ratatui::{Terminal, backend::TestBackend};
 
 fn node(id: &str, task: &str, state: Option<JobState>) -> JobMonitorNode {
