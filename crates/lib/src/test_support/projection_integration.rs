@@ -2228,7 +2228,7 @@ async fn projectors_receive_the_autocompacted_request() {
         &["observer", crate::extensions::autocompact::NAME],
     )
     .await;
-    fx.backend.insert_model_window(String::new(), 100_000);
+    fx.backend.insert_model_window("mock-model".into(), 100_000);
     let db = fx.session.lock().await.database().clone();
     crate::extension::write_settings(
         &db,
@@ -2309,7 +2309,7 @@ async fn autocompact_waits_for_complete_projected_envelope_not_just_history() {
         &["adds-tail", crate::extensions::autocompact::NAME],
     )
     .await;
-    fx.backend.insert_model_window(String::new(), 100_000);
+    fx.backend.insert_model_window("mock-model".into(), 100_000);
     let db = fx.session.lock().await.database().clone();
     crate::extension::write_settings(
         &db,

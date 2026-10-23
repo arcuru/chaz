@@ -746,6 +746,7 @@ It is off until you turn it on for a session.
 | `/autocompact <length>` | —                     | Turn on with this trigger. `27000`, `27k` and `27K` all mean 27,000 tokens; zero, negative, fractional or overflowing values are refused. |
 | `/autocompact on`       | —                     | Turn on at the default trigger.                                                                                                           |
 | `/autocompact off`      | —                     | Stop new automatic summaries. Manual `/compact` and existing history are unchanged.                                                       |
+| `enabled`               | `false`               | Allow automatic summary calls for this session. `/autocompact on`, `off` or a length changes this setting.                                |
 | `trigger_tokens`        | unset = 80% of window | Estimated size of the next model request that starts a summary. Never above the request budget.                                           |
 | `keep_recent_tokens`    | `20000`               | Recent messages kept word for word (Pi's default), capped at half the trigger.                                                            |
 | `summary_max_tokens`    | `8192`                | Output ceiling for one summary call, bounded by the backend ceiling and remaining model window. A ceiling, not a target.                  |
@@ -775,7 +776,7 @@ A preparation makes at most two tool-free calls (older history and active-reques
 Each summary is one tool-free call to the turn's own model and backend, separately metered: its usage appears under `/autocompact`, not in the reply's token counts.
 Turning the feature on authorizes these calls under the existing backend access and budget limits.
 They use the backend's configured request timeout.
-Provider errors or cancellation may leave usage unknown; estimates are not substituted for it.
+Completed summary calls keep their reported usage even if a later segment is cancelled. Provider errors or cancellation of an in-flight call may leave that call's usage unknown; estimates are not substituted for it.
 There is one summary in flight at a time and no automatic retry.
 
 Summaries replace history only in what the model is sent.

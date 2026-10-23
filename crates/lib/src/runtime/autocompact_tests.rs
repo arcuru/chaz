@@ -105,7 +105,7 @@ impl BackendDispatch for Stub {
                 calls.len()
             };
             if *self.release_after_main.lock().unwrap() == Some(count) {
-                self.released.notify_waiters();
+                self.released.notify_one();
                 *self.release_after_main.lock().unwrap() = None;
             }
             let delay = *self.main_delay.lock().unwrap();

@@ -172,17 +172,11 @@ struct Job {
     previous: Option<(String, usize)>,
 }
 
-#[derive(Debug)]
-struct Prepared {
-    summaries: Vec<String>,
-    usage: Vec<ResponseMetadata>,
-}
-
 struct Pending {
     jobs: Vec<Job>,
     cut: usize,
     estimated_before: usize,
-    handle: tokio::task::JoinHandle<Result<Prepared, (String, Vec<ResponseMetadata>)>>,
+    handle: tokio::task::JoinHandle<Result<Vec<String>, String>>,
 }
 
 impl Drop for Pending {
@@ -215,7 +209,9 @@ pub(crate) struct Compactor {
     session: Option<(eidetica::Database, Vec<String>)>,
     invalidated: bool,
     boundary_failure: Option<String>,
-    usage: Vec<ResponseMetadata>,
+    /// Each finished call reports immediately, even if a later segment is
+    /// cancelled or invalidated before the preparation completes.
+    usage: std::sync::Arc<std::sync::Mutex<Vec<ResponseMetadata>>>,
 }
 
 #[derive(Debug)]
@@ -290,7 +286,12 @@ impl Compactor {
         initial: &[RuntimeMessage],
         sources: &[ContextSource],
     ) -> Option<Self> {
-        let window = backend.context_window(resolved_model);
+        // Window discovery uses catalog IDs, including the backend prefix in
+        // multi-backend setups, not the raw model name sent to the provider.
+        let budget_model = model
+            .map(str::to_string)
+            .or_else(|| backend.default_model());
+        let window = backend.context_window(budget_model.as_deref().unwrap_or(resolved_model));
         // Without a known window the configured request budget is the only
         // ceiling Chaz has for this model.
         let base = window.or(hard)?;
@@ -333,7 +334,7 @@ impl Compactor {
             session: None,
             invalidated: false,
             boundary_failure: None,
-            usage: Vec::new(),
+            usage: Default::default(),
         })
     }
 
@@ -377,7 +378,7 @@ impl Compactor {
 
     pub(crate) fn take_status(&mut self) -> Option<Status> {
         let mut status = self.status.take()?;
-        status.summary_usage = self.usage.clone();
+        status.summary_usage = self.usage.lock().unwrap().clone();
         let key = (status.state.clone(), status.detail.clone());
         if self.reported.as_ref() == Some(&key) {
             return None;
@@ -537,13 +538,17 @@ impl Compactor {
 
     fn start(&mut self, messages: &[RuntimeMessage], sources: &[ContextSource], estimate: usize) {
         let Some(jobs) = self.plan(messages, sources) else {
-            self.set_status(
-                "no-eligible-range",
-                format!(
-                    "request is ~{estimate} tokens (trigger {}), but no completed history is eligible to summarize",
-                    self.trigger
-                ),
-            );
+            // Keep the last rejection visible instead of replacing it with
+            // the expected absence of a fresh range at the same cut.
+            if self.exhausted == 0 {
+                self.set_status(
+                    "no-eligible-range",
+                    format!(
+                        "request is ~{estimate} tokens (trigger {}), but no completed history is eligible to summarize",
+                        self.trigger
+                    ),
+                );
+            }
             return;
         };
         let cut = jobs.last().map_or(0, |j| j.end);
@@ -552,6 +557,7 @@ impl Compactor {
         let window = self.window;
         let max_tokens = self.policy.summary_max_tokens;
         let work = jobs.clone();
+        let usage = self.usage.clone();
         info!(
             estimate,
             trigger = self.trigger,
@@ -560,23 +566,20 @@ impl Compactor {
             "Starting background autocompaction"
         );
         let handle = tokio::spawn(async move {
-            let mut prepared = Prepared {
-                summaries: Vec::new(),
-                usage: Vec::new(),
-            };
+            let mut summaries = Vec::new();
             for job in &work {
                 match summarize(&backend, model.as_deref(), window, max_tokens, job).await {
-                    Ok((text, usage)) => {
-                        prepared.summaries.push(text);
-                        prepared.usage.extend(usage);
+                    Ok((text, reported)) => {
+                        usage.lock().unwrap().extend(reported);
+                        summaries.push(text);
                     }
-                    Err((error, usage)) => {
-                        prepared.usage.extend(usage);
-                        return Err((error, prepared.usage));
+                    Err((error, reported)) => {
+                        usage.lock().unwrap().extend(reported);
+                        return Err(error);
                     }
                 }
             }
-            Ok(prepared)
+            Ok(summaries)
         });
         self.pending = Some(Pending {
             jobs,
@@ -594,24 +597,22 @@ impl Compactor {
     fn settle(
         &mut self,
         pending: Pending,
-        result: Result<Prepared, (String, Vec<ResponseMetadata>)>,
+        result: Result<Vec<String>, String>,
         messages: &[RuntimeMessage],
         sources: &[ContextSource],
         tools: &[ToolDefinition],
     ) -> Result<(), String> {
         let before = estimate_request_tokens(&self.view(messages, sources).messages, tools);
-        let refuse =
-            |this: &mut Self, state: &str, detail: String, usage: Vec<ResponseMetadata>| {
-                warn!(%detail, cut = pending.cut, "Autocompaction result rejected");
-                this.exhausted = this.exhausted.max(pending.cut);
-                let status = this.set_status(state, detail.clone());
-                status.estimated_before = Some(before);
-                status.summary_usage = usage;
-                Err(detail)
-            };
-        let prepared = match result {
-            Ok(prepared) => prepared,
-            Err((error, usage)) => return refuse(self, "failed", error, usage),
+        let refuse = |this: &mut Self, state: &str, detail: String| {
+            warn!(%detail, cut = pending.cut, "Autocompaction result rejected");
+            this.exhausted = this.exhausted.max(pending.cut);
+            let status = this.set_status(state, detail.clone());
+            status.estimated_before = Some(before);
+            Err(detail)
+        };
+        let summaries = match result {
+            Ok(summaries) => summaries,
+            Err(error) => return refuse(self, "failed", error),
         };
         // Stale-source rejection: every covered message must be unchanged.
         let stale = pending.jobs.iter().any(|job| {
@@ -627,11 +628,10 @@ impl Compactor {
                 self,
                 "stale",
                 "covered messages changed while the summary was prepared".into(),
-                prepared.usage,
             );
         }
         let mut candidate = self.applied.clone();
-        for (job, summary) in pending.jobs.iter().zip(&prepared.summaries) {
+        for (job, summary) in pending.jobs.iter().zip(&summaries) {
             candidate.retain(|a| a.start != job.start);
             candidate.push(Applied {
                 start: job.start,
@@ -650,7 +650,6 @@ impl Compactor {
                 self,
                 "no-progress",
                 format!("summary did not shrink the request (~{before} -> ~{after} tokens)"),
-                prepared.usage,
             );
         }
         info!(before, after, "Applied autocompaction summary");
@@ -664,7 +663,6 @@ impl Compactor {
         );
         status.estimated_before = Some(pending.estimated_before.max(before));
         status.estimated_after = Some(after);
-        status.summary_usage = prepared.usage;
         Ok(())
     }
 
@@ -685,13 +683,8 @@ impl Compactor {
         let mut pending = self.pending.take().expect("pending checked");
         let result = match (&mut pending.handle).await {
             Ok(result) => result,
-            Err(error) => Err((format!("summary task failed: {error}"), Vec::new())),
+            Err(error) => Err(format!("summary task failed: {error}")),
         };
-        let usage = match &result {
-            Ok(p) => &p.usage,
-            Err((_, usage)) => usage,
-        };
-        self.usage.extend(usage.iter().cloned());
         // Manual compaction may have completed while a hard-limit wait was
         // pending. Recheck its snapshot-bound coverage before applying.
         self.check_fence().await?;
@@ -720,12 +713,7 @@ impl Compactor {
             );
             return;
         }
-        let result = (&mut pending.handle).await;
-        match result {
-            Ok(Ok(prepared)) => self.usage.extend(prepared.usage),
-            Ok(Err((_, usage))) => self.usage.extend(usage),
-            Err(_) => {}
-        }
+        let _ = (&mut pending.handle).await;
         self.set_status(
             "unused",
             "turn ended before the prepared summary was needed".into(),
@@ -946,10 +934,12 @@ mod tests {
         release: tokio::sync::Notify,
         calls: AtomicUsize,
         limits: Mutex<Vec<u32>>,
-        dropped: Arc<AtomicBool>,
+        /// Responses allowed through before `hold` starts blocking.
+        ready_responses: usize,
+        dropped: AtomicBool,
     }
-    struct DropFlag(Arc<AtomicBool>);
-    impl Drop for DropFlag {
+    struct DropFlag<'a>(&'a AtomicBool);
+    impl Drop for DropFlag<'_> {
         fn drop(&mut self) {
             self.0.store(true, Ordering::SeqCst);
         }
@@ -979,17 +969,26 @@ mod tests {
             max_output_tokens: u32,
         ) -> Pin<Box<dyn Future<Output = Result<LLMResponse, LlmError>> + Send + 'a>> {
             Box::pin(async move {
-                self.calls.fetch_add(1, Ordering::SeqCst);
+                let call = self.calls.fetch_add(1, Ordering::SeqCst);
                 self.limits.lock().unwrap().push(max_output_tokens);
-                let flag = DropFlag(self.dropped.clone());
-                if self.hold.load(Ordering::SeqCst) {
+                let flag = DropFlag(&self.dropped);
+                if self.hold.load(Ordering::SeqCst) && call >= self.ready_responses {
                     self.release.notified().await;
                 }
                 std::mem::forget(flag);
                 Ok(LLMResponse::Text {
                     content: "short summary".into(),
                     provider_extra: Default::default(),
-                    metadata: None,
+                    metadata: Some(ResponseMetadata {
+                        model: "stub".into(),
+                        usage: super::super::TokenUsage {
+                            prompt_tokens: 11,
+                            completion_tokens: 2,
+                            total_tokens: 13,
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    }),
                 })
             })
         }
@@ -1171,6 +1170,43 @@ mod tests {
         })
         .await
         .expect("cancelled summary must be dropped");
+    }
+
+    #[tokio::test]
+    async fn autocompact_cancel_keeps_usage_of_finished_segments() {
+        let gate = Arc::new(Gate {
+            ready_responses: 1,
+            ..Default::default()
+        });
+        gate.hold.store(true, Ordering::SeqCst);
+        let mut c = compactor(gate.clone(), None, Some(1_000_000)).await;
+        let (mut messages, mut sources) = transcript(4);
+        messages.splice(
+            1..1,
+            [
+                RuntimeMessage::User("old question ".repeat(100)),
+                RuntimeMessage::Assistant("old answer ".repeat(100)),
+            ],
+        );
+        sources.splice(1..1, vec![ContextSource::Unattributed; 2]);
+        c.input_start = 3;
+        c.before_call(&messages, &sources, &[]).await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while gate.calls.load(Ordering::SeqCst) < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("second summary segment must reach stub");
+        c.finish_turn().await;
+        let status = c.take_status().unwrap();
+        assert_eq!(status.state, "cancelled");
+        assert_eq!(
+            status.summary_usage.len(),
+            1,
+            "the first completed call is known, not unknown"
+        );
+        assert_eq!(status.summary_usage[0].usage.prompt_tokens, 11);
     }
 
     #[tokio::test]
@@ -1390,6 +1426,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn autocompact_uses_the_selected_route_window_including_the_default_route() {
+        use crate::config::{Backend, BackendType, Model};
+
+        let backends = [100_000, 40_000]
+            .into_iter()
+            .enumerate()
+            .map(|(i, window)| {
+                let mut backend = Backend::new(BackendType::OpenAICompatible);
+                backend.name = Some(format!("route{i}"));
+                backend.models = Some(vec![Model {
+                    name: "same-model".into(),
+                    api: None,
+                    reasoning: None,
+                    price_input: None,
+                    price_output: None,
+                    price_cache_read: None,
+                    context_window: Some(window),
+                }]);
+                backend
+            })
+            .collect();
+        let backend =
+            BackendManager::new(&Some(backends), crate::test_support::empty_secrets().await);
+        for (model, window) in [(None, 100_000), (Some("route1:same-model"), 40_000)] {
+            let c = Compactor::new(
+                Policy {
+                    trigger_tokens: None,
+                    keep_recent_tokens: 20_000,
+                    summary_max_tokens: 8_192,
+                },
+                backend.clone(),
+                model,
+                &backend.resolve_model_name(model),
+                Some(window - 4_096),
+                &[],
+                &[],
+            )
+            .unwrap();
+            assert_eq!(c.trigger, window * 80 / 100, "{model:?}");
+            assert_eq!(c.window, Some(window), "auxiliary window for {model:?}");
+        }
+    }
+
+    #[tokio::test]
     async fn new_input_outside_coverage_does_not_invalidate_a_summary() {
         let gate = Arc::new(Gate::default());
         gate.hold.store(true, Ordering::SeqCst);
@@ -1429,7 +1509,6 @@ mod tests {
         };
         gate.release.notify_one();
         settle_pending(&mut c).await;
-        c.hold_trigger_for_test();
         let view = c.before_call(&replaced, &sources, &[]).await.unwrap();
         assert!(!view.compacted);
         assert!(c.applied.is_empty());
@@ -1446,16 +1525,13 @@ mod tests {
         c.before_call(&messages, &sources, &[]).await.unwrap();
         wait_for_call(&gate).await;
         drop(c);
-        for _ in 0..100 {
-            if gate.dropped.load(Ordering::SeqCst) {
-                break;
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !gate.dropped.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
             }
-            tokio::task::yield_now().await;
-        }
-        assert!(
-            gate.dropped.load(Ordering::SeqCst),
-            "summary call was aborted"
-        );
+        })
+        .await
+        .expect("summary call must be aborted");
     }
 
     #[tokio::test]
