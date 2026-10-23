@@ -1052,7 +1052,7 @@ pub async fn build(
 
     // Fast-start: the server is now fully constructed and the spawn-tool
     // cell is wired, so the gateway can draw and accept input immediately.
-    // The remaining at-startup work — model-window warm, agent reconcile,
+    // The remaining at-startup work — model-window warm, agent seed completion,
     // schedule materialization, routine engine — is heavy (per-agent and
     // per-session DB opens) and does NOT need to block the first render.
     // Run it in the background; message *processing* is gated on the
@@ -1071,7 +1071,7 @@ pub async fn build(
         let registry = registry.clone();
         let default_backend = default_backend.clone();
         let deferred_config = config.clone();
-        let reconcile_agents_from_config = opts.bootstrap_agents_from_config;
+        let complete_agent_seeds = opts.bootstrap_agents_from_config;
         let run_routine_engine = opts.run_routine_engine;
         let run_agent_loop = opts.run_agent_loop;
         let mcp_readiness = opts.mcp_readiness;
@@ -1082,7 +1082,7 @@ pub async fn build(
                 registry,
                 deferred_config,
                 default_backend,
-                reconcile_agents_from_config,
+                complete_agent_seeds,
                 run_routine_engine,
                 run_agent_loop,
                 mcp_readiness,
@@ -1120,9 +1120,9 @@ pub async fn build(
 ///
 /// 1. `warm_model_windows` — best-effort; the per-turn budget falls back
 ///    to the static default until this lands, so a miss is tolerated.
-/// 2. `reconcile_agents_from_config` — resolves yaml system prompts into
-///    the blob store and refreshes declarative agent fields. This is the
-///    data-correctness gate: `mark_startup_ready` runs immediately after
+/// 2. `complete_agent_seeds` — resolves the system prompt of agents seeded
+///    from yaml that have no prompt pointer yet; never re-applies yaml to an
+///    existing agent. `mark_startup_ready` runs immediately after
 ///    so held turns release the moment agent config is consistent, before
 ///    the (slower) schedule + routine work below.
 /// 3. Schedule materialization + routine engine — long-lived background
@@ -1136,7 +1136,7 @@ async fn run_deferred_startup(
     registry: Arc<session::SessionRegistry>,
     config: Config,
     default_backend: backends::BackendManager,
-    reconcile_agents_from_config: bool,
+    complete_agent_seeds: bool,
     run_routine_engine: bool,
     run_agent_loop: bool,
     mcp_readiness: McpReadiness,
@@ -1160,14 +1160,15 @@ async fn run_deferred_startup(
         return;
     }
 
-    // 2. Reconcile each agent's DB config from yaml, then open the gate.
-    //    `/agent reload` runs this same path on demand.
-    if reconcile_agents_from_config {
+    // 2. Finish seeding newly bootstrapped yaml agents (resolve their system
+    //    prompt into the blob store), then open the gate. Existing agents keep
+    //    their DB config: yaml only seeds.
+    if complete_agent_seeds {
         let t = Instant::now();
-        server.reconcile_agents_from_config(&config).await;
+        server.complete_agent_seeds_from_config(&config).await;
         info!(
             elapsed_ms = t.elapsed().as_millis() as u64,
-            "Deferred: reconciled agents from config"
+            "Deferred: completed agent seeds from config"
         );
     }
     // 2b. A one-shot run gets a single turn, so it must not start that turn
