@@ -302,7 +302,16 @@ web_search:
     - type: searxng
       url: "http://localhost:8888" # self-hosted docker container
     - type: duckduckgo # safety net if the instance is down
+
+security:
+  tool_policies:
+    web_search:
+      grants:
+        network:
+          allow_private: true # required for a localhost / LAN / .local instance
 ```
+
+Every backend request goes through the tool host under `web_search`'s network grant, so listing a backend here does not authorize it. A SearxNG instance on `localhost`, a private address (RFC 1918, loopback, link-local) or an internal hostname (`.local`, `.internal`) is refused unless the effective `web_search` grant has `allow_private: true`. Without it, startup logs `web_search: SearxNG backend will be denied: …` and each search fails over past the instance. Session and agent ceilings can still remove the permission; see [Private SearxNG and network grants](security.md#private-searxng-and-network-grants).
 
 Self-hosting is ~5 minutes with the official docker-compose stack at https://docs.searxng.org/admin/installation-docker.html and doesn't require opening any ports externally.
 
