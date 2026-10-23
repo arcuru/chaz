@@ -378,8 +378,7 @@ pub(super) struct AgentDiffView {
     pub diff: chaz_core::agent_diff::AgentDiff,
     /// Which sub-mode is active (plain view / per-field pick / reseed confirm).
     pub mode: AgentDiffMode,
-    /// Row cursor — indexes `diff.rows` (the mergeable field rows only;
-    /// workers are display-only and not cursorable).
+    /// Row cursor — indexes `diff.rows`, including the whole workers list.
     pub cursor: usize,
     /// Per-row accept flags for `[a]` pick mode. `picks.len() == diff.rows.len()`.
     /// Seeded to the changed rows; nothing is written until Enter in pick mode.

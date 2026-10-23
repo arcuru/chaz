@@ -441,6 +441,6 @@ separate extension-per-bank.
 - Unit: `PromptAugmentation` hub collection (empty, one provider, multiple providers, per-session filter)
 - Unit: `Agent::build()` file resolution (missing file, multiple files, empty files)
 - Unit: `SystemPromptSnapshot` round-trip
-- Integration: `/agent reload` with file edit → new system prompt on next turn
+- Integration: file edit stays pinned through restart and read-only `/agent reload`; `/agent set system_prompt_files` explicitly refreshes it, including empty content
 - Integration: skill triggers match in TUI session → skill body appears in assembled prompt
 - Integration: old config with `persona:` / `role:` → clear startup error with migration instructions

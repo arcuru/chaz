@@ -2150,9 +2150,7 @@ async fn settings_peer_inspector_collects_actual_catalog_and_loaded_templates_on
     server.shutdown().await;
 }
 
-/// The yaml diff is a read-only view: no single keypress applies yaml to an
-/// existing agent. `r` (the retired "bring drift back") does nothing, `R` only
-/// arms a confirmation, and a pick applies exactly the chosen fields.
+/// Viewing is read-only; only a pick or confirmed reseed submits a merge.
 #[tokio::test]
 async fn agent_diff_view_applies_nothing_without_pick_or_confirmed_reseed() {
     use chaz_core::agent_diff::{AgentField, AgentMergeMode};
@@ -2210,6 +2208,64 @@ async fn agent_diff_view_applies_nothing_without_pick_or_confirmed_reseed() {
             assert_eq!(fields, vec![AgentField::Model]);
         }
         _ => panic!("pick mode Enter should apply only the picked field"),
+    }
+    // A reseed is submitted only after the separate confirmation keystroke.
+    app.agent_diff = Some(AgentDiffView {
+        agent_name: "agent-00".into(),
+        diff: chaz_core::agent_diff::diff_agent(&yaml, &AgentDbConfig::default()),
+        mode: AgentDiffMode::View,
+        cursor: 0,
+        picks: vec![],
+    });
+    key(&mut app, KeyCode::Char('R'));
+    assert!(matches!(
+        key(&mut app, KeyCode::Char('y')),
+        input::SettingsKey::ApplyAgentMerge {
+            mode: AgentMergeMode::Reseed,
+            ..
+        }
+    ));
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn agent_diff_cursor_keeps_workers_and_values_visible() {
+    use chaz_core::agent_diff::{AgentField, diff_agent};
+    let (_instance, server, backend, mut app) = fixture().await;
+    open(&mut app, SettingsScope::Peer, 0);
+    let yaml = AgentDbConfig {
+        workers: vec![WorkerDbConfig {
+            name: "writer".into(),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let db = AgentDbConfig {
+        workers: vec![WorkerDbConfig {
+            name: "reader".into(),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let diff = diff_agent(&yaml, &db);
+    let cursor = diff
+        .rows
+        .iter()
+        .position(|row| row.field == AgentField::Workers)
+        .unwrap();
+    app.agent_diff = Some(AgentDiffView {
+        agent_name: "alpha".into(),
+        picks: vec![true; diff.rows.len()],
+        diff,
+        cursor,
+        mode: AgentDiffMode::Pick,
+    });
+    for (width, height) in [(80, 24), (64, 14), (120, 40)] {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        let rows = draw(&mut terminal, &mut app, &server, &backend);
+        for expected in ["▸ [✓] ~ workers", "yaml: writer", "db:   reader"] {
+            assert!(contains(&rows, expected), "{width}x{height}: {rows:?}");
+        }
     }
     server.shutdown().await;
 }

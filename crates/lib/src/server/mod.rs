@@ -1633,7 +1633,7 @@ impl Server {
     /// Resolve the system prompt for a DB-backed agent. The normal path reads
     /// the resolved text from the prompt blob store by `system_prompt_ref` (no
     /// per-turn file IO). When no ref is set yet — a freshly bootstrapped agent
-    /// that hasn't been reconciled, or one with paths but no blob — it falls
+    /// that hasn't finished seeding, or a legacy config with no blob — it falls
     /// back to reading the files directly so the prompt is never silently empty.
     async fn resolve_db_prompt(&self, cfg: &crate::agent_db::AgentDbConfig) -> String {
         if let Some(snap) = cfg.system_prompt_ref.as_ref()
@@ -1670,8 +1670,10 @@ impl Server {
     /// Resolve an inline-plus-files prompt into the blob store and return the
     /// pointer to store in an agent's config. Reuses `current_ref` when the
     /// resolved text is byte-identical to what that snapshot holds (so an
-    /// unchanged prompt never churns the store); returns `None` for an empty
-    /// prompt. Shared by seed completion, the explicit yaml merge and the
+    /// unchanged prompt never churns the store). Even empty file-backed prompts
+    /// are pinned: a later file edit must not silently replace an empty prompt.
+    /// Returns `None` only when there is no text and no file list.
+    /// Shared by seed completion, the explicit yaml merge and the
     /// `/agent set` re-resolve so all produce identical refs for identical
     /// inputs.
     async fn resolve_prompt_ref(
@@ -1681,7 +1683,7 @@ impl Server {
         current_ref: Option<&eidetica::Snapshot>,
     ) -> anyhow::Result<Option<eidetica::Snapshot>> {
         let resolved = crate::agent::resolve_system_prompt(inline, files);
-        if resolved.is_empty() {
+        if resolved.is_empty() && files.is_empty() {
             return Ok(None);
         }
         let unchanged = match current_ref {
@@ -1810,8 +1812,9 @@ impl Server {
     /// This is the second half of first-boot seeding — `bootstrap_from_config`
     /// creates the DB from yaml but can't reach the prompt store. It never
     /// reads yaml values into an existing agent: every other field is left
-    /// exactly as stored, and an agent that already has a pointer (or whose
-    /// prompt resolves empty) is untouched. Returns `Ok(true)` when it wrote.
+    /// exactly as stored, and an agent that already has a pointer is untouched.
+    /// The startup caller passes only agents created in this boot, never an
+    /// existing DB, even if it has no pointer. Returns `Ok(true)` when it wrote.
     /// A config that can't be read is an error, never a default to write over.
     pub async fn complete_agent_seed(&self, name: &str) -> anyhow::Result<bool> {
         let Some(entry) = self.agent_index.find_by_name(name) else {
@@ -1966,24 +1969,21 @@ impl Server {
         Ok(outcome)
     }
 
-    /// Finish seeding every agent declared in `config` (see
+    /// Finish seeding the agents created during this boot (see
     /// [`Self::complete_agent_seed`]). Run once at startup, after bootstrap.
     /// Yaml values are never re-applied to an existing agent here. A per-agent
     /// failure is logged and skipped — one bad entry doesn't abort the rest.
-    pub async fn complete_agent_seeds_from_config(&self, config: &crate::config::Config) {
-        let Some(agents) = config.agents.as_ref() else {
-            return;
-        };
+    pub async fn complete_agent_seeds(&self, names: &[String]) {
         let mut seeded = 0usize;
-        for ac in agents {
-            match self.complete_agent_seed(&ac.name).await {
+        for name in names {
+            match self.complete_agent_seed(name).await {
                 Ok(true) => {
                     seeded += 1;
-                    tracing::info!(agent = %ac.name, "resolved seeded agent's system prompt");
+                    tracing::info!(agent = %name, "resolved seeded agent's system prompt");
                 }
                 Ok(false) => {}
                 Err(e) => {
-                    tracing::warn!(agent = %ac.name, error = %e, "agent seed completion failed")
+                    tracing::warn!(agent = %name, error = %e, "agent seed completion failed")
                 }
             }
         }

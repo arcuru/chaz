@@ -1260,21 +1260,7 @@ async fn hydrate_returns_input_when_agent_not_in_index() {
 }
 
 fn prompt_probe_agent(name: &str) -> crate::agent::Agent {
-    crate::agent::Agent {
-        name: name.to_string(),
-        system_prompt: String::new(),
-        system_prompt_files: vec![],
-        default_model: None,
-        allowed_tools: None,
-        workers: HashMap::new(),
-        max_spawn_depth: 10,
-        autonomous: false,
-        presets: HashMap::new(),
-        tool_profile: None,
-        max_context_tokens: None,
-        capabilities: crate::grants::Grants::default(),
-        grants: HashMap::new(),
-    }
+    crate::agent::Agent::from_db_config(name, &AgentDbConfig::default())
 }
 
 async fn seed_like_bootstrap(
@@ -1282,25 +1268,10 @@ async fn seed_like_bootstrap(
     registry: &crate::session::SessionRegistry,
     ac: &crate::config::AgentConfig,
 ) -> crate::agent_db::AgentDb {
-    let (db, pubkey) = {
-        let mut user = registry.user_for_tests().await;
-        create_agent_db(
-            &mut user,
-            &ac.name,
-            &crate::agent_db::AgentDbConfig::from_agent_config(ac),
-            &AgentMeta {
-                display_name: Some(ac.name.clone()),
-                ..Default::default()
-            },
-        )
+    let (_, db) = seed_agent(server, registry, &ac.name).await;
+    db.write_config(&AgentDbConfig::from_agent_config(ac))
         .await
-        .unwrap()
-    };
-    server.agent_index().register(DbEntry {
-        db_id: db.id(),
-        display_name: ac.name.clone(),
-        pubkey,
-    });
+        .unwrap();
     db
 }
 
@@ -1368,15 +1339,6 @@ async fn seed_completion_leaves_existing_and_legacy_agents_untouched() {
     db.write_config(&legacy).await.unwrap();
 
     assert!(!server.complete_agent_seed("alpha").await.unwrap());
-    let mut changed_yaml = ac.clone();
-    changed_yaml.model = Some("other-model".into());
-    changed_yaml.autonomous = true;
-    server
-        .complete_agent_seeds_from_config(&crate::config::Config {
-            agents: Some(vec![changed_yaml]),
-            ..Default::default()
-        })
-        .await;
     assert_eq!(db.read_config().await.unwrap(), legacy);
 
     // An agent with no prompt at all has nothing to seed and is not written.

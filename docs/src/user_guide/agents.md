@@ -57,7 +57,7 @@ A yaml `agents:` entry is a **seed**. It supplies the configuration of an agent 
 
 What happens automatically:
 
-- **First boot of an entry.** chaz creates the Agent DB from the yaml block, then (in the background, before the first turn runs) reads the declared `system_prompt_files` and stores the resolved prompt. This is the only time yaml values are written into an agent.
+- **First boot of an entry.** chaz creates the Agent DB from the yaml block, then (in the background, before the first turn runs) reads the declared `system_prompt_files` and stores the resolved prompt. Startup writes yaml configuration only for new agents.
 - **Every later startup, restart and `/agent reload`.** Existing agents are left exactly as stored — whatever the yaml now says, whichever keys were removed from it, and whatever the prompt files now contain. A database written by an older chaz keeps its stored values too; its leftover `applied_config_hash` is preserved but no longer read.
 - **Removing an entry from yaml.** Removes nothing. The Agent DB, its keys and its sessions stay; use `/agent delete` to unregister an agent.
 
@@ -65,21 +65,23 @@ What you do yourself:
 
 - **Change one field:** `/agent set <ref> <field> <value>`. The stored value wins from then on, including `false`, an empty list, or a value equal to the default — chaz never guesses that a default-looking value was "unset".
 - **See how yaml and the DB differ:** `/agent reload [ref]`. It re-reads the yaml file and reports, writing nothing.
-- **Take yaml values on purpose:** the TUI **Settings → Peer → Agents** diff (`r` on an agent). Pick fields with `a`, or reseed every declarative field — including worker templates, capability ceilings and grants — with `R` and a `y` confirmation. These are the only paths that copy yaml into an existing agent.
+- **Take yaml values on purpose:** the TUI **Settings → Peer → Agents** diff (`r` on an agent). Pick fields with `a`, or reseed every listed field — including worker templates, capability ceilings and grants — with `R` and a `y` confirmation. These are the only paths that copy yaml configuration into an existing agent.
 - **Pick up edited prompt-file contents:** run `/agent set <ref> system_prompt_files <paths>` again (same paths are fine); the write re-reads the files.
 
-Failure modes worth knowing: an edit to yaml for an existing agent has **no effect** until you apply it as above — `/agent reload` will list it as a difference. A yaml file that doesn't parse makes `/agent reload` fail with the parse error and changes nothing. Pressing `R` in the diff and confirming overwrites every listed field, including deliberate `/agent set` edits; use `a` to take only some.
+The comparison covers the listed mergeable fields, not resolved prompt-file contents. A yaml file that doesn't parse makes `/agent reload` fail with the parse error and changes nothing. Pressing `R` in the diff and confirming overwrites every listed field, including deliberate `/agent set` edits; use `a` to take only some.
+
+This rule concerns Agent configuration, not all daemon settings or resource attachment. Providers, bridges and peer settings still use their existing configuration paths. In particular, [`default_memory_banks`](memory.md#attaching-banks-to-a-session) still attaches banks from yaml at each startup; bank attachments are not reset by Pick or Reseed.
 
 ### Walkthrough: changing an agent that already exists
 
-1. The yaml declares `model: m1` for `chaz`, and chaz has started once, so the `chaz` Agent DB exists with `default_model = m1`.
+1. The yaml declares `model: m1` and `autonomous: true` for `chaz`, and chaz has started once, so the `chaz` Agent DB exists with those values.
 2. You turn autonomy off live: `/agent set chaz autonomous false` replies `Set autonomous=false on agent 'chaz' (takes effect next message)`.
 3. Later you edit the yaml to `model: m2` and restart. The agent still answers with `m1` and autonomy stays off: startup did not touch the existing DB.
 4. `/agent reload` shows the difference without applying it:
 
    ```text
    YAML seeds new agents only; existing agents keep their DB config. Nothing was changed.
-     chaz: DB differs from yaml in default_model — apply with /agent set or the TUI Peer → Agents diff
+     chaz: DB differs from yaml in default_model, autonomous — apply with /agent set or the TUI Peer → Agents diff
    ```
 
 5. To adopt the new model, run `/agent set chaz model m2`, or open the TUI diff, press `a`, keep only `default_model` ticked and press `Enter`. The status line reads `chaz: merged default_model (effective next message)`; `autonomous` is still `false`.
@@ -99,6 +101,8 @@ The resolved prompt is stored **off** the agent's primary DB in a content-addres
 Resolution happens at three points, all sharing the same blob-store logic: when startup **finishes seeding** a new agent, on **`/agent set system_prompt[_files]`**, and when an explicit yaml **pick or reseed** includes a prompt field. An unchanged prompt reuses the existing ref (the store grows only with distinct versions).
 
 Editing the **contents** of a `system_prompt_files` path therefore does not take effect on its own — not on restart and not on `/agent reload`. Run `/agent set <ref> system_prompt_files <paths>` (the same paths are fine) to re-read them. Changing **which** files an agent uses is likewise a DB edit: `/agent set <ref> system_prompt_files <paths>`.
+
+Empty file-backed prompts are pinned too, so filling an empty or previously missing file does not silently change the prompt. Older agents without a prompt snapshot, or whose snapshot is unavailable on this peer, retain the direct-file fallback. Startup does not backfill those agents; re-set their prompt fields to pin the current content explicitly.
 
 ### Editing the system prompt
 

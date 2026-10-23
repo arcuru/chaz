@@ -43,7 +43,7 @@ impl PromptStore {
     /// yields `text`. No hash is computed — the commit's tip (a CID) is the
     /// address.
     ///
-    /// Callers (reconcile) avoid churn by *not* calling this when the prompt is
+    /// Callers avoid churn by *not* calling this when the prompt is
     /// unchanged — they reuse the existing `system_prompt_ref` instead — so a
     /// new entry lands only when the resolved prompt actually changes.
     pub async fn put(&self, text: &str) -> anyhow::Result<Snapshot> {
