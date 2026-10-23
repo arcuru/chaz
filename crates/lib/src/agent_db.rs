@@ -1082,6 +1082,8 @@ pub async fn find_agent_db(
 pub struct BootstrappedAgent {
     pub db: AgentDb,
     pub pubkey: PublicKey,
+    /// True only when this bootstrap created the DB, not when it reused one.
+    pub created: bool,
 }
 
 /// Ensure the given agent has an AgentDb on this peer. Creates one with
@@ -1098,7 +1100,11 @@ pub async fn ensure_agent_db(
 ) -> anyhow::Result<BootstrappedAgent> {
     if let Some((db, pubkey)) = find_agent_db(user, display_name).await {
         db.ensure_stores().await?;
-        return Ok(BootstrappedAgent { db, pubkey });
+        return Ok(BootstrappedAgent {
+            db,
+            pubkey,
+            created: false,
+        });
     }
     let meta = AgentMeta {
         display_name: Some(display_name.to_string()),
@@ -1106,7 +1112,11 @@ pub async fn ensure_agent_db(
     };
     let (db, pubkey) =
         create_agent_db(user, display_name, &AgentDbConfig::default(), &meta).await?;
-    Ok(BootstrappedAgent { db, pubkey })
+    Ok(BootstrappedAgent {
+        db,
+        pubkey,
+        created: true,
+    })
 }
 
 /// Bootstrap: materialize an Agent DB for each yaml agent entry.
@@ -1130,7 +1140,11 @@ pub async fn bootstrap_from_config(
             Some((db, pubkey)) => {
                 info!(agent = %ac.name, db_id = %db.id(), "Reusing existing Agent DB (yaml is template; DB config preserved)");
                 db.ensure_stores().await?;
-                BootstrappedAgent { db, pubkey }
+                BootstrappedAgent {
+                    db,
+                    pubkey,
+                    created: false,
+                }
             }
             None => {
                 let agent_cfg = AgentDbConfig::from_agent_config(ac);
@@ -1139,7 +1153,11 @@ pub async fn bootstrap_from_config(
                     ..Default::default()
                 };
                 let (db, pubkey) = create_agent_db(user, &ac.name, &agent_cfg, &meta).await?;
-                BootstrappedAgent { db, pubkey }
+                BootstrappedAgent {
+                    db,
+                    pubkey,
+                    created: true,
+                }
             }
         };
 

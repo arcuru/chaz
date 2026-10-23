@@ -356,7 +356,7 @@ eidetica:
                 built.registry.clone(),
                 config.clone(),
                 backends::BackendManager::new(&None, built.secret_store.clone()),
-                false,
+                Vec::new(),
                 false,
                 false,
                 McpReadiness::Deferred,
@@ -485,9 +485,16 @@ pub async fn build(
     // agents: it either ticket-bootstraps (direct owner) or shares the
     // service login. Minting here could fork a divergent agent DB; the
     // hosted index below discovers the existing DBs.
+    let mut new_agent_seeds = Vec::new();
     if opts.bootstrap_agents_from_config {
         let t = Instant::now();
         let bootstrapped = agent_db::bootstrap_from_config(&mut user, config).await?;
+        new_agent_seeds.extend(
+            bootstrapped
+                .iter()
+                .filter(|(_, agent)| agent.created)
+                .map(|(name, _)| name.clone()),
+        );
         if !bootstrapped.is_empty() {
             info!(
                 count = bootstrapped.len(),
@@ -1071,7 +1078,6 @@ pub async fn build(
         let registry = registry.clone();
         let default_backend = default_backend.clone();
         let deferred_config = config.clone();
-        let complete_agent_seeds = opts.bootstrap_agents_from_config;
         let run_routine_engine = opts.run_routine_engine;
         let run_agent_loop = opts.run_agent_loop;
         let mcp_readiness = opts.mcp_readiness;
@@ -1082,7 +1088,7 @@ pub async fn build(
                 registry,
                 deferred_config,
                 default_backend,
-                complete_agent_seeds,
+                new_agent_seeds,
                 run_routine_engine,
                 run_agent_loop,
                 mcp_readiness,
@@ -1136,7 +1142,7 @@ async fn run_deferred_startup(
     registry: Arc<session::SessionRegistry>,
     config: Config,
     default_backend: backends::BackendManager,
-    complete_agent_seeds: bool,
+    new_agent_seeds: Vec<String>,
     run_routine_engine: bool,
     run_agent_loop: bool,
     mcp_readiness: McpReadiness,
@@ -1163,9 +1169,9 @@ async fn run_deferred_startup(
     // 2. Finish seeding newly bootstrapped yaml agents (resolve their system
     //    prompt into the blob store), then open the gate. Existing agents keep
     //    their DB config: yaml only seeds.
-    if complete_agent_seeds {
+    if !new_agent_seeds.is_empty() {
         let t = Instant::now();
-        server.complete_agent_seeds_from_config(&config).await;
+        server.complete_agent_seeds(&new_agent_seeds).await;
         info!(
             elapsed_ms = t.elapsed().as_millis() as u64,
             "Deferred: completed agent seeds from config"

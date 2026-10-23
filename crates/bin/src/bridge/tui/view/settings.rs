@@ -406,7 +406,7 @@ fn settings_status_hint(app: &App, scope: SettingsScope) -> &'static str {
                 if detail {
                     " ↑↓ select · → read · ← category · Enter model · [r] reload · Esc back "
                 } else {
-                    " ↑↓/Tab category · → list · [r] reload yaml · Esc back "
+                    " ↑↓/Tab category · → list · [r] compare yaml · Esc back "
                 }
             }
             Some(PeerSettingsCategory::Defaults) => {
@@ -840,7 +840,7 @@ fn render_peer_agents(
         });
     detail.push(Line::from(""));
     detail.push(Line::from(vec![Span::styled(
-        "  Enter — set default model · [r] reload from yaml",
+        "  Enter — set default model · [r] compare with yaml",
         Style::default().fg(theme::DIM),
     )]));
     render_content(
@@ -1008,16 +1008,9 @@ fn render_agent_diff(f: &mut ratatui::Frame, area: Rect, view: &AgentDiffView) {
     f.render_widget(Paragraph::new(header_line), chunks[0]);
 
     // ── body ────────────────────────────────────────────────────────
-    let scroll = view
-        .cursor
-        .saturating_sub(chunks[1].height.saturating_sub(4) as usize);
-    let visible_rows = view
-        .diff
-        .rows
-        .iter()
-        .enumerate()
-        .skip(scroll)
-        .take(chunks[1].height.saturating_sub(1) as usize);
+    // Three header lines, then four lines per field. Keep the cursor's label
+    // and both values visible, including the last (workers) field.
+    let scroll = (3 + view.cursor * 4 + 3).saturating_sub(chunks[1].height as usize);
 
     let mut lines: Vec<Line> = Vec::new();
     lines.push(Line::from(""));
@@ -1030,7 +1023,7 @@ fn render_agent_diff(f: &mut ratatui::Frame, area: Rect, view: &AgentDiffView) {
     ]));
     lines.push(Line::from(""));
 
-    for (i, row) in visible_rows {
+    for (i, row) in view.diff.rows.iter().enumerate() {
         let sty = status_style(row.status);
         let sym = status_symbol(row.status);
         let cursor = if i == view.cursor { "▸" } else { " " };
@@ -1061,10 +1054,10 @@ fn render_agent_diff(f: &mut ratatui::Frame, area: Rect, view: &AgentDiffView) {
         lines.push(Line::from(""));
     }
 
-    // Workers section (display-only, not cursorable)
+    // Per-template detail; the selectable workers row applies the whole list.
     if !view.diff.workers.is_empty() {
         lines.push(Line::from(vec![Span::styled(
-            "  workers (yaml-owned, display-only)",
+            "  worker templates (apply with the workers row)",
             Style::default().fg(theme::DIM),
         )]));
         for w in &view.diff.workers {
@@ -1085,13 +1078,13 @@ fn render_agent_diff(f: &mut ratatui::Frame, area: Rect, view: &AgentDiffView) {
         )]));
     }
 
-    let para = Paragraph::new(lines).scroll((0, 0));
+    let para = Paragraph::new(lines).scroll((scroll as u16, 0));
     f.render_widget(para, chunks[1]);
 
     // ── hints ───────────────────────────────────────────────────────
     let hint_text = match view.mode {
         AgentDiffMode::View => {
-            "[a] pick fields  [R] reseed all  [Esc] close  (DB is authoritative; nothing applies until you choose)"
+            "[a] pick fields  [R] reseed (confirm)  [Esc] close — no automatic apply"
         }
         AgentDiffMode::Pick => "[Space] toggle  [Enter] apply picked  [Esc] back",
         AgentDiffMode::ConfirmReseed => "[y] confirm reseed  [n] cancel",

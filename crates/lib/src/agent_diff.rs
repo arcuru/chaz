@@ -1,4 +1,4 @@
-//! Agent yaml↔DB diff + merge semantics (settings-pages Stage 4.5).
+//! Explicit Agent yaml↔DB comparison and merging.
 //!
 //! An Agent's declarative shape lives in two places: the **yaml** template
 //! (`AgentConfig`, which seeds a new Agent DB) and the **DB-actual** config
@@ -229,8 +229,8 @@ pub struct AgentDiff {
 }
 
 impl AgentDiff {
-    /// Whether any declarative field differs (workers excluded — they're
-    /// informational). Used by the TUI to short-circuit "nothing to merge".
+    /// Whether any mergeable field differs, including worker templates.
+    /// Used by the TUI to short-circuit "nothing to merge".
     pub fn has_field_changes(&self) -> bool {
         self.rows.iter().any(|r| r.status != FieldStatus::Unchanged)
     }
