@@ -825,6 +825,8 @@ struct RoundProjector<'a> {
     rounds: Vec<(usize, u64)>,
     // Retain the accepted request, not the unprojected durable baseline.
     last_request: Option<ProjectedRequest>,
+    /// Native in-request autocompaction, when the extension enables it.
+    compactor: Option<Box<autocompact::Compactor>>,
 }
 
 impl<'a> RoundProjector<'a> {
@@ -859,6 +861,59 @@ impl<'a> RoundProjector<'a> {
             base_sources,
             rounds: Vec::new(),
             last_request: None,
+            compactor: None,
+        }
+    }
+
+    /// Enable native autocompaction for this turn when the `autocompact`
+    /// extension is active and its settings turn it on. Unreadable settings
+    /// refuse the turn; no summary call is made without a valid opt-in.
+    async fn enable_autocompact(
+        &mut self,
+        backend: &BackendManager,
+        model: Option<&str>,
+        initial: &[RuntimeMessage],
+    ) -> Result<(), String> {
+        if !self
+            .tool_ctx
+            .active_extensions
+            .contains(crate::extensions::autocompact::NAME)
+        {
+            return Ok(());
+        }
+        let db = self.tool_ctx.session.lock().await.database().clone();
+        let policy = match crate::extensions::autocompact::policy(&db).await {
+            Ok(Some(policy)) => policy,
+            Ok(None) => return Ok(()),
+            Err(error) => return Err(format!("autocompaction settings unreadable: {error}")),
+        };
+        let sources = self.sources_for(initial.len());
+        self.compactor = autocompact::Compactor::new(
+            policy,
+            backend.clone(),
+            model,
+            self.resolved_model,
+            self.scope.request_budget_tokens,
+            initial,
+            &sources,
+        )
+        .map(Box::new);
+        if let Some(compactor) = &mut self.compactor {
+            compactor.bind_session(db).await?;
+        }
+        Ok(())
+    }
+
+    async fn record_autocompact_status(&mut self) {
+        let Some(status) = self.compactor.as_mut().and_then(|c| c.take_status()) else {
+            return;
+        };
+        let db = self.tool_ctx.session.lock().await.database().clone();
+        if let Err(error) =
+            crate::extensions::autocompact::record_status(&db, &self.tool_ctx.agent_name, &status)
+                .await
+        {
+            warn!(%error, "Failed to record autocompaction status");
         }
     }
 
@@ -904,6 +959,8 @@ impl<'a> RoundProjector<'a> {
     async fn project(
         &self,
         messages: &[RuntimeMessage],
+        sources: Vec<ContextSource>,
+        base_cache: &crate::cache::CacheOptions,
         tools: &[ToolDefinition],
         model_round: u64,
     ) -> Result<Option<ProjectedRequest>, String> {
@@ -945,17 +1002,15 @@ impl<'a> RoundProjector<'a> {
         } else {
             HashSet::new()
         };
-        let sources = self.sources_for(messages.len());
         // Optional revoked contributions disappear from the request copy only.
         // The retained originals/receipts and actual exchange vector stay intact.
         let selected: Vec<_> = messages.iter().zip(&sources).enumerate().filter(|(_, (_, source))| {
             !matches!(source, ContextSource::DurableContribution { extension, .. } if !allowed.contains(extension))
         }).collect();
-        self.scope
-            .cache
+        base_cache
             .validate(messages)
             .map_err(|error| error.to_string())?;
-        let mut cache = self.scope.cache.clone();
+        let mut cache = base_cache.clone();
         // Host-side revocation removes messages before extension projection.
         // Keep anchors on the same surviving item, never on its new neighbour.
         cache.anchors = cache
@@ -1025,9 +1080,12 @@ impl<'a> RoundProjector<'a> {
             session_db: self.session_db.as_ref(),
             history: Some(&history),
         };
-        let mut accepted = projection::run_chain(&chain, &baseline, &inputs)
-            .await
-            .map_err(refused)?;
+        let mut accepted = if self.compactor.is_some() {
+            projection::run_chain_before_compaction(&chain, &baseline, &inputs).await
+        } else {
+            projection::run_chain(&chain, &baseline, &inputs).await
+        }
+        .map_err(refused)?;
         // Host coordinates are projection-only. Backend requests and transport
         // retries remain identical to the ordinary unprojected message shape.
         for message in &mut accepted.messages {
@@ -1056,7 +1114,54 @@ impl<'a> RoundProjector<'a> {
         recorder: &Option<Arc<dyn RuntimeRecorder>>,
     ) -> Result<Result<LLMResponse, LlmError>, String> {
         let baseline = messages;
-        let projected = self.project(messages, tools, model_round).await?;
+        let sources = self.sources_for(messages.len());
+        if let Some(compactor) = &mut self.compactor {
+            compactor.refresh(messages, &sources, tools).await?;
+        }
+        let projected = loop {
+            // Always start from the original vector. Projector additions and
+            // context tails are never fed back into the summarizer's source.
+            let compacted = self.compactor.as_ref().map(|c| c.view(messages, &sources));
+            let (view_messages, view_sources, view_cache) = match &compacted {
+                Some(view) => (
+                    view.messages.as_slice(),
+                    view.sources.clone(),
+                    view.remap_cache(&self.scope.cache),
+                ),
+                None => (messages, sources.clone(), self.scope.cache.clone()),
+            };
+            let mut projected = self
+                .project(view_messages, view_sources, &view_cache, tools, model_round)
+                .await?;
+            if projected.is_none() && compacted.as_ref().is_some_and(|v| v.compacted) {
+                projected = Some(ProjectedRequest {
+                    cache: view_cache,
+                    messages: view_messages.to_vec(),
+                    tools: tools.to_vec(),
+                });
+            }
+            let (sent, sent_tools) = projected.as_ref().map_or((view_messages, tools), |p| {
+                (p.messages.as_slice(), p.tools.as_slice())
+            });
+            let estimate = crate::context::estimate_request_tokens(sent, sent_tools);
+            let wait = match &mut self.compactor {
+                Some(compactor) => {
+                    compactor
+                        .consider(messages, &sources, tools, estimate)
+                        .await
+                }
+                None => Ok(false),
+            };
+            self.record_autocompact_status().await;
+            if !wait? {
+                break projected;
+            }
+        };
+        // Final, complete-envelope gate is never waived for compaction.
+        if let Some(request) = &projected {
+            projection::check_budget(request, self.scope.request_budget_tokens)
+                .map_err(|e| e.to_string())?;
+        }
         let (messages, tools) = match &projected {
             Some(request) => (request.messages.as_slice(), request.tools.as_slice()),
             None => (messages, tools),
@@ -1273,7 +1378,7 @@ async fn run_turn(
     recorder: Option<Arc<dyn RuntimeRecorder>>,
     hub: Option<&ExtensionHub>,
     cancel: Option<&TurnCancel>,
-    mut capacity: Option<ExecutionCapacity>,
+    capacity: Option<ExecutionCapacity>,
     resume: Option<RuntimeResume>,
     scope: ModelCallScope,
 ) -> Result<RuntimeOutcome, TurnError> {
@@ -1309,9 +1414,6 @@ async fn run_turn(
     };
     let scoped_backend = backend.for_session(&session_id, &caller);
     let backend = &scoped_backend;
-    let max_retries = backend.max_retries_for_model(model);
-    let mut acc = MetadataAccumulator::default();
-    let mut model_sequence = 0;
     let mut projector = RoundProjector::new(
         hub,
         tool_ctx,
@@ -1320,7 +1422,53 @@ async fn run_turn(
         initial_messages.len(),
     )
     .await;
+    // Boxed: keeps the settings read off this already large future.
+    Box::pin(projector.enable_autocompact(backend, model, &initial_messages)).await?;
 
+    let result = Box::pin(run_prepared_turn(
+        model,
+        initial_messages,
+        backend,
+        security,
+        tool_ctx,
+        policies,
+        recorder,
+        hub,
+        cancel,
+        capacity,
+        resume,
+        supports_tools,
+        &mut projector,
+    ))
+    .await;
+    if let Some(compactor) = &mut projector.compactor {
+        compactor.finish_turn().await;
+        projector.record_autocompact_status().await;
+    }
+    result
+}
+
+/// Run the admitted turn; the caller always settles auxiliary work on exit.
+#[allow(clippy::too_many_arguments)]
+async fn run_prepared_turn(
+    model: Option<&str>,
+    initial_messages: Vec<RuntimeMessage>,
+    backend: &BackendManager,
+    security: &SecurityContext,
+    tool_ctx: &ToolContext,
+    policies: &ToolPolicyRegistry,
+    recorder: Option<Arc<dyn RuntimeRecorder>>,
+    hub: Option<&ExtensionHub>,
+    cancel: Option<&TurnCancel>,
+    mut capacity: Option<ExecutionCapacity>,
+    resume: Option<RuntimeResume>,
+    supports_tools: bool,
+    projector: &mut RoundProjector<'_>,
+) -> Result<RuntimeOutcome, TurnError> {
+    let tools = &tool_ctx.tools;
+    let max_retries = backend.max_retries_for_model(model);
+    let mut acc = MetadataAccumulator::default();
+    let mut model_sequence = 0;
     let hook_ctx = hub.map(|_| HookContext {
         agent_name: tool_ctx.agent_name.clone(),
         model: model.map(|s| s.to_string()),
@@ -2447,6 +2595,13 @@ fn redact_sensitive_params(arguments_json: &str, sensitive: &[&str]) -> String {
         arguments_json.to_string()
     }
 }
+
+#[path = "runtime/autocompact.rs"]
+pub(crate) mod autocompact;
+
+#[cfg(test)]
+#[path = "runtime/autocompact_tests.rs"]
+mod autocompact_tests;
 
 #[cfg(test)]
 #[path = "runtime/capacity_tests.rs"]

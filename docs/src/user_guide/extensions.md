@@ -32,6 +32,7 @@ others are runtime hooks that fire around each agent turn.
 | `mcp-<server>`      | Tool                         | One extension per configured [MCP server](mcp.md), named `mcp-<server_name>`. Wraps the server and registers its tools under the server's namespace. |
 | `path_normalizer`   | ToolCall                     | Strips trailing slashes from `path` arguments on filesystem tools before they execute.                                                               |
 | `session_naming`    | TurnComplete                 | Opt-in, one-shot model-assisted naming of an unnamed session. See [Model-assisted session names](#model-assisted-session-names).                     |
+| `autocompact`       | Command                      | `/autocompact`: opt-in summary of older context when a request grows past a size. See [Automatic compaction](#automatic-compaction).                 |
 | `security_warnings` | ToolResult                   | Scans tool output for prompt-injection patterns and logs warnings (warning-only — output is unmodified).                                             |
 
 Disabling an extension hides its tools from the LLM, stops its hooks
@@ -733,3 +734,100 @@ As with `/name`, a name collision is an error, not a reason to take over another
    Send the next user prompt; its successful reply triggers one fresh naming attempt.
    Alternatively, use `/name Migration investigation` for a manual name with no naming-model call.
    If you want to regenerate an existing name, both `/name` (clear it) and the explicit attempt reset are required.
+
+## Automatic compaction
+
+`autocompact` keeps a long session or a long tool loop inside the model's context window by summarizing older messages, the way [Pi](https://github.com/earendil-works/pi) does.
+It is off until you turn it on for a session.
+
+| Command or setting      | Default               | Meaning                                                                                                                                   |
+| ----------------------- | --------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
+| `/autocompact`          | —                     | Show the settings and the last compaction status, including provider-reported summary usage.                                              |
+| `/autocompact <length>` | —                     | Turn on with this trigger. `27000`, `27k` and `27K` all mean 27,000 tokens; zero, negative, fractional or overflowing values are refused. |
+| `/autocompact on`       | —                     | Turn on at the default trigger.                                                                                                           |
+| `/autocompact off`      | —                     | Stop new automatic summaries. Manual `/compact` and existing history are unchanged.                                                       |
+| `enabled`               | `false`               | Allow automatic summary calls for this session. `/autocompact on`, `off` or a length changes this setting.                                |
+| `trigger_tokens`        | unset = 80% of window | Estimated size of the next model request that starts a summary. Never above the request budget.                                           |
+| `keep_recent_tokens`    | `20000`               | Recent messages kept word for word (Pi's default), capped at half the trigger.                                                            |
+| `summary_max_tokens`    | `8192`                | Output ceiling for one summary call, bounded by the backend ceiling and remaining model window. A ceiling, not a target.                  |
+
+Change the last two with `/extensions set autocompact <key> <value>`.
+Settings and activation changes take effect on the next turn, as with other extensions.
+
+### What gets summarized, and what never is
+
+Counts are Chaz's local estimate of the **next complete model request** (instructions, tool schemas, messages and tool results), not billed tokens or session totals.
+When the estimate reaches the trigger, Chaz walks back from the newest message, keeps about `keep_recent_tokens` of recent history, and cuts at a user or assistant message, never between a tool call and its results.
+Everything before the cut is summarized, including completed tool exchanges from earlier in the request that is still running.
+A long tool loop can therefore keep working after its early results no longer fit.
+
+These are never summarized: your current message, queued messages and a retried request; instructions; extension context tails, injections and durable contributions; tool calls that have not finished.
+They stay word for word in the same place.
+Older history and the active request's earlier work get separate summaries, so the summary of earlier work sits after your message, not in place of it.
+A later compaction updates the previous summary with only the newly covered messages rather than re-reading everything.
+
+### When it runs, and what it costs
+
+The summary is prepared in the background while the agent keeps calling tools; it takes effect at the next model call after it is ready.
+Nothing is restarted: tool results, approvals and call order stay as they were, and no tool runs twice.
+Only when the next request would be over the request budget does the call wait for the summary.
+
+A preparation makes at most two tool-free calls (older history and active-request prefix), one at a time.
+Each summary is one tool-free call to the turn's own model and backend, separately metered: its usage appears under `/autocompact`, not in the reply's token counts.
+Turning the feature on authorizes these calls under the existing backend access and budget limits.
+They use the backend's configured request timeout.
+Completed summary calls keep their reported usage even if a later segment is cancelled. Provider errors or cancellation of an in-flight call may leave that call's usage unknown; estimates are not substituted for it.
+There is one summary in flight at a time and no automatic retry.
+
+Summaries replace history only in what the model is sent.
+The transcript, `/print` and tool-result records keep every original message.
+Summaries are local to the running turn; a later turn may summarize its selected history again.
+They do not change which summaries other agents or peers consume.
+The summary is labelled as a record of earlier messages, not instructions; that framing does not guarantee a summary is faithful.
+
+### Failure modes
+
+- A summary that fails, times out, is empty, hits its output ceiling, asks for a tool, or does not make the request smaller is discarded and reported as `failed` or `no-progress`.
+  The same range is not summarized again until the history grows past it.
+- A summary whose covered messages or native compaction coverage changed is discarded as `stale`. Competing manual compaction stops background preparation for the rest of that turn.
+- If what must be kept word for word is itself over the request budget, the call fails with `over-budget` rather than truncating anything.
+- Stopping the turn cancels a pending summary.
+
+### Walkthrough: turn it on, watch it apply, recover from an oversized request
+
+1. Turn it on with a 27k trigger and check it:
+
+   ```text
+   /autocompact 27k
+   Autocompaction on at 27000 tokens of model-facing context.
+   /autocompact
+   Autocompaction: on (trigger 27000 tokens; keep ~20000 recent tokens; summary ceiling 8192 tokens)
+   Usage: /autocompact [<length> | on | off]  (length: 27000 or 27k)
+   ```
+
+2. Ask for a long investigation.
+   When the agent's tool results push the next request past 27,000 tokens, it keeps working while the summary is prepared, and the following model call carries it.
+   Afterwards:
+
+   ```text
+   /autocompact
+   Autocompaction: on (trigger 27000 tokens; keep ~20000 recent tokens; summary ceiling 8192 tokens)
+   Last: applied — summarized 1 segment(s) before message 14 (estimated ~27400 -> ~14100 tokens)
+   Summary call on example/chat-model: 13280 input / 912 output tokens (provider-reported where available)
+   Usage: /autocompact [<length> | on | off]  (length: 27000 or 27k)
+   ```
+
+3. Failure and recovery: paste a single message larger than the model's request budget.
+   Your message is never summarized, so there is nothing to compact, and the turn fails instead of sending a request that will not fit:
+
+   ```text
+   /autocompact
+   Autocompaction: on (trigger 27000 tokens; keep ~20000 recent tokens; summary ceiling 8192 tokens)
+   Last: over-budget — request is ~131500 tokens, over the 126000-token budget, and autocompaction found nothing more to summarize
+   Usage: /autocompact [<length> | on | off]  (length: 27000 or 27k)
+   ```
+
+   Send the material in smaller pieces or switch to a larger-window model, then continue.
+   `/autocompact off` stops new summaries without changing anything already in the session.
+
+The design and its Pi source pin are in [Automatic Compaction](../design/autocompaction.md).

@@ -38,6 +38,7 @@ regex = "1"
 dirs = "5"
 getrandom = "0.3"
 async-openai = { version = "0.36", default-features = false, features = ["rustls", "byot", "chat-completion"] }
+backoff = "0.4"
 chrono = { version = "0.4", features = ["serde"] }
 cron = "0.15"
 meval = "0.2"

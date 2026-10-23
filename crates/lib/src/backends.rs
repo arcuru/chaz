@@ -736,7 +736,7 @@ impl BackendManager {
         let backend = self.select_backend_for_model(model);
         let client = BackendClient::for_model(backend, &self.secrets, &resolved)?;
         let cache = crate::extensions::context::default_cache_options();
-        let limit = Some(max_output_tokens);
+        let limit = Some(max_output_tokens.min(backend.max_output_tokens()));
         with_backend!(client,
             b => b.chat_with_cache_impl(messages, &[], &resolved, &cache, limit).await,
             responses => b.chat_with_tools_bounded(messages, &[], &resolved, None, limit).await
@@ -1186,6 +1186,7 @@ mod tests {
                 .await;
             let mut config = Backend::new(kind.clone());
             config.name = Some("route".into());
+            config.max_tokens = Some(64);
             config.api_base = Some(format!("{}/v1", server.uri()));
             config.api_key = Some("test-key".into());
             config.models = Some(vec![Model {
@@ -1219,18 +1220,82 @@ mod tests {
             assert_eq!(body["model"], "test-model");
             assert!(body.get("tools").is_none());
             if api == ModelApi::AnthropicMessages {
-                assert_eq!(body["max_tokens"], 128);
-                assert_eq!(normal["max_tokens"], 8192);
+                assert_eq!(body["max_tokens"], 64);
+                assert_eq!(normal["max_tokens"], 64);
             } else if api == ModelApi::Responses {
-                assert_eq!(body["max_output_tokens"], 128);
+                assert_eq!(body["max_output_tokens"], 64);
                 assert_eq!(body["reasoning"]["effort"], "high");
-                assert!(normal.get("max_output_tokens").is_none());
+                assert_eq!(normal["max_output_tokens"], 64);
             } else {
-                assert_eq!(body["max_completion_tokens"], 128);
+                assert_eq!(body["max_completion_tokens"], 64);
                 assert_eq!(body["reasoning"]["effort"], "high");
                 assert!(normal.get("max_completion_tokens").is_none());
             }
         }
+    }
+
+    #[tokio::test]
+    async fn bounded_completion_never_uses_sdk_retries_on_rate_or_server_errors() {
+        use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
+        for status in [429, 500] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(status).set_body_json(serde_json::json!({
+                    "error": {"message":"temporary failure", "type":"rate_limit_exceeded", "code":"rate_limit_exceeded"}
+                }))).mount(&server).await;
+            let mut config = Backend::new(BackendType::OpenAICompatible);
+            config.api_base = Some(format!("{}/v1", server.uri()));
+            config.api_key = Some("test-key".into());
+            config.request_timeout = Some(2);
+            config.max_retries = Some(9);
+            let manager = BackendManager::new(&Some(vec![config]), empty_secrets().await);
+            assert!(
+                manager
+                    .complete_bounded(
+                        Some("active-model"),
+                        &[RuntimeMessage::User("source".into())],
+                        128
+                    )
+                    .await
+                    .is_err()
+            );
+            assert_eq!(
+                server.received_requests().await.unwrap().len(),
+                1,
+                "SDK retried HTTP {status}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn bounded_chat_completion_stopped_on_length_is_truncated_not_complete() {
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{method, path},
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"choices": [{"message": {"role": "assistant", "content": "partial sum"}, "finish_reason": "length"}], "model": "test-model", "usage": {"prompt_tokens": 10, "completion_tokens": 128, "total_tokens": 138}})))
+            .expect(2)
+            .mount(&server)
+            .await;
+        let mut config = Backend::new(BackendType::OpenAICompatible);
+        config.api_base = Some(format!("{}/v1", server.uri()));
+        config.api_key = Some("test-key".into());
+        let manager = BackendManager::new(&Some(vec![config]), empty_secrets().await);
+        let messages = vec![RuntimeMessage::User("context".into())];
+        assert!(matches!(
+            manager.complete_bounded(Some("test-model"), &messages, 128).await,
+            Err(LlmError::TruncatedOutput { reason }) if reason == "length"
+        ));
+        // The unbounded ReAct path keeps its existing behaviour.
+        assert!(
+            manager
+                .chat_with_tools_for_model(Some("test-model"), &messages, &[], "test-model")
+                .await
+                .is_ok()
+        );
     }
 
     #[tokio::test]

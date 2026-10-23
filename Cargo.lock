@@ -851,6 +851,7 @@ dependencies = [
  "anyhow",
  "async-openai",
  "async-trait",
+ "backoff",
  "base64",
  "blake3",
  "chrono",
