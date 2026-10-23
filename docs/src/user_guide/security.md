@@ -36,7 +36,7 @@ Two more orthogonal layers wrap everything:
 - **Secret store** keeps API keys out of LLM context entirely — they're resolved at the HTTP client boundary, never quoted to the model.
 - **Agent-level controls** (`allowed_tools`, per-Agent `workers:` list, depth caps) shrink which layers even get a chance to run for a given Agent.
 
-The capability boundary is the **`ToolHost`** trait. The default `NativeToolHost` runs in-process and enforces grants; future hosts (WASM, bubblewrap) will swap in stronger isolation without any tool-code changes. Session-time tool code never calls OS APIs directly — it requests a `Capability::Shell|FileRead|FileWrite|HttpRequest` from the host. Grants bound what tools do; they do not bound the daemon's own connections to its model providers — see [Not an air-gap](#not-an-air-gap-what-tool-grants-do-not-cover).
+The capability boundary is the **`ToolHost`** trait. The default `NativeToolHost` runs in-process and enforces grants; future hosts (WASM, bubblewrap) will swap in stronger isolation without any tool-code changes. Session-time tool code never calls OS APIs directly — it requests a `Capability::Shell|FileRead|FileWrite|HttpRequest` from the host, and a source-scan test fails the build if tool or extension code reintroduces a direct client ([architecture](../architecture/tools.md#toolhost)). Grants bound what tools do; they do not bound the daemon's own connections to its model providers — see [Not an air-gap](#not-an-air-gap-what-tool-grants-do-not-cover).
 
 ## Tool Approval
 
