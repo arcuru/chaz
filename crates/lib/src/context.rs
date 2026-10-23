@@ -116,6 +116,7 @@ pub struct ContextBuilder<'a> {
     pub(crate) entries: &'a [SessionEntry],
     pub(crate) tool_history: Option<&'a [Vec<TurnTranscriptRecord>]>,
     pub(crate) entry_ids: Option<&'a [Option<crate::session::TurnRequestId>]>,
+    protected_inputs: Option<&'a std::collections::HashSet<crate::session::TurnRequestId>>,
     pub(crate) contributions: &'a [crate::extension::durable_context::CommittedContribution],
     pub(crate) agent_name: &'a str,
     system_prompt: &'a str,
@@ -151,6 +152,7 @@ impl<'a> ContextBuilder<'a> {
             entries,
             tool_history: None,
             entry_ids: None,
+            protected_inputs: None,
             contributions: &[],
             agent_name,
             system_prompt,
@@ -206,6 +208,7 @@ impl<'a> ContextBuilder<'a> {
     /// Supply the complete selected view from one coherent database snapshot.
     pub fn with_context_view(mut self, view: &'a crate::session::SessionContextView) -> Self {
         self.entry_ids = Some(&view.entry_ids);
+        self.protected_inputs = Some(&view.protected_inputs);
         self.tool_history = Some(&view.tool_history);
         self.contributions = &view.contributions;
         self
@@ -544,6 +547,11 @@ impl<'a> ContextBuilder<'a> {
                     .and_then(|ids| ids.get(*index))
                     .and_then(Option::as_ref)
                 {
+                    Some(id) if self.protected_inputs.is_some_and(|ids| ids.contains(id)) => {
+                        ContextSource::ProtectedInput {
+                            id: id.as_str().into(),
+                        }
+                    }
                     Some(id) => ContextSource::PersistedSessionEntry {
                         id: id.as_str().into(),
                     },
@@ -927,6 +935,73 @@ mod tests {
             entry_type,
             metadata: None,
             routing: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn autocompact_provenance_keeps_native_retried_and_nontrailing_queued_inputs() {
+        let (_instance, session) = crate::test_support::fresh_session().await;
+        let mut session = session.lock().await;
+        let queued = session
+            .add_entry(make_entry("user", "queued request", EntryType::Message))
+            .await
+            .unwrap();
+        session
+            .add_entry(make_entry(
+                "test-agent",
+                "interleaved answer",
+                EntryType::Message,
+            ))
+            .await
+            .unwrap();
+        let current = session
+            .add_entry(make_entry("user", "current retry", EntryType::Message))
+            .await
+            .unwrap();
+        let interrupted = session.start_turn_attempt(current.clone()).await.unwrap();
+        let command_id = crate::session::TurnRequestId::parse("retry-current");
+        session
+            .submit_command(crate::session::SessionCommandRequest {
+                command_id: command_id.clone(),
+                sender: "user".into(),
+                created_at: Utc::now(),
+                command: crate::session::SessionCommand::Retry {
+                    target_request_id: current.clone(),
+                    expected_interrupted_attempt_id: interrupted.attempt_id.clone(),
+                },
+            })
+            .await
+            .unwrap();
+        let command = session.start_turn_attempt(command_id).await.unwrap();
+        let retried = session
+            .accept_retry_command_if_interrupted(
+                &command,
+                current.clone(),
+                &interrupted.attempt_id,
+                &HashSet::new(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(retried.generation > interrupted.generation);
+        // The same native pending predicate protects an explicit retry and
+        // queued input despite a later agent reply.
+        let snapshot = session.database().snapshot().await.unwrap();
+        let view = session
+            .turn_context_view_at(snapshot, &current, |name| name == "test-agent")
+            .await
+            .unwrap();
+        assert!(view.protected_inputs.contains(&current));
+        assert!(view.protected_inputs.contains(&queued));
+        let config = default_config();
+        let context = ContextBuilder::new(&view.entries, "test-agent", "sys", &config)
+            .with_context_view(&view)
+            .build()
+            .await;
+        for id in [&current, &queued] {
+            assert!(context.sources.contains(&ContextSource::ProtectedInput {
+                id: id.as_str().into()
+            }));
         }
     }
 

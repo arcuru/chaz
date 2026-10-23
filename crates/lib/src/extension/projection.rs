@@ -148,6 +148,8 @@ pub enum ContextSource {
     },
     /// Stable Eidetica row identity when supplied by coherent reconstruction.
     PersistedSessionEntry { id: String },
+    /// Current/retried or queued request, selected by native snapshot state.
+    ProtectedInput { id: String },
     /// Intentional committed custom context, identified by the host.
     DurableContribution {
         source_id: String,
@@ -166,6 +168,9 @@ pub enum ContextSource {
     TurnInjection,
     /// Messages completed or accepted at a boundary of the current attempt.
     CurrentAttempt { model_sequence: u64 },
+    /// A host-generated autocompaction summary standing in for earlier
+    /// messages of this request. Historical data, not instructions.
+    CompactionSummary,
     /// A caller supplied no provenance for this message.
     Unattributed,
 }
@@ -307,6 +312,31 @@ pub(crate) async fn run_chain(
     baseline: &ProjectedRequest,
     inputs: &RoundInputs<'_>,
 ) -> Result<ProjectedRequest, ProjectionError> {
+    run_chain_inner(chain, baseline, inputs, false).await
+}
+
+/// Native autocompaction may need to prepare/wait before the size gate. All
+/// capability, exchange and cache validation still runs; its caller must gate
+/// the complete final envelope before dispatch.
+pub(crate) async fn run_chain_before_compaction(
+    chain: &[ResolvedProjector],
+    baseline: &ProjectedRequest,
+    inputs: &RoundInputs<'_>,
+) -> Result<ProjectedRequest, ProjectionError> {
+    run_chain_inner(chain, baseline, inputs, true).await
+}
+
+async fn run_chain_inner(
+    chain: &[ResolvedProjector],
+    baseline: &ProjectedRequest,
+    inputs: &RoundInputs<'_>,
+    defer_budget: bool,
+) -> Result<ProjectedRequest, ProjectionError> {
+    let budget = if defer_budget {
+        None
+    } else {
+        inputs.budget_tokens
+    };
     let mut current = baseline.clone();
     for step in chain {
         let input = current.clone();
@@ -350,7 +380,7 @@ pub(crate) async fn run_chain(
                 &candidate,
                 step.authority,
                 inputs.current_exchanges,
-                inputs.budget_tokens,
+                budget,
             )
             .map(|()| candidate)
             .map_err(|violation| format!("invalid output: {violation}")),
@@ -372,11 +402,11 @@ pub(crate) async fn run_chain(
         }
     }
     // The fallback is not exempt: whatever survives must fit the budget.
-    check_budget(&current, inputs.budget_tokens).map_err(ProjectionError::Undispatchable)?;
+    check_budget(&current, budget).map_err(ProjectionError::Undispatchable)?;
     Ok(current)
 }
 
-fn check_budget(
+pub(crate) fn check_budget(
     request: &ProjectedRequest,
     budget: Option<usize>,
 ) -> Result<(), ProjectionViolation> {

@@ -249,6 +249,7 @@ The TUI catalogs every built-in slash command in its inline completion popup —
 | `/sync <ticket>`      | Sync a remote session via a ticket URL                                                            |
 | `/compact`            | Ask the executor to compact the current immutable session snapshot                                |
 | `/context`            | Context-window usage for the current agent ([details](usage.md#context-window-snapshots-context)) |
+| `/autocompact [<n>]`  | Show or set automatic compaction ([details](extensions.md#automatic-compaction))                  |
 | `/print`              | Dump the transcript                                                                               |
 | `/stop`               | Stop the active turn in this session; idle sessions are unchanged                                 |
 
