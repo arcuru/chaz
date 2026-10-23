@@ -14,6 +14,7 @@
 //! bridges) legitimately uses these APIs and is deliberately not scanned.
 
 use regex::Regex;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 /// Directories (relative to the crate root) holding session-time tool code.
@@ -50,7 +51,7 @@ fn patterns() -> &'static [Regex] {
         [
             r"\b(std|tokio)::(fs|process|net)\b",
             r"\breqwest::",
-            r"\buse (std|tokio)::\{[^}]*\b(fs|process|net)\b",
+            r"\buse\s+(std|tokio)::\{[^}]*\b(fs|process|net)\b",
             r"\bFile::(open|create)\b",
             r"\bCommand::new\b",
         ]
@@ -109,17 +110,31 @@ fn production_lines(src: &str) -> Vec<(usize, &str)> {
 }
 
 /// Direct OS/network API uses in the production part of `src`, each tagged
-/// with the most recent `fn` declared above it.
+/// with its enclosing rustfmt-formatted function, if any.
 fn violations(src: &str) -> Vec<Violation> {
     static FN_DECL: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
     let fn_decl = FN_DECL.get_or_init(|| Regex::new(r"\bfn\s+([A-Za-z_][A-Za-z0-9_]*)").unwrap());
+    let lines = production_lines(src);
+    let source = lines.iter().map(|(_, l)| *l).collect::<Vec<_>>().join("\n");
+    // Match across lines so ordinary rustfmt-expanded grouped imports count.
+    let matched_lines: HashSet<_> = patterns()
+        .iter()
+        .flat_map(|p| p.find_iter(&source))
+        .map(|m| source[..m.start()].bytes().filter(|b| *b == b'\n').count())
+        .collect();
     let mut function = None;
+    let mut function_indent = 0;
     let mut out = Vec::new();
-    for (line, text) in production_lines(src) {
+    for (idx, (line, text)) in lines.into_iter().enumerate() {
+        let indent = text.len() - text.trim_start().len();
+        if text.trim() == "}" && indent == function_indent {
+            function = None;
+        }
         if let Some(caps) = fn_decl.captures(text) {
             function = Some(caps[1].to_string());
+            function_indent = indent;
         }
-        if patterns().iter().any(|p| p.is_match(text)) {
+        if matched_lines.contains(&idx) {
             out.push(Violation {
                 line,
                 function: function.clone(),
@@ -288,6 +303,7 @@ fn planted_direct_io_is_flagged() {
         "fn f() { let c = reqwest::Client::new(); }",
         "use std::fs;",
         "use std::{fs, io};",
+        "use std::{\n    fs,\n    io,\n};",
         "use tokio::{net::TcpStream, io};",
         "fn f() { std::net::TcpStream::connect(a); }",
         "fn f() { tokio::process::Command::new(\"sh\"); }",
@@ -380,4 +396,15 @@ fn exemption_without_a_match_is_stale() {
     for e in EXEMPTIONS {
         assert!(!e.reason.is_empty());
     }
+}
+
+#[test]
+fn skills_exemption_does_not_leak_past_the_function() {
+    let src = "fn parse_skill_md() {\n    std::fs::read_to_string(p);\n}\n\
+               const CONTENT: String = std::fs::read_to_string(p);\n";
+    let mut used = vec![0; EXEMPTIONS.len()];
+    let left = apply_exemptions("src/extensions/skills.rs", violations(src), &mut used);
+    assert_eq!(left.len(), 1);
+    assert_eq!(left[0].line, 4);
+    assert_eq!(left[0].function, None);
 }

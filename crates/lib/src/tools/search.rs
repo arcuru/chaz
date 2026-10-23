@@ -14,10 +14,15 @@
 //! backend does not authorize it; a private or local SearxNG instance needs a
 //! private-network grant on `web_search`.
 
-use crate::tool::{ApprovalRequirement, RiskLevel, Tool, ToolContext, ToolDescriptor, ToolPolicy};
+use crate::grants::Grants;
+use crate::tool::{
+    ApprovalRequirement, RiskLevel, Tool, ToolContext, ToolDescriptor, ToolError, ToolPolicy,
+};
+use crate::tool_host::{Capability, CapabilityResult, ToolHost};
 use regex::Regex;
 use serde::Serialize;
 use serde_json::Value;
+use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::OnceLock;
@@ -129,7 +134,10 @@ fn unauthorized_private_backends<'a>(
 }
 
 /// Log the startup warning for [`unauthorized_private_backends`].
-pub fn warn_unauthorized_private_backends(backends: &[SearchBackend], policy_grants: &Grants) {
+pub(crate) fn warn_unauthorized_private_backends(
+    backends: &[SearchBackend],
+    policy_grants: &Grants,
+) {
     for url in unauthorized_private_backends(backends, policy_grants) {
         warn!(
             %url,
@@ -282,11 +290,6 @@ where
 // ================================================================
 // Provider requests and responses
 // ================================================================
-
-use crate::grants::Grants;
-use crate::tool::ToolError;
-use crate::tool_host::{Capability, CapabilityResult, ToolHost};
-use std::collections::HashMap;
 
 /// Build the `HttpRequest` capability for one backend. API keys travel in
 /// headers (or Tavily's JSON body, as its API requires), never in the URL.
@@ -503,24 +506,26 @@ fn parse_result_list(
     snippet_field: &str,
     max_results: usize,
 ) -> Vec<SearchResult> {
+    list.and_then(|r| r.as_array())
+        .into_iter()
+        .flatten()
+        .take(max_results)
+        .map(|r| parse_result(r, url_field, snippet_field))
+        .collect()
+}
+
+fn parse_result(r: &Value, url_field: &str, snippet_field: &str) -> SearchResult {
     let field = |r: &Value, key: &str| {
         r.get(key)
             .and_then(|v| v.as_str())
             .unwrap_or_default()
             .to_string()
     };
-    list.and_then(|r| r.as_array())
-        .map(|arr| {
-            arr.iter()
-                .take(max_results)
-                .map(|r| SearchResult {
-                    title: field(r, "title"),
-                    url: field(r, url_field),
-                    snippet: field(r, snippet_field),
-                })
-                .collect()
-        })
-        .unwrap_or_default()
+    SearchResult {
+        title: field(r, "title"),
+        url: field(r, url_field),
+        snippet: field(r, snippet_field),
+    }
 }
 
 /// Extract search-result (`t: 0`) entries from a Kagi response. Pulled out
@@ -528,17 +533,15 @@ fn parse_result_list(
 /// Response `data[]` is a discriminated list; `t: 0` entries are search
 /// results (url/title/snippet), `t: 1` is related searches.
 fn parse_kagi_results(parsed: &Value, max_results: usize) -> Vec<SearchResult> {
-    let results: Vec<Value> = parsed
+    parsed
         .get("data")
         .and_then(|d| d.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter(|r| r.get("t").and_then(|t| t.as_u64()) == Some(0))
-                .cloned()
-                .collect()
-        })
-        .unwrap_or_default();
-    parse_result_list(Some(&Value::Array(results)), "url", "snippet", max_results)
+        .into_iter()
+        .flatten()
+        .filter(|r| r.get("t").and_then(|t| t.as_u64()) == Some(0))
+        .take(max_results)
+        .map(|r| parse_result(r, "url", "snippet"))
+        .collect()
 }
 
 /// Pull result entries out of a SearxNG JSON response. `content` is the
@@ -1366,8 +1369,8 @@ mod tests {
 
         // ── Real host against a local listener ──
 
-        /// A local HTTP listener that counts requests and answers each with
-        /// an empty SearxNG result list.
+        /// A local HTTP listener that counts requests and answers with a
+        /// canned SearxNG result.
         struct Listener {
             base_url: String,
             hits: Arc<AtomicUsize>,
@@ -1569,6 +1572,62 @@ mod tests {
                 vec!["http://127.0.0.1:8888", "http://searx.local"]
             );
             assert!(unauthorized_private_backends(&backends, &private_policy()).is_empty());
+        }
+
+        #[test]
+        fn startup_warning_names_the_backend_and_config_fix() {
+            use std::sync::Mutex;
+            use tracing::{Event, Metadata, Subscriber, span};
+
+            #[derive(Clone, Default)]
+            struct Messages(Arc<Mutex<Vec<String>>>);
+
+            impl tracing::field::Visit for Messages {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    self.0.lock().unwrap().push(format!("{field}={value:?}"));
+                }
+            }
+
+            impl Subscriber for Messages {
+                fn enabled(&self, _: &Metadata<'_>) -> bool {
+                    true
+                }
+                fn new_span(&self, _: &span::Attributes<'_>) -> span::Id {
+                    span::Id::from_u64(1)
+                }
+                fn record(&self, _: &span::Id, _: &span::Record<'_>) {}
+                fn record_follows_from(&self, _: &span::Id, _: &span::Id) {}
+                fn enter(&self, _: &span::Id) {}
+                fn exit(&self, _: &span::Id) {}
+                fn event(&self, event: &Event<'_>) {
+                    event.record(&mut self.clone());
+                }
+            }
+
+            let messages = Messages::default();
+            let backends = [SearchBackend::Searxng {
+                base_url: "http://127.0.0.1:8888".into(),
+            }];
+            tracing::subscriber::with_default(messages.clone(), || {
+                warn_unauthorized_private_backends(&backends, &Grants::default());
+            });
+            let output = messages.0.lock().unwrap().join("\n");
+            assert!(
+                output.contains("web_search: SearxNG backend will be denied:"),
+                "{output}"
+            );
+            assert!(output.contains(PRIVATE_GRANT_HINT), "{output}");
+            assert!(output.contains("http://127.0.0.1:8888"), "{output}");
+
+            messages.0.lock().unwrap().clear();
+            tracing::subscriber::with_default(messages.clone(), || {
+                warn_unauthorized_private_backends(&backends, &private_policy());
+            });
+            assert!(messages.0.lock().unwrap().is_empty());
         }
     }
 }

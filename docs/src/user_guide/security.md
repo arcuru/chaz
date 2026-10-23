@@ -231,7 +231,7 @@ A worked migration, for a self-hosted instance with no fallback:
                  path_prefix: "/search"
    ```
 
-5. After a restart the warning is gone and searches reach the instance. A session or agent whose ceiling sets `allow_private: false` or `endpoints: []` still gets the step 3 error, because a narrower tier can only remove authority.
+5. After a restart the warning is gone and searches reach the instance. A session or agent whose ceiling sets `allow_private: false` still gets the step 3 error. A ceiling with `endpoints: []` instead reports `Network policy denied: … not in allowed endpoints`. Both deny the request before sending anything: a narrower tier can only remove authority.
 
 > **Deprecated**: `security.allowed_endpoints` is a legacy field. It still works but is converted to a network grant at startup with a deprecation warning. Use `tool_policies.web_fetch.grants.network.endpoints` for new configs.
 
