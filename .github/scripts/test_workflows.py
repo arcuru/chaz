@@ -1,5 +1,6 @@
 """Check the workflow configuration, not a model of GitHub's scheduler."""
 
+import glob
 import json
 import os
 from pathlib import Path
@@ -285,7 +286,66 @@ class Workflows(unittest.TestCase):
             "cargo build --bin chaz --bin chaz-matrix --example e2ee_probe",
             steps["Build binaries"]["run"],
         )
-        self.assertIn("dev/matrix-e2e/run.sh --verbose", steps["Matrix E2E"]["run"])
+        self.assertIn("dev/matrix-e2e/run.sh --keep --verbose", steps["Matrix E2E"]["run"])
+
+    def test_failed_matrix_run_retains_diagnostics_without_changing_limits(self):
+        job = self.e2e["jobs"]["e2e"]
+        steps = {step["name"]: step for step in job["steps"]}
+        run = steps["Matrix E2E"]
+        self.assertEqual(job["timeout-minutes"], "45")
+        self.assertEqual(run["timeout-minutes"], "10")
+        self.assertIn('env TMPDIR="$RUNNER_TEMP/matrix-e2e"', run["run"])
+        self.assertIn("dev/matrix-e2e/run.sh --keep --verbose", run["run"])
+        self.assertIn('tee "$RUNNER_TEMP/matrix-e2e/harness.log"', run["run"])
+        self.assertIn("rc=${PIPESTATUS[0]}", run["run"])
+        self.assertIn('exit "$rc"', run["run"])
+        upload = steps["Retain failed Matrix diagnostics"]
+        self.assertEqual(upload["if"], "failure()")
+        self.assertRegex(upload["uses"], r"^actions/upload-artifact@[0-9a-f]{40}$")
+        self.assertEqual(upload["with"]["retention-days"], "7")
+
+    def test_matrix_artifact_selects_logs_and_both_peer_databases_only(self):
+        upload = next(
+            s for s in self.e2e["jobs"]["e2e"]["steps"]
+            if s["name"] == "Retain failed Matrix diagnostics"
+        )
+        base = "matrix-e2e/chaz-matrix-e2e-fixture/"
+        wanted = {
+            "matrix-e2e/harness.log",
+            *(base + name for name in (
+                "register-agent.log", "register-puppet.log", "register-stranger.log",
+                "daemon.log", "daemon-after-snapshot.log", "daemon-participation.log",
+                "bridge.log", "bridge-restarted.log", "synapse.log", "stub-llm.log",
+                "synapse/homeserver.log", "synapse/homeserver.log.1",
+                "state-daemon/eidetica.db", "state-daemon/eidetica.db-wal",
+                "state-daemon/eidetica.db-shm", "state-bridge/eidetica.db",
+                "state-bridge/eidetica.db-wal", "state-bridge/eidetica.db-shm",
+            )),
+        }
+        excluded = {
+            base + name for name in (
+                "daemon.yaml", "bridge.yaml", "synapse/homeserver.yaml",
+                "state-daemon/eidetica.db.eidetica-owner",
+                "state-bridge/eidetica.db.eidetica-owner",
+                "synapse/homeserver.db", "synapse/e2e.test.signing.key",
+                "state-bridge/matrix/_agent_e2e_test/session",
+                "state-bridge/matrix/_agent_e2e_test/crypto-store/matrix-sdk-crypto.sqlite3",
+                "probe-signed/session", "probe-unsigned/session",
+                "xdg-config/chaz/shares/ticket", "home/.config/credentials",
+            )
+        } | {"unrelated/eidetica.db", "unrelated/production.log"}
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for name in wanted | excluded:
+                path = root / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.touch()
+            selected = {
+                str(Path(path).relative_to(root))
+                for pattern in upload["with"]["path"].splitlines()
+                for path in glob.glob(pattern.replace("${{ runner.temp }}", directory))
+            }
+            self.assertEqual(selected, wanted)
 
     def test_native_main_queue_covers_ci_and_publish(self):
         self.assertEqual(expression(self.ci["concurrency"]["group"]), MAIN_QUEUE)

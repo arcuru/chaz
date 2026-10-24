@@ -115,7 +115,7 @@ python3 "$HERE/test_stub_llm.py"
 WORKSPACE="$(mktemp -d -t chaz-matrix-e2e-XXXXXX)"
 PIDS=()
 
-log() { printf '\033[1;35m==>\033[0m %s\n' "$*" >&2; }
+log() { printf '\033[1;35m==>\033[0m [%ss] %s\n' "$SECONDS" "$*" >&2; }
 fail() {
 	printf '\033[1;31mFAIL:\033[0m %s\n' "$*" >&2
 	# Preserve fixture rejection details even when default cleanup removes it.
@@ -369,11 +369,18 @@ log "registering accounts"
 for pair in "agent:$AGENT_PASSWORD" "puppet:$PUPPET_PASSWORD" "stranger:$STRANGER_PASSWORD"; do
 	user="${pair%%:*}"
 	pass="${pair#*:}"
-	register_new_matrix_user \
+	log "registering @$user:$SERVER_NAME"
+	registration_start=$SECONDS
+	if register_new_matrix_user \
 		-c "$SYNAPSE_DIR/homeserver.yaml" \
 		-u "$user" -p "$pass" --no-admin \
-		"$HOMESERVER" >>"$WORKSPACE/register.log" 2>&1 ||
-		fail "could not register @$user:$SERVER_NAME (see $WORKSPACE/register.log)"
+		"$HOMESERVER" >"$WORKSPACE/register-$user.log" 2>&1; then
+		log "registered @$user:$SERVER_NAME in $((SECONDS - registration_start))s"
+	else
+		rc=$?
+		log "registration of @$user:$SERVER_NAME failed after $((SECONDS - registration_start))s (exit $rc)"
+		fail "could not register @$user:$SERVER_NAME (see $WORKSPACE/register-$user.log)"
+	fi
 done
 
 AGENT_MXID="@agent:$SERVER_NAME"
@@ -413,12 +420,14 @@ default_agents: [chaz]
 EOF
 
 mkdir -p "$WORKSPACE/state-daemon" "$WORKSPACE/state-bridge"
+log "initialising daemon Eidetica store"
 nix run "$EIDETICA_FLAKE" -- \
 	daemon --data-dir "$WORKSPACE/state-daemon" init --username chaz --passwordless \
 	>>"$WORKSPACE/bringup.log" 2>&1 || fail "could not initialise daemon Eidetica store (see $WORKSPACE/bringup.log)"
 # The bridge's store is provisioned the same explicit way: the connector
 # never creates one, and the legacy `chaz-matrix` login is what its config
 # names.
+log "initialising bridge Eidetica store"
 nix run "$EIDETICA_FLAKE" -- \
 	daemon --data-dir "$WORKSPACE/state-bridge" init --username chaz-matrix --passwordless \
 	>>"$WORKSPACE/bringup.log" 2>&1 || fail "could not initialise bridge Eidetica store (see $WORKSPACE/bringup.log)"
@@ -596,9 +605,9 @@ kill -TERM "$DAEMON_PID"
 wait_for "daemon to exit for state snapshot" 30 sh -c "! kill -0 $DAEMON_PID 2>/dev/null"
 retire_pid "$DAEMON_PID"
 cp -a "$WORKSPACE/state-daemon" "$DAEMON_PRE_SESSION_STATE"
-spawn daemon "$CHAZ_BIN" --config "$DAEMON_CONFIG" daemon
+spawn daemon-after-snapshot "$CHAZ_BIN" --config "$DAEMON_CONFIG" daemon
 DAEMON_PID="$SPAWNED_PID"
-wait_for "daemon after state snapshot" 120 grep -q "daemon ready" "$WORKSPACE/daemon.log"
+wait_for "daemon after state snapshot" 120 grep -q "daemon ready" "$WORKSPACE/daemon-after-snapshot.log"
 
 # --------------------------------------------------------------- puppet ------
 mx() {

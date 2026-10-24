@@ -430,21 +430,52 @@ smart stub is a second implementation of the thing under test.
 
 ## When it fails
 
-Every component logs into the workspace. Re-run with `--keep` and read:
+Every component logs into the workspace. Phase messages include elapsed seconds;
+registration logs a start and duration for each account, followed by separately
+named Eidetica provisioning phases. Re-run with `--keep` and read:
 
-| File           | What it holds                          |
-| -------------- | -------------------------------------- |
-| `bringup.log`  | pubkey, invite, and ticket minting     |
-| `daemon.log`   | the agent peer                         |
-| `bridge.log`   | Matrix login, bootstrap, room handling |
-| `synapse.log`  | the homeserver                         |
-| `stub-llm.log` | requests the agent actually made       |
-| `register.log` | account creation                       |
+| File                     | What it holds                                        |
+| ------------------------ | ---------------------------------------------------- |
+| `bringup.log`            | pubkey, invite, and ticket minting                   |
+| `daemon*.log`            | the agent peer, with separate files for each restart |
+| `bridge.log`             | Matrix login, bootstrap, room handling               |
+| `synapse.log`            | the homeserver                                       |
+| `stub-llm.log`           | requests the agent actually made                     |
+| `register-<account>.log` | individual account creation                          |
 
 The failure message names the step that timed out, and each step waits on a
 specific observable — the daemon's readiness line, the bridge's Matrix login,
 the agent's join, then the reply — so the step that fails is the one that
 broke.
+
+The `Matrix E2E` workflow (`.github/workflows/matrix-e2e.yml`) keeps the
+fixture outside Nix's temporary shell directory and uploads
+`matrix-e2e-diagnostics` **only on failure**, including a ten-minute harness-step
+timeout. The artifact expires after seven days. It contains `harness.log`, the
+separate component/registration logs, Synapse's file log, and both disposable
+peers' `eidetica.db` files with any `-wal`/`-shm` sidecars. Keep sidecars beside
+their matching database when inspecting a copy. A setup failure may precede the
+creation of either peer database; the harness log identifies that phase.
+
+The upload excludes YAML configs, Matrix login sessions and crypto stores,
+probe stores, Synapse's database/keys, and share tickets. The retained Eidetica
+stores still contain disposable peer identities and fixture conversation state;
+they are diagnostic data, not a reusable deployment or a public-text attachment.
+Never substitute production accounts, credentials, databases, or transcripts.
+No artifact is uploaded on success; the runner discards the kept workspace.
+
+For example, after a failed hosted run:
+
+1. Open its **Matrix E2E** job and download `matrix-e2e-diagnostics`.
+2. Read `harness.log`. Lines such as `==> [4s] registering @agent:e2e.test`
+   and `==> [6s] registered @agent:e2e.test in 2s` separate registration
+   latency from `initialising daemon Eidetica store`. If an account never
+   finishes, its start line and `register-agent.log` locate the stalled call.
+3. For a restart assertion failure, compare `daemon-participation.log` with
+   the corresponding `bridge*.log`, `stub-llm.log`, and **copies** of both
+   peer databases. Do not infer lost authorization merely from an adjacent
+   background-sync permission error. Retain the failing evidence before
+   proposing a repair; a later green run does not explain it.
 
 ## Key-maintenance acceptance
 
