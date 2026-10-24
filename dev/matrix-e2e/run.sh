@@ -1513,8 +1513,14 @@ ws_expect() {
 		--timeout "$REPLY_TIMEOUT" >/dev/null || fail "no reply containing '$2' (see $WORKSPACE/probe.log, $BRIDGE_LOG)"
 }
 # The puppet's pending invitation whose stripped state names the room `$1`.
+# Synapse caches a device's initial /sync per request, so each lookup varies
+# its filter with a nonce (callers run this in a subshell, so no counter);
+# otherwise a check made before the invitation would be replayed.
 ws_invited() {
-	mx GET '/_matrix/client/v3/sync?timeout=0' "$PUPPET_TOKEN" | jq -er --arg n "$1" '
+	local filter
+	filter="$(jq -rn --arg n "ws-$(date +%s%N)" '{presence:{not_types:[$n]}} | tojson | @uri')"
+	mx GET "/_matrix/client/v3/sync?timeout=0&filter=$filter" "$PUPPET_TOKEN" |
+		jq -er --arg n "$1" '
 		.rooms.invite // {} | to_entries[]
 		| select(any(.value.invite_state.events[]; .type == "m.room.name" and .content.name == $n))
 		| .key'
@@ -1587,6 +1593,29 @@ CHAT_BINDINGS="$(grep -F "Channel bound to session" "$BRIDGE_LOG" | grep -cF "$C
 [[ $CHAT_BINDINGS -eq 1 ]] || fail "expected one session binding for the chat, found $CHAT_BINDINGS"
 printf '\033[1;32mPASS\033[0m — new chat: private, linked from the Space, answered in its own room only, one session\n' >&2
 
+log "workspace: second chat has independent history and addressed replies"
+ws_say "$LOBBY_ID" "!chaz chat new Trip plans"
+ws_expect "$LOBBY_ID" "(c2) — done"
+OTHER_CHAT_ID="$(ws_invited "Trip plans")" || fail "no second chat invitation"
+ws_join "$OTHER_CHAT_ID"
+ws_assert_private "$OTHER_CHAT_ID" true
+CHAT_REPLIES="$(probe --dir "$SIGNED_DIR" wire --room "$CHAT_ID" --sender "$AGENT_MXID")"
+ws_say "$OTHER_CHAT_ID" "workspace sibling ping"
+ws_expect "$OTHER_CHAT_ID" "$MARKER"
+[[ "$(probe --dir "$SIGNED_DIR" wire --room "$CHAT_ID" --sender "$AGENT_MXID")" -eq "$CHAT_REPLIES" ]] ||
+    fail "sibling reply reached the first chat"
+! grep -F 'stub_llm: request:' "$WORKSPACE/stub-llm.log" | grep -F 'workspace sibling ping' | grep -qF 'workspace chat ping' ||
+    fail "independent chats shared their transcripts"
+TURNS_BEFORE="$(stub_requests)"
+ws_say "$LOBBY_ID" "!chaz chat rename c1 Winter bike"
+ws_expect "$LOBBY_ID" "rename c1 to “Winter bike” — done"
+ws_state "$CHAT_ID" | jq -e 'map(select(.type == "m.room.name"))[0].content.name == "Winter bike"' >/dev/null ||
+    fail "literal rename did not update Matrix"
+ws_say "$LOBBY_ID" "!chaz chat list"
+ws_expect "$LOBBY_ID" "c1 “Winter bike”"
+[[ "$(stub_requests)" -eq "$TURNS_BEFORE" ]] || fail "literal rename invoked a model"
+printf '\033[1;32mPASS\033[0m — workspace siblings: separate transcripts and addressed replies; literal rename/list without a model\n' >&2
+
 log "Case W4: bridge and daemon restarts keep the chat"
 kill -TERM "$BRIDGE_PID"
 wait_for "bridge to exit" 30 sh -c "! kill -0 $BRIDGE_PID 2>/dev/null"
@@ -1605,10 +1634,24 @@ ws_say "$CHAT_ID" "workspace chat after restart"
 probe --dir "$SIGNED_DIR" expect --room "$CHAT_ID" --sender "$AGENT_MXID" --contains "$MARKER" \
 	--timeout "$REPLY_TIMEOUT" >/dev/null || fail "no chat reply after restarts (see $BRIDGE_LOG)"
 ws_say "$LOBBY_ID" "!chaz chat list"
-ws_expect "$LOBBY_ID" "c1 “Bike repair”"
+ws_expect "$LOBBY_ID" "c1 “Winter bike”"
 ! grep -F "Created transport channel session" "$BRIDGE_LOG" | grep -qF "$CHAT_ID" ||
 	fail "a replacement session was created for the chat after restart"
 [[ "$(mx GET /_matrix/client/v3/joined_rooms "$PUPPET_TOKEN" | jq --arg s "$SPACE_ID" --arg l "$LOBBY_ID" --arg c "$CHAT_ID" \
 	'[.joined_rooms[] | select(. == $s or . == $l or . == $c)] | length')" -eq 3 ]] || fail "workspace rooms changed"
-[[ -z "$(ws_invited "Bike repair" || true)" ]] || fail "a second chat room was created"
+[[ -z "$(ws_invited "Winter bike" || true)" ]] || fail "a second chat room was created"
 printf '\033[1;32mPASS\033[0m — workspace after bridge + daemon restart: same chat answers, listed once, no replacement session or room\n' >&2
+
+log "workspace: approval stays in its own chat"
+LOBBY_REPLIES="$(probe --dir "$SIGNED_DIR" wire --room "$LOBBY_ID" --sender "$AGENT_MXID")"
+OTHER_REPLIES="$(probe --dir "$SIGNED_DIR" wire --room "$OTHER_CHAT_ID" --sender "$AGENT_MXID")"
+ws_say "$CHAT_ID" "workspace approval probe"
+ws_expect "$CHAT_ID" "Tool approval required"
+[[ "$(probe --dir "$SIGNED_DIR" wire --room "$LOBBY_ID" --sender "$AGENT_MXID")" -eq "$LOBBY_REPLIES" ]] || fail "approval prompt leaked to Lobby"
+[[ "$(probe --dir "$SIGNED_DIR" wire --room "$OTHER_CHAT_ID" --sender "$AGENT_MXID")" -eq "$OTHER_REPLIES" ]] || fail "approval prompt leaked to sibling"
+ws_say "$OTHER_CHAT_ID" "!chaz deny"
+ws_expect "$OTHER_CHAT_ID" "No pending approval"
+ws_say "$CHAT_ID" "!chaz deny"
+ws_expect "$CHAT_ID" "$MARKER workspace-approval-denied"
+grep -qF 'stub_llm: workspace approval denied' "$WORKSPACE/stub-llm.log" || fail "denial did not reach the requesting turn"
+printf '\033[1;32mPASS\033[0m — workspace approvals: prompt and denied final only in intended chat; sibling decision cannot resolve it\n' >&2
