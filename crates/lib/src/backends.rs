@@ -55,24 +55,32 @@ impl BackendClient {
 
     fn for_model(backend: &Backend, secrets: &SecretStore, model: &str) -> Result<Self, LlmError> {
         let api = backend.api_for_model(model);
-        match (&backend.backend_type, api) {
+        let client = match (&backend.backend_type, api) {
             (BackendType::OpenAICompatible, ModelApi::ChatCompletions) => {
-                Ok(Self::OpenAI(OpenAI::new(backend, secrets)))
+                Self::OpenAI(OpenAI::new(backend, secrets))
             }
             (BackendType::Anthropic, ModelApi::AnthropicMessages) => {
-                Ok(Self::Anthropic(Anthropic::new(backend, secrets)))
+                Self::Anthropic(Anthropic::new(backend, secrets))
             }
             (BackendType::OpenAICompatible, ModelApi::Responses) => {
-                Ok(Self::Responses(Responses::new(backend, secrets)))
+                Self::Responses(Responses::new(backend, secrets))
             }
-            _ => Err(LlmError::Configuration {
-                message: format!(
-                    "API '{}' is incompatible with backend type {:?}",
-                    api.as_str(),
-                    backend.backend_type
-                ),
-            }),
-        }
+            _ => {
+                return Err(LlmError::Configuration {
+                    message: format!(
+                        "API '{}' is incompatible with backend type {:?}",
+                        api.as_str(),
+                        backend.backend_type
+                    ),
+                });
+            }
+        };
+        // A Chat-only reasoning format on a native API fails before any request,
+        // including on Anthropic Messages, which otherwise ignores reasoning.
+        backend
+            .reasoning_control(model)
+            .map_err(|message| LlmError::Configuration { message })?;
+        Ok(client)
     }
 
     fn list_models(&self) -> Vec<String> {
@@ -1193,6 +1201,7 @@ mod tests {
                 api: Some(api),
                 reasoning: Some(crate::config::ReasoningConfig {
                     effort: crate::config::ReasoningEffort::High,
+                    format: None,
                 }),
                 price_input: None,
                 price_output: None,

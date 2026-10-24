@@ -209,3 +209,19 @@ No raw scope identifier or credential enters the wire key, and no prompt bytes
 participate in its derivation.
 Legacy standalone calls without a session omit the key.
 Usage comes from the response, not from the identity or a predicted cache hit.
+
+## Reasoning controls
+
+`Backend::reasoning_control` is the single resolver for what a model's
+configured reasoning puts on the wire. It resolves the model's effective API
+first, then the optional Chat `format`, and returns the field to send, nothing
+(unlisted models, omitted `reasoning`, native Anthropic), or a configuration
+error for an explicit Chat format on a native API.
+Startup (`config::reasoning_report`), client selection and both OpenAI-family
+request builders call it, so a refusal happens before any request and the
+builders cannot disagree about the field.
+The Chat and Responses clients keep the returned control for the request's
+lifetime and use it only to annotate a provider rejection; the error variant,
+and so retry classification, is unchanged.
+Chat success bodies are decoded from raw JSON after the SDK returns, so only
+provider error bodies reach the bounded-excerpt path in `LlmError`.

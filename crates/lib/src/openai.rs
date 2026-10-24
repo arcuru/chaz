@@ -12,7 +12,7 @@ use serde_json::{Map, Value};
 use crate::{
     backends::{ChatContext, LLMBackend},
     cache::{CacheAnchor, CacheControl, CacheOptions},
-    config::{Backend, ReasoningConfig},
+    config::{Backend, ReasoningControl, ReasoningEffort},
     error::LlmError,
     runtime::{LLMResponse, ResponseMetadata, RuntimeMessage, TokenUsage, ToolCallRequest},
     security::SecretStore,
@@ -47,13 +47,22 @@ struct ChatRequest<'a> {
     /// Model-configured default. This must be omitted rather than serialized
     /// as null when the provider should retain its own reasoning behavior.
     #[serde(skip_serializing_if = "Option::is_none")]
-    reasoning: Option<ReasoningConfig>,
+    reasoning: Option<EffortObject>,
+    /// OpenAI Chat's top-level spelling, sent only for `format: openai`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_effort: Option<ReasoningEffort>,
     /// Opt into OpenRouter's extended usage accounting (`cost`, cache details,
     /// reasoning tokens). Unknown to vanilla OpenAI/DeepSeek but ignored
     /// silently per the spec, so we always set it.
     usage: UsageOpts,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_completion_tokens: Option<u32>,
+}
+
+/// `reasoning: {"effort": …}` (OpenRouter's Chat object).
+#[derive(Debug, Clone, Copy, Serialize)]
+struct EffortObject {
+    effort: ReasoningEffort,
 }
 
 #[derive(Debug, Clone, Copy, Serialize)]
@@ -334,15 +343,9 @@ impl OpenAI {
     fn build_client(&self) -> Result<Client<OpenAIConfig>, LlmError> {
         // Host-boundary injection: resolve API key from SecretStore by reference,
         // falling back to the raw api_key field for backward compatibility.
-        let api_key = self
-            .backend
-            .api_key_ref
-            .as_ref()
-            .and_then(|r| self.secrets.get(r))
-            .or_else(|| self.backend.api_key.clone())
-            .ok_or_else(|| LlmError::Configuration {
-                message: "API key not configured".to_string(),
-            })?;
+        let api_key = self.api_key().ok_or_else(|| LlmError::Configuration {
+            message: "API key not configured".to_string(),
+        })?;
         let api_base = self
             .backend
             .api_base
@@ -356,16 +359,82 @@ impl OpenAI {
         Ok(Client::with_config(config))
     }
 
-    /// Return the configured reasoning default for `model`, matching either
-    /// its raw id or its `backend:model` form.
-    fn reasoning_for_model(&self, model: &str) -> Option<ReasoningConfig> {
-        let model = model.trim_start_matches(&format!("{}:", self.backend.get_name()));
+    fn raw_model<'m>(&self, model: &'m str) -> &'m str {
+        model.trim_start_matches(&format!("{}:", self.backend.get_name()))
+    }
+
+    /// The configured reasoning control for `model`, matching either its raw
+    /// id or its `backend:model` form. A conflicting format is a configuration
+    /// error before any request is sent.
+    fn reasoning_control(&self, model: &str) -> Result<Option<ReasoningControl>, LlmError> {
+        let control = self
+            .backend
+            .reasoning_control(self.raw_model(model))
+            .map_err(|message| LlmError::Configuration { message })?;
+        match control {
+            Some(control) => tracing::debug!(
+                backend = %self.backend.get_name(),
+                model,
+                field = control.field(),
+                effort = control.effort().as_str(),
+                "Chat reasoning control sent"
+            ),
+            None => tracing::debug!(
+                backend = %self.backend.get_name(),
+                model,
+                "No Chat reasoning control sent"
+            ),
+        }
+        Ok(control)
+    }
+
+    /// Attribute a rejected request to the reasoning control it carried, and
+    /// keep this backend's credential out of any echoed provider text.
+    fn annotate(
+        &self,
+        control: Option<ReasoningControl>,
+        model: &str,
+        error: LlmError,
+    ) -> LlmError {
+        let error = ReasoningControl::annotate(
+            control,
+            &self.backend.get_name(),
+            self.raw_model(model),
+            error,
+        );
+        match self.api_key() {
+            Some(key) => error.redact_secret(&key),
+            None => error,
+        }
+    }
+
+    /// Decode a successful Chat body. The SDK hands back raw JSON so that only
+    /// provider *error* bodies reach its deserialize-error path, where
+    /// [`LlmError::from_openai_error`] keeps a bounded excerpt. An error
+    /// envelope returned with HTTP 200 is classified as before; any other
+    /// malformed success body (which may echo the conversation) is not quoted.
+    fn decode(
+        &self,
+        control: Option<ReasoningControl>,
+        model: &str,
+        body: Value,
+    ) -> Result<ChatResponse, LlmError> {
+        ChatResponse::deserialize(&body).map_err(|e| {
+            match crate::error::classify_error_value(&body) {
+                Some(error) => self.annotate(control, model, error),
+                None => LlmError::InvalidRequest {
+                    message: format!("Response deserialize error: {e}"),
+                },
+            }
+        })
+    }
+
+    fn api_key(&self) -> Option<String> {
         self.backend
-            .models
-            .as_ref()?
-            .iter()
-            .find(|configured| configured.name == model)
-            .and_then(|configured| configured.reasoning.clone())
+            .api_key_ref
+            .as_ref()
+            .and_then(|r| self.secrets.get(r))
+            .or_else(|| self.backend.api_key.clone())
     }
 
     fn chat_request<'a>(
@@ -373,12 +442,19 @@ impl OpenAI {
         model: &'a str,
         messages: Vec<ChatMessage>,
         tools: Option<Vec<ChatTool>>,
+        reasoning: Option<ReasoningControl>,
     ) -> ChatRequest<'a> {
+        let (reasoning, reasoning_effort) = match reasoning {
+            Some(ReasoningControl::Object(effort)) => (Some(EffortObject { effort }), None),
+            Some(ReasoningControl::TopLevel(effort)) => (None, Some(effort)),
+            None => (None, None),
+        };
         ChatRequest {
             model,
             messages,
             tools,
-            reasoning: self.reasoning_for_model(model),
+            reasoning,
+            reasoning_effort,
             usage: UsageOpts { include: true },
             max_completion_tokens: None,
         }
@@ -391,6 +467,7 @@ impl OpenAI {
         tools: &[ToolDefinition],
         model: &'a str,
         cache: &CacheOptions,
+        reasoning: Option<ReasoningControl>,
     ) -> ChatRequest<'a> {
         let mut openai_messages = convert_runtime_messages(messages);
         let mut openai_tools = convert_tool_definitions(tools);
@@ -410,6 +487,7 @@ impl OpenAI {
             } else {
                 Some(openai_tools)
             },
+            reasoning,
         )
     }
 
@@ -445,23 +523,23 @@ impl OpenAI {
             .map_err(|e| LlmError::Configuration {
                 message: e.to_string(),
             })?;
+        let reasoning = self.reasoning_control(model)?;
         let client = self.build_client()?;
 
-        let mut request = self.build_chat_request(messages, tools, model, cache);
+        let mut request = self.build_chat_request(messages, tools, model, cache, reasoning);
         request.max_completion_tokens = max_output_tokens;
         let timeout = self.backend.request_timeout();
-        let response: ChatResponse = tokio::time::timeout(
+        let response: Value = tokio::time::timeout(
             timeout,
-            client
-                .chat()
-                .create_byot::<ChatRequest, ChatResponse>(request),
+            client.chat().create_byot::<ChatRequest, Value>(request),
         )
         .await
         .map_err(|_| {
             tracing::warn!(timeout_secs = timeout.as_secs(), "LLM request timed out");
             LlmError::Timeout
         })?
-        .map_err(LlmError::from_openai_error)?;
+        .map_err(|e| self.annotate(reasoning, model, LlmError::from_openai_error(e)))?;
+        let response = self.decode(reasoning, model, response)?;
 
         let ChatResponse {
             choices,
@@ -754,21 +832,21 @@ impl LLMBackend for OpenAI {
             "LLM request"
         );
 
-        let request = self.chat_request(&model, messages, None);
+        let reasoning = self.reasoning_control(&model)?;
+        let request = self.chat_request(&model, messages, None, reasoning);
 
         let timeout = self.backend.request_timeout();
-        let response: ChatResponse = tokio::time::timeout(
+        let response: Value = tokio::time::timeout(
             timeout,
-            client
-                .chat()
-                .create_byot::<ChatRequest, ChatResponse>(request),
+            client.chat().create_byot::<ChatRequest, Value>(request),
         )
         .await
         .map_err(|_| {
             tracing::warn!(timeout_secs = timeout.as_secs(), "LLM request timed out");
             LlmError::Timeout
         })?
-        .map_err(LlmError::from_openai_error)?;
+        .map_err(|e| self.annotate(reasoning, &model, LlmError::from_openai_error(e)))?;
+        let response = self.decode(reasoning, &model, response)?;
 
         Ok(response
             .choices
@@ -1038,7 +1116,9 @@ pub(crate) async fn serialize_cache_fixture(
     );
     let secrets = crate::test_support::empty_secrets().await;
     let adapter = OpenAI::new(&backend, &secrets);
-    serde_json::to_value(adapter.build_chat_request(messages, tools, model, options)).unwrap()
+    let reasoning = adapter.reasoning_control(model).unwrap();
+    serde_json::to_value(adapter.build_chat_request(messages, tools, model, options, reasoning))
+        .unwrap()
 }
 
 #[cfg(test)]
@@ -1189,7 +1269,10 @@ mod tests {
         backend.models = Some(vec![crate::config::Model {
             name: "test-model".into(),
             api: None,
-            reasoning: reasoning.map(|effort| ReasoningConfig { effort }),
+            reasoning: reasoning.map(|effort| crate::config::ReasoningConfig {
+                effort,
+                format: None,
+            }),
             price_input: None,
             price_output: None,
             price_cache_read: None,
@@ -1201,7 +1284,12 @@ mod tests {
     #[tokio::test]
     async fn configured_reasoning_is_serialized_in_outbound_request() {
         let backend = openai_for(Some(ReasoningEffort::None)).await;
-        let request = backend.chat_request("test-model", vec![msg("user", "hello")], None);
+        let request = backend.chat_request(
+            "test-model",
+            vec![msg("user", "hello")],
+            None,
+            backend.reasoning_control("test-model").unwrap(),
+        );
         let body = serde_json::to_value(request).unwrap();
         assert_eq!(body["reasoning"], serde_json::json!({"effort": "none"}));
     }
@@ -1209,7 +1297,12 @@ mod tests {
     #[tokio::test]
     async fn nonzero_reasoning_effort_is_serialized_verbatim() {
         let backend = openai_for(Some(ReasoningEffort::High)).await;
-        let request = backend.chat_request("test-model", vec![msg("user", "hello")], None);
+        let request = backend.chat_request(
+            "test-model",
+            vec![msg("user", "hello")],
+            None,
+            backend.reasoning_control("test-model").unwrap(),
+        );
         let body = serde_json::to_value(request).unwrap();
         assert_eq!(body["reasoning"], serde_json::json!({"effort": "high"}));
     }
@@ -1228,8 +1321,9 @@ mod tests {
             (ReasoningEffort::Max, "max"),
         ];
         for (effort, wire) in cases {
-            let v = serde_json::to_value(ReasoningConfig { effort }).unwrap();
+            let v = serde_json::to_value(EffortObject { effort }).unwrap();
             assert_eq!(v, serde_json::json!({"effort": wire}));
+            assert_eq!(effort.as_str(), wire);
         }
     }
 
@@ -1238,7 +1332,12 @@ mod tests {
         // Absent config must omit the field rather than null it, so the
         // provider default applies.
         let backend = openai_for(None).await;
-        let request = backend.chat_request("test-model", vec![msg("user", "hello")], None);
+        let request = backend.chat_request(
+            "test-model",
+            vec![msg("user", "hello")],
+            None,
+            backend.reasoning_control("test-model").unwrap(),
+        );
         let body = serde_json::to_value(request).unwrap();
         assert!(
             body.get("reasoning").is_none(),
@@ -1250,7 +1349,12 @@ mod tests {
     async fn configured_reasoning_matches_backend_prefixed_model_id() {
         // Callers may pass `backend:model`; the configured default still applies.
         let backend = openai_for(Some(ReasoningEffort::None)).await;
-        let request = backend.chat_request("proxy:test-model", vec![msg("user", "hi")], None);
+        let request = backend.chat_request(
+            "proxy:test-model",
+            vec![msg("user", "hi")],
+            None,
+            backend.reasoning_control("proxy:test-model").unwrap(),
+        );
         let body = serde_json::to_value(request).unwrap();
         assert_eq!(body["reasoning"], serde_json::json!({"effort": "none"}));
     }
@@ -1258,7 +1362,12 @@ mod tests {
     #[tokio::test]
     async fn unknown_model_omits_reasoning_field() {
         let backend = openai_for(Some(ReasoningEffort::None)).await;
-        let request = backend.chat_request("other-model", vec![msg("user", "hi")], None);
+        let request = backend.chat_request(
+            "other-model",
+            vec![msg("user", "hi")],
+            None,
+            backend.reasoning_control("other-model").unwrap(),
+        );
         let body = serde_json::to_value(request).unwrap();
         assert!(
             body.get("reasoning").is_none(),
@@ -1464,6 +1573,9 @@ mod tests {
 
 #[cfg(test)]
 mod request_reload_tests;
+
+#[cfg(test)]
+mod reasoning_tests;
 
 #[cfg(test)]
 mod telemetry_tests {

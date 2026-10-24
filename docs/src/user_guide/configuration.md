@@ -389,10 +389,98 @@ backends:
         reasoning: { effort: none }
 ```
 
-Available levels, from least to most thinking: `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`. Setting `none` turns the extra thinking off, which keeps small prompts fast. Other levels are passed through to the selected API, except `max`, which the native Responses client rejects.
-Only use levels your provider and model support.
+| Field                                  | Default                     | Meaning                                                                                                                                         |
+| -------------------------------------- | --------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
+| `backends[].models[].reasoning.effort` | Omitted: no control sent    | `none`, `minimal`, `low`, `medium`, `high`, `xhigh` or `max`, forwarded unchanged. Which values a model accepts is up to its provider.          |
+| `backends[].models[].reasoning.format` | Omitted: `reasoning` object | Chat Completions only. `openrouter` sends `reasoning: {"effort": …}`; `openai` sends top-level `reasoning_effort`. Unknown values fail parsing. |
 
-When present, Chaz includes `reasoning` in the Chat Completions or Responses request body, so this explicit choice takes precedence over a backend or provider default. Omit `reasoning` to leave that default unchanged. The setting applies only to the named model; models on the same backend may use different levels.
+What reaches the wire depends on the model's effective API (see [Choosing an API](#choosing-an-api-without-renaming-models)):
+
+| Effective API        | `format` omitted                                     | `format: openrouter`         | `format: openai`        |
+| -------------------- | ---------------------------------------------------- | ---------------------------- | ----------------------- |
+| `chat-completions`   | `"reasoning": {"effort": …}` (unchanged legacy body) | `"reasoning": {"effort": …}` | `"reasoning_effort": …` |
+| `responses`          | `"reasoning": {"effort": …}`; `max` refused          | Refused at startup           | Refused at startup      |
+| `anthropic-messages` | Nothing; startup warning                             | Refused at startup           | Refused at startup      |
+
+The setting applies only to the named model; models on the same backend may use different levels and formats.
+Live-discovered or unlisted models send no reasoning control.
+See [Reasoning controls are requests, not guarantees](#reasoning-controls-are-requests-not-guarantees) for what a provider does with them.
+
+## Reasoning controls are requests, not guarantees
+
+`reasoning.effort` tells Chaz which field to send. The provider decides what it means.
+Supported levels depend on the model, the API and the provider, and change over time:
+
+- `none` is not a universal off switch. Some models reject it (OpenRouter marks them `mandatory`), some cannot stop thinking at all, and native Anthropic effort has no `none`.
+- A provider may map an unsupported level to the nearest supported one (OpenRouter documents this), return HTTP 400, or ignore a field it does not know.
+- Chaz never translates a level, guesses a format from a URL, host or model name, or retries a rejected request without the control. Any of those would silently change cost and behavior.
+
+**Format is explicit.** OpenRouter's Chat dialect is a `reasoning` object; OpenAI Chat Completions and several OpenAI-compatible servers document a top-level `reasoning_effort` string instead.
+Omitting `format` keeps the `reasoning` object Chaz has always sent, byte for byte.
+Format is per model because one gateway can front providers that speak different dialects.
+It is separate from `api`: the native Responses API always uses its own `reasoning.effort`, so any explicit `format` on a Responses or Anthropic Messages model refuses to start, even though the OpenRouter object looks similar.
+
+**Native Anthropic does not send effort.** Chaz has no mapping to Anthropic's `output_config.effort` yet.
+A model on `type: anthropic` with `reasoning` configured starts with a warning and keeps the provider default; its requests are unchanged.
+
+**Proxies can override you.** When Chaz talks to a gateway, Chaz's explicit value replaces a gateway _default_ that applies only to requests without one.
+A gateway that _forces_ a field overwrites whatever Chaz sent, and Chaz cannot see that.
+Chaz reports what it sent, not what reached the model.
+
+**What you see.** At startup the executor logs one line per configured model: `sends <field>=<value>` at info, the Anthropic warning, or the refusal.
+When a provider rejects a request that carried a control, the error keeps the provider's message and adds the field and value sent, without claiming that field was the cause.
+A provider body that is not OpenAI-shaped (for example a bare 422) is kept as a single-line excerpt of at most 500 characters, with the backend's credential redacted, rather than replaced by a parser error.
+Rejections stay non-retryable.
+Reasoning token counts appear in usage only when the provider reports them; a missing count is unknown, not zero.
+
+These settings live in the executor's YAML and take effect after restart.
+
+### Walkthrough: one gateway, two reasoning dialects
+
+1. Configure one gateway with a model that takes OpenRouter's object, one that documents `reasoning_effort`, and a native Anthropic model:
+
+   ```yaml
+   backends:
+     - name: proxy
+       type: openaicompatible
+       api_base: http://127.0.0.1:18081/v1
+       models:
+         - name: example/router-model
+           reasoning: { effort: low }
+         - name: example/openai-model
+           reasoning: { effort: low, format: openai }
+     - name: claude
+       type: anthropic
+       models:
+         - name: example/claude-model
+           reasoning: { effort: low }
+   ```
+
+2. Start the executor. Its log states what each model will send:
+
+   ```text
+   INFO chaz: Reasoning: backend 'proxy' model 'example/router-model' (chat-completions) sends reasoning.effort=low; provider support is not verified
+   INFO chaz: Reasoning: backend 'proxy' model 'example/openai-model' (chat-completions) sends reasoning_effort=low; provider support is not verified
+   WARN chaz: Reasoning: backend 'claude' model 'example/claude-model': reasoning.effort=low is not sent; Chaz has no reasoning control for the anthropic-messages API, so the provider default applies
+   ```
+
+   Remove `reasoning` from the Anthropic model if you do not want the warning; its requests are the same either way.
+
+3. Change `example/openai-model` to `effort: none` on a model that requires reasoning. The turn fails once, with no retry:
+
+   ```text
+   Invalid request: Unsupported value: 'reasoning_effort' does not support 'none' with this model. (request to backend 'proxy' model 'example/openai-model' included reasoning_effort=none; the provider did not say whether that field caused the rejection)
+   ```
+
+   Choose a level the model's provider documents, or remove `reasoning`, restart, and resend.
+
+4. Move `example/openai-model` to `api: responses` but leave `format: openai`. The executor refuses to start:
+
+   ```text
+   Error: invalid reasoning config: backend 'proxy' model 'example/openai-model': reasoning.format 'openai' selects a Chat Completions field, but the model's API is 'responses'. Remove reasoning.format; Responses always sends reasoning.effort
+   ```
+
+   Delete the `format` line. Responses then sends `reasoning: {"effort": "low"}` natively.
 
 ## Choosing an API without renaming models
 
@@ -753,16 +841,16 @@ Chat Completions.
 Other models on the same connection keep their configured API or the backend
 family's default.
 
-| Setting or behavior                    | Responses transport                                                                                                                   |
-| -------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
-| `backends[].models[].api: responses`   | Select the native Responses client for this exact model ID.                                                                           |
-| `backends[].models[].reasoning.effort` | Send `none`, `minimal`, `low`, `medium`, `high` or `xhigh`; `max` is rejected before sending. Provider/model support may be narrower. |
-| `backends[].max_tokens`                | Send an optional `max_output_tokens` ceiling; omission leaves the provider default.                                                   |
-| Conversation storage                   | Use stateless requests (`store: false`); replay opaque output only for the same API, requested raw model and connection origin.       |
-| Cache identity                         | Send an opaque `prompt_cache_key` scoped to the caller, connection and persisted session.                                             |
-| Cache accounting                       | Record the returned `usage.input_tokens_details.cached_tokens`; zero is a reported miss, absence or malformed data is unknown.        |
-| Completed model switches               | Convert only retained visible text and complete real call/result pairs; unsupported history refuses before HTTP.                      |
-| Pending waits                          | Changed or unknown origin refuses before wait observation, approval or further effects.                                               |
+| Setting or behavior                    | Responses transport                                                                                                                                                                   |
+| -------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `backends[].models[].api: responses`   | Select the native Responses client for this exact model ID.                                                                                                                           |
+| `backends[].models[].reasoning.effort` | Send `none`, `minimal`, `low`, `medium`, `high` or `xhigh`; `max` is rejected before sending. Provider/model support may be narrower; an explicit `reasoning.format` refuses startup. |
+| `backends[].max_tokens`                | Send an optional `max_output_tokens` ceiling; omission leaves the provider default.                                                                                                   |
+| Conversation storage                   | Use stateless requests (`store: false`); replay opaque output only for the same API, requested raw model and connection origin.                                                       |
+| Cache identity                         | Send an opaque `prompt_cache_key` scoped to the caller, connection and persisted session.                                                                                             |
+| Cache accounting                       | Record the returned `usage.input_tokens_details.cached_tokens`; zero is a reported miss, absence or malformed data is unknown.                                                        |
+| Completed model switches               | Convert only retained visible text and complete real call/result pairs; unsupported history refuses before HTTP.                                                                      |
+| Pending waits                          | Changed or unknown origin refuses before wait observation, approval or further effects.                                                                                               |
 
 ### What survives a restart
 

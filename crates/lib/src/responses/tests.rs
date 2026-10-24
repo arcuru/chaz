@@ -1,5 +1,5 @@
 use super::*;
-use crate::config::{BackendType, Model};
+use crate::config::{BackendType, Model, ReasoningConfig};
 use crate::test_support::empty_secrets;
 use wiremock::{
     Mock, MockServer, ResponseTemplate,
@@ -63,6 +63,7 @@ async fn ordered_wire_replay_keeps_every_item_and_call_id() {
     config.max_tokens = Some(1234);
     config.models.as_mut().unwrap()[0].reasoning = Some(ReasoningConfig {
         effort: ReasoningEffort::XHigh,
+        format: None,
     });
     let client = Responses::new(&config, &secrets);
     Mock::given(method("POST"))
@@ -441,6 +442,7 @@ async fn unsupported_reasoning_and_corrupt_replay_fail_before_http() {
     let mut config = backend(&server.uri());
     config.models.as_mut().unwrap()[0].reasoning = Some(ReasoningConfig {
         effort: ReasoningEffort::Max,
+        format: None,
     });
     let client = Responses::new(&config, &empty_secrets().await);
     assert!(matches!(
