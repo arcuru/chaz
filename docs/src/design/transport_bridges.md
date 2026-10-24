@@ -367,6 +367,7 @@ ask in the first place (see [Security → Tool Approval](../user_guide/security.
 | Approval entry types + helpers   | `session::EntryType`, `chaz_core::bridge` (`approval_*`, `resolved_decisions`, `unrendered_approval_requests`) |
 | Approval proxy (daemon)          | `server/approval_proxy.rs` (`spawn_session_db_approval_proxy`)                                                 |
 | Approval render/capture (bridge) | `attach_approval_watcher`, `handle_approval_reaction`, `resolve_pending_approval` in each bridge crate         |
+| Matrix workspace rooms           | `chaz-matrix-bridge` `bridge::workspace`; see [Matrix Workspace](./matrix_workspace.md)                        |
 
 ## See also
 

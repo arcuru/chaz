@@ -61,6 +61,7 @@ Example with a shared room:
        allow_list: "@you:example" # optional; falls back to a top-level allow_list
        # id: <stable-login-id>         # optional; defaults to the MXID
        # room_size_limit: 100          # optional per-login cap
+       # workspace_manager: "@you:example" # optional; enables the personal workspace
 
    # chaz runtime keys the embedded server needs:
    state_dir: /var/lib/chaz-matrix
@@ -82,7 +83,8 @@ Example with a shared room:
    `homeserver_url`, `username`, and `password` are the bot's login; `password`
    (and `unlock_password`) accept `${ENV}` references so no secret has to live in
    the file. `allow_list` / `room_size_limit` may be set per-login or as global
-   fallbacks at the top level.
+   fallbacks at the top level. `workspace_manager` is per-login only; see
+   [Personal workspace](#personal-workspace-space-lobby-and-named-chats).
 
 4. **Run the bridge** (with the daemon already running):
 
@@ -331,13 +333,31 @@ Commands are sent as Matrix messages. Session ops go through the same transport-
 
 ### Approval & misc
 
-| Command                        | Description                                                                 |
-| ------------------------------ | --------------------------------------------------------------------------- |
-| `!chaz approve` / `!chaz deny` | Decide the pending tool approval (or react to the notice with ✅ / ❌ / ⏭) |
-| `!chaz send <msg>`             | One-shot message with no conversation context                               |
-| `!chaz clear`                  | Ignore all messages before this point                                       |
-| `!chaz rename`                 | Rename the Matrix room based on conversation content                        |
-| `!chaz party`                  | 🎉                                                                          |
+| Command                        | Description                                                                   |
+| ------------------------------ | ----------------------------------------------------------------------------- |
+| `!chaz approve` / `!chaz deny` | Decide the pending tool approval (or react to the notice with ✅ / ❌ / ⏭)   |
+| `!chaz send <msg>`             | One-shot message with no conversation context                                 |
+| `!chaz clear`                  | Ignore all messages before this point                                         |
+| `!chaz rename`                 | Rename the Matrix room based on conversation content (not in workspace chats) |
+| `!chaz party`                  | 🎉                                                                            |
+
+### Workspace
+
+Only the login's configured `workspace_manager` may run these; see
+[Personal workspace](#personal-workspace-space-lobby-and-named-chats).
+
+| Command                           | Where                    | Description                                                              |
+| --------------------------------- | ------------------------ | ------------------------------------------------------------------------ |
+| `!chaz workspace help`            | anywhere                 | Show the workspace vocabulary                                            |
+| `!chaz workspace setup`           | direct chat with the bot | Preview the Space and Lobby, with room version and creator powers        |
+| `!chaz workspace confirm <op>`    | direct chat with the bot | Create the previewed Space and Lobby                                     |
+| `!chaz workspace status [<op>]`   | Lobby or direct chat     | Workspace summary, or the exact progress of one operation                |
+| `!chaz workspace retry <op>`      | Lobby or direct chat     | Continue an incomplete operation, or re-check an uncertain room creation |
+| `!chaz workspace cancel <op>`     | Lobby or direct chat     | Stop an unfinished operation; deletes nothing                            |
+| `!chaz chat new <name>`           | Lobby                    | Create a fresh named chat room with its own new session                  |
+| `!chaz chat list`                 | Lobby                    | List this workspace's chats with their handles (`c1`, `c2`, …) and links |
+| `!chaz chat rename <chat> <name>` | Lobby                    | Rename a chat by handle; the room and session stay the same              |
+| `!chaz chat rename <name>`        | inside a workspace chat  | Rename this chat                                                         |
 
 ## Attached rooms and reply routing
 
@@ -557,6 +577,173 @@ out of the conversation. It does not keep the conversation out of chaz or the mo
    ```
 
    Verify that device from another of your sessions, then send the message again.
+
+## Personal workspace (Space, Lobby and named chats)
+
+A workspace gives one person a tidy place to keep separate conversations with
+the bot: a private Matrix **Space** that lists a **Lobby** and one room per
+chat. Every chat room has exactly one new Chaz session, so chats never share
+a transcript. Turn it on by setting `workspace_manager` on the login to your
+exact MXID; unset, every workspace command refuses.
+
+**A Space is a folder of rooms, not a conversation and not a permission
+group.** What each part does:
+
+| Room      | You use it for                                  | Chaz context                        |
+| --------- | ----------------------------------------------- | ----------------------------------- |
+| Space     | Finding the Lobby and your chats in your client | None; the bot never replies there   |
+| Lobby     | `!chaz chat …` and `!chaz workspace …` commands | None; it is command-only, no agent  |
+| Each chat | Talking to the agent, like any direct chat      | Exactly one session, created for it |
+
+What is automatic and what you do:
+
+- **Only you manage it.** A command counts only when its sender is exactly the
+  configured `workspace_manager` and passes the login's `allow_list`. Being in
+  the Space or Lobby, or quoting a command, grants nothing.
+- **Only new chats appear.** `chat new` creates a fresh room and a fresh
+  session. Existing rooms, sessions, internal sessions and the agent catalog
+  are never listed, imported or moved, and `chat list` shows only this
+  workspace's chats. An old workspace chat is resumed by opening its link.
+- **Privacy is explicit.** The bot creates every room invite-only, with
+  history visible to joined members only, no guest access and no room
+  directory entry. The Lobby and chats are encrypted from creation. Only you
+  are invited, and only once a chat is ready; Space membership never invites
+  anyone or grants access. Room names, topics, Space links and the
+  `dev.chaz.workspace` marker described below are room state, which Matrix does
+  not end-to-end encrypt: do not put secrets in chat names.
+- **The bot creates the rooms.** You get power level 100 in each and are not a
+  creator. `setup` shows the homeserver's room version before anything is
+  created: from room version 12 on, a creator's power is permanent and cannot
+  be revoked, so the bot keeps it. An unrecognised room version refuses setup.
+- **Names are literal labels.** `chat rename` sets the room name and the
+  session's [description](tui.md#session-descriptions) to exactly what you
+  typed; no model writes titles. The model-based `!chaz rename` is refused in
+  workspace chats. Rooms and sessions are identified by ID, never by name.
+- **Bindings are fixed.** `attach`, `detach` and `participation` are refused
+  in workspace chats, and the bot never creates a replacement session for a
+  chat whose session it cannot open. Replies and tool approvals use the
+  ordinary [reply routing](#attached-rooms-and-reply-routing) for that room
+  only; nothing is ever posted to the Lobby or another chat instead.
+
+**Where the state lives.** The workspace record — the Space, Lobby and chat
+room IDs, their session IDs and every operation's progress — is in the bridge
+peer's local `chaz_peer` database, which never syncs. Each room also carries a
+`dev.chaz.workspace` state event naming its workspace, operation and role; the
+bridge uses it to keep such rooms away from ordinary history bootstrap even
+when the record does not list them.
+
+**Failure modes.** Room creation cannot be made exactly-once, so every request
+is an operation (`op-N`) whose progress is saved before each step:
+
+- If a room-creation request has an unknown outcome (a dropped connection or a
+  server error), the operation becomes **uncertain**. The request is never sent
+  again. `workspace retry` looks for a room the bot created with that
+  operation's marker and continues with it; if none, or more than one, is
+  visible it stays uncertain. Use `workspace cancel` only if you are sure no
+  room was created.
+- If a later step fails (session setup, a Space link, an invitation), the
+  operation is **incomplete** and its report names what is done and pending.
+  `workspace retry` runs only the pending steps. A chat whose session is not
+  ready replies "not ready" and sends nothing to the agent.
+- A session database created before an interruption is found again through a
+  marker in its initial settings, so a retry never makes a second one.
+- One operation runs at a time; a new request waits until the unfinished one
+  is retried or cancelled. Repeated delivery of the same command returns the
+  same report. Bridge restarts keep everything; nothing resumes on its own.
+- Cancel never deletes or leaves a room. A room an operation already created
+  stays as it is, marked "not ready" in `chat list`, and setup cannot be
+  cancelled once it created a room — retry it instead.
+
+V1 has no archive, threaded Inbox, existing-room adoption, nested Spaces or
+model-driven management.
+
+### Walkthrough: a workspace with one interrupted chat
+
+1. Set `workspace_manager: "@you:example"` on the bot's login and restart the
+   bridge. In your existing direct chat with the bot, ask for a preview:
+
+   ```text
+   > !chaz workspace setup
+   Proposed workspace (operation op-1):
+   - Bot login @chaz:example, owning agent chaz, manager @you:example.
+   - A private Space “Chaz” and a command-only “Lobby” room.
+   - Lobby and chats: invite-only, encrypted, history visible to joined members only, no guests, not in the room directory. Only @you:example is invited.
+   - The Space is invite-only and unlisted; its names and links are room state, which Matrix does not end-to-end encrypt.
+   - Room version 12: the bot is the room creator with permanent, unlimited power that no one can revoke. @you:example gets power 100 in every room and is not a creator.
+   - No existing sessions or rooms are listed, moved or imported.
+   Reply `!chaz workspace confirm op-1` to create these rooms.
+   ```
+
+2. Confirm it, then accept both invitations in your client:
+
+   ```text
+   > !chaz workspace confirm op-1
+   op-1: workspace setup — done.
+   Done: Space created, Lobby created, listed in the Space, linked back to the Space, invited to the Space, invited to the Lobby.
+   Space: https://matrix.to/#/!space:example
+   Lobby: https://matrix.to/#/!lobby:example
+   Accept both invitations; create chats from the Lobby.
+   ```
+
+3. In the Lobby, start a chat. Accept its invitation and talk there:
+
+   ```text
+   > !chaz chat new Bike repair
+   op-2: new chat “Bike repair” (c1) — done.
+   Done: room created, session created and bound, session label set, reply delivery installed, listed in the Space, linked back to the Space, invitation sent.
+   Open chat: https://matrix.to/#/!bike:example
+   A new session is ready; no other chat history was copied.
+   ```
+
+4. Failure and recovery. The connection drops while creating a second chat,
+   and the daemon has not yet synced the owning agent to this bridge:
+
+   ```text
+   > !chaz chat new Trip plans
+   op-3: new chat “Trip plans” (c2) — uncertain.
+   Pending: room creation (outcome unknown), session created and bound, session label set, reply delivery installed, listed in the Space, linked back to the Space, invitation sent.
+   Last error: room.create: outcome unknown (connection reset); it will not be sent again
+   !chaz workspace retry op-3 checks again for the room. If you are sure no room was created, !chaz workspace cancel op-3 stops it.
+
+   > !chaz chat new Taxes
+   !chaz Error: op-3 is unfinished (uncertain); use !chaz workspace retry op-3 or cancel op-3 first
+
+   > !chaz workspace retry op-3
+   op-3: new chat “Trip plans” (c2) — incomplete.
+   Done: room created.
+   Pending: session created and bound, session label set, reply delivery installed, listed in the Space, linked back to the Space, invitation sent.
+   Last error: session.provision: owning agent chaz is not hosted yet
+   Room !trip:example exists; it is not ready for chat. No second room will be created.
+   Continue with !chaz workspace retry op-3 (only pending steps run).
+   ```
+
+   The retry found the room the lost request had created instead of creating
+   another. Once the agent has synced, retry again; only the pending steps run:
+
+   ```text
+   > !chaz workspace retry op-3
+   op-3: new chat “Trip plans” (c2) — done.
+   Done: room created, session created and bound, session label set, reply delivery installed, listed in the Space, linked back to the Space, invitation sent.
+   Open chat: https://matrix.to/#/!trip:example
+   A new session is ready; no other chat history was copied.
+   ```
+
+5. Find and rename chats from the Lobby:
+
+   ```text
+   > !chaz chat list
+   Chats in this workspace:
+   c1 “Bike repair” — https://matrix.to/#/!bike:example
+   c2 “Trip plans” — https://matrix.to/#/!trip:example
+
+   > !chaz chat rename c1 Winter bike
+   op-4: rename c1 to “Winter bike” — done.
+   Done: room name set, session label set.
+   Room and session unchanged; only the label changed.
+   ```
+
+   Typing an ordinary message in the Lobby gets a reminder that it is
+   command-only; nothing reaches the agent.
 
 ## Limitations
 
