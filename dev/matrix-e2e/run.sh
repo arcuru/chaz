@@ -508,6 +508,7 @@ logins:
     username: "$AGENT_MXID"
     password: "$AGENT_PASSWORD"
     allow_list: "$PUPPET_MXID"
+    workspace_manager: "$PUPPET_MXID"
 
 agents:
   - name: chaz
@@ -1484,3 +1485,130 @@ for out in true-reset-preview true-reset-execute true-reset-empty; do
         fail "agent password leaked into $out"
 done
 printf '\033[1;32mPASS\033[0m — true reset: nonmutating preview, invite rejected, joined room left, both forgotten, control readable, rerun empty, no secret leaked\n' >&2
+
+# ------------------------------------------------------- workspace cases ---
+# The personal workspace on a real homeserver, driven by the cross-signed
+# probe device because the Lobby and chats are encrypted. The true reset above
+# left the bridge stopped with no rooms; start it again and open a fresh
+# encrypted control DM.
+#
+# Case W1 — setup previews, then creates a Space and Lobby with private state
+# Case W2 — the Lobby is command-only: plain text reaches no model
+# Case W3 — a new chat is private, linked, and answers in its own room only
+# Case W4 — after bridge and daemon restarts the chat still answers, and no
+#           second room or session appears
+log "workspace: restarting the bridge"
+spawn bridge-workspace env RUST_LOG="$BRIDGE_RUST_LOG" "$CHAZ_MATRIX_BIN" --config "$BRIDGE_CONFIG"
+BRIDGE_PID="$SPAWNED_PID"
+BRIDGE_LOG="$WORKSPACE/bridge-workspace.log"
+wait_for "bridge to come back for the workspace" 120 grep -q "The client is ready" "$BRIDGE_LOG"
+CONTROL_ROOM="$(probe --dir "$SIGNED_DIR" create-dm --invite "$AGENT_MXID")" ||
+	fail "could not create the workspace control DM"
+probe --dir "$SIGNED_DIR" wait-joined --room "$CONTROL_ROOM" --user "$AGENT_MXID" --timeout 90 ||
+	fail "the agent did not join the workspace control DM"
+
+ws_say() { probe --dir "$SIGNED_DIR" send --room "$1" --body "$2" >/dev/null || fail "could not send '$2'"; }
+ws_expect() {
+	probe --dir "$SIGNED_DIR" expect --room "$1" --sender "$AGENT_MXID" --contains "$2" \
+		--timeout "$REPLY_TIMEOUT" >/dev/null || fail "no reply containing '$2' (see $WORKSPACE/probe.log, $BRIDGE_LOG)"
+}
+# The puppet's pending invitation whose stripped state names the room `$1`.
+ws_invited() {
+	mx GET '/_matrix/client/v3/sync?timeout=0' "$PUPPET_TOKEN" | jq -er --arg n "$1" '
+		.rooms.invite // {} | to_entries[]
+		| select(any(.value.invite_state.events[]; .type == "m.room.name" and .content.name == $n))
+		| .key'
+}
+ws_join() {
+	mx POST "/_matrix/client/v3/join/$(jq -rn --arg r "$1" '$r|@uri')" "$PUPPET_TOKEN" '{}' |
+		jq -e '.room_id' >/dev/null || fail "puppet could not join $1"
+}
+ws_state() { mx GET "/_matrix/client/v3/rooms/$(jq -rn --arg r "$1" '$r|@uri')/state" "$PUPPET_TOKEN"; }
+# Private by construction, and nobody but the bot and puppet is in or invited.
+ws_assert_private() {
+	local room="$1" encrypted="$2" state
+	state="$(ws_state "$room")"
+	jq -e --arg p "$PUPPET_MXID" --arg a "$AGENT_MXID" --argjson enc "$encrypted" '
+		(map(select(.type == "m.room.join_rules"))[0].content.join_rule == "invite")
+		and (map(select(.type == "m.room.history_visibility"))[0].content.history_visibility == "joined")
+		and (map(select(.type == "m.room.guest_access"))[0].content.guest_access == "forbidden")
+		and ((map(select(.type == "m.room.encryption")) | length > 0) == $enc)
+		and (map(select(.type == "dev.chaz.workspace")) | length == 1)
+		and (map(select(.type == "m.room.power_levels"))[0].content.users[$p] == 100)
+		and ([.[] | select(.type == "m.room.member" and (.content.membership == "join" or .content.membership == "invite")) | .state_key] | sort == ([$a, $p] | sort))
+	' <<<"$state" >/dev/null || fail "workspace room $room is not private as created: $state"
+	mx GET "/_matrix/client/v3/directory/list/room/$(jq -rn --arg r "$room" '$r|@uri')" "" |
+		jq -e '.visibility == "private"' >/dev/null || fail "workspace room $room is in the room directory"
+}
+
+log "Case W1: workspace setup preview and confirm"
+ws_say "$CONTROL_ROOM" "!chaz workspace setup"
+ws_expect "$CONTROL_ROOM" "workspace confirm op-1"
+[[ -z "$(ws_invited Lobby || true)" ]] || fail "the preview created rooms"
+ws_say "$CONTROL_ROOM" "!chaz workspace confirm op-1"
+ws_expect "$CONTROL_ROOM" "workspace setup — done"
+SPACE_ID="$(ws_invited Chaz)" || fail "no Space invitation"
+LOBBY_ID="$(ws_invited Lobby)" || fail "no Lobby invitation"
+ws_join "$SPACE_ID"
+ws_join "$LOBBY_ID"
+ws_state "$SPACE_ID" | jq -e --arg l "$LOBBY_ID" '
+	(map(select(.type == "m.room.create"))[0].content.type == "m.space")
+	and (map(select(.type == "m.space.child" and .state_key == $l)) | length == 1)' >/dev/null ||
+	fail "the Space is not a Space that lists the Lobby"
+ws_assert_private "$SPACE_ID" false
+ws_assert_private "$LOBBY_ID" true
+printf '\033[1;32mPASS\033[0m — workspace setup: preview created nothing; private Space lists an encrypted invite-only Lobby\n' >&2
+
+log "Case W2: the Lobby is command-only"
+TURNS_BEFORE="$(stub_requests)"
+ws_say "$LOBBY_ID" "hello lobby"
+ws_expect "$LOBBY_ID" "The Lobby is command-only"
+[[ "$(stub_requests)" -eq "$TURNS_BEFORE" ]] || fail "a Lobby message started a model turn"
+for room in "$SPACE_ID" "$LOBBY_ID"; do
+	! grep -F "Channel bound to session" "$BRIDGE_LOG" | grep -qF "$room" ||
+		fail "the bridge bound a session to workspace room $room"
+done
+printf '\033[1;32mPASS\033[0m — Lobby: plain text answered with a notice, no model turn, no session for Space or Lobby\n' >&2
+
+log "Case W3: a fresh named chat"
+ws_say "$LOBBY_ID" "!chaz chat new Bike repair"
+ws_expect "$LOBBY_ID" "(c1) — done"
+CHAT_ID="$(ws_invited "Bike repair")" || fail "no chat invitation"
+ws_join "$CHAT_ID"
+ws_assert_private "$CHAT_ID" true
+ws_state "$SPACE_ID" | jq -e --arg c "$CHAT_ID" 'map(select(.type == "m.space.child" and .state_key == $c)) | length == 1' >/dev/null ||
+	fail "the Space does not list the chat"
+LOBBY_REPLIES="$(probe --dir "$SIGNED_DIR" wire --room "$LOBBY_ID" --sender "$AGENT_MXID")"
+ws_say "$CHAT_ID" "workspace chat ping"
+ws_expect "$CHAT_ID" "$MARKER"
+[[ "$(probe --dir "$SIGNED_DIR" wire --room "$LOBBY_ID" --sender "$AGENT_MXID")" -eq "$LOBBY_REPLIES" ]] ||
+	fail "the chat's reply also reached the Lobby"
+CHAT_BINDINGS="$(grep -F "Channel bound to session" "$BRIDGE_LOG" | grep -cF "$CHAT_ID")"
+[[ $CHAT_BINDINGS -eq 1 ]] || fail "expected one session binding for the chat, found $CHAT_BINDINGS"
+printf '\033[1;32mPASS\033[0m — new chat: private, linked from the Space, answered in its own room only, one session\n' >&2
+
+log "Case W4: bridge and daemon restarts keep the chat"
+kill -TERM "$BRIDGE_PID"
+wait_for "bridge to exit" 30 sh -c "! kill -0 $BRIDGE_PID 2>/dev/null"
+retire_pid "$BRIDGE_PID"
+kill -TERM "$DAEMON_PID"
+wait_for "daemon to exit" 30 sh -c "! kill -0 $DAEMON_PID 2>/dev/null"
+retire_pid "$DAEMON_PID"
+spawn daemon-workspace "$CHAZ_BIN" --config "$DAEMON_CONFIG" daemon
+DAEMON_PID="$SPAWNED_PID"
+wait_for "daemon after workspace restart" 120 grep -q "daemon ready" "$WORKSPACE/daemon-workspace.log"
+spawn bridge-workspace-restarted env RUST_LOG="$BRIDGE_RUST_LOG" "$CHAZ_MATRIX_BIN" --config "$BRIDGE_CONFIG"
+BRIDGE_PID="$SPAWNED_PID"
+BRIDGE_LOG="$WORKSPACE/bridge-workspace-restarted.log"
+wait_for "bridge after workspace restart" 120 grep -q "The client is ready" "$BRIDGE_LOG"
+ws_say "$CHAT_ID" "workspace chat after restart"
+probe --dir "$SIGNED_DIR" expect --room "$CHAT_ID" --sender "$AGENT_MXID" --contains "$MARKER" \
+	--timeout "$REPLY_TIMEOUT" >/dev/null || fail "no chat reply after restarts (see $BRIDGE_LOG)"
+ws_say "$LOBBY_ID" "!chaz chat list"
+ws_expect "$LOBBY_ID" "c1 “Bike repair”"
+! grep -F "Created transport channel session" "$BRIDGE_LOG" | grep -qF "$CHAT_ID" ||
+	fail "a replacement session was created for the chat after restart"
+[[ "$(mx GET /_matrix/client/v3/joined_rooms "$PUPPET_TOKEN" | jq --arg s "$SPACE_ID" --arg l "$LOBBY_ID" --arg c "$CHAT_ID" \
+	'[.joined_rooms[] | select(. == $s or . == $l or . == $c)] | length')" -eq 3 ]] || fail "workspace rooms changed"
+[[ -z "$(ws_invited "Bike repair" || true)" ]] || fail "a second chat room was created"
+printf '\033[1;32mPASS\033[0m — workspace after bridge + daemon restart: same chat answers, listed once, no replacement session or room\n' >&2

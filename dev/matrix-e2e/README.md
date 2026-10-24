@@ -185,6 +185,31 @@ both. Server queries require zero joined rooms and invites, and denied DM
 history access, while the group room left by plain `leave-all` stays readable.
 A second reset has nothing to do. Neither path may print the agent's password.
 
+### Personal workspace
+
+The bridge login sets `workspace_manager` to the puppet. After the reset the
+harness restarts the bridge and opens a fresh encrypted DM from the cross-signed
+probe device, which drives every workspace command because the Lobby and chats
+are encrypted:
+
+- **Setup (W1):** `workspace setup` must create nothing; `confirm` creates a
+  Space (`m.space`) listing a Lobby. Both are invite-only with joined-only
+  history, no guests, the workspace marker, the puppet at power 100, nobody but
+  the agent and puppet joined or invited, and no directory entry; only the Lobby
+  is encrypted.
+- **Command-only Lobby (W2):** plain text gets a notice and no stub turn, and
+  the bridge binds no session to the Space or Lobby.
+- **New chat (W3):** `chat new` creates a private encrypted room listed in the
+  Space. A message there is answered there, the Lobby receives nothing, and
+  exactly one session is bound to the room.
+- **Restarts (W4):** after both the bridge and daemon restart, the same chat
+  answers, `chat list` still shows it, no replacement session is created and no
+  second room appears.
+
+Room-creation uncertainty and partial-step recovery are covered by the bridge's
+hermetic unit tests, not here: a real homeserver cannot be made to lose a
+`createRoom` response on demand.
+
 ## Transport
 
 The harness supports two transport modes for eidetica sync between the daemon
