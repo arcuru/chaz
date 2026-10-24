@@ -223,5 +223,9 @@ builders cannot disagree about the field.
 The Chat and Responses clients keep the returned control for the request's
 lifetime and use it only to annotate a provider rejection; the error variant,
 and so retry classification, is unchanged.
-Chat success bodies are decoded from raw JSON after the SDK returns, so only
-provider error bodies reach the bounded-excerpt path in `LlmError`.
+Chat success bodies are decoded into `ChatResponse` from raw JSON after the
+SDK returns, so a well-formed success body of the wrong shape is reported
+without quoting it.
+A body that is not valid JSON at all reaches the bounded-excerpt path in
+`LlmError` whether it came with an error status or a broken success status,
+because the SDK reports both as the same deserialize error.

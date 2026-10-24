@@ -135,8 +135,6 @@ fn validate_session_scope(args: &ChazArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Resolve the configured state directory, expanding a leading `~` when set.
-/// Falls back to the platform XDG state directory when it is absent.
 /// Say once, at load, which reasoning control each configured model sends.
 /// An explicit Chat-only format on a native API refuses to start.
 fn log_reasoning_config(config: &Config) -> anyhow::Result<()> {
@@ -156,6 +154,8 @@ fn log_reasoning_config(config: &Config) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Resolve the configured state directory, expanding a leading `~` when set.
+/// Falls back to the platform XDG state directory when it is absent.
 fn resolve_state_dir(config: &Config) -> Option<PathBuf> {
     config
         .state_dir
