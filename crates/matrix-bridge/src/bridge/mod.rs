@@ -2,6 +2,7 @@ pub(crate) mod client;
 mod commands;
 mod history;
 mod typing;
+mod workspace;
 
 use chaz_core::bridge::delivery::{DeliveryBinding, DeliveryReconciler, DeliveryStore};
 use chaz_core::bridge::outbound::{
@@ -129,8 +130,14 @@ async fn backfill_joined_room(
     login_id: &str,
     owning_agent: &str,
     backfilled: &Mutex<HashMap<String, BackfilledRoom>>,
+    workspace_rooms: &workspace::RoomIndex,
 ) -> anyhow::Result<()> {
     if room.state() != RoomState::Joined {
+        return Ok(());
+    }
+    // Workspace rooms never get a bootstrapped session: the Space and Lobby
+    // have none, and each chat's session is provisioned by its operation.
+    if workspace_rooms.get(room.room_id().as_str()).is_some() {
         return Ok(());
     }
     let room_id = room.room_id().to_string();
@@ -146,6 +153,13 @@ async fn backfill_joined_room(
     let state = client
         .send(RoomStateRequest::new(room.room_id().to_owned()))
         .await?;
+    // A room created by a workspace operation the record does not list (an
+    // uncertain or cancelled create) is excluded too, by its marker state.
+    if state.room_state.iter().any(|raw| {
+        raw.get_field::<String>("type").ok().flatten().as_deref() == Some(workspace::MARKER_TYPE)
+    }) {
+        return Ok(());
+    }
     let join_id = state
         .room_state
         .iter()
@@ -374,6 +388,7 @@ fn is_transient_matrix_send_error(error: &matrix_sdk::Error) -> bool {
 const MATRIX_MESSAGE_LIMIT: usize = 8_000;
 
 /// Dispatch a shared command in the context of a Matrix room.
+#[allow(clippy::too_many_arguments)]
 async fn dispatch_in_room(
     cmd: Command,
     room: Room,
@@ -382,22 +397,43 @@ async fn dispatch_in_room(
     secrets: SecretStore,
     login_id: &str,
     owning_agent: &str,
+    managed_chat: bool,
 ) -> anyhow::Result<()> {
     let room_id = room.room_id().to_string();
 
     let Some(agent_entry) = owning_agent_entry(&server, owning_agent) else {
         anyhow::bail!("owning agent '{owning_agent}' is not hosted on this bridge yet");
     };
-    let (_conv_id, session_db) = server
-        .registry()
-        .get_or_create_conversational_channel_session(
-            &agent_entry,
-            login_id,
-            "matrix",
-            login_id,
-            &room_id,
-        )
-        .await?;
+    let (_conv_id, session_db) = if managed_chat {
+        // A workspace chat's session was provisioned by its operation; never
+        // create a replacement because a lookup came back empty.
+        match server
+            .registry()
+            .find_channel_session(&agent_entry, login_id, "matrix", login_id, &room_id)
+            .await?
+        {
+            Some(found) => found,
+            None => {
+                let _ = room
+                    .send(RoomMessageEventContent::notice_plain(
+                        MANAGED_SESSION_UNAVAILABLE,
+                    ))
+                    .await;
+                return Ok(());
+            }
+        }
+    } else {
+        server
+            .registry()
+            .get_or_create_conversational_channel_session(
+                &agent_entry,
+                login_id,
+                "matrix",
+                login_id,
+                &room_id,
+            )
+            .await?
+    };
     let session_db_id = session_db.root_id().to_string();
     let backend = get_backend(Some(&session_db), &config, &secrets).await;
     let meta = chaz_core::session::read_meta_from_db(&session_db).await;
@@ -419,6 +455,9 @@ async fn dispatch_in_room(
     render_outcome_to_room(&room, outcome).await;
     Ok(())
 }
+
+const MANAGED_SESSION_UNAVAILABLE: &str = "This workspace chat's session is not available on \
+     this bridge right now. Nothing was sent, and no replacement session was created.";
 
 async fn render_outcome_to_room(room: &Room, outcome: CommandOutcome) {
     let text = match outcome {
@@ -607,6 +646,7 @@ fn help_text() -> String {
         "`channels` — rooms bound to this session",
         "",
         "Matrix-local: `attach <session>` · `detach` · `participation <on|off|status>` · `clear` · `send <msg>` · `rename` · `party`",
+        "Workspace: `workspace help` — personal Space, command-only Lobby and named chats",
         "",
         "In a DM or when @mentioned, just talk — no prefix needed.",
     ]
@@ -780,12 +820,64 @@ impl Bridge for MatrixBridge {
         // installed, so room history is not replayed through them on startup.
         mc.initial_sync().await;
 
+        // Rooms with outbound delivery installed, and the reconciler that
+        // owns each one's persisted progress.
+        let (typing_stop, stopped) = tokio::sync::watch::channel(false);
+        let typing_tasks = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let typing_lifetime = TypingLifetime {
+            stop: typing_stop,
+            tasks: typing_tasks.clone(),
+        };
+        let attached_channels: AttachedChannels = Arc::new(Channels {
+            bindings: Mutex::new(Some(HashMap::new())),
+            stopped,
+            typing_tasks,
+        });
+
+        // Posted tool-approval prompts awaiting a reaction/command, keyed by the
+        // prompt's event id. Shared across the startup attach, the message
+        // handler, and the reaction handler.
+        let pending_approvals: PendingApprovals = Arc::new(ApprovalRelay {
+            // No timeout here: the daemon owns the clock and stamps each
+            // request with its own deadline.
+            slots: Mutex::new(HashMap::new()),
+        });
+
+        // The personal workspace record for this login. A malformed record
+        // stops the bridge rather than letting its rooms fall back to
+        // ordinary session bootstrap.
+        let workspace = Arc::new(
+            workspace::Workspace::open(
+                workspace::WorkspaceStore::new(server.registry().chaz_peer().clone(), &login_id),
+                workspace::live::LiveMatrix::new(mc.client().clone()),
+                workspace::live::LiveSessions {
+                    server: server.clone(),
+                    client: mc.client().clone(),
+                    attached: attached_channels.clone(),
+                    pending: pending_approvals.clone(),
+                    login_id: login_id.clone(),
+                    owning_agent: owning_agent.clone(),
+                },
+                login_id.clone(),
+                owning_agent.clone(),
+                creds.workspace_manager.clone(),
+            )
+            .await?,
+        );
+        let workspace_rooms = workspace.index();
+
         let backfilled_rooms: Arc<Mutex<HashMap<String, BackfilledRoom>>> =
             Arc::new(Mutex::new(HashMap::new()));
         for room in mc.client().joined_rooms() {
-            if let Err(e) =
-                backfill_joined_room(&room, &server, &login_id, &owning_agent, &backfilled_rooms)
-                    .await
+            if let Err(e) = backfill_joined_room(
+                &room,
+                &server,
+                &login_id,
+                &owning_agent,
+                &backfilled_rooms,
+                &workspace_rooms,
+            )
+            .await
             {
                 error!(room_id = %room.room_id(), "Join history backfill failed: {e}");
             }
@@ -798,12 +890,14 @@ impl Bridge for MatrixBridge {
             let login_id = login_id.clone();
             let owning_agent = owning_agent.clone();
             let backfilled_rooms = backfilled_rooms.clone();
+            let workspace_rooms = workspace_rooms.clone();
             mc.client()
                 .add_event_handler(move |event: OriginalSyncRoomMemberEvent, room: Room| {
                     let server = server.clone();
                     let login_id = login_id.clone();
                     let owning_agent = owning_agent.clone();
                     let backfilled_rooms = backfilled_rooms.clone();
+                    let workspace_rooms = workspace_rooms.clone();
                     async move {
                         if room.client().user_id() != Some(event.state_key.as_ref())
                             || event.content.membership != MembershipState::Join
@@ -816,6 +910,7 @@ impl Bridge for MatrixBridge {
                             &login_id,
                             &owning_agent,
                             &backfilled_rooms,
+                            &workspace_rooms,
                         )
                         .await
                         {
@@ -867,29 +962,6 @@ impl Bridge for MatrixBridge {
         }
 
         info!("The client is ready! Listening to new messages…");
-
-        // Rooms with outbound delivery installed, and the reconciler that
-        // owns each one's persisted progress.
-        let (typing_stop, stopped) = tokio::sync::watch::channel(false);
-        let typing_tasks = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let typing_lifetime = TypingLifetime {
-            stop: typing_stop,
-            tasks: typing_tasks.clone(),
-        };
-        let attached_channels: AttachedChannels = Arc::new(Channels {
-            bindings: Mutex::new(Some(HashMap::new())),
-            stopped,
-            typing_tasks,
-        });
-
-        // Posted tool-approval prompts awaiting a reaction/command, keyed by the
-        // prompt's event id. Shared across the startup attach, the message
-        // handler, and the reaction handler.
-        let pending_approvals: PendingApprovals = Arc::new(ApprovalRelay {
-            // No timeout here: the daemon owns the clock and stamps each
-            // request with its own deadline.
-            slots: Mutex::new(HashMap::new()),
-        });
 
         // --- Startup: install response callbacks for every room this login
         //     already has a session bound to. This is what makes the daemon's
@@ -979,6 +1051,8 @@ impl Bridge for MatrixBridge {
             // newer enable (or undo an off) while waiting for its receipt.
             let participation_command_lock = Arc::new(Mutex::new(()));
             let pending_approvals = pending_approvals.clone();
+            let workspace = workspace.clone();
+            let workspace_rooms = workspace_rooms.clone();
 
             mc.client().add_event_handler(
                 move |event: OriginalSyncRoomMessageEvent, room: Room| {
@@ -995,6 +1069,8 @@ impl Bridge for MatrixBridge {
                     let participation_counts = participation_counts.clone();
                     let participation_command_lock = participation_command_lock.clone();
                     let pending_approvals = pending_approvals.clone();
+                    let workspace = workspace.clone();
+                    let workspace_rooms = workspace_rooms.clone();
                     async move {
                         if room.state() != RoomState::Joined {
                             return;
@@ -1009,11 +1085,44 @@ impl Bridge for MatrixBridge {
                             return;
                         }
 
+                        let room_id = room.room_id().to_string();
+                        // Workspace rooms are routed before any bootstrap or
+                        // session lookup: the Space and Lobby never reach an
+                        // agent, and a chat is chat-capable only once ready.
+                        let place = workspace_rooms.get(&room_id);
+                        let managed_chat = matches!(place, Some(workspace::Place::Chat { .. }));
+                        {
+                            let raw = text_content.body.trim_start();
+                            let inner = raw.strip_prefix("!chaz").and_then(|r| {
+                                (r.is_empty() || r.starts_with(char::is_whitespace))
+                                    .then(|| r.trim().to_string())
+                            });
+                            let marked = place.is_some() || workspace::live::has_marker(&room).await;
+                            let routed = workspace::route(place.as_ref(), marked, inner.as_deref());
+                            // Unmanaged-room workspace commands go through the
+                            // join cutoff below like every other command.
+                            if routed != workspace::Route::Normal
+                                && !(place.is_none() && routed == workspace::Route::Workspace)
+                            {
+                                if routed == workspace::Route::Ignore
+                                    || !seen_events.lock().await.insert(event.event_id.to_string())
+                                {
+                                    return;
+                                }
+                                if let workspace::Route::Notice(text) = routed {
+                                    let _ = room.send(RoomMessageEventContent::notice_plain(text)).await;
+                                    return;
+                                }
+                                let origin = workspace::Origin::Managed(place.unwrap());
+                                spawn_workspace_command(&workspace, &room, &event, origin, inner);
+                                return;
+                            }
+                        }
                         // Apply the join cutoff before commands or address checks:
                         // delayed history must not execute an old command either.
-                        let room_id = room.room_id().to_string();
                         if let Err(e) = backfill_joined_room(
                             &room, &server, &login_id, &owning_agent, &backfilled_rooms,
+                            &workspace_rooms,
                         ).await {
                             error!(room_id, "Join history backfill failed: {e}");
                             return;
@@ -1042,6 +1151,15 @@ impl Bridge for MatrixBridge {
                         });
 
                         if let Some(inner) = command_inner {
+                            if place.is_none() && workspace::is_workspace_command(&inner) {
+                                let origin = if room_kind(&room).await == RoomKind::Direct {
+                                    workspace::Origin::Direct
+                                } else {
+                                    workspace::Origin::Other
+                                };
+                                spawn_workspace_command(&workspace, &room, &event, origin, Some(inner));
+                                return;
+                            }
                             let verb = inner.split_whitespace().next().unwrap_or("");
                             // View-local Matrix verbs, checked before the
                             // shared parser. These either need bridge state
@@ -1158,6 +1276,7 @@ impl Bridge for MatrixBridge {
                                         secrets.clone(),
                                         &login_id,
                                         &owning_agent,
+                                        managed_chat,
                                     )
                                     .await
                                     {
@@ -1233,7 +1352,7 @@ impl Bridge for MatrixBridge {
                             );
                             return;
                         };
-                        let resolved = if wake {
+                        let resolved = if wake && !managed_chat {
                             server.registry().get_or_create_conversational_channel_session(
                                 &agent_entry, &login_id, "matrix", &login_id, &room_id,
                             ).await.map(Some)
@@ -1244,6 +1363,16 @@ impl Bridge for MatrixBridge {
                         };
                         let (_conv_id, session_db) = match resolved {
                             Ok(Some(r)) => r,
+                            Ok(None) if managed_chat => {
+                                if wake {
+                                    let _ = room
+                                        .send(RoomMessageEventContent::notice_plain(
+                                            MANAGED_SESSION_UNAVAILABLE,
+                                        ))
+                                        .await;
+                                }
+                                return;
+                            }
                             Ok(None) => {
                                 tracing::debug!(room_id, "Unbound Matrix room observation ignored");
                                 return;
@@ -1383,6 +1512,39 @@ impl Bridge for MatrixBridge {
         futures::future::join_all(finishes).await;
         Ok(())
     }
+}
+
+type LiveWorkspace =
+    workspace::Workspace<workspace::live::LiveMatrix, workspace::live::LiveSessions>;
+
+/// Run one workspace command off the sync callback (operations wait for room
+/// echoes from sync) and post its reply into the room it came from.
+fn spawn_workspace_command(
+    workspace: &Arc<LiveWorkspace>,
+    room: &Room,
+    event: &OriginalSyncRoomMessageEvent,
+    origin: workspace::Origin,
+    command: Option<String>,
+) {
+    let (workspace, room) = (workspace.clone(), room.clone());
+    let (sender, event_id) = (event.sender.to_string(), event.event_id.to_string());
+    let command = command.unwrap_or_default();
+    tokio::spawn(async move {
+        let request = workspace::Request {
+            sender: &sender,
+            event_id: &event_id,
+            room_id: room.room_id().as_str(),
+            origin,
+            command: &command,
+        };
+        if let Some(text) = workspace.handle(request).await
+            && let Err(e) = room
+                .send(RoomMessageEventContent::notice_markdown(text))
+                .await
+        {
+            error!("Failed to send workspace reply: {e}");
+        }
+    });
 }
 
 /// Install outbound delivery for `(room, session)` exactly once per process.
@@ -1770,6 +1932,7 @@ mod tests {
                 chaz_core::security::SecretStore,
                 &'static str,
                 &'static str,
+                bool,
             ) -> F,
         ) -> usize {
             std::mem::size_of::<F>()

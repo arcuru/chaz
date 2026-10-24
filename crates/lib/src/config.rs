@@ -279,6 +279,11 @@ pub struct MatrixLogin {
     pub allow_list: Option<String>,
     /// Per-login room size limit. Falls back to top-level `room_size_limit`.
     pub room_size_limit: Option<usize>,
+    /// Exact MXID allowed to manage this login's personal Matrix workspace
+    /// (`!chaz workspace …` / `!chaz chat …`). Unset disables the workspace
+    /// commands. Being on `allow_list` alone never grants management.
+    #[serde(default)]
+    pub workspace_manager: Option<String>,
 }
 
 impl std::fmt::Debug for MatrixLogin {
@@ -289,6 +294,7 @@ impl std::fmt::Debug for MatrixLogin {
             .field("password", &self.password.as_ref().map(|_| "<redacted>"))
             .field("allow_list", &self.allow_list)
             .field("room_size_limit", &self.room_size_limit)
+            .field("workspace_manager", &self.workspace_manager)
             .finish()
     }
 }
