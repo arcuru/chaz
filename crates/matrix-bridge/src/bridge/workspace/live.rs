@@ -127,6 +127,9 @@ pub(crate) async fn has_marker(room: &Room) -> bool {
 }
 
 impl MatrixOps for LiveMatrix {
+    fn bot_id(&self) -> anyhow::Result<String> {
+        Ok(self.bot()?.to_string())
+    }
     async fn default_room_version(&self) -> anyhow::Result<String> {
         let response = self
             .client
@@ -222,7 +225,17 @@ pub(crate) struct LiveSessions {
 }
 
 impl SessionOps for LiveSessions {
-    async fn provision(&self, room: &str, source: &str) -> anyhow::Result<String> {
+    fn agent_id(&self) -> anyhow::Result<String> {
+        owning_agent_entry(&self.server, &self.owning_agent)
+            .map(|agent| agent.db_id.to_string())
+            .ok_or_else(|| anyhow::anyhow!("owning agent is not hosted"))
+    }
+    async fn provision(
+        &self,
+        room: &str,
+        source: &str,
+        allow_create: bool,
+    ) -> anyhow::Result<String> {
         let agent = owning_agent_entry(&self.server, &self.owning_agent).ok_or_else(|| {
             anyhow::anyhow!("owning agent {} is not hosted yet", self.owning_agent)
         })?;
@@ -236,13 +249,23 @@ impl SessionOps for LiveSessions {
                 &self.login_id,
                 room,
                 source,
+                allow_create,
             )
             .await?;
         Ok(db.root_id().to_string())
     }
 
     async fn install_delivery(&self, room: &str, session: &str) -> anyhow::Result<()> {
-        let (_conv, db) = self.server.registry().open_session(session).await?;
+        let agent = owning_agent_entry(&self.server, &self.owning_agent)
+            .ok_or_else(|| anyhow::anyhow!("owning agent is not hosted"))?;
+        let (_conv, db) = crate::bridge::resolve_workspace_session(
+            &self.server,
+            &agent,
+            &self.login_id,
+            room,
+            session,
+        )
+        .await?;
         let id = OwnedRoomId::try_from(room)?;
         let room = match self.client.get_room(&id) {
             Some(room) => room,

@@ -51,6 +51,9 @@ impl FakeMatrix {
 }
 
 impl MatrixOps for FakeMatrix {
+    fn bot_id(&self) -> anyhow::Result<String> {
+        Ok(BOT.into())
+    }
     async fn default_room_version(&self) -> anyhow::Result<String> {
         Ok(self.0.lock().unwrap().version.clone())
     }
@@ -72,6 +75,7 @@ impl MatrixOps for FakeMatrix {
         }
     }
     async fn find_marked_rooms(&self, marker: &Marker) -> anyhow::Result<Vec<String>> {
+        self.fail("lookup")?;
         let hs = self.0.lock().unwrap();
         Ok(hs
             .rooms
@@ -138,18 +142,32 @@ impl FakeSessions {
 }
 
 impl SessionOps for FakeSessions {
-    async fn provision(&self, room: &str, source: &str) -> anyhow::Result<String> {
-        self.fail("provision")?;
+    fn agent_id(&self) -> anyhow::Result<String> {
+        Ok("agent-id".into())
+    }
+    async fn provision(
+        &self,
+        room: &str,
+        source: &str,
+        allow_create: bool,
+    ) -> anyhow::Result<String> {
         let mut reg = self.0.lock().unwrap();
         let sid = match reg.by_source.get(source) {
             Some(sid) => sid.clone(),
             None => {
+                anyhow::ensure!(
+                    allow_create,
+                    "session creation outcome is unknown; refusing a replacement"
+                );
                 reg.creates += 1;
                 let sid = format!("session-{}", reg.creates);
                 reg.by_source.insert(source.into(), sid.clone());
                 sid
             }
         };
+        if reg.fail_once.remove("provision") {
+            anyhow::bail!("injected failure after DB creation");
+        }
         if let Some(bound) = reg.bindings.get(room) {
             anyhow::ensure!(bound == &sid, "room already bound elsewhere");
         }
@@ -284,7 +302,7 @@ async fn setup_previews_then_creates_a_private_space_and_lobby() {
     let h = harness("12").await;
     let preview = h.send(Origin::Direct, "workspace setup").await;
     for expected in [
-        "Bot login @chaz:example.org, owning agent chaz, manager @patrick:example.org",
+        "Bot @chaz:example.org on login @chaz:example.org, owning agent chaz (agent-id), manager @patrick:example.org",
         "Room version 12",
         "permanent, unlimited power",
         "not end-to-end encrypt",
@@ -331,10 +349,12 @@ async fn setup_previews_then_creates_a_private_space_and_lobby() {
 
 #[tokio::test]
 async fn unrecognized_room_version_refuses_setup() {
-    let h = harness("org.example.custom").await;
-    let reply = h.send(Origin::Direct, "workspace setup").await;
-    assert!(reply.contains("not recognized"), "{reply}");
-    assert!(h.store.load().await.unwrap().is_none());
+    for version in ["org.example.custom", "0", "13"] {
+        let h = harness(version).await;
+        let reply = h.send(Origin::Direct, "workspace setup").await;
+        assert!(reply.contains("not recognized"), "{reply}");
+        assert!(h.store.load().await.unwrap().is_none());
+    }
 }
 
 #[tokio::test]
@@ -387,53 +407,41 @@ async fn unauthorized_or_misplaced_commands_change_nothing() {
     assert_eq!(none, None);
 
     // No manager configured: everything except help refuses.
-    let ws = open(&h.store, &h.hs, &h.reg, AGENT, None).await.unwrap();
-    let reply = ws
-        .handle(Request {
-            sender: MANAGER,
-            event_id: "$x",
-            room_id: "!lobby",
-            origin: Origin::Managed(Place::Lobby),
-            command: "chat list",
-        })
+    let err = open(&h.store, &h.hs, &h.reg, AGENT, None)
         .await
+        .err()
         .unwrap();
-    assert!(reply.contains("not configured"), "{reply}");
+    assert!(err.to_string().contains("refusing"), "{err}");
 }
 
 #[tokio::test]
 async fn a_record_for_another_identity_or_a_malformed_record_refuses() {
     let h = harness("12").await;
     h.setup().await;
-    let ws = open(&h.store, &h.hs, &h.reg, "other-agent", Some(MANAGER))
-        .await
-        .unwrap();
-    let reply = ws
-        .handle(Request {
-            sender: MANAGER,
-            event_id: "$x",
-            room_id: "!lobby",
-            origin: Origin::Managed(Place::Lobby),
-            command: "chat new Hi",
-        })
-        .await
-        .unwrap();
-    assert!(reply.contains("refusing"), "{reply}");
-    let ws = open(&h.store, &h.hs, &h.reg, AGENT, Some("@else:example.org"))
-        .await
-        .unwrap();
-    let reply = ws
-        .handle(Request {
-            sender: "@else:example.org",
-            event_id: "$y",
-            room_id: "!lobby",
-            origin: Origin::Managed(Place::Lobby),
-            command: "chat list",
-        })
-        .await
-        .unwrap();
-    assert!(reply.contains("refusing"), "{reply}");
-
+    for (agent, manager) in [("other-agent", MANAGER), (AGENT, "@else:example.org")] {
+        let err = open(&h.store, &h.hs, &h.reg, agent, Some(manager))
+            .await
+            .err()
+            .unwrap();
+        assert!(err.to_string().contains("refusing"), "{err}");
+    }
+    for field in ["bot", "agent"] {
+        let mut state = h.state().await;
+        if field == "bot" {
+            state.bot_mxid = "@other:example.org".into();
+        } else {
+            state.agent_db_id = "other-id".into();
+        }
+        h.store.save(&state).await.unwrap();
+        let err = open(&h.store, &h.hs, &h.reg, AGENT, Some(MANAGER))
+            .await
+            .err()
+            .unwrap();
+        assert!(err.to_string().contains("refusing"), "{err}");
+        state.bot_mxid = BOT.into();
+        state.agent_db_id = "agent-id".into();
+        h.store.save(&state).await.unwrap();
+    }
     let txn = h.store.db.new_transaction().await.unwrap();
     txn.get_store::<DocStore>(STORE)
         .await
@@ -497,7 +505,8 @@ async fn each_new_chat_gets_its_own_room_and_session() {
         h.ws.index().get(&c1.room_id),
         Some(Place::Chat {
             handle: "c1".into(),
-            ready: true
+            ready: true,
+            session_db_id: c1.session_db_id.clone(),
         })
     );
     // The directory lists exactly the workspace's chats.
@@ -526,6 +535,21 @@ async fn repeated_and_concurrent_delivery_of_one_request_creates_one_chat() {
     assert_eq!(h.state().await.chats.len(), 1);
     assert_eq!(h.posts(), 3, "Space, Lobby, one chat");
     assert_eq!(h.reg.0.lock().unwrap().creates, 1);
+    let restarted = open(&h.store, &h.hs, &h.reg, AGENT, Some(MANAGER))
+        .await
+        .unwrap();
+    let receipt = restarted
+        .handle(Request {
+            sender: MANAGER,
+            event_id: "$same",
+            room_id: "!lobby",
+            origin: Origin::Managed(Place::Lobby),
+            command: "chat new Once",
+        })
+        .await
+        .unwrap();
+    assert_eq!(receipt, a);
+    assert_eq!(h.posts(), 3);
 }
 
 #[tokio::test]
@@ -552,6 +576,10 @@ async fn a_lost_create_response_is_reconciled_never_reposted() {
     let busy = h.lobby("chat new Other").await;
     assert!(busy.contains("op-2 is unfinished"), "{busy}");
 
+    h.hs.0.lock().unwrap().fail_once.insert("lookup");
+    let held = h.lobby("workspace retry op-2").await;
+    assert!(held.contains("cannot check rooms"), "{held}");
+    assert_eq!(h.posts(), 3, "a lookup failure never repeats createRoom");
     // Restart: a fresh engine reloads the record and reconciles by marker.
     let posts = h.posts();
     let ws = open(&h.store, &h.hs, &h.reg, AGENT, Some(MANAGER))
@@ -645,7 +673,8 @@ async fn partial_provisioning_reports_state_and_resumes_only_pending_steps() {
         h.ws.index().get(&room),
         Some(Place::Chat {
             handle: "c1".into(),
-            ready: false
+            ready: false,
+            session_db_id: None,
         })
     );
     assert!(
@@ -664,6 +693,8 @@ async fn partial_provisioning_reports_state_and_resumes_only_pending_steps() {
     assert!(reply.contains("its session is ready"), "{reply}");
     assert!(reply.contains("Pending: invitation sent."), "{reply}");
     let posts = h.posts();
+    let cancel = h.lobby("workspace cancel op-2").await;
+    assert!(cancel.contains("retry it to finish"), "{cancel}");
     let reply = h.lobby("workspace retry op-2").await;
     assert!(reply.contains("done"), "{reply}");
     assert_eq!(h.posts(), posts);
@@ -698,6 +729,7 @@ async fn rename_is_literal_and_reports_partial_success() {
     let chat = Origin::Managed(Place::Chat {
         handle: "c1".into(),
         ready: true,
+        session_db_id: None,
     });
     let reply = h.send(chat.clone(), "chat rename Winter bike").await;
     assert!(reply.contains("Done: room name set."), "{reply}");
@@ -710,6 +742,8 @@ async fn rename_is_literal_and_reports_partial_success() {
     );
     assert_eq!(h.hs.0.lock().unwrap().names[&room], "Winter bike");
 
+    let cancel = h.lobby("workspace cancel op-3").await;
+    assert!(cancel.contains("finish the session label"), "{cancel}");
     let reply = h.lobby("workspace retry op-3").await;
     assert!(reply.contains("only the label changed"), "{reply}");
     let state = h.state().await;
@@ -732,10 +766,12 @@ fn routing_keeps_workspace_rooms_out_of_chat_dispatch() {
     let pending = Place::Chat {
         handle: "c1".into(),
         ready: false,
+        session_db_id: None,
     };
     let ready = Place::Chat {
         handle: "c1".into(),
         ready: true,
+        session_db_id: None,
     };
     assert_eq!(route(Some(&Place::Space), true, None), Route::Ignore);
     assert_eq!(

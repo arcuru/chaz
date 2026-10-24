@@ -471,11 +471,16 @@ impl SessionRegistry {
     pub async fn find_sessions_by_source(&self, source: &str) -> anyhow::Result<Vec<String>> {
         let name = format!("session:{source}");
         let user = self.user.lock().await;
-        match user.find_database(&name).await {
-            Ok(found) => Ok(found.iter().map(|db| db.root_id().to_string()).collect()),
-            Err(e) if e.is_not_found() => Ok(Vec::new()),
-            Err(e) => Err(e.into()),
+        // AccountSession::find_database skips unreadable tracked databases.
+        // Provisioning must not interpret a failed read as marker absence.
+        let mut found = Vec::new();
+        for tracked in user.databases().await? {
+            let db = user.open_database(&tracked.database_id).await?;
+            if db.get_name().await? == name {
+                found.push(db.root_id().to_string());
+            }
         }
+        Ok(found)
     }
 
     /// Whether this registry itself created the session during this process.

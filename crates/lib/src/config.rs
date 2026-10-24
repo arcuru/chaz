@@ -1291,6 +1291,7 @@ fn known_config_keys() -> HashSet<&'static str> {
         "logins[].password",
         "logins[].allow_list",
         "logins[].room_size_limit",
+        "logins[].workspace_manager",
         "logins[].id",
         "logins[].state_dir",
         "logins[].token",

@@ -27,7 +27,8 @@ Spaces, and model-callable or proactive management.
 
 **Identity is IDs, not names or Space edges.** A chat is the recorded room ID
 and session ID. Space child/parent state links rooms for navigation only. The
-record also pins the login, owning agent and manager it was created for; a
+record also pins the login, authenticated bot MXID, owning agent name/DB ID
+and manager it was created for; a
 bridge configured differently refuses to act on it.
 
 **Authorization is the exact manager.** A request is accepted only from the
@@ -39,14 +40,18 @@ the existing record rather than inheriting it.
 routes every event through `workspace::route` before history bootstrap or any
 session lookup. Join bootstrap skips rooms the record lists and rooms whose
 homeserver state carries the `dev.chaz.workspace` marker. A ready chat
-resolves its session by binding and never falls back to get-or-create, so a
+resolves its session through a strict scan of the owning agent's exposed
+sessions, rejects unreadable/ambiguous bindings, checks the recorded session
+ID, and never falls back to get-or-create, so a
 failed lookup cannot mint a replacement. `attach`, `detach`, `participation`
 and the model-based `rename` are refused in workspace chats.
 
 **Outputs stay addressed.** A chat's replies and approvals use the existing
 `(login, room, session)` delivery reconciler and approval watcher, installed
 during provisioning and reinstalled at startup like any bound room. Workspace
-notices contain management metadata only, posted to the room that asked.
+notices contain management metadata only, posted to the room that asked with an event-derived Matrix transaction ID.
+Management runs outside the sync callback, with bounded waits and generation-owned
+cancellation; an interruption leaves saved progress for explicit continuation.
 
 **Creation is journaled, not atomic.** Matrix `createRoom` has no transaction
 ID, and Matrix state and Eidetica writes cannot share a transaction. Every
@@ -62,7 +67,10 @@ request is an operation whose step progress is written to the peer-local
    settings (the same commit that creates the DB), so
    `provision_marked_conversational_channel_session` recovers a DB whose ID
    was lost and refuses if two carry the marker or the room is already bound
-   elsewhere.
+   elsewhere. DB creation is admitted durably before calling the helper;
+   after interruption a missing marker is an uncertain result, not permission
+   to create again. Recovery completes schema/catalog initialization as well
+   as hosting, binding and publication. Marker scans propagate read errors.
 3. Binding, owning-agent hosting, publication on the login and delivery are
    installed before the chat is marked ready; only then are Space links set and
    the manager invited, so no first message can arrive before the chat can

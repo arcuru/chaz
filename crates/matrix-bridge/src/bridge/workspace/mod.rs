@@ -92,6 +92,7 @@ pub(crate) enum CreateError {
 
 /// Matrix effects the workspace performs, all as the bot's own account.
 pub(crate) trait MatrixOps: Send + Sync + 'static {
+    fn bot_id(&self) -> anyhow::Result<String>;
     /// The homeserver's default room version for new rooms.
     fn default_room_version(&self) -> impl Future<Output = anyhow::Result<String>> + Send;
     /// One `createRoom` POST, never retried below this call.
@@ -123,6 +124,7 @@ pub(crate) trait MatrixOps: Send + Sync + 'static {
 
 /// Session effects for a workspace chat.
 pub(crate) trait SessionOps: Send + Sync + 'static {
+    fn agent_id(&self) -> anyhow::Result<String>;
     /// Create or recover the one session carrying `source` in its initial
     /// settings, bound to `room`, hosted by the owning agent and published on
     /// this login. Returns the session DB ID.
@@ -130,6 +132,7 @@ pub(crate) trait SessionOps: Send + Sync + 'static {
         &self,
         room: &str,
         source: &str,
+        allow_create: bool,
     ) -> impl Future<Output = anyhow::Result<String>> + Send;
     /// Install addressed outbound delivery and the approval watcher.
     fn install_delivery(
@@ -186,7 +189,7 @@ pub(crate) enum OpStatus {
 #[serde(tag = "state", content = "value", rename_all = "snake_case")]
 pub(crate) enum Step {
     Pending,
-    /// Request sent; its outcome was not recorded.
+    /// Room/DB creation admitted; its outcome was not recorded.
     Attempted,
     Done(Option<String>),
 }
@@ -209,6 +212,8 @@ pub(crate) struct WorkspaceState {
     pub workspace_id: String,
     pub login_id: String,
     pub owning_agent: String,
+    pub agent_db_id: String,
+    pub bot_mxid: String,
     pub manager: String,
     pub room_version: String,
     #[serde(default)]
@@ -302,7 +307,11 @@ impl WorkspaceStore {
 pub(crate) enum Place {
     Space,
     Lobby,
-    Chat { handle: String, ready: bool },
+    Chat {
+        handle: String,
+        ready: bool,
+        session_db_id: Option<String>,
+    },
 }
 
 /// Room ID → role for every room the workspace recorded. Shared with join
@@ -331,6 +340,7 @@ impl RoomIndex {
                     Place::Chat {
                         handle: chat.handle.clone(),
                         ready: chat.ready,
+                        session_db_id: chat.session_db_id.clone(),
                     },
                 );
             }
@@ -445,7 +455,10 @@ fn link(room_id: &str) -> String {
 /// does not recognize (setup then refuses instead of guessing).
 pub(crate) fn creator_rule(version: &str) -> Option<&'static str> {
     let n: u32 = version.parse().ok()?;
-    Some(if n >= 12 {
+    if !(1..=12).contains(&n) {
+        return None;
+    }
+    Some(if n == 12 {
         "the bot is the room creator with permanent, unlimited power that no one can revoke"
     } else {
         "the bot creates each room at power 100; another admin can later lower it"
@@ -471,6 +484,16 @@ impl<M: MatrixOps, S: SessionOps> Workspace<M, S> {
         manager: Option<String>,
     ) -> anyhow::Result<Self> {
         let state = store.load().await?;
+        if let Some(state) = &state {
+            anyhow::ensure!(
+                state.login_id == login_id
+                    && state.owning_agent == owning_agent
+                    && Some(state.manager.as_str()) == manager.as_deref()
+                    && state.bot_mxid == matrix.bot_id()?
+                    && state.agent_db_id == sessions.agent_id()?,
+                "workspace identity differs from this login/bot/agent/manager; refusing startup"
+            );
+        }
         let index = RoomIndex::default();
         index.refresh(state.as_ref());
         Ok(Self {
@@ -526,7 +549,9 @@ impl<M: MatrixOps, S: SessionOps> Workspace<M, S> {
             anyhow::ensure!(
                 state.login_id == self.login_id
                     && state.owning_agent == self.owning_agent
-                    && state.manager == manager,
+                    && state.manager == manager
+                    && state.bot_mxid == self.matrix.bot_id()?
+                    && state.agent_db_id == self.sessions.agent_id()?,
                 "the workspace record belongs to login {} / agent {} / manager {}, \
                  not this configuration; refusing",
                 state.login_id,
@@ -746,6 +771,8 @@ impl<M: MatrixOps, S: SessionOps> Workspace<M, S> {
                 workspace_id: new_workspace_id()?,
                 login_id: self.login_id.clone(),
                 owning_agent: self.owning_agent.clone(),
+                agent_db_id: self.sessions.agent_id()?,
+                bot_mxid: self.matrix.bot_id()?,
                 manager: manager.to_string(),
                 room_version: version.clone(),
                 space: None,
@@ -782,7 +809,7 @@ impl<M: MatrixOps, S: SessionOps> Workspace<M, S> {
         self.save(state).await?;
         Ok(format!(
             "Proposed workspace (operation {id}):\n\
-             - Bot login {login}, owning agent {agent}, manager {manager}.\n\
+             - Bot {bot} on login {login}, owning agent {agent} ({agent_id}), manager {manager}.\n\
              - A private Space \u{201c}{SPACE_NAME}\u{201d} and a command-only \u{201c}{LOBBY_NAME}\u{201d} room.\n\
              - Lobby and chats: invite-only, encrypted, history visible to joined members only, \
              no guests, not in the room directory. Only {manager} is invited.\n\
@@ -793,6 +820,8 @@ impl<M: MatrixOps, S: SessionOps> Workspace<M, S> {
              Reply `!chaz workspace confirm {id}` to create these rooms.",
             login = self.login_id,
             agent = self.owning_agent,
+            bot = state.bot_mxid,
+            agent_id = state.agent_db_id,
         ))
     }
 
@@ -810,6 +839,18 @@ impl<M: MatrixOps, S: SessionOps> Workspace<M, S> {
         );
         if op.kind == OpKind::Setup && (state.space.is_some() || state.lobby.is_some()) {
             anyhow::bail!("{id} already created workspace rooms; retry it to finish setup");
+        }
+        if matches!(op.kind, OpKind::NewChat { .. })
+            && state.chats.iter().any(|c| c.operation == id)
+        {
+            anyhow::bail!("{id} already created a chat room; retry it to finish provisioning");
+        }
+        if matches!(op.kind, OpKind::Rename { .. })
+            && matches!(op.steps.get("matrix.name"), Some(Step::Done(_)))
+        {
+            anyhow::bail!(
+                "{id} already changed the room name; retry it to finish the session label"
+            );
         }
         let op = state.operations.iter_mut().find(|o| o.id == id).unwrap();
         op.status = OpStatus::Cancelled;
@@ -931,9 +972,12 @@ impl<M: MatrixOps, S: SessionOps> Workspace<M, S> {
                 match step {
                     "session.provision" => {
                         let source = format!("matrix-workspace:{wid}:{id}");
+                        let allow_create = state.op(id).unwrap().steps[name] == Step::Pending;
+                        set_step(state, id, name, Step::Attempted);
+                        self.save(state).await.map_err(StepFailure::failed)?;
                         let sid = self
                             .sessions
-                            .provision(&chat.room_id, &source)
+                            .provision(&chat.room_id, &source, allow_create)
                             .await
                             .map_err(failed)?;
                         state.chat_mut(handle).unwrap().session_db_id = Some(sid.clone());
@@ -1124,7 +1168,7 @@ fn describe(state: &WorkspaceState, op: &Operation) -> String {
         .iter()
         .filter(|(_, s)| !matches!(s, Step::Done(_)))
         .map(|(n, s)| {
-            if **s == Step::Attempted {
+            if **s == Step::Attempted && n.ends_with(".create") {
                 "room creation (outcome unknown)"
             } else {
                 step_label(n)

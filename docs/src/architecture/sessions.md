@@ -291,6 +291,18 @@ An addressed Matrix message in a new room creates and attaches a session, while 
 The bridge delivers only generic addressed outbound events for its own login and room, then records a generic receipt.
 A Matrix-origin final enters that outbox atomically with its local copy; TUI, schedule, and local-agent finals never enter it.
 Startup reconciliation and per-binding progress retry queued sends even when the agent is offline.
+The optional personal Matrix workspace uses a narrower provisioning path.
+Its Space and command-only Lobby never get sessions or history bootstrap.
+A fresh named chat's room ID and session DB ID are recorded in a peer-local
+operation journal; creation is admitted before external effects, with markers
+in initial Matrix state and initial session DB settings for recovery.
+Binding, explicit owning-agent enrollment, sync publication and addressed
+delivery must succeed before invitation/readiness.
+Workspace lookups reject unreadable or ambiguous candidates and require the
+recorded session ID; they never mint a replacement after a failed lookup.
+The journal is management state, not a second transcript or outbound router.
+See [Matrix workspace contracts](../design/matrix_workspace.md#contracts).
+
 See [Matrix Bot](../user_guide/matrix.md#attached-rooms-and-reply-routing).
 
 ### Named Sessions

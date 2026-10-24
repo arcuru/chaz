@@ -314,6 +314,44 @@ impl SessionRegistry {
         Ok(None)
     }
 
+    /// Strict workspace lookup: prove a unique binding across the agent's
+    /// explicitly exposed sessions. An unreadable candidate is not absence.
+    /// Ordinary rooms retain their existing lookup policy.
+    pub async fn find_unique_channel_session(
+        &self,
+        agent: &DbEntry,
+        bridge_label: &str,
+        transport: &str,
+        login_id: &str,
+        channel: &str,
+    ) -> anyhow::Result<Option<(ConversationId, Database)>> {
+        let agent_db = self
+            .open_agent_db(&agent.db_id, None)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("owning agent DB is unavailable"))?;
+        let mut found = None;
+        for r in agent_db.list_session_refs().await? {
+            if !r.exposed_on.iter().any(|b| b == bridge_label) {
+                continue;
+            }
+            let (conv, db) = self.open_session(&r.session_db_id).await?;
+            let attachment = session_attachment(&db).await?;
+            if attachment.as_ref().is_some_and(|a| {
+                a.transport == transport
+                    && a.login_id == login_id
+                    && a.channel == channel
+                    && a.conversational_replies
+            }) {
+                anyhow::ensure!(
+                    found.is_none(),
+                    "multiple sessions bind this channel; refusing to choose"
+                );
+                found = Some((conv, db));
+            }
+        }
+        Ok(found)
+    }
+
     /// Bridge entry point: resolve (or create) the session for a transport
     /// channel.
     ///
@@ -449,6 +487,7 @@ impl SessionRegistry {
     /// different session, refuses rather than choosing. On success the
     /// channel is bound, `agent` hosts the session and it is published on
     /// `bridge_label`, exactly like [`Self::get_or_create_conversational_channel_session`].
+    #[allow(clippy::too_many_arguments)]
     pub async fn provision_marked_conversational_channel_session(
         &self,
         agent: &DbEntry,
@@ -457,6 +496,7 @@ impl SessionRegistry {
         login_id: &str,
         channel: &str,
         source: &str,
+        allow_create: bool,
     ) -> anyhow::Result<(ConversationId, Database)> {
         let Some(agent_db) = self.open_agent_db(&agent.db_id, None).await? else {
             anyhow::bail!(
@@ -476,7 +516,7 @@ impl SessionRegistry {
         );
         let marked = marked.pop();
         let bound = self
-            .find_channel_session_in(&agent_db, bridge_label, transport, login_id, channel)
+            .find_unique_channel_session(agent, bridge_label, transport, login_id, channel)
             .await?;
         let (conv, db) = match (marked, bound) {
             (Some(id), Some(found)) if found.1.root_id().to_string() == id => found,
@@ -485,12 +525,28 @@ impl SessionRegistry {
                 found.1.root_id()
             ),
             (Some(id), None) => self.open_session(&id).await?,
-            (None, None) => self.create_session(Some(source)).await?,
+            (None, None) if allow_create => self.create_session(Some(source)).await?,
+            (None, None) => anyhow::bail!(
+                "session creation outcome is unknown; no marked DB is visible; refusing a replacement"
+            ),
         };
+        // A recovered DB may predate every post-creation initialization write.
+        // Finish those writes before exposing it; never reset an existing turn
+        // baseline or transcript.
+        super::Session::try_new(conv.clone(), db.clone())
+            .await?
+            .ensure_turn_schema_baseline()
+            .await?;
+        crate::db_kind::write_marker(&db, crate::db_kind::KIND_SESSION, source).await?;
+        self.upsert_session_catalog(&db.root_id().to_string(), Some(source), None)
+            .await?;
         bind_conversational_transport(&db, transport, login_id, channel).await?;
         self.ensure_session_host(&db.root_id().to_string(), agent)
             .await?;
-        self.publish_channel_session(&agent_db, db.root_id(), bridge_label)
+        // Workspace readiness must not swallow a sync-publication failure.
+        self.enable_sync_for(db.root_id()).await?;
+        agent_db
+            .expose_session_on(&db.root_id().to_string(), bridge_label)
             .await?;
         Ok((conv, db))
     }
@@ -722,6 +778,128 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn marked_recovery_completes_interrupted_initialization() {
+        let (_inst, reg) = make_registry().await;
+        let agent = make_agent_entry(&reg, "chaz").await;
+        let source = "matrix-workspace:recovery:op-2";
+        // Crash immediately after DB creation, before schema, entity marker
+        // and local catalog registration. The creation settings survive.
+        let orphan = {
+            let mut user = reg.user.lock().await;
+            let mut settings = eidetica::crdt::Doc::new();
+            settings.set("name", format!("session:{source}"));
+            let key = user.get_default_key().unwrap();
+            user.create_database(settings, &key).await.unwrap()
+        };
+        let (_, recovered) = reg
+            .provision_marked_conversational_channel_session(
+                &agent, "login", "matrix", "login", "!new:s", source, false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(recovered.root_id(), orphan.root_id());
+        assert!(
+            reg.list_sessions()
+                .await
+                .unwrap()
+                .iter()
+                .any(|s| s.session_db_id == orphan.root_id().to_string()),
+            "recovered DB must finish catalog registration"
+        );
+        assert_eq!(
+            crate::db_kind::read_marker(&recovered).await.unwrap().0,
+            crate::db_kind::KIND_SESSION
+        );
+        let txn = recovered.new_transaction().await.unwrap();
+        assert_eq!(
+            txn.get_store::<DocStore>("meta")
+                .await
+                .unwrap()
+                .get_string("turn_request_schema")
+                .await
+                .unwrap(),
+            "1"
+        );
+    }
+
+    #[tokio::test]
+    async fn workspace_lookup_rejects_two_sessions_bound_to_one_room() {
+        let (_inst, reg) = make_registry().await;
+        let agent = make_agent_entry(&reg, "chaz").await;
+        for source in ["one", "two"] {
+            let (_, db) = reg.create_session(Some(source)).await.unwrap();
+            bind_conversational_transport(&db, "matrix", "login", "!room:s")
+                .await
+                .unwrap();
+            reg.ensure_session_host(&db.root_id().to_string(), &agent)
+                .await
+                .unwrap();
+            let adb = reg
+                .open_agent_db(&agent.db_id, None)
+                .await
+                .unwrap()
+                .unwrap();
+            adb.expose_session_on(&db.root_id().to_string(), "login")
+                .await
+                .unwrap();
+        }
+        let result = reg
+            .find_unique_channel_session(&agent, "login", "matrix", "login", "!room:s")
+            .await;
+        assert!(result.is_err(), "must not choose the first of two sessions");
+        let before = reg.list_sessions().await.unwrap().len();
+        let err = reg
+            .provision_marked_conversational_channel_session(
+                &agent,
+                "login",
+                "matrix",
+                "login",
+                "!missing:s",
+                "unseen-marker",
+                false,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("multiple sessions") || err.to_string().contains("unknown"),
+            "{err}"
+        );
+        assert_eq!(reg.list_sessions().await.unwrap().len(), before);
+        let adb = reg
+            .open_agent_db(&agent.db_id, None)
+            .await
+            .unwrap()
+            .unwrap();
+        for r in adb.list_session_refs().await.unwrap() {
+            adb.deregister_session_ref(&r.session_db_id).await.unwrap();
+        }
+        let err = reg
+            .provision_marked_conversational_channel_session(
+                &agent,
+                "login",
+                "matrix",
+                "login",
+                "!missing:s",
+                "unseen-marker",
+                false,
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("unknown"), "{err}");
+        adb.register_session_ref(crate::agent_db::SessionRef {
+            session_db_id: "unreadable".into(),
+            exposed_on: vec!["login".into()],
+        })
+        .await
+        .unwrap();
+        assert!(
+            reg.find_unique_channel_session(&agent, "login", "matrix", "login", "!missing:s")
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
     async fn marked_provisioning_recovers_the_same_db_and_refuses_ambiguity() {
         let (_inst, reg) = make_registry().await;
         let agent = make_agent_entry(&reg, "chaz").await;
@@ -739,7 +917,7 @@ mod tests {
 
         let (_cv, db) = reg
             .provision_marked_conversational_channel_session(
-                &agent, login, "matrix", login, "!new:s", marker,
+                &agent, login, "matrix", login, "!new:s", marker, true,
             )
             .await
             .unwrap();
@@ -764,7 +942,7 @@ mod tests {
         // Repeating is idempotent.
         let (_cv, again) = reg
             .provision_marked_conversational_channel_session(
-                &agent, login, "matrix", login, "!new:s", marker,
+                &agent, login, "matrix", login, "!new:s", marker, true,
             )
             .await
             .unwrap();
@@ -780,6 +958,7 @@ mod tests {
                 login,
                 "!new:s",
                 "matrix-workspace:ws1:op-3",
+                true,
             )
             .await
             .unwrap_err();
@@ -791,7 +970,7 @@ mod tests {
         reg.create_session(Some(dup)).await.unwrap();
         let err = reg
             .provision_marked_conversational_channel_session(
-                &agent, login, "matrix", login, "!dup:s", dup,
+                &agent, login, "matrix", login, "!dup:s", dup, true,
             )
             .await
             .unwrap_err();

@@ -646,13 +646,18 @@ is an operation (`op-N`) whose progress is saved before each step:
   `workspace retry` runs only the pending steps. A chat whose session is not
   ready replies "not ready" and sends nothing to the agent.
 - A session database created before an interruption is found again through a
-  marker in its initial settings, so a retry never makes a second one.
+  marker in its initial settings. The bridge also finishes any interrupted
+  schema/catalog initialization before exposing it. If a DB-creation attempt
+  was admitted but no marked DB is visible, retry refuses a replacement: retain
+  the operation and investigate storage/sync rather than creating another DB.
 - One operation runs at a time; a new request waits until the unfinished one
   is retried or cancelled. Repeated delivery of the same command returns the
   same report. Bridge restarts keep everything; nothing resumes on its own.
 - Cancel never deletes or leaves a room. A room an operation already created
   stays as it is, marked "not ready" in `chat list`, and setup cannot be
-  cancelled once it created a room — retry it instead.
+  cancelled once it created a room — retry it instead. The same holds for a
+  chat with a known room or a rename that already changed the Matrix name:
+  finish the operation rather than abandoning inconsistent labels.
 
 V1 has no archive, threaded Inbox, existing-room adoption, nested Spaces or
 model-driven management.
@@ -665,7 +670,7 @@ model-driven management.
    ```text
    > !chaz workspace setup
    Proposed workspace (operation op-1):
-   - Bot login @chaz:example, owning agent chaz, manager @you:example.
+   - Bot @chaz:example on login @chaz:example, owning agent chaz (<agent DB ID>), manager @you:example.
    - A private Space “Chaz” and a command-only “Lobby” room.
    - Lobby and chats: invite-only, encrypted, history visible to joined members only, no guests, not in the room directory. Only @you:example is invited.
    - The Space is invite-only and unlisted; its names and links are room state, which Matrix does not end-to-end encrypt.
@@ -712,13 +717,13 @@ model-driven management.
    op-3: new chat “Trip plans” (c2) — incomplete.
    Done: room created.
    Pending: session created and bound, session label set, reply delivery installed, listed in the Space, linked back to the Space, invitation sent.
-   Last error: session.provision: owning agent chaz is not hosted yet
+   Last error: session.provision: injected failure after DB creation
    Room !trip:example exists; it is not ready for chat. No second room will be created.
    Continue with !chaz workspace retry op-3 (only pending steps run).
    ```
 
    The retry found the room the lost request had created instead of creating
-   another. Once the agent has synced, retry again; only the pending steps run:
+   another. After storage access is restored, retry again; only the pending steps run:
 
    ```text
    > !chaz workspace retry op-3

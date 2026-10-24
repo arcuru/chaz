@@ -4,6 +4,8 @@ mod history;
 mod typing;
 mod workspace;
 
+use futures::FutureExt;
+
 use chaz_core::bridge::delivery::{DeliveryBinding, DeliveryReconciler, DeliveryStore};
 use chaz_core::bridge::outbound::{
     chunk_message_bytes, is_transient_outbound_status, retry_outbound_chunk,
@@ -397,31 +399,15 @@ async fn dispatch_in_room(
     secrets: SecretStore,
     login_id: &str,
     owning_agent: &str,
-    managed_chat: bool,
+    managed_session: Option<&str>,
 ) -> anyhow::Result<()> {
     let room_id = room.room_id().to_string();
 
     let Some(agent_entry) = owning_agent_entry(&server, owning_agent) else {
         anyhow::bail!("owning agent '{owning_agent}' is not hosted on this bridge yet");
     };
-    let (_conv_id, session_db) = if managed_chat {
-        // A workspace chat's session was provisioned by its operation; never
-        // create a replacement because a lookup came back empty.
-        match server
-            .registry()
-            .find_channel_session(&agent_entry, login_id, "matrix", login_id, &room_id)
-            .await?
-        {
-            Some(found) => found,
-            None => {
-                let _ = room
-                    .send(RoomMessageEventContent::notice_plain(
-                        MANAGED_SESSION_UNAVAILABLE,
-                    ))
-                    .await;
-                return Ok(());
-            }
-        }
+    let (_conv_id, session_db) = if let Some(expected) = managed_session {
+        resolve_workspace_session(&server, &agent_entry, login_id, &room_id, expected).await?
     } else {
         server
             .registry()
@@ -976,6 +962,7 @@ impl Bridge for MatrixBridge {
             let login_id = login_id.clone();
             let owning_agent = owning_agent.clone();
             let pending_approvals = pending_approvals.clone();
+            let workspace_rooms = workspace_rooms.clone();
             tokio::spawn(async move {
                 let Some(agent_entry) = owning_agent_entry(&server, &owning_agent) else {
                     info!("Owning agent not hosted yet; skipping startup channel attach");
@@ -1004,6 +991,36 @@ impl Bridge for MatrixBridge {
                     let bindings = transport_bindings(&db).await.unwrap_or_default();
                     for (transport, chan_login, room_id) in bindings {
                         if transport != "matrix" || chan_login != login_id {
+                            continue;
+                        }
+                        if let Some(place) = workspace_rooms.get(&room_id) {
+                            let workspace::Place::Chat {
+                                session_db_id: Some(expected),
+                                ..
+                            } = place
+                            else {
+                                continue;
+                            };
+                            if expected != r.session_db_id {
+                                continue;
+                            }
+                            if let Err(e) = resolve_workspace_session(
+                                &server,
+                                &agent_entry,
+                                &login_id,
+                                &room_id,
+                                &expected,
+                            )
+                            .await
+                            {
+                                error!(room_id, "Workspace startup binding unavailable: {e}");
+                                continue;
+                            }
+                        } else if let Ok(id) =
+                            matrix_sdk::ruma::OwnedRoomId::try_from(room_id.as_str())
+                            && let Some(room) = client.get_room(&id)
+                            && workspace::live::has_marker(&room).await
+                        {
                             continue;
                         }
                         attach_existing_channel(
@@ -1114,7 +1131,25 @@ impl Bridge for MatrixBridge {
                                     return;
                                 }
                                 let origin = workspace::Origin::Managed(place.unwrap());
-                                spawn_workspace_command(&workspace, &room, &event, origin, inner);
+                                spawn_workspace_command(&workspace, &attached_channels, &room, &event, origin, inner);
+                                return;
+                            }
+                        }
+                        let managed_session = match &place {
+                            Some(workspace::Place::Chat { session_db_id: Some(id), .. }) => Some(id.as_str()),
+                            Some(workspace::Place::Chat { .. }) => {
+                                let _ = room.send(RoomMessageEventContent::notice_plain(MANAGED_SESSION_UNAVAILABLE)).await;
+                                return;
+                            }
+                            _ => None,
+                        };
+                        // Even room-local commands/approvals must not act through
+                        // a stale or competing session binding.
+                        if let Some(expected) = managed_session {
+                            let Some(agent) = owning_agent_entry(&server, &owning_agent) else { return; };
+                            if let Err(e) = resolve_workspace_session(&server, &agent, &login_id, &room_id, expected).await {
+                                error!(room_id, "Workspace binding unavailable: {e}");
+                                let _ = room.send(RoomMessageEventContent::notice_plain(MANAGED_SESSION_UNAVAILABLE)).await;
                                 return;
                             }
                         }
@@ -1157,7 +1192,7 @@ impl Bridge for MatrixBridge {
                                 } else {
                                     workspace::Origin::Other
                                 };
-                                spawn_workspace_command(&workspace, &room, &event, origin, Some(inner));
+                                spawn_workspace_command(&workspace, &attached_channels, &room, &event, origin, Some(inner));
                                 return;
                             }
                             let verb = inner.split_whitespace().next().unwrap_or("");
@@ -1276,7 +1311,7 @@ impl Bridge for MatrixBridge {
                                         secrets.clone(),
                                         &login_id,
                                         &owning_agent,
-                                        managed_chat,
+                                        managed_session,
                                     )
                                     .await
                                     {
@@ -1352,7 +1387,9 @@ impl Bridge for MatrixBridge {
                             );
                             return;
                         };
-                        let resolved = if wake && !managed_chat {
+                        let resolved = if let Some(expected) = managed_session {
+                            resolve_workspace_session(&server, &agent_entry, &login_id, &room_id, expected).await.map(Some)
+                        } else if wake {
                             server.registry().get_or_create_conversational_channel_session(
                                 &agent_entry, &login_id, "matrix", &login_id, &room_id,
                             ).await.map(Some)
@@ -1514,6 +1551,25 @@ impl Bridge for MatrixBridge {
     }
 }
 
+async fn resolve_workspace_session(
+    server: &Server,
+    agent: &chaz_core::hosted_index::DbEntry,
+    login: &str,
+    room: &str,
+    expected: &str,
+) -> anyhow::Result<(chaz_core::types::ConversationId, eidetica::Database)> {
+    let found = server
+        .registry()
+        .find_unique_channel_session(agent, login, "matrix", login, room)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("workspace session is not enrolled/bound"))?;
+    anyhow::ensure!(
+        found.1.root_id().to_string() == expected,
+        "workspace session identity changed; refusing"
+    );
+    Ok(found)
+}
+
 type LiveWorkspace =
     workspace::Workspace<workspace::live::LiveMatrix, workspace::live::LiveSessions>;
 
@@ -1521,6 +1577,7 @@ type LiveWorkspace =
 /// echoes from sync) and post its reply into the room it came from.
 fn spawn_workspace_command(
     workspace: &Arc<LiveWorkspace>,
+    attached: &AttachedChannels,
     room: &Room,
     event: &OriginalSyncRoomMessageEvent,
     origin: workspace::Origin,
@@ -1529,7 +1586,11 @@ fn spawn_workspace_command(
     let (workspace, room) = (workspace.clone(), room.clone());
     let (sender, event_id) = (event.sender.to_string(), event.event_id.to_string());
     let command = command.unwrap_or_default();
-    tokio::spawn(async move {
+    let mut tasks = attached.typing_tasks.lock().unwrap();
+    if *attached.stopped.borrow() {
+        return;
+    }
+    let task = tokio::spawn(async move {
         let request = workspace::Request {
             sender: &sender,
             event_id: &event_id,
@@ -1537,14 +1598,35 @@ fn spawn_workspace_command(
             origin,
             command: &command,
         };
-        if let Some(text) = workspace.handle(request).await
-            && let Err(e) = room
+        // Creation progress is saved before effects, so timeout/panic leaves
+        // an explicit resumable operation, not a blind room/DB retry.
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(180),
+            std::panic::AssertUnwindSafe(workspace.handle(request)).catch_unwind(),
+        )
+        .await;
+        let text = match result {
+            Ok(Ok(text)) => text,
+            Ok(Err(_)) => {
+                error!(event_id, "Workspace command panicked");
+                Some("Workspace command interrupted. Check !chaz workspace status before continuing; no automatic retry was made.".into())
+            }
+            Err(_) => Some("Workspace command timed out. Check !chaz workspace status before continuing; no automatic retry was made.".into()),
+        };
+        if let Some(text) = text {
+            use sha2::Digest;
+            let digest = sha2::Sha256::digest(event_id.as_bytes());
+            let txn: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+            let send = room
                 .send(RoomMessageEventContent::notice_markdown(text))
-                .await
-        {
-            error!("Failed to send workspace reply: {e}");
+                .with_transaction_id(OwnedTransactionId::from(format!("workspace-{txn}")));
+            match tokio::time::timeout(std::time::Duration::from_secs(30), send).await {
+                Ok(Ok(_)) => {}
+                result => error!(?result, "Failed to send workspace reply"),
+            }
         }
     });
+    tasks.push(task.abort_handle());
 }
 
 /// Install outbound delivery for `(room, session)` exactly once per process.
@@ -1932,7 +2014,7 @@ mod tests {
                 chaz_core::security::SecretStore,
                 &'static str,
                 &'static str,
-                bool,
+                Option<&'static str>,
             ) -> F,
         ) -> usize {
             std::mem::size_of::<F>()
