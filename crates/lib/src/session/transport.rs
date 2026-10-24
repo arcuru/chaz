@@ -439,6 +439,62 @@ impl SessionRegistry {
         Ok((conv, db))
     }
 
+    /// Provision the one conversational session for a freshly created
+    /// channel, identified by a caller-supplied unique provisioning `source`
+    /// marker rather than by channel lookup alone.
+    ///
+    /// Recovery-safe: a DB already carrying `source` (for example one created
+    /// before an interruption lost its ID) is reused instead of creating a
+    /// second; more than one carrier, or a channel already bound to a
+    /// different session, refuses rather than choosing. On success the
+    /// channel is bound, `agent` hosts the session and it is published on
+    /// `bridge_label`, exactly like [`Self::get_or_create_conversational_channel_session`].
+    pub async fn provision_marked_conversational_channel_session(
+        &self,
+        agent: &DbEntry,
+        bridge_label: &str,
+        transport: &str,
+        login_id: &str,
+        channel: &str,
+        source: &str,
+    ) -> anyhow::Result<(ConversationId, Database)> {
+        let Some(agent_db) = self.open_agent_db(&agent.db_id, None).await? else {
+            anyhow::bail!(
+                "agent DB {} not openable on this peer; refusing to provision a channel session",
+                agent.db_id
+            );
+        };
+        let lock = self
+            .channel_create_lock(&channel_key(transport, login_id, channel))
+            .await;
+        let _guard = lock.lock().await;
+        let mut marked = self.find_sessions_by_source(source).await?;
+        anyhow::ensure!(
+            marked.len() <= 1,
+            "{} sessions carry provisioning marker {source}; refusing to choose one",
+            marked.len()
+        );
+        let marked = marked.pop();
+        let bound = self
+            .find_channel_session_in(&agent_db, bridge_label, transport, login_id, channel)
+            .await?;
+        let (conv, db) = match (marked, bound) {
+            (Some(id), Some(found)) if found.1.root_id().to_string() == id => found,
+            (_, Some(found)) => anyhow::bail!(
+                "channel is already bound to session {}; refusing to provision another",
+                found.1.root_id()
+            ),
+            (Some(id), None) => self.open_session(&id).await?,
+            (None, None) => self.create_session(Some(source)).await?,
+        };
+        bind_conversational_transport(&db, transport, login_id, channel).await?;
+        self.ensure_session_host(&db.root_id().to_string(), agent)
+            .await?;
+        self.publish_channel_session(&agent_db, db.root_id(), bridge_label)
+            .await?;
+        Ok((conv, db))
+    }
+
     /// Make a channel session available to the daemon before notifying it
     /// through the agent DB registry. This also refreshes an existing
     /// session's exposure after bridge restart or state recovery: the registry
@@ -659,6 +715,89 @@ mod tests {
         );
         assert!(
             reg.find_channel_session(&agent, login, "matrix", login, "!other:s")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn marked_provisioning_recovers_the_same_db_and_refuses_ambiguity() {
+        let (_inst, reg) = make_registry().await;
+        let agent = make_agent_entry(&reg, "chaz").await;
+        let login = "@chaz:example.com";
+        let marker = "matrix-workspace:ws1:op-2";
+
+        // Interrupted run: the DB exists with the marker, but its ID was lost
+        // before it was bound or recorded anywhere.
+        let (_cv, orphan) = reg.create_session(Some(marker)).await.unwrap();
+        let orphan_id = orphan.root_id().to_string();
+        assert_eq!(
+            reg.find_sessions_by_source(marker).await.unwrap(),
+            vec![orphan_id.clone()]
+        );
+
+        let (_cv, db) = reg
+            .provision_marked_conversational_channel_session(
+                &agent, login, "matrix", login, "!new:s", marker,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            db.root_id().to_string(),
+            orphan_id,
+            "recovered, not duplicated"
+        );
+        assert!(is_bound(&db, "matrix", login, "!new:s").await.unwrap());
+        let agent_db = reg
+            .open_agent_db(&agent.db_id, Some(&agent.pubkey))
+            .await
+            .unwrap()
+            .unwrap();
+        let r = agent_db
+            .find_session_ref(&orphan_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(r.exposed_on, vec![login.to_string()]);
+
+        // Repeating is idempotent.
+        let (_cv, again) = reg
+            .provision_marked_conversational_channel_session(
+                &agent, login, "matrix", login, "!new:s", marker,
+            )
+            .await
+            .unwrap();
+        assert_eq!(again.root_id().to_string(), orphan_id);
+        assert_eq!(reg.find_sessions_by_source(marker).await.unwrap().len(), 1);
+
+        // A fresh marker never adopts the room's existing session.
+        let err = reg
+            .provision_marked_conversational_channel_session(
+                &agent,
+                login,
+                "matrix",
+                login,
+                "!new:s",
+                "matrix-workspace:ws1:op-3",
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("already bound"), "{err}");
+
+        // Two carriers of one marker refuse instead of choosing.
+        let dup = "matrix-workspace:ws1:op-4";
+        reg.create_session(Some(dup)).await.unwrap();
+        reg.create_session(Some(dup)).await.unwrap();
+        let err = reg
+            .provision_marked_conversational_channel_session(
+                &agent, login, "matrix", login, "!dup:s", dup,
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("refusing to choose"), "{err}");
+        assert!(
+            reg.find_channel_session(&agent, login, "matrix", login, "!dup:s")
                 .await
                 .unwrap()
                 .is_none()

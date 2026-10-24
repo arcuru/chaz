@@ -462,6 +462,22 @@ impl SessionRegistry {
         Ok((conv_id, db))
     }
 
+    /// Session DBs this peer tracks whose initial settings were created by
+    /// [`Self::create_session`] with exactly `source`. The display name is
+    /// written in the same commit that creates the DB, so a caller that put a
+    /// unique provisioning marker in `source` can recover a DB whose ID was
+    /// never recorded (interrupted after creation). Callers decide what more
+    /// than one match means; this never picks one.
+    pub async fn find_sessions_by_source(&self, source: &str) -> anyhow::Result<Vec<String>> {
+        let name = format!("session:{source}");
+        let user = self.user.lock().await;
+        match user.find_database(&name).await {
+            Ok(found) => Ok(found.iter().map(|db| db.root_id().to_string()).collect()),
+            Err(e) if e.is_not_found() => Ok(Vec::new()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     /// Whether this registry itself created the session during this process.
     pub async fn created_session_locally(&self, session_db_id: &str) -> bool {
         self.locally_created_sessions
