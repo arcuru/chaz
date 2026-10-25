@@ -494,3 +494,65 @@ Account credentials and recovery material stay in that private fixture tree.
 Only public fingerprints, test names and the final counted summary are output.
 The whole transport suite (`just e2e`) separately verifies that a live bridge
 rejects concurrent key maintenance.
+
+## Opt-in capped real-model smoke
+
+The default remains the deterministic stub suite. `--real-model` instead runs
+just two allowed turns and an unauthorized sender on the **same** disposable
+Synapse/daemon/bridge fixture. It does not use production accounts, state,
+configuration, credentials, or a second persistent daemon.
+
+Supply an already metered, loopback OpenAI-compatible completion endpoint and
+an exact model ID. Verify its current pricing before supplying conservative
+USD-per-million input/output rate ceilings; unknown pricing is a stop, not a
+reason to guess. The endpoint must report `usage.cost` as well as token usage.
+No vendor API key is accepted by this harness (the relay uses a dummy bearer).
+
+```bash
+export MATRIX_E2E_MODEL_ENDPOINT=http://127.0.0.1:18081/v1/chat/completions
+export MATRIX_E2E_MODEL=your-exact-model-id
+export MATRIX_E2E_INPUT_RATE=0.15  # replace with verified conservative pricing
+export MATRIX_E2E_OUTPUT_RATE=0.60
+export MATRIX_E2E_EVIDENCE="$(mktemp -d)"
+just e2e --real-model
+cat "$MATRIX_E2E_EVIDENCE/result.json"
+```
+
+Hard bounds per opt-in invocation: six forwarded requests, 64 KiB per
+forwarded request, 512 output tokens per request, 120s upstream socket timeout,
+900s total fixture deadline, and at most USD 0.10 conservatively reserved.
+The relay fsyncs a reservation before forwarding and halts on uncertain
+responses, missing usage/cost, or a violated ceiling. ReAct iterations and
+retries share the same six-call allowance. A ledger is never reused or reset;
+use a fresh evidence directory for a new explicitly authorized invocation and
+include failed invocations when totaling actual spend. Timeouts may leave
+uncertain provider usage: report reserved spend, not zero cost. Pricing changes
+or a provider violating its declared contract cannot be made into a billing
+guarantee by a client-side cap.
+
+The model is asked to call `matrix__send` once, then emit a distinguishable
+terminal final. Both allowed turns must complete durably. Provider response
+IDs must match the disposable `turn_transcript`; tool-call IDs must match
+successful durable tool results. The room must contain exactly the two explicit
+sends, **not** the later local finals. Between those turns the stranger asks
+for a forbidden send; the completed second turn is the barrier, and any extra
+model response, durable attempt, or room message fails the check. This covers
+explicit-send final suppression, not ordinary-final auto-delivery, encryption,
+scheduling, restart behavior, or production model reliability.
+
+`result.json` contains these correlations, token usage, actual reported model
+spend and worst-case reserved spend. `model.jsonl` is retained even on failure;
+it contains only disposable response text/tool calls and usage, never credentials.
+The workspace is otherwise self-cleaning unless `--keep` is supplied. The smoke
+uses an empty disposable `HOME` to avoid host-global skills/configuration.
+It requires the default HTTP sync transport; iroh is refused.
+
+Offline checks never contact a model:
+
+```bash
+uv run --no-project --with cbor2 dev/matrix-e2e/test_real_model.py -v
+```
+
+A timeout or a model that ignores the requested send/final sequence is a failed
+smoke, not a transport pass. Inspect retained evidence before requesting another
+paid invocation; do not repeatedly retry a noncompliant model.
