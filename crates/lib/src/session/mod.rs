@@ -28,6 +28,8 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::{HashMap, HashSet};
 use tracing::{error, info, warn};
 
+#[cfg(test)]
+mod activity_tests;
 mod agents;
 mod bridge_event;
 pub mod execution;
@@ -661,32 +663,57 @@ fn fresh_activity(at: DateTime<Utc>, now: DateTime<Utc>) -> bool {
     age >= chrono::Duration::zero() && age < TURN_ACTIVITY_TIMEOUT
 }
 
+/// Disposable presentation evidence from one native Verified read. This is not
+/// authorization or execution ownership; refresh it after any session write.
+/// Retaining timestamps (including future ones) lets timers age the view without
+/// rereading historical tables. Completed attempts are discarded before caching.
+#[derive(Clone, Debug, Default)]
+pub struct TurnActivity {
+    starts: Vec<(String, DateTime<Utc>)>,
+}
+
+impl TurnActivity {
+    fn from_rows(attempts: Vec<TurnAttempt>, heartbeats: &HashMap<String, DateTime<Utc>>) -> Self {
+        // A late heartbeat cannot resurrect a completed attempt.
+        let completed: HashSet<_> = attempts
+            .iter()
+            .filter(|a| a.status == TurnAttemptStatus::Completed)
+            .map(|a| a.attempt_id.as_str())
+            .collect();
+        let starts = attempts
+            .iter()
+            .filter(|a| {
+                a.status == TurnAttemptStatus::Started && !completed.contains(a.attempt_id.as_str())
+            })
+            .map(|a| {
+                (
+                    a.attempt_id.clone(),
+                    heartbeats
+                        .get(&a.attempt_id)
+                        .copied()
+                        .unwrap_or(a.started_at),
+                )
+            })
+            .collect();
+        Self { starts }
+    }
+
+    pub fn active_at(&self, now: DateTime<Utc>) -> impl Iterator<Item = &str> {
+        self.starts
+            .iter()
+            .filter(move |(_, at)| fresh_activity(*at, now))
+            .map(|(id, _)| id.as_str())
+    }
+}
+
 fn visible_attempts(
     attempts: Vec<TurnAttempt>,
     heartbeats: &HashMap<String, DateTime<Utc>>,
     now: DateTime<Utc>,
 ) -> Vec<String> {
-    // A late heartbeat cannot resurrect a completed attempt.
-    let completed: HashSet<_> = attempts
-        .iter()
-        .filter(|a| a.status == TurnAttemptStatus::Completed)
-        .map(|a| a.attempt_id.clone())
-        .collect();
-    attempts
-        .into_iter()
-        .filter(|a| {
-            a.status == TurnAttemptStatus::Started && !completed.contains(a.attempt_id.as_str())
-        })
-        .filter(|a| {
-            fresh_activity(
-                heartbeats
-                    .get(&a.attempt_id)
-                    .copied()
-                    .unwrap_or(a.started_at),
-                now,
-            )
-        })
-        .map(|a| a.attempt_id)
+    TurnActivity::from_rows(attempts, heartbeats)
+        .active_at(now)
+        .map(str::to_owned)
         .collect()
 }
 
@@ -782,7 +809,16 @@ impl Session {
         database: Database,
     ) -> anyhow::Result<Self> {
         let snapshot = database.snapshot().await?;
-        let (entry_ids, entries) = Self::load_entries_at(&database, "entries", &snapshot).await?;
+        Self::try_new_at(conversation_id, database, &snapshot).await
+    }
+
+    /// Open one pinned transcript; helpers must not hydrate a second live view.
+    pub async fn try_new_at(
+        conversation_id: ConversationId,
+        database: Database,
+        snapshot: &Snapshot,
+    ) -> anyhow::Result<Self> {
+        let (entry_ids, entries) = Self::load_entries_at(&database, "entries", snapshot).await?;
         Ok(Self {
             conversation_id,
             database,
@@ -1038,15 +1074,11 @@ impl Session {
             }
             None => HashSet::new(),
         };
-        // Same request classification as turn_requests_with_attempts. An
-        // interrupted request stays compacted until explicitly retried.
+        // An interrupted request stays compacted until explicitly retried.
         let pending = |id: &TurnRequestId, entry: &SessionEntry| {
             current.is_some_and(|current| {
                 id == current
-                    || ((entry.entry_type == EntryType::Directive
-                        || (entry.entry_type == EntryType::Message && !is_agent(&entry.sender)))
-                        && !baseline.contains(id.as_str())
-                        && !states.contains_key(id))
+                    || (is_turn_request(id, entry, &baseline, is_agent) && !states.contains_key(id))
             })
         };
         let rows: Vec<_> =
@@ -1246,16 +1278,24 @@ impl Session {
         attempts: Vec<(String, TurnAttempt)>,
         baseline: HashSet<String>,
     ) -> anyhow::Result<Vec<TurnRequest>> {
-        let states = index_attempt_states(attempts, live_attempts);
+        self.turn_requests_with_states(
+            is_agent,
+            index_attempt_states(attempts, live_attempts),
+            baseline,
+        )
+    }
+
+    fn turn_requests_with_states(
+        &self,
+        is_agent: impl Fn(&str) -> bool,
+        states: HashMap<TurnRequestId, TurnRequestState>,
+        baseline: HashSet<String>,
+    ) -> anyhow::Result<Vec<TurnRequest>> {
         Ok(self
             .entries
             .iter()
             .zip(&self.entry_ids)
-            .filter(|entry| {
-                entry.0.entry_type == EntryType::Directive
-                    || (entry.0.entry_type == EntryType::Message && !is_agent(&entry.0.sender))
-            })
-            .filter(|(_, id)| !baseline.contains(id.as_str()))
+            .filter(|(entry, id)| is_turn_request(id, entry, &baseline, &is_agent))
             .map(|(entry, id)| {
                 let entry = entry.clone();
                 let id = id.clone();
@@ -1881,8 +1921,18 @@ impl Session {
     }
 
     /// Visible, unexpired per-turn claims. Never infer activity from Ack or
-    /// session-level runtime ownership. Clients re-read this on sync and timer.
+    /// session-level runtime ownership. Action callers always read fresh evidence;
+    /// presentation clients may retain [`TurnActivity`] between write callbacks.
     pub async fn active_turn_attempts(database: &Database) -> anyhow::Result<Vec<String>> {
+        Ok(Self::turn_activity(database)
+            .await?
+            .active_at(Utc::now())
+            .map(str::to_owned)
+            .collect())
+    }
+
+    /// Read activity using this handle's identity and the native Verified view.
+    pub async fn turn_activity(database: &Database) -> anyhow::Result<TurnActivity> {
         let txn = database.new_transaction().await?;
         let attempts = txn
             .get_store::<Table<TurnAttempt>>(TURN_ATTEMPTS_STORE)
@@ -1899,7 +1949,7 @@ impl Session {
             .await?
             .into_iter()
             .collect();
-        Ok(visible_attempts(attempts, &heartbeats, Utc::now()))
+        Ok(TurnActivity::from_rows(attempts, &heartbeats))
     }
 
     /// Record a user stop for the one visibly active turn. No active turn is
@@ -2151,6 +2201,17 @@ fn sort_persisted_entries(
         .unzip()
 }
 
+fn is_turn_request(
+    id: &TurnRequestId,
+    entry: &SessionEntry,
+    baseline: &HashSet<String>,
+    is_agent: &dyn Fn(&str) -> bool,
+) -> bool {
+    (entry.entry_type == EntryType::Directive
+        || (entry.entry_type == EntryType::Message && !is_agent(&entry.sender)))
+        && !baseline.contains(id.as_str())
+}
+
 async fn read_turn_baseline_from(store: &DocStore) -> anyhow::Result<HashSet<String>> {
     match store.get_string(TURN_BASELINE_KEY).await {
         Ok(value) => Ok(serde_json::from_str(&value)?),
@@ -2281,7 +2342,15 @@ pub async fn read_meta_from_db(database: &Database) -> SessionMeta {
 /// Read session metadata without confusing absent fields with storage failures.
 /// Presentation clients use this when replacing a last-good cached snapshot.
 pub async fn try_read_meta_from_db(database: &Database) -> anyhow::Result<SessionMeta> {
-    let txn = database.new_transaction().await?;
+    try_read_meta_at(database, &database.snapshot().await?).await
+}
+
+/// Strict metadata from the same pinned view as the displayed transcript.
+pub async fn try_read_meta_at(
+    database: &Database,
+    snapshot: &Snapshot,
+) -> anyhow::Result<SessionMeta> {
+    let txn = database.new_transaction_at(snapshot).await?;
     let doc = txn
         .get_store::<DocStore>(META_STORE)
         .await?
@@ -3078,6 +3147,28 @@ mod tests {
             .unwrap();
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].id, new_id);
+
+        let summary_id = legacy
+            .add_entry(SessionEntry {
+                entry_type: EntryType::Summary,
+                ..entry_at("user", -1, None)
+            })
+            .await
+            .unwrap();
+        // Compaction must not resurrect baseline history as queued requests.
+        let view = legacy
+            .turn_context_view_at(db.snapshot().await.unwrap(), &new_id, |_| false)
+            .await
+            .unwrap();
+        let boundary = view
+            .entry_ids
+            .iter()
+            .position(|id| id.as_ref() == Some(&summary_id))
+            .unwrap();
+        assert_eq!(
+            &view.entry_ids[boundary..],
+            &[Some(summary_id), Some(new_id)]
+        );
     }
 
     #[tokio::test]

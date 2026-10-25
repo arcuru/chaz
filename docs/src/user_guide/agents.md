@@ -563,7 +563,7 @@ A queued job can be adopted after executor restart. An attempt that started but 
 
 ### Waiting without holding a slot
 
-The executor allows ten turns to execute at once. An Agent calling `job_wait` releases its slot while observing, so ten waiting parents cannot block their own queued children. The parent keeps its attempt and execution branch; waiting does not complete, retry, or restart the turn. It reacquires a slot before running another tool, an extension result hook, or a model request. This capacity wait can delay continuation beyond the observation deadline. Tool errors and policy timeouts also require reacquisition; executor shutdown or an observed earlier execution of the same job stops the turn instead. A restarted executor can resume the wait itself, not the work around it; see [Resuming a checkpointed wait after restart](#resuming-a-checkpointed-wait-after-restart).
+The executor allows ten turns to execute at once. An Agent calling `job_wait` releases its slot while observing, so ten waiting parents cannot block their own queued children. The parent keeps its attempt and execution branch; waiting does not complete, retry, or restart the turn. An eligible checkpointed wait also unloads its live conversation while the child is pending; see [Waiting without a loaded parent](#waiting-without-a-loaded-parent). It reacquires a slot before running another tool, an extension result hook, or a model request. This capacity wait can delay continuation beyond the observation deadline. Tool errors and policy timeouts also require reacquisition; executor shutdown or an observed earlier execution of the same job stops the turn instead. A restarted executor can resume the wait itself, not the work around it; see [Resuming a checkpointed wait after restart](#resuming-a-checkpointed-wait-after-restart).
 
 For example:
 
@@ -618,6 +618,30 @@ For example, suppose a parent turn called `job_wait` on a child with `"timeout_s
    Inspect the child transcript before running `/retry <child request ID>`.
 
 4. If the parent's own turn stopped somewhere other than a pending wait — for example after a tool ran but before its result was recorded — nothing resumes. `/interrupted` in the parent session lists that attempt the same way, and only an explicit `/retry` runs it again.
+
+## Waiting without a loaded parent
+
+A checkpointed `job_wait` can suspend inside the running executor too. The parent releases its execution slot and drops its loaded conversation and turn task. The session remains busy under the same attempt, so a newer message or command waits behind it. No earlier model call, tool effect or child submission repeats.
+
+| Wait state                                                                                                                       | In-process behavior                                                           |
+| -------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------- |
+| Restorable final `job_wait`, child pending                                                                                       | Unload; keep a small wait descriptor and session reservation                  |
+| Child already finished, or finishes during registration                                                                          | Recheck persisted state and readmit the same wait                             |
+| Missing or duplicate child notifications                                                                                         | Periodic reconciliation; no second advancement                                |
+| Observation or policy deadline expires                                                                                           | Readmit under the original deadlines, not a fresh timeout                     |
+| User stops the suspended attempt                                                                                                 | Pair the pending call with a cancelled result and stop; leave the child alone |
+| Approval pending, **Approve all**, later calls in the batch, injected turn input, active turn hooks or Worker completion channel | Stay resident with capacity yield and a diagnostic                            |
+
+Hooks may keep turn-local state that the checkpoint cannot restore. Without a carryover contract, any active before-start, tool-call, tool-result or end hook prevents unloading, even if it injected no messages. This conservative fallback does not disable the hook or change approvals. The runtime logs the reason it kept the turn resident.
+
+For example:
+
+1. Submit a child job and call `job_wait` with `{"session_db_id":"<child DB ID>","timeout_seconds":30}`. If the turn is eligible, the parent unloads while the child runs. `job_status` still observes the same job, and a new message to the parent session does not overtake it.
+2. When the child finishes, the executor reacquires capacity and reconstructs the parent from its original session snapshot and paired transcript. The wait returns, for example, `{"session_db_id":"<child DB ID>","state":{"Succeeded":{"text":"Canonical reference found"}}}`, and the next model request continues that same attempt.
+3. If 30 seconds pass first, the wait returns the current state after capacity becomes available, for example `{"session_db_id":"<child DB ID>","state":"Queued"}`. The child is not cancelled, and capacity delay does not start another 30-second observation.
+4. If you use `/stop` while the parent is unloaded, the session records `Stopped: the turn was cancelled at the user's request.` No model, tool or hook resumes to produce that stop. A late child result does not revive the parent.
+
+Restart behavior is unchanged: only an unretired exact checkpoint may continue; all uncertain effects stay held for explicit handling. Suspension creates no new persisted schema, cross-peer pickup permission or fencing guarantee.
 
 ## Parallel executions of one job
 

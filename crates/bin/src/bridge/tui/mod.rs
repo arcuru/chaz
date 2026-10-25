@@ -36,10 +36,14 @@ use tokio::sync::{Semaphore, mpsc};
 use tokio::task::JoinSet;
 use tokio_stream::StreamExt;
 
+#[cfg(test)]
+#[path = "../../../../lib/src/test_support/counting_backend.rs"]
+mod activity_backend;
 mod bridge_impl;
 mod input;
 mod jobs;
 mod operations;
+mod peer_pages;
 #[cfg(test)]
 mod readiness_tests;
 mod reconnect;
@@ -73,6 +77,7 @@ enum Action {
     /// list (already merged with cache); `Err` carries a display message.
     ModelsFetched(ModelCatalog),
     SessionLoad(SessionLoad),
+    PeerPage(peer_pages::Loaded),
     JobsLoaded(jobs::Loaded),
     /// A background tab read finished (see [`refresh`]).
     Refresh(refresh::Refresh),
@@ -183,8 +188,7 @@ impl SettingsReader {
 }
 
 /// Categories listed in the Peer Settings sidebar. Ordering here is the
-/// display order. Stage 1 leaves every category as a `(coming soon)`
-/// placeholder; subsequent stages fill in the detail panes.
+/// display order; read-only inspectors share the Content reader.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum PeerSettingsCategory {
     Agents,
@@ -751,6 +755,7 @@ pub(super) struct App {
     /// active tab). Lets the Session-side category renderers read the meta
     /// without doing async work mid-frame. `None` outside Session Settings.
     pub(super) session_settings_snapshot: Option<SessionMetaSnapshot>,
+    peer_pages: peer_pages::Pages,
     /// Sub-cursor inside the Peer → Agents list. Cycles with ↑↓ while
     /// that category is selected; clamped each frame to the live agent
     /// count. Persists across category switches so the user lands back
@@ -896,6 +901,7 @@ impl App {
             model_picker_scope: ModelPickerScope::Session,
             model_picker_current_pin: None,
             session_settings_snapshot: None,
+            peer_pages: peer_pages::Pages::default(),
             settings_return: None,
             peer_settings_index: 0,
             session_settings_index: 0,
@@ -1851,11 +1857,21 @@ async fn build_tab(
     session_db: eidetica::Database,
     session_db_id: String,
 ) -> Result<Tab, String> {
+    let snapshot = refresh::load_session_snapshot(&session_db_id, session_db.clone()).await?;
+    tab_from_snapshot(server, backend, session_db, session_db_id, snapshot).await
+}
+
+async fn tab_from_snapshot(
+    server: &Server,
+    backend: &BackendManager,
+    session_db: eidetica::Database,
+    session_db_id: String,
+    snapshot: refresh::SessionSnapshot,
+) -> Result<Tab, String> {
     let agent = server
         .registry()
         .resolve_agent(&session_db_id, None, server.agent_index())
         .await;
-    let snapshot = refresh::load_session_snapshot(&session_db_id, session_db.clone()).await?;
     let meta = snapshot.meta;
     let roster = build_roster(server, backend, &meta);
     let session_name = meta.name.clone();
@@ -1870,7 +1886,8 @@ async fn build_tab(
         .unwrap_or_default();
     let context_budget = server.effective_context_budget(&context_model, agent.max_context_tokens);
     let entries = snapshot.entries;
-    let active_turns = snapshot.active_turns?;
+    let evidence = snapshot.active_turns?;
+    let active_turns = evidence.active_at(chrono::Utc::now()).count();
     Ok(Tab {
         job: None,
         session_db_id,
@@ -1890,6 +1907,9 @@ async fn build_tab(
         expanded_entries: HashSet::new(),
         live: {
             let mut live = refresh::TabLive::with_meta(meta, snapshot.telemetry);
+            live.activity_evidence = Some(evidence);
+            live.covered = Some(snapshot.tips);
+            live.steering = snapshot.steering;
             live.inputs = snapshot.inputs;
             live.input_attempt = snapshot.input_attempt;
             live
@@ -2490,7 +2510,11 @@ mod session_picker_tests {
             .start_turn_attempt(chaz_core::session::TurnRequestId::parse("tui-message"))
             .await
             .unwrap();
-        tab.active_turns = refresh::load_active_turns(&tab.session_db).await.unwrap();
+        tab.active_turns = refresh::load_active_turns(&tab.session_db)
+            .await
+            .unwrap()
+            .active_at(chrono::Utc::now())
+            .count();
         assert_eq!(tab.active_turns, 1);
         assert!(view::turn_activity_line(tab.active_turns).is_some());
         session.complete_turn_attempt(&attempt, None).await.unwrap();
@@ -2505,7 +2529,11 @@ mod session_picker_tests {
             })
             .await
             .unwrap();
-        tab.active_turns = refresh::load_active_turns(&tab.session_db).await.unwrap();
+        tab.active_turns = refresh::load_active_turns(&tab.session_db)
+            .await
+            .unwrap()
+            .active_at(chrono::Utc::now())
+            .count();
         assert_eq!(tab.active_turns, 0);
         assert!(view::turn_activity_line(tab.active_turns).is_none());
     }
@@ -2686,6 +2714,8 @@ mod session_picker_tests {
                         session_db_id: loaded_id,
                         ticket,
                         snapshot: Ok(Box::new(refresh::SessionSnapshot {
+                            tips: eidetica::Snapshot::EMPTY,
+                            steering: None,
                             input_attempt: None,
                             inputs: vec![],
                             entries: vec![],
@@ -2694,7 +2724,7 @@ mod session_picker_tests {
                                 name: name.map(str::to_owned),
                                 ..Default::default()
                             },
-                            active_turns: Ok(0),
+                            active_turns: Ok(chaz_core::session::TurnActivity::default()),
                         })),
                     }
                 },

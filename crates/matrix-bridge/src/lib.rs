@@ -21,6 +21,7 @@ pub mod bridge;
 pub mod config;
 pub mod credentials;
 pub mod keys;
+pub mod login_state;
 pub mod rooms;
 mod store_lock;
 

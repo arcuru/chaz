@@ -14,7 +14,9 @@ configuration and behavior.
 
 The bridge only observes the per-turn claim; it does not run the agent or infer
 activity from a room binding, an old acknowledgement, or session runtime
-ownership. Typing is renewed every three seconds while the claim remains
+ownership. Session writes refresh the activity evidence; the renewal timer
+ages that evidence locally without rereading unchanged activity tables.
+Typing is renewed every three seconds while the claim remains
 fresh, with a ten-second server timeout, avoiding gaps if a renewal is delayed. On release it sends
 a cancellation. A missing executor heartbeat times out instead of showing
 permanent typing after a crash; network or sync lag can delay observation.
@@ -28,7 +30,7 @@ Example with a shared room:
    the bridge remains connected to the room. A second message starts a new turn.
 3. If the executor crashes, the typing notice expires and the bridge stops
    renewing it when the last heartbeat ages out (within 45 seconds plus sync
-   and polling delay). The turn is interrupted; inspect `/interrupted` from a
+   and renewal-timer delay). The turn is interrupted; inspect `/interrupted` from a
    client and use `/retry <request_id>` only after checking for external effects.
 
 ## Setup
@@ -158,17 +160,111 @@ chaz-matrix --config matrix-bridge.yaml rooms leave-all \
 `--retries` and `--delay-ms` tune only `leave-all`; listing has no leave policy
 to tune.
 
+### True reset: `--reset`
+
+Plain `leave-all` leaves joined rooms but keeps pending invitations and access
+to left-room history. Add `--reset` to also reject pending invites and forget
+each successfully left or rejected room. Like plain `leave-all`, it previews
+without changing membership unless you pass `--execute`.
+
+| Flag           | Effect                                                                                                       |
+| -------------- | ------------------------------------------------------------------------------------------------------------ |
+| `--reset`      | Include pending invites in the preview; with `--execute`, reject them and forget each room after leaving it. |
+| `--execute`    | Perform the previewed membership changes, plus forgetting when `--reset` is set.                             |
+| `--retries N`  | Attempt each leave or forget up to N times (default 3, range 1–10).                                          |
+| `--delay-ms N` | Wait N milliseconds between rooms (default 250, range 100–60000).                                            |
+
+Leaving an invited room rejects its invite. Forgetting a left room drops this
+account's server-side history access; it does not erase other users' copies,
+local history, or the bridge's Chaz sessions. The command handles only rooms
+joined or invited at enumeration time, not rooms left by an earlier run. A new
+invite can still join the account to the room after the bridge restarts.
+
+```bash
+chaz-matrix --config matrix-bridge.yaml rooms leave-all --reset            # preview
+chaz-matrix --config matrix-bridge.yaml rooms leave-all --execute --reset  # true reset
+```
+
+**Stop the bridge before a reset and leave it stopped until the run exits.**
+The steady-state bridge installs an invite auto-joiner at startup and joins
+every allowed invite it sees. A reset raced against a live bridge can be
+silently undone: an invite that arrives mid-run, or is still pending when the
+bridge next starts, puts the account right back in the room that was just
+left. There is no protocol way for the maintenance command to prevent this —
+the only fix is ordering.
+
+A forget that ultimately fails is reported as a warning and does not fail the
+run: forget behavior varies by server — those that already forget on leave
+(the `m.forget_forced_upon_leave` capability) may reject the redundant forget,
+and forget support outside Synapse is unverified. The exit code reflects the
+membership operations only.
+
+#### Walkthrough: resetting a bot account
+
+1. Stop the `chaz-matrix` bridge process so its auto-joiner cannot race the
+   reset.
+2. Preview. Nothing changes, and invites are listed before joined rooms:
+
+   ```text
+   $ chaz-matrix --config matrix-bridge.yaml rooms leave-all --reset
+   config: matrix-bridge.yaml
+   login: @chaz:example
+   agent: chaz
+   account: @chaz:example
+   homeserver: https://matrix.example
+   mode: dry-run (reset)
+   pending invite !invited:example
+   joined !general:example
+   joined !ops:example
+   1 pending invite(s) to reject, 2 joined room(s) to leave and forget; nothing was changed (dry-run)
+   re-run `rooms leave-all --execute --reset` for a true reset (stop the bridge first)
+   ```
+
+3. Execute. Each invite is rejected, then each joined room is left, and every
+   successful leave is followed by a forget. Here one leave keeps failing after
+   all its retries, and the server refuses one forget:
+
+   ```text
+   $ chaz-matrix --config matrix-bridge.yaml rooms leave-all --reset --execute
+   ...
+   mode: execute (reset: reject invites, forget after leave) (retries=3, delay=250ms)
+   rejected invite !invited:example
+   forgot !invited:example
+   left !general:example
+   warning: forget failed for !general:example (3 attempts): ...
+   FAILED !ops:example (3 attempts): ...
+   summary: rejected 1, left 1, failed 1, forgot 1, forget-failed 1
+   $ echo $?
+   1
+   ```
+
+4. Recover by re-running the same command. The new run enumerates only what is
+   still joined or invited, so `!ops:example` is retried and the rooms already
+   handled are not touched again. A room whose forget failed is already left and
+   does not reappear, so this command will not retry its forget; its history
+   stays readable to the account until it is forgotten some other way.
+5. Check the summary and any forget warnings before restarting the bridge.
+   Exit `0` means membership changes succeeded, not that every forget succeeded.
+
 Exit codes: `0` for a successful run, an empty room list, or a dry-run; `1`
-when one or more rooms failed to leave; `2` for a setup failure — no or
-ambiguous login, an unresolved password, a failed login, or an authenticated
-account that does not match the configured username.
+when one or more rooms failed to leave or invites failed to reject; `2` for a
+setup failure — no or ambiguous login, an unresolved password, a failed login,
+an authenticated account that does not match the configured username, or (with
+`--reset`) a failed invite enumeration.
 
 Safety notes:
 
 - Each run signs in with a **fresh throwaway device** that is logged out at the
-  end, so it never disturbs the bridge's own persisted session or device.
-- **Pending invitations are untouched** — only rooms the account is already
-  joined to are enumerated and left.
+  end, so it never disturbs the bridge's own persisted session or device. The
+  login path is deliberately crypto-free — no keys are uploaded — which keeps
+  the ephemeral device invisible to other clients.
+- Every run costs one login from each of Synapse's two login rate-limit
+  buckets (0.003/s, burst 5): fine at human or cron cadence, exhaustible by
+  tight retry loops around the command. `--reset` roughly doubles the per-room
+  API calls (leave plus forget).
+- **Pending invitations are untouched by plain `leave-all`** — only rooms the
+  account is already joined to are enumerated and left. `--reset` rejects them
+  instead.
 - Run it **with the bridge stopped** for a quiescent reset: a running bridge
   auto-joins allowed invitations it sees, so a room it re-joins mid-run is not
   part of the enumeration.
@@ -208,6 +304,7 @@ Commands are sent as Matrix messages. Session ops go through the same transport-
 | `!chaz unshare`              | Stop sharing the current session                                                             |
 | `!chaz sync <ticket>`        | Sync a remote session via ticket URL                                                         |
 | `!chaz compact`              | Summarize and compact conversation history                                                   |
+| `!chaz context`              | Context-window usage for this room's agent                                                   |
 | `!chaz print`                | Print the current conversation context                                                       |
 | `!chaz stop`                 | Stop the turn running in this session ([details](tui.md#stopping-a-running-turn))            |
 
@@ -387,15 +484,18 @@ The bridge reads and answers encrypted rooms. There is nothing to configure: eve
 Matrix login keeps a persistent encryption device, and the bridge decides which other
 devices it trusts from Matrix cross-signing alone.
 
-| What                   | Behavior                                                                                                             |
-| ---------------------- | -------------------------------------------------------------------------------------------------------------------- |
-| Device store           | `{state_dir}/matrix/{login_id}/store/`, a passphrase-encrypted SQLite store holding the device's keys and room state |
-| Store passphrase       | Generated on first start, kept in `{state_dir}/matrix/{login_id}/session` (mode `0600`, directory `0700`)            |
-| Bot device             | Signed with the account's cross-signing identity on first start; the identity is created if the account has none     |
-| Outbound room keys     | Shared only with devices their owner has cross-signed (MSC4153)                                                      |
-| Inbound messages       | Decrypted only from cross-signed devices; anything else is logged and ignored                                        |
-| Command authorization  | Unchanged: `allow_list`, approvals, and command rules apply exactly as in plaintext rooms                            |
-| Pre-encryption session | Upgraded in place on first start: same device, new store                                                             |
+| What                   | Behavior                                                                                                         |
+| ---------------------- | ---------------------------------------------------------------------------------------------------------------- |
+| Device store           | `{login dir}/store/`, a passphrase-encrypted SQLite store holding the device's keys and room state               |
+| Store passphrase       | Generated on first start, kept in `{login dir}/session` (mode `0600`, directory `0700`)                          |
+| Bot device             | Signed with the account's cross-signing identity on first start; the identity is created if the account has none |
+| Outbound room keys     | Shared only with devices their owner has cross-signed (MSC4153)                                                  |
+| Inbound messages       | Decrypted only from cross-signed devices; anything else is logged and ignored                                    |
+| Command authorization  | Unchanged: `allow_list`, approvals, and command rules apply exactly as in plaintext rooms                        |
+| Pre-encryption session | Upgraded in place on first start: same device, new store                                                         |
+
+`{login dir}` is the login's own directory under `{state_dir}/matrix/`; see
+[Per-login state directories](#per-login-state-directories).
 
 ### How encrypted-room trust works
 
@@ -461,6 +561,113 @@ out of the conversation. It does not keep the conversation out of chaz or the mo
 ## Limitations
 
 - **Text only.** The Matrix bridge currently ingests only text messages. Image, file, and other non-text Matrix events are skipped on both the live path and during history backfill. Multimodal models will not see attached images sent in the room. Restoring multimodal ingestion is tracked as a TODO in `crates/matrix-bridge/src/bridge/commands.rs` and `crates/matrix-bridge/src/bridge/history.rs`.
+
+## Per-login state directories
+
+Each configured login keeps its Matrix device in its own directory under
+`{state_dir}/matrix/`: the `session` file, the encrypted `store/`, the store lock,
+and any pending key-reset journal. Two logins that shared a directory would share
+one device and its keys, so the bridge makes sure each raw login id (the `id:`, or
+the `username:` when `id:` is unset) gets a directory that no other id can reach.
+
+| Item                   | Behavior                                                                                                                                         |
+| ---------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
+| New directory name     | `<prefix>-<tag>`: the id with characters outside `[A-Za-z0-9_-]` replaced by `_`, lowercased, cut to 48 characters, then a 32-hex-character tag  |
+| Tag                    | First 32 hex characters of SHA-256 of `chaz-matrix-login-state-v1`, a NUL byte, and the raw id. The id is not trimmed, normalized or case-folded |
+| `login-id` marker      | In every login directory, mode `0600`: `chaz-matrix-login-state-v1`, a newline, then the raw id. Written under the store lock                    |
+| Legacy directory       | Name from earlier releases: the replaced-characters id, not lowercased, with no tag. Used in place when it unambiguously belongs to the login    |
+| Ambiguous directory    | The whole bridge (and `keys` maintenance) refuses to start and writes nothing                                                                    |
+| Empty or duplicate id  | Rejected when the config is loaded                                                                                                               |
+| Moved or renamed files | Never. No directory is renamed, copied or deleted, and no device, store or cross-signing identity is regenerated by path resolution              |
+
+### Why names changed, and what happens to an existing directory
+
+Earlier releases named the directory by replacing every character outside
+`[A-Za-z0-9_-]` with `_`. Different ids can map to the same name that way:
+`@chaz:example` and `@chaz_example` both become `_chaz_example`, and on a
+case-insensitive filesystem so do `@Bot:hs` and `@bot:hs`. The tag in the new name
+differs for every raw id, and the lowercase prefix keeps names apart even where
+the filesystem ignores case. The prefix is only there so you can recognize the
+directory; the marker records exactly which id owns it, and a marker naming a
+different id refuses rather than letting two logins share state.
+
+On start, before it connects anywhere, the bridge resolves every configured login
+together, using the same code `chaz-matrix keys` uses:
+
+1. If the new-name directory exists, it is used. Its marker must name this login.
+   A legacy directory that also exists is left untouched.
+2. If neither exists, the new-name directory is created (mode `0700`) with a marker.
+3. A legacy directory with a marker belongs to the id it names. Any other login
+   that maps to the same legacy name gets a new-name directory.
+4. An unmarked legacy directory that only one configured login maps to is used in
+   place, provided its saved `session` (if there is one) is for that login's
+   account and homeserver. A different saved account refuses, as before.
+5. If several configured logins map to one unmarked legacy directory, the saved
+   session decides: the one login whose account and homeserver match uses it, and
+   the others get new-name directories. They could never have started from it.
+6. Anything else refuses: several logins match the saved account (two `id:`
+   aliases of one account), none does, or there is no session to decide by.
+
+An adopted legacy directory keeps its name for good. The `session` file records
+the store's absolute path, and a pending key reset records its staged store, so
+moving the directory would break both. Symlinks anywhere in the path, a marker or
+session that is a symlink or not a regular file, and an unreadable session are
+refused too. Errors never print session contents.
+
+**Repair.** A refusal lists every blocked login and the directory in question. Stop
+the bridge, then either remove the login that should not own the directory from
+`logins:`, or write the marker for the login that does, for example:
+
+```sh
+printf 'chaz-matrix-login-state-v1\n%s' '@chaz:example' > /var/lib/chaz-matrix/matrix/_chaz_example/login-id
+chmod 600 /var/lib/chaz-matrix/matrix/_chaz_example/login-id
+```
+
+Write the raw id byte for byte, with no trailing newline. The other logins that
+mapped to that directory then start fresh devices under new-name directories.
+
+### Walkthrough: upgrading with two logins that shared a legacy name
+
+A bridge config has two logins whose ids both map to the legacy name
+`_chaz_example`, and an earlier release left that directory without a `session`:
+
+```yaml
+logins:
+  - agent: chaz
+    type: matrix
+    homeserver_url: https://matrix.example
+    username: "@chaz:example"
+  - agent: helper
+    id: "@chaz_example"
+    type: matrix
+    homeserver_url: https://matrix.example
+    username: "@helper:example"
+```
+
+1. Start the upgraded bridge. Neither login can be shown to own the directory, so
+   nothing starts and nothing on disk changes:
+
+   ```text
+   INFO chaz_matrix: Starting chaz-matrix config=/var/lib/chaz-matrix-demo/config.yaml label=matrix
+   Error: refusing to start any Matrix login; per-login state is ambiguous or unsafe. Nothing was written, moved or regenerated.
+     login "@chaz:example": legacy directory /var/lib/chaz-matrix-demo/state/matrix/_chaz_example has no saved session to tell its claimants apart ("@chaz:example", "@chaz_example"); write a login-id marker naming the owner, or remove the extra logins
+     login "@chaz_example": legacy directory /var/lib/chaz-matrix-demo/state/matrix/_chaz_example has no saved session to tell its claimants apart ("@chaz:example", "@chaz_example"); write a login-id marker naming the owner, or remove the extra logins
+   ```
+
+   `chaz-matrix keys --login @chaz:example status` refuses with the same message.
+
+2. The directory was `@chaz:example`'s, so write its marker as shown under
+   **Repair** above, and start again. The first login uses the legacy directory in
+   place; the second gets its own new-name directory:
+
+   ```text
+   INFO chaz_matrix: Matrix login state: using legacy-named directory in place login=@chaz:example dir=/var/lib/chaz-matrix-demo/state/matrix/_chaz_example
+   INFO chaz_matrix: Matrix login state login=@chaz_example dir=/var/lib/chaz-matrix-demo/state/matrix/_chaz_example-2697f116dea2c15f91519f3371162faf
+   ```
+
+3. When the legacy directory does hold a `session`, no repair is needed: the login
+   whose account matches it keeps it, and the bridge writes the marker itself the
+   first time that login starts.
 
 ## Key maintenance: one store, one owner
 

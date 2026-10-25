@@ -44,5 +44,8 @@ unicode-width.workspace = true
 
 [dev-dependencies]
 async-trait.workspace = true
+# Native Remote verification notifications in isolated TUI tests.
+eidetica = { workspace = true, features = ["testing"] }
 insta = "1.41"
 tempfile.workspace = true
+wiremock = "0.6"

@@ -187,9 +187,20 @@ impl Session {
         &self,
         snapshot: &eidetica::Snapshot,
     ) -> anyhow::Result<Vec<JobInput>> {
-        super::jobs::require_observer_write(&self.database).await?;
-        let requests = ordered_inputs_at(&self.database, snapshot).await?;
-        let txn = self.database.new_transaction_at(snapshot).await?;
+        Ok(Self::steering_view_at(&self.database, snapshot)
+            .await?
+            .inputs_at(chrono::Utc::now()))
+    }
+
+    /// Disposable pinned steering/activity evidence, never authority to publish.
+    /// Timers can age it locally; refresh it after any database write.
+    pub async fn steering_view_at(
+        db: &Database,
+        snapshot: &eidetica::Snapshot,
+    ) -> anyhow::Result<SteeringView> {
+        super::jobs::require_observer_write(db).await?;
+        let requests = ordered_inputs_at(db, snapshot).await?;
+        let txn = db.new_transaction_at(snapshot).await?;
         let receipts = txn
             .get_store::<Table<JobInputState>>(RECEIPTS)
             .await?
@@ -200,38 +211,92 @@ impl Session {
             .await?
             .search(|_: &bool| true)
             .await?;
-        let current: Vec<_> = recent_states(&txn)
-            .await?
-            .into_values()
-            .filter_map(|state| match state {
-                super::TurnRequestState::InFlight { attempt_id } => Some(attempt_id),
-                _ => None,
-            })
-            .collect();
         let attempts = txn
             .get_store::<Table<super::TurnAttempt>>(super::TURN_ATTEMPTS_STORE)
             .await?
             .search(|_| true)
             .await?;
         let states = super::index_attempt_states(attempts.clone(), &Default::default());
-        let completed: Vec<_> = attempts
-            .into_iter()
-            .filter(|(_, attempt)| {
+        let completed = attempts
+            .iter()
+            .filter(|(_, a)| {
                 matches!(
-                    states.get(&attempt.request_id),
+                    states.get(&a.request_id),
                     Some(super::TurnRequestState::Completed { .. })
                 )
             })
-            .map(|(_, attempt)| attempt.attempt_id)
+            .map(|(_, a)| a.attempt_id.clone())
             .collect();
+        let heartbeats = txn
+            .get_store::<Table<chrono::DateTime<chrono::Utc>>>(super::TURN_ACTIVITY_STORE)
+            .await?
+            .search(|_| true)
+            .await?
+            .into_iter()
+            .collect();
+        let activity = super::TurnActivity::from_rows(
+            attempts.into_iter().map(|(_, a)| a).collect(),
+            &heartbeats,
+        );
         let boundaries = txn
             .get_store::<Table<super::TurnTranscriptRecord>>(super::TURN_TRANSCRIPT_STORE)
             .await?
             .search(|r| matches!(r.message, super::TurnTranscriptMessage::Steering { .. }))
             .await?;
+        Ok(SteeringView {
+            requests,
+            receipts,
+            closed,
+            states,
+            completed,
+            boundaries,
+            activity,
+        })
+    }
+}
+
+/// In-memory derived values from one Verified snapshot, including expiry evidence.
+#[derive(Clone)]
+pub struct SteeringView {
+    requests: Vec<JobInputRequest>,
+    receipts: Vec<(String, JobInputState)>,
+    closed: Vec<(String, bool)>,
+    pub(super) states: std::collections::HashMap<super::TurnRequestId, super::TurnRequestState>,
+    completed: Vec<String>,
+    boundaries: Vec<(String, super::TurnTranscriptRecord)>,
+    activity: super::TurnActivity,
+}
+
+impl SteeringView {
+    pub fn activity(&self) -> &super::TurnActivity {
+        &self.activity
+    }
+
+    pub fn active_at(&self, now: chrono::DateTime<chrono::Utc>) -> impl Iterator<Item = &str> {
+        self.activity.active_at(now)
+    }
+
+    pub fn attempts_at(&self, now: chrono::DateTime<chrono::Utc>) -> Vec<String> {
+        let active: std::collections::HashSet<_> = self.active_at(now).collect();
+        self.states
+            .values()
+            .filter_map(|state| match state {
+                super::TurnRequestState::Interrupted { attempt_id }
+                    if active.contains(attempt_id.as_str()) =>
+                {
+                    Some(attempt_id.clone())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    pub fn inputs_at(&self, now: chrono::DateTime<chrono::Utc>) -> Vec<JobInput> {
+        let current = self.attempts_at(now);
         let mut inputs = Vec::new();
-        for request in requests {
-            let mut state = receipts
+        for request in &self.requests {
+            let mut state = self
+                .receipts
                 .iter()
                 .find(|(id, _)| id == &request.id)
                 .map(|(_, state)| state.clone())
@@ -240,7 +305,8 @@ impl Session {
                 state,
                 JobInputState::Queued | JobInputState::Accepted | JobInputState::Dispatching { .. }
             ) {
-                let is_closed = closed
+                let is_closed = self
+                    .closed
                     .iter()
                     .any(|(id, closed)| id == &request.attempt_id && *closed);
                 state = if matches!(state, JobInputState::Queued) && is_closed {
@@ -248,7 +314,7 @@ impl Session {
                         reason: "not accepted before executor closed input".into(),
                     }
                 } else if !current.contains(&request.attempt_id) {
-                    if completed.contains(&request.attempt_id)
+                    if self.completed.contains(&request.attempt_id)
                         && !matches!(state, JobInputState::Dispatching { .. })
                     {
                         JobInputState::NotApplied {
@@ -263,15 +329,15 @@ impl Session {
                     state
                 };
             }
-            let incorporated = boundaries.iter().any(|(_, r)| r.attempt_id == request.attempt_id
+            let incorporated = self.boundaries.iter().any(|(_, r)| r.attempt_id == request.attempt_id
                 && matches!(&r.message, super::TurnTranscriptMessage::Steering { inputs, .. } if inputs.iter().any(|i| i.id == request.id)));
             inputs.push(JobInput {
-                request,
+                request: request.clone(),
                 state,
                 incorporated,
             });
         }
-        Ok(inputs)
+        inputs
     }
 }
 
@@ -325,6 +391,22 @@ async fn ordered_inputs_at(
     db: &Database,
     snapshot: &eidetica::Snapshot,
 ) -> anyhow::Result<Vec<JobInputRequest>> {
+    // Read the snapshot's materialized input Table before reconstructing
+    // order. With no visible input there is nothing to order, so skip the
+    // store-frontier walk: it reads every main Entry when the store is
+    // absent, one service round trip each.
+    if snapshot.tips().is_empty()
+        || db
+            .new_transaction_at(snapshot)
+            .await?
+            .get_store::<Table<JobInputRequest>>(INPUTS)
+            .await?
+            .search(|_: &JobInputRequest| true)
+            .await?
+            .is_empty()
+    {
+        return Ok(Vec::new());
+    }
     let entries = super::execution::store_entries_at(db, INPUTS, snapshot).await?;
     let mut seen = std::collections::HashSet::new();
     let mut ordered = Vec::new();
@@ -537,3 +619,7 @@ pub(crate) fn validate_boundary(
                 && seen.insert(input.id.clone())
         })
 }
+
+#[cfg(test)]
+#[path = "steering_tests.rs"]
+mod tests;

@@ -841,6 +841,7 @@ dependencies = [
  "unicode-normalization",
  "unicode-segmentation",
  "unicode-width 0.2.0",
+ "wiremock",
 ]
 
 [[package]]
@@ -849,6 +850,7 @@ version = "0.3.0"
 dependencies = [
  "anyhow",
  "async-openai",
+ "async-trait",
  "base64",
  "blake3",
  "chrono",
@@ -859,6 +861,7 @@ dependencies = [
  "futures",
  "getrandom 0.3.4",
  "lazy_static",
+ "libc",
  "matrix-sdk",
  "meval",
  "regex",
@@ -911,6 +914,7 @@ dependencies = [
  "clap",
  "dirs",
  "eidetica",
+ "futures",
  "getrandom 0.3.4",
  "libc",
  "matrix-sdk",
@@ -922,6 +926,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
+ "sha2 0.10.9",
  "tempfile",
  "tokio",
  "tracing",

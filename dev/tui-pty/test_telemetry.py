@@ -161,5 +161,118 @@ default_agents: [chaz]
             (out / "requests.json").write_text(json.dumps(calls, indent=2) + "\n")
 
 
+    def test_context_snapshot_and_read_only_peer_pages(self):
+        calls = []
+
+        class Handler(stub.Handler):
+            def log_message(self, *_):
+                pass
+
+            def do_POST(self):
+                body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                calls.append(body)
+                self._send({
+                    "id": f"context-{len(calls)}", "object": "chat.completion", "created": 0,
+                    "model": "stub",
+                    "choices": [{"index": 0, "message": {
+                        "role": "assistant", "content": f"CONTEXT-REPLY-{len(calls)}",
+                    }, "finish_reason": "stop"}],
+                    "usage": {"prompt_tokens": 2222, "completion_tokens": 10, "total_tokens": 2232},
+                })
+
+        http = HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=http.serve_forever, daemon=True)
+        thread.start()
+        process = None
+        out = evidence("context-and-peer-inspectors")
+        try:
+            with tempfile.TemporaryDirectory(prefix="chaz-context-pty-") as directory:
+                home = Path(directory)
+                env = environment(home)
+                config = home / "config.yaml"
+                config.write_text(f'''execution: executor
+state_dir: "{home}/state"
+unlock_password: fixture-only
+eidetica:
+  connection: "sqlite://{home}/fixture.db"
+  login:
+    username: pty-test
+    passwordless: true
+backends:
+  - name: stub
+    type: openaicompatible
+    api_base: "http://127.0.0.1:{http.server_port}/v1"
+    api_key: not-a-real-key
+    models:
+      - name: stub
+        context_window: 10000
+agents:
+  - name: chaz
+    model: stub
+    tools: []
+    system_prompt: You are a disposable test fixture.
+default_agents: [chaz]
+agent_groups:
+  inspection: [chaz]
+''')
+                subprocess.run([FIXTURE, home / "fixture.db"], env=env, cwd=home,
+                               check=True, timeout=20, capture_output=True)
+                process = PtyProcess([BINARY, "--config", config, "--session", "context"], env, home)
+                process.resize(180, 40)
+                process.expect_screen("Ctrl+S settings")
+                process.send("\x10")
+                process.expect_screen("Sessions")
+                process.send("s")
+                process.expect_screen("Peer Settings")
+                process.send("\x1b[B" * 4)
+                process.expect_screen("Scope: this process registration catalog")
+                process.expect_screen("Extension: baseline_context")
+                process.capture(out / "extensions")
+                process.send("\x1b[B" * 2)
+                process.expect_screen("Scope: loaded new-session roster templates")
+                process.expect_screen("Template: inspection")
+                process.capture(out / "groups")
+                process.send("\x1b[B")
+                process.expect_screen("Scope: connected account default public key")
+                process.expect_screen("ed25519:")
+                process.expect_screen("Fingerprint:")
+                process.capture(out / "identity")
+                self.assertEqual(calls, [], "read-only inspectors woke a model")
+                process.send("\x1b")
+                process.expect_screen("Sessions")
+                process.send("\r")
+                process.expect_screen("Ctrl+S settings")
+                process.send("first context turn\r")
+                process.expect_screen("CONTEXT-REPLY-1")
+                process.send("/context\r")
+                process.expect_screen("Last completed request: 2,222 input tokens")
+                process.expect_screen("Used: 2,222 / 10,000 = 22.2% of budget")
+                process.expect_screen("chaz will see this snapshot on its next turn")
+                process.capture(out / "shown")
+                self.assertEqual(len(calls), 1, "/context woke a model")
+                process.send("what did the snapshot say?\r")
+                process.expect_screen("CONTEXT-REPLY-2")
+                tail = calls[1]["messages"][-1]["content"]
+                self.assertTrue(tail.startswith("[/context diagnostic snapshot"), tail)
+                self.assertIn("Used: 2,222 / 10,000 = 22.2% of budget", tail)
+                process.send("and the later turn?\r")
+                process.expect_screen("CONTEXT-REPLY-3")
+                self.assertEqual(len(calls), 3)
+                self.assertFalse(any("[/context diagnostic snapshot" in str(message.get("content", ""))
+                                     for message in calls[2]["messages"]))
+                process.send("\x1b")
+                process.child.wait(timeout=10)
+                self.assertEqual(process.child.returncode, 0)
+        finally:
+            if process is not None:
+                process.capture(out / "exit")
+                process.close()
+            http.shutdown()
+            http.server_close()
+            thread.join(timeout=5)
+            out.mkdir(parents=True, exist_ok=True)
+            (out / "requests.json").write_text(json.dumps(calls, indent=2) + "\n")
+
+
 if __name__ == "__main__":
     unittest.main()

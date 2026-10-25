@@ -47,6 +47,7 @@ mod jobs;
 pub use job_monitor::{JobMonitor, JobMonitorNode};
 mod runtime_lease;
 mod schedule;
+mod suspended_wait;
 
 pub use build::{BuildOptions, BuiltServer, McpReadiness, build};
 pub use runtime_lease::{LeaseError, LocalRuntimeLease, OwnerId, RuntimeLease};
@@ -75,6 +76,7 @@ struct SessionRuntimeRecorder {
     /// The session state this attempt's context was assembled from. Without
     /// it a wait cannot be reconstructed, so none is checkpointed.
     context_snapshot: Option<eidetica::Snapshot>,
+    can_suspend: bool,
     /// The job execution branch whose evidence this recorder writes.
     branch: Option<String>,
     #[cfg(test)]
@@ -82,6 +84,10 @@ struct SessionRuntimeRecorder {
 }
 
 impl runtime::RuntimeRecorder for SessionRuntimeRecorder {
+    fn can_suspend_job_wait(&self) -> bool {
+        self.can_suspend
+    }
+
     fn input_boundary<'a>(
         &'a self,
         model_sequence: u64,
@@ -311,12 +317,28 @@ impl runtime::RuntimeRecorder for SessionRuntimeRecorder {
                 snapshot,
                 wait,
             );
-            self.session
-                .lock()
-                .await
+            let session = self.session.lock().await;
+            session
                 .record_job_wait_checkpoint(&checkpoint)
                 .await
-                .map_err(|error| format!("failed to persist job wait checkpoint: {error}"))
+                .map_err(|error| format!("failed to persist job wait checkpoint: {error}"))?;
+            if self.can_suspend {
+                // The tool will not enter until readmission. Keep the same
+                // bounded monitor activity that a resident wait records.
+                session
+                    .start_job_wait(
+                        &self.request_id,
+                        &format!(
+                            "{}:{}:{}",
+                            checkpoint.model_sequence, checkpoint.call_index, checkpoint.call_id
+                        ),
+                        &checkpoint.child_session_db_id,
+                        checkpoint.deadline,
+                    )
+                    .await
+                    .map_err(|error| format!("failed to record entered job wait: {error}"))?;
+            }
+            Ok(())
         })
     }
 
@@ -705,6 +727,54 @@ fn clamp_budget_to_window(agent_cap: Option<usize>, window: Option<usize>) -> Op
     }
 }
 
+/// Which input decided a resolved context budget. Mirrors the branches of
+/// `clamp_budget_to_window` plus the builder's configured fallback, so a
+/// diagnostic surface can say *why* the budget is what it is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContextBudgetSource {
+    /// The model's known context window (no lower per-agent cap).
+    ModelWindow,
+    /// The agent's explicit `max_context_tokens` (below the window, or the
+    /// window is unknown).
+    AgentCap,
+    /// Neither a window nor a cap is known: the configured
+    /// `context.max_context_tokens` default.
+    ConfiguredDefault,
+}
+
+/// A context budget with its provenance, as the runtime would resolve it for
+/// the next turn on this peer. `tokens` is the same value
+/// [`Server::effective_context_budget`] returns.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContextBudget {
+    /// Model id the budget was resolved for (`None` when no model is pinned
+    /// and the backend has no default).
+    pub model: Option<String>,
+    pub tokens: usize,
+    pub source: ContextBudgetSource,
+    /// The model's known context window, if any.
+    pub model_window: Option<usize>,
+    /// The agent's explicit cap, if any.
+    pub agent_cap: Option<usize>,
+    /// Tokens the context builder holds back for the reply.
+    pub reserved_output_tokens: usize,
+}
+
+/// Pure budget resolution with provenance. Agrees with
+/// `clamp_budget_to_window(agent_cap, window).unwrap_or(configured_default)`.
+fn resolve_budget_source(
+    agent_cap: Option<usize>,
+    window: Option<usize>,
+    configured_default: usize,
+) -> (usize, ContextBudgetSource) {
+    match (window, agent_cap) {
+        (Some(w), Some(cap)) if cap < w => (cap, ContextBudgetSource::AgentCap),
+        (Some(w), _) => (w, ContextBudgetSource::ModelWindow),
+        (None, Some(cap)) => (cap, ContextBudgetSource::AgentCap),
+        (None, None) => (configured_default, ContextBudgetSource::ConfiguredDefault),
+    }
+}
+
 /// The model id used for context-window budgeting and the learn-on-first-use
 /// window fetch: the session/agent pin when present, else the backend's
 /// resolved default. The fallback mirrors the model the actual LLM call lands
@@ -869,6 +939,11 @@ pub struct Server {
     /// Sessions currently being processed (prevents concurrent agent runs per session)
     processing: Arc<Mutex<std::collections::HashSet<String>>>,
     turns: RunningTurns,
+    suspended_waits: Arc<Mutex<HashMap<String, suspended_wait::SuspendedWait>>>,
+    #[cfg(test)]
+    suspended_wait_hints: AtomicBool,
+    #[cfg(test)]
+    suspended_wait_reconciliations: AtomicUsize,
     #[cfg(test)]
     transcript_fail_after: Arc<std::sync::Mutex<Option<usize>>>,
     /// Attempts started by this process and not yet durably completed.
@@ -1031,6 +1106,11 @@ impl Server {
             job_incarnation: uuid::Uuid::new_v4().to_string(),
             pending_retry_attempts: Arc::new(Mutex::new(std::collections::HashSet::new())),
             considered_wait_checkpoints: Default::default(),
+            suspended_waits: Default::default(),
+            #[cfg(test)]
+            suspended_wait_hints: AtomicBool::new(true),
+            #[cfg(test)]
+            suspended_wait_reconciliations: AtomicUsize::new(0),
             schedule_accounting: Arc::new(Mutex::new(HashMap::new())),
             skip_counters: Arc::new(Mutex::new(HashMap::new())),
             active_extensions: Arc::new(Mutex::new(HashMap::new())),
@@ -1984,6 +2064,36 @@ impl Server {
             .unwrap_or(self.context_config.max_context_tokens)
     }
 
+    /// The budget the next turn of `agent` would target, with its
+    /// provenance. Resolves the model the same way the turn path does
+    /// (session/agent pin, else the backend default) and windows through
+    /// the server's own `default_backend`, like
+    /// [`Self::effective_context_budget`].
+    pub fn context_budget(
+        &self,
+        session_model: Option<&str>,
+        agent_default_model: Option<&str>,
+        agent_cap: Option<usize>,
+    ) -> ContextBudget {
+        let model = budget_model_id(&self.default_backend, session_model, agent_default_model);
+        let model_window = model
+            .as_deref()
+            .and_then(|m| self.default_backend.context_window(m));
+        let (tokens, source) = resolve_budget_source(
+            agent_cap,
+            model_window,
+            self.context_config.max_context_tokens,
+        );
+        ContextBudget {
+            model,
+            tokens,
+            source,
+            model_window,
+            agent_cap,
+            reserved_output_tokens: self.context_config.reserved_output_tokens,
+        }
+    }
+
     /// Persist a model's pulled info into the in-use [`ModelInfoStore`] and
     /// slot its window (if any) into the live overlay. Called when the user
     /// selects a model in the picker — the "on switch" half of populating the
@@ -2810,6 +2920,14 @@ impl Server {
         // current turn may be blocked in a model, approval, or tool wait.
         self.observe_stop_requests(session_db_id, &session).await;
 
+        if self
+            .suspended_waits
+            .lock()
+            .await
+            .contains_key(session_db_id)
+        {
+            return Ok(None); // the lightweight waiter owns this reservation
+        }
         let live_attempts = self.live_attempts.lock().await.clone();
         let command = session.next_command_request(&live_attempts).await?;
         let queued = session
@@ -2884,6 +3002,8 @@ impl Server {
                     job_authority.as_ref(),
                     request,
                     plan,
+                    None,
+                    false,
                 )
                 .await?
         {
@@ -3267,6 +3387,7 @@ impl Server {
     /// Returns `None` when this checkpoint is now held, so ordinary queued
     /// work may run; `Some` when the session was handled, including when a
     /// transient gate (participation, home peer, a busy session) defers the resume.
+    #[allow(clippy::too_many_arguments)]
     async fn resume_checkpointed_wait(
         self: &Arc<Self>,
         session_db_id: &str,
@@ -3274,6 +3395,8 @@ impl Server {
         job: Option<&crate::session::jobs::AcceptedAgentJob>,
         request: crate::session::TurnRequest,
         plan: crate::session::wait_resume::ResumableWait,
+        reserved_permit: Option<OwnedSemaphorePermit>,
+        suspended: bool,
     ) -> anyhow::Result<Option<Option<String>>> {
         let key = plan.checkpoint.key();
         let attempt_id = plan.checkpoint.attempt_id.clone();
@@ -3328,11 +3451,12 @@ impl Server {
         if !self.is_startup_ready() {
             self.await_startup_ready().await;
         }
-        if !self
-            .processing
-            .lock()
-            .await
-            .insert(session_db_id.to_string())
+        if !suspended
+            && !self
+                .processing
+                .lock()
+                .await
+                .insert(session_db_id.to_string())
         {
             return Ok(Some(None));
         }
@@ -3396,14 +3520,23 @@ impl Server {
         .await;
         let live = self.live_attempts.lock().await.clone();
         let current = match fresh.turn_state_for_entry(&request.id, &live).await {
-            Ok(TurnRequestState::Interrupted {
-                attempt_id: current,
-            }) if current == plan.checkpoint.attempt_id => fresh
-                .latest_job_wait_checkpoint(&current)
-                .await
-                .ok()
-                .flatten()
-                .filter(|checkpoint| checkpoint == &plan.checkpoint),
+            Ok(
+                TurnRequestState::Interrupted {
+                    attempt_id: current,
+                }
+                | TurnRequestState::InFlight {
+                    attempt_id: current,
+                },
+            ) if current == plan.checkpoint.attempt_id
+                && (suspended || !live.contains(&current)) =>
+            {
+                fresh
+                    .latest_job_wait_checkpoint(&current)
+                    .await
+                    .ok()
+                    .flatten()
+                    .filter(|checkpoint| checkpoint == &plan.checkpoint)
+            }
             _ => None,
         };
         let plan = match current {
@@ -3461,7 +3594,7 @@ impl Server {
             backend,
             attempt,
             spawn_ctx,
-            None,
+            reserved_permit,
             Some(plan),
         )
         .await;
@@ -3473,7 +3606,7 @@ impl Server {
     // simply drops the permit without producing an interrupted attempt.
     #[allow(clippy::too_many_arguments)]
     async fn start_queued_job(
-        &self,
+        self: &Arc<Self>,
         sid: String,
         session: Session,
         job: crate::session::jobs::AcceptedAgentJob,
@@ -3773,7 +3906,7 @@ impl Server {
 
     #[allow(clippy::too_many_arguments)]
     async fn spawn_agent_task(
-        &self,
+        self: &Arc<Self>,
         session_db_id: String,
         session: Session,
         agent: crate::agent::Agent,
@@ -3836,7 +3969,13 @@ impl Server {
         #[cfg(test)]
         let transcript_fail_after = self.transcript_fail_after.clone();
 
-        let cancel = runtime::TurnCancel::new();
+        // A suspended segment keeps the same sticky stop signal.
+        let cancel = match self.turns.lock().await.get(&session_db_id) {
+            Some(turn) if turn.attempt.attempt_id == attempt.attempt_id => turn.cancel.clone(),
+            _ => runtime::TurnCancel::new(),
+        };
+        let server = Arc::downgrade(self);
+        let considered_wait_checkpoints = self.considered_wait_checkpoints.clone();
         self.turns.lock().await.insert(
             session_db_id.clone(),
             RunningTurn {
@@ -3866,6 +4005,7 @@ impl Server {
                 .and(projection.as_ref())
                 .map(|_| uuid::Uuid::new_v4().to_string());
             let (branch_started, branch_recorded) = tokio::sync::oneshot::channel::<()>();
+            let mut suspended = None;
             let work = async {
             if let (Some((queue, agent_db_id, peer)), Some(job)) = (&projection, &projection_job) {
                 let _guard = projection_lock.lock().await;
@@ -4148,6 +4288,7 @@ impl Server {
                 agent_name: agent_name.clone(),
                 requested_model: backend.resolve_model_name(effective_model.as_deref()),
                 context_snapshot,
+                can_suspend: spawn.completion_tx.is_none(),
                 branch: branch_id.clone(),
                 #[cfg(test)]
                 fail_after: transcript_fail_after,
@@ -4201,6 +4342,21 @@ impl Server {
                 return;
             }
 
+            if let Err(runtime::TurnError::Suspended { wait }) = &result {
+                // The single descriptor owns this pickup. An observer failure
+                // must not turn its cleanup wake into another automatic run.
+                considered_wait_checkpoints.lock().unwrap().insert(format!(
+                    "{}:{:020}:{:010}", attempt.attempt_id, wait.model_sequence, wait.call_index,
+                ));
+                suspended = Some(suspended_wait::SuspendedWait {
+                    attempt_id: attempt.attempt_id.clone(),
+                    child: wait.child_session_db_id.clone(),
+                    // A shorter policy budget is also absolute; readmission
+                    // still uses the unchanged original observation deadline.
+                    deadline: wait.deadline.min(wait.checkpointed_at + chrono::Duration::seconds(wait.policy_timeout_seconds as i64)),
+                });
+                return;
+            }
             let mut s = session.lock().await;
             let persistence_failed =
                 matches!(&result, Err(runtime::TurnError::Failed(error)) if error.starts_with("runtime persistence failed:"));
@@ -4266,6 +4422,7 @@ impl Server {
                     warn!(session_db_id, %reason, "Holding native continuation; attempt and checkpoint remain interrupted");
                     return;
                 }
+                Err(runtime::TurnError::Suspended { .. }) => unreachable!("suspension handled before settlement"),
                 Err(runtime::TurnError::Failed(err)) => {
                     error!("Agent error for {}: {err}", session_db_id);
                     (Some(SessionEntry {
@@ -4385,6 +4542,14 @@ impl Server {
                 }
             } else { work.await; }
 
+            // The work future (and its Session, context and recorder) is
+            // gone. A wait descriptor, not this turn task, keeps ordering.
+            if let Some(wait) = suspended
+                && let Some(server) = server.upgrade()
+            {
+                server.suspend_job_wait(session_db_id, wait, cancel).await;
+                return;
+            }
             live_attempts.lock().await.remove(&attempt.attempt_id);
 
             spawn.turns.lock().await.remove(&session_db_id);

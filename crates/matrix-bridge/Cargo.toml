@@ -22,6 +22,7 @@ clap.workspace = true
 dirs.workspace = true
 eidetica.workspace = true
 getrandom.workspace = true
+futures.workspace = true
 matrix-sdk.workspace = true
 matrix-sdk-base.workspace = true
 matrix-sdk-sqlite = { version = "0.18", default-features = false, features = ["crypto-store"] }
@@ -30,6 +31,7 @@ regex.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serde_yaml.workspace = true
+sha2.workspace = true
 tempfile.workspace = true
 tokio.workspace = true
 tracing.workspace = true

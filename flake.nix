@@ -162,11 +162,21 @@
 
         chaz-doc = craneLib.cargoDoc buildArgs;
 
-        # Compile once for filtered local runs and the full cargo test check.
+        # Share test compilation without requiring a portable nextest bundle in CI.
         # Keep Crane's existing Cargo profile and default workspace features.
+        chaz-test-artifacts = craneLib.mkCargoDerivation (buildArgs
+          // {
+            pnameSuffix = "-test-artifacts";
+            buildPhaseCargoCommand = "cargoWithProfile test --locked --workspace --no-run";
+          });
+
+        # Only filtered local runs need the portable archive. Reuse the compiled
+        # tests, and do not install another Cargo target cache alongside the bundle.
         chaz-test-archive = craneLib.mkCargoDerivation (buildArgs
           // {
             pnameSuffix = "-test-archive";
+            cargoArtifacts = chaz-test-artifacts;
+            doInstallCargoArtifacts = false;
             nativeBuildInputs = buildArgs.nativeBuildInputs or [] ++ [pkgs.cargo-nextest];
             buildPhaseCargoCommand = ''
               cargo nextest archive --locked --workspace \
@@ -182,8 +192,8 @@
         # Still cargo test, including doctests; only the compiled artifacts change.
         chaz-test = craneLib.cargoTest (testArgs
           // {
-            cargoArtifacts = chaz-test-archive;
-            # The archive owns reusable artifacts; this check has no consumers.
+            cargoArtifacts = chaz-test-artifacts;
+            # The compile step owns reusable artifacts; this check has no consumers.
             doInstallCargoArtifacts = false;
           });
 
@@ -283,6 +293,8 @@
           # Test group
           test = {
             default = chaz-test;
+            deps = cargoArtifacts;
+            artifacts = chaz-test-artifacts;
             archive = chaz-test-archive;
           };
 

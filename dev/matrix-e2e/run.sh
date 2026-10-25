@@ -534,6 +534,8 @@ BRIDGE_LOG="$WORKSPACE/bridge.log"
 # empty crypto store path and passphrase, for a device that never uploaded
 # keys. Start this run from one, so the first bridge start takes the upgrade
 # path a real deployment takes rather than the fresh-login path.
+# The directory uses the name earlier releases gave it, so the bridge must
+# adopt it in place rather than start a new device under the v1 name.
 LOGIN_STATE_DIR="$WORKSPACE/state-bridge/matrix/_agent_e2e_test"
 log "seeding a pre-encryption bridge session"
 LEGACY_LOGIN="$(curl -sS --max-time "$CURL_MAX_TIME" -X POST -H 'Content-Type: application/json' \
@@ -575,6 +577,13 @@ grep -q "Upgrading pre-encryption Matrix session" "$WORKSPACE/bridge.log" ||
 	fail "session file or login state dir is readable by others"
 AGENT_DEVICE_KEY="$(jq -r '.client_session.device_ed25519_key // empty' "$LOGIN_STATE_DIR/session")"
 [[ -n $AGENT_DEVICE_KEY ]] || fail "upgraded session did not record the device key"
+[[ $(printf 'chaz-matrix-login-state-v1\n%s' "$AGENT_MXID" | sha256sum) == $(sha256sum <"$LOGIN_STATE_DIR/login-id") && $(stat -c %a "$LOGIN_STATE_DIR/login-id") == 600 ]] ||
+	fail "adopted legacy login dir has no private login-id marker for the agent"
+[[ $(find "$WORKSPACE/state-bridge/matrix" -mindepth 1 -maxdepth 1 | wc -l) == 1 ]] ||
+	fail "bridge created another login dir instead of adopting the legacy one in place"
+grep -q "using legacy-named directory in place" "$WORKSPACE/bridge.log" ||
+	fail "bridge did not report adopting the legacy login dir"
+printf '\033[1;32mPASS\033[0m — legacy login dir adopted in place and marked\n' >&2
 
 # Preserve the daemon's pre-conversation state. Restoring it below models the
 # observed failure: the daemon's copied state knows the agent and bridge but
@@ -1365,3 +1374,113 @@ wait_for "eight durable completed DM attempts" 60 eight_completed_attempts
 COMPLETED="$(completed_attempts)"
 printf '\033[1;32mPASS\033[0m — rejoin and durable delivery: %s DM sends, %s completed attempts\n' \
     "$DM_OUTBOUND" "$COMPLETED" >&2
+
+# /context is a bridge-local command, not an agent request. Its persisted
+# report must cross the peer boundary and reach exactly the next model turn.
+log "context snapshot: bridge report, no wake, next-turn delivery"
+CONTEXT_TURNS_BEFORE="$(stub_requests)"
+TXN="e2e-$(date +%s%N)"
+mx PUT "/_matrix/client/v3/rooms/$ROOM_URI/send/m.room.message/$TXN" \
+    "$PUPPET_TOKEN" '{"msgtype":"m.text","body":"!chaz context"}' >/dev/null
+context_report_arrived() {
+    mx GET "/_matrix/client/v3/rooms/$ROOM_URI/messages?dir=b&limit=200" "$PUPPET_TOKEN" |
+        jq -er --arg a "$AGENT_MXID" \
+        '[.chunk[] | select(.sender == $a) | .content.body // "" |
+          select(contains("Context for agent") and contains("will see this snapshot on its next turn"))][0]' \
+        >"$WORKSPACE/context-shown.txt"
+}
+wait_for "user-visible context report in Matrix" "$REPLY_TIMEOUT" context_report_arrived
+[[ "$(stub_requests)" -eq "$CONTEXT_TURNS_BEFORE" ]] || fail "/context woke a model"
+context_probe_arrived() {
+    mx GET "/_matrix/client/v3/rooms/$ROOM_URI/messages?dir=b&limit=200" "$PUPPET_TOKEN" |
+        jq -e --arg a "$AGENT_MXID" --arg marker "$1" \
+        '[.chunk[] | select(.sender == $a) | select(.content.body // "" | contains($marker))] | length > 0'
+}
+for probe in context-probe-once context-probe-after; do
+    TXN="e2e-$(date +%s%N)"
+    mx PUT "/_matrix/client/v3/rooms/$ROOM_URI/send/m.room.message/$TXN" \
+        "$PUPPET_TOKEN" "$(jq -nc --arg b "$probe" '{msgtype:"m.text",body:$b}')" >/dev/null
+    wait_for "$probe reply" "$REPLY_TIMEOUT" context_probe_arrived "$probe"
+done
+[[ "$(stub_requests)" -eq $((CONTEXT_TURNS_BEFORE + 2)) ]] || fail "context command created an extra model turn"
+uv run --no-project --offline python - "$WORKSPACE" <<'PY'
+import json
+from pathlib import Path
+import sys
+root = Path(sys.argv[1])
+report = (root / "context-shown.txt").read_text().split("\n\n(")[0]
+probes = [json.loads(line.removeprefix("stub_llm: context probe: "))
+          for line in (root / "stub-llm.log").read_text().splitlines()
+          if line.startswith("stub_llm: context probe: ")]
+assert [p["marker"] for p in probes] == ["context-probe-once", "context-probe-after"], probes
+assert len(probes[0]["tails"]) == 1, probes
+delivered = probes[0]["tails"][0].split("\n", 1)[1]
+# Other enabled extensions can share the same user-role tail message.
+assert delivered == report or delivered.startswith(report + "\n\n"), probes
+assert probes[1]["tails"] == [], probes
+print("PASS — Matrix /context: exact shown snapshot delivered once; no command-triggered model call")
+PY
+
+# -------------------------------------------------------- invite + forget ---
+# Stop the auto-joiner before creating the invite. Reuse this homeserver and
+# the bridge's token for independent membership/history checks.
+log "true reset: stopping the bridge and creating a pending invite"
+kill -TERM "$BRIDGE_PID"
+wait_for "bridge to exit before reset" 30 sh -c "! kill -0 $BRIDGE_PID 2>/dev/null"
+retire_pid "$BRIDGE_PID"
+AGENT_TOKEN="$(jq -r '.user_session.access_token' "$LOGIN_STATE_DIR/session")"
+INVITED_ROOM="$(mx POST /_matrix/client/v3/createRoom "$PUPPET_TOKEN" "$(jq -nc \
+    --arg agent "$AGENT_MXID" '{preset:"trusted_private_chat",invite:[$agent]}')" |
+    jq -r '.room_id // empty')"
+[[ -n $INVITED_ROOM ]] || fail "could not create the reset invite"
+GROUP_URI="$(jq -rn --arg r "$GROUP_ROOM_ID" '$r|@uri')"
+mx GET "/_matrix/client/v3/rooms/$ROOM_URI/state" "$AGENT_TOKEN" | jq -e 'type == "array"' >/dev/null ||
+    fail "joined DM history was not readable before reset"
+mx GET "/_matrix/client/v3/rooms/$GROUP_URI/state" "$AGENT_TOKEN" | jq -e 'type == "array"' >/dev/null ||
+    fail "plain leave-all unexpectedly removed group history access"
+
+log "true reset: preview leaves membership unchanged"
+"$CHAZ_MATRIX_BIN" --config "$BRIDGE_CONFIG" rooms leave-all --reset >"$WORKSPACE/true-reset-preview.log" 2>&1 ||
+    fail "true-reset preview failed"
+grep -qF "pending invite $INVITED_ROOM" "$WORKSPACE/true-reset-preview.log" ||
+    fail "true-reset preview omitted the invite"
+grep -qF "joined $ROOM_ID" "$WORKSPACE/true-reset-preview.log" ||
+    fail "true-reset preview omitted the joined DM"
+mx GET /_matrix/client/v3/joined_rooms "$AGENT_TOKEN" |
+    jq -e --arg room "$ROOM_ID" '.joined_rooms == [$room]' >/dev/null ||
+    fail "true-reset preview changed joined rooms"
+mx GET '/_matrix/client/v3/sync?timeout=0' "$AGENT_TOKEN" |
+    jq -e --arg room "$INVITED_ROOM" '(.rooms.invite | keys) == [$room]' >/dev/null ||
+    fail "true-reset preview changed pending invites"
+
+log "true reset: reject, leave and forget"
+"$CHAZ_MATRIX_BIN" --config "$BRIDGE_CONFIG" rooms leave-all --reset --execute >"$WORKSPACE/true-reset-execute.log" 2>&1 ||
+    fail "true-reset execute failed"
+grep -qF 'summary: rejected 1, left 1, failed 0, forgot 2, forget-failed 0' "$WORKSPACE/true-reset-execute.log" ||
+    fail "true-reset summary did not confirm both rooms were handled"
+# Initial /sync responses are cached per device. Use a fresh observer so the
+# post-reset check cannot replay the preview's pre-reset invite snapshot.
+AGENT_TOKEN="$(mx POST /_matrix/client/v3/login "" "$(jq -nc \
+    --arg u "$AGENT_MXID" --arg p "$AGENT_PASSWORD" \
+    '{type:"m.login.password",identifier:{type:"m.id.user",user:$u},password:$p}')" |
+    jq -er '.access_token // empty')" || fail "could not log in the reset observer"
+mx GET /_matrix/client/v3/joined_rooms "$AGENT_TOKEN" | jq -e '.joined_rooms == []' >/dev/null ||
+    fail "true reset left joined rooms"
+mx GET '/_matrix/client/v3/sync?timeout=0' "$AGENT_TOKEN" |
+    jq -e '(.rooms.invite // {} | length) == 0' >/dev/null ||
+    fail "true reset left pending invites"
+mx GET "/_matrix/client/v3/rooms/$ROOM_URI/state" "$AGENT_TOKEN" |
+    jq -e '.errcode == "M_FORBIDDEN"' >/dev/null ||
+    fail "true reset did not remove DM history access"
+mx GET "/_matrix/client/v3/rooms/$GROUP_URI/state" "$AGENT_TOKEN" | jq -e 'type == "array"' >/dev/null ||
+    fail "true reset changed the already-left control room"
+
+"$CHAZ_MATRIX_BIN" --config "$BRIDGE_CONFIG" rooms leave-all --reset --execute >"$WORKSPACE/true-reset-empty.log" 2>&1 ||
+    fail "true-reset rerun failed"
+grep -qF 'nothing to do (no joined rooms, no pending invites)' "$WORKSPACE/true-reset-empty.log" ||
+    fail "true-reset rerun was not empty"
+for out in true-reset-preview true-reset-execute true-reset-empty; do
+    ! grep -qF "$AGENT_PASSWORD" "$WORKSPACE/$out.log" ||
+        fail "agent password leaked into $out"
+done
+printf '\033[1;32mPASS\033[0m — true reset: nonmutating preview, invite rejected, joined room left, both forgotten, control readable, rerun empty, no secret leaked\n' >&2

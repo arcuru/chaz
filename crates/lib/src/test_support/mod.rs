@@ -13,6 +13,8 @@ pub(crate) use mock_backend::*;
 pub(crate) use mock_host::*;
 
 #[cfg(test)]
+pub(crate) mod counting_backend;
+#[cfg(test)]
 pub(crate) mod projection_integration;
 #[cfg(test)]
 mod runtime_integration;

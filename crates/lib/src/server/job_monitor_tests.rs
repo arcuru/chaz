@@ -124,7 +124,7 @@ async fn service_steering(
             .await
             .unwrap()
     };
-    tokio::time::timeout(std::time::Duration::from_secs(15), gate.wait_started())
+    tokio::time::timeout(ASYNC_TEST_TIMEOUT, gate.wait_started())
         .await
         .unwrap();
     let (_, db) = registry.open_job_session(&id).await.unwrap();
@@ -140,7 +140,7 @@ async fn service_steering(
     // The observation deadline expires while the actual child call is gated.
     // Later release/settlement below must still use this same job and attempt.
     let bounded = tokio::time::timeout(
-        std::time::Duration::from_secs(5),
+        ASYNC_TEST_TIMEOUT,
         client.wait_job(&id, std::time::Duration::from_millis(20)),
     )
     .await
@@ -287,7 +287,7 @@ async fn service_steering(
         gate.release();
         assert_eq!(
             client
-                .wait_job(&id, std::time::Duration::from_secs(14))
+                .wait_job(&id, ASYNC_TEST_TIMEOUT)
                 .await
                 .unwrap()
                 .state,
@@ -463,12 +463,9 @@ async fn service_steering(
         let gate = if sequence == 1 {
             let continuation = mock.block_next_call();
             gate.release();
-            tokio::time::timeout(
-                std::time::Duration::from_secs(10),
-                continuation.wait_started(),
-            )
-            .await
-            .unwrap();
+            tokio::time::timeout(ASYNC_TEST_TIMEOUT, continuation.wait_started())
+                .await
+                .unwrap();
             assert!(
                 crate::session::jobs::read_job_result(&db)
                     .await
@@ -485,11 +482,11 @@ async fn service_steering(
             gate
         };
         executor.shutdown().await;
-        tokio::time::timeout(std::time::Duration::from_secs(5), gate.wait_stopped())
+        tokio::time::timeout(ASYNC_TEST_TIMEOUT, gate.wait_stopped())
             .await
             .unwrap();
         let (restarted, next_mock) = published_executor_with_mock(&settings, agents, agent).await;
-        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        tokio::time::timeout(ASYNC_TEST_TIMEOUT, async {
             while !restarted.is_watching_session(&id).await {
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
@@ -513,7 +510,7 @@ async fn service_steering(
             .unwrap();
         assert!(
             client
-                .wait_job(&id, std::time::Duration::from_secs(14))
+                .wait_job(&id, ASYNC_TEST_TIMEOUT)
                 .await
                 .unwrap()
                 .state
@@ -579,7 +576,7 @@ async fn service_steering(
             "job_wait".into(),
             // This exercises a live child wait, not timeout expiry. Service
             // discovery and debug-mode projection must fit inside the bound.
-            serde_json::json!({"session_db_id": child, "timeout_seconds": 30}).to_string(),
+            serde_json::json!({"session_db_id": child, "timeout_seconds": ASYNC_TEST_TIMEOUT.as_secs()}).to_string(),
         )]);
         // Upstream yields the parent's slot inside job_wait: the child calls
         // before the parent can reacquire and request its terminal answer.
@@ -616,12 +613,9 @@ async fn service_steering(
     let continuation = mock.block_next_call();
     let child_gate = child_wait.as_ref().map(|_| mock.block_next_call());
     gate.release();
-    tokio::time::timeout(
-        std::time::Duration::from_secs(10),
-        continuation.wait_started(),
-    )
-    .await
-    .unwrap();
+    tokio::time::timeout(ASYNC_TEST_TIMEOUT, continuation.wait_started())
+        .await
+        .unwrap();
     assert!(
         crate::session::jobs::read_job_result(&db)
             .await
@@ -644,12 +638,12 @@ async fn service_steering(
     continuation.release();
     if let Some((child, _)) = &child_wait {
         let child_gate = child_gate.as_ref().unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(5), child_gate.wait_started())
+        tokio::time::timeout(ASYNC_TEST_TIMEOUT, child_gate.wait_started())
             .await
             .expect("child must acquire the parent's yielded slot");
         assert!(mock.recorded_calls()[2].messages.iter().any(|message|
             matches!(message, RuntimeMessage::User(text) if text == "referenced queued child")));
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        tokio::time::timeout(ASYNC_TEST_TIMEOUT, async {
             loop {
                 let graph = observer.job_monitor().await.unwrap();
                 let parent = graph
@@ -675,10 +669,7 @@ async fn service_steering(
         .expect("actual bounded child wait must be observable before it finishes");
         child_gate.release();
     }
-    let terminal = client
-        .wait_job(&id, std::time::Duration::from_secs(14))
-        .await
-        .unwrap();
+    let terminal = client.wait_job(&id, ASYNC_TEST_TIMEOUT).await.unwrap();
     assert_eq!(
         terminal.state,
         JobState::Succeeded {

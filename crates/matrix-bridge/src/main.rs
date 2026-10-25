@@ -28,6 +28,7 @@ use chaz_core::config::Config;
 use chaz_core::instance::{self, ConnectedInstance, InstanceOwnership};
 use chaz_core::server;
 
+use chaz_matrix_bridge::login_state::Resolution;
 use chaz_matrix_bridge::{MatrixBridge, MatrixBridgeConfig, MatrixCredentials};
 
 use clap::Parser;
@@ -100,6 +101,12 @@ struct LeaveAllArgs {
     #[arg(long)]
     execute: bool,
 
+    /// True reset: also reject every pending invite and forget each room
+    /// after leaving it. Stop the bridge first so its invite auto-joiner
+    /// cannot race the reset.
+    #[arg(long)]
+    reset: bool,
+
     /// Leave attempts per room before giving up.
     #[arg(long, default_value_t = 3, value_parser = parse_retries)]
     retries: u32,
@@ -143,6 +150,8 @@ fn parse_delay_ms(s: &str) -> Result<u64, String> {
 struct ReadyLogin {
     spec: LoginSpec,
     creds: MatrixCredentials,
+    /// This login's resolved per-login Matrix state directory.
+    state_dir: PathBuf,
 }
 
 #[tokio::main]
@@ -171,11 +180,12 @@ async fn main() -> anyhow::Result<()> {
     // The `rooms` maintenance subcommand runs once and exits; it never starts
     // the bridge or opens the bridge's own backend.
     if let Some(Command::Rooms(rooms)) = &args.command {
-        let (login, execute, retries, delay_ms) = match &rooms.command {
-            RoomsCommand::List(selection) => (selection.login.as_deref(), false, 3, 250),
+        let (login, execute, reset, retries, delay_ms) = match &rooms.command {
+            RoomsCommand::List(selection) => (selection.login.as_deref(), false, false, 3, 250),
             RoomsCommand::LeaveAll(args) => (
                 args.selection.login.as_deref(),
                 args.execute,
+                args.reset,
                 args.retries,
                 args.delay_ms,
             ),
@@ -193,6 +203,7 @@ async fn main() -> anyhow::Result<()> {
             &bridge_cfg,
             login,
             execute,
+            reset,
             retries,
             delay_ms,
         )
@@ -223,6 +234,24 @@ async fn main() -> anyhow::Result<()> {
     }
 
     info!(config = %config_path.display(), label = %bridge_cfg.label, "Starting chaz-matrix");
+
+    // Resolve every login's Matrix state directory before anything else
+    // touches disk. An ambiguous or unsafe directory refuses the whole bridge
+    // here, having written nothing.
+    let state_dirs = bridge_cfg.login_state_dirs()?;
+    for (entry, resolution) in bridge_cfg.logins.iter().zip(&state_dirs) {
+        match resolution {
+            Resolution::New(path) => {
+                info!(login = %entry.login.login_id(), dir = %path.display(), "Matrix login state")
+            }
+            Resolution::Adopted(path) => info!(
+                login = %entry.login.login_id(),
+                dir = %path.display(),
+                "Matrix login state: using legacy-named directory in place"
+            ),
+            Resolution::Refused(_) => unreachable!("login_state_dirs refuses as a whole"),
+        }
+    }
 
     // The bridge's own state dir: the Matrix client's sync token and session
     // live here, and a direct owner's legacy store is expected at
@@ -273,7 +302,7 @@ async fn main() -> anyhow::Result<()> {
         key_name: BRIDGE_KEY_NAME,
     };
     let mut ready: Vec<ReadyLogin> = Vec::new();
-    for entry in &bridge_cfg.logins {
+    for (entry, resolution) in bridge_cfg.logins.iter().zip(&state_dirs) {
         let spec = LoginSpec {
             login_id: entry.login.login_id().to_string(),
             agent: entry.agent.clone(),
@@ -296,7 +325,15 @@ async fn main() -> anyhow::Result<()> {
                     .ok_or_else(|| {
                         anyhow::anyhow!("no seeded credentials found for login {}", spec.login_id)
                     })?;
-                ready.push(ReadyLogin { spec, creds });
+                let state_dir = resolution
+                    .path()
+                    .expect("resolved state directory")
+                    .to_path_buf();
+                ready.push(ReadyLogin {
+                    spec,
+                    creds,
+                    state_dir,
+                });
             }
             LoginOutcome::Pending(_) => {}
         }
@@ -309,10 +346,9 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let ownership = connected.capabilities.ownership();
-    let generation = build_generation(
+    let mut generation = build_generation(
         &mut config,
         &config_path,
-        &base,
         connected,
         &bridge_key,
         &bridge_db_id,
@@ -326,13 +362,12 @@ async fn main() -> anyhow::Result<()> {
             let context = Arc::new(RebuildContext {
                 config,
                 config_path,
-                base,
                 bridge_key,
                 bridge_db_id,
                 ready,
             });
             instance::supervise_service(
-                generation,
+                &mut generation,
                 move || {
                     let context = context.clone();
                     async move {
@@ -341,7 +376,6 @@ async fn main() -> anyhow::Result<()> {
                         build_generation(
                             &mut config,
                             &context.config_path,
-                            &context.base,
                             connected,
                             &context.bridge_key,
                             &context.bridge_db_id,
@@ -363,7 +397,6 @@ async fn main() -> anyhow::Result<()> {
 struct RebuildContext {
     config: Config,
     config_path: PathBuf,
-    base: PathBuf,
     bridge_key: PublicKey,
     bridge_db_id: String,
     ready: Vec<ReadyLogin>,
@@ -375,7 +408,6 @@ struct RebuildContext {
 async fn build_generation(
     config: &mut Config,
     config_path: &Path,
-    base: &Path,
     connected: ConnectedInstance,
     bridge_key: &PublicKey,
     bridge_db_id: &str,
@@ -420,11 +452,7 @@ async fn build_generation(
     }
 
     for login in ready {
-        let login_state_dir = base
-            .join("matrix")
-            .join(sanitize_login_id(&login.spec.login_id))
-            .to_string_lossy()
-            .into_owned();
+        let login_state_dir = login.state_dir.to_string_lossy().into_owned();
         let bridge = MatrixBridge::new(
             login.creds.clone(),
             login.spec.login_id.clone(),
@@ -439,12 +467,6 @@ async fn build_generation(
         generation.spawn(async move { bridge.run(server).await });
     }
     Ok(generation)
-}
-
-/// Per-login matrix-client state-dir component: keep it filesystem-safe by
-/// replacing anything outside `[A-Za-z0-9_-]` (MXIDs carry `@` and `:`).
-fn sanitize_login_id(login_id: &str) -> String {
-    chaz_matrix_bridge::config::sanitize_login_id(login_id)
 }
 
 /// Resolve the bridge config path: explicit `--config`, else
@@ -503,8 +525,9 @@ mod tests {
     }
 
     /// Parse a `rooms leave-all` invocation through the real clap wiring,
-    /// returning `(execute, retries, delay_ms)` or `None` when clap rejects it.
-    fn parse_leave_all(args: &[&str]) -> Option<(bool, u32, u64)> {
+    /// returning `(execute, reset, retries, delay_ms)` or `None` when clap
+    /// rejects it.
+    fn parse_leave_all(args: &[&str]) -> Option<(bool, bool, u32, u64)> {
         let argv = ["chaz-matrix", "rooms", "leave-all"]
             .into_iter()
             .chain(args.iter().copied())
@@ -514,7 +537,9 @@ mod tests {
             return None;
         };
         match rooms.command {
-            RoomsCommand::LeaveAll(args) => Some((args.execute, args.retries, args.delay_ms)),
+            RoomsCommand::LeaveAll(args) => {
+                Some((args.execute, args.reset, args.retries, args.delay_ms))
+            }
             RoomsCommand::List(_) => None,
         }
     }
@@ -529,11 +554,19 @@ mod tests {
             panic!("rooms list parsed as the wrong command");
         };
 
-        assert_eq!(parse_leave_all(&[]), Some((false, 3, 250)));
-        assert_eq!(parse_leave_all(&["--execute"]), Some((true, 3, 250)));
+        assert_eq!(parse_leave_all(&[]), Some((false, false, 3, 250)));
+        assert_eq!(parse_leave_all(&["--execute"]), Some((true, false, 3, 250)));
+        // --reset previews the true reset on its own and combines with
+        // --execute; it exists only on leave-all.
+        assert_eq!(parse_leave_all(&["--reset"]), Some((false, true, 3, 250)));
+        assert_eq!(
+            parse_leave_all(&["--execute", "--reset"]),
+            Some((true, true, 3, 250))
+        );
         assert!(Args::try_parse_from(["chaz-matrix", "rooms"]).is_err());
         assert!(Args::try_parse_from(["chaz-matrix", "rooms", "list", "--execute"]).is_err());
         assert!(Args::try_parse_from(["chaz-matrix", "rooms", "list", "--retries", "3"]).is_err());
+        assert!(Args::try_parse_from(["chaz-matrix", "rooms", "list", "--reset"]).is_err());
     }
 
     #[test]
@@ -548,18 +581,21 @@ mod tests {
 
     #[test]
     fn leave_all_args_accept_boundaries_and_defaults() {
-        assert_eq!(parse_leave_all(&["--retries", "1"]), Some((false, 1, 250)));
+        assert_eq!(
+            parse_leave_all(&["--retries", "1"]),
+            Some((false, false, 1, 250))
+        );
         assert_eq!(
             parse_leave_all(&["--retries", "10"]),
-            Some((false, 10, 250))
+            Some((false, false, 10, 250))
         );
         assert_eq!(
             parse_leave_all(&["--delay-ms", "100"]),
-            Some((false, 3, 100))
+            Some((false, false, 3, 100))
         );
         assert_eq!(
             parse_leave_all(&["--delay-ms", "60000"]),
-            Some((false, 3, 60000))
+            Some((false, false, 3, 60000))
         );
     }
 }

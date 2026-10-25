@@ -44,6 +44,10 @@ pub(super) fn command_catalog() -> Vec<(&'static str, &'static str)> {
         ),
         ("/info", "show current session info"),
         ("/costs", "aggregate LLM usage + cost across all sessions"),
+        (
+            "/context",
+            "context-window usage; shared with the agent's next turn",
+        ),
         ("/interrupted", "list turns requiring an explicit retry"),
         ("/retry ", "retry one interrupted request by stable id"),
         ("/channels", "list Matrix rooms attached to this session"),
@@ -1896,7 +1900,7 @@ mod tests {
             "/help",
         ];
         // Verbs deliberately dispatched as `Command::Extension`.
-        const EXTENSION: &[&str] = &["/memory", "/schedule"];
+        const EXTENSION: &[&str] = &["/context", "/memory", "/schedule"];
 
         for (tpl, _) in command_catalog() {
             if tpl.starts_with('#') {

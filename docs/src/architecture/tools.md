@@ -166,3 +166,15 @@ overrides in `security.tool_policies` apply on top of the tool's
 ## Agent-job submission
 
 `spawn_agent` prepares a child session DB and its initial Directive before publishing the ID in the existing watched catalog. A client can submit and observe the handle but cannot admit or run it; the executor validates and participates in that same DB. Status is `Pending` until acceptance or `Rejected` on refusal. There is no parent request key for automatic deduplication: an uncertain creation response requires catalog inspection before another submission.
+
+## MCP process ownership
+
+`McpServer::start` synchronously creates the transport; `initialize` is a separate awaited operation. The MCP registry retains the server and its startup task before initialization or discovery can be cancelled. Startup builds its tool list privately, then publishes tools and Running status under the registry's synchronous admission lock. No registry lock is held over an await. A pending-source guard also retires announcements when an unpolled startup is aborted.
+
+A stdio transport owns a complete child/stdin/stdout generation behind one asynchronous mutex. Close and restart interrupt active I/O before acquiring that mutex. Restart reaps the old generation, waits the existing backoff, then checks terminal admission and synchronously installs all new I/O together. Cancellation leaves either that complete generation or a terminal transport with cleanup ownership retained. Cancelling the recovery handshake also closes admission to the newly spawned generation. Failed tool calls retain their original outcomes and are not replayed.
+
+Each explicit child cleanup uses one monotonic EOF/TERM/forced-reap budget, including its startup join and generation-lock wait. Failures return an incomplete result without removing the owned child or registry entry. Registry close joins startup by reference and removes an entry only after both join and explicit reap succeed. Repeated or cancelled close calls can therefore retry the same owner.
+
+`BuiltServer::try_shutdown` borrows the runtime and reports incomplete cleanup. Terminal callers retry on that same runtime; service supervision borrows the old generation until cleanup succeeds before constructing a replacement. Normal and error one-shot exits take the same shutdown path without changing the bridge result. No extension-instance teardown or detached reaper owns a second copy of cleanup responsibility.
+
+The guarantee is direct-child-only. Inherited stdout held by a wrapper descendant does not prevent direct-child reap, and no process-tree signaling is performed. See [Direct-child shutdown](../user_guide/mcp.md#direct-child-shutdown) for the fixed phase allowances and sequential multi-server scaling.

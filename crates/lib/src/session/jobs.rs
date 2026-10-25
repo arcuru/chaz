@@ -193,67 +193,8 @@ pub(crate) async fn status_from_db(
     live_attempts: &std::collections::HashSet<String>,
     executor_observer: bool,
 ) -> anyhow::Result<JobStatus> {
-    let accepted = match read_accepted_job(db).await? {
-        Some(accepted) => accepted,
-        None if crate::db_kind::read_marker(db)
-            .await
-            .is_some_and(|(kind, name)| {
-                kind == crate::db_kind::KIND_SESSION && name.starts_with("job-stage:submitter:")
-            })
-            || read_job_rejection(db).await?.is_some() =>
-        {
-            return Ok(JobStatus {
-                session_db_id: db.root_id().to_string(),
-                state: match read_job_rejection(db).await? {
-                    Some(message) => JobState::Rejected { message },
-                    None => JobState::Pending,
-                },
-            });
-        }
-        None => anyhow::bail!("session has no accepted agent job"),
-    };
-    let session_db_id = db.root_id().to_string();
-    let session =
-        super::Session::new(super::ConversationId(session_db_id.clone()), db.clone()).await;
-    let request_id = super::TurnRequestId::parse(accepted.directive_id);
-    let request = session
-        .turn_request(&request_id, |_| false, live_attempts)
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("accepted job Directive is missing"))?;
-    let state = match request.state {
-        super::TurnRequestState::Queued => JobState::Queued,
-        super::TurnRequestState::InFlight { attempt_id } => JobState::Running { attempt_id },
-        super::TurnRequestState::Interrupted { attempt_id } => {
-            if executor_observer {
-                JobState::Interrupted { attempt_id }
-            } else {
-                let activity_recent = super::Session::active_turn_attempts(db)
-                    .await?
-                    .contains(&attempt_id);
-                JobState::StartedUnknown {
-                    attempt_id,
-                    activity_recent,
-                }
-            }
-        }
-        super::TurnRequestState::Completed { attempt_id } => {
-            let receipt = read_job_result(db)
-                .await?
-                .ok_or_else(|| anyhow::anyhow!("completed job lacks terminal receipt"))?;
-            anyhow::ensure!(
-                receipt.attempt_id == attempt_id,
-                "job receipt attempt differs"
-            );
-            match receipt.terminal {
-                JobTerminal::Success { text } => JobState::Succeeded { text },
-                JobTerminal::Failure { message } => JobState::Failed { message },
-            }
-        }
-    };
-    Ok(JobStatus {
-        session_db_id,
-        state,
-    })
+    let snapshot = db.snapshot().await?;
+    status_at(db, &snapshot, None, live_attempts, executor_observer, None).await
 }
 /// Local-v1 observation needs write-capable credentials because the current
 /// service materializes native record caches while reading. This checks existing
@@ -283,6 +224,157 @@ pub async fn require_observer_write(
 pub async fn observer_status(db: &eidetica::Database) -> anyhow::Result<JobStatus> {
     require_observer_write(db).await?;
     status_from_db(db, &Default::default(), false).await
+}
+
+impl super::Session {
+    /// Observe a job using this session's already-loaded transcript and the
+    /// same pinned snapshot. Construct the session with `try_new_at` first.
+    /// Existing authority is rechecked; this never acquires execution ownership.
+    pub async fn observer_status_at(
+        &self,
+        snapshot: &eidetica::Snapshot,
+        steering: &super::steering::SteeringView,
+    ) -> anyhow::Result<JobStatus> {
+        require_observer_write(&self.database).await?;
+        status_at(
+            &self.database,
+            snapshot,
+            Some(self),
+            &Default::default(),
+            false,
+            Some(steering),
+        )
+        .await
+    }
+}
+
+/// One interpretation for executor status and pinned client presentation.
+async fn status_at(
+    db: &eidetica::Database,
+    snapshot: &eidetica::Snapshot,
+    session: Option<&super::Session>,
+    live_attempts: &std::collections::HashSet<String>,
+    executor_observer: bool,
+    steering: Option<&super::steering::SteeringView>,
+) -> anyhow::Result<JobStatus> {
+    let txn = db.new_transaction_at(snapshot).await?;
+    let doc = txn
+        .get_store::<DocStore>(ACCEPTANCE)
+        .await?
+        .get_all()
+        .await?;
+    let accepted = doc
+        .get("v1")
+        .map(|v| -> anyhow::Result<AcceptedAgentJob> {
+            let json: String = v.try_into()?;
+            Ok(serde_json::from_str(&json)?)
+        })
+        .transpose()?;
+    let state = if let Some(accepted) = accepted {
+        // The TUI supplies its pinned transcript; other observers hydrate it once.
+        let loaded;
+        let session = if let Some(session) = session {
+            session
+        } else {
+            loaded = super::Session::try_new_at(
+                super::ConversationId(db.root_id().to_string()),
+                db.clone(),
+                snapshot,
+            )
+            .await?;
+            &loaded
+        };
+        let baseline = session.read_turn_baseline_at(snapshot).await?;
+        let requests = if let Some(steering) = steering {
+            session.turn_requests_with_states(|_| false, steering.states.clone(), baseline)?
+        } else {
+            let attempts = session.read_turn_attempts_at(snapshot).await?;
+            session.turn_requests_with_attempts(|_| false, live_attempts, attempts, baseline)?
+        };
+        let request = requests
+            .into_iter()
+            .find(|r| r.id.as_str() == accepted.directive_id)
+            .ok_or_else(|| anyhow::anyhow!("accepted job Directive is missing"))?;
+        match request.state {
+            super::TurnRequestState::Queued => JobState::Queued,
+            super::TurnRequestState::Interrupted { attempt_id } if executor_observer => {
+                JobState::Interrupted { attempt_id }
+            }
+            super::TurnRequestState::Interrupted { attempt_id } => {
+                let activity_recent = if let Some(steering) = steering {
+                    steering
+                        .active_at(chrono::Utc::now())
+                        .any(|id| id == attempt_id)
+                } else {
+                    let attempts = session
+                        .read_turn_attempts_at(snapshot)
+                        .await?
+                        .into_iter()
+                        .map(|(_, a)| a)
+                        .collect();
+                    let activity = txn
+                        .get_store::<eidetica::store::Table<chrono::DateTime<chrono::Utc>>>(
+                            super::TURN_ACTIVITY_STORE,
+                        )
+                        .await?
+                        .search(|_| true)
+                        .await?
+                        .into_iter()
+                        .collect();
+                    super::visible_attempts(attempts, &activity, chrono::Utc::now())
+                        .contains(&attempt_id)
+                };
+                JobState::StartedUnknown {
+                    attempt_id,
+                    activity_recent,
+                }
+            }
+            super::TurnRequestState::Completed { attempt_id } => {
+                let receipt = read_job_result_in_txn(&txn)
+                    .await?
+                    .ok_or_else(|| anyhow::anyhow!("completed job lacks terminal receipt"))?;
+                anyhow::ensure!(
+                    receipt.attempt_id == attempt_id,
+                    "job receipt attempt differs"
+                );
+                match receipt.terminal {
+                    JobTerminal::Success { text } => JobState::Succeeded { text },
+                    JobTerminal::Failure { message } => JobState::Failed { message },
+                }
+            }
+            super::TurnRequestState::InFlight { attempt_id } => JobState::Running { attempt_id },
+        }
+    } else {
+        let rejection = txn
+            .get_store::<DocStore>(JOB_REJECTION)
+            .await?
+            .get_all()
+            .await?;
+        let rejection: Option<String> = rejection.get("v1").map(TryInto::try_into).transpose()?;
+        match rejection {
+            Some(message) => JobState::Rejected { message },
+            None => {
+                let meta = txn.get_store::<DocStore>("meta").await?.get_all().await?;
+                let kind: Option<String> = meta.get("kind").map(TryInto::try_into).transpose()?;
+                let name: Option<String> = meta
+                    .get("display_name")
+                    .map(TryInto::try_into)
+                    .transpose()?;
+                anyhow::ensure!(
+                    kind.as_deref() == Some(crate::db_kind::KIND_SESSION)
+                        && name
+                            .as_deref()
+                            .is_some_and(|n| n.starts_with("job-stage:submitter:")),
+                    "session has no accepted agent job"
+                );
+                JobState::Pending
+            }
+        }
+    };
+    Ok(JobStatus {
+        session_db_id: db.root_id().to_string(),
+        state,
+    })
 }
 
 impl SessionRegistry {

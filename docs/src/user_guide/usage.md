@@ -126,6 +126,66 @@ chaz --config config.yaml usage --active-only
 
 The JSON output preserves the per-session and per-model breakdowns, the applied filter, and a `cost_reported` flag that lets downstream consumers distinguish "we know the cost was zero" from "the backend never reported one."
 
+## Context-window snapshots (`/context`)
+
+`/context` (TUI) or `!chaz context` (Matrix) answers "how full is this agent's context window?" for the agent responding in the current session, and hands the same answer to that agent's next turn, so you can run it and then ask the agent about it.
+
+### A snapshot, not a live meter
+
+- **Last completed request** is measured, not estimated. It is the provider's input-token count for the final request of the agent's latest measured reply in this session, not the turn's summed `prompt_tokens`. The TUI's live meter can also show estimates and in-flight calls; `/context` does not.
+- **Next request** is never measured in advance. The report says how many transcript entries (messages, directives, summaries) were added since the measurement; the snapshot itself also adds its own length.
+- **Context budget** is what the runtime targets for the agent's next turn on this peer, with its source:
+  - `model catalog window` — the model's known window;
+  - `explicit agent cap (max_context_tokens)` — the agent's cap is lower than the window, or the window is unknown;
+  - `fallback: configured max_context_tokens default` — neither is known.
+- **Reserved for the reply** is the `reserved_output_tokens` share of the budget the context builder keeps free.
+- **Used** shows the numerator and denominator explicitly against the budget, and against the model window too when they differ.
+- Anything chaz does not know is reported as `unknown`.
+
+The command records the report on the session DB (the `context_reports` store, one entry per agent). Running it again replaces that agent's pending snapshot; other agents' snapshots are unchanged. On the agent's next turn in this session, the `context` extension appends it after the conversation, labelled as diagnostic data the user requested rather than instructions, and records that it was delivered (`context_report_deliveries`). Later turns don't repeat it. Running `/context` itself does not wake the agent or call a model. Because both stores live on the session DB, the snapshot reaches the turn even when the command ran in a TUI service client or on a Matrix bridge peer. The budget, though, is resolved on the peer that ran the command.
+
+Failure modes:
+
+- **No measurement yet.** A new session, an agent that hasn't replied, or a provider that reports no usage gives `Last completed request: unknown` and `Used: unknown`.
+- **Another turn consumes the snapshot first.** It goes to the agent's next turn, whatever woke it (for example a schedule fire). Run `/context` again.
+- **Turn failed.** Delivery is recorded during context assembly. If that request later fails, the snapshot is not re-sent. Run `/context` again.
+- **Recording failed.** A report followed by `Not shared with …: failed to record the snapshot` was shown to you but not saved for delivery. Check the connection and existing session write permission before trying again.
+
+| Surface | Command         | Shown to                                  |
+| ------- | --------------- | ----------------------------------------- |
+| TUI     | `/context`      | You, plus the current agent's next turn   |
+| Matrix  | `!chaz context` | The room, plus the room agent's next turn |
+
+`/extensions remove context` disables both the command and delivery for a session. A pending snapshot waits until `/extensions add context` enables it again. Per-agent opt-outs also suppress delivery.
+
+### Walkthrough: checking headroom before a long task
+
+1. After a few turns with `chaz`, run `/context`:
+
+   ```text
+   Context for agent 'chaz' (snapshot 2027-01-15T08:02:05Z)
+   Last completed request: 45,210 input tokens, measured 2027-01-15T08:00:05Z (2m ago) on test-model
+   Next request: not yet measured; 0 transcript entries added since the measurement
+   Context budget: 200,000 tokens for test-model — model catalog window; 4,096 reserved for the reply
+   Model window: 200,000 tokens
+   Used: 45,210 / 200,000 = 22.6% of budget
+
+   (chaz will see this snapshot on its next turn in this session.)
+   ```
+
+2. Ask `chaz` "Given /context, can you read the whole log file in one go?". That request includes the snapshot after the conversation, alongside any other enabled context tails.
+3. Ask a follow-up. The snapshot is not attached again; the agent sees only its earlier answer.
+4. Failure path: in a new session where the agent hasn't replied yet, `/context` shows
+
+   ```text
+   Last completed request: unknown (no measured reply from this agent in this session)
+   Next request: not yet measured
+   ...
+   Used: unknown
+   ```
+
+   Send one message, then run `/context` again to get a measured snapshot.
+
 ## What Doesn't Roll Up
 
 - **Audit entries** — `ToolCall`, `ToolResult`, and `Ack` entries do not add usage. Ordinary errors have no metadata; a stopped turn's error can carry completed-call totals.

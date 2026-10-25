@@ -39,8 +39,9 @@ pub struct MatrixBridgeConfig {
     /// store. A `${ENV}` reference is resolved at seed time.
     pub unlock_password: String,
 
-    /// The per-agent logins this bridge manages.
-    #[serde(default)]
+    /// The per-agent logins this bridge manages. Raw login ids must be
+    /// non-empty and distinct; loading refuses otherwise.
+    #[serde(default, deserialize_with = "validated_logins")]
     pub logins: Vec<MatrixLoginConfig>,
 }
 
@@ -80,18 +81,30 @@ pub struct MatrixLoginConfig {
     pub login: LoginConfig,
 }
 
-/// Filesystem-safe per-login state component, shared by runtime and maintenance.
-pub fn sanitize_login_id(login_id: &str) -> String {
-    login_id
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect()
+/// Deserialize `logins`, rejecting an empty raw login id or two entries with
+/// the same raw id. Ids are compared byte-for-byte, as stored. An empty id
+/// would make the per-login state directory the parent of every other
+/// login's; duplicates would overwrite each other's seeded credentials.
+fn validated_logins<'de, D>(deserializer: D) -> Result<Vec<MatrixLoginConfig>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let logins = Vec::<MatrixLoginConfig>::deserialize(deserializer)?;
+    let mut seen = std::collections::HashSet::new();
+    for (index, entry) in logins.iter().enumerate() {
+        let id = entry.login.login_id();
+        if id.is_empty() {
+            return Err(serde::de::Error::custom(format!(
+                "logins[{index}] has an empty login id; set a non-empty `id:` or `username:`"
+            )));
+        }
+        if !seen.insert(id) {
+            return Err(serde::de::Error::custom(format!(
+                "logins[{index}] repeats login id {id:?}; every login needs a distinct id"
+            )));
+        }
+    }
+    Ok(logins)
 }
 
 fn default_label() -> String {
@@ -130,6 +143,26 @@ impl MatrixBridgeConfig {
             std::iter::once(self.unlock_password.as_str())
                 .chain(self.logins.iter().filter_map(|entry| entry.login.secret())),
         );
+    }
+
+    /// Resolve every configured login's per-login state directory, in
+    /// `logins` order, through the one resolver both the runtime and `keys`
+    /// maintenance use. Read-only: any ambiguity refuses the whole set.
+    pub fn login_state_dirs(&self) -> anyhow::Result<Vec<crate::login_state::Resolution>> {
+        let base = crate::login_state::state_base(self.state_dir.as_deref())?;
+        let claimants: Vec<_> = self
+            .logins
+            .iter()
+            .map(|entry| {
+                let TransportConfig::Matrix(m) = &entry.login.transport;
+                crate::login_state::Claimant {
+                    id: entry.login.login_id(),
+                    username: &m.username,
+                    homeserver_url: &m.homeserver_url,
+                }
+            })
+            .collect();
+        crate::login_state::resolve_logins(&base, &claimants)
     }
 
     /// Resolve the settings-DB unlock password (expanding a `${ENV}` ref).
@@ -275,6 +308,74 @@ logins:
         );
         assert_eq!(entry.login.login_id(), "@chaz:example");
         assert_eq!(entry.login.transport_kind(), "matrix");
+    }
+
+    fn with_logins(entries: &[(&str, Option<&str>)]) -> String {
+        let mut yaml = String::from("unlock_password: literal-pw\nlogins:\n");
+        for (username, id) in entries {
+            yaml.push_str("  - agent: chaz\n    type: matrix\n");
+            yaml.push_str("    homeserver_url: https://matrix.example\n");
+            yaml.push_str(&format!("    username: {username:?}\n"));
+            if let Some(id) = id {
+                yaml.push_str(&format!("    id: {id:?}\n"));
+            }
+        }
+        yaml
+    }
+
+    #[test]
+    fn empty_and_duplicate_login_ids_are_rejected_at_load() {
+        for (entries, needle) in [
+            (vec![("@a:hs", Some(""))], "empty login id"),
+            (vec![("", None)], "empty login id"),
+            (vec![("@a:hs", None), ("@a:hs", None)], "repeats login id"),
+            (
+                vec![("@a:hs", None), ("@b:hs", Some("@a:hs"))],
+                "repeats login id",
+            ),
+        ] {
+            let error = serde_yaml::from_str::<MatrixBridgeConfig>(&with_logins(&entries))
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(needle), "{entries:?}: {error}");
+            assert!(!error.contains("literal-pw"), "{error}");
+        }
+        // Raw bytes: case and whitespace variants are distinct ids, and a
+        // shared account under distinct ids is still loadable.
+        for entries in [
+            vec![("@a:hs", None), ("@A:hs", None)],
+            vec![("@a:hs", None), ("@a:hs", Some(" @a:hs"))],
+            vec![("@a:hs", None), ("@a:hs", Some("alias"))],
+        ] {
+            let cfg: MatrixBridgeConfig = serde_yaml::from_str(&with_logins(&entries)).unwrap();
+            assert_eq!(cfg.logins.len(), 2);
+        }
+    }
+
+    #[test]
+    fn runtime_and_maintenance_share_one_tilde_expanded_login_dir() {
+        let base = tempfile::tempdir().unwrap();
+        let home = dirs::home_dir().unwrap();
+        for (state_dir, expected) in [
+            (base.path().display().to_string(), base.path().to_path_buf()),
+            (
+                "~/chaz-matrix-fixture".to_string(),
+                home.join("chaz-matrix-fixture"),
+            ),
+        ] {
+            let yaml = format!(
+                "state_dir: {state_dir:?}\n{}",
+                with_logins(&[("@a:hs", None)])
+            );
+            let cfg: MatrixBridgeConfig = serde_yaml::from_str(&yaml).unwrap();
+            let dirs = cfg.login_state_dirs().unwrap();
+            let want = expected
+                .join("matrix")
+                .join(crate::login_state::login_dir_name("@a:hs"));
+            assert_eq!(dirs, vec![crate::login_state::Resolution::New(want)]);
+            // Resolution never creates anything.
+            assert!(!expected.join("matrix").exists());
+        }
     }
 
     #[test]

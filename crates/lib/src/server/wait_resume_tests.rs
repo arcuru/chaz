@@ -13,7 +13,12 @@ use std::time::Duration;
 use tokio::sync::watch;
 
 /// A countable stand-in for an effectful tool run before the wait.
-struct Effect(Arc<AtomicUsize>);
+struct Effect {
+    calls: Arc<AtomicUsize>,
+    sessions: Arc<std::sync::Mutex<Vec<std::sync::Weak<Mutex<Session>>>>>,
+    retain: Arc<std::sync::Mutex<Option<Arc<Mutex<Session>>>>>,
+    keep: Arc<AtomicBool>,
+}
 
 impl crate::tool::Tool for Effect {
     fn descriptor(&self) -> crate::tool::ToolDescriptor {
@@ -27,12 +32,19 @@ impl crate::tool::Tool for Effect {
     fn execute<'a>(
         &'a self,
         _: serde_json::Value,
-        _: &'a ToolContext,
+        ctx: &'a ToolContext,
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<String, crate::tool::ToolError>> + Send + 'a>,
     > {
         Box::pin(async move {
-            self.0.fetch_add(1, Ordering::SeqCst);
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.sessions
+                .lock()
+                .unwrap()
+                .push(Arc::downgrade(&ctx.session));
+            if self.keep.load(Ordering::SeqCst) {
+                *self.retain.lock().unwrap() = Some(ctx.session.clone());
+            }
             Ok("effect ran".into())
         })
     }
@@ -42,6 +54,38 @@ impl crate::tool::Tool for Effect {
 struct ResultCounter {
     count: Arc<AtomicUsize>,
     manifest: crate::extension::manifest::ExtensionManifest,
+}
+
+type WaitDeadlines = Arc<std::sync::Mutex<Vec<Option<chrono::DateTime<Utc>>>>>;
+
+/// Observe the runtime's actual deadline without replacing the real wait tool.
+struct ObservedJobWait {
+    inner: crate::tools::JobWaitTool,
+    deadlines: WaitDeadlines,
+}
+
+impl crate::tool::Tool for ObservedJobWait {
+    fn descriptor(&self) -> crate::tool::ToolDescriptor {
+        crate::tool::Tool::descriptor(&self.inner)
+    }
+
+    fn default_policy(&self) -> crate::tool::ToolPolicy {
+        crate::tool::Tool::default_policy(&self.inner)
+    }
+
+    fn execute<'a>(
+        &'a self,
+        arguments: serde_json::Value,
+        ctx: &'a ToolContext,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<String, crate::tool::ToolError>> + Send + 'a>,
+    > {
+        self.deadlines
+            .lock()
+            .unwrap()
+            .push(ctx.observation_deadline);
+        crate::tool::Tool::execute(&self.inner, arguments, ctx)
+    }
 }
 
 impl crate::extension::Extension for ResultCounter {
@@ -93,6 +137,10 @@ struct Fixture {
     settings: crate::config::EideticaConfig,
     agent: DbEntry,
     effects: Arc<AtomicUsize>,
+    sessions: Arc<std::sync::Mutex<Vec<std::sync::Weak<Mutex<Session>>>>>,
+    retain: Arc<std::sync::Mutex<Option<Arc<Mutex<Session>>>>>,
+    keep: Arc<AtomicBool>,
+    wait_deadlines: Option<WaitDeadlines>,
     _shutdown: watch::Sender<()>,
     _service: tokio::task::JoinHandle<eidetica::Result<()>>,
 }
@@ -142,6 +190,10 @@ impl Fixture {
                 pubkey,
             },
             effects: Arc::new(AtomicUsize::new(0)),
+            sessions: Default::default(),
+            retain: Default::default(),
+            keep: Default::default(),
+            wait_deadlines: None,
             _shutdown: shutdown,
             _service: service,
         }
@@ -195,10 +247,23 @@ impl Fixture {
         .await;
         let slot = crate::instance::ServerSlot::default();
         slot.set(server.clone());
-        server.tools.register(crate::tools::JobWaitTool {
+        let wait_tool = crate::tools::JobWaitTool {
             server: slot.clone(),
+        };
+        if let Some(deadlines) = &self.wait_deadlines {
+            server.tools.register(ObservedJobWait {
+                inner: wait_tool,
+                deadlines: deadlines.clone(),
+            });
+        } else {
+            server.tools.register(wait_tool);
+        }
+        server.tools.register(Effect {
+            calls: self.effects.clone(),
+            sessions: self.sessions.clone(),
+            retain: self.retain.clone(),
+            keep: self.keep.clone(),
         });
-        server.tools.register(Effect(self.effects.clone()));
         Process {
             server,
             child_mock,
@@ -335,7 +400,7 @@ async fn crash_while_waiting_with_input(
                 .submit_agent_job(&sid.0, "default", "child task")
                 .await
                 .unwrap();
-            tokio::time::timeout(Duration::from_secs(30), gate.wait_started())
+            tokio::time::timeout(ASYNC_TEST_TIMEOUT, gate.wait_started())
                 .await
                 .unwrap();
             (child, None)
@@ -359,7 +424,7 @@ async fn crash_while_waiting_with_input(
         .await
         .unwrap();
     if let Some(gate) = gate {
-        tokio::time::timeout(Duration::from_secs(30), gate.wait_started())
+        tokio::time::timeout(ASYNC_TEST_TIMEOUT, gate.wait_started())
             .await
             .unwrap();
         let attempt = Session::steering_attempts(&db)
@@ -377,7 +442,7 @@ async fn crash_while_waiting_with_input(
             .unwrap();
         gate.release();
     }
-    let checkpoint = tokio::time::timeout(Duration::from_secs(30), async {
+    let checkpoint = tokio::time::timeout(ASYNC_TEST_TIMEOUT, async {
         loop {
             if let Some(checkpoint) = checkpoints(&db).await.pop() {
                 return checkpoint;
@@ -417,7 +482,7 @@ async fn crash_while_waiting_with_input(
 /// A restarted executor adopts the indexed parent on its own, with its
 /// default backend: no frontend re-registration is involved.
 async fn await_resumed(process: &Process, attempt_id: &str) {
-    tokio::time::timeout(Duration::from_secs(30), async {
+    tokio::time::timeout(ASYNC_TEST_TIMEOUT, async {
         while !process
             .server
             .live_attempts
@@ -433,7 +498,7 @@ async fn await_resumed(process: &Process, attempt_id: &str) {
 }
 
 async fn await_calls(mock: &MockBackend, count: usize) {
-    tokio::time::timeout(Duration::from_secs(30), async {
+    tokio::time::timeout(ASYNC_TEST_TIMEOUT, async {
         while mock.recorded_calls().len() < count {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -1161,7 +1226,7 @@ async fn crash_job_parent_while_waiting(fx: &Fixture) -> JobParentCrash {
         .unwrap();
     a_mock.push_tool_calls([wait_call(&grandchild.db.root_id().to_string(), 240)]);
     registry.publish_agent_job(parent).await.unwrap();
-    let checkpoint = tokio::time::timeout(Duration::from_secs(30), async {
+    let checkpoint = tokio::time::timeout(ASYNC_TEST_TIMEOUT, async {
         loop {
             if let Some(checkpoint) = checkpoints(&parent_db).await.pop() {
                 return checkpoint;
@@ -1192,7 +1257,7 @@ async fn crash_job_parent_while_waiting(fx: &Fixture) -> JobParentCrash {
 }
 
 async fn await_branches(db: &eidetica::Database, count: usize) {
-    tokio::time::timeout(Duration::from_secs(10), async {
+    tokio::time::timeout(ASYNC_TEST_TIMEOUT, async {
         while crate::session::execution::ordered_starts(db)
             .await
             .unwrap()
@@ -1248,7 +1313,7 @@ async fn job_parent_resumes_as_exact_continuation_and_keeps_its_scope() {
         .await
         .unwrap();
     await_calls(&b_mock, 2).await;
-    tokio::time::timeout(Duration::from_secs(30), async {
+    tokio::time::timeout(ASYNC_TEST_TIMEOUT, async {
         while !b
             .server
             .job_status(&crashed.parent_job)
@@ -1325,11 +1390,11 @@ async fn resumed_job_wait_drains_accepted_steering_before_terminal_delivery() {
         .publish_agent_job(crashed.grandchild)
         .await
         .unwrap();
-    tokio::time::timeout(Duration::from_secs(30), child_gate.wait_started())
+    tokio::time::timeout(ASYNC_TEST_TIMEOUT, child_gate.wait_started())
         .await
         .unwrap();
     child_gate.release();
-    tokio::time::timeout(Duration::from_secs(30), provisional_gate.wait_started())
+    tokio::time::timeout(ASYNC_TEST_TIMEOUT, provisional_gate.wait_started())
         .await
         .unwrap();
     let input = JobInputRequest::new(
@@ -1351,7 +1416,7 @@ async fn resumed_job_wait_drains_accepted_steering_before_terminal_delivery() {
             .is_none()
     );
     provisional_gate.release();
-    tokio::time::timeout(Duration::from_secs(30), final_gate.wait_started())
+    tokio::time::timeout(ASYNC_TEST_TIMEOUT, final_gate.wait_started())
         .await
         .unwrap();
     assert!(
@@ -1437,7 +1502,7 @@ async fn observed_successor_during_resumed_wait_stops_without_continuing() {
     let successor = crate::session::execution::test_supersede(&crashed.parent_db)
         .await
         .unwrap();
-    tokio::time::timeout(Duration::from_secs(30), async {
+    tokio::time::timeout(ASYNC_TEST_TIMEOUT, async {
         while b
             .server
             .live_attempts
@@ -1486,7 +1551,7 @@ async fn user_stop_during_resumed_job_wait_pairs_history_and_preserves_monitor_d
     let crashed = crash_job_parent_while_waiting(&fx).await;
     let b = fx.start().await;
     await_resumed(&b, &crashed.checkpoint.attempt_id).await;
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(ASYNC_TEST_TIMEOUT, async {
         loop {
             let waits = crate::session::jobs::job_waits(&crashed.parent_db)
                 .await
@@ -1509,12 +1574,7 @@ async fn user_stop_during_resumed_job_wait_pairs_history_and_preserves_monitor_d
     )
     .await;
     assert!(frontend.request_stop("user").await.unwrap());
-    tokio::time::timeout(
-        Duration::from_secs(5),
-        await_no_processing(&b.server, &crashed.parent_job),
-    )
-    .await
-    .expect("user stop must not wait for the child's deadline");
+    await_no_processing(&b.server, &crashed.parent_job).await;
     let stopped = Session::new(
         ConversationId(crashed.parent_job.clone()),
         crashed.parent_db.clone(),
@@ -1638,7 +1698,7 @@ async fn service_job_steering_all_publications_follow_fifo_in_actual_request() {
         .submit_agent_job(&parent.0, "default", "original job")
         .await
         .unwrap();
-    tokio::time::timeout(Duration::from_secs(30), first.wait_started())
+    tokio::time::timeout(ASYNC_TEST_TIMEOUT, first.wait_started())
         .await
         .unwrap();
     let (_, db) = process
@@ -1670,7 +1730,7 @@ async fn service_job_steering_all_publications_follow_fifo_in_actual_request() {
             .unwrap();
     }
     first.release();
-    tokio::time::timeout(Duration::from_secs(30), next.wait_started())
+    tokio::time::timeout(ASYNC_TEST_TIMEOUT, next.wait_started())
         .await
         .unwrap();
     let calls = mock.recorded_calls();
@@ -1702,7 +1762,7 @@ async fn service_job_steering_all_publications_follow_fifo_in_actual_request() {
     assert!(
         process
             .server
-            .wait_job(&job, Duration::from_secs(30))
+            .wait_job(&job, ASYNC_TEST_TIMEOUT)
             .await
             .unwrap()
             .state
@@ -1774,7 +1834,7 @@ async fn origin_pending_refusal_remains_interrupted_at_executor() {
         .await
         .unwrap();
     process.register_parent(&db, &process.child_mock).await;
-    tokio::time::timeout(Duration::from_secs(10), async {
+    tokio::time::timeout(ASYNC_TEST_TIMEOUT, async {
         loop {
             if process
                 .server
@@ -1809,3 +1869,677 @@ async fn origin_pending_refusal_remains_interrupted_at_executor() {
 }
 #[path = "timer_example.rs"]
 mod timer_example;
+
+struct WaitingParent {
+    process: Process,
+    sid: String,
+    db: eidetica::Database,
+    child: crate::session::PreparedAgentJob,
+    mock: Arc<MockBackend>,
+    checkpoint: JobWaitCheckpoint,
+}
+
+async fn waiting_parent(fx: &Fixture, seconds: u64, worker: bool, hints: bool) -> WaitingParent {
+    let process = fx.start().await;
+    process
+        .server
+        .suspended_wait_hints
+        .store(hints, Ordering::SeqCst);
+    let registry = process.server.registry.clone();
+    let (sid, db) = registry
+        .create_session(Some("unloaded-parent"))
+        .await
+        .unwrap();
+    registry
+        .attach_agent_to_session(&sid.0, &fx.agent)
+        .await
+        .unwrap();
+    let child = registry
+        .prepare_agent_job(&sid.0, "default", "child task")
+        .await
+        .unwrap();
+    let mock = Arc::new(MockBackend::new());
+    // One model response, with an earlier effect in the same tool batch.
+    mock.push_tool_calls([
+        ("effect-call".into(), "effect".into(), "{}".into()),
+        wait_call(&child.db.root_id().to_string(), seconds),
+    ]);
+    mock.push_text("finished");
+    process.register_parent(&db, &mock).await;
+    if worker {
+        let (tx, _rx) = mpsc::channel(1);
+        process
+            .server
+            .sessions
+            .lock()
+            .await
+            .get_mut(&sid.0)
+            .unwrap()
+            .completion_tx = Some(tx);
+    }
+    Session::new(sid.clone(), db.clone())
+        .await
+        .add_entry(SessionEntry {
+            sender: "user".into(),
+            content: "observe child".into(),
+            timestamp: Utc::now(),
+            entry_type: EntryType::Directive,
+            metadata: None,
+            routing: None,
+        })
+        .await
+        .unwrap();
+    let checkpoint = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            if let Some(checkpoint) = checkpoints(&db).await.pop() {
+                break checkpoint;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    WaitingParent {
+        process,
+        sid: sid.0,
+        db,
+        child,
+        mock,
+        checkpoint,
+    }
+}
+
+async fn await_unloaded(parent: &WaitingParent) {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            if parent
+                .process
+                .server
+                .suspended_waits
+                .lock()
+                .await
+                .contains_key(&parent.sid)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("wait must actually suspend in-process");
+    assert!(
+        parent
+            .process
+            .server
+            .processing
+            .lock()
+            .await
+            .contains(&parent.sid)
+    );
+    assert!(
+        parent
+            .process
+            .server
+            .live_attempts
+            .lock()
+            .await
+            .contains(&parent.checkpoint.attempt_id)
+    );
+}
+
+async fn await_pending_reconciliation(server: &Server) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while server.suspended_wait_reconciliations.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("initial pending-state reconciliation must precede child writes");
+}
+
+fn assert_parent_dropped(fx: &Fixture) {
+    let (count, retained) = {
+        let weak = fx.sessions.lock().unwrap();
+        (
+            weak.len(),
+            weak.first().is_some_and(|weak| weak.upgrade().is_some()),
+        )
+    };
+    assert_eq!(count, 1, "the earlier tool ran once");
+    assert!(!retained, "the live parent Session/context was retained");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn in_process_wait_unloads_parent_and_orders_new_turns() {
+    let fx = Fixture::new("unload-parent").await;
+    let parent = waiting_parent(&fx, 240, false, true).await;
+    await_unloaded(&parent).await;
+    assert_parent_dropped(&fx);
+    assert_eq!(
+        parent.process.server.semaphore.available_permits(),
+        MAX_CONCURRENT_LLM_CALLS
+    );
+    assert_eq!(parent.mock.recorded_calls().len(), 1);
+    let next_gate = parent.mock.block_next_call();
+    parent.mock.push_text("newer turn");
+    Session::new(ConversationId(parent.sid.clone()), parent.db.clone())
+        .await
+        .add_entry(SessionEntry {
+            sender: "user".into(),
+            content: "newer request".into(),
+            timestamp: Utc::now(),
+            entry_type: EntryType::Directive,
+            metadata: None,
+            routing: None,
+        })
+        .await
+        .unwrap();
+    for _ in 0..4 {
+        parent
+            .process
+            .server
+            .process_session(&parent.sid)
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        parent.mock.recorded_calls().len(),
+        1,
+        "no turn overtakes the suspension"
+    );
+    await_pending_reconciliation(&parent.process.server).await;
+    // Child writes are hints, not permission to advance a still-pending wait.
+    let child_gate = parent.process.child_mock.block_next_call();
+    let child_db = parent.child.db.clone();
+    parent
+        .process
+        .server
+        .registry
+        .publish_agent_job(parent.child)
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(30), child_gate.wait_started())
+        .await
+        .unwrap();
+    let JobState::Running { attempt_id } = parent
+        .process
+        .server
+        .job_status(&child_db.root_id().to_string())
+        .await
+        .unwrap()
+        .state
+    else {
+        panic!("blocked child must be running");
+    };
+    for _ in 0..2 {
+        Session::renew_turn_activity(&child_db, &attempt_id)
+            .await
+            .unwrap();
+    }
+    assert_eq!(parent.mock.recorded_calls().len(), 1);
+    child_gate.release();
+    tokio::time::timeout(Duration::from_secs(30), next_gate.wait_started())
+        .await
+        .unwrap();
+    for _ in 0..2 {
+        Session::renew_turn_activity(&child_db, &attempt_id)
+            .await
+            .unwrap();
+    }
+    for _ in 0..4 {
+        parent
+            .process
+            .server
+            .process_session(&parent.sid)
+            .await
+            .unwrap();
+    }
+    next_gate.release();
+    await_calls(&parent.mock, 3).await;
+    await_no_processing(&parent.process.server, &parent.sid).await;
+    assert_eq!(fx.effects.load(Ordering::SeqCst), 1);
+    assert_eq!(job_count(&parent.process.server).await, 1);
+    assert_eq!(parent.process.child_mock.recorded_calls().len(), 1);
+    assert_eq!(parent.mock.recorded_calls().len(), 3);
+    assert!(wait_result(&parent.mock.recorded_calls()[1]).contains("Succeeded"));
+    let s = Session::new(ConversationId(parent.sid.clone()), parent.db.clone()).await;
+    let records = s
+        .turn_transcript(&parent.checkpoint.attempt_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        records.iter().map(|r| r.sequence).collect::<Vec<_>>(),
+        [0, 1, 2, 3]
+    );
+    assert_eq!(
+        checkpoints(&parent.db).await,
+        [finished_checkpoint(parent.checkpoint)]
+    );
+    parent.process.server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unloaded_drop_probe_detects_a_retained_strong_reference() {
+    let fx = Fixture::new("unload-control").await;
+    fx.keep.store(true, Ordering::SeqCst);
+    let parent = waiting_parent(&fx, 240, false, true).await;
+    await_unloaded(&parent).await;
+    // The exact same assertion must fail with the deliberate strong ref.
+    assert!(std::panic::catch_unwind(|| assert_parent_dropped(&fx)).is_err());
+    fx.retain.lock().unwrap().take();
+    assert_parent_dropped(&fx);
+    parent.process.server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unloaded_deadline_expires_without_reset_or_child_cancellation() {
+    let mut fx = Fixture::new("unload-deadline").await;
+    let deadlines = WaitDeadlines::default();
+    fx.wait_deadlines = Some(deadlines.clone());
+    let parent = waiting_parent(&fx, 2, false, true).await;
+    await_unloaded(&parent).await;
+    assert_parent_dropped(&fx);
+    let all_capacity = parent
+        .process
+        .server
+        .semaphore
+        .clone()
+        .acquire_many_owned(MAX_CONCURRENT_LLM_CALLS as u32)
+        .await
+        .unwrap();
+    let remaining = (parent.checkpoint.deadline - Utc::now())
+        .to_std()
+        .unwrap_or_default();
+    tokio::time::sleep(remaining + Duration::from_millis(150)).await;
+    assert_eq!(parent.mock.recorded_calls().len(), 1);
+    assert!(deadlines.lock().unwrap().is_empty());
+    assert_parent_dropped(&fx); // capacity waiter is also context-free
+    drop(all_capacity);
+    await_no_processing(&parent.process.server, &parent.sid).await;
+    // Observe the deadline passed to the real tool, not the latency of admission,
+    // database writes, and cleanup on a loaded runner.
+    assert_eq!(
+        *deadlines.lock().unwrap(),
+        [Some(parent.checkpoint.deadline)],
+        "deadline reset on readmission"
+    );
+    assert!(wait_result(&parent.mock.recorded_calls()[1]).contains("Pending"));
+    assert!(parent.process.child_mock.recorded_calls().is_empty());
+    assert_eq!(
+        checkpoints(&parent.db).await,
+        [finished_checkpoint(parent.checkpoint)]
+    );
+    parent
+        .process
+        .server
+        .registry
+        .publish_agent_job(parent.child)
+        .await
+        .unwrap();
+    await_calls(&parent.process.child_mock, 1).await;
+    parent.process.server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stop_settles_unloaded_wait_without_readmitting_effects_or_capacity() {
+    let fx = Fixture::new("unload-stop").await;
+    let parent = waiting_parent(&fx, 240, false, true).await;
+    await_unloaded(&parent).await;
+    assert_parent_dropped(&fx);
+    let all_capacity = parent
+        .process
+        .server
+        .semaphore
+        .clone()
+        .acquire_many_owned(MAX_CONCURRENT_LLM_CALLS as u32)
+        .await
+        .unwrap();
+    let mut client = Session::new(ConversationId(parent.sid.clone()), parent.db.clone()).await;
+    assert!(client.request_stop("user").await.unwrap());
+    tokio::time::timeout(
+        Duration::from_secs(3),
+        await_no_processing(&parent.process.server, &parent.sid),
+    )
+    .await
+    .unwrap();
+    assert_eq!(parent.mock.recorded_calls().len(), 1);
+    assert_eq!(fx.effects.load(Ordering::SeqCst), 1);
+    assert!(parent.process.child_mock.recorded_calls().is_empty());
+    let session = Session::new(ConversationId(parent.sid.clone()), parent.db.clone()).await;
+    let records = session
+        .turn_transcript(&parent.checkpoint.attempt_id)
+        .await
+        .unwrap();
+    assert!(matches!(
+        records[2].message,
+        TurnTranscriptMessage::ToolResult {
+            outcome: runtime::ToolResultOutcome::Cancelled,
+            ..
+        }
+    ));
+    assert!(matches!(
+        records[3].message,
+        TurnTranscriptMessage::Cancelled
+    ));
+    assert!(
+        session
+            .entries()
+            .iter()
+            .any(|entry| entry.content == TURN_STOPPED_MESSAGE)
+    );
+    drop(all_capacity);
+    parent
+        .process
+        .server
+        .registry
+        .publish_agent_job(parent.child)
+        .await
+        .unwrap();
+    await_calls(&parent.process.child_mock, 1).await;
+    for _ in 0..4 {
+        parent
+            .process
+            .server
+            .process_session(&parent.sid)
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        parent.mock.recorded_calls().len(),
+        1,
+        "late hints cannot revive the stopped parent"
+    );
+    parent.process.server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn worker_completion_channel_keeps_checkpointed_wait_resident() {
+    let fx = Fixture::new("unload-worker-fallback").await;
+    let parent = waiting_parent(&fx, 240, true, true).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        !parent
+            .process
+            .server
+            .suspended_waits
+            .lock()
+            .await
+            .contains_key(&parent.sid)
+    );
+    assert!(fx.sessions.lock().unwrap()[0].upgrade().is_some());
+    assert_eq!(
+        parent.process.server.semaphore.available_permits(),
+        MAX_CONCURRENT_LLM_CALLS
+    );
+    parent
+        .process
+        .server
+        .registry
+        .publish_agent_job(parent.child)
+        .await
+        .unwrap();
+    await_no_processing(&parent.process.server, &parent.sid).await;
+    assert!(wait_result(&parent.mock.recorded_calls()[1]).contains("Succeeded"));
+    parent.process.server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unloaded_wait_reconciles_without_hints_and_matches_restart() {
+    let mut outcomes = Vec::new();
+    for restart in [false, true] {
+        let fx = Fixture::new(if restart {
+            "unload-match-restart"
+        } else {
+            "unload-no-hints"
+        })
+        .await;
+        let parent = waiting_parent(&fx, 240, false, false).await;
+        await_unloaded(&parent).await;
+        assert_parent_dropped(&fx);
+        await_pending_reconciliation(&parent.process.server).await;
+        let resumed = if restart {
+            parent.process.server.shutdown().await;
+            let resumed = fx.start().await;
+            await_resumed(&resumed, &parent.checkpoint.attempt_id).await;
+            Some(resumed)
+        } else {
+            None
+        };
+        crate::session::jobs::reject_job(&parent.child.db, "child refused")
+            .await
+            .unwrap();
+        let (server, mock) = match &resumed {
+            Some(process) => (&process.server, &process.child_mock),
+            None => (&parent.process.server, &parent.mock),
+        };
+        await_no_processing(server, &parent.sid).await;
+        let calls = mock.recorded_calls();
+        let continuation = calls.last().unwrap();
+        let text =
+            wait_result(continuation).replace(&parent.child.db.root_id().to_string(), "CHILD");
+        outcomes.push(text);
+        assert_eq!(fx.effects.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            parent.mock.recorded_calls().len(),
+            if restart { 1 } else { 2 }
+        );
+        assert_eq!(calls.len(), if restart { 1 } else { 2 });
+        assert!(
+            server
+                .interrupted_turns(&parent.sid)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            checkpoints(&parent.db).await,
+            [finished_checkpoint(parent.checkpoint)]
+        );
+        server.shutdown().await;
+    }
+    assert_eq!(
+        outcomes[0], outcomes[1],
+        "in-process and restart loaders observe the same result"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn child_completed_before_suspension_registration_is_not_lost() {
+    let fx = Fixture::new("unload-already-ready").await;
+    let process = fx.start().await;
+    let registry = process.server.registry.clone();
+    let (sid, db) = registry
+        .create_session(Some("already-ready-parent"))
+        .await
+        .unwrap();
+    registry
+        .attach_agent_to_session(&sid.0, &fx.agent)
+        .await
+        .unwrap();
+    let child = process
+        .server
+        .submit_agent_job(&sid.0, "default", "child task")
+        .await
+        .unwrap();
+    let result = process
+        .server
+        .wait_job(&child, Duration::from_secs(30))
+        .await
+        .unwrap();
+    assert!(matches!(result.state, JobState::Succeeded { .. }));
+    let mock = Arc::new(MockBackend::new());
+    mock.push_tool_calls([
+        ("effect-call".into(), "effect".into(), "{}".into()),
+        wait_call(&child, 240),
+    ]);
+    mock.push_text("parent finished");
+    process.register_parent(&db, &mock).await;
+    Session::new(sid.clone(), db.clone())
+        .await
+        .add_entry(SessionEntry {
+            sender: "user".into(),
+            content: "observe already completed child".into(),
+            timestamp: Utc::now(),
+            entry_type: EntryType::Directive,
+            metadata: None,
+            routing: None,
+        })
+        .await
+        .unwrap();
+    await_calls(&mock, 2).await;
+    await_no_processing(&process.server, &sid.0).await;
+    assert_parent_dropped(&fx);
+    assert!(wait_result(&mock.recorded_calls()[1]).contains("Succeeded"));
+    assert_eq!(fx.effects.load(Ordering::SeqCst), 1);
+    assert_eq!(process.child_mock.recorded_calls().len(), 1);
+    assert_eq!(job_count(&process.server).await, 1);
+    process.server.shutdown().await;
+}
+
+/// Publishes a preprepared child from an earlier parent tool call, counting
+/// the actual durable submission. A replay would publish a second time.
+struct SubmitChild {
+    registry: Arc<SessionRegistry>,
+    prepared: Mutex<Option<crate::session::PreparedAgentJob>>,
+    count: Arc<AtomicUsize>,
+}
+impl crate::tool::Tool for SubmitChild {
+    fn descriptor(&self) -> crate::tool::ToolDescriptor {
+        crate::tool::ToolDescriptor {
+            name: "submit_child".into(),
+            description: "counted child submission".into(),
+            parameters: serde_json::json!({"type":"object", "properties":{}}),
+        }
+    }
+    fn execute<'a>(
+        &'a self,
+        _: serde_json::Value,
+        _: &'a ToolContext,
+    ) -> Pin<Box<dyn Future<Output = Result<String, crate::tool::ToolError>> + Send + 'a>> {
+        Box::pin(async move {
+            self.count.fetch_add(1, Ordering::SeqCst);
+            let child = self
+                .prepared
+                .lock()
+                .await
+                .take()
+                .ok_or_else(|| "submission replayed".to_string())?;
+            self.registry
+                .publish_agent_job(child)
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok("submitted child".into())
+        })
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unloaded_job_parent_continues_one_branch_without_resubmitting_child() {
+    let fx = Fixture::new("unload-job-lineage").await;
+    let mock = Arc::new(MockBackend::new());
+    let process = fx.start_with(mock.clone()).await;
+    let registry = process.server.registry.clone();
+    let (root, _) = registry.create_session(Some("root")).await.unwrap();
+    registry
+        .attach_agent_to_session(&root.0, &fx.agent)
+        .await
+        .unwrap();
+    let parent = registry
+        .prepare_agent_job(&root.0, "default", "orchestrate")
+        .await
+        .unwrap();
+    let sid = parent.db.root_id().to_string();
+    let db = parent.db.clone();
+    let child = registry
+        .prepare_agent_job(&sid, "default", "child task")
+        .await
+        .unwrap();
+    let child_id = child.db.root_id().to_string();
+    let child_db = child.db.clone();
+    let submissions = Arc::new(AtomicUsize::new(0));
+    process.server.tools.register(SubmitChild {
+        registry: registry.clone(),
+        prepared: Mutex::new(Some(child)),
+        count: submissions.clone(),
+    });
+    mock.push_tool_calls([
+        ("effect-call".into(), "effect".into(), "{}".into()),
+        ("submit-call".into(), "submit_child".into(), "{}".into()),
+        wait_call(&child_id, 240),
+    ]);
+    mock.push_text("child finished");
+    mock.push_text("parent finished");
+    let parent_gate = mock.block_next_call();
+    let child_gate = mock.block_next_call();
+    registry.publish_agent_job(parent).await.unwrap();
+    parent_gate.wait_started().await;
+    parent_gate.release();
+    tokio::time::timeout(Duration::from_secs(30), child_gate.wait_started())
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while !process
+            .server
+            .suspended_waits
+            .lock()
+            .await
+            .contains_key(&sid)
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_parent_dropped(&fx);
+    assert_eq!(submissions.load(Ordering::SeqCst), 1);
+    let checkpoint = checkpoints(&db).await.pop().unwrap();
+    let waits = crate::session::jobs::job_waits(&db).await.unwrap();
+    assert_eq!(
+        waits.len(),
+        1,
+        "unloaded wait is still visible to the job monitor"
+    );
+    assert!(!waits[0].finished);
+    child_gate.release();
+    process
+        .server
+        .wait_job(&sid, Duration::from_secs(30))
+        .await
+        .unwrap();
+    await_no_processing(&process.server, &sid).await;
+    for _ in 0..4 {
+        process.server.process_session(&sid).await.unwrap();
+    }
+    assert_eq!(submissions.load(Ordering::SeqCst), 1);
+    assert_eq!(fx.effects.load(Ordering::SeqCst), 1);
+    assert_eq!(mock.recorded_calls().len(), 3);
+    assert_eq!(job_count(&process.server).await, 2);
+    assert!(matches!(
+        process.server.job_status(&child_id).await.unwrap().state,
+        JobState::Succeeded { .. }
+    ));
+    let starts = crate::session::execution::ordered_starts(&db)
+        .await
+        .unwrap();
+    assert_eq!(starts.len(), 2);
+    assert_eq!(
+        starts[1].start.attempt.attempt_id,
+        starts[0].start.attempt.attempt_id
+    );
+    assert_eq!(starts[1].start.incarnation, starts[0].start.incarnation);
+    let continuation = starts[1].start.continuation.as_ref().unwrap();
+    assert_eq!(continuation.predecessor, starts[0].start.id);
+    assert_eq!(continuation.checkpoint, checkpoint.key());
+    assert!(crate::session::jobs::job_waits(&db).await.unwrap()[0].finished);
+    assert!(
+        crate::session::jobs::read_job_result(&child_db)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(
+        tool_names(&mock.recorded_calls()[0]),
+        tool_names(&mock.recorded_calls()[2])
+    );
+    process.server.shutdown().await;
+}

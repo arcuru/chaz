@@ -28,123 +28,164 @@ concurrency:
 jobs:
   ci:
     name: CI
-    runs-on: ubicloud-standard-8
-    timeout-minutes: 30
+    if: >-
+      ${{ !(github.repository == 'arcuru/chaz' && github.repository_owner == 'arcuru' &&
+        github.ref == 'refs/heads/main' &&
+        (github.event_name == 'push' || github.event_name == 'workflow_dispatch')) }}
+    # Pull requests and merge-queue runs check on the native ARM64 runner. Its
+    # one Nix store persists across jobs, so unchanged outputs are reused rather
+    # than rebuilt or restored; its preinstalled daemon owns substituters and
+    # build limits, and jobs are untrusted clients with no publishing
+    # credentials. Nonmain manual checks stay unprivileged. Trusted main runs
+    # ARM first, then checks and publishes x86 outputs from one hosted store.
+    runs-on: >-
+      ${{ fromJSON((github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
+          '"ubicloud-standard-8"' ||
+          '["self-hosted", "Linux", "ARM64", "zinc", "nix"]') }}
+    # The ARM runner needs room for a cold store; later runs reuse its outputs.
+    timeout-minutes: >-
+      ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && 30 || 60 }}
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
+          ref: ${{ github.sha }}
           persist-credentials: false
 
+      # The ARM runner provides Nix; hosted runners install it fresh.
       - name: Setup Nix
-        uses: ./.github/actions/setup-nix
-
-      - name: Lint
-        run: |
-          nix-fast-build --skip-cached --no-nom --no-link \
-            -f '.#checks.x86_64-linux.lint'
-          nix-fast-build --skip-cached --no-nom --no-link \
-            -f '.#checks.x86_64-linux.treefmt'
-          nix-fast-build --skip-cached --no-nom --no-link \
-            -f '.#checks.x86_64-linux.ci-policy'
-
-      - name: Test
-        run: |
-          nix-fast-build --skip-cached --no-nom --no-link \
-            -f '.#checks.x86_64-linux.test'
-
-      # PRs retain normal Cargo tests (including doctests), lint and build.
-      - name: Doc
         if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
-        run: |
-          nix-fast-build --skip-cached --no-nom --no-link \
-            -f '.#checks.x86_64-linux.doc'
+        uses: ./.github/actions/setup-nix
 
-      - name: Build
-        run: |
-          nix-fast-build --skip-cached --no-nom --no-link \
-            -f '.#checks.x86_64-linux.build'
+      # One graph shares dependency work and lets independent checks overlap.
+      # Hosted main allows two builds at once, each using all cores so a
+      # dependency build running alone can use the whole runner. The ARM
+      # runner's Nix configuration sets concurrency for its memory instead.
+      - name: Checks
+        env:
+          CI_EVENT_NAME: ${{ github.event_name }}
+        run: &checks |
+          system=aarch64-linux
+          limits=()
+          names=(lint treefmt ci-policy test build)
+          # PRs retain normal Cargo tests, including doctests.
+          if [[ "$CI_EVENT_NAME" == push || "$CI_EVENT_NAME" == workflow_dispatch ]]; then
+            system=x86_64-linux
+            limits=(--max-jobs 2 --cores 0)
+            names+=(doc)
+          fi
+          checks=()
+          for name in "${names[@]}"; do
+            checks+=(".#checks.$system.$name")
+          done
+          build_status=0
+          nix build -L --no-link --keep-going "${limits[@]}" "${checks[@]}" || build_status=$?
+          if ((build_status == 0)); then
+            nix path-info "${checks[@]}" > "$RUNNER_TEMP/chaz-checks-paths" || build_status=$?
+          fi
+          # Report even after failure or a cache hit. Reading a stored log does
+          # not rerun a check, and unavailable logs do not change build status.
+          for name in "${names[@]}"; do
+            log=".#checks.$system.$name"
+            # lint is a symlinkJoin with no own log; read Clippy itself.
+            if [[ "$name" == lint ]]; then
+              log=".#legacyPackages.$system.lint.chaz-clippy"
+            fi
+            echo "::group::$name — replaying stored derivation log; checks are not being rerun"
+            if ! nix log "$log"; then
+              echo "::warning::Stored log unavailable for $log (local store or configured binary caches); no test result inferred"
+            fi
+            echo '::endgroup::'
+          done
+          exit "$build_status"
 
-  # The Matrix bridge end-to-end test. Separate from the checks above because it
-  # pulls Synapse into the closure and stands up four processes, neither of which
-  # the fast checks should wait on. Needs no secrets — the homeserver, the
-  # accounts, and the model are all throwaway and local to the runner.
-  e2e:
-    name: Matrix E2E
-    runs-on: ubicloud-standard-8
-    # Full coverage runs on main pushes or a manually selected branch, not on
-    # PRs/merge groups. The custom runner only exists in the upstream repository.
+  # Keep the required PR status `CI` unchanged above. Main adds a second
+  # native platform, using the same single zinc listener and persistent store.
+  ci-arm:
+    name: Main ARM64
     if: |
-      github.repository_owner == 'arcuru' &&
+      github.repository == 'arcuru/chaz' && github.repository_owner == 'arcuru' &&
+      github.ref == 'refs/heads/main' &&
       (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
-    # The two steps below budget 30 minutes between them. The rest is headroom
-    # for the checkout, the nix installer, and pulling the Synapse closure.
-    timeout-minutes: 45
+    runs-on: [self-hosted, Linux, ARM64, zinc, nix]
+    timeout-minutes: 60
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
+          ref: ${{ github.sha }}
           persist-credentials: false
 
-      - name: Setup Nix
-        uses: ./.github/actions/setup-nix
-
-      # rust-cache must inspect the same compiler that nix develop uses, not
-      # the runner's preinstalled Rust. Only expose that toolchain's bin path.
-      - name: Expose Nix Rust toolchain
+      # No installer or client build-limit overrides: zinc's daemon owns both.
+      - name: Checks
         run: |
-          nix develop .# --command sh <<'SH'
-          dirname "$(command -v cargo)" >> "$GITHUB_PATH"
-          SH
+          system=aarch64-linux
+          names=(lint treefmt ci-policy test build)
+          checks=()
+          for name in "${names[@]}"; do
+            checks+=(".#checks.$system.$name")
+          done
+          build_status=0
+          nix build -L --no-link --keep-going "${checks[@]}" || build_status=$?
+          # The main ARM path needs the same retained results as PR checks.
+          for name in "${names[@]}"; do
+            log=".#checks.$system.$name"
+            if [[ "$name" == lint ]]; then
+              log=".#legacyPackages.$system.lint.chaz-clippy"
+            fi
+            echo "::group::$name — replaying stored derivation log; checks are not being rerun"
+            if ! nix log "$log"; then
+              echo "::warning::Stored log unavailable for $log (local store or configured binary caches); no test result inferred"
+            fi
+            echo '::endgroup::'
+          done
+          exit "$build_status"
 
-      # Keep this dependency/target cache separate from release jobs, and
-      # invalidate even restore prefixes when the Nix environment changes.
-      # GitHub's normal branch/PR cache scope still applies; no Nix store paths.
-      - name: Cache E2E dependencies
-        uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
-        with:
-          key: matrix-e2e-${{ hashFiles('flake.nix', 'flake.lock') }}
-          cache-bin: false
-
-      # Debug binaries, matching what `just e2e` builds locally. Split from the
-      # harness step so a slow cold compile does not eat the harness budget.
-      - name: Build binaries
-        run: |
-          nix develop .# --command cargo build --bin chaz --bin chaz-matrix --example e2ee_probe
-        timeout-minutes: 20
-
-      # Every wait inside run.sh is bounded, so a passing run finishes in about a
-      # minute. This ceiling is the backstop for a Synapse that comes up wedged
-      # and never satisfies any of them. `--verbose` streams the component logs
-      # into the job output, because the harness deletes its workspace on exit
-      # and there is nothing to collect afterwards.
-      # Exit 2 means the harness never got far enough to test anything — a
-      # missing binary, a tool absent from the shell, a homeserver that would
-      # not start. That is a different problem from a failing assertion, and
-      # the job UI shows both as a red X, so say which one it was.
-      - name: Matrix E2E
-        run: |
-          set +e
-          nix develop .#e2e --command dev/matrix-e2e/run.sh --verbose
-          rc=$?
-          if [ "$rc" -eq 2 ]; then
-            echo "::error::harness could not start (exit 2) — see the log above"
-          fi
-          exit "$rc"
-        timeout-minutes: 10
-
-  publish:
-    name: Publish
-    needs: [ci, e2e]
+  main:
+    name: Main x86 and publish
+    # Wait before allocating a hosted runner; no polling or store handoff.
+    # Default success() prevents failed, skipped or cancelled ARM publication.
+    needs: [ci-arm]
     if: |
-      github.repository_owner == 'arcuru' && github.ref == 'refs/heads/main' &&
+      github.repository == 'arcuru/chaz' && github.repository_owner == 'arcuru' &&
+      github.ref == 'refs/heads/main' &&
       (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
-    uses: ./.github/workflows/publish.yml
+    environment: publish
+    runs-on: ubicloud-standard-8
+    timeout-minutes: 60
     permissions:
       contents: read
-    # Reusable workflows require the names even for environment-scoped secrets;
-    # their values are resolved in the callee's protected publishing job.
-    secrets:
-      NIX_CACHE_ACCESS_KEY_ID: ${{ secrets.NIX_CACHE_ACCESS_KEY_ID }}
-      NIX_CACHE_SECRET_ACCESS_KEY: ${{ secrets.NIX_CACHE_SECRET_ACCESS_KEY }}
-      NIX_CACHE_SIGNING_KEY: ${{ secrets.NIX_CACHE_SIGNING_KEY }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Setup Nix
+        uses: ./.github/actions/setup-nix
+
+      # Share the exact check graph and retained-log reporting above.
+      - name: Checks
+        timeout-minutes: 30
+        env:
+          CI_EVENT_NAME: ${{ github.event_name }}
+        run: *checks
+
+      # Tests already compiled these artifacts. Only wrappers/archive remain.
+      # Resolve paths before secrets enter the environment; publication only copies.
+      - name: Prepare final outputs
+        run: |
+          nix build -L --no-link --max-jobs 2 --cores 0 --print-out-paths \
+            '.#packages.x86_64-linux.default' \
+            '.#legacyPackages.x86_64-linux.test.deps' \
+            '.#legacyPackages.x86_64-linux.test.artifacts' \
+            '.#legacyPackages.x86_64-linux.test.archive' \
+            > "$RUNNER_TEMP/chaz-final-paths"
+
+      - name: Publish successful outputs
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.NIX_CACHE_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.NIX_CACHE_SECRET_ACCESS_KEY }}
+          NIX_CACHE_SIGNING_KEY: ${{ secrets.NIX_CACHE_SIGNING_KEY }}
+        run: bash .github/scripts/publish-cache.sh
