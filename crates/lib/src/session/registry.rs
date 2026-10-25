@@ -561,8 +561,64 @@ impl SessionRegistry {
             return Ok((ConversationId(session_db_id.to_string()), db));
         }
         let user = self.user.lock().await;
-        let db = user.open_database(&root_id).await?;
+        let key_id = user
+            .find_key(&root_id)?
+            .ok_or_else(|| anyhow::anyhow!("no session signing key"))?;
+        let mut db = user.open_database_with_key(&root_id, &key_id).await?;
+        // Single-hop delegated sessions share an inherited snapshot floor across
+        // interactive turns, tools and pinned schedules. Refresh every keyed
+        // embedded open, including read-only opens, without changing the selected key.
+        // Service discovery cannot resolve delegation: preserve its bound identity
+        // and explicit authority gaps rather than selecting a different path.
+        // Direct and nested handles retain their existing native semantics.
+        if self.instance.backend().local_engine().is_some()
+            && matches!(db.auth_identity(), Some(eidetica::auth::types::SigKey::Delegation { path, .. }) if path.len() == 1)
+        {
+            let (identity, _) = Database::find_sigkeys(&self.instance, &root_id, &key_id)
+                .await?
+                .into_iter()
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("session signer has no current identity"))?;
+            db = db.with_key(eidetica::database::DatabaseKey::with_identity(
+                user.get_signing_key(&key_id)?,
+                identity,
+            ));
+        }
         Ok((ConversationId(session_db_id.to_string()), db))
+    }
+
+    /// Capture the actual selected signer while opening an embedded session.
+    /// Cached local-client handles retain their existing exact identity; this
+    /// path cannot recover their private signer and must not guess a substitute.
+    pub(crate) async fn open_session_with_signer(
+        &self,
+        session_db_id: &str,
+    ) -> anyhow::Result<(
+        ConversationId,
+        Database,
+        Option<eidetica::auth::crypto::PrivateKey>,
+    )> {
+        if let Some(db) = self
+            .local_client_sessions
+            .lock()
+            .await
+            .get(session_db_id)
+            .cloned()
+        {
+            return Ok((ConversationId(session_db_id.to_string()), db, None));
+        }
+        let root = eidetica::entry::ID::parse(session_db_id)?;
+        let user = self.user.lock().await;
+        let key_id = user
+            .find_key(&root)?
+            .ok_or_else(|| anyhow::anyhow!("no session signing key"))?;
+        let db = user.open_database_with_key(&root, &key_id).await?;
+        if self.instance.backend().local_engine().is_none() {
+            return Ok((ConversationId(session_db_id.to_string()), db, None));
+        }
+        let key = user.get_signing_key(&key_id)?;
+        let db = super::current_session_writer(&db, &key).await?;
+        Ok((ConversationId(session_db_id.to_string()), db, Some(key)))
     }
 
     /// Open a session created through this daemon's local Eidetica service.

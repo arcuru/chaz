@@ -131,3 +131,27 @@ Future direction, not current scope:
 | SDK and registry effects              | `crates/matrix-bridge/src/bridge/workspace/live.rs` (`create_request`, `LiveMatrix`, `LiveSessions`)                 |
 | Marker-based session provisioning     | `session::transport` (`provision_marked_conversational_channel_session`), `SessionRegistry::find_sessions_by_source` |
 | Handler integration and exclusions    | `crates/matrix-bridge/src/bridge/mod.rs` (`backfill_joined_room`, message handler, `spawn_workspace_command`)        |
+
+## Delegated daemon writers
+
+A retained database handle carries a delegated signing snapshot, not a live
+identity lookup. A write with a newer snapshot raises the session's inherited
+floor; another writer retaining the older snapshot can then be rejected. The
+daemon captures the actual account key at keyed-open and refreshes its native
+identity before approval publication/expiry, active-turn recorder writes,
+heartbeat and final settlement. Pinned schedules and tools writing the same
+session use that same policy. Refresh replaces only the signing binding: it
+does not reload the active transcript, change the session root, select another
+private key, or replay a failed effect.
+
+Native discovery and commit validation remain authoritative. Read-only and
+revoked keys do not become writers. Missing delegated history or concurrent
+advancement can still reject a commit; requests then deny or the turn remains
+interrupted. The embedded discovery API supports single-hop delegation; this
+is not a new nested-delegation walker or service-client authorization scheme.
+Service-backed opens retain their bound identities and existing explicit
+unsupported-authority gaps; native discovery is limited to embedded opens.
+Cached local-client handles whose signer cannot be captured retain their
+existing native behavior rather than guessing a substitute. Authentication
+and current entitlement of a received approval decision remain a separate
+boundary from publishing the request with a current writer.

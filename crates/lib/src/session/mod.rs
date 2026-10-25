@@ -646,6 +646,8 @@ pub struct SessionCatalogEntry {
 pub struct Session {
     pub conversation_id: ConversationId,
     database: Database,
+    /// Actual key captured by the daemon at keyed-open, never inferred from SigKey.
+    signing_key: Option<eidetica::auth::crypto::PrivateKey>,
     entries: Vec<SessionEntry>,
     entry_ids: Vec<TurnRequestId>,
     /// Store name — "entries" for regular, "entries:{id}" for ephemeral
@@ -788,12 +790,53 @@ session_wire_enum! {
     }
 }
 
+/// Refresh only the signing binding, preserving the database root and read context.
+/// Native discovery/commit retain all permission and inherited-floor checks. A
+/// concurrent authority change may still reject the write; never replay it.
+pub(crate) async fn current_session_writer(
+    db: &Database,
+    key: &eidetica::auth::crypto::PrivateKey,
+) -> anyhow::Result<Database> {
+    let instance = db.instance()?;
+    let (identity, _) = Database::find_sigkeys(&instance, db.root_id(), &key.public_key())
+        .await?
+        .into_iter()
+        .find(|(_, permission)| permission.can_write())
+        .ok_or_else(|| anyhow::anyhow!("session signer has no current writable identity"))?;
+    Ok(db
+        .clone()
+        .with_key(eidetica::database::DatabaseKey::with_identity(
+            key.clone(),
+            identity,
+        )))
+}
+
 impl Session {
+    pub(crate) fn with_signing_key(
+        mut self,
+        key: Option<eidetica::auth::crypto::PrivateKey>,
+    ) -> Self {
+        self.signing_key = key;
+        self
+    }
+
+    /// Refresh a daemon writer without reloading its transcript/context snapshot.
+    pub(crate) async fn refresh_writer(&mut self) -> anyhow::Result<()> {
+        if let Some(key) = &self.signing_key {
+            self.database = current_session_writer(&self.database, key).await?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn signing_key(&self) -> Option<eidetica::auth::crypto::PrivateKey> {
+        self.signing_key.clone()
+    }
     /// Open a session, loading existing entries from its database.
     pub async fn new(conversation_id: ConversationId, database: Database) -> Self {
         let mut session = Session {
             conversation_id,
             database,
+            signing_key: None,
             entries: Vec::new(),
             entry_ids: Vec::new(),
             store_name: "entries".to_string(),
@@ -822,6 +865,7 @@ impl Session {
         Ok(Self {
             conversation_id,
             database,
+            signing_key: None,
             entries,
             entry_ids,
             store_name: "entries".into(),
@@ -1322,6 +1366,7 @@ impl Session {
             entries,
             entry_ids,
             database: self.database.clone(),
+            signing_key: None,
             store_name: self.store_name.clone(),
         };
         let attempts = historical.read_turn_attempts_at(&snapshot).await?;
