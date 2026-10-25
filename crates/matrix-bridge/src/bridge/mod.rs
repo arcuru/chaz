@@ -157,9 +157,12 @@ async fn backfill_joined_room(
         .await?;
     // A room created by a workspace operation the record does not list (an
     // uncertain or cancelled create) is excluded too, by its marker state.
-    if state.room_state.iter().any(|raw| {
-        raw.get_field::<String>("type").ok().flatten().as_deref() == Some(workspace::MARKER_TYPE)
-    }) {
+    let state_events = state
+        .room_state
+        .iter()
+        .map(|raw| serde_json::from_str::<serde_json::Value>(raw.json().get()))
+        .collect::<Result<Vec<_>, _>>()?;
+    if state_events.iter().any(workspace::live::is_workspace_state) {
         return Ok(());
     }
     let join_id = state

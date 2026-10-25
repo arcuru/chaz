@@ -1540,6 +1540,8 @@ ws_assert_private() {
 		and (map(select(.type == "m.room.guest_access"))[0].content.guest_access == "forbidden")
 		and ((map(select(.type == "m.room.encryption")) | length > 0) == $enc)
 		and (map(select(.type == "dev.chaz.workspace")) | length == 1)
+		and (map(select(.type == "m.room.create"))[0].content["dev.chaz.workspace"]
+		     == map(select(.type == "dev.chaz.workspace"))[0].content)
 		and (map(select(.type == "m.room.power_levels"))[0].content.users[$p] == 100)
 		and ([.[] | select(.type == "m.room.member" and (.content.membership == "join" or .content.membership == "invite")) | .state_key] | sort == ([$a, $p] | sort))
 	' <<<"$state" >/dev/null || fail "workspace room $room is not private as created: $state"

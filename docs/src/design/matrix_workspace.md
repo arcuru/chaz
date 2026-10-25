@@ -39,7 +39,13 @@ the existing record rather than inheriting it.
 **Workspace rooms stay out of generic session paths.** The message handler
 routes every event through `workspace::route` before history bootstrap or any
 session lookup. Join bootstrap skips rooms the record lists and rooms whose
-homeserver state carries the `dev.chaz.workspace` marker. A ready chat
+homeserver state carries the `dev.chaz.workspace` marker. The marker is also
+embedded in immutable `m.room.create` content: a homeserver may expose the
+creator's join before processing the custom initial-state event or returning
+`createRoom`. Genesis therefore excludes that room even before its ID reaches
+the operation journal. Older custom state markers remain recognized; neither
+marker grants access or authorizes a session. A failed local state read is not
+permission to dispatch a chat. A ready chat
 resolves its session through a strict scan of the owning agent's exposed
 sessions, rejects unreadable/ambiguous bindings, checks the recorded session
 ID, and never falls back to get-or-create, so a

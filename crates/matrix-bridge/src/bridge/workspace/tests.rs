@@ -892,8 +892,58 @@ fn created_rooms_are_private_encrypted_and_invite_nobody() {
             .as_ref()
             .map(|raw| serde_json::from_str::<serde_json::Value>(raw.json().get()).unwrap());
         assert_eq!(
-            creation.map(|c| c["type"].clone()),
-            (role == Role::Space).then(|| serde_json::json!("m.space"))
+            creation.unwrap()["type"],
+            if role == Role::Space {
+                serde_json::json!("m.space")
+            } else {
+                serde_json::Value::Null
+            }
+        );
+    }
+}
+
+#[test]
+fn workspace_is_marked_before_initial_state_or_create_response() {
+    for role in [Role::Space, Role::Lobby, Role::Chat] {
+        let spec = RoomSpec {
+            role,
+            name: "Pending".into(),
+            topic: None,
+            room_version: "12".into(),
+            manager: MANAGER.into(),
+            marker: Marker {
+                workspace: "ws".into(),
+                operation: "op-2".into(),
+                role,
+            },
+        };
+        let request = live::create_request(&spec, BOT).unwrap();
+        // Synapse can expose the creator's join before processing initial_state
+        // or returning createRoom. Neither the local index nor the mutable
+        // marker event exists at this boundary. Only genesis is guaranteed.
+        let creation = request
+            .creation_content
+            .as_ref()
+            .map(|raw| serde_json::from_str::<serde_json::Value>(raw.json().get()).unwrap())
+            .unwrap_or_default();
+        assert_eq!(
+            creation[MARKER_TYPE],
+            serde_json::to_value(&spec.marker).unwrap()
+        );
+        let early_state = [
+            serde_json::json!({"type": "m.room.create", "content": creation}),
+            serde_json::json!({"type": "m.room.member", "state_key": BOT,
+                               "content": {"membership": "join"}}),
+        ];
+        assert!(early_state.iter().any(live::is_workspace_state));
+        assert!(!live::is_workspace_state(&serde_json::json!({
+            "type": "m.room.create", "content": {"creator": BOT}
+        })));
+        assert!(
+            live::is_workspace_state(&serde_json::json!({
+                "type": MARKER_TYPE, "content": {}
+            })),
+            "older mutable markers remain excluded too"
         );
     }
 }

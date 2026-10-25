@@ -36,11 +36,15 @@ pub(crate) fn create_request(spec: &RoomSpec, bot: &str) -> anyhow::Result<Creat
     request.visibility = Visibility::Private;
     request.is_direct = false;
     request.room_version = Some(version);
+    // A homeserver may publish the creator's join before applying initial_state
+    // or returning createRoom. Mark genesis too, so bootstrap cannot win that
+    // window and create an unrelated session. This marker only excludes rooms;
+    // it never authorizes enrollment or identifies a session.
+    let mut creation = json!({MARKER_TYPE: spec.marker});
     if spec.role == Role::Space {
-        request.creation_content = Some(Raw::from_json_string(
-            json!({"type": "m.space"}).to_string(),
-        )?);
+        creation["type"] = json!("m.space");
     }
+    request.creation_content = Some(Raw::from_json_string(creation.to_string())?);
     let mut state = vec![
         json!({"type": "m.room.join_rules", "state_key": "",
                "content": {"join_rule": "invite"}}),
@@ -119,11 +123,34 @@ async fn room_marker(room: &Room) -> Option<Marker> {
 /// cache. Used to keep such a room out of chat dispatch even when the record
 /// does not list it (for example after an uncertain create).
 pub(crate) async fn has_marker(room: &Room) -> bool {
-    room.get_state_event(StateEventType::from(MARKER_TYPE), "")
-        .await
-        .ok()
-        .flatten()
-        .is_some()
+    // A failed state read is not proof that ordinary bootstrap is safe.
+    for event_type in [MARKER_TYPE, "m.room.create"] {
+        match room
+            .get_state_event(StateEventType::from(event_type), "")
+            .await
+        {
+            Err(_) => return true,
+            Ok(Some(raw)) => {
+                let raw = match raw {
+                    RawAnySyncOrStrippedState::Sync(raw) => raw.json().get().to_owned(),
+                    RawAnySyncOrStrippedState::Stripped(raw) => raw.json().get().to_owned(),
+                };
+                match serde_json::from_str::<serde_json::Value>(&raw) {
+                    Ok(event) if is_workspace_state(&event) => return true,
+                    Err(_) => return true,
+                    _ => {}
+                }
+            }
+            Ok(None) if event_type == "m.room.create" => return true,
+            Ok(None) => {}
+        }
+    }
+    false
+}
+
+pub(crate) fn is_workspace_state(event: &serde_json::Value) -> bool {
+    event["type"] == MARKER_TYPE
+        || (event["type"] == "m.room.create" && event["content"].get(MARKER_TYPE).is_some())
 }
 
 impl MatrixOps for LiveMatrix {
