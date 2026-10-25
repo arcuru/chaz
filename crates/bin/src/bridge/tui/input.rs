@@ -33,7 +33,7 @@ pub(super) fn command_catalog() -> Vec<(&'static str, &'static str)> {
         ("# Session", ""),
         ("/sessions", "open session picker"),
         ("/jobs", "open Jobs ancestry and wait monitor"),
-        ("/new", "create a new session [agent group]"),
+        ("/new", "create a new session [agent group] (Ctrl+T)"),
         ("/groups", "list configured agent groups"),
         ("/join ", "switch to session by name or DB ID"),
         ("/name ", "set (or clear) a session alias"),
@@ -145,7 +145,7 @@ pub(super) fn command_catalog() -> Vec<(&'static str, &'static str)> {
         ("/clear", "clear display (entries still in DB)"),
         ("/raw", "dump raw entry data for debugging"),
         ("/debug", "toggle debug mode (Ctrl+D)"),
-        ("/expand", "toggle expand/collapse tool calls (Ctrl+T)"),
+        ("/expand", "toggle expand/collapse tool calls (Ctrl+R)"),
         ("/help", "this help"),
         ("/quit", "exit"),
     ]
@@ -269,6 +269,10 @@ pub(super) fn handle_overlay_key(app: &mut App, key: KeyEvent) -> OverlayKey {
     let Some(overlay) = app.overlay.as_mut() else {
         return OverlayKey::NotConsumed;
     };
+    if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('t' | 'r'))
+    {
+        return OverlayKey::Consumed;
+    }
     match overlay {
         Overlay::Help { scroll } => match key.code {
             KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => {
@@ -706,6 +710,21 @@ pub(super) fn handle_chat_key(app: &mut App, key: KeyEvent) -> Option<ChatAction
         return None;
     }
 
+    if key.modifiers.contains(KeyModifiers::CONTROL) {
+        match key.code {
+            KeyCode::Char('t') => {
+                return Some(ChatAction::Dispatch(
+                    chaz_core::commands::Command::NewSession(None),
+                ));
+            }
+            KeyCode::Char('r') => {
+                app.expand_all = !app.expand_all;
+                return None;
+            }
+            _ => {}
+        }
+    }
+
     if edit_draft(app, key) {
         return None;
     }
@@ -1106,6 +1125,11 @@ pub(super) fn handle_settings_key(
         }
     }
     if app.overlay.is_some() || handle_approval_key(app, key) {
+        return SettingsKey::None;
+    }
+    // Session shortcuts must not become text or plain-r settings actions.
+    if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('t' | 'r'))
+    {
         return SettingsKey::None;
     }
     app.sync_settings_reader(scope);
@@ -1772,6 +1796,10 @@ pub(super) fn handle_picker_key(app: &mut App, key: KeyEvent) -> Option<String> 
             }
             None
         }
+        KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            Some("__new__".to_string())
+        }
+        KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => None,
         KeyCode::Enter => Some(app.picker_selection()),
         KeyCode::Char('n') => Some("__new__".to_string()),
         KeyCode::Char('s') => {
