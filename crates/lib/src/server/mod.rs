@@ -4024,6 +4024,7 @@ impl Server {
                 active_extensions: active_extensions.clone(),
                 routine_engine: routine_engine.clone(),
                 observation_deadline: None,
+                call_deadline: None,
             };
 
             if resume.is_some() && tool_ctx.tools.get(runtime::JOB_WAIT_TOOL).is_none() {

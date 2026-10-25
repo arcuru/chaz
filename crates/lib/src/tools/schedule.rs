@@ -830,6 +830,7 @@ mod tests {
             active_extensions: std::collections::HashSet::new(),
             routine_engine: None,
             observation_deadline: None,
+            call_deadline: None,
         }
     }
 

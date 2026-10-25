@@ -98,7 +98,7 @@ trait ToolHost: Send + Sync {
 }
 
 enum Capability {
-    Shell { command: String, working_dir: Option<String> },
+    Shell { command: String, working_dir: Option<String>, timeout: Option<Duration> },
     FileRead { path: String },
     FileWrite { path: String, content: String },
     HttpRequest { url: String, method: String, headers: HashMap<String, String>, body: Option<String> },
@@ -111,6 +111,8 @@ The host enforces grants at the capability boundary — the tool says what it wa
 | -------------------- | ---------- | ------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------- |
 | `NativeToolHost`     | Native     | In-process, grant enforcement only                                       | The only host wired in today — used for every built-in tool.                                              |
 | `BubblewrapToolHost` | OS sandbox | Wraps `Shell` capability invocations in `bwrap`; other caps pass through | Implemented in `crates/lib/src/bubblewrap_host.rs` but not yet config-selectable (`#[allow(dead_code)]`). |
+
+Every host that spawns a local shell goes through `tool_host::run_shell_process`. It starts the process in its own process group, collects stdout and stderr concurrently, and kills the group when the requested `timeout` expires, keeping the output read so far (`ShellOutput::timed_out`, `elapsed`). Dropping the future (a user stop or the runtime's outer timeout) kills the group as well. `BubblewrapToolHost` also unshares the PID namespace, because `--new-session` moves the sandboxed shell out of `bwrap`'s process group. Killing `bwrap` then ends the whole sandboxed tree.
 
 Tools (shell, web, file) call `ctx.host().request()` against the trait, so swapping host implementations needs no tool-code changes; what's missing is the config plumbing to choose anything other than `NativeToolHost`.
 
@@ -134,8 +136,11 @@ struct ToolContext {
     agent_capabilities: Grants,                  // agent-wide ceiling (from agent config)
     agent_grants: HashMap<String, Grants>,       // per-tool overrides from agent config
     host: Arc<dyn ToolHost>,                     // sandboxed capability boundary
+    call_deadline: Option<tokio::time::Instant>, // when the runtime's policy timeout drops this call
 }
 ```
+
+The runtime sets `call_deadline` immediately before running each call. A tool that can stop its own work cleanly, as `shell` does, stops just before the deadline and returns an honest partial result. The runtime's timeout still drops anything that runs over.
 
 Before each tool call the runtime calls `ctx.resolve_call_grants(&policy.grants, tool_name)`, which attenuates the tool's policy grant through the session ceiling, the agent-wide cap, and the per-tool override (most-restrictive-wins; see [`Grants::attenuate`](https://github.com/arcuru/chaz/blob/main/crates/lib/src/grants.rs)), and stores the result in `grants`. Tools use `ctx.host()` for system access (shell, file, network) and `ctx.grants()` only for introspection (e.g., `describe_tool` listing available capabilities). `active_extensions` is built by `Server::active_extensions_for` and is what `ScopedTools` consults to hide tools from extensions disabled in this session.
 

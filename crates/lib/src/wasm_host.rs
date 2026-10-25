@@ -302,6 +302,7 @@ fn add_host_functions(linker: &mut wasmtime::Linker<WasmHostState>) -> Result<()
                             &crate::tool_host::Capability::Shell {
                                 command: cmd,
                                 working_dir: None,
+                                timeout: None,
                             },
                             ctx.grants(),
                         )
