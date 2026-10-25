@@ -101,7 +101,10 @@ impl Server {
             // These are short-lived views, never retained across the wait.
             let (_, db) = self.registry.open_session(sid).await?;
             let session = Session::new(ConversationId(sid.to_string()), db.clone()).await;
-            self.observe_stop_requests(sid, &session).await;
+            if self.turns.lock().await.contains_key(sid) {
+                let meta = session.read_meta().await;
+                self.observe_stop_requests(sid, &session, &meta).await;
+            }
             if let Some(branch) =
                 crate::session::execution::latest_branch(&db, &wait.attempt_id).await?
             {
@@ -155,7 +158,10 @@ impl Server {
         }
         let (_, db) = self.registry.open_session(sid).await?;
         let session = Session::new(ConversationId(sid.to_string()), db.clone()).await;
-        self.observe_stop_requests(sid, &session).await;
+        if self.turns.lock().await.contains_key(sid) {
+            let meta = session.read_meta().await;
+            self.observe_stop_requests(sid, &session, &meta).await;
+        }
         if let Some(branch) =
             crate::session::execution::latest_branch(&db, &wait.attempt_id).await?
         {

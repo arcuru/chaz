@@ -2917,9 +2917,10 @@ impl Server {
         let session = Session::new(conversation_id.clone(), session_db.clone())
             .await
             .with_signing_key(signing_key);
+        let meta = session.read_meta().await;
         // Receipt proves the executor observed this generation through session
         // sync. A bridge never acknowledges enablement on its own write alone.
-        if let Some(policy) = session.read_meta().await.ambient_participation
+        if let Some(policy) = &meta.ambient_participation
             && crate::session::session_attachment(&session_db)
                 .await
                 .ok()
@@ -2931,7 +2932,8 @@ impl Server {
         }
         // Observe control entries before command/queue/processing gates: the
         // current turn may be blocked in a model, approval, or tool wait.
-        self.observe_stop_requests(session_db_id, &session).await;
+        self.observe_stop_requests(session_db_id, &session, &meta)
+            .await;
 
         if self
             .suspended_waits
@@ -3050,9 +3052,7 @@ impl Server {
             let burst = crate::session::trailing_agent_message_burst(session.entries(), |name| {
                 self.agents.get(name).is_some()
             });
-            let budget = session
-                .read_meta()
-                .await
+            let budget = meta
                 .burst_budget_override
                 .unwrap_or_else(|| self.agent_burst_budget());
             if burst >= budget {
@@ -3899,8 +3899,12 @@ impl Server {
         }
     }
 
-    async fn observe_stop_requests(&self, session_db_id: &str, session: &Session) {
-        let meta = session.read_meta().await;
+    async fn observe_stop_requests(
+        &self,
+        session_db_id: &str,
+        session: &Session,
+        meta: &crate::session::SessionMeta,
+    ) {
         let turns = self.turns.lock().await;
         let Some(turn) = turns.get(session_db_id) else {
             return;
@@ -4003,7 +4007,9 @@ impl Server {
             session.database().clone(),
         )
         .await;
-        self.observe_stop_requests(&session_db_id, &fresh).await;
+        let meta = fresh.read_meta().await;
+        self.observe_stop_requests(&session_db_id, &fresh, &meta)
+            .await;
 
         self.track_task(tokio::spawn(async move {
             let claim_db = session.database().clone();
