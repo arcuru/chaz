@@ -356,7 +356,7 @@ See [Extensions](extensions.md). Extensions can also register their own slash co
 | `/raw`                 | Dump raw entry data (index, timestamp, type, sender, content)              |
 | `/settings`            | Open [Session Settings](#settings) (also `Ctrl+S` in chat)                 |
 | `/debug`               | Toggle debug mode (also `Ctrl+D`)                                          |
-| `/expand`              | Toggle full tool-call/result and directive display (also `Ctrl+R` in chat) |
+| `/expand`              | Toggle full tool-call/result and directive display (also `Ctrl+O` in chat) |
 | `/quit`, `/q`, `/exit` | Exit                                                                       |
 
 Unknown `/<name>` commands route to extension dispatch — see the error you get back for the closest match.
@@ -375,7 +375,7 @@ Unknown `/<name>` commands route to extension dispatch — see the error you get
 | `F1`                  | Open the help overlay                                                 |
 | `Ctrl+P`              | Open the session hub (in the hub: back to the open conversation)      |
 | `Ctrl+T`              | Open and focus a new session tab (chat or session hub)                |
-| `Ctrl+R`              | Toggle expanded tool calls/results and directives (chat only)         |
+| `Ctrl+O`              | Toggle expanded tool calls/results and directives (chat only)         |
 | `Ctrl+D`              | Toggle debug mode                                                     |
 | `Ctrl+W`              | Close the active view; the last one returns to the hub                |
 | `Ctrl+H` / `Ctrl+L`   | Cycle to previous / next tab (wraps, chat only)                       |
@@ -465,16 +465,16 @@ in the hub. The existing conversation stays open, including its history and scro
 position. Settings and the model picker do not create sessions on `Ctrl+T`; press
 `Esc` to return first. Help and rename overlays keep keyboard focus.
 
-`Ctrl+R` changes only the chat display, just like `/expand`. It expands or collapses
+`Ctrl+O` changes only the chat display, just like `/expand`. It expands or collapses
 tool calls, tool results and directives without changing stored or model-facing
-history. In the model picker it still refreshes the catalog. Plain `r` still
+history. `Ctrl+R` still refreshes the catalog in the model picker. Plain `r` still
 renames a session in the hub and keeps its existing Settings actions.
 These bindings are built in; the TUI has no configurable keymap.
 
 1. From the session hub, press `Ctrl+T` to open a new conversation.
 2. Run `/name first`, then press `Ctrl+T` again. The new tab is focused and the
    `first` tab remains open. Press `Ctrl+H` to return to `first`.
-3. Press `Ctrl+R`. The status bar adds `EXP`; press it again to collapse the
+3. Press `Ctrl+O`. The status bar adds `EXP`; press it again to collapse the
    transcript. This does not create a tab.
 4. Open help with `F1` and press `Ctrl+T`. No session opens while help owns the
    keyboard. Press `Esc`, then `Ctrl+T` to create the next session.

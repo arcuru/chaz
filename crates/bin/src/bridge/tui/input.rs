@@ -145,7 +145,7 @@ pub(super) fn command_catalog() -> Vec<(&'static str, &'static str)> {
         ("/clear", "clear display (entries still in DB)"),
         ("/raw", "dump raw entry data for debugging"),
         ("/debug", "toggle debug mode (Ctrl+D)"),
-        ("/expand", "toggle expand/collapse tool calls (Ctrl+R)"),
+        ("/expand", "toggle expand/collapse tool calls (Ctrl+O)"),
         ("/help", "this help"),
         ("/quit", "exit"),
     ]
@@ -269,7 +269,8 @@ pub(super) fn handle_overlay_key(app: &mut App, key: KeyEvent) -> OverlayKey {
     let Some(overlay) = app.overlay.as_mut() else {
         return OverlayKey::NotConsumed;
     };
-    if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('t' | 'r'))
+    if key.modifiers.contains(KeyModifiers::CONTROL)
+        && matches!(key.code, KeyCode::Char('t' | 'r' | 'o'))
     {
         return OverlayKey::Consumed;
     }
@@ -717,10 +718,11 @@ pub(super) fn handle_chat_key(app: &mut App, key: KeyEvent) -> Option<ChatAction
                     chaz_core::commands::Command::NewSession(None),
                 ));
             }
-            KeyCode::Char('r') => {
+            KeyCode::Char('o') => {
                 app.expand_all = !app.expand_all;
                 return None;
             }
+            KeyCode::Char('r') => return None,
             _ => {}
         }
     }
@@ -1128,7 +1130,8 @@ pub(super) fn handle_settings_key(
         return SettingsKey::None;
     }
     // Session shortcuts must not become text or plain-r settings actions.
-    if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('t' | 'r'))
+    if key.modifiers.contains(KeyModifiers::CONTROL)
+        && matches!(key.code, KeyCode::Char('t' | 'r' | 'o'))
     {
         return SettingsKey::None;
     }

@@ -669,7 +669,7 @@ pub(super) struct App {
     pub(super) startup_ready: bool,
     /// When true, tool calls / tool results / directives render their full
     /// content. When false (default), they collapse to a one-line summary.
-    /// Toggled by Ctrl+R or `/expand`.
+    /// Toggled by Ctrl+O or `/expand`.
     pub(super) expand_all: bool,
     pub(super) session_list: Vec<SessionInfo>,
     /// Whether the current catalog snapshot is reusable on the next open.

@@ -759,10 +759,13 @@ async fn session_shortcuts_create_focus_and_retain_the_previous_conversation() {
     app.active_mut().scroll_offset = 0;
     assert!(frame(&mut app, &server, &backend, 160, 30).contains("retained transcript"));
 
-    let expand_key = KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL);
+    let expand_key = KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL);
     for expanded in [true, false] {
         assert!(input::handle_chat_key(&mut app, expand_key).is_none());
         assert_eq!(app.expand_all, expanded);
+        let old_key = KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL);
+        assert!(input::handle_chat_key(&mut app, old_key).is_none());
+        assert_eq!(app.expand_all, expanded, "Ctrl+R still toggles expansion");
         let screen = frame(&mut app, &server, &backend, 160, 30);
         assert_eq!(screen.contains(" | EXP"), expanded, "{screen}");
     }
@@ -797,7 +800,7 @@ async fn session_shortcuts_respect_modes_and_modals() {
         },
     ] {
         app.overlay = Some(overlay);
-        for c in ['t', 'r'] {
+        for c in ['t', 'r', 'o'] {
             assert!(matches!(
                 input::handle_overlay_key(&mut app, ctrl(c)),
                 input::OverlayKey::Consumed
@@ -819,7 +822,7 @@ async fn session_shortcuts_respect_modes_and_modals() {
         },
         decision_tx,
     });
-    for c in ['t', 'r'] {
+    for c in ['t', 'r', 'o'] {
         assert!(input::handle_chat_key(&mut app, ctrl(c)).is_none());
         assert!(app.has_pending_approval());
     }
@@ -833,10 +836,12 @@ async fn session_shortcuts_respect_modes_and_modals() {
         input::handle_model_picker_key(&mut app, ctrl('r')),
         input::ModelPickerKey::Refresh
     ));
-    assert!(matches!(
-        input::handle_model_picker_key(&mut app, ctrl('t')),
-        input::ModelPickerKey::None
-    ));
+    for c in ['t', 'o'] {
+        assert!(matches!(
+            input::handle_model_picker_key(&mut app, ctrl(c)),
+            input::ModelPickerKey::None
+        ));
+    }
     assert!(app.model_search.is_empty());
 
     app.open_settings(SettingsScope::Peer, TuiMode::SessionPicker);
@@ -851,7 +856,7 @@ async fn session_shortcuts_respect_modes_and_modals() {
         cursor: 5,
         intent: SettingsPromptIntent::AddPeerDefault,
     });
-    for c in ['t', 'r'] {
+    for c in ['t', 'r', 'o'] {
         assert!(matches!(
             input::handle_settings_key(&mut app, ctrl(c), SettingsScope::Peer),
             input::SettingsKey::None
@@ -865,8 +870,10 @@ async fn session_shortcuts_respect_modes_and_modals() {
     app.mode = TuiMode::SessionPicker;
     super::super::apply_session_catalog(&mut app, server.registry().list_sessions().await.unwrap());
     app.picker_index = 1;
-    assert!(input::handle_picker_key(&mut app, ctrl('r')).is_none());
-    assert!(app.overlay.is_none());
+    for c in ['r', 'o'] {
+        assert!(input::handle_picker_key(&mut app, ctrl(c)).is_none());
+        assert!(app.overlay.is_none());
+    }
     input::handle_picker_key(&mut app, key(KeyCode::Char('r')));
     assert!(matches!(app.overlay, Some(Overlay::RenamePrompt { .. })));
     assert_eq!(app.tabs.len(), 1);
@@ -874,6 +881,6 @@ async fn session_shortcuts_respect_modes_and_modals() {
     assert!(
         input::command_catalog()
             .iter()
-            .any(|(cmd, hint)| *cmd == "/expand" && hint.contains("Ctrl+R"))
+            .any(|(cmd, hint)| *cmd == "/expand" && hint.contains("Ctrl+O"))
     );
 }
