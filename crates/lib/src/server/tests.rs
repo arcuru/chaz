@@ -6162,6 +6162,7 @@ async fn published_executor_using_mock(
         agent,
         mock,
         Arc::new(crate::test_support::context_hub().await),
+        true,
     )
     .await
 }
@@ -6172,6 +6173,7 @@ async fn published_executor_using_mock_and_hub(
     agent: DbEntry,
     mock: Arc<crate::test_support::MockBackend>,
     hub: Arc<crate::extension::ExtensionHub>,
+    resident_adoption: bool,
 ) -> (Arc<Server>, Arc<crate::test_support::MockBackend>) {
     let connection =
         crate::instance::connect_with(settings, crate::config::ExecutionRole::Executor)
@@ -6182,6 +6184,11 @@ async fn published_executor_using_mock_and_hub(
             .await
             .unwrap(),
     );
+    if !resident_adoption {
+        // Manual-admission fixtures own the one-shot subscription before the
+        // Server can start its competing resident adopter.
+        drop(registry.subscribe_new_sessions().await.unwrap());
+    }
     let index = HostedIndex::empty("agent");
     index.register(agent.clone());
     let backend = crate::backends::BackendManager::with_mock(
