@@ -4754,6 +4754,7 @@ async fn abort_after_recorded_host_effect_stays_interrupted_until_retry() {
         &crate::tool_host::Capability::Shell {
             command: "external-side-effect".into(),
             working_dir: None,
+            timeout: None,
         },
         &Default::default(),
     )

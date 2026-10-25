@@ -492,3 +492,135 @@ async fn mcp_stdio_failed_recovery_preserves_the_original_call_error() {
     assert_eq!(line_count(&directory.path().join("effects")), 1);
     server.shutdown().await.unwrap();
 }
+
+/// Run one real native `shell` call under a policy timeout and return its
+/// recorded outcome, model-visible output and the call's wall time.
+#[cfg(unix)]
+async fn run_shell(policy_timeout: u64, args: Value) -> (ToolResultOutcome, String, Duration) {
+    let (_instance, session) = fresh_session().await;
+    let registry = Arc::new(ToolRegistry::new());
+    registry.register(crate::tools::ShellExec);
+    let ctx = tool_context(session, registry);
+    let mock = Arc::new(MockBackend::new());
+    mock.push_tool_calls([("call".into(), "shell".into(), args.to_string())]);
+    mock.push_text("done");
+    let backend = BackendManager::with_mock(mock.clone(), empty_secrets().await);
+    let policies = ToolPolicyRegistry::new(std::collections::HashMap::from([(
+        "shell".into(),
+        ToolPolicy {
+            approval: ApprovalRequirement::Never,
+            timeout: policy_timeout,
+            ..crate::tools::ShellExec.default_policy()
+        },
+    )]));
+    let recorder = Arc::new(RecordingRuntime::default());
+    let started = std::time::Instant::now();
+    let out = execute_with_recorder(
+        None,
+        vec![RuntimeMessage::User("test".into())],
+        &backend,
+        &crate::test_support::permissive_security(),
+        &ctx,
+        &policies,
+        Some(recorder.clone()),
+        None,
+        None,
+        ModelCallScope::default(),
+    )
+    .await
+    .unwrap();
+    let wall = started.elapsed();
+    assert_eq!(out.body, "done");
+    let records = recorder.records.lock().unwrap();
+    let RuntimeRecord::ToolResult {
+        output, outcome, ..
+    } = &records[1]
+    else {
+        panic!("missing tool result")
+    };
+    (outcome.clone(), output.clone(), wall)
+}
+
+/// The policy deadline stops the command's whole process group before the
+/// runtime drops the call, so the result keeps the partial output and its
+/// timed-out classification instead of a bare runtime timeout.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_shell_policy_timeout_reports_partial_output_and_kills_descendants() {
+    let directory = tempfile::tempdir().unwrap();
+    let leaked = directory.path().join("leaked");
+    let command = format!(
+        "echo started; (sleep 3; echo leaked > '{}') & sleep 30; echo finished",
+        leaked.display()
+    );
+    let (outcome, output, wall) = run_shell(2, json!({ "command": command })).await;
+    assert_eq!(outcome, ToolResultOutcome::TimedOut, "{output}");
+    assert!(output.starts_with("Tool timed out after 1."), "{output}");
+    assert!(output.contains("policy timeout"), "{output}");
+    assert!(output.contains("started"), "{output}");
+    assert!(!output.contains("finished"), "{output}");
+    assert!(!output.contains("[exit code"), "{output}");
+    assert!(wall < Duration::from_secs(3), "stopped at {wall:?}");
+    tokio::time::sleep(Duration::from_millis(3200)).await;
+    assert!(!leaked.exists(), "a timed-out shell descendant survived");
+}
+
+/// A requested `timeout` shorter than the policy stops the command at the
+/// requested time and says so.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_requested_shell_timeout_stops_before_the_policy() {
+    let (outcome, output, wall) = run_shell(
+        30,
+        json!({ "command": "echo partial; sleep 30", "timeout": 0.5 }),
+    )
+    .await;
+    assert_eq!(outcome, ToolResultOutcome::TimedOut, "{output}");
+    assert!(output.starts_with("Tool timed out after 0."), "{output}");
+    assert!(output.contains("requested timeout of 0.5s"), "{output}");
+    assert!(output.ends_with("partial\n"), "{output}");
+    assert!(wall < Duration::from_secs(5), "stopped at {wall:?}");
+}
+
+/// A command that finishes inside its deadline keeps the historical result:
+/// complete output, its real exit status and a success classification.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_completed_shell_command_keeps_its_exit_status() {
+    let (outcome, output, _) = run_shell(
+        30,
+        json!({ "command": "echo 'test result: ok. 2 passed'; exit 3", "timeout": 20 }),
+    )
+    .await;
+    assert_eq!(outcome, ToolResultOutcome::Success, "{output}");
+    assert_eq!(output, "test result: ok. 2 passed\n\n[exit code 3]");
+}
+
+/// Manual check that a command runs past the former 30s/60s shell limits
+/// when the operator's policy allows it, and still reports its final output,
+/// exit status and wall time. Minutes long, so ignored by default:
+///
+/// ```text
+/// cargo test -p chaz-core -- --ignored --nocapture a_shell_command_outlives_the_former_limit
+/// ```
+#[cfg(unix)]
+#[tokio::test]
+#[ignore = "runs for over a minute"]
+async fn a_shell_command_outlives_the_former_limit() {
+    // Exercise this exact build's real tests, not a printed fake summary.
+    // The final nonzero status also checks the shell verdict survives.
+    let command = format!(
+        "sleep 65; '{}' --nocapture tools::shell::tests && exit 3",
+        std::env::current_exe().unwrap().display()
+    );
+    let (outcome, output, wall) = run_shell(600, json!({ "command": command })).await;
+    println!(
+        "[outcome] {outcome:?} after {:.1}s\n{output}",
+        wall.as_secs_f64()
+    );
+    assert_eq!(outcome, ToolResultOutcome::Success, "{output}");
+    assert!(wall > Duration::from_secs(60), "finished at {wall:?}");
+    assert!(output.contains("test result: ok."), "{output}");
+    assert!(output.contains("0 failed"), "{output}");
+    assert!(output.ends_with("[exit code 3]"), "{output}");
+}

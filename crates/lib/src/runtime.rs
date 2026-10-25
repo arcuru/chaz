@@ -2172,8 +2172,10 @@ async fn invoke_tool(
     let Some(exec_result) = until_cancelled(cancel, async {
         // A lost reply can follow a completed effect. Invoke once; an error
         // classification is not permission to resubmit the call.
+        let deadline = tokio::time::Instant::now() + timeout;
+        call_ctx.call_deadline = Some(deadline);
         let result =
-            tokio::time::timeout(timeout, async { tool.execute(args, &call_ctx).await }).await;
+            tokio::time::timeout_at(deadline, async { tool.execute(args, &call_ctx).await }).await;
         // Outside the tool timeout: success, error and timeout
         // all regain capacity before hooks, another tool in
         // this batch, or the next model request can execute.
