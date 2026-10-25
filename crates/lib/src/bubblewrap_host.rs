@@ -216,6 +216,10 @@ mod tests {
             debug.contains("--die-with-parent"),
             "Should die with parent: {debug}"
         );
+        assert!(
+            debug.contains("--unshare-pid"),
+            "Should isolate PIDs for process-tree cleanup: {debug}"
+        );
         assert!(debug.contains("sh"), "Should run sh: {debug}");
         assert!(debug.contains("-c"), "Should use -c flag: {debug}");
         assert!(
@@ -256,13 +260,6 @@ mod tests {
         let debug = format!("{cmd:?}");
         // Should have --ro-bind for system directories that exist
         assert!(debug.contains("--ro-bind"), "Should have ro-bind: {debug}");
-    }
-
-    #[test]
-    fn test_bwrap_command_isolates_pids() {
-        let host = BubblewrapToolHost::with_path("/usr/bin/bwrap");
-        let debug = format!("{:?}", host.build_shell_command("id", None));
-        assert!(debug.contains("--unshare-pid"), "{debug}");
     }
 
     /// Needs working unprivileged user namespaces, which build sandboxes

@@ -362,12 +362,28 @@ mod tests {
     }
 
     #[test]
-    fn descriptor_lists_command_required_and_working_dir_optional() {
+    fn descriptor_lists_command_required_and_optional_directory_and_timeout() {
         let d = ShellExec.descriptor();
         assert_eq!(d.name, "shell");
         let required = d.parameters["required"].as_array().expect("required[]");
         assert!(required.iter().any(|v| v == "command"));
         assert!(!required.iter().any(|v| v == "working_dir"));
+        assert!(!required.iter().any(|v| v == "timeout"));
+        assert_eq!(d.parameters["properties"]["timeout"]["type"], "number");
+    }
+
+    #[test]
+    fn approval_only_policy_override_explains_the_generic_timeout() {
+        let policy: ToolPolicy = serde_yaml::from_str("approval: never").unwrap();
+        let policies = crate::tool::ToolPolicyRegistry::new(std::collections::HashMap::from([(
+            "shell".into(),
+            policy,
+        )]));
+        let effective = policies.resolve(&ShellExec);
+        assert_eq!(ShellExec.default_policy().timeout, 30);
+        assert_eq!(effective.timeout, 60);
+        assert_eq!(effective.risk, RiskLevel::Low);
+        assert_eq!(effective.approval, ApprovalRequirement::Never);
     }
 
     #[tokio::test]
@@ -407,14 +423,6 @@ mod tests {
             }
             other => panic!("unexpected capability: {other:?}"),
         }
-    }
-
-    #[test]
-    fn descriptor_offers_an_optional_pi_style_timeout() {
-        let d = ShellExec.descriptor();
-        assert_eq!(d.parameters["properties"]["timeout"]["type"], "number");
-        let required = d.parameters["required"].as_array().expect("required[]");
-        assert!(!required.iter().any(|v| v == "timeout"));
     }
 
     #[tokio::test]

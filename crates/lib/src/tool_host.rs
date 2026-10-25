@@ -358,8 +358,6 @@ impl Drop for ShellProcessGroup {
 
 /// Check a shell command against allowlist/denylist from a `ShellGrant`.
 /// An empty `allow` list means allow-all. Denylist entries always apply.
-/// Check a shell command against allowlist/denylist from a `ShellGrant`.
-/// An empty `allow` list means allow-all. Denylist entries always apply.
 ///
 /// Public so other host implementations (e.g., bubblewrap) can enforce
 /// the same grant checks before executing via their own mechanism.
