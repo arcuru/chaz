@@ -225,6 +225,22 @@ context:
   max_context_tokens: 128000
   reserved_output_tokens: 4096
 
+# Tool execution host for capability requests. Omit (default) for the native
+# in-process host (grant checks only). Set "bubblewrap" to run shell commands
+# in Linux namespaces — no network, private PID namespace, cleared
+# environment, read-only system dirs and /nix/store. Startup fails if a
+# working bwrap sandbox cannot be created; set
+# "bubblewrap-unsafe-fallback" instead to explicitly accept native
+# execution without sandboxing.
+# tool_host: bubblewrap
+
+# Directories the bubblewrap host may mount read-write as a shell working
+# directory. Requested working dirs must canonicalize inside one of these
+# roots; omit for none (commands run against the ephemeral /tmp). A root
+# that canonicalizes to / is refused at startup.
+# tool_host_writable_roots:
+#   - /srv/work
+
 # Web search tool (ordered failover chain)
 web_search:
   backends:
