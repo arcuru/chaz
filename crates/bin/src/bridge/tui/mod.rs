@@ -542,7 +542,7 @@ pub(super) struct Tab {
     /// defaults so live agent edits can re-resolve unpinned models on draw.
     pub model_pin: Option<String>,
     /// Per-entry expand override (entry index → "opposite of `App::expand_all`").
-    /// Empty by default; click on an entry's icon toggles its presence here.
+    /// Empty by default; click on an entry's header row toggles its presence here.
     pub expanded_entries: HashSet<usize>,
     /// Backend-derived state refreshed off the input/render path, plus the
     /// transcript render cache. See [`refresh`].
