@@ -447,9 +447,10 @@ rejected for a Matrix-bound turn rather than silently posting a fallback answer.
    gives `!chaz Error: session <id> is not bound to this room on this login`;
    it does not remove another binding.
 
-3. Once the remaining mapping is unique, new messages and addressed delivery
-   use it again without a restart. Attaching a different session is a separate
-   explicit action, not a move or history merge.
+3. Once the remaining mapping is unique, detach reinstalls any delivery
+   observers that startup refused. Queued output resumes to its original room
+   without a new inbound message or a restart. Attaching a different session
+   is a separate explicit action, not a move or history merge.
 
 ## Migration: schedules no longer auto-post finals
 

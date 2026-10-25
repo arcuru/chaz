@@ -294,6 +294,8 @@ Unexposed local CLI/TUI sessions remain outside the bridge's routing and access 
 `!chaz detach [<exact-session-db-id>]` removes only the current login/room binding, including from legacy multi-bound sessions.
 Multiple sessions on a room require an exact ID from the error, not registry-order selection.
 Detach preserves other bindings and history, retains login exposure while any binding still needs it, and stops the removed room's in-process observers.
+Observer installation waits for teardown to finish; approval posts are cancelled before draining their route gate.
+After detach, the bridge repeats startup attachment to install surviving routes that were previously ambiguous.
 Delivery and approval posts revalidate exact room/session uniqueness; a stopped observer cannot resume on a later session write.
 `!chaz channels` lists bindings, including dotted-domain Matrix identities.
 The bridge delivers only generic addressed outbound events for its own login and room, then records a generic receipt.
