@@ -3,6 +3,7 @@
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
@@ -115,6 +116,38 @@ class Workflows(unittest.TestCase):
             )
         self.assertEqual(result.stdout.count("::endgroup::"), len(names))
         return result, invocations[0]
+
+    def test_shared_actions_use_one_release(self):
+        pins = []
+        for path in (ROOT / ".github").rglob("*"):
+            if path.suffix not in (".yml", ".yaml"):
+                continue
+            for line in path.read_text().splitlines():
+                if "uses: arcuru/actions/" not in line:
+                    continue
+                with self.subTest(path=path, line=line):
+                    pin = re.fullmatch(
+                        r"\s*uses: arcuru/actions/[^@]+@([0-9a-f]{40}) # (v\d+\.\d+\.\d+)",
+                        line,
+                    )
+                    self.assertIsNotNone(pin)
+                    pins.append(pin.groups())
+        self.assertTrue(pins)
+        self.assertEqual(len(set(pins)), 1, pins)
+
+    def test_hold_expiry_keeps_the_pat_backed_verification_contract(self):
+        workflow = yaml.load(
+            (ROOT / ".github/workflows/update-hold.yml").read_text(),
+            Loader=yaml.BaseLoader,
+        )
+        self.assertEqual(workflow["permissions"], {
+            "contents": "read", "pull-requests": "write",
+        })
+        job = workflow["jobs"]["update-hold"]
+        self.assertEqual(job["if"], "github.repository_owner == 'arcuru'")
+        self.assertEqual(job["secrets"], "inherit")
+        self.assertEqual(job["with"]["environment"], "automation")
+        self.assertNotIn("verify-pins", job["with"])
 
     def test_prepare_reuses_check_and_test_outputs_before_secrets(self):
         steps = self.ci["jobs"]["main"]["steps"]
