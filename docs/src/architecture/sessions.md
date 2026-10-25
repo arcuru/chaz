@@ -287,7 +287,15 @@ graph LR
 An external attachment is an explicit `(transport, login_id, channel)` record in the session DB, with a reply capability for conversational adapters.
 There is at most one publishable external attachment per session; TUI/CLI remain local clients, not extra attachments.
 An addressed Matrix message in a new room creates and attaches a session, while unaddressed messages in an already-attached room become context-only `BridgeEvent` observations.
-`!chaz attach <session>` rejects another external binding until explicit detach or migration, and `!chaz channels` lists bindings.
+`!chaz attach <session>` rejects both an occupied target session and a room already bound to a different session; the exact same binding may be retried.
+Channel creation, explicit attach and detach share a per-channel lock; attach also serializes mutations of the target session.
+Lookup scans exact bindings in the owning agent's exposed registry rather than choosing the first match or treating an ambiguity/read error as absence.
+Unexposed local CLI/TUI sessions remain outside the bridge's routing and access surface.
+`!chaz detach [<exact-session-db-id>]` removes only the current login/room binding, including from legacy multi-bound sessions.
+Multiple sessions on a room require an exact ID from the error, not registry-order selection.
+Detach preserves other bindings and history, retains login exposure while any binding still needs it, and stops the removed room's in-process observers.
+Delivery and approval posts revalidate exact room/session uniqueness; a stopped observer cannot resume on a later session write.
+`!chaz channels` lists bindings, including dotted-domain Matrix identities.
 The bridge delivers only generic addressed outbound events for its own login and room, then records a generic receipt.
 A Matrix-origin final enters that outbox atomically with its local copy; TUI, schedule, and local-agent finals never enter it.
 Startup reconciliation and per-binding progress retry queued sends even when the agent is offline.
