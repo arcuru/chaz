@@ -2366,7 +2366,9 @@ pub(crate) async fn read_session_name_from_db(
         .transpose()
 }
 
-/// Read the meta DocStore of a session DB. Returns default on any error.
+/// Read session metadata leniently from one meta DocStore view.
+/// Store read errors return default metadata; absent or malformed fields
+/// fall back individually without discarding other valid fields.
 pub async fn read_meta_from_db(database: &Database) -> SessionMeta {
     let Ok(txn) = database.new_transaction().await else {
         return SessionMeta::default();
@@ -2912,6 +2914,44 @@ mod tests {
                     .contains(&format!("Malformed {field} in SessionMeta, ignoring:"))),
                 "missing warning for {field}: {messages:?}"
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn lenient_meta_preserves_ambient_key_precedence() {
+        use eidetica::crdt::doc::Value;
+
+        let (_instance, _user, db) = test_session_db().await;
+        let legacy = AmbientParticipation {
+            transport: "matrix".into(),
+            login_id: "@bot:example".into(),
+            channel: "!legacy:example".into(),
+            generation: "legacy-generation".into(),
+        };
+        let current = AmbientParticipation::new_for("discord", "bot", "channel");
+        for (primary, expected) in [
+            (None, Some(legacy.clone())),
+            (Some(Value::from(42)), Some(legacy.clone())),
+            (Some(Value::from("not-json")), None),
+            (
+                Some(Value::from(serde_json::to_string(&current).unwrap())),
+                Some(current),
+            ),
+        ] {
+            let txn = db.new_transaction().await.unwrap();
+            let store = txn.get_store::<DocStore>(META_STORE).await.unwrap();
+            store
+                .set_string(
+                    "matrix_ambient_v1",
+                    r#"{"login_id":"@bot:example","room_id":"!legacy:example","generation":"legacy-generation"}"#,
+                )
+                .await
+                .unwrap();
+            if let Some(primary) = primary {
+                store.set("bridge_ambient_v1", primary).await.unwrap();
+            }
+            txn.commit().await.unwrap();
+            assert_eq!(read_meta_from_db(&db).await.ambient_participation, expected);
         }
     }
 
