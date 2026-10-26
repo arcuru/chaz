@@ -49,7 +49,9 @@ permission to dispatch a chat. A ready chat
 resolves its session through a strict scan of the owning agent's exposed
 sessions, rejects unreadable/ambiguous bindings, checks the recorded session
 ID, and never falls back to get-or-create, so a
-failed lookup cannot mint a replacement. `attach`, `detach`, `participation`
+failed lookup cannot mint a replacement. Rename checks that same binding before
+either label write; approval reactions require it and the prompt's exact room.
+`attach`, `detach`, `participation`
 and the model-based `rename` are refused in workspace chats.
 
 **Outputs stay addressed.** A chat's replies and approvals use the existing
@@ -61,8 +63,8 @@ cancellation; an interruption leaves saved progress for explicit continuation.
 
 **Creation is journaled, not atomic.** Matrix `createRoom` has no transaction
 ID, and Matrix state and Eidetica writes cannot share a transaction. Every
-request is an operation whose step progress is written to the peer-local
-`chaz_peer` DB before each external effect:
+request is an operation in the peer-local `chaz_peer` DB. Creation attempts
+and completed steps are persisted:
 
 1. The room-creation step is marked _attempted_ before a single POST with SDK
    retries disabled. A 4xx answer means no room and resets the step; any other
@@ -85,7 +87,10 @@ request is an operation whose step progress is written to the peer-local
 Duplicate sync delivery returns the stored receipt for that event ID. One
 operation is unfinished at a time. Partial results are reported step by step
 and continue only on an explicit `retry`; `cancel` never deletes, leaves or
-re-permissions a room.
+re-permissions a room. A Matrix rename is also marked attempted before its
+state write. Once attempted, it cannot be cancelled: a lost response may have
+left only the Matrix name changed. Retry sets the same literal name and finishes
+the session label.
 
 **Privacy is set explicitly.** Each room is created invite-only, with joined
 history visibility, guest access forbidden, no directory entry and no
@@ -138,9 +143,11 @@ A retained database handle carries a delegated signing snapshot, not a live
 identity lookup. A write with a newer snapshot raises the session's inherited
 floor; another writer retaining the older snapshot can then be rejected. The
 daemon captures the actual account key at keyed-open and refreshes its native
-identity before approval publication/expiry, active-turn recorder writes,
-heartbeat and final settlement. Pinned schedules and tools writing the same
-session use that same policy. Refresh replaces only the signing binding: it
+identity before approval publication/expiry, context status/selection writes,
+active-turn recorder writes, heartbeat and final settlement. Context assembly
+keeps its selected coherent transcript even if a concurrent fresh writer raises
+the signing floor before selection persistence. Pinned schedules and tools writing
+the same session use that same policy. Refresh replaces only the signing binding: it
 does not reload the active transcript, change the session root, select another
 private key, or replay a failed effect.
 
@@ -151,7 +158,8 @@ interrupted. The embedded discovery API supports single-hop delegation; this
 is not a new nested-delegation walker or service-client authorization scheme.
 Service-backed opens retain their bound identities and existing explicit
 unsupported-authority gaps; native discovery is limited to embedded opens.
-Cached local-client handles whose signer cannot be captured retain their
-existing native behavior rather than guessing a substitute. Authentication
+Explicitly bound nested paths and cached local-client handles retain their
+existing native behavior rather than requiring unsupported discovery or
+guessing a substitute. Authentication
 and current entitlement of a received approval decision remain a separate
 boundary from publishing the request with a current writer.

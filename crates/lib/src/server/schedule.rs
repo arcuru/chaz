@@ -26,12 +26,9 @@ impl crate::runtime::RuntimeRecorder for ScheduleRecorder {
         call: crate::session::usage::CallObservation,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>> {
         Box::pin(async move {
-            let db = match &self.signing_key {
-                Some(key) => crate::session::current_session_writer(&self.db, key)
-                    .await
-                    .map_err(|e| e.to_string())?,
-                None => self.db.clone(),
-            };
+            let db = crate::session::current_session_writer(&self.db, self.signing_key.as_ref())
+                .await
+                .map_err(|e| e.to_string())?;
             crate::session::usage::persist_call(&db, &self.invocation, None, &self.agent, call)
                 .await
         })
@@ -774,6 +771,7 @@ impl Server {
                 .with_room_participants(&roster)
                 .with_extension_hub(self.extensions.clone())
                 .with_session_db(session_db)
+                .with_session_signing_key(signing_key.clone())
                 .with_invocation(&active_extensions, None)
                 .try_build()
                 .await?;

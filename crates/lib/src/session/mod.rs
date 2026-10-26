@@ -793,10 +793,14 @@ session_wire_enum! {
 /// Refresh only the signing binding, preserving the database root and read context.
 /// Native discovery/commit retain all permission and inherited-floor checks. A
 /// concurrent authority change may still reject the write; never replay it.
+/// Without a captured embedded signer, retain the already-bound native handle.
 pub(crate) async fn current_session_writer(
     db: &Database,
-    key: &eidetica::auth::crypto::PrivateKey,
+    key: Option<&eidetica::auth::crypto::PrivateKey>,
 ) -> anyhow::Result<Database> {
+    let Some(key) = key else {
+        return Ok(db.clone());
+    };
     let instance = db.instance()?;
     let (identity, _) = Database::find_sigkeys(&instance, db.root_id(), &key.public_key())
         .await?
@@ -823,7 +827,7 @@ impl Session {
     /// Refresh a daemon writer without reloading its transcript/context snapshot.
     pub(crate) async fn refresh_writer(&mut self) -> anyhow::Result<()> {
         if let Some(key) = &self.signing_key {
-            self.database = current_session_writer(&self.database, key).await?;
+            self.database = current_session_writer(&self.database, Some(key)).await?;
         }
         Ok(())
     }

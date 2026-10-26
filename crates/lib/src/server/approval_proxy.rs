@@ -26,7 +26,7 @@ use crate::bridge::{
     ApprovalDecision, ApprovalExchange, approval_decision_entry, approval_request_entry,
     resolved_decisions,
 };
-use crate::session::Session;
+use crate::session::{Session, current_session_writer};
 use crate::types::ConversationId;
 use eidetica::Database;
 use eidetica::auth::crypto::PrivateKey;
@@ -37,22 +37,6 @@ use tokio::sync::{Mutex, mpsc, oneshot};
 use tracing::{debug, info, warn};
 
 type Pending = Arc<Mutex<HashMap<String, oneshot::Sender<ApprovalDecision>>>>;
-
-/// A Database clone retains its delegated SigKey snapshot. Runtime writes
-/// may have raised the session's inherited floor since this proxy opened it.
-/// Rediscover a current native identity for the *same captured signer* before
-/// publication; a revoked/Read key stays a failure, not a fallback to another
-/// account key. Without a captured embedded key, retain the already-bound
-/// native writer. Native commit validation remains authoritative.
-async fn current_approval_writer(
-    db: &Database,
-    key: Option<&PrivateKey>,
-) -> anyhow::Result<Database> {
-    match key {
-        Some(key) => crate::session::current_session_writer(db, key).await,
-        None => Ok(db.clone()),
-    }
-}
 
 /// Spawn the approval proxy for one bridge-exposed session and return the
 /// `approval_tx` to hand to [`Server::register_session`](crate::server::Server::register_session).
@@ -134,7 +118,7 @@ pub async fn spawn_session_db_approval_proxy(
                     .await
                     .insert(request_id.clone(), exchange.decision_tx);
                 let written = async {
-                    let writer = current_approval_writer(&db, signing_key.as_ref()).await?;
+                    let writer = current_session_writer(&db, signing_key.as_ref()).await?;
                     let mut session = Session::try_new(ConversationId(sid.clone()), writer).await?;
                     session.add_entry(entry).await
                 }.await;
@@ -170,7 +154,7 @@ pub async fn spawn_session_db_approval_proxy(
                     // bridge can tell its channel — without any of them running
                     // a clock of their own.
                     let written = async {
-                        let writer = current_approval_writer(&db, signing_key.as_ref()).await?;
+                        let writer = current_session_writer(&db, signing_key.as_ref()).await?;
                         let mut session = Session::try_new(ConversationId(sid.clone()), writer).await?;
                         session.add_entry(approval_decision_entry("system", &request_id, ApprovalDecision::TimedOut)).await
                     }.await;
@@ -302,7 +286,7 @@ mod tests {
         let txn = identity.new_transaction().await.unwrap();
         txn.get_settings().unwrap().set_name(name).await.unwrap();
         txn.commit().await.unwrap();
-        let fresh = current_approval_writer(db, Some(key)).await.unwrap();
+        let fresh = current_session_writer(db, Some(key)).await.unwrap();
         let txn = fresh.new_transaction().await.unwrap();
         txn.get_store::<DocStore>("floor")
             .await
@@ -311,6 +295,71 @@ mod tests {
             .await
             .unwrap();
         txn.commit().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn context_selection_refreshes_the_held_signer_without_reloading_context() {
+        use crate::context::ContextBuilder;
+        use crate::runtime::RuntimeMessage;
+        use eidetica::store::DocStore;
+        let (_instance, _user, identity, old, key) = delegated_proxy_fixture().await;
+        let mut session = Session::new(ConversationId(old.root_id().to_string()), old.clone())
+            .await
+            .with_signing_key(Some(key.clone()));
+        let entry = |content: &str| crate::session::SessionEntry {
+            sender: "human".into(),
+            content: content.into(),
+            timestamp: chrono::Utc::now(),
+            entry_type: crate::session::EntryType::Message,
+            metadata: None,
+            routing: None,
+        };
+        session.add_entry(entry("held context")).await.unwrap();
+        let hub = crate::test_support::context_hub().await;
+        hub.record_active(&old).await.unwrap();
+        // The fresh heartbeat can raise the inherited floor after the turn
+        // captures its writer, before the first context selection is persisted.
+        raise_approval_floor(&identity, &old, &key, "before context selection").await;
+        let mut fresh = Session::new(
+            ConversationId(old.root_id().to_string()),
+            current_session_writer(&old, Some(&key)).await.unwrap(),
+        )
+        .await;
+        fresh.add_entry(entry("later message")).await.unwrap();
+        let config = Default::default();
+        let active = std::collections::HashSet::from(["baseline_context".to_string()]);
+        let assembled = ContextBuilder::new(session.entries(), "host", "", &config)
+            .with_extension_hub(Arc::new(hub))
+            .with_session_db(session.database())
+            .with_session_signing_key(session.signing_key())
+            .with_invocation(&active, None)
+            .try_build()
+            .await
+            .unwrap();
+        assert!(
+            assembled
+                .messages
+                .iter()
+                .any(|m| matches!(m, RuntimeMessage::User(text) if text == "held context"))
+        );
+        assert!(
+            !assembled
+                .messages
+                .iter()
+                .any(|m| matches!(m, RuntimeMessage::User(text) if text == "later message"))
+        );
+        let txn = old.new_transaction().await.unwrap();
+        let selected = txn
+            .get_store::<DocStore>("context_selections")
+            .await
+            .unwrap();
+        assert!(
+            selected
+                .get_string("[\"host\",\"baseline_context\"]")
+                .await
+                .is_ok()
+        );
+        assert!(Session::renew_turn_activity(&old, "missing").await.is_err());
     }
 
     #[tokio::test]
@@ -362,7 +411,7 @@ mod tests {
         let id = await_request_id(&old).await;
         let mut bridge = Session::new(
             sid.clone(),
-            current_approval_writer(&old, Some(&key)).await.unwrap(),
+            current_session_writer(&old, Some(&key)).await.unwrap(),
         )
         .await;
         bridge
@@ -395,7 +444,7 @@ mod tests {
                     .is_err(),
                 "native floor must still reject stale handles"
             );
-            let heartbeat = current_approval_writer(&old, Some(&key)).await.unwrap();
+            let heartbeat = current_session_writer(&old, Some(&key)).await.unwrap();
             Session::renew_turn_activity(&heartbeat, &attempt.attempt_id)
                 .await
                 .unwrap();
@@ -468,7 +517,7 @@ mod tests {
         );
         let mut pending = tokio::spawn(async move { security(tx).request_approval(ask()).await });
         let request = await_request_id(&old).await;
-        let fresh = current_approval_writer(&old, Some(&key)).await.unwrap();
+        let fresh = current_session_writer(&old, Some(&key)).await.unwrap();
         let mut session = Session::new(ConversationId(old.root_id().to_string()), fresh).await;
         // A different request ID cannot resolve this slot.
         session
@@ -548,7 +597,7 @@ mod tests {
         let other = user
             .get_signing_key(&user.get_default_key().unwrap())
             .unwrap();
-        assert!(current_approval_writer(&old, Some(&other)).await.is_ok());
+        assert!(current_session_writer(&old, Some(&other)).await.is_ok());
         for grant in [
             AuthKey::active(Some("writer"), Permission::Read),
             AuthKey::new(
@@ -564,8 +613,8 @@ mod tests {
                 .await
                 .unwrap();
             txn.commit().await.unwrap();
-            assert!(current_approval_writer(&old, Some(&key)).await.is_err());
-            assert!(current_approval_writer(&old, Some(&other)).await.is_ok());
+            assert!(current_session_writer(&old, Some(&key)).await.is_err());
+            assert!(current_session_writer(&old, Some(&other)).await.is_ok());
         }
     }
 

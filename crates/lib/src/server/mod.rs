@@ -4093,10 +4093,7 @@ impl Server {
                 loop {
                     tick.tick().await;
                     let renewed = async {
-                        let db = match &heartbeat_key {
-                            Some(key) => crate::session::current_session_writer(&heartbeat_db, key).await?,
-                            None => heartbeat_db.clone(),
-                        };
+                        let db = crate::session::current_session_writer(&heartbeat_db, heartbeat_key.as_ref()).await?;
                         Session::renew_turn_activity(&db, &heartbeat_id).await
                     }.await;
                     if let Err(error) = renewed {
@@ -4262,6 +4259,7 @@ impl Server {
                         .with_room_participants(&roster)
                         .with_extension_hub(spawn_extensions.clone())
                         .with_session_db(s.database())
+                        .with_session_signing_key(s.signing_key())
                         .with_invocation(&active_extensions, Some(attempt.request_id.as_str()))
                         .try_build()
                         .await;
