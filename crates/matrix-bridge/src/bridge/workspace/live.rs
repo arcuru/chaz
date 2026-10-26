@@ -314,6 +314,20 @@ impl SessionOps for LiveSessions {
         .await
     }
 
+    async fn check_binding(&self, room: &str, session: &str) -> anyhow::Result<()> {
+        let agent = owning_agent_entry(&self.server, &self.owning_agent)
+            .ok_or_else(|| anyhow::anyhow!("owning agent is not hosted"))?;
+        crate::bridge::resolve_workspace_session(
+            &self.server,
+            &agent,
+            &self.login_id,
+            room,
+            session,
+        )
+        .await?;
+        Ok(())
+    }
+
     async fn set_label(&self, session: &str, label: &str) -> anyhow::Result<()> {
         let (_conv, db) = self.server.registry().open_session(session).await?;
         chaz_core::session::set_session_description(&db, Some(label)).await?;

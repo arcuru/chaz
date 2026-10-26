@@ -207,8 +207,8 @@ are encrypted:
   second room appears.
 
 Room-creation uncertainty and partial-step recovery are covered by the bridge's
-hermetic unit tests, not here: a real homeserver cannot be made to lose a
-`createRoom` response on demand.
+hermetic unit tests. This harness does not inject network faults or verify a
+particular desktop or mobile client's navigation UI.
 
 ## Transport
 

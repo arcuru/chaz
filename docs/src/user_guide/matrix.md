@@ -583,8 +583,10 @@ out of the conversation. It does not keep the conversation out of chaz or the mo
 A workspace gives one person a tidy place to keep separate conversations with
 the bot: a private Matrix **Space** that lists a **Lobby** and one room per
 chat. Every chat room has exactly one new Chaz session, so chats never share
-a transcript. Turn it on by setting `workspace_manager` on the login to your
-exact MXID; unset, every workspace command refuses.
+a transcript. They still use the owning agent's shared tools and memory;
+separate transcripts do not create separate agents or authorization domains.
+Turn it on by setting `workspace_manager` on the login to your exact MXID;
+unset, management commands refuse (help remains available).
 
 **A Space is a folder of rooms, not a conversation and not a permission
 group.** What each part does:
@@ -621,7 +623,8 @@ What is automatic and what you do:
   workspace chats. Rooms and sessions are identified by ID, never by name.
 - **Bindings are fixed.** `attach`, `detach` and `participation` are refused
   in workspace chats, and the bot never creates a replacement session for a
-  chat whose session it cannot open. Replies and tool approvals use the
+  chat whose session it cannot open. Literal rename and approval reactions also
+  refuse a missing or competing binding. Replies and tool approvals use the
   ordinary [reply routing](#attached-rooms-and-reply-routing) for that room
   only; nothing is ever posted to the Lobby or another chat instead.
 
@@ -633,7 +636,7 @@ bridge uses it to keep such rooms away from ordinary history bootstrap even
 when the record does not list them.
 
 **Failure modes.** Room creation cannot be made exactly-once, so every request
-is an operation (`op-N`) whose progress is saved before each step:
+is an operation (`op-N`) with saved step progress:
 
 - If a room-creation request has an unknown outcome (a dropped connection or a
   server error), the operation becomes **uncertain**. The request is never sent
@@ -656,8 +659,9 @@ is an operation (`op-N`) whose progress is saved before each step:
 - Cancel never deletes or leaves a room. A room an operation already created
   stays as it is, marked "not ready" in `chat list`, and setup cannot be
   cancelled once it created a room — retry it instead. The same holds for a
-  chat with a known room or a rename that already changed the Matrix name:
-  finish the operation rather than abandoning inconsistent labels.
+  chat with a known room or a rename whose Matrix name write was attempted:
+  a lost response may hide a successful write. Retry the same literal rename
+  to finish both labels rather than cancelling it.
 
 V1 has no archive, threaded Inbox, existing-room adoption, nested Spaces or
 model-driven management.
@@ -700,8 +704,8 @@ model-driven management.
    A new session is ready; no other chat history was copied.
    ```
 
-4. Failure and recovery. The connection drops while creating a second chat,
-   and the daemon has not yet synced the owning agent to this bridge:
+4. Failure and recovery. This example drops the room-creation response, then
+   simulates a storage failure after creating the session DB:
 
    ```text
    > !chaz chat new Trip plans

@@ -1489,10 +1489,18 @@ impl Bridge for MatrixBridge {
         {
             let pending_approvals = pending_approvals.clone();
             let allow_list = allow_list.clone();
+            let workspace_rooms = workspace_rooms.clone();
+            let server = server.clone();
+            let login_id = login_id.clone();
+            let owning_agent = owning_agent.clone();
             mc.client()
                 .add_event_handler(move |event: OriginalSyncReactionEvent, room: Room| {
                     let pending_approvals = pending_approvals.clone();
                     let allow_list = allow_list.clone();
+                    let workspace_rooms = workspace_rooms.clone();
+                    let server = server.clone();
+                    let login_id = login_id.clone();
+                    let owning_agent = owning_agent.clone();
                     async move {
                         // Same gate as the message path: only an allow-listed
                         // sender (never the bot itself) can resolve an approval.
@@ -1504,7 +1512,43 @@ impl Bridge for MatrixBridge {
                         if !is_allowed(allow_list.as_deref(), event.sender.as_str(), &bot_uid) {
                             return;
                         }
-                        handle_approval_reaction(event, pending_approvals, &room).await;
+                        match workspace_rooms.get(room.room_id().as_str()) {
+                            Some(workspace::Place::Chat {
+                                ready: true,
+                                session_db_id: Some(expected),
+                                ..
+                            }) => {
+                                let Some(agent) = owning_agent_entry(&server, &owning_agent) else {
+                                    return;
+                                };
+                                if let Err(error) = resolve_workspace_session(
+                                    &server,
+                                    &agent,
+                                    &login_id,
+                                    room.room_id().as_str(),
+                                    &expected,
+                                )
+                                .await
+                                {
+                                    error!(%error, "Workspace approval binding unavailable");
+                                    return;
+                                }
+                            }
+                            Some(_) => return,
+                            None if workspace::live::has_marker(&room).await => return,
+                            None => {}
+                        }
+                        if let Some(notice) = handle_approval_reaction(
+                            event,
+                            pending_approvals,
+                            room.room_id().as_str(),
+                        )
+                        .await
+                        {
+                            let _ = room
+                                .send(RoomMessageEventContent::notice_plain(notice))
+                                .await;
+                        }
                     }
                 });
         }
@@ -1621,7 +1665,7 @@ fn spawn_workspace_command(
             let digest = sha2::Sha256::digest(event_id.as_bytes());
             let txn: String = digest.iter().map(|b| format!("{b:02x}")).collect();
             let send = room
-                .send(RoomMessageEventContent::notice_markdown(text))
+                .send(RoomMessageEventContent::notice_plain(text))
                 .with_transaction_id(OwnedTransactionId::from(format!("workspace-{txn}")));
             match tokio::time::timeout(std::time::Duration::from_secs(30), send).await {
                 Ok(Ok(_)) => {}
@@ -1930,17 +1974,21 @@ async fn attach_approval_watcher(
 async fn handle_approval_reaction(
     event: OriginalSyncReactionEvent,
     pending: PendingApprovals,
-    room: &Room,
-) {
+    room_id: &str,
+) -> Option<String> {
     let relates_to = &event.content.relates_to;
     let decision = match relates_to.key.as_str() {
         "✅" => ApprovalDecision::Approve,
         "❌" => ApprovalDecision::Deny,
         "⏭" | "⏭️" => ApprovalDecision::ApproveAll,
-        _ => return,
+        _ => return None,
     };
-    let Some(req) = pending.slots.lock().await.remove(&relates_to.event_id) else {
-        return;
+    let req = {
+        let mut slots = pending.slots.lock().await;
+        if slots.get(&relates_to.event_id)?.room_id != room_id {
+            return None;
+        }
+        slots.remove(&relates_to.event_id)?
     };
     info!(
         room = %req.room_id, request_id = %req.request_id, ?decision,
@@ -1953,11 +2001,7 @@ async fn handle_approval_reaction(
         decision,
     )
     .await;
-    if let Some(notice) = already.as_ref().and_then(already_resolved_notice) {
-        let _ = room
-            .send(RoomMessageEventContent::notice_plain(notice))
-            .await;
-    }
+    already.as_ref().and_then(already_resolved_notice)
 }
 
 /// Approve or deny the oldest pending tool-approval request in `room` — the
@@ -2006,6 +2050,69 @@ async fn resolve_pending_approval(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn approval_reaction_cannot_resolve_another_rooms_request() {
+        use super::*;
+        use eidetica::{Instance, NewAccount, backend::database::InMemory};
+        let (_instance, mut user) = Instance::create_backend(
+            Box::new(InMemory::new()),
+            NewAccount::passwordless("approval-room"),
+        )
+        .await
+        .unwrap();
+        let key = user.get_default_key().unwrap();
+        let db = user
+            .create_database(eidetica::crdt::Doc::new(), &key)
+            .await
+            .unwrap();
+        let prompt = OwnedEventId::try_from("$prompt").unwrap();
+        let pending = Arc::new(ApprovalRelay {
+            slots: Mutex::new(HashMap::from([(
+                prompt.clone(),
+                PendingApproval {
+                    session_db: db.clone(),
+                    request_id: "request".into(),
+                    room_id: "!intended:example.org".into(),
+                    seq: 0,
+                },
+            )])),
+        });
+        let reaction = || {
+            serde_json::from_value::<OriginalSyncReactionEvent>(serde_json::json!({
+                "type": "m.reaction", "event_id": "$reaction", "sender": "@human:example.org",
+                "origin_server_ts": 1, "content": {"m.relates_to": {
+                    "rel_type": "m.annotation", "event_id": "$prompt", "key": "✅",
+                }},
+            }))
+            .unwrap()
+        };
+        handle_approval_reaction(reaction(), pending.clone(), "!sibling:example.org").await;
+        let session = Session::new(
+            chaz_core::types::ConversationId(db.root_id().to_string()),
+            db.clone(),
+        )
+        .await;
+        assert!(
+            chaz_core::bridge::existing_decision(session.entries(), "request").is_none(),
+            "a sibling reaction must not authorize this request"
+        );
+        assert!(
+            pending.slots.lock().await.contains_key(&prompt),
+            "wrong-room reaction must not consume the prompt"
+        );
+        handle_approval_reaction(reaction(), pending.clone(), "!intended:example.org").await;
+        let session = Session::new(
+            chaz_core::types::ConversationId(db.root_id().to_string()),
+            db,
+        )
+        .await;
+        assert_eq!(
+            chaz_core::bridge::existing_decision(session.entries(), "request"),
+            Some(ApprovalDecision::Approve)
+        );
+        assert!(pending.slots.lock().await.is_empty());
+    }
+
     #[test]
     fn command_dispatch_futures_stay_bounded() {
         fn future_size<F: std::future::Future>(

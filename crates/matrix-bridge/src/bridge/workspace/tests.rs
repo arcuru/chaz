@@ -114,7 +114,10 @@ impl MatrixOps for FakeMatrix {
     async fn set_name(&self, room: &str, name: &str) -> anyhow::Result<()> {
         self.fail("set_name")?;
         let mut hs = self.0.lock().unwrap();
-        *hs.names.entry(room.into()).or_default() = name.into();
+        hs.names.insert(room.into(), name.into());
+        if hs.fail_once.remove("set_name_response") {
+            anyhow::bail!("injected lost rename response");
+        }
         Ok(())
     }
 }
@@ -179,6 +182,19 @@ impl SessionOps for FakeSessions {
         let mut reg = self.0.lock().unwrap();
         anyhow::ensure!(reg.bindings.get(room).map(String::as_str) == Some(session));
         reg.delivery.insert((room.into(), session.into()));
+        Ok(())
+    }
+    async fn check_binding(&self, room: &str, session: &str) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.0
+                .lock()
+                .unwrap()
+                .bindings
+                .get(room)
+                .map(String::as_str)
+                == Some(session),
+            "workspace binding changed"
+        );
         Ok(())
     }
     async fn set_label(&self, session: &str, label: &str) -> anyhow::Result<()> {
@@ -758,6 +774,90 @@ async fn rename_is_literal_and_reports_partial_success() {
     let reply = h.lobby("chat rename c9 Nope").await;
     assert!(reply.contains("no workspace chat"), "{reply}");
     assert_eq!(h.state().await.chats[0].label, "Spring bike");
+}
+
+#[tokio::test]
+async fn rename_refuses_a_changed_binding_before_either_label_write() {
+    let h = harness("12").await;
+    h.setup().await;
+    h.lobby("chat new Bike repair").await;
+    let before = h.state().await;
+    let chat = &before.chats[0];
+    h.reg
+        .0
+        .lock()
+        .unwrap()
+        .bindings
+        .insert(chat.room_id.clone(), "other-session".into());
+    let reply = h.lobby("chat rename c1 Winter bike").await;
+    assert!(reply.contains("incomplete"), "{reply}");
+    assert!(!h.hs.0.lock().unwrap().names.contains_key(&chat.room_id));
+    assert_eq!(
+        h.reg.0.lock().unwrap().labels[chat.session_db_id.as_ref().unwrap()],
+        "Bike repair"
+    );
+    assert_eq!(h.state().await.chats, before.chats);
+    h.reg
+        .0
+        .lock()
+        .unwrap()
+        .bindings
+        .insert(chat.room_id.clone(), chat.session_db_id.clone().unwrap());
+    let reply = h.lobby("workspace retry op-3").await;
+    assert!(reply.contains("done"), "{reply}");
+}
+
+#[tokio::test]
+async fn lost_rename_response_cannot_abandon_inconsistent_labels() {
+    let h = harness("12").await;
+    h.setup().await;
+    h.lobby("chat new Bike repair").await;
+    h.hs.0.lock().unwrap().fail_once.insert("set_name_response");
+    let reply = h.lobby("chat rename c1 Winter bike").await;
+    assert!(reply.contains("incomplete"), "{reply}");
+    let before = h.state().await;
+    let chat = &before.chats[0];
+    assert_eq!(h.hs.0.lock().unwrap().names[&chat.room_id], "Winter bike");
+    assert_eq!(
+        h.reg.0.lock().unwrap().labels[chat.session_db_id.as_ref().unwrap()],
+        "Bike repair"
+    );
+
+    // Cancellation must not turn an unknown Matrix outcome into permission
+    // to abandon the pending coordinated rename, even after a restart.
+    let restarted = open(&h.store, &h.hs, &h.reg, AGENT, Some(MANAGER))
+        .await
+        .unwrap();
+    let cancel = restarted
+        .handle(Request {
+            sender: MANAGER,
+            event_id: "$cancel",
+            room_id: "!lobby",
+            origin: Origin::Managed(Place::Lobby),
+            command: "workspace cancel op-3",
+        })
+        .await
+        .unwrap();
+    assert!(cancel.contains("retry"), "{cancel}");
+    let reply = restarted
+        .handle(Request {
+            sender: MANAGER,
+            event_id: "$retry",
+            room_id: "!lobby",
+            origin: Origin::Managed(Place::Lobby),
+            command: "workspace retry op-3",
+        })
+        .await
+        .unwrap();
+    assert!(reply.contains("done"), "{reply}");
+    let after = h.state().await;
+    assert_eq!(after.chats[0].label, "Winter bike");
+    assert_eq!(
+        h.reg.0.lock().unwrap().labels[chat.session_db_id.as_ref().unwrap()],
+        "Winter bike"
+    );
+    assert_eq!(after.chats[0].room_id, chat.room_id);
+    assert_eq!(after.chats[0].session_db_id, chat.session_db_id);
 }
 
 #[test]

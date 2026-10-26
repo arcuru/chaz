@@ -9,8 +9,8 @@
 //! MXID plus the existing allow list.
 //!
 //! Room creation and session-DB creation cannot be made exactly-once, so every
-//! request is a durable [`Operation`] whose step progress is saved before each
-//! external effect. A room-creation POST whose outcome is unknown is never
+//! request is a durable [`Operation`] with saved creation attempts and completed
+//! steps. A room-creation POST whose outcome is unknown is never
 //! repeated: the operation becomes *uncertain* and an explicit retry
 //! reconciles it against rooms carrying its marker state. Session creation is
 //! recovered through a marker written into the DB's initial settings.
@@ -42,6 +42,25 @@ const STORE: &str = "matrix_workspace";
 const SPACE_NAME: &str = "Chaz";
 const LOBBY_NAME: &str = "Lobby";
 const LOBBY_TOPIC: &str = "Create and find chats here; talk in a chat room.";
+
+const SETUP_STEPS: [&str; 6] = [
+    "space.create",
+    "lobby.create",
+    "space.child",
+    "lobby.parent",
+    "invite.space",
+    "invite.lobby",
+];
+const CHAT_STEPS: [&str; 7] = [
+    "room.create",
+    "session.provision",
+    "session.label",
+    "delivery",
+    "space.child",
+    "room.parent",
+    "invite",
+];
+const RENAME_STEPS: [&str; 2] = ["matrix.name", "session.label"];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -140,6 +159,13 @@ pub(crate) trait SessionOps: Send + Sync + 'static {
         room: &str,
         session: &str,
     ) -> impl Future<Output = anyhow::Result<()>> + Send;
+    /// Require this exact room/session binding in the owning agent's exposed
+    /// sessions; unreadable or competing bindings refuse management too.
+    fn check_binding(
+        &self,
+        room: &str,
+        session: &str,
+    ) -> impl Future<Output = anyhow::Result<()>> + Send;
     /// Literal browse-only label on the session (its description).
     fn set_label(
         &self,
@@ -189,7 +215,7 @@ pub(crate) enum OpStatus {
 #[serde(tag = "state", content = "value", rename_all = "snake_case")]
 pub(crate) enum Step {
     Pending,
-    /// Room/DB creation admitted; its outcome was not recorded.
+    /// Room/DB creation or Matrix rename admitted; outcome not recorded.
     Attempted,
     Done(Option<String>),
 }
@@ -646,15 +672,7 @@ impl<M: MatrixOps, S: SessionOps> Workspace<M, S> {
                 let handle = format!("c{}", state.next_chat);
                 let id = state.alloc_op();
                 let mut steps = BTreeMap::new();
-                for step in [
-                    "room.create",
-                    "session.provision",
-                    "session.label",
-                    "delivery",
-                    "space.child",
-                    "room.parent",
-                    "invite",
-                ] {
+                for step in CHAT_STEPS {
                     steps.insert(step.to_string(), Step::Pending);
                 }
                 state.operations.push(Operation {
@@ -702,7 +720,7 @@ impl<M: MatrixOps, S: SessionOps> Workspace<M, S> {
                 );
                 self.ensure_idle(state)?;
                 let id = state.alloc_op();
-                let steps = ["matrix.name", "session.label"]
+                let steps = RENAME_STEPS
                     .into_iter()
                     .map(|s| (s.to_string(), Step::Pending))
                     .collect();
@@ -785,17 +803,10 @@ impl<M: MatrixOps, S: SessionOps> Workspace<M, S> {
         };
         state.room_version = version.clone();
         let id = state.alloc_op();
-        let steps = [
-            "space.create",
-            "lobby.create",
-            "space.child",
-            "lobby.parent",
-            "invite.space",
-            "invite.lobby",
-        ]
-        .into_iter()
-        .map(|s| (s.to_string(), Step::Pending))
-        .collect();
+        let steps = SETUP_STEPS
+            .into_iter()
+            .map(|s| (s.to_string(), Step::Pending))
+            .collect();
         state.operations.push(Operation {
             id: id.clone(),
             kind: OpKind::Setup,
@@ -846,10 +857,13 @@ impl<M: MatrixOps, S: SessionOps> Workspace<M, S> {
             anyhow::bail!("{id} already created a chat room; retry it to finish provisioning");
         }
         if matches!(op.kind, OpKind::Rename { .. })
-            && matches!(op.steps.get("matrix.name"), Some(Step::Done(_)))
+            && matches!(
+                op.steps.get("matrix.name"),
+                Some(Step::Attempted | Step::Done(_))
+            )
         {
             anyhow::bail!(
-                "{id} already changed the room name; retry it to finish the session label"
+                "{id} may have changed the room name; retry it to finish the session label"
             );
         }
         let op = state.operations.iter_mut().find(|o| o.id == id).unwrap();
@@ -1003,8 +1017,19 @@ impl<M: MatrixOps, S: SessionOps> Workspace<M, S> {
             }
             (OpKind::Rename { handle, label }, step) => {
                 let chat = state.chat(handle).unwrap().clone();
+                self.sessions
+                    .check_binding(&chat.room_id, chat.session_db_id.as_deref().unwrap())
+                    .await
+                    .map_err(failed)?;
                 match step {
-                    "matrix.name" => self.matrix.set_name(&chat.room_id, label).await,
+                    "matrix.name" => {
+                        // A lost response or cancellation may follow a successful
+                        // state write. Retain that uncertainty and require retry
+                        // of the same literal name, not abandonment of half a rename.
+                        set_step(state, id, name, Step::Attempted);
+                        self.save(state).await.map_err(StepFailure::failed)?;
+                        self.matrix.set_name(&chat.room_id, label).await
+                    }
                     "session.label" => {
                         self.sessions
                             .set_label(chat.session_db_id.as_deref().unwrap(), label)
@@ -1095,24 +1120,9 @@ fn set_step(state: &mut WorkspaceState, id: &str, name: &str, step: Step) {
 
 fn step_order(kind: &OpKind, name: &str) -> usize {
     let order: &[&str] = match kind {
-        OpKind::Setup => &[
-            "space.create",
-            "lobby.create",
-            "space.child",
-            "lobby.parent",
-            "invite.space",
-            "invite.lobby",
-        ],
-        OpKind::NewChat { .. } => &[
-            "room.create",
-            "session.provision",
-            "session.label",
-            "delivery",
-            "space.child",
-            "room.parent",
-            "invite",
-        ],
-        OpKind::Rename { .. } => &["matrix.name", "session.label"],
+        OpKind::Setup => &SETUP_STEPS,
+        OpKind::NewChat { .. } => &CHAT_STEPS,
+        OpKind::Rename { .. } => &RENAME_STEPS,
     };
     order.iter().position(|n| *n == name).unwrap_or(usize::MAX)
 }
@@ -1170,6 +1180,8 @@ fn describe(state: &WorkspaceState, op: &Operation) -> String {
         .map(|(n, s)| {
             if **s == Step::Attempted && n.ends_with(".create") {
                 "room creation (outcome unknown)"
+            } else if **s == Step::Attempted && n.as_str() == "matrix.name" {
+                "room name (outcome unknown)"
             } else {
                 step_label(n)
             }
