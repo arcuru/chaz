@@ -4887,7 +4887,6 @@ async fn shared_service_clients_observe_durable_attempt_completion() {
             password: None,
             passwordless: true,
         },
-        max_frame_bytes: None,
         sync: None,
     };
     let executor =
@@ -5123,7 +5122,6 @@ async fn populated_service_targeted_indices_resume_and_create_without_history_op
             password: None,
             passwordless: true,
         },
-        max_frame_bytes: None,
         sync: None,
     };
     let connected = crate::instance::connect_with(&config, crate::config::ExecutionRole::Client)
@@ -5248,7 +5246,6 @@ async fn resident_executor_adopts_and_processes_local_client_session() {
             password: None,
             passwordless: true,
         },
-        max_frame_bytes: None,
         sync: None,
     };
 
@@ -5370,7 +5367,6 @@ async fn service_restart_reopens_and_reconciles_persisted_work() {
             password: None,
             passwordless: true,
         },
-        max_frame_bytes: None,
         sync: None,
     };
     let connected =
@@ -5872,7 +5868,6 @@ async fn shared_login_transport_and_observer_frontends_keep_independent_progress
             password: None,
             passwordless: true,
         },
-        max_frame_bytes: None,
         sync: None,
     };
     let agents = || Arc::new(AgentRegistry::with_default_agent());
@@ -6312,7 +6307,6 @@ async fn published_job_admission_uses_one_scope_snapshot_during_attachment() {
                     password: None,
                     passwordless: true,
                 },
-                max_frame_bytes: None,
                 sync: None,
             };
             let agents = local_server.agents_arc();
@@ -6520,7 +6514,6 @@ async fn published_job_is_adopted_without_creating_another_child() {
                 password: None,
                 passwordless: true,
             },
-            max_frame_bytes: None,
             sync: None,
         };
         let agents = Arc::new(AgentRegistry::with_default_agent());
@@ -6939,7 +6932,6 @@ async fn accepted_job_restart_uses_agent_db_depth_not_yaml() {
                 password: None,
                 passwordless: true,
             },
-            max_frame_bytes: None,
             sync: None,
         };
         let (executor, mock) = published_executor_with_mock(
@@ -7152,7 +7144,6 @@ async fn client_submission_publishes_one_child_then_executor_runs_it() {
                     password: None,
                     passwordless: true,
                 },
-                max_frame_bytes: None,
                 sync: None,
             };
             let agents = Arc::new(AgentRegistry::with_default_agent());
@@ -8337,7 +8328,6 @@ async fn sole_job_settles_after_former_claim_ttl_without_ownership_writes() {
             password: None,
             passwordless: true,
         },
-        max_frame_bytes: None,
         sync: None,
     };
     let (executor, child_mock) = published_executor_with_mock(
@@ -8512,7 +8502,6 @@ async fn running_job_branch_gets_one_parallel_notice_and_still_delivers() {
             password: None,
             passwordless: true,
         },
-        max_frame_bytes: None,
         sync: None,
     };
     // The child makes one tool call, so its second model request is a safe
@@ -8712,7 +8701,6 @@ async fn ten_job_wait_parents_yield_capacity_and_reacquire_before_continuing() {
             password: None,
             passwordless: true,
         },
-        max_frame_bytes: None,
         sync: None,
     };
     let (executor, child_mock) = published_executor_with_mock(

@@ -128,11 +128,6 @@ eidetica:
   login: { username: chaz, passwordless: true }
 ```
 
-Service-connected bridges can set
-[`eidetica.max_frame_bytes`](configuration.md#service-frame-limits) in this same
-block. Configure both the Eidetica daemon and each client when raising the
-64 MiB default; direct-owner bridges must omit the field.
-
 A service client holds the agent databases already, so the `ticket:` field on
 its logins is an owner-only control and must be omitted; the bridge refuses to
 start otherwise and names the owner-side command. It publishes a login pointer

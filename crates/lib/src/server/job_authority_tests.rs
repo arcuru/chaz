@@ -84,7 +84,6 @@ impl AuthorityFixture {
                     password: None,
                     passwordless: true,
                 },
-                max_frame_bytes: None,
                 sync: None,
             },
             yaml,

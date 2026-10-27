@@ -120,9 +120,6 @@ pub struct EideticaConfig {
     /// Debug redacts password-bearing userinfo and `user`, `password`, and
     /// `sslpassword` query values without changing the connection string.
     pub connection: String,
-    /// Optional maximum encoded service-frame payload, in bytes. Only valid
-    /// for `unix:` connections; omission keeps Eidetica's 64 MiB default.
-    pub max_frame_bytes: Option<u64>,
     /// Existing Eidetica user to log in as. Connecting never provisions it.
     pub login: EideticaLoginConfig,
     /// Direct-owner sync setup. Service clients must omit this block because
@@ -134,7 +131,6 @@ impl std::fmt::Debug for EideticaConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("EideticaConfig")
             .field("connection", &redact_connection_url(&self.connection))
-            .field("max_frame_bytes", &self.max_frame_bytes)
             .field("login", &self.login)
             .field("sync", &self.sync)
             .finish()
@@ -1245,7 +1241,6 @@ fn known_config_keys() -> HashSet<&'static str> {
     for k in [
         "eidetica",
         "eidetica.connection",
-        "eidetica.max_frame_bytes",
         "eidetica.login",
         "eidetica.login.username",
         "eidetica.login.password",
@@ -2136,8 +2131,7 @@ agents:
         let yaml = r#"
 execution: executor
 eidetica:
-  connection: unix:///run/eidetica/service.sock
-  max_frame_bytes: 1073741824
+  connection: memory://
   login:
     username: chaz
     passwordless: true
@@ -2199,7 +2193,6 @@ eidetica:
                     password: None,
                     passwordless: true,
                 },
-                max_frame_bytes: None,
                 sync: None,
             };
             let rendered = format!("{config:?}");
@@ -2241,7 +2234,6 @@ eidetica:
                     password: None,
                     passwordless: true,
                 },
-                max_frame_bytes: None,
                 sync: None,
             }
         );

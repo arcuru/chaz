@@ -5,7 +5,6 @@
 //! layers so client and executor authority cannot be inferred from connection
 //! ownership.
 
-use eidetica::service::ServiceConfig;
 use eidetica::sync::DatabaseTicket;
 use eidetica::sync::transports::http::HttpTransport;
 use eidetica::sync::transports::iroh::IrohTransport;
@@ -366,7 +365,7 @@ pub async fn connect_with(
     config: &EideticaConfig,
     execution: ExecutionRole,
 ) -> Result<ConnectedInstance, ConnectError> {
-    let service_config = validate(config)?;
+    validate(config)?;
     let service_connection = is_service_connection(&config.connection);
     if service_connection && config.sync.is_some() {
         return Err(ConnectError::Config(
@@ -377,11 +376,9 @@ pub async fn connect_with(
 
     // Strict connect is load-only for every native target. Provisioning uses
     // Eidetica's explicit create APIs and never happens as connector fallback.
-    let instance = match service_config {
-        Some(policy) => Instance::connect_with_service_config(&config.connection, policy).await,
-        None => Instance::connect(&config.connection).await,
-    }
-    .map_err(ConnectError::Connection)?;
+    let instance = Instance::connect(&config.connection)
+        .await
+        .map_err(ConnectError::Connection)?;
     let ownership = if service_connection {
         InstanceOwnership::Service
     } else {
@@ -427,7 +424,7 @@ fn validate_strict_target(config: &EideticaConfig) -> Result<(), ConnectError> {
     Ok(())
 }
 
-fn validate(config: &EideticaConfig) -> Result<Option<ServiceConfig>, ConnectError> {
+fn validate(config: &EideticaConfig) -> Result<(), ConnectError> {
     if config.connection.trim().is_empty() {
         return Err(ConnectError::Config(
             "`eidetica.connection` must not be empty".into(),
@@ -446,18 +443,7 @@ fn validate(config: &EideticaConfig) -> Result<Option<ServiceConfig>, ConnectErr
             "set `eidetica.login.password` or explicitly opt into `passwordless: true`".into(),
         )),
         _ => Ok(()),
-    }?;
-    config.max_frame_bytes.map(|bytes| {
-        let policy = ServiceConfig::new(bytes).map_err(|error| {
-            ConnectError::Config(format!("`eidetica.max_frame_bytes`: {error}"))
-        })?;
-        if !is_service_connection(&config.connection) {
-            return Err(ConnectError::Config(
-                "`eidetica.max_frame_bytes` requires a `unix://` service connection; embedded backends have no service frames".into(),
-            ));
-        }
-        Ok(policy)
-    }).transpose()
+    }
 }
 
 fn is_service_connection(connection: &str) -> bool {
@@ -537,7 +523,6 @@ mod tests {
                 password: None,
                 passwordless: true,
             },
-            max_frame_bytes: None,
             sync: None,
         }
     }

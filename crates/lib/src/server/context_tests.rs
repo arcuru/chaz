@@ -137,7 +137,6 @@ async fn context_command_service_client_delivers_once_without_executor_authority
             password: None,
             passwordless: true,
         },
-        max_frame_bytes: None,
         sync: None,
     };
     let connected =
