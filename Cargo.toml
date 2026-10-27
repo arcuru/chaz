@@ -14,7 +14,7 @@ publish = false
 
 [workspace.dependencies]
 # Pinned external sources — kept in sync across both crates.
-eidetica = { git = "https://github.com/arcuru/eidetica", rev = "c67ee6665c5b106e9032d957cbd5573916411d41", features = ["sqlite"] }
+eidetica = { git = "https://github.com/arcuru/eidetica", rev = "7c0727956d2301d4f5cf48bfb365c77545241bf5", features = ["sqlite"] }
 
 # Shared third-party deps.
 anyhow = "1"

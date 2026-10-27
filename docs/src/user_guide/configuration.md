@@ -77,6 +77,62 @@ client before mutation and direct the operator to run them on the Eidetica
 owner. Ordinary session, agent, approval, and user-level sync-preference data
 operations continue through the service API.
 
+## Service frame limits
+
+| Setting                    | Meaning                                                                                                                                                   |
+| -------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `eidetica.max_frame_bytes` | Optional maximum encoded JSON service-frame payload in bytes, excluding the four-byte prefix; omitted means 67108864 (64 MiB). Only valid with `unix://`. |
+
+This is a **local endpoint limit**, not negotiation or an aggregate memory budget.
+Eidetica validates a positive integer that fits its wire length and local allocation
+range (at most 4294967295 on 64-bit hosts). Zero, negative, fractional and
+out-of-range values fail startup. Embedded SQLite, Postgres and memory connections
+reject the setting rather than pretending to enforce a service-frame limit.
+
+Both ends must accept a large frame: set the Eidetica daemon's
+`--max-frame-bytes` and this field in every service-connected Chaz process that
+needs it (executor, TUI, command client, Matrix or Discord gateway). Reconnects
+reuse the same configuration. A larger value permits larger per-frame allocations;
+it does not enlarge record chunks, pages, queues or the model context window.
+If either end refuses a frame, the connection fails rather than retrying that
+operation. Do not blindly replay an interrupted write or model/tool turn.
+
+### Raising a service limit
+
+1. Stop the disposable service and its clients, then start the existing store
+   with a matching daemon cap:
+
+   ```sh
+   eidetica daemon --data-dir /path/to/existing-state --max-frame-bytes 1073741824
+   ```
+
+2. Set the client cap in each service-connected Chaz configuration, retaining
+   its connection, login and execution role:
+
+   ```yaml
+   execution: client
+   eidetica:
+     connection: "unix:///run/eidetica/service.sock"
+     max_frame_bytes: 1073741824 # 1 GiB; not allocated at startup
+     login: { username: chaz, passwordless: true }
+   ```
+
+   Restart those clients. Small operations remain compatible with a default-cap
+   peer, but replies above 64 MiB require the larger cap on both endpoints.
+
+3. If the field is accidentally added to an embedded configuration, startup
+   reports:
+
+   ```text
+   invalid Eidetica configuration: `eidetica.max_frame_bytes` requires a `unix://` service connection; embedded backends have no service frames
+   ```
+
+   Remove the field for embedded mode, or deliberately select the existing
+   service URL. If a service read disconnects on a large reply, check both caps;
+   setting only the client's cap cannot override the daemon's. Reconnect after
+   correction and inspect any interrupted work before explicitly retrying it.
+   Removing the field restores the 64 MiB default; it does not shrink stored data.
+
 ## Full Example
 
 ```yaml

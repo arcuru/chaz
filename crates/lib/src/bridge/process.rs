@@ -451,6 +451,7 @@ eidetica:
                 password: None,
                 passwordless: true,
             },
+            max_frame_bytes: None,
             sync: None,
         };
         let service = instance::connect_with(

@@ -1490,6 +1490,7 @@ mod tests {
                 password: None,
                 passwordless: true,
             },
+            max_frame_bytes: None,
             sync: None,
         };
         let client = chaz_core::instance::connect_with(&config, ExecutionRole::Client)

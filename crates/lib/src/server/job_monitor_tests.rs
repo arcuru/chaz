@@ -56,6 +56,7 @@ async fn service_steering(
             password: None,
             passwordless: true,
         },
+        max_frame_bytes: None,
         sync: None,
     };
     let agents = Arc::new(AgentRegistry::with_default_agent());

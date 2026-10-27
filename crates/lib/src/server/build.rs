@@ -130,6 +130,7 @@ mod build_options_tests {
                 password: None,
                 passwordless: true,
             },
+            max_frame_bytes: None,
             sync: None,
         };
         crate::instance::capabilities_for_test(&config, role)
@@ -154,6 +155,7 @@ mod build_options_tests {
                     password: None,
                     passwordless: true,
                 },
+                max_frame_bytes: None,
                 sync: None,
             }),
             ..Default::default()
@@ -198,6 +200,7 @@ mod build_options_tests {
                 password: None,
                 passwordless: true,
             },
+            max_frame_bytes: None,
             sync: None,
         };
         let options = BuildOptions::local_oneshot(
