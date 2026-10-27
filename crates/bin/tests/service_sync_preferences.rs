@@ -1,5 +1,4 @@
 //! Preference-only commands use the signed service path, not owner sync APIs.
-use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -16,6 +15,7 @@ use eidetica::service::ServiceServer;
 use eidetica::store::DocStore;
 use eidetica::sync::DatabaseTicket;
 use eidetica::{Database, Instance, NewAccount};
+use tokio::process::Command;
 use tokio::sync::watch;
 
 // Read the owner's derived state independently of the account preference. Never
@@ -28,11 +28,17 @@ async fn combined_settings(owner: &Instance, db: &Database) -> Option<SyncSettin
         .get_store_viewer::<DocStore>("database_users")
         .await
         .unwrap();
-    let row = store
+    match store
         .get_path_as::<String>(path!(db.root_id().to_string(), "combined_settings"))
         .await
-        .ok()?;
-    Some(serde_json::from_str(&row).unwrap())
+    {
+        Ok(row) => Some(serde_json::from_str(&row).unwrap()),
+        Err(error) if error.is_not_found() => None,
+        Err(error) => panic!(
+            "Failed to read combined settings for {}: {error}",
+            db.root_id()
+        ),
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -130,19 +136,25 @@ async fn service_cli_unshare_commits_preferences_and_preserves_owner_gates() {
     .unwrap();
     let binary = std::env::var_os("NEXTEST_BIN_EXE_chaz")
         .unwrap_or_else(|| env!("CARGO_BIN_EXE_chaz").into());
-    let run = |command: &str| {
-        Command::new(&binary)
-            .env("XDG_CONFIG_HOME", dir.path().join("config"))
-            .args(["--config"])
-            .arg(&config)
-            .args(["cmd", command, "--session", "fixture"])
-            .output()
-            .unwrap()
+    let run = async |command: &str| {
+        tokio::time::timeout(
+            Duration::from_secs(20),
+            Command::new(&binary)
+                .kill_on_drop(true)
+                .env("XDG_CONFIG_HOME", dir.path().join("config"))
+                .arg("--config")
+                .arg(&config)
+                .args(["cmd", command, "--session", "fixture"])
+                .output(),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("{command} timed out"))
+        .unwrap()
     };
     // The fixture session has not run an executor's session-start hook. Enable
     // its bank commands through the normal client surface before taking baselines.
     for command in ["/extensions add memory", "/extensions add skills"] {
-        let output = run(command);
+        let output = run(command).await;
         assert!(
             output.status.success(),
             "{command}: {}",
@@ -172,7 +184,7 @@ async fn service_cli_unshare_commits_preferences_and_preserves_owner_gates() {
         format!("/memory attach {ticket}"),
         format!("/skills attach {ticket}"),
     ] {
-        let output = run(&command);
+        let output = run(&command).await;
         let error = String::from_utf8_lossy(&output.stderr);
         assert!(!output.status.success(), "{command} unexpectedly succeeded");
         assert!(
@@ -194,7 +206,7 @@ async fn service_cli_unshare_commits_preferences_and_preserves_owner_gates() {
     for (command, db) in targets {
         let snapshot = db.snapshot().await.unwrap();
         for _ in 0..2 {
-            let output = run(command);
+            let output = run(command).await;
             assert!(
                 output.status.success(),
                 "{command}: {}",

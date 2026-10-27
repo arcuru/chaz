@@ -119,7 +119,7 @@ All four `unshare` commands work through a service connection (`unix://`). They 
 
 Ticket creation (`share`), ticket import (including `attach <ticket>`), bootstrap approval queues, and `/sharing status` still require the Eidetica owner. Attaching an already-hosted bank by name or DB ID does not import a ticket and works from a client.
 
-For example, from a client connected to the daemon hosting memory bank `facts` and skill bank `ops`:
+For example, from a client connected to the daemon hosting memory bank `facts` and skill bank `ops`, with the memory and skills extensions active in the session:
 
 1. Disable the preferences from the client:
 
