@@ -111,7 +111,35 @@ Memory banks use the same `/memory share` + `/memory import [perm]` shape. Sessi
 
 The `/sharing` command surface is unified across kinds. Bare `/sharing` (or `/sharing status`) lists every database this peer is currently sharing, grouped by kind with DB root IDs. `/sharing requests`, `/sharing approve <id>`, `/sharing reject <id>` operate on the single eidetica request queue regardless of whether the request is for an agent, bank, or session DB. The list output names the resource when the target DB is hosted on this peer.
 
-To stop sharing a database — without revoking keys already held by peers who imported it — use `/unshare` for the current session, `/agent unshare <ref>` for an agent, or `/memory unshare <bank>` for a memory bank.
+To stop sharing a database — without revoking keys already held by peers who imported it — use `/unshare` for the current session, `/agent unshare <ref>` for an agent, `/memory unshare <bank>` for a memory bank, or `/skills unshare <bank>` for a skill bank.
+
+### Service clients and sharing preferences
+
+All four `unshare` commands work through a service connection (`unix://`). They commit the logged-in user's persisted sync preference on the connected Eidetica instance; the daemon reconciles that preference into its effective sync state. If another user on that instance still enables sharing for the same database, the daemon continues sharing it. Unsharing does not delete the database, detach it, or revoke keys.
+
+Ticket creation (`share`), ticket import (including `attach <ticket>`), bootstrap approval queues, and `/sharing status` still require the Eidetica owner. Attaching an already-hosted bank by name or DB ID does not import a ticket and works from a client.
+
+For example, from a client connected to the daemon hosting memory bank `facts` and skill bank `ops`:
+
+1. Disable the preferences from the client:
+
+   ```text
+   > /memory unshare facts
+   Sync disabled for memory bank 'facts' — it is no longer shared.
+   > /skills unshare ops
+   Sync disabled for skill bank 'ops' — it is no longer shared.
+   ```
+
+   Repeating either command is safe. The success confirms the preference write; it does not override other users' preferences.
+
+2. Trying to share again from the client fails before changing the preference:
+
+   ```text
+   > /memory share facts
+   This command controls daemon-owned Eidetica sync. Run it on the Eidetica owner to create the memory bank ticket; this service client made no changes.
+   ```
+
+3. To resume sharing, run `/memory share facts` or `/skills share ops` on the Eidetica owner with a listening sync transport, then use the returned ticket on the receiving peer.
 
 ### After approval
 
