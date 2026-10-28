@@ -63,22 +63,42 @@ jobs:
           nix develop .# --command cargo build --bin chaz --bin chaz-matrix --example e2ee_probe
         timeout-minutes: 20
 
-      # Every wait inside run.sh is bounded, so a passing run finishes in about a
-      # minute. This ceiling is the backstop for a Synapse that comes up wedged
-      # and never satisfies any of them. `--verbose` streams the component logs
-      # into the job output, because the harness deletes its workspace on exit
-      # and there is nothing to collect afterwards.
+      # Keep the existing harness deadline as a backstop for setup or a component
+      # that stops making progress. Keep the disposable workspace outside
+      # Nix's temporary shell directory so failed/timed-out runs can be inspected.
       # Exit 2 means the harness never got far enough to test anything — a
       # missing binary, a tool absent from the shell, a homeserver that would
       # not start. That is a different problem from a failing assertion, and
       # the job UI shows both as a red X, so say which one it was.
       - name: Matrix E2E
         run: |
+          mkdir -p "$RUNNER_TEMP/matrix-e2e"
           set +e
-          nix develop .#e2e --command dev/matrix-e2e/run.sh --verbose
-          rc=$?
+          nix develop .#e2e --command env TMPDIR="$RUNNER_TEMP/matrix-e2e" \
+            dev/matrix-e2e/run.sh --keep --verbose 2>&1 | tee "$RUNNER_TEMP/matrix-e2e/harness.log"
+          rc=${PIPESTATUS[0]}
           if [ "$rc" -eq 2 ]; then
             echo "::error::harness could not start (exit 2) — see the log above"
           fi
           exit "$rc"
         timeout-minutes: 10
+
+      # Only this run's fixture logs and Eidetica databases (including SQLite
+      # sidecars). Never upload configs, Matrix sessions/crypto stores, Synapse
+      # databases/keys, or share tickets. No production state enters this job.
+      - name: Retain failed Matrix diagnostics
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: matrix-e2e-diagnostics
+          retention-days: 7
+          path: |
+            ${{ runner.temp }}/matrix-e2e/harness.log
+            ${{ runner.temp }}/matrix-e2e/chaz-matrix-e2e-*/*.log
+            ${{ runner.temp }}/matrix-e2e/chaz-matrix-e2e-*/synapse/homeserver.log*
+            ${{ runner.temp }}/matrix-e2e/chaz-matrix-e2e-*/state-daemon/eidetica.db
+            ${{ runner.temp }}/matrix-e2e/chaz-matrix-e2e-*/state-daemon/eidetica.db-wal
+            ${{ runner.temp }}/matrix-e2e/chaz-matrix-e2e-*/state-daemon/eidetica.db-shm
+            ${{ runner.temp }}/matrix-e2e/chaz-matrix-e2e-*/state-bridge/eidetica.db
+            ${{ runner.temp }}/matrix-e2e/chaz-matrix-e2e-*/state-bridge/eidetica.db-wal
+            ${{ runner.temp }}/matrix-e2e/chaz-matrix-e2e-*/state-bridge/eidetica.db-shm

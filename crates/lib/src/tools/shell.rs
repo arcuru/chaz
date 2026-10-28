@@ -16,7 +16,10 @@ impl Tool for ShellExec {
     fn descriptor(&self) -> ToolDescriptor {
         ToolDescriptor {
             name: "shell".to_string(),
-            description: "Execute a shell command and return its stdout, stderr, and exit code"
+            description: "Execute a shell command and return its stdout, stderr, and exit code. \
+                          Runs until it exits, the optional timeout expires, the tool policy \
+                          timeout is reached, or the user stops the turn; a stopped command's \
+                          whole process group is killed."
                 .to_string(),
             parameters: serde_json::json!({
                 "type": "object",
@@ -28,6 +31,12 @@ impl Tool for ShellExec {
                     "working_dir": {
                         "type": "string",
                         "description": "Optional working directory for the command"
+                    },
+                    "timeout": {
+                        "type": "number",
+                        "description": "Optional timeout in seconds. On expiry the command is \
+                                        killed and its output so far is returned. The tool \
+                                        policy timeout still applies."
                     }
                 },
                 "required": ["command"]
@@ -61,8 +70,13 @@ impl Tool for ShellExec {
                 .get("working_dir")
                 .and_then(|v| v.as_str())
                 .map(String::from);
+            let requested = requested_timeout(&arguments)?;
+            let policy = ctx.call_deadline.map(|deadline| {
+                report_window(deadline.saturating_duration_since(tokio::time::Instant::now()))
+            });
+            let limit = stop_limit(requested, policy);
 
-            info!(command = %command, "Executing shell command via host");
+            info!(command = %command, ?limit, "Executing shell command via host");
 
             let result = ctx
                 .host()
@@ -70,6 +84,7 @@ impl Tool for ShellExec {
                     &Capability::Shell {
                         command: command.to_string(),
                         working_dir,
+                        timeout: limit.map(|limit| limit.after()),
                     },
                     ctx.grants(),
                 )
@@ -77,11 +92,17 @@ impl Tool for ShellExec {
 
             match result {
                 crate::tool_host::CapabilityResult::Shell(output) => {
-                    let formatted =
-                        format_shell_output(&output.stdout, &output.stderr, output.exit_code);
+                    let formatted = match limit.filter(|_| output.timed_out) {
+                        Some(limit) => format_timed_out(&output, limit),
+                        None => {
+                            format_shell_output(&output.stdout, &output.stderr, output.exit_code)
+                        }
+                    };
 
                     debug!(
                         exit_code = output.exit_code,
+                        timed_out = output.timed_out,
+                        elapsed_ms = output.elapsed.as_millis() as u64,
                         output_len = formatted.len(),
                         "Shell command completed"
                     );
@@ -94,6 +115,104 @@ impl Tool for ShellExec {
             }
         })
     }
+}
+
+/// Largest explicit `timeout`, matching Pi's bash tool (the Node timer cap).
+const MAX_TIMEOUT_SECS: f64 = 2_147_483.647;
+
+/// Read the optional `timeout` argument in seconds. Like Pi's bash tool it
+/// must be a finite positive number; absent means no per-call deadline.
+fn requested_timeout(
+    arguments: &Value,
+) -> Result<Option<std::time::Duration>, crate::tool::ToolError> {
+    let Some(value) = arguments.get("timeout").filter(|v| !v.is_null()) else {
+        return Ok(None);
+    };
+    match value.as_f64() {
+        Some(secs) if secs > 0.0 && secs <= MAX_TIMEOUT_SECS => {
+            Ok(Some(std::time::Duration::from_secs_f64(secs)))
+        }
+        _ => Err(crate::tool::ToolError::InvalidArgument(format!(
+            "'timeout' must be a positive number of seconds no greater than {MAX_TIMEOUT_SECS}"
+        ))),
+    }
+}
+
+/// Time held back from the runtime's policy deadline so the tool can kill
+/// the command, collect its partial output and report before the runtime
+/// drops the call without any output.
+const REPORT_RESERVE: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// The part of the remaining policy time the command itself may use.
+fn report_window(remaining: std::time::Duration) -> std::time::Duration {
+    remaining.saturating_sub(REPORT_RESERVE.min(remaining / 4))
+}
+
+/// Which deadline stops the command.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum StopLimit {
+    /// The model's `timeout` argument.
+    Requested(std::time::Duration),
+    /// The tool policy timeout enforced by the runtime.
+    Policy(std::time::Duration),
+}
+
+impl StopLimit {
+    fn after(self) -> std::time::Duration {
+        match self {
+            StopLimit::Requested(after) | StopLimit::Policy(after) => after,
+        }
+    }
+}
+
+/// The earlier of the requested timeout and the policy window.
+fn stop_limit(
+    requested: Option<std::time::Duration>,
+    policy: Option<std::time::Duration>,
+) -> Option<StopLimit> {
+    match (requested, policy) {
+        (Some(requested), Some(policy)) if policy < requested => Some(StopLimit::Policy(policy)),
+        (Some(requested), _) => Some(StopLimit::Requested(requested)),
+        (None, Some(policy)) => Some(StopLimit::Policy(policy)),
+        (None, None) => None,
+    }
+}
+
+/// Report a command the host stopped at `limit`.
+///
+/// The leading `Tool timed out` keeps the runtime's timed-out outcome. The
+/// exit status of a killed group is an artifact of the kill, so it is left
+/// out; the elapsed time is measured, not the configured limit.
+fn format_timed_out(output: &crate::tool_host::ShellOutput, limit: StopLimit) -> String {
+    let elapsed = output.elapsed.as_secs_f64();
+    let reason = match limit {
+        StopLimit::Requested(after) => format!(
+            "the command reached its requested timeout of {}s",
+            after.as_secs_f64()
+        ),
+        StopLimit::Policy(_) => {
+            "the command reached the shell tool's policy timeout, which a larger \
+             `timeout` argument cannot extend"
+                .to_string()
+        }
+    };
+    let mut formatted = format!(
+        "Tool timed out after {elapsed:.1} seconds: {reason}. Its process group was killed. \
+         Output before the stop:\n"
+    );
+    let budget = OUTPUT_LIMIT - formatted.len();
+    let partial = format_shell_output(&output.stdout, &output.stderr, 0);
+    if partial.len() <= budget {
+        formatted.push_str(&partial);
+    } else {
+        formatted.push_str(&project_long_output(
+            &output.stdout,
+            &output.stderr,
+            0,
+            budget,
+        ));
+    }
+    formatted
 }
 
 /// Total byte ceiling for a formatted shell result — the historical cap.
@@ -130,17 +249,17 @@ fn format_shell_output(stdout: &str, stderr: &str, exit_code: i32) -> String {
     if formatted.len() <= OUTPUT_LIMIT {
         return formatted;
     }
-    project_long_output(stdout, stderr, exit_code)
+    project_long_output(stdout, stderr, exit_code, OUTPUT_LIMIT)
 }
 
 /// Project an over-limit result into a bounded preview.
 ///
 /// The fixed framing (labels, separators, exit line) is charged against
-/// [`OUTPUT_LIMIT`] before any output bytes are spent, so the verdict can
+/// `limit` before any output bytes are spent, so the verdict can
 /// never be clipped away. Each present stream gets at least half the
 /// remaining budget — a long stdout cannot starve stderr — and each long
 /// stream keeps a head and a tail around an explicit omission notice.
-fn project_long_output(stdout: &str, stderr: &str, exit_code: i32) -> String {
+fn project_long_output(stdout: &str, stderr: &str, exit_code: i32, limit: usize) -> String {
     let exit_line = (exit_code != 0).then(|| format!("[exit code {exit_code}]"));
 
     let mut overhead = 0;
@@ -159,7 +278,7 @@ fn project_long_output(stdout: &str, stderr: &str, exit_code: i32) -> String {
         + exit_line.is_some() as usize;
     overhead += sections.saturating_sub(1);
 
-    let budget = OUTPUT_LIMIT.saturating_sub(overhead);
+    let budget = limit.saturating_sub(overhead);
     let (mut stdout_budget, mut stderr_budget) = match (!stdout.is_empty(), !stderr.is_empty()) {
         (true, true) => (budget / 2, budget - budget / 2),
         (true, false) => (budget, 0),
@@ -243,12 +362,28 @@ mod tests {
     }
 
     #[test]
-    fn descriptor_lists_command_required_and_working_dir_optional() {
+    fn descriptor_lists_command_required_and_optional_directory_and_timeout() {
         let d = ShellExec.descriptor();
         assert_eq!(d.name, "shell");
         let required = d.parameters["required"].as_array().expect("required[]");
         assert!(required.iter().any(|v| v == "command"));
         assert!(!required.iter().any(|v| v == "working_dir"));
+        assert!(!required.iter().any(|v| v == "timeout"));
+        assert_eq!(d.parameters["properties"]["timeout"]["type"], "number");
+    }
+
+    #[test]
+    fn approval_only_policy_override_explains_the_generic_timeout() {
+        let policy: ToolPolicy = serde_yaml::from_str("approval: never").unwrap();
+        let policies = crate::tool::ToolPolicyRegistry::new(std::collections::HashMap::from([(
+            "shell".into(),
+            policy,
+        )]));
+        let effective = policies.resolve(&ShellExec);
+        assert_eq!(ShellExec.default_policy().timeout, 30);
+        assert_eq!(effective.timeout, 60);
+        assert_eq!(effective.risk, RiskLevel::Low);
+        assert_eq!(effective.approval, ApprovalRequirement::Never);
     }
 
     #[tokio::test]
@@ -280,11 +415,138 @@ mod tests {
             Capability::Shell {
                 command,
                 working_dir,
+                timeout,
             } => {
+                assert_eq!(timeout, None, "no deadline without an argument or policy");
                 assert_eq!(command, "ls -la");
                 assert_eq!(working_dir.as_deref(), Some("/tmp"));
             }
             other => panic!("unexpected capability: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_timeouts_are_rejected_before_running() {
+        for timeout in [
+            serde_json::json!(0),
+            serde_json::json!(-1),
+            serde_json::json!("10"),
+            serde_json::json!(3_000_000),
+        ] {
+            let host = Arc::new(MockHost::new());
+            let (_i, c) = ctx_with(host.clone()).await;
+            let err = ShellExec
+                .execute(
+                    serde_json::json!({ "command": "x", "timeout": timeout }),
+                    &c,
+                )
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, crate::tool::ToolError::InvalidArgument(_)),
+                "{timeout}: {err}"
+            );
+            assert!(host.recorded_calls().is_empty());
+        }
+    }
+
+    #[test]
+    fn the_earlier_deadline_stops_the_command() {
+        let s = std::time::Duration::from_secs;
+        assert_eq!(stop_limit(None, None), None);
+        assert_eq!(
+            stop_limit(Some(s(5)), None),
+            Some(StopLimit::Requested(s(5)))
+        );
+        assert_eq!(
+            stop_limit(None, Some(s(29))),
+            Some(StopLimit::Policy(s(29)))
+        );
+        assert_eq!(
+            stop_limit(Some(s(5)), Some(s(29))),
+            Some(StopLimit::Requested(s(5)))
+        );
+        assert_eq!(
+            stop_limit(Some(s(600)), Some(s(29))),
+            Some(StopLimit::Policy(s(29)))
+        );
+        assert_eq!(report_window(s(30)), s(29));
+        assert_eq!(
+            report_window(std::time::Duration::from_millis(400)),
+            std::time::Duration::from_millis(300)
+        );
+    }
+
+    #[tokio::test]
+    async fn the_policy_deadline_bounds_a_longer_requested_timeout() {
+        let host = Arc::new(MockHost::new());
+        host.push_shell_timed_out("partial\n", std::time::Duration::from_millis(29_000));
+        let (_i, mut c) = ctx_with(host.clone()).await;
+        c.call_deadline = Some(tokio::time::Instant::now() + std::time::Duration::from_secs(30));
+        let out = ShellExec
+            .execute(serde_json::json!({ "command": "x", "timeout": 600 }), &c)
+            .await
+            .unwrap();
+        let Capability::Shell { timeout, .. } = host.last_call().unwrap() else {
+            panic!("expected a shell call");
+        };
+        let timeout = timeout.expect("policy deadline forwarded");
+        assert!(timeout <= std::time::Duration::from_secs(29), "{timeout:?}");
+        assert!(timeout > std::time::Duration::from_secs(28), "{timeout:?}");
+        assert_eq!(
+            out,
+            "Tool timed out after 29.0 seconds: the command reached the shell tool's policy \
+             timeout, which a larger `timeout` argument cannot extend. Its process group was \
+             killed. Output before the stop:\npartial\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_requested_timeout_is_reported_without_a_kill_exit_code() {
+        let host = Arc::new(MockHost::new());
+        host.push_shell_timed_out("", std::time::Duration::from_millis(1_500));
+        let (_i, c) = ctx_with(host.clone()).await;
+        let out = ShellExec
+            .execute(serde_json::json!({ "command": "x", "timeout": 1.5 }), &c)
+            .await
+            .unwrap();
+        let Capability::Shell { timeout, .. } = host.last_call().unwrap() else {
+            panic!("expected a shell call");
+        };
+        assert_eq!(timeout, Some(std::time::Duration::from_millis(1_500)));
+        assert!(
+            out.starts_with("Tool timed out after 1.5 seconds: "),
+            "{out}"
+        );
+        assert!(out.contains("requested timeout of 1.5s"), "{out}");
+        assert!(
+            out.ends_with("Output before the stop:\n[no output]"),
+            "{out}"
+        );
+        assert!(!out.contains("exit code"), "{out}");
+    }
+
+    #[test]
+    fn timed_out_output_keeps_both_tails_within_the_total_cap() {
+        let output = crate::tool_host::ShellOutput {
+            stdout: format!("stdout head\n{}\nstdout tail", "é".repeat(10_000)),
+            stderr: format!("stderr head\n{}\nstderr tail", "日".repeat(10_000)),
+            exit_code: 137,
+            timed_out: true,
+            elapsed: std::time::Duration::from_secs(2),
+        };
+        for limit in [
+            StopLimit::Requested(std::time::Duration::from_secs(2)),
+            StopLimit::Policy(std::time::Duration::from_secs(2)),
+        ] {
+            let out = format_timed_out(&output, limit);
+            assert!(out.len() <= OUTPUT_LIMIT, "bound exceeded: {}", out.len());
+            assert!(out.starts_with("Tool timed out after 2.0 seconds:"));
+            assert!(!out.contains("exit code"), "kill is not a command verdict");
+            for retained in ["stdout head", "stdout tail", "stderr head", "stderr tail"] {
+                assert!(out.contains(retained), "missing {retained}");
+            }
+            assert_eq!(out.matches("bytes omitted").count(), 2);
         }
     }
 

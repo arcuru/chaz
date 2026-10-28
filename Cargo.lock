@@ -851,6 +851,7 @@ dependencies = [
  "anyhow",
  "async-openai",
  "async-trait",
+ "backoff",
  "base64",
  "blake3",
  "chrono",
@@ -2047,7 +2048,7 @@ dependencies = [
 [[package]]
 name = "eidetica"
 version = "0.2.0"
-source = "git+https://github.com/arcuru/eidetica?rev=21592c4eb5c6776ff91760a6f2ad25b378d4e126#21592c4eb5c6776ff91760a6f2ad25b378d4e126"
+source = "git+https://github.com/arcuru/eidetica?rev=c67ee6665c5b106e9032d957cbd5573916411d41#c67ee6665c5b106e9032d957cbd5573916411d41"
 dependencies = [
  "aes-gcm",
  "argon2",

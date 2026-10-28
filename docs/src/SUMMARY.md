@@ -41,3 +41,4 @@
 - [Skills & Prompts](design/skills_and_prompts.md)
 - [Model Info Store](design/model_info_store.md)
 - [Checkpointed Job Waits](design/checkpointed_waits.md)
+- [Automatic Compaction](design/autocompaction.md)

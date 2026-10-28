@@ -715,3 +715,172 @@ async fn description_edit_patches_the_cached_picker_row_without_renaming() {
     let line = narrow.lines().find(|l| l.contains('界')).expect(&narrow);
     assert!(line.contains('…') && line.ends_with('│'), "{narrow}");
 }
+
+#[tokio::test]
+async fn session_shortcuts_create_focus_and_retain_the_previous_conversation() {
+    use super::super::{ChatAction, Command, handle_chat_action, show_system_msg};
+
+    let (_instance, server, backend, mut app) = fixture().await;
+    let (approval, notify, _) = channels();
+    let (models, _) = mpsc::channel(4);
+    let (rows, _) = mpsc::channel(128);
+    let secrets = SecretStore::new(server.registry().chaz_peer().clone()).await;
+    let original_id = app.active().session_db_id.clone();
+    show_system_msg(&mut app, "retained transcript".into());
+    app.input = "unsent draft".into();
+    app.cursor = 4;
+    app.active_mut().scroll_offset = 5;
+    let before = session_ids(&server).await;
+    let new_key = KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL);
+    let action = input::handle_chat_key(&mut app, new_key).unwrap();
+    assert!(matches!(
+        action,
+        ChatAction::Dispatch(Command::NewSession(None))
+    ));
+    assert!(!app.expand_all, "Ctrl+T still toggles expansion");
+    handle_chat_action(
+        action, &mut app, &server, &backend, &secrets, &approval, &notify, &models, &rows,
+    );
+    settle(&mut app).await;
+    assert_eq!(app.mode, TuiMode::Chat);
+    assert_eq!(app.tabs.len(), 2);
+    assert_eq!(app.active_tab, 1);
+    assert_ne!(app.active().session_db_id, original_id);
+    assert!(app.input.is_empty());
+    assert_eq!(session_ids(&server).await.len(), before.len() + 1);
+    let screen = frame(&mut app, &server, &backend, 160, 30);
+    assert!(screen.contains("Ctrl+T new"), "{screen}");
+    assert!(!screen.contains("retained transcript"), "{screen}");
+    super::super::cycle_tab(&mut app, -1);
+    assert_eq!(app.active().session_db_id, original_id);
+    assert_eq!((app.input.as_str(), app.cursor), ("unsent draft", 4));
+    assert_eq!(app.active().scroll_offset, 5);
+    let entries = app.active().entries.clone();
+    app.active_mut().scroll_offset = 0;
+    assert!(frame(&mut app, &server, &backend, 160, 30).contains("retained transcript"));
+
+    let expand_key = KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL);
+    for expanded in [true, false] {
+        assert!(input::handle_chat_key(&mut app, expand_key).is_none());
+        assert_eq!(app.expand_all, expanded);
+        let old_key = KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL);
+        assert!(input::handle_chat_key(&mut app, old_key).is_none());
+        assert_eq!(app.expand_all, expanded, "Ctrl+R still toggles expansion");
+        let screen = frame(&mut app, &server, &backend, 160, 30);
+        assert_eq!(screen.contains(" | EXP"), expanded, "{screen}");
+    }
+    assert_eq!(app.active().entries.len(), entries.len());
+    assert_eq!(app.active().entries[0].content, entries[0].content);
+    assert_eq!((app.input.as_str(), app.cursor), ("unsent draft", 4));
+
+    app.mode = TuiMode::SessionPicker;
+    let selected = input::handle_picker_key(&mut app, new_key).unwrap();
+    assert_eq!(selected, "__new__");
+    dispatch_picker_selection(selected, &mut app, &server, &backend, &approval, &notify);
+    settle(&mut app).await;
+    assert_eq!(app.mode, TuiMode::Chat);
+    assert_eq!(app.tabs.len(), 3);
+    assert_eq!(app.active_tab, 2);
+    assert_eq!(session_ids(&server).await.len(), before.len() + 2);
+}
+
+#[tokio::test]
+async fn session_shortcuts_respect_modes_and_modals() {
+    use super::super::{SettingsPrompt, SettingsPromptIntent};
+
+    let (_instance, server, backend, mut app) = fixture().await;
+    let ctrl = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL);
+    for overlay in [
+        Overlay::Help { scroll: 0 },
+        Overlay::RenamePrompt {
+            session_db_id: app.active().session_db_id.clone(),
+            title: "Rename".into(),
+            input: "draft".into(),
+            cursor: 5,
+        },
+    ] {
+        app.overlay = Some(overlay);
+        for c in ['t', 'r', 'o'] {
+            assert!(matches!(
+                input::handle_overlay_key(&mut app, ctrl(c)),
+                input::OverlayKey::Consumed
+            ));
+        }
+        assert!(app.overlay.is_some());
+        assert!(!app.expand_all);
+        if let Some(Overlay::RenamePrompt { input, .. }) = &app.overlay {
+            assert_eq!(input, "draft");
+        }
+    }
+    app.overlay = None;
+    let (decision_tx, mut decision_rx) = tokio::sync::oneshot::channel();
+    app.active_mut().pending_approval = Some(chaz_core::bridge::ApprovalExchange {
+        info: chaz_core::tool::ToolApprovalInfo {
+            name: "test".into(),
+            arguments_display: "{}".into(),
+            risk_level: chaz_core::tool::RiskLevel::High,
+        },
+        decision_tx,
+    });
+    for c in ['t', 'r', 'o'] {
+        assert!(input::handle_chat_key(&mut app, ctrl(c)).is_none());
+        assert!(app.has_pending_approval());
+    }
+    assert!(!app.expand_all);
+    assert!(decision_rx.try_recv().is_err());
+    app.active_mut().pending_approval = None;
+
+    app.mode = TuiMode::ModelPicker;
+    app.model_picker_loading = false;
+    assert!(matches!(
+        input::handle_model_picker_key(&mut app, ctrl('r')),
+        input::ModelPickerKey::Refresh
+    ));
+    for c in ['t', 'o'] {
+        assert!(matches!(
+            input::handle_model_picker_key(&mut app, ctrl(c)),
+            input::ModelPickerKey::None
+        ));
+    }
+    assert!(app.model_search.is_empty());
+
+    app.open_settings(SettingsScope::Peer, TuiMode::SessionPicker);
+    frame(&mut app, &server, &backend, 120, 40);
+    assert!(matches!(
+        input::handle_settings_key(&mut app, key(KeyCode::Char('r')), SettingsScope::Peer),
+        input::SettingsKey::OpenAgentDiff { .. }
+    ));
+    app.settings_prompt = Some(SettingsPrompt {
+        label: "Add default".into(),
+        input: "draft".into(),
+        cursor: 5,
+        intent: SettingsPromptIntent::AddPeerDefault,
+    });
+    for c in ['t', 'r', 'o'] {
+        assert!(matches!(
+            input::handle_settings_key(&mut app, ctrl(c), SettingsScope::Peer),
+            input::SettingsKey::None
+        ));
+    }
+    assert_eq!(app.settings_prompt.as_ref().unwrap().input, "draft");
+    input::handle_settings_key(&mut app, key(KeyCode::Char('r')), SettingsScope::Peer);
+    assert_eq!(app.settings_prompt.as_ref().unwrap().input, "draftr");
+    app.settings_prompt = None;
+
+    app.mode = TuiMode::SessionPicker;
+    super::super::apply_session_catalog(&mut app, server.registry().list_sessions().await.unwrap());
+    app.picker_index = 1;
+    for c in ['r', 'o'] {
+        assert!(input::handle_picker_key(&mut app, ctrl(c)).is_none());
+        assert!(app.overlay.is_none());
+    }
+    input::handle_picker_key(&mut app, key(KeyCode::Char('r')));
+    assert!(matches!(app.overlay, Some(Overlay::RenamePrompt { .. })));
+    assert_eq!(app.tabs.len(), 1);
+    assert!(!app.expand_all);
+    assert!(
+        input::command_catalog()
+            .iter()
+            .any(|(cmd, hint)| *cmd == "/expand" && hint.contains("Ctrl+O"))
+    );
+}

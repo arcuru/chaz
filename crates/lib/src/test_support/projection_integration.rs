@@ -2218,3 +2218,136 @@ async fn optional_projector_cannot_change_native_replay_origin() {
         }
     }
 }
+
+#[tokio::test]
+async fn projectors_receive_the_autocompacted_request() {
+    let p = probe("observer", noop());
+    let fx = Fixture::new(
+        &[&p],
+        &[grant("observer", ProjectionAuthority::Conversation, false)],
+        &["observer", crate::extensions::autocompact::NAME],
+    )
+    .await;
+    fx.backend.insert_model_window("mock-model".into(), 100_000);
+    let db = fx.session.lock().await.database().clone();
+    crate::extension::write_settings(
+        &db,
+        crate::extensions::autocompact::NAME,
+        serde_json::json!({"enabled": true, "trigger_tokens": 300, "keep_recent_tokens": 100}),
+    )
+    .await
+    .unwrap();
+    let mut messages = vec![RuntimeMessage::System("You are a test agent.".into())];
+    let mut sources = vec![ContextSource::Instructions];
+    for i in 0..3 {
+        messages.push(RuntimeMessage::User(format!(
+            "old {i} {}",
+            "words ".repeat(150)
+        )));
+        messages.push(RuntimeMessage::Assistant(format!(
+            "reply {i} {}",
+            "words ".repeat(150)
+        )));
+        sources.push(ContextSource::PersistedSessionEntry {
+            id: format!("u{i}"),
+        });
+        sources.push(ContextSource::PersistedSessionEntry {
+            id: format!("a{i}"),
+        });
+    }
+    messages.push(RuntimeMessage::User("question".into()));
+    sources.push(ContextSource::PersistedSessionEntry { id: "now".into() });
+    let budget = crate::context::estimate_request_tokens(&messages, &[]) - 100;
+    // Over the budget at the first call: it waits for the summary (popped
+    // first from the shared mock script), then sends the compacted request.
+    fx.mock.push_text("earlier: three old exchanges");
+    fx.mock.push_text("ok");
+    let (result, _) = fx
+        .run(
+            messages.clone(),
+            ModelCallScope {
+                request_budget_tokens: Some(budget),
+                sources,
+                ..Default::default()
+            },
+        )
+        .await;
+    assert_eq!(result.unwrap().body, "ok");
+    let calls = fx.mock.recorded_calls();
+    assert_eq!(calls.len(), 2);
+    assert!(calls[0].tools.is_empty(), "summary call is tool-free");
+    let seen = p.seen();
+    assert_eq!(
+        seen.len(),
+        2,
+        "measure complete envelope, then rebuild after waiting"
+    );
+    let seen = seen.last().unwrap();
+    assert!(seen.sources.contains(&ContextSource::CompactionSummary));
+    assert_eq!(seen.input.messages, calls[1].messages);
+    assert!(
+        calls[1]
+            .messages
+            .contains(&RuntimeMessage::User("question".into()))
+    );
+    assert!(crate::context::estimate_request_tokens(&calls[1].messages, &[]) <= budget);
+}
+
+#[tokio::test]
+async fn autocompact_waits_for_complete_projected_envelope_not_just_history() {
+    let tail = "projector-tail-sentinel ".repeat(30);
+    let addition = tail.clone();
+    let p = probe("adds-tail", move |_, mut request| {
+        request
+            .messages
+            .push(RuntimeMessage::User(addition.clone()));
+        Ok(request)
+    });
+    let fx = Fixture::new(
+        &[&p],
+        &[grant("adds-tail", ProjectionAuthority::Conversation, true)],
+        &["adds-tail", crate::extensions::autocompact::NAME],
+    )
+    .await;
+    fx.backend.insert_model_window("mock-model".into(), 100_000);
+    let db = fx.session.lock().await.database().clone();
+    crate::extension::write_settings(
+        &db,
+        crate::extensions::autocompact::NAME,
+        json!({"enabled":true,"trigger_tokens":1000000,"keep_recent_tokens":50}),
+    )
+    .await
+    .unwrap();
+    let messages = vec![
+        RuntimeMessage::System("sys".into()),
+        RuntimeMessage::User("old question ".repeat(120)),
+        RuntimeMessage::Assistant("old answer ".repeat(120)),
+        RuntimeMessage::User("current request".into()),
+    ];
+    let budget = crate::context::estimate_request_tokens(&messages, &[]) + 10;
+    fx.mock.push_text("old question answered"); // auxiliary stub, no tools
+    fx.mock.push_text("done");
+    let (result, _) = fx
+        .run(
+            messages,
+            ModelCallScope {
+                request_budget_tokens: Some(budget),
+                ..Default::default()
+            },
+        )
+        .await;
+    assert_eq!(result.unwrap().body, "done");
+    let calls = fx.mock.recorded_calls();
+    assert_eq!(calls.len(), 2, "one summary, one main call");
+    assert!(
+        !format!("{:?}", calls[0].messages).contains("projector-tail-sentinel"),
+        "projector additions are not summary source"
+    );
+    assert_eq!(calls[1].messages.last(), Some(&RuntimeMessage::User(tail)));
+    assert!(crate::context::estimate_request_tokens(&calls[1].messages, &calls[1].tools) <= budget);
+    assert_eq!(
+        p.count(),
+        2,
+        "reproject originals only after hard-limit wait"
+    );
+}

@@ -68,6 +68,8 @@ pub struct SessionContextView {
     #[cfg(test)]
     pub(crate) read_volume: serde_json::Value,
     pub entry_ids: Vec<Option<TurnRequestId>>,
+    /// Current/retried and still-queued inputs, resolved at the same snapshot.
+    pub protected_inputs: HashSet<TurnRequestId>,
     pub entries: Vec<SessionEntry>,
     pub tool_history: Vec<Vec<TurnTranscriptRecord>>,
     pub contributions: Vec<crate::extension::durable_context::CommittedContribution>,
@@ -1062,6 +1064,41 @@ impl Session {
         Ok(entries)
     }
 
+    /// Identity of native compaction coverage at one immutable snapshot.
+    /// Ordinary new input/tool records do not invalidate background work;
+    /// competing compact commands or positional summaries do.
+    pub(crate) async fn compaction_fence_at(
+        database: &Database,
+        snapshot: &Snapshot,
+    ) -> anyhow::Result<Vec<String>> {
+        let txn = database.new_transaction_at(snapshot).await?;
+        let commands = txn
+            .get_store::<Table<SessionCommandRequest>>(SESSION_COMMANDS_STORE)
+            .await?;
+        let mut fence = Vec::new();
+        for (id, result) in txn
+            .get_store::<Table<SessionCommandResult>>(SESSION_COMMAND_RESULTS_STORE)
+            .await?
+            .search(|r| matches!(r.outcome, SessionCommandOutcome::Compact { .. }))
+            .await?
+        {
+            // Include the immutable source snapshot as well as the result:
+            // equal summary text need not mean equal covered history.
+            fence.push(serde_json::to_string(&(
+                id.clone(),
+                commands.get(&id).await?,
+                result,
+            ))?);
+        }
+        for (id, entry) in Self::entries_with_ids_at_snapshot(database, snapshot).await? {
+            if entry.entry_type == EntryType::Summary {
+                fence.push(serde_json::to_string(&(id, entry))?);
+            }
+        }
+        fence.sort();
+        Ok(fence)
+    }
+
     /// One immutable view of compacted entries and selected completed attempts.
     pub async fn context_with_tool_history(
         &self,
@@ -1137,6 +1174,10 @@ impl Session {
                 .collect();
         let contributions =
             crate::extension::durable_context::read_at(&self.database, &snapshot).await?;
+        let protected_inputs = rows
+            .iter()
+            .filter_map(|(id, entry)| id.as_ref().filter(|id| pending(id, entry)).cloned())
+            .collect();
         let selected: HashMap<_, _> = states
             .into_iter()
             .filter_map(|(id, state)| {
@@ -1184,6 +1225,7 @@ impl Session {
             #[cfg(test)]
             read_volume,
             entry_ids,
+            protected_inputs,
             entries,
             tool_history,
             contributions,

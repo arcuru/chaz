@@ -723,6 +723,7 @@ impl Server {
             active_extensions: active_extensions.clone(),
             routine_engine: self.routine_engine().cloned(),
             observation_deadline: None,
+            call_deadline: None,
         };
 
         let tool_defs = tool_ctx.definitions();
