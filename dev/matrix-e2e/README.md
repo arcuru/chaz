@@ -430,21 +430,52 @@ smart stub is a second implementation of the thing under test.
 
 ## When it fails
 
-Every component logs into the workspace. Re-run with `--keep` and read:
+Every component logs into the workspace. Phase messages include elapsed seconds;
+registration logs a start and duration for each account, followed by separately
+named Eidetica provisioning phases. Re-run with `--keep` and read:
 
-| File           | What it holds                          |
-| -------------- | -------------------------------------- |
-| `bringup.log`  | pubkey, invite, and ticket minting     |
-| `daemon.log`   | the agent peer                         |
-| `bridge.log`   | Matrix login, bootstrap, room handling |
-| `synapse.log`  | the homeserver                         |
-| `stub-llm.log` | requests the agent actually made       |
-| `register.log` | account creation                       |
+| File                     | What it holds                                        |
+| ------------------------ | ---------------------------------------------------- |
+| `bringup.log`            | pubkey, invite, and ticket minting                   |
+| `daemon*.log`            | the agent peer, with separate files for each restart |
+| `bridge.log`             | Matrix login, bootstrap, room handling               |
+| `synapse.log`            | the homeserver                                       |
+| `stub-llm.log`           | requests the agent actually made                     |
+| `register-<account>.log` | individual account creation                          |
 
 The failure message names the step that timed out, and each step waits on a
 specific observable — the daemon's readiness line, the bridge's Matrix login,
 the agent's join, then the reply — so the step that fails is the one that
 broke.
+
+The `Matrix E2E` workflow (`.github/workflows/matrix-e2e.yml`) keeps the
+fixture outside Nix's temporary shell directory and uploads
+`matrix-e2e-diagnostics` **only on failure**, including a ten-minute harness-step
+timeout. The artifact expires after seven days. It contains `harness.log`, the
+separate component/registration logs, Synapse's file log, and both disposable
+peers' `eidetica.db` files with any `-wal`/`-shm` sidecars. Keep sidecars beside
+their matching database when inspecting a copy. A setup failure may precede the
+creation of either peer database; the harness log identifies that phase.
+
+The upload excludes YAML configs, Matrix login sessions and crypto stores,
+probe stores, Synapse's database/keys, and share tickets. The retained Eidetica
+stores still contain disposable peer identities and fixture conversation state;
+they are diagnostic data, not a reusable deployment or a public-text attachment.
+Never substitute production accounts, credentials, databases, or transcripts.
+No artifact is uploaded on success; the runner discards the kept workspace.
+
+For example, after a failed hosted run:
+
+1. Open its **Matrix E2E** job and download `matrix-e2e-diagnostics`.
+2. Read `harness.log`. Lines such as `==> [4s] registering @agent:e2e.test`
+   and `==> [6s] registered @agent:e2e.test in 2s` separate registration
+   latency from `initialising daemon Eidetica store`. If an account never
+   finishes, its start line and `register-agent.log` locate the stalled call.
+3. For a restart assertion failure, compare `daemon-participation.log` with
+   the corresponding `bridge*.log`, `stub-llm.log`, and **copies** of both
+   peer databases. Do not infer lost authorization merely from an adjacent
+   background-sync permission error. Retain the failing evidence before
+   proposing a repair; a later green run does not explain it.
 
 ## Key-maintenance acceptance
 
@@ -463,3 +494,65 @@ Account credentials and recovery material stay in that private fixture tree.
 Only public fingerprints, test names and the final counted summary are output.
 The whole transport suite (`just e2e`) separately verifies that a live bridge
 rejects concurrent key maintenance.
+
+## Opt-in capped real-model smoke
+
+The default remains the deterministic stub suite. `--real-model` instead runs
+just two allowed turns and an unauthorized sender on the **same** disposable
+Synapse/daemon/bridge fixture. It does not use production accounts, state,
+configuration, credentials, or a second persistent daemon.
+
+Supply an already metered, loopback OpenAI-compatible completion endpoint and
+an exact model ID. Verify its current pricing before supplying conservative
+USD-per-million input/output rate ceilings; unknown pricing is a stop, not a
+reason to guess. The endpoint must report `usage.cost` as well as token usage.
+No vendor API key is accepted by this harness (the relay uses a dummy bearer).
+
+```bash
+export MATRIX_E2E_MODEL_ENDPOINT=http://127.0.0.1:18081/v1/chat/completions
+export MATRIX_E2E_MODEL=your-exact-model-id
+export MATRIX_E2E_INPUT_RATE=0.15  # replace with verified conservative pricing
+export MATRIX_E2E_OUTPUT_RATE=0.60
+export MATRIX_E2E_EVIDENCE="$(mktemp -d)"
+just e2e --real-model
+cat "$MATRIX_E2E_EVIDENCE/result.json"
+```
+
+Hard bounds per opt-in invocation: six forwarded requests, 64 KiB per
+forwarded request, 512 output tokens per request, 120s upstream socket timeout,
+900s total fixture deadline, and at most USD 0.10 conservatively reserved.
+The relay fsyncs a reservation before forwarding and halts on uncertain
+responses, missing usage/cost, or a violated ceiling. ReAct iterations and
+retries share the same six-call allowance. A ledger is never reused or reset;
+use a fresh evidence directory for a new explicitly authorized invocation and
+include failed invocations when totaling actual spend. Timeouts may leave
+uncertain provider usage: report reserved spend, not zero cost. Pricing changes
+or a provider violating its declared contract cannot be made into a billing
+guarantee by a client-side cap.
+
+The model is asked to call `matrix__send` once, then emit a distinguishable
+terminal final. Both allowed turns must complete durably. Provider response
+IDs must match the disposable `turn_transcript`; tool-call IDs must match
+successful durable tool results. The room must contain exactly the two explicit
+sends, **not** the later local finals. Between those turns the stranger asks
+for a forbidden send; the completed second turn is the barrier, and any extra
+model response, durable attempt, or room message fails the check. This covers
+explicit-send final suppression, not ordinary-final auto-delivery, encryption,
+scheduling, restart behavior, or production model reliability.
+
+`result.json` contains these correlations, token usage, actual reported model
+spend and worst-case reserved spend. `model.jsonl` is retained even on failure;
+it contains only disposable response text/tool calls and usage, never credentials.
+The workspace is otherwise self-cleaning unless `--keep` is supplied. The smoke
+uses an empty disposable `HOME` to avoid host-global skills/configuration.
+It requires the default HTTP sync transport; iroh is refused.
+
+Offline checks never contact a model:
+
+```bash
+uv run --no-project --with cbor2 dev/matrix-e2e/test_real_model.py -v
+```
+
+A timeout or a model that ignores the requested send/final sequence is a failed
+smoke, not a transport pass. Inspect retained evidence before requesting another
+paid invocation; do not repeatedly retry a noncompliant model.

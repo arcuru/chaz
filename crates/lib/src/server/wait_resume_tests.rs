@@ -243,6 +243,7 @@ impl Fixture {
             self.agent.clone(),
             mock,
             hub,
+            true,
         )
         .await;
         let slot = crate::instance::ServerSlot::default();

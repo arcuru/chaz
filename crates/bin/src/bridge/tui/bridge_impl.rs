@@ -292,10 +292,6 @@ impl TuiBridge {
                             && key.modifiers.contains(KeyModifiers::CONTROL)
                         {
                             app.debug_mode = !app.debug_mode;
-                        } else if key.code == KeyCode::Char('t')
-                            && key.modifiers.contains(KeyModifiers::CONTROL)
-                        {
-                            app.expand_all = !app.expand_all;
                         } else if key.code == KeyCode::Char('w')
                             && key.modifiers.contains(KeyModifiers::CONTROL)
                         {

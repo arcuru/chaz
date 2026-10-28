@@ -147,6 +147,8 @@ remains available through `get_time`.
 
 Before each model call the runtime runs the operator-granted context projection chain over a copy of this vector plus the current attempt's completed exchanges; see [Context projection](extensions.md#context-projection). The projected request is sent (and resent unchanged on transport retries); the local vector and the recorded transcript keep the originals. With no `context_projection` grants the vector is sent as-is.
 
+When the `autocompact` extension is on, a native step substitutes ready, still-valid summaries for their covered ranges (source `CompactionSummary`) before the projection chain runs. The complete projected request determines whether to start another background preparation or wait at the hard budget. Protected input, instructions, tails and unfinished tool work are never covered, and a request still over budget is refused before dispatch. See [Automatic Compaction](../design/autocompaction.md).
+
 `AssistantToolCalls` and `ToolResult` messages are maintained in the runtime's local message vector for the active continuation. Completed structured forms are persisted. Later turns can reconstruct complete prior call/result groups from completed attempts inside the conversation budget, but only an exact pending checkpointed `job_wait` can resume an interrupted attempt.
 
 ## Concurrency

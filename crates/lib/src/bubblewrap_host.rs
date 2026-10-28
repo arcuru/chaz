@@ -108,7 +108,11 @@ fn build_bwrap_command(
 ) -> tokio::process::Command {
     let mut cmd = tokio::process::Command::new(bwrap_path);
 
+    // A private PID namespace dies with its init, so killing bwrap (stop,
+    // timeout) also ends descendants that `--new-session` moved out of its
+    // process group.
     cmd.arg("--unshare-net")
+        .arg("--unshare-pid")
         .arg("--unshare-ipc")
         .arg("--unshare-uts")
         .arg("--die-with-parent")
@@ -135,8 +139,6 @@ fn build_bwrap_command(
     }
 
     cmd.arg("sh").arg("-c").arg(command);
-    cmd.stdout(std::process::Stdio::piped());
-    cmd.stderr(std::process::Stdio::piped());
 
     cmd
 }
@@ -152,8 +154,9 @@ impl ToolHost for BubblewrapToolHost {
                 Capability::Shell {
                     command,
                     working_dir,
+                    timeout,
                 } if self.available => {
-                    exec_shell_bwrap(command, working_dir.as_deref(), grants).await
+                    exec_shell_bwrap(command, working_dir.as_deref(), *timeout, grants).await
                 }
                 // Shell when bwrap unavailable, plus all other capabilities
                 _ => NativeToolHost.request(capability, grants).await,
@@ -175,6 +178,7 @@ impl ToolHost for BubblewrapToolHost {
 async fn exec_shell_bwrap(
     command: &str,
     working_dir: Option<&str>,
+    timeout: Option<std::time::Duration>,
     grants: &Grants,
 ) -> Result<CapabilityResult, ToolError> {
     // Grant check — shared with native host
@@ -183,18 +187,12 @@ async fn exec_shell_bwrap(
         ToolError::Execution(msg)
     })?;
 
-    let mut cmd = build_bwrap_command("bwrap", command, working_dir);
+    let cmd = build_bwrap_command("bwrap", command, working_dir);
 
-    let output = cmd
-        .output()
+    crate::tool_host::run_shell_process(cmd, timeout)
         .await
-        .map_err(|e| ToolError::Execution(format!("bwrap failed: {e}")))?;
-
-    Ok(CapabilityResult::Shell(crate::tool_host::ShellOutput {
-        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-        exit_code: output.status.code().unwrap_or(-1),
-    }))
+        .map(CapabilityResult::Shell)
+        .map_err(|e| ToolError::Execution(format!("bwrap failed: {e}")))
 }
 
 // ── Tests ────────────────────────────────────────────────────────
@@ -217,6 +215,10 @@ mod tests {
         assert!(
             debug.contains("--die-with-parent"),
             "Should die with parent: {debug}"
+        );
+        assert!(
+            debug.contains("--unshare-pid"),
+            "Should isolate PIDs for process-tree cleanup: {debug}"
         );
         assert!(debug.contains("sh"), "Should run sh: {debug}");
         assert!(debug.contains("-c"), "Should use -c flag: {debug}");
@@ -258,6 +260,40 @@ mod tests {
         let debug = format!("{cmd:?}");
         // Should have --ro-bind for system directories that exist
         assert!(debug.contains("--ro-bind"), "Should have ro-bind: {debug}");
+    }
+
+    /// Needs working unprivileged user namespaces, which build sandboxes
+    /// usually lack. Run with `--ignored` on a host that has them.
+    #[tokio::test]
+    #[ignore = "requires a usable bwrap"]
+    async fn bwrap_timeout_kills_the_sandboxed_tree() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().to_str().unwrap();
+        let command =
+            format!("echo before; (sleep 1; echo leaked > {path}/leaked) & sleep 30; echo after");
+        let host = BubblewrapToolHost::new();
+        assert!(host.available, "bwrap not found");
+        let result = host
+            .request(
+                &Capability::Shell {
+                    command,
+                    working_dir: Some(path.into()),
+                    timeout: Some(std::time::Duration::from_millis(500)),
+                },
+                &Grants::default(),
+            )
+            .await
+            .unwrap();
+        let CapabilityResult::Shell(out) = result else {
+            panic!("expected shell output");
+        };
+        assert!(out.timed_out, "{out:?}");
+        assert_eq!(out.stdout, "before\n", "{out:?}");
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        assert!(
+            !directory.path().join("leaked").exists(),
+            "a sandboxed descendant survived the timeout"
+        );
     }
 
     #[test]

@@ -524,7 +524,15 @@ impl OpenAI {
                 message: e.to_string(),
             })?;
         let reasoning = self.reasoning_control(model)?;
-        let client = self.build_client()?;
+        let mut client = self.build_client()?;
+        if max_output_tokens.is_some() {
+            // The SDK otherwise retries 429/5xx independently of the runtime.
+            // Bounded auxiliary calls authorize exactly one provider attempt.
+            client = client.with_backoff(backoff::ExponentialBackoff {
+                max_elapsed_time: Some(std::time::Duration::ZERO),
+                ..Default::default()
+            });
+        }
 
         let mut request = self.build_chat_request(messages, tools, model, cache, reasoning);
         request.max_completion_tokens = max_output_tokens;
@@ -559,6 +567,14 @@ impl OpenAI {
                 message: "No choices in response".to_string(),
             })?;
 
+        // A bounded auxiliary call that stopped on its output ceiling holds a
+        // partial answer (reasoning counts against the same limit); never
+        // hand it back as if it were complete.
+        if max_output_tokens.is_some() && choice.finish_reason.as_deref() == Some("length") {
+            return Err(LlmError::TruncatedOutput {
+                reason: "length".into(),
+            });
+        }
         let ChatMessage {
             content,
             tool_calls,

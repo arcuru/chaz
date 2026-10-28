@@ -272,11 +272,23 @@ The tool is Low-risk and approval-free because the agent never supplies the dest
 
 ### shell
 
-Executes a shell command. Subject to command allowlist/denylist filtering.
+Executes a shell command with `sh -c`. Subject to command allowlist/denylist filtering.
 
 ```json
-{ "command": "ls -la /tmp" }
+{
+  "command": "cargo test --workspace",
+  "working_dir": "/srv/project",
+  "timeout": 900
+}
 ```
+
+| Argument      | Required | Meaning                                                                                                                         |
+| ------------- | -------- | ------------------------------------------------------------------------------------------------------------------------------- |
+| `command`     | yes      | Shell command line.                                                                                                             |
+| `working_dir` | no       | Directory to run in.                                                                                                            |
+| `timeout`     | no       | Seconds, a positive number up to 2,147,483.647. Stops the command early; it cannot outlast the tool's policy `timeout` (below). |
+
+The command runs until it exits, its `timeout` expires, the shell policy timeout is nearly reached, or the user stops the turn. Timeouts and user stops kill the command's whole process group. See [Long-running shell commands](#long-running-shell-commands) for how the deadlines combine and what a stopped command returns.
 
 **Output shape.** Results stay within 10,000 bytes, including labels, omission notices and exit status. Short results keep the existing format: stdout, then `[stderr] …` when stderr is present, then `[exit code N]` for a nonzero exit. A successful command with no output returns `[no output]`; a silent failure returns its exit-code line. Longer results label each present stream (`[stdout]` / `[stderr]`) and keep head and tail excerpts of clipped streams around a `[… N bytes omitted …]` notice. Cuts respect UTF-8 boundaries. Both streams receive preview space, with unused space going to the other stream, and the nonzero-exit verdict remains outside the clipped output.
 
@@ -526,6 +538,68 @@ Tool error: invalid argument: 'limit' must be a positive integer (1 or more), go
 Tool error: Filesystem read of '/etc/shadow' is outside the allowed paths
 ```
 
+## Long-running shell commands
+
+A `shell` call has one hard bound, the shell tool's **policy timeout**, set by the operator. The default is 30 seconds. Within that, the model may pass a shorter `timeout`, and the user can stop the turn at any moment. Chaz adds no other deadline. The optional `timeout` and seconds unit follow Pi's `bash` tool. Omitting it adds no per-call deadline, but unlike Pi, Chaz still enforces its existing operator policy ceiling.
+
+**Where the policy timeout comes from.** `security.tool_policies.shell` replaces the tool's built-in policy as a whole; it is not merged field by field. An override that sets only `approval` therefore gets the generic defaults for everything else, including a 60-second timeout and `low` risk. That is why a deployment can observe 60 seconds instead of the documented 30. To run longer commands, restate the full policy:
+
+```yaml
+security:
+  tool_policies:
+    shell:
+      risk: high
+      approval: always
+      timeout: 1800 # seconds
+```
+
+The model request timeout (`request_timeout` on a backend) is a different clock. It bounds each LLM HTTP request, never a tool call.
+
+**What a stop returns.** Chaz runs the command in its own process group, so stopping it also stops background children it started:
+
+- **Requested `timeout` expires.** The group is killed and the result keeps the output received so far.
+- **Policy timeout.** The shell stops the command one second early (a quarter of the timeout when that is shorter) so it can report the same way. The runtime's own cutoff (`Tool timed out after N seconds` with no output) remains as a backstop.
+- **User stop.** Esc or `/stop` ends the turn ([Stopping a Running Turn](tui.md#stopping-a-running-turn)). The group is killed and the tool result is recorded as cancelled, not successful. Partial output is not retained on this path.
+
+A timed-out result starts with `Tool timed out after`, so the turn transcript records it as timed out rather than successful. It gives the measured elapsed time, which limit fired, and the partial output. A kill's exit status is left out, since it reflects the kill rather than the command. A command that finishes keeps the normal format, including `[exit code N]`. A signal-terminated command reports 128 plus the signal number, as shells do.
+
+Nothing resumes a stopped command. It is gone, and repeating it means running it again. A descendant that leaves the process group on purpose (for example with `setsid`) is not tracked. Its open pipes are abandoned after a short drain, and the result reports what had arrived.
+
+### Walkthrough: a test run that outlives the old limit
+
+1. The operator restates the shell policy with `timeout: 1800`, as above.
+2. The model calls `shell` with `{"command": "sleep 65; cargo test --workspace"}`. The call can run past both 30 and 60 seconds and returns once the command exits, with the test runner's final summary intact:
+
+   ```text
+   test result: ok. … passed; 0 failed; …
+   ```
+
+   A failing command keeps its verdict; for example, a summary followed by `exit 3` returns:
+
+   ```text
+   test result: ok. 2 passed
+
+   [exit code 3]
+   ```
+
+3. **Failure: a shorter policy wins.** Set the policy's `timeout` to 2 seconds and call `{"command": "echo started; sleep 30", "timeout": 600}`. The command stops at about 1.5 seconds and returns (outcome `TimedOut`):
+
+   ```text
+   Tool timed out after 1.5 seconds: the command reached the shell tool's policy timeout, which a larger `timeout` argument cannot extend. Its process group was killed. Output before the stop:
+   started
+   ```
+
+   Recovery: raise `timeout` in the full shell policy, then run the command again. Passing `"timeout": 600` in the call does not help.
+
+4. **A shorter requested timeout.** `{"command": "echo partial; sleep 30", "timeout": 0.5}` returns:
+
+   ```text
+   Tool timed out after 0.5 seconds: the command reached its requested timeout of 0.5s. Its process group was killed. Output before the stop:
+   partial
+   ```
+
+5. **User stop.** Pressing Esc while the command runs ends the turn within a moment. The command and its background children are killed, and the call shows as cancelled in the transcript.
+
 ## External Tools (MCP)
 
 Chaz supports external tools via the Model Context Protocol. MCP servers run as subprocesses (or are reached over Streamable HTTP) and their tools are registered alongside built-ins, subject to the same policy layer. See [MCP External Tools](mcp.md) for configuration and a worked example.
@@ -626,6 +700,6 @@ Tool results fed back to the LLM are wrapped in XML delimiters (`<tool_output to
 
 ### Timeouts and rate limits
 
-Tool execution is wrapped in a configurable timeout (default varies by tool). Tools can also have a `rate_limit` (max calls per minute) configured in their policy.
+Tool execution is wrapped in a configurable timeout (default varies by tool). A `security.tool_policies.<tool>` entry replaces that tool's whole policy, so omitted fields take the generic defaults (60 seconds, `low` risk), not the tool's own; see [Long-running shell commands](#long-running-shell-commands). Tools can also have a `rate_limit` (max calls per minute) configured in their policy.
 
 See [Security](security.md) for details on network policies, shell sandboxing, rate limiting, and approval configuration.
