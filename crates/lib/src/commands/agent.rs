@@ -651,7 +651,10 @@ pub(super) async fn agent_delete(agent_ref: &str, ctx: &CommandContext<'_>) -> C
 }
 
 /// Edit one field on a Living Agent's DB config. Live hydration picks
-/// up the change on the next message — no restart. We also upsert
+/// up the change on the next message — no restart. The DB config is
+/// authoritative, so the edit survives restarts and `/agent reload`
+/// regardless of what the yaml declares, including when the new value
+/// equals the field's default. We also upsert
 /// the runtime `AgentRegistry` snapshot so the current session sees the
 /// edit immediately (hydration rebuilds on message, upsert is belt-and-
 /// suspenders for code paths that read registry state between messages).
@@ -714,37 +717,53 @@ pub(super) async fn agent_set(
     ))
 }
 
-/// `/agent reload [ref]` — re-read the on-disk chaz yaml and re-run the
-/// hash-gated reconcile, for one named agent or (with no ref) every agent.
-/// This is the on-demand twin of the startup reconcile: yaml-declared fields
-/// and the resolved system prompt refresh into each agent's DB, while a live
-/// `/agent set` edit survives when the yaml block and prompt files are
-/// unchanged. Changes take effect on the next message via live hydration.
+/// `/agent reload [ref]` — re-read the on-disk chaz yaml and report, for one
+/// named agent or (with no ref) every declared agent, whether its Agent DB
+/// config matches the yaml entry. Read-only: yaml `agents:` entries seed new
+/// agents at startup, and once an agent exists its DB config is authoritative.
+/// The report names differing fields so the user can apply them deliberately
+/// with `/agent set` or the TUI Peer→Agents diff.
 pub(super) async fn agent_reload(
     agent_ref: Option<&str>,
     ctx: &CommandContext<'_>,
 ) -> CommandOutcome {
-    match ctx.server.reload_config_for(agent_ref).await {
-        Ok(report) => {
-            if let Some(name) = agent_ref
-                && report.considered == 0
-            {
-                return CommandOutcome::Error(format!(
-                    "No agent '{name}' declared in the chaz config — nothing to reload"
-                ));
-            }
-            match report.changed.as_slice() {
-                [] => CommandOutcome::Text(
-                    "Reload: every agent already matched its yaml — no change".to_string(),
-                ),
-                names => CommandOutcome::Text(format!(
-                    "Reloaded from yaml: {} (effective next message)",
-                    names.join(", ")
-                )),
-            }
-        }
-        Err(e) => CommandOutcome::Error(format!("Reload failed: {e}")),
+    let report = match ctx.server.reload_config_for(agent_ref).await {
+        Ok(report) => report,
+        Err(e) => return CommandOutcome::Error(format!("Reload failed: {e}")),
+    };
+    if let Some(name) = agent_ref
+        && report.considered == 0
+    {
+        return CommandOutcome::Error(format!(
+            "No agent '{name}' declared in the chaz config — nothing to compare"
+        ));
     }
+    CommandOutcome::Text(format_reload_report(&report))
+}
+
+fn format_reload_report(report: &crate::server::ReloadReport) -> String {
+    let mut lines = vec![
+        "YAML seeds new agents only; existing agents keep their DB config. Nothing was changed."
+            .to_string(),
+    ];
+    for (name, fields) in &report.differs {
+        lines.push(format!(
+            "  {name}: DB differs from yaml in {} — apply with /agent set or the TUI Peer → Agents diff",
+            fields.join(", ")
+        ));
+    }
+    for name in &report.in_sync {
+        lines.push(format!("  {name}: matches yaml"));
+    }
+    for name in &report.not_seeded {
+        lines.push(format!(
+            "  {name}: no Agent DB on this peer yet — seeded from yaml at next startup"
+        ));
+    }
+    if report.considered == 0 {
+        lines.push("  (no agents declared in the chaz config)".to_string());
+    }
+    lines.join("\n")
 }
 
 // -----------------------------------------------------------------------------

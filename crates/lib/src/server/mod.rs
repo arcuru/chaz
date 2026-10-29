@@ -809,27 +809,21 @@ fn budget_model_id(
         .or_else(|| backend.default_model())
 }
 
-/// Stable hash of an agent's intended (yaml-derived) DB config, the gate that
-/// keeps reconcile from clobbering live `/agent set` edits when the yaml block
-/// and prompt files are unchanged. Routed through `serde_json::Value` so the
-/// `HashMap` fields (`presets`, `grants`) serialize with sorted keys —
-/// `preserve_order` is off — making the hash deterministic across processes.
-/// `applied_config_hash` must be cleared on `cfg` before calling, so the hash
-/// doesn't depend on its own prior value.
-fn config_gate_hash(cfg: &crate::agent_db::AgentDbConfig) -> anyhow::Result<String> {
-    let canonical = serde_json::to_string(&serde_json::to_value(cfg)?)?;
-    Ok(blake3::hash(canonical.as_bytes()).to_hex().to_string())
-}
-
 /// Outcome of [`Server::reload_config_for`]. `considered` counts the yaml agent
 /// entries that passed the optional name filter — `considered == 0` with a name
-/// filter means "no such agent in yaml", distinct from "matched but unchanged".
+/// filter means "no such agent in yaml". A reload never writes an agent DB: it
+/// only reports how the yaml compares with what this peer hosts.
 #[derive(Debug, Default, Clone)]
 pub struct ReloadReport {
-    /// Names of agents whose DB config was rewritten.
-    pub changed: Vec<String>,
     /// Number of yaml agent entries considered after the name filter.
     pub considered: usize,
+    /// Hosted agents whose DB config differs from their yaml entry, with the
+    /// labels of the differing fields. The DB value stays in force.
+    pub differs: Vec<(String, Vec<&'static str>)>,
+    /// Hosted agents whose DB config matches their yaml entry.
+    pub in_sync: Vec<String>,
+    /// Yaml entries with no Agent DB on this peer yet. Startup seeds them.
+    pub not_seeded: Vec<String>,
 }
 
 /// Outcome of [`Server::merge_agent_from_yaml`]. Distinguishes the
@@ -1008,9 +1002,9 @@ pub struct Server {
     /// semantics as `default_agents`.
     agent_groups: std::sync::RwLock<HashMap<String, Vec<String>>>,
     /// Path to the on-disk chaz yaml, set once at startup via
-    /// [`Server::set_config_path`]. Lets `/agent reload` and the TUI `[r]`
-    /// action re-read the config and re-run the agent reconcile without
-    /// threading the path through every call site. `None` in `--print` and
+    /// [`Server::set_config_path`]. Lets `/agent reload` and the TUI yaml
+    /// diff re-read the config without threading the path through every
+    /// call site. `None` in `--print` and
     /// tests, where reload is unavailable.
     config_path: std::sync::RwLock<Option<std::path::PathBuf>>,
     /// Fail-closed ceiling on a pending tool approval, set once at startup
@@ -1647,7 +1641,7 @@ impl Server {
     /// Resolve the system prompt for a DB-backed agent. The normal path reads
     /// the resolved text from the prompt blob store by `system_prompt_ref` (no
     /// per-turn file IO). When no ref is set yet — a freshly bootstrapped agent
-    /// that hasn't been reconciled, or one with paths but no blob — it falls
+    /// that hasn't finished seeding, or a legacy config with no blob — it falls
     /// back to reading the files directly so the prompt is never silently empty.
     async fn resolve_db_prompt(&self, cfg: &crate::agent_db::AgentDbConfig) -> String {
         if let Some(snap) = cfg.system_prompt_ref.as_ref()
@@ -1684,9 +1678,12 @@ impl Server {
     /// Resolve an inline-plus-files prompt into the blob store and return the
     /// pointer to store in an agent's config. Reuses `current_ref` when the
     /// resolved text is byte-identical to what that snapshot holds (so an
-    /// unchanged prompt never churns the store); returns `None` for an empty
-    /// prompt. Shared by the yaml reconcile and the `/agent set` re-resolve so
-    /// both produce identical refs for identical inputs.
+    /// unchanged prompt never churns the store). Even empty file-backed prompts
+    /// are pinned: a later file edit must not silently replace an empty prompt.
+    /// Returns `None` only when there is no text and no file list.
+    /// Shared by seed completion, the explicit yaml merge and the
+    /// `/agent set` re-resolve so all produce identical refs for identical
+    /// inputs.
     async fn resolve_prompt_ref(
         &self,
         inline: &str,
@@ -1694,7 +1691,7 @@ impl Server {
         current_ref: Option<&eidetica::Snapshot>,
     ) -> anyhow::Result<Option<eidetica::Snapshot>> {
         let resolved = crate::agent::resolve_system_prompt(inline, files);
-        if resolved.is_empty() {
+        if resolved.is_empty() && files.is_empty() {
             return Ok(None);
         }
         let unchanged = match current_ref {
@@ -1710,11 +1707,9 @@ impl Server {
 
     /// Re-resolve `cfg`'s prompt (inline `system_prompt` + `system_prompt_files`)
     /// into the blob store and update `cfg.system_prompt_ref` in place. Used by
-    /// `/agent set` so a manual prompt edit refreshes the blob the same way a
-    /// yaml reconcile does — without it, a stale ref would mask the new files.
-    /// Leaves `applied_config_hash` untouched: a live edit intentionally keeps
-    /// the yaml gate so it survives the next startup reconcile when yaml is
-    /// unchanged.
+    /// `/agent set` and the explicit yaml merge so a prompt edit refreshes the
+    /// blob — without it, a stale ref would mask the new text or files. It is
+    /// also the explicit way to pick up edited prompt-file contents.
     pub async fn refresh_prompt_ref(
         &self,
         cfg: &mut crate::agent_db::AgentDbConfig,
@@ -1753,13 +1748,16 @@ impl Server {
         *self.config_path.write().expect("config_path lock poisoned") = Some(path);
     }
 
-    /// Re-read the on-disk chaz yaml and re-run the agent reconcile, optionally
-    /// scoped to a single agent name (`only`). Returns the names of agents
-    /// whose DB config changed plus how many yaml entries were considered (so a
-    /// caller can distinguish "no change" from "no such agent in yaml"). Errors
-    /// when no config path is set, or the file can't be read or parsed. Shares
-    /// [`Server::reconcile_agent_from_yaml`] with the startup path, so an
-    /// on-demand reload behaves identically to a restart.
+    /// Re-read the on-disk chaz yaml and report how each declared agent
+    /// (optionally only `only`) compares with the Agent DB this peer hosts.
+    ///
+    /// Yaml `agents:` entries seed new Agent DBs at startup; once an agent
+    /// exists its DB config is authoritative. A reload therefore never writes:
+    /// it validates the file and tells the caller which agents differ, which
+    /// match, and which haven't been seeded yet. Applying a yaml value to an
+    /// existing agent is an explicit act (`/agent set`, or the TUI
+    /// Peer→Agents diff). Errors when no config path is set, or the file can't
+    /// be read or parsed.
     pub async fn reload_config_for(&self, only: Option<&str>) -> anyhow::Result<ReloadReport> {
         let path = self
             .config_path
@@ -1794,33 +1792,40 @@ impl Server {
                 continue;
             }
             report.considered += 1;
-            match self.reconcile_agent_from_yaml(ac).await {
-                Ok(true) => {
-                    report.changed.push(ac.name.clone());
-                    tracing::info!(agent = %ac.name, "reloaded agent config from yaml");
+            match self.agent_diff_for(ac).await? {
+                Some(diff) => {
+                    let differing: Vec<&'static str> = diff
+                        .rows
+                        .iter()
+                        .filter(|r| r.status != crate::agent_diff::FieldStatus::Unchanged)
+                        .map(|r| r.label)
+                        .collect();
+                    if differing.is_empty() {
+                        report.in_sync.push(ac.name.clone());
+                    } else {
+                        report.differs.push((ac.name.clone(), differing));
+                    }
                 }
-                Ok(false) => {}
-                Err(e) => tracing::warn!(agent = %ac.name, error = %e, "agent reload failed"),
+                None => report.not_seeded.push(ac.name.clone()),
             }
         }
         Ok(report)
     }
 
-    /// Reconcile one agent's DB config from its yaml definition: resolve the
-    /// prompt (reading `system_prompt_files`), store it in the blob store, and —
-    /// only when the yaml-derived config differs from what was last applied (the
-    /// `applied_config_hash` gate) — write the refreshed declarative config
-    /// (including the new `system_prompt_ref`) into the agent's DB. A live
-    /// `/agent set` edit survives when the yaml block and prompt files are
-    /// unchanged. The blob is written only when the resolved prompt actually
-    /// changes (an unchanged prompt reuses the existing ref). Returns `Ok(true)`
-    /// when the DB was rewritten, `Ok(false)` when the gate matched or the agent
-    /// isn't bootstrapped yet.
-    pub async fn reconcile_agent_from_yaml(
-        &self,
-        ac: &crate::config::AgentConfig,
-    ) -> anyhow::Result<bool> {
-        let Some(entry) = self.agent_index.find_by_name(&ac.name) else {
+    /// Finish seeding a yaml-declared agent: when its DB config has no
+    /// resolved-prompt pointer yet, resolve the prompt the DB config itself
+    /// declares (inline `system_prompt` + `system_prompt_files`) into the blob
+    /// store and record the pointer.
+    ///
+    /// This is the second half of first-boot seeding — `bootstrap_from_config`
+    /// creates the DB from yaml but can't reach the prompt store. It never
+    /// reads yaml values into an existing agent: every other field is left
+    /// exactly as stored, and an agent that already has a pointer is untouched.
+    /// The startup caller passes only agents created in this boot, never an
+    /// existing DB, even if it has no pointer. Returns `Ok(true)` when it wrote.
+    /// A config that can't be read is an error, never a default to write over.
+    pub async fn complete_agent_seed(&self, name: &str) -> anyhow::Result<bool> {
+        let Some(entry) = self.agent_index.find_by_name(name) else {
             return Ok(false);
         };
         let Some(db) = self
@@ -1831,32 +1836,16 @@ impl Server {
             return Ok(false);
         };
 
-        let current = db.read_config().await.unwrap_or_default();
-
-        // Resolve the prompt from yaml's declared sources into the blob store,
-        // reusing `current`'s pointer when the text is unchanged.
-        let files: Vec<std::path::PathBuf> = ac
-            .system_prompt_files
-            .clone()
-            .unwrap_or_default()
-            .into_iter()
-            .map(std::path::PathBuf::from)
-            .collect();
-        let inline = ac.system_prompt.clone().unwrap_or_default();
-        let prompt_ref = self
-            .resolve_prompt_ref(&inline, &files, current.system_prompt_ref.as_ref())
-            .await?;
-
-        // Build the intended declarative config and gate on its hash.
-        let mut intended = crate::agent_db::AgentDbConfig::from_agent_config(ac);
-        intended.system_prompt_ref = prompt_ref;
-        intended.applied_config_hash = None;
-        let new_hash = config_gate_hash(&intended)?;
-        if current.applied_config_hash.as_deref() == Some(new_hash.as_str()) {
+        let current = db.read_config().await?;
+        if current.system_prompt_ref.is_some() {
             return Ok(false);
         }
-        intended.applied_config_hash = Some(new_hash);
-        db.write_config(&intended).await?;
+        let mut seeded = current.clone();
+        self.refresh_prompt_ref(&mut seeded).await?;
+        if seeded.system_prompt_ref.is_none() {
+            return Ok(false);
+        }
+        db.write_config(&seeded).await?;
         Ok(true)
     }
 
@@ -1878,7 +1867,7 @@ impl Server {
     /// Compute the field-level diff between an agent's yaml-declared config and
     /// its DB-actual config. Powers the TUI Peer→Agents diff view. Returns
     /// `Ok(None)` when the agent has no yaml entry or this peer doesn't host its
-    /// DB — both render as "nothing to diff" upstream.
+    /// DB — both render as "nothing to diff" upstream. Read-only.
     pub async fn agent_diff(
         &self,
         name: &str,
@@ -1891,7 +1880,16 @@ impl Server {
         else {
             return Ok(None);
         };
-        let Some(entry) = self.agent_index.find_by_name(name) else {
+        self.agent_diff_for(ac).await
+    }
+
+    /// Diff one yaml entry against the agent DB this peer hosts under its
+    /// name. `Ok(None)` when no such hosted, writable DB exists.
+    async fn agent_diff_for(
+        &self,
+        ac: &crate::config::AgentConfig,
+    ) -> anyhow::Result<Option<crate::agent_diff::AgentDiff>> {
+        let Some(entry) = self.agent_index.find_by_name(&ac.name) else {
             return Ok(None);
         };
         let Some(db) = self
@@ -1901,7 +1899,7 @@ impl Server {
         else {
             return Ok(None);
         };
-        let db_cfg = db.read_config().await.unwrap_or_default();
+        let db_cfg = db.read_config().await?;
         let yaml_cfg = crate::agent_db::AgentDbConfig::from_agent_config(ac);
         Ok(Some(crate::agent_diff::diff_agent(&yaml_cfg, &db_cfg)))
     }
@@ -1911,10 +1909,10 @@ impl Server {
     /// refresh the prompt blob when a prompt field changed, persist, and upsert
     /// the runtime registry so the edit is live on the next message.
     ///
-    /// Unlike [`Self::reconcile_agent_from_yaml`] this is *not* hash-gated — the
-    /// caller explicitly asked to merge. The `applied_config_hash` gate is left
-    /// untouched (same stance as `/agent set`): a future startup reconcile still
-    /// re-fires only when the yaml block itself changed.
+    /// This is the only path that copies yaml values into an existing agent,
+    /// and it runs only when a user explicitly picks fields or confirms a
+    /// reseed. Startup and `/agent reload` never call it. A DB config that
+    /// can't be read aborts the merge rather than merging over defaults.
     pub async fn merge_agent_from_yaml(
         &self,
         name: &str,
@@ -1944,9 +1942,9 @@ impl Server {
         };
         outcome.found_db = true;
 
-        let current = db.read_config().await.unwrap_or_default();
+        let current = db.read_config().await?;
         let yaml_cfg = crate::agent_db::AgentDbConfig::from_agent_config(ac);
-        let fields = mode.fields(&current);
+        let fields = mode.fields();
         if fields.is_empty() {
             return Ok(outcome);
         }
@@ -1979,29 +1977,26 @@ impl Server {
         Ok(outcome)
     }
 
-    /// Reconcile every agent declared in `config` from yaml into its DB. Run at
-    /// startup (after bootstrap) and on demand by `/agent reload`; shares the
-    /// hash-gated semantics so both paths behave identically. A per-agent
+    /// Finish seeding the agents created during this boot (see
+    /// [`Self::complete_agent_seed`]). Run once at startup, after bootstrap.
+    /// Yaml values are never re-applied to an existing agent here. A per-agent
     /// failure is logged and skipped — one bad entry doesn't abort the rest.
-    pub async fn reconcile_agents_from_config(&self, config: &crate::config::Config) {
-        let Some(agents) = config.agents.as_ref() else {
-            return;
-        };
-        let mut changed = 0usize;
-        for ac in agents {
-            match self.reconcile_agent_from_yaml(ac).await {
+    pub async fn complete_agent_seeds(&self, names: &[String]) {
+        let mut seeded = 0usize;
+        for name in names {
+            match self.complete_agent_seed(name).await {
                 Ok(true) => {
-                    changed += 1;
-                    tracing::info!(agent = %ac.name, "reconciled agent config from yaml");
+                    seeded += 1;
+                    tracing::info!(agent = %name, "resolved seeded agent's system prompt");
                 }
                 Ok(false) => {}
                 Err(e) => {
-                    tracing::warn!(agent = %ac.name, error = %e, "agent reconcile failed")
+                    tracing::warn!(agent = %name, error = %e, "agent seed completion failed")
                 }
             }
         }
-        if changed > 0 {
-            tracing::info!(agents = changed, "reconciled agent configs from yaml");
+        if seeded > 0 {
+            tracing::info!(agents = seeded, "completed agent seeds from yaml");
         }
     }
 
@@ -4604,6 +4599,8 @@ impl Drop for ActivityHeartbeat {
     }
 }
 
+#[cfg(test)]
+mod seed_restart_tests;
 #[cfg(test)]
 mod telemetry_tests;
 #[cfg(test)]

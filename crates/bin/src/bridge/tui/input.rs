@@ -76,7 +76,7 @@ pub(super) fn command_catalog() -> Vec<(&'static str, &'static str)> {
         ),
         (
             "/agent reload",
-            "re-read yaml + reconcile agent config(s) [ref]",
+            "compare yaml with agent DB config(s) [ref]; read-only",
         ),
         ("/agent delete ", "unregister a Living Agent (DB preserved)"),
         ("/agent share ", "generate a share ticket for an agent's DB"),
@@ -1433,9 +1433,10 @@ pub(super) fn handle_settings_key(
 
 /// Route a key while the Peer→Agents diff/merge modal is open. Three
 /// sub-modes:
-///   - **View** (default): `↑`/`↓` scroll the field cursor; `[r]` applies the
-///     additive drift merge, `[R]` arms reseed-confirm, `[a]` enters pick mode,
-///     `Esc` closes.
+///   - **View** (default): `↑`/`↓` scroll the field cursor; `[R]` arms
+///     reseed-confirm, `[a]` enters pick mode, `Esc` closes. Viewing never
+///     writes: yaml reaches an existing agent only through an explicit pick or
+///     a confirmed reseed.
 ///   - **Pick**: `↑`/`↓` move, `Space` toggles the row, `Enter` applies the
 ///     selected fields, `Esc` returns to View.
 ///   - **ConfirmReseed**: `y`/`Enter` commits the full overwrite; `n`/`Esc`
@@ -1447,7 +1448,7 @@ pub(super) fn handle_settings_key(
 fn handle_agent_diff_key(app: &mut App, key: KeyEvent) -> SettingsKey {
     use chaz_core::agent_diff::{AgentMergeMode, FieldStatus};
     if (!app.backend_ready() || !app.operations.has_capacity())
-        && matches!(key.code, KeyCode::Enter | KeyCode::Char('y' | 'R' | 'r'))
+        && matches!(key.code, KeyCode::Enter | KeyCode::Char('y' | 'R'))
     {
         app.operations.notice =
             Some("Backend unavailable or action queue full — merge not submitted".into());
@@ -1530,14 +1531,6 @@ fn handle_agent_diff_key(app: &mut App, key: KeyEvent) -> SettingsKey {
                     view.cursor += 1;
                 }
                 SettingsKey::None
-            }
-            KeyCode::Char('r') => {
-                let name = view.agent_name.clone();
-                app.agent_diff = None;
-                SettingsKey::ApplyAgentMerge {
-                    name,
-                    mode: AgentMergeMode::Drift,
-                }
             }
             KeyCode::Char('R') => {
                 view.mode = AgentDiffMode::ConfirmReseed;
