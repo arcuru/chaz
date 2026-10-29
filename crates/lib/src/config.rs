@@ -717,6 +717,84 @@ impl Backend {
                 BackendType::Anthropic => ModelApi::AnthropicMessages,
             })
     }
+
+    /// The reasoning control sent for a raw (backend-prefix-free) model id,
+    /// resolved after its effective API. `Ok(None)` sends nothing: unlisted
+    /// models, omitted `reasoning`, and native Anthropic Messages, which has
+    /// no Chaz reasoning mapping. An explicit Chat-only `format` on a native
+    /// API is an error, even where the wire shapes happen to coincide.
+    pub fn reasoning_control(&self, model: &str) -> Result<Option<ReasoningControl>, String> {
+        let Some(reasoning) = self
+            .models
+            .as_ref()
+            .and_then(|models| models.iter().find(|m| m.name == model))
+            .and_then(|m| m.reasoning.as_ref())
+        else {
+            return Ok(None);
+        };
+        let effort = reasoning.effort;
+        match (self.api_for_model(model), reasoning.format) {
+            (ModelApi::ChatCompletions, None | Some(ReasoningFormat::OpenRouter)) => {
+                Ok(Some(ReasoningControl::Object(effort)))
+            }
+            (ModelApi::ChatCompletions, Some(ReasoningFormat::OpenAI)) => {
+                Ok(Some(ReasoningControl::TopLevel(effort)))
+            }
+            (api, Some(format)) => Err(format!(
+                "backend '{}' model '{model}': reasoning.format '{}' selects a Chat Completions field, but the model's API is '{}'. Remove reasoning.format; {}",
+                self.get_name(),
+                format.as_str(),
+                api.as_str(),
+                match api {
+                    ModelApi::Responses => "Responses always sends reasoning.effort",
+                    _ => "Chaz sends no reasoning control on native Anthropic Messages",
+                },
+            )),
+            (ModelApi::Responses, None) => Ok(Some(ReasoningControl::Object(effort))),
+            (ModelApi::AnthropicMessages, None) => Ok(None),
+        }
+    }
+}
+
+/// What configured per-model reasoning will do, for logging at config load.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct ReasoningReport {
+    /// Controls Chaz sends. Sending is not evidence the provider honours them.
+    pub sent: Vec<String>,
+    /// Configured efforts Chaz does not send.
+    pub not_sent: Vec<String>,
+    /// Invalid combinations; requests to these models fail before sending.
+    pub conflicts: Vec<String>,
+}
+
+/// Classify every YAML-listed model's reasoning setting.
+pub fn reasoning_report(backends: &[Backend]) -> ReasoningReport {
+    let mut report = ReasoningReport::default();
+    for backend in backends {
+        for model in backend.models.iter().flatten() {
+            let Some(reasoning) = &model.reasoning else {
+                continue;
+            };
+            let (name, api) = (backend.get_name(), backend.api_for_model(&model.name));
+            match backend.reasoning_control(&model.name) {
+                Ok(Some(control)) => report.sent.push(format!(
+                    "backend '{name}' model '{}' ({}) sends {}={}",
+                    model.name,
+                    api.as_str(),
+                    control.field(),
+                    control.effort().as_str(),
+                )),
+                Ok(None) => report.not_sent.push(format!(
+                    "backend '{name}' model '{}': reasoning.effort={} is not sent; Chaz has no reasoning control for the {} API, so the provider default applies",
+                    model.name,
+                    reasoning.effort.as_str(),
+                    api.as_str(),
+                )),
+                Err(message) => report.conflicts.push(message),
+            }
+        }
+    }
+    report
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -725,8 +803,8 @@ pub struct Model {
     pub name: String,
     /// Request API override for this exact model id on its backend.
     pub api: Option<ModelApi>,
-    /// OpenAI-compatible reasoning mode for requests to this model. Omit to
-    /// leave the provider's default unchanged.
+    /// Reasoning effort for requests to this model. Omit to send no
+    /// reasoning control and leave the provider's default unchanged.
     pub reasoning: Option<ReasoningConfig>,
     /// Input token price in USD per million tokens, if known. Surfaced in
     /// the TUI model picker; optional because backends typically don't
@@ -751,21 +829,27 @@ pub struct Model {
     pub context_window: Option<u32>,
 }
 
-/// OpenAI-compatible reasoning settings for one configured model.
+/// Reasoning settings for one configured model.
 ///
 /// This is deliberately model-scoped: one backend commonly serves models
 /// with different reasoning defaults. The configured value applies to every
 /// request for the named model; there is no per-request override.
-#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
+#[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
 pub struct ReasoningConfig {
-    /// How hard the provider should think for this model. `none` pins
-    /// reasoning off.
+    /// How hard the provider should think for this model. Which values a
+    /// provider accepts, and whether `none` disables thinking, depends on
+    /// the model, API and provider.
     pub effort: ReasoningEffort,
+    /// Chat Completions wire field for `effort`. Omit to keep the legacy
+    /// `reasoning: {effort}` object. Only valid when the model's effective
+    /// API is Chat Completions; native APIs use their own encoding.
+    #[serde(default)]
+    pub format: Option<ReasoningFormat>,
 }
 
-/// Reasoning effort levels accepted by OpenRouter and OpenAI-compatible
-/// APIs. `none` turns reasoning off; anything else selects how much the
-/// model thinks before answering. Unknown strings fail config parsing.
+/// Reasoning effort levels Chaz can send. Unknown strings fail config
+/// parsing. Chaz forwards the value unchanged (Responses refuses `max` before
+/// sending); the provider decides what each level means for a model.
 #[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum ReasoningEffort {
@@ -776,6 +860,87 @@ pub enum ReasoningEffort {
     High,
     XHigh,
     Max,
+}
+
+impl ReasoningEffort {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Minimal => "minimal",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::XHigh => "xhigh",
+            Self::Max => "max",
+        }
+    }
+}
+
+/// Chat Completions dialect for the configured effort. Explicit only:
+/// Chaz never infers it from a URL, host or model name.
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ReasoningFormat {
+    /// OpenRouter's `reasoning: {"effort": …}` object (the legacy default).
+    OpenRouter,
+    /// OpenAI Chat Completions' top-level `reasoning_effort` string.
+    OpenAI,
+}
+
+impl ReasoningFormat {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::OpenRouter => "openrouter",
+            Self::OpenAI => "openai",
+        }
+    }
+}
+
+/// The reasoning control Chaz puts on the wire for one request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReasoningControl {
+    /// `reasoning: {"effort": …}` — Chat (OpenRouter format) and Responses.
+    Object(ReasoningEffort),
+    /// Top-level `reasoning_effort` — Chat with `format: openai`.
+    TopLevel(ReasoningEffort),
+}
+
+impl ReasoningControl {
+    /// Request-body field path, as written in diagnostics.
+    pub fn field(self) -> &'static str {
+        match self {
+            Self::Object(_) => "reasoning.effort",
+            Self::TopLevel(_) => "reasoning_effort",
+        }
+    }
+
+    pub fn effort(self) -> ReasoningEffort {
+        match self {
+            Self::Object(effort) | Self::TopLevel(effort) => effort,
+        }
+    }
+
+    /// Append request context to a provider-rejected request. It names what
+    /// was sent without claiming the field caused the rejection.
+    pub(crate) fn annotate(
+        control: Option<Self>,
+        backend: &str,
+        model: &str,
+        error: crate::error::LlmError,
+    ) -> crate::error::LlmError {
+        match (control, error) {
+            (Some(control), crate::error::LlmError::InvalidRequest { message }) => {
+                crate::error::LlmError::InvalidRequest {
+                    message: format!(
+                        "{message} (request to backend '{backend}' model '{model}' included {}={}; the provider did not say whether that field caused the rejection)",
+                        control.field(),
+                        control.effort().as_str(),
+                    ),
+                }
+            }
+            (_, error) => error,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -1090,6 +1255,7 @@ fn known_config_keys() -> HashSet<&'static str> {
         "backends[].models[].api",
         "backends[].models[].reasoning",
         "backends[].models[].reasoning.effort",
+        "backends[].models[].reasoning.format",
         "backends[].models[].price_input",
         "backends[].models[].price_output",
         "backends[].models[].price_cache_read",
@@ -1586,7 +1752,8 @@ backends:
         assert_eq!(
             b.models.as_ref().unwrap()[0].reasoning,
             Some(ReasoningConfig {
-                effort: ReasoningEffort::None
+                effort: ReasoningEffort::None,
+                format: None,
             })
         );
         // secret_key scopes to backend name
@@ -1606,6 +1773,145 @@ backends:
           effort: turbo
 "#;
         assert!(serde_yaml::from_str::<Config>(yaml).is_err());
+    }
+
+    #[test]
+    fn reasoning_format_parses_and_unknown_values_fail() {
+        let yaml = r#"
+backends:
+  - type: openaicompatible
+    models:
+      - name: a
+        reasoning: { effort: low, format: openrouter }
+      - name: b
+        reasoning: { effort: high, format: openai }
+      - name: c
+        reasoning: { effort: high }
+"#;
+        assert!(check_unknown_config_keys(yaml).is_empty());
+        let backends = serde_yaml::from_str::<Config>(yaml)
+            .unwrap()
+            .backends
+            .unwrap();
+        let formats: Vec<_> = backends[0]
+            .models
+            .iter()
+            .flatten()
+            .map(|m| m.reasoning.as_ref().unwrap().format)
+            .collect();
+        assert_eq!(
+            formats,
+            [
+                Some(ReasoningFormat::OpenRouter),
+                Some(ReasoningFormat::OpenAI),
+                None
+            ]
+        );
+        let error = serde_yaml::from_str::<Config>(
+            "backends: [{type: openaicompatible, models: [{name: m, reasoning: {effort: low, format: zai}}]}]",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("unknown variant `zai`"), "{error}");
+        assert!(
+            error.contains("openrouter") && error.contains("openai"),
+            "{error}"
+        );
+    }
+
+    /// One fixture covering every effective-API/format combination, with
+    /// backend-level and per-model API selection resolved before validation.
+    fn reasoning_matrix() -> Vec<Backend> {
+        serde_yaml::from_str::<Config>(
+            r#"
+backends:
+  - type: openaicompatible
+    name: proxy
+    models:
+      - { name: legacy, reasoning: { effort: high } }
+      - { name: router, reasoning: { effort: high, format: openrouter } }
+      - { name: openai, reasoning: { effort: none, format: openai } }
+      - { name: plain }
+      - { name: native, api: responses, reasoning: { effort: low } }
+      - { name: native-openai, api: responses, reasoning: { effort: low, format: openai } }
+      - { name: native-router, api: responses, reasoning: { effort: low, format: openrouter } }
+  - type: openaicompatible
+    name: resp
+    api: responses
+    models:
+      - { name: chat-override, api: chat-completions, reasoning: { effort: medium, format: openai } }
+  - type: anthropic
+    name: claude
+    models:
+      - { name: omitted, reasoning: { effort: low } }
+      - { name: explicit, reasoning: { effort: low, format: openrouter } }
+"#,
+        )
+        .unwrap()
+        .backends
+        .unwrap()
+    }
+
+    #[test]
+    fn reasoning_control_resolves_effective_api_before_format() {
+        use ReasoningControl::{Object, TopLevel};
+        let b = reasoning_matrix();
+        let ok = |i: usize, m: &str| b[i].reasoning_control(m).unwrap();
+        // Omitted format keeps the legacy object; explicit openrouter is the same.
+        assert_eq!(ok(0, "legacy"), Some(Object(ReasoningEffort::High)));
+        assert_eq!(ok(0, "router"), Some(Object(ReasoningEffort::High)));
+        assert_eq!(ok(0, "openai"), Some(TopLevel(ReasoningEffort::None)));
+        // Omitted reasoning and unlisted/discovered models send nothing.
+        assert_eq!(ok(0, "plain"), None);
+        assert_eq!(ok(0, "discovered/model"), None);
+        // Native Responses keeps its own encoding when format is omitted.
+        assert_eq!(ok(0, "native"), Some(Object(ReasoningEffort::Low)));
+        // A per-model Chat override on a Responses backend may choose a format.
+        assert_eq!(
+            ok(1, "chat-override"),
+            Some(TopLevel(ReasoningEffort::Medium))
+        );
+        // Native Anthropic has no mapping: nothing is sent.
+        assert_eq!(ok(2, "omitted"), None);
+        // Any explicit Chat format on a native API is refused, even `openrouter`,
+        // whose object happens to look like the Responses shape.
+        for (i, model, format, api) in [
+            (0, "native-openai", "openai", "responses"),
+            (0, "native-router", "openrouter", "responses"),
+            (2, "explicit", "openrouter", "anthropic-messages"),
+        ] {
+            let error = b[i].reasoning_control(model).unwrap_err();
+            assert!(
+                error.contains(&format!("reasoning.format '{format}'"))
+                    && error.contains(&format!("API is '{api}'"))
+                    && error.contains("Remove reasoning.format")
+                    && error.contains(&format!("model '{model}'")),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn reasoning_report_names_sent_unsent_and_conflicting_controls() {
+        let report = reasoning_report(&reasoning_matrix());
+        assert_eq!(
+            report.sent,
+            [
+                "backend 'proxy' model 'legacy' (chat-completions) sends reasoning.effort=high",
+                "backend 'proxy' model 'router' (chat-completions) sends reasoning.effort=high",
+                "backend 'proxy' model 'openai' (chat-completions) sends reasoning_effort=none",
+                "backend 'proxy' model 'native' (responses) sends reasoning.effort=low",
+                "backend 'resp' model 'chat-override' (chat-completions) sends reasoning_effort=medium",
+            ]
+        );
+        assert_eq!(
+            report.not_sent,
+            [
+                "backend 'claude' model 'omitted': reasoning.effort=low is not sent; Chaz has no reasoning control for the anthropic-messages API, so the provider default applies"
+            ]
+        );
+        assert_eq!(report.conflicts.len(), 3);
+        assert_eq!(reasoning_report(&[]), ReasoningReport::default());
     }
 
     #[test]

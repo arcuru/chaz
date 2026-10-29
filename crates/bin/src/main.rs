@@ -135,6 +135,25 @@ fn validate_session_scope(args: &ChazArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Say once, at load, which reasoning control each configured model sends.
+/// An explicit Chat-only format on a native API refuses to start.
+fn log_reasoning_config(config: &Config) -> anyhow::Result<()> {
+    let report = config::reasoning_report(config.backends.as_deref().unwrap_or_default());
+    for line in &report.sent {
+        info!("Reasoning: {line}; provider support is not verified");
+    }
+    for line in &report.not_sent {
+        warn!("Reasoning: {line}");
+    }
+    if !report.conflicts.is_empty() {
+        for line in &report.conflicts {
+            error!("Reasoning: {line}");
+        }
+        anyhow::bail!("invalid reasoning config: {}", report.conflicts.join("; "));
+    }
+    Ok(())
+}
+
 /// Resolve the configured state directory, expanding a leading `~` when set.
 /// Falls back to the platform XDG state directory when it is absent.
 fn resolve_state_dir(config: &Config) -> Option<PathBuf> {
@@ -260,6 +279,7 @@ async fn main() -> anyhow::Result<()> {
         "Starting chaz"
     );
     info!("Config loaded from {}", config_path.display());
+    log_reasoning_config(&config)?;
 
     // Whole-startup wall clock: time from here to the gateway taking over.
     let startup_start = Instant::now();
@@ -495,10 +515,31 @@ async fn run_usage_subcommand(args: UsageArgs, config: &Config) -> anyhow::Resul
 
 #[cfg(test)]
 mod tests {
-    use super::{ChazArgs, resolve_config_path, resolve_state_dir, validate_session_scope};
+    use super::{
+        ChazArgs, log_reasoning_config, resolve_config_path, resolve_state_dir,
+        validate_session_scope,
+    };
     use chaz_core::config::Config;
     use clap::Parser;
     use std::path::PathBuf;
+
+    #[test]
+    fn explicit_chat_reasoning_format_on_native_api_refuses_startup() {
+        let config = |yaml: &str| serde_yaml::from_str::<Config>(yaml).unwrap();
+        // Unsent Anthropic effort only warns; a valid Chat format is accepted.
+        log_reasoning_config(&config(
+            "backends: [{type: anthropic, models: [{name: c, reasoning: {effort: low}}]}, \
+             {type: openaicompatible, name: p, models: [{name: m, reasoning: {effort: low, format: openai}}]}]",
+        ))
+        .unwrap();
+        let error = log_reasoning_config(&config(
+            "backends: [{type: openaicompatible, models: [{name: m, api: responses, reasoning: {effort: low, format: openai}}]}]",
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(error.starts_with("invalid reasoning config:"), "{error}");
+        assert!(error.contains("API is 'responses'"), "{error}");
+    }
 
     #[test]
     fn session_flag_reaches_interactive_and_print_but_not_subcommands() {
