@@ -83,6 +83,17 @@ struct SessionRuntimeRecorder {
     fail_after: Arc<std::sync::Mutex<Option<usize>>>,
 }
 
+impl SessionRuntimeRecorder {
+    async fn write_session(&self) -> Result<tokio::sync::MutexGuard<'_, Session>, String> {
+        let mut session = self.session.lock().await;
+        session
+            .refresh_writer()
+            .await
+            .map_err(|error| format!("runtime persistence failed: writer refresh: {error}"))?;
+        Ok(session)
+    }
+}
+
 impl runtime::RuntimeRecorder for SessionRuntimeRecorder {
     fn can_suspend_job_wait(&self) -> bool {
         self.can_suspend
@@ -95,7 +106,7 @@ impl runtime::RuntimeRecorder for SessionRuntimeRecorder {
     ) -> Pin<Box<dyn Future<Output = Result<Vec<runtime::RuntimeMessage>, String>> + Send + 'a>>
     {
         Box::pin(async move {
-            let session = self.session.lock().await;
+            let session = self.write_session().await?;
             let mut messages: Vec<runtime::RuntimeMessage> =
                 crate::session::steering::input_boundary(
                     session.database(),
@@ -143,7 +154,7 @@ impl runtime::RuntimeRecorder for SessionRuntimeRecorder {
     ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
         Box::pin(async move {
             let inputs = {
-                let session = self.session.lock().await;
+                let session = self.write_session().await?;
                 crate::session::steering::dispatch_inputs(
                     session.database(),
                     &self.attempt_id,
@@ -181,7 +192,7 @@ impl runtime::RuntimeRecorder for SessionRuntimeRecorder {
                 }
             }
             if let runtime::RuntimeRecord::ModelResponse { model_sequence, .. } = &message {
-                let session = self.session.lock().await;
+                let session = self.write_session().await?;
                 crate::session::steering::input_call_observed(
                     session.database(),
                     &self.attempt_id,
@@ -258,9 +269,8 @@ impl runtime::RuntimeRecorder for SessionRuntimeRecorder {
             ) {
                 // Usage is observable before response hooks or reply preflight
                 // finish. No final Message, completion or outbox is published.
-                self.session
-                    .lock()
-                    .await
+                self.write_session()
+                    .await?
                     .append_turn_transcript_for_branch(
                         record.clone(),
                         Vec::new(),
@@ -272,9 +282,8 @@ impl runtime::RuntimeRecorder for SessionRuntimeRecorder {
                 return Ok(());
             }
             let display_entries = display_entries_for_record(&self.agent_name, &record);
-            self.session
-                .lock()
-                .await
+            self.write_session()
+                .await?
                 .append_turn_transcript_for_branch(record, display_entries, self.branch.as_deref())
                 .await
                 .map_err(|error| format!("failed to persist runtime transcript: {error}"))?;
@@ -290,7 +299,7 @@ impl runtime::RuntimeRecorder for SessionRuntimeRecorder {
         call: crate::session::usage::CallObservation,
     ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
         Box::pin(async move {
-            let session = self.session.lock().await;
+            let session = self.write_session().await?;
             crate::session::usage::persist_call(
                 session.database(),
                 &self.attempt_id,
@@ -317,7 +326,7 @@ impl runtime::RuntimeRecorder for SessionRuntimeRecorder {
                 snapshot,
                 wait,
             );
-            let session = self.session.lock().await;
+            let session = self.write_session().await?;
             session
                 .record_job_wait_checkpoint(&checkpoint)
                 .await
@@ -348,9 +357,8 @@ impl runtime::RuntimeRecorder for SessionRuntimeRecorder {
         call_index: usize,
     ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
         Box::pin(async move {
-            self.session
-                .lock()
-                .await
+            self.write_session()
+                .await?
                 .finish_job_wait_checkpoint(&self.attempt_id, model_sequence, call_index)
                 .await
                 .map_err(|error| format!("failed to retire job wait checkpoint: {error}"))
@@ -2878,7 +2886,10 @@ impl Server {
         if !self.executor_authorized {
             anyhow::bail!("client server cannot execute agent or tool turns");
         }
-        let (conversation_id, session_db) = self.registry.open_session(session_db_id).await?;
+        let (conversation_id, session_db, signing_key) = self
+            .registry
+            .open_session_with_signer(session_db_id)
+            .await?;
         let job_authority = if crate::session::jobs::is_job_session(&session_db).await {
             Some(
                 self.validate_accepted_job(&session_db)
@@ -2903,7 +2914,9 @@ impl Server {
             }
             return Ok(None);
         }
-        let session = Session::new(conversation_id.clone(), session_db.clone()).await;
+        let session = Session::new(conversation_id.clone(), session_db.clone())
+            .await
+            .with_signing_key(signing_key);
         // Receipt proves the executor observed this generation through session
         // sync. A bridge never acknowledges enablement on its own write alone.
         if let Some(policy) = session.read_meta().await.ambient_participation
@@ -4073,12 +4086,17 @@ impl Server {
             // The persisted start is the per-turn claim. Refresh its bounded
             // visibility even while waiting for a semaphore or tool approval.
             let heartbeat_db = session.database().clone();
+            let heartbeat_key = session.signing_key();
             let heartbeat_id = attempt.attempt_id.clone();
             let heartbeat = tokio::spawn(async move {
                 let mut tick = tokio::time::interval(std::time::Duration::from_secs(10));
                 loop {
                     tick.tick().await;
-                    if let Err(error) = Session::renew_turn_activity(&heartbeat_db, &heartbeat_id).await {
+                    let renewed = async {
+                        let db = crate::session::current_session_writer(&heartbeat_db, heartbeat_key.as_ref()).await?;
+                        Session::renew_turn_activity(&db, &heartbeat_id).await
+                    }.await;
+                    if let Err(error) = renewed {
                         warn!(%error, "Could not renew turn activity");
                     }
                 }
@@ -4242,6 +4260,7 @@ impl Server {
                         .with_room_participants(&roster)
                         .with_extension_hub(spawn_extensions.clone())
                         .with_session_db(s.database())
+                        .with_session_signing_key(s.signing_key())
                         .with_invocation(&active_extensions, Some(attempt.request_id.as_str()))
                         .try_build()
                         .await;
@@ -4358,6 +4377,10 @@ impl Server {
                 return;
             }
             let mut s = session.lock().await;
+            if let Err(error) = s.refresh_writer().await {
+                error!(%error, session_db_id, "Writer refresh failed before settlement; attempt remains interrupted");
+                return;
+            }
             let persistence_failed =
                 matches!(&result, Err(runtime::TurnError::Failed(error)) if error.starts_with("runtime persistence failed:"));
             // A branch stopped by an observed yield computed no result of its

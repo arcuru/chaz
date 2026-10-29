@@ -2,6 +2,9 @@ pub(crate) mod client;
 mod commands;
 mod history;
 mod typing;
+mod workspace;
+
+use futures::FutureExt;
 
 use chaz_core::bridge::delivery::{DeliveryBinding, DeliveryReconciler, DeliveryStore};
 use chaz_core::bridge::outbound::{
@@ -129,8 +132,14 @@ async fn backfill_joined_room(
     login_id: &str,
     owning_agent: &str,
     backfilled: &Mutex<HashMap<String, BackfilledRoom>>,
+    workspace_rooms: &workspace::RoomIndex,
 ) -> anyhow::Result<()> {
     if room.state() != RoomState::Joined {
+        return Ok(());
+    }
+    // Workspace rooms never get a bootstrapped session: the Space and Lobby
+    // have none, and each chat's session is provisioned by its operation.
+    if workspace_rooms.get(room.room_id().as_str()).is_some() {
         return Ok(());
     }
     let room_id = room.room_id().to_string();
@@ -146,6 +155,16 @@ async fn backfill_joined_room(
     let state = client
         .send(RoomStateRequest::new(room.room_id().to_owned()))
         .await?;
+    // A room created by a workspace operation the record does not list (an
+    // uncertain or cancelled create) is excluded too, by its marker state.
+    let state_events = state
+        .room_state
+        .iter()
+        .map(|raw| serde_json::from_str::<serde_json::Value>(raw.json().get()))
+        .collect::<Result<Vec<_>, _>>()?;
+    if state_events.iter().any(workspace::live::is_workspace_state) {
+        return Ok(());
+    }
     let join_id = state
         .room_state
         .iter()
@@ -374,6 +393,7 @@ fn is_transient_matrix_send_error(error: &matrix_sdk::Error) -> bool {
 const MATRIX_MESSAGE_LIMIT: usize = 8_000;
 
 /// Dispatch a shared command in the context of a Matrix room.
+#[allow(clippy::too_many_arguments)]
 async fn dispatch_in_room(
     cmd: Command,
     room: Room,
@@ -382,22 +402,27 @@ async fn dispatch_in_room(
     secrets: SecretStore,
     login_id: &str,
     owning_agent: &str,
+    managed_session: Option<&str>,
 ) -> anyhow::Result<()> {
     let room_id = room.room_id().to_string();
 
     let Some(agent_entry) = owning_agent_entry(&server, owning_agent) else {
         anyhow::bail!("owning agent '{owning_agent}' is not hosted on this bridge yet");
     };
-    let (_conv_id, session_db) = server
-        .registry()
-        .get_or_create_conversational_channel_session(
-            &agent_entry,
-            login_id,
-            "matrix",
-            login_id,
-            &room_id,
-        )
-        .await?;
+    let (_conv_id, session_db) = if let Some(expected) = managed_session {
+        resolve_workspace_session(&server, &agent_entry, login_id, &room_id, expected).await?
+    } else {
+        server
+            .registry()
+            .get_or_create_conversational_channel_session(
+                &agent_entry,
+                login_id,
+                "matrix",
+                login_id,
+                &room_id,
+            )
+            .await?
+    };
     let session_db_id = session_db.root_id().to_string();
     let backend = get_backend(Some(&session_db), &config, &secrets).await;
     let meta = chaz_core::session::read_meta_from_db(&session_db).await;
@@ -419,6 +444,9 @@ async fn dispatch_in_room(
     render_outcome_to_room(&room, outcome).await;
     Ok(())
 }
+
+const MANAGED_SESSION_UNAVAILABLE: &str = "This workspace chat's session is not available on \
+     this bridge right now. Nothing was sent, and no replacement session was created.";
 
 async fn render_outcome_to_room(room: &Room, outcome: CommandOutcome) {
     let text = match outcome {
@@ -607,6 +635,7 @@ fn help_text() -> String {
         "`channels` — rooms bound to this session",
         "",
         "Matrix-local: `attach <session>` · `detach` · `participation <on|off|status>` · `clear` · `send <msg>` · `rename` · `party`",
+        "Workspace: `workspace help` — personal Space, command-only Lobby and named chats",
         "",
         "In a DM or when @mentioned, just talk — no prefix needed.",
     ]
@@ -780,12 +809,64 @@ impl Bridge for MatrixBridge {
         // installed, so room history is not replayed through them on startup.
         mc.initial_sync().await;
 
+        // Rooms with outbound delivery installed, and the reconciler that
+        // owns each one's persisted progress.
+        let (typing_stop, stopped) = tokio::sync::watch::channel(false);
+        let typing_tasks = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let typing_lifetime = TypingLifetime {
+            stop: typing_stop,
+            tasks: typing_tasks.clone(),
+        };
+        let attached_channels: AttachedChannels = Arc::new(Channels {
+            bindings: Mutex::new(Some(HashMap::new())),
+            stopped,
+            typing_tasks,
+        });
+
+        // Posted tool-approval prompts awaiting a reaction/command, keyed by the
+        // prompt's event id. Shared across the startup attach, the message
+        // handler, and the reaction handler.
+        let pending_approvals: PendingApprovals = Arc::new(ApprovalRelay {
+            // No timeout here: the daemon owns the clock and stamps each
+            // request with its own deadline.
+            slots: Mutex::new(HashMap::new()),
+        });
+
+        // The personal workspace record for this login. A malformed record
+        // stops the bridge rather than letting its rooms fall back to
+        // ordinary session bootstrap.
+        let workspace = Arc::new(
+            workspace::Workspace::open(
+                workspace::WorkspaceStore::new(server.registry().chaz_peer().clone(), &login_id),
+                workspace::live::LiveMatrix::new(mc.client().clone()),
+                workspace::live::LiveSessions {
+                    server: server.clone(),
+                    client: mc.client().clone(),
+                    attached: attached_channels.clone(),
+                    pending: pending_approvals.clone(),
+                    login_id: login_id.clone(),
+                    owning_agent: owning_agent.clone(),
+                },
+                login_id.clone(),
+                owning_agent.clone(),
+                creds.workspace_manager.clone(),
+            )
+            .await?,
+        );
+        let workspace_rooms = workspace.index();
+
         let backfilled_rooms: Arc<Mutex<HashMap<String, BackfilledRoom>>> =
             Arc::new(Mutex::new(HashMap::new()));
         for room in mc.client().joined_rooms() {
-            if let Err(e) =
-                backfill_joined_room(&room, &server, &login_id, &owning_agent, &backfilled_rooms)
-                    .await
+            if let Err(e) = backfill_joined_room(
+                &room,
+                &server,
+                &login_id,
+                &owning_agent,
+                &backfilled_rooms,
+                &workspace_rooms,
+            )
+            .await
             {
                 error!(room_id = %room.room_id(), "Join history backfill failed: {e}");
             }
@@ -798,12 +879,14 @@ impl Bridge for MatrixBridge {
             let login_id = login_id.clone();
             let owning_agent = owning_agent.clone();
             let backfilled_rooms = backfilled_rooms.clone();
+            let workspace_rooms = workspace_rooms.clone();
             mc.client()
                 .add_event_handler(move |event: OriginalSyncRoomMemberEvent, room: Room| {
                     let server = server.clone();
                     let login_id = login_id.clone();
                     let owning_agent = owning_agent.clone();
                     let backfilled_rooms = backfilled_rooms.clone();
+                    let workspace_rooms = workspace_rooms.clone();
                     async move {
                         if room.client().user_id() != Some(event.state_key.as_ref())
                             || event.content.membership != MembershipState::Join
@@ -816,6 +899,7 @@ impl Bridge for MatrixBridge {
                             &login_id,
                             &owning_agent,
                             &backfilled_rooms,
+                            &workspace_rooms,
                         )
                         .await
                         {
@@ -868,29 +952,6 @@ impl Bridge for MatrixBridge {
 
         info!("The client is ready! Listening to new messages…");
 
-        // Rooms with outbound delivery installed, and the reconciler that
-        // owns each one's persisted progress.
-        let (typing_stop, stopped) = tokio::sync::watch::channel(false);
-        let typing_tasks = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let typing_lifetime = TypingLifetime {
-            stop: typing_stop,
-            tasks: typing_tasks.clone(),
-        };
-        let attached_channels: AttachedChannels = Arc::new(Channels {
-            bindings: Mutex::new(Some(HashMap::new())),
-            stopped,
-            typing_tasks,
-        });
-
-        // Posted tool-approval prompts awaiting a reaction/command, keyed by the
-        // prompt's event id. Shared across the startup attach, the message
-        // handler, and the reaction handler.
-        let pending_approvals: PendingApprovals = Arc::new(ApprovalRelay {
-            // No timeout here: the daemon owns the clock and stamps each
-            // request with its own deadline.
-            slots: Mutex::new(HashMap::new()),
-        });
-
         // --- Startup: install response callbacks for every room this login
         //     already has a session bound to. This is what makes the daemon's
         //     replies (including scheduler fires) deliver when no user has
@@ -904,6 +965,7 @@ impl Bridge for MatrixBridge {
             let login_id = login_id.clone();
             let owning_agent = owning_agent.clone();
             let pending_approvals = pending_approvals.clone();
+            let workspace_rooms = workspace_rooms.clone();
             tokio::spawn(async move {
                 let Some(agent_entry) = owning_agent_entry(&server, &owning_agent) else {
                     info!("Owning agent not hosted yet; skipping startup channel attach");
@@ -932,6 +994,36 @@ impl Bridge for MatrixBridge {
                     let bindings = transport_bindings(&db).await.unwrap_or_default();
                     for (transport, chan_login, room_id) in bindings {
                         if transport != "matrix" || chan_login != login_id {
+                            continue;
+                        }
+                        if let Some(place) = workspace_rooms.get(&room_id) {
+                            let workspace::Place::Chat {
+                                session_db_id: Some(expected),
+                                ..
+                            } = place
+                            else {
+                                continue;
+                            };
+                            if expected != r.session_db_id {
+                                continue;
+                            }
+                            if let Err(e) = resolve_workspace_session(
+                                &server,
+                                &agent_entry,
+                                &login_id,
+                                &room_id,
+                                &expected,
+                            )
+                            .await
+                            {
+                                error!(room_id, "Workspace startup binding unavailable: {e}");
+                                continue;
+                            }
+                        } else if let Ok(id) =
+                            matrix_sdk::ruma::OwnedRoomId::try_from(room_id.as_str())
+                            && let Some(room) = client.get_room(&id)
+                            && workspace::live::has_marker(&room).await
+                        {
                             continue;
                         }
                         attach_existing_channel(
@@ -979,6 +1071,8 @@ impl Bridge for MatrixBridge {
             // newer enable (or undo an off) while waiting for its receipt.
             let participation_command_lock = Arc::new(Mutex::new(()));
             let pending_approvals = pending_approvals.clone();
+            let workspace = workspace.clone();
+            let workspace_rooms = workspace_rooms.clone();
 
             mc.client().add_event_handler(
                 move |event: OriginalSyncRoomMessageEvent, room: Room| {
@@ -995,6 +1089,8 @@ impl Bridge for MatrixBridge {
                     let participation_counts = participation_counts.clone();
                     let participation_command_lock = participation_command_lock.clone();
                     let pending_approvals = pending_approvals.clone();
+                    let workspace = workspace.clone();
+                    let workspace_rooms = workspace_rooms.clone();
                     async move {
                         if room.state() != RoomState::Joined {
                             return;
@@ -1009,11 +1105,62 @@ impl Bridge for MatrixBridge {
                             return;
                         }
 
+                        let room_id = room.room_id().to_string();
+                        // Workspace rooms are routed before any bootstrap or
+                        // session lookup: the Space and Lobby never reach an
+                        // agent, and a chat is chat-capable only once ready.
+                        let place = workspace_rooms.get(&room_id);
+                        let managed_chat = matches!(place, Some(workspace::Place::Chat { .. }));
+                        {
+                            let raw = text_content.body.trim_start();
+                            let inner = raw.strip_prefix("!chaz").and_then(|r| {
+                                (r.is_empty() || r.starts_with(char::is_whitespace))
+                                    .then(|| r.trim().to_string())
+                            });
+                            let marked = place.is_some() || workspace::live::has_marker(&room).await;
+                            let routed = workspace::route(place.as_ref(), marked, inner.as_deref());
+                            // Unmanaged-room workspace commands go through the
+                            // join cutoff below like every other command.
+                            if routed != workspace::Route::Normal
+                                && !(place.is_none() && routed == workspace::Route::Workspace)
+                            {
+                                if routed == workspace::Route::Ignore
+                                    || !seen_events.lock().await.insert(event.event_id.to_string())
+                                {
+                                    return;
+                                }
+                                if let workspace::Route::Notice(text) = routed {
+                                    let _ = room.send(RoomMessageEventContent::notice_plain(text)).await;
+                                    return;
+                                }
+                                let origin = workspace::Origin::Managed(place.unwrap());
+                                spawn_workspace_command(&workspace, &attached_channels, &room, &event, origin, inner);
+                                return;
+                            }
+                        }
+                        let managed_session = match &place {
+                            Some(workspace::Place::Chat { session_db_id: Some(id), .. }) => Some(id.as_str()),
+                            Some(workspace::Place::Chat { .. }) => {
+                                let _ = room.send(RoomMessageEventContent::notice_plain(MANAGED_SESSION_UNAVAILABLE)).await;
+                                return;
+                            }
+                            _ => None,
+                        };
+                        // Even room-local commands/approvals must not act through
+                        // a stale or competing session binding.
+                        if let Some(expected) = managed_session {
+                            let Some(agent) = owning_agent_entry(&server, &owning_agent) else { return; };
+                            if let Err(e) = resolve_workspace_session(&server, &agent, &login_id, &room_id, expected).await {
+                                error!(room_id, "Workspace binding unavailable: {e}");
+                                let _ = room.send(RoomMessageEventContent::notice_plain(MANAGED_SESSION_UNAVAILABLE)).await;
+                                return;
+                            }
+                        }
                         // Apply the join cutoff before commands or address checks:
                         // delayed history must not execute an old command either.
-                        let room_id = room.room_id().to_string();
                         if let Err(e) = backfill_joined_room(
                             &room, &server, &login_id, &owning_agent, &backfilled_rooms,
+                            &workspace_rooms,
                         ).await {
                             error!(room_id, "Join history backfill failed: {e}");
                             return;
@@ -1042,6 +1189,15 @@ impl Bridge for MatrixBridge {
                         });
 
                         if let Some(inner) = command_inner {
+                            if place.is_none() && workspace::is_workspace_command(&inner) {
+                                let origin = if room_kind(&room).await == RoomKind::Direct {
+                                    workspace::Origin::Direct
+                                } else {
+                                    workspace::Origin::Other
+                                };
+                                spawn_workspace_command(&workspace, &attached_channels, &room, &event, origin, Some(inner));
+                                return;
+                            }
                             let verb = inner.split_whitespace().next().unwrap_or("");
                             // View-local Matrix verbs, checked before the
                             // shared parser. These either need bridge state
@@ -1158,6 +1314,7 @@ impl Bridge for MatrixBridge {
                                         secrets.clone(),
                                         &login_id,
                                         &owning_agent,
+                                        managed_session,
                                     )
                                     .await
                                     {
@@ -1233,7 +1390,9 @@ impl Bridge for MatrixBridge {
                             );
                             return;
                         };
-                        let resolved = if wake {
+                        let resolved = if let Some(expected) = managed_session {
+                            resolve_workspace_session(&server, &agent_entry, &login_id, &room_id, expected).await.map(Some)
+                        } else if wake {
                             server.registry().get_or_create_conversational_channel_session(
                                 &agent_entry, &login_id, "matrix", &login_id, &room_id,
                             ).await.map(Some)
@@ -1244,6 +1403,16 @@ impl Bridge for MatrixBridge {
                         };
                         let (_conv_id, session_db) = match resolved {
                             Ok(Some(r)) => r,
+                            Ok(None) if managed_chat => {
+                                if wake {
+                                    let _ = room
+                                        .send(RoomMessageEventContent::notice_plain(
+                                            MANAGED_SESSION_UNAVAILABLE,
+                                        ))
+                                        .await;
+                                }
+                                return;
+                            }
                             Ok(None) => {
                                 tracing::debug!(room_id, "Unbound Matrix room observation ignored");
                                 return;
@@ -1320,10 +1489,18 @@ impl Bridge for MatrixBridge {
         {
             let pending_approvals = pending_approvals.clone();
             let allow_list = allow_list.clone();
+            let workspace_rooms = workspace_rooms.clone();
+            let server = server.clone();
+            let login_id = login_id.clone();
+            let owning_agent = owning_agent.clone();
             mc.client()
                 .add_event_handler(move |event: OriginalSyncReactionEvent, room: Room| {
                     let pending_approvals = pending_approvals.clone();
                     let allow_list = allow_list.clone();
+                    let workspace_rooms = workspace_rooms.clone();
+                    let server = server.clone();
+                    let login_id = login_id.clone();
+                    let owning_agent = owning_agent.clone();
                     async move {
                         // Same gate as the message path: only an allow-listed
                         // sender (never the bot itself) can resolve an approval.
@@ -1335,7 +1512,43 @@ impl Bridge for MatrixBridge {
                         if !is_allowed(allow_list.as_deref(), event.sender.as_str(), &bot_uid) {
                             return;
                         }
-                        handle_approval_reaction(event, pending_approvals, &room).await;
+                        match workspace_rooms.get(room.room_id().as_str()) {
+                            Some(workspace::Place::Chat {
+                                ready: true,
+                                session_db_id: Some(expected),
+                                ..
+                            }) => {
+                                let Some(agent) = owning_agent_entry(&server, &owning_agent) else {
+                                    return;
+                                };
+                                if let Err(error) = resolve_workspace_session(
+                                    &server,
+                                    &agent,
+                                    &login_id,
+                                    room.room_id().as_str(),
+                                    &expected,
+                                )
+                                .await
+                                {
+                                    error!(%error, "Workspace approval binding unavailable");
+                                    return;
+                                }
+                            }
+                            Some(_) => return,
+                            None if workspace::live::has_marker(&room).await => return,
+                            None => {}
+                        }
+                        if let Some(notice) = handle_approval_reaction(
+                            event,
+                            pending_approvals,
+                            room.room_id().as_str(),
+                        )
+                        .await
+                        {
+                            let _ = room
+                                .send(RoomMessageEventContent::notice_plain(notice))
+                                .await;
+                        }
                     }
                 });
         }
@@ -1383,6 +1596,84 @@ impl Bridge for MatrixBridge {
         futures::future::join_all(finishes).await;
         Ok(())
     }
+}
+
+async fn resolve_workspace_session(
+    server: &Server,
+    agent: &chaz_core::hosted_index::DbEntry,
+    login: &str,
+    room: &str,
+    expected: &str,
+) -> anyhow::Result<(chaz_core::types::ConversationId, eidetica::Database)> {
+    let found = server
+        .registry()
+        .find_unique_channel_session(agent, login, "matrix", login, room)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("workspace session is not enrolled/bound"))?;
+    anyhow::ensure!(
+        found.1.root_id().to_string() == expected,
+        "workspace session identity changed; refusing"
+    );
+    Ok(found)
+}
+
+type LiveWorkspace =
+    workspace::Workspace<workspace::live::LiveMatrix, workspace::live::LiveSessions>;
+
+/// Run one workspace command off the sync callback (operations wait for room
+/// echoes from sync) and post its reply into the room it came from.
+fn spawn_workspace_command(
+    workspace: &Arc<LiveWorkspace>,
+    attached: &AttachedChannels,
+    room: &Room,
+    event: &OriginalSyncRoomMessageEvent,
+    origin: workspace::Origin,
+    command: Option<String>,
+) {
+    let (workspace, room) = (workspace.clone(), room.clone());
+    let (sender, event_id) = (event.sender.to_string(), event.event_id.to_string());
+    let command = command.unwrap_or_default();
+    let mut tasks = attached.typing_tasks.lock().unwrap();
+    if *attached.stopped.borrow() {
+        return;
+    }
+    let task = tokio::spawn(async move {
+        let request = workspace::Request {
+            sender: &sender,
+            event_id: &event_id,
+            room_id: room.room_id().as_str(),
+            origin,
+            command: &command,
+        };
+        // Creation progress is saved before effects, so timeout/panic leaves
+        // an explicit resumable operation, not a blind room/DB retry.
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(180),
+            std::panic::AssertUnwindSafe(workspace.handle(request)).catch_unwind(),
+        )
+        .await;
+        let text = match result {
+            Ok(Ok(text)) => text,
+            Ok(Err(_)) => {
+                error!(event_id, "Workspace command panicked");
+                Some("Workspace command interrupted. Check !chaz workspace status before continuing; no automatic retry was made.".into())
+            }
+            Err(_) => Some("Workspace command timed out. Check !chaz workspace status before continuing; no automatic retry was made.".into()),
+        };
+        if let Some(text) = text {
+            use sha2::Digest;
+            let digest = sha2::Sha256::digest(event_id.as_bytes());
+            let txn: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+            let send = room
+                .send(RoomMessageEventContent::notice_plain(text))
+                .with_transaction_id(OwnedTransactionId::from(format!("workspace-{txn}")));
+            match tokio::time::timeout(std::time::Duration::from_secs(30), send).await {
+                Ok(Ok(_)) => {}
+                result => error!(?result, "Failed to send workspace reply"),
+            }
+        }
+    });
+    tasks.push(task.abort_handle());
 }
 
 /// Install outbound delivery for `(room, session)` exactly once per process.
@@ -1683,17 +1974,21 @@ async fn attach_approval_watcher(
 async fn handle_approval_reaction(
     event: OriginalSyncReactionEvent,
     pending: PendingApprovals,
-    room: &Room,
-) {
+    room_id: &str,
+) -> Option<String> {
     let relates_to = &event.content.relates_to;
     let decision = match relates_to.key.as_str() {
         "✅" => ApprovalDecision::Approve,
         "❌" => ApprovalDecision::Deny,
         "⏭" | "⏭️" => ApprovalDecision::ApproveAll,
-        _ => return,
+        _ => return None,
     };
-    let Some(req) = pending.slots.lock().await.remove(&relates_to.event_id) else {
-        return;
+    let req = {
+        let mut slots = pending.slots.lock().await;
+        if slots.get(&relates_to.event_id)?.room_id != room_id {
+            return None;
+        }
+        slots.remove(&relates_to.event_id)?
     };
     info!(
         room = %req.room_id, request_id = %req.request_id, ?decision,
@@ -1706,11 +2001,7 @@ async fn handle_approval_reaction(
         decision,
     )
     .await;
-    if let Some(notice) = already.as_ref().and_then(already_resolved_notice) {
-        let _ = room
-            .send(RoomMessageEventContent::notice_plain(notice))
-            .await;
-    }
+    already.as_ref().and_then(already_resolved_notice)
 }
 
 /// Approve or deny the oldest pending tool-approval request in `room` — the
@@ -1759,6 +2050,69 @@ async fn resolve_pending_approval(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn approval_reaction_cannot_resolve_another_rooms_request() {
+        use super::*;
+        use eidetica::{Instance, NewAccount, backend::database::InMemory};
+        let (_instance, mut user) = Instance::create_backend(
+            Box::new(InMemory::new()),
+            NewAccount::passwordless("approval-room"),
+        )
+        .await
+        .unwrap();
+        let key = user.get_default_key().unwrap();
+        let db = user
+            .create_database(eidetica::crdt::Doc::new(), &key)
+            .await
+            .unwrap();
+        let prompt = OwnedEventId::try_from("$prompt").unwrap();
+        let pending = Arc::new(ApprovalRelay {
+            slots: Mutex::new(HashMap::from([(
+                prompt.clone(),
+                PendingApproval {
+                    session_db: db.clone(),
+                    request_id: "request".into(),
+                    room_id: "!intended:example.org".into(),
+                    seq: 0,
+                },
+            )])),
+        });
+        let reaction = || {
+            serde_json::from_value::<OriginalSyncReactionEvent>(serde_json::json!({
+                "type": "m.reaction", "event_id": "$reaction", "sender": "@human:example.org",
+                "origin_server_ts": 1, "content": {"m.relates_to": {
+                    "rel_type": "m.annotation", "event_id": "$prompt", "key": "✅",
+                }},
+            }))
+            .unwrap()
+        };
+        handle_approval_reaction(reaction(), pending.clone(), "!sibling:example.org").await;
+        let session = Session::new(
+            chaz_core::types::ConversationId(db.root_id().to_string()),
+            db.clone(),
+        )
+        .await;
+        assert!(
+            chaz_core::bridge::existing_decision(session.entries(), "request").is_none(),
+            "a sibling reaction must not authorize this request"
+        );
+        assert!(
+            pending.slots.lock().await.contains_key(&prompt),
+            "wrong-room reaction must not consume the prompt"
+        );
+        handle_approval_reaction(reaction(), pending.clone(), "!intended:example.org").await;
+        let session = Session::new(
+            chaz_core::types::ConversationId(db.root_id().to_string()),
+            db,
+        )
+        .await;
+        assert_eq!(
+            chaz_core::bridge::existing_decision(session.entries(), "request"),
+            Some(ApprovalDecision::Approve)
+        );
+        assert!(pending.slots.lock().await.is_empty());
+    }
+
     #[test]
     fn command_dispatch_futures_stay_bounded() {
         fn future_size<F: std::future::Future>(
@@ -1770,6 +2124,7 @@ mod tests {
                 chaz_core::security::SecretStore,
                 &'static str,
                 &'static str,
+                Option<&'static str>,
             ) -> F,
         ) -> usize {
             std::mem::size_of::<F>()

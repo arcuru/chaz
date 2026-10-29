@@ -1614,13 +1614,13 @@ async fn register_one_exposed_session(
     // Open it; if the tree isn't local, pull it from the peers we already
     // sync this agent DB with (the exposing bridge is one of them), then
     // retry. Best-effort — a miss just defers to the next registry rescan.
-    let mut opened = registry.open_session(&r.session_db_id).await;
+    let mut opened = registry.open_session_with_signer(&r.session_db_id).await;
     if opened.is_err() {
         pull_session_tree_from_agent_peers(registry, entry, adb, &r.session_db_id).await;
-        opened = registry.open_session(&r.session_db_id).await;
+        opened = registry.open_session_with_signer(&r.session_db_id).await;
     }
     match opened {
-        Ok((conv_id, sdb)) => {
+        Ok((conv_id, sdb, signing_key)) => {
             // Before anything else: a session the bridge created names the
             // bridge as its home peer, and a bridge runs no agent loop. Take
             // it over now, while adopting it, rather than registering a
@@ -1647,6 +1647,7 @@ async fn register_one_exposed_session(
                     sdb.clone(),
                     entry.display_name.clone(),
                     server.approval_timeout(),
+                    signing_key,
                 )
                 .await;
             for task in approval_tasks {
