@@ -198,19 +198,15 @@ pub async fn unbind_transport(
     let txn = session_db.new_transaction().await?;
     let store = txn.get_store::<DocStore>(STORE_TRANSPORT_BINDINGS).await?;
     let key = channel_key(transport, login_id, channel);
-    if transport == "matrix" {
-        let count = binding_keys(&store.get_all().await?)
-            .into_iter()
-            .filter(|(kind, _, _)| kind == "matrix")
-            .count();
-        anyhow::ensure!(
-            count <= 1,
-            "conflicting legacy Matrix bindings; explicit migration required"
-        );
+    // Explicit removal only reduces ambiguity. Do not require the legacy set
+    // to be unique before letting the operator repair it.
+    let existed = binding_keys(&store.get_all().await?)
+        .iter()
+        .any(|(t, l, c)| t == transport && l == login_id && c == channel);
+    if existed {
+        store.delete(&key).await?;
+        txn.commit().await?;
     }
-    let existed = store.get_string(&key).await.is_ok();
-    let _ = store.delete(&key).await;
-    txn.commit().await?;
     Ok(existed)
 }
 
@@ -297,21 +293,155 @@ impl SessionRegistry {
         login_id: &str,
         channel: &str,
     ) -> anyhow::Result<Option<(ConversationId, Database)>> {
+        let mut matches = self
+            .channel_sessions_in(agent_db, bridge_label, transport, login_id, channel)
+            .await?;
+        anyhow::ensure!(
+            matches.len() <= 1,
+            "channel is bound to multiple sessions: {}; use !chaz detach <exact-session-db-id> in this room",
+            matches
+                .iter()
+                .map(|(_, db)| db.root_id().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        let found = matches.pop();
+        if let Some((_, db)) = &found {
+            session_attachment(db).await?;
+        }
+        Ok(found)
+    }
+
+    /// Raw exact matches, including ambiguous legacy sessions. Only explicit
+    /// detach may select from this set; ordinary routing requires uniqueness.
+    async fn channel_sessions_in(
+        &self,
+        agent_db: &crate::agent_db::AgentDb,
+        bridge_label: &str,
+        transport: &str,
+        login_id: &str,
+        channel: &str,
+    ) -> anyhow::Result<Vec<(ConversationId, Database)>> {
+        let mut matches = Vec::new();
         for r in agent_db.list_session_refs().await? {
+            // Local CLI/TUI sessions are not this bridge's routing surface
+            // and may not grant it any key. Preserve the exposure boundary.
             if !r.exposed_on.iter().any(|b| b == bridge_label) {
                 continue;
             }
-            let Ok((conv, db)) = self.open_session(&r.session_db_id).await else {
-                continue;
-            };
-            if is_bound(&db, transport, login_id, channel)
-                .await
-                .unwrap_or(false)
+            // An unreadable *exposed* session is not proof the room is free.
+            let (conv, db) = self.open_session(&r.session_db_id).await?;
+            if transport_bindings(&db)
+                .await?
+                .iter()
+                .any(|(t, l, c)| t == transport && l == login_id && c == channel)
             {
-                return Ok(Some((conv, db)));
+                matches.push((conv, db));
             }
         }
-        Ok(None)
+        Ok(matches)
+    }
+
+    /// Explicit attach shares the inbound create lock: a room already bound
+    /// elsewhere refuses, rather than becoming a second route to its history.
+    pub async fn attach_conversational_channel_session(
+        &self,
+        agent: &DbEntry,
+        bridge_label: &str,
+        transport: &str,
+        login_id: &str,
+        channel: &str,
+        target_db: &Database,
+    ) -> anyhow::Result<()> {
+        let agent_db = self
+            .open_agent_db(&agent.db_id, None)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("owning agent DB not available"))?;
+        let lock = self
+            .channel_create_lock(&channel_key(transport, login_id, channel))
+            .await;
+        let _guard = lock.lock().await;
+        let session_lock = self
+            .channel_create_lock(&format!("session:{}", target_db.root_id()))
+            .await;
+        let _session_guard = session_lock.lock().await;
+        if let Some((_, existing)) = self
+            .find_channel_session_in(&agent_db, bridge_label, transport, login_id, channel)
+            .await?
+        {
+            anyhow::ensure!(
+                existing.root_id() == target_db.root_id(),
+                "room is already bound to session {}; detach first",
+                existing.root_id()
+            );
+        }
+        bind_conversational_transport(target_db, transport, login_id, channel).await?;
+        self.ensure_session_host(&target_db.root_id().to_string(), agent)
+            .await?;
+        self.publish_channel_session(&agent_db, target_db.root_id(), bridge_label)
+            .await
+    }
+
+    /// Remove exactly this channel, even from a legacy multi-bound session.
+    /// A room bound to multiple sessions requires an exact DB ID, never a name
+    /// or registry-order winner. Returns the removed session ID, if present.
+    pub async fn detach_channel_session(
+        &self,
+        agent: &DbEntry,
+        bridge_label: &str,
+        transport: &str,
+        login_id: &str,
+        channel: &str,
+        session_db_id: Option<&str>,
+    ) -> anyhow::Result<Option<String>> {
+        let agent_db = self
+            .open_agent_db(&agent.db_id, None)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("owning agent DB not available"))?;
+        let lock = self
+            .channel_create_lock(&channel_key(transport, login_id, channel))
+            .await;
+        let _guard = lock.lock().await;
+        let mut matches = self
+            .channel_sessions_in(&agent_db, bridge_label, transport, login_id, channel)
+            .await?;
+        let selected = if let Some(id) = session_db_id {
+            Some(
+                matches
+                    .iter()
+                    .position(|(_, db)| db.root_id().to_string() == id)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("session {id} is not bound to this room on this login")
+                    })?,
+            )
+        } else {
+            anyhow::ensure!(
+                matches.len() <= 1,
+                "channel is bound to multiple sessions: {}; use !chaz detach <exact-session-db-id> in this room",
+                matches
+                    .iter()
+                    .map(|(_, db)| db.root_id().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            (!matches.is_empty()).then_some(0)
+        };
+        let Some(index) = selected else {
+            return Ok(None);
+        };
+        let (_, db) = matches.swap_remove(index);
+        let sid = db.root_id().to_string();
+        let session_lock = self.channel_create_lock(&format!("session:{sid}")).await;
+        let _session_guard = session_lock.lock().await;
+        unbind_transport(&db, transport, login_id, channel).await?;
+        if !transport_bindings(&db)
+            .await?
+            .iter()
+            .any(|(_, login, _)| login == login_id)
+        {
+            agent_db.unexpose_session_from(&sid, bridge_label).await?;
+        }
+        Ok(Some(sid))
     }
 
     /// Strict workspace lookup: prove a unique binding across the agent's
@@ -722,13 +852,367 @@ mod tests {
                 .to_string(),
             "session has a different or conflicting external attachment; detach or migrate explicitly"
         );
-        assert_eq!(
+        assert!(
             unbind_transport(&db, "matrix", "@a:s", "!a:s")
                 .await
-                .unwrap_err()
-                .to_string(),
-            "conflicting legacy Matrix bindings; explicit migration required"
+                .unwrap()
         );
+    }
+
+    async fn legacy_bind(db: &Database, login: &str, room: &str) {
+        let txn = db.new_transaction().await.unwrap();
+        txn.get_store::<DocStore>(STORE_TRANSPORT_BINDINGS)
+            .await
+            .unwrap()
+            .set_string(channel_key("matrix", login, room), "matrix")
+            .await
+            .unwrap();
+        txn.commit().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn legacy_multi_room_lookup_refuses_without_creating_or_hiding_bindings() {
+        let (_inst, reg) = make_registry().await;
+        let agent = make_agent_entry(&reg, "chaz").await;
+        let login = "@chaz:example.com";
+        let (_, db) = reg
+            .get_or_create_channel_session(&agent, login, "matrix", login, "!one:example.com")
+            .await
+            .unwrap();
+        legacy_bind(&db, login, "!two:example.com").await;
+        let agent_db = reg
+            .open_agent_db(&agent.db_id, None)
+            .await
+            .unwrap()
+            .unwrap();
+        let before = agent_db.list_session_refs().await.unwrap();
+        assert_eq!(transport_bindings(&db).await.unwrap().len(), 2);
+        for room in ["!one:example.com", "!two:example.com"] {
+            assert!(
+                reg.find_channel_session(&agent, login, "matrix", login, room)
+                    .await
+                    .is_err(),
+                "legacy ambiguity must not be reported as an absent binding"
+            );
+            assert!(
+                reg.get_or_create_conversational_channel_session(
+                    &agent, login, "matrix", login, room,
+                )
+                .await
+                .is_err(),
+                "ambiguity must not mint a new session"
+            );
+        }
+        assert_eq!(
+            agent_db.list_session_refs().await.unwrap().len(),
+            before.len()
+        );
+        assert_eq!(transport_bindings(&db).await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn duplicate_room_lookup_refuses_without_registry_order_winner_or_creation() {
+        let (_inst, reg) = make_registry().await;
+        let agent = make_agent_entry(&reg, "chaz").await;
+        let login = "@chaz:example.com";
+        let room = "!one:example.com";
+        let (_, first) = reg
+            .get_or_create_channel_session(&agent, login, "matrix", login, room)
+            .await
+            .unwrap();
+        let (_, second) = reg.create_session(Some("legacy-duplicate")).await.unwrap();
+        legacy_bind(&second, login, room).await;
+        reg.ensure_session_host(&second.root_id().to_string(), &agent)
+            .await
+            .unwrap();
+        let agent_db = reg
+            .open_agent_db(&agent.db_id, None)
+            .await
+            .unwrap()
+            .unwrap();
+        agent_db
+            .expose_session_on(&second.root_id().to_string(), login)
+            .await
+            .unwrap();
+        let error = reg
+            .find_channel_session(&agent, login, "matrix", login, room)
+            .await
+            .expect_err("must not choose by registry order")
+            .to_string();
+        assert!(error.contains(&first.root_id().to_string()), "{error}");
+        assert!(error.contains(&second.root_id().to_string()), "{error}");
+        assert!(
+            reg.get_or_create_channel_session(&agent, login, "matrix", login, room)
+                .await
+                .is_err()
+        );
+        assert_eq!(agent_db.list_session_refs().await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn legacy_unbind_reduces_ambiguity_and_preserves_remaining_history() {
+        let (_inst, reg) = make_registry().await;
+        let (conv, db) = reg.create_session(Some("legacy")).await.unwrap();
+        let mut session = super::super::Session::new(conv.clone(), db.clone()).await;
+        session
+            .add_entry(super::super::SessionEntry::new_bridge_event(
+                "human",
+                super::super::BridgeEventRole::Observation,
+                "retained history",
+                None,
+            ))
+            .await
+            .unwrap();
+        legacy_bind(&db, "@bot:example.com", "!one:example.com").await;
+        legacy_bind(&db, "@bot:example.com", "!two:example.com").await;
+        assert!(
+            unbind_transport(&db, "matrix", "@bot:example.com", "!two:example.com")
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            session_attachment(&db).await.unwrap().unwrap().channel,
+            "!one:example.com"
+        );
+        let reloaded = super::super::Session::new(conv, db).await;
+        assert!(
+            reloaded
+                .entries()
+                .iter()
+                .any(|e| e.bridge_body().as_deref() == Some("retained history"))
+        );
+    }
+
+    #[tokio::test]
+    async fn attach_refuses_bound_room_and_repeated_exact_attach_is_safe() {
+        let (_inst, reg) = make_registry_with_sync().await;
+        let agent = make_agent_entry(&reg, "chaz").await;
+        let login = "@bot:example.com";
+        let room = "!one:example.com";
+        let (_, first) = reg
+            .get_or_create_conversational_channel_session(&agent, login, "matrix", login, room)
+            .await
+            .unwrap();
+        let (_, target) = reg.create_session(Some("local")).await.unwrap();
+        let error = reg
+            .attach_conversational_channel_session(&agent, login, "matrix", login, room, &target)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("detach first"), "{error}");
+        assert!(transport_bindings(&target).await.unwrap().is_empty());
+        for _ in 0..2 {
+            reg.attach_conversational_channel_session(&agent, login, "matrix", login, room, &first)
+                .await
+                .unwrap();
+        }
+        assert_eq!(transport_bindings(&first).await.unwrap().len(), 1);
+        assert_eq!(
+            reg.find_channel_session(&agent, login, "matrix", login, room)
+                .await
+                .unwrap()
+                .unwrap()
+                .1
+                .root_id(),
+            first.root_id()
+        );
+        // No two concurrent rooms can claim the same previously local session.
+        let (one, two) = tokio::join!(
+            reg.attach_conversational_channel_session(
+                &agent,
+                login,
+                "matrix",
+                login,
+                "!two:example.com",
+                &target
+            ),
+            reg.attach_conversational_channel_session(
+                &agent,
+                login,
+                "matrix",
+                login,
+                "!three:example.com",
+                &target
+            ),
+        );
+        assert_ne!(one.is_ok(), two.is_ok());
+        assert_eq!(transport_bindings(&target).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn explicit_legacy_detach_preserves_sibling_exposure_and_exact_identity() {
+        let (_inst, reg) = make_registry_with_sync().await;
+        let agent = make_agent_entry(&reg, "chaz").await;
+        let login = "@bot:example.com";
+        let one = "!one:example.com";
+        let two = "!two:example.com";
+        let (_, original) = reg
+            .get_or_create_channel_session(&agent, login, "matrix", login, one)
+            .await
+            .unwrap();
+        legacy_bind(&original, login, two).await;
+        let sid = original.root_id().to_string();
+        let agent_db = reg
+            .open_agent_db(&agent.db_id, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            reg.detach_channel_session(&agent, login, "matrix", login, two, None)
+                .await
+                .unwrap(),
+            Some(sid.clone())
+        );
+        assert_eq!(
+            agent_db
+                .find_session_ref(&sid)
+                .await
+                .unwrap()
+                .unwrap()
+                .exposed_on,
+            [login]
+        );
+        assert_eq!(
+            reg.get_or_create_channel_session(&agent, login, "matrix", login, one)
+                .await
+                .unwrap()
+                .1
+                .root_id(),
+            original.root_id()
+        );
+        // Simulate a separate legacy session mapping to the *same* exact room.
+        let (_, duplicate) = reg.create_session(Some("legacy-duplicate")).await.unwrap();
+        legacy_bind(&duplicate, login, one).await;
+        reg.ensure_session_host(&duplicate.root_id().to_string(), &agent)
+            .await
+            .unwrap();
+        agent_db
+            .expose_session_on(&duplicate.root_id().to_string(), login)
+            .await
+            .unwrap();
+        assert!(
+            reg.detach_channel_session(&agent, login, "matrix", login, one, None)
+                .await
+                .is_err()
+        );
+        assert!(
+            reg.detach_channel_session(&agent, login, "matrix", login, one, Some("wrong-id"))
+                .await
+                .is_err()
+        );
+        assert_eq!(transport_bindings(&original).await.unwrap().len(), 1);
+        let duplicate_sid = duplicate.root_id().to_string();
+        assert_eq!(
+            reg.detach_channel_session(&agent, login, "matrix", login, one, Some(&duplicate_sid))
+                .await
+                .unwrap(),
+            Some(duplicate_sid.clone())
+        );
+        assert!(
+            agent_db
+                .find_session_ref(&duplicate_sid)
+                .await
+                .unwrap()
+                .unwrap()
+                .exposed_on
+                .is_empty()
+        );
+        assert_eq!(
+            reg.find_channel_session(&agent, login, "matrix", login, one)
+                .await
+                .unwrap()
+                .unwrap()
+                .1
+                .root_id(),
+            original.root_id()
+        );
+        assert_eq!(agent_db.list_session_refs().await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn detach_propagates_write_errors_instead_of_claiming_success() {
+        use eidetica::auth::types::{AuthKey, Permission};
+        let (_inst, reg) = make_registry().await;
+        let (_, db) = reg.create_session(Some("read-only")).await.unwrap();
+        legacy_bind(&db, "@bot:example.com", "!one:example.com").await;
+        let reader_key = reg
+            .user
+            .lock()
+            .await
+            .add_private_key(Some("reader"))
+            .await
+            .unwrap();
+        let txn = db.new_transaction().await.unwrap();
+        txn.get_settings()
+            .unwrap()
+            .set_auth_key(
+                &reader_key,
+                AuthKey::active(Some("reader"), Permission::Read),
+            )
+            .await
+            .unwrap();
+        txn.commit().await.unwrap();
+        let private = reg.user.lock().await.get_signing_key(&reader_key).unwrap();
+        let (identity, _) = Database::find_sigkeys(reg.instance(), db.root_id(), &reader_key)
+            .await
+            .unwrap()
+            .remove(0);
+        let reader = db
+            .clone()
+            .with_key(eidetica::database::DatabaseKey::with_identity(
+                private, identity,
+            ));
+        assert!(
+            unbind_transport(&reader, "matrix", "@bot:example.com", "!one:example.com")
+                .await
+                .is_err()
+        );
+        assert_eq!(transport_bindings(&db).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn unexposed_unreadable_local_sessions_do_not_block_bridge_routing() {
+        let (_inst, reg) = make_registry().await;
+        let agent = make_agent_entry(&reg, "chaz").await;
+        let (_foreign, _user, local_only) = test_session_db().await;
+        let agent_db = reg
+            .open_agent_db(&agent.db_id, None)
+            .await
+            .unwrap()
+            .unwrap();
+        let local_id = local_only.root_id().to_string();
+        agent_db
+            .register_session_ref(crate::agent_db::SessionRef {
+                session_db_id: local_id.clone(),
+                exposed_on: vec![],
+            })
+            .await
+            .unwrap();
+        let login = "@bot:example.com";
+        let room = "!one:example.com";
+        let (_, db) = reg
+            .get_or_create_channel_session(&agent, login, "matrix", login, room)
+            .await
+            .unwrap();
+        assert_ne!(db.root_id(), local_only.root_id());
+        assert_eq!(
+            reg.find_channel_session(&agent, login, "matrix", login, room)
+                .await
+                .unwrap()
+                .unwrap()
+                .1
+                .root_id(),
+            db.root_id()
+        );
+        // In contrast, an unreadable exposed session must fail closed, not be
+        // treated as absence followed by another implicit channel creation.
+        agent_db.expose_session_on(&local_id, login).await.unwrap();
+        assert!(
+            reg.get_or_create_channel_session(&agent, login, "matrix", login, "!two:example.com")
+                .await
+                .is_err()
+        );
+        assert_eq!(agent_db.list_session_refs().await.unwrap().len(), 2);
     }
 
     #[tokio::test]

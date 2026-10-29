@@ -290,25 +290,25 @@ Commands are sent as Matrix messages. Session ops go through the same transport-
 
 ### Session
 
-| Command                      | Description                                                                                  |
-| ---------------------------- | -------------------------------------------------------------------------------------------- |
-| `!chaz sessions`             | List every session known to the registry                                                     |
-| `!chaz info`                 | Show details for the session attached to this room                                           |
-| `!chaz name [<alias>]`       | Set (or clear, with no arg) a human-friendly alias                                           |
-| `!chaz description [<text>]` | Set (or clear, with no arg) a browse-only [session description](tui.md#session-descriptions) |
-| `!chaz attach <session>`     | Bind this room to a specific session (name or DB ID)                                         |
-| `!chaz detach`               | Detach this room from its session                                                            |
-| `!chaz participation on`     | Enable agent-selected replies for this group room after executor confirmation                |
-| `!chaz participation status` | Report whether this login and room are confirmed enabled                                     |
-| `!chaz participation off`    | Disable participation in this room                                                           |
-| `!chaz channels`             | List transport channels attached to this session                                             |
-| `!chaz share`                | Generate a shareable ticket URL for this session                                             |
-| `!chaz unshare`              | Stop sharing the current session                                                             |
-| `!chaz sync <ticket>`        | Sync a remote session via ticket URL                                                         |
-| `!chaz compact`              | Summarize and compact conversation history                                                   |
-| `!chaz context`              | Context-window usage for this room's agent                                                   |
-| `!chaz print`                | Print the current conversation context                                                       |
-| `!chaz stop`                 | Stop the turn running in this session ([details](tui.md#stopping-a-running-turn))            |
+| Command                          | Description                                                                                  |
+| -------------------------------- | -------------------------------------------------------------------------------------------- |
+| `!chaz sessions`                 | List every session known to the registry                                                     |
+| `!chaz info`                     | Show details for the session attached to this room                                           |
+| `!chaz name [<alias>]`           | Set (or clear, with no arg) a human-friendly alias                                           |
+| `!chaz description [<text>]`     | Set (or clear, with no arg) a browse-only [session description](tui.md#session-descriptions) |
+| `!chaz attach <session>`         | Bind a free room to a free session (name or DB ID); exact retries are safe                   |
+| `!chaz detach [<session-db-id>]` | Remove this room's binding; an ambiguous room requires the exact session DB ID               |
+| `!chaz participation on`         | Enable agent-selected replies for this group room after executor confirmation                |
+| `!chaz participation status`     | Report whether this login and room are confirmed enabled                                     |
+| `!chaz participation off`        | Disable participation in this room                                                           |
+| `!chaz channels`                 | List transport channels attached to this session                                             |
+| `!chaz share`                    | Generate a shareable ticket URL for this session                                             |
+| `!chaz unshare`                  | Stop sharing the current session                                                             |
+| `!chaz sync <ticket>`            | Sync a remote session via ticket URL                                                         |
+| `!chaz compact`                  | Summarize and compact conversation history                                                   |
+| `!chaz context`                  | Context-window usage for this room's agent                                                   |
+| `!chaz print`                    | Print the current conversation context                                                       |
+| `!chaz stop`                     | Stop the turn running in this session ([details](tui.md#stopping-a-running-turn))            |
 
 ### Living Agents
 
@@ -361,14 +361,30 @@ Only the login's configured `workspace_manager` may run these; see
 
 ## Attached rooms and reply routing
 
-A session can attach **at most one Matrix `(login, room)`**. It is still the
-same session in the TUI; selecting it there does not change the Matrix room or
-make it the TUI's default. `!chaz attach <session>` refuses a second Matrix
-room or login until the existing room is detached. An older session with
-conflicting bindings fails closed: detach or explicitly migrate its bindings,
-not a silent redirect. `!chaz detach` removes this room's binding; the next
-addressed message there creates a fresh session. Non-Matrix transport bindings
-are separate.
+A session has **at most one external attachment**, identified by exact
+`(transport, login, channel)`. Each such channel belongs to at most one session
+in the owning agent's exposed registry. TUI and CLI are local clients, not extra
+attachments; selecting a session there does not change its Matrix room.
+
+`!chaz attach <session>` refuses if this room already belongs to a different
+session: detach first. It also refuses if the target session already has a
+different attachment, including another transport. Repeating an attach to the
+same session and room is safe. Attach does not copy history, replay local
+finals, or redirect queued sends from another room.
+
+Legacy conflicts fail closed in both directions: neither multiple rooms on one
+session nor multiple sessions on one room gets an arbitrary winner. Inbound
+lookup does not create a replacement session, and delivery and approval posts
+stop until the binding is unambiguous. There is no automatic split or migration.
+
+Use `!chaz detach` **in the room being removed**. It removes only that exact
+login/room binding and stops its delivery and approval observers without a
+bridge restart. Any remaining binding retains the original session, history
+and required login exposure. The detached room's next addressed message can
+create a fresh session. If the room itself belongs to multiple sessions, the
+error lists their DB IDs: use `!chaz detach <exact-session-db-id>` to remove
+one explicitly. Names and guessed IDs cannot disambiguate it. Errors are
+reported rather than claiming detach succeeded.
 
 | Action                                     | Effect                                                                                                       |
 | ------------------------------------------ | ------------------------------------------------------------------------------------------------------------ |
@@ -406,6 +422,35 @@ that agent to produce a local final; burst limits still apply. The model-facing
 local turns, to keep the tool list stable; non-Matrix-origin finals never auto-post.
 A model without tool-calling support cannot safely choose `no_reply` and is
 rejected for a Matrix-bound turn rather than silently posting a fallback answer.
+
+### Recovering a legacy binding
+
+1. If a session was bound to two rooms, choose which room to keep. In the
+   other room, send `!chaz detach`:
+
+   ```text
+   Room detached. Future messages will create a fresh session.
+   ```
+
+   The remaining room still uses the original session and transcript. Nothing
+   is copied to the removed room, and pending output to it stops in-process.
+
+2. If a single room instead belongs to two sessions, bare detach refuses. The
+   response names the exact IDs (shown here as `<A>` and `<B>`):
+
+   ```text
+   !chaz Error: channel is bound to multiple sessions: <A>, <B>; use !chaz detach <exact-session-db-id> in this room
+   ```
+
+   Send `!chaz detach <A>` in that room, substituting the complete unwanted
+   session DB ID. Session `<B>` and its history remain untouched. A wrong ID
+   gives `!chaz Error: session <id> is not bound to this room on this login`;
+   it does not remove another binding.
+
+3. Once the remaining mapping is unique, detach reinstalls any delivery
+   observers that startup refused. Queued output resumes to its original room
+   without a new inbound message or a restart. Attaching a different session
+   is a separate explicit action, not a move or history merge.
 
 ## Migration: schedules no longer auto-post finals
 
@@ -468,9 +513,12 @@ Example in an allowlisted group room:
    the room receives that explicit post from its Matrix login, while the
    session shows the addressed event as pending, then sent. A later normal
    final on that turn remains **local** and does not produce a second room post.
-3. A second room tries `!chaz attach <session>` and receives
-   `!chaz Error: failed to bind room: session has a different or conflicting external attachment; detach or migrate explicitly`.
-   Detach the old room first if moving the handle is intentional; an old
+3. A room already bound to another session tries `!chaz attach <session>` and
+   receives `!chaz Error: failed to bind room: room is already bound to session <room-session-db-id>; detach first`.
+   Detach this room first if replacing its binding is intentional. If the
+   target session still has another attachment, attach also refuses with
+   `session has a different or conflicting external attachment; detach or migrate explicitly`.
+   Detach the old room explicitly before attaching the free target. An old
    queued send is not rerouted to the new room.
 4. `@you:example` sends `!chaz participation on` and sees
    `Matrix participation: on` only after executor confirmation. A bare

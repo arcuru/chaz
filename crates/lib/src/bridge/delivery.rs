@@ -327,8 +327,8 @@ impl DeliveryReconciler {
         &self.binding
     }
 
-    /// Cancel any pending durable retry. Session writes still reach this
-    /// reconciler until its database handle's instance is dropped.
+    /// Stop delivery and cancel durable retries. Later session callbacks or
+    /// explicit passes cannot restart this reconciler.
     pub fn stop(&self) {
         self.stop.send_replace(true);
     }
@@ -384,6 +384,9 @@ impl DeliveryReconciler {
     /// converged; `Ok(false)` when a send failed and the tail remains.
     async fn reconcile_once(&self) -> anyhow::Result<bool> {
         let mut state = self.state.lock().await;
+        if *self.stop.borrow() {
+            return Ok(true);
+        }
         anyhow::ensure!(
             crate::session::transport_bindings(&self.session_db)
                 .await?
@@ -496,6 +499,9 @@ impl DeliveryReconciler {
             };
             let total = chunks.len();
             for (index, body) in chunks.into_iter().enumerate().skip(start) {
+                if *self.stop.borrow() {
+                    return Ok(true);
+                }
                 let chunk = OutboundChunk {
                     body,
                     idempotency_key: self.binding.idempotency_key(id.as_str(), index),
@@ -952,6 +958,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stopped_reconciler_cannot_be_revived_by_writes_or_manual_passes() {
+        let fx = fixture().await;
+        let wire = Arc::new(Transport::default());
+        let reconciler = attach(&fx, "room", &wire, one_chunk).await;
+        reconciler.stop();
+        write(&fx.session_db, "default", "after stop").await;
+        reconciler.run_pass().await;
+        assert_eq!(wire.attempts.load(Ordering::SeqCst), 0);
+        let replacement = attach(&fx, "room", &wire, one_chunk).await;
+        assert_eq!(wire.bodies().await, ["after stop"]);
+        replacement.stop();
+    }
+
+    #[tokio::test]
     async fn a_response_committed_while_offline_delivers_on_reattach() {
         let fx = fixture().await;
         write(&fx.session_db, "user", "hello").await;
@@ -1065,7 +1085,6 @@ mod tests {
         let transport = Arc::new(Transport::default());
         transport.fail.lock().await.insert("second".into());
         let reconciler = attach(&fx, "room", &transport, pipe_chunks).await;
-        reconciler.stop(); // no timer retry: the restart is what resumes
         let id = write(&fx.session_db, "default", "first|second|third").await;
         wait_until("first chunk", async || !transport.bodies().await.is_empty()).await;
         // Let the failing second chunk settle before inspecting the record.
@@ -1080,6 +1099,7 @@ mod tests {
             Some(&DeliveryMark::Chunks(1))
         );
         let first_key = transport.sent.lock().await[0].idempotency_key.clone();
+        reconciler.stop();
         drop(reconciler);
 
         // A fresh process resumes at the failed chunk, never the prefix.
@@ -1143,7 +1163,6 @@ mod tests {
         let matrix_side = attach(&fx, "matrix-room", &matrix, one_chunk).await;
         let discord_side = attach(&fx, "discord-channel", &discord, one_chunk).await;
         discord.fail.lock().await.insert("fan out".into());
-        discord_side.stop();
 
         write(&fx.session_db, "default", "fan out").await;
         wait_until("matrix delivery", async || {
@@ -1168,6 +1187,7 @@ mod tests {
         assert!(discord_progress.entries.is_empty());
 
         // The Discord side recovers on its own once its transport does.
+        discord_side.stop();
         discord.fail.lock().await.clear();
         drop(discord_side);
         let discord_side = attach(&fx, "discord-channel", &discord, one_chunk).await;

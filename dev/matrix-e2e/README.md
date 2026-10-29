@@ -90,7 +90,12 @@ persistence and reconnection:
   messages in the same room. A fourth message is sent and the reply is
   asserted.
 
-Both cases use `replies_at_least <n>` rather than `reply_arrived`, because
+The attachment lifecycle case explicitly detaches the DM and reattaches its
+original session twice. It checks exact-ID errors, no model wake or historical
+output replay, and a new addressed reply after reattachment. Synthetic Rust
+fixtures separately cover ambiguous legacy data without touching live stores.
+
+Both restart cases use `replies_at_least <n>` rather than `reply_arrived`, because
 `reply_arrived` checks `length > 0` and would pass instantly on the first
 reply without testing the restart.
 

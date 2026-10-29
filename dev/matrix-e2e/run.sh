@@ -1463,6 +1463,44 @@ assert probes[1]["tails"] == [], probes
 print("PASS — Matrix /context: exact shown snapshot delivered once; no command-triggered model call")
 PY
 
+# Explicit detach/attach is administrative: no implicit session creation,
+# historical output replay or model turn, and an exact retry is idempotent.
+log "attachment lifecycle: detach and reattach the original session"
+ATTACH_TURNS_BEFORE="$(stub_requests)"
+attachment_outbound_count() {
+    mx GET "/_matrix/client/v3/rooms/$ROOM_URI/messages?dir=b&limit=200" "$PUPPET_TOKEN" |
+        jq --arg a "$AGENT_MXID" --arg m "$MARKER" \
+        '[.chunk[] | select(.sender == $a and (.content.body // "" | contains($m)))] | length'
+}
+ATTACH_OUTBOUND_BEFORE="$(attachment_outbound_count)"
+attachment_notice() {
+    mx GET "/_matrix/client/v3/rooms/$ROOM_URI/messages?dir=b&limit=200" "$PUPPET_TOKEN" |
+        jq -e --arg a "$AGENT_MXID" --arg text "$1" --argjson n "${2:-1}" \
+        '[.chunk[] | select(.sender == $a and .content.body == $text)] | length >= $n'
+}
+attachment_command() {
+    local txn="e2e-$(date +%s%N)"
+    mx PUT "/_matrix/client/v3/rooms/$ROOM_URI/send/m.room.message/$txn" \
+        "$PUPPET_TOKEN" "$(jq -nc --arg b "$1" '{msgtype:"m.text",body:$b}')" >/dev/null
+}
+attachment_command '!chaz detach wrong-id'
+wait_for "exact-ID detach error" "$REPLY_TIMEOUT" attachment_notice \
+    '!chaz Error: session wrong-id is not bound to this room on this login'
+attachment_command '!chaz detach'
+wait_for "explicit detach acknowledgement" "$REPLY_TIMEOUT" attachment_notice \
+    'Room detached. Future messages will create a fresh session.'
+for n in 1 2; do
+    attachment_command "!chaz attach $DM_SESSION_ID"
+    wait_for "idempotent original-session attach $n" "$REPLY_TIMEOUT" attachment_notice \
+        "Attached this room to session $DM_SESSION_ID." "$n"
+done
+[[ "$(stub_requests)" -eq "$ATTACH_TURNS_BEFORE" ]] || fail "attach/detach woke a model"
+POST_ATTACH_OUTBOUND="$(attachment_outbound_count)"
+[[ "$POST_ATTACH_OUTBOUND" == "$ATTACH_OUTBOUND_BEFORE" ]] || fail "reattach replayed historical output"
+attachment_command 'addressed after explicit reattach'
+wait_for "new reply after reattach" "$REPLY_TIMEOUT" replies_at_least "$((ATTACH_OUTBOUND_BEFORE + 1))"
+printf '\033[1;32mPASS\033[0m — explicit detach/attach: exact-ID errors, original session reused, repeated attach safe, no replay/model wake, new addressed reply delivered\n' >&2
+
 # -------------------------------------------------------- invite + forget ---
 # Stop the auto-joiner before creating the invite. Reuse this homeserver and
 # the bridge's token for independent membership/history checks.
