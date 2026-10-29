@@ -2366,7 +2366,9 @@ pub(crate) async fn read_session_name_from_db(
         .transpose()
 }
 
-/// Read the meta DocStore of a session DB. Returns default on any error.
+/// Read session metadata leniently from one meta DocStore view.
+/// Store read errors return default metadata; absent or malformed fields
+/// fall back individually without discarding other valid fields.
 pub async fn read_meta_from_db(database: &Database) -> SessionMeta {
     let Ok(txn) = database.new_transaction().await else {
         return SessionMeta::default();
@@ -2375,56 +2377,54 @@ pub async fn read_meta_from_db(database: &Database) -> SessionMeta {
         return SessionMeta::default();
     };
 
-    let agents: Vec<AgentRef> = match store.get_string("agents").await {
-        Ok(json) => serde_json::from_str(&json).unwrap_or_else(|e| {
+    let Ok(doc) = store.get_all().await else {
+        return SessionMeta::default();
+    };
+    let text = |key: &str| -> Option<String> { doc.get(key).and_then(|v| v.try_into().ok()) };
+
+    let agents: Vec<AgentRef> = match text("agents") {
+        Some(json) => serde_json::from_str(&json).unwrap_or_else(|e| {
             warn!("Malformed agents list in SessionMeta, ignoring: {e}");
             Vec::new()
         }),
-        Err(_) => Vec::new(),
+        None => Vec::new(),
     };
 
-    let agent_models: HashMap<String, String> = match store.get_string("agent_models").await {
-        Ok(json) => serde_json::from_str(&json).unwrap_or_else(|e| {
+    let agent_models: HashMap<String, String> = match text("agent_models") {
+        Some(json) => serde_json::from_str(&json).unwrap_or_else(|e| {
             warn!("Malformed agent_models map in SessionMeta, ignoring: {e}");
             HashMap::new()
         }),
-        Err(_) => HashMap::new(),
+        None => HashMap::new(),
     };
 
-    let burst_budget_override: Option<usize> = match store.get_string("burst_budget_override").await
-    {
-        Ok(s) => s.parse().ok(),
-        Err(_) => None,
-    };
+    let burst_budget_override = text("burst_budget_override").and_then(|s| s.parse().ok());
 
-    let capabilities: crate::grants::Grants = match store.get_string("capabilities").await {
-        Ok(json) => serde_json::from_str(&json).unwrap_or_else(|e| {
+    let capabilities: crate::grants::Grants = match text("capabilities") {
+        Some(json) => serde_json::from_str(&json).unwrap_or_else(|e| {
             warn!("Malformed capabilities in SessionMeta, ignoring: {e}");
             Default::default()
         }),
-        Err(_) => Default::default(),
+        None => Default::default(),
     };
 
-    let ambient_raw = match store.get_string("bridge_ambient_v1").await {
-        Ok(value) => Some(value),
-        Err(_) => store.get_string("matrix_ambient_v1").await.ok(),
-    };
+    let ambient_raw = text("bridge_ambient_v1").or_else(|| text("matrix_ambient_v1"));
     let ambient_participation = ambient_raw.and_then(|json| serde_json::from_str(&json).ok());
 
     SessionMeta {
         ambient_participation,
-        name: store.get_string("name").await.ok(),
-        description: store.get_string("description").await.ok(),
-        agent_name: store.get_string("agent_name").await.ok(),
+        name: text("name"),
+        description: text("description"),
+        agent_name: text("agent_name"),
         agents,
-        host_agent_db_id: store.get_string("host_agent_db_id").await.ok(),
-        model: store.get_string("model").await.ok(),
+        host_agent_db_id: text("host_agent_db_id"),
+        model: text("model"),
         agent_models,
-        role_name: store.get_string("role_name").await.ok(),
-        role_prompt: store.get_string("role_prompt").await.ok(),
-        backend_name: store.get_string("backend_name").await.ok(),
-        backend_url: store.get_string("backend_url").await.ok(),
-        backend_key_ref: store.get_string("backend_key_ref").await.ok(),
+        role_name: text("role_name"),
+        role_prompt: text("role_prompt"),
+        backend_name: text("backend_name"),
+        backend_url: text("backend_url"),
+        backend_key_ref: text("backend_key_ref"),
         burst_budget_override,
         capabilities,
     }
@@ -2846,6 +2846,114 @@ mod tests {
 
     use super::test_helpers::*;
     use super::*;
+
+    #[tokio::test]
+    async fn lenient_meta_defaults_malformed_fields_and_preserves_warnings() {
+        use tracing::instrument::WithSubscriber;
+
+        #[derive(Clone, Default)]
+        struct Warnings(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+        impl tracing::field::Visit for Warnings {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                if field.name() == "message" {
+                    self.0.lock().unwrap().push(format!("{value:?}"));
+                }
+            }
+        }
+        impl tracing::Subscriber for Warnings {
+            fn enabled(&self, meta: &tracing::Metadata<'_>) -> bool {
+                *meta.level() == tracing::Level::WARN
+            }
+            fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+                tracing::span::Id::from_u64(1)
+            }
+            fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+            fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+            fn event(&self, event: &tracing::Event<'_>) {
+                event.record(&mut self.clone());
+            }
+            fn enter(&self, _: &tracing::span::Id) {}
+            fn exit(&self, _: &tracing::span::Id) {}
+        }
+
+        let (_instance, _user, db) = test_session_db().await;
+        assert_eq!(
+            serde_json::to_value(read_meta_from_db(&db).await).unwrap(),
+            serde_json::to_value(SessionMeta::default()).unwrap()
+        );
+        let txn = db.new_transaction().await.unwrap();
+        let store = txn.get_store::<DocStore>(META_STORE).await.unwrap();
+        for key in [
+            "agents",
+            "agent_models",
+            "capabilities",
+            "burst_budget_override",
+            "bridge_ambient_v1",
+        ] {
+            store.set_string(key, "not-json").await.unwrap();
+        }
+        store.set_string("model", "keep-good-fields").await.unwrap();
+        store.set("name", 42).await.unwrap();
+        txn.commit().await.unwrap();
+        let warnings = Warnings::default();
+        let meta = read_meta_from_db(&db)
+            .with_subscriber(warnings.clone())
+            .await;
+        let expected = SessionMeta {
+            model: Some("keep-good-fields".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            serde_json::to_value(meta).unwrap(),
+            serde_json::to_value(expected).unwrap()
+        );
+        let messages = warnings.0.lock().unwrap();
+        for field in ["agents list", "agent_models map", "capabilities"] {
+            assert!(
+                messages.iter().any(|message| message
+                    .contains(&format!("Malformed {field} in SessionMeta, ignoring:"))),
+                "missing warning for {field}: {messages:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn lenient_meta_preserves_ambient_key_precedence() {
+        use eidetica::crdt::doc::Value;
+
+        let (_instance, _user, db) = test_session_db().await;
+        let legacy = AmbientParticipation {
+            transport: "matrix".into(),
+            login_id: "@bot:example".into(),
+            channel: "!legacy:example".into(),
+            generation: "legacy-generation".into(),
+        };
+        let current = AmbientParticipation::new_for("discord", "bot", "channel");
+        for (primary, expected) in [
+            (None, Some(legacy.clone())),
+            (Some(Value::from(42)), Some(legacy.clone())),
+            (Some(Value::from("not-json")), None),
+            (
+                Some(Value::from(serde_json::to_string(&current).unwrap())),
+                Some(current),
+            ),
+        ] {
+            let txn = db.new_transaction().await.unwrap();
+            let store = txn.get_store::<DocStore>(META_STORE).await.unwrap();
+            store
+                .set_string(
+                    "matrix_ambient_v1",
+                    r#"{"login_id":"@bot:example","room_id":"!legacy:example","generation":"legacy-generation"}"#,
+                )
+                .await
+                .unwrap();
+            if let Some(primary) = primary {
+                store.set("bridge_ambient_v1", primary).await.unwrap();
+            }
+            txn.commit().await.unwrap();
+            assert_eq!(read_meta_from_db(&db).await.ambient_participation, expected);
+        }
+    }
 
     #[tokio::test]
     async fn fallible_meta_distinguishes_absence_and_rejects_mutation_after_read_failure() {
