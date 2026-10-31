@@ -129,7 +129,66 @@ pub enum LlmError {
     },
 }
 
+/// Longest provider error-body excerpt kept in an error message.
+pub(crate) const PROVIDER_EXCERPT_CHARS: usize = 500;
+
+/// A bounded, single-line excerpt of a provider error body for diagnostics.
+/// Control characters and whitespace runs collapse to one space so a body
+/// cannot forge extra log lines.
+pub(crate) fn provider_excerpt(body: &str) -> String {
+    let flat = body
+        .split(|c: char| c.is_whitespace() || c.is_control())
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let total = flat.chars().count();
+    if total == 0 {
+        return "(empty)".into();
+    }
+    if total <= PROVIDER_EXCERPT_CHARS {
+        return flat;
+    }
+    let kept: String = flat.chars().take(PROVIDER_EXCERPT_CHARS).collect();
+    format!("{kept}… ({} more chars)", total - PROVIDER_EXCERPT_CHARS)
+}
+
 impl LlmError {
+    /// Replace every occurrence of `secret` in this error's message, so a
+    /// provider echoing the request credential cannot leak it onward.
+    pub(crate) fn redact_secret(self, secret: &str) -> Self {
+        if secret.is_empty() {
+            return self;
+        }
+        let clean = |message: String| message.replace(secret, "[redacted]");
+        match self {
+            LlmError::RateLimited {
+                retry_after_duration,
+                message,
+            } => LlmError::RateLimited {
+                retry_after_duration,
+                message: clean(message),
+            },
+            LlmError::ServerError { status, message } => LlmError::ServerError {
+                status,
+                message: clean(message),
+            },
+            LlmError::AuthFailed { status, message } => LlmError::AuthFailed {
+                status,
+                message: clean(message),
+            },
+            LlmError::InsufficientCredits { message } => LlmError::InsufficientCredits {
+                message: clean(message),
+            },
+            LlmError::InvalidRequest { message } => LlmError::InvalidRequest {
+                message: clean(message),
+            },
+            LlmError::NetworkError { message } => LlmError::NetworkError {
+                message: clean(message),
+            },
+            other => other,
+        }
+    }
+
     /// Whether this error is transient and the request should be retried.
     pub fn is_retryable(&self) -> bool {
         matches!(
@@ -280,8 +339,13 @@ impl LlmError {
                 if let Some(classified) = classify_error_body(raw_body) {
                     return classified;
                 }
+                // Not an OpenAI-style envelope (e.g. a bare 422 from a proxy).
+                // Keep the provider's own words rather than only the parser's.
                 LlmError::InvalidRequest {
-                    message: format!("Response deserialize error: {e}"),
+                    message: format!(
+                        "Response deserialize error: {e}; provider body: {}",
+                        provider_excerpt(raw_body)
+                    ),
                 }
             }
             OpenAIError::InvalidArgument(ref message) => LlmError::InvalidRequest {
@@ -309,7 +373,12 @@ impl LlmError {
 /// Returns `None` if the body doesn't match either shape, so the caller can
 /// fall back to a generic InvalidRequest.
 fn classify_error_body(body: &str) -> Option<LlmError> {
-    let value: serde_json::Value = serde_json::from_str(body).ok()?;
+    classify_error_value(&serde_json::from_str(body).ok()?)
+}
+
+/// [`classify_error_body`] for an already-parsed body, such as an error
+/// envelope a provider returned with HTTP 200.
+pub(crate) fn classify_error_value(value: &serde_json::Value) -> Option<LlmError> {
     let err_obj = value.get("error")?;
 
     // Prefer the innermost upstream message when OpenRouter wraps it.
@@ -332,7 +401,7 @@ fn classify_error_body(body: &str) -> Option<LlmError> {
                 .and_then(|m| m.as_str())
                 .map(String::from)
         })
-        .unwrap_or_else(|| body.to_string());
+        .unwrap_or_else(|| provider_excerpt(&value.to_string()));
 
     // `code` can be an integer (OpenRouter: HTTP status) or a string (OpenAI: symbolic).
     let status_from_int = err_obj.get("code").and_then(|c| c.as_u64()).and_then(|n| {
@@ -594,6 +663,30 @@ mod tests {
         let err = classify_error_body(body).expect("should parse");
         assert!(err.is_retryable());
         assert!(matches!(err, LlmError::RateLimited { .. }));
+    }
+
+    #[test]
+    fn provider_excerpt_flattens_and_bounds() {
+        assert_eq!(provider_excerpt(""), "(empty)");
+        assert_eq!(provider_excerpt(" a\r\n\tb\u{1b}c "), "a b c");
+        let long = provider_excerpt(&"y".repeat(PROVIDER_EXCERPT_CHARS + 7));
+        assert!(long.ends_with("… (7 more chars)"), "{long}");
+        assert_eq!(
+            long.chars().filter(|c| *c == 'y').count(),
+            PROVIDER_EXCERPT_CHARS
+        );
+    }
+
+    #[test]
+    fn redact_secret_preserves_classification() {
+        let err =
+            LlmError::from_http_status(429, "key sk-1 throttled".into()).redact_secret("sk-1");
+        assert!(err.is_retryable());
+        assert_eq!(err.to_string(), "Rate limited: key [redacted] throttled");
+        let err = LlmError::InvalidRequest {
+            message: "sk-1".into(),
+        };
+        assert_eq!(err.redact_secret("").to_string(), "Invalid request: sk-1");
     }
 
     #[test]

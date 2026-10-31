@@ -15,6 +15,7 @@ name = "chaz_core"
 [dependencies]
 anyhow.workspace = true
 async-openai.workspace = true
+backoff.workspace = true
 base64.workspace = true
 blake3.workspace = true
 chrono.workspace = true

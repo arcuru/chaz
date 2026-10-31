@@ -1559,8 +1559,11 @@ fn render_tab_bar(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     let used = x.saturating_sub(area.x);
     let remaining = area.width.saturating_sub(used) as usize;
     if let Some(hint) = [
+        " Ctrl+T new · Ctrl+P sessions · Ctrl+S settings · Ctrl+H/L tabs · Ctrl+W close",
         " Ctrl+P sessions · Ctrl+S settings · Ctrl+H/L tabs · Ctrl+W close",
+        " Ctrl+T new · Ctrl+P sessions · Ctrl+S settings · Ctrl+W close",
         " Ctrl+P sessions · Ctrl+S settings · Ctrl+W close",
+        " Ctrl+T new · Ctrl+P sessions",
         " Ctrl+P sessions",
     ]
     .into_iter()
@@ -1939,8 +1942,9 @@ pub(super) fn ui_picker(f: &mut ratatui::Frame, app: &mut App) {
         let width = chunks[1].width as usize;
         let hint = [
             format!(
-                " ↑↓ select · Enter open · n new · r rename · s peer settings{back} · Ctrl+C quit"
+                " ↑↓ select · Enter open · n new / Ctrl+T · r rename · s peer settings{back} · Ctrl+C quit"
             ),
+            format!(" ↑↓ select · Enter open · n new · r rename · s peer settings{back} · Ctrl+C quit"),
             format!(" ↑↓ · Enter open · n new · r rename · s settings{back}"),
             format!(" Enter open · n new · s settings{back}"),
         ]

@@ -484,7 +484,7 @@ mod tests {
             Driver::start(session.database().clone(), Arc::new(Semaphore::new(100))).await;
         assert_eq!(old.sent.recv().await, Some(true));
         let tasks = Arc::new(std::sync::Mutex::new(vec![old.watcher.abort_handle()]));
-        let lifetime = super::super::TypingLifetime {
+        let lifetime = super::super::ChannelLifetime {
             stop: old.stop.clone(),
             tasks,
         };

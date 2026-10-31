@@ -68,6 +68,8 @@ pub struct SessionContextView {
     #[cfg(test)]
     pub(crate) read_volume: serde_json::Value,
     pub entry_ids: Vec<Option<TurnRequestId>>,
+    /// Current/retried and still-queued inputs, resolved at the same snapshot.
+    pub protected_inputs: HashSet<TurnRequestId>,
     pub entries: Vec<SessionEntry>,
     pub tool_history: Vec<Vec<TurnTranscriptRecord>>,
     pub contributions: Vec<crate::extension::durable_context::CommittedContribution>,
@@ -646,6 +648,8 @@ pub struct SessionCatalogEntry {
 pub struct Session {
     pub conversation_id: ConversationId,
     database: Database,
+    /// Actual key captured by the daemon at keyed-open, never inferred from SigKey.
+    signing_key: Option<eidetica::auth::crypto::PrivateKey>,
     entries: Vec<SessionEntry>,
     entry_ids: Vec<TurnRequestId>,
     /// Store name — "entries" for regular, "entries:{id}" for ephemeral
@@ -788,12 +792,57 @@ session_wire_enum! {
     }
 }
 
+/// Refresh only the signing binding, preserving the database root and read context.
+/// Native discovery/commit retain all permission and inherited-floor checks. A
+/// concurrent authority change may still reject the write; never replay it.
+/// Without a captured embedded signer, retain the already-bound native handle.
+pub(crate) async fn current_session_writer(
+    db: &Database,
+    key: Option<&eidetica::auth::crypto::PrivateKey>,
+) -> anyhow::Result<Database> {
+    let Some(key) = key else {
+        return Ok(db.clone());
+    };
+    let instance = db.instance()?;
+    let (identity, _) = Database::find_sigkeys(&instance, db.root_id(), &key.public_key())
+        .await?
+        .into_iter()
+        .find(|(_, permission)| permission.can_write())
+        .ok_or_else(|| anyhow::anyhow!("session signer has no current writable identity"))?;
+    Ok(db
+        .clone()
+        .with_key(eidetica::database::DatabaseKey::with_identity(
+            key.clone(),
+            identity,
+        )))
+}
+
 impl Session {
+    pub(crate) fn with_signing_key(
+        mut self,
+        key: Option<eidetica::auth::crypto::PrivateKey>,
+    ) -> Self {
+        self.signing_key = key;
+        self
+    }
+
+    /// Refresh a daemon writer without reloading its transcript/context snapshot.
+    pub(crate) async fn refresh_writer(&mut self) -> anyhow::Result<()> {
+        if let Some(key) = &self.signing_key {
+            self.database = current_session_writer(&self.database, Some(key)).await?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn signing_key(&self) -> Option<eidetica::auth::crypto::PrivateKey> {
+        self.signing_key.clone()
+    }
     /// Open a session, loading existing entries from its database.
     pub async fn new(conversation_id: ConversationId, database: Database) -> Self {
         let mut session = Session {
             conversation_id,
             database,
+            signing_key: None,
             entries: Vec::new(),
             entry_ids: Vec::new(),
             store_name: "entries".to_string(),
@@ -822,6 +871,7 @@ impl Session {
         Ok(Self {
             conversation_id,
             database,
+            signing_key: None,
             entries,
             entry_ids,
             store_name: "entries".into(),
@@ -1014,6 +1064,41 @@ impl Session {
         Ok(entries)
     }
 
+    /// Identity of native compaction coverage at one immutable snapshot.
+    /// Ordinary new input/tool records do not invalidate background work;
+    /// competing compact commands or positional summaries do.
+    pub(crate) async fn compaction_fence_at(
+        database: &Database,
+        snapshot: &Snapshot,
+    ) -> anyhow::Result<Vec<String>> {
+        let txn = database.new_transaction_at(snapshot).await?;
+        let commands = txn
+            .get_store::<Table<SessionCommandRequest>>(SESSION_COMMANDS_STORE)
+            .await?;
+        let mut fence = Vec::new();
+        for (id, result) in txn
+            .get_store::<Table<SessionCommandResult>>(SESSION_COMMAND_RESULTS_STORE)
+            .await?
+            .search(|r| matches!(r.outcome, SessionCommandOutcome::Compact { .. }))
+            .await?
+        {
+            // Include the immutable source snapshot as well as the result:
+            // equal summary text need not mean equal covered history.
+            fence.push(serde_json::to_string(&(
+                id.clone(),
+                commands.get(&id).await?,
+                result,
+            ))?);
+        }
+        for (id, entry) in Self::entries_with_ids_at_snapshot(database, snapshot).await? {
+            if entry.entry_type == EntryType::Summary {
+                fence.push(serde_json::to_string(&(id, entry))?);
+            }
+        }
+        fence.sort();
+        Ok(fence)
+    }
+
     /// One immutable view of compacted entries and selected completed attempts.
     pub async fn context_with_tool_history(
         &self,
@@ -1089,6 +1174,10 @@ impl Session {
                 .collect();
         let contributions =
             crate::extension::durable_context::read_at(&self.database, &snapshot).await?;
+        let protected_inputs = rows
+            .iter()
+            .filter_map(|(id, entry)| id.as_ref().filter(|id| pending(id, entry)).cloned())
+            .collect();
         let selected: HashMap<_, _> = states
             .into_iter()
             .filter_map(|(id, state)| {
@@ -1136,6 +1225,7 @@ impl Session {
             #[cfg(test)]
             read_volume,
             entry_ids,
+            protected_inputs,
             entries,
             tool_history,
             contributions,
@@ -1322,6 +1412,7 @@ impl Session {
             entries,
             entry_ids,
             database: self.database.clone(),
+            signing_key: None,
             store_name: self.store_name.clone(),
         };
         let attempts = historical.read_turn_attempts_at(&snapshot).await?;

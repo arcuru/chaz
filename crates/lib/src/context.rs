@@ -116,6 +116,7 @@ pub struct ContextBuilder<'a> {
     pub(crate) entries: &'a [SessionEntry],
     pub(crate) tool_history: Option<&'a [Vec<TurnTranscriptRecord>]>,
     pub(crate) entry_ids: Option<&'a [Option<crate::session::TurnRequestId>]>,
+    protected_inputs: Option<&'a std::collections::HashSet<crate::session::TurnRequestId>>,
     pub(crate) contributions: &'a [crate::extension::durable_context::CommittedContribution],
     pub(crate) agent_name: &'a str,
     system_prompt: &'a str,
@@ -136,6 +137,7 @@ pub struct ContextBuilder<'a> {
     extension_hub: Option<Arc<ExtensionHub>>,
     /// Session DB passed through to the hub for per-session provider resolution.
     session_db: Option<&'a Database>,
+    session_signing_key: Option<eidetica::auth::crypto::PrivateKey>,
     active: Option<&'a HashSet<String>>,
     request_id: Option<&'a str>,
 }
@@ -151,6 +153,7 @@ impl<'a> ContextBuilder<'a> {
             entries,
             tool_history: None,
             entry_ids: None,
+            protected_inputs: None,
             contributions: &[],
             agent_name,
             system_prompt,
@@ -161,6 +164,7 @@ impl<'a> ContextBuilder<'a> {
             attachment: None,
             extension_hub: None,
             session_db: None,
+            session_signing_key: None,
             active: None,
             request_id: None,
         }
@@ -169,6 +173,15 @@ impl<'a> ContextBuilder<'a> {
     /// Supply the session DB for per-session extension provider resolution.
     pub fn with_session_db(mut self, db: &'a Database) -> Self {
         self.session_db = Some(db);
+        self
+    }
+
+    /// Retain the active turn's exact signer for context-persistence writes.
+    pub(crate) fn with_session_signing_key(
+        mut self,
+        key: Option<eidetica::auth::crypto::PrivateKey>,
+    ) -> Self {
+        self.session_signing_key = key;
         self
     }
 
@@ -206,6 +219,7 @@ impl<'a> ContextBuilder<'a> {
     /// Supply the complete selected view from one coherent database snapshot.
     pub fn with_context_view(mut self, view: &'a crate::session::SessionContextView) -> Self {
         self.entry_ids = Some(&view.entry_ids);
+        self.protected_inputs = Some(&view.protected_inputs);
         self.tool_history = Some(&view.tool_history);
         self.contributions = &view.contributions;
         self
@@ -358,7 +372,10 @@ impl<'a> ContextBuilder<'a> {
         // actual rendered cost before the strategy chooses visible history.
         let tail_text = if let Some(ref hub) = self.extension_hub {
             if let Some(db) = self.session_db {
-                hub.refresh_status_outputs(self.agent_name, db).await;
+                let writer =
+                    crate::session::current_session_writer(db, self.session_signing_key.as_ref())
+                        .await?;
+                hub.refresh_status_outputs(self.agent_name, &writer).await;
             }
             let text = hub
                 .context_tails_for_call(
@@ -447,7 +464,13 @@ impl<'a> ContextBuilder<'a> {
             hub.check_context_strategy(Some(name), self.agent_name, self.session_db, &active)
                 .await?;
             if let Some(db) = self.session_db {
-                hub.record_context_selection(db, self.agent_name, name, &settings)
+                // Heartbeat or extension-tail writes can advance the inherited
+                // floor while assembly awaits. Refresh only this captured signer,
+                // without replacing the coherent view used to select context.
+                let writer =
+                    crate::session::current_session_writer(db, self.session_signing_key.as_ref())
+                        .await?;
+                hub.record_context_selection(&writer, self.agent_name, name, &settings)
                     .await?;
             }
         }
@@ -544,6 +567,11 @@ impl<'a> ContextBuilder<'a> {
                     .and_then(|ids| ids.get(*index))
                     .and_then(Option::as_ref)
                 {
+                    Some(id) if self.protected_inputs.is_some_and(|ids| ids.contains(id)) => {
+                        ContextSource::ProtectedInput {
+                            id: id.as_str().into(),
+                        }
+                    }
                     Some(id) => ContextSource::PersistedSessionEntry {
                         id: id.as_str().into(),
                     },
@@ -927,6 +955,73 @@ mod tests {
             entry_type,
             metadata: None,
             routing: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn autocompact_provenance_keeps_native_retried_and_nontrailing_queued_inputs() {
+        let (_instance, session) = crate::test_support::fresh_session().await;
+        let mut session = session.lock().await;
+        let queued = session
+            .add_entry(make_entry("user", "queued request", EntryType::Message))
+            .await
+            .unwrap();
+        session
+            .add_entry(make_entry(
+                "test-agent",
+                "interleaved answer",
+                EntryType::Message,
+            ))
+            .await
+            .unwrap();
+        let current = session
+            .add_entry(make_entry("user", "current retry", EntryType::Message))
+            .await
+            .unwrap();
+        let interrupted = session.start_turn_attempt(current.clone()).await.unwrap();
+        let command_id = crate::session::TurnRequestId::parse("retry-current");
+        session
+            .submit_command(crate::session::SessionCommandRequest {
+                command_id: command_id.clone(),
+                sender: "user".into(),
+                created_at: Utc::now(),
+                command: crate::session::SessionCommand::Retry {
+                    target_request_id: current.clone(),
+                    expected_interrupted_attempt_id: interrupted.attempt_id.clone(),
+                },
+            })
+            .await
+            .unwrap();
+        let command = session.start_turn_attempt(command_id).await.unwrap();
+        let retried = session
+            .accept_retry_command_if_interrupted(
+                &command,
+                current.clone(),
+                &interrupted.attempt_id,
+                &HashSet::new(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(retried.generation > interrupted.generation);
+        // The same native pending predicate protects an explicit retry and
+        // queued input despite a later agent reply.
+        let snapshot = session.database().snapshot().await.unwrap();
+        let view = session
+            .turn_context_view_at(snapshot, &current, |name| name == "test-agent")
+            .await
+            .unwrap();
+        assert!(view.protected_inputs.contains(&current));
+        assert!(view.protected_inputs.contains(&queued));
+        let config = default_config();
+        let context = ContextBuilder::new(&view.entries, "test-agent", "sys", &config)
+            .with_context_view(&view)
+            .build()
+            .await;
+        for id in [&current, &queued] {
+            assert!(context.sources.contains(&ContextSource::ProtectedInput {
+                id: id.as_str().into()
+            }));
         }
     }
 

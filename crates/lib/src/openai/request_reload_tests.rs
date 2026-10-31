@@ -228,6 +228,7 @@ async fn wire(call: &RecordedCall) -> Value {
         &call.tools,
         &call.model,
         &call.cache,
+        None,
     ))
     .unwrap()
 }

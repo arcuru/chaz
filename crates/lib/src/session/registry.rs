@@ -462,6 +462,27 @@ impl SessionRegistry {
         Ok((conv_id, db))
     }
 
+    /// Session DBs this peer tracks whose initial settings were created by
+    /// [`Self::create_session`] with exactly `source`. The display name is
+    /// written in the same commit that creates the DB, so a caller that put a
+    /// unique provisioning marker in `source` can recover a DB whose ID was
+    /// never recorded (interrupted after creation). Callers decide what more
+    /// than one match means; this never picks one.
+    pub async fn find_sessions_by_source(&self, source: &str) -> anyhow::Result<Vec<String>> {
+        let name = format!("session:{source}");
+        let user = self.user.lock().await;
+        // AccountSession::find_database skips unreadable tracked databases.
+        // Provisioning must not interpret a failed read as marker absence.
+        let mut found = Vec::new();
+        for tracked in user.databases().await? {
+            let db = user.open_database(&tracked.database_id).await?;
+            if db.get_name().await? == name {
+                found.push(db.root_id().to_string());
+            }
+        }
+        Ok(found)
+    }
+
     /// Whether this registry itself created the session during this process.
     pub async fn created_session_locally(&self, session_db_id: &str) -> bool {
         self.locally_created_sessions
@@ -540,8 +561,68 @@ impl SessionRegistry {
             return Ok((ConversationId(session_db_id.to_string()), db));
         }
         let user = self.user.lock().await;
-        let db = user.open_database(&root_id).await?;
+        let key_id = user
+            .find_key(&root_id)?
+            .ok_or_else(|| anyhow::anyhow!("no session signing key"))?;
+        let mut db = user.open_database_with_key(&root_id, &key_id).await?;
+        // Single-hop delegated sessions share an inherited snapshot floor across
+        // interactive turns, tools and pinned schedules. Refresh every keyed
+        // embedded open, including read-only opens, without changing the selected key.
+        // Service discovery cannot resolve delegation: preserve its bound identity
+        // and explicit authority gaps rather than selecting a different path.
+        // Direct and nested handles retain their existing native semantics.
+        if self.instance.backend().local_engine().is_some()
+            && matches!(db.auth_identity(), Some(eidetica::auth::types::SigKey::Delegation { path, .. }) if path.len() == 1)
+        {
+            let (identity, _) = Database::find_sigkeys(&self.instance, &root_id, &key_id)
+                .await?
+                .into_iter()
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("session signer has no current identity"))?;
+            db = db.with_key(eidetica::database::DatabaseKey::with_identity(
+                user.get_signing_key(&key_id)?,
+                identity,
+            ));
+        }
         Ok((ConversationId(session_db_id.to_string()), db))
+    }
+
+    /// Capture the actual selected signer while opening an embedded session.
+    /// Cached local-client handles retain their existing exact identity; this
+    /// path cannot recover their private signer and must not guess a substitute.
+    pub(crate) async fn open_session_with_signer(
+        &self,
+        session_db_id: &str,
+    ) -> anyhow::Result<(
+        ConversationId,
+        Database,
+        Option<eidetica::auth::crypto::PrivateKey>,
+    )> {
+        if let Some(db) = self
+            .local_client_sessions
+            .lock()
+            .await
+            .get(session_db_id)
+            .cloned()
+        {
+            return Ok((ConversationId(session_db_id.to_string()), db, None));
+        }
+        let root = eidetica::entry::ID::parse(session_db_id)?;
+        let user = self.user.lock().await;
+        let key_id = user
+            .find_key(&root)?
+            .ok_or_else(|| anyhow::anyhow!("no session signing key"))?;
+        let db = user.open_database_with_key(&root, &key_id).await?;
+        if self.instance.backend().local_engine().is_none()
+            || matches!(db.auth_identity(), Some(eidetica::auth::types::SigKey::Delegation { path, .. }) if path.len() > 1)
+        {
+            // Native discovery cannot enumerate nested paths. Keep a bound
+            // nested writer just as we keep a service-bound writer.
+            return Ok((ConversationId(session_db_id.to_string()), db, None));
+        }
+        let key = user.get_signing_key(&key_id)?;
+        let db = super::current_session_writer(&db, Some(&key)).await?;
+        Ok((ConversationId(session_db_id.to_string()), db, Some(key)))
     }
 
     /// Open a session created through this daemon's local Eidetica service.
@@ -1332,6 +1413,89 @@ mod tests {
         assert!(observer.open_job_session(&orphan_id).await.is_err());
         shutdown.send(()).unwrap();
         task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn keyed_open_preserves_a_bound_nested_writer() {
+        use eidetica::auth::types::{DelegationStep, SigKey};
+        let (instance, registry) = make_registry().await;
+        let mut user = registry.user.lock().await;
+        let key_id = user.get_default_key().unwrap();
+        let key = user.get_signing_key(&key_id).unwrap();
+        let authority = user
+            .create_database(eidetica::crdt::Doc::new(), &key_id)
+            .await
+            .unwrap();
+        let mut path = Vec::new();
+        let mut parent = authority;
+        for _ in 0..2 {
+            path.insert(
+                0,
+                DelegationStep {
+                    tree: parent.root_id().clone(),
+                    tips: parent.snapshot().await.unwrap().into_tips(),
+                },
+            );
+            let child = Database::create(
+                &instance,
+                eidetica::auth::crypto::PrivateKey::generate(),
+                eidetica::crdt::Doc::new(),
+            )
+            .await
+            .unwrap();
+            let txn = child.new_transaction().await.unwrap();
+            txn.get_settings()
+                .unwrap()
+                .add_delegated_tree(DelegatedTreeRef {
+                    permission_bounds: PermissionBounds {
+                        max: Permission::Admin(0),
+                        min: None,
+                    },
+                    tree: TreeReference {
+                        root: parent.root_id().clone(),
+                        tips: parent.snapshot().await.unwrap().into_tips(),
+                    },
+                })
+                .await
+                .unwrap();
+            txn.commit().await.unwrap();
+            parent = child;
+        }
+        let identity = SigKey::Delegation {
+            path,
+            hint: SigKey::from_pubkey(&key_id).hint().clone(),
+        };
+        user.map_key(&key_id, parent.root_id(), identity.clone())
+            .await
+            .unwrap();
+        let bound = parent.with_key(eidetica::database::DatabaseKey::with_identity(
+            key,
+            identity.clone(),
+        ));
+        // Native commits can validate the explicitly bound nested path even
+        // though find_sigkeys only discovers single-hop paths.
+        let txn = bound.new_transaction().await.unwrap();
+        txn.get_settings()
+            .unwrap()
+            .set_name("before open")
+            .await
+            .unwrap();
+        txn.commit().await.unwrap();
+        let id = bound.root_id().to_string();
+        drop(user);
+        let (_, reopened, captured) = registry.open_session_with_signer(&id).await.unwrap();
+        let mut session = super::super::Session::new(ConversationId(id), reopened)
+            .await
+            .with_signing_key(captured);
+        session.refresh_writer().await.unwrap();
+        assert_eq!(session.database().auth_identity(), Some(&identity));
+        let txn = session.database().new_transaction().await.unwrap();
+        txn.get_settings()
+            .unwrap()
+            .set_name("after open")
+            .await
+            .unwrap();
+        txn.commit().await.unwrap();
     }
 
     #[tokio::test]

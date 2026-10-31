@@ -147,6 +147,8 @@ remains available through `get_time`.
 
 Before each model call the runtime runs the operator-granted context projection chain over a copy of this vector plus the current attempt's completed exchanges; see [Context projection](extensions.md#context-projection). The projected request is sent (and resent unchanged on transport retries); the local vector and the recorded transcript keep the originals. With no `context_projection` grants the vector is sent as-is.
 
+When the `autocompact` extension is on, a native step substitutes ready, still-valid summaries for their covered ranges (source `CompactionSummary`) before the projection chain runs. The complete projected request determines whether to start another background preparation or wait at the hard budget. Protected input, instructions, tails and unfinished tool work are never covered, and a request still over budget is refused before dispatch. See [Automatic Compaction](../design/autocompaction.md).
+
 `AssistantToolCalls` and `ToolResult` messages are maintained in the runtime's local message vector for the active continuation. Completed structured forms are persisted. Later turns can reconstruct complete prior call/result groups from completed attempts inside the conversation budget, but only an exact pending checkpointed `job_wait` can resume an interrupted attempt.
 
 ## Concurrency
@@ -209,3 +211,23 @@ No raw scope identifier or credential enters the wire key, and no prompt bytes
 participate in its derivation.
 Legacy standalone calls without a session omit the key.
 Usage comes from the response, not from the identity or a predicted cache hit.
+
+## Reasoning controls
+
+`Backend::reasoning_control` is the single resolver for what a model's
+configured reasoning puts on the wire. It resolves the model's effective API
+first, then the optional Chat `format`, and returns the field to send, nothing
+(unlisted models, omitted `reasoning`, native Anthropic), or a configuration
+error for an explicit Chat format on a native API.
+Startup (`config::reasoning_report`), client selection and both OpenAI-family
+request builders call it, so a refusal happens before any request and the
+builders cannot disagree about the field.
+The Chat and Responses clients keep the returned control for the request's
+lifetime and use it only to annotate a provider rejection; the error variant,
+and so retry classification, is unchanged.
+Chat success bodies are decoded into `ChatResponse` from raw JSON after the
+SDK returns, so a well-formed success body of the wrong shape is reported
+without quoting it.
+A body that is not valid JSON at all reaches the bounded-excerpt path in
+`LlmError` whether it came with an error status or a broken success status,
+because the SDK reports both as the same deserialize error.

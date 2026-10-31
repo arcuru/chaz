@@ -7,6 +7,7 @@
 //! pushing them into the legacy [`crate::tool::ToolRegistry`].
 
 pub mod agent_schedule;
+pub mod autocompact;
 pub mod context;
 pub mod context_report;
 pub mod core;
@@ -66,6 +67,7 @@ pub fn all_builtins(deps: BuiltinDeps) -> Vec<Arc<dyn crate::extension::Extensio
         )),
         Arc::new(path_normalizer::PathNormalizer),
         Arc::new(session_naming::SessionNaming),
+        Arc::new(autocompact::AutocompactExtension),
         Arc::new(security_warnings::SecurityWarnings),
         Arc::new(fs::FsExtension),
         Arc::new(system::SystemExtension),

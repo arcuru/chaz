@@ -91,7 +91,7 @@ still controls agent processing.
 
 The TUI has four main pieces:
 
-1. **Tab bar** — one tab per open conversation view. Click to switch, `×` to close, or use `Ctrl+H`/`Ctrl+L` for the previous/next tab. Closing a view never deletes, detaches, or stops its session; closing the last one returns to the [session hub](#session-hub). The right side lists the keys that fit.
+1. **Tab bar** — one tab per open conversation view. `Ctrl+T` opens and focuses a new session tab without closing the current one. Click to switch, `×` to close, or use `Ctrl+H`/`Ctrl+L` for the previous/next tab. Closing a view never deletes, detaches, or stops its session; closing the last one returns to the [session hub](#session-hub). The right side lists the keys that fit.
 2. **Messages area** — conversation history with all entry types
 3. **Status bar** — session name, context usage/budget, then the agent and model. A single-agent
    session shows `agent: <name> | model: <model>`; a multi-agent session lists
@@ -232,7 +232,7 @@ The TUI catalogs every built-in slash command in its inline completion popup —
 | --------------------- | ------------------------------------------------------------------------------------------------- |
 | `/help`, `/?`         | Open the help overlay (also `F1`)                                                                 |
 | `/sessions`, `/s`     | Open the session hub (also `Ctrl+P`)                                                              |
-| `/new`                | Create a new session and switch to it                                                             |
+| `/new`                | Create a new session and switch to it (also `Ctrl+T`)                                             |
 | `/new <group>`        | Create a new session with a named agent group attached                                            |
 | `/groups`             | List the configured agent groups                                                                  |
 | `/join <ref>`         | Switch to a session by name or eidetica DB ID                                                     |
@@ -249,6 +249,7 @@ The TUI catalogs every built-in slash command in its inline completion popup —
 | `/sync <ticket>`      | Sync a remote session via a ticket URL                                                            |
 | `/compact`            | Ask the executor to compact the current immutable session snapshot                                |
 | `/context`            | Context-window usage for the current agent ([details](usage.md#context-window-snapshots-context)) |
+| `/autocompact [<n>]`  | Show or set automatic compaction ([details](extensions.md#automatic-compaction))                  |
 | `/print`              | Dump the transcript                                                                               |
 | `/stop`               | Stop the active turn in this session; idle sessions are unchanged                                 |
 
@@ -350,13 +351,14 @@ See [Extensions](extensions.md). Extensions can also register their own slash co
 
 ### TUI utilities
 
-| Command                | Description                                                   |
-| ---------------------- | ------------------------------------------------------------- |
-| `/clear`               | Clear the display (entries remain in the database)            |
-| `/raw`                 | Dump raw entry data (index, timestamp, type, sender, content) |
-| `/settings`            | Open [Session Settings](#settings) (also `Ctrl+S` in chat)    |
-| `/debug`               | Toggle debug mode (also `Ctrl+D`)                             |
-| `/quit`, `/q`, `/exit` | Exit                                                          |
+| Command                | Description                                                                |
+| ---------------------- | -------------------------------------------------------------------------- |
+| `/clear`               | Clear the display (entries remain in the database)                         |
+| `/raw`                 | Dump raw entry data (index, timestamp, type, sender, content)              |
+| `/settings`            | Open [Session Settings](#settings) (also `Ctrl+S` in chat)                 |
+| `/debug`               | Toggle debug mode (also `Ctrl+D`)                                          |
+| `/expand`              | Toggle full tool-call/result and directive display (also `Ctrl+O` in chat) |
+| `/quit`, `/q`, `/exit` | Exit                                                                       |
 
 Unknown `/<name>` commands route to extension dispatch — see the error you get back for the closest match.
 
@@ -373,6 +375,8 @@ Unknown `/<name>` commands route to extension dispatch — see the error you get
 | `Esc`                 | Dismiss overlay/completion first; otherwise stop busy turn, quit idle |
 | `F1`                  | Open the help overlay                                                 |
 | `Ctrl+P`              | Open the session hub (in the hub: back to the open conversation)      |
+| `Ctrl+T`              | Open and focus a new session tab (chat or session hub)                |
+| `Ctrl+O`              | Toggle expanded tool calls/results and directives (chat only)         |
 | `Ctrl+D`              | Toggle debug mode                                                     |
 | `Ctrl+W`              | Close the active view; the last one returns to the hub                |
 | `Ctrl+H` / `Ctrl+L`   | Cycle to previous / next tab (wraps, chat only)                       |
@@ -454,6 +458,32 @@ OSC 52.
    `set-clipboard on` if desired. Retry the short reply and paste again.
    If writes cannot be enabled, use the terminal-native override and Copy,
    accounting for its screen-cell limitations above.
+
+## New sessions and transcript expansion
+
+`Ctrl+T` uses the same session-creation path as `/new` in chat or **New session**
+in the hub. The existing conversation stays open, including its history and scroll
+position. Settings and the model picker do not create sessions on `Ctrl+T`; press
+`Esc` to return first. Help and rename overlays keep keyboard focus.
+
+`Ctrl+O` changes only the chat display, just like `/expand`. It expands or collapses
+tool calls, tool results and directives without changing stored or model-facing
+history. `Ctrl+R` still refreshes the catalog in the model picker. Plain `r` still
+renames a session in the hub and keeps its existing Settings actions.
+These bindings are built in; the TUI has no configurable keymap.
+
+1. From the session hub, press `Ctrl+T` to open a new conversation.
+2. Run `/name first`, then press `Ctrl+T` again. The new tab is focused and the
+   `first` tab remains open. Press `Ctrl+H` to return to `first`.
+3. Press `Ctrl+O`. The status bar adds `EXP`; press it again to collapse the
+   transcript. This does not create a tab.
+4. Open help with `F1` and press `Ctrl+T`. No session opens while help owns the
+   keyboard. Press `Esc`, then `Ctrl+T` to create the next session.
+
+If the backend is unavailable or session creation is already pending, no second
+creation is accepted. The notice says `Backend unavailable or action queue full —
+creation not accepted` or `Session creation already pending — not accepted again`.
+Wait for the backend or the pending action before retrying.
 
 ## Debug Mode
 

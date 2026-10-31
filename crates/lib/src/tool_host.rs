@@ -39,6 +39,10 @@ pub enum Capability {
     Shell {
         command: String,
         working_dir: Option<String>,
+        /// Stop the command's process group after this long and return what
+        /// it printed so far. `None` waits for completion; the caller's own
+        /// deadline (if any) still bounds the request.
+        timeout: Option<std::time::Duration>,
     },
     /// Read a file's contents as UTF-8 text.
     FileRead { path: String },
@@ -58,7 +62,13 @@ pub enum Capability {
 pub struct ShellOutput {
     pub stdout: String,
     pub stderr: String,
+    /// Exit code, or 128 + signal number when a signal ended the shell.
     pub exit_code: i32,
+    /// The requested timeout expired and the host stopped the process
+    /// group; `stdout`/`stderr` hold only what arrived before that.
+    pub timed_out: bool,
+    /// Wall-clock time from spawn until the output was collected.
+    pub elapsed: std::time::Duration,
 }
 
 /// Output from an HTTP request executed by the host.
@@ -96,6 +106,7 @@ pub enum CapabilityResult {
 ///     &Capability::Shell {
 ///         command: "ls -la".into(),
 ///         working_dir: None,
+///         timeout: None,
 ///     },
 ///     ctx.grants(),
 /// ).await?;
@@ -162,7 +173,16 @@ impl ToolHost for NativeToolHost {
                 Capability::Shell {
                     command,
                     working_dir,
-                } => exec_shell(command, working_dir.as_deref(), grants.shell.as_ref()).await,
+                    timeout,
+                } => {
+                    exec_shell(
+                        command,
+                        working_dir.as_deref(),
+                        *timeout,
+                        grants.shell.as_ref(),
+                    )
+                    .await
+                }
                 Capability::FileRead { path } => exec_file_read(path, grants).await,
                 Capability::FileWrite { path, content } => {
                     exec_file_write(path, content, grants).await
@@ -197,6 +217,7 @@ impl ToolHost for NativeToolHost {
 async fn exec_shell(
     command: &str,
     working_dir: Option<&str>,
+    timeout: Option<std::time::Duration>,
     grant: Option<&ShellGrant>,
 ) -> Result<CapabilityResult, ToolError> {
     check_shell_command(command, grant).map_err(|msg| {
@@ -210,41 +231,108 @@ async fn exec_shell(
         cmd.current_dir(dir);
     }
 
+    run_shell_process(cmd, timeout)
+        .await
+        .map(CapabilityResult::Shell)
+        .map_err(|e| ToolError::Execution(format!("Failed to execute command: {e}")))
+}
+
+/// How long to keep draining pipes after the process group was killed. A
+/// descendant that escaped the group can hold them open indefinitely.
+const KILLED_DRAIN: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Run a prepared shell process in its own process group and collect its
+/// output, shared by every host that spawns a local process.
+///
+/// With `timeout`, the whole group is killed when it expires and the output
+/// received so far is returned with `timed_out` set. Dropping the returned
+/// future (user stop, an outer deadline, shutdown) kills the group too.
+pub(crate) async fn run_shell_process(
+    mut cmd: tokio::process::Command,
+    timeout: Option<std::time::Duration>,
+) -> std::io::Result<ShellOutput> {
+    use tokio::io::AsyncReadExt;
+
     cmd.kill_on_drop(true);
     #[cfg(unix)]
     cmd.process_group(0);
-    let child = cmd
+    let started = std::time::Instant::now();
+    let mut child = cmd
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
-        .spawn()
-        .map_err(|e| ToolError::Execution(format!("Failed to execute command: {e}")))?;
-    #[cfg(unix)]
+        .spawn()?;
     let mut group = ShellProcessGroup(child.id());
-    let output = child
-        .wait_with_output()
-        .await
-        .map_err(|e| ToolError::Execution(format!("Failed to execute command: {e}")))?;
+    let (Some(mut stdout_pipe), Some(mut stderr_pipe)) = (child.stdout.take(), child.stderr.take())
+    else {
+        return Err(std::io::Error::other("shell pipes were not captured"));
+    };
 
+    let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
+    let mut timed_out = false;
+    let status = {
+        // Bytes already read stay in the buffers if this is abandoned.
+        let collect = async {
+            tokio::try_join!(
+                stdout_pipe.read_to_end(&mut stdout),
+                stderr_pipe.read_to_end(&mut stderr),
+                child.wait(),
+            )
+            .map(|(_, _, status)| status)
+        };
+        tokio::pin!(collect);
+        let finished = match timeout {
+            Some(limit) => tokio::time::timeout(limit, &mut collect).await.ok(),
+            None => Some((&mut collect).await),
+        };
+        match finished {
+            Some(status) => Some(status?),
+            None => {
+                timed_out = true;
+                group.kill();
+                tokio::time::timeout(KILLED_DRAIN, &mut collect)
+                    .await
+                    .ok()
+                    .transpose()?
+            }
+        }
+    };
+    let status = match status {
+        Some(status) => status,
+        // An escaped descendant still holds a pipe: report without it.
+        None => child.wait().await?,
+    };
+    // Reaped: the group id may be reused, so never signal it again.
+    group.0 = None;
+
+    Ok(ShellOutput {
+        stdout: String::from_utf8_lossy(&stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&stderr).into_owned(),
+        exit_code: exit_code(status),
+        timed_out,
+        elapsed: started.elapsed(),
+    })
+}
+
+/// Exit code as a shell reports it: 128 + signal for a signalled process.
+fn exit_code(status: std::process::ExitStatus) -> i32 {
     #[cfg(unix)]
     {
-        group.0 = None;
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(signal) = status.signal() {
+            return 128 + signal;
+        }
     }
-    Ok(CapabilityResult::Shell(ShellOutput {
-        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-        exit_code: output.status.code().unwrap_or(-1),
-    }))
+    status.code().unwrap_or(-1)
 }
 
 /// Dropping a shell wait (user stop, timeout, or shutdown) must also stop
 /// descendants. Use the native shell's kill builtin, with the child in its
 /// own process group; kill_on_drop reaps the direct child through Tokio.
-#[cfg(unix)]
 struct ShellProcessGroup(Option<u32>);
 
-#[cfg(unix)]
-impl Drop for ShellProcessGroup {
-    fn drop(&mut self) {
+impl ShellProcessGroup {
+    fn kill(&self) {
+        #[cfg(unix)]
         if let Some(pid) = self.0 {
             let result = std::process::Command::new("sh")
                 .args([
@@ -262,8 +350,12 @@ impl Drop for ShellProcessGroup {
     }
 }
 
-/// Check a shell command against allowlist/denylist from a `ShellGrant`.
-/// An empty `allow` list means allow-all. Denylist entries always apply.
+impl Drop for ShellProcessGroup {
+    fn drop(&mut self) {
+        self.kill();
+    }
+}
+
 /// Check a shell command against allowlist/denylist from a `ShellGrant`.
 /// An empty `allow` list means allow-all. Denylist entries always apply.
 ///
@@ -545,6 +637,88 @@ mod tests {
         // `..` that stays within is fine.
         check_fs_path("/work/sub/../file", Some(&allow), "write")
             .expect("path should be permitted by the filesystem grant");
+    }
+
+    // ── Shell process lifecycle ──
+
+    #[cfg(unix)]
+    fn sh(command: &str) -> tokio::process::Command {
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.arg("-c").arg(command);
+        cmd
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn completed_shell_reports_output_status_and_elapsed() {
+        let out = run_shell_process(
+            sh("echo out; echo err >&2; sleep 0.2; exit 4"),
+            Some(std::time::Duration::from_secs(10)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            (out.stdout.as_str(), out.stderr.as_str()),
+            ("out\n", "err\n")
+        );
+        assert_eq!(out.exit_code, 4);
+        assert!(!out.timed_out);
+        assert!(out.elapsed >= std::time::Duration::from_millis(200));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_signalled_shell_reports_128_plus_signal() {
+        let out = run_shell_process(sh("kill -TERM $$"), None).await.unwrap();
+        assert_eq!(out.exit_code, 128 + 15);
+        assert!(!out.timed_out);
+    }
+
+    /// The timeout kills the group, including a backgrounded descendant and
+    /// a shell ignoring TERM, and keeps the output that arrived first.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_timeout_kills_the_group_and_keeps_partial_output() {
+        let directory = tempfile::tempdir().unwrap();
+        let leaked = directory.path().join("leaked");
+        let command = format!(
+            "trap '' TERM; echo before; echo warn >&2; (sleep 1; echo leaked > '{}') & sleep 30; echo after",
+            leaked.display()
+        );
+        let started = std::time::Instant::now();
+        let out = run_shell_process(sh(&command), Some(std::time::Duration::from_millis(300)))
+            .await
+            .unwrap();
+        assert!(out.timed_out);
+        assert_eq!(
+            (out.stdout.as_str(), out.stderr.as_str()),
+            ("before\n", "warn\n")
+        );
+        assert!(out.elapsed >= std::time::Duration::from_millis(300));
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+        assert!(!leaked.exists(), "a timed-out descendant survived");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn native_host_forwards_the_shell_timeout() {
+        let result = NativeToolHost
+            .request(
+                &Capability::Shell {
+                    command: "echo hi; sleep 30".into(),
+                    working_dir: None,
+                    timeout: Some(std::time::Duration::from_millis(200)),
+                },
+                &Grants::default(),
+            )
+            .await
+            .unwrap();
+        let CapabilityResult::Shell(out) = result else {
+            panic!("expected shell output");
+        };
+        assert!(out.timed_out);
+        assert_eq!(out.stdout, "hi\n");
     }
 
     // ── Shell grant checks ──

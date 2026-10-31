@@ -40,6 +40,23 @@ impl MockHost {
                 stdout: stdout.to_string(),
                 stderr: stderr.to_string(),
                 exit_code,
+                timed_out: false,
+                elapsed: std::time::Duration::ZERO,
+            })));
+    }
+
+    /// Script a shell result whose requested timeout expired.
+    pub fn push_shell_timed_out(&self, stdout: &str, elapsed: std::time::Duration) {
+        self.state
+            .lock()
+            .unwrap()
+            .script
+            .push_back(Ok(CapabilityResult::Shell(crate::tool_host::ShellOutput {
+                stdout: stdout.to_string(),
+                stderr: String::new(),
+                exit_code: 137,
+                timed_out: true,
+                elapsed,
             })));
     }
 

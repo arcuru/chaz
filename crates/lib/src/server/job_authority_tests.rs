@@ -138,10 +138,15 @@ impl AuthorityFixture {
         Arc<crate::test_support::MockBackend>,
         tokio::sync::OwnedSemaphorePermit,
     ) {
-        let (server, mock) = published_executor_with_mock(
+        let mock = Arc::new(crate::test_support::MockBackend::new());
+        mock.push_text("finished");
+        let (server, mock) = published_executor_using_mock_and_hub(
             &self.settings,
             Arc::new(AgentRegistry::from_config(&self.yaml)),
             self.entries[0].clone(),
+            mock,
+            Arc::new(crate::test_support::context_hub().await),
+            false,
         )
         .await;
         server.agent_index().register(self.entries[1].clone());

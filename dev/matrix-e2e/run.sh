@@ -20,8 +20,9 @@
 #
 # Usage:
 #   dev/matrix-e2e/run.sh [--keep] [--timeout SECONDS] [--verbose]
-#                         [--transport http|iroh] [--legacy-max-iterations N]
+#                         [--transport http|iroh] [--legacy-max-iterations N] [--real-model]
 #
+#   --real-model run the opt-in capped smoke instead of the stub suite (see README)
 #   --keep      leave the workspace in place and print its path
 #   --timeout   seconds to wait for the reply (default 120)
 #   --verbose   stream component logs to stderr as they are written
@@ -42,10 +43,12 @@ VERBOSE=0
 REPLY_TIMEOUT=120
 TRANSPORT="http"
 LEGACY_MAX_ITERATIONS=""
+REAL_MODEL=0
 while [[ $# -gt 0 ]]; do
 	case "$1" in
 	--) ;; # `just` passes -- to separate its flags from ours; fall through to outer shift
 	--keep) KEEP=1 ;;
+	--real-model) REAL_MODEL=1 ;;
 	--verbose) VERBOSE=1 ;;
 	--timeout)
 		[[ $# -ge 2 ]] || {
@@ -90,13 +93,25 @@ while [[ $# -gt 0 ]]; do
 	shift
 done
 
+if [[ $REAL_MODEL -eq 1 ]]; then
+	[[ $TRANSPORT == http ]] || { echo "real-model smoke requires loopback http transport" >&2; exit 2; }
+	for variable in MATRIX_E2E_MODEL_ENDPOINT MATRIX_E2E_MODEL MATRIX_E2E_INPUT_RATE MATRIX_E2E_OUTPUT_RATE MATRIX_E2E_EVIDENCE; do
+		[[ -n ${!variable:-} ]] || { echo "missing $variable for --real-model" >&2; exit 2; }
+	done
+	mkdir -p "$MATRIX_E2E_EVIDENCE"
+	[[ ! -e $MATRIX_E2E_EVIDENCE/result.json && ! -e $MATRIX_E2E_EVIDENCE/model.jsonl ]] || { echo "use a fresh evidence directory" >&2; exit 2; }
+	REPLY_TIMEOUT=300
+fi
+
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 HERE="$REPO_ROOT/dev/matrix-e2e"
 CHAZ_BIN="${CHAZ_BIN:-$REPO_ROOT/target/debug/chaz}"
 CHAZ_MATRIX_BIN="${CHAZ_MATRIX_BIN:-$REPO_ROOT/target/debug/chaz-matrix}"
 E2EE_PROBE_BIN="${E2EE_PROBE_BIN:-$REPO_ROOT/target/debug/examples/e2ee_probe}"
 
-for bin in "$CHAZ_BIN" "$CHAZ_MATRIX_BIN" "$E2EE_PROBE_BIN"; do
+BINS=("$CHAZ_BIN" "$CHAZ_MATRIX_BIN")
+[[ $REAL_MODEL -eq 1 ]] || BINS+=("$E2EE_PROBE_BIN")
+for bin in "${BINS[@]}"; do
 	if [[ ! -x $bin ]]; then
 		echo "missing binary: $bin (run 'just e2e', or set CHAZ_BIN / CHAZ_MATRIX_BIN / E2EE_PROBE_BIN)" >&2
 		exit 2
@@ -115,7 +130,7 @@ python3 "$HERE/test_stub_llm.py"
 WORKSPACE="$(mktemp -d -t chaz-matrix-e2e-XXXXXX)"
 PIDS=()
 
-log() { printf '\033[1;35m==>\033[0m %s\n' "$*" >&2; }
+log() { printf '\033[1;35m==>\033[0m [%ss] %s\n' "$SECONDS" "$*" >&2; }
 fail() {
 	printf '\033[1;31mFAIL:\033[0m %s\n' "$*" >&2
 	# Preserve fixture rejection details even when default cleanup removes it.
@@ -139,6 +154,9 @@ cleanup() {
 		done
 		kill -KILL "$pid" 2>/dev/null || true
 	done
+	if [[ $REAL_MODEL -eq 1 && -f $WORKSPACE/model.jsonl ]]; then
+		cp "$WORKSPACE/model.jsonl" "$MATRIX_E2E_EVIDENCE/model.jsonl"
+	fi
 	if [[ $KEEP -eq 1 ]]; then
 		log "workspace kept at $WORKSPACE"
 	else
@@ -277,8 +295,17 @@ fi
 EIDETICA_FLAKE="${EIDETICA_FLAKE:-git+https://github.com/arcuru/eidetica?rev=$(sed -n 's/^eidetica = .*rev = "\([^"]*\)".*/\1/p' "$REPO_ROOT/Cargo.toml")}"
 
 # ---------------------------------------------------------------- stub LLM ---
-log "starting stub LLM"
-spawn stub-llm python3 "$HERE/stub_llm.py" "$STUB_PORT" "$MARKER"
+MODEL_NAME=stub
+if [[ $REAL_MODEL -eq 1 ]]; then
+	log "starting capped real-model relay (900s/run, six calls, USD 0.10 reserved maximum)"
+	MODEL_NAME="$MATRIX_E2E_MODEL"
+	spawn real-model python3 "$HERE/real_model.py" --port "$STUB_PORT" --trace "$WORKSPACE/model.jsonl"
+	trap 'exit 124' TERM
+	spawn deadline bash -c 'sleep 900 & timer=$!; trap '"'"'kill "$timer" 2>/dev/null; exit'"'"' TERM; wait "$timer" && kill -TERM "$1"' _ "$$"
+else
+	log "starting stub LLM"
+	spawn stub-llm python3 "$HERE/stub_llm.py" "$STUB_PORT" "$MARKER"
+fi
 wait_for "stub LLM" 30 curl -sf --max-time "$CURL_MAX_TIME" "http://127.0.0.1:$STUB_PORT/v1/models"
 
 # ----------------------------------------------------------------- synapse ---
@@ -369,11 +396,18 @@ log "registering accounts"
 for pair in "agent:$AGENT_PASSWORD" "puppet:$PUPPET_PASSWORD" "stranger:$STRANGER_PASSWORD"; do
 	user="${pair%%:*}"
 	pass="${pair#*:}"
-	register_new_matrix_user \
+	log "registering @$user:$SERVER_NAME"
+	registration_start=$SECONDS
+	if register_new_matrix_user \
 		-c "$SYNAPSE_DIR/homeserver.yaml" \
 		-u "$user" -p "$pass" --no-admin \
-		"$HOMESERVER" >>"$WORKSPACE/register.log" 2>&1 ||
-		fail "could not register @$user:$SERVER_NAME (see $WORKSPACE/register.log)"
+		"$HOMESERVER" >"$WORKSPACE/register-$user.log" 2>&1; then
+		log "registered @$user:$SERVER_NAME in $((SECONDS - registration_start))s"
+	else
+		rc=$?
+		log "registration of @$user:$SERVER_NAME failed after $((SECONDS - registration_start))s (exit $rc)"
+		fail "could not register @$user:$SERVER_NAME (see $WORKSPACE/register-$user.log)"
+	fi
 done
 
 AGENT_MXID="@agent:$SERVER_NAME"
@@ -400,11 +434,11 @@ backends:
     api_base: "http://127.0.0.1:$STUB_PORT/v1"
     api_key: "not-a-real-key"
     models:
-      - name: stub
+      - name: "$MODEL_NAME"
 
 agents:
   - name: chaz
-    model: "stub"
+    model: "$MODEL_NAME"
 ${LEGACY_MAX_ITERATIONS:+    max_iterations: $LEGACY_MAX_ITERATIONS}
     system_prompt: |
       You are a test fixture.
@@ -413,12 +447,14 @@ default_agents: [chaz]
 EOF
 
 mkdir -p "$WORKSPACE/state-daemon" "$WORKSPACE/state-bridge"
+log "initialising daemon Eidetica store"
 nix run "$EIDETICA_FLAKE" -- \
 	daemon --data-dir "$WORKSPACE/state-daemon" init --username chaz --passwordless \
 	>>"$WORKSPACE/bringup.log" 2>&1 || fail "could not initialise daemon Eidetica store (see $WORKSPACE/bringup.log)"
 # The bridge's store is provisioned the same explicit way: the connector
 # never creates one, and the legacy `chaz-matrix` login is what its config
 # names.
+log "initialising bridge Eidetica store"
 nix run "$EIDETICA_FLAKE" -- \
 	daemon --data-dir "$WORKSPACE/state-bridge" init --username chaz-matrix --passwordless \
 	>>"$WORKSPACE/bringup.log" 2>&1 || fail "could not initialise bridge Eidetica store (see $WORKSPACE/bringup.log)"
@@ -508,6 +544,7 @@ logins:
     username: "$AGENT_MXID"
     password: "$AGENT_PASSWORD"
     allow_list: "$PUPPET_MXID"
+    workspace_manager: "$PUPPET_MXID"
 
 agents:
   - name: chaz
@@ -596,9 +633,9 @@ kill -TERM "$DAEMON_PID"
 wait_for "daemon to exit for state snapshot" 30 sh -c "! kill -0 $DAEMON_PID 2>/dev/null"
 retire_pid "$DAEMON_PID"
 cp -a "$WORKSPACE/state-daemon" "$DAEMON_PRE_SESSION_STATE"
-spawn daemon "$CHAZ_BIN" --config "$DAEMON_CONFIG" daemon
+spawn daemon-after-snapshot "$CHAZ_BIN" --config "$DAEMON_CONFIG" daemon
 DAEMON_PID="$SPAWNED_PID"
-wait_for "daemon after state snapshot" 120 grep -q "daemon ready" "$WORKSPACE/daemon.log"
+wait_for "daemon after state snapshot" 120 grep -q "daemon ready" "$WORKSPACE/daemon-after-snapshot.log"
 
 # --------------------------------------------------------------- puppet ------
 mx() {
@@ -632,6 +669,11 @@ agent_joined() {
 		"$PUPPET_TOKEN" | jq -e --arg a "$AGENT_MXID" '.joined | has($a)'
 }
 wait_for "the agent to join the room" 90 agent_joined
+
+if [[ $REAL_MODEL -eq 1 ]]; then
+	source "$HERE/real-smoke.sh"
+	exit 0
+fi
 
 log "sending the prompt"
 PROMPT_DATE_BEFORE="$(date -u +%F)"
@@ -1421,6 +1463,44 @@ assert probes[1]["tails"] == [], probes
 print("PASS — Matrix /context: exact shown snapshot delivered once; no command-triggered model call")
 PY
 
+# Explicit detach/attach is administrative: no implicit session creation,
+# historical output replay or model turn, and an exact retry is idempotent.
+log "attachment lifecycle: detach and reattach the original session"
+ATTACH_TURNS_BEFORE="$(stub_requests)"
+attachment_outbound_count() {
+    mx GET "/_matrix/client/v3/rooms/$ROOM_URI/messages?dir=b&limit=200" "$PUPPET_TOKEN" |
+        jq --arg a "$AGENT_MXID" --arg m "$MARKER" \
+        '[.chunk[] | select(.sender == $a and (.content.body // "" | contains($m)))] | length'
+}
+ATTACH_OUTBOUND_BEFORE="$(attachment_outbound_count)"
+attachment_notice() {
+    mx GET "/_matrix/client/v3/rooms/$ROOM_URI/messages?dir=b&limit=200" "$PUPPET_TOKEN" |
+        jq -e --arg a "$AGENT_MXID" --arg text "$1" --argjson n "${2:-1}" \
+        '[.chunk[] | select(.sender == $a and .content.body == $text)] | length >= $n'
+}
+attachment_command() {
+    local txn="e2e-$(date +%s%N)"
+    mx PUT "/_matrix/client/v3/rooms/$ROOM_URI/send/m.room.message/$txn" \
+        "$PUPPET_TOKEN" "$(jq -nc --arg b "$1" '{msgtype:"m.text",body:$b}')" >/dev/null
+}
+attachment_command '!chaz detach wrong-id'
+wait_for "exact-ID detach error" "$REPLY_TIMEOUT" attachment_notice \
+    '!chaz Error: session wrong-id is not bound to this room on this login'
+attachment_command '!chaz detach'
+wait_for "explicit detach acknowledgement" "$REPLY_TIMEOUT" attachment_notice \
+    'Room detached. Future messages will create a fresh session.'
+for n in 1 2; do
+    attachment_command "!chaz attach $DM_SESSION_ID"
+    wait_for "idempotent original-session attach $n" "$REPLY_TIMEOUT" attachment_notice \
+        "Attached this room to session $DM_SESSION_ID." "$n"
+done
+[[ "$(stub_requests)" -eq "$ATTACH_TURNS_BEFORE" ]] || fail "attach/detach woke a model"
+POST_ATTACH_OUTBOUND="$(attachment_outbound_count)"
+[[ "$POST_ATTACH_OUTBOUND" == "$ATTACH_OUTBOUND_BEFORE" ]] || fail "reattach replayed historical output"
+attachment_command 'addressed after explicit reattach'
+wait_for "new reply after reattach" "$REPLY_TIMEOUT" replies_at_least "$((ATTACH_OUTBOUND_BEFORE + 1))"
+printf '\033[1;32mPASS\033[0m — explicit detach/attach: exact-ID errors, original session reused, repeated attach safe, no replay/model wake, new addressed reply delivered\n' >&2
+
 # -------------------------------------------------------- invite + forget ---
 # Stop the auto-joiner before creating the invite. Reuse this homeserver and
 # the bridge's token for independent membership/history checks.
@@ -1484,3 +1564,175 @@ for out in true-reset-preview true-reset-execute true-reset-empty; do
         fail "agent password leaked into $out"
 done
 printf '\033[1;32mPASS\033[0m — true reset: nonmutating preview, invite rejected, joined room left, both forgotten, control readable, rerun empty, no secret leaked\n' >&2
+
+# ------------------------------------------------------- workspace cases ---
+# The personal workspace on a real homeserver, driven by the cross-signed
+# probe device because the Lobby and chats are encrypted. The true reset above
+# left the bridge stopped with no rooms; start it again and open a fresh
+# encrypted control DM.
+#
+# Case W1 — setup previews, then creates a Space and Lobby with private state
+# Case W2 — the Lobby is command-only: plain text reaches no model
+# Case W3 — a new chat is private, linked, and answers in its own room only
+# Case W4 — after bridge and daemon restarts the chat still answers, and no
+#           second room or session appears
+log "workspace: restarting the bridge"
+spawn bridge-workspace env RUST_LOG="$BRIDGE_RUST_LOG" "$CHAZ_MATRIX_BIN" --config "$BRIDGE_CONFIG"
+BRIDGE_PID="$SPAWNED_PID"
+BRIDGE_LOG="$WORKSPACE/bridge-workspace.log"
+wait_for "bridge to come back for the workspace" 120 grep -q "The client is ready" "$BRIDGE_LOG"
+CONTROL_ROOM="$(probe --dir "$SIGNED_DIR" create-dm --invite "$AGENT_MXID")" ||
+	fail "could not create the workspace control DM"
+probe --dir "$SIGNED_DIR" wait-joined --room "$CONTROL_ROOM" --user "$AGENT_MXID" --timeout 90 ||
+	fail "the agent did not join the workspace control DM"
+
+ws_say() { probe --dir "$SIGNED_DIR" send --room "$1" --body "$2" >/dev/null || fail "could not send '$2'"; }
+ws_expect() {
+	probe --dir "$SIGNED_DIR" expect --room "$1" --sender "$AGENT_MXID" --contains "$2" \
+		--timeout "$REPLY_TIMEOUT" >/dev/null || fail "no reply containing '$2' (see $WORKSPACE/probe.log, $BRIDGE_LOG)"
+}
+# The puppet's pending invitation whose stripped state names the room `$1`.
+# Synapse caches a device's initial /sync per request, so each lookup varies
+# its filter with a nonce (callers run this in a subshell, so no counter);
+# otherwise a check made before the invitation would be replayed.
+ws_invited() {
+	local filter
+	filter="$(jq -rn --arg n "ws-$(date +%s%N)" '{presence:{not_types:[$n]}} | tojson | @uri')"
+	mx GET "/_matrix/client/v3/sync?timeout=0&filter=$filter" "$PUPPET_TOKEN" |
+		jq -er --arg n "$1" '
+		.rooms.invite // {} | to_entries[]
+		| select(any(.value.invite_state.events[]; .type == "m.room.name" and .content.name == $n))
+		| .key'
+}
+ws_join() {
+	mx POST "/_matrix/client/v3/join/$(jq -rn --arg r "$1" '$r|@uri')" "$PUPPET_TOKEN" '{}' |
+		jq -e '.room_id' >/dev/null || fail "puppet could not join $1"
+}
+ws_state() { mx GET "/_matrix/client/v3/rooms/$(jq -rn --arg r "$1" '$r|@uri')/state" "$PUPPET_TOKEN"; }
+# Private by construction, and nobody but the bot and puppet is in or invited.
+ws_assert_private() {
+	local room="$1" encrypted="$2" state
+	state="$(ws_state "$room")"
+	jq -e --arg p "$PUPPET_MXID" --arg a "$AGENT_MXID" --argjson enc "$encrypted" '
+		(map(select(.type == "m.room.join_rules"))[0].content.join_rule == "invite")
+		and (map(select(.type == "m.room.history_visibility"))[0].content.history_visibility == "joined")
+		and (map(select(.type == "m.room.guest_access"))[0].content.guest_access == "forbidden")
+		and ((map(select(.type == "m.room.encryption")) | length > 0) == $enc)
+		and (map(select(.type == "dev.chaz.workspace")) | length == 1)
+		and (map(select(.type == "m.room.create"))[0].content["dev.chaz.workspace"]
+		     == map(select(.type == "dev.chaz.workspace"))[0].content)
+		and (map(select(.type == "m.room.power_levels"))[0].content.users[$p] == 100)
+		and ([.[] | select(.type == "m.room.member" and (.content.membership == "join" or .content.membership == "invite")) | .state_key] | sort == ([$a, $p] | sort))
+	' <<<"$state" >/dev/null || fail "workspace room $room is not private as created: $state"
+	mx GET "/_matrix/client/v3/directory/list/room/$(jq -rn --arg r "$room" '$r|@uri')" "" |
+		jq -e '.visibility == "private"' >/dev/null || fail "workspace room $room is in the room directory"
+}
+
+log "Case W1: workspace setup preview and confirm"
+ws_say "$CONTROL_ROOM" "!chaz workspace setup"
+ws_expect "$CONTROL_ROOM" "workspace confirm op-1"
+[[ -z "$(ws_invited Lobby || true)" ]] || fail "the preview created rooms"
+ws_say "$CONTROL_ROOM" "!chaz workspace confirm op-1"
+ws_expect "$CONTROL_ROOM" "workspace setup — done"
+SPACE_ID="$(ws_invited Chaz)" || fail "no Space invitation"
+LOBBY_ID="$(ws_invited Lobby)" || fail "no Lobby invitation"
+ws_join "$SPACE_ID"
+ws_join "$LOBBY_ID"
+ws_state "$SPACE_ID" | jq -e --arg l "$LOBBY_ID" '
+	(map(select(.type == "m.room.create"))[0].content.type == "m.space")
+	and (map(select(.type == "m.space.child" and .state_key == $l)) | length == 1)' >/dev/null ||
+	fail "the Space is not a Space that lists the Lobby"
+ws_assert_private "$SPACE_ID" false
+ws_assert_private "$LOBBY_ID" true
+printf '\033[1;32mPASS\033[0m — workspace setup: preview created nothing; private Space lists an encrypted invite-only Lobby\n' >&2
+
+log "Case W2: the Lobby is command-only"
+TURNS_BEFORE="$(stub_requests)"
+ws_say "$LOBBY_ID" "hello lobby"
+ws_expect "$LOBBY_ID" "The Lobby is command-only"
+[[ "$(stub_requests)" -eq "$TURNS_BEFORE" ]] || fail "a Lobby message started a model turn"
+for room in "$SPACE_ID" "$LOBBY_ID"; do
+	! grep -F "Channel bound to session" "$BRIDGE_LOG" | grep -qF "$room" ||
+		fail "the bridge bound a session to workspace room $room"
+done
+printf '\033[1;32mPASS\033[0m — Lobby: plain text answered with a notice, no model turn, no session for Space or Lobby\n' >&2
+
+log "Case W3: a fresh named chat"
+ws_say "$LOBBY_ID" "!chaz chat new Bike repair"
+ws_expect "$LOBBY_ID" "(c1) — done"
+CHAT_ID="$(ws_invited "Bike repair")" || fail "no chat invitation"
+ws_join "$CHAT_ID"
+ws_assert_private "$CHAT_ID" true
+ws_state "$SPACE_ID" | jq -e --arg c "$CHAT_ID" 'map(select(.type == "m.space.child" and .state_key == $c)) | length == 1' >/dev/null ||
+	fail "the Space does not list the chat"
+LOBBY_REPLIES="$(probe --dir "$SIGNED_DIR" wire --room "$LOBBY_ID" --sender "$AGENT_MXID")"
+ws_say "$CHAT_ID" "workspace chat ping"
+ws_expect "$CHAT_ID" "$MARKER"
+[[ "$(probe --dir "$SIGNED_DIR" wire --room "$LOBBY_ID" --sender "$AGENT_MXID")" -eq "$LOBBY_REPLIES" ]] ||
+	fail "the chat's reply also reached the Lobby"
+CHAT_BINDINGS="$(grep -F "Channel bound to session" "$BRIDGE_LOG" | grep -cF "$CHAT_ID")"
+[[ $CHAT_BINDINGS -eq 1 ]] || fail "expected one session binding for the chat, found $CHAT_BINDINGS"
+printf '\033[1;32mPASS\033[0m — new chat: private, linked from the Space, answered in its own room only, one session\n' >&2
+
+log "workspace: second chat has independent history and addressed replies"
+ws_say "$LOBBY_ID" "!chaz chat new Trip plans"
+ws_expect "$LOBBY_ID" "(c2) — done"
+OTHER_CHAT_ID="$(ws_invited "Trip plans")" || fail "no second chat invitation"
+ws_join "$OTHER_CHAT_ID"
+ws_assert_private "$OTHER_CHAT_ID" true
+CHAT_REPLIES="$(probe --dir "$SIGNED_DIR" wire --room "$CHAT_ID" --sender "$AGENT_MXID")"
+ws_say "$OTHER_CHAT_ID" "workspace sibling ping"
+ws_expect "$OTHER_CHAT_ID" "$MARKER"
+[[ "$(probe --dir "$SIGNED_DIR" wire --room "$CHAT_ID" --sender "$AGENT_MXID")" -eq "$CHAT_REPLIES" ]] ||
+    fail "sibling reply reached the first chat"
+! grep -F 'stub_llm: request:' "$WORKSPACE/stub-llm.log" | grep -F 'workspace sibling ping' | grep -qF 'workspace chat ping' ||
+    fail "independent chats shared their transcripts"
+TURNS_BEFORE="$(stub_requests)"
+ws_say "$LOBBY_ID" "!chaz chat rename c1 Winter bike"
+ws_expect "$LOBBY_ID" "rename c1 to “Winter bike” — done"
+ws_state "$CHAT_ID" | jq -e 'map(select(.type == "m.room.name"))[0].content.name == "Winter bike"' >/dev/null ||
+    fail "literal rename did not update Matrix"
+ws_say "$LOBBY_ID" "!chaz chat list"
+ws_expect "$LOBBY_ID" "c1 “Winter bike”"
+[[ "$(stub_requests)" -eq "$TURNS_BEFORE" ]] || fail "literal rename invoked a model"
+printf '\033[1;32mPASS\033[0m — workspace siblings: separate transcripts and addressed replies; literal rename/list without a model\n' >&2
+
+log "Case W4: bridge and daemon restarts keep the chat"
+kill -TERM "$BRIDGE_PID"
+wait_for "bridge to exit" 30 sh -c "! kill -0 $BRIDGE_PID 2>/dev/null"
+retire_pid "$BRIDGE_PID"
+kill -TERM "$DAEMON_PID"
+wait_for "daemon to exit" 30 sh -c "! kill -0 $DAEMON_PID 2>/dev/null"
+retire_pid "$DAEMON_PID"
+spawn daemon-workspace "$CHAZ_BIN" --config "$DAEMON_CONFIG" daemon
+DAEMON_PID="$SPAWNED_PID"
+wait_for "daemon after workspace restart" 120 grep -q "daemon ready" "$WORKSPACE/daemon-workspace.log"
+spawn bridge-workspace-restarted env RUST_LOG="$BRIDGE_RUST_LOG" "$CHAZ_MATRIX_BIN" --config "$BRIDGE_CONFIG"
+BRIDGE_PID="$SPAWNED_PID"
+BRIDGE_LOG="$WORKSPACE/bridge-workspace-restarted.log"
+wait_for "bridge after workspace restart" 120 grep -q "The client is ready" "$BRIDGE_LOG"
+ws_say "$CHAT_ID" "workspace chat after restart"
+probe --dir "$SIGNED_DIR" expect --room "$CHAT_ID" --sender "$AGENT_MXID" --contains "$MARKER" \
+	--timeout "$REPLY_TIMEOUT" >/dev/null || fail "no chat reply after restarts (see $BRIDGE_LOG)"
+ws_say "$LOBBY_ID" "!chaz chat list"
+ws_expect "$LOBBY_ID" "c1 “Winter bike”"
+! grep -F "Created transport channel session" "$BRIDGE_LOG" | grep -qF "$CHAT_ID" ||
+	fail "a replacement session was created for the chat after restart"
+[[ "$(mx GET /_matrix/client/v3/joined_rooms "$PUPPET_TOKEN" | jq --arg s "$SPACE_ID" --arg l "$LOBBY_ID" --arg c "$CHAT_ID" \
+	'[.joined_rooms[] | select(. == $s or . == $l or . == $c)] | length')" -eq 3 ]] || fail "workspace rooms changed"
+[[ -z "$(ws_invited "Winter bike" || true)" ]] || fail "a second chat room was created"
+printf '\033[1;32mPASS\033[0m — workspace after bridge + daemon restart: same chat answers, listed once, no replacement session or room\n' >&2
+
+log "workspace: approval stays in its own chat"
+LOBBY_REPLIES="$(probe --dir "$SIGNED_DIR" wire --room "$LOBBY_ID" --sender "$AGENT_MXID")"
+OTHER_REPLIES="$(probe --dir "$SIGNED_DIR" wire --room "$OTHER_CHAT_ID" --sender "$AGENT_MXID")"
+ws_say "$CHAT_ID" "workspace approval probe"
+ws_expect "$CHAT_ID" "Tool approval required"
+[[ "$(probe --dir "$SIGNED_DIR" wire --room "$LOBBY_ID" --sender "$AGENT_MXID")" -eq "$LOBBY_REPLIES" ]] || fail "approval prompt leaked to Lobby"
+[[ "$(probe --dir "$SIGNED_DIR" wire --room "$OTHER_CHAT_ID" --sender "$AGENT_MXID")" -eq "$OTHER_REPLIES" ]] || fail "approval prompt leaked to sibling"
+ws_say "$OTHER_CHAT_ID" "!chaz deny"
+ws_expect "$OTHER_CHAT_ID" "No pending approval"
+ws_say "$CHAT_ID" "!chaz deny"
+ws_expect "$CHAT_ID" "$MARKER workspace-approval-denied"
+grep -qF 'stub_llm: workspace approval denied' "$WORKSPACE/stub-llm.log" || fail "denial did not reach the requesting turn"
+printf '\033[1;32mPASS\033[0m — workspace approvals: prompt and denied final only in intended chat; sibling decision cannot resolve it\n' >&2
