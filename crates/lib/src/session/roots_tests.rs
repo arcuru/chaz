@@ -709,7 +709,7 @@ async fn failed_reference_write_reports_created_id_and_retry_requires_repair() {
 }
 
 #[tokio::test]
-async fn creation_tracking_failure_must_not_leave_an_undiscoverable_root() {
+async fn creation_tracking_failure_is_reported_without_using_an_untracked_root() {
     let probe = BackendProbe::default();
     let (instance, mut user) = Instance::create_backend(
         Box::new(CountingBackend::new(InMemory::new(), probe.clone())),
@@ -745,34 +745,42 @@ async fn creation_tracking_failure_must_not_leave_an_undiscoverable_root() {
         "creation failure: {error}; orphan roots: {orphan:?}; tracked roots: {:?}",
         user.databases().await.unwrap()
     );
+    assert!(
+        matches!(
+            &error,
+            RootsError::Initialize {
+                kind: RootKind::Group,
+                ..
+            }
+        ),
+        "{error}"
+    );
+    assert!(
+        error.to_string().contains("injected root write failure"),
+        "{error}"
+    );
+    // Initial creation has no application data yet. A failed tracking write
+    // may leave an unused orphan; it must still fail startup, not select it.
+    assert!(user.databases().await.unwrap().is_empty());
+    for kind in [RootKind::Group, RootKind::Peer] {
+        assert_eq!(roots::referenced(&user, kind).await.unwrap(), None);
+    }
+
     let mut restarted = relogin(&instance).await;
     let retry = roots::open(&mut restarted, RootSetup::Initialize)
         .await
-        .map(|roots| (roots.group.root_id().clone(), roots.peer.root_id().clone()));
-    eprintln!("retry result: {retry:?}");
-    // Rollback is fine. If creation persisted, the error must identify the
-    // existing target and retry must refuse to create anything else.
-    for id in &orphan {
+        .unwrap();
+    for (kind, db) in [
+        (RootKind::Group, &retry.group),
+        (RootKind::Peer, &retry.peer),
+    ] {
         assert!(
-            error.to_string().contains(&id.to_string()),
-            "partial creation must report committed root {id} for explicit repair: {error}"
+            !orphan.contains(db.root_id()),
+            "retry selected an untracked root"
         );
-    }
-    if !orphan.is_empty() {
-        assert!(
-            retry.is_err(),
-            "retry must require explicit repair: {retry:?}"
+        assert_eq!(
+            roots::referenced(&restarted, kind).await.unwrap(),
+            Some(db.root_id().clone())
         );
-        let mut after_retry = instance
-            .backend()
-            .local_engine()
-            .unwrap()
-            .all_roots()
-            .await
-            .unwrap();
-        let mut after = after;
-        after_retry.sort();
-        after.sort();
-        assert_eq!(after_retry, after, "retry created additional roots");
     }
 }
