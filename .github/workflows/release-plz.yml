@@ -17,22 +17,22 @@ jobs:
       id-token: write
     steps:
       - name: Checkout repository
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: stable
       - name: Rust Cache
-        uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
 
       - name: Authenticate with crates.io
-        uses: rust-lang/crates-io-auth-action@bbd81622f20ce9e2dd9622e3218b975523e45bbe # v1.0.4
+        uses: rust-lang/crates-io-auth-action@3268eb413133e2960fa4ae0e963ca76380c54cd9 # v1.0.6
         id: cratesio-auth
 
       - name: Run release-plz
-        uses: release-plz/action@f708778669256143d984cce4b23592637532e040 # v0.5.127
+        uses: release-plz/action@f67a7e724bdad4a0f6875f186060a0ca2770d76c # v0.5.147
         with:
           command: release
           config: .config/release-plz.toml
@@ -53,15 +53,15 @@ jobs:
       cancel-in-progress: false
     steps:
       - name: Checkout repository
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: stable
       - name: Rust Cache
-        uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
 
       - name: Check if release PR exists
         id: check-pr
@@ -74,7 +74,7 @@ jobs:
 
       - name: Run release-plz
         if: github.event_name == 'workflow_dispatch' || steps.check-pr.outputs.exists != '0'
-        uses: release-plz/action@f708778669256143d984cce4b23592637532e040 # v0.5.127
+        uses: release-plz/action@f67a7e724bdad4a0f6875f186060a0ca2770d76c # v0.5.147
         with:
           command: release-pr
           config: .config/release-plz.toml
