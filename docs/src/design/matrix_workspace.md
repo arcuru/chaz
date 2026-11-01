@@ -151,8 +151,11 @@ the same session use that same policy. Refresh replaces only the signing binding
 does not reload the active transcript, change the session root, select another
 private key, or replay a failed effect.
 
-Native discovery and commit validation remain authoritative. Read-only and
-revoked keys do not become writers. Missing delegated history or concurrent
+Single-hop retained writers refresh their already-bound delegation from the
+parent's verified frontier, not raw sync tips whose ancestry may still be
+incomplete. Native permission and commit validation remain authoritative;
+unverified entries supply no authority. Read-only and revoked keys do not become
+writers. Missing delegated history or concurrent
 advancement can still reject a commit; requests then deny or the turn remains
 interrupted. The embedded discovery API supports single-hop delegation; this
 is not a new nested-delegation walker or service-client authorization scheme.

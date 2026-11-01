@@ -800,10 +800,36 @@ pub(crate) async fn current_session_writer(
     db: &Database,
     key: Option<&eidetica::auth::crypto::PrivateKey>,
 ) -> anyhow::Result<Database> {
+    use eidetica::auth::types::{DelegationStep, SigKey};
+    use eidetica::database::DatabaseKey;
+
     let Some(key) = key else {
         return Ok(db.clone());
     };
     let instance = db.instance()?;
+    if let Some(SigKey::Delegation { path, .. }) = db.auth_identity()
+        && path.len() == 1
+    {
+        // Discovery uses raw parent tips, which can include a sync entry whose
+        // ancestry is not verified yet. Refresh the already-bound route from
+        // the verified frontier instead; native validation still owns authority.
+        let parent = Database::open(&instance, &path[0].tree).await?;
+        let identity = SigKey::Delegation {
+            path: vec![DelegationStep {
+                tree: path[0].tree.clone(),
+                tips: parent.snapshot().await?.into_tips(),
+            }],
+            hint: SigKey::from_pubkey(&key.public_key()).hint().clone(),
+        };
+        let writer = db
+            .clone()
+            .with_key(DatabaseKey::with_identity(key.clone(), identity));
+        anyhow::ensure!(
+            writer.current_permission().await?.can_write(),
+            "session signer has no current writable identity"
+        );
+        return Ok(writer);
+    }
     let (identity, _) = Database::find_sigkeys(&instance, db.root_id(), &key.public_key())
         .await?
         .into_iter()
