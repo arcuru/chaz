@@ -332,6 +332,17 @@ async fn nested_tool_compact_height_is_constant_live_completed_and_reopened() {
         assert!(text(&app).contains("Final answer remains visible."));
         assert!(text(&app).contains(&format!("{count} done")));
         assert!(text(&app).contains("attempt completed"));
+        let run_key = app.active().live.tool_activity.runs[0].key.clone();
+        let item_key = app.active().live.tool_activity.items[0].key.clone();
+        app.active_mut().live.expanded_runs.insert(run_key);
+        app.active_mut().live.expanded_tools.insert(item_key);
+        app.active_mut().touch_transcript();
+        draw(&mut app, 80, 60);
+        assert_eq!(
+            text(&app).matches("END-0-0").count(),
+            1,
+            "expansion must render the native result suffix beyond the 500-character audit preview, once"
+        );
         let snapshot = refresh::load_session_snapshot("tools", db.clone())
             .await
             .unwrap();
