@@ -223,6 +223,7 @@ pub struct DeliveryReconciler {
     backoff: Box<BackoffFn>,
     state: Mutex<ReconcileState>,
     stop: watch::Sender<bool>,
+    shutdown: watch::Sender<bool>,
 }
 
 impl DeliveryReconciler {
@@ -292,6 +293,7 @@ impl DeliveryReconciler {
                 retry_scheduled: false,
             }),
             stop,
+            shutdown: watch::channel(false).0,
         });
 
         // Subscribe at the cursor the first pass reads from, so a write
@@ -327,15 +329,33 @@ impl DeliveryReconciler {
         &self.binding
     }
 
-    /// Cancel any pending durable retry. Session writes still reach this
-    /// reconciler until its database handle's instance is dropped.
+    /// Stop delivery and cancel durable retries. Later session callbacks or
+    /// explicit passes cannot restart this reconciler.
     pub fn stop(&self) {
         self.stop.send_replace(true);
     }
 
+    /// Stop delivery for a torn-down transport generation and await the end
+    /// of its active send. Future session writes do no work.
+    pub async fn shutdown(&self) {
+        self.shutdown.send_replace(true);
+        self.stop();
+        // reconcile_once owns this lock through every transport send. The
+        // shutdown signal cancels that future before this barrier resolves.
+        drop(self.state.lock().await);
+    }
+
     /// Run one pass and, if anything is still undelivered, schedule a retry.
     pub async fn run_pass(self: &Arc<Self>) {
-        let outcome = self.reconcile_once().await;
+        let mut shutdown = self.shutdown.subscribe();
+        if *shutdown.borrow() || *self.stop.borrow() {
+            return;
+        }
+        let outcome = tokio::select! {
+            biased;
+            _ = shutdown.changed() => return,
+            outcome = self.reconcile_once() => outcome,
+        };
         let mut state = self.state.lock().await;
         match outcome {
             Ok(true) => state.retry_attempt = 0,
@@ -384,6 +404,9 @@ impl DeliveryReconciler {
     /// converged; `Ok(false)` when a send failed and the tail remains.
     async fn reconcile_once(&self) -> anyhow::Result<bool> {
         let mut state = self.state.lock().await;
+        if *self.stop.borrow() {
+            return Ok(true);
+        }
         anyhow::ensure!(
             crate::session::transport_bindings(&self.session_db)
                 .await?
@@ -496,6 +519,9 @@ impl DeliveryReconciler {
             };
             let total = chunks.len();
             for (index, body) in chunks.into_iter().enumerate().skip(start) {
+                if *self.stop.borrow() {
+                    return Ok(true);
+                }
                 let chunk = OutboundChunk {
                     body,
                     idempotency_key: self.binding.idempotency_key(id.as_str(), index),
@@ -952,6 +978,79 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stopped_reconciler_cannot_be_revived_by_writes_or_manual_passes() {
+        let fx = fixture().await;
+        let wire = Arc::new(Transport::default());
+        let reconciler = attach(&fx, "room", &wire, one_chunk).await;
+        reconciler.stop();
+        write(&fx.session_db, "default", "after stop").await;
+        reconciler.run_pass().await;
+        assert_eq!(wire.attempts.load(Ordering::SeqCst), 0);
+        let replacement = attach(&fx, "room", &wire, one_chunk).await;
+        assert_eq!(wire.bodies().await, ["after stop"]);
+        replacement.stop();
+    }
+
+    #[tokio::test]
+    async fn shutdown_cancels_an_active_send_and_ignores_later_writes() {
+        let fx = fixture().await;
+        let started = Arc::new(tokio::sync::Notify::new());
+        let sends = Arc::new(AtomicUsize::new(0));
+        let transport = Arc::new(());
+        let retained = transport.clone();
+        let wake = started.clone();
+        let count = sends.clone();
+        let reconciler = DeliveryReconciler::attach(
+            fx.session_db.clone(),
+            fx.store.clone(),
+            binding("room", &fx.session_db),
+            fx.agents.clone(),
+            "default".into(),
+            one_chunk,
+            move |_| {
+                let retained = retained.clone();
+                let wake = wake.clone();
+                let count = count.clone();
+                Box::pin(async move {
+                    let _transport = retained;
+                    count.fetch_add(1, Ordering::SeqCst);
+                    wake.notify_one();
+                    std::future::pending().await
+                })
+            },
+        )
+        .await
+        .unwrap();
+        let db = fx.session_db.clone();
+        let writer = tokio::spawn(async move { write(&db, "default", "blocked").await });
+        tokio::time::timeout(Duration::from_secs(5), started.notified())
+            .await
+            .unwrap();
+        assert_eq!(
+            Arc::strong_count(&transport),
+            3,
+            "active send holds the transport"
+        );
+        tokio::time::timeout(Duration::from_secs(5), reconciler.shutdown())
+            .await
+            .unwrap();
+        assert_eq!(
+            Arc::strong_count(&transport),
+            2,
+            "shutdown awaits the cancelled send's drop"
+        );
+        writer.await.unwrap();
+        write(&fx.session_db, "default", "after shutdown").await;
+        reconciler.run_pass().await;
+        assert_eq!(sends.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            fx.store.load(reconciler.binding()).await.unwrap().unwrap(),
+            DeliveryProgress::default(),
+            "a cancelled send must not be acknowledged"
+        );
+    }
+
+    #[tokio::test]
     async fn a_response_committed_while_offline_delivers_on_reattach() {
         let fx = fixture().await;
         write(&fx.session_db, "user", "hello").await;
@@ -1065,7 +1164,6 @@ mod tests {
         let transport = Arc::new(Transport::default());
         transport.fail.lock().await.insert("second".into());
         let reconciler = attach(&fx, "room", &transport, pipe_chunks).await;
-        reconciler.stop(); // no timer retry: the restart is what resumes
         let id = write(&fx.session_db, "default", "first|second|third").await;
         wait_until("first chunk", async || !transport.bodies().await.is_empty()).await;
         // Let the failing second chunk settle before inspecting the record.
@@ -1080,6 +1178,7 @@ mod tests {
             Some(&DeliveryMark::Chunks(1))
         );
         let first_key = transport.sent.lock().await[0].idempotency_key.clone();
+        reconciler.stop();
         drop(reconciler);
 
         // A fresh process resumes at the failed chunk, never the prefix.
@@ -1143,7 +1242,6 @@ mod tests {
         let matrix_side = attach(&fx, "matrix-room", &matrix, one_chunk).await;
         let discord_side = attach(&fx, "discord-channel", &discord, one_chunk).await;
         discord.fail.lock().await.insert("fan out".into());
-        discord_side.stop();
 
         write(&fx.session_db, "default", "fan out").await;
         wait_until("matrix delivery", async || {
@@ -1168,6 +1266,7 @@ mod tests {
         assert!(discord_progress.entries.is_empty());
 
         // The Discord side recovers on its own once its transport does.
+        discord_side.stop();
         discord.fail.lock().await.clear();
         drop(discord_side);
         let discord_side = attach(&fx, "discord-channel", &discord, one_chunk).await;

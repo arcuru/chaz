@@ -135,8 +135,10 @@ without sync addresses, needs no approval, and monitors the connection the way
 the daemon does: a transient Eidetica daemon restart tears the bridge's runtime
 and transport connections down completely, then reconnects with bounded
 backoff, re-logs in, reopens the databases, reinstalls its hooks, and
-reconciles delivery progress. Bad credentials or invalid configuration fail
-immediately.
+reconciles delivery progress. Matrix drains its room typing and approval
+watchers, startup attachment work, and pending auto-joins before releasing the
+SDK client's store lease; the replacement client never bypasses that lock.
+Bad credentials or invalid configuration fail immediately.
 
 ## Fresh-state service rehearsal (no automatic migration)
 

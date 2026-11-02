@@ -61,6 +61,7 @@ Example with a shared room:
        allow_list: "@you:example" # optional; falls back to a top-level allow_list
        # id: <stable-login-id>         # optional; defaults to the MXID
        # room_size_limit: 100          # optional per-login cap
+       # workspace_manager: "@you:example" # optional; enables the personal workspace
 
    # chaz runtime keys the embedded server needs:
    state_dir: /var/lib/chaz-matrix
@@ -82,7 +83,8 @@ Example with a shared room:
    `homeserver_url`, `username`, and `password` are the bot's login; `password`
    (and `unlock_password`) accept `${ENV}` references so no secret has to live in
    the file. `allow_list` / `room_size_limit` may be set per-login or as global
-   fallbacks at the top level.
+   fallbacks at the top level. `workspace_manager` is per-login only; see
+   [Personal workspace](#personal-workspace-space-lobby-and-named-chats).
 
 4. **Run the bridge** (with the daemon already running):
 
@@ -288,25 +290,25 @@ Commands are sent as Matrix messages. Session ops go through the same transport-
 
 ### Session
 
-| Command                      | Description                                                                                  |
-| ---------------------------- | -------------------------------------------------------------------------------------------- |
-| `!chaz sessions`             | List every session known to the registry                                                     |
-| `!chaz info`                 | Show details for the session attached to this room                                           |
-| `!chaz name [<alias>]`       | Set (or clear, with no arg) a human-friendly alias                                           |
-| `!chaz description [<text>]` | Set (or clear, with no arg) a browse-only [session description](tui.md#session-descriptions) |
-| `!chaz attach <session>`     | Bind this room to a specific session (name or DB ID)                                         |
-| `!chaz detach`               | Detach this room from its session                                                            |
-| `!chaz participation on`     | Enable agent-selected replies for this group room after executor confirmation                |
-| `!chaz participation status` | Report whether this login and room are confirmed enabled                                     |
-| `!chaz participation off`    | Disable participation in this room                                                           |
-| `!chaz channels`             | List transport channels attached to this session                                             |
-| `!chaz share`                | Generate a shareable ticket URL for this session                                             |
-| `!chaz unshare`              | Stop sharing the current session                                                             |
-| `!chaz sync <ticket>`        | Sync a remote session via ticket URL                                                         |
-| `!chaz compact`              | Summarize and compact conversation history                                                   |
-| `!chaz context`              | Context-window usage for this room's agent                                                   |
-| `!chaz print`                | Print the current conversation context                                                       |
-| `!chaz stop`                 | Stop the turn running in this session ([details](tui.md#stopping-a-running-turn))            |
+| Command                          | Description                                                                                  |
+| -------------------------------- | -------------------------------------------------------------------------------------------- |
+| `!chaz sessions`                 | List every session known to the registry                                                     |
+| `!chaz info`                     | Show details for the session attached to this room                                           |
+| `!chaz name [<alias>]`           | Set (or clear, with no arg) a human-friendly alias                                           |
+| `!chaz description [<text>]`     | Set (or clear, with no arg) a browse-only [session description](tui.md#session-descriptions) |
+| `!chaz attach <session>`         | Bind a free room to a free session (name or DB ID); exact retries are safe                   |
+| `!chaz detach [<session-db-id>]` | Remove this room's binding; an ambiguous room requires the exact session DB ID               |
+| `!chaz participation on`         | Enable agent-selected replies for this group room after executor confirmation                |
+| `!chaz participation status`     | Report whether this login and room are confirmed enabled                                     |
+| `!chaz participation off`        | Disable participation in this room                                                           |
+| `!chaz channels`                 | List transport channels attached to this session                                             |
+| `!chaz share`                    | Generate a shareable ticket URL for this session                                             |
+| `!chaz unshare`                  | Stop sharing the current session                                                             |
+| `!chaz sync <ticket>`            | Sync a remote session via ticket URL                                                         |
+| `!chaz compact`                  | Summarize and compact conversation history                                                   |
+| `!chaz context`                  | Context-window usage for this room's agent                                                   |
+| `!chaz print`                    | Print the current conversation context                                                       |
+| `!chaz stop`                     | Stop the turn running in this session ([details](tui.md#stopping-a-running-turn))            |
 
 ### Living Agents
 
@@ -331,24 +333,58 @@ Commands are sent as Matrix messages. Session ops go through the same transport-
 
 ### Approval & misc
 
-| Command                        | Description                                                                 |
-| ------------------------------ | --------------------------------------------------------------------------- |
-| `!chaz approve` / `!chaz deny` | Decide the pending tool approval (or react to the notice with ✅ / ❌ / ⏭) |
-| `!chaz send <msg>`             | One-shot message with no conversation context                               |
-| `!chaz clear`                  | Ignore all messages before this point                                       |
-| `!chaz rename`                 | Rename the Matrix room based on conversation content                        |
-| `!chaz party`                  | 🎉                                                                          |
+| Command                        | Description                                                                   |
+| ------------------------------ | ----------------------------------------------------------------------------- |
+| `!chaz approve` / `!chaz deny` | Decide the pending tool approval (or react to the notice with ✅ / ❌ / ⏭)   |
+| `!chaz send <msg>`             | One-shot message with no conversation context                                 |
+| `!chaz clear`                  | Ignore all messages before this point                                         |
+| `!chaz rename`                 | Rename the Matrix room based on conversation content (not in workspace chats) |
+| `!chaz party`                  | 🎉                                                                            |
+
+### Workspace
+
+Only the login's configured `workspace_manager` may run these; see
+[Personal workspace](#personal-workspace-space-lobby-and-named-chats).
+
+| Command                           | Where                    | Description                                                              |
+| --------------------------------- | ------------------------ | ------------------------------------------------------------------------ |
+| `!chaz workspace help`            | anywhere                 | Show the workspace vocabulary                                            |
+| `!chaz workspace setup`           | direct chat with the bot | Preview the Space and Lobby, with room version and creator powers        |
+| `!chaz workspace confirm <op>`    | direct chat with the bot | Create the previewed Space and Lobby                                     |
+| `!chaz workspace status [<op>]`   | Lobby or direct chat     | Workspace summary, or the exact progress of one operation                |
+| `!chaz workspace retry <op>`      | Lobby or direct chat     | Continue an incomplete operation, or re-check an uncertain room creation |
+| `!chaz workspace cancel <op>`     | Lobby or direct chat     | Stop an unfinished operation; deletes nothing                            |
+| `!chaz chat new <name>`           | Lobby                    | Create a fresh named chat room with its own new session                  |
+| `!chaz chat list`                 | Lobby                    | List this workspace's chats with their handles (`c1`, `c2`, …) and links |
+| `!chaz chat rename <chat> <name>` | Lobby                    | Rename a chat by handle; the room and session stay the same              |
+| `!chaz chat rename <name>`        | inside a workspace chat  | Rename this chat                                                         |
 
 ## Attached rooms and reply routing
 
-A session can attach **at most one Matrix `(login, room)`**. It is still the
-same session in the TUI; selecting it there does not change the Matrix room or
-make it the TUI's default. `!chaz attach <session>` refuses a second Matrix
-room or login until the existing room is detached. An older session with
-conflicting bindings fails closed: detach or explicitly migrate its bindings,
-not a silent redirect. `!chaz detach` removes this room's binding; the next
-addressed message there creates a fresh session. Non-Matrix transport bindings
-are separate.
+A session has **at most one external attachment**, identified by exact
+`(transport, login, channel)`. Each such channel belongs to at most one session
+in the owning agent's exposed registry. TUI and CLI are local clients, not extra
+attachments; selecting a session there does not change its Matrix room.
+
+`!chaz attach <session>` refuses if this room already belongs to a different
+session: detach first. It also refuses if the target session already has a
+different attachment, including another transport. Repeating an attach to the
+same session and room is safe. Attach does not copy history, replay local
+finals, or redirect queued sends from another room.
+
+Legacy conflicts fail closed in both directions: neither multiple rooms on one
+session nor multiple sessions on one room gets an arbitrary winner. Inbound
+lookup does not create a replacement session, and delivery and approval posts
+stop until the binding is unambiguous. There is no automatic split or migration.
+
+Use `!chaz detach` **in the room being removed**. It removes only that exact
+login/room binding and stops its delivery and approval observers without a
+bridge restart. Any remaining binding retains the original session, history
+and required login exposure. The detached room's next addressed message can
+create a fresh session. If the room itself belongs to multiple sessions, the
+error lists their DB IDs: use `!chaz detach <exact-session-db-id>` to remove
+one explicitly. Names and guessed IDs cannot disambiguate it. Errors are
+reported rather than claiming detach succeeded.
 
 | Action                                     | Effect                                                                                                       |
 | ------------------------------------------ | ------------------------------------------------------------------------------------------------------------ |
@@ -386,6 +422,35 @@ that agent to produce a local final; burst limits still apply. The model-facing
 local turns, to keep the tool list stable; non-Matrix-origin finals never auto-post.
 A model without tool-calling support cannot safely choose `no_reply` and is
 rejected for a Matrix-bound turn rather than silently posting a fallback answer.
+
+### Recovering a legacy binding
+
+1. If a session was bound to two rooms, choose which room to keep. In the
+   other room, send `!chaz detach`:
+
+   ```text
+   Room detached. Future messages will create a fresh session.
+   ```
+
+   The remaining room still uses the original session and transcript. Nothing
+   is copied to the removed room, and pending output to it stops in-process.
+
+2. If a single room instead belongs to two sessions, bare detach refuses. The
+   response names the exact IDs (shown here as `<A>` and `<B>`):
+
+   ```text
+   !chaz Error: channel is bound to multiple sessions: <A>, <B>; use !chaz detach <exact-session-db-id> in this room
+   ```
+
+   Send `!chaz detach <A>` in that room, substituting the complete unwanted
+   session DB ID. Session `<B>` and its history remain untouched. A wrong ID
+   gives `!chaz Error: session <id> is not bound to this room on this login`;
+   it does not remove another binding.
+
+3. Once the remaining mapping is unique, detach reinstalls any delivery
+   observers that startup refused. Queued output resumes to its original room
+   without a new inbound message or a restart. Attaching a different session
+   is a separate explicit action, not a move or history merge.
 
 ## Migration: schedules no longer auto-post finals
 
@@ -448,9 +513,12 @@ Example in an allowlisted group room:
    the room receives that explicit post from its Matrix login, while the
    session shows the addressed event as pending, then sent. A later normal
    final on that turn remains **local** and does not produce a second room post.
-3. A second room tries `!chaz attach <session>` and receives
-   `!chaz Error: failed to bind room: session has a different or conflicting external attachment; detach or migrate explicitly`.
-   Detach the old room first if moving the handle is intentional; an old
+3. A room already bound to another session tries `!chaz attach <session>` and
+   receives `!chaz Error: failed to bind room: room is already bound to session <room-session-db-id>; detach first`.
+   Detach this room first if replacing its binding is intentional. If the
+   target session still has another attachment, attach also refuses with
+   `session has a different or conflicting external attachment; detach or migrate explicitly`.
+   Detach the old room explicitly before attaching the free target. An old
    queued send is not rerouted to the new room.
 4. `@you:example` sends `!chaz participation on` and sees
    `Matrix participation: on` only after executor confirmation. A bare
@@ -557,6 +625,182 @@ out of the conversation. It does not keep the conversation out of chaz or the mo
    ```
 
    Verify that device from another of your sessions, then send the message again.
+
+## Personal workspace (Space, Lobby and named chats)
+
+A workspace gives one person a tidy place to keep separate conversations with
+the bot: a private Matrix **Space** that lists a **Lobby** and one room per
+chat. Every chat room has exactly one new Chaz session, so chats never share
+a transcript. They still use the owning agent's shared tools and memory;
+separate transcripts do not create separate agents or authorization domains.
+Turn it on by setting `workspace_manager` on the login to your exact MXID;
+unset, management commands refuse (help remains available).
+
+**A Space is a folder of rooms, not a conversation and not a permission
+group.** What each part does:
+
+| Room      | You use it for                                  | Chaz context                        |
+| --------- | ----------------------------------------------- | ----------------------------------- |
+| Space     | Finding the Lobby and your chats in your client | None; the bot never replies there   |
+| Lobby     | `!chaz chat …` and `!chaz workspace …` commands | None; it is command-only, no agent  |
+| Each chat | Talking to the agent, like any direct chat      | Exactly one session, created for it |
+
+What is automatic and what you do:
+
+- **Only you manage it.** A command counts only when its sender is exactly the
+  configured `workspace_manager` and passes the login's `allow_list`. Being in
+  the Space or Lobby, or quoting a command, grants nothing.
+- **Only new chats appear.** `chat new` creates a fresh room and a fresh
+  session. Existing rooms, sessions, internal sessions and the agent catalog
+  are never listed, imported or moved, and `chat list` shows only this
+  workspace's chats. An old workspace chat is resumed by opening its link.
+- **Privacy is explicit.** The bot creates every room invite-only, with
+  history visible to joined members only, no guest access and no room
+  directory entry. The Lobby and chats are encrypted from creation. Only you
+  are invited, and only once a chat is ready; Space membership never invites
+  anyone or grants access. Room names, topics, Space links and the
+  `dev.chaz.workspace` marker described below are room state, which Matrix does
+  not end-to-end encrypt: do not put secrets in chat names.
+- **The bot creates the rooms.** You get power level 100 in each and are not a
+  creator. `setup` shows the homeserver's room version before anything is
+  created: from room version 12 on, a creator's power is permanent and cannot
+  be revoked, so the bot keeps it. An unrecognised room version refuses setup.
+- **Names are literal labels.** `chat rename` sets the room name and the
+  session's [description](tui.md#session-descriptions) to exactly what you
+  typed; no model writes titles. The model-based `!chaz rename` is refused in
+  workspace chats. Rooms and sessions are identified by ID, never by name.
+- **Bindings are fixed.** `attach`, `detach` and `participation` are refused
+  in workspace chats, and the bot never creates a replacement session for a
+  chat whose session it cannot open. Literal rename and approval reactions also
+  refuse a missing or competing binding. Replies and tool approvals use the
+  ordinary [reply routing](#attached-rooms-and-reply-routing) for that room
+  only; nothing is ever posted to the Lobby or another chat instead.
+
+**Where the state lives.** The workspace record — the Space, Lobby and chat
+room IDs, their session IDs and every operation's progress — is in the bridge
+peer's local `chaz_peer` database, which never syncs. Each room also carries a
+`dev.chaz.workspace` state event naming its workspace, operation and role; the
+bridge uses it to keep such rooms away from ordinary history bootstrap even
+when the record does not list them.
+
+**Failure modes.** Room creation cannot be made exactly-once, so every request
+is an operation (`op-N`) with saved step progress:
+
+- If a room-creation request has an unknown outcome (a dropped connection or a
+  server error), the operation becomes **uncertain**. The request is never sent
+  again. `workspace retry` looks for a room the bot created with that
+  operation's marker and continues with it; if none, or more than one, is
+  visible it stays uncertain. Use `workspace cancel` only if you are sure no
+  room was created.
+- If a later step fails (session setup, a Space link, an invitation), the
+  operation is **incomplete** and its report names what is done and pending.
+  `workspace retry` runs only the pending steps. A chat whose session is not
+  ready replies "not ready" and sends nothing to the agent.
+- A session database created before an interruption is found again through a
+  marker in its initial settings. The bridge also finishes any interrupted
+  schema/catalog initialization before exposing it. If a DB-creation attempt
+  was admitted but no marked DB is visible, retry refuses a replacement: retain
+  the operation and investigate storage/sync rather than creating another DB.
+- One operation runs at a time; a new request waits until the unfinished one
+  is retried or cancelled. Repeated delivery of the same command returns the
+  same report. Bridge restarts keep everything; nothing resumes on its own.
+- Cancel never deletes or leaves a room. A room an operation already created
+  stays as it is, marked "not ready" in `chat list`, and setup cannot be
+  cancelled once it created a room — retry it instead. The same holds for a
+  chat with a known room or a rename whose Matrix name write was attempted:
+  a lost response may hide a successful write. Retry the same literal rename
+  to finish both labels rather than cancelling it.
+
+V1 has no archive, threaded Inbox, existing-room adoption, nested Spaces or
+model-driven management.
+
+### Walkthrough: a workspace with one interrupted chat
+
+1. Set `workspace_manager: "@you:example"` on the bot's login and restart the
+   bridge. In your existing direct chat with the bot, ask for a preview:
+
+   ```text
+   > !chaz workspace setup
+   Proposed workspace (operation op-1):
+   - Bot @chaz:example on login @chaz:example, owning agent chaz (<agent DB ID>), manager @you:example.
+   - A private Space “Chaz” and a command-only “Lobby” room.
+   - Lobby and chats: invite-only, encrypted, history visible to joined members only, no guests, not in the room directory. Only @you:example is invited.
+   - The Space is invite-only and unlisted; its names and links are room state, which Matrix does not end-to-end encrypt.
+   - Room version 12: the bot is the room creator with permanent, unlimited power that no one can revoke. @you:example gets power 100 in every room and is not a creator.
+   - No existing sessions or rooms are listed, moved or imported.
+   Reply `!chaz workspace confirm op-1` to create these rooms.
+   ```
+
+2. Confirm it, then accept both invitations in your client:
+
+   ```text
+   > !chaz workspace confirm op-1
+   op-1: workspace setup — done.
+   Done: Space created, Lobby created, listed in the Space, linked back to the Space, invited to the Space, invited to the Lobby.
+   Space: https://matrix.to/#/!space:example
+   Lobby: https://matrix.to/#/!lobby:example
+   Accept both invitations; create chats from the Lobby.
+   ```
+
+3. In the Lobby, start a chat. Accept its invitation and talk there:
+
+   ```text
+   > !chaz chat new Bike repair
+   op-2: new chat “Bike repair” (c1) — done.
+   Done: room created, session created and bound, session label set, reply delivery installed, listed in the Space, linked back to the Space, invitation sent.
+   Open chat: https://matrix.to/#/!bike:example
+   A new session is ready; no other chat history was copied.
+   ```
+
+4. Failure and recovery. This example drops the room-creation response, then
+   simulates a storage failure after creating the session DB:
+
+   ```text
+   > !chaz chat new Trip plans
+   op-3: new chat “Trip plans” (c2) — uncertain.
+   Pending: room creation (outcome unknown), session created and bound, session label set, reply delivery installed, listed in the Space, linked back to the Space, invitation sent.
+   Last error: room.create: outcome unknown (connection reset); it will not be sent again
+   !chaz workspace retry op-3 checks again for the room. If you are sure no room was created, !chaz workspace cancel op-3 stops it.
+
+   > !chaz chat new Taxes
+   !chaz Error: op-3 is unfinished (uncertain); use !chaz workspace retry op-3 or cancel op-3 first
+
+   > !chaz workspace retry op-3
+   op-3: new chat “Trip plans” (c2) — incomplete.
+   Done: room created.
+   Pending: session created and bound, session label set, reply delivery installed, listed in the Space, linked back to the Space, invitation sent.
+   Last error: session.provision: injected failure after DB creation
+   Room !trip:example exists; it is not ready for chat. No second room will be created.
+   Continue with !chaz workspace retry op-3 (only pending steps run).
+   ```
+
+   The retry found the room the lost request had created instead of creating
+   another. After storage access is restored, retry again; only the pending steps run:
+
+   ```text
+   > !chaz workspace retry op-3
+   op-3: new chat “Trip plans” (c2) — done.
+   Done: room created, session created and bound, session label set, reply delivery installed, listed in the Space, linked back to the Space, invitation sent.
+   Open chat: https://matrix.to/#/!trip:example
+   A new session is ready; no other chat history was copied.
+   ```
+
+5. Find and rename chats from the Lobby:
+
+   ```text
+   > !chaz chat list
+   Chats in this workspace:
+   c1 “Bike repair” — https://matrix.to/#/!bike:example
+   c2 “Trip plans” — https://matrix.to/#/!trip:example
+
+   > !chaz chat rename c1 Winter bike
+   op-4: rename c1 to “Winter bike” — done.
+   Done: room name set, session label set.
+   Room and session unchanged; only the label changed.
+   ```
+
+   Typing an ordinary message in the Lobby gets a reminder that it is
+   command-only; nothing reaches the agent.
 
 ## Limitations
 

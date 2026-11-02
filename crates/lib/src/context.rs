@@ -137,6 +137,7 @@ pub struct ContextBuilder<'a> {
     extension_hub: Option<Arc<ExtensionHub>>,
     /// Session DB passed through to the hub for per-session provider resolution.
     session_db: Option<&'a Database>,
+    session_signing_key: Option<eidetica::auth::crypto::PrivateKey>,
     active: Option<&'a HashSet<String>>,
     request_id: Option<&'a str>,
 }
@@ -163,6 +164,7 @@ impl<'a> ContextBuilder<'a> {
             attachment: None,
             extension_hub: None,
             session_db: None,
+            session_signing_key: None,
             active: None,
             request_id: None,
         }
@@ -171,6 +173,15 @@ impl<'a> ContextBuilder<'a> {
     /// Supply the session DB for per-session extension provider resolution.
     pub fn with_session_db(mut self, db: &'a Database) -> Self {
         self.session_db = Some(db);
+        self
+    }
+
+    /// Retain the active turn's exact signer for context-persistence writes.
+    pub(crate) fn with_session_signing_key(
+        mut self,
+        key: Option<eidetica::auth::crypto::PrivateKey>,
+    ) -> Self {
+        self.session_signing_key = key;
         self
     }
 
@@ -361,7 +372,10 @@ impl<'a> ContextBuilder<'a> {
         // actual rendered cost before the strategy chooses visible history.
         let tail_text = if let Some(ref hub) = self.extension_hub {
             if let Some(db) = self.session_db {
-                hub.refresh_status_outputs(self.agent_name, db).await;
+                let writer =
+                    crate::session::current_session_writer(db, self.session_signing_key.as_ref())
+                        .await?;
+                hub.refresh_status_outputs(self.agent_name, &writer).await;
             }
             let text = hub
                 .context_tails_for_call(
@@ -450,7 +464,13 @@ impl<'a> ContextBuilder<'a> {
             hub.check_context_strategy(Some(name), self.agent_name, self.session_db, &active)
                 .await?;
             if let Some(db) = self.session_db {
-                hub.record_context_selection(db, self.agent_name, name, &settings)
+                // Heartbeat or extension-tail writes can advance the inherited
+                // floor while assembly awaits. Refresh only this captured signer,
+                // without replacing the coherent view used to select context.
+                let writer =
+                    crate::session::current_session_writer(db, self.session_signing_key.as_ref())
+                        .await?;
+                hub.record_context_selection(&writer, self.agent_name, name, &settings)
                     .await?;
             }
         }

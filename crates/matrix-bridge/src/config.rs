@@ -129,6 +129,7 @@ impl MatrixLoginConfig {
                 password,
                 allow_list: m.allow_list.clone(),
                 room_size_limit: m.room_size_limit,
+                workspace_manager: m.workspace_manager.clone(),
             },
         };
         Ok((login_id, creds))

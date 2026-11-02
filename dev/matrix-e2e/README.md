@@ -90,7 +90,12 @@ persistence and reconnection:
   messages in the same room. A fourth message is sent and the reply is
   asserted.
 
-Both cases use `replies_at_least <n>` rather than `reply_arrived`, because
+The attachment lifecycle case explicitly detaches the DM and reattaches its
+original session twice. It checks exact-ID errors, no model wake or historical
+output replay, and a new addressed reply after reattachment. Synthetic Rust
+fixtures separately cover ambiguous legacy data without touching live stores.
+
+Both restart cases use `replies_at_least <n>` rather than `reply_arrived`, because
 `reply_arrived` checks `length > 0` and would pass instantly on the first
 reply without testing the restart.
 
@@ -184,6 +189,31 @@ either. With `--execute`, it must reject the invite, leave the DM and forget
 both. Server queries require zero joined rooms and invites, and denied DM
 history access, while the group room left by plain `leave-all` stays readable.
 A second reset has nothing to do. Neither path may print the agent's password.
+
+### Personal workspace
+
+The bridge login sets `workspace_manager` to the puppet. After the reset the
+harness restarts the bridge and opens a fresh encrypted DM from the cross-signed
+probe device, which drives every workspace command because the Lobby and chats
+are encrypted:
+
+- **Setup (W1):** `workspace setup` must create nothing; `confirm` creates a
+  Space (`m.space`) listing a Lobby. Both are invite-only with joined-only
+  history, no guests, the workspace marker, the puppet at power 100, nobody but
+  the agent and puppet joined or invited, and no directory entry; only the Lobby
+  is encrypted.
+- **Command-only Lobby (W2):** plain text gets a notice and no stub turn, and
+  the bridge binds no session to the Space or Lobby.
+- **New chat (W3):** `chat new` creates a private encrypted room listed in the
+  Space. A message there is answered there, the Lobby receives nothing, and
+  exactly one session is bound to the room.
+- **Restarts (W4):** after both the bridge and daemon restart, the same chat
+  answers, `chat list` still shows it, no replacement session is created and no
+  second room appears.
+
+Room-creation uncertainty and partial-step recovery are covered by the bridge's
+hermetic unit tests. This harness does not inject network faults or verify a
+particular desktop or mobile client's navigation UI.
 
 ## Transport
 

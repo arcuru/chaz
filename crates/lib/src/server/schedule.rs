@@ -10,6 +10,7 @@ use super::*;
 struct ScheduleRecorder {
     events: crate::runtime::EventRecorder,
     db: eidetica::Database,
+    signing_key: Option<eidetica::auth::crypto::PrivateKey>,
     invocation: String,
     agent: String,
 }
@@ -25,7 +26,10 @@ impl crate::runtime::RuntimeRecorder for ScheduleRecorder {
         call: crate::session::usage::CallObservation,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>> {
         Box::pin(async move {
-            crate::session::usage::persist_call(&self.db, &self.invocation, None, &self.agent, call)
+            let db = crate::session::current_session_writer(&self.db, self.signing_key.as_ref())
+                .await
+                .map_err(|e| e.to_string())?;
+            crate::session::usage::persist_call(&db, &self.invocation, None, &self.agent, call)
                 .await
         })
     }
@@ -679,12 +683,20 @@ impl Server {
         let scoped_tools = ScopedTools::new(self.tools.clone(), allowed_tools)
             .with_active_extensions(Some(active_extensions.clone()));
 
-        // Build the session view + context
-        let session = Session::new(
-            ConversationId(session_db_id.to_string()),
-            session_db.clone(),
-        )
-        .await;
+        // The pinned target can already contain a newer delegated floor from
+        // an interactive turn. Anchor its actual signer before this invocation.
+        let (conversation_id, current_db, signing_key) = self
+            .registry
+            .open_session_with_signer(session_db_id)
+            .await?;
+        anyhow::ensure!(
+            current_db.root_id() == session_db.root_id(),
+            "schedule target changed"
+        );
+        let session_db = &current_db;
+        let session = Session::new(conversation_id, current_db.clone())
+            .await
+            .with_signing_key(signing_key.clone());
         let session_capabilities = session.read_meta().await.capabilities;
         let session = Arc::new(tokio::sync::Mutex::new(session));
         let attachment = crate::session::session_attachment(session_db).await?;
@@ -760,6 +772,7 @@ impl Server {
                 .with_room_participants(&roster)
                 .with_extension_hub(self.extensions.clone())
                 .with_session_db(session_db)
+                .with_session_signing_key(signing_key.clone())
                 .with_invocation(&active_extensions, None)
                 .try_build()
                 .await?;
@@ -805,6 +818,10 @@ impl Server {
         let event_writer = tokio::spawn(async move {
             while let Some(event) = event_rx.recv().await {
                 let mut s = event_session.lock().await;
+                if let Err(error) = s.refresh_writer().await {
+                    tracing::error!(%error, "Cannot refresh scheduled event writer");
+                    continue;
+                }
                 match event {
                     crate::runtime::RuntimeEvent::ToolCall {
                         name, arguments, ..
@@ -868,6 +885,7 @@ impl Server {
         let recorder = Arc::new(ScheduleRecorder {
             events: crate::runtime::EventRecorder(event_tx),
             db: session_db.clone(),
+            signing_key,
             invocation: invocation.clone(),
             agent: agent_name.into(),
         });
@@ -904,6 +922,7 @@ impl Server {
 
         // Write the terminal Message unless the Matrix-bound turn ended with no_reply.
         let mut s = session.lock().await;
+        s.refresh_writer().await?;
         match &result {
             Ok(outcome) if tool_ctx.allow_no_reply && outcome.body.trim().is_empty() => {}
             Ok(outcome) => {

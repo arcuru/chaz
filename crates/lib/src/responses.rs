@@ -6,7 +6,7 @@ use serde_json::{Map, Value, json};
 
 use crate::{
     backends::{ChatContext, LLMBackend, MessageRole, ModelInfo},
-    config::{Backend, ModelApi, ReasoningConfig, ReasoningEffort},
+    config::{Backend, ModelApi, ReasoningControl, ReasoningEffort},
     error::LlmError,
     openai::OpenAI,
     runtime::{LLMResponse, ResponseMetadata, RuntimeMessage, TokenUsage, ToolCallRequest},
@@ -81,7 +81,7 @@ struct Request<'a> {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     tools: Vec<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    reasoning: Option<ReasoningConfig>,
+    reasoning: Option<EffortObject>,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_output_tokens: Option<u32>,
     store: bool,
@@ -89,6 +89,12 @@ struct Request<'a> {
     include: [&'static str; 1],
     #[serde(skip_serializing_if = "Option::is_none")]
     prompt_cache_key: Option<&'a str>,
+}
+
+/// Native Responses `reasoning: {"effort": …}`.
+#[derive(Serialize)]
+struct EffortObject {
+    effort: ReasoningEffort,
 }
 
 #[derive(Deserialize)]
@@ -169,18 +175,10 @@ impl Responses {
         prompt_cache_key: Option<&'a str>,
         origin: &ReplayOrigin,
     ) -> Result<Request<'a>, LlmError> {
-        let reasoning = self
-            .backend
-            .models
-            .as_ref()
-            .and_then(|models| models.iter().find(|m| m.name == model))
-            .and_then(|m| m.reasoning.clone());
+        let reasoning = self.reasoning_control(model)?;
         // `max` is an OpenRouter extension, not a Responses effort value. Never
         // silently lower it or send an unsupported control to another API.
-        if reasoning
-            .as_ref()
-            .is_some_and(|r| r.effort == ReasoningEffort::Max)
-        {
+        if reasoning.is_some_and(|r| r.effort() == ReasoningEffort::Max) {
             return Err(LlmError::Configuration {
                 message: "Responses reasoning effort 'max' is unsupported; configure a supported effort such as 'xhigh'".into(),
             });
@@ -245,13 +243,21 @@ impl Responses {
                     })
                 })
                 .collect(),
-            reasoning,
+            reasoning: reasoning.map(|r| EffortObject { effort: r.effort() }),
             max_output_tokens: self.backend.max_tokens,
             store: false,
             stream: false,
             include: ["reasoning.encrypted_content"],
             prompt_cache_key,
         })
+    }
+
+    /// Resolved after the model's effective API; an explicit Chat-only
+    /// `format` is refused before any request is built.
+    fn reasoning_control(&self, model: &str) -> Result<Option<ReasoningControl>, LlmError> {
+        self.backend
+            .reasoning_control(model)
+            .map_err(|message| LlmError::Configuration { message })
     }
 
     pub async fn chat_with_tools(
@@ -307,7 +313,7 @@ impl Responses {
             .map_err(network_error)?;
         let response = client
             .post(format!("{}/responses", api_base.trim_end_matches('/')))
-            .bearer_auth(api_key)
+            .bearer_auth(&api_key)
             .json(&request)
             .send()
             .await
@@ -321,22 +327,39 @@ impl Responses {
             .filter(|s| *s > 0.0 && *s <= 60.0)
             .map(std::time::Duration::from_secs_f64);
         let body = response.bytes().await.map_err(network_error)?;
+        let control = request
+            .reasoning
+            .as_ref()
+            .map(|r| ReasoningControl::Object(r.effort));
+        let rejected = |error: LlmError| {
+            ReasoningControl::annotate(control, &self.backend.get_name(), model, error)
+                .redact_secret(&api_key)
+        };
         if !status.is_success() {
             let message = serde_json::from_slice::<Value>(&body)
                 .ok()
                 .and_then(|v| v.get("error").map(error_message))
-                .unwrap_or_else(|| String::from_utf8_lossy(&body).into_owned());
-            return Err(LlmError::from_http_status_with_retry_after(
+                .unwrap_or_else(|| crate::error::provider_excerpt(&String::from_utf8_lossy(&body)));
+            return Err(rejected(LlmError::from_http_status_with_retry_after(
                 status.as_u16(),
                 message,
                 retry_after,
-            ));
+            )));
         }
         let response =
             serde_json::from_slice::<Response>(&body).map_err(|e| LlmError::InvalidRequest {
                 message: format!("decode Responses response: {e}"),
             })?;
-        let mut result = parse_response(response, model)?;
+        // Only a provider-reported error is a rejection; local decoding
+        // failures of a completed response are not attributed to the request.
+        let provider_error = response.error.is_some();
+        let mut result = parse_response(response, model).map_err(|error| {
+            if provider_error {
+                rejected(error)
+            } else {
+                error
+            }
+        })?;
         let origin = json!(origin);
         let (provider_extra, metadata) = match &mut result {
             LLMResponse::Text {

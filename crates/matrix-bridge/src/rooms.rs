@@ -547,6 +547,7 @@ mod tests {
             password: Some("hunter2".to_string()),
             allow_list: None,
             room_size_limit: None,
+            workspace_manager: None,
         }
     }
 
@@ -903,6 +904,7 @@ mod tests {
             password: Some("<sentinel-secret>".to_string()),
             allow_list: None,
             room_size_limit: None,
+            workspace_manager: None,
         };
 
         // Dry-run.

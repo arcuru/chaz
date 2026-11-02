@@ -36,6 +36,10 @@ pub struct MatrixCredentials {
     /// Largest room (member count) this login will respond in.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub room_size_limit: Option<usize>,
+    /// Exact MXID that may manage this login's Matrix workspace. `None`
+    /// leaves the workspace commands disabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_manager: Option<String>,
 }
 
 impl std::fmt::Debug for MatrixCredentials {
@@ -46,6 +50,7 @@ impl std::fmt::Debug for MatrixCredentials {
             .field("password", &self.password.as_ref().map(|_| "<redacted>"))
             .field("allow_list", &self.allow_list)
             .field("room_size_limit", &self.room_size_limit)
+            .field("workspace_manager", &self.workspace_manager)
             .finish()
     }
 }
@@ -62,6 +67,7 @@ mod tests {
             password: Some("hunter2-super-secret".to_string()),
             allow_list: None,
             room_size_limit: None,
+            workspace_manager: None,
         };
         let rendered = format!("{creds:?}");
         assert!(!rendered.contains("hunter2"), "password leaked: {rendered}");

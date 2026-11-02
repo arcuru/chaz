@@ -12,6 +12,9 @@ mod native_steering_tests;
 #[path = "compaction_tests.rs"]
 mod compaction_tests;
 
+#[path = "meta_tests.rs"]
+mod meta_tests;
+
 use super::*;
 
 // These guards detect stalled fixtures, not runtime latency regressions. LLVM

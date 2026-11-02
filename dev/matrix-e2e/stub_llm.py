@@ -327,6 +327,22 @@ class Handler(BaseHTTPRequestHandler):
                             if isinstance(msg, dict) and msg.get("role") == "user"
                             and isinstance(msg.get("content"), str)
                             and not msg["content"].startswith("## Relevant Memories")), "")
+        if "workspace approval probe" in latest_user:
+            if has_tool_result:
+                result = messages[-1]
+                if (result.get("role") != "tool"
+                        or result.get("tool_call_id") != "workspace-approval"
+                        or "Tool execution denied by user" not in str(result.get("content", ""))):
+                    self._send({"error": "workspace approval not denied by its own chat"}, status=400)
+                    return
+                sys.stderr.write("stub_llm: workspace approval denied\n")
+                self._fixture_reply(content=self.server.reply + " workspace-approval-denied")
+            elif "shell" not in tools:
+                self._send({"error": "workspace approval shell tool unavailable"}, status=400)
+            else:
+                self._fixture_reply(name="shell", call_id="workspace-approval",
+                                    arguments={"command": "printf workspace-approval-must-be-denied"})
+            return
         try:
             multi_round = multi_round_response(request, self.server.reply)
         except ValueError as error:
