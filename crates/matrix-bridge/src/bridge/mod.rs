@@ -46,6 +46,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::{Mutex, Notify};
+use tokio::task::JoinSet;
 use tracing::{debug, error, info, warn};
 
 use client::is_allowed;
@@ -287,12 +288,14 @@ struct AttachedChannel {
     typing: typing::Watcher,
     approval: ApprovalWatcher,
     route: Arc<ChannelRoute>,
+    // Callbacks/retries hold only a weak Room until active sends drain.
+    _room: Arc<Room>,
 }
 impl AttachedChannel {
     async fn finish(self) {
         // Cancel a pending approval read/post before draining its route gate.
         self.route.stop.send_replace(true);
-        self.delivery.stop();
+        self.delivery.shutdown().await;
         *self.route.active.lock().await = false;
         self.approval.finish().await;
         self.typing.finish().await;
@@ -334,7 +337,7 @@ impl Drop for ChannelLifetime {
 /// here, and the reply lands in the room.
 async fn attach_response_callback(
     session_db: &eidetica::Database,
-    room: Room,
+    room: Arc<Room>,
     server: &Server,
     login_id: &str,
     owning_agent: String,
@@ -344,13 +347,14 @@ async fn attach_response_callback(
     // Same session DB, two watchers: deliver agent replies, and surface tool
     // approval prompts the daemon proxied here.
     let approval =
-        attach_approval_watcher(session_db, room.clone(), pending, route.clone()).await?;
+        attach_approval_watcher(session_db, (*room).clone(), pending, route.clone()).await?;
     let binding = DeliveryBinding::new(
         "matrix",
         login_id,
         room.room_id().as_str(),
         session_db.root_id().to_string(),
     );
+    let weak_room = Arc::downgrade(&room);
     let delivery = DeliveryReconciler::attach(
         session_db.clone(),
         DeliveryStore::new(server.registry().chaz_peer().clone()),
@@ -358,7 +362,14 @@ async fn attach_response_callback(
         server.agents_arc(),
         owning_agent,
         |body| chunk_message_bytes(body, MATRIX_MESSAGE_LIMIT),
-        move |chunk| Box::pin(send_response_chunk(room.clone(), route.clone(), chunk)),
+        move |chunk| {
+            let room = weak_room.upgrade();
+            let route = route.clone();
+            Box::pin(async move {
+                let room = room.ok_or_else(|| anyhow::anyhow!("Matrix channel shut down"))?;
+                send_response_chunk((*room).clone(), route, chunk).await
+            })
+        },
     )
     .await?;
     Ok((delivery, approval))
@@ -1043,6 +1054,7 @@ impl Bridge for MatrixBridge {
 
         info!("The client is ready! Listening to new messages…");
 
+        let mut startup = JoinSet::new();
         // --- Startup: install response callbacks for every room this login
         //     already has a session bound to. This is what makes the daemon's
         //     replies (including scheduler fires) deliver when no user has
@@ -1057,7 +1069,7 @@ impl Bridge for MatrixBridge {
             let owning_agent = owning_agent.clone();
             let pending_approvals = pending_approvals.clone();
             let workspace_rooms = workspace_rooms.clone();
-            tokio::spawn(async move {
+            startup.spawn(async move {
                 attach_registered_channels(
                     &server,
                     &client,
@@ -1088,7 +1100,7 @@ impl Bridge for MatrixBridge {
             let login_id = login_id.clone();
             let owning_agent = owning_agent.clone();
             let allow_list = allow_list.clone();
-            let attached_channels = attached_channels.clone();
+            let attached_channels = Arc::downgrade(&attached_channels);
             let message_counts: Arc<Mutex<HashMap<String, u64>>> =
                 Arc::new(Mutex::new(HashMap::new()));
             let seen_events: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
@@ -1100,7 +1112,7 @@ impl Bridge for MatrixBridge {
             // newer enable (or undo an off) while waiting for its receipt.
             let participation_command_lock = Arc::new(Mutex::new(()));
             let pending_approvals = pending_approvals.clone();
-            let workspace = workspace.clone();
+            let workspace = Arc::downgrade(&workspace);
             let workspace_rooms = workspace_rooms.clone();
 
             mc.client().add_event_handler(
@@ -1111,16 +1123,17 @@ impl Bridge for MatrixBridge {
                     let login_id = login_id.clone();
                     let owning_agent = owning_agent.clone();
                     let allow_list = allow_list.clone();
-                    let attached_channels = attached_channels.clone();
+                    let attached_channels = attached_channels.upgrade();
                     let message_counts = message_counts.clone();
                     let backfilled_rooms = backfilled_rooms.clone();
                     let seen_events = seen_events.clone();
                     let participation_counts = participation_counts.clone();
                     let participation_command_lock = participation_command_lock.clone();
                     let pending_approvals = pending_approvals.clone();
-                    let workspace = workspace.clone();
+                    let workspace = workspace.upgrade();
                     let workspace_rooms = workspace_rooms.clone();
                     async move {
+                        let (Some(attached_channels), Some(workspace)) = (attached_channels, workspace) else { return; };
                         if room.state() != RoomState::Joined {
                             return;
                         }
@@ -1611,6 +1624,8 @@ impl Bridge for MatrixBridge {
             }
         }
         typing_lifetime.stop.send_replace(true);
+        startup.shutdown().await;
+        mc.shutdown().await;
         // Close admission before draining: late event handlers cannot install
         // observers onto a retired generation.
         let bindings = attached_channels
@@ -1623,6 +1638,7 @@ impl Bridge for MatrixBridge {
         // shutdown to one lease per room.
         let finishes = bindings.into_values().map(AttachedChannel::finish);
         futures::future::join_all(finishes).await;
+        info!(%login_id, "Matrix room background work drained");
         Ok(())
     }
 }
@@ -1747,9 +1763,10 @@ async fn attach_once(
         anyhow::ensure!(!*attached.stopped.borrow(), "Matrix generation stopped");
         tasks.push(typing.abort_handle());
     }
+    let room = Arc::new(room);
     let (reconciler, approval) = attach_response_callback(
         session_db,
-        room,
+        room.clone(),
         server,
         login_id,
         owning_agent.to_string(),
@@ -1779,6 +1796,7 @@ async fn attach_once(
             typing,
             approval,
             route,
+            _room: room,
         },
     );
     Ok(())

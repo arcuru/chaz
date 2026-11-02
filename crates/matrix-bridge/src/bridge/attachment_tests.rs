@@ -435,6 +435,7 @@ async fn detach_stops_delivery_and_approval_observers_without_history_replay() {
     assert!(pending.slots.lock().await.is_empty());
     assert_eq!(sent(&http).await.len(), 2);
     let channel = AttachedChannel {
+        _room: Arc::new(room.clone()),
         delivery: reconciler.clone(),
         approval,
         route: route.clone(),
@@ -594,6 +595,7 @@ async fn detach_cancels_an_inflight_approval_post_before_draining_its_route() {
     .await
     .unwrap();
     let channel = AttachedChannel {
+        _room: Arc::new(room.clone()),
         delivery,
         approval,
         typing: typing::attach(&db, room, route.stop.subscribe())
@@ -780,4 +782,81 @@ async fn approval_reaction_cannot_resolve_another_rooms_request() {
         Some(ApprovalDecision::Approve)
     );
     assert!(pending.slots.lock().await.is_empty());
+}
+
+#[tokio::test]
+async fn room_watcher_shutdown_drains_sends_and_releases_the_client_lease() {
+    use std::time::Duration;
+
+    for blocked_send in [false, true] {
+        let fx = Fixture::new().await;
+        let db = fx.bound().await;
+        let server = fx.server().await;
+        let (http, room) = mock_room().await;
+        let dir = tempfile::tempdir().unwrap();
+        let lease = crate::store_lock::StoreLock::acquire(dir.path()).unwrap();
+        room.client().add_event_handler_context(Arc::new(lease));
+        Mock::given(method("PUT"))
+            .and(path_regex(
+                "/_matrix/client/v3/rooms/.*/send/m.room.message/.*",
+            ))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"event_id":"$delayed"}))
+                    .set_delay(Duration::from_secs(60)),
+            )
+            .with_priority(1)
+            .mount(&http)
+            .await;
+        let (_stop, stopped) = tokio::sync::watch::channel(false);
+        let attached = Arc::new(Channels {
+            bindings: Mutex::new(Some(HashMap::new())),
+            stopped,
+            observer_tasks: Default::default(),
+        });
+        attach_once(
+            &attached,
+            &db,
+            room.clone(),
+            &server,
+            LOGIN,
+            "default",
+            Arc::new(ApprovalRelay {
+                slots: Mutex::new(HashMap::new()),
+            }),
+        )
+        .await
+        .unwrap();
+        if blocked_send {
+            let mut session =
+                Session::new(ConversationId(db.root_id().to_string()), db.clone()).await;
+            session.add_entry(approval_request()).await.unwrap();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while sent(&http).await.is_empty() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("approval watcher must reach the held Matrix send");
+        }
+        drop(room);
+        assert!(
+            crate::store_lock::StoreLock::acquire(dir.path()).is_err(),
+            "the channel-owned Room must retain the lease"
+        );
+        let channels = attached.bindings.lock().await.take().unwrap();
+        // Keep an external reconciler clone alive, like a pending callback.
+        let deliveries: Vec<_> = channels.values().map(|c| c.delivery.clone()).collect();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            futures::future::join_all(channels.into_values().map(AttachedChannel::finish)).await;
+        })
+        .await
+        .expect("shutdown must drain even a blocked send");
+        assert!(
+            crate::store_lock::StoreLock::acquire(dir.path()).is_ok(),
+            "watchers and callbacks must release the client while the database and reconciler remain alive"
+        );
+        drop(deliveries);
+        server.shutdown().await;
+    }
 }
