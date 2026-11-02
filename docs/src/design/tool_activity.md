@@ -1,6 +1,6 @@
 # Nested Tool Activity in the TUI
 
-Status: implementation contract, not a description of shipped behaviour.
+Status: implemented as a TUI-only projection of native session evidence.
 
 The conversation should show what the agent said, with a compact account of its
 tools, rather than two unrelated rows for every invocation and result.
@@ -41,19 +41,19 @@ needed.
 
 ### Concrete layouts
 
-These are design examples, not screenshots of the existing renderer.
-A Ratatui buffer prototype exercised 2, 48 and 96 calls at widths 20, 40 and 80:
-the compact tool rows stayed at two and the prose stayed outside collapse.
-For example, at 40 columns:
+This forty-column excerpt comes from the native-snapshot TUI buffer fixture
+(with pane borders omitted).
+The compact tool rows stay at two; prose remains outside collapse.
 
 ```text
-user: Inspect the files.
-chaz [R1 e0]: I will check them.
-▸ ! R1 chaz · 48 tools
-  46 done · 1 failed · 1 awaiting
-chaz [R1 e2]: First checks are back;
-looking further.
-chaz: Final answer stays visible.
+chaz [local] [R1 e0]:
+  I will inspect these files.
+
+▸ … R1 chaz · 48 tools · attempt acti…
+  0 done · 0 failed · 0 cancelled · 4…
+chaz [local] [R1 e1]:
+  First checks are back; looking
+further.
 ```
 
 `R1` is a tab-local display label for a stable run identity, not a new execution
@@ -64,23 +64,23 @@ The failure marker must precede text that can be clipped; do not show a success
 marker simply because one call succeeded.
 At very narrow widths the complete counts require expansion.
 
-The following expanded layout illustrates a three-call run with a later result:
+The following excerpt illustrates expanded items, omitting the full audit identities:
 
 ```text
 chaz [R1 e0]: I will check them.
-▾ ! R1 chaz · 3 tools
-  1 done · 1 failed · 1 awaiting
-  ▾ R1 #1 query file-1 · done [e0.0→e3]
+▾ ! R1 chaz · 3 tools · attempt active
+  1 done · 1 failed · 0 cancelled · 1 without result · 0 unknown
+  ▾ R1 #1 query · done [e0.0→e3] path: file-1
     call e0.0 → result e3 (later)
     Arguments:
       path: file-1
     Result:
       first line
         indented line
-  ▸ R1 #2 query file-2 · failed [e0.1→e1]
+  ▸ R1 #2 query · failed [e0.1→e1] path: file-2
 chaz [R1 e2]: First checks are back;
 looking further.
-  ▸ R1 #3 query file-3 · awaiting [e4.0→?]
+  ▸ R1 #3 query · awaiting result [e4.0→?] path: file-3
 ```
 
 Moving the result into its invocation item must not imply it preceded the
@@ -132,6 +132,8 @@ An evidence-read failure retains the last coherent view with the existing stale
 read/error indication and retry; it must not cover the snapshot as fresh or
 turn missing evidence into success.
 An absent table on old history is an empty typed source, with legacy fallback.
+Unknown typed tool outcomes have no display audit row in the native writer;
+retain their exact identity-matched payload as unknown without consuming any row.
 
 ### Exact association
 

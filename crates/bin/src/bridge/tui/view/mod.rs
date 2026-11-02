@@ -53,6 +53,9 @@ mod list_tests;
 mod settings;
 #[cfg(test)]
 mod settings_tests;
+mod tool_activity;
+#[cfg(test)]
+mod tool_activity_tests;
 
 /// Last `/`-separated segment of a model id (`anthropic/claude-opus-4-7` →
 /// `claude-opus-4-7`). Bare ids without `/` are returned as-is. Used for the
@@ -1167,8 +1170,8 @@ fn refresh_transcript(
         offsets.push(total);
     }
     let mut copy_text = super::selection::CopyText::default();
-    for (line, text) in sources {
-        copy_text.add(line, offsets[line], &text, width);
+    for (line, indent, text) in sources {
+        copy_text.add_indented(line, offsets[line], &text, width, indent);
     }
     tab.live.render = TranscriptCache {
         key: Some(key),
@@ -1189,13 +1192,40 @@ fn build_transcript(
 ) -> (
     Vec<Line<'static>>,
     Vec<(usize, ClickTarget)>,
-    Vec<(usize, String)>,
+    Vec<(usize, usize, String)>,
 ) {
     let mut lines: Vec<Line<'static>> = Vec::new();
     let mut sources = Vec::new();
     let mut pending_clicks: Vec<(usize, ClickTarget)> = Vec::new();
 
     for (entry_idx, entry) in tab.entries.iter().enumerate() {
+        use super::tool_activity::ToolRow;
+        let row = tab
+            .live
+            .entry_ids
+            .get(entry_idx)
+            .and_then(Option::as_ref)
+            .and_then(|id| tab.live.tool_activity.rows.get(id));
+        match row {
+            Some(ToolRow::Call(index)) => {
+                let (tool_lines, clicks, copy) =
+                    tool_activity::render(tab, *index, debug_mode, expand_all, inner_width);
+                let offset = lines.len();
+                lines.extend(tool_lines);
+                pending_clicks.extend(
+                    clicks
+                        .into_iter()
+                        .map(|(line, target)| (line + offset, target)),
+                );
+                sources.extend(
+                    copy.into_iter()
+                        .map(|(line, indent, text)| (line + offset, indent, text)),
+                );
+                continue;
+            }
+            Some(ToolRow::Result) => continue,
+            _ => {}
+        }
         let debug_prefix = if debug_mode {
             let ts = entry.timestamp.format("%H:%M:%S");
             let typ = format!("{:?}", entry.entry_type);
@@ -1235,7 +1265,13 @@ fn build_transcript(
                     .and_then(|r| r.source.as_ref())
                     .map(|r| format!(" [via {} {}]", r.transport, r.channel))
                     .unwrap_or_default();
-                let label = format!("{}{}{}:", debug_prefix, entry.sender, source);
+                let provenance = match row {
+                    Some(ToolRow::Prose { run, sequence }) => {
+                        format!(" [R{} e{sequence}]", run + 1)
+                    }
+                    _ => String::new(),
+                };
+                let label = format!("{}{}{}{}:", debug_prefix, entry.sender, source, provenance);
 
                 lines.push(Line::from(vec![Span::styled(label, sender_style)]));
 
@@ -1281,7 +1317,7 @@ fn build_transcript(
                 if let Some(body) = entry.bridge_body() {
                     for content_line in body.lines() {
                         let safe = content::safe_line(content_line);
-                        sources.push((lines.len(), content::copy_line(content_line, &safe)));
+                        sources.push((lines.len(), 2, content::copy_line(content_line, &safe)));
                         lines.push(Line::from(format!("  {safe}")));
                     }
                 }
@@ -1325,6 +1361,7 @@ fn build_transcript(
             }
             EntryType::ToolCall => {
                 let (name, args) = summarize_tool_call(&entry.content);
+                let name = content::safe_line(&format!("{name} [unpaired / identity unavailable]"));
                 let tool_style = Style::default().fg(COLOR_TOOL);
                 let expanded = expand_all != tab.expanded_entries.contains(&entry_idx);
                 let icon = if expanded { "▾" } else { "▸" };
@@ -1336,7 +1373,7 @@ fn build_transcript(
                         Span::styled(name, tool_style),
                     ]
                 } else {
-                    let preview = ellipsize(&args, 90);
+                    let preview = content::safe_line(&ellipsize(&args, 90));
                     vec![
                         Span::styled(format!("{debug_prefix}  "), dim),
                         Span::styled(icon, dim),
@@ -1348,13 +1385,12 @@ fn build_transcript(
                 lines.push(Line::from(header_spans));
                 pending_clicks.push((lines.len() - 1, ClickTarget::ToggleEntryExpanded(entry_idx)));
                 if expanded {
-                    for l in display_lines(&args, None) {
-                        lines.push(Line::from(vec![Span::styled(format!("      {l}"), dim)]));
-                    }
+                    tool_activity::payload(&mut lines, &mut sources, &entry.content, true);
                 }
             }
             EntryType::ToolResult => {
                 let (name, summary, is_error) = summarize_tool_result(&entry.content);
+                let name = content::safe_line(&format!("{name} [unpaired / identity unavailable]"));
                 let tool_style = Style::default().fg(COLOR_TOOL);
                 let expanded = expand_all != tab.expanded_entries.contains(&entry_idx);
                 let icon = if is_error {
@@ -1395,9 +1431,11 @@ fn build_transcript(
                         .map(|(_, b)| b)
                         .unwrap_or(&entry.content);
                     let body = body.strip_prefix("ERROR: ").unwrap_or(body);
-                    for l in display_lines(&content::tool_output(body), None) {
-                        lines.push(Line::from(vec![Span::styled(format!("      {l}"), dim)]));
-                    }
+                    lines.push(Line::from(Span::styled(
+                        "    Stored preview only; full evidence unavailable",
+                        dim,
+                    )));
+                    tool_activity::payload(&mut lines, &mut sources, body, debug_mode);
                 }
             }
             EntryType::Error => {
@@ -2832,7 +2870,7 @@ mod transcript_tests {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
-    fn entry(sender: &str, content: &str, entry_type: EntryType) -> SessionEntry {
+    pub(super) fn entry(sender: &str, content: &str, entry_type: EntryType) -> SessionEntry {
         SessionEntry {
             sender: sender.into(),
             content: content.into(),
@@ -2876,7 +2914,7 @@ mod transcript_tests {
             .collect()
     }
 
-    async fn app_with(entries: Vec<SessionEntry>) -> (Instance, App) {
+    pub(super) async fn app_with(entries: Vec<SessionEntry>) -> (Instance, App) {
         let (instance, mut user) = Instance::create_backend(
             Box::new(InMemory::new()),
             NewAccount::passwordless("transcript-frame"),
@@ -2910,7 +2948,7 @@ mod transcript_tests {
         (instance, app)
     }
 
-    fn rows(terminal: &Terminal<TestBackend>, from: u16, to: u16) -> Vec<String> {
+    pub(super) fn rows(terminal: &Terminal<TestBackend>, from: u16, to: u16) -> Vec<String> {
         let buffer = terminal.backend().buffer();
         (from..to)
             .map(|y| {
@@ -2923,7 +2961,7 @@ mod transcript_tests {
 
     /// Reference: the pre-windowing algorithm — wrap every line, scroll the
     /// whole paragraph — drawn into a box the size of the messages area.
-    fn reference(app: &App, width: u16, messages_h: u16) -> Vec<String> {
+    pub(super) fn reference(app: &App, width: u16, messages_h: u16) -> Vec<String> {
         let tab = app.active();
         let mut lines = tab.live.render.lines.clone();
         lines.extend(turn_activity_line(tab.active_turns));
@@ -3201,9 +3239,9 @@ mod transcript_tests {
         app.active_mut().session_name = Some("render-demo".into());
         app.active_mut().active_turns = 0;
         app.expand_all = true;
-        let mut terminal = Terminal::new(TestBackend::new(64, 38)).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(64, 60)).unwrap();
         terminal.draw(|f| ui_chat(f, &mut app, &[])).unwrap();
-        let drawn = rows(&terminal, 0, 38);
+        let drawn = rows(&terminal, 0, 60);
         assert!(
             drawn
                 .iter()
