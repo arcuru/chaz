@@ -298,6 +298,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn writer_refresh_uses_verified_delegation_tips_during_partial_sync() {
+        use eidetica::backend::VerificationStatus;
+        use eidetica::entry::Entry;
+        use eidetica::store::DocStore;
+
+        let (instance, _user, identity, old, key) = delegated_proxy_fixture().await;
+        let verified = identity.snapshot().await.unwrap();
+        // Sync can publish a raw tip before all of its ancestry arrives. It
+        // cannot supply authority, but must not hide the verified signer either.
+        let missing = Entry::root_builder().build().unwrap().id();
+        let pending = Entry::builder(identity.root_id().clone())
+            .set_parents([verified.tips().to_vec(), vec![missing]].concat())
+            .set_height(100)
+            .build()
+            .unwrap();
+        let pending_id = pending.id();
+        let engine = instance.backend().local_engine().unwrap();
+        engine.put(pending).await.unwrap();
+        engine
+            .update_verification_status(&pending_id, VerificationStatus::Unverified)
+            .await
+            .unwrap();
+        assert_eq!(identity.snapshot().await.unwrap(), verified);
+        assert_eq!(
+            engine.get_verification_status(&pending_id).await.unwrap(),
+            VerificationStatus::Unverified
+        );
+        assert!(
+            instance
+                .backend()
+                .snapshot(identity.root_id())
+                .await
+                .unwrap()
+                .tips()
+                .contains(&pending_id)
+        );
+        // Native discovery reads raw delegation tips and suppresses the
+        // resolution error, reproducing the misleading missing-writer result.
+        assert!(
+            Database::find_sigkeys(&instance, old.root_id(), &key.public_key())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        let writer = current_session_writer(&old, Some(&key))
+            .await
+            .expect("verified delegated writer must survive an unrelated pending sync tip");
+        assert_eq!(writer.root_id(), old.root_id());
+        assert_eq!(writer.auth_identity(), old.auth_identity());
+        let txn = writer.new_transaction().await.unwrap();
+        txn.get_store::<DocStore>("after-sync")
+            .await
+            .unwrap()
+            .set_string("value", "written by the same signer")
+            .await
+            .unwrap();
+        let written = txn.commit().await.unwrap();
+        assert!(writer.verify_entry_signature(&written).await.unwrap());
+        assert_eq!(
+            engine.get_verification_status(&pending_id).await.unwrap(),
+            VerificationStatus::Unverified
+        );
+    }
+
+    #[tokio::test]
     async fn context_selection_refreshes_the_held_signer_without_reloading_context() {
         use crate::context::ContextBuilder;
         use crate::runtime::RuntimeMessage;
