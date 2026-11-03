@@ -400,8 +400,8 @@ pub struct ToolContext {
     /// the runtime. A resumed wait keeps its original deadline across a
     /// restart instead of starting a new relative timeout.
     pub observation_deadline: Option<chrono::DateTime<chrono::Utc>>,
-    /// When the runtime's policy timeout drops this call. Set per call by
-    /// the runtime so a tool can stop its own work and report what happened.
+    /// Execution deadline set per call by the runtime, so a tool can stop
+    /// its work and report before the outer timeout drops the call.
     /// `None` means no policy deadline (also used outside a runtime turn).
     pub call_deadline: Option<tokio::time::Instant>,
     /// Configured execution ceiling, before elapsed time or reporting grace.

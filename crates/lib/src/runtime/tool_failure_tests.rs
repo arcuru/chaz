@@ -600,7 +600,7 @@ async fn a_completed_shell_command_keeps_its_exit_status() {
 }
 
 /// Manual check that a command runs past the former 30s/60s shell limits
-/// when the operator's policy allows it, and still reports its final output,
+/// without an administrator ceiling, and still reports its final output,
 /// exit status and wall time. Minutes long, so ignored by default:
 ///
 /// ```text
@@ -616,7 +616,8 @@ async fn a_shell_command_outlives_the_former_limit() {
         "sleep 65; '{}' --nocapture tools::shell::tests && exit 3",
         std::env::current_exe().unwrap().display()
     );
-    let (outcome, output, wall) = run_shell(Some(600), json!({ "command": command })).await;
+    let (outcome, output, wall) =
+        run_shell(None, json!({ "command": command, "timeout": 600 })).await;
     println!(
         "[outcome] {outcome:?} after {:.1}s\n{output}",
         wall.as_secs_f64()
