@@ -13,10 +13,93 @@ use serde_json::Value;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-/// An instance endpoint fired once when a runtime turn succeeds, before the
-/// runtime returns. Errors, panics and a 15-second deadline are fail-open.
+/// An instance endpoint dispatched when a runtime turn succeeds. Work runs
+/// outside reply completion, owned by the hub until completion or teardown.
+/// Errors, panics and a 15-second deadline are fail-open.
 pub trait TurnComplete: Send + Sync {
     fn on_turn_complete<'a>(&'a self, ctx: &'a TurnCompleteContext<'_>) -> CapFuture<'a, ()>;
+}
+
+/// Hub-owned auxiliary work. JoinSet aborts on drop; tasks never retain the hub.
+/// A session's serial lock preserves the persisted naming attempt across turns.
+#[derive(Default)]
+pub(crate) struct TurnCompleteTasks {
+    stopped: bool,
+    sessions: std::collections::HashMap<String, SessionTasks>,
+}
+
+#[derive(Default)]
+struct SessionTasks {
+    closed: bool,
+    serial: std::sync::Arc<tokio::sync::Mutex<()>>,
+    tasks: tokio::task::JoinSet<()>,
+}
+
+impl TurnCompleteTasks {
+    pub fn spawn(
+        &mut self,
+        id: String,
+        cancel: Option<crate::runtime::TurnCancel>,
+        work: impl std::future::Future<Output = ()> + Send + 'static,
+    ) {
+        if self.stopped {
+            return;
+        }
+        let session = self.sessions.entry(id).or_default();
+        if session.closed {
+            return;
+        }
+        while session.tasks.try_join_next().is_some() {}
+        let serial = session.serial.clone();
+        session.tasks.spawn(async move {
+            use futures::FutureExt;
+            let work = async move {
+                let _guard = serial.lock().await;
+                work.await;
+            };
+            let work = std::panic::AssertUnwindSafe(work).catch_unwind();
+            let result = match cancel {
+                Some(cancel) => tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => return,
+                    result = work => result,
+                },
+                None => work.await,
+            };
+            if result.is_err() {
+                tracing::warn!("Turn-complete dispatch panicked; preserving user turn");
+            }
+        });
+    }
+
+    pub fn start_session(&mut self, id: &str) {
+        if let Some(session) = self.sessions.get_mut(id) {
+            session.closed = false;
+        }
+    }
+
+    pub async fn stop_session(&mut self, id: &str) {
+        let session = self.sessions.entry(id.to_owned()).or_default();
+        session.closed = true;
+        session.tasks.shutdown().await;
+    }
+
+    pub async fn shutdown(&mut self) {
+        self.stopped = true;
+        for session in self.sessions.values_mut() {
+            session.tasks.abort_all();
+        }
+        for session in self.sessions.values_mut() {
+            session.tasks.shutdown().await;
+        }
+    }
+
+    #[cfg(test)]
+    pub async fn drain(&mut self) {
+        for session in self.sessions.values_mut() {
+            while session.tasks.join_next().await.is_some() {}
+        }
+    }
 }
 
 pub struct Completion {

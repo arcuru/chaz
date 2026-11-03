@@ -665,11 +665,15 @@ async fn finalize_outcome(
     request: (&[RuntimeMessage], &[ToolDefinition]),
     backend: &BackendManager,
     security: &SecurityContext,
+    cancel: Option<&TurnCancel>,
 ) -> RuntimeOutcome {
     if let (Some(hub), Some(ctx)) = (hub, ctx) {
         let public = crate::extension::turn::public_messages(request.0, &outcome.body);
-        hub.fire_turn_complete(ctx, &public, request.1, backend, security)
-            .await;
+        until_cancelled(
+            cancel,
+            hub.fire_turn_complete(ctx, &public, request.1, backend, security, cancel),
+        )
+        .await;
         hub.fire_agent_end(ctx).await;
     }
     outcome
@@ -1549,6 +1553,7 @@ async fn run_prepared_turn(
                         projector.last_request(&messages, &[]),
                         backend,
                         security,
+                        cancel,
                     )
                     .await);
                 }
@@ -1766,6 +1771,7 @@ async fn run_prepared_turn(
                     projector.last_request(&messages, &tool_defs),
                     backend,
                     security,
+                    cancel,
                 )
                 .await);
             }
@@ -1810,6 +1816,7 @@ async fn run_prepared_turn(
                         projector.last_request(&messages, &tool_defs),
                         backend,
                         security,
+                        cancel,
                     )
                     .await);
                 }
@@ -1905,6 +1912,7 @@ async fn run_prepared_turn(
                         projector.last_request(&messages, &tool_defs),
                         backend,
                         security,
+                        cancel,
                     )
                     .await);
                 }

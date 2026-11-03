@@ -1348,6 +1348,7 @@ impl Server {
         for task in tasks {
             let _ = task.await;
         }
+        self.extensions.shutdown_turn_complete().await;
     }
 
     pub(crate) fn track_task(&self, task: tokio::task::JoinHandle<()>) {

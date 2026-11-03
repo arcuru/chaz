@@ -175,10 +175,14 @@ trait CapResolver: Send + Sync {
 ### Successful-turn observation
 
 `TurnComplete` is a live-instance endpoint, not part of the Global hook drain.
-After a successful runtime response, before returning the reply and firing `AgentEnd`, the runtime dispatches it to the composed Global/PerAgent/PerSession instance set (session wins by name).
+After a successful runtime response, the runtime enqueues it to the composed Global/PerAgent/PerSession instance set (session wins by name).
 Only instances declaring `HookKind::TurnComplete` and present in the effective session-minus-agent active set run; session and agent revocations are rechecked at dispatch.
 Dispatch requires the current session to be openable by the registry's keys, sorts by extension name, and isolates each invocation's errors, panics and 15-second deadline.
-Dispatch is awaited inline, so an endpoint's work delays that reply (never its content) up to the deadline.
+The hub owns background tasks with copied public request data and cloned scoped host handles; neither reply completion nor `AgentEnd` waits for them.
+Tasks serialize per session to preserve the naming attempt marker across overlapping turns.
+The originating turn stop cancels its observation; session shutdown cancels and joins that session's tasks before shutdown hooks, and server shutdown cancels and joins all observations, refusing later dispatch.
+Session start permits observation again without clearing persisted naming state.
+Dropping the hub aborts remaining tasks; tasks do not retain the hub.
 It does not fire on runtime errors.
 
 `extension::turn::TurnCompleteContext` supplies a read-only public copy of the final accepted model request, the final reply and that request's tool definitions.
