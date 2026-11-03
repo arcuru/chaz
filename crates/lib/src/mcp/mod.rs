@@ -126,9 +126,9 @@ default_policy:
 "#;
         let config: McpServerConfig = serde_yaml::from_str(yaml).unwrap();
         let policy = config.default_policy.unwrap();
-        assert_eq!(policy.risk, RiskLevel::High);
-        assert_eq!(policy.approval, ApprovalRequirement::Always);
-        assert_eq!(policy.timeout, 10);
+        assert_eq!(policy.risk, Some(RiskLevel::High));
+        assert_eq!(policy.approval, Some(ApprovalRequirement::Always));
+        assert_eq!(policy.timeout, Some(Some(10)));
     }
 
     #[test]

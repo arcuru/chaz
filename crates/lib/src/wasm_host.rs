@@ -209,7 +209,7 @@ impl Tool for WasmTool {
         ToolPolicy {
             risk: crate::tool::RiskLevel::Medium,
             approval: crate::tool::ApprovalRequirement::UnlessAutoApproved,
-            timeout: 60,
+            timeout: Some(60),
             ..ToolPolicy::default()
         }
     }
@@ -303,6 +303,7 @@ fn add_host_functions(linker: &mut wasmtime::Linker<WasmHostState>) -> Result<()
                                 command: cmd,
                                 working_dir: None,
                                 timeout: None,
+                                cancel: None,
                             },
                             ctx.grants(),
                         )

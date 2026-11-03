@@ -175,7 +175,7 @@ security:
       rate_limit: 5 # max 5 calls per minute (omit = unlimited)
     web_fetch:
       approval: unless_auto_approved
-      timeout: 30 # seconds (default 60)
+      timeout: 30 # seconds; omitted inherits, null means no deadline
 
 # MCP external tools. Stdio subprocess transport when `command` is set;
 # Streamable HTTP transport when `url` is set. See `user_guide/mcp.md`.

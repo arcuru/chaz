@@ -4758,6 +4758,7 @@ async fn abort_after_recorded_host_effect_stays_interrupted_until_retry() {
             command: "external-side-effect".into(),
             working_dir: None,
             timeout: None,
+            cancel: None,
         },
         &Default::default(),
     )

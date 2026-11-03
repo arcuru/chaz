@@ -155,8 +155,16 @@ impl ToolHost for BubblewrapToolHost {
                     command,
                     working_dir,
                     timeout,
+                    cancel,
                 } if self.available => {
-                    exec_shell_bwrap(command, working_dir.as_deref(), *timeout, grants).await
+                    exec_shell_bwrap(
+                        command,
+                        working_dir.as_deref(),
+                        *timeout,
+                        cancel.as_ref(),
+                        grants,
+                    )
+                    .await
                 }
                 // Shell when bwrap unavailable, plus all other capabilities
                 _ => NativeToolHost.request(capability, grants).await,
@@ -179,6 +187,7 @@ async fn exec_shell_bwrap(
     command: &str,
     working_dir: Option<&str>,
     timeout: Option<std::time::Duration>,
+    cancel: Option<&crate::runtime::TurnCancel>,
     grants: &Grants,
 ) -> Result<CapabilityResult, ToolError> {
     // Grant check — shared with native host
@@ -189,7 +198,7 @@ async fn exec_shell_bwrap(
 
     let cmd = build_bwrap_command("bwrap", command, working_dir);
 
-    crate::tool_host::run_shell_process(cmd, timeout)
+    crate::tool_host::run_shell_process(cmd, timeout, cancel)
         .await
         .map(CapabilityResult::Shell)
         .map_err(|e| ToolError::Execution(format!("bwrap failed: {e}")))
@@ -279,6 +288,7 @@ mod tests {
                     command,
                     working_dir: Some(path.into()),
                     timeout: Some(std::time::Duration::from_millis(500)),
+                    cancel: None,
                 },
                 &Grants::default(),
             )

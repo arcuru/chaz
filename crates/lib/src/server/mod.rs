@@ -4189,6 +4189,8 @@ impl Server {
                 routine_engine: routine_engine.clone(),
                 observation_deadline: None,
                 call_deadline: None,
+        call_timeout: None,
+        call_cancel: None,
             };
 
             if resume.is_some() && tool_ctx.tools.get(runtime::JOB_WAIT_TOOL).is_none() {

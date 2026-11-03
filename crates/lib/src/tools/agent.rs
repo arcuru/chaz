@@ -40,7 +40,7 @@ impl Tool for SpawnAgent {
         ToolPolicy {
             risk: RiskLevel::Medium,
             approval: ApprovalRequirement::UnlessAutoApproved,
-            timeout: 300,
+            timeout: Some(300),
             ..ToolPolicy::default()
         }
     }

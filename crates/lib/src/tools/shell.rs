@@ -36,7 +36,8 @@ impl Tool for ShellExec {
                         "type": "number",
                         "description": "Optional timeout in seconds. On expiry the command is \
                                         killed and its output so far is returned. The tool \
-                                        policy timeout still applies."
+                                        policy ceiling still applies. A timeout above that \
+                                        ceiling is rejected before starting the command."
                     }
                 },
                 "required": ["command"]
@@ -48,7 +49,7 @@ impl Tool for ShellExec {
         ToolPolicy {
             risk: RiskLevel::High,
             approval: ApprovalRequirement::Always,
-            timeout: 30,
+            timeout: None,
             ..ToolPolicy::default()
         }
     }
@@ -71,9 +72,18 @@ impl Tool for ShellExec {
                 .and_then(|v| v.as_str())
                 .map(String::from);
             let requested = requested_timeout(&arguments)?;
-            let policy = ctx.call_deadline.map(|deadline| {
-                report_window(deadline.saturating_duration_since(tokio::time::Instant::now()))
-            });
+            if let (Some(requested), Some(ceiling)) = (requested, ctx.call_timeout)
+                && requested > ceiling
+            {
+                return Err(crate::tool::ToolError::InvalidArgument(format!(
+                    "requested timeout of {}s exceeds shell policy ceiling of {}s; command was not started",
+                    requested.as_secs_f64(),
+                    ceiling.as_secs_f64()
+                )));
+            }
+            let policy = ctx
+                .call_deadline
+                .map(|deadline| deadline.saturating_duration_since(tokio::time::Instant::now()));
             let limit = stop_limit(requested, policy);
 
             info!(command = %command, ?limit, "Executing shell command via host");
@@ -85,6 +95,7 @@ impl Tool for ShellExec {
                         command: command.to_string(),
                         working_dir,
                         timeout: limit.map(|limit| limit.after()),
+                        cancel: ctx.call_cancel.clone(),
                     },
                     ctx.grants(),
                 )
@@ -92,10 +103,16 @@ impl Tool for ShellExec {
 
             match result {
                 crate::tool_host::CapabilityResult::Shell(output) => {
-                    let formatted = match limit.filter(|_| output.timed_out) {
-                        Some(limit) => format_timed_out(&output, limit),
-                        None => {
-                            format_shell_output(&output.stdout, &output.stderr, output.exit_code)
+                    let formatted = if output.cancelled {
+                        format_stopped(&output, "Tool execution cancelled by user".into())
+                    } else {
+                        match limit.filter(|_| output.timed_out) {
+                            Some(limit) => format_timed_out(&output, limit),
+                            None => format_shell_output(
+                                &output.stdout,
+                                &output.stderr,
+                                output.exit_code,
+                            ),
                         }
                     };
 
@@ -138,22 +155,12 @@ fn requested_timeout(
     }
 }
 
-/// Time held back from the runtime's policy deadline so the tool can kill
-/// the command, collect its partial output and report before the runtime
-/// drops the call without any output.
-const REPORT_RESERVE: std::time::Duration = std::time::Duration::from_secs(1);
-
-/// The part of the remaining policy time the command itself may use.
-fn report_window(remaining: std::time::Duration) -> std::time::Duration {
-    remaining.saturating_sub(REPORT_RESERVE.min(remaining / 4))
-}
-
 /// Which deadline stops the command.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum StopLimit {
     /// The model's `timeout` argument.
     Requested(std::time::Duration),
-    /// The tool policy timeout enforced by the runtime.
+    /// The configured tool policy ceiling.
     Policy(std::time::Duration),
 }
 
@@ -196,10 +203,15 @@ fn format_timed_out(output: &crate::tool_host::ShellOutput, limit: StopLimit) ->
                 .to_string()
         }
     };
-    let mut formatted = format!(
-        "Tool timed out after {elapsed:.1} seconds: {reason}. Its process group was killed. \
-         Output before the stop:\n"
-    );
+    format_stopped(
+        output,
+        format!("Tool timed out after {elapsed:.1} seconds: {reason}"),
+    )
+}
+
+fn format_stopped(output: &crate::tool_host::ShellOutput, reason: String) -> String {
+    let mut formatted =
+        format!("{reason}. Its process group was killed. Output before the stop:\n");
     let budget = OUTPUT_LIMIT - formatted.len();
     let partial = format_shell_output(&output.stdout, &output.stderr, 0);
     if partial.len() <= budget {
@@ -358,7 +370,7 @@ mod tests {
         let p = ShellExec.default_policy();
         assert!(matches!(p.risk, RiskLevel::High));
         assert!(matches!(p.approval, ApprovalRequirement::Always));
-        assert_eq!(p.timeout, 30);
+        assert_eq!(p.timeout, None);
     }
 
     #[test]
@@ -373,16 +385,17 @@ mod tests {
     }
 
     #[test]
-    fn approval_only_policy_override_explains_the_generic_timeout() {
-        let policy: ToolPolicy = serde_yaml::from_str("approval: never").unwrap();
+    fn approval_only_policy_override_preserves_shell_defaults() {
+        let policy: crate::tool::ToolPolicyOverride =
+            serde_yaml::from_str("approval: never").unwrap();
         let policies = crate::tool::ToolPolicyRegistry::new(std::collections::HashMap::from([(
             "shell".into(),
             policy,
         )]));
         let effective = policies.resolve(&ShellExec);
-        assert_eq!(ShellExec.default_policy().timeout, 30);
-        assert_eq!(effective.timeout, 60);
-        assert_eq!(effective.risk, RiskLevel::Low);
+        assert_eq!(ShellExec.default_policy().timeout, None);
+        assert_eq!(effective.timeout, ShellExec.default_policy().timeout);
+        assert_eq!(effective.risk, RiskLevel::High);
         assert_eq!(effective.approval, ApprovalRequirement::Never);
     }
 
@@ -416,6 +429,7 @@ mod tests {
                 command,
                 working_dir,
                 timeout,
+                ..
             } => {
                 assert_eq!(timeout, None, "no deadline without an argument or policy");
                 assert_eq!(command, "ls -la");
@@ -470,35 +484,22 @@ mod tests {
             stop_limit(Some(s(600)), Some(s(29))),
             Some(StopLimit::Policy(s(29)))
         );
-        assert_eq!(report_window(s(30)), s(29));
-        assert_eq!(
-            report_window(std::time::Duration::from_millis(400)),
-            std::time::Duration::from_millis(300)
-        );
     }
 
     #[tokio::test]
-    async fn the_policy_deadline_bounds_a_longer_requested_timeout() {
+    async fn an_excessive_requested_timeout_is_rejected_before_the_host() {
         let host = Arc::new(MockHost::new());
         host.push_shell_timed_out("partial\n", std::time::Duration::from_millis(29_000));
         let (_i, mut c) = ctx_with(host.clone()).await;
         c.call_deadline = Some(tokio::time::Instant::now() + std::time::Duration::from_secs(30));
-        let out = ShellExec
+        c.call_timeout = Some(std::time::Duration::from_secs(30));
+        let error = ShellExec
             .execute(serde_json::json!({ "command": "x", "timeout": 600 }), &c)
             .await
-            .unwrap();
-        let Capability::Shell { timeout, .. } = host.last_call().unwrap() else {
-            panic!("expected a shell call");
-        };
-        let timeout = timeout.expect("policy deadline forwarded");
-        assert!(timeout <= std::time::Duration::from_secs(29), "{timeout:?}");
-        assert!(timeout > std::time::Duration::from_secs(28), "{timeout:?}");
-        assert_eq!(
-            out,
-            "Tool timed out after 29.0 seconds: the command reached the shell tool's policy \
-             timeout, which a larger `timeout` argument cannot extend. Its process group was \
-             killed. Output before the stop:\npartial\n"
-        );
+            .unwrap_err();
+        assert!(matches!(error, crate::tool::ToolError::InvalidArgument(_)));
+        assert!(error.to_string().contains("command was not started"));
+        assert!(host.recorded_calls().is_empty());
     }
 
     #[tokio::test]
@@ -533,6 +534,7 @@ mod tests {
             stderr: format!("stderr head\n{}\nstderr tail", "日".repeat(10_000)),
             exit_code: 137,
             timed_out: true,
+            cancelled: false,
             elapsed: std::time::Duration::from_secs(2),
         };
         for limit in [

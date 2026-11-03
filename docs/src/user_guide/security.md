@@ -62,6 +62,21 @@ security:
       timeout: 30
 ```
 
+### Tool policy overrides
+
+`security.tool_policies.<tool>` merges field by field with that tool's defaults. Setting only approval does not change risk, timeout, sensitive parameters, rate limits, or grants. For MCP tools, the starting policy includes annotations and any server-level overrides; [MCP policy](mcp.md#policy) describes the order.
+
+| Field              | Omitted               | Explicit value                                                                   |
+| ------------------ | --------------------- | -------------------------------------------------------------------------------- |
+| `risk`             | Inherit tool risk     | `low`, `medium`, `high`                                                          |
+| `approval`         | Inherit tool approval | `never`, `unless_auto_approved`, `always`                                        |
+| `timeout`          | Inherit tool deadline | Integer seconds; `null` explicitly removes the deadline                          |
+| `sensitive_params` | Inherit redactions    | Replacement list; `[]` clears it                                                 |
+| `rate_limit`       | Inherit rate limit    | Calls/minute; `0` disables calls; `null` explicitly removes the limit            |
+| `grants`           | Inherit policy grants | Replace the grants object; `{}` clears policy grants, not session/agent ceilings |
+
+Only supplied top-level policy fields are replaced; grants objects and lists are not recursively merged. Session and agent capability attenuation still applies afterward. Non-shell tools retain their existing finite defaults unless explicitly overridden. Shell's default is unbounded; configure a finite `timeout` to impose an administrator ceiling. In JSON as in YAML, `null` is explicit removal, not inheritance. Remove the field to restore inheritance.
+
 Approval levels:
 
 - **Never** -- runs without asking

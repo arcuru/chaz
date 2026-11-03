@@ -47,7 +47,7 @@ mcp_servers:
 | `args`                 | No       | Arguments for the command (stdio only)                                                          |
 | `env`                  | No       | Environment variables (supports `${VAR}` references; stdio only)                                |
 | `url`                  | HTTP     | Endpoint URL for Streamable HTTP transport — when set, `command` is ignored                     |
-| `default_policy`       | No       | Default `ToolPolicy` for every tool from this server                                            |
+| `default_policy`       | No       | Partial policy overrides for every tool from this server                                        |
 | `startup_timeout_secs` | No       | Seconds to allow for handshake + tool discovery before marking the server failed (default `30`) |
 
 Set exactly one of `command` (stdio) or `url` (HTTP) per server. You can also drop one MCP server config per file into `mcp_server_dir` (see [Configuration](configuration.md)); those entries are merged with the inline list at startup.
@@ -146,15 +146,17 @@ Both transports honour the spec's `notifications/tools/list_changed`: when a ser
 
 ## Policy
 
-Each MCP tool resolves to a `ToolPolicy` in this precedence order:
+Each MCP tool resolves to a `ToolPolicy` field by field in this precedence order:
 
-1. **`security.tool_policies.<namespaced_name>`** — per-tool override in chaz config; wins unconditionally.
-2. **`mcp_servers[*].default_policy`** — per-server pin in chaz config.
+1. **`security.tool_policies.<namespaced_name>`** — per-tool overrides; supplied fields win.
+2. **`mcp_servers[*].default_policy`** — per-server overrides of supplied fields.
 3. **Annotations from `tools/list`** — the server self-reports its behavior via the MCP 2025-06 `annotations` field. Chaz maps:
    - `destructiveHint: true` → `risk: high`, `approval: always`
    - `readOnlyHint: true` → `risk: low`, `approval: never`
    - (`destructive` wins if both are set; misconfigured servers fail closed)
 4. **chaz default** — `risk: medium`, `approval: unless_auto_approved`, `timeout: 60`.
+
+Omitted fields inherit from the next layer, so an approval-only override preserves the annotation-derived risk and the 60-second default timeout. Explicit `timeout: null` removes that deadline; `rate_limit: null` removes a rate limit. Grants objects and lists replace their whole policy field when supplied.
 
 A well-behaved MCP server can therefore ship without any chaz-side policy boilerplate; chaz trusts the server's self-declaration unless you pin a different value:
 

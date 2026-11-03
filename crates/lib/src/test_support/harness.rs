@@ -176,6 +176,8 @@ pub(crate) fn tool_context_with_host(
         routine_engine: None,
         observation_deadline: None,
         call_deadline: None,
+        call_timeout: None,
+        call_cancel: None,
     }
 }
 

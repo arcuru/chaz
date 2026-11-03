@@ -62,7 +62,7 @@ pub struct ToolPolicy {
     #[serde(default)]
     pub approval: ApprovalRequirement,
     #[serde(default = "default_timeout_secs")]
-    pub timeout: u64,
+    pub timeout: Option<u64>,
     #[serde(default)]
     pub sensitive_params: Vec<String>,
     /// Maximum calls per minute (None = unlimited)
@@ -74,8 +74,8 @@ pub struct ToolPolicy {
     pub grants: Grants,
 }
 
-fn default_timeout_secs() -> u64 {
-    60
+fn default_timeout_secs() -> Option<u64> {
+    Some(60)
 }
 
 impl Default for ToolPolicy {
@@ -83,7 +83,7 @@ impl Default for ToolPolicy {
         Self {
             risk: RiskLevel::Low,
             approval: ApprovalRequirement::Never,
-            timeout: 60,
+            timeout: Some(60),
             sensitive_params: Vec::new(),
             rate_limit: None,
             grants: Grants::default(),
@@ -92,8 +92,82 @@ impl Default for ToolPolicy {
 }
 
 impl ToolPolicy {
-    pub fn timeout_duration(&self) -> Duration {
-        Duration::from_secs(self.timeout)
+    pub fn timeout_duration(&self) -> Option<Duration> {
+        self.timeout.map(Duration::from_secs)
+    }
+}
+
+/// Administrator overrides. Omitted fields inherit the applicable tool policy.
+/// Explicit `timeout: null` removes the deadline; `rate_limit: null` removes
+/// the rate limit. A supplied grants object replaces that policy field only.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ToolPolicyOverride {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub risk: Option<RiskLevel>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval: Option<ApprovalRequirement>,
+    #[serde(
+        default,
+        deserialize_with = "explicit_nullable",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub timeout: Option<Option<u64>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sensitive_params: Option<Vec<String>>,
+    #[serde(
+        default,
+        deserialize_with = "explicit_nullable",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub rate_limit: Option<Option<u32>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grants: Option<Grants>,
+}
+
+// serde's ordinary Option treats null and absence alike; an override must
+// distinguish an explicit removal from inheritance.
+fn explicit_nullable<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer).map(Some)
+}
+
+impl ToolPolicyOverride {
+    pub fn apply(&self, mut policy: ToolPolicy) -> ToolPolicy {
+        if let Some(value) = &self.risk {
+            policy.risk = value.clone();
+        }
+        if let Some(value) = &self.approval {
+            policy.approval = value.clone();
+        }
+        if let Some(value) = self.timeout {
+            policy.timeout = value;
+        }
+        if let Some(value) = &self.sensitive_params {
+            policy.sensitive_params = value.clone();
+        }
+        if let Some(value) = self.rate_limit {
+            policy.rate_limit = value;
+        }
+        if let Some(value) = &self.grants {
+            policy.grants = value.clone();
+        }
+        policy
+    }
+}
+
+impl From<ToolPolicy> for ToolPolicyOverride {
+    fn from(policy: ToolPolicy) -> Self {
+        Self {
+            risk: Some(policy.risk),
+            approval: Some(policy.approval),
+            timeout: Some(policy.timeout),
+            sensitive_params: Some(policy.sensitive_params),
+            rate_limit: Some(policy.rate_limit),
+            grants: Some(policy.grants),
+        }
     }
 }
 
@@ -327,9 +401,13 @@ pub struct ToolContext {
     /// restart instead of starting a new relative timeout.
     pub observation_deadline: Option<chrono::DateTime<chrono::Utc>>,
     /// When the runtime's policy timeout drops this call. Set per call by
-    /// the runtime so a tool can stop its own work first and report what
-    /// happened; `None` outside a runtime turn.
+    /// the runtime so a tool can stop its own work and report what happened.
+    /// `None` means no policy deadline (also used outside a runtime turn).
     pub call_deadline: Option<tokio::time::Instant>,
+    /// Configured execution ceiling, before elapsed time or reporting grace.
+    pub call_timeout: Option<Duration>,
+    /// User stop propagated to cooperative shell hosts for partial-output reporting.
+    pub call_cancel: Option<crate::runtime::TurnCancel>,
 }
 
 impl ToolContext {
@@ -490,8 +568,8 @@ pub trait Tool: Send + Sync {
         ctx: &'a ToolContext,
     ) -> Pin<Box<dyn Future<Output = Result<String, ToolError>> + Send + 'a>>;
 
-    /// Default policy for this tool. Used when no config override exists.
-    /// Built-in tools override this with sensible defaults (e.g., shell → High/Always/30s).
+    /// Default policy for this tool. Config overrides merge into it field by field.
+    /// Built-in tools override this with sensible defaults (e.g., shell → High/Always/no deadline).
     /// Config-level policy always takes precedence.
     fn default_policy(&self) -> ToolPolicy {
         ToolPolicy::default()
@@ -532,11 +610,11 @@ pub struct ToolDefinition {
 
 /// Resolves effective policy for tools: config overrides > tool defaults.
 pub struct ToolPolicyRegistry {
-    overrides: HashMap<String, ToolPolicy>,
+    overrides: HashMap<String, ToolPolicyOverride>,
 }
 
 impl ToolPolicyRegistry {
-    pub fn new(overrides: HashMap<String, ToolPolicy>) -> Self {
+    pub fn new(overrides: HashMap<String, ToolPolicyOverride>) -> Self {
         Self { overrides }
     }
 
@@ -546,13 +624,14 @@ impl ToolPolicyRegistry {
         }
     }
 
-    /// Get the effective policy for a tool: config override if present, else tool's default.
+    /// Get the effective policy for a tool: tool defaults with configured fields applied.
     pub fn resolve(&self, tool: &dyn Tool) -> ToolPolicy {
         let desc = tool.descriptor();
-        self.overrides
-            .get(&desc.name)
-            .cloned()
-            .unwrap_or_else(|| tool.default_policy())
+        let policy = tool.default_policy();
+        match self.overrides.get(&desc.name) {
+            Some(overrides) => overrides.apply(policy),
+            None => policy,
+        }
     }
 }
 
@@ -1194,5 +1273,108 @@ mod tests {
         let mut rl = RateLimiter::new();
         let err = rl.check("shell", 0).unwrap_err();
         assert!(err.contains("disabled"), "unexpected error: {err}");
+    }
+}
+
+#[cfg(test)]
+mod policy_override_tests {
+    use super::*;
+
+    #[test]
+    fn approval_only_preserves_every_other_policy_field() {
+        let grants: Grants = serde_yaml::from_str("shell: {allow: []}").unwrap();
+        let base = ToolPolicy {
+            risk: RiskLevel::High,
+            approval: ApprovalRequirement::Always,
+            timeout: Some(7),
+            sensitive_params: vec!["secret".into()],
+            rate_limit: Some(3),
+            grants,
+        };
+        let overrides: ToolPolicyOverride = serde_yaml::from_str("approval: never").unwrap();
+        let effective = overrides.apply(base.clone());
+        assert_eq!(effective.approval, ApprovalRequirement::Never);
+        assert_eq!(effective.risk, base.risk);
+        assert_eq!(effective.timeout, base.timeout);
+        assert_eq!(effective.sensitive_params, base.sensitive_params);
+        assert_eq!(effective.rate_limit, base.rate_limit);
+        assert_eq!(effective.grants, base.grants);
+    }
+
+    #[test]
+    fn omitted_null_and_explicit_fields_survive_yaml_and_json_roundtrips() {
+        for text in [
+            "{}",
+            "timeout: null\nrate_limit: null",
+            "timeout: 12\nrate_limit: 0",
+        ] {
+            let overrides: ToolPolicyOverride = serde_yaml::from_str(text).unwrap();
+            for copy in [
+                serde_yaml::from_str::<ToolPolicyOverride>(
+                    &serde_yaml::to_string(&overrides).unwrap(),
+                )
+                .unwrap(),
+                serde_json::from_str::<ToolPolicyOverride>(
+                    &serde_json::to_string(&overrides).unwrap(),
+                )
+                .unwrap(),
+            ] {
+                let base = ToolPolicy {
+                    rate_limit: Some(5),
+                    ..Default::default()
+                };
+                let effective = copy.apply(base);
+                assert_eq!(
+                    effective.timeout,
+                    match text {
+                        "{}" => Some(60),
+                        t if t.contains("null") => None,
+                        _ => Some(12),
+                    }
+                );
+                assert_eq!(
+                    effective.rate_limit,
+                    match text {
+                        "{}" => Some(5),
+                        t if t.contains("null") => None,
+                        _ => Some(0),
+                    }
+                );
+            }
+        }
+        let explicit: ToolPolicyOverride = serde_yaml::from_str("risk: medium\napproval: always\ntimeout: 9\nsensitive_params: []\nrate_limit: 2\ngrants: {shell: {allow: []}}").unwrap();
+        let effective = explicit.apply(ToolPolicy::default());
+        assert_eq!(effective.risk, RiskLevel::Medium);
+        assert_eq!(effective.approval, ApprovalRequirement::Always);
+        assert_eq!(effective.timeout, Some(9));
+        assert!(effective.sensitive_params.is_empty());
+        assert_eq!(effective.rate_limit, Some(2));
+        assert_eq!(
+            effective.grants.shell.unwrap().allow.entries(),
+            Some([].as_slice())
+        );
+    }
+
+    #[test]
+    fn approval_only_overrides_preserve_representative_builtin_defaults() {
+        let tools: Vec<Box<dyn Tool>> = vec![
+            Box::new(crate::tools::ShellExec),
+            Box::new(crate::tools::WriteFile),
+            Box::new(crate::tools::ReadFile),
+            Box::new(crate::tools::WebFetch),
+        ];
+        for tool in tools {
+            let base = tool.default_policy();
+            let registry = ToolPolicyRegistry::new(HashMap::from([(
+                tool.descriptor().name,
+                serde_yaml::from_str("approval: never").unwrap(),
+            )]));
+            let effective = registry.resolve(tool.as_ref());
+            assert_eq!(effective.timeout, base.timeout);
+            assert_eq!(effective.risk, base.risk);
+            assert_eq!(effective.grants, base.grants);
+            assert_eq!(effective.sensitive_params, base.sensitive_params);
+            assert_eq!(effective.rate_limit, base.rate_limit);
+        }
     }
 }

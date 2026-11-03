@@ -831,6 +831,8 @@ mod tests {
             routine_engine: None,
             observation_deadline: None,
             call_deadline: None,
+            call_timeout: None,
+            call_cancel: None,
         }
     }
 
