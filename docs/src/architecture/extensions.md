@@ -176,7 +176,8 @@ trait CapResolver: Send + Sync {
 
 `TurnComplete` is a live-instance endpoint, not part of the Global hook drain.
 After a successful runtime response, the runtime enqueues it to the composed Global/PerAgent/PerSession instance set (session wins by name).
-Only instances declaring `HookKind::TurnComplete` and present in the effective session-minus-agent active set run; session and agent revocations are rechecked at dispatch.
+Only instances declaring `HookKind::TurnComplete` and present in the effective session-minus-agent active set run.
+Session keys and session/agent revocations are rechecked when queued work reaches each endpoint, without expanding the originating turn's authority.
 Dispatch requires the current session to be openable by the registry's keys, sorts by extension name, and isolates each invocation's errors, panics and 15-second deadline.
 The hub owns background tasks with copied public request data and cloned scoped host handles; neither reply completion nor `AgentEnd` waits for them.
 Tasks serialize per session to preserve the naming attempt marker across overlapping turns.

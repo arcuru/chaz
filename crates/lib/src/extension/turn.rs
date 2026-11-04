@@ -256,3 +256,52 @@ pub(crate) fn public_messages(messages: &[RuntimeMessage], reply: &str) -> Vec<R
     out.push(RuntimeMessage::Assistant(reply.to_owned()));
     out
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn queued_cancellation_preserves_serialization_and_other_sessions() {
+        let mut owner = TurnCompleteTasks::default();
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let (release, wait) = tokio::sync::oneshot::channel();
+        owner.spawn("session".into(), None, async move {
+            started.send(()).unwrap();
+            let _ = wait.await;
+        });
+        ready.await.unwrap();
+        let cancel = crate::runtime::TurnCancel::new();
+        let cancelled_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls = cancelled_calls.clone();
+        owner.spawn("session".into(), Some(cancel.clone()), async move {
+            calls.fetch_add(1, Ordering::SeqCst);
+        });
+        cancel.cancel();
+        let (next, mut next_ready) = tokio::sync::oneshot::channel();
+        owner.spawn("session".into(), None, async move {
+            next.send(()).unwrap();
+        });
+        let (other, other_ready) = tokio::sync::oneshot::channel();
+        owner.spawn("other".into(), None, async move {
+            other.send(()).unwrap();
+        });
+        tokio::time::timeout(Duration::from_secs(2), other_ready)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut next_ready)
+                .await
+                .is_err(),
+            "overlapping observations must wait before reading or writing their attempt state"
+        );
+        release.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), next_ready)
+            .await
+            .unwrap()
+            .unwrap();
+        owner.drain().await;
+        assert_eq!(cancelled_calls.load(Ordering::SeqCst), 0);
+    }
+}

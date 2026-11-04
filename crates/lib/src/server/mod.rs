@@ -2633,6 +2633,10 @@ impl Server {
     /// state. Best-effort: process exit / abnormal termination skips this
     /// hook. Idempotent — calling on an unknown session is a no-op.
     pub async fn deregister_session(&self, session_db_id: &str) {
+        // Cancellation must not depend on a successful database/key read.
+        self.extensions
+            .stop_session_turn_complete(session_db_id)
+            .await;
         // Build a hook context from whatever runtime state we still have.
         // If the session is unknown we still let the caller fire-and-forget.
         let agent_name = {

@@ -449,6 +449,34 @@ pub async fn append_event(session_db: &Database, event: ExtensionEvent) -> anyho
     Ok(())
 }
 
+/// Recheck current revocations without expanding the originating turn's authority.
+async fn attenuate_active_extensions(
+    agent_name: &str,
+    session_db: Option<&Database>,
+    turn_active: &HashSet<String>,
+    server: Option<&crate::server::Server>,
+) -> HashSet<String> {
+    let mut active = turn_active.clone();
+    if let Some(db) = session_db {
+        match read_active(db).await {
+            Ok(refs) => {
+                let session_active: HashSet<_> =
+                    refs.into_iter().map(|r| r.name().to_string()).collect();
+                active.retain(|name| session_active.contains(name));
+            }
+            Err(error) => {
+                warn!(%error, "Could not read active extensions; no extension is active");
+                active.clear();
+            }
+        }
+    }
+    if let Some(server) = server {
+        let disabled = server.agent_disabled_extensions(agent_name).await;
+        active.retain(|name| !disabled.contains(name));
+    }
+    active
+}
+
 /// Decision returned from a `tool_call` hook.
 #[derive(Debug)]
 pub enum ToolCallDecision {
@@ -1197,29 +1225,11 @@ impl ExtensionHub {
         session_db: Option<&Database>,
         turn_active: &HashSet<String>,
     ) -> HashSet<String> {
-        let mut active = turn_active.clone();
-        if let Some(db) = session_db {
-            match read_active(db).await {
-                Ok(refs) => {
-                    let session_active: HashSet<_> =
-                        refs.into_iter().map(|r| r.name().to_string()).collect();
-                    active.retain(|name| session_active.contains(name));
-                }
-                Err(error) => {
-                    warn!(%error, "Could not read active extensions; no extension is active");
-                    active.clear();
-                }
-            }
-        }
-        if let Some(server) = self
+        let server = self
             .peer_handles
             .as_ref()
-            .and_then(|peer| peer.server_slot.get())
-        {
-            let disabled = server.agent_disabled_extensions(agent_name).await;
-            active.retain(|name| !disabled.contains(name));
-        }
-        active
+            .and_then(|peer| peer.server_slot.get());
+        attenuate_active_extensions(agent_name, session_db, turn_active, server.as_deref()).await
     }
 
     /// Every instance reachable for `(agent, session)`, keyed by extension
@@ -1598,7 +1608,7 @@ impl ExtensionHub {
     pub async fn fire_turn_complete(
         &self,
         ctx: &HookContext,
-        messages: &[RuntimeMessage],
+        messages: Vec<RuntimeMessage>,
         tools: &[crate::tool::ToolDefinition],
         backend: &crate::backends::BackendManager,
         security: &crate::security::SecurityContext,
@@ -1642,7 +1652,12 @@ impl ExtensionHub {
         let agent_name = ctx.agent_name.clone();
         let model = ctx.model.clone();
         let call_depth = ctx.call_depth;
-        let messages = messages.to_vec();
+        // Never keep the owning hub/server alive through queued work.
+        let server = self
+            .peer_handles
+            .as_ref()
+            .and_then(|peer| peer.server_slot.get())
+            .map(|server| Arc::downgrade(&server));
         let tools = tools.to_vec();
         let work = async move {
             for (name, endpoint) in endpoints {
@@ -1659,7 +1674,30 @@ impl ExtensionHub {
                     security: &security,
                     completion_used: std::sync::atomic::AtomicBool::new(false),
                 };
-                let fut = AssertUnwindSafe(async { endpoint.on_turn_complete(&turn).await });
+                let fut = AssertUnwindSafe(async {
+                    // Queueing must not extend authority past a later revocation.
+                    if registry
+                        .open_session(&db.root_id().to_string())
+                        .await
+                        .is_err()
+                    {
+                        return Ok(());
+                    }
+                    let active = attenuate_active_extensions(
+                        &agent_name,
+                        Some(&db),
+                        &active,
+                        server
+                            .as_ref()
+                            .and_then(std::sync::Weak::upgrade)
+                            .as_deref(),
+                    )
+                    .await;
+                    if !active.contains(&name) {
+                        return Ok(());
+                    }
+                    endpoint.on_turn_complete(&turn).await
+                });
                 match tokio::time::timeout(std::time::Duration::from_secs(15), fut.catch_unwind())
                     .await
                 {
@@ -1680,6 +1718,10 @@ impl ExtensionHub {
             .lock()
             .await
             .spawn(id, cancel.cloned(), work);
+    }
+
+    pub(crate) async fn stop_session_turn_complete(&self, id: &str) {
+        self.turn_complete_tasks.lock().await.stop_session(id).await;
     }
 
     /// Cancel and join auxiliary observations before this server generation ends.
@@ -1720,11 +1762,7 @@ impl ExtensionHub {
 
     pub async fn fire_session_shutdown(&self, ctx: &HookContext) {
         let id = ctx.session.lock().await.database().root_id().to_string();
-        self.turn_complete_tasks
-            .lock()
-            .await
-            .stop_session(&id)
-            .await;
+        self.stop_session_turn_complete(&id).await;
         for reg in &self.session_shutdown {
             if !ctx.active_extensions.contains(reg.owner) {
                 continue;

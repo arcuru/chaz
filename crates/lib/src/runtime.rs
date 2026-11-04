@@ -671,7 +671,7 @@ async fn finalize_outcome(
         let public = crate::extension::turn::public_messages(request.0, &outcome.body);
         until_cancelled(
             cancel,
-            hub.fire_turn_complete(ctx, &public, request.1, backend, security, cancel),
+            hub.fire_turn_complete(ctx, public, request.1, backend, security, cancel),
         )
         .await;
         hub.fire_agent_end(ctx).await;

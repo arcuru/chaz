@@ -128,10 +128,10 @@ impl Fixture {
             routine_engine: None,
         }
     }
-    async fn server(&self) -> Arc<crate::server::Server> {
+    fn server(&self, registry: Arc<SessionRegistry>) -> Arc<crate::server::Server> {
         crate::server::Server::new(
-            self.registry.clone(),
-            self.registry.agents.clone(),
+            registry.clone(),
+            registry.agents.clone(),
             HostedIndex::empty("agent"),
             HostedIndex::empty("bank"),
             HostedIndex::empty("skill_bank"),
@@ -1110,7 +1110,7 @@ async fn turn_stop_cancels_pending_naming_without_changing_success() {
 #[tokio::test]
 async fn server_shutdown_cancels_naming_and_refuses_late_dispatch() {
     let f = Fixture::new(json!({"enabled": true})).await;
-    let server = f.server().await;
+    let server = f.server(f.registry.clone());
     let naming_gate = f.pending_naming().await;
     server.shutdown().await;
     tokio::time::timeout(
@@ -1173,4 +1173,25 @@ async fn cancelled_main_turn_ends_once_without_starting_naming() {
     assert_eq!(ends.load(std::sync::atomic::Ordering::SeqCst), 1);
     assert_eq!(f.mock.recorded_calls().len(), 1);
     assert!(f.settings().await.get("attempted").is_none());
+}
+
+#[tokio::test]
+async fn deregister_cancels_naming_even_when_session_cannot_be_reopened() {
+    let f = Fixture::new(json!({"enabled": true})).await;
+    let naming_gate = f.pending_naming().await;
+    // A registry without this session's keys deterministically exercises the
+    // same best-effort hook branch as a failed storage/service read.
+    let (_instance, registry) = fresh_session_registry().await;
+    let server = f.server(registry.clone());
+    let id = f.id().await;
+    assert!(registry.open_session(&id).await.is_err());
+    server.deregister_session(&id).await;
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        naming_gate.wait_stopped(),
+    )
+    .await
+    .expect("deregister must cancel naming even without a readable session");
+    assert!(f.ctx.session.lock().await.read_meta().await.name.is_none());
+    server.shutdown().await;
 }
