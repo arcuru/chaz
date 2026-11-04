@@ -110,14 +110,14 @@ An ordinary launch opens the [session hub](#session-hub) rather than any convers
 
 ## Reading messages and tool output
 
-| Content                  | Display                                                                                                   |
-| ------------------------ | --------------------------------------------------------------------------------------------------------- |
-| Message Markdown         | Headings, bold/italic emphasis, ordered/nested lists and readable links                                   |
-| Inline and fenced code   | Accent text on a dark background; code indentation and literal escapes are retained                       |
-| Collapsed tool entry     | One-line preview, capped at 90 characters plus an ellipsis                                                |
-| Expanded tool result     | Indented plain text, with line breaks; complete JSON becomes an indented outline with decoded text values |
-| Click the `▸` / `▾` icon | Expand or collapse that entry                                                                             |
-| `Ctrl+T` or `/expand`    | Toggle expansion for all tool entries and directives                                                      |
+| Content                                  | Display                                                                                                   |
+| ---------------------------------------- | --------------------------------------------------------------------------------------------------------- |
+| Message Markdown                         | Headings, bold/italic emphasis, ordered/nested lists and readable links                                   |
+| Inline and fenced code                   | Accent text on a dark background; code indentation and literal escapes are retained                       |
+| Collapsed tool entry                     | One-line preview, capped at 90 characters plus an ellipsis                                                |
+| Expanded tool result                     | Indented plain text, with line breaks; complete JSON becomes an indented outline with decoded text values |
+| Click anywhere on a `▸` / `▾` header row | Expand or collapse that entry                                                                             |
+| `Ctrl+O` or `/expand`                    | Toggle expansion for all tool entries and directives                                                      |
 
 ## Formatting is a view, not a rewrite
 
@@ -125,6 +125,11 @@ Messages use Markdown styling automatically. Links show their label and target;
 they do not launch a browser. Tool output is **not** Markdown, so shell syntax,
 asterisks and code remain text. Both wrap to the pane's width and use the same
 history scrolling as other entries.
+
+Each collapsible header is a full-row click target, including its label,
+right-hand space and wrapped continuation rows. Only the header toggles: clicks
+on expanded body text do not collapse it. Scrolling and resizing keep the target
+aligned with the displayed header; keyboard toggles and text selection are unchanged.
 
 The TUI decodes a tool result only when its body is a complete JSON value.
 JSON string values become text with real line breaks; an intentionally literal
@@ -150,8 +155,8 @@ structure. `/raw` still shows the stored entry representation.
    { "text": "one\n  two", "literal": "keep \\n" }
    ```
 
-   The collapsed row starts with `▸ query` and a short preview. Click its icon,
-   or press `Ctrl+T`. The body reads:
+   The collapsed row starts with `▸ query` and a short preview. Click anywhere
+   on its header row, or press `Ctrl+O` to expand all entries. The body reads:
 
    ```text
      ▾ query
@@ -163,6 +168,8 @@ structure. `/raw` still shows the stored entry representation.
    ```
 
    `two` occupies a separate line, while `keep \n` remains on one line.
+   Clicking the body leaves it expanded. To collapse an entry you opened by
+   mistake, click its header again.
 
 3. If the preview ends midway through JSON, for example
    `{"text":"one\n…`, expansion cannot recover the missing bytes. Ask the tool
