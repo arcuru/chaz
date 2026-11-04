@@ -77,7 +77,7 @@ impl Tool for SpawnWorker {
         ToolPolicy {
             risk: RiskLevel::Medium,
             approval: ApprovalRequirement::UnlessAutoApproved,
-            timeout: 300,
+            timeout: Some(300),
             ..ToolPolicy::default()
         }
     }
@@ -326,7 +326,7 @@ mod tests {
             p.approval,
             ApprovalRequirement::UnlessAutoApproved
         ));
-        assert_eq!(p.timeout, 300, "spawn_worker gets a 5-minute timeout");
+        assert_eq!(p.timeout, Some(300), "spawn_worker gets a 5-minute timeout");
     }
 
     #[tokio::test]

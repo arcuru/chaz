@@ -43,6 +43,8 @@ pub enum Capability {
         /// it printed so far. `None` waits for completion; the caller's own
         /// deadline (if any) still bounds the request.
         timeout: Option<std::time::Duration>,
+        /// User cancellation kills/drains the group and returns partial output.
+        cancel: Option<crate::runtime::TurnCancel>,
     },
     /// Read a file's contents as UTF-8 text.
     FileRead { path: String },
@@ -67,6 +69,7 @@ pub struct ShellOutput {
     /// The requested timeout expired and the host stopped the process
     /// group; `stdout`/`stderr` hold only what arrived before that.
     pub timed_out: bool,
+    pub cancelled: bool,
     /// Wall-clock time from spawn until the output was collected.
     pub elapsed: std::time::Duration,
 }
@@ -107,6 +110,7 @@ pub enum CapabilityResult {
 ///         command: "ls -la".into(),
 ///         working_dir: None,
 ///         timeout: None,
+///         cancel: None,
 ///     },
 ///     ctx.grants(),
 /// ).await?;
@@ -174,11 +178,13 @@ impl ToolHost for NativeToolHost {
                     command,
                     working_dir,
                     timeout,
+                    cancel,
                 } => {
                     exec_shell(
                         command,
                         working_dir.as_deref(),
                         *timeout,
+                        cancel.as_ref(),
                         grants.shell.as_ref(),
                     )
                     .await
@@ -218,6 +224,7 @@ async fn exec_shell(
     command: &str,
     working_dir: Option<&str>,
     timeout: Option<std::time::Duration>,
+    cancel: Option<&crate::runtime::TurnCancel>,
     grant: Option<&ShellGrant>,
 ) -> Result<CapabilityResult, ToolError> {
     check_shell_command(command, grant).map_err(|msg| {
@@ -231,7 +238,7 @@ async fn exec_shell(
         cmd.current_dir(dir);
     }
 
-    run_shell_process(cmd, timeout)
+    run_shell_process(cmd, timeout, cancel)
         .await
         .map(CapabilityResult::Shell)
         .map_err(|e| ToolError::Execution(format!("Failed to execute command: {e}")))
@@ -250,9 +257,16 @@ const KILLED_DRAIN: std::time::Duration = std::time::Duration::from_millis(250);
 pub(crate) async fn run_shell_process(
     mut cmd: tokio::process::Command,
     timeout: Option<std::time::Duration>,
+    cancel: Option<&crate::runtime::TurnCancel>,
 ) -> std::io::Result<ShellOutput> {
     use tokio::io::AsyncReadExt;
 
+    if cancel.is_some_and(crate::runtime::TurnCancel::is_cancelled) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Interrupted,
+            "shell cancelled before spawn",
+        ));
+    }
     cmd.kill_on_drop(true);
     #[cfg(unix)]
     cmd.process_group(0);
@@ -269,6 +283,7 @@ pub(crate) async fn run_shell_process(
 
     let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
     let mut timed_out = false;
+    let mut cancelled = false;
     let status = {
         // Bytes already read stay in the buffers if this is abandoned.
         let collect = async {
@@ -280,14 +295,27 @@ pub(crate) async fn run_shell_process(
             .map(|(_, _, status)| status)
         };
         tokio::pin!(collect);
-        let finished = match timeout {
-            Some(limit) => tokio::time::timeout(limit, &mut collect).await.ok(),
-            None => Some((&mut collect).await),
+        let deadline = async {
+            match timeout {
+                Some(limit) => tokio::time::sleep(limit).await,
+                None => std::future::pending().await,
+            }
+        };
+        let stop = async {
+            match cancel {
+                Some(cancel) => cancel.cancelled().await,
+                None => std::future::pending().await,
+            }
+        };
+        let finished = tokio::select! {
+            biased;
+            _ = stop => { cancelled = true; None },
+            _ = deadline => { timed_out = true; None },
+            status = &mut collect => Some(status),
         };
         match finished {
             Some(status) => Some(status?),
             None => {
-                timed_out = true;
                 group.kill();
                 tokio::time::timeout(KILLED_DRAIN, &mut collect)
                     .await
@@ -309,6 +337,7 @@ pub(crate) async fn run_shell_process(
         stderr: String::from_utf8_lossy(&stderr).into_owned(),
         exit_code: exit_code(status),
         timed_out,
+        cancelled,
         elapsed: started.elapsed(),
     })
 }
@@ -654,6 +683,7 @@ mod tests {
         let out = run_shell_process(
             sh("echo out; echo err >&2; sleep 0.2; exit 4"),
             Some(std::time::Duration::from_secs(10)),
+            None,
         )
         .await
         .unwrap();
@@ -669,7 +699,9 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn a_signalled_shell_reports_128_plus_signal() {
-        let out = run_shell_process(sh("kill -TERM $$"), None).await.unwrap();
+        let out = run_shell_process(sh("kill -TERM $$"), None, None)
+            .await
+            .unwrap();
         assert_eq!(out.exit_code, 128 + 15);
         assert!(!out.timed_out);
     }
@@ -686,9 +718,13 @@ mod tests {
             leaked.display()
         );
         let started = std::time::Instant::now();
-        let out = run_shell_process(sh(&command), Some(std::time::Duration::from_millis(300)))
-            .await
-            .unwrap();
+        let out = run_shell_process(
+            sh(&command),
+            Some(std::time::Duration::from_millis(300)),
+            None,
+        )
+        .await
+        .unwrap();
         assert!(out.timed_out);
         assert_eq!(
             (out.stdout.as_str(), out.stderr.as_str()),
@@ -709,6 +745,7 @@ mod tests {
                     command: "echo hi; sleep 30".into(),
                     working_dir: None,
                     timeout: Some(std::time::Duration::from_millis(200)),
+                    cancel: None,
                 },
                 &Grants::default(),
             )

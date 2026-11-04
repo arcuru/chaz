@@ -38,7 +38,7 @@ pub struct McpServer {
     transport: Transport,
     closed: AtomicBool,
     next_id: AtomicU64,
-    default_policy: Option<ToolPolicy>,
+    default_policy: Option<crate::tool::ToolPolicyOverride>,
     /// Set when the server sends `notifications/tools/list_changed`.
     tools_changed: AtomicBool,
     /// Shared metadata for each tool, keyed by raw tool name.
@@ -727,7 +727,7 @@ impl McpToolAnnotations {
             return ToolPolicy {
                 risk: RiskLevel::High,
                 approval: ApprovalRequirement::Always,
-                timeout: 60,
+                timeout: Some(60),
                 sensitive_params: Vec::new(),
                 rate_limit: None,
                 grants: Default::default(),
@@ -737,7 +737,7 @@ impl McpToolAnnotations {
             return ToolPolicy {
                 risk: RiskLevel::Low,
                 approval: ApprovalRequirement::Never,
-                timeout: 60,
+                timeout: Some(60),
                 sensitive_params: Vec::new(),
                 rate_limit: None,
                 grants: Default::default(),
@@ -755,7 +755,7 @@ fn mcp_default_policy() -> ToolPolicy {
     ToolPolicy {
         risk: RiskLevel::Medium,
         approval: ApprovalRequirement::UnlessAutoApproved,
-        timeout: 60,
+        timeout: Some(60),
         sensitive_params: Vec::new(),
         rate_limit: None,
         grants: Default::default(),
@@ -803,22 +803,15 @@ impl Tool for McpTool {
     }
 
     fn default_policy(&self) -> ToolPolicy {
-        // Precedence:
-        //  1. `default_policy` set explicitly on the server in yaml — wins
-        //     unconditionally so users can always pin behavior they care about
-        //  2. Annotations from `tools/list` — `destructiveHint` / `readOnlyHint`
-        //     map to High+Always / Low+Never respectively
-        //  3. Otherwise: Medium + UnlessAutoApproved, chaz's historical default
-        if let Some(p) = self.server.default_policy.clone() {
-            return p;
-        }
         let metadata = self.server.tool_metadata.read().unwrap();
-        if let Some(meta) = metadata.get(&self.raw_name)
-            && let Some(ann) = &meta.annotations
-        {
-            return ann.to_policy();
+        let policy = metadata
+            .get(&self.raw_name)
+            .and_then(|meta| meta.annotations.as_ref())
+            .map_or_else(mcp_default_policy, McpToolAnnotations::to_policy);
+        match &self.server.default_policy {
+            Some(overrides) => overrides.apply(policy),
+            None => policy,
         }
-        mcp_default_policy()
     }
 }
 

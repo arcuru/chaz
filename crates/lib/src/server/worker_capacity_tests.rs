@@ -90,9 +90,10 @@ async fn start_parent(
     let policies = ToolPolicyRegistry::new(HashMap::from([(
         "spawn_worker".into(),
         ToolPolicy {
-            timeout,
+            timeout: Some(timeout),
             ..Default::default()
-        },
+        }
+        .into(),
     )]));
     let capacity = runtime::ExecutionCapacity::new(server.semaphore.clone(), permit, job_execution);
     let task = tokio::spawn(async move {

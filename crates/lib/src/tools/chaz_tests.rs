@@ -331,18 +331,20 @@ async fn tools_use_child_scope_hidden_presentation_and_effective_policy_grants()
             ToolPolicy {
                 risk: crate::tool::RiskLevel::Medium,
                 approval: crate::tool::ApprovalRequirement::UnlessAutoApproved,
-                timeout: 17,
+                timeout: Some(17),
                 rate_limit: Some(3),
                 grants,
                 ..Default::default()
-            },
+            }
+            .into(),
         ),
         (
             "get_time".into(),
             ToolPolicy {
-                timeout: 999,
+                timeout: Some(999),
                 ..Default::default()
-            },
+            }
+            .into(),
         ),
     ])));
     let t = ChazTool {
@@ -502,7 +504,8 @@ async fn runtime_enforces_scope_extension_and_policy_for_chaz() {
                 ToolPolicy {
                     approval: crate::tool::ApprovalRequirement::Always,
                     ..Default::default()
-                },
+                }
+                .into(),
             )])
         } else {
             HashMap::new()

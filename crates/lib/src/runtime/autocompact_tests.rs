@@ -216,7 +216,8 @@ async fn run(
         crate::tool::ToolPolicy {
             approval: crate::tool::ApprovalRequirement::Never,
             ..Default::default()
-        },
+        }
+        .into(),
     )]));
     let result = tokio::time::timeout(
         Duration::from_secs(20),

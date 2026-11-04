@@ -1632,16 +1632,24 @@ async fn run_prepared_turn(
                 call_ctx.observation_deadline = Some(resume.deadline);
                 // The remaining policy budget, not a fresh one: an expired
                 // budget reports the original timeout immediately.
-                let timeout = (resume.policy_deadline - chrono::Utc::now())
+                let remaining = (resume.policy_deadline - chrono::Utc::now())
                     .to_std()
-                    .unwrap_or_default()
-                    .min(policy.timeout_duration());
+                    .unwrap_or_default();
+                let timeout = Some(
+                    policy
+                        .timeout_duration()
+                        .map_or(remaining, |limit| remaining.min(limit)),
+                );
                 invoke_tool(
                     tool,
                     args,
                     &call_ctx,
                     timeout,
-                    resume.policy_timeout_seconds.min(policy.timeout),
+                    policy
+                        .timeout
+                        .map_or(resume.policy_timeout_seconds, |limit| {
+                            resume.policy_timeout_seconds.min(limit)
+                        }),
                     &call.name,
                     cancel,
                     &mut capacity,
@@ -2140,6 +2148,7 @@ async fn run_prepared_turn(
                                 if call_index + 1 == tool_calls.len()
                                     && !approve_all
                                     && !hooks_injected
+                                    && let Some(timeout) = timeout
                                     && let Some(recorder) = &recorder
                                 {
                                     let wait = JobWaitIntent {
@@ -2213,7 +2222,7 @@ async fn run_prepared_turn(
                                 args,
                                 &call_ctx,
                                 timeout,
-                                timeout.as_secs(),
+                                timeout.map_or(0, |limit| limit.as_secs()),
                                 &call.name,
                                 cancel,
                                 &mut capacity,
@@ -2269,6 +2278,25 @@ async fn run_prepared_turn(
                         },
                     };
 
+                    if cancel.is_some_and(TurnCancel::is_cancelled) {
+                        record_tool_result(
+                            &recorder,
+                            model_sequence,
+                            call_index,
+                            call,
+                            &bound_tool_output(&result),
+                            ToolResultOutcome::Cancelled,
+                        )
+                        .await?;
+                        record_cancelled_calls(
+                            &recorder,
+                            model_sequence,
+                            call_index + 1,
+                            &tool_calls,
+                        )
+                        .await?;
+                        return Err(cancelled_outcome(&recorder, hub, hook_ctx.as_ref(), acc).await);
+                    }
                     settle_tool_result(
                         &recorder,
                         &mut messages,
@@ -2291,6 +2319,9 @@ async fn run_prepared_turn(
 /// Name of the only tool whose observation can resume from a checkpoint.
 pub(crate) const JOB_WAIT_TOOL: &str = "job_wait";
 
+/// Shell cleanup/reporting only; host execution still stops at its exact limit.
+const SHELL_REPORT_GRACE: Duration = Duration::from_secs(1);
+
 /// Run one admitted call and turn its outcome into the model-visible result.
 /// `job_wait` yields for its whole call; submission tools yield only after
 /// committing the child. Regain capacity outside the tool timeout, before
@@ -2300,7 +2331,7 @@ async fn invoke_tool(
     tool: &dyn crate::tool::Tool,
     args: serde_json::Value,
     call_ctx: &ToolContext,
-    timeout: Duration,
+    timeout: Option<Duration>,
     timeout_label_secs: u64,
     name: &str,
     cancel: Option<&TurnCancel>,
@@ -2317,13 +2348,27 @@ async fn invoke_tool(
     if name == JOB_WAIT_TOOL {
         call_ctx.yield_for_observation();
     }
-    let Some(exec_result) = until_cancelled(cancel, async {
+    call_ctx.call_cancel = cancel.cloned();
+    let execution = async {
         // A lost reply can follow a completed effect. Invoke once; an error
         // classification is not permission to resubmit the call.
-        let deadline = tokio::time::Instant::now() + timeout;
-        call_ctx.call_deadline = Some(deadline);
-        let result =
-            tokio::time::timeout_at(deadline, async { tool.execute(args, &call_ctx).await }).await;
+        call_ctx.call_timeout = timeout;
+        call_ctx.call_deadline = timeout.map(|limit| tokio::time::Instant::now() + limit);
+        // Shell enforces the exact execution ceiling in its host. Give only
+        // cleanup/reporting a short grace period, not the command itself.
+        let outer_deadline = call_ctx.call_deadline.map(|deadline| {
+            if name == "shell" {
+                deadline + SHELL_REPORT_GRACE
+            } else {
+                deadline
+            }
+        });
+        let result = match outer_deadline {
+            Some(deadline) => {
+                tokio::time::timeout_at(deadline, tool.execute(args, &call_ctx)).await
+            }
+            None => Ok(tool.execute(args, &call_ctx).await),
+        };
         // Outside the tool timeout: success, error and timeout
         // all regain capacity before hooks, another tool in
         // this batch, or the next model request can execute.
@@ -2331,12 +2376,30 @@ async fn invoke_tool(
             capacity.reacquire().await?;
         }
         Ok::<_, String>(result)
-    })
-    .await
-    else {
-        return Ok(None);
     };
-    let exec_result = exec_result?;
+    tokio::pin!(execution);
+    let exec_result = match until_cancelled(cancel, &mut execution).await {
+        Some(result) => result?,
+        // The shell host observes the same stop and kills/drains the group.
+        // Bound that cooperation so a broken host cannot prevent a user stop.
+        None if name == "shell" => {
+            match tokio::time::timeout(SHELL_REPORT_GRACE, &mut execution).await {
+                Ok(result) => result?,
+                Err(_) => return Ok(None),
+            }
+        }
+        None => return Ok(None),
+    };
+    if cancel.is_some_and(TurnCancel::is_cancelled) {
+        let output = match exec_result {
+            Ok(Ok(output)) => security
+                .leak_detector
+                .scan(&output)
+                .unwrap_or_else(|error| format!("Tool output blocked: {error}")),
+            _ => TOOL_CANCELLED_OUTPUT.to_string(),
+        };
+        return Ok(Some(output));
+    }
 
     // Observation is safe to repeat; result hooks need not be. Retire the
     // checkpoint before crossing that boundary, even on error or timeout.

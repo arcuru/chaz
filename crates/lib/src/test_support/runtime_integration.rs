@@ -135,7 +135,7 @@ impl Tool for GatedTool {
         ToolPolicy {
             risk: RiskLevel::High,
             approval: ApprovalRequirement::Always,
-            timeout: 60,
+            timeout: Some(60),
             sensitive_params: Vec::new(),
             rate_limit: None,
             grants: Default::default(),
