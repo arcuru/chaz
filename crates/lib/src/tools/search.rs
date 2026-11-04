@@ -1364,7 +1364,13 @@ mod tests {
         fn default_backend_timeout_is_bounded_below_tool_timeout() {
             let tool = WebSearch::new(vec![]);
             assert_eq!(tool.backend_timeout, Duration::from_secs(15));
-            assert!(tool.backend_timeout.as_secs() < tool.default_policy().timeout);
+            assert!(
+                tool.backend_timeout.as_secs()
+                    < tool
+                        .default_policy()
+                        .timeout
+                        .expect("web_search has a finite default timeout")
+            );
         }
 
         // ── Real host against a local listener ──

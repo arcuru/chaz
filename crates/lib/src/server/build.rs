@@ -2171,7 +2171,7 @@ async fn build_web_search_backends(
         .as_ref()
         .and_then(|s| s.tool_policies.as_ref())
         .and_then(|p| p.get("web_search"))
-        .map(|p| p.grants.clone())
+        .and_then(|p| p.grants.clone())
         .unwrap_or_default();
     tools::warn_unauthorized_private_backends(&built, &policy_grants);
     built
