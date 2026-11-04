@@ -6,11 +6,23 @@
 //! configured. The tool holds an ordered preference list of backends and
 //! tries each in turn, failing over to the next on any error. The last
 //! entry is the final answer — if it also errors, that error is returned.
+//!
+//! Every backend request is a `Capability::HttpRequest` through the call's
+//! `ToolHost` under its resolved grants, like `web_fetch`. The query is
+//! model-chosen text sent to a third party, so it is tool egress: a network
+//! grant that denies a backend's endpoint denies that backend. Configuring a
+//! backend does not authorize it; a private or local SearxNG instance needs a
+//! private-network grant on `web_search`.
 
-use crate::tool::{ApprovalRequirement, RiskLevel, Tool, ToolContext, ToolDescriptor, ToolPolicy};
+use crate::grants::Grants;
+use crate::tool::{
+    ApprovalRequirement, RiskLevel, Tool, ToolContext, ToolDescriptor, ToolError, ToolPolicy,
+};
+use crate::tool_host::{Capability, CapabilityResult, ToolHost};
 use regex::Regex;
 use serde::Serialize;
 use serde_json::Value;
+use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::OnceLock;
@@ -58,11 +70,24 @@ impl SearchBackend {
     }
 }
 
+/// Per-backend deadline. A hung backend must not consume the whole tool
+/// timeout (60 s by default), or failover would never reach the next one.
+const BACKEND_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// DuckDuckGo blocks bot UAs; send a generic browser UA to every backend.
+const USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64; rv:120.0) Gecko/20100101 Firefox/120.0";
+
+/// Config path that authorizes a private or local SearxNG instance.
+const PRIVATE_GRANT_HINT: &str = "private SearxNG needs \
+     `security.tool_policies.web_search.grants.network.allow_private: true`, \
+     and session and agent capability ceilings must also allow private networks";
+
 pub struct WebSearch {
     /// Non-empty ordered preference list. Tried in sequence on failure.
     /// An empty `new()` input is coerced to a single DuckDuckGo entry so
     /// the tool always has a fallback.
     backends: Vec<SearchBackend>,
+    backend_timeout: Duration,
 }
 
 impl WebSearch {
@@ -72,17 +97,65 @@ impl WebSearch {
         } else {
             backends
         };
-        Self { backends }
+        Self {
+            backends,
+            backend_timeout: BACKEND_TIMEOUT,
+        }
     }
 
-    fn http_client() -> Result<reqwest::Client, String> {
-        reqwest::Client::builder()
-            .timeout(Duration::from_secs(15))
-            // DuckDuckGo blocks bot UAs; use a generic browser UA for all backends.
-            .user_agent("Mozilla/5.0 (X11; Linux x86_64; rv:120.0) Gecko/20100101 Firefox/120.0")
-            .build()
-            .map_err(|e| format!("Failed to create HTTP client: {e}"))
+    #[cfg(test)]
+    fn with_backend_timeout(mut self, timeout: Duration) -> Self {
+        self.backend_timeout = timeout;
+        self
     }
+}
+
+/// Configured SearxNG URLs at a private address or internal hostname that the
+/// given `web_search` policy grant does not authorize. Session and agent
+/// ceilings can only narrow the policy grant, so every one of these is denied
+/// by the host at call time. Used for a startup warning; enforcement stays in
+/// the host.
+fn unauthorized_private_backends<'a>(
+    backends: &'a [SearchBackend],
+    policy_grants: &Grants,
+) -> Vec<&'a str> {
+    if allows_private(policy_grants) {
+        return Vec::new();
+    }
+    backends
+        .iter()
+        .filter_map(|b| match b {
+            SearchBackend::Searxng { base_url } if is_private_url(base_url) => {
+                Some(base_url.as_str())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// Log the startup warning for [`unauthorized_private_backends`].
+pub(crate) fn warn_unauthorized_private_backends(
+    backends: &[SearchBackend],
+    policy_grants: &Grants,
+) {
+    for url in unauthorized_private_backends(backends, policy_grants) {
+        warn!(
+            %url,
+            "web_search: SearxNG backend will be denied: {PRIVATE_GRANT_HINT}"
+        );
+    }
+}
+
+fn allows_private(grants: &Grants) -> bool {
+    grants.network.as_ref().is_some_and(|n| n.allow_private)
+}
+
+/// Whether the host's private-address check would refuse this URL. Mirrors
+/// the host policy for diagnostics only; the host makes the decision.
+fn is_private_url(url: &str) -> bool {
+    crate::security::NetworkPolicy::permissive()
+        .check(url, "GET")
+        .is_err_and(|e| e.starts_with("SSRF protection"))
 }
 
 impl Tool for WebSearch {
@@ -118,7 +191,7 @@ impl Tool for WebSearch {
     fn execute<'a>(
         &'a self,
         arguments: Value,
-        _ctx: &'a ToolContext,
+        ctx: &'a ToolContext,
     ) -> Pin<Box<dyn Future<Output = Result<String, crate::tool::ToolError>> + Send + 'a>> {
         use crate::tool::ToolError;
         Box::pin(async move {
@@ -141,8 +214,15 @@ impl Tool for WebSearch {
             let chain: Vec<&'static str> = self.backends.iter().map(|b| b.name()).collect();
             info!(backends = ?chain, %query, max_results, "Searching web");
 
-            let client = Self::http_client().map_err(ToolError::Execution)?;
-            let results = try_backends(&self.backends, &client, query, max_results).await?;
+            let results = try_backends(
+                &self.backends,
+                ctx.host(),
+                ctx.grants(),
+                self.backend_timeout,
+                query,
+                max_results,
+            )
+            .await?;
 
             debug!(count = results.len(), "Search results");
             serde_json::to_string(&results)
@@ -154,31 +234,22 @@ impl Tool for WebSearch {
 /// Run the query against each backend in order, returning the first `Ok`.
 /// If every backend errors, returns the last error. The chain is assumed
 /// non-empty (`WebSearch::new` guarantees this).
+///
+/// Every request goes through the host with the call's resolved grants, so a
+/// denial is an error for that backend like any other: failover may try the
+/// next one, which the same grants judge in turn.
 async fn try_backends(
     backends: &[SearchBackend],
-    client: &reqwest::Client,
+    host: &dyn ToolHost,
+    grants: &Grants,
+    timeout: Duration,
     query: &str,
     max_results: usize,
 ) -> Result<Vec<SearchResult>, ToolError> {
     try_backends_with(backends, |backend| async move {
-        match backend {
-            SearchBackend::Kagi { api_key } => {
-                kagi_search(client, api_key, query, max_results).await
-            }
-            SearchBackend::Tavily { api_key } => {
-                tavily_search(client, api_key, query, max_results).await
-            }
-            SearchBackend::Brave { api_key } => {
-                brave_search(client, api_key, query, max_results).await
-            }
-            SearchBackend::Serper { api_key } => {
-                serper_search(client, api_key, query, max_results).await
-            }
-            SearchBackend::Searxng { base_url } => {
-                searxng_search(client, base_url, query, max_results).await
-            }
-            SearchBackend::DuckDuckGo => duckduckgo_search(client, query, max_results).await,
-        }
+        let request = build_request(backend, query, max_results)?;
+        let (status, text) = send(backend, host, grants, timeout, request).await?;
+        parse_response(backend, status, &text, max_results)
     })
     .await
 }
@@ -217,339 +288,266 @@ where
 }
 
 // ================================================================
-// Provider implementations
+// Provider requests and responses
 // ================================================================
 
-use crate::tool::ToolError;
-
-async fn kagi_search(
-    client: &reqwest::Client,
-    api_key: &str,
+/// Build the `HttpRequest` capability for one backend. API keys travel in
+/// headers (or Tavily's JSON body, as its API requires), never in the URL.
+fn build_request(
+    backend: &SearchBackend,
     query: &str,
     max_results: usize,
+) -> Result<Capability, ToolError> {
+    let limit = max_results.to_string();
+    let mut headers = HashMap::from([("User-Agent".to_string(), USER_AGENT.to_string())]);
+    let (method, url, body) = match backend {
+        // Kagi's Search API is GET /api/v0/search?q=&limit= with
+        // `Authorization: Bot <token>` (literal word "Bot", not "Bearer").
+        SearchBackend::Kagi { api_key } => {
+            headers.insert("Authorization".into(), format!("Bot {api_key}"));
+            let url = with_query(
+                backend,
+                "https://kagi.com/api/v0/search",
+                &[("q", query), ("limit", &limit)],
+            )?;
+            ("GET", url, None)
+        }
+        SearchBackend::Tavily { api_key } => {
+            headers.insert("Content-Type".into(), "application/json".into());
+            let body = serde_json::json!({
+                "api_key": api_key,
+                "query": query,
+                "max_results": max_results,
+            });
+            (
+                "POST",
+                "https://api.tavily.com/search".to_string(),
+                Some(body.to_string()),
+            )
+        }
+        SearchBackend::Brave { api_key } => {
+            headers.insert("Accept".into(), "application/json".into());
+            headers.insert("X-Subscription-Token".into(), api_key.clone());
+            let url = with_query(
+                backend,
+                "https://api.search.brave.com/res/v1/web/search",
+                &[("q", query), ("count", &limit)],
+            )?;
+            ("GET", url, None)
+        }
+        SearchBackend::Serper { api_key } => {
+            headers.insert("X-API-KEY".into(), api_key.clone());
+            headers.insert("Content-Type".into(), "application/json".into());
+            let body = serde_json::json!({ "q": query, "num": max_results });
+            (
+                "POST",
+                "https://google.serper.dev/search".to_string(),
+                Some(body.to_string()),
+            )
+        }
+        // SearxNG exposes both HTML and JSON on the same `/search` endpoint;
+        // `format=json` selects JSON. The instance must have the JSON output
+        // format enabled (default on `searxng` ≥ 2022 but some public
+        // instances disable it — error messages from the server are
+        // informative).
+        SearchBackend::Searxng { base_url } => {
+            let base = format!("{}/search", base_url.trim_end_matches('/'));
+            let url = with_query(backend, &base, &[("q", query), ("format", "json")])?;
+            ("GET", url, None)
+        }
+        // DDG blocks GET requests with non-browser UAs; POST with form data
+        // works reliably.
+        SearchBackend::DuckDuckGo => {
+            headers.insert(
+                "Content-Type".into(),
+                "application/x-www-form-urlencoded".into(),
+            );
+            let body = url::form_urlencoded::Serializer::new(String::new())
+                .append_pair("q", query)
+                .finish();
+            (
+                "POST",
+                "https://html.duckduckgo.com/html/".to_string(),
+                Some(body),
+            )
+        }
+    };
+    Ok(Capability::HttpRequest {
+        url,
+        method: method.to_string(),
+        headers,
+        body,
+    })
+}
+
+/// `base` with `params` appended as an encoded query string.
+fn with_query(
+    backend: &SearchBackend,
+    base: &str,
+    params: &[(&str, &str)],
+) -> Result<String, ToolError> {
+    url::Url::parse_with_params(base, params)
+        .map(String::from)
+        .map_err(|e| ToolError::Execution(format!("{}: invalid URL: {e}", backend.name())))
+}
+
+/// Send one backend request through the host under the call's grants,
+/// bounded by `timeout`. Returns the status and the body as text.
+async fn send(
+    backend: &SearchBackend,
+    host: &dyn ToolHost,
+    grants: &Grants,
+    timeout: Duration,
+    request: Capability,
+) -> Result<(u16, String), ToolError> {
+    let name = backend.name();
+    let result = match tokio::time::timeout(timeout, host.request(&request, grants)).await {
+        Ok(result) => result,
+        Err(_) => {
+            return Err(ToolError::Network(format!(
+                "{name}: no response within {}s",
+                timeout.as_secs_f32()
+            )));
+        }
+    };
+    match result {
+        Ok(CapabilityResult::HttpResponse(response)) => Ok((
+            response.status,
+            String::from_utf8_lossy(&response.body).into_owned(),
+        )),
+        Ok(_) => Err(ToolError::Execution(format!(
+            "{name}: unexpected host result for HTTP capability"
+        ))),
+        Err(e) => Err(annotate_host_error(backend, grants, e)),
+    }
+}
+
+/// Prefix a host error with the backend name. A private SearxNG instance
+/// refused for lack of a private-network grant also gets the config fix.
+fn annotate_host_error(backend: &SearchBackend, grants: &Grants, err: ToolError) -> ToolError {
+    let name = backend.name();
+    let hint = match backend {
+        SearchBackend::Searxng { base_url }
+            if !allows_private(grants) && is_private_url(base_url) =>
+        {
+            warn!(
+                url = %base_url,
+                "web_search: SearxNG backend denied: {PRIVATE_GRANT_HINT}"
+            );
+            format!(" ({PRIVATE_GRANT_HINT})")
+        }
+        _ => String::new(),
+    };
+    match err {
+        ToolError::Network(m) => ToolError::Network(format!("{name}: {m}{hint}")),
+        ToolError::Execution(m) => ToolError::Execution(format!("{name}: {m}{hint}")),
+        other => other,
+    }
+}
+
+/// Turn one backend's HTTP status and body into results. A non-success
+/// status is an error (so failover moves on); an empty result list is not,
+/// except for DuckDuckGo, whose empty page usually means rate limiting.
+fn parse_response(
+    backend: &SearchBackend,
+    status: u16,
+    text: &str,
+    max_results: usize,
 ) -> Result<Vec<SearchResult>, ToolError> {
-    // Kagi's Search API is GET /api/v0/search?q=&limit= with
-    // `Authorization: Bot <token>` (literal word "Bot", not "Bearer").
-    // Response `data[]` is a discriminated list; `t: 0` entries are
-    // search results (url/title/snippet), `t: 1` is related searches.
-    let response = client
-        .get("https://kagi.com/api/v0/search")
-        .query(&[("q", query), ("limit", &max_results.to_string())])
-        .header("Authorization", format!("Bot {api_key}"))
-        .send()
-        .await
-        .map_err(|e| ToolError::Network(format!("kagi: {e}")))?;
-    let status = response.status();
-    let text = response
-        .text()
-        .await
-        .map_err(|e| ToolError::Network(format!("kagi: {e}")))?;
-    if !status.is_success() {
+    let name = backend.name();
+    if let SearchBackend::DuckDuckGo = backend {
+        // DDG returns 202 when rate-limiting or blocking the request; treat
+        // it as an error so the failover chain can try the next backend.
+        if status != 200 {
+            return Err(ToolError::Execution(format!(
+                "duckduckgo returned HTTP {status}"
+            )));
+        }
+        let results = parse_duckduckgo_html(text, max_results);
+        if results.is_empty() {
+            warn!("duckduckgo returned no parseable results (HTML may have changed)");
+            return Err(ToolError::Execution(
+                "duckduckgo returned no results (may be rate-limited or HTML changed)".into(),
+            ));
+        }
+        return Ok(results);
+    }
+    if !(200..300).contains(&status) {
         return Err(ToolError::Execution(format!(
-            "kagi returned HTTP {status}: {text}"
+            "{name} returned HTTP {status}: {text}"
         )));
     }
-    let parsed: Value = serde_json::from_str(&text)
-        .map_err(|e| ToolError::Execution(format!("kagi: bad JSON: {e}")))?;
-    Ok(parse_kagi_results(&parsed, max_results))
+    let parsed: Value = serde_json::from_str(text)
+        .map_err(|e| ToolError::Execution(format!("{name}: bad JSON: {e}")))?;
+    Ok(match backend {
+        SearchBackend::Kagi { .. } => parse_kagi_results(&parsed, max_results),
+        SearchBackend::Tavily { .. } => {
+            parse_result_list(parsed.get("results"), "url", "content", max_results)
+        }
+        SearchBackend::Brave { .. } => parse_result_list(
+            parsed.get("web").and_then(|w| w.get("results")),
+            "url",
+            "description",
+            max_results,
+        ),
+        SearchBackend::Serper { .. } => {
+            parse_result_list(parsed.get("organic"), "link", "snippet", max_results)
+        }
+        SearchBackend::Searxng { .. } => parse_searxng_results(&parsed, max_results),
+        SearchBackend::DuckDuckGo => unreachable!("handled above"),
+    })
+}
+
+/// Map a JSON array of results with `title` plus the given URL and snippet
+/// fields. A missing array is an empty result list.
+fn parse_result_list(
+    list: Option<&Value>,
+    url_field: &str,
+    snippet_field: &str,
+    max_results: usize,
+) -> Vec<SearchResult> {
+    list.and_then(|r| r.as_array())
+        .into_iter()
+        .flatten()
+        .take(max_results)
+        .map(|r| parse_result(r, url_field, snippet_field))
+        .collect()
+}
+
+fn parse_result(r: &Value, url_field: &str, snippet_field: &str) -> SearchResult {
+    let field = |r: &Value, key: &str| {
+        r.get(key)
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string()
+    };
+    SearchResult {
+        title: field(r, "title"),
+        url: field(r, url_field),
+        snippet: field(r, snippet_field),
+    }
 }
 
 /// Extract search-result (`t: 0`) entries from a Kagi response. Pulled out
 /// so it can be unit-tested against a canned response without HTTP.
+/// Response `data[]` is a discriminated list; `t: 0` entries are search
+/// results (url/title/snippet), `t: 1` is related searches.
 fn parse_kagi_results(parsed: &Value, max_results: usize) -> Vec<SearchResult> {
     parsed
         .get("data")
         .and_then(|d| d.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter(|r| r.get("t").and_then(|t| t.as_u64()) == Some(0))
-                .take(max_results)
-                .map(|r| SearchResult {
-                    title: r
-                        .get("title")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or_default()
-                        .to_string(),
-                    url: r
-                        .get("url")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or_default()
-                        .to_string(),
-                    snippet: r
-                        .get("snippet")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or_default()
-                        .to_string(),
-                })
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-async fn tavily_search(
-    client: &reqwest::Client,
-    api_key: &str,
-    query: &str,
-    max_results: usize,
-) -> Result<Vec<SearchResult>, ToolError> {
-    let body = serde_json::json!({
-        "api_key": api_key,
-        "query": query,
-        "max_results": max_results,
-    });
-    let response = client
-        .post("https://api.tavily.com/search")
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| ToolError::Network(format!("tavily: {e}")))?;
-    let status = response.status();
-    let text = response
-        .text()
-        .await
-        .map_err(|e| ToolError::Network(format!("tavily: {e}")))?;
-    if !status.is_success() {
-        return Err(ToolError::Execution(format!(
-            "tavily returned HTTP {status}: {text}"
-        )));
-    }
-    let parsed: Value = serde_json::from_str(&text)
-        .map_err(|e| ToolError::Execution(format!("tavily: bad JSON: {e}")))?;
-    Ok(parsed
-        .get("results")
-        .and_then(|r| r.as_array())
-        .map(|arr| {
-            arr.iter()
-                .take(max_results)
-                .map(|r| SearchResult {
-                    title: r
-                        .get("title")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or_default()
-                        .to_string(),
-                    url: r
-                        .get("url")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or_default()
-                        .to_string(),
-                    snippet: r
-                        .get("content")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or_default()
-                        .to_string(),
-                })
-                .collect()
-        })
-        .unwrap_or_default())
-}
-
-async fn brave_search(
-    client: &reqwest::Client,
-    api_key: &str,
-    query: &str,
-    max_results: usize,
-) -> Result<Vec<SearchResult>, ToolError> {
-    let response = client
-        .get("https://api.search.brave.com/res/v1/web/search")
-        .query(&[("q", query), ("count", &max_results.to_string())])
-        .header("Accept", "application/json")
-        .header("X-Subscription-Token", api_key)
-        .send()
-        .await
-        .map_err(|e| ToolError::Network(format!("brave: {e}")))?;
-    let status = response.status();
-    let text = response
-        .text()
-        .await
-        .map_err(|e| ToolError::Network(format!("brave: {e}")))?;
-    if !status.is_success() {
-        return Err(ToolError::Execution(format!(
-            "brave returned HTTP {status}: {text}"
-        )));
-    }
-    let parsed: Value = serde_json::from_str(&text)
-        .map_err(|e| ToolError::Execution(format!("brave: bad JSON: {e}")))?;
-    Ok(parsed
-        .get("web")
-        .and_then(|w| w.get("results"))
-        .and_then(|r| r.as_array())
-        .map(|arr| {
-            arr.iter()
-                .take(max_results)
-                .map(|r| SearchResult {
-                    title: r
-                        .get("title")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or_default()
-                        .to_string(),
-                    url: r
-                        .get("url")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or_default()
-                        .to_string(),
-                    snippet: r
-                        .get("description")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or_default()
-                        .to_string(),
-                })
-                .collect()
-        })
-        .unwrap_or_default())
-}
-
-async fn serper_search(
-    client: &reqwest::Client,
-    api_key: &str,
-    query: &str,
-    max_results: usize,
-) -> Result<Vec<SearchResult>, ToolError> {
-    let body = serde_json::json!({ "q": query, "num": max_results });
-    let response = client
-        .post("https://google.serper.dev/search")
-        .header("X-API-KEY", api_key)
-        .header("Content-Type", "application/json")
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| ToolError::Network(format!("serper: {e}")))?;
-    let status = response.status();
-    let text = response
-        .text()
-        .await
-        .map_err(|e| ToolError::Network(format!("serper: {e}")))?;
-    if !status.is_success() {
-        return Err(ToolError::Execution(format!(
-            "serper returned HTTP {status}: {text}"
-        )));
-    }
-    let parsed: Value = serde_json::from_str(&text)
-        .map_err(|e| ToolError::Execution(format!("serper: bad JSON: {e}")))?;
-    Ok(parsed
-        .get("organic")
-        .and_then(|r| r.as_array())
-        .map(|arr| {
-            arr.iter()
-                .take(max_results)
-                .map(|r| SearchResult {
-                    title: r
-                        .get("title")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or_default()
-                        .to_string(),
-                    url: r
-                        .get("link")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or_default()
-                        .to_string(),
-                    snippet: r
-                        .get("snippet")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or_default()
-                        .to_string(),
-                })
-                .collect()
-        })
-        .unwrap_or_default())
-}
-
-async fn searxng_search(
-    client: &reqwest::Client,
-    base_url: &str,
-    query: &str,
-    max_results: usize,
-) -> Result<Vec<SearchResult>, ToolError> {
-    // SearxNG exposes both HTML and JSON on the same `/search` endpoint;
-    // `format=json` selects JSON. The instance must have the JSON output
-    // format enabled (default on `searxng` ≥ 2022 but some public instances
-    // disable it — error messages from the server are informative).
-    let trimmed = base_url.trim_end_matches('/');
-    let url = format!("{trimmed}/search");
-    let response = client
-        .get(&url)
-        .query(&[("q", query), ("format", "json")])
-        .send()
-        .await
-        .map_err(|e| ToolError::Network(format!("searxng: {e}")))?;
-    let status = response.status();
-    let text = response
-        .text()
-        .await
-        .map_err(|e| ToolError::Network(format!("searxng: {e}")))?;
-    if !status.is_success() {
-        return Err(ToolError::Execution(format!(
-            "searxng returned HTTP {status}: {text}"
-        )));
-    }
-    let parsed: Value = serde_json::from_str(&text)
-        .map_err(|e| ToolError::Execution(format!("searxng: bad JSON: {e}")))?;
-    Ok(parse_searxng_results(&parsed, max_results))
+        .into_iter()
+        .flatten()
+        .filter(|r| r.get("t").and_then(|t| t.as_u64()) == Some(0))
+        .take(max_results)
+        .map(|r| parse_result(r, "url", "snippet"))
+        .collect()
 }
 
 /// Pull result entries out of a SearxNG JSON response. `content` is the
 /// snippet field upstream; we normalize to `snippet`.
 fn parse_searxng_results(parsed: &Value, max_results: usize) -> Vec<SearchResult> {
-    parsed
-        .get("results")
-        .and_then(|r| r.as_array())
-        .map(|arr| {
-            arr.iter()
-                .take(max_results)
-                .map(|r| SearchResult {
-                    title: r
-                        .get("title")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or_default()
-                        .to_string(),
-                    url: r
-                        .get("url")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or_default()
-                        .to_string(),
-                    snippet: r
-                        .get("content")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or_default()
-                        .to_string(),
-                })
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-async fn duckduckgo_search(
-    client: &reqwest::Client,
-    query: &str,
-    max_results: usize,
-) -> Result<Vec<SearchResult>, ToolError> {
-    // DDG blocks GET requests with non-browser UAs; POST with form data works reliably.
-    let response = client
-        .post("https://html.duckduckgo.com/html/")
-        .form(&[("q", query)])
-        .send()
-        .await
-        .map_err(|e| ToolError::Network(format!("duckduckgo: {e}")))?;
-    let status = response.status();
-    let body = response
-        .text()
-        .await
-        .map_err(|e| ToolError::Network(format!("duckduckgo: {e}")))?;
-    // DDG returns 202 when rate-limiting or blocking the request; treat it as
-    // an error so the failover chain can try the next backend.
-    if status.as_u16() != 200 {
-        return Err(ToolError::Execution(format!(
-            "duckduckgo returned HTTP {status}"
-        )));
-    }
-
-    let results = parse_duckduckgo_html(&body, max_results);
-    if results.is_empty() {
-        warn!("duckduckgo returned no parseable results (HTML may have changed)");
-        return Err(ToolError::Execution(
-            "duckduckgo returned no results (may be rate-limited or HTML changed)".into(),
-        ));
-    }
-    Ok(results)
+    parse_result_list(parsed.get("results"), "url", "content", max_results)
 }
 
 /// Parse results out of DuckDuckGo's `html.duckduckgo.com/html/` response.
@@ -980,5 +978,656 @@ mod tests {
         assert!(r[0].snippet.contains("async runtime"));
         assert_eq!(r[1].url, "https://async.rs/");
         assert_eq!(r[1].title, "async-std");
+    }
+
+    /// web_search through the `ToolHost`: request encoding per backend,
+    /// grant enforcement with a real host against a local listener, and the
+    /// failover/timeout behaviour the routing must preserve. No live network.
+    mod host_routing {
+        use super::*;
+        use crate::grants::{Allowlist, EndpointPattern, NetworkGrant};
+        use crate::test_support::{MockHost, fresh_session, tool_context_with_host};
+        use crate::tool::ToolRegistry;
+        use crate::tool_host::NativeToolHost;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        const KEY: &str = "sk-test-secret-123";
+        const QUERY: &str = "rust & tokio=fast/é?";
+
+        async fn ctx(host: Arc<dyn ToolHost>) -> (eidetica::Instance, ToolContext) {
+            let (instance, session) = fresh_session().await;
+            let ctx = tool_context_with_host(session, Arc::new(ToolRegistry::new()), host);
+            (instance, ctx)
+        }
+
+        fn net(endpoints: Allowlist<EndpointPattern>, allow_private: bool) -> Grants {
+            Grants {
+                network: Some(NetworkGrant {
+                    endpoints,
+                    allow_private,
+                }),
+                ..Grants::default()
+            }
+        }
+
+        fn deny_all() -> Grants {
+            // `allow_private` stays true so only the endpoint ceiling can be
+            // what refuses the local listener.
+            net(Allowlist::Only(vec![]), true)
+        }
+
+        fn http_parts(call: &Capability) -> (&str, &str, &HashMap<String, String>, Option<&str>) {
+            match call {
+                Capability::HttpRequest {
+                    url,
+                    method,
+                    headers,
+                    body,
+                } => (method, url, headers, body.as_deref()),
+                other => panic!("expected HttpRequest, got {other:?}"),
+            }
+        }
+
+        /// Run one search against a MockHost answering `status`/`body`, and
+        /// return the tool output and the single recorded request.
+        async fn run_mock(
+            backend: SearchBackend,
+            status: u16,
+            body: &str,
+        ) -> (Result<String, ToolError>, Capability) {
+            let host = Arc::new(MockHost::new());
+            host.push_http(status, body.as_bytes().to_vec());
+            let (_i, c) = ctx(host.clone()).await;
+            let out = WebSearch::new(vec![backend])
+                .execute(serde_json::json!({ "query": QUERY, "max_results": 3 }), &c)
+                .await;
+            let calls = host.recorded_calls();
+            assert_eq!(calls.len(), 1, "exactly one host request per attempt");
+            (out, calls[0].clone())
+        }
+
+        fn query_pairs(url: &str) -> Vec<(String, String)> {
+            url::Url::parse(url)
+                .unwrap()
+                .query_pairs()
+                .map(|(k, v)| (k.into_owned(), v.into_owned()))
+                .collect()
+        }
+
+        #[tokio::test]
+        async fn kagi_request_is_encoded_get_with_bot_auth_header() {
+            let body = r#"{"data":[{"t":0,"url":"https://a","title":"A","snippet":"s"}]}"#;
+            let (out, call) = run_mock(
+                SearchBackend::Kagi {
+                    api_key: KEY.into(),
+                },
+                200,
+                body,
+            )
+            .await;
+            let (method, url, headers, req_body) = http_parts(&call);
+            assert_eq!(method, "GET");
+            assert!(url.starts_with("https://kagi.com/api/v0/search?"), "{url}");
+            assert_eq!(
+                query_pairs(url),
+                vec![("q".into(), QUERY.into()), ("limit".into(), "3".into())]
+            );
+            assert_eq!(headers["Authorization"], format!("Bot {KEY}"));
+            assert_eq!(headers["User-Agent"], USER_AGENT);
+            assert!(req_body.is_none());
+            assert!(!url.contains(KEY));
+            assert!(out.unwrap().contains("https://a"));
+        }
+
+        #[tokio::test]
+        async fn tavily_request_is_json_post_with_key_in_body() {
+            let body = r#"{"results":[{"title":"A","url":"https://a","content":"s"}]}"#;
+            let (out, call) = run_mock(
+                SearchBackend::Tavily {
+                    api_key: KEY.into(),
+                },
+                200,
+                body,
+            )
+            .await;
+            let (method, url, headers, req_body) = http_parts(&call);
+            assert_eq!(method, "POST");
+            assert_eq!(url, "https://api.tavily.com/search");
+            assert_eq!(headers["Content-Type"], "application/json");
+            assert_eq!(headers["User-Agent"], USER_AGENT);
+            let sent: Value = serde_json::from_str(req_body.unwrap()).unwrap();
+            assert_eq!(
+                sent,
+                serde_json::json!({ "api_key": KEY, "query": QUERY, "max_results": 3 })
+            );
+            assert_eq!(
+                serde_json::from_str::<Value>(&out.unwrap()).unwrap(),
+                serde_json::json!([{ "title": "A", "url": "https://a", "snippet": "s" }])
+            );
+        }
+
+        #[tokio::test]
+        async fn brave_request_is_encoded_get_with_token_header() {
+            let body = r#"{"web":{"results":[{"title":"A","url":"https://a","description":"s"}]}}"#;
+            let (out, call) = run_mock(
+                SearchBackend::Brave {
+                    api_key: KEY.into(),
+                },
+                200,
+                body,
+            )
+            .await;
+            let (method, url, headers, req_body) = http_parts(&call);
+            assert_eq!(method, "GET");
+            assert!(url.starts_with("https://api.search.brave.com/res/v1/web/search?"));
+            assert_eq!(
+                query_pairs(url),
+                vec![("q".into(), QUERY.into()), ("count".into(), "3".into())]
+            );
+            assert_eq!(headers["X-Subscription-Token"], KEY);
+            assert_eq!(headers["Accept"], "application/json");
+            assert!(req_body.is_none());
+            assert!(!url.contains(KEY));
+            assert!(out.unwrap().contains("\"snippet\":\"s\""));
+        }
+
+        #[tokio::test]
+        async fn serper_request_is_json_post_with_key_header() {
+            let body = r#"{"organic":[{"title":"A","link":"https://a","snippet":"s"}]}"#;
+            let (out, call) = run_mock(
+                SearchBackend::Serper {
+                    api_key: KEY.into(),
+                },
+                200,
+                body,
+            )
+            .await;
+            let (method, url, headers, req_body) = http_parts(&call);
+            assert_eq!(method, "POST");
+            assert_eq!(url, "https://google.serper.dev/search");
+            assert_eq!(headers["X-API-KEY"], KEY);
+            assert_eq!(headers["Content-Type"], "application/json");
+            let sent: Value = serde_json::from_str(req_body.unwrap()).unwrap();
+            assert_eq!(sent, serde_json::json!({ "q": QUERY, "num": 3 }));
+            assert!(out.unwrap().contains("https://a"));
+        }
+
+        #[tokio::test]
+        async fn searxng_request_appends_search_path_and_json_format() {
+            let body = r#"{"results":[{"title":"A","url":"https://a","content":"s"}]}"#;
+            let backend = SearchBackend::Searxng {
+                base_url: "https://searx.example/".into(),
+            };
+            let (out, call) = run_mock(backend, 200, body).await;
+            let (method, url, headers, req_body) = http_parts(&call);
+            assert_eq!(method, "GET");
+            assert!(url.starts_with("https://searx.example/search?"), "{url}");
+            assert_eq!(
+                query_pairs(url),
+                vec![("q".into(), QUERY.into()), ("format".into(), "json".into())]
+            );
+            assert_eq!(headers.len(), 1, "only the User-Agent: {headers:?}");
+            assert!(req_body.is_none());
+            assert!(out.unwrap().contains("https://a"));
+        }
+
+        #[tokio::test]
+        async fn duckduckgo_request_is_form_post() {
+            let html =
+                r#"<a class="result__a" href="https://a">A</a><a class="result__snippet">s</a>"#;
+            let (out, call) = run_mock(SearchBackend::DuckDuckGo, 200, html).await;
+            let (method, url, headers, req_body) = http_parts(&call);
+            assert_eq!(method, "POST");
+            assert_eq!(url, "https://html.duckduckgo.com/html/");
+            assert_eq!(headers["Content-Type"], "application/x-www-form-urlencoded");
+            assert_eq!(headers["User-Agent"], USER_AGENT);
+            let body = req_body.unwrap();
+            assert_eq!(body, "q=rust+%26+tokio%3Dfast%2F%C3%A9%3F");
+            let decoded: Vec<(String, String)> = url::form_urlencoded::parse(body.as_bytes())
+                .map(|(k, v)| (k.into_owned(), v.into_owned()))
+                .collect();
+            assert_eq!(decoded, vec![("q".into(), QUERY.into())]);
+            assert!(out.unwrap().contains("https://a"));
+        }
+
+        #[tokio::test]
+        async fn error_status_and_host_errors_never_disclose_the_key() {
+            for backend in [
+                SearchBackend::Kagi {
+                    api_key: KEY.into(),
+                },
+                SearchBackend::Tavily {
+                    api_key: KEY.into(),
+                },
+                SearchBackend::Brave {
+                    api_key: KEY.into(),
+                },
+                SearchBackend::Serper {
+                    api_key: KEY.into(),
+                },
+            ] {
+                let (out, _) = run_mock(backend.clone(), 401, "unauthorized").await;
+                let err = format!("{}", out.unwrap_err());
+                assert!(err.contains("HTTP 401"), "{err}");
+                assert!(!err.contains(KEY), "{} leaked key: {err}", backend.name());
+
+                let host = Arc::new(MockHost::new());
+                host.push_err(ToolError::Network("connection reset".into()));
+                let (_i, c) = ctx(host).await;
+                let err = WebSearch::new(vec![backend.clone()])
+                    .execute(serde_json::json!({ "query": "q" }), &c)
+                    .await
+                    .unwrap_err();
+                let err = format!("{err}");
+                assert!(err.contains(backend.name()), "{err}");
+                assert!(!err.contains(KEY), "{} leaked key: {err}", backend.name());
+            }
+        }
+
+        #[tokio::test]
+        async fn redirect_is_not_followed_and_fails_over() {
+            let host = Arc::new(MockHost::new());
+            host.push_http_with_headers(
+                302,
+                [("location".to_string(), "http://10.0.0.1/".to_string())].into(),
+                b"".to_vec(),
+            );
+            host.push_http(200, br#"{"results":[]}"#.to_vec());
+            let (_i, c) = ctx(host.clone()).await;
+            let out = WebSearch::new(vec![
+                SearchBackend::Brave {
+                    api_key: KEY.into(),
+                },
+                SearchBackend::Searxng {
+                    base_url: "https://searx.example".into(),
+                },
+            ])
+            .execute(serde_json::json!({ "query": "q" }), &c)
+            .await
+            .unwrap();
+            assert_eq!(out, "[]");
+            assert_eq!(host.recorded_calls().len(), 2, "no request to the Location");
+        }
+
+        #[tokio::test]
+        async fn host_denial_fails_over_to_next_backend() {
+            let host = Arc::new(MockHost::new());
+            host.push_err(ToolError::Execution(
+                "Network policy denied: GET https://kagi.com/... not in allowed endpoints".into(),
+            ));
+            host.push_http(
+                200,
+                br#"{"results":[{"title":"A","url":"https://a","content":"s"}]}"#.to_vec(),
+            );
+            let (_i, c) = ctx(host.clone()).await;
+            let out = WebSearch::new(vec![
+                SearchBackend::Kagi {
+                    api_key: KEY.into(),
+                },
+                SearchBackend::Searxng {
+                    base_url: "https://searx.example".into(),
+                },
+            ])
+            .execute(serde_json::json!({ "query": "q" }), &c)
+            .await
+            .unwrap();
+            assert!(out.contains("https://a"));
+            assert_eq!(host.recorded_calls().len(), 2);
+        }
+
+        #[tokio::test]
+        async fn empty_results_do_not_fail_over() {
+            let host = Arc::new(MockHost::new());
+            host.push_http(200, br#"{"results":[]}"#.to_vec());
+            let (_i, c) = ctx(host.clone()).await;
+            let out = WebSearch::new(vec![
+                SearchBackend::Searxng {
+                    base_url: "https://searx.example".into(),
+                },
+                SearchBackend::DuckDuckGo,
+            ])
+            .execute(serde_json::json!({ "query": "q" }), &c)
+            .await
+            .unwrap();
+            assert_eq!(out, "[]");
+            assert_eq!(host.recorded_calls().len(), 1);
+        }
+
+        /// Never answers its first request; later requests get `200 []`.
+        struct HangFirstHost(AtomicUsize);
+
+        impl ToolHost for HangFirstHost {
+            fn request<'a>(
+                &'a self,
+                _capability: &'a Capability,
+                _grants: &'a Grants,
+            ) -> Pin<Box<dyn Future<Output = Result<CapabilityResult, ToolError>> + Send + 'a>>
+            {
+                let n = self.0.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async move {
+                    if n == 0 {
+                        std::future::pending::<()>().await;
+                    }
+                    Ok(CapabilityResult::HttpResponse(
+                        crate::tool_host::HttpResponse {
+                            status: 200,
+                            headers: HashMap::new(),
+                            body: br#"{"results":[]}"#.to_vec(),
+                        },
+                    ))
+                })
+            }
+
+            fn name(&self) -> &str {
+                "hang-first"
+            }
+        }
+
+        #[tokio::test]
+        async fn hung_backend_times_out_and_fails_over() {
+            let host = Arc::new(HangFirstHost(AtomicUsize::new(0)));
+            let (_i, c) = ctx(host.clone()).await;
+            let tool = WebSearch::new(vec![
+                SearchBackend::Brave {
+                    api_key: KEY.into(),
+                },
+                SearchBackend::Searxng {
+                    base_url: "https://searx.example".into(),
+                },
+            ])
+            .with_backend_timeout(Duration::from_millis(50));
+            let out = tokio::time::timeout(
+                Duration::from_secs(10),
+                tool.execute(serde_json::json!({ "query": "q" }), &c),
+            )
+            .await
+            .expect("bounded by the per-backend timeout")
+            .unwrap();
+            assert_eq!(out, "[]");
+            assert_eq!(host.0.load(Ordering::SeqCst), 2);
+
+            // Alone, the hung backend's timeout is the tool's error.
+            let host = Arc::new(HangFirstHost(AtomicUsize::new(0)));
+            let (_i, c) = ctx(host).await;
+            let err = WebSearch::new(vec![SearchBackend::Brave {
+                api_key: KEY.into(),
+            }])
+            .with_backend_timeout(Duration::from_millis(50))
+            .execute(serde_json::json!({ "query": "q" }), &c)
+            .await
+            .unwrap_err();
+            assert!(matches!(err, ToolError::Network(ref m) if m.contains("brave: no response")));
+        }
+
+        #[test]
+        fn default_backend_timeout_is_bounded_below_tool_timeout() {
+            let tool = WebSearch::new(vec![]);
+            assert_eq!(tool.backend_timeout, Duration::from_secs(15));
+            assert!(tool.backend_timeout.as_secs() < tool.default_policy().timeout);
+        }
+
+        // ── Real host against a local listener ──
+
+        /// A local HTTP listener that counts requests and answers with a
+        /// canned SearxNG result.
+        struct Listener {
+            base_url: String,
+            hits: Arc<AtomicUsize>,
+        }
+
+        async fn listener() -> Listener {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let sock = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = sock.local_addr().unwrap();
+            let hits = Arc::new(AtomicUsize::new(0));
+            let counter = hits.clone();
+            tokio::spawn(async move {
+                loop {
+                    let Ok((mut stream, _)) = sock.accept().await else {
+                        return;
+                    };
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    let mut buf = [0u8; 4096];
+                    let _ = stream.read(&mut buf).await;
+                    let body = r#"{"results":[{"title":"L","url":"https://l","content":"c"}]}"#;
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = stream.write_all(resp.as_bytes()).await;
+                }
+            });
+            Listener {
+                base_url: format!("http://{addr}"),
+                hits,
+            }
+        }
+
+        /// Run web_search on `NativeToolHost` with the grants the runtime
+        /// would resolve for this call from `policy` and `c`'s ceilings.
+        async fn run_native(
+            c: &mut ToolContext,
+            policy: &Grants,
+            base_url: &str,
+        ) -> Result<String, ToolError> {
+            c.grants = c.resolve_call_grants(policy, "web_search");
+            WebSearch::new(vec![SearchBackend::Searxng {
+                base_url: base_url.into(),
+            }])
+            .execute(serde_json::json!({ "query": "exfil-me" }), c)
+            .await
+        }
+
+        fn private_policy() -> Grants {
+            net(Allowlist::Permissive, true)
+        }
+
+        #[tokio::test]
+        async fn native_host_reaches_listener_without_a_ceiling() {
+            // Positive control: the harness does observe a request.
+            let l = listener().await;
+            let (_i, mut c) = ctx(Arc::new(NativeToolHost)).await;
+            let out = run_native(&mut c, &private_policy(), &l.base_url)
+                .await
+                .unwrap();
+            assert!(out.contains("https://l"), "{out}");
+            assert_eq!(l.hits.load(Ordering::SeqCst), 1);
+        }
+
+        #[tokio::test]
+        async fn session_deny_all_sends_nothing() {
+            let l = listener().await;
+            let (_i, mut c) = ctx(Arc::new(NativeToolHost)).await;
+            c.session_capabilities = deny_all();
+            let err = run_native(&mut c, &private_policy(), &l.base_url)
+                .await
+                .unwrap_err();
+            assert!(
+                format!("{err}").contains("not in allowed endpoints"),
+                "{err}"
+            );
+            assert_eq!(l.hits.load(Ordering::SeqCst), 0);
+        }
+
+        #[tokio::test]
+        async fn agent_deny_all_sends_nothing() {
+            let l = listener().await;
+            let (_i, mut c) = ctx(Arc::new(NativeToolHost)).await;
+            c.agent_capabilities = deny_all();
+            assert!(
+                run_native(&mut c, &private_policy(), &l.base_url)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(l.hits.load(Ordering::SeqCst), 0);
+        }
+
+        #[tokio::test]
+        async fn per_tool_deny_all_sends_nothing() {
+            let l = listener().await;
+            let (_i, mut c) = ctx(Arc::new(NativeToolHost)).await;
+            c.agent_grants.insert("web_search".into(), deny_all());
+            assert!(
+                run_native(&mut c, &private_policy(), &l.base_url)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(l.hits.load(Ordering::SeqCst), 0);
+        }
+
+        #[tokio::test]
+        async fn policy_deny_all_sends_nothing() {
+            let l = listener().await;
+            let (_i, mut c) = ctx(Arc::new(NativeToolHost)).await;
+            assert!(run_native(&mut c, &deny_all(), &l.base_url).await.is_err());
+            assert_eq!(l.hits.load(Ordering::SeqCst), 0);
+        }
+
+        #[tokio::test]
+        async fn deny_all_across_failover_returns_last_error_and_sends_nothing() {
+            let a = listener().await;
+            let b = listener().await;
+            let (_i, mut c) = ctx(Arc::new(NativeToolHost)).await;
+            c.session_capabilities = deny_all();
+            c.grants = c.resolve_call_grants(&private_policy(), "web_search");
+            let err = WebSearch::new(vec![
+                SearchBackend::Searxng {
+                    base_url: a.base_url.clone(),
+                },
+                SearchBackend::Searxng {
+                    base_url: b.base_url.clone(),
+                },
+            ])
+            .execute(serde_json::json!({ "query": "q" }), &c)
+            .await
+            .unwrap_err();
+            let port_b = b.base_url.rsplit(':').next().unwrap();
+            assert!(format!("{err}").contains(port_b), "last error: {err}");
+            assert_eq!(a.hits.load(Ordering::SeqCst), 0);
+            assert_eq!(b.hits.load(Ordering::SeqCst), 0);
+        }
+
+        #[tokio::test]
+        async fn private_searxng_without_grant_is_denied_with_fix() {
+            let l = listener().await;
+            let (_i, mut c) = ctx(Arc::new(NativeToolHost)).await;
+            let err = run_native(&mut c, &Grants::default(), &l.base_url)
+                .await
+                .unwrap_err();
+            let msg = format!("{err}");
+            assert!(msg.contains("SSRF protection"), "{msg}");
+            assert!(
+                msg.contains("tool_policies.web_search.grants.network.allow_private"),
+                "{msg}"
+            );
+            assert_eq!(l.hits.load(Ordering::SeqCst), 0);
+        }
+
+        #[tokio::test]
+        async fn private_grant_cannot_be_widened_past_a_ceiling() {
+            // The per-tool policy allows private, the session ceiling does not.
+            let l = listener().await;
+            let (_i, mut c) = ctx(Arc::new(NativeToolHost)).await;
+            c.session_capabilities = net(Allowlist::Permissive, false);
+            assert!(
+                run_native(&mut c, &private_policy(), &l.base_url)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(l.hits.load(Ordering::SeqCst), 0);
+        }
+
+        #[tokio::test]
+        async fn private_grant_respects_endpoint_restrictions() {
+            let l = listener().await;
+            let (_i, mut c) = ctx(Arc::new(NativeToolHost)).await;
+            let other_host = net(
+                Allowlist::Only(vec![EndpointPattern {
+                    host: "searx.example".into(),
+                    ..EndpointPattern::default()
+                }]),
+                true,
+            );
+            assert!(run_native(&mut c, &other_host, &l.base_url).await.is_err());
+            assert_eq!(l.hits.load(Ordering::SeqCst), 0);
+        }
+
+        #[test]
+        fn startup_check_flags_only_unauthorized_private_searxng() {
+            let backends = vec![
+                SearchBackend::Searxng {
+                    base_url: "http://127.0.0.1:8888".into(),
+                },
+                SearchBackend::Searxng {
+                    base_url: "http://searx.local".into(),
+                },
+                SearchBackend::Searxng {
+                    base_url: "https://searx.example".into(),
+                },
+                SearchBackend::DuckDuckGo,
+            ];
+            assert_eq!(
+                unauthorized_private_backends(&backends, &Grants::default()),
+                vec!["http://127.0.0.1:8888", "http://searx.local"]
+            );
+            assert!(unauthorized_private_backends(&backends, &private_policy()).is_empty());
+        }
+
+        #[test]
+        fn startup_warning_names_the_backend_and_config_fix() {
+            use std::sync::Mutex;
+            use tracing::{Event, Metadata, Subscriber, span};
+
+            #[derive(Clone, Default)]
+            struct Messages(Arc<Mutex<Vec<String>>>);
+
+            impl tracing::field::Visit for Messages {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    self.0.lock().unwrap().push(format!("{field}={value:?}"));
+                }
+            }
+
+            impl Subscriber for Messages {
+                fn enabled(&self, _: &Metadata<'_>) -> bool {
+                    true
+                }
+                fn new_span(&self, _: &span::Attributes<'_>) -> span::Id {
+                    span::Id::from_u64(1)
+                }
+                fn record(&self, _: &span::Id, _: &span::Record<'_>) {}
+                fn record_follows_from(&self, _: &span::Id, _: &span::Id) {}
+                fn enter(&self, _: &span::Id) {}
+                fn exit(&self, _: &span::Id) {}
+                fn event(&self, event: &Event<'_>) {
+                    event.record(&mut self.clone());
+                }
+            }
+
+            let messages = Messages::default();
+            let backends = [SearchBackend::Searxng {
+                base_url: "http://127.0.0.1:8888".into(),
+            }];
+            tracing::subscriber::with_default(messages.clone(), || {
+                warn_unauthorized_private_backends(&backends, &Grants::default());
+            });
+            let output = messages.0.lock().unwrap().join("\n");
+            assert!(
+                output.contains("web_search: SearxNG backend will be denied:"),
+                "{output}"
+            );
+            assert!(output.contains(PRIVATE_GRANT_HINT), "{output}");
+            assert!(output.contains("http://127.0.0.1:8888"), "{output}");
+
+            messages.0.lock().unwrap().clear();
+            tracing::subscriber::with_default(messages.clone(), || {
+                warn_unauthorized_private_backends(&backends, &private_policy());
+            });
+            assert!(messages.0.lock().unwrap().is_empty());
+        }
     }
 }

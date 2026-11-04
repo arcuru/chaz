@@ -2161,6 +2161,19 @@ async fn build_web_search_backends(
         })
         .collect();
     info!(chain = ?chain, "web_search backends");
+
+    // Configuring a backend does not authorize it: the host judges each
+    // request against web_search's grants. Flag a private SearxNG instance
+    // that the policy tier already refuses, so the operator sees the fix at
+    // startup rather than as a failover at search time.
+    let policy_grants = config
+        .security
+        .as_ref()
+        .and_then(|s| s.tool_policies.as_ref())
+        .and_then(|p| p.get("web_search"))
+        .map(|p| p.grants.clone())
+        .unwrap_or_default();
+    tools::warn_unauthorized_private_backends(&built, &policy_grants);
     built
 }
 

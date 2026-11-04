@@ -270,6 +270,8 @@ Empty results are a legitimate answer and do **not** trigger failover — otherw
 
 The tool is Low-risk and approval-free because the agent never supplies the destination URL — only a query string — and every HTTP destination is fixed by operator config.
 
+The query is still model-chosen text sent to a third party, so each backend request is an `HttpRequest` through the tool host under `web_search`'s resolved [network grant](security.md#network-grants). A grant that excludes a backend's endpoint makes that backend fail, which fails over to the next; with network deny-all (`endpoints: []`) on any tier, every backend fails and nothing is sent. Each backend gets 15 seconds before the tool moves on. Redirects are not followed: a 3xx answer is a backend error. A private or local SearxNG instance needs `allow_private: true` on `web_search` ([migration](security.md#private-searxng-and-network-grants)).
+
 ### shell
 
 Executes a shell command with `sh -c`. Subject to command allowlist/denylist filtering.
