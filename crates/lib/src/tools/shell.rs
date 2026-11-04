@@ -487,6 +487,7 @@ mod tests {
     #[tokio::test]
     async fn an_excessive_requested_timeout_is_capped_at_the_policy() {
         let host = Arc::new(MockHost::new());
+        host.push_shell("", "", 0);
         let (_i, mut c) = ctx_with(host.clone()).await;
         c.call_deadline = Some(tokio::time::Instant::now() + std::time::Duration::from_secs(30));
         c.call_timeout = Some(std::time::Duration::from_secs(30));
