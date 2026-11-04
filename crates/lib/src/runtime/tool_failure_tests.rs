@@ -705,24 +705,21 @@ async fn optional_shell_deadlines_are_effective_through_runtime() {
 
 #[cfg(unix)]
 #[tokio::test]
-async fn an_excessive_shell_timeout_refuses_before_a_sentinel_effect() {
+async fn an_excessive_shell_timeout_runs_once_and_stops_at_the_policy() {
     let directory = tempfile::tempdir().unwrap();
     let sentinel = directory.path().join("sentinel");
     let (outcome, output, _) = run_shell(
         Some(1),
         json!({
-            "command": format!("echo effect >> '{}'", sentinel.display()), "timeout": 600
+            "command": format!("echo effect >> '{}'; echo started; sleep 30; echo finished", sentinel.display()), "timeout": 600
         }),
     )
     .await;
-    assert_eq!(outcome, ToolResultOutcome::Error, "{output}");
-    assert!(
-        output.contains(
-            "requested timeout of 600s exceeds shell policy ceiling of 1s; command was not started"
-        ),
-        "{output}"
-    );
-    assert!(!sentinel.exists());
+    assert_eq!(outcome, ToolResultOutcome::TimedOut, "{output}");
+    assert!(output.contains("policy timeout of 1s"), "{output}");
+    assert!(output.contains("started"), "{output}");
+    assert!(!output.contains("finished"), "{output}");
+    assert_eq!(std::fs::read_to_string(&sentinel).unwrap(), "effect\n");
 }
 
 #[cfg(unix)]

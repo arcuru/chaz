@@ -37,7 +37,7 @@ impl Tool for ShellExec {
                         "description": "Optional timeout in seconds. On expiry the command is \
                                         killed and its output so far is returned. The tool \
                                         policy ceiling still applies. A timeout above that \
-                                        ceiling is rejected before starting the command."
+                                        ceiling is capped at that ceiling."
                     }
                 },
                 "required": ["command"]
@@ -72,15 +72,6 @@ impl Tool for ShellExec {
                 .and_then(|v| v.as_str())
                 .map(String::from);
             let requested = requested_timeout(&arguments)?;
-            if let (Some(requested), Some(ceiling)) = (requested, ctx.call_timeout)
-                && requested > ceiling
-            {
-                return Err(crate::tool::ToolError::InvalidArgument(format!(
-                    "requested timeout of {}s exceeds shell policy ceiling of {}s; command was not started",
-                    requested.as_secs_f64(),
-                    ceiling.as_secs_f64()
-                )));
-            }
             let policy = ctx
                 .call_deadline
                 .map(|deadline| deadline.saturating_duration_since(tokio::time::Instant::now()));
@@ -107,7 +98,15 @@ impl Tool for ShellExec {
                         format_stopped(&output, "Tool execution cancelled by user".into())
                     } else {
                         match limit.filter(|_| output.timed_out) {
-                            Some(limit) => format_timed_out(&output, limit),
+                            Some(limit) => {
+                                let report_limit = match limit {
+                                    StopLimit::Policy(after) => {
+                                        StopLimit::Policy(ctx.call_timeout.unwrap_or(after))
+                                    }
+                                    requested => requested,
+                                };
+                                format_timed_out(&output, report_limit)
+                            }
                             None => format_shell_output(
                                 &output.stdout,
                                 &output.stderr,
@@ -197,11 +196,10 @@ fn format_timed_out(output: &crate::tool_host::ShellOutput, limit: StopLimit) ->
             "the command reached its requested timeout of {}s",
             after.as_secs_f64()
         ),
-        StopLimit::Policy(_) => {
-            "the command reached the shell tool's policy timeout, which a larger \
-             `timeout` argument cannot extend"
-                .to_string()
-        }
+        StopLimit::Policy(after) => format!(
+            "the command reached the shell tool's policy timeout of {}s",
+            after.as_secs_f64()
+        ),
     };
     format_stopped(
         output,
@@ -487,18 +485,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_excessive_requested_timeout_is_rejected_before_the_host() {
+    async fn an_excessive_requested_timeout_is_capped_at_the_policy() {
         let host = Arc::new(MockHost::new());
         let (_i, mut c) = ctx_with(host.clone()).await;
         c.call_deadline = Some(tokio::time::Instant::now() + std::time::Duration::from_secs(30));
         c.call_timeout = Some(std::time::Duration::from_secs(30));
-        let error = ShellExec
+        ShellExec
             .execute(serde_json::json!({ "command": "x", "timeout": 600 }), &c)
             .await
-            .unwrap_err();
-        assert!(matches!(error, crate::tool::ToolError::InvalidArgument(_)));
-        assert!(error.to_string().contains("command was not started"));
-        assert!(host.recorded_calls().is_empty());
+            .unwrap();
+        let Capability::Shell { timeout, .. } = host.last_call().unwrap() else {
+            panic!("expected shell capability");
+        };
+        let timeout = timeout.expect("policy must bound the command");
+        assert!(timeout <= std::time::Duration::from_secs(30));
+        assert!(timeout > std::time::Duration::from_secs(29));
     }
 
     #[tokio::test]

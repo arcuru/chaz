@@ -282,11 +282,11 @@ Executes a shell command with `sh -c`. Subject to command allowlist/denylist fil
 }
 ```
 
-| Argument      | Required | Meaning                                                                                                                |
-| ------------- | -------- | ---------------------------------------------------------------------------------------------------------------------- |
-| `command`     | yes      | Shell command line.                                                                                                    |
-| `working_dir` | no       | Directory to run in.                                                                                                   |
-| `timeout`     | no       | Seconds, a positive number up to 2,147,483.647. Above an explicit policy ceiling, refuses before starting the command. |
+| Argument      | Required | Meaning                                                                                                         |
+| ------------- | -------- | --------------------------------------------------------------------------------------------------------------- |
+| `command`     | yes      | Shell command line.                                                                                             |
+| `working_dir` | no       | Directory to run in.                                                                                            |
+| `timeout`     | no       | Seconds, a positive number up to 2,147,483.647. Capped at an explicit policy ceiling; the command still starts. |
 
 The command runs until it exits, its `timeout` expires, an explicit shell policy timeout is reached, or the user stops the turn. Timeouts and user stops kill the command's whole process group. See [Long-running shell commands](#long-running-shell-commands) for how the deadlines combine and what a stopped command returns.
 
@@ -548,7 +548,7 @@ A `shell` call has **no execution deadline by default**. It runs until it exits 
 | No policy ceiling, call `timeout: 600`      | Allow up to 600 seconds               |
 | Policy `timeout: 900`, no call `timeout`    | Stop at the 900-second ceiling        |
 | Policy `timeout: 900`, call `timeout: 600`  | Stop at the requested 600 seconds     |
-| Policy `timeout: 900`, call `timeout: 1200` | Reject before the command starts      |
+| Policy `timeout: 900`, call `timeout: 1200` | Stop at the 900-second ceiling        |
 | Policy `timeout: null`                      | Explicitly remove the policy deadline |
 
 **Policy inheritance.** Each configured field overrides only that field of the tool's default policy. For example, `approval: never` on shell preserves its `high` risk, unbounded default timeout, and all other fields. An omitted `timeout` inherits; an explicit YAML `null` means unbounded. See [Tool policy overrides](security.md#tool-policy-overrides) for all fields. For a finite shell ceiling, no other fields need restating:
@@ -571,7 +571,7 @@ A kill's exit status is left out because it reflects the kill, not the command. 
 
 Nothing resumes or automatically retries a stopped command. It may already have changed files or remote state; inspect those effects before explicitly running it again. A descendant that leaves the process group on purpose (for example with `setsid`) is not tracked. Its open pipes are abandoned after a short drain, and the result reports what had arrived. If a host cannot finish reporting within the runtime's grace period, the fallback result may lack partial output.
 
-### Walkthrough: a bounded test run and a refused request
+### Walkthrough: requested and capped deadlines
 
 1. With the default shell policy, the model calls `shell` with `{"command": "sleep 65; printf 'finished\\n'", "timeout": 600}`. After approval it can run past both 30 and 60 seconds:
 
@@ -581,13 +581,14 @@ Nothing resumes or automatically retries a stopped command. It may already have 
 
    Omitting the call's `timeout` removes that per-call deadline too.
 
-2. The operator adds `timeout: 2` under `security.tool_policies.shell` in the configuration above and starts Chaz with that config. A call `{"command": "echo started; sleep 30", "timeout": 600}` now refuses without printing `started` or running any part of the command:
+2. The operator adds `timeout: 2` under `security.tool_policies.shell` in the configuration above and starts Chaz with that config. A call `{"command": "echo started; sleep 30", "timeout": 600}` now starts and runs for up to two seconds, then returns approximately:
 
    ```text
-   Tool error: invalid argument: requested timeout of 600s exceeds shell policy ceiling of 2s; command was not started
+   Tool timed out after 2.0 seconds: the command reached the shell tool's policy timeout of 2s. Its process group was killed. Output before the stop:
+   started
    ```
 
-   Recovery: request at most two seconds, or ask the operator to change the ceiling. A larger call timeout cannot silently extend it.
+   The larger requested timeout is capped, not rejected. Ask the operator to change the ceiling only if the command needs more time.
 
 3. Call `{"command": "echo partial; sleep 30", "timeout": 0.5}`. It starts and then returns approximately:
 
