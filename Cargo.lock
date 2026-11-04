@@ -877,6 +877,7 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tracing",
+ "tracing-subscriber",
  "unicode-normalization",
  "url",
  "uuid",

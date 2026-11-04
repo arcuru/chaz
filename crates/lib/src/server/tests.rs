@@ -5211,6 +5211,16 @@ async fn targeted_service_client_expands_peer_discovery_only_on_demand() {
 
 #[tokio::test]
 async fn resident_executor_adopts_and_processes_local_client_session() {
+    // Spawned service/callback tasks share this current-thread runtime, so a
+    // thread-local subscriber captures this turn without affecting other tests.
+    let logs = tempfile::NamedTempFile::new().unwrap();
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_max_level(tracing::Level::ERROR)
+        .with_writer(logs.reopen().unwrap())
+        .finish();
+    let _subscriber = tracing::subscriber::set_default(subscriber);
+
     use eidetica::NewAccount;
     use eidetica::backend::database::InMemory;
     use eidetica::service::ServiceServer;
@@ -5262,6 +5272,23 @@ async fn resident_executor_adopts_and_processes_local_client_session() {
     let client = crate::instance::connect_with(&settings, crate::config::ExecutionRole::Client)
         .await
         .unwrap();
+    // Agent DB access requires its bound per-database key, not the login key.
+    // Callback dispatch must not reopen this tree as the connection identity.
+    assert_ne!(agent.pubkey, client.user.get_default_key().unwrap());
+    let unbound = eidetica::Database::open(&client.instance, &agent_db.id())
+        .await
+        .unwrap_err();
+    assert!(unbound.to_string().contains("PermissionDenied"));
+    let client_agent = client.user.open_database(&agent_db.id()).await.unwrap();
+    let (agent_wake_tx, mut agent_wake_rx) = tokio::sync::mpsc::unbounded_channel();
+    let _agent_callback = client_agent
+        .on_write(move |_, _| {
+            agent_wake_tx.send(()).unwrap();
+            std::future::ready(Ok(()))
+        })
+        .await
+        .unwrap();
+
     let client_registry = Arc::new(
         crate::session::SessionRegistry::new(client.instance, client.user, agents.clone())
             .await
@@ -5340,6 +5367,16 @@ async fn resident_executor_adopts_and_processes_local_client_session() {
     drop(executor_registry);
     drop(shutdown);
     task.await.unwrap().unwrap();
+
+    let logs = std::fs::read_to_string(logs.path()).unwrap();
+    assert!(
+        !logs.contains("Failed to open database for callbacks"),
+        "local service turn must not reopen callback trees with the login key: {logs}"
+    );
+    assert!(
+        agent_wake_rx.try_recv().is_ok(),
+        "local session publication must notify the bound Agent DB subscriber"
+    );
 }
 
 #[tokio::test]
