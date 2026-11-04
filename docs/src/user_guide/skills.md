@@ -98,7 +98,7 @@ Every transport uses the same surface. TUI: `/skills <sub>`. Matrix: `!chaz skil
 | `/skills grant <bank> <agent> <read\|write>`   | Authorize an agent's key on the bank and write a `SkillBankRef` into the agent's DB so the bank appears in its source list |
 | `/skills revoke <bank> <agent>`                | Reverse `grant` — removes the auth key and the agent's ref                                                                 |
 | `/skills share <bank>`                         | Generate a `DatabaseTicket` URL for the bank so another peer can `/skills import` it                                       |
-| `/skills unshare <bank>`                       | Stop sharing — disables sync for the bank on this peer; doesn't revoke keys already held                                   |
+| `/skills unshare <bank>`                       | Disable the logged-in user's sync preference for the bank (also from a service client); doesn't revoke existing keys       |
 | `/skills import <ticket> [admin\|write\|read]` | Request access to a shared bank via the bootstrap workflow. Default `write`. Returns the new bank name on success.         |
 | `/skills attach <bank\|db_id\|ticket>`         | Attach a bank to the current session (transient, source #5). If passed a ticket, imports it first.                         |
 | `/skills detach <bank>`                        | Detach a bank from the current session                                                                                     |
