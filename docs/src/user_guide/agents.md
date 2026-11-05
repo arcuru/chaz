@@ -97,8 +97,98 @@ Each Agent DB contains the following well-known stores:
 | `schedule_fires` | `Table<...>`                 | Per-fire records (cost, errors) for schedules — used by the standalone fire path for attribution     |
 | `skills`         | `Table<Skill>`               | Agent-local skills (prompt fragments) attached as private context                                    |
 | `skill_banks`    | `Table<SkillBankRef>`        | Refs to shared skill banks this agent has been granted access to                                     |
+| `providers`      | `Table<ProviderRef>`         | Known Provider roots and routing hints; metadata only, no grants or session attachments              |
 
 The peer maintains two **in-memory** indices (`hosted_index::HostedIndex`) — one for Living Agents and one for standalone Memory Bank DBs — built once at startup by walking eidetica's `user.databases()` and reading each DB's `meta.kind` marker (`agent` / `bank` / `session`, written at creation time). Both indices map `db_id ↔ display_name ↔ pubkey`. They exist because eidetica has no inverse "list DBs this key can access" query, and routing reads them on every session entry. Mutations from `/agent new`, `/memory new`, `/agent delete`, etc. update the cache directly. There is no persistent mirror — eidetica's key store is the single source of truth for "which DBs does this peer host."
+
+## Provider catalog (library metadata only)
+
+The AgentDB Provider catalog records known Provider DB roots and a default set for
+future selection. It does **not** implement Provider creation, session attachment,
+resource grants, discovery, or execution. No CLI or YAML management workflow is
+provided for this catalog, and current session creation does not consume it.
+
+A `ProviderRef` has a stable `db_id`, a mutable `display_name`, optional
+`peer_pubkey`, and `sync_addresses: Vec<(String, String)>` routing hints, like
+`LoginRef`. Labels and routes never identify an authorized operating key. Two
+roots with the same label remain different Providers; editing a label or route
+cannot retarget a saved root.
+
+### API reference
+
+These APIs are exported from `chaz_core::agent_db`:
+
+| API / field                                          | Meaning                                                                                                                                                |
+| ---------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `AgentDb::list_providers()` / `find_provider(db_id)` | Inspect catalog records by stable root, not label; requires AgentDB Read or higher.                                                                    |
+| `AgentDb::upsert_provider(reference)`                | Replace all catalog rows for that exact root; requires native AgentDB Write or higher.                                                                 |
+| `AgentDb::remove_provider(db_id)`                    | Remove its catalog rows and prune its default IDs in one native transaction; returns whether a catalog row existed. Requires Write or higher.          |
+| `AgentDbConfig.default_providers: Vec<String>`       | Provider DB root IDs, empty for old or missing configuration. Catalog membership alone is not default selection.                                       |
+| `AgentDb::set_default_providers(ids)`                | Validate against the catalog, deduplicate/sort by root, and persist only that config field. Requires Write or higher.                                  |
+| `select_providers(catalog, defaults, override_ids)`  | Pure computation returning records sorted/deduplicated by root. `None` uses defaults; `Some(&[])` selects none; a nonempty override replaces defaults. |
+
+Invalid roots, unknown selected IDs, malformed stored data, and conflicting
+same-root catalog rows are errors, not skipped Providers or fallback agents.
+Identical duplicate rows are harmless. Upserting an explicit root can replace
+conflicting metadata for that root. Selection revalidates references because sync
+or a general config writer can leave dangling defaults; a successful earlier
+update is not proof that later selection is consistent or authorized.
+
+Removal changes future configuration only. It does not revoke or rewrite any
+existing session attachment or access. Removal and default updates preserve
+unrelated config fields, including unknown fields; unreadable config blocks the
+edit. The transaction boundary is local native Eidetica atomicity, not a global
+cross-peer lock. Session protected policy is not stored in this catalog.
+
+### API walkthrough: configure, select, refuse, recover
+
+1. Given a writable `AgentDb`, register a root and select it by default. This
+   example uses well-formed example roots; catalog registration does not open or
+   authenticate either Provider DB.
+
+   ```rust,ignore
+   use chaz_core::agent_db::{AgentDb, ProviderRef, select_providers};
+
+   async fn configure(agent: &AgentDb) -> anyhow::Result<()> {
+       let root = "bafyreibog4r3zw5d53sv5u72tms2vz5ye5eudvmqc7tfpn2bjfyebqtqzm";
+       let unknown = "bafyreibog4r3zw5d53sv5u72tms2vz5ye5eudvmqc7tfpn2bjfyebqtqzi";
+       agent.upsert_provider(ProviderRef {
+           db_id: root.into(), display_name: "build-box".into(),
+           peer_pubkey: None, sync_addresses: vec![],
+       }).await?;
+       agent.set_default_providers(&[root.into()]).await?;
+       let catalog = agent.list_providers().await?;
+       let defaults = agent.read_config().await?.default_providers;
+       let selected = select_providers(&catalog, &defaults, None)?;
+       println!("selected: {}", selected[0].display_name);
+
+       // An unknown override ID is refused, not replaced by the default.
+       let error = select_providers(&catalog, &defaults, Some(&[unknown.into()]))
+           .unwrap_err();
+       println!("{error}");
+       assert!(agent.set_default_providers(&[unknown.into()]).await.is_err());
+       assert_eq!(agent.read_config().await?.default_providers, defaults);
+
+       // An explicit empty override is a valid recovery: select nothing.
+       assert!(select_providers(&catalog, &defaults, Some(&[]))?.is_empty());
+       agent.remove_provider(root).await?;
+       assert!(agent.read_config().await?.default_providers.is_empty());
+       Ok(())
+   }
+   ```
+
+2. The selected metadata and failed lookup print:
+
+   ```text
+   selected: build-box
+   unknown Provider DB ID: bafyreibog4r3zw5d53sv5u72tms2vz5ye5eudvmqc7tfpn2bjfyebqtqzi
+   ```
+
+3. The failed persisted update leaves the earlier default unchanged. The empty
+   override selects none without changing configuration. Removal then clears the
+   catalog row and its default in one transaction, but leaves existing sessions
+   alone. A Read-only handle can inspect the catalog and config; its valid
+   upsert, default-update, and removal attempts are refused by native auth.
 
 ## Session participation
 
