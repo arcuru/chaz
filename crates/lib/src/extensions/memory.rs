@@ -1152,6 +1152,7 @@ impl MemoryCommand {
                 }
             };
 
+        let _guard = crate::extension::SETTINGS_UPDATE_LOCK.lock().await;
         let mut settings = ctx.get_settings("memory").await;
         let bank_json = serde_json::Value::String(bank_name.clone());
         let banks_arr = settings
@@ -1190,6 +1191,7 @@ async fn detach_cmd(bank_name: &str, ctx: &HookContext) -> ExtensionCommandOutco
         return ExtensionCommandOutcome::Error("Usage: /memory detach <bank_name>".into());
     }
 
+    let _guard = crate::extension::SETTINGS_UPDATE_LOCK.lock().await;
     let mut settings = ctx.get_settings("memory").await;
     let banks = settings
         .as_object_mut()
@@ -2000,6 +2002,50 @@ mod tests {
             routine_engine: None,
         };
         cmd.attach_cmd(arg, &ctx).await
+    }
+
+    #[tokio::test]
+    async fn attach_and_detach_wait_for_an_in_flight_settings_update() {
+        use crate::session::Session;
+        use crate::test_support::{assert_waits_for_settings_update, hook_context};
+        use crate::types::ConversationId;
+        use serde_json::json;
+
+        let (_i, _r, cmd) = fixture().await;
+        cmd.new_cmd("patrick").await;
+        let (_conv, db) = cmd.registry.create_session(Some("test")).await.unwrap();
+        let session = Session::new(ConversationId(db.root_id().to_string()), db.clone()).await;
+        let ctx = hook_context(Arc::new(tokio::sync::Mutex::new(session)));
+
+        crate::extension::write_settings(&db, "memory", json!({"attached_banks": []}))
+            .await
+            .unwrap();
+        assert_text(
+            assert_waits_for_settings_update(
+                &db,
+                "memory",
+                json!({"first": 1}),
+                cmd.attach_cmd("patrick", &ctx),
+            )
+            .await,
+            "Attached bank 'patrick'",
+        );
+        assert_text(
+            assert_waits_for_settings_update(
+                &db,
+                "memory",
+                json!({"second": 1}),
+                detach_cmd("patrick", &ctx),
+            )
+            .await,
+            "Detached bank 'patrick'",
+        );
+        assert_eq!(
+            crate::extension::read_settings_checked(&db, "memory")
+                .await
+                .unwrap(),
+            json!({"attached_banks": [], "first": 1, "second": 1})
+        );
     }
 
     #[tokio::test]

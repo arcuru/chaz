@@ -102,6 +102,13 @@ pub const EXTENSIONS_STORE: &str = "extensions";
 /// blobs. Lives on the session DB so settings travel with the session.
 pub const EXTENSION_SETTINGS_STORE: &str = "extension_settings";
 
+/// Hold across every read-modify-write of a settings blob so a concurrent
+/// writer in this process cannot overwrite the update. Keep it to the read and
+/// write: never hold it across model inference or other unbounded work. Each
+/// blob is one last-writer-wins key, so writers in other processes or peers are
+/// not covered.
+pub(crate) static SETTINGS_UPDATE_LOCK: Mutex<()> = Mutex::const_new(());
+
 /// Read the settings JSON for one extension on this session's DB.
 /// Missing key (or any read error) yields `json!({})` rather than
 /// propagating — settings absence is the normal "no overrides" state.

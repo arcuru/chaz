@@ -162,6 +162,7 @@ impl TurnCompleteContext<'_> {
 
     /// Merge a patch into this extension's current settings.
     pub async fn update_settings(&self, patch: Value) -> anyhow::Result<()> {
+        let _guard = super::SETTINGS_UPDATE_LOCK.lock().await;
         let mut settings = self.settings().await?;
         let object = settings
             .as_object_mut()

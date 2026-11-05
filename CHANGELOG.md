@@ -47,6 +47,12 @@ All notable changes to this project will be documented in this file.
   denies. A 3xx response is now returned as-is; `web_fetch` reports its
   `Location`, and fetching that URL is a new request checked against the grant.
 
+### Bug Fixes
+
+- Fixed extension settings updates in one process overwriting each other, such
+  as `/extensions set` racing a session-naming status update. Writers in other
+  processes and peers remain last-writer-wins.
+
 ## [0.3.0](https://github.com/arcuru/chaz/compare/v0.2.0...v0.3.0) - 2024-10-25
 
 ### Other

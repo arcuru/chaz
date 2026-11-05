@@ -93,6 +93,52 @@ pub(crate) async fn fresh_session() -> (Instance, Arc<TokioMutex<Session>>) {
     (instance, session)
 }
 
+/// Hook context for driving an extension command against `session`.
+pub(crate) fn hook_context(session: Arc<TokioMutex<Session>>) -> crate::extension::HookContext {
+    crate::extension::HookContext {
+        agent_name: "test-agent".into(),
+        model: None,
+        call_depth: 0,
+        session,
+        active_extensions: Default::default(),
+        routine_engine: None,
+    }
+}
+
+/// Act as a settings update paused between its read and its write: `competitor`
+/// must not finish until `patch` is stored, and must then build on it rather
+/// than overwrite it. Without the shared lock the competitor writes during the
+/// pause and this stale read-modify-write discards its change. The timeout only
+/// gives such a writer time to finish, so a correct writer cannot fail on speed.
+pub(crate) async fn assert_waits_for_settings_update<T>(
+    db: &eidetica::Database,
+    extension: &str,
+    patch: serde_json::Value,
+    competitor: impl Future<Output = T>,
+) -> T {
+    use crate::extension::{SETTINGS_UPDATE_LOCK, read_settings_checked, write_settings};
+
+    let guard = SETTINGS_UPDATE_LOCK.lock().await;
+    let mut settings = read_settings_checked(db, extension).await.unwrap();
+    let mut competitor = std::pin::pin!(competitor);
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), &mut competitor)
+            .await
+            .is_err(),
+        "settings writer did not wait for the in-flight update"
+    );
+    let patch = patch.as_object().unwrap();
+    settings.as_object_mut().unwrap().extend(patch.clone());
+    write_settings(db, extension, settings).await.unwrap();
+    drop(guard);
+    let output = competitor.await;
+    let stored = read_settings_checked(db, extension).await.unwrap();
+    for (key, value) in patch {
+        assert_eq!(&stored[key], value, "in-flight update to {key} was lost");
+    }
+    output
+}
+
 /// Fresh in-memory `SessionRegistry` wired against a one-user instance, holding
 /// only the bare-bones `"default"` agent. Used by extension tests that need a
 /// `SessionRegistry` handle (e.g. to construct a `SkillsPromptAugmentation`)

@@ -179,8 +179,10 @@ Merges `key = value` into the named extension's per-session settings.
   so it's stored as the string `"foo"`
 
 Each call replaces the value at that key while preserving every other
-key already stored. There's no `/extensions unset` yet — to clear a
-key, overwrite it with `null`:
+key already stored, including keys an extension updates at the same time in
+the same chaz process. A write from another process or peer is not coordinated,
+so it can still replace the whole settings blob. There's no
+`/extensions unset` yet — to clear a key, overwrite it with `null`:
 
 ```
 /extensions set memory custom_limit null

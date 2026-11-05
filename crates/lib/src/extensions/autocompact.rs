@@ -197,6 +197,7 @@ struct AutocompactCommand;
 impl AutocompactCommand {
     async fn run(&self, args: &str, ctx: &HookContext) -> ExtensionCommandOutcome {
         let db = ctx.session.lock().await.database().clone();
+        let _guard = crate::extension::SETTINGS_UPDATE_LOCK.lock().await;
         let mut settings = match read(&db).await {
             Ok(settings) => settings,
             // A corrupt blob is reported, and only an explicit new value
@@ -413,6 +414,21 @@ mod tests {
             "{report}"
         );
         assert!(!report.contains("0 input / 0 output"));
+    }
+
+    #[tokio::test]
+    async fn command_waits_for_an_in_flight_settings_update() {
+        let (_instance, session) = crate::test_support::fresh_session().await;
+        let db = session.lock().await.database().clone();
+        crate::test_support::assert_waits_for_settings_update(
+            &db,
+            NAME,
+            serde_json::json!({"keep_recent_tokens": 1234}),
+            invoke("27k", &session),
+        )
+        .await
+        .unwrap();
+        assert_eq!(read(&db).await.unwrap().trigger_tokens, Some(27_000));
     }
 
     #[tokio::test]

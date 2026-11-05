@@ -1406,6 +1406,7 @@ impl SkillCommand {
                 }
             };
 
+        let _guard = crate::extension::SETTINGS_UPDATE_LOCK.lock().await;
         let mut settings = ctx.get_settings("skills").await;
         let bank_json = serde_json::Value::String(bank_name.clone());
         let banks_arr = settings
@@ -1441,6 +1442,7 @@ async fn detach_cmd(bank_name: &str, ctx: &HookContext) -> ExtensionCommandOutco
     if bank_name.is_empty() {
         return ExtensionCommandOutcome::Error("Usage: /skills detach <bank_name>".into());
     }
+    let _guard = crate::extension::SETTINGS_UPDATE_LOCK.lock().await;
     let mut settings = ctx.get_settings("skills").await;
     let banks = settings
         .as_object_mut()
@@ -1488,6 +1490,51 @@ mod tests {
     use crate::extension::Extension;
     use crate::test_support::{fresh_session, fresh_session_registry, tool_context};
     use std::io::Write;
+
+    #[tokio::test]
+    async fn attach_and_detach_wait_for_an_in_flight_settings_update() {
+        use crate::session::Session;
+        use crate::test_support::{assert_waits_for_settings_update, hook_context};
+        use crate::types::ConversationId;
+        use serde_json::json;
+
+        let (_instance, registry) = fresh_session_registry().await;
+        let cmd = SkillCommand {
+            registry: registry.clone(),
+            agent_index: HostedIndex::empty("agent"),
+            skill_bank_index: HostedIndex::empty("skill_bank"),
+        };
+        cmd.new_cmd("team").await;
+        let (_conv, db) = registry.create_session(Some("test")).await.unwrap();
+        let session = Session::new(ConversationId(db.root_id().to_string()), db.clone()).await;
+        let ctx = hook_context(Arc::new(tokio::sync::Mutex::new(session)));
+
+        crate::extension::write_settings(&db, "skills", json!({"attached_banks": []}))
+            .await
+            .unwrap();
+        let attached = assert_waits_for_settings_update(
+            &db,
+            "skills",
+            json!({"first": 1}),
+            cmd.attach_cmd("team", &ctx),
+        )
+        .await;
+        assert!(matches!(attached, ExtensionCommandOutcome::Text(_)));
+        let detached = assert_waits_for_settings_update(
+            &db,
+            "skills",
+            json!({"second": 1}),
+            detach_cmd("team", &ctx),
+        )
+        .await;
+        assert!(matches!(detached, ExtensionCommandOutcome::Text(_)));
+        assert_eq!(
+            crate::extension::read_settings_checked(&db, "skills")
+                .await
+                .unwrap(),
+            json!({"attached_banks": [], "first": 1, "second": 1})
+        );
+    }
 
     // ── helpers ──────────────────────────────────────────────────────
 

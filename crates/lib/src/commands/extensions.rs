@@ -287,6 +287,7 @@ async fn set(name: &str, key: &str, value: &str, ctx: &CommandContext<'_>) -> Co
     let parsed_value: serde_json::Value = serde_json::from_str(value)
         .unwrap_or_else(|_| serde_json::Value::String(value.to_string()));
 
+    let _guard = crate::extension::SETTINGS_UPDATE_LOCK.lock().await;
     let mut current = crate::extension::read_settings(ctx.session_db, name).await;
     if !current.is_object() {
         current = serde_json::json!({});
@@ -534,6 +535,60 @@ mod tests {
             current_agent: "chaz",
             session_name: None,
         }
+    }
+
+    /// A turn's settings patch and `/extensions set` each read, merge and
+    /// write one blob, so neither may land inside the other's update.
+    #[tokio::test]
+    async fn turn_patches_and_extensions_set_keep_each_others_keys() {
+        use crate::extension::read_settings_checked;
+        use crate::extension::turn::TurnCompleteContext;
+        use crate::test_support::{assert_waits_for_settings_update, permissive_security};
+        use serde_json::json;
+
+        let f = fixture().await;
+        let security = permissive_security();
+        let turn = TurnCompleteContext {
+            agent_name: "chaz",
+            model: None,
+            call_depth: 0,
+            messages: &[],
+            tools: &[],
+            extension: "schedule",
+            db: &f.session_db,
+            registry: &f._registry,
+            backend: &f.backend,
+            security: &security,
+            completion_used: std::sync::atomic::AtomicBool::new(false),
+        };
+        let command_ctx = ctx(&f);
+        let set = dispatch(
+            Command::Extensions(ExtensionsAction::Set {
+                name: "schedule".into(),
+                key: "operator".into(),
+                value: "1".into(),
+            }),
+            &command_ctx,
+        );
+        assert!(matches!(
+            assert_waits_for_settings_update(&f.session_db, "schedule", json!({"turn": 1}), set)
+                .await,
+            CommandOutcome::Text(_)
+        ));
+        assert_waits_for_settings_update(
+            &f.session_db,
+            "schedule",
+            json!({"operator_again": 1}),
+            turn.update_settings(json!({"turn_again": 1})),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            read_settings_checked(&f.session_db, "schedule")
+                .await
+                .unwrap(),
+            json!({"operator": 1, "turn": 1, "operator_again": 1, "turn_again": 1})
+        );
     }
 
     /// Build a `ScopedTools` view that mirrors what the runtime would

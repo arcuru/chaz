@@ -198,6 +198,7 @@ There is no public database, backend or registry handle and no target-session ar
 Names use `SessionRegistry`'s canonical name index and session meta writes; local explicit/conditional renames serialize under the same registry lock, with a fresh name check after inference.
 Names and settings retain their existing sync/peer-local semantics; this is not distributed compare-and-swap or a new naming store.
 Settings reads use the checked host facility; corrupt or unavailable settings are errors, not permission to overwrite them with defaults.
+`update_settings()` holds the settings update lock described under [Per-session settings](#per-session-settings), and only for its read and write, never across `complete()`.
 Native Rust extensions remain trusted code, not a sandbox.
 
 `complete()` accepts one instruction and an optional model override, sends the entire public context plus tool definitions as reference data, and routes through `BackendManager` with no executable tools.
@@ -461,6 +462,14 @@ reach it through the host-only `Settings` cap
 `write_settings` helpers an instance calls at instantiate time (e.g.
 `memory` reads `attached_banks` when building its per-session context
 tail).
+
+Each blob is one last-writer-wins key, so a read-modify-write can discard a
+concurrent change. Every such update in the host (`/extensions set`, a
+turn-complete `update_settings()` patch, and the `/autocompact`, `/memory` and
+`/skills` writers) holds one process-wide lock from its read through its write.
+The lock does not reach another process: a service-client TUI, bridge, or
+`chaz cmd` writing while the daemon runs a turn can still overwrite that update,
+and synced peers keep ordinary last-writer-wins behavior.
 
 ## Extension identity
 
