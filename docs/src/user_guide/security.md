@@ -36,7 +36,7 @@ Two more orthogonal layers wrap everything:
 - **Secret store** keeps API keys out of LLM context entirely — they're resolved at the HTTP client boundary, never quoted to the model.
 - **Agent-level controls** (`allowed_tools`, per-Agent `workers:` list, depth caps) shrink which layers even get a chance to run for a given Agent.
 
-The capability boundary is the **`ToolHost`** trait. The default `NativeToolHost` runs in-process and enforces grants; future hosts (WASM, bubblewrap) will swap in stronger isolation without any tool-code changes. Tools never call OS APIs directly — they request a `Capability::Shell|FileRead|FileWrite|HttpRequest` from the host.
+The capability boundary is the **`ToolHost`** trait. The default `NativeToolHost` runs in-process and enforces grants; future hosts (WASM, bubblewrap) will swap in stronger isolation without any tool-code changes. Session-time tool code never calls OS APIs directly — it requests a `Capability::Shell|FileRead|FileWrite|HttpRequest` from the host, and a source-scan test fails the build if tool or extension code reintroduces a direct client ([architecture](../architecture/tools.md#toolhost)). Grants bound what tools do; they do not bound the daemon's own connections to its model providers — see [Not an air-gap](#not-an-air-gap-what-tool-grants-do-not-cover).
 
 ## Tool Approval
 
@@ -118,7 +118,7 @@ effective = tool policy  ∩  session ceiling  ∩  agent capabilities  ∩  per
 | **Agent capabilities** | Every tool call this agent makes, across all its tools | `agents[].capabilities` (the agent-wide chokepoint)         |
 | **Per-tool override**  | One tool, for one agent                                | `agents[].grants.<tool>`                                    |
 
-The key property: the **session ceiling** and **agent capabilities** are chokepoints. The filesystem is reachable through both `shell` and `write_file`; the network through both `web_fetch` and `shell` (`curl`). Setting `allow_private: false` on a single tool doesn't stop another tool reaching the resource — but a session or agent ceiling binds _every_ tool that can reach it at once. That is how you express "this agent has no network" (a `private` profile) or "this is a confined session."
+The key property: the **session ceiling** and **agent capabilities** are chokepoints. The filesystem is reachable through both `shell` and `write_file`; the network through `web_fetch`, `web_search` and `shell` (`curl`). Setting `allow_private: false` on a single tool doesn't stop another tool reaching the resource — but a session or agent ceiling binds _every_ tool that can reach it at once. That is how you express "this agent has no network" (a `private` profile) or "this is a confined session."
 
 Within each grant, attenuation means: **allowlists intersect**, **denylists union**, and booleans like `allow_private` are AND-ed. A narrower tier clearing a `deny` entry cannot un-deny it — the union keeps it.
 
@@ -162,7 +162,7 @@ If `allow` is non-empty, only commands starting with an allowed prefix are permi
 
 ### Network grants
 
-The `web_fetch` tool's HTTP requests are filtered by endpoint patterns:
+Tool HTTP requests — `web_fetch`, and every `web_search` backend request — are filtered by endpoint patterns in the calling tool's network grant:
 
 ```yaml
 security:
@@ -193,6 +193,60 @@ Location: https://api.example.com/admin
 The agent can fetch that `Location` with a new `web_fetch` call, which is checked against the grant like any other request. Above, `/admin` is outside the `/v1` prefix and is denied.
 
 Grant checks look at the URL text, not the address the hostname resolves to. A public hostname whose DNS answer is a private address (DNS rebinding) is not caught by `allow_private: false`; that needs the sandboxed host's network boundary.
+
+#### Private SearxNG and network grants
+
+`web_search` sends its query through the host like any other tool request, so configuring a backend under `web_search.backends` is not permission to reach it. Public backends work under the default (absent) grant. A SearxNG instance on `localhost`, a private address or an internal hostname is refused by the private-address check unless the effective `web_search` grant allows private networks:
+
+| Setting                                                       | Effect                                                                     |
+| ------------------------------------------------------------- | -------------------------------------------------------------------------- |
+| `tool_policies.web_search.grants.network.allow_private: true` | Lets `web_search` reach private/local backends. `web_fetch` is unaffected. |
+| `tool_policies.web_search.grants.network.endpoints: [...]`    | Restricts which backends `web_search` may reach at all.                    |
+| Session or agent ceiling with `allow_private: false`          | Removes private access again for that session or agent (AND-ed).           |
+| Any tier with `endpoints: []`                                 | Every backend is denied; no search request leaves the process.             |
+
+The permission is per tool, so granting it to `web_search` does not open private addresses to `web_fetch` or `shell`. Configs that used a local SearxNG before backend requests went through the host need the `allow_private` line; without it chaz warns at startup and the instance fails over on every search.
+
+A worked migration, for a self-hosted instance with no fallback:
+
+1. The config names the instance but grants nothing:
+
+   ```yaml
+   web_search:
+     backends:
+       - type: searxng
+         url: "http://127.0.0.1:8888"
+   ```
+
+2. Startup warns that the backend cannot be used:
+
+   ```text
+   WARN chaz_core::tools::search: web_search: SearxNG backend will be denied: private SearxNG needs `security.tool_policies.web_search.grants.network.allow_private: true`, and session and agent capability ceilings must also allow private networks url=http://127.0.0.1:8888
+   ```
+
+3. A search fails without sending anything, and the tool error names the fix:
+
+   ```text
+   searxng: SSRF protection: private IP 127.0.0.1 not allowed (private SearxNG needs `security.tool_policies.web_search.grants.network.allow_private: true`, and session and agent capability ceilings must also allow private networks)
+   ```
+
+   With a `duckduckgo` entry after it, the search would instead fail over and return DuckDuckGo results, with the same error in the `Search backend failed; trying next` log line.
+
+4. Grant private access to `web_search` only, and optionally pin it to the instance:
+
+   ```yaml
+   security:
+     tool_policies:
+       web_search:
+         grants:
+           network:
+             allow_private: true
+             endpoints:
+               - host: "127.0.0.1"
+                 path_prefix: "/search"
+   ```
+
+5. After a restart the warning is gone and searches reach the instance. A session or agent whose ceiling sets `allow_private: false` still gets the step 3 error. A ceiling with `endpoints: []` instead reports `Network policy denied: … not in allowed endpoints`. Both deny the request before sending anything: a narrower tier can only remove authority.
 
 > **Deprecated**: `security.allowed_endpoints` is a legacy field. It still works but is converted to a network grant at startup with a deprecation warning. Use `tool_policies.web_fetch.grants.network.endpoints` for new configs.
 
@@ -243,7 +297,17 @@ The session ceiling lives on the session itself (`SessionMeta.capabilities`) rat
 >     endpoints: [] # deny-all egress
 > ```
 >
-> This is an in-process check, so it blocks the `web_fetch` capability but a determined `shell` tool could still shell out to `curl`. For a hard guarantee that an agent _cannot_ reach the network regardless of tool, the enforcement point has to be the OS boundary (a network namespace with no interface) — that lands with the sandboxed host. Pair the `endpoints: []` ceiling with a `shell` denylist (or no `shell` tool) until then.
+> This is an in-process check, so it blocks the `web_fetch` and `web_search` capabilities but a determined `shell` tool could still shell out to `curl`. For a hard guarantee that an agent _cannot_ reach the network regardless of tool, the enforcement point has to be the OS boundary (a network namespace with no interface) — that lands with the sandboxed host. Pair the `endpoints: []` ceiling with a `shell` denylist (or no `shell` tool) until then.
+
+### Not an air-gap: what tool grants do not cover
+
+Grants and ceilings govern what **tools** do when a session calls them. Three things sit outside them, and network deny-all on a session or agent is therefore not an air-gap:
+
+- **Model and embedding providers.** The daemon sends the conversation to the configured model backend every turn, and `remember`/`recall` and memory recall send text to the configured embedding endpoint. Those connections carry model-chosen text, may be remote, and are not checked against any `network` grant. Choosing where a session's content goes means choosing its providers; a deny-all ceiling does not keep content local.
+- **Operator skill catalog.** Disk skills under `.chaz/skills` and `~/.config/chaz/skills` are read once at startup, before any session exists, and become shared catalog content like prompt files and skill banks. A session `fs.allow_read` ceiling does not hide them, and `skill_list`/`skill_show` do no file reads at call time. Put only content every session may see in those directories.
+- **Daemon infrastructure.** MCP server processes and connections, config and secret files, and bridge transports are operator configuration, not tool requests. MCP tool calls are not routed through the host's network check.
+
+Within tools, the remaining limits are the ones noted above: grants check URL text rather than resolved addresses (DNS rebinding), filesystem confinement is lexical, and `shell` can reach anything its command allowlist permits. A hard boundary needs an OS-level sandbox.
 
 ## Leak Detection
 
