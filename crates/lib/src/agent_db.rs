@@ -274,6 +274,31 @@ pub struct SessionRef {
     pub exposed_on: Vec<String>,
 }
 
+/// Collapse rows that name the same session. `register_session_ref` replaces
+/// by `session_db_id`, but two writers that both saw no row (e.g. two
+/// executors adopting one job) can each insert one; a CRDT table cannot make
+/// that exclusive, so readers converge. Exposures are unioned in first-seen
+/// order; the next registration rewrites the rows as one.
+fn merge_session_refs(rows: impl IntoIterator<Item = SessionRef>) -> Vec<SessionRef> {
+    let mut merged: Vec<SessionRef> = Vec::new();
+    for row in rows {
+        match merged
+            .iter_mut()
+            .find(|existing| existing.session_db_id == row.session_db_id)
+        {
+            Some(existing) => {
+                for label in row.exposed_on {
+                    if !existing.exposed_on.contains(&label) {
+                        existing.exposed_on.push(label);
+                    }
+                }
+            }
+            None => merged.push(row),
+        }
+    }
+    merged
+}
+
 impl AgentDbConfig {
     pub fn from_agent_config(cfg: &AgentConfig) -> Self {
         Self {
@@ -676,12 +701,12 @@ impl AgentDb {
     // agent on. Upsert-by-`session_db_id`, mirroring the login registry.
     // -----------------------------------------------------------------
 
-    /// List every session attached to this agent.
+    /// List every session attached to this agent, one entry per session.
     pub async fn list_session_refs(&self) -> anyhow::Result<Vec<SessionRef>> {
         let txn = self.database.new_transaction().await?;
         let store = txn.get_store::<Table<SessionRef>>(SESSIONS_STORE).await?;
         let rows = store.search(|_: &SessionRef| true).await?;
-        Ok(rows.into_iter().map(|(_, r)| r).collect())
+        Ok(merge_session_refs(rows.into_iter().map(|(_, r)| r)))
     }
 
     /// Find a single session entry by its `session_db_id`.
@@ -691,10 +716,10 @@ impl AgentDb {
     ) -> anyhow::Result<Option<SessionRef>> {
         let txn = self.database.new_transaction().await?;
         let store = txn.get_store::<Table<SessionRef>>(SESSIONS_STORE).await?;
-        let mut rows = store
+        let rows = store
             .search(|r: &SessionRef| r.session_db_id == session_db_id)
             .await?;
-        Ok(rows.pop().map(|(_, r)| r))
+        Ok(merge_session_refs(rows.into_iter().map(|(_, r)| r)).pop())
     }
 
     /// Add or update a session entry, replacing any existing row with the same
@@ -1925,6 +1950,55 @@ mod tests {
         let all = db.list_session_refs().await.unwrap();
         assert_eq!(all.len(), 1, "register must replace, not append");
         assert_eq!(all[0].exposed_on, vec!["matrix", "discord"]);
+    }
+
+    #[tokio::test]
+    async fn concurrent_session_ref_rows_read_as_one() {
+        let (_user, db) = peer_with_agent_db().await;
+        // Two writers that each saw no row insert independently.
+        let txn = db.database().new_transaction().await.unwrap();
+        let store = txn
+            .get_store::<Table<SessionRef>>(SESSIONS_STORE)
+            .await
+            .unwrap();
+        for exposed in [vec!["matrix".to_string()], vec!["discord".to_string()]] {
+            store
+                .insert(SessionRef {
+                    session_db_id: "sha256:sess".into(),
+                    exposed_on: exposed,
+                })
+                .await
+                .unwrap();
+        }
+        txn.commit().await.unwrap();
+        let merged = SessionRef {
+            session_db_id: "sha256:sess".into(),
+            exposed_on: vec!["matrix".into(), "discord".into()],
+        };
+        let mut listed = db.list_session_refs().await.unwrap();
+        assert_eq!(listed.len(), 1);
+        listed[0].exposed_on.sort();
+        let mut expected = merged.exposed_on.clone();
+        expected.sort();
+        assert_eq!(listed[0].exposed_on, expected);
+        assert_eq!(
+            db.find_session_ref("sha256:sess")
+                .await
+                .unwrap()
+                .map(|r| r.exposed_on.len()),
+            Some(2)
+        );
+        // The next registration rewrites them as one row.
+        db.register_session_ref(merged).await.unwrap();
+        let txn = db.database().new_transaction().await.unwrap();
+        let rows = txn
+            .get_store::<Table<SessionRef>>(SESSIONS_STORE)
+            .await
+            .unwrap()
+            .search(|_: &SessionRef| true)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
     }
 
     #[tokio::test]
