@@ -2149,3 +2149,123 @@ async fn settings_peer_inspector_collects_actual_catalog_and_loaded_templates_on
     }
     server.shutdown().await;
 }
+
+/// Viewing is read-only; only a pick or confirmed reseed submits a merge.
+#[tokio::test]
+async fn agent_diff_view_applies_nothing_without_pick_or_confirmed_reseed() {
+    use chaz_core::agent_diff::{AgentField, AgentMergeMode};
+    let (_instance, server, _backend, mut app) = fixture().await;
+    open(&mut app, SettingsScope::Peer, 0);
+    app.settings_focus = SettingsFocus::Content;
+    let yaml = AgentDbConfig {
+        model: Some("opus".into()),
+        autonomous: true,
+        ..Default::default()
+    };
+    let diff = chaz_core::agent_diff::diff_agent(&yaml, &AgentDbConfig::default());
+    let picks = diff
+        .rows
+        .iter()
+        .map(|r| r.field == AgentField::Model)
+        .collect();
+    app.agent_diff = Some(AgentDiffView {
+        agent_name: "agent-00".into(),
+        diff,
+        mode: AgentDiffMode::View,
+        cursor: 0,
+        picks,
+    });
+
+    for code in [KeyCode::Char('r'), KeyCode::Enter, KeyCode::Char('y')] {
+        assert!(matches!(key(&mut app, code), input::SettingsKey::None));
+        assert_eq!(app.agent_diff.as_ref().unwrap().mode, AgentDiffMode::View);
+    }
+
+    assert!(matches!(
+        key(&mut app, KeyCode::Char('R')),
+        input::SettingsKey::None
+    ));
+    assert_eq!(
+        app.agent_diff.as_ref().unwrap().mode,
+        AgentDiffMode::ConfirmReseed
+    );
+    assert!(matches!(
+        key(&mut app, KeyCode::Char('n')),
+        input::SettingsKey::None
+    ));
+    assert_eq!(app.agent_diff.as_ref().unwrap().mode, AgentDiffMode::View);
+
+    assert!(matches!(
+        key(&mut app, KeyCode::Char('a')),
+        input::SettingsKey::None
+    ));
+    match key(&mut app, KeyCode::Enter) {
+        input::SettingsKey::ApplyAgentMerge {
+            name,
+            mode: AgentMergeMode::Pick(fields),
+        } => {
+            assert_eq!(name, "agent-00");
+            assert_eq!(fields, vec![AgentField::Model]);
+        }
+        _ => panic!("pick mode Enter should apply only the picked field"),
+    }
+    // A reseed is submitted only after the separate confirmation keystroke.
+    app.agent_diff = Some(AgentDiffView {
+        agent_name: "agent-00".into(),
+        diff: chaz_core::agent_diff::diff_agent(&yaml, &AgentDbConfig::default()),
+        mode: AgentDiffMode::View,
+        cursor: 0,
+        picks: vec![],
+    });
+    key(&mut app, KeyCode::Char('R'));
+    assert!(matches!(
+        key(&mut app, KeyCode::Char('y')),
+        input::SettingsKey::ApplyAgentMerge {
+            mode: AgentMergeMode::Reseed,
+            ..
+        }
+    ));
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn agent_diff_cursor_keeps_workers_and_values_visible() {
+    use chaz_core::agent_diff::{AgentField, diff_agent};
+    let (_instance, server, backend, mut app) = fixture().await;
+    open(&mut app, SettingsScope::Peer, 0);
+    let yaml = AgentDbConfig {
+        workers: vec![WorkerDbConfig {
+            name: "writer".into(),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let db = AgentDbConfig {
+        workers: vec![WorkerDbConfig {
+            name: "reader".into(),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let diff = diff_agent(&yaml, &db);
+    let cursor = diff
+        .rows
+        .iter()
+        .position(|row| row.field == AgentField::Workers)
+        .unwrap();
+    app.agent_diff = Some(AgentDiffView {
+        agent_name: "alpha".into(),
+        picks: vec![true; diff.rows.len()],
+        diff,
+        cursor,
+        mode: AgentDiffMode::Pick,
+    });
+    for (width, height) in [(80, 24), (64, 14), (120, 40)] {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        let rows = draw(&mut terminal, &mut app, &server, &backend);
+        for expected in ["▸ [✓] ~ workers", "yaml: writer", "db:   reader"] {
+            assert!(contains(&rows, expected), "{width}x{height}: {rows:?}");
+        }
+    }
+    server.shutdown().await;
+}

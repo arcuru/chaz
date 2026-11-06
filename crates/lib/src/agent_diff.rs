@@ -1,28 +1,26 @@
-//! Agent yaml↔DB diff + merge semantics (settings-pages Stage 4.5).
+//! Explicit Agent yaml↔DB comparison and merging.
 //!
 //! An Agent's declarative shape lives in two places: the **yaml** template
-//! (`AgentConfig`, a first-boot seed) and the **DB-actual** config
-//! ([`AgentDbConfig`], the runtime source of truth after bootstrap). Once an
-//! agent is bootstrapped, the two can drift — a live `/agent set` edit changes
-//! the DB without touching yaml, and a yaml edit doesn't auto-apply.
+//! (`AgentConfig`, which seeds a new Agent DB) and the **DB-actual** config
+//! ([`AgentDbConfig`], authoritative once the agent exists). The two can
+//! differ — a live `/agent set` edit changes the DB without touching yaml, and
+//! a yaml edit is never applied to an existing agent automatically.
 //!
 //! This module is the pure, testable core behind the TUI Peer→Agents diff
-//! view: it computes a field-level diff between the two and applies one of
-//! three merge modes back into the DB config. It does no IO — the server layer
-//! reads/writes the actual DBs and reconciles the prompt blob.
+//! view: it computes a field-level diff between the two and applies an
+//! explicitly chosen merge back into the DB config. It does no IO — the server
+//! layer reads/writes the actual DBs and resolves the prompt blob.
 //!
 //! ## Merge modes
-//! - [`AgentMergeMode::Drift`] (`[r]`, "bring drift back") — additive. Overwrite
-//!   only the fields the DB never explicitly set (DB value == default). Fields a
-//!   user changed via `/agent set` are preserved.
-//! - [`AgentMergeMode::Reseed`] (`[R]`, "reseed from declared") — force every
-//!   declarative field from yaml into the DB.
+//! Both modes are user actions; nothing calls them on its own.
+//! - [`AgentMergeMode::Reseed`] (`[R]`, confirmed) — copy every declarative
+//!   field, including worker templates, from yaml into the DB.
 //! - [`AgentMergeMode::Pick`] (`[a]`, "pick changes") — apply exactly the
 //!   user-selected fields.
 //!
-//! Workers are **not** part of the merge: yaml fully owns them (they're
-//! templates, not stateful entities). They surface in the diff for visibility
-//! only — see [`AgentDiff::workers`].
+//! There is deliberately no "fill in what the DB never set" mode: a value equal
+//! to the type default may be a deliberate `/agent set` choice (e.g.
+//! `autonomous=false`), and the DB keeps no record of which fields were set.
 
 use crate::agent_db::AgentDbConfig;
 
@@ -41,10 +39,12 @@ pub enum FieldStatus {
     Changed,
 }
 
-/// The declarative `AgentDbConfig` fields the diff/merge covers. Workers are
-/// excluded by design (yaml-owned). `system_prompt_ref` and
-/// `applied_config_hash` are runtime bookkeeping, not declarative, so they're
-/// excluded too — the server recomputes them on write.
+/// The declarative `AgentDbConfig` fields the diff/merge covers.
+/// `system_prompt_ref` and `applied_config_hash` are runtime bookkeeping, not
+/// declarative, so they're excluded — the server re-resolves the prompt
+/// pointer when a prompt field is merged. `default_memory_banks` and
+/// `default_skill_banks` are excluded too: bank attachment reads them from
+/// yaml at startup, not from the DB.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AgentField {
     SystemPrompt,
@@ -58,6 +58,7 @@ pub enum AgentField {
     MaxContextTokens,
     Capabilities,
     Grants,
+    Workers,
 }
 
 impl AgentField {
@@ -74,6 +75,7 @@ impl AgentField {
         Self::MaxContextTokens,
         Self::Capabilities,
         Self::Grants,
+        Self::Workers,
     ];
 
     /// Human label shown in the diff view.
@@ -90,12 +92,13 @@ impl AgentField {
             Self::MaxContextTokens => "max_context_tokens",
             Self::Capabilities => "capabilities",
             Self::Grants => "grants",
+            Self::Workers => "workers",
         }
     }
 
-    /// Whether `cfg`'s value for this field is the type default — i.e. the DB
-    /// never explicitly set it. Drives the additive ([`AgentMergeMode::Drift`])
-    /// merge and the Added/Removed classification.
+    /// Whether `cfg`'s value for this field is the type default. Display-only:
+    /// it labels a diff row Added/Removed. It says nothing about whether a user
+    /// chose that value, so no merge decision may rest on it.
     pub fn is_default(self, cfg: &AgentDbConfig) -> bool {
         let d = AgentDbConfig::default();
         self.eq_field(cfg, &d)
@@ -116,6 +119,7 @@ impl AgentField {
             Self::MaxContextTokens => a.max_context_tokens == b.max_context_tokens,
             Self::Capabilities => a.capabilities == b.capabilities,
             Self::Grants => a.grants == b.grants,
+            Self::Workers => a.workers == b.workers,
         }
     }
 
@@ -166,6 +170,16 @@ impl AgentField {
                     json_compact(&cfg.grants)
                 }
             }
+            Self::Workers => {
+                if cfg.workers.is_empty() {
+                    "(none)".to_string()
+                } else {
+                    let mut names: Vec<&str> =
+                        cfg.workers.iter().map(|w| w.name.as_str()).collect();
+                    names.sort_unstable();
+                    names.join(", ")
+                }
+            }
         }
     }
 
@@ -184,6 +198,7 @@ impl AgentField {
             Self::MaxContextTokens => into.max_context_tokens = from.max_context_tokens,
             Self::Capabilities => into.capabilities = from.capabilities.clone(),
             Self::Grants => into.grants = from.grants.clone(),
+            Self::Workers => into.workers = from.workers.clone(),
         }
     }
 }
@@ -198,8 +213,8 @@ pub struct AgentDiffRow {
     pub status: FieldStatus,
 }
 
-/// One worker entry in the diff. Display-only — workers are yaml-owned and
-/// never merged into the DB by this module.
+/// One worker entry in the diff: per-template detail behind the `workers`
+/// field row. Merging applies the whole template list via that row.
 #[derive(Clone, Debug)]
 pub struct WorkerDiffRow {
     pub name: String,
@@ -214,8 +229,8 @@ pub struct AgentDiff {
 }
 
 impl AgentDiff {
-    /// Whether any declarative field differs (workers excluded — they're
-    /// informational). Used by the TUI to short-circuit "nothing to merge".
+    /// Whether any mergeable field differs, including worker templates.
+    /// Used by the TUI to short-circuit "nothing to merge".
     pub fn has_field_changes(&self) -> bool {
         self.rows.iter().any(|r| r.status != FieldStatus::Unchanged)
     }
@@ -286,24 +301,16 @@ fn diff_workers(yaml: &AgentDbConfig, db: &AgentDbConfig) -> Vec<WorkerDiffRow> 
 /// Which merge to apply. See module docs.
 #[derive(Clone, Debug)]
 pub enum AgentMergeMode {
-    /// `[r]` — additive: overwrite only DB-default (never-set) fields.
-    Drift,
-    /// `[R]` — force every declarative field from yaml.
+    /// `[R]` (confirmed) — copy every declarative field from yaml.
     Reseed,
     /// `[a]` — apply exactly these fields.
     Pick(Vec<AgentField>),
 }
 
 impl AgentMergeMode {
-    /// Resolve the concrete field set this mode writes, given the two configs.
-    /// `Drift` depends on `db` (which fields are unset); the others don't.
-    pub fn fields(&self, db: &AgentDbConfig) -> Vec<AgentField> {
+    /// The concrete field set this mode writes.
+    pub fn fields(&self) -> Vec<AgentField> {
         match self {
-            AgentMergeMode::Drift => AgentField::ALL
-                .iter()
-                .copied()
-                .filter(|f| f.is_default(db))
-                .collect(),
             AgentMergeMode::Reseed => AgentField::ALL.to_vec(),
             AgentMergeMode::Pick(fields) => fields.clone(),
         }
@@ -318,7 +325,7 @@ pub fn apply_merge(
     yaml: &AgentDbConfig,
     mode: &AgentMergeMode,
 ) -> AgentDbConfig {
-    let fields = mode.fields(db);
+    let fields = mode.fields();
     let mut out = db.clone();
     for f in &fields {
         f.copy_into(yaml, &mut out);
@@ -427,24 +434,6 @@ mod tests {
     }
 
     #[test]
-    fn drift_preserves_explicit_db_edits_overwrites_defaults() {
-        // yaml declares model + max_spawn_depth; DB has a user-set model
-        // (explicit) but default max_spawn_depth (never set).
-        let mut yaml = cfg();
-        yaml.model = Some("opus".into());
-        yaml.max_spawn_depth = Some(20);
-
-        let mut db = cfg();
-        db.model = Some("haiku".into()); // explicit /agent set edit
-
-        let merged = apply_merge(&db, &yaml, &AgentMergeMode::Drift);
-        // model was explicitly set in DB → preserved.
-        assert_eq!(merged.model.as_deref(), Some("haiku"));
-        // max_spawn_depth was default in DB → taken from yaml.
-        assert_eq!(merged.max_spawn_depth, Some(20));
-    }
-
-    #[test]
     fn reseed_overwrites_everything_from_yaml() {
         let mut yaml = cfg();
         yaml.model = Some("opus".into());
@@ -460,19 +449,42 @@ mod tests {
     }
 
     #[test]
-    fn reseed_preserves_workers_and_runtime_bookkeeping() {
-        let yaml = cfg();
+    fn reseed_copies_workers_and_preserves_runtime_bookkeeping() {
+        let mut yaml = cfg();
+        yaml.workers = vec![WorkerDbConfig {
+            name: "writer".into(),
+            ..Default::default()
+        }];
         let mut db = cfg();
         db.workers = vec![WorkerDbConfig {
             name: "researcher".into(),
             ..Default::default()
         }];
         db.applied_config_hash = Some("deadbeef".into());
+        db.default_memory_banks = vec!["notes".into()];
 
         let merged = apply_merge(&db, &yaml, &AgentMergeMode::Reseed);
-        // Workers are not a merge field — preserved from db.
-        assert_eq!(merged.workers.len(), 1);
+        assert_eq!(merged.workers, yaml.workers);
         assert_eq!(merged.applied_config_hash.as_deref(), Some("deadbeef"));
+        assert_eq!(merged.default_memory_banks, vec!["notes".to_string()]);
+    }
+
+    #[test]
+    fn pick_leaves_deliberate_default_values_alone() {
+        // `autonomous=false` and empty tools may be deliberate `/agent set`
+        // choices. Only a picked field changes; nothing is inferred from a
+        // value equalling the default.
+        let mut yaml = cfg();
+        yaml.autonomous = true;
+        yaml.tools = Some(vec!["shell".into()]);
+        yaml.model = Some("opus".into());
+        let mut db = cfg();
+        db.tools = Some(vec![]);
+
+        let merged = apply_merge(&db, &yaml, &AgentMergeMode::Pick(vec![AgentField::Model]));
+        assert_eq!(merged.model.as_deref(), Some("opus"));
+        assert!(!merged.autonomous);
+        assert_eq!(merged.tools, Some(vec![]));
     }
 
     #[test]
@@ -520,12 +532,8 @@ mod tests {
     }
 
     #[test]
-    fn drift_fields_are_exactly_db_defaults() {
-        let mut db = cfg();
-        db.model = Some("haiku".into());
-        let fields = AgentMergeMode::Drift.fields(&db);
-        // model is set → not in drift set; everything else (default) is.
-        assert!(!fields.contains(&AgentField::Model));
-        assert!(fields.contains(&AgentField::Tools));
+    fn reseed_fields_cover_every_declarative_field() {
+        assert_eq!(AgentMergeMode::Reseed.fields(), AgentField::ALL.to_vec());
+        assert!(AgentField::ALL.contains(&AgentField::Workers));
     }
 }
