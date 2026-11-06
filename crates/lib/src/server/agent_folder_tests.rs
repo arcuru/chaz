@@ -675,3 +675,70 @@ async fn folder_replacement_adopts_only_explicit_sources_and_resets_scope() {
     );
     server.shutdown().await;
 }
+
+#[tokio::test]
+async fn folder_rejected_commit_keeps_sources_runtime_and_projection_unchanged() {
+    use eidetica::auth::Permission;
+    use eidetica::auth::types::AuthKey;
+    use eidetica::store::DocStore;
+    let (_instance, server, registry) = server_fixture().await;
+    let external = tempfile::tempdir().unwrap();
+    let local = tempfile::tempdir().unwrap();
+    server.set_agent_config_root(local.path().join("agents"));
+    let (entry, db) = portable_agent(&server, &registry, external.path()).await;
+    server.initialize_agent_folders().await;
+    let accepted = db.read_config().await.unwrap();
+    let runtime = server.agents().get("alpha").unwrap().system_prompt;
+    let folder = folder(&server, &entry);
+    let yaml = std::fs::read(folder.join("agent.yaml")).unwrap();
+    let journal = std::fs::read(folder.join(".projection.json")).unwrap();
+    let mut attempted = accepted.clone();
+    attempted.model = Some("REFUSED".into());
+    attempted.prompt_sources.as_mut().unwrap().files.insert(
+        accepted.system_prompt_files[0].clone(),
+        "REFUSED SOURCE".into(),
+    );
+    let settings = db.database().new_transaction().await.unwrap();
+    settings
+        .get_settings()
+        .unwrap()
+        .set_auth_key(
+            &entry.pubkey,
+            AuthKey::active(Some("reader"), Permission::Read),
+        )
+        .await
+        .unwrap();
+    settings.commit().await.unwrap();
+    let before = db.database().snapshot().await.unwrap();
+    // Retain the already-open native handle. Reads and local staging succeed;
+    // the actual engine commit must reject its now read-only signing key.
+    let transaction = db.database().new_transaction().await.unwrap();
+    transaction
+        .get_store::<DocStore>("config")
+        .await
+        .unwrap()
+        .set_string("value", serde_json::to_string(&attempted).unwrap())
+        .await
+        .unwrap();
+    let error = transaction.commit().await.unwrap_err();
+    assert_eq!(error.to_string(), "Entry validation failed");
+    assert_eq!(db.database().snapshot().await.unwrap(), before);
+    assert!(db.write_config(&attempted).await.is_err());
+    assert!(
+        server
+            .update_agent_config("alpha", false, false, |cfg| {
+                *cfg = attempted;
+                Ok(())
+            })
+            .await
+            .is_err()
+    );
+    assert_eq!(db.read_config().await.unwrap(), accepted);
+    assert_eq!(server.agents().get("alpha").unwrap().system_prompt, runtime);
+    assert_eq!(std::fs::read(folder.join("agent.yaml")).unwrap(), yaml);
+    assert_eq!(
+        std::fs::read(folder.join(".projection.json")).unwrap(),
+        journal
+    );
+    server.shutdown().await;
+}
