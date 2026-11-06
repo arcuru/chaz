@@ -1324,13 +1324,41 @@ async fn reconcile_resolves_prompt_into_blob_and_is_gated() {
     let hydrated = server.hydrate_agent_from_db(input.clone()).await;
     assert_eq!(hydrated.system_prompt, "You are Chaz. Operating manual v1.");
 
-    // Unchanged yaml + file → gate matches → no-op.
+    // A live edit must survive an unchanged reconcile and a subsequent
+    // session open, which also refreshes command/TUI registry snapshots.
+    let mut live_cfg = db.read_config().await.unwrap();
+    live_cfg.model = Some("live-model".into());
+    db.write_config(&live_cfg).await.unwrap();
+    let (session_id, session_db) = registry.create_session(Some("tui")).await.unwrap();
+    let entry = server.agent_index().find_by_name("chaz").unwrap();
+    registry
+        .attach_agent_to_session(&session_id.0, &entry)
+        .await
+        .unwrap();
+    server.load_session_entities(&session_db).await.unwrap();
+    assert_eq!(
+        server
+            .agents()
+            .get("chaz")
+            .unwrap()
+            .default_model
+            .as_deref(),
+        Some("live-model")
+    );
     assert!(!server.reconcile_agent_from_yaml(&ac).await.unwrap());
+    assert_eq!(db.read_config().await.unwrap(), live_cfg);
 
     // Editing the file content makes the resolved prompt change, so
     // reconcile applies again and hydration reflects the new text.
     std::fs::write(&prompt_path, "You are Chaz. Operating manual v2!").unwrap();
     assert!(server.reconcile_agent_from_yaml(&ac).await.unwrap());
+    // A real declarative change refreshes the registry as well as the DB.
+    let reconciled = server.agents().get("chaz").unwrap();
+    assert_eq!(reconciled.default_model, None);
+    assert_eq!(
+        reconciled.system_prompt,
+        "You are Chaz. Operating manual v2!"
+    );
     let hydrated2 = server.hydrate_agent_from_db(input).await;
     assert_eq!(
         hydrated2.system_prompt,

@@ -1424,7 +1424,7 @@ impl Server {
             })
             .collect::<Vec<_>>();
         let user = self.registry.user_lock().await;
-        crate::hosted_index::extend_targeted(
+        let stats = crate::hosted_index::extend_targeted(
             &user,
             &explicit_agents,
             &[],
@@ -1432,7 +1432,16 @@ impl Server {
             &self.memory_bank_index,
             &self.skill_bank_index,
         )
-        .await
+        .await?;
+        drop(user);
+        // A targeted client may be opening these agents for the first time.
+        // Refresh their display/runtime snapshots, not just their index rows.
+        for (_, name) in explicit_agents {
+            if let Some(agent) = self.agents.get(&name) {
+                self.hydrate_agent_from_db(agent).await;
+            }
+        }
+        Ok(stats)
     }
 
     /// Best-effort attach of the configured default agents to a
@@ -1858,6 +1867,9 @@ impl Server {
         }
         intended.applied_config_hash = Some(new_hash);
         db.write_config(&intended).await?;
+        let mut agent = self.agents.build_from_db_config(&ac.name, &intended);
+        agent.system_prompt = self.resolve_db_prompt(&intended).await;
+        self.agents.upsert(agent);
         Ok(true)
     }
 
