@@ -662,7 +662,7 @@ impl Server {
             }
         };
         // Hydrate from the Living Agent DB (live refresh).
-        agent = self.hydrate_agent_from_db(agent).await;
+        agent = self.agent_for_execution(agent).await?;
 
         let default_model = agent.default_model.clone();
         let allowed_tools = agent.allowed_tools.clone();

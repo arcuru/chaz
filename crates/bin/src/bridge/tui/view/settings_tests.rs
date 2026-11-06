@@ -563,7 +563,6 @@ async fn settings_modals_keep_reader_position_and_own_background_input() {
                     ),
                     mode: AgentDiffMode::View,
                     cursor: 0,
-                    picks: Vec::new(),
                 })
             }
             1 => {
@@ -1015,7 +1014,7 @@ async fn settings_compact_empty_missing_and_static_pages_use_full_content_slot()
                     key(&mut app, KeyCode::End);
                     let tail = draw(&mut terminal, &mut app, &server, &backend);
                     let sentinel = match (scope, category) {
-                        (SettingsScope::Peer, 0) => "yaml",
+                        (SettingsScope::Peer, 0) => "project",
                         (SettingsScope::Peer, 2) => "restart.",
                         (SettingsScope::Peer, 8) => "agent groups",
                         (SettingsScope::Peer, 4 | 6 | 7) => "result",
@@ -1222,9 +1221,8 @@ async fn settings_too_small_freezes_modals_and_refuses_invisible_submit_or_confi
                         &AgentDbConfig::default(),
                         &AgentDbConfig::default(),
                     ),
-                    mode: AgentDiffMode::ConfirmReseed,
+                    mode: AgentDiffMode::ConfirmReload,
                     cursor: 0,
-                    picks: Vec::new(),
                 })
             }
             1 => {
@@ -1335,7 +1333,7 @@ async fn settings_too_small_freezes_modals_and_refuses_invisible_submit_or_confi
         match modal {
             0 => assert_eq!(
                 app.agent_diff.as_ref().unwrap().mode,
-                AgentDiffMode::ConfirmReseed
+                AgentDiffMode::ConfirmReload
             ),
             1 => assert_eq!(app.settings_prompt.as_ref().unwrap().input, "draft"),
             2 => {
@@ -2919,81 +2917,42 @@ async fn settings_session_inspector_sharing_checked_selected_row_and_no_writes()
     foreign_server.shutdown().await;
 }
 
-/// Viewing is read-only; only a pick or confirmed reseed submits a merge.
+/// Viewing and old pick keys cannot apply; only a confirmed full reload can.
 #[tokio::test]
-async fn agent_diff_view_applies_nothing_without_pick_or_confirmed_reseed() {
-    use chaz_core::agent_diff::{AgentField, AgentMergeMode};
+async fn agent_diff_view_requires_confirmed_full_reload() {
     let (_instance, server, _backend, mut app) = fixture().await;
     open(&mut app, SettingsScope::Peer, 0);
     app.settings_focus = SettingsFocus::Content;
-    let yaml = AgentDbConfig {
-        model: Some("opus".into()),
-        autonomous: true,
-        ..Default::default()
-    };
-    let diff = chaz_core::agent_diff::diff_agent(&yaml, &AgentDbConfig::default());
-    let picks = diff
-        .rows
-        .iter()
-        .map(|r| r.field == AgentField::Model)
-        .collect();
     app.agent_diff = Some(AgentDiffView {
         agent_name: "agent-00".into(),
-        diff,
+        diff: chaz_core::agent_diff::diff_agent(
+            &AgentDbConfig::default(),
+            &AgentDbConfig::default(),
+        ),
         mode: AgentDiffMode::View,
         cursor: 0,
-        picks,
     });
-
-    for code in [KeyCode::Char('r'), KeyCode::Enter, KeyCode::Char('y')] {
+    for code in [
+        KeyCode::Char('r'),
+        KeyCode::Char('a'),
+        KeyCode::Enter,
+        KeyCode::Char('y'),
+    ] {
         assert!(matches!(key(&mut app, code), input::SettingsKey::None));
         assert_eq!(app.agent_diff.as_ref().unwrap().mode, AgentDiffMode::View);
     }
-
-    assert!(matches!(
-        key(&mut app, KeyCode::Char('R')),
-        input::SettingsKey::None
-    ));
+    key(&mut app, KeyCode::Char('R'));
     assert_eq!(
         app.agent_diff.as_ref().unwrap().mode,
-        AgentDiffMode::ConfirmReseed
+        AgentDiffMode::ConfirmReload
     );
-    assert!(matches!(
-        key(&mut app, KeyCode::Char('n')),
-        input::SettingsKey::None
-    ));
+    key(&mut app, KeyCode::Char('n'));
     assert_eq!(app.agent_diff.as_ref().unwrap().mode, AgentDiffMode::View);
-
-    assert!(matches!(
-        key(&mut app, KeyCode::Char('a')),
-        input::SettingsKey::None
-    ));
-    match key(&mut app, KeyCode::Enter) {
-        input::SettingsKey::ApplyAgentMerge {
-            name,
-            mode: AgentMergeMode::Pick(fields),
-        } => {
-            assert_eq!(name, "agent-00");
-            assert_eq!(fields, vec![AgentField::Model]);
-        }
-        _ => panic!("pick mode Enter should apply only the picked field"),
-    }
-    // A reseed is submitted only after the separate confirmation keystroke.
-    app.agent_diff = Some(AgentDiffView {
-        agent_name: "agent-00".into(),
-        diff: chaz_core::agent_diff::diff_agent(&yaml, &AgentDbConfig::default()),
-        mode: AgentDiffMode::View,
-        cursor: 0,
-        picks: vec![],
-    });
     key(&mut app, KeyCode::Char('R'));
-    assert!(matches!(
-        key(&mut app, KeyCode::Char('y')),
-        input::SettingsKey::ApplyAgentMerge {
-            mode: AgentMergeMode::Reseed,
-            ..
-        }
-    ));
+    assert!(
+        matches!(key(&mut app, KeyCode::Char('y')), input::SettingsKey::ReloadAgentFolder { name } if name == "agent-00")
+    );
+    assert!(app.agent_diff.is_none());
     server.shutdown().await;
 }
 
@@ -3024,15 +2983,15 @@ async fn agent_diff_cursor_keeps_workers_and_values_visible() {
         .unwrap();
     app.agent_diff = Some(AgentDiffView {
         agent_name: "alpha".into(),
-        picks: vec![true; diff.rows.len()],
+
         diff,
         cursor,
-        mode: AgentDiffMode::Pick,
+        mode: AgentDiffMode::View,
     });
     for (width, height) in [(80, 24), (64, 14), (120, 40)] {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         let rows = draw(&mut terminal, &mut app, &server, &backend);
-        for expected in ["▸ [✓] ~ workers", "yaml: writer", "db:   reader"] {
+        for expected in ["▸ ~ workers", "file: writer", "db:   reader"] {
             assert!(contains(&rows, expected), "{width}x{height}: {rows:?}");
         }
     }

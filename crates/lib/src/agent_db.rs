@@ -93,15 +93,14 @@ pub struct AgentDbConfig {
     /// Paths to system-prompt files, concatenated before `system_prompt`.
     #[serde(default)]
     pub system_prompt_files: Vec<String>,
-    /// Pointer to the *resolved* system prompt (files read + inline) in the
-    /// [`crate::prompt_store`] blob store on `chaz_peer`: an eidetica
-    /// [`Snapshot`](eidetica::Snapshot) of the commit that wrote it. Set when
-    /// startup finishes seeding the agent and whenever `/agent set` (or an
-    /// explicit yaml merge) changes a prompt field; the runtime fetches the
-    /// resolved text by reading at this snapshot rather than re-reading the
-    /// files each turn. Stored as a tip (CID) rather than a recomputed hash so
-    /// the exact prompt version is reproducible. `None` until then — the
-    /// runtime reads the files directly in that case.
+    /// Portable ordered source text, committed atomically with these settings.
+    /// None denotes an unmigrated legacy config; old writers are unsupported
+    /// once a bundle is in use.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_sources: Option<crate::agent_bundle::PromptSources>,
+    /// Legacy saved effective-prompt pointer on unsynchronized `chaz_peer`.
+    /// Migration reads it to preserve exact text, then clears the pointer in
+    /// favor of the synchronized source bundle. Historical blobs are retained.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub system_prompt_ref: Option<eidetica::Snapshot>,
     /// Legacy bookkeeping: hash of the yaml-derived config an older chaz last
@@ -283,6 +282,7 @@ impl AgentDbConfig {
             // (Server::complete_agent_seed), which reads the files and stores
             // the blob.
             system_prompt_ref: None,
+            prompt_sources: None,
             applied_config_hash: None,
             model: cfg.model.clone(),
             tools: cfg.tools.clone(),
@@ -536,10 +536,13 @@ impl AgentDb {
     }
 
     pub async fn read_config(&self) -> anyhow::Result<AgentDbConfig> {
-        read_blob(&self.database, CONFIG_STORE).await
+        let cfg = read_blob(&self.database, CONFIG_STORE).await?;
+        crate::agent_bundle::validate(&cfg)?;
+        Ok(cfg)
     }
 
     pub async fn write_config(&self, cfg: &AgentDbConfig) -> anyhow::Result<()> {
+        crate::agent_bundle::validate(cfg)?;
         write_blob(&self.database, CONFIG_STORE, cfg).await
     }
 
@@ -1031,6 +1034,7 @@ pub async fn create_agent_db(
     agent_cfg: &AgentDbConfig,
     meta: &AgentMeta,
 ) -> anyhow::Result<(AgentDb, PublicKey)> {
+    crate::agent_bundle::validate(agent_cfg)?;
     let key = user
         .add_private_key(Some(&format!("agent:{display_name}")))
         .await?;
@@ -1147,7 +1151,10 @@ pub async fn bootstrap_from_config(
                 }
             }
             None => {
-                let agent_cfg = AgentDbConfig::from_agent_config(ac);
+                let mut agent_cfg = AgentDbConfig::from_agent_config(ac);
+                if config.agent_config_dir.is_some() {
+                    crate::agent_bundle::import_sources(&mut agent_cfg)?;
+                }
                 let meta = AgentMeta {
                     display_name: Some(ac.name.clone()),
                     ..Default::default()

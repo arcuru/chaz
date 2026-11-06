@@ -1,4 +1,4 @@
-//! YAML seeds agents; the Agent DB is authoritative afterwards. These tests
+//! YAML seeds agents; managed folders explicitly round-trip scoped config. These tests
 //! drive the real daemon build (`build` + its deferred startup) over an
 //! Eidetica service over on-disk SQLite, stop both, and rebuild from the same
 //! file with edited yaml. No model
@@ -6,7 +6,7 @@
 
 use super::build::{BuildOptions, BuiltServer, McpReadiness, build};
 use crate::agent_db::AgentDbConfig;
-use crate::commands::{Command, CommandContext, CommandOutcome, dispatch};
+use crate::commands::{Command, CommandOutcome};
 use crate::config::Config;
 use eidetica::Instance;
 use std::path::{Path, PathBuf};
@@ -48,7 +48,9 @@ impl Disk {
             format_args!("unix://{}", self.socket.display())
         );
         std::fs::write(&self.config_path, &body).unwrap();
-        serde_yaml::from_str(&body).unwrap()
+        let mut config: Config = serde_yaml::from_str(&body).unwrap();
+        config.agent_config_dir = Some(self._dir.path().join("agents").display().to_string());
+        config
     }
 }
 
@@ -93,7 +95,7 @@ async fn boot(disk: &Disk, mut config: Config, first: bool) -> (BuiltServer, Ser
         .await
         .unwrap();
     let user = instance.login_account("chaz", None).await.unwrap();
-    let built = build(
+    let built = Box::pin(build(
         &mut config,
         instance,
         user,
@@ -106,7 +108,7 @@ async fn boot(disk: &Disk, mut config: Config, first: bool) -> (BuiltServer, Ser
             mcp_readiness: McpReadiness::Deferred,
             targeted_session: None,
         },
-    )
+    ))
     .await
     .unwrap();
     // Seed completion runs in the deferred startup task, before the
@@ -161,25 +163,15 @@ async fn open_agent(
 }
 
 async fn command(built: &BuiltServer, cmd: Command) -> Result<String, String> {
-    let (session_db_id, session_db) = built
-        .registry
-        .create_session(Some("seed-test"))
-        .await
-        .unwrap();
-    let backend = crate::backends::BackendManager::new(&None, built.secret_store.clone());
-    let ctx = CommandContext {
-        server: &built.server,
-        secrets: &built.secret_store,
-        backend: &backend,
-        session_db_id: &session_db_id.0,
-        session_db: &session_db,
-        current_agent: "alpha",
-        session_name: None,
-    };
-    match dispatch(cmd, &ctx).await {
-        CommandOutcome::Text(text) => Ok(text),
-        CommandOutcome::Error(error) => Err(error),
-        _ => Err("unexpected outcome".into()),
+    match Box::pin(crate::commands::dispatch_without_session(
+        cmd,
+        &built.server,
+    ))
+    .await
+    {
+        Ok(CommandOutcome::Text(text)) => Ok(text),
+        Ok(CommandOutcome::Error(error)) => Err(error),
+        _ => Err("expected sessionless administration outcome".into()),
     }
 }
 
@@ -202,6 +194,21 @@ async fn prompt(built: &BuiltServer, name: &str) -> String {
         .hydrate_agent_from_db(agent)
         .await
         .system_prompt
+}
+
+async fn write_document(built: &BuiltServer, name: &str, cfg: &AgentDbConfig) {
+    let entry = built.server.agent_index().find_by_name(name).unwrap();
+    let folder = built
+        .server
+        .agent_folders()
+        .unwrap()
+        .folder(name, &entry.db_id.to_string());
+    let document = crate::agent_bundle::AgentDocument::from_config(&entry.db_id.to_string(), cfg);
+    std::fs::write(
+        folder.join("agent.yaml"),
+        serde_yaml::to_string(&document).unwrap(),
+    )
+    .unwrap();
 }
 
 fn alpha_v1(prompt_path: &Path) -> String {
@@ -236,7 +243,8 @@ async fn yaml_seeds_new_agents_and_db_config_survives_full_restart() {
         Some(serde_json::json!({"endpoints": [], "allow_private": false}))
     );
     assert_eq!(seeded.workers.len(), 1);
-    assert!(seeded.system_prompt_ref.is_some());
+    assert!(seeded.prompt_sources.is_some());
+    assert!(seeded.system_prompt_ref.is_none());
     assert_eq!(prompt(&built, "alpha").await, "file v1\n\ninline v1");
     let (entry, db) = open_agent(&built, "alpha").await;
     let bank_refs = db.list_memory_banks().await.unwrap();
@@ -280,11 +288,19 @@ async fn yaml_seeds_new_agents_and_db_config_survives_full_restart() {
     assert_eq!(edited.max_spawn_depth, Some(10));
     assert_eq!(edited.system_prompt, "");
 
-    // `/agent reload` only reports.
+    // Explicit reload of the unchanged projection is a no-op, not global YAML apply.
     let report = command(&built, Command::AgentReload(None)).await.unwrap();
-    assert!(report.contains("Nothing was changed"), "{report}");
-    assert!(report.contains("alpha: DB differs from yaml"), "{report}");
+    assert!(report.contains("already matches accepted"), "{report}");
     assert_eq!(read_agent(&built, "alpha").await.1, edited);
+    let (entry, _) = open_agent(&built, "alpha").await;
+    let managed = built
+        .server
+        .agent_folders()
+        .unwrap()
+        .folder("alpha", &entry.db_id.to_string());
+    std::fs::write(managed.join("agent.yaml"), "invalid pending draft: [").unwrap();
+    let pending_prompt = managed.join(&edited.system_prompt_files[0]);
+    std::fs::write(&pending_prompt, "PENDING LOCAL FILE").unwrap();
     stop(built, service).await;
 
     // ── Boot 2: yaml changed in every way an old reconcile reacted to. ──
@@ -318,40 +334,44 @@ async fn yaml_seeds_new_agents_and_db_config_survives_full_restart() {
     drop(session_db);
     let (_, beta) = read_agent(&built, "beta").await;
     assert_eq!(beta.model.as_deref(), Some("b1"));
-    assert!(beta.system_prompt_ref.is_some());
+    assert!(beta.prompt_sources.is_some());
     assert_eq!(prompt(&built, "beta").await, "beta prompt");
 
-    // An explicit pick is the deliberate way to take a yaml value; it writes
-    // only that field.
-    let outcome = built
-        .server
-        .merge_agent_from_yaml(
-            "alpha",
-            &crate::agent_diff::AgentMergeMode::Pick(vec![crate::agent_diff::AgentField::Model]),
-        )
+    assert_eq!(
+        std::fs::read_to_string(managed.join("agent.yaml")).unwrap(),
+        "invalid pending draft: ["
+    );
+    assert_eq!(
+        std::fs::read_to_string(&pending_prompt).unwrap(),
+        "PENDING LOCAL FILE"
+    );
+    assert!(
+        command(&built, Command::AgentReload(Some("alpha".into())))
+            .await
+            .is_err()
+    );
+    command(&built, Command::AgentProject("alpha".into()))
         .await
         .unwrap();
-    assert!(outcome.changed);
-    let (_, picked) = read_agent(&built, "alpha").await;
+    assert_eq!(std::fs::read_to_string(&pending_prompt).unwrap(), "file v1");
+    // Full folder replacement, not a field-pick import from the seed YAML.
     let mut expected = edited.clone();
     expected.model = Some("m2".into());
-    assert_eq!(picked, expected);
-    built
-        .server
-        .merge_agent_from_yaml(
-            "alpha",
-            &crate::agent_diff::AgentMergeMode::Pick(vec![crate::agent_diff::AgentField::Workers]),
-        )
-        .await
-        .unwrap();
-    let (_, picked) = read_agent(&built, "alpha").await;
+    write_document(&built, "alpha", &expected).await;
+    let outcome = built.server.reload_agent_folder("alpha").await.unwrap();
+    assert!(outcome.changed);
+    assert!(outcome.projection_error.is_none());
+    assert_eq!(read_agent(&built, "alpha").await.1, expected);
     expected.workers = vec![crate::agent_db::WorkerDbConfig {
         name: "writer".into(),
         ..Default::default()
     }];
+    write_document(&built, "alpha", &expected).await;
+    built.server.reload_agent_folder("alpha").await.unwrap();
+    let (_, picked) = read_agent(&built, "alpha").await;
     assert_eq!(
         picked, expected,
-        "worker import changes only the selected list"
+        "full scoped replacement preserved unrelated state"
     );
     stop(built, service).await;
 
@@ -384,27 +404,46 @@ async fn yaml_seeds_new_agents_and_db_config_survives_full_restart() {
 }
 
 #[tokio::test]
-async fn legacy_applied_config_hash_never_triggers_reapply() {
+async fn legacy_saved_prompt_migration_preserves_identity_and_hash_across_restart() {
     let disk = Disk::new();
     std::fs::write(&disk.prompt_path, "file v1").unwrap();
-    let (built, service) = boot(&disk, disk.config(&alpha_v1(&disk.prompt_path)), true).await;
-
-    // Simulate a database last written by the hash-gated reconcile, then
-    // edited by the user afterwards.
-    let (_, db) = open_agent(&built, "alpha").await;
-    let mut legacy = db.read_config().await.unwrap();
+    let mut seed = disk.config(&alpha_v1(&disk.prompt_path));
+    seed.agent_config_dir = None; // A real older-format writer with a saved snapshot.
+    let (built, service) = boot(&disk, seed, true).await;
+    let (identity, mut legacy) = read_agent(&built, "alpha").await;
+    assert!(legacy.prompt_sources.is_none() && legacy.system_prompt_ref.is_some());
     legacy.applied_config_hash = Some("hash-from-older-chaz".into());
     legacy.autonomous = false;
-    // No pointer is not proof of an unfinished seed: older versions used it
-    // for empty resolved prompts, including missing or empty prompt files.
-    legacy.system_prompt_ref = None;
+    let (_, db) = open_agent(&built, "alpha").await;
     db.write_config(&legacy).await.unwrap();
+    let bank_refs = db.list_memory_banks().await.unwrap();
     drop(db);
     stop(built, service).await;
 
+    std::fs::write(&disk.prompt_path, "EXTERNAL EDIT NOT APPROVED").unwrap();
     let config = disk.config("  - name: alpha\n    model: m9\n    autonomous: true\n");
+    let (built, service) = boot(&disk, config.clone(), false).await;
+    let (after_identity, migrated) = read_agent(&built, "alpha").await;
+    assert_eq!(after_identity, identity);
+    assert_eq!(migrated.model, legacy.model);
+    assert_eq!(migrated.capabilities, legacy.capabilities);
+    assert_eq!(migrated.grants, legacy.grants);
+    assert_eq!(migrated.workers, legacy.workers);
+    assert_eq!(migrated.autonomous, legacy.autonomous);
+    assert_eq!(migrated.applied_config_hash, legacy.applied_config_hash);
+    assert!(migrated.prompt_sources.is_some() && migrated.system_prompt_ref.is_none());
+    assert_eq!(prompt(&built, "alpha").await, "file v1\n\ninline v1");
+    assert_eq!(
+        std::fs::read_to_string(&disk.prompt_path).unwrap(),
+        "EXTERNAL EDIT NOT APPROVED"
+    );
+    let (_, db) = open_agent(&built, "alpha").await;
+    assert_eq!(db.list_memory_banks().await.unwrap(), bank_refs);
+    drop(db);
+    stop(built, service).await;
     let (built, service) = boot(&disk, config, false).await;
-    assert_eq!(read_agent(&built, "alpha").await.1, legacy);
+    assert_eq!(read_agent(&built, "alpha").await, (identity, migrated));
+    assert_eq!(prompt(&built, "alpha").await, "file v1\n\ninline v1");
     stop(built, service).await;
 }
 
@@ -417,13 +456,7 @@ async fn empty_file_prompt_stays_pinned_until_explicit_refresh() {
         disk.prompt_path.display()
     );
     let (built, service) = boot(&disk, disk.config(&yaml), true).await;
-    assert!(
-        read_agent(&built, "alpha")
-            .await
-            .1
-            .system_prompt_ref
-            .is_some()
-    );
+    assert!(read_agent(&built, "alpha").await.1.prompt_sources.is_some());
     std::fs::write(&disk.prompt_path, "file edit").unwrap();
     assert_eq!(prompt(&built, "alpha").await, "");
 
@@ -434,7 +467,7 @@ async fn empty_file_prompt_stays_pinned_until_explicit_refresh() {
     std::fs::write(&disk.prompt_path, "").unwrap();
     set(&built, "system_prompt_files", path).await.unwrap();
     let (_, empty) = read_agent(&built, "alpha").await;
-    assert!(empty.system_prompt_ref.is_some());
+    assert!(empty.prompt_sources.is_some());
     std::fs::write(&disk.prompt_path, "another file edit").unwrap();
     assert_eq!(prompt(&built, "alpha").await, "");
     command(&built, Command::AgentReload(None)).await.unwrap();
@@ -444,32 +477,20 @@ async fn empty_file_prompt_stays_pinned_until_explicit_refresh() {
     let (built, service) = boot(&disk, disk.config(&yaml), false).await;
     assert_eq!(read_agent(&built, "alpha").await.1, empty);
     assert_eq!(prompt(&built, "alpha").await, "");
-    // A partial prompt pick resolves the final combination of YAML inline
-    // text and the *DB's* file list, not a YAML-only prompt.
-    disk.config("  - name: alpha\n    system_prompt: inline imported\n");
-    built
-        .server
-        .merge_agent_from_yaml(
-            "alpha",
-            &crate::agent_diff::AgentMergeMode::Pick(vec![
-                crate::agent_diff::AgentField::SystemPrompt,
-            ]),
-        )
+    // Inline scalar edits do not import pending external or managed file edits.
+    disk.config("  - name: alpha\n    system_prompt: stale seed text\n");
+    set(&built, "system_prompt", "inline imported")
         .await
         .unwrap();
     let (_, merged) = read_agent(&built, "alpha").await;
     assert_eq!(merged.system_prompt_files, empty.system_prompt_files);
     assert_eq!(merged.system_prompt, "inline imported");
-    assert_eq!(
-        prompt(&built, "alpha").await,
-        "another file edit\n\ninline imported"
-    );
+    assert_eq!(prompt(&built, "alpha").await, "inline imported");
     stop(built, service).await;
 }
 
 #[tokio::test]
 async fn unreadable_config_refuses_seed_merge_reload_and_set_without_writes() {
-    use crate::agent_diff::AgentMergeMode;
     use eidetica::store::DocStore;
 
     let disk = Disk::new();
@@ -498,13 +519,7 @@ async fn unreadable_config_refuses_seed_merge_reload_and_set_without_writes() {
         let before = db.database().snapshot().await.unwrap();
         assert!(built.server.complete_agent_seed("alpha").await.is_err());
         assert!(built.server.agent_diff("alpha").await.is_err());
-        assert!(
-            built
-                .server
-                .merge_agent_from_yaml("alpha", &AgentMergeMode::Reseed)
-                .await
-                .is_err()
-        );
+        assert!(built.server.reload_agent_folder("alpha").await.is_err());
         assert!(command(&built, Command::AgentReload(None)).await.is_err());
         assert!(set(&built, "model", "replacement").await.is_err());
         assert_eq!(db.database().snapshot().await.unwrap(), before);
@@ -552,13 +567,7 @@ async fn unreadable_config_refuses_seed_merge_reload_and_set_without_writes() {
     let before = db.database().snapshot().await.unwrap();
     let error = set(&built, "model", "replacement").await.unwrap_err();
     assert!(error.contains("Permission denied"), "{error}");
-    assert!(
-        built
-            .server
-            .merge_agent_from_yaml("alpha", &AgentMergeMode::Reseed)
-            .await
-            .is_err()
-    );
+    assert!(built.server.reload_agent_folder("alpha").await.is_err());
     assert_eq!(db.database().snapshot().await.unwrap(), before);
     assert_eq!(db.read_config().await.unwrap(), healthy);
     assert_eq!(

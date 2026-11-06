@@ -1,30 +1,10 @@
-//! Explicit Agent yaml↔DB comparison and merging.
-//!
-//! An Agent's declarative shape lives in two places: the **yaml** template
-//! (`AgentConfig`, which seeds a new Agent DB) and the **DB-actual** config
-//! ([`AgentDbConfig`], authoritative once the agent exists). The two can
-//! differ — a live `/agent set` edit changes the DB without touching yaml, and
-//! a yaml edit is never applied to an existing agent automatically.
-//!
-//! This module is the pure, testable core behind the TUI Peer→Agents diff
-//! view: it computes a field-level diff between the two and applies an
-//! explicitly chosen merge back into the DB config. It does no IO — the server
-//! layer reads/writes the actual DBs and resolves the prompt blob.
-//!
-//! ## Merge modes
-//! Both modes are user actions; nothing calls them on its own.
-//! - [`AgentMergeMode::Reseed`] (`[R]`, confirmed) — copy every declarative
-//!   field, including worker templates, from yaml into the DB.
-//! - [`AgentMergeMode::Pick`] (`[a]`, "pick changes") — apply exactly the
-//!   user-selected fields.
-//!
-//! There is deliberately no "fill in what the DB never set" mode: a value equal
-//! to the type default may be a deliberate `/agent set` choice (e.g.
-//! `autonomous=false`), and the DB keeps no record of which fields were set.
+//! Read-only pending-folder versus accepted Agent DB comparison.
+//! Field-default equality labels display differences; it never chooses which
+//! values survive a reload. Imports replace the complete editable scope.
 
 use crate::agent_db::AgentDbConfig;
 
-/// How a single field (or worker) differs between the yaml-declared config and
+/// How a single field (or worker) differs between the folder draft and
 /// the DB-actual config. Direction is yaml→DB: "added" means applying yaml
 /// would *add* a value the DB lacks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -40,15 +20,15 @@ pub enum FieldStatus {
 }
 
 /// The declarative `AgentDbConfig` fields the diff/merge covers.
-/// `system_prompt_ref` and `applied_config_hash` are runtime bookkeeping, not
-/// declarative, so they're excluded — the server re-resolves the prompt
-/// pointer when a prompt field is merged. `default_memory_banks` and
+/// `system_prompt_ref` and `applied_config_hash` are legacy bookkeeping, not
+/// editable settings. Individual prompt contents have their own display row. `default_memory_banks` and
 /// `default_skill_banks` are excluded too: bank attachment reads them from
 /// yaml at startup, not from the DB.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AgentField {
     SystemPrompt,
     SystemPromptFiles,
+    PromptSources,
     Model,
     Tools,
     MaxSpawnDepth,
@@ -62,10 +42,11 @@ pub enum AgentField {
 }
 
 impl AgentField {
-    /// Every mergeable field, in display order.
+    /// Every displayed field, in display order.
     pub const ALL: &'static [Self] = &[
         Self::SystemPrompt,
         Self::SystemPromptFiles,
+        Self::PromptSources,
         Self::Model,
         Self::Tools,
         Self::MaxSpawnDepth,
@@ -83,6 +64,7 @@ impl AgentField {
         match self {
             Self::SystemPrompt => "system_prompt",
             Self::SystemPromptFiles => "system_prompt_files",
+            Self::PromptSources => "prompt_contents",
             Self::Model => "default_model",
             Self::Tools => "allowed_tools",
             Self::MaxSpawnDepth => "max_spawn_depth",
@@ -110,6 +92,7 @@ impl AgentField {
         match self {
             Self::SystemPrompt => a.system_prompt == b.system_prompt,
             Self::SystemPromptFiles => a.system_prompt_files == b.system_prompt_files,
+            Self::PromptSources => a.prompt_sources == b.prompt_sources,
             Self::Model => a.model == b.model,
             Self::Tools => a.tools == b.tools,
             Self::MaxSpawnDepth => a.max_spawn_depth == b.max_spawn_depth,
@@ -135,6 +118,21 @@ impl AgentField {
                     cfg.system_prompt_files.join(", ")
                 }
             }
+            Self::PromptSources => cfg
+                .prompt_sources
+                .as_ref()
+                .map(|sources| {
+                    sources
+                        .files
+                        .iter()
+                        .map(|(path, text)| {
+                            let hash = blake3::hash(text.as_bytes()).to_hex();
+                            format!("{path} [{}]: {}", &hash[..8], preview(text))
+                        })
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                })
+                .unwrap_or_else(|| "(legacy sources)".into()),
             Self::Model => opt_str(cfg.model.as_deref()),
             Self::Tools => render_tools(cfg.tools.as_deref()),
             Self::MaxSpawnDepth => cfg
@@ -182,25 +180,6 @@ impl AgentField {
             }
         }
     }
-
-    /// Copy this field's value from `from` into `into`. The single per-field
-    /// write primitive behind every merge mode.
-    pub fn copy_into(self, from: &AgentDbConfig, into: &mut AgentDbConfig) {
-        match self {
-            Self::SystemPrompt => into.system_prompt = from.system_prompt.clone(),
-            Self::SystemPromptFiles => into.system_prompt_files = from.system_prompt_files.clone(),
-            Self::Model => into.model = from.model.clone(),
-            Self::Tools => into.tools = from.tools.clone(),
-            Self::MaxSpawnDepth => into.max_spawn_depth = from.max_spawn_depth,
-            Self::Autonomous => into.autonomous = from.autonomous,
-            Self::Presets => into.presets = from.presets.clone(),
-            Self::ToolProfile => into.tool_profile = from.tool_profile.clone(),
-            Self::MaxContextTokens => into.max_context_tokens = from.max_context_tokens,
-            Self::Capabilities => into.capabilities = from.capabilities.clone(),
-            Self::Grants => into.grants = from.grants.clone(),
-            Self::Workers => into.workers = from.workers.clone(),
-        }
-    }
 }
 
 /// One row of the diff — a single field, both rendered values, and the status.
@@ -214,14 +193,14 @@ pub struct AgentDiffRow {
 }
 
 /// One worker entry in the diff: per-template detail behind the `workers`
-/// field row. Merging applies the whole template list via that row.
+/// field row. The list is included in a whole-scope reload.
 #[derive(Clone, Debug)]
 pub struct WorkerDiffRow {
     pub name: String,
     pub status: FieldStatus,
 }
 
-/// Full diff between a yaml-declared config and a DB-actual config.
+/// Full diff between a folder draft and a DB-actual config.
 #[derive(Clone, Debug)]
 pub struct AgentDiff {
     pub rows: Vec<AgentDiffRow>,
@@ -229,15 +208,14 @@ pub struct AgentDiff {
 }
 
 impl AgentDiff {
-    /// Whether any mergeable field differs, including worker templates.
-    /// Used by the TUI to short-circuit "nothing to merge".
+    /// Whether any displayed field differs, including sources and workers.
+    /// Used by read-only administration displays.
     pub fn has_field_changes(&self) -> bool {
         self.rows.iter().any(|r| r.status != FieldStatus::Unchanged)
     }
 }
 
-/// Compute the field-level diff. `yaml` is the yaml-derived config
-/// (`AgentDbConfig::from_agent_config(...)`); `db` is the DB-actual config.
+/// Compute the field-level diff. `yaml` is the validated folder config; `db` is the DB-actual config.
 pub fn diff_agent(yaml: &AgentDbConfig, db: &AgentDbConfig) -> AgentDiff {
     let rows = AgentField::ALL
         .iter()
@@ -296,41 +274,6 @@ fn diff_workers(yaml: &AgentDbConfig, db: &AgentDbConfig) -> Vec<WorkerDiffRow> 
             WorkerDiffRow { name, status }
         })
         .collect()
-}
-
-/// Which merge to apply. See module docs.
-#[derive(Clone, Debug)]
-pub enum AgentMergeMode {
-    /// `[R]` (confirmed) — copy every declarative field from yaml.
-    Reseed,
-    /// `[a]` — apply exactly these fields.
-    Pick(Vec<AgentField>),
-}
-
-impl AgentMergeMode {
-    /// The concrete field set this mode writes.
-    pub fn fields(&self) -> Vec<AgentField> {
-        match self {
-            AgentMergeMode::Reseed => AgentField::ALL.to_vec(),
-            AgentMergeMode::Pick(fields) => fields.clone(),
-        }
-    }
-}
-
-/// Apply a merge: returns a new DB config with the selected fields taken from
-/// `yaml` and everything else (including workers and runtime bookkeeping)
-/// preserved from `db`. Pure — the caller persists the result.
-pub fn apply_merge(
-    db: &AgentDbConfig,
-    yaml: &AgentDbConfig,
-    mode: &AgentMergeMode,
-) -> AgentDbConfig {
-    let fields = mode.fields();
-    let mut out = db.clone();
-    for f in &fields {
-        f.copy_into(yaml, &mut out);
-    }
-    out
 }
 
 // ---- small render helpers ------------------------------------------------
@@ -434,73 +377,6 @@ mod tests {
     }
 
     #[test]
-    fn reseed_overwrites_everything_from_yaml() {
-        let mut yaml = cfg();
-        yaml.model = Some("opus".into());
-        yaml.max_spawn_depth = Some(20);
-
-        let mut db = cfg();
-        db.model = Some("haiku".into());
-        db.max_spawn_depth = Some(99);
-
-        let merged = apply_merge(&db, &yaml, &AgentMergeMode::Reseed);
-        assert_eq!(merged.model.as_deref(), Some("opus"));
-        assert_eq!(merged.max_spawn_depth, Some(20));
-    }
-
-    #[test]
-    fn reseed_copies_workers_and_preserves_runtime_bookkeeping() {
-        let mut yaml = cfg();
-        yaml.workers = vec![WorkerDbConfig {
-            name: "writer".into(),
-            ..Default::default()
-        }];
-        let mut db = cfg();
-        db.workers = vec![WorkerDbConfig {
-            name: "researcher".into(),
-            ..Default::default()
-        }];
-        db.applied_config_hash = Some("deadbeef".into());
-        db.default_memory_banks = vec!["notes".into()];
-
-        let merged = apply_merge(&db, &yaml, &AgentMergeMode::Reseed);
-        assert_eq!(merged.workers, yaml.workers);
-        assert_eq!(merged.applied_config_hash.as_deref(), Some("deadbeef"));
-        assert_eq!(merged.default_memory_banks, vec!["notes".to_string()]);
-    }
-
-    #[test]
-    fn pick_leaves_deliberate_default_values_alone() {
-        // `autonomous=false` and empty tools may be deliberate `/agent set`
-        // choices. Only a picked field changes; nothing is inferred from a
-        // value equalling the default.
-        let mut yaml = cfg();
-        yaml.autonomous = true;
-        yaml.tools = Some(vec!["shell".into()]);
-        yaml.model = Some("opus".into());
-        let mut db = cfg();
-        db.tools = Some(vec![]);
-
-        let merged = apply_merge(&db, &yaml, &AgentMergeMode::Pick(vec![AgentField::Model]));
-        assert_eq!(merged.model.as_deref(), Some("opus"));
-        assert!(!merged.autonomous);
-        assert_eq!(merged.tools, Some(vec![]));
-    }
-
-    #[test]
-    fn pick_applies_only_selected_fields() {
-        let mut yaml = cfg();
-        yaml.model = Some("opus".into());
-        yaml.tool_profile = Some("deep".into());
-
-        let db = cfg();
-        let merged = apply_merge(&db, &yaml, &AgentMergeMode::Pick(vec![AgentField::Model]));
-        assert_eq!(merged.model.as_deref(), Some("opus"));
-        // tool_profile not picked → stays at db default.
-        assert_eq!(merged.tool_profile, None);
-    }
-
-    #[test]
     fn worker_diff_classifies_presence() {
         let mut yaml = cfg();
         yaml.workers = vec![
@@ -532,8 +408,31 @@ mod tests {
     }
 
     #[test]
-    fn reseed_fields_cover_every_declarative_field() {
-        assert_eq!(AgentMergeMode::Reseed.fields(), AgentField::ALL.to_vec());
-        assert!(AgentField::ALL.contains(&AgentField::Workers));
+    fn content_only_prompt_changes_are_visible() {
+        let mut accepted = cfg();
+        accepted.prompt_sources = Some(crate::agent_bundle::PromptSources {
+            version: 1,
+            files: std::collections::BTreeMap::from([(
+                "prompts/system.md".into(),
+                "ACCEPTED".into(),
+            )]),
+            ..Default::default()
+        });
+        let mut draft = accepted.clone();
+        draft
+            .prompt_sources
+            .as_mut()
+            .unwrap()
+            .files
+            .insert("prompts/system.md".into(), "EDITED".into());
+        let diff = diff_agent(&draft, &accepted);
+        let row = diff
+            .rows
+            .iter()
+            .find(|r| r.field == AgentField::PromptSources)
+            .unwrap();
+        assert_eq!(row.status, FieldStatus::Changed);
+        assert!(row.yaml.contains("EDITED"));
+        assert!(row.db.contains("ACCEPTED"));
     }
 }

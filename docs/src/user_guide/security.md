@@ -38,6 +38,14 @@ Two more orthogonal layers wrap everything:
 
 The capability boundary is the **`ToolHost`** trait. The default `NativeToolHost` runs in-process and enforces grants; future hosts (WASM, bubblewrap) will swap in stronger isolation without any tool-code changes. Session-time tool code never calls OS APIs directly — it requests a `Capability::Shell|FileRead|FileWrite|HttpRequest` from the host, and a source-scan test fails the build if tool or extension code reintroduces a direct client ([architecture](../architecture/tools.md#toolhost)). Grants bound what tools do; they do not bound the daemon's own connections to its model providers — see [Not an air-gap](#not-an-air-gap-what-tool-grants-do-not-cover).
 
+## Agent configuration is operator-owned
+
+Managed agent settings and prompt-source folders are an administration interface, not model memory. Trusted local clients and remote bridges retain their existing key/ownership checks and administration access. Models have read-only Chaz queries, not settings mutation or general slash-command dispatch. Reply text is never interpreted as an operator command.
+
+The model file-tool host denies writes to the managed root, including traversal, symlink and hardlink aliases, while preserving ordinary granted workspace writes. Operator commits and folder projection bypass that model-only interface. This is a narrower check than the general advisory filesystem grants described below.
+
+**Native same-user shell and trusted native extensions are not isolated.** They can bypass the direct file-tool boundary. This feature adds no OS sandbox, login-role system or separate host-owned grant registry. Restrictions remain in operator-controlled agent configuration, and full reload omission restores their documented defaults. See [Agent folders](agents.md#operator-owned-not-model-editable) for rollout and old-writer limits.
+
 ## Tool Approval
 
 Each tool has a default approval requirement that can be overridden in config:

@@ -302,7 +302,7 @@ mod tests {
 
     async fn ctx_with(host: Arc<MockHost>) -> (eidetica::Instance, ToolContext) {
         let (instance, session) = fresh_session().await;
-        let ctx = tool_context_with_host(session, Arc::new(ToolRegistry::new()), host);
+        let ctx = tool_context_with_host(session, Arc::new(crate::tool::ToolRegistry::new()), host);
         (instance, ctx)
     }
 
@@ -887,5 +887,57 @@ mod tests {
             .await
             .unwrap_err();
         assert!(format!("{err}").to_lowercase().contains("unexpected"));
+    }
+    #[tokio::test]
+    async fn managed_agent_files_are_operator_only_even_through_aliases() {
+        let root = tempfile::tempdir().unwrap();
+        let managed = root.path().join("agents");
+        let folder = managed.join("helper");
+        std::fs::create_dir_all(&folder).unwrap();
+        let settings = folder.join("agent.yaml");
+        std::fs::write(&settings, "OPERATOR").unwrap();
+        let (instance, session) = fresh_session().await;
+        let host = Arc::new(crate::tool_host::AgentConfigToolHost::new(managed.clone()));
+        let ctx = tool_context_with_host(session, Arc::new(crate::tool::ToolRegistry::new()), host);
+        let mut denied = vec![
+            settings.clone(),
+            root.path().join("agents/helper/../helper/agent.yaml"),
+            folder.join("new-prompt.md"),
+        ];
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&managed, root.path().join("alias")).unwrap();
+            denied.push(root.path().join("alias/helper/agent.yaml"));
+            denied.push(root.path().join("alias/helper/new.md"));
+            std::fs::hard_link(&settings, root.path().join("hardlink.yaml")).unwrap();
+            denied.push(root.path().join("hardlink.yaml"));
+            let outside = root.path().join("ordinary.md");
+            std::fs::write(&outside, "OUTSIDE").unwrap();
+            std::os::unix::fs::symlink(&outside, folder.join("escape.md")).unwrap();
+            denied.push(folder.join("escape.md"));
+            std::os::unix::fs::symlink(root.path(), folder.join("escape-dir")).unwrap();
+            denied.push(folder.join("escape-dir/new.md"));
+        }
+        for path in denied {
+            let error = WriteFile
+                .execute(serde_json::json!({"path":path,"content":"MODEL"}), &ctx)
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("operator-owned"), "{error}");
+            assert_eq!(std::fs::read_to_string(&settings).unwrap(), "OPERATOR");
+        }
+        let allowed = root.path().join("workspace.md");
+        WriteFile
+            .execute(
+                serde_json::json!({"path":allowed,"content":"WORKSPACE"}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(allowed).unwrap(), "WORKSPACE");
+        // Trusted administration writes do not go through the model host.
+        std::fs::write(&settings, "ADMIN").unwrap();
+        assert_eq!(std::fs::read_to_string(&settings).unwrap(), "ADMIN");
+        drop(instance);
     }
 }

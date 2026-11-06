@@ -6,8 +6,10 @@
 //! CLI) and the entrypoint.
 
 pub mod agent;
+pub mod agent_bundle;
 pub mod agent_db;
 pub mod agent_diff;
+pub mod agent_folder;
 pub mod anthropic;
 pub mod backends;
 pub mod bridge;
