@@ -21,7 +21,7 @@ pub(super) async fn resolve_agent_ref(
 
 async fn resolve_hosted_agent(
     agent_ref: &str,
-    server: &crate::server::Server,
+    server: &std::sync::Arc<crate::server::Server>,
 ) -> Result<crate::hosted_index::DbEntry, String> {
     if let Err(e) = server.ensure_hosted_indices_complete().await {
         return Err(format!("Failed to load hosted agents: {e}"));
@@ -373,6 +373,11 @@ pub(super) async fn agent_new(
     if let Err(msg) = apply_agent_new_overrides(&mut cfg, overrides) {
         return CommandOutcome::Error(msg);
     }
+    if ctx.server.agent_folders().is_some()
+        && let Err(e) = crate::agent_bundle::import_sources(&mut cfg)
+    {
+        return CommandOutcome::Error(format!("Invalid agent prompt sources: {e:#}"));
+    }
     let meta = crate::agent_db::AgentMeta {
         display_name: Some(name.to_string()),
         ..Default::default()
@@ -405,6 +410,24 @@ pub(super) async fn agent_new(
         return CommandOutcome::Error(format!(
             "Agent DB created + indexed but runtime registry rejected: {e}"
         ));
+    }
+
+    if ctx.server.agent_folders().is_some() {
+        if let Err(e) = ctx.server.watch_agent_config(name).await {
+            return CommandOutcome::Error(format!("Agent created, but config watch failed: {e:#}"));
+        }
+        match ctx.server.project_agent_config(name, false).await {
+            Ok(outcome) if outcome.projection_error.is_none() => {}
+            Ok(outcome) => {
+                return CommandOutcome::Error(format!(
+                    "Agent created; projection failed: {:?}",
+                    outcome.projection_error
+                ));
+            }
+            Err(e) => {
+                return CommandOutcome::Error(format!("Agent created; projection failed: {e:#}"));
+            }
+        }
     }
 
     CommandOutcome::Text(format!(
@@ -583,6 +606,28 @@ pub(super) async fn agent_import(
         ));
     }
 
+    if ctx.server.agent_folders().is_some() {
+        if let Err(e) = ctx.server.watch_agent_config(&display_name).await {
+            return CommandOutcome::Error(format!(
+                "Imported, but configuration watch failed: {e:#}"
+            ));
+        }
+        match ctx.server.project_agent_config(&display_name, false).await {
+            Ok(outcome) if outcome.projection_error.is_none() => {}
+            Ok(outcome) => {
+                return CommandOutcome::Error(format!(
+                    "Imported; DB authoritative, projection failed: {:?}",
+                    outcome.projection_error
+                ));
+            }
+            Err(e) => {
+                return CommandOutcome::Error(format!(
+                    "Imported; folder migration/projection blocked: {e:#}"
+                ));
+            }
+        }
+    }
+
     CommandOutcome::Text(format!(
         "Imported agent '{display_name}' (DB {db_id}). Attach with /agent add {display_name}."
     ))
@@ -598,7 +643,14 @@ pub(super) async fn agent_hosted(ctx: &CommandContext<'_>) -> CommandOutcome {
     }
     let lines: Vec<String> = entries
         .iter()
-        .map(|e| format!("  {} ({})", e.display_name, e.db_id))
+        .map(|e| {
+            format!(
+                "  {} ({})\n    {}",
+                e.display_name,
+                e.db_id,
+                ctx.server.agent_folder_status(&e.display_name)
+            )
+        })
         .collect();
     CommandOutcome::Text(format!(
         "Living Agents hosted on this peer:\n{}",
@@ -662,108 +714,111 @@ pub(super) async fn agent_set(
     agent_ref: &str,
     field: &str,
     value: &str,
-    server: &crate::server::Server,
+    server: &std::sync::Arc<crate::server::Server>,
 ) -> CommandOutcome {
     let entry = match resolve_hosted_agent(agent_ref, server).await {
         Ok(e) => e,
         Err(msg) => return CommandOutcome::Error(msg),
     };
 
-    let agent_db = match server
-        .registry()
-        .open_agent_db(&entry.db_id, Some(&entry.pubkey))
+    match server
+        .update_agent_config(
+            &entry.display_name,
+            field == "system_prompt_files",
+            matches!(field, "system_prompt" | "system_prompt_files"),
+            |cfg| apply_agent_field(cfg, field, value).map_err(anyhow::Error::msg),
+        )
         .await
     {
-        Ok(Some(db)) => db,
-        Ok(None) => {
-            return CommandOutcome::Error(format!(
-                "This peer holds no key for agent '{}' — can't edit a read-only import",
-                entry.display_name
-            ));
-        }
-        Err(e) => return CommandOutcome::Error(format!("Failed to open agent DB: {e}")),
-    };
-
-    let mut cfg = match agent_db.read_config().await {
-        Ok(c) => c,
-        Err(e) => return CommandOutcome::Error(format!("Failed to read agent config: {e}")),
-    };
-
-    if let Err(msg) = apply_agent_field(&mut cfg, field, value) {
-        return CommandOutcome::Error(msg);
+        Ok(outcome) if outcome.projection_error.is_none() => CommandOutcome::Text(format!(
+            "Set {field}={value} on agent '{}' (takes effect next message)\n{}{}",
+            entry.display_name,
+            server.agent_folder_status(&entry.display_name),
+            if outcome.flattened {
+                "\nSaved prompt preserved as one source; original decomposition unavailable."
+            } else {
+                ""
+            }
+        )),
+        Ok(outcome) => CommandOutcome::Error(format!(
+            "Agent DB committed (effective next message), but folder projection failed: {}. Retry /agent project {} — do not reload stale files.",
+            outcome.projection_error.unwrap(),
+            entry.display_name
+        )),
+        Err(e) => CommandOutcome::Error(format!("Agent config unchanged: {e:#}")),
     }
-
-    // A prompt edit must refresh the blob pointer, else a stale
-    // `system_prompt_ref` would mask the new inline text / files at hydration.
-    // Other fields leave the ref untouched.
-    if matches!(field, "system_prompt" | "system_prompt_files")
-        && let Err(e) = server.refresh_prompt_ref(&mut cfg).await
-    {
-        return CommandOutcome::Error(format!("Failed to resolve system prompt: {e}"));
-    }
-
-    if let Err(e) = agent_db.write_config(&cfg).await {
-        return CommandOutcome::Error(format!("Failed to write agent config: {e}"));
-    }
-
-    let runtime_agent = server
-        .agents()
-        .build_from_db_config(&entry.display_name, &cfg);
-    server.agents().upsert(runtime_agent.clone());
-
-    CommandOutcome::Text(format!(
-        "Set {field}={value} on agent '{}' (takes effect next message)",
-        entry.display_name
-    ))
 }
 
-/// `/agent reload [ref]` — re-read the on-disk chaz yaml and report, for one
-/// named agent or (with no ref) every declared agent, whether its Agent DB
-/// config matches the yaml entry. Read-only: yaml `agents:` entries seed new
-/// agents at startup, and once an agent exists its DB config is authoritative.
-/// The report names differing fields so the user can apply them deliberately
-/// with `/agent set` or the TUI Peer→Agents diff.
+/// Import one complete managed folder, or report each already-hosted agent.
 pub(super) async fn agent_reload(
     agent_ref: Option<&str>,
-    ctx: &CommandContext<'_>,
+    server: &std::sync::Arc<crate::server::Server>,
 ) -> CommandOutcome {
-    let report = match ctx.server.reload_config_for(agent_ref).await {
-        Ok(report) => report,
-        Err(e) => return CommandOutcome::Error(format!("Reload failed: {e}")),
+    let target = if let Some(reference) = agent_ref {
+        match resolve_hosted_agent(reference, server).await {
+            Ok(entry) => Some(entry.display_name),
+            Err(msg) => return CommandOutcome::Error(msg),
+        }
+    } else {
+        None
     };
-    if let Some(name) = agent_ref
-        && report.considered == 0
-    {
-        return CommandOutcome::Error(format!(
-            "No agent '{name}' declared in the chaz config — nothing to compare"
+    let report = match server.reload_config_for(target.as_deref()).await {
+        Ok(report) => report,
+        Err(e) => return CommandOutcome::Error(format!("Reload failed: {e:#}")),
+    };
+    let mut lines = vec![];
+    for (name, changed) in &report.applied {
+        lines.push(format!(
+            "{name}: {} (effective next message)\n{}",
+            if *changed {
+                "reloaded scoped settings and sources"
+            } else {
+                "already matches accepted settings and sources"
+            },
+            server.agent_folder_status(name)
         ));
     }
-    CommandOutcome::Text(format_reload_report(&report))
-}
-
-fn format_reload_report(report: &crate::server::ReloadReport) -> String {
-    let mut lines = vec![
-        "YAML seeds new agents only; existing agents keep their DB config. Nothing was changed."
-            .to_string(),
-    ];
-    for (name, fields) in &report.differs {
+    for (name, error) in &report.failed {
         lines.push(format!(
-            "  {name}: DB differs from yaml in {} — apply with /agent set or the TUI Peer → Agents diff",
-            fields.join(", ")
-        ));
-    }
-    for name in &report.in_sync {
-        lines.push(format!("  {name}: matches yaml"));
-    }
-    for name in &report.not_seeded {
-        lines.push(format!(
-            "  {name}: no Agent DB on this peer yet — seeded from yaml at next startup"
+            "{name}: {error}\n{}",
+            server.agent_folder_status(name)
         ));
     }
     if report.considered == 0 {
-        lines.push("  (no agents declared in the chaz config)".to_string());
+        lines.push("No hosted agents to reload.".into());
     }
-    lines.join("\n")
+    let text = lines.join("\n");
+    if report.failed.is_empty() {
+        CommandOutcome::Text(text)
+    } else {
+        CommandOutcome::Error(text)
+    }
+}
+
+pub(super) async fn agent_project(
+    agent_ref: &str,
+    server: &std::sync::Arc<crate::server::Server>,
+) -> CommandOutcome {
+    let entry = match resolve_hosted_agent(agent_ref, server).await {
+        Ok(entry) => entry,
+        Err(msg) => return CommandOutcome::Error(msg),
+    };
+    match server.project_agent_config(&entry.display_name, true).await {
+        Ok(outcome) if outcome.projection_error.is_none() => {
+            if let Err(e) = server.watch_agent_config(&entry.display_name).await {
+                return CommandOutcome::Error(format!("Projected, but config watch failed: {e:#}"));
+            }
+            CommandOutcome::Text(format!(
+                "Projected accepted DB configuration; no files imported.\n{}",
+                server.agent_folder_status(&entry.display_name)
+            ))
+        }
+        Ok(outcome) => CommandOutcome::Error(format!(
+            "DB authoritative; projection failed: {}",
+            outcome.projection_error.unwrap()
+        )),
+        Err(e) => CommandOutcome::Error(format!("Projection failed: {e:#}")),
+    }
 }
 
 // -----------------------------------------------------------------------------

@@ -406,7 +406,7 @@ fn settings_status_hint(app: &App, scope: SettingsScope) -> &'static str {
                 if detail {
                     " ↑↓ select · → read · ← category · Enter model · [r] reload · Esc back "
                 } else {
-                    " ↑↓/Tab category · → list · [r] compare yaml · Esc back "
+                    " ↑↓/Tab category · → list · [r] folder diff · [p] project DB · Esc back "
                 }
             }
             Some(PeerSettingsCategory::Defaults) => {
@@ -838,9 +838,14 @@ fn render_peer_agents(
                 Style::default().fg(theme::DIM),
             )])]
         });
+    if let Some(name) = names.get(cursor)
+        && server.agent_folders().is_some()
+    {
+        detail.insert(0, Line::from(server.agent_folder_status(name)));
+    }
     detail.push(Line::from(""));
     detail.push(Line::from(vec![Span::styled(
-        "  Enter — set default model · [r] compare with yaml",
+        "  Enter model · r folder diff · p project",
         Style::default().fg(theme::DIM),
     )]));
     render_content(
@@ -994,13 +999,9 @@ fn render_agent_diff(f: &mut ratatui::Frame, area: Rect, view: &AgentDiffView) {
 
     // ── header ──────────────────────────────────────────────────────
     let header_text = match view.mode {
-        AgentDiffMode::View => format!("{}  —  yaml ↔ DB diff", view.agent_name),
-        AgentDiffMode::Pick => format!(
-            "{}  —  pick fields to apply  (Space=⏻, Enter=apply, Esc=back)",
-            view.agent_name
-        ),
-        AgentDiffMode::ConfirmReseed => format!(
-            "{}  —  reseed ALL fields from yaml?  (y=yes, n=no)",
+        AgentDiffMode::View => format!("{} — folder ↔ accepted DB", view.agent_name),
+        AgentDiffMode::ConfirmReload => format!(
+            "{} — replace ALL scoped settings from folder? (y=yes, n=no)",
             view.agent_name
         ),
     };
@@ -1018,7 +1019,7 @@ fn render_agent_diff(f: &mut ratatui::Frame, area: Rect, view: &AgentDiffView) {
     // Field header
     lines.push(Line::from(vec![
         Span::styled("  Field", Style::default().fg(theme::DIM)),
-        Span::styled("          yaml declared", Style::default().fg(theme::DIM)),
+        Span::styled("          folder draft", Style::default().fg(theme::DIM)),
         Span::styled("          db actual", Style::default().fg(theme::DIM)),
     ]));
     lines.push(Line::from(""));
@@ -1028,23 +1029,12 @@ fn render_agent_diff(f: &mut ratatui::Frame, area: Rect, view: &AgentDiffView) {
         let sym = status_symbol(row.status);
         let cursor = if i == view.cursor { "▸" } else { " " };
 
-        // Pick mode: prepend a checkbox
-        let pick_mark = if view.mode == AgentDiffMode::Pick {
-            if view.picks.get(i).copied().unwrap_or(false) {
-                "[✓] "
-            } else {
-                "[ ] "
-            }
-        } else {
-            ""
-        };
-
         lines.push(Line::from(vec![Span::styled(
-            format!("{cursor} {pick_mark}{sym} {}", row.label),
+            format!("{cursor} {sym} {}", row.label),
             sty,
         )]));
         lines.push(Line::from(vec![Span::styled(
-            format!("         yaml: {}", row.yaml),
+            format!("         file: {}", row.yaml),
             sty,
         )]));
         lines.push(Line::from(vec![Span::styled(
@@ -1057,7 +1047,7 @@ fn render_agent_diff(f: &mut ratatui::Frame, area: Rect, view: &AgentDiffView) {
     // Per-template detail; the selectable workers row applies the whole list.
     if !view.diff.workers.is_empty() {
         lines.push(Line::from(vec![Span::styled(
-            "  worker templates (apply with the workers row)",
+            "  worker templates (included in full reload)",
             Style::default().fg(theme::DIM),
         )]));
         for w in &view.diff.workers {
@@ -1084,10 +1074,11 @@ fn render_agent_diff(f: &mut ratatui::Frame, area: Rect, view: &AgentDiffView) {
     // ── hints ───────────────────────────────────────────────────────
     let hint_text = match view.mode {
         AgentDiffMode::View => {
-            "[a] pick fields  [R] reseed (confirm)  [Esc] close — no automatic apply"
+            "[R] reload entire scope (confirm) · [Esc] close — no automatic import"
         }
-        AgentDiffMode::Pick => "[Space] toggle  [Enter] apply picked  [Esc] back",
-        AgentDiffMode::ConfirmReseed => "[y] confirm reseed  [n] cancel",
+        AgentDiffMode::ConfirmReload => {
+            "[y] confirm reload · [n] cancel — omitted settings reset to defaults"
+        }
     };
     let hint_line = Line::from(vec![Span::styled(
         hint_text,

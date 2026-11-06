@@ -40,7 +40,9 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, TryAcquireError, mpsc};
 use tracing::{debug, error, info, warn};
 
+mod agent_config;
 mod approval_proxy;
+pub use agent_config::AgentConfigOutcome;
 mod build;
 mod job_monitor;
 mod jobs;
@@ -630,6 +632,7 @@ pub(crate) fn bridge_home_to_migrate(
 struct SessionRuntime {
     backend: BackendManager,
     agent_override: Option<String>,
+    worker_prompt: Option<String>,
     approval_tx: Option<mpsc::Sender<ApprovalExchange>>,
     /// Spawn nesting depth (0 for bridge-originated sessions)
     call_depth: usize,
@@ -643,6 +646,7 @@ struct SessionRuntime {
 
 /// Context for spawned agent tasks (call depth, tool scope, completion signal).
 struct SpawnContext {
+    worker_prompt: Option<String>,
     job_projection: Option<(eidetica::Database, String, String)>,
     job_incarnation: Option<String>,
     /// Explicit retry command identity for a job execution branch; ordinary
@@ -809,36 +813,12 @@ fn budget_model_id(
         .or_else(|| backend.default_model())
 }
 
-/// Outcome of [`Server::reload_config_for`]. `considered` counts the yaml agent
-/// entries that passed the optional name filter — `considered == 0` with a name
-/// filter means "no such agent in yaml". A reload never writes an agent DB: it
-/// only reports how the yaml compares with what this peer hosts.
+/// Per-agent results: a batch reload is not a cross-agent transaction.
 #[derive(Debug, Default, Clone)]
 pub struct ReloadReport {
-    /// Number of yaml agent entries considered after the name filter.
     pub considered: usize,
-    /// Hosted agents whose DB config differs from their yaml entry, with the
-    /// labels of the differing fields. The DB value stays in force.
-    pub differs: Vec<(String, Vec<&'static str>)>,
-    /// Hosted agents whose DB config matches their yaml entry.
-    pub in_sync: Vec<String>,
-    /// Yaml entries with no Agent DB on this peer yet. Startup seeds them.
-    pub not_seeded: Vec<String>,
-}
-
-/// Outcome of [`Server::merge_agent_from_yaml`]. Distinguishes the
-/// "agent missing from yaml/DB" cases (so the TUI can message precisely)
-/// from "matched but the merge wrote nothing new".
-#[derive(Debug, Default, Clone)]
-pub struct MergeOutcome {
-    /// A yaml `agents:` entry by this name exists.
-    pub found_yaml: bool,
-    /// This peer hosts (holds a key for) the agent's DB.
-    pub found_db: bool,
-    /// The merge actually rewrote the DB config.
-    pub changed: bool,
-    /// Labels of the fields the merge wrote (empty when nothing applied).
-    pub applied: Vec<&'static str>,
+    pub applied: Vec<(String, bool)>,
+    pub failed: Vec<(String, String)>,
 }
 
 /// Background half of "learn a model's context window on first use", shared by
@@ -902,6 +882,7 @@ fn track_owned_task(
 
 /// Callback-driven agent server.
 pub struct Server {
+    self_ref: std::sync::Weak<Self>,
     registry: Arc<SessionRegistry>,
     agents: Arc<AgentRegistry>,
     agent_index: HostedIndex,
@@ -1002,11 +983,14 @@ pub struct Server {
     /// semantics as `default_agents`.
     agent_groups: std::sync::RwLock<HashMap<String, Vec<String>>>,
     /// Path to the on-disk chaz yaml, set once at startup via
-    /// [`Server::set_config_path`]. Lets `/agent reload` and the TUI yaml
-    /// diff re-read the config without threading the path through every
-    /// call site. `None` in `--print` and
-    /// tests, where reload is unavailable.
+    /// [`Server::set_config_path`] for legacy API compatibility. Managed
+    /// reload uses the peer-local agent folder, not this seed path.
     config_path: std::sync::RwLock<Option<std::path::PathBuf>>,
+    agent_config_root: Arc<std::sync::RwLock<Option<std::path::PathBuf>>>,
+    agent_folders: std::sync::RwLock<Option<Arc<crate::agent_folder::AgentFolders>>>,
+    agent_folder_statuses: std::sync::RwLock<HashMap<String, String>>,
+    agent_config_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    watched_agent_configs: Mutex<std::collections::HashSet<String>>,
     /// Fail-closed ceiling on a pending tool approval, set once at startup
     /// from `Config.approvals` via [`Server::set_approval_timeout`]. Read by
     /// the per-session approval proxy each time an exposed session registers,
@@ -1079,8 +1063,13 @@ impl Server {
     ) -> Arc<Self> {
         let (notify_tx, notify_rx) = mpsc::channel(256);
         let executor_authorized = executor.is_some();
+        let agent_config_root = Arc::new(std::sync::RwLock::new(None));
+        let host: Arc<dyn ToolHost> = Arc::new(
+            crate::tool_host::AgentConfigToolHost::with_root_cell(host, agent_config_root.clone()),
+        );
 
-        let server = Arc::new(Self {
+        let server = Arc::new_cyclic(|weak| Self {
+            self_ref: weak.clone(),
             registry,
             agents,
             agent_index,
@@ -1122,6 +1111,11 @@ impl Server {
             default_agents: std::sync::RwLock::new(Vec::new()),
             agent_groups: std::sync::RwLock::new(HashMap::new()),
             config_path: std::sync::RwLock::new(None),
+            agent_config_root,
+            agent_folders: std::sync::RwLock::new(None),
+            agent_folder_statuses: std::sync::RwLock::new(HashMap::new()),
+            agent_config_locks: Mutex::new(HashMap::new()),
+            watched_agent_configs: Mutex::new(std::collections::HashSet::new()),
             approval_timeout: std::sync::RwLock::new(
                 crate::bridge::ApprovalsConfig::default().timeout(),
             ),
@@ -1190,6 +1184,7 @@ impl Server {
             self.skill_bank_index.register(entry);
         }
         self.hosted_indices_complete.store(true, Ordering::Release);
+        Box::pin(self.initialize_agent_folders()).await;
         Ok(())
     }
 
@@ -1417,7 +1412,7 @@ impl Server {
             })
             .collect::<Vec<_>>();
         let user = self.registry.user_lock().await;
-        crate::hosted_index::extend_targeted(
+        let stats = crate::hosted_index::extend_targeted(
             &user,
             &explicit_agents,
             &[],
@@ -1425,7 +1420,10 @@ impl Server {
             &self.memory_bank_index,
             &self.skill_bank_index,
         )
-        .await
+        .await?;
+        drop(user);
+        Box::pin(self.initialize_agent_folders()).await;
+        Ok(stats)
     }
 
     /// Best-effort attach of the configured default agents to a
@@ -1644,6 +1642,14 @@ impl Server {
     /// that hasn't finished seeding, or a legacy config with no blob — it falls
     /// back to reading the files directly so the prompt is never silently empty.
     async fn resolve_db_prompt(&self, cfg: &crate::agent_db::AgentDbConfig) -> String {
+        if let Some(sources) = &cfg.prompt_sources {
+            return crate::agent_bundle::assemble(
+                &cfg.system_prompt,
+                &cfg.system_prompt_files,
+                sources,
+            )
+            .expect("validated synchronized sources");
+        }
         if let Some(snap) = cfg.system_prompt_ref.as_ref()
             && let Some(text) = self.fetch_resolved_prompt(snap).await
         {
@@ -1681,9 +1687,8 @@ impl Server {
     /// unchanged prompt never churns the store). Even empty file-backed prompts
     /// are pinned: a later file edit must not silently replace an empty prompt.
     /// Returns `None` only when there is no text and no file list.
-    /// Shared by seed completion, the explicit yaml merge and the
-    /// `/agent set` re-resolve so all produce identical refs for identical
-    /// inputs.
+    /// Legacy seed/explicit prompt-write compatibility for library callers
+    /// without a configured folder root. New bundles never write these refs.
     async fn resolve_prompt_ref(
         &self,
         inline: &str,
@@ -1707,9 +1712,8 @@ impl Server {
 
     /// Re-resolve `cfg`'s prompt (inline `system_prompt` + `system_prompt_files`)
     /// into the blob store and update `cfg.system_prompt_ref` in place. Used by
-    /// `/agent set` and the explicit yaml merge so a prompt edit refreshes the
-    /// blob — without it, a stale ref would mask the new text or files. It is
-    /// also the explicit way to pick up edited prompt-file contents.
+    /// legacy prompt writes without a folder interface. Managed edits use
+    /// synchronized sources instead, and never mutate this peer-local cache.
     pub async fn refresh_prompt_ref(
         &self,
         cfg: &mut crate::agent_db::AgentDbConfig,
@@ -1742,71 +1746,29 @@ impl Server {
             .expect("approval_timeout lock poisoned")
     }
 
-    /// Record the on-disk chaz yaml path so `/agent reload` and the TUI `[r]`
-    /// action can re-read it. Called once at startup.
+    /// Retain the original global config path for legacy callers. Managed
+    /// folder reload and the TUI never reapply this seed file.
     pub fn set_config_path(&self, path: std::path::PathBuf) {
         *self.config_path.write().expect("config_path lock poisoned") = Some(path);
     }
 
-    /// Re-read the on-disk chaz yaml and report how each declared agent
-    /// (optionally only `only`) compares with the Agent DB this peer hosts.
-    ///
-    /// Yaml `agents:` entries seed new Agent DBs at startup; once an agent
-    /// exists its DB config is authoritative. A reload therefore never writes:
-    /// it validates the file and tells the caller which agents differ, which
-    /// match, and which haven't been seeded yet. Applying a yaml value to an
-    /// existing agent is an explicit act (`/agent set`, or the TUI
-    /// Peer→Agents diff). Errors when no config path is set, or the file can't
-    /// be read or parsed.
+    /// Explicit folder import for hosted agents only. Never reapply global
+    /// seed YAML, discover arbitrary directories, or hide partial batch success.
     pub async fn reload_config_for(&self, only: Option<&str>) -> anyhow::Result<ReloadReport> {
-        let path = self
-            .config_path
-            .read()
-            .expect("config_path lock poisoned")
-            .clone()
-            .ok_or_else(|| anyhow::anyhow!("no config path set — reload unavailable"))?;
-        let contents = std::fs::read_to_string(&path)
-            .map_err(|e| anyhow::anyhow!("read {}: {e}", path.display()))?;
-        let config: crate::config::Config = serde_yaml::from_str(&contents)
-            .map_err(|e| anyhow::anyhow!("parse {}: {e}", path.display()))?;
-
-        // Warn about unrecognised keys on each reload (config may change).
-        let unknown = crate::config::check_unknown_config_keys(&contents);
-        if !unknown.is_empty() {
-            tracing::warn!(
-                config = %path.display(),
-                count = unknown.len(),
-                keys = %unknown.join(", "),
-                "Unrecognised config key(s)"
-            );
-        }
-
-        let Some(agents) = config.agents.as_ref() else {
-            return Ok(ReloadReport::default());
-        };
+        anyhow::ensure!(
+            self.agent_folders().is_some(),
+            "agent folder interface not configured on this peer"
+        );
         let mut report = ReloadReport::default();
-        for ac in agents {
-            if let Some(name) = only
-                && ac.name != name
-            {
+        for entry in self.agent_index.list() {
+            if only.is_some_and(|name| name != entry.display_name) {
                 continue;
             }
             report.considered += 1;
-            match self.agent_diff_for(ac).await? {
-                Some(diff) => {
-                    let differing: Vec<&'static str> = diff
-                        .rows
-                        .iter()
-                        .filter(|r| r.status != crate::agent_diff::FieldStatus::Unchanged)
-                        .map(|r| r.label)
-                        .collect();
-                    if differing.is_empty() {
-                        report.in_sync.push(ac.name.clone());
-                    } else {
-                        report.differs.push((ac.name.clone(), differing));
-                    }
-                }
-                None => report.not_seeded.push(ac.name.clone()),
+            match self.reload_agent_folder(&entry.display_name).await {
+                Ok(outcome) if outcome.projection_error.is_none() => report.applied.push((entry.display_name, outcome.changed)),
+                Ok(outcome) => report.failed.push((entry.display_name, format!("DB committed; folder projection failed: {}. Retry /agent project, not reload", outcome.projection_error.unwrap()))),
+                Err(error) => report.failed.push((entry.display_name, format!("{error:#}"))),
             }
         }
         Ok(report)
@@ -1837,7 +1799,7 @@ impl Server {
         };
 
         let current = db.read_config().await?;
-        if current.system_prompt_ref.is_some() {
+        if current.prompt_sources.is_some() || current.system_prompt_ref.is_some() {
             return Ok(false);
         }
         let mut seeded = current.clone();
@@ -1849,132 +1811,30 @@ impl Server {
         Ok(true)
     }
 
-    /// Re-read the on-disk yaml and parse it. Shared by the diff/merge paths so
-    /// they observe the same config a `/agent reload` would.
-    fn read_config_from_disk(&self) -> anyhow::Result<crate::config::Config> {
-        let path = self
-            .config_path
-            .read()
-            .expect("config_path lock poisoned")
-            .clone()
-            .ok_or_else(|| anyhow::anyhow!("no config path set — config unavailable"))?;
-        let contents = std::fs::read_to_string(&path)
-            .map_err(|e| anyhow::anyhow!("read {}: {e}", path.display()))?;
-        serde_yaml::from_str(&contents)
-            .map_err(|e| anyhow::anyhow!("parse {}: {e}", path.display()))
-    }
-
-    /// Compute the field-level diff between an agent's yaml-declared config and
-    /// its DB-actual config. Powers the TUI Peer→Agents diff view. Returns
-    /// `Ok(None)` when the agent has no yaml entry or this peer doesn't host its
-    /// DB — both render as "nothing to diff" upstream. Read-only.
+    /// Compare pending folder settings AND source contents against the coherent
+    /// accepted DB config. This operation never applies either representation.
     pub async fn agent_diff(
         &self,
         name: &str,
     ) -> anyhow::Result<Option<crate::agent_diff::AgentDiff>> {
-        let config = self.read_config_from_disk()?;
-        let Some(ac) = config
-            .agents
-            .as_ref()
-            .and_then(|a| a.iter().find(|a| a.name == name))
-        else {
+        let Some(folders) = self.agent_folders() else {
             return Ok(None);
-        };
-        self.agent_diff_for(ac).await
-    }
-
-    /// Diff one yaml entry against the agent DB this peer hosts under its
-    /// name. `Ok(None)` when no such hosted, writable DB exists.
-    async fn agent_diff_for(
-        &self,
-        ac: &crate::config::AgentConfig,
-    ) -> anyhow::Result<Option<crate::agent_diff::AgentDiff>> {
-        let Some(entry) = self.agent_index.find_by_name(&ac.name) else {
-            return Ok(None);
-        };
-        let Some(db) = self
-            .registry
-            .open_agent_db(&entry.db_id, Some(&entry.pubkey))
-            .await?
-        else {
-            return Ok(None);
-        };
-        let db_cfg = db.read_config().await?;
-        let yaml_cfg = crate::agent_db::AgentDbConfig::from_agent_config(ac);
-        Ok(Some(crate::agent_diff::diff_agent(&yaml_cfg, &db_cfg)))
-    }
-
-    /// Apply a [`crate::agent_diff::AgentMergeMode`] for one agent: read the
-    /// yaml entry + DB config, merge the selected fields into the DB config,
-    /// refresh the prompt blob when a prompt field changed, persist, and upsert
-    /// the runtime registry so the edit is live on the next message.
-    ///
-    /// This is the only path that copies yaml values into an existing agent,
-    /// and it runs only when a user explicitly picks fields or confirms a
-    /// reseed. Startup and `/agent reload` never call it. A DB config that
-    /// can't be read aborts the merge rather than merging over defaults.
-    pub async fn merge_agent_from_yaml(
-        &self,
-        name: &str,
-        mode: &crate::agent_diff::AgentMergeMode,
-    ) -> anyhow::Result<MergeOutcome> {
-        let config = self.read_config_from_disk()?;
-        let Some(ac) = config
-            .agents
-            .as_ref()
-            .and_then(|a| a.iter().find(|a| a.name == name))
-        else {
-            return Ok(MergeOutcome::default());
-        };
-        let mut outcome = MergeOutcome {
-            found_yaml: true,
-            ..Default::default()
         };
         let Some(entry) = self.agent_index.find_by_name(name) else {
-            return Ok(outcome);
+            return Ok(None);
         };
+        let id = entry.db_id.to_string();
+        let _file_lock = folders.lock_wait(&id).await?;
         let Some(db) = self
             .registry
             .open_agent_db(&entry.db_id, Some(&entry.pubkey))
             .await?
         else {
-            return Ok(outcome);
+            return Ok(None);
         };
-        outcome.found_db = true;
-
         let current = db.read_config().await?;
-        let yaml_cfg = crate::agent_db::AgentDbConfig::from_agent_config(ac);
-        let fields = mode.fields();
-        if fields.is_empty() {
-            return Ok(outcome);
-        }
-
-        let mut merged = crate::agent_diff::apply_merge(&current, &yaml_cfg, mode);
-
-        // A prompt-affecting field must refresh the blob pointer, else a stale
-        // `system_prompt_ref` would mask the new inline text / files.
-        let touches_prompt = fields.iter().any(|f| {
-            matches!(
-                f,
-                crate::agent_diff::AgentField::SystemPrompt
-                    | crate::agent_diff::AgentField::SystemPromptFiles
-            )
-        });
-        if touches_prompt {
-            self.refresh_prompt_ref(&mut merged).await?;
-        }
-
-        if merged == current {
-            return Ok(outcome);
-        }
-
-        db.write_config(&merged).await?;
-        let runtime_agent = self.agents.build_from_db_config(name, &merged);
-        self.agents.upsert(runtime_agent);
-
-        outcome.changed = true;
-        outcome.applied = fields.iter().map(|f| f.label()).collect();
-        Ok(outcome)
+        let pending = folders.read_locked(name, &id, &current)?;
+        Ok(Some(crate::agent_diff::diff_agent(&pending, &current)))
     }
 
     /// Finish seeding the agents created during this boot (see
@@ -2230,6 +2090,7 @@ impl Server {
                 SessionRuntime {
                     backend,
                     agent_override,
+                    worker_prompt: None,
                     approval_tx,
                     call_depth: 0,
                     max_call_depth: 0,
@@ -2545,6 +2406,31 @@ impl Server {
         parent_tools: ScopedTools,
         parent_session_db_id: Option<&str>,
     ) -> anyhow::Result<(ConversationId, eidetica::Database, mpsc::Receiver<()>)> {
+        self.register_child_session_with_prompt(
+            agent_name,
+            backend,
+            approval_tx,
+            call_depth,
+            max_call_depth,
+            parent_tools,
+            parent_session_db_id,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn register_child_session_with_prompt(
+        &self,
+        agent_name: &str,
+        backend: BackendManager,
+        approval_tx: Option<mpsc::Sender<ApprovalExchange>>,
+        call_depth: usize,
+        max_call_depth: usize,
+        parent_tools: ScopedTools,
+        parent_session_db_id: Option<&str>,
+        worker_prompt: Option<String>,
+    ) -> anyhow::Result<(ConversationId, eidetica::Database, mpsc::Receiver<()>)> {
         if !self.executor_authorized {
             anyhow::bail!("client server cannot create agent execution sessions");
         }
@@ -2568,6 +2454,7 @@ impl Server {
                 SessionRuntime {
                     backend,
                     agent_override: Some(agent_name.to_string()),
+                    worker_prompt,
                     approval_tx,
                     call_depth,
                     max_call_depth,
@@ -3123,6 +3010,7 @@ impl Server {
                     m.agent_override.clone(),
                     m.approval_tx.clone(),
                     SpawnContext {
+                        worker_prompt: m.worker_prompt.clone(),
                         job_projection: None,
                         job_retry: None,
                         job_incarnation: job_authority
@@ -3177,7 +3065,13 @@ impl Server {
         // on this peer, rebuild its runtime snapshot from the DB's `config`
         // store so edits to the DB (local or synced from origin peer)
         // propagate to the next run without a restart.
-        let agent = self.hydrate_agent_from_db(agent).await;
+        let agent = match self.agent_for_execution(agent).await {
+            Ok(agent) => agent,
+            Err(error) => {
+                self.processing.lock().await.remove(session_db_id);
+                return Err(error);
+            }
+        };
 
         // Per-session home-peer gate. When the session's AgentRef for this
         // agent names a `home_pubkey`, only the peer whose local key on the
@@ -3479,6 +3373,7 @@ impl Server {
                     m.agent_override.clone(),
                     m.approval_tx.clone(),
                     SpawnContext {
+                        worker_prompt: m.worker_prompt.clone(),
                         job_projection: None,
                         job_retry: None,
                         job_incarnation: job.map(|_| self.job_incarnation.clone()),
@@ -3511,7 +3406,13 @@ impl Server {
             hold("request now resolves to a different Agent");
             return Ok(None);
         }
-        let agent = self.hydrate_agent_from_db(agent).await;
+        let agent = match self.agent_for_execution(agent).await {
+            Ok(agent) => agent,
+            Err(error) => {
+                release().await;
+                return Err(error);
+            }
+        };
         if !self.peer_is_home_for(session_db_id, &agent.name).await {
             release().await;
             self.record_home_skip(session_db_id, &agent.name).await;
@@ -3931,7 +3832,10 @@ impl Server {
     ) {
         let agent_name = agent.name.clone();
         let agent_identity = self.agent_index.find_by_name(&agent_name);
-        let system_prompt = agent.system_prompt.clone();
+        let system_prompt = spawn
+            .worker_prompt
+            .clone()
+            .unwrap_or_else(|| agent.system_prompt.clone());
         let default_model = agent.default_model.clone();
         let allowed_tools = agent.allowed_tools.clone();
         let session_capabilities = session.read_meta().await.capabilities;

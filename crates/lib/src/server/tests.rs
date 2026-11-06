@@ -1,5 +1,8 @@
 //! Unit tests for the agent server. Extracted from `mod.rs`.
 
+#[path = "agent_folder_tests.rs"]
+mod agent_folder_tests;
+
 #[path = "job_monitor_tests.rs"]
 mod job_monitor_tests;
 
@@ -1356,60 +1359,72 @@ async fn seed_completion_leaves_existing_and_legacy_agents_untouched() {
 }
 
 #[tokio::test]
-async fn reload_config_for_reports_without_writing() {
-    // `/agent reload` path: the file on disk is compared, never applied.
+async fn reload_config_for_imports_hosted_folders_and_reports_partial_batches() {
     let (_instance, server, registry) = server_fixture().await;
-
     let dir = tempfile::tempdir().unwrap();
-    let config_path = dir.path().join("config.yaml");
-    let write_config = |model: &str| {
-        std::fs::write(
-            &config_path,
-            format!(
-                "homeserver_url: http://localhost\nusername: test\nagents:\n  - name: alpha\n    model: {model}\n    autonomous: true\n  - name: same\n    model: m\n  - name: pending\n"
-            ),
-        )
-        .unwrap();
-    };
-    write_config("m1");
-    server.set_config_path(config_path.clone());
-
-    let alpha: crate::config::AgentConfig =
-        serde_yaml::from_str("name: alpha\nmodel: m1\nautonomous: true\n").unwrap();
-    let alpha_db = seed_like_bootstrap(&server, &registry, &alpha).await;
-    let same: crate::config::AgentConfig = serde_yaml::from_str("name: same\nmodel: m\n").unwrap();
-    seed_like_bootstrap(&server, &registry, &same).await;
-
-    // The user turns autonomy off; yaml still says true.
-    let mut edited = alpha_db.read_config().await.unwrap();
-    edited.autonomous = false;
-    alpha_db.write_config(&edited).await.unwrap();
-    write_config("m2");
-
+    server.set_agent_config_root(dir.path().join("agents"));
+    for name in ["alpha", "same"] {
+        let ac: crate::config::AgentConfig =
+            serde_yaml::from_str(&format!("name: {name}\nmodel: m1\n")).unwrap();
+        seed_like_bootstrap(&server, &registry, &ac).await;
+    }
+    server.initialize_agent_folders().await;
+    let entry = server.agent_index().find_by_name("alpha").unwrap();
+    let folder = server
+        .agent_folders()
+        .unwrap()
+        .folder("alpha", &entry.db_id.to_string());
+    std::fs::write(
+        folder.join("agent.yaml"),
+        format!(
+            "version: 1\nagent_id: {}\nmodel: replacement\n",
+            entry.db_id
+        ),
+    )
+    .unwrap();
+    let same = server.agent_index().find_by_name("same").unwrap();
+    let other = server
+        .agent_folders()
+        .unwrap()
+        .folder("same", &same.db_id.to_string());
+    std::fs::write(other.join("agent.yaml"), "invalid: [").unwrap();
     let report = server.reload_config_for(None).await.unwrap();
-    assert_eq!(report.considered, 3);
-    assert_eq!(report.in_sync, vec!["same".to_string()]);
-    assert_eq!(report.not_seeded, vec!["pending".to_string()]);
-    assert_eq!(report.differs.len(), 1);
-    let (name, fields) = &report.differs[0];
-    assert_eq!(name, "alpha");
-    assert_eq!(fields, &vec!["default_model", "autonomous"]);
-    assert_eq!(alpha_db.read_config().await.unwrap(), edited);
-
-    // A name that isn't in the yaml is considered zero times.
-    let missing = server.reload_config_for(Some("ghost")).await.unwrap();
-    assert_eq!(missing.considered, 0);
-
-    // An unparseable file is rejected before anything is read or written.
-    std::fs::write(&config_path, "agents: [unterminated").unwrap();
-    assert!(server.reload_config_for(None).await.is_err());
-    assert_eq!(alpha_db.read_config().await.unwrap(), edited);
+    assert_eq!(report.considered, 2);
+    assert_eq!(report.applied, vec![("alpha".into(), true)]);
+    assert_eq!(report.failed.len(), 1);
+    assert_eq!(report.failed[0].0, "same");
+    assert_eq!(
+        server
+            .agents()
+            .get("alpha")
+            .unwrap()
+            .default_model
+            .as_deref(),
+        Some("replacement")
+    );
+    assert_eq!(
+        server
+            .agents()
+            .get("same")
+            .unwrap()
+            .default_model
+            .as_deref(),
+        Some("m1")
+    );
+    assert_eq!(
+        server
+            .reload_config_for(Some("ghost"))
+            .await
+            .unwrap()
+            .considered,
+        0
+    );
+    server.shutdown().await;
 }
 
 #[tokio::test]
-async fn reload_config_for_errors_without_config_path() {
+async fn reload_config_for_requires_explicit_library_folder_root() {
     let (_instance, server, _registry) = server_fixture().await;
-    // No set_config_path call → reload is unavailable.
     assert!(server.reload_config_for(None).await.is_err());
 }
 
@@ -7898,6 +7913,7 @@ async fn a_stop_that_lands_before_the_turn_starts_still_stops_it() {
                 manager,
                 attempt.clone(),
                 SpawnContext {
+                    worker_prompt: None,
                     job_projection: None,
                     job_retry: None,
                     job_incarnation: None,
@@ -9042,6 +9058,7 @@ async fn job_wait_executor_shutdown_and_observed_yield_stop_observation_or_reacq
                     backend,
                     attempt.clone(),
                     SpawnContext {
+                        worker_prompt: None,
                         // Identity only: without job authority no queue
                         // projection is reconciled.
                         job_projection: claim_loss

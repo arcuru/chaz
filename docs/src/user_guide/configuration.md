@@ -99,6 +99,7 @@ eidetica:
 
 # Logs and other Chaz-local files (does not select the Eidetica database)
 state_dir: "/path/to/state" # Default: $XDG_STATE_HOME/chaz
+agent_config_dir: "/path/to/writable/agents" # Default: $XDG_CONFIG_HOME/chaz/agents
 
 # LLM backends (OpenAI-compatible)
 backends:
@@ -570,7 +571,7 @@ change the effective fallback model and protocol even with pinned agents.
 
 ## Agents
 
-Each `agents:` entry seeds an Agent DB on first boot; subsequent edits live in the DB, not the YAML. See [Agents](agents.md) for the runtime model and live-edit commands. Per-agent fields:
+Each `agents:` entry seeds an Agent DB on first boot. Existing settings and ordered parent/worker sources round-trip through managed folders and the synchronized DB, never back into this global seed. `agent_config_dir` selects a writable peer-local root; it is not synchronized and need not be next to a read-only/Nix config. Only explicit `/agent reload` imports folder edits; startup projects accepted data outward. See [Agents](agents.md#two-representations-one-accepted-configuration) for omission defaults, migration, recovery and old-writer limits. Per-agent seed fields:
 
 | Field                  | Type                   | Notes                                                                                                                                 |
 | ---------------------- | ---------------------- | ------------------------------------------------------------------------------------------------------------------------------------- |

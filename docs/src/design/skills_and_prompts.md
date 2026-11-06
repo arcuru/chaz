@@ -14,7 +14,9 @@
 > - `PromptAugmentation` shipped as an extension-providable cap (`crates/lib/src/extension/caps.rs`) and is wired through `ContextBuilder::build`.
 > - **Divergence:** the `SystemPromptSnapshot` entry type / `SystemPromptSnapshotPayload` / observational audit log were **not** built; `PersonaSnapshot` was simply removed from `EntryType`. There is no per-turn snapshot today — every turn assembles fresh and the contributions are not persisted.
 > - **Divergence:** `/agent reload <ref>` shipped as `agent_reload` (re-reads yaml + hash-gated reconcile), not as the narrower file-only re-read described in the original § `/agent reload command` below.
-> - **Superseded (yaml seeds agents):** the hash-gated reconcile is gone. Yaml seeds a new Agent DB only; startup finishes that seed by resolving the prompt once, and `/agent reload` is a read-only yaml↔DB comparison. Prompt-file contents are re-read by `/agent set <ref> system_prompt_files <paths>`. See [YAML seeds, the Agent DB decides](../user_guide/agents.md#yaml-seeds-the-agent-db-decides).
+> - **Current configuration-folder lifecycle:** global YAML seeds new agents only. A versioned synchronized source bundle is committed/read with typed Agent DB settings. Commands/TUI and peer config changes project outward; only explicit `/agent reload` imports a complete validated managed-folder scope. `/agent project` retries outward recovery. See [Agent folders](../user_guide/agents.md#two-representations-one-accepted-configuration).
+>
+> The original design below is retained for rationale. Its proposed file-resolution/startup details are not the current editing procedure; use the linked guide.
 
 ## Summary
 
@@ -336,14 +338,9 @@ drives no behavior.
 /agent reload [ref]
 ```
 
-Re-reads the chaz yaml from disk and reports, for each agent (or the named
-agent), which declarative fields differ from its Agent DB config and which
-entries have no Agent DB yet. It writes nothing: yaml only seeds new agents,
-and an existing agent's DB config is authoritative. (An earlier version ran a
-hash-gated reconcile here that rewrote the DB whenever the yaml block or
-prompt files changed.)
+Validates the complete managed `agent.yaml` and every explicitly referenced parent/worker source, then replaces the scoped settings and synchronized sources together. Omitted settings reset to defaults; identity and unrelated DB state survive. It does not read an existing agent's global YAML seed. With no ref, results are per hosted agent, not one batch transaction.
 
-Errors when no config path is set or the yaml cannot be read or parsed.
+Startup and DB notifications only project outward using a deterministic config/source identity. A successful DB commit followed by failed filesystem projection is reported as a partial outcome; the persisted journal and `/agent project` provide recovery without importing stale files. See the current guide for validation, migration, writer compatibility and file-tool boundaries.
 
 ### Migration
 
@@ -441,6 +438,6 @@ separate extension-per-bank.
 - Unit: `PromptAugmentation` hub collection (empty, one provider, multiple providers, per-session filter)
 - Unit: `Agent::build()` file resolution (missing file, multiple files, empty files)
 - Unit: `SystemPromptSnapshot` round-trip
-- Integration: file edit stays pinned through restart and read-only `/agent reload`; `/agent set system_prompt_files` explicitly refreshes it, including empty content
+- Integration: pending folder edits survive same-revision restart without import; explicit reload accepts content-only parent/worker edits, including empty sources; DB updates project outward with recoverable failure status
 - Integration: skill triggers match in TUI session → skill body appears in assembled prompt
 - Integration: old config with `persona:` / `role:` → clear startup error with migration instructions

@@ -176,6 +176,15 @@ async fn main() -> anyhow::Result<()> {
     file.read_to_string(&mut contents)?;
 
     let mut config: Config = serde_yaml::from_str(&contents)?;
+    if config.agent_config_dir.is_none() {
+        config.agent_config_dir = Some(
+            dirs::config_dir()
+                .ok_or_else(|| anyhow::anyhow!("no user config directory; set agent_config_dir"))?
+                .join("chaz/agents")
+                .display()
+                .to_string(),
+        );
+    }
 
     // Validate the connector contract before even creating log/state
     // directories. A missing or mixed migration config must be a read-only

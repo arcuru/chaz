@@ -946,6 +946,10 @@ pub async fn build(
 
     // Create the callback-driven server
     let context_config = config.context.clone().unwrap_or_default();
+    let folder_root = config
+        .agent_config_dir
+        .as_deref()
+        .map(|p| crate::agent::expand_home(std::path::Path::new(p)));
     let tool_host = std::sync::Arc::new(tool_host::NativeToolHost::new())
         as std::sync::Arc<dyn tool_host::ToolHost>;
 
@@ -993,6 +997,9 @@ pub async fn build(
     // Record the config path before anything (the gateway, `/agent reload`,
     // or the deferred reconcile below) can re-read it.
     server.set_config_path(opts.config_path.clone());
+    if let Some(root) = folder_root {
+        server.set_agent_config_root(root);
+    }
 
     // Apply the approval ceiling before any exposed session registers, so
     // every proxy this daemon spawns denies on the same schedule.
@@ -1158,6 +1165,10 @@ async fn run_deferred_startup(
         elapsed_ms = t.elapsed().as_millis() as u64,
         "Deferred: warmed model windows"
     );
+
+    // Folder synchronization also belongs to trusted clients. It neither
+    // starts agent turns nor imports pending file edits.
+    Box::pin(server.initialize_agent_folders()).await;
 
     // Model-window metadata is also presentation data. Clients warm it in the
     // background, but never reconcile agents, materialize schedules or open an

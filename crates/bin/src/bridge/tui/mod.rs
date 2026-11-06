@@ -365,34 +365,18 @@ impl SettingsPicker {
     }
 }
 
-/// Peer→Agents yaml↔DB diff/merge modal. Present (`App::agent_diff` is
-/// `Some`) while the user is inspecting one agent's drift and choosing a
-/// merge. Mutually exclusive with the prompt/picker — opening it from the
-/// Peer→Agents list takes over the detail pane. The actual diff data is
-/// computed server-side ([`Server::agent_diff`]); this just holds the
-/// snapshot plus per-row pick state for the interactive `[a]` flow.
+/// Read-only pending-folder/accepted-DB comparison with confirmed full reload.
 pub(super) struct AgentDiffView {
-    /// Display name of the agent being diffed.
     pub agent_name: String,
-    /// Field + worker diff snapshot taken when the view opened.
     pub diff: chaz_core::agent_diff::AgentDiff,
-    /// Which sub-mode is active (plain view / per-field pick / reseed confirm).
     pub mode: AgentDiffMode,
-    /// Row cursor — indexes `diff.rows`, including the whole workers list.
     pub cursor: usize,
-    /// Per-row accept flags for `[a]` pick mode. `picks.len() == diff.rows.len()`.
-    /// Seeded to the changed rows; nothing is written until Enter in pick mode.
-    pub picks: Vec<bool>,
 }
 
-/// Sub-mode of the [`AgentDiffView`]. Plain `View` lists the diff; `Pick`
-/// adds per-row checkboxes for `[a]`; `ConfirmReseed` gates the destructive
-/// `[R]` full overwrite behind a y/n.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum AgentDiffMode {
     View,
-    Pick,
-    ConfirmReseed,
+    ConfirmReload,
 }
 
 /// Frozen view of an active session's meta + a few cached derivatives, taken
@@ -2226,47 +2210,27 @@ fn handle_settings_outcome(
             let server = server.clone();
             operations::submit(app, false, None, async move {
                 match server.agent_diff(&name).await.map_err(|e| e.to_string())? {
-                    Some(diff) => {
-                        let picks = diff
-                            .rows
-                            .iter()
-                            .map(|r| r.status != chaz_core::agent_diff::FieldStatus::Unchanged)
-                            .collect();
-                        Ok(operations::Effect::Diff(AgentDiffView {
-                            agent_name: name,
-                            diff,
-                            mode: AgentDiffMode::View,
-                            cursor: 0,
-                            picks,
-                        }))
-                    }
+                    Some(diff) => Ok(operations::Effect::Diff(AgentDiffView {
+                        agent_name: name,
+                        diff,
+                        mode: AgentDiffMode::View,
+                        cursor: 0,
+                    })),
                     None => Ok(operations::Effect::Settings(format!(
-                        "No yaml entry for '{name}', or this peer doesn't host it — nothing to diff"
+                        "No managed folder for '{name}' on this peer — configure the folder root and project the accepted DB first"
                     ))),
                 }
             });
         }
-        input::SettingsKey::ApplyAgentMerge { name, mode } => {
-            let server = server.clone();
-            operations::submit(app, true, None, async move {
-                let outcome = server
-                    .merge_agent_from_yaml(&name, &mode)
-                    .await
-                    .map_err(|e| e.to_string())?;
-                let text = if !outcome.found_yaml {
-                    format!("No yaml entry for '{name}' — nothing applied")
-                } else if !outcome.found_db {
-                    format!("This peer holds no key for '{name}' — can't merge")
-                } else if !outcome.changed {
-                    format!("{name}: nothing to apply — already in sync")
-                } else {
-                    format!(
-                        "{name}: merged {} (effective next message)",
-                        outcome.applied.join(", ")
-                    )
-                };
-                Ok(operations::Effect::Settings(text))
-            });
+        input::SettingsKey::ReloadAgentFolder { name } => {
+            let target = operations::Target::capture(app);
+            let ctx = operation_context(server, backend, secrets, approval_tx, notify_tx);
+            operations::submit(
+                app,
+                true,
+                None,
+                ctx.command(Command::AgentReload(Some(name)), target, None),
+            );
         }
         input::SettingsKey::EditPeerDefaults(edit) => {
             submit_defaults_edit(app, server, edit);
