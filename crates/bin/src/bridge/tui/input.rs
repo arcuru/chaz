@@ -76,7 +76,11 @@ pub(super) fn command_catalog() -> Vec<(&'static str, &'static str)> {
         ),
         (
             "/agent reload",
-            "re-read yaml + reconcile agent config(s) [ref]",
+            "validate and replace settings/prompts from managed folders [ref]",
+        ),
+        (
+            "/agent project",
+            "retry DB-to-folder projection <ref>; imports nothing",
         ),
         ("/agent delete ", "unregister a Living Agent (DB preserved)"),
         ("/agent share ", "generate a share ticket for an agent's DB"),
@@ -1091,19 +1095,15 @@ pub(super) enum SettingsKey {
         intent: SettingsPromptIntent,
         value: String,
     },
-    /// Open the yaml↔DB diff/merge modal for one agent. Triggered by `[r]`
+    /// Open the managed-folder/DB comparison for one agent. Triggered by `[r]`
     /// on the Peer→Agents list. Payload is the agent display name; the main
     /// loop computes the diff server-side and seeds `App::agent_diff`.
     OpenAgentDiff {
         name: String,
     },
-    /// Apply a merge mode for one agent's DB config from its yaml entry.
-    /// Triggered from inside the diff modal (`[r]`/`[R]`/`[a]`). The main
-    /// loop calls `Server::merge_agent_from_yaml`, reports the result, and
-    /// closes the modal.
-    ApplyAgentMerge {
+    /// Confirmed full-scope managed-folder replacement.
+    ReloadAgentFolder {
         name: String,
-        mode: chaz_core::agent_diff::AgentMergeMode,
     },
     /// An identity-based edit, evaluated against the ordered worker's latest
     /// defaults rather than replacing it with a possibly stale UI snapshot.
@@ -1218,10 +1218,14 @@ pub(super) fn handle_settings_key(
             super::PeerSettingsCategory::ALL.get(cur),
             Some(super::PeerSettingsCategory::Agents)
         )
-        && let KeyCode::Char('r') = key.code
+        && matches!(key.code, KeyCode::Char('r' | 'p'))
     {
         if let Some(name) = app.peer_agents_names.get(app.peer_agents_cursor).cloned() {
-            return SettingsKey::OpenAgentDiff { name };
+            return if key.code == KeyCode::Char('p') {
+                SettingsKey::DispatchCommand(chaz_core::commands::Command::AgentProject(name))
+            } else {
+                SettingsKey::OpenAgentDiff { name }
+            };
         }
         return SettingsKey::None;
     }
@@ -1431,41 +1435,25 @@ pub(super) fn handle_settings_key(
     }
 }
 
-/// Route a key while the Peer→Agents diff/merge modal is open. Three
-/// sub-modes:
-///   - **View** (default): `↑`/`↓` scroll the field cursor; `[r]` applies the
-///     additive drift merge, `[R]` arms reseed-confirm, `[a]` enters pick mode,
-///     `Esc` closes.
-///   - **Pick**: `↑`/`↓` move, `Space` toggles the row, `Enter` applies the
-///     selected fields, `Esc` returns to View.
-///   - **ConfirmReseed**: `y`/`Enter` commits the full overwrite; `n`/`Esc`
-///     backs out to View.
-///
-/// Merge-applying keys clear `app.agent_diff` and hand the work to the main
-/// loop via [`SettingsKey::ApplyAgentMerge`]; everything else mutates the
-/// modal in place and returns `None`.
+/// Inspecting a folder never writes. R arms an explicit whole-scope reload;
+/// y/Enter confirms it, and n/Esc cancels. There is no per-field seed merge.
 fn handle_agent_diff_key(app: &mut App, key: KeyEvent) -> SettingsKey {
-    use chaz_core::agent_diff::{AgentMergeMode, FieldStatus};
     if (!app.backend_ready() || !app.operations.has_capacity())
-        && matches!(key.code, KeyCode::Enter | KeyCode::Char('y' | 'R' | 'r'))
+        && matches!(key.code, KeyCode::Enter | KeyCode::Char('y' | 'R'))
     {
         app.operations.notice =
-            Some("Backend unavailable or action queue full — merge not submitted".into());
+            Some("Backend unavailable or action queue full — reload not submitted".into());
         return SettingsKey::None;
     }
     let Some(view) = app.agent_diff.as_mut() else {
         return SettingsKey::None;
     };
-    let row_count = view.diff.rows.len();
     match view.mode {
-        AgentDiffMode::ConfirmReseed => match key.code {
-            KeyCode::Char('y') | KeyCode::Char('R') | KeyCode::Enter => {
+        AgentDiffMode::ConfirmReload => match key.code {
+            KeyCode::Char('y') | KeyCode::Enter => {
                 let name = view.agent_name.clone();
                 app.agent_diff = None;
-                SettingsKey::ApplyAgentMerge {
-                    name,
-                    mode: AgentMergeMode::Reseed,
-                }
+                SettingsKey::ReloadAgentFolder { name }
             }
             KeyCode::Char('n') | KeyCode::Esc => {
                 view.mode = AgentDiffMode::View;
@@ -1473,93 +1461,18 @@ fn handle_agent_diff_key(app: &mut App, key: KeyEvent) -> SettingsKey {
             }
             _ => SettingsKey::None,
         },
-        AgentDiffMode::Pick => match key.code {
-            KeyCode::Esc => {
-                view.mode = AgentDiffMode::View;
-                SettingsKey::None
-            }
-            KeyCode::Up => {
-                view.cursor = view.cursor.saturating_sub(1);
-                SettingsKey::None
-            }
-            KeyCode::Down => {
-                if view.cursor + 1 < row_count {
-                    view.cursor += 1;
+        AgentDiffMode::View => {
+            match key.code {
+                KeyCode::Esc => app.agent_diff = None,
+                KeyCode::Up => view.cursor = view.cursor.saturating_sub(1),
+                KeyCode::Down => {
+                    view.cursor = (view.cursor + 1).min(view.diff.rows.len().saturating_sub(1))
                 }
-                SettingsKey::None
+                KeyCode::Char('R') => view.mode = AgentDiffMode::ConfirmReload,
+                _ => {}
             }
-            KeyCode::Char(' ') => {
-                if let Some(p) = view.picks.get_mut(view.cursor) {
-                    *p = !*p;
-                }
-                SettingsKey::None
-            }
-            KeyCode::Enter => {
-                let fields: Vec<chaz_core::agent_diff::AgentField> = view
-                    .diff
-                    .rows
-                    .iter()
-                    .zip(view.picks.iter())
-                    .filter(|(_, picked)| **picked)
-                    .map(|(row, _)| row.field)
-                    .collect();
-                let name = view.agent_name.clone();
-                app.agent_diff = None;
-                if fields.is_empty() {
-                    app.settings_status = Some("No fields picked — nothing applied".to_string());
-                    return SettingsKey::None;
-                }
-                SettingsKey::ApplyAgentMerge {
-                    name,
-                    mode: AgentMergeMode::Pick(fields),
-                }
-            }
-            _ => SettingsKey::None,
-        },
-        AgentDiffMode::View => match key.code {
-            KeyCode::Esc => {
-                app.agent_diff = None;
-                SettingsKey::None
-            }
-            KeyCode::Up => {
-                view.cursor = view.cursor.saturating_sub(1);
-                SettingsKey::None
-            }
-            KeyCode::Down => {
-                if view.cursor + 1 < row_count {
-                    view.cursor += 1;
-                }
-                SettingsKey::None
-            }
-            KeyCode::Char('r') => {
-                let name = view.agent_name.clone();
-                app.agent_diff = None;
-                SettingsKey::ApplyAgentMerge {
-                    name,
-                    mode: AgentMergeMode::Drift,
-                }
-            }
-            KeyCode::Char('R') => {
-                view.mode = AgentDiffMode::ConfirmReseed;
-                SettingsKey::None
-            }
-            KeyCode::Char('a') => {
-                // Only worth entering pick mode if something differs.
-                if view
-                    .diff
-                    .rows
-                    .iter()
-                    .any(|r| r.status != FieldStatus::Unchanged)
-                {
-                    view.mode = AgentDiffMode::Pick;
-                } else {
-                    app.settings_status = Some("No differences to pick".to_string());
-                    app.agent_diff = None;
-                }
-                SettingsKey::None
-            }
-            _ => SettingsKey::None,
-        },
+            SettingsKey::None
+        }
     }
 }
 

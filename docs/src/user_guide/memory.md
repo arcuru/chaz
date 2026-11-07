@@ -136,7 +136,7 @@ agents:
       - shared-facts
 ```
 
-`default_memory_banks` are applied at bootstrap and on `/agent reload`. They grant Write access and write a `MemoryBankRef` to the agent DB — idempotent across restarts.
+`default_memory_banks` are read from the yaml and applied at each startup. They grant Write access and write a `MemoryBankRef` to the agent DB — idempotent across restarts.
 
 Missing banks are auto-created on first startup — no manual `/memory new` needed for banks listed in `default_memory_banks`. The same bank name can appear on multiple agents to share it between them.
 

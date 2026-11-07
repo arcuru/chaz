@@ -221,7 +221,7 @@ impl Tool for SpawnWorker {
             // `max_spawn_depth` value is the child's spawn-depth ceiling;
             // it does not bound the child's tool-calling loop.
             let (conversation_id, session_db, mut completion_rx) = server
-                .register_child_session(
+                .register_child_session_with_prompt(
                     &ctx.agent_name,
                     self.backend.clone(),
                     self.security.approval_callback.clone(),
@@ -229,6 +229,7 @@ impl Tool for SpawnWorker {
                     resolved_max_spawn_depth as usize,
                     child_tools,
                     Some(&parent_session_db_id),
+                    Some(worker.system_prompt.clone()),
                 )
                 .await
                 .map_err(|e| format!("Failed to create child session: {e}"))?;

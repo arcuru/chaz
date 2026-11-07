@@ -406,7 +406,7 @@ fn settings_status_hint(app: &App, scope: SettingsScope) -> &'static str {
                 if detail {
                     " ↑↓ select · → read · ← category · Enter model · [r] reload · Esc back "
                 } else {
-                    " ↑↓/Tab category · → list · [r] reload yaml · Esc back "
+                    " ↑↓/Tab category · → list · [r] folder diff · [p] project DB · Esc back "
                 }
             }
             Some(PeerSettingsCategory::Defaults) => {
@@ -838,9 +838,14 @@ fn render_peer_agents(
                 Style::default().fg(theme::DIM),
             )])]
         });
+    if let Some(name) = names.get(cursor)
+        && server.agent_folders().is_some()
+    {
+        detail.insert(0, Line::from(server.agent_folder_status(name)));
+    }
     detail.push(Line::from(""));
     detail.push(Line::from(vec![Span::styled(
-        "  Enter — set default model · [r] reload from yaml",
+        "  Enter model · r folder diff · p project",
         Style::default().fg(theme::DIM),
     )]));
     render_content(
@@ -994,13 +999,9 @@ fn render_agent_diff(f: &mut ratatui::Frame, area: Rect, view: &AgentDiffView) {
 
     // ── header ──────────────────────────────────────────────────────
     let header_text = match view.mode {
-        AgentDiffMode::View => format!("{}  —  yaml ↔ DB diff", view.agent_name),
-        AgentDiffMode::Pick => format!(
-            "{}  —  pick fields to apply  (Space=⏻, Enter=apply, Esc=back)",
-            view.agent_name
-        ),
-        AgentDiffMode::ConfirmReseed => format!(
-            "{}  —  reseed ALL fields from yaml?  (y=yes, n=no)",
+        AgentDiffMode::View => format!("{} — folder ↔ accepted DB", view.agent_name),
+        AgentDiffMode::ConfirmReload => format!(
+            "{} — replace ALL scoped settings from folder? (y=yes, n=no)",
             view.agent_name
         ),
     };
@@ -1008,16 +1009,9 @@ fn render_agent_diff(f: &mut ratatui::Frame, area: Rect, view: &AgentDiffView) {
     f.render_widget(Paragraph::new(header_line), chunks[0]);
 
     // ── body ────────────────────────────────────────────────────────
-    let scroll = view
-        .cursor
-        .saturating_sub(chunks[1].height.saturating_sub(4) as usize);
-    let visible_rows = view
-        .diff
-        .rows
-        .iter()
-        .enumerate()
-        .skip(scroll)
-        .take(chunks[1].height.saturating_sub(1) as usize);
+    // Three header lines, then four lines per field. Keep the cursor's label
+    // and both values visible, including the last (workers) field.
+    let scroll = (3 + view.cursor * 4 + 3).saturating_sub(chunks[1].height as usize);
 
     let mut lines: Vec<Line> = Vec::new();
     lines.push(Line::from(""));
@@ -1025,33 +1019,22 @@ fn render_agent_diff(f: &mut ratatui::Frame, area: Rect, view: &AgentDiffView) {
     // Field header
     lines.push(Line::from(vec![
         Span::styled("  Field", Style::default().fg(theme::DIM)),
-        Span::styled("          yaml declared", Style::default().fg(theme::DIM)),
+        Span::styled("          folder draft", Style::default().fg(theme::DIM)),
         Span::styled("          db actual", Style::default().fg(theme::DIM)),
     ]));
     lines.push(Line::from(""));
 
-    for (i, row) in visible_rows {
+    for (i, row) in view.diff.rows.iter().enumerate() {
         let sty = status_style(row.status);
         let sym = status_symbol(row.status);
         let cursor = if i == view.cursor { "▸" } else { " " };
 
-        // Pick mode: prepend a checkbox
-        let pick_mark = if view.mode == AgentDiffMode::Pick {
-            if view.picks.get(i).copied().unwrap_or(false) {
-                "[✓] "
-            } else {
-                "[ ] "
-            }
-        } else {
-            ""
-        };
-
         lines.push(Line::from(vec![Span::styled(
-            format!("{cursor} {pick_mark}{sym} {}", row.label),
+            format!("{cursor} {sym} {}", row.label),
             sty,
         )]));
         lines.push(Line::from(vec![Span::styled(
-            format!("         yaml: {}", row.yaml),
+            format!("         file: {}", row.yaml),
             sty,
         )]));
         lines.push(Line::from(vec![Span::styled(
@@ -1061,10 +1044,10 @@ fn render_agent_diff(f: &mut ratatui::Frame, area: Rect, view: &AgentDiffView) {
         lines.push(Line::from(""));
     }
 
-    // Workers section (display-only, not cursorable)
+    // Per-template detail; the selectable workers row applies the whole list.
     if !view.diff.workers.is_empty() {
         lines.push(Line::from(vec![Span::styled(
-            "  workers (yaml-owned, display-only)",
+            "  worker templates (included in full reload)",
             Style::default().fg(theme::DIM),
         )]));
         for w in &view.diff.workers {
@@ -1085,14 +1068,17 @@ fn render_agent_diff(f: &mut ratatui::Frame, area: Rect, view: &AgentDiffView) {
         )]));
     }
 
-    let para = Paragraph::new(lines).scroll((0, 0));
+    let para = Paragraph::new(lines).scroll((scroll as u16, 0));
     f.render_widget(para, chunks[1]);
 
     // ── hints ───────────────────────────────────────────────────────
     let hint_text = match view.mode {
-        AgentDiffMode::View => "[r] bring drift back  [R] reseed all  [a] pick fields  [Esc] close",
-        AgentDiffMode::Pick => "[Space] toggle  [Enter] apply picked  [Esc] back",
-        AgentDiffMode::ConfirmReseed => "[y] confirm reseed  [n] cancel",
+        AgentDiffMode::View => {
+            "[R] reload entire scope (confirm) · [Esc] close — no automatic import"
+        }
+        AgentDiffMode::ConfirmReload => {
+            "[y] confirm reload · [n] cancel — omitted settings reset to defaults"
+        }
     };
     let hint_line = Line::from(vec![Span::styled(
         hint_text,

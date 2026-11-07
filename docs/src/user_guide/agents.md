@@ -4,7 +4,7 @@ Chaz Agents have persistent identity as _Living Agents_ — each Agent is its ow
 
 An **Agent** is a first-class entity (Chaz, Scout). A Worker — declared under an Agent's `workers:` list — is something different: a configured one-shot LLM call with no keys and no persistent identity, invocable from that Agent only via `spawn_worker`. The four-tier conceptual model (Peer / Agent / Worker / Resource) sits behind the names but isn't load-bearing for day-to-day yaml editing.
 
-YAML `agents:` config is the bootstrap path: at startup, chaz materializes one Agent DB per yaml entry (idempotent), populating its `config` and `meta` stores from the yaml. Worker templates declared under an Agent travel with that Agent's DB as part of its config.
+YAML `agents:` config is the bootstrap path: at startup, chaz materializes an Agent DB for each yaml entry that doesn't have one yet, seeding its `config` and `meta` stores from the yaml. Worker templates declared under an Agent travel with that Agent's DB as part of its config. After that the DB decides — see [YAML seeds, the Agent DB decides](#yaml-seeds-the-agent-db-decides).
 
 ## Defining Agents (bootstrap via YAML)
 
@@ -49,34 +49,135 @@ agents:
             max_spawn_depth: 30
 ```
 
-At startup, each yaml entry becomes an Agent DB named `agent:<display_name>` on first boot only. On subsequent boots, existing DBs are reused without overwriting their `config` — yaml is a bootstrap template, and the AgentDb is the authoritative source of agent configuration once it exists. Edit live config with `/agent set <ref> <field> <value>`, which takes effect on the next message (no restart needed) via runtime hydration from the DB.
+At startup, each yaml entry becomes an Agent DB named `agent:<display_name>` on first boot only. Edit live config with `/agent set <ref> <field> <value>`, which takes effect on the next message (no restart needed) via runtime hydration from the DB.
 
-Because the DB — not the yaml — is authoritative after first boot, a later edit to the yaml block (or to a `system_prompt_files` path) only reaches an already-bootstrapped agent through a **reconcile**. The reconcile runs automatically at startup and on demand via `/agent reload [ref]`; it is hash-gated, so an unchanged yaml block leaves the DB (and any live `/agent set` edits) untouched, while a changed block refreshes the agent's declarative config and re-resolves its system prompt. See [System Prompts](#system-prompts).
+## YAML seeds, the Agent DB decides
+
+Global `agents:` YAML initializes a new agent once. Editing or removing that seed later does not replace the existing agent's settings, identity or resources. Providers, bridges, peer settings and startup bank attachment still use their existing configuration paths.
+
+Each hosted agent also has a **managed configuration folder** backed by its synchronized Agent DB. Use `/agent hosted` or **Settings → Peer → Agents** to find its exact path and projection status. Executables default to `$XDG_CONFIG_HOME/chaz/agents` (usually `~/.config/chaz/agents`); set the peer-local `agent_config_dir` to choose another writable root. Library callers must inject a disposable or operator-selected root themselves.
+
+```text
+agents/
+  helper-<identity-suffix>/
+    agent.yaml
+    prompts/
+      parent-0.md
+      worker-0-0.md
+    .projection.json
+```
+
+The readable folder name is not authority. `agent.yaml` binds to the full stable Agent DB ID; keep its `version: 1` and `agent_id` unchanged. Chaz refuses a directory belonging to another identity or an unrelated pre-existing directory. `.projection.json` is recovery bookkeeping, not an editable setting.
+
+### Two representations, one accepted configuration
+
+The DB is the accepted runtime configuration. The folder is an operator editing interface:
+
+- Operator commands/TUI edits and incoming synchronized configuration changes automatically project the accepted settings and individual sources outward. **These updates may overwrite pending local edits.** Save a copy before changing settings elsewhere.
+- Only `/agent reload [ref]` imports the folder. Startup never imports it, and there is no file watcher. Restarting at the same successfully projected revision leaves even an invalid local draft alone.
+- A changed DB configuration arriving while this peer was offline projects outward on startup. Memory, session-index and other unrelated DB writes do not overwrite drafts. A no-op setting update does not export again.
+- Reload validates the entire scoped document and every referenced parent/worker source before committing. A malformed/duplicate/unknown field, wrong version/identity, missing source, traversal, symlink or special file fails without changing accepted settings or runtime prompts. With no ref, it visits already hosted agents and reports each result; batch reload is not cross-agent atomic.
+- Projection uses individual atomic file replacements and a persistent interruption journal. It is **not atomic with the DB commit**. If the DB commits but write-back fails, the result says so. Fix the filesystem problem and run `/agent project <ref>` to retry outward from the DB, not reload stale files. An incomplete projection blocks reload. Restart or a later DB event also retries pending outward work.
+
+Only explicitly referenced sources are imported and synchronized. Chaz neither discovers agents from arbitrary folders nor recursively ingests nearby files. Obsolete tracked prompt files may be removed after a successful update; unrelated files are left alone.
+
+### Folder reference and omission defaults
+
+Reload replaces this complete editable scope, not the whole Agent DB. **Omitting restrictions resets them too**; defaults are not inferred from whether a value looks deliberate.
+
+| Field                                | Default when omitted                                        |
+| ------------------------------------ | ----------------------------------------------------------- |
+| `version`, `agent_id`                | Required format version and full stable identity            |
+| `system_prompt`                      | Empty inline text                                           |
+| `system_prompt_files`                | `[]`; ordered relative source paths inside this folder      |
+| `model`                              | `null`; use normal model resolution                         |
+| `tools`                              | `null`; no agent-specific tool allowlist (`[]` allows none) |
+| `workers`                            | `[]`; remove all templates                                  |
+| `max_spawn_depth`                    | `null`; runtime default 10                                  |
+| `autonomous`                         | `false`                                                     |
+| `presets`                            | `{}`                                                        |
+| `tool_profile`, `max_context_tokens` | `null`; normal defaults                                     |
+| `capabilities`                       | `{}`; no agent-specific capability ceiling                  |
+| `grants`                             | `{}`; no agent-specific per-tool grants                     |
+
+`false`, empty lists and values equal to a default are real values. Nullable fields also accept explicit `null`. Existing host/tool/session restrictions and capability attenuation still apply after an agent-specific restriction is removed.
+
+Worker entries accept `name` (required, unique), `system_prompt`, `system_prompt_files`, `model`, `tools`, `max_spawn_depth` and `presets`. Files are ordered before inline text, just as for the parent. Worker prompts reach the child model request; the child still uses the parent agent's identity and existing tool/ownership restrictions.
+
+Legacy bookkeeping, bank-default references, keys, credentials, logins, bank attachments, memories, skills, schedules, sessions and other unrelated state are outside this editable scope and survive reload. Skills and schedules are not managed as files by this interface.
+
+### Walkthrough: edit a prompt and a worker
+
+In this example, substitute the actual path and ID shown by your installation for the angle-bracketed placeholders.
+
+1. Find the existing agent:
+
+   ```text
+   /agent hosted
+     helper (<agent-id>)
+       /home/operator/.config/chaz/agents/helper-<identity-suffix> (projected; local edits import only on reload)
+   ```
+
+2. Edit an existing referenced file, or add a new file and list it explicitly. Keep the other settings you want to retain in `agent.yaml`; this excerpt shows the prompt/worker portion:
+
+   ```yaml
+   version: 1
+   agent_id: <agent-id>
+   system_prompt_files: [prompts/system.md]
+   system_prompt: "Answer concisely."
+   workers:
+     - name: researcher
+       system_prompt_files: [prompts/researcher.md]
+       system_prompt: "Cite sources."
+   ```
+
+   Put `Use metric units.` in `prompts/system.md` and `Check primary evidence.` in `prompts/researcher.md`. Nothing has changed at runtime yet, even if Chaz restarts.
+
+3. Apply through a trusted client with `/agent reload helper`, or run `chaz cmd '/agent reload helper'` without creating a conversation or an LLM turn. The command reports:
+
+   ```text
+   helper: reloaded scoped settings and sources (effective next message)
+   /home/operator/.config/chaz/agents/helper-<identity-suffix> (projected; local edits import only on reload)
+   ```
+
+   The next parent prompt contains `Use metric units.` followed by `Answer concisely.`; the next `researcher` invocation uses `Check primary evidence.` followed by `Cite sources.`. A second peer recreates these individual files from synchronized source data without accessing the originals.
+
+4. Error/recovery: change a reference to `../outside.md`. Reload reports `prompt path must be relative and normalized` or `invalid prompt path`, leaves the accepted DB/prompt unchanged, and names the failing agent. Restore the relative path and retry. Invalid YAML similarly reports a parse error; viewing the TUI folder diff never applies it.
+
+5. Write-back recovery: if a managed file has become a directory, a setting edit can report:
+
+   ```text
+   Agent DB committed (effective next message), but folder projection failed: ... Retry /agent project helper — do not reload stale files.
+   ```
+
+   Fix that filesystem obstruction, then run `/agent project helper`. Success reports `Projected accepted DB configuration; no files imported.` This deliberately replaces pending drafts with the accepted DB version. The TUI offers the same outward retry with `p`; `r` opens the folder/DB diff and `R`, then `y`, confirms a full reload. There is no global-YAML Pick/Reseed operation.
+
+### Migration and writer compatibility
+
+For an existing agent, migration preserves its saved effective prompt and stable identity. Original fragments are copied only when they reproduce that saved prompt exactly. Otherwise Chaz exports the exact saved text as one managed source and reports the lost decomposition; the operator can split it later. That flattened source preserves significant trailing whitespace until explicitly edited. Original external files, including Nix sources and symlink targets, are never written back. A missing saved snapshot or unreadable source needed to recover the effective prompt blocks that agent's migration rather than inventing a partial bundle. Recover the saved content on a peer that has it, migrate there, and synchronize the resulting bundle. A folder-configured executor refuses to run an agent whose migration is blocked.
+
+Upgrade **all configuration-writing peers before using bundles**. Old writers are unsupported: a valid old keyholder can still write old-format data and discard source information. This is a rollout prerequisite, not a claim that new peers remotely prevent old writes. Rolling binaries back does not undo synchronized data; keep backups and do not resume old writers against a migrated agent.
+
+### Operator-owned, not model-editable
+
+Trusted CLI/TUI and remote bridges retain their existing administration access and key/ownership checks. There is no new login or operator-role system. Models receive the resulting tools/restrictions, not a settings-mutation or general command-dispatch API; a model reply resembling `/agent set` is just reply text. Direct model file-tool writes to managed configuration paths are denied, including path traversal, symlink and hardlink aliases. Ordinary allowed workspace writes still work.
+
+**This is not an OS sandbox.** Unrestricted native shell under the operator's OS identity remains an escape route, as does trusted native extension code. Process/filesystem/credential isolation and a separate host-owned permission registry are not provided here.
 
 ## System Prompts
 
-An agent's system prompt is built from two AgentDbConfig fields, both optional:
+For migrated agents, typed settings and a versioned bundle of individual source texts live in the same synchronized config blob and are read from one coherent snapshot. The runtime assembles parent and worker prompts from those accepted sources, not pending local files or another peer's unsynchronized `chaz_peer` prompt store. Historical prompt stores are preserved for migration, not used as new bundle dependencies.
 
-| Field                 | Type          | Notes                                                                                                                                                                                                                                                                         |
-| --------------------- | ------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `system_prompt_files` | `Vec<String>` | Paths concatenated in order. `~`/`~/...` expansion supported. Resolved (read + folded with `system_prompt`) at **reconcile** time, not every turn. A path that can't be read is logged at `warn` and skipped, so a bad path degrades the prompt rather than failing the turn. |
-| `system_prompt`       | `String`      | Inline text appended after file content. The final prompt the LLM sees is `<concatenated file bodies>\n\n<system_prompt>`.                                                                                                                                                    |
+Files are concatenated in list order, with trailing file whitespace trimmed and empty fragments skipped, then nonempty inline text is appended with `\n\n` separators. Migration's exact saved-source preservation is the exception described above. Changing inline text does not flatten separate fragments, and editing a non-prompt setting never imports pending prompt files.
 
-The resolved prompt is stored **off** the agent's primary DB in a content-addressed blob store (a `DocStore` on `chaz_peer`), and `AgentDbConfig.system_prompt_ref` holds an eidetica `Snapshot` pointing at it. Hydration reads the prompt by that ref (memoized — the snapshot is an immutable content address) rather than re-reading the files each turn, so the append-only config never accumulates tens of KB of prompt text and the runtime does no per-turn file IO. ContextBuilder injects the resolved text as the first chat message.
+| Command                                                | Effect                                                                                                                                                       |
+| ------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `/agent set <ref> system_prompt <text>`                | Change only the inline component; effective next message                                                                                                     |
+| `/agent set <ref> system_prompt_files <path1>,<path2>` | Explicit one-shot source import; external paths support `~`, and managed relative sources may be listed                                                      |
+| `/agent reload [ref]`                                  | Validate and replace the complete editable settings/source scope from managed folders, for one or all already-hosted agents. Reports partial batch failures. |
+| `/agent project <ref>`                                 | Retry outward projection of accepted DB data; never import a draft                                                                                           |
 
-Resolution happens at three points, all sharing the same blob-store logic: the **startup reconcile**, **`/agent reload`**, and **`/agent set system_prompt[_files]`**. An unchanged prompt reuses the existing ref (the store grows only with distinct versions).
-
-This is the key behavior change from the per-turn model: editing the **contents** of a `system_prompt_files` path no longer takes effect automatically — the blob is only refreshed by a reconcile. Run `/agent reload <ref>` (or restart) after editing a prompt file. Changing **which** files an agent uses is likewise stored in the DB: edit the yaml and `/agent reload`, or `/agent set <ref> system_prompt_files <paths>` directly.
-
-### Editing the system prompt
-
-| Command                                                | Effect                                                                                                       |
-| ------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------ |
-| `/agent set <ref> system_prompt <text>`                | Set the inline prompt text. Re-resolves the blob and updates `system_prompt_ref`. Takes effect next message. |
-| `/agent set <ref> system_prompt_files <path1>,<path2>` | Replace the file list (comma-separated, supports `~`). Re-reads + re-resolves the blob on this write.        |
-| `/agent reload [ref]`                                  | Re-read the yaml from disk and reconcile one agent (or all). Picks up edited prompt-file **contents**.       |
-
-The `skills` extension can additionally append text to the system prompt at context-assembly time via the `PromptAugmentation` capability — see the design note in [`design/skills_and_prompts.md`](../design/skills_and_prompts.md). A dedicated user-guide page for Skills is not written yet.
+External source paths are imported copies, not live links. Subsequent external edits have no effect until explicitly imported again. A missing source fails an explicit import/reload rather than being silently skipped. ContextBuilder injects the effective prompt as the first model message, with any `PromptAugmentation` contributions from extensions added during context assembly; see [Skills](skills.md).
 
 ### Legacy `roles:` (deprecated)
 
@@ -86,17 +187,17 @@ Older configs used a top-level `roles:` block and an `agent.role:` reference. Th
 
 Each Agent DB contains the following well-known stores:
 
-| Store            | Kind                         | Contents                                                                                             |
-| ---------------- | ---------------------------- | ---------------------------------------------------------------------------------------------------- |
-| `config`         | DocStore                     | Serialized `AgentDbConfig`: model, tools, max_spawn_depth, grants, presets, `system_prompt`/`_files` |
-| `memory`         | `Table<MemoryEntry>`         | The agent's own persistent key-value facts (written by `remember`, read by `recall`)                 |
-| `meta`           | DocStore                     | `AgentMeta`: display_name, description, capabilities, avatar, agent-level `home_pubkey`              |
-| `history`        | `Table<SessionHistoryEntry>` | Sessions this agent has participated in (appended on attach)                                         |
-| `memory_banks`   | `Table<MemoryBankRef>`       | Refs to shared memory banks this agent has been granted access to (name, db_id, permission)          |
-| `schedules`      | `Table<Schedule>`            | Agent-owned cron, interval, and one-shot wakes — see [Schedules](#schedules) below                   |
-| `schedule_fires` | `Table<...>`                 | Per-fire records (cost, errors) for schedules — used by the standalone fire path for attribution     |
-| `skills`         | `Table<Skill>`               | Agent-local skills (prompt fragments) attached as private context                                    |
-| `skill_banks`    | `Table<SkillBankRef>`        | Refs to shared skill banks this agent has been granted access to                                     |
+| Store            | Kind                         | Contents                                                                                                       |
+| ---------------- | ---------------------------- | -------------------------------------------------------------------------------------------------------------- |
+| `config`         | DocStore                     | Serialized `AgentDbConfig`: scoped settings plus versioned individual prompt sources in the same coherent blob |
+| `memory`         | `Table<MemoryEntry>`         | The agent's own persistent key-value facts (written by `remember`, read by `recall`)                           |
+| `meta`           | DocStore                     | `AgentMeta`: display_name, description, capabilities, avatar, agent-level `home_pubkey`                        |
+| `history`        | `Table<SessionHistoryEntry>` | Sessions this agent has participated in (appended on attach)                                                   |
+| `memory_banks`   | `Table<MemoryBankRef>`       | Refs to shared memory banks this agent has been granted access to (name, db_id, permission)                    |
+| `schedules`      | `Table<Schedule>`            | Agent-owned cron, interval, and one-shot wakes — see [Schedules](#schedules) below                             |
+| `schedule_fires` | `Table<...>`                 | Per-fire records (cost, errors) for schedules — used by the standalone fire path for attribution               |
+| `skills`         | `Table<Skill>`               | Agent-local skills (prompt fragments) attached as private context                                              |
+| `skill_banks`    | `Table<SkillBankRef>`        | Refs to shared skill banks this agent has been granted access to                                               |
 
 The peer maintains two **in-memory** indices (`hosted_index::HostedIndex`) — one for Living Agents and one for standalone Memory Bank DBs — built once at startup by walking eidetica's `user.databases()` and reading each DB's `meta.kind` marker (`agent` / `bank` / `session`, written at creation time). Both indices map `db_id ↔ display_name ↔ pubkey`. They exist because eidetica has no inverse "list DBs this key can access" query, and routing reads them on every session entry. Mutations from `/agent new`, `/memory new`, `/agent delete`, etc. update the cache directly. There is no persistent mirror — eidetica's key store is the single source of truth for "which DBs does this peer host."
 
@@ -159,27 +260,27 @@ Every ref is either an agent's display name or its eidetica DB ID; resolution tr
 
 These aren't session-scoped; they act on the Living Agent itself.
 
-| Command                                             | What                                                                                                                                                                                                                                                                                     |
-| --------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `/agent new <name> [k=v ...]`                       | Create a new Living Agent DB. Optional `k=v` for `model`/`tools`/`autonomous`/`max_spawn_depth`/`tool_profile`/`max_context_tokens`/`system_prompt`/`system_prompt_files` (same set accepted by `/agent set`). Worker templates are edited via yaml + `/agent reload`, not `/agent set`. |
-| `/agent set <ref> <field> <value>`                  | Edit one field on the agent's DB config. Takes effect on the next message via live hydration — no restart.                                                                                                                                                                               |
-| `/agent reload [ref]`                               | Re-read the chaz yaml from disk and re-run the hash-gated reconcile for one agent (or all). Refreshes yaml-declared fields and re-resolves the system prompt; live `/agent set` edits survive when the yaml block is unchanged. Same path as the startup reconcile.                      |
-| `/agent hosted`                                     | List every Living Agent this peer hosts (from the in-memory hosted-agents index).                                                                                                                                                                                                        |
-| `/agent delete <ref>`                               | Unregister locally (index + runtime registry). The DB is **preserved** for archive. Refuses if the agent is still attached to any known session.                                                                                                                                         |
-| `/agent share <ref>`                                | Generate a `DatabaseTicket` URL for the agent's DB, so another peer can sync it.                                                                                                                                                                                                         |
-| `/agent unshare <ref>`                              | Stop sharing the agent's DB — disable sync so this peer stops serving it. Does not revoke keys already held by peers who imported it.                                                                                                                                                    |
-| `/agent import <ticket> [admin\|write\|read]`       | Request access to a synced agent DB via the bootstrap workflow. Default `write`. If the receiver's key is preseeded, sync proceeds; otherwise queues a request for the owner's `/sharing approve`.                                                                                       |
-| `/pubkey`                                           | Print this peer's default pubkey, for pasting into an owner's `/agent invite`.                                                                                                                                                                                                           |
-| `/agent invite <ref> <pubkey> [admin\|write\|read]` | Preseed another peer's pubkey on this agent's DB so their `/agent import` succeeds without an approval round-trip. Default `admin` (`Admin(1)`).                                                                                                                                         |
-| `/agent revoke-peer <ref> <pubkey>`                 | Revoke a previously-invited pubkey. Historical entries signed by it remain verifiable; no new writes. Cannot revoke this peer's own key (use `/agent delete` for that).                                                                                                                  |
-| `/sharing` or `/sharing status`                     | List every database this peer is currently sharing, grouped by kind (agent / bank / session) with DB root IDs.                                                                                                                                                                           |
-| `/sharing requests`                                 | List bootstrap requests pending an admin's approval on this peer (covers agents, banks, sessions — eidetica's queue is unified).                                                                                                                                                         |
-| `/sharing approve <id>`                             | Approve a queued bootstrap request, granting the requester their requested permission.                                                                                                                                                                                                   |
-| `/sharing reject <id>`                              | Reject a queued bootstrap request.                                                                                                                                                                                                                                                       |
-| `/agent rehost <ref> [pubkey]`                      | Reassign the home peer for **this session** (default scope). With no `pubkey`, defaults to "rehost to me." See [Execution ownership](#execution-ownership-home-peer) for what this controls.                                                                                             |
-| `/agent rehost --agent <ref> [pubkey]`              | Reassign the agent-level home — the peer that runs `Fresh` schedule fires for this agent.                                                                                                                                                                                                |
-| `/agent rehost [--agent] --clear <ref>`             | Clear the chosen home, restoring legacy "any keyholder runs" behavior. **WARNING:** re-introduces the multi-peer race.                                                                                                                                                                   |
-| `/agent home-status [ref]`                          | Print agent-level and per-session `home_pubkey` for one or all locally-hosted agents. This peer's keys are tagged `← (me)`.                                                                                                                                                              |
+| Command                                             | What                                                                                                                                                                                               |
+| --------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `/agent new <name> [k=v ...]`                       | Create a Living Agent DB with the existing scalar/list overrides. Edit worker templates and larger structures in its managed folder, then reload.                                                  |
+| `/agent set <ref> <field> <value>`                  | Edit one field on the agent's DB config. Takes effect on the next message via live hydration — no restart.                                                                                         |
+| `/agent reload [ref]`                               | Validate and replace the complete editable settings/source scope from managed folders, for one or all already-hosted agents. Reports partial batch failures.                                       |
+| `/agent hosted`                                     | List hosted agents, stable IDs, real local folder paths and projection status.                                                                                                                     |
+| `/agent delete <ref>`                               | Unregister locally (index + runtime registry). The DB is **preserved** for archive. Refuses if the agent is still attached to any known session.                                                   |
+| `/agent share <ref>`                                | Generate a `DatabaseTicket` URL for the agent's DB, so another peer can sync it.                                                                                                                   |
+| `/agent unshare <ref>`                              | Stop sharing the agent's DB — disable sync so this peer stops serving it. Does not revoke keys already held by peers who imported it.                                                              |
+| `/agent import <ticket> [admin\|write\|read]`       | Request access to a synced agent DB via the bootstrap workflow. Default `write`. If the receiver's key is preseeded, sync proceeds; otherwise queues a request for the owner's `/sharing approve`. |
+| `/pubkey`                                           | Print this peer's default pubkey, for pasting into an owner's `/agent invite`.                                                                                                                     |
+| `/agent invite <ref> <pubkey> [admin\|write\|read]` | Preseed another peer's pubkey on this agent's DB so their `/agent import` succeeds without an approval round-trip. Default `admin` (`Admin(1)`).                                                   |
+| `/agent revoke-peer <ref> <pubkey>`                 | Revoke a previously-invited pubkey. Historical entries signed by it remain verifiable; no new writes. Cannot revoke this peer's own key (use `/agent delete` for that).                            |
+| `/sharing` or `/sharing status`                     | List every database this peer is currently sharing, grouped by kind (agent / bank / session) with DB root IDs.                                                                                     |
+| `/sharing requests`                                 | List bootstrap requests pending an admin's approval on this peer (covers agents, banks, sessions — eidetica's queue is unified).                                                                   |
+| `/sharing approve <id>`                             | Approve a queued bootstrap request, granting the requester their requested permission.                                                                                                             |
+| `/sharing reject <id>`                              | Reject a queued bootstrap request.                                                                                                                                                                 |
+| `/agent rehost <ref> [pubkey]`                      | Reassign the home peer for **this session** (default scope). With no `pubkey`, defaults to "rehost to me." See [Execution ownership](#execution-ownership-home-peer) for what this controls.       |
+| `/agent rehost --agent <ref> [pubkey]`              | Reassign the agent-level home — the peer that runs `Fresh` schedule fires for this agent.                                                                                                          |
+| `/agent rehost [--agent] --clear <ref>`             | Clear the chosen home, restoring legacy "any keyholder runs" behavior. **WARNING:** re-introduces the multi-peer race.                                                                             |
+| `/agent home-status [ref]`                          | Print agent-level and per-session `home_pubkey` for one or all locally-hosted agents. This peer's keys are tagged `← (me)`.                                                                        |
 
 ## Execution ownership (home peer)
 

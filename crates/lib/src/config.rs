@@ -15,6 +15,9 @@ pub struct Config {
     pub room_size_limit: Option<usize>,
     /// Set the state directory for chaz
     pub state_dir: Option<String>,
+    /// Peer-local writable operator agent folders. Executables default this
+    /// to the user's Chaz config area; library callers must inject a root.
+    pub agent_config_dir: Option<String>,
     /// Connection and login settings for this process's Eidetica instance.
     /// Startup callers opt into the shared connector explicitly; legacy
     /// callers continue to use `state_dir` until their migration slice.
@@ -1206,6 +1209,7 @@ fn known_config_keys() -> HashSet<&'static str> {
         "message_limit",
         "room_size_limit",
         "state_dir",
+        "agent_config_dir",
         "chat_summary_model",
         "backends",
         "agents",

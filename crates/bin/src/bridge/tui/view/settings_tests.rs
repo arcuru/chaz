@@ -563,7 +563,6 @@ async fn settings_modals_keep_reader_position_and_own_background_input() {
                     ),
                     mode: AgentDiffMode::View,
                     cursor: 0,
-                    picks: Vec::new(),
                 })
             }
             1 => {
@@ -1015,7 +1014,7 @@ async fn settings_compact_empty_missing_and_static_pages_use_full_content_slot()
                     key(&mut app, KeyCode::End);
                     let tail = draw(&mut terminal, &mut app, &server, &backend);
                     let sentinel = match (scope, category) {
-                        (SettingsScope::Peer, 0) => "yaml",
+                        (SettingsScope::Peer, 0) => "project",
                         (SettingsScope::Peer, 2) => "restart.",
                         (SettingsScope::Peer, 8) => "agent groups",
                         (SettingsScope::Peer, 4 | 6 | 7) => "result",
@@ -1221,9 +1220,8 @@ async fn settings_too_small_freezes_modals_and_refuses_invisible_submit_or_confi
                         &AgentDbConfig::default(),
                         &AgentDbConfig::default(),
                     ),
-                    mode: AgentDiffMode::ConfirmReseed,
+                    mode: AgentDiffMode::ConfirmReload,
                     cursor: 0,
-                    picks: Vec::new(),
                 })
             }
             1 => {
@@ -1334,7 +1332,7 @@ async fn settings_too_small_freezes_modals_and_refuses_invisible_submit_or_confi
         match modal {
             0 => assert_eq!(
                 app.agent_diff.as_ref().unwrap().mode,
-                AgentDiffMode::ConfirmReseed
+                AgentDiffMode::ConfirmReload
             ),
             1 => assert_eq!(app.settings_prompt.as_ref().unwrap().input, "draft"),
             2 => {
@@ -2146,6 +2144,87 @@ async fn settings_peer_inspector_collects_actual_catalog_and_loaded_templates_on
         app.active_mut().current_agent = "other-agent".into();
         peer_pages::update(&mut app, &server, &tx);
         assert!(rx.try_recv().is_err());
+    }
+    server.shutdown().await;
+}
+
+/// Viewing and old pick keys cannot apply; only a confirmed full reload can.
+#[tokio::test]
+async fn agent_diff_view_requires_confirmed_full_reload() {
+    let (_instance, server, _backend, mut app) = fixture().await;
+    open(&mut app, SettingsScope::Peer, 0);
+    app.settings_focus = SettingsFocus::Content;
+    app.agent_diff = Some(AgentDiffView {
+        agent_name: "agent-00".into(),
+        diff: chaz_core::agent_diff::diff_agent(
+            &AgentDbConfig::default(),
+            &AgentDbConfig::default(),
+        ),
+        mode: AgentDiffMode::View,
+        cursor: 0,
+    });
+    for code in [
+        KeyCode::Char('r'),
+        KeyCode::Char('a'),
+        KeyCode::Enter,
+        KeyCode::Char('y'),
+    ] {
+        assert!(matches!(key(&mut app, code), input::SettingsKey::None));
+        assert_eq!(app.agent_diff.as_ref().unwrap().mode, AgentDiffMode::View);
+    }
+    key(&mut app, KeyCode::Char('R'));
+    assert_eq!(
+        app.agent_diff.as_ref().unwrap().mode,
+        AgentDiffMode::ConfirmReload
+    );
+    key(&mut app, KeyCode::Char('n'));
+    assert_eq!(app.agent_diff.as_ref().unwrap().mode, AgentDiffMode::View);
+    key(&mut app, KeyCode::Char('R'));
+    assert!(
+        matches!(key(&mut app, KeyCode::Char('y')), input::SettingsKey::ReloadAgentFolder { name } if name == "agent-00")
+    );
+    assert!(app.agent_diff.is_none());
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn agent_diff_cursor_keeps_workers_and_values_visible() {
+    use chaz_core::agent_diff::{AgentField, diff_agent};
+    let (_instance, server, backend, mut app) = fixture().await;
+    open(&mut app, SettingsScope::Peer, 0);
+    let yaml = AgentDbConfig {
+        workers: vec![WorkerDbConfig {
+            name: "writer".into(),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let db = AgentDbConfig {
+        workers: vec![WorkerDbConfig {
+            name: "reader".into(),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let diff = diff_agent(&yaml, &db);
+    let cursor = diff
+        .rows
+        .iter()
+        .position(|row| row.field == AgentField::Workers)
+        .unwrap();
+    app.agent_diff = Some(AgentDiffView {
+        agent_name: "alpha".into(),
+
+        diff,
+        cursor,
+        mode: AgentDiffMode::View,
+    });
+    for (width, height) in [(80, 24), (64, 14), (120, 40)] {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        let rows = draw(&mut terminal, &mut app, &server, &backend);
+        for expected in ["▸ ~ workers", "file: writer", "db:   reader"] {
+            assert!(contains(&rows, expected), "{width}x{height}: {rows:?}");
+        }
     }
     server.shutdown().await;
 }

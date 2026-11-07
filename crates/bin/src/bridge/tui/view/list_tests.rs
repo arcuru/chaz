@@ -497,7 +497,6 @@ async fn wheel_ownership_stays_with_modal_or_visible_list() {
         ),
         mode: AgentDiffMode::View,
         cursor: 0,
-        picks: Vec::new(),
     });
     input::handle_mouse(&mut app, wheel);
     assert_eq!(app.peer_agents_cursor, 0, "diff modal hides the list");
