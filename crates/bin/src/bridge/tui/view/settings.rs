@@ -1447,7 +1447,28 @@ fn render_session_category(
         SessionSettingsCategory::Overview => render_session_overview(f, area, app),
         SessionSettingsCategory::Models => render_session_models(f, area, app, backend),
         SessionSettingsCategory::Agents => render_session_agents(f, area, app, backend),
-        _ => render_settings_detail_placeholder(f, area, app, category.label()),
+        SessionSettingsCategory::Routing
+        | SessionSettingsCategory::History
+        | SessionSettingsCategory::Sharing => {
+            let lines = super::super::session_pages::lines(app, category)
+                .into_iter()
+                .map(Line::from)
+                .collect();
+            let id = app
+                .current()
+                .and_then(|tab| eidetica::entry::ID::parse(&tab.session_db_id).ok())
+                .filter(|id| !id.is_empty())
+                .map(|id| super::super::short_session_id(&id.to_string()))
+                .unwrap_or_else(|| "unavailable".into());
+            render_content(
+                f,
+                area,
+                app,
+                &format!("{} {id}", category.label()),
+                lines,
+                1,
+            );
+        }
     }
 }
 

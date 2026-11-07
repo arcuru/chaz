@@ -609,7 +609,7 @@ A model picker returns to its Settings page on selection or `Esc`; canceling wri
 
 ### Shipped pages and controls
 
-These tables list every category in sidebar order. Read-only pages are inspectors, not editors waiting for an apply key. The three Session **coming soon** pages are placeholders and have no settings controls.
+These tables list every category in sidebar order. Read-only pages are inspectors, not editors waiting for an apply key.
 
 | Peer category | Current behavior                                                                                                                                                                                                                                                                                                                                                                |
 | ------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -628,9 +628,9 @@ These tables list every category in sidebar order. Read-only pages are inspector
 | Overview         | Read-only active-session identity, creation time, entry count, attached-agent count and host, current agent, and effective model.              |
 | Agents           | Inspect the attached roster. `a` opens a filtered picker of hosted agents not already attached (`Enter` adds); `d` removes the selected agent. |
 | Models           | Edit the session-wide pin or a per-agent session override via the [model picker](#model-picker).                                               |
-| Routing          | **Coming soon.**                                                                                                                               |
-| History          | **Coming soon.**                                                                                                                               |
-| Sharing          | **Coming soon.**                                                                                                                               |
+| Routing          | Read-only recorded host/roster, locally indexed Active+Write candidates, home-key comparison, model-resolution inputs and cached TUI agent.    |
+| History          | Read-only counts by entry type and timestamp bounds from the selected tab's already-loaded cache, not database totals.                         |
+| Sharing          | Read-only local sync preference, first account-held public key and its direct auth status/permission; no tickets or permission changes.        |
 
 ### Peer inspectors are snapshots, not runtime verdicts
 
@@ -684,6 +684,84 @@ snapshot, not synchronization or network health.
    and type `/pubkey`; its result may help diagnose the read, but is not an
    automatic repair. On success, the full public key and `Fingerprint` are
    reachable in Content, including at 40×8.
+
+### Session inspectors: recorded, local, cached
+
+Routing, History and Sharing inspect the selected open conversation. The full
+session DB identifier is reachable in Content; its short form stays pinned while
+reading. These pages have no mutation keys or clickable commands. Press `Right`
+to read, then `Home`/`End`, page keys or the wheel to reach long fields. Existing
+Agents and Models controls remain on their own pages.
+
+Routing joins recorded session metadata with this process's agent registry and
+hosted index. Candidates mean locally indexed **Active+Write** records, not total
+membership or a predicted next responder. Recorded home keys are compared with
+local agent keys, not tested for liveness. Local model precedence is per-agent
+session override, session pin, local agent default, then backend default; a remote
+agent's missing local default stays unavailable. Mentions, explicit turn overrides
+and the execution-home gate can change what happens on an actual turn. The
+`TUI cached agent` label is not an authorization or routing verdict.
+
+History samples only cached entry types and timestamps. It does not read more
+transcript rows, display their content, or verify persistence, completeness or the
+context/compaction boundary. An empty cache says
+`No cached entries; persisted history not verified`. Counts include audit rows,
+not just human messages.
+
+Sharing shows this connected account's preference for this DB, not aggregate
+sharing or network health. The first account-held public key is not necessarily
+the handle's signer. Its direct Active/Revoked and Read/Write/Admin record does not
+resolve delegated authority. `No direct key record; delegated authority not
+inspected` is not an access-denied verdict. Private keys, tickets, credentials and
+raw query errors never enter these pages.
+
+Routing and Sharing take dated local snapshots in the background on entry and
+matching session-change notifications. A notification burst coalesces into one
+follow-up read. History resamples when the tab cache changes. Scrolling does not
+refresh anything. Leave/re-enter a category to refresh local preference changes
+that have no session notification. Queries have a five-second overall deadline;
+loading, unavailable, denied, malformed and failed reads are distinct from empty
+results. A refresh clears old values rather than presenting them as current, and
+switching sessions discards old responses. These are not atomic cross-peer views.
+
+### Example: inspect a session and retry a failed read
+
+1. In an open conversation, press `Ctrl+S`, then `4` for Routing and `Right`
+   for Content. Example fields might read:
+
+   ```text
+   Session pin: local:small-model
+   Resolution input: local:small-model
+   Local resolved model: small-model
+   TUI cached agent: alpha (cache, not routing verdict)
+   ```
+
+   Press `End` to read the guidance. To inspect via commands, press `Esc` and
+   type `/agents` or `/agent room`, then `/model`. Do not use bare `/agent host`
+   for inspection: without an argument it clears the host.
+
+2. Reopen Settings and press `5` for History. A new tab can show
+   `No cached entries; persisted history not verified`. For an independent read,
+   leave Settings and use `/info`, `/print` or `/interrupted`. `/print` displays
+   Message/Directive/Summary/Error rows, not every audit type. None of these
+   commands proves that the TUI cache is complete.
+3. Reopen and press `6` for Sharing. A disabled preference reads
+   `Local sync preference: disabled (this account only)`; it does not mean other
+   peers lost their historical access. If the preference cannot be decoded, the
+   page instead shows:
+
+   ```text
+   Local sync preference: Failed to read source; diagnostic text withheld
+   ```
+
+   A timeout shows `Timed out reading local snapshot`. Neither error becomes a
+   disabled preference, and reading the page does not create a key or repair data.
+
+4. Leave/reopen Sharing to retry. For independent inspection, leave Settings and
+   type `/sharing status` or `/sharing requests`. The latter inspects the source
+   peer's request queue, not just this session. `/share` generates a ticket and
+   changes serving; `/unshare` changes local serving. They are deliberate commands,
+   not actions on this read-only page, and do not revoke existing peers' data.
 
 ### Example: session override, then peer inspection
 

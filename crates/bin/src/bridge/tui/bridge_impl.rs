@@ -113,6 +113,7 @@ impl TuiBridge {
         let (models_tx, mut models_rx) = mpsc::channel::<ModelCatalog>(4);
         let (session_rows_tx, mut session_rows_rx) = mpsc::channel::<SessionLoad>(128);
         let (peer_pages_tx, mut peer_pages_rx) = mpsc::channel(1);
+        let (session_pages_tx, mut session_pages_rx) = mpsc::channel(1);
         let (jobs_tx, mut jobs_rx) = mpsc::channel::<jobs::Loaded>(1);
         // Background tab reads (session reloads, status strip, live-turn
         // counts). Tasks are owned by their tab's slots; the channel adds
@@ -145,6 +146,7 @@ impl TuiBridge {
         'run: loop {
             operations::cancel_closed_reads(&mut app);
             peer_pages::update(&mut app, server, &peer_pages_tx);
+            session_pages::update(&mut app, server, &backend, &session_pages_tx);
             if !app.backend_available
                 && reconnect_allowed
                 && runtime_task.is_none()
@@ -218,6 +220,7 @@ impl TuiBridge {
                     Some(res) = models_rx.recv() => Action::ModelsFetched(res),
                     Some(load) = session_rows_rx.recv() => Action::SessionLoad(load),
                     Some(loaded) = peer_pages_rx.recv() => Action::PeerPage(loaded),
+                    Some(loaded) = session_pages_rx.recv() => Action::SessionPage(loaded),
                     Some(loaded) = jobs_rx.recv() => Action::JobsLoaded(loaded),
                     _ = activity_tick.tick() => {
                         if app.backend_available {
@@ -507,6 +510,7 @@ impl TuiBridge {
                         }
                     }
                     Action::SessionChanged(id) => {
+                        session_pages::changed(&mut app, &id);
                         if !app.backend_available {
                             continue;
                         }
@@ -645,6 +649,7 @@ impl TuiBridge {
                         }
                     }
                     Action::PeerPage(loaded) => peer_pages::apply(&mut app, loaded),
+                    Action::SessionPage(loaded) => session_pages::apply(&mut app, loaded),
                     Action::JobsLoaded(loaded) => jobs::apply_loaded(&mut app, loaded),
                     Action::ModelsFetched(res) => {
                         apply_model_catalog(&mut app, res);
@@ -664,6 +669,7 @@ impl TuiBridge {
                 }
 
                 peer_pages::update(&mut app, server, &peer_pages_tx);
+                session_pages::update(&mut app, server, &backend, &session_pages_tx);
 
                 let navigation_after = (
                     app.mode,

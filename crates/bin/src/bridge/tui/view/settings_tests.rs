@@ -1022,6 +1022,7 @@ async fn settings_compact_empty_missing_and_static_pages_use_full_content_slot()
                         (SettingsScope::Peer, 1 | 3 | 5) => "view-only in v1",
                         (SettingsScope::Session, 0) => "agent)",
                         (SettingsScope::Session, 1) if !missing => "selected",
+                        (SettingsScope::Session, 3..=5) => "result",
                         _ => "coming soon",
                     };
                     assert!(
@@ -2148,4 +2149,772 @@ async fn settings_peer_inspector_collects_actual_catalog_and_loaded_templates_on
         assert!(rx.try_recv().is_err());
     }
     server.shutdown().await;
+}
+
+fn session_snapshot(
+    app: &App,
+    category: SessionSettingsCategory,
+    result: Option<Result<Vec<String>, super::super::session_pages::Failure>>,
+) -> super::super::session_pages::Snapshot {
+    super::super::session_pages::Snapshot {
+        category,
+        id: app.active().session_db_id.clone(),
+        incarnation: app.active().live.incarnation,
+        observed_at: None,
+        result,
+    }
+}
+
+#[tokio::test]
+async fn settings_session_inspector_frames_states_geometry_inputs_and_redaction() {
+    use super::super::session_pages::Failure;
+    let (_instance, server, backend, mut app) = fixture().await;
+    let id = app.active().session_db_id.clone();
+    let short = super::super::short_session_id(&id);
+    let key_text = server
+        .registry()
+        .default_pubkey()
+        .await
+        .unwrap()
+        .to_prefixed_string();
+    for (index, category, field) in [
+        (
+            3,
+            SessionSettingsCategory::Routing,
+            "TUI cached agent: FINAL_R",
+        ),
+        (
+            4,
+            SessionSettingsCategory::History,
+            "Latest cached time: FINAL_H",
+        ),
+        (
+            5,
+            SessionSettingsCategory::Sharing,
+            "Direct key permission: FINAL_S",
+        ),
+    ] {
+        for result in [
+            None,
+            Some(Err(Failure::Unavailable)),
+            Some(Err(Failure::Denied)),
+            Some(Err(Failure::Failed)),
+            Some(Err(Failure::Invalid)),
+            Some(Err(Failure::Timeout)),
+            Some(Ok(vec![
+                match category {
+                    SessionSettingsCategory::Routing => "No roster metadata recorded",
+                    SessionSettingsCategory::History => {
+                        "No cached entries; persisted history not verified"
+                    }
+                    SessionSettingsCategory::Sharing => "Not tracked by this account",
+                    _ => unreachable!(),
+                }
+                .into(),
+            ])),
+            Some(Ok((0..90)
+                .map(|i| format!("synthetic allowed field {i}"))
+                .chain([format!("Full public key: {key_text}"), field.into()])
+                .collect())),
+        ] {
+            app.session_pages.snapshot = Some(session_snapshot(&app, category, result.clone()));
+            open(&mut app, SettingsScope::Session, index);
+            app.input = "unsent draft".into();
+            app.active_mut().scroll_offset = 7;
+            let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+            for (w, h) in [
+                (80, 24),
+                (64, 14),
+                (40, 8),
+                (39, 7),
+                (120, 40),
+                (80, 24),
+                (0, 0),
+                (1, 1),
+                (15, 8),
+                (16, 8),
+                (17, 8),
+                (39, 14),
+                (40, 14),
+                (41, 14),
+                (63, 14),
+                (65, 14),
+                (64, 7),
+                (64, 8),
+                (64, 9),
+                (64, 13),
+                (64, 15),
+            ] {
+                terminal.backend_mut().resize(w, h);
+                terminal.resize(Rect::new(0, 0, w, h)).unwrap();
+                let before = app.settings_reader.offset;
+                draw(&mut terminal, &mut app, &server, &backend);
+                if w < 40 || h < 8 {
+                    assert!(app.click_regions.is_empty() && app.settings_reader.viewport.is_none());
+                    for code in [KeyCode::Enter, KeyCode::Down, KeyCode::End] {
+                        assert!(matches!(key(&mut app, code), input::SettingsKey::None));
+                    }
+                    assert_eq!(app.settings_reader.offset, before);
+                    continue;
+                }
+                assert_eq!(
+                    app.settings_layout,
+                    if w >= 64 && h >= 14 {
+                        super::super::SettingsLayout::Normal
+                    } else {
+                        super::super::SettingsLayout::Compact
+                    }
+                );
+                key(&mut app, KeyCode::Right);
+                assert_eq!(app.settings_focus, SettingsFocus::Content);
+                let seen = peer_read_all(&mut terminal, &mut app, &server, &backend);
+                let flat = seen.split_whitespace().collect::<Vec<_>>().join(" ");
+                let cells = seen.split_whitespace().collect::<String>();
+                assert!(cells.contains(&id));
+                let expected = match &result {
+                    None => "Loading local snapshot",
+                    Some(Err(Failure::Unavailable)) => "Unavailable",
+                    Some(Err(Failure::Denied)) => "Read denied",
+                    Some(Err(Failure::Failed)) => "Failed to read source",
+                    Some(Err(Failure::Invalid)) => "Invalid stored metadata",
+                    Some(Err(Failure::Timeout)) => "Timed out reading local snapshot",
+                    Some(Ok(rows)) if rows.len() == 1 => rows[0].as_str(),
+                    Some(Ok(_)) => field,
+                };
+                assert!(flat.contains(expected), "{category:?} {w}x{h}: {flat}");
+                if result
+                    .as_ref()
+                    .is_some_and(|r| r.as_ref().is_ok_and(|rows| rows.len() > 1))
+                {
+                    assert!(cells.contains(&key_text), "full public key lost");
+                }
+                assert!(flat.contains("Scope: selected"));
+                assert!(flat.contains("existing command's result"));
+                assert!(!flat.contains("coming soon") && !flat.contains("SECRET_"));
+                let tail = draw(&mut terminal, &mut app, &server, &backend);
+                assert!(
+                    contains(&tail, &short),
+                    "pinned session missing at End: {tail:?}"
+                );
+                assert_eq!(app.settings_reader.offset, app.settings_reader.max_offset);
+                key(&mut app, KeyCode::PageUp);
+                key(&mut app, KeyCode::PageDown);
+                assert_eq!(app.settings_reader.offset, app.settings_reader.max_offset);
+                key(&mut app, KeyCode::Home);
+                draw(&mut terminal, &mut app, &server, &backend);
+                let viewport = app.settings_reader.viewport.unwrap();
+                assert!(viewport.height > 0);
+                for y in [viewport.y, viewport.bottom() - 1] {
+                    for _ in 0..=app.settings_reader.max_offset {
+                        send_mouse(&mut app, MouseEventKind::ScrollDown, viewport.x, y);
+                    }
+                    draw(&mut terminal, &mut app, &server, &backend);
+                    assert_eq!(app.settings_reader.offset, app.settings_reader.max_offset);
+                    key(&mut app, KeyCode::Home);
+                }
+                send_mouse(
+                    &mut app,
+                    MouseEventKind::Down(MouseButton::Left),
+                    viewport.x,
+                    viewport.y,
+                );
+                assert_eq!(app.settings_focus, SettingsFocus::Content);
+                let offset = app.settings_reader.offset;
+                for (x, y) in [(0, 0), (0, h - 1), (w, h), (viewport.x, viewport.y - 1)] {
+                    send_mouse(&mut app, MouseEventKind::ScrollDown, x, y);
+                    assert_eq!(app.settings_reader.offset, offset);
+                }
+                for code in [
+                    KeyCode::Enter,
+                    KeyCode::Char('a'),
+                    KeyCode::Char('d'),
+                    KeyCode::Char('r'),
+                    KeyCode::Char('y'),
+                ] {
+                    assert!(matches!(key(&mut app, code), input::SettingsKey::None));
+                    assert!(
+                        app.settings_prompt.is_none()
+                            && app.settings_picker.is_none()
+                            && app.agent_diff.is_none()
+                    );
+                }
+                assert_regions(&app, w, h);
+                assert!(app.settings_list_area.is_none());
+                assert!(
+                    !app.click_regions
+                        .iter()
+                        .any(|r| matches!(r.target, ClickTarget::SettingsDetailRow(_)))
+                );
+                assert_eq!(app.session_settings_index, index);
+                assert_eq!(app.active().scroll_offset, 7);
+                assert_eq!(app.input, "unsent draft");
+            }
+        }
+        // Same DB id but a new tab incarnation must not show the previous snapshot.
+        app.active_mut().live.incarnation += 1;
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        draw(&mut terminal, &mut app, &server, &backend);
+        let seen = peer_read_all(&mut terminal, &mut app, &server, &backend);
+        assert!(seen.contains("Page snapshot unavailable") && !seen.contains(field));
+        let rx = approval(&mut app);
+        draw(&mut terminal, &mut app, &server, &backend);
+        deny(&mut app, false, rx).await;
+        key(&mut app, KeyCode::Left);
+        assert_eq!(app.settings_focus, SettingsFocus::Category);
+        key(&mut app, KeyCode::Tab);
+        assert_eq!(app.settings_reader.offset, 0);
+    }
+    server.shutdown().await;
+}
+
+async fn load_session_page(
+    app: &mut App,
+    server: &Arc<Server>,
+    backend: &BackendManager,
+    index: usize,
+) -> String {
+    use super::super::session_pages;
+    let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+    app.close_settings();
+    session_pages::update(app, server, backend, &tx);
+    open(app, SettingsScope::Session, index);
+    session_pages::update(app, server, backend, &tx);
+    if index != 4 {
+        assert!(
+            app.session_pages
+                .snapshot
+                .as_ref()
+                .unwrap()
+                .result
+                .is_none()
+        );
+        session_pages::apply(
+            app,
+            tokio::time::timeout(std::time::Duration::from_secs(6), rx.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+        );
+    }
+    session_pages::lines(app, SessionSettingsCategory::ALL[index]).join("\n")
+}
+
+#[tokio::test]
+async fn settings_session_inspector_actual_routing_queries_models_candidates_and_invalid_metadata()
+{
+    use chaz_core::{hosted_index::DbEntry, session::AgentRef};
+    use eidetica::{
+        auth::types::{AuthKey, Permission},
+        entry::ID,
+        store::DocStore,
+    };
+    let (_instance, server, backend, mut app) = fixture().await;
+    let db = app.active().session_db.clone();
+    let registry = server.registry();
+    app.active_mut().current_agent.clear();
+    let empty = load_session_page(&mut app, &server, &backend, 3).await;
+    assert!(empty.contains("No roster metadata recorded") && empty.contains("Host not set"));
+    assert!(empty.contains("TUI cached agent: Unavailable"));
+    assert!(empty.contains("No locally indexed Active+Write candidates"));
+    app.active_mut().current_agent = "agent-00".into();
+    let mut refs = Vec::new();
+    let mut keys = Vec::new();
+    for (i, permission) in [
+        Permission::Write(10),
+        Permission::Read,
+        Permission::Admin(1),
+        Permission::Write(10),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let name = format!("agent-{i:02}");
+        let key = registry
+            .user_lock()
+            .await
+            .add_private_key(Some(&name))
+            .await
+            .unwrap();
+        let id = ID::from_bytes(name.as_bytes());
+        server.agent_index().register(DbEntry {
+            db_id: id.clone(),
+            display_name: name.clone(),
+            pubkey: key.clone(),
+        });
+        let txn = db.new_transaction().await.unwrap();
+        txn.get_settings()
+            .unwrap()
+            .set_auth_key(
+                &key,
+                if i == 3 {
+                    AuthKey::new(
+                        Some(&name),
+                        permission,
+                        eidetica::auth::types::KeyStatus::Revoked,
+                    )
+                } else {
+                    AuthKey::active(Some(&name), permission)
+                },
+            )
+            .await
+            .unwrap();
+        txn.commit().await.unwrap();
+        refs.push(AgentRef {
+            db_id: id.to_string(),
+            display_name: name,
+            home_pubkey: Some(key.to_prefixed_string()),
+        });
+        keys.push(key);
+    }
+    refs[1].home_pubkey = Some(keys[0].to_prefixed_string());
+    refs[2].home_pubkey = None;
+    refs[3].home_pubkey = Some("SECRET_INVALID_HOME".into());
+    refs.push(AgentRef {
+        db_id: "SECRET_INVALID_DB".into(),
+        display_name: "remote-only".into(),
+        home_pubkey: None,
+    });
+    agent(&server, "agent-00", 0, false);
+    server.agents().upsert(Agent::from_db_config(
+        "agent-00",
+        &AgentDbConfig {
+            model: Some("local:default".into()),
+            ..Default::default()
+        },
+    ));
+    let txn = db.new_transaction().await.unwrap();
+    let meta = txn.get_store::<DocStore>("meta").await.unwrap();
+    meta.set("agents", serde_json::to_string(&refs).unwrap())
+        .await
+        .unwrap();
+    meta.set("host_agent_db_id", refs[0].db_id.as_str())
+        .await
+        .unwrap();
+    meta.set("model", "session:pin").await.unwrap();
+    meta.set("agent_models", r#"{"agent-00":"override:model"}"#)
+        .await
+        .unwrap();
+    for key in [
+        "backend_url",
+        "backend_key_ref",
+        "role_prompt",
+        "credentials",
+    ] {
+        meta.set(key, "SECRET_EXCLUDED_METADATA").await.unwrap();
+    }
+    txn.commit().await.unwrap();
+    let before = db.snapshot().await.unwrap();
+    let seen = load_session_page(&mut app, &server, &backend, 3).await;
+    for required in [
+        "Recorded host DB",
+        &refs[0].db_id,
+        "Matches local agent key",
+        "Different from local agent key",
+        "Legacy/unset home",
+        "Invalid home public-key metadata",
+        "Invalid identifier metadata",
+        "Local agent default unavailable",
+        "Per-agent session override: override:model",
+        "Session pin: session:pin",
+        "Resolution input: override:model",
+        "Model resolution unavailable",
+        "TUI cached agent: agent-00 (cache, not routing verdict)",
+    ] {
+        assert!(seen.contains(required), "missing {required}: {seen}");
+    }
+    assert!(!seen.contains("SECRET_"));
+    let canonical = registry
+        .authorized_hosted_agents(&db, server.agent_index())
+        .await
+        .unwrap();
+    assert_eq!(canonical.len(), 1);
+    let candidates = seen
+        .split("Locally indexed Active+Write candidates (not total membership or turn order):")
+        .nth(1)
+        .unwrap()
+        .split("TUI cached agent:")
+        .next()
+        .unwrap();
+    assert!(candidates.contains(&canonical[0].db_id.to_string()));
+    for excluded in &refs[1..4] {
+        assert!(!candidates.contains(&excluded.db_id));
+    }
+    assert_eq!(
+        db.snapshot().await.unwrap(),
+        before,
+        "inspector wrote session data"
+    );
+    // Exercise every model-precedence rung against the actual canonical helpers.
+    let configured =
+        BackendManager::new(
+            &Some(vec![serde_json::from_value(serde_json::json!({
+        "type": "openaicompatible", "name": "local", "api_base": "http://127.0.0.1:9/v1",
+        "models": [{"name": "backend-default"}]
+    })).unwrap()]),
+            chaz_core::security::SecretStore::new(registry.chaz_peer().clone()).await,
+        );
+    for (pin, overrides, local, expected) in [
+        (
+            Some("local:session"),
+            r#"{"agent-00":"local:override"}"#,
+            Some("local:default"),
+            "local:override",
+        ),
+        (
+            Some("local:session"),
+            "{}",
+            Some("local:default"),
+            "local:session",
+        ),
+        (None, "{}", Some("local:default"), "local:default"),
+        (None, "{}", None, "Backend default (no pin)"),
+    ] {
+        let txn = db.new_transaction().await.unwrap();
+        let meta = txn.get_store::<DocStore>("meta").await.unwrap();
+        if let Some(pin) = pin {
+            meta.set("model", pin).await.unwrap();
+        } else {
+            meta.delete("model").await.unwrap();
+        }
+        meta.set("agent_models", overrides).await.unwrap();
+        txn.commit().await.unwrap();
+        server.agents().upsert(Agent::from_db_config(
+            "agent-00",
+            &AgentDbConfig {
+                model: local.map(str::to_owned),
+                ..Default::default()
+            },
+        ));
+        let seen = load_session_page(&mut app, &server, &configured, 3).await;
+        assert!(
+            seen.contains(&format!("Resolution input: {expected}")),
+            "{seen}"
+        );
+        let canonical = chaz_core::session::SessionMeta {
+            model: pin.map(str::to_owned),
+            agent_models: serde_json::from_str(overrides).unwrap(),
+            ..Default::default()
+        };
+        let resolved =
+            configured.resolve_model_name(canonical.resolve_model_for_agent("agent-00").or(local));
+        assert!(
+            seen.contains(&format!("Local resolved model: {resolved}")),
+            "{seen}"
+        );
+    }
+    // Malformed optional data is not compatibility absence, and raw values never echo.
+    let txn = db.new_transaction().await.unwrap();
+    let meta = txn.get_store::<DocStore>("meta").await.unwrap();
+    meta.set("host_agent_db_id", "SECRET_INVALID_HOST")
+        .await
+        .unwrap();
+    meta.set("agents", "SECRET_INVALID_JSON").await.unwrap();
+    meta.set("model", eidetica::crdt::doc::Value::Int(12))
+        .await
+        .unwrap();
+    txn.commit().await.unwrap();
+    let seen = load_session_page(&mut app, &server, &backend, 3).await;
+    assert!(
+        seen.contains("Invalid identifier metadata") && seen.contains("Invalid stored metadata")
+    );
+    assert!(!seen.contains("No roster metadata recorded") && !seen.contains("SECRET_"));
+    // A viewer alone would return an empty doc: enforce the registered type.
+    let txn = db.new_transaction().await.unwrap();
+    txn.get_index()
+        .await
+        .unwrap()
+        .set_entry("meta", "table:v0", eidetica::crdt::Doc::new())
+        .await
+        .unwrap();
+    txn.commit().await.unwrap();
+    let seen = load_session_page(&mut app, &server, &backend, 3).await;
+    assert!(seen.contains("Routing metadata: Invalid stored metadata"));
+    assert!(!seen.contains("Host not set") && !seen.contains("No roster metadata recorded"));
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn settings_session_inspector_history_samples_type_and_time_only_without_reads() {
+    use super::super::session_pages;
+    use chaz_core::session::SessionEntry;
+    let (_instance, server, backend, mut app) = fixture().await;
+    let types = [
+        EntryType::Message,
+        EntryType::BridgeEvent,
+        EntryType::MatrixObserved,
+        EntryType::MatrixSend,
+        EntryType::MatrixSent,
+        EntryType::Directive,
+        EntryType::ToolCall,
+        EntryType::ToolResult,
+        EntryType::Ack,
+        EntryType::Error,
+        EntryType::Summary,
+        EntryType::ApprovalRequest,
+        EntryType::ApprovalDecision,
+        EntryType::Cancel,
+        EntryType::TurnContext,
+        EntryType::Unknown {
+            kind: "SECRET_KIND".into(),
+            raw: serde_json::json!({"SECRET_FUTURE": "SECRET_BODY"}),
+        },
+    ];
+    app.active_mut().entries = types
+        .into_iter()
+        .enumerate()
+        .map(|(i, entry_type)| SessionEntry {
+            content: "SECRET_TRANSCRIPT".into(),
+            sender: "SECRET_SENDER".into(),
+            timestamp: chrono::DateTime::from_timestamp(1000 - i as i64, 0).unwrap(),
+            entry_type,
+            metadata: None,
+            routing: None,
+        })
+        .collect();
+    let guard = server.registry().user_lock().await;
+    let seen = load_session_page(&mut app, &server, &backend, 4).await;
+    assert!(seen.contains("Cached entries: 16 (not DB total)"));
+    assert!(seen.contains("Cached ApprovalDecision: 1") && seen.contains("Cached Unknown: 1"));
+    assert!(seen.contains("Earliest cached time: 1970-01-01T00:16:25+00:00"));
+    assert!(seen.contains("Latest cached time: 1970-01-01T00:16:40+00:00"));
+    assert!(!seen.contains("SECRET_"));
+    assert!(seen.contains("Cache only; persistence/completeness"));
+    app.active_mut().entries.clear();
+    app.active_mut().live.transcript_rev += 1;
+    let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+    session_pages::update(&mut app, &server, &backend, &tx);
+    let seen = session_pages::lines(&app, SessionSettingsCategory::History).join("\n");
+    assert!(seen.contains("No cached entries; persisted history not verified"));
+    assert!(seen.contains("Not available: no cached timestamps"));
+    assert!(rx.try_recv().is_err());
+    drop(guard);
+    server.shutdown().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn settings_session_inspector_queries_coalesce_timeout_cancel_and_reject_stale_results() {
+    use super::super::session_pages;
+    let (_instance, server, backend, mut app) = fixture().await;
+    let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+    open(&mut app, SettingsScope::Session, 5);
+    session_pages::update(&mut app, &server, &backend, &tx);
+    let old = rx.recv().await.unwrap();
+    // A completed old-session response cannot land on a different selected tab.
+    let (id, db) = server
+        .registry()
+        .create_session(Some("different"))
+        .await
+        .unwrap();
+    app.active_mut().session_db_id = id.to_string();
+    app.active_mut().session_db = db;
+    app.active_mut().live.incarnation += 1;
+    session_pages::update(&mut app, &server, &backend, &tx);
+    session_pages::apply(&mut app, old);
+    assert!(
+        app.session_pages
+            .snapshot
+            .as_ref()
+            .unwrap()
+            .result
+            .is_none()
+    );
+    session_pages::apply(&mut app, rx.recv().await.unwrap());
+    let snapshot = session_pages::lines(&app, SessionSettingsCategory::Sharing);
+    // Render/scroll never requests another read.
+    let mut terminal = Terminal::new(TestBackend::new(40, 8)).unwrap();
+    for _ in 0..10 {
+        draw(&mut terminal, &mut app, &server, &backend);
+        key(&mut app, KeyCode::Right);
+        key(&mut app, KeyCode::Down);
+        session_pages::update(&mut app, &server, &backend, &tx);
+    }
+    assert!(rx.try_recv().is_err());
+    assert_eq!(
+        session_pages::lines(&app, SessionSettingsCategory::Sharing),
+        snapshot
+    );
+    let registry = server.registry_arc();
+    let guard = registry.user_lock().await;
+    let id = app.active().session_db_id.clone();
+    session_pages::changed(&mut app, &id);
+    session_pages::update(&mut app, &server, &backend, &tx);
+    for _ in 0..20 {
+        session_pages::changed(&mut app, &id);
+        session_pages::update(&mut app, &server, &backend, &tx);
+    }
+    tokio::task::yield_now().await;
+    tokio::time::advance(std::time::Duration::from_secs(5)).await;
+    let timed_out = rx.recv().await.unwrap();
+    assert!(rx.try_recv().is_err(), "more than one in-flight read");
+    session_pages::apply(&mut app, timed_out);
+    session_pages::update(&mut app, &server, &backend, &tx); // single pending refresh
+    drop(guard);
+    session_pages::apply(&mut app, rx.recv().await.unwrap());
+    session_pages::update(&mut app, &server, &backend, &tx);
+    assert!(rx.try_recv().is_err(), "burst produced growing query queue");
+    // Re-entry timeout clears old values and does not automatically retry.
+    app.close_settings();
+    session_pages::update(&mut app, &server, &backend, &tx);
+    let guard = registry.user_lock().await;
+    open(&mut app, SettingsScope::Session, 5);
+    session_pages::update(&mut app, &server, &backend, &tx);
+    tokio::task::yield_now().await;
+    tokio::time::advance(std::time::Duration::from_secs(5)).await;
+    session_pages::apply(&mut app, rx.recv().await.unwrap());
+    let seen = session_pages::lines(&app, SessionSettingsCategory::Sharing).join("\n");
+    assert!(seen.contains("Timed out reading local snapshot"));
+    assert!(!seen.contains("Local sync preference:") && !seen.contains("snapshot at"));
+    for _ in 0..10 {
+        session_pages::update(&mut app, &server, &backend, &tx);
+    }
+    assert!(rx.try_recv().is_err());
+    app.close_settings();
+    session_pages::update(&mut app, &server, &backend, &tx);
+    open(&mut app, SettingsScope::Session, 5);
+    session_pages::update(&mut app, &server, &backend, &tx);
+    app.close_settings();
+    session_pages::update(&mut app, &server, &backend, &tx);
+    drop(guard);
+    tokio::task::yield_now().await;
+    assert!(
+        rx.try_recv().is_err(),
+        "closed page still completed its read"
+    );
+    // A new Server generation cannot consume even a completed old-server reply.
+    open(&mut app, SettingsScope::Session, 5);
+    session_pages::update(&mut app, &server, &backend, &tx);
+    let old = rx.recv().await.unwrap();
+    let (_instance2, server2, _, _app2) = fixture().await;
+    session_pages::update(&mut app, &server2, &backend, &tx);
+    session_pages::apply(&mut app, old);
+    assert!(
+        app.session_pages
+            .snapshot
+            .as_ref()
+            .unwrap()
+            .result
+            .is_none()
+    );
+    session_pages::apply(&mut app, rx.recv().await.unwrap());
+    app.close_settings();
+    session_pages::update(&mut app, &server, &backend, &tx);
+    app.active_mut().session_db_id = "SECRET_MISMATCHED_ID".into();
+    open(&mut app, SettingsScope::Session, 5);
+    session_pages::update(&mut app, &server, &backend, &tx);
+    let seen = session_pages::lines(&app, SessionSettingsCategory::Sharing).join("\n");
+    assert!(seen.contains("Unavailable") && seen.contains("Invalid identifier metadata"));
+    assert!(!seen.contains("SECRET_") && !seen.contains("Direct key status:"));
+    assert!(
+        rx.try_recv().is_err(),
+        "mismatched handle must not issue a query"
+    );
+    server.shutdown().await;
+    server2.shutdown().await;
+}
+
+#[tokio::test]
+async fn settings_session_inspector_sharing_checked_selected_row_and_no_writes() {
+    use eidetica::{Store, store::DocStore};
+    let (_instance, server, backend, mut app) = fixture().await;
+    let db = app.active().session_db.clone();
+    let id = db.root_id();
+    for enabled in [true, false] {
+        server
+            .registry()
+            .user_lock()
+            .await
+            .set_sync_preferences(id, enabled, false, None)
+            .await
+            .unwrap();
+        let before = db.snapshot().await.unwrap();
+        let account_db = server
+            .registry()
+            .user_lock()
+            .await
+            .account()
+            .database()
+            .clone();
+        let account_before = account_db.snapshot().await.unwrap();
+        let seen = load_session_page(&mut app, &server, &backend, 5).await;
+        assert!(
+            seen.contains(if enabled {
+                "Local sync preference: enabled (this account only)"
+            } else {
+                "Local sync preference: disabled (this account only)"
+            }),
+            "{seen}"
+        );
+        assert!(
+            seen.contains("Direct key status: Active")
+                && seen.contains("Direct key permission: Admin(0)"),
+            "{seen}"
+        );
+        assert!(seen.contains("Delegated authority is not inspected"));
+        assert_eq!(db.snapshot().await.unwrap(), before);
+        assert_eq!(account_db.snapshot().await.unwrap(), account_before);
+    }
+    let account_db = server
+        .registry()
+        .user_lock()
+        .await
+        .account()
+        .database()
+        .clone();
+    // Only the selected tracked row is decoded; unrelated bad rows cannot poison it.
+    let txn = account_db.new_transaction().await.unwrap();
+    let rows = DocStore::load(&txn, "databases".into()).await.unwrap();
+    rows.set("unrelated", "SECRET_BAD_UNRELATED_JSON")
+        .await
+        .unwrap();
+    txn.commit().await.unwrap();
+    let seen = load_session_page(&mut app, &server, &backend, 5).await;
+    assert!(seen.contains("Local sync preference: disabled"));
+    assert!(!seen.contains("SECRET_"));
+    // A malformed selected row is failure, not missing or a disabled preference.
+    let txn = account_db.new_transaction().await.unwrap();
+    DocStore::load(&txn, "databases".into())
+        .await
+        .unwrap()
+        .set(id.to_string(), "SECRET_BROKEN_ROW")
+        .await
+        .unwrap();
+    txn.commit().await.unwrap();
+    let seen = load_session_page(&mut app, &server, &backend, 5).await;
+    assert!(
+        seen.contains("Local sync preference: Failed to read source"),
+        "{seen}"
+    );
+    assert!(
+        !seen.contains("Not tracked")
+            && !seen.contains("Local sync preference: disabled")
+            && !seen.contains("SECRET_")
+    );
+    assert!(
+        seen.contains("Direct key status: Active"),
+        "independent key group lost: {seen}"
+    );
+    let txn = account_db.new_transaction().await.unwrap();
+    DocStore::load(&txn, "databases".into())
+        .await
+        .unwrap()
+        .delete(id.to_string())
+        .await
+        .unwrap();
+    txn.commit().await.unwrap();
+    let seen = load_session_page(&mut app, &server, &backend, 5).await;
+    assert!(seen.contains("Not tracked by this account"), "{seen}");
+    assert!(!seen.contains("Local sync preference: disabled"));
+    // A genuinely foreign selected DB must not fall back to another local key/session.
+    let (_foreign_instance, foreign_server, _, foreign_app) = fixture().await;
+    app.active_mut().session_db_id = foreign_app.active().session_db_id.clone();
+    app.active_mut().session_db = foreign_app.active().session_db.clone();
+    app.active_mut().live.incarnation += 1;
+    let seen = load_session_page(&mut app, &server, &backend, 5).await;
+    assert!(
+        seen.contains("No local key found in this account view; direct record not queried"),
+        "{seen}"
+    );
+    assert!(!seen.contains("Direct key status:"));
+    server.shutdown().await;
+    foreign_server.shutdown().await;
 }
