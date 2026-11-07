@@ -1638,6 +1638,10 @@ async fn register_one_exposed_session(
                     session_db_id = %r.session_db_id,
                     "enable on-commit sync for exposed session failed: {e}"
                 );
+                // Keep this session eligible for the next agent-registry rescan.
+                // Registering before its signer is discoverable can cache an
+                // empty extension set and leave replies without on-commit sync.
+                return;
             }
             // Proxy tool approvals over the session DB: the runtime
             // blocks on this channel, the proxy writes a request entry,
