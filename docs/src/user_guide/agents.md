@@ -53,9 +53,26 @@ At startup, each yaml entry becomes an Agent DB named `agent:<display_name>` on 
 
 ## YAML seeds, the Agent DB decides
 
-Global `agents:` YAML initializes a new agent once. Editing or removing that seed later does not replace the existing agent's settings, identity or resources. Providers, bridges, peer settings and startup bank attachment still use their existing configuration paths.
+Agent settings need to survive restarts, travel to co-owning peers and remain editable without a conversation. Chaz uses the Agent DB as the accepted configuration and a **managed configuration folder** as the operator's local editor. The folder is not a second authority or a live directory watched by the runtime.
 
-Each hosted agent also has a **managed configuration folder** backed by its synchronized Agent DB. Use `/agent hosted` or **Settings → Peer → Agents** to find its exact path and projection status. Executables default to `$XDG_CONFIG_HOME/chaz/agents` (usually `~/.config/chaz/agents`); set the peer-local `agent_config_dir` to choose another writable root. Library callers must inject a disposable or operator-selected root themselves.
+```text
+Global config.yaml agents: ── first creation only ──> Agent DB
+Trusted commands / TUI ───── validate and commit ───> Agent DB
+
+Agent DB settings + source texts ──> next-turn parent/worker prompts
+              │
+              ├── sync ──> other peers' Agent DBs
+              │
+              └── automatic projection ──> local agent.yaml + prompts
+                                                    │
+Agent DB <── validate and commit <── explicit /agent reload
+```
+
+Global `agents:` YAML initializes a new agent once. Editing or removing that seed later does not replace the existing agent's settings, identity or resources. The seed file is never written back, so it can remain read-only or Nix-managed. Providers, bridges, peer settings and startup bank attachment still use their existing configuration paths.
+
+### Find the folder
+
+Each hosted agent has a **managed configuration folder** backed by its synchronized Agent DB. Use `/agent hosted` or **Settings → Peer → Agents** to find its exact path and projection status. Executables default to `$XDG_CONFIG_HOME/chaz/agents` (usually `~/.config/chaz/agents`); set the peer-local `agent_config_dir` to choose another writable root. Library callers must inject a disposable or operator-selected root themselves.
 
 ```text
 agents/
@@ -67,19 +84,37 @@ agents/
     .projection.json
 ```
 
+This is an illustrative first-import layout: the directory suffix is 16 hex characters derived from the full DB identity. Parent seed sources become `prompts/parent-0.md`, `parent-1.md`, and so on; worker seed sources become `prompts/worker-<worker-index>-<file-index>.md`. Later explicit parent imports use `prompts/import-<index>-<content-hash>.md`. You can choose other normalized relative paths when editing the folder. Read the actual lists in `agent.yaml`, not a guessed filename.
+
 The readable folder name is not authority. `agent.yaml` binds to the full stable Agent DB ID; keep its `version: 1` and `agent_id` unchanged. Chaz refuses a directory belonging to another identity or an unrelated pre-existing directory. `.projection.json` is recovery bookkeeping, not an editable setting.
 
 ### Two representations, one accepted configuration
 
-The DB is the accepted runtime configuration. The folder is an operator editing interface:
+Choose the direction deliberately:
 
-- Operator commands/TUI edits and incoming synchronized configuration changes automatically project the accepted settings and individual sources outward. **These updates may overwrite pending local edits.** Save a copy before changing settings elsewhere.
-- Only `/agent reload [ref]` imports the folder. Startup never imports it, and there is no file watcher. Restarting at the same successfully projected revision leaves even an invalid local draft alone.
-- A changed DB configuration arriving while this peer was offline projects outward on startup. Memory, session-index and other unrelated DB writes do not overwrite drafts. A no-op setting update does not export again.
-- Reload validates the entire scoped document and every referenced parent/worker source before committing. A malformed/duplicate/unknown field, wrong version/identity, missing source, traversal, symlink or special file fails without changing accepted settings or runtime prompts. With no ref, it visits already hosted agents and reports each result; batch reload is not cross-agent atomic.
-- Projection uses individual atomic file replacements and a persistent interruption journal. It is **not atomic with the DB commit**. If the DB commits but write-back fails, the result says so. Fix the filesystem problem and run `/agent project <ref>` to retry outward from the DB, not reload stale files. An incomplete projection blocks reload. Restart or a later DB event also retries pending outward work.
+| Operator action                            | Reads                                                                        | Accepted configuration and folder effect                         |
+| ------------------------------------------ | ---------------------------------------------------------------------------- | ---------------------------------------------------------------- |
+| `/agent set` or a Peer Settings edit       | Accepted DB config; a source-list edit also reads the explicitly named files | Commit settings/sources, then project outward                    |
+| Edit `agent.yaml` or a referenced prompt   | Local files only                                                             | A draft; no runtime change until reload                          |
+| `/agent reload [ref]`                      | Complete local document and all referenced parent/worker files               | Validate, replace the editable scope in DB, then project outward |
+| `/agent project <ref>`                     | Accepted DB settings and sources                                             | Overwrite the local projection; **do not import files**          |
+| Start/restart or receive a DB notification | Accepted DB config/source revision                                           | Project if changed or pending; never import the draft            |
 
-Only explicitly referenced sources are imported and synchronized. Chaz neither discovers agents from arbitrary folders nor recursively ingests nearby files. Obsolete tracked prompt files may be removed after a successful update; unrelated files are left alone.
+**Accepted DB updates may overwrite pending local edits.** Save drafts elsewhere before changing settings through commands, the TUI or another peer.
+
+There is no file watcher. Restarting at the same successfully projected revision leaves even an invalid local draft alone. A changed DB configuration arriving while this peer was offline projects outward on startup. Memory, session-index and other unrelated DB writes do not overwrite drafts, and a no-op setting update does not export again.
+
+Reload validates the entire scoped document and every referenced parent/worker source before committing. A malformed/duplicate/unknown field, wrong version/identity, missing source, traversal, symlink or special file fails without changing accepted settings or runtime prompts. With no ref, it visits already hosted agents and reports each result; batch reload is not cross-agent atomic.
+
+Projection uses individual atomic file replacements and a persistent interruption journal. It is **not atomic with the DB commit**. If the DB commits but write-back fails, the result says so. Fix the filesystem problem and run `/agent project <ref>` to retry outward from the DB, not reload stale files. An incomplete projection blocks reload. Restart or a later DB event also retries pending outward work.
+
+Only explicitly referenced sources are imported and synchronized. Chaz neither discovers agents from arbitrary folders nor recursively ingests nearby files. Obsolete tracked prompt files may be removed after a successful update; unrelated files are left alone. Projection normalizes the YAML: comments, key order and custom formatting are not retained.
+
+#### What a second peer receives
+
+Peers sharing the **same Agent DB** synchronize settings together with the ordered relative paths and individual source texts. Each peer projects into its own local `agent_config_dir`; absolute roots and `.projection.json` do not sync. The receiving runtime uses the synchronized source text even if the original external file does not exist there. Merely sharing a conversation is not a substitute for sharing the agent; use the existing [agent co-ownership procedure](session_sharing.md#example-co-owning-an-agent-across-two-peers).
+
+For example, reload `prompts/system.md` on peer A. After agent sync reaches B, B's accepted settings and that file's contents project into B's folder and become its next-turn prompt input. A pending local edit to the same file on B may be overwritten. A memory write instead does not reproject configuration, and changing only a local draft on A sends nothing to B. Configuration sync does not elect an execution owner; the existing [home-peer rules](#execution-ownership-home-peer) still decide who runs a turn.
 
 ### Folder reference and omission defaults
 
@@ -104,36 +139,54 @@ Reload replaces this complete editable scope, not the whole Agent DB. **Omitting
 
 Worker entries accept `name` (required, unique), `system_prompt`, `system_prompt_files`, `model`, `tools`, `max_spawn_depth` and `presets`. Files are ordered before inline text, just as for the parent. Worker prompts reach the child model request; the child still uses the parent agent's identity and existing tool/ownership restrictions.
 
+Reload is **replacement, not a patch or a merge**. Deleting `workers` removes all worker templates. Deleting `capabilities` removes the agent-wide ceiling, and deleting `grants` removes its per-tool overrides. For example, omitting a previous `capabilities.network.endpoints: []` no longer expresses deny-all networking at the agent tier. Review the entire document, especially restrictions, before applying it; remaining host/tool/session limits still apply.
+
 Legacy bookkeeping, bank-default references, keys, credentials, logins, bank attachments, memories, skills, schedules, sessions and other unrelated state are outside this editable scope and survive reload. Skills and schedules are not managed as files by this interface.
 
 ### Walkthrough: edit a prompt and a worker
 
-In this example, substitute the actual path and ID shown by your installation for the angle-bracketed placeholders.
+Use a test agent for the complete example below. Substitute the actual path and full ID shown by your installation for the angle-bracketed placeholders. On an existing agent, edit its projected document instead of replacing it with this example: omitted settings reset.
 
 1. Find the existing agent:
 
    ```text
    /agent hosted
+   Living Agents hosted on this peer:
      helper (<agent-id>)
        /home/operator/.config/chaz/agents/helper-<identity-suffix> (projected; local edits import only on reload)
    ```
 
-2. Edit an existing referenced file, or add a new file and list it explicitly. Keep the other settings you want to retain in `agent.yaml`; this excerpt shows the prompt/worker portion:
+2. In the folder just shown, create the `prompts/` directory if needed and write the two regular files below. List them explicitly in `agent.yaml`; the following is a complete scoped document for this test agent, not a fragment to overlay:
 
    ```yaml
    version: 1
    agent_id: <agent-id>
    system_prompt_files: [prompts/system.md]
    system_prompt: "Answer concisely."
+   model: null
+   tools: [get_time, calculate, spawn_worker]
+   autonomous: false
+   max_spawn_depth: 10
+   capabilities:
+     network:
+       endpoints: [] # No tool-host network access at the agent tier
+   grants: {}
    workers:
      - name: researcher
        system_prompt_files: [prompts/researcher.md]
        system_prompt: "Cite sources."
+       tools: [get_time, calculate]
    ```
 
    Put `Use metric units.` in `prompts/system.md` and `Check primary evidence.` in `prompts/researcher.md`. Nothing has changed at runtime yet, even if Chaz restarts.
 
-3. Apply through a trusted client with `/agent reload helper`, or run `chaz cmd '/agent reload helper'` without creating a conversation or an LLM turn. The command reports:
+3. Apply through a trusted client with `/agent reload helper`. For a sessionless CLI reload:
+
+   ```bash
+   chaz --config config.yaml cmd '/agent reload helper'
+   ```
+
+   Use a client connection to an existing Eidetica service, or stop a direct-owner daemon before opening the same store from another process; see [connection ownership](configuration.md#eidetica-connection-and-execution-role). The reload creates neither a conversation nor an LLM turn. It reports:
 
    ```text
    helper: reloaded scoped settings and sources (effective next message)
@@ -142,15 +195,47 @@ In this example, substitute the actual path and ID shown by your installation fo
 
    The next parent prompt contains `Use metric units.` followed by `Answer concisely.`; the next `researcher` invocation uses `Check primary evidence.` followed by `Cite sources.`. A second peer recreates these individual files from synchronized source data without accessing the originals.
 
-4. Error/recovery: change a reference to `../outside.md`. Reload reports `prompt path must be relative and normalized` or `invalid prompt path`, leaves the accepted DB/prompt unchanged, and names the failing agent. Restore the relative path and retry. Invalid YAML similarly reports a parse error; viewing the TUI folder diff never applies it.
+4. To make a small command edit instead, run `/agent set helper system_prompt Answer in short paragraphs.`. The response begins:
 
-5. Write-back recovery: if a managed file has become a directory, a setting edit can report:
+   ```text
+   Set system_prompt=Answer in short paragraphs. on agent 'helper' (takes effect next message)
+   ```
+
+   This changes the inline component, retains the accepted file fragments and projects the document outward. It does **not** read pending edits in `prompts/system.md`. A changed DB setting can overwrite those edits; copy drafts elsewhere before using another editing surface.
+
+5. Error/recovery: change a reference to `../outside.md`. Reload includes `invalid prompt path "../outside.md"`, leaves the accepted DB/prompt unchanged, and names the failing agent. Restore the relative path and retry. Invalid YAML similarly reports a parse error; viewing the TUI folder diff never applies it.
+
+### Diagnose and repair outward projection
+
+A `projected` status means the last outward write completed; it does not mean local files still match the DB or that a draft is valid. Use the TUI diff to compare. Distinguish validation/commit refusal from write-back failure:
+
+| Report                                                                  | Active DB/runtime                                                             | Recovery                                                                        |
+| ----------------------------------------------------------------------- | ----------------------------------------------------------------------------- | ------------------------------------------------------------------------------- |
+| Parse, source-read or key/commit error before acceptance                | Unchanged                                                                     | Fix input or access, then retry the intended update                             |
+| `Agent DB committed ... but folder projection failed`                   | New accepted config is effective                                              | Preserve any draft separately, fix the filesystem obstruction, then **project** |
+| `projection incomplete` or `folder is behind accepted DB configuration` | DB remains authoritative; reload refused                                      | Copy drafts elsewhere, then project before editing/reloading again              |
+| `projection/migration blocked` due to unavailable saved prompt          | Original legacy data preserved; execution blocked on a folder-configured peer | Recover the saved source on a peer that has it; see migration below             |
+
+For a disposable failure/recovery example:
+
+1. Replace a previously managed prompt file with a directory, then change a scalar setting through `/agent set`. A typical result is:
 
    ```text
    Agent DB committed (effective next message), but folder projection failed: ... Retry /agent project helper — do not reload stale files.
    ```
 
-   Fix that filesystem obstruction, then run `/agent project helper`. Success reports `Projected accepted DB configuration; no files imported.` This deliberately replaces pending drafts with the accepted DB version. The TUI offers the same outward retry with `p`; `r` opens the folder/DB diff and `R`, then `y`, confirms a full reload. There is no global-YAML Pick/Reseed operation.
+2. Move the obstructing directory out of the managed folder, then run `/agent project helper`. Success reports:
+
+   ```text
+   Projected accepted DB configuration; no files imported.
+   /home/operator/.config/chaz/agents/helper-<identity-suffix> (projected; local edits import only on reload)
+   ```
+
+   The restored file comes from the committed DB, not from the obstruction or a draft. Do not use reload as repair: that would try to import local state, and a recorded incomplete projection refuses it.
+
+3. Inspect the result before making further edits. Restart or a later DB event also retries pending projection, using the same DB-to-folder path. The TUI offers outward retry with `p`; `r` opens the folder/DB diff and `R`, then `y`, confirms a full reload. There is no global-YAML Pick/Reseed operation.
+
+Do not edit or delete `.projection.json` to clear an error. It binds the folder identity, last completed settings/source revision and pending work. Chaz refuses unrelated pre-existing directories and untracked files at a new projection target rather than overwriting them. Preserve those files outside the managed location and retry; only previously tracked obsolete sources are eligible for removal.
 
 ### Migration and writer compatibility
 
@@ -265,6 +350,7 @@ These aren't session-scoped; they act on the Living Agent itself.
 | `/agent new <name> [k=v ...]`                       | Create a Living Agent DB with the existing scalar/list overrides. Edit worker templates and larger structures in its managed folder, then reload.                                                  |
 | `/agent set <ref> <field> <value>`                  | Edit one field on the agent's DB config. Takes effect on the next message via live hydration — no restart.                                                                                         |
 | `/agent reload [ref]`                               | Validate and replace the complete editable settings/source scope from managed folders, for one or all already-hosted agents. Reports partial batch failures.                                       |
+| `/agent project <ref>`                              | Retry outward projection from accepted DB settings/sources; imports no files.                                                                                                                      |
 | `/agent hosted`                                     | List hosted agents, stable IDs, real local folder paths and projection status.                                                                                                                     |
 | `/agent delete <ref>`                               | Unregister locally (index + runtime registry). The DB is **preserved** for archive. Refuses if the agent is still attached to any known session.                                                   |
 | `/agent share <ref>`                                | Generate a `DatabaseTicket` URL for the agent's DB, so another peer can sync it.                                                                                                                   |

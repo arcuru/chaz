@@ -273,7 +273,9 @@ See [Agents](agents.md) for the model and full per-command behaviour.
 | `/agent room`                                      | Chat-room status: roster, host, burst budget                              |
 | `/agent hosted`                                    | List every Living Agent this peer hosts                                   |
 | `/agent new <name> [k=v ...]`                      | Create a Living Agent on this peer                                        |
-| `/agent set <ref> <field> <value>`                 | Edit an agent's runtime config (takes effect on next message)             |
+| `/agent set <ref> <field> <value>`                 | Commit a field and project the agent folder; effective next message       |
+| `/agent reload [ref]`                              | Validate/import the whole managed scope; omitted settings reset           |
+| `/agent project <ref>`                             | Repair the folder outward from accepted DB data; imports nothing          |
 | `/agent delete <ref>`                              | Unregister a Living Agent (DB preserved)                                  |
 | `/agent share <ref>`                               | Generate a share ticket for an agent's DB                                 |
 | `/agent unshare <ref>`                             | Stop sharing an agent DB                                                  |
@@ -631,6 +633,25 @@ These tables list every category in sidebar order. Read-only pages are inspector
 | Routing          | Read-only recorded host/roster, locally indexed Active+Write candidates, home-key comparison, model-resolution inputs and cached TUI agent.    |
 | History          | Read-only counts by entry type and timestamp bounds from the selected tab's already-loaded cache, not database totals.                         |
 | Sharing          | Read-only local sync preference, first account-held public key and its direct auth status/permission; no tickets or permission changes.        |
+
+### Editing an agent folder from Peer Settings
+
+**Peer → Agents edits the agent itself; Session → Agents edits only the conversation roster.** A Peer model edit commits to the Agent DB and writes back its folder. A local file edit is only a draft until explicitly reloaded; the next accepted DB update can overwrite it.
+
+| In Peer → Agents                      | Action                                                                           |
+| ------------------------------------- | -------------------------------------------------------------------------------- |
+| Select an agent                       | Read its real managed-folder path and last projection status                     |
+| `Enter`                               | Pick the DB-default model; does not import prompt drafts                         |
+| `r`                                   | Open `folder ↔ accepted DB`, including parent/worker prompt-content differences  |
+| In the diff: `R`, then `y` or `Enter` | Confirm replacement of **all** editable settings, not just the highlighted field |
+| In confirmation: `n` or `Esc`         | Cancel; no import                                                                |
+| On the Agents page: `p`               | Force outward projection from the DB; pending drafts may be replaced             |
+
+1. Open Peer Settings from the hub with `s` or `Ctrl+S`, choose Agents, then select `helper`. Copy its folder path and save any drafts elsewhere before changing settings.
+2. Edit a referenced prompt file in that folder. Press `r` to inspect the difference; navigation and `Esc` do not apply it. Press `R` to see `replace ALL scoped settings from folder?`, review omission/default consequences, then confirm with `y`.
+3. If the draft has invalid YAML or a missing source, opening the diff/reload reports the error without accepting it. Fix the draft and retry. If the DB committed but projection failed, fix the filesystem cause and use `p`, **not reload**, to restore the accepted version. `projected` records a completed export, not a continuous check that the folder matches.
+
+See the [complete parent/worker example](agents.md#walkthrough-edit-a-prompt-and-a-worker) and [projection recovery](agents.md#diagnose-and-repair-outward-projection) for command output, defaults and failure cases. These controls replace the old global-YAML Pick/Reseed interface; they add no automatic file import.
 
 ### Peer inspectors are snapshots, not runtime verdicts
 

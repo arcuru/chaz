@@ -128,8 +128,9 @@ backends:
 #
 # YAML `agents:` is a *first-boot template only* — the per-agent eidetica
 # DB (AgentDb) is the runtime source of truth afterwards. Use `/agent set`
-# (TUI) or `!chaz agent set` (Matrix) to edit a live agent. See
-# `user_guide/agents.md`.
+# or edit the projected agent.yaml/prompts and explicitly `/agent reload`.
+# Accepted edits sync through the Agent DB and project to each peer's folder;
+# this global seed is never written back. See `user_guide/agents.md`.
 agents:
   - name: chaz
     system_prompt: "You are Chaz, a helpful AI assistant."
@@ -571,24 +572,49 @@ change the effective fallback model and protocol even with pinned agents.
 
 ## Agents
 
-Each `agents:` entry seeds an Agent DB on first boot. Existing settings and ordered parent/worker sources round-trip through managed folders and the synchronized DB, never back into this global seed. `agent_config_dir` selects a writable peer-local root; it is not synchronized and need not be next to a read-only/Nix config. Only explicit `/agent reload` imports folder edits; startup projects accepted data outward. See [Agents](agents.md#two-representations-one-accepted-configuration) for omission defaults, migration, recovery and old-writer limits. Per-agent seed fields:
+There are three distinct locations, not three competing configurations:
 
-| Field                  | Type                   | Notes                                                                                                                                 |
-| ---------------------- | ---------------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
-| `name`                 | string                 | Required. Display name; also the lookup key for `default_agents`, `/agent add`, schedules.                                            |
-| `system_prompt`        | string                 | Inline system prompt. Appended after `system_prompt_files` content when both are set.                                                 |
-| `system_prompt_files`  | list of paths          | File contents concatenated into the system prompt. `~` expansion supported.                                                           |
-| `model`                | string                 | Default model (e.g. `openrouter:anthropic/claude-sonnet-4`). Backend prefix required when ambiguous.                                  |
-| `tools`                | list of tool names     | Whitelist. `null` (omitted) means "all tools". Supports `namespace__*` globs for MCP tools.                                           |
-| `workers`              | list of WorkerConfig   | Per-Agent Worker templates invocable via `spawn_worker`. See "Worker fields" below.                                                   |
-| `max_spawn_depth`      | int                    | Maximum nested spawn depth. Default 10. Does not cap tool calls; see [How a turn ends](agents.md#how-a-turn-ends).                    |
-| `autonomous`           | bool                   | Allow firing without an inbound human message (scheduler wakes). Default `false`.                                                     |
-| `max_context_tokens`   | int                    | Per-agent override of `context.max_context_tokens`.                                                                                   |
-| `tool_profile`         | string                 | References a key in top-level `tool_profiles`.                                                                                        |
-| `grants`               | map<tool, Grants>      | Per-tool grant overrides (shell allow/deny, network endpoints, fs paths). Merged per-kind over policy.                                |
-| `default_memory_banks` | list of bank names     | Auto-attached at first boot. Missing banks are auto-created.                                                                          |
-| `default_skill_banks`  | list of bank names     | Auto-attached at first boot. Missing banks are warned and skipped.                                                                    |
-| `presets`              | map<name, AgentPreset> | Named override bundles for Worker templates (model / spawn depth / tools / role suffix / tool_profile); not a `spawn_agent` argument. |
+| Location                         | What belongs there                                         | How changes take effect                                                            |
+| -------------------------------- | ---------------------------------------------------------- | ---------------------------------------------------------------------------------- |
+| Global YAML passed to `--config` | Peer/provider/bridge setup and `agents:` seeds             | Agent entries initialize new DBs only; existing agents are not reseeded on restart |
+| Synchronized Agent DB            | Accepted per-agent settings and parent/worker source texts | Trusted command/TUI edits or explicit folder reload; runtime reads this state      |
+| Peer-local managed agent folder  | Editable `agent.yaml` and individual prompt copies         | Files are drafts until `/agent reload`; DB changes project outward automatically   |
+
+### `agent_config_dir`
+
+The top-level `agent_config_dir` selects the writable root for managed agent folders on this peer. It is separate from `state_dir` and from the path passed to `--config`, and it is not synchronized. Omit it to use `$XDG_CONFIG_HOME/chaz/agents` (normally `~/.config/chaz/agents`). Chaz adds an identity-bound subdirectory for each hosted agent; `/agent hosted` shows the exact paths. Use ordinary directories, not symlinks in the managed path.
+
+```yaml
+# Peer-local config.yaml, not a managed agent.yaml
+agent_config_dir: "/home/operator/.config/chaz/agents"
+agents:
+  - name: helper
+    system_prompt_files: ["/home/operator/prompts/system.md"]
+    system_prompt: "Answer concisely."
+```
+
+This external prompt is a one-shot imported copy for a new agent, not a live include. Subsequent edits to the original file or seed do not update an existing agent. Edit its managed copy and reload, or explicitly reimport the source list with `/agent set helper system_prompt_files /home/operator/prompts/system.md`. Originals, including read-only/Nix files, are never projection targets.
+
+Startup migrates existing agents' saved prompts when recoverable and projects accepted DB state outward; it never imports local folder drafts. `agent.yaml` is a scoped replacement document with required `version` and full `agent_id`, not another global configuration file: it has no `agents:` wrapper, provider credentials or `agent_config_dir`. See the [folder reference and defaults](agents.md#folder-reference-and-omission-defaults), [editing walkthrough](agents.md#walkthrough-edit-a-prompt-and-a-worker) and [migration/old-writer limits](agents.md#migration-and-writer-compatibility).
+
+### Per-agent seed fields
+
+| Field                  | Type                   | Notes                                                                                                                                             |
+| ---------------------- | ---------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `name`                 | string                 | Required. Display name; also the lookup key for `default_agents`, `/agent add`, schedules.                                                        |
+| `system_prompt`        | string                 | Inline system prompt. Appended after `system_prompt_files` content when both are set.                                                             |
+| `system_prompt_files`  | list of paths          | Seed/import sources copied into the Agent DB; ordered before inline text. External paths support `~`; managed-folder references must be relative. |
+| `model`                | string                 | Default model (e.g. `openrouter:anthropic/claude-sonnet-4`). Backend prefix required when ambiguous.                                              |
+| `tools`                | list of tool names     | Whitelist. `null` (omitted) means "all tools". Supports `namespace__*` globs for MCP tools.                                                       |
+| `workers`              | list of WorkerConfig   | Per-Agent Worker templates invocable via `spawn_worker`. See "Worker fields" below.                                                               |
+| `max_spawn_depth`      | int                    | Maximum nested spawn depth. Default 10. Does not cap tool calls; see [How a turn ends](agents.md#how-a-turn-ends).                                |
+| `autonomous`           | bool                   | Allow firing without an inbound human message (scheduler wakes). Default `false`.                                                                 |
+| `max_context_tokens`   | int                    | Per-agent override of `context.max_context_tokens`.                                                                                               |
+| `tool_profile`         | string                 | References a key in top-level `tool_profiles`.                                                                                                    |
+| `grants`               | map<tool, Grants>      | Per-tool grant overrides (shell allow/deny, network endpoints, fs paths). Merged per-kind over policy.                                            |
+| `default_memory_banks` | list of bank names     | Auto-attached at first boot. Missing banks are auto-created.                                                                                      |
+| `default_skill_banks`  | list of bank names     | Auto-attached at first boot. Missing banks are warned and skipped.                                                                                |
+| `presets`              | map<name, AgentPreset> | Named override bundles for Worker templates (model / spawn depth / tools / role suffix / tool_profile); not a `spawn_agent` argument.             |
 
 ### Worker fields
 
@@ -602,7 +628,7 @@ signed by the parent Agent's key. Lookup is per-Agent; Chaz's
 | --------------------- | ---------------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
 | `name`                | string                 | Required. Unique within the parent Agent's `workers:` list. Used as `spawn_worker(name=…)`.                                              |
 | `system_prompt`       | string                 | Worker's system prompt. Falls back to (inherits) the parent Agent's prompt when omitted.                                                 |
-| `system_prompt_files` | list of paths          | Concatenated into the Worker prompt. `~` expansion supported.                                                                            |
+| `system_prompt_files` | list of paths          | Ordered Worker prompt sources, copied on seed/import. In managed `agent.yaml`, use relative paths within the folder.                     |
 | `model`               | string                 | Override the model. Falls back to the parent Agent's `model`.                                                                            |
 | `tools`               | list of tool names     | Narrows the parent Agent's tool list. May include other Worker names; recursion bounded by depth.                                        |
 | `max_spawn_depth`     | int                    | Maximum nested spawn depth of this Worker's child session. Falls back to the parent Agent's value. Does not cap the Worker's tool calls. |

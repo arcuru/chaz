@@ -44,7 +44,11 @@ Managed agent settings and prompt-source folders are an administration interface
 
 The model file-tool host denies writes to the managed root, including traversal, symlink and hardlink aliases, while preserving ordinary granted workspace writes. Operator commits and folder projection bypass that model-only interface. This is a narrower check than the general advisory filesystem grants described below.
 
-**Native same-user shell and trusted native extensions are not isolated.** They can bypass the direct file-tool boundary. This feature adds no OS sandbox, login-role system or separate host-owned grant registry. Restrictions remain in operator-controlled agent configuration, and full reload omission restores their documented defaults. See [Agent folders](agents.md#operator-owned-not-model-editable) for rollout and old-writer limits.
+**Native same-user shell and trusted native extensions are not isolated.** They can bypass the direct file-tool boundary. This feature adds no OS sandbox, login-role system or separate host-owned grant registry. Removing `shell` from a model's tool list can reduce that escape route, but does not isolate other same-user code.
+
+Restrictions remain in operator-controlled agent configuration and synchronize with it. Reload is a full scoped replacement: omitting `capabilities` removes the agent-wide ceiling, and omitting `grants` removes its per-tool overrides. This is an operator action, not an automatic grant to a model; other host/tool/session limits still apply. Trusted remote clients have the same existing administration path as local ones, not a new local-only privilege.
+
+Prompt-source synchronization is also data disclosure to authorized agent peers. Only explicitly referenced files are copied, but their full text travels with the agent; do not put credentials in prompt sources. This interface does not export credentials, login configuration, keys or arbitrary neighboring files. See [Agent folders](agents.md#operator-owned-not-model-editable) for the editable scope and [writer compatibility](agents.md#migration-and-writer-compatibility) before upgrading or rolling back.
 
 ## Tool Approval
 
