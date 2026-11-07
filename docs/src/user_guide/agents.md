@@ -315,7 +315,7 @@ Each agent on a session can have its own session-scoped model pin, independent o
 | `/model <agent> <id>`  | Set a per-agent override (`SessionMeta.agent_models[agent]`)                   |
 | `/model <agent> clear` | Clear that agent's override                                                    |
 
-The picker exposes the same controls graphically — see [Model Picker / Scope tabs](tui.md#scope-tabs).
+The picker exposes the same controls graphically — see [Model Picker](tui.md#model-picker).
 
 Resolution order on every turn:
 
