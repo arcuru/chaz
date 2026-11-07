@@ -73,6 +73,14 @@ impl Fixture {
         }
     }
     async fn run(&self, messages: Vec<RuntimeMessage>) -> Result<runtime::RuntimeOutcome, String> {
+        let outcome = self.reply(messages).await;
+        self.hub.drain_turn_complete().await;
+        outcome
+    }
+    async fn reply(
+        &self,
+        messages: Vec<RuntimeMessage>,
+    ) -> Result<runtime::RuntimeOutcome, String> {
         runtime::execute(
             Some("turn-model"),
             messages,
@@ -84,6 +92,72 @@ impl Fixture {
             Some(&self.hub),
         )
         .await
+    }
+    async fn pending_naming(&self) -> crate::test_support::MockCallGate {
+        self.mock.push_text("main reply");
+        self.mock.push_text("Generated name");
+        let main_gate = self.mock.block_next_call();
+        let naming_gate = self.mock.block_next_call();
+        let reply = self.reply(vec![RuntimeMessage::User("request".into())]);
+        tokio::pin!(reply);
+        tokio::select! {
+            _ = main_gate.wait_started() => {},
+            result = &mut reply => panic!("main call was not blocked: {result:?}"),
+        }
+        main_gate.release();
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(2), reply)
+            .await
+            .expect("reply must not wait for naming")
+            .unwrap();
+        assert_eq!(outcome.body, "main reply");
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            naming_gate.wait_started(),
+        )
+        .await
+        .unwrap();
+        naming_gate
+    }
+    fn hook_context(&self) -> crate::extension::HookContext {
+        crate::extension::HookContext {
+            agent_name: self.ctx.agent_name.clone(),
+            model: Some("turn-model".into()),
+            call_depth: self.ctx.call_depth,
+            session: self.ctx.session.clone(),
+            active_extensions: self.ctx.active_extensions.clone(),
+            routine_engine: None,
+        }
+    }
+    fn server(&self, registry: Arc<SessionRegistry>) -> Arc<crate::server::Server> {
+        crate::server::Server::new(
+            registry.clone(),
+            registry.agents.clone(),
+            HostedIndex::empty("agent"),
+            HostedIndex::empty("bank"),
+            HostedIndex::empty("skill_bank"),
+            Arc::new(ToolRegistry::new()),
+            Arc::new(ToolPolicyRegistry::empty()),
+            permissive_security(),
+            Default::default(),
+            Default::default(),
+            Arc::new(crate::tool_host::NativeToolHost::new()),
+            self.hub.clone(),
+            self.backend.clone(),
+            Arc::new(crate::mcp::McpRegistry::new()),
+            Some(crate::instance::ExecutorCapability::for_test()),
+        )
+    }
+    async fn end_probe(&mut self) -> Arc<std::sync::atomic::AtomicUsize> {
+        let ends = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let hub = Arc::get_mut(&mut self.hub).unwrap();
+        hub.install_all(vec![Arc::new(EndProbe(ends.clone()))])
+            .await
+            .unwrap();
+        hub.record_active(self.ctx.session.lock().await.database())
+            .await
+            .unwrap();
+        self.ctx.active_extensions.insert("end_probe".into());
+        ends
     }
     async fn id(&self) -> String {
         self.ctx
@@ -839,6 +913,7 @@ async fn resumed_turn_names_once_from_its_restored_exchange() {
     .await
     .unwrap();
     assert_eq!(outcome.body, "resumed reply");
+    f.hub.drain_turn_complete().await;
     let calls = f.mock.recorded_calls();
     assert_eq!(
         calls.len(),
@@ -863,4 +938,260 @@ async fn resumed_turn_names_once_from_its_restored_exchange() {
         Some(f.id().await)
     );
     assert_eq!(f.settings().await["status"], "named");
+}
+
+struct EndProbe(Arc<std::sync::atomic::AtomicUsize>);
+struct EndProbeInstance {
+    manifest: crate::extension::manifest::ExtensionManifest,
+    count: Arc<std::sync::atomic::AtomicUsize>,
+}
+impl Extension for EndProbe {
+    fn name(&self) -> &'static str {
+        "end_probe"
+    }
+    fn supported_hooks(&self) -> &[HookKind] {
+        &[HookKind::AgentEnd]
+    }
+    fn instantiate<'a>(&'a self, _: ScopeCtx<'a>) -> InstantiateFuture<'a> {
+        Box::pin(async move {
+            Ok(Arc::new(EndProbeInstance {
+                manifest: self.manifest(),
+                count: self.0.clone(),
+            }) as Arc<dyn ExtensionInstance>)
+        })
+    }
+}
+impl ExtensionInstance for EndProbeInstance {
+    fn manifest(&self) -> &crate::extension::manifest::ExtensionManifest {
+        &self.manifest
+    }
+    fn agent_end_hook(&self) -> Option<Arc<dyn crate::extension::handler::HookHandlerAgentEnd>> {
+        Some(Arc::new(EndProbe(self.count.clone())))
+    }
+}
+impl crate::extension::handler::HookHandlerAgentEnd for EndProbe {
+    fn on_agent_end<'a>(&'a self) -> crate::extension::handler::HandlerFuture<'a, ()> {
+        Box::pin(async move {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        })
+    }
+}
+
+#[tokio::test]
+async fn reply_and_end_hooks_do_not_wait_for_naming_or_repeat_the_attempt() {
+    let mut f = Fixture::new(json!({"enabled": true})).await;
+    let ends = f.end_probe().await;
+    let naming_gate = f.pending_naming().await;
+    assert_eq!(ends.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(f.settings().await["attempted"], true);
+    f.mock.push_text("second reply");
+    assert_eq!(
+        tokio::time::timeout(std::time::Duration::from_secs(2), f.reply(vec![]))
+            .await
+            .unwrap()
+            .unwrap()
+            .body,
+        "second reply"
+    );
+    assert_eq!(ends.load(std::sync::atomic::Ordering::SeqCst), 2);
+    naming_gate.release();
+    f.hub.drain_turn_complete().await;
+    assert_eq!(
+        f.mock.recorded_calls().len(),
+        3,
+        "two turns and only one auxiliary request"
+    );
+    assert_eq!(f.settings().await["status"], "named");
+}
+
+#[tokio::test]
+async fn session_shutdown_cancels_naming_and_start_does_not_reset_attempt() {
+    let f = Fixture::new(json!({"enabled": true})).await;
+    let naming_gate = f.pending_naming().await;
+    let ctx = f.hook_context();
+    f.hub.fire_session_shutdown(&ctx).await;
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        naming_gate.wait_stopped(),
+    )
+    .await
+    .unwrap();
+    naming_gate.release();
+    assert_eq!(f.settings().await["status"], "attempting");
+    assert!(f.ctx.session.lock().await.read_meta().await.name.is_none());
+    f.hub.fire_session_start(&ctx).await;
+    f.mock.push_text("reopened reply");
+    f.run(vec![]).await.unwrap();
+    assert_eq!(f.mock.recorded_calls().len(), 3);
+    assert_eq!(f.settings().await["status"], "attempting");
+    f.hub.fire_session_shutdown(&ctx).await;
+    let db = f.ctx.session.lock().await.database().clone();
+    write_settings(
+        &db,
+        "session_naming",
+        json!({"enabled": true, "attempted": false}),
+    )
+    .await
+    .unwrap();
+    // Even an explicit attempt reset cannot re-open a closed auxiliary owner.
+    f.mock.push_text("late reply");
+    f.run(vec![]).await.unwrap();
+    assert_eq!(f.mock.recorded_calls().len(), 4);
+    assert_eq!(f.settings().await["attempted"], false);
+}
+
+#[tokio::test]
+async fn dropping_hub_aborts_pending_naming() {
+    let f = Fixture::new(json!({"enabled": true})).await;
+    let naming_gate = f.pending_naming().await;
+    drop(f.hub);
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        naming_gate.wait_stopped(),
+    )
+    .await
+    .unwrap();
+    naming_gate.release();
+    assert!(f.ctx.session.lock().await.read_meta().await.name.is_none());
+}
+
+#[tokio::test]
+async fn turn_stop_cancels_pending_naming_without_changing_success() {
+    let f = Fixture::new(json!({"enabled": true})).await;
+    f.mock.push_text("main reply");
+    f.mock.push_text("Generated name");
+    let main_gate = f.mock.block_next_call();
+    let naming_gate = f.mock.block_next_call();
+    let cancel = runtime::TurnCancel::new();
+    let security = permissive_security();
+    let policies = ToolPolicyRegistry::empty();
+    let reply = runtime::execute_cancellable_with_recorder(
+        Some("turn-model"),
+        vec![],
+        &f.backend,
+        &security,
+        &f.ctx,
+        &policies,
+        None,
+        Some(&f.hub),
+        Some(&cancel),
+        None,
+        runtime::ModelCallScope::default(),
+    );
+    tokio::pin!(reply);
+    tokio::select! {
+        _ = main_gate.wait_started() => {},
+        result = &mut reply => panic!("main call was not blocked: {result:?}"),
+    }
+    main_gate.release();
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(2), reply)
+        .await
+        .unwrap()
+        .unwrap();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        naming_gate.wait_started(),
+    )
+    .await
+    .unwrap();
+    cancel.cancel();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        naming_gate.wait_stopped(),
+    )
+    .await
+    .unwrap();
+    f.hub.drain_turn_complete().await;
+    assert_eq!(outcome.body, "main reply");
+    assert_eq!(f.settings().await["status"], "attempting");
+    assert!(f.ctx.session.lock().await.read_meta().await.name.is_none());
+}
+
+#[tokio::test]
+async fn server_shutdown_cancels_naming_and_refuses_late_dispatch() {
+    let f = Fixture::new(json!({"enabled": true})).await;
+    let server = f.server(f.registry.clone());
+    let naming_gate = f.pending_naming().await;
+    server.shutdown().await;
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        naming_gate.wait_stopped(),
+    )
+    .await
+    .unwrap();
+    assert!(f.ctx.session.lock().await.read_meta().await.name.is_none());
+    let db = f.ctx.session.lock().await.database().clone();
+    write_settings(
+        &db,
+        "session_naming",
+        json!({"enabled": true, "attempted": false}),
+    )
+    .await
+    .unwrap();
+    f.mock.push_text("late reply");
+    f.run(vec![]).await.unwrap();
+    assert_eq!(f.mock.recorded_calls().len(), 3);
+    assert_eq!(f.settings().await["attempted"], false);
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn cancelled_main_turn_ends_once_without_starting_naming() {
+    let mut f = Fixture::new(json!({"enabled": true})).await;
+    let ends = f.end_probe().await;
+    f.mock.push_text("cancelled reply");
+    let main_gate = f.mock.block_next_call();
+    let cancel = runtime::TurnCancel::new();
+    let security = permissive_security();
+    let policies = ToolPolicyRegistry::empty();
+    let reply = runtime::execute_cancellable_with_recorder(
+        Some("turn-model"),
+        vec![],
+        &f.backend,
+        &security,
+        &f.ctx,
+        &policies,
+        None,
+        Some(&f.hub),
+        Some(&cancel),
+        None,
+        runtime::ModelCallScope::default(),
+    );
+    tokio::pin!(reply);
+    tokio::select! {
+        _ = main_gate.wait_started() => {},
+        result = &mut reply => panic!("main call was not blocked: {result:?}"),
+    }
+    cancel.cancel();
+    assert!(matches!(
+        tokio::time::timeout(std::time::Duration::from_secs(2), reply)
+            .await
+            .unwrap(),
+        Err(runtime::TurnError::Cancelled { .. })
+    ));
+    f.hub.drain_turn_complete().await;
+    assert_eq!(ends.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(f.mock.recorded_calls().len(), 1);
+    assert!(f.settings().await.get("attempted").is_none());
+}
+
+#[tokio::test]
+async fn deregister_cancels_naming_even_when_session_cannot_be_reopened() {
+    let f = Fixture::new(json!({"enabled": true})).await;
+    let naming_gate = f.pending_naming().await;
+    // A registry without this session's keys deterministically exercises the
+    // same best-effort hook branch as a failed storage/service read.
+    let (_instance, registry) = fresh_session_registry().await;
+    let server = f.server(registry.clone());
+    let id = f.id().await;
+    assert!(registry.open_session(&id).await.is_err());
+    server.deregister_session(&id).await;
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        naming_gate.wait_stopped(),
+    )
+    .await
+    .expect("deregister must cancel naming even without a readable session");
+    assert!(f.ctx.session.lock().await.read_meta().await.name.is_none());
+    server.shutdown().await;
 }

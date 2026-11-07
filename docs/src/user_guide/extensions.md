@@ -661,7 +661,8 @@ It is active by default but **makes no model calls until you enable it on a sess
 | `/name`                               | —       | Clear the name; does not reset the naming attempt.                                                                                       |
 
 The first eligible turn spends at most one auxiliary completion: 128 output tokens and a 10-second deadline, without tools or retries.
-The naming call runs before that turn's reply is returned, so the first eligible reply can be delayed by up to the naming deadline; later turns only read the persisted marker.
+Naming runs in the background: neither the successful reply nor its end hooks wait for the auxiliary completion.
+Observations serialize per session, so a later turn cannot start a second naming call while the first is pending.
 The attempt marker persists with the session, so restarting the daemon, clearing the name, or removing/re-adding the extension does not repeat inference.
 There is no periodic renaming and no replacement policy: **every existing name is preserved**, including manual names and names generated earlier.
 An explicit rename made while inference is in flight is rechecked before applying the result.
@@ -682,7 +683,9 @@ Selecting another model sends this same public context to that model's configure
 Names must be nonempty, one line, at most 80 characters, and pass the runtime's secret-leak scan.
 An unavailable model, timeout, tool-call response, invalid name or name already taken by another session leaves the user reply intact and consumes the attempt.
 `status` is `attempting`, `named`, `preserved` (a name appeared during inference), or `failed`.
-A crash or endpoint deadline can leave `attempting`; it still prevents automatic retries.
+Stopping the originating turn, closing its session, or shutting down the daemon cancels pending naming work; dropping the runtime also aborts it.
+A cancellation, crash or endpoint deadline can leave `attempting`; it still prevents automatic retries.
+Short-lived one-shot sessions may exit before a name is generated.
 Failures are logged, not inserted as user-visible conversation errors.
 
 Auxiliary usage metadata returned with a text response is stored separately in `last_usage` under this extension's settings, even if the resulting name cannot be applied.
@@ -704,8 +707,9 @@ As with `/name`, a name collision is an error, not a reason to take over another
    ```
 
 2. Ask the agent to diagnose a migration problem.
-   It replies normally once the naming completion finishes or fails; the reply text is never changed by naming.
-   If it returns `Migration diagnosis`, the open tab and session picker show `Migration diagnosis`, and `/join Migration diagnosis` resolves through the same alias index as `/name`.
+   It replies without waiting for naming; the reply text is never changed by naming.
+   While the auxiliary request is pending, you can continue the conversation and settings may show `"status": "attempting"`.
+   When the auxiliary request returns `Migration diagnosis`, the open tab and session picker show `Migration diagnosis`, and `/join Migration diagnosis` resolves through the same alias index as `/name`.
    `/extensions settings session_naming` now includes `"status": "named"` and `"attempted": true`.
    Further turns do not rename it or spend another naming call.
 

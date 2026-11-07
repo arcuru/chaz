@@ -1497,3 +1497,185 @@ async fn active_turn_hooks_keep_checkpointed_job_waits_resident() {
         }
     }
 }
+
+struct TurnProbe {
+    calls: Arc<std::sync::atomic::AtomicUsize>,
+    failure: &'static str,
+}
+
+impl turn::TurnComplete for TurnProbe {
+    fn on_turn_complete<'a>(
+        &'a self,
+        _: &'a turn::TurnCompleteContext<'_>,
+    ) -> caps::CapFuture<'a, ()> {
+        // Also exercise panics while constructing the endpoint future.
+        assert_ne!(self.failure, "construct-panic");
+        Box::pin(async move {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            match self.failure {
+                "panic" => panic!("turn probe"),
+                "error" => anyhow::bail!("turn probe"),
+                "timeout" => std::future::pending().await,
+                _ => Ok(()),
+            }
+        })
+    }
+}
+
+#[tokio::test]
+async fn queued_turn_complete_rechecks_session_and_agent_revocation() {
+    use crate::test_support::{MockBackend, empty_secrets, permissive_security};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    for case in ["allowed", "session", "agent"] {
+        let mut hub = test_hub().await;
+        let registry = hub.session_registry.as_ref().unwrap().clone();
+        let peer = hub.peer_handles.as_ref().unwrap().clone();
+        let calls = Arc::new(AtomicUsize::new(0));
+        hub.install_all(vec![Arc::new(TestExt::new("observer").turn_complete(
+            Arc::new(TurnProbe {
+                calls: calls.clone(),
+                failure: "",
+            }),
+        ))])
+        .await
+        .unwrap();
+        let (conv, db) = registry.create_session(None).await.unwrap();
+        hub.record_active(&db).await.unwrap();
+        let seeded =
+            crate::agent_db::ensure_agent_db(&mut *registry.user_for_tests().await, "test-agent")
+                .await
+                .unwrap();
+        peer.agent_index.register(crate::hosted_index::DbEntry {
+            db_id: seeded.db.id(),
+            display_name: "test-agent".into(),
+            pubkey: seeded.pubkey,
+        });
+        let backend = crate::backends::BackendManager::with_mock(
+            Arc::new(MockBackend::new()),
+            empty_secrets().await,
+        );
+        let hub = Arc::new(hub);
+        let server = crate::server::Server::new(
+            registry.clone(),
+            registry.agents.clone(),
+            peer.agent_index.clone(),
+            peer.memory_bank_index.clone(),
+            peer.skill_bank_index.clone(),
+            peer.tool_registry.clone(),
+            Arc::new(crate::tool::ToolPolicyRegistry::empty()),
+            permissive_security(),
+            Default::default(),
+            Default::default(),
+            Arc::new(crate::tool_host::NativeToolHost::new()),
+            hub.clone(),
+            backend.clone(),
+            peer.mcp_registry.clone(),
+            None,
+        );
+        peer.server_slot.set(server.clone());
+        let ctx = HookContext {
+            agent_name: "test-agent".into(),
+            model: None,
+            call_depth: 0,
+            session: Arc::new(Mutex::new(Session::new(conv, db.clone()).await)),
+            active_extensions: all_active(&["observer"]),
+            routine_engine: None,
+        };
+        let (release, wait) = tokio::sync::oneshot::channel();
+        let (started, ready) = tokio::sync::oneshot::channel();
+        hub.turn_complete_tasks
+            .lock()
+            .await
+            .spawn(db.root_id().to_string(), None, async move {
+                started.send(()).unwrap();
+                let _ = wait.await;
+            });
+        ready.await.unwrap();
+        hub.fire_turn_complete(&ctx, vec![], &[], &backend, &permissive_security(), None)
+            .await;
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        if case != "allowed" {
+            append_event(
+                if case == "session" {
+                    &db
+                } else {
+                    seeded.db.database()
+                },
+                ExtensionEvent::Deactivated {
+                    name: "observer".into(),
+                    timestamp: Utc::now() + chrono::Duration::seconds(1),
+                },
+            )
+            .await
+            .unwrap();
+        }
+        release.send(()).unwrap();
+        hub.drain_turn_complete().await;
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            usize::from(case == "allowed"),
+            "queued {case} observer"
+        );
+        peer.server_slot.clear();
+        server.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn turn_complete_failures_do_not_block_later_endpoints() {
+    use crate::test_support::{MockBackend, empty_secrets, permissive_security};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    for failure in ["construct-panic", "panic", "error", "timeout"] {
+        let mut hub = test_hub().await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        hub.install_all(vec![
+            Arc::new(TestExt::new("a-failing").turn_complete(Arc::new(TurnProbe {
+                calls: calls.clone(),
+                failure,
+            }))),
+            Arc::new(
+                TestExt::new("b-survivor").turn_complete(Arc::new(TurnProbe {
+                    calls: calls.clone(),
+                    failure: "",
+                })),
+            ),
+        ])
+        .await
+        .unwrap();
+        let (conv, db) = hub
+            .session_registry
+            .as_ref()
+            .unwrap()
+            .create_session(None)
+            .await
+            .unwrap();
+        hub.record_active(&db).await.unwrap();
+        let ctx = HookContext {
+            agent_name: "test-agent".into(),
+            model: None,
+            call_depth: 0,
+            session: Arc::new(Mutex::new(Session::new(conv, db).await)),
+            active_extensions: all_active(&["a-failing", "b-survivor"]),
+            routine_engine: None,
+        };
+        let backend = crate::backends::BackendManager::with_mock(
+            Arc::new(MockBackend::new()),
+            empty_secrets().await,
+        );
+        hub.fire_turn_complete(&ctx, vec![], &[], &backend, &permissive_security(), None)
+            .await;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            hub.drain_turn_complete(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            if failure == "construct-panic" { 1 } else { 2 },
+            "{failure}"
+        );
+    }
+}
