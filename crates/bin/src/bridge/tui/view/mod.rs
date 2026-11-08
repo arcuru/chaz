@@ -1234,13 +1234,7 @@ fn build_transcript(
                     .as_ref()
                     .and_then(|r| r.source.as_ref())
                     .map(|r| format!(" [via {} {}]", r.transport, r.channel))
-                    .unwrap_or_else(|| {
-                        if is_agent {
-                            " [local]".into()
-                        } else {
-                            String::new()
-                        }
-                    });
+                    .unwrap_or_default();
                 let label = format!("{}{}{}:", debug_prefix, entry.sender, source);
 
                 lines.push(Line::from(vec![Span::styled(label, sender_style)]));

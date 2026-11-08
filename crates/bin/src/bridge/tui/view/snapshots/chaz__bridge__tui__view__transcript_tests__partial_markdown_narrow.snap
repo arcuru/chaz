@@ -4,7 +4,7 @@ expression: screen
 ---
  render-demo ×
 ╭ Chaz ────────────────────╮
-│chaz [local]:             │
+│chaz:                     │
 │    let path =            │
 │r"C:\new\file";           │
 │                          │
