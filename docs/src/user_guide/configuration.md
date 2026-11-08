@@ -614,7 +614,7 @@ Startup migrates existing agents' saved prompts when recoverable and projects ac
 | `grants`               | map<tool, Grants>      | Per-tool grant overrides (shell allow/deny, network endpoints, fs paths). Merged per-kind over policy.                                            |
 | `default_memory_banks` | list of bank names     | Auto-attached at first boot. Missing banks are auto-created.                                                                                      |
 | `default_skill_banks`  | list of bank names     | Auto-attached at first boot. Missing banks are warned and skipped.                                                                                |
-| `presets`              | map<name, AgentPreset> | Named override bundles for Worker templates (model / spawn depth / tools / role suffix / tool_profile); not a `spawn_agent` argument.             |
+| `presets`              | map<name, AgentPreset> | Named Worker bundles; spawn depth and tools apply. Model/role suffix propagation is unsupported. Not a `spawn_agent` argument.                    |
 
 ### Worker fields
 
@@ -624,15 +624,15 @@ state of their own — entries written during a Worker invocation are
 signed by the parent Agent's key. Lookup is per-Agent; Chaz's
 `researcher` is distinct from Scout's `researcher`.
 
-| Field                 | Type                   | Notes                                                                                                                                    |
-| --------------------- | ---------------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
-| `name`                | string                 | Required. Unique within the parent Agent's `workers:` list. Used as `spawn_worker(name=…)`.                                              |
-| `system_prompt`       | string                 | Worker's system prompt. Falls back to (inherits) the parent Agent's prompt when omitted.                                                 |
-| `system_prompt_files` | list of paths          | Ordered Worker prompt sources, copied on seed/import. In managed `agent.yaml`, use relative paths within the folder.                     |
-| `model`               | string                 | Override the model. Falls back to the parent Agent's `model`.                                                                            |
-| `tools`               | list of tool names     | Narrows the parent Agent's tool list. May include other Worker names; recursion bounded by depth.                                        |
-| `max_spawn_depth`     | int                    | Maximum nested spawn depth of this Worker's child session. Falls back to the parent Agent's value. Does not cap the Worker's tool calls. |
-| `presets`             | map<name, AgentPreset> | Selectable via the `preset` arg of `spawn_worker`.                                                                                       |
+| Field                 | Type                   | Notes                                                                                                                                       |
+| --------------------- | ---------------------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
+| `name`                | string                 | Required. Unique within the parent Agent's `workers:` list. Used as `spawn_worker(name=…)`.                                                 |
+| `system_prompt`       | string                 | Worker's inline system prompt; defaults to empty. With no prompt files or inline text, sends no system prompt; never inherits the parent's. |
+| `system_prompt_files` | list of paths          | Ordered Worker prompt sources, copied on seed/import. In managed `agent.yaml`, use relative paths within the folder.                        |
+| `model`               | string                 | Accepted but not yet propagated to the child runtime; the parent Agent's model is used.                                                     |
+| `tools`               | list of tool names     | Narrows the parent Agent's tool list. May include other Worker names; recursion bounded by depth.                                           |
+| `max_spawn_depth`     | int                    | Maximum nested spawn depth of this Worker's child session. Falls back to the parent Agent's value. Does not cap the Worker's tool calls.    |
+| `presets`             | map<name, AgentPreset> | Selectable via `spawn_worker`'s `preset` arg. Spawn depth and tools apply; model and `role_suffix` propagation remain unsupported.          |
 
 ### `default_agents`
 

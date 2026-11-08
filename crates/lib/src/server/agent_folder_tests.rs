@@ -57,7 +57,7 @@ async fn record_model_prompts(
     registry: &Arc<crate::session::SessionRegistry>,
     entry: &DbEntry,
     parent_prompt: &str,
-    worker_prompt: &str,
+    worker_prompt: Option<&str>,
 ) {
     let db = registry
         .open_agent_db(&entry.db_id, None)
@@ -165,11 +165,18 @@ async fn record_model_prompts(
     assert_eq!(result, "worker response");
     let calls = mock.recorded_calls();
     assert_eq!(calls.len(), 2);
-    for (call, expected) in calls.iter().zip([parent_prompt, worker_prompt]) {
-        assert!(
-            call.messages.iter().any(
-                |m| matches!(m, crate::runtime::RuntimeMessage::System(text) if text == expected)
-            ),
+    for (call, expected) in calls.iter().zip([Some(parent_prompt), worker_prompt]) {
+        let system_prompts: Vec<&str> = call
+            .messages
+            .iter()
+            .filter_map(|message| match message {
+                crate::runtime::RuntimeMessage::System(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            system_prompts,
+            expected.into_iter().collect::<Vec<_>>(),
             "wrong request prompt: {:?}",
             call.messages
         );
@@ -255,9 +262,30 @@ async fn folder_reload_drives_parent_and_worker_recorded_model_prompts() {
         &registry,
         &entry,
         "NEW PARENT\n\nSECOND\n\nINLINE",
-        "NEW WORKER\n\nWORKER INLINE",
+        Some("NEW WORKER\n\nWORKER INLINE"),
     )
     .await;
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn default_worker_prompt_records_no_system_message_or_parent_instructions() {
+    let (_instance, server, registry) = server_fixture().await;
+    let local = tempfile::tempdir().unwrap();
+    server.set_agent_config_root(local.path().join("agents"));
+    let (entry, db) = seed_agent(&server, &registry, "alpha").await;
+    let parent_prompt = "PARENT INSTRUCTIONS MUST NOT REACH THE WORKER";
+    let mut cfg = db.read_config().await.unwrap();
+    cfg.system_prompt = parent_prompt.into();
+    cfg.workers = vec![WorkerDbConfig {
+        name: "helper".into(),
+        ..Default::default()
+    }];
+    crate::agent_bundle::import_sources(&mut cfg).unwrap();
+    db.write_config(&cfg).await.unwrap();
+    server.initialize_agent_folders().await;
+
+    record_model_prompts(&server, &registry, &entry, parent_prompt, None).await;
     server.shutdown().await;
 }
 
@@ -567,7 +595,7 @@ async fn folder_two_peer_sync_reconstructs_sources_without_feedback() {
         &peer_registry,
         &entry,
         "SYNCED\n\nSECOND\n\nINLINE",
-        "WORKER\n\nWORKER INLINE",
+        Some("WORKER\n\nWORKER INLINE"),
     )
     .await;
     server.shutdown().await;
