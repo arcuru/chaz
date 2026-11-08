@@ -133,7 +133,7 @@ impl Tool for JobWaitTool {
 
     fn default_policy(&self) -> ToolPolicy {
         ToolPolicy {
-            timeout: 300,
+            timeout: Some(300),
             ..ToolPolicy::default()
         }
     }

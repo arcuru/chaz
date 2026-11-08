@@ -81,7 +81,7 @@ impl Tool for Wait {
 
     fn default_policy(&self) -> ToolPolicy {
         ToolPolicy {
-            timeout: 300,
+            timeout: Some(300),
             ..Default::default()
         }
     }
@@ -162,6 +162,7 @@ async fn only_a_final_wait_in_a_restorable_turn_is_checkpointed() {
         "approve-all",
         "invalid",
         "boundary-input",
+        "unbounded-policy",
     ] {
         let deadlines = Arc::new(Mutex::new(Vec::new()));
         let effects = Arc::new(AtomicUsize::new(0));
@@ -205,13 +206,21 @@ async fn only_a_final_wait_in_a_restorable_turn_is_checkpointed() {
             suspend: case == "boundary-input",
             ..Default::default()
         });
+        let policies = if case == "unbounded-policy" {
+            ToolPolicyRegistry::new(std::collections::HashMap::from([(
+                "job_wait".into(),
+                serde_yaml::from_str("timeout: null").unwrap(),
+            )]))
+        } else {
+            ToolPolicyRegistry::empty()
+        };
         let outcome = execute_with_recorder(
             None,
             vec![RuntimeMessage::User("go".into())],
             &backend,
             &security,
             &ctx,
-            &ToolPolicyRegistry::empty(),
+            &policies,
             Some(recorder.clone()),
             None,
             None,
@@ -240,7 +249,7 @@ async fn only_a_final_wait_in_a_restorable_turn_is_checkpointed() {
                     "the live wait uses the persisted deadline"
                 );
             }
-            "not-final" | "approve-all" => {
+            "not-final" | "approve-all" | "unbounded-policy" => {
                 assert!(intents.is_empty(), "{case} must not checkpoint");
                 assert!(deadlines[0].is_some(), "{case} still uses a fixed deadline");
             }
@@ -559,9 +568,10 @@ async fn resumed_wait_obeys_a_shorter_current_policy_timeout() {
     let policies = ToolPolicyRegistry::new(std::collections::HashMap::from([(
         "job_wait".into(),
         ToolPolicy {
-            timeout: 1,
+            timeout: Some(1),
             ..Default::default()
-        },
+        }
+        .into(),
     )]));
     let now = chrono::Utc::now();
     tokio::time::timeout(

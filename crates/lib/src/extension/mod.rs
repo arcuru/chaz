@@ -449,6 +449,34 @@ pub async fn append_event(session_db: &Database, event: ExtensionEvent) -> anyho
     Ok(())
 }
 
+/// Recheck current revocations without expanding the originating turn's authority.
+async fn attenuate_active_extensions(
+    agent_name: &str,
+    session_db: Option<&Database>,
+    turn_active: &HashSet<String>,
+    server: Option<&crate::server::Server>,
+) -> HashSet<String> {
+    let mut active = turn_active.clone();
+    if let Some(db) = session_db {
+        match read_active(db).await {
+            Ok(refs) => {
+                let session_active: HashSet<_> =
+                    refs.into_iter().map(|r| r.name().to_string()).collect();
+                active.retain(|name| session_active.contains(name));
+            }
+            Err(error) => {
+                warn!(%error, "Could not read active extensions; no extension is active");
+                active.clear();
+            }
+        }
+    }
+    if let Some(server) = server {
+        let disabled = server.agent_disabled_extensions(agent_name).await;
+        active.retain(|name| !disabled.contains(name));
+    }
+    active
+}
+
 /// Decision returned from a `tool_call` hook.
 #[derive(Debug)]
 pub enum ToolCallDecision {
@@ -786,6 +814,7 @@ pub struct ExtensionHub {
     /// `ScopeCtx` without rebuilding from scratch on every event.
     /// `None` until the host wires it via [`Self::set_peer_handles`].
     peer_handles: Option<Arc<instance::PeerHandles>>,
+    turn_complete_tasks: Mutex<turn::TurnCompleteTasks>,
 }
 
 impl Default for ExtensionHub {
@@ -823,6 +852,7 @@ impl ExtensionHub {
             agent_instances: tokio::sync::RwLock::new(HashMap::new()),
             session_instances: tokio::sync::RwLock::new(HashMap::new()),
             peer_handles: None,
+            turn_complete_tasks: Mutex::new(turn::TurnCompleteTasks::default()),
         }
     }
 
@@ -1195,29 +1225,11 @@ impl ExtensionHub {
         session_db: Option<&Database>,
         turn_active: &HashSet<String>,
     ) -> HashSet<String> {
-        let mut active = turn_active.clone();
-        if let Some(db) = session_db {
-            match read_active(db).await {
-                Ok(refs) => {
-                    let session_active: HashSet<_> =
-                        refs.into_iter().map(|r| r.name().to_string()).collect();
-                    active.retain(|name| session_active.contains(name));
-                }
-                Err(error) => {
-                    warn!(%error, "Could not read active extensions; no extension is active");
-                    active.clear();
-                }
-            }
-        }
-        if let Some(server) = self
+        let server = self
             .peer_handles
             .as_ref()
-            .and_then(|peer| peer.server_slot.get())
-        {
-            let disabled = server.agent_disabled_extensions(agent_name).await;
-            active.retain(|name| !disabled.contains(name));
-        }
-        active
+            .and_then(|peer| peer.server_slot.get());
+        attenuate_active_extensions(agent_name, session_db, turn_active, server.as_deref()).await
     }
 
     /// Every instance reachable for `(agent, session)`, keyed by extension
@@ -1590,15 +1602,17 @@ impl ExtensionHub {
         acc
     }
 
-    /// Read-only successful-turn endpoint. Uses the same active set as the
-    /// runtime, and never hands an extension an unscoped registry/backend.
+    /// Enqueue successful-turn observation without waiting for auxiliary work.
+    /// Resolve scoped endpoints now; the task owns only this turn's public data
+    /// and scoped host handles, never the hub itself.
     pub async fn fire_turn_complete(
         &self,
         ctx: &HookContext,
-        messages: &[RuntimeMessage],
+        messages: Vec<RuntimeMessage>,
         tools: &[crate::tool::ToolDefinition],
         backend: &crate::backends::BackendManager,
         security: &crate::security::SecurityContext,
+        cancel: Option<&crate::runtime::TurnCancel>,
     ) {
         let Some(registry) = self.session_registry.as_ref() else {
             return;
@@ -1618,46 +1632,106 @@ impl ExtensionHub {
             .active_extensions_for_call(&ctx.agent_name, Some(&db), &ctx.active_extensions)
             .await;
         instances.sort_by(|a, b| a.0.cmp(&b.0));
-        for (name, instance) in instances {
-            if !active.contains(&name)
-                || !instance
-                    .manifest()
-                    .supported_hooks
-                    .contains(&HookKind::TurnComplete)
-            {
-                continue;
-            }
-            let Some(endpoint) = instance.turn_complete_hook() else {
-                continue;
-            };
-            let turn = turn::TurnCompleteContext {
-                agent_name: &ctx.agent_name,
-                model: ctx.model.as_deref(),
-                call_depth: ctx.call_depth,
-                messages,
-                tools,
-                extension: &name,
-                db: &db,
-                registry,
-                backend,
-                security,
-                completion_used: std::sync::atomic::AtomicBool::new(false),
-            };
-            let fut = AssertUnwindSafe(endpoint.on_turn_complete(&turn));
-            match tokio::time::timeout(std::time::Duration::from_secs(15), fut.catch_unwind()).await
-            {
-                Ok(Ok(Ok(()))) => {}
-                Ok(Ok(Err(error))) => {
-                    warn!(extension = %name, %error, "Turn-complete extension failed; preserving user turn")
-                }
-                Ok(Err(_)) => {
-                    warn!(extension = %name, "Turn-complete extension panicked; preserving user turn")
-                }
-                Err(_) => {
-                    warn!(extension = %name, "Turn-complete extension timed out; preserving user turn")
-                }
-            }
+        let endpoints: Vec<_> = instances
+            .into_iter()
+            .filter(|(name, instance)| {
+                active.contains(name)
+                    && instance
+                        .manifest()
+                        .supported_hooks
+                        .contains(&HookKind::TurnComplete)
+            })
+            .filter_map(|(name, instance)| instance.turn_complete_hook().map(|hook| (name, hook)))
+            .collect();
+        if endpoints.is_empty() {
+            return;
         }
+        let registry = registry.clone();
+        let backend = backend.clone();
+        let security = security.clone();
+        let agent_name = ctx.agent_name.clone();
+        let model = ctx.model.clone();
+        let call_depth = ctx.call_depth;
+        // Never keep the owning hub/server alive through queued work.
+        let server = self
+            .peer_handles
+            .as_ref()
+            .and_then(|peer| peer.server_slot.get())
+            .map(|server| Arc::downgrade(&server));
+        let tools = tools.to_vec();
+        let work = async move {
+            for (name, endpoint) in endpoints {
+                let turn = turn::TurnCompleteContext {
+                    agent_name: &agent_name,
+                    model: model.as_deref(),
+                    call_depth,
+                    messages: &messages,
+                    tools: &tools,
+                    extension: &name,
+                    db: &db,
+                    registry: &registry,
+                    backend: &backend,
+                    security: &security,
+                    completion_used: std::sync::atomic::AtomicBool::new(false),
+                };
+                let fut = AssertUnwindSafe(async {
+                    // Queueing must not extend authority past a later revocation.
+                    if registry
+                        .open_session(&db.root_id().to_string())
+                        .await
+                        .is_err()
+                    {
+                        return Ok(());
+                    }
+                    let active = attenuate_active_extensions(
+                        &agent_name,
+                        Some(&db),
+                        &active,
+                        server
+                            .as_ref()
+                            .and_then(std::sync::Weak::upgrade)
+                            .as_deref(),
+                    )
+                    .await;
+                    if !active.contains(&name) {
+                        return Ok(());
+                    }
+                    endpoint.on_turn_complete(&turn).await
+                });
+                match tokio::time::timeout(std::time::Duration::from_secs(15), fut.catch_unwind())
+                    .await
+                {
+                    Ok(Ok(Ok(()))) => {}
+                    Ok(Ok(Err(error))) => {
+                        warn!(extension = %name, %error, "Turn-complete extension failed; preserving user turn")
+                    }
+                    Ok(Err(_)) => {
+                        warn!(extension = %name, "Turn-complete extension panicked; preserving user turn")
+                    }
+                    Err(_) => {
+                        warn!(extension = %name, "Turn-complete extension timed out; preserving user turn")
+                    }
+                }
+            }
+        };
+        self.turn_complete_tasks
+            .lock()
+            .await
+            .spawn(id, cancel.cloned(), work);
+    }
+
+    pub(crate) async fn stop_session_turn_complete(&self, id: &str) {
+        self.turn_complete_tasks.lock().await.stop_session(id).await;
+    }
+
+    /// Cancel and join auxiliary observations before this server generation ends.
+    pub(crate) async fn shutdown_turn_complete(&self) {
+        self.turn_complete_tasks.lock().await.shutdown().await;
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn drain_turn_complete(&self) {
+        self.turn_complete_tasks.lock().await.drain().await;
     }
 
     pub async fn fire_agent_end(&self, ctx: &HookContext) {
@@ -1673,6 +1747,8 @@ impl ExtensionHub {
     }
 
     pub async fn fire_session_start(&self, ctx: &HookContext) {
+        let id = ctx.session.lock().await.database().root_id().to_string();
+        self.turn_complete_tasks.lock().await.start_session(&id);
         for reg in &self.session_start {
             if !ctx.active_extensions.contains(reg.owner) {
                 continue;
@@ -1685,6 +1761,8 @@ impl ExtensionHub {
     }
 
     pub async fn fire_session_shutdown(&self, ctx: &HookContext) {
+        let id = ctx.session.lock().await.database().root_id().to_string();
+        self.stop_session_turn_complete(&id).await;
         for reg in &self.session_shutdown {
             if !ctx.active_extensions.contains(reg.owner) {
                 continue;

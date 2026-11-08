@@ -562,7 +562,7 @@ fn extension_service_owner_only(command: &Command) -> bool {
     }
     let mut words = args.split_whitespace();
     match words.next() {
-        Some("share" | "unshare" | "import") => true,
+        Some("share" | "import") => true,
         Some("attach") => words
             .next()
             .is_some_and(|arg| arg.parse::<eidetica::sync::DatabaseTicket>().is_ok()),
@@ -584,11 +584,6 @@ fn owner_redirect(command: &Command) -> String {
             Some("share") => {
                 return format!(
                     "This command controls daemon-owned Eidetica sync. Run it on the Eidetica owner to create the {name} bank ticket; this service client made no changes."
-                );
-            }
-            Some("unshare") => {
-                return format!(
-                    "This command controls daemon-owned Eidetica sync. Run it on the Eidetica owner to disable {name} bank sync; this service client made no changes."
                 );
             }
             Some("import" | "attach") => {
@@ -680,43 +675,46 @@ mod capability_tests {
         }
         assert!(!service_owner_only(&Command::ListSessions));
         assert!(!service_owner_only(&Command::SessionUnshare));
+        assert!(!service_owner_only(&Command::AgentUnshare("chaz".into())));
         assert!(!service_owner_only(&Command::AgentInvite {
             agent_ref: "chaz".into(),
             pubkey: "key".into(),
             permission: CoOwnerPermission::Write,
         }));
-        for command in [
-            Command::Extension {
-                name: "memory".into(),
-                args: "share bank".into(),
-            },
-            Command::Extension {
-                name: "memory".into(),
-                args: "unshare bank".into(),
-            },
-            Command::Extension {
-                name: "memory".into(),
-                args: "import not-a-ticket".into(),
-            },
-            Command::Extension {
-                name: "skills".into(),
-                args: "share bank".into(),
-            },
-            Command::Extension {
-                name: "skills".into(),
-                args: "unshare bank".into(),
-            },
-            Command::Extension {
-                name: "skills".into(),
-                args: "import not-a-ticket".into(),
-            },
-        ] {
-            assert!(extension_service_owner_only(&command));
-            assert!(owner_redirect(&command).contains("made no changes"));
+    }
+
+    #[test]
+    fn bank_commands_distinguish_preferences_from_owner_operations() {
+        let ticket = eidetica::sync::DatabaseTicket::new(eidetica::entry::ID::from_bytes(
+            b"bank-classification",
+        ));
+        for name in ["memory", "skills"] {
+            for (args, owner_only) in [
+                ("share bank".to_string(), true),
+                ("import not-a-ticket".to_string(), true),
+                (format!("attach {ticket}"), true),
+                ("unshare bank".to_string(), false),
+                ("  unshare   bank  ".to_string(), false),
+                ("unshare".to_string(), false),
+                ("attach existing-bank".to_string(), false),
+                ("list".to_string(), false),
+                (String::new(), false),
+            ] {
+                let command = Command::Extension {
+                    name: name.into(),
+                    args,
+                };
+                assert_eq!(
+                    extension_service_owner_only(&command),
+                    owner_only,
+                    "{command:?}"
+                );
+                if owner_only {
+                    let message = owner_redirect(&command);
+                    assert!(message.contains("Eidetica owner"));
+                    assert!(message.contains("made no changes"));
+                }
+            }
         }
-        assert!(!extension_service_owner_only(&Command::Extension {
-            name: "memory".into(),
-            args: "attach existing-bank".into(),
-        }));
     }
 }

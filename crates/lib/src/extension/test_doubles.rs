@@ -30,6 +30,7 @@ impl Extension for NamedExt {
 #[derive(Default, Clone)]
 pub(super) struct TestParts {
     pub(super) tool_call: Option<Arc<dyn handler::HookHandlerToolCall>>,
+    pub(super) turn_complete: Option<Arc<dyn turn::TurnComplete>>,
     pub(super) before_agent_start: Option<Arc<dyn handler::HookHandlerBeforeAgentStart>>,
     pub(super) tool_result: Option<Arc<dyn handler::HookHandlerToolResult>>,
     pub(super) routine_handler: Option<Arc<dyn handler::RoutineHandler>>,
@@ -126,6 +127,11 @@ impl TestExt {
     }
     pub(super) fn status_segment(mut self, s: Arc<dyn caps::StatusSegment>) -> Self {
         self.parts.status_segment = Some(s);
+        self
+    }
+    pub(super) fn turn_complete(mut self, h: Arc<dyn turn::TurnComplete>) -> Self {
+        self.supported.push(HookKind::TurnComplete);
+        self.parts.turn_complete = Some(h);
         self
     }
     pub(super) fn tool_call(mut self, h: Arc<dyn handler::HookHandlerToolCall>) -> Self {
@@ -233,6 +239,9 @@ impl instance::ExtensionInstance for TestInstance {
     }
     fn commands(&self) -> Vec<(String, Arc<dyn ExtensionCommand>)> {
         self.parts.commands.clone()
+    }
+    fn turn_complete_hook(&self) -> Option<Arc<dyn turn::TurnComplete>> {
+        self.parts.turn_complete.clone()
     }
     fn tool_call_hook(&self) -> Option<Arc<dyn handler::HookHandlerToolCall>> {
         self.parts.tool_call.clone()

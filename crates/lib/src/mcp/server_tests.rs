@@ -218,20 +218,23 @@ fn test_mcp_tool_default_policy_no_override() {
     let policy = tool.default_policy();
     assert_eq!(policy.risk, RiskLevel::Medium);
     assert_eq!(policy.approval, ApprovalRequirement::UnlessAutoApproved);
-    assert_eq!(policy.timeout, 60);
+    assert_eq!(policy.timeout, Some(60));
 }
 
 #[test]
 fn test_mcp_tool_default_policy_with_server_override() {
     let mut server = make_test_server("srv");
-    server.default_policy = Some(ToolPolicy {
-        risk: RiskLevel::High,
-        approval: ApprovalRequirement::Always,
-        timeout: 10,
-        sensitive_params: vec!["secret".to_string()],
-        rate_limit: Some(5),
-        grants: Default::default(),
-    });
+    server.default_policy = Some(
+        ToolPolicy {
+            risk: RiskLevel::High,
+            approval: ApprovalRequirement::Always,
+            timeout: Some(10),
+            sensitive_params: vec!["secret".to_string()],
+            rate_limit: Some(5),
+            grants: Default::default(),
+        }
+        .into(),
+    );
     let server = Arc::new(server);
     let tool = McpTool {
         server,
@@ -240,7 +243,7 @@ fn test_mcp_tool_default_policy_with_server_override() {
     };
     let policy = tool.default_policy();
     assert_eq!(policy.risk, RiskLevel::High);
-    assert_eq!(policy.timeout, 10);
+    assert_eq!(policy.timeout, Some(10));
     assert_eq!(policy.sensitive_params, vec!["secret"]);
     assert_eq!(policy.rate_limit, Some(5));
 }
@@ -382,14 +385,17 @@ fn server_yaml_policy_overrides_annotations() {
     // destructiveHint would derive High+Always, but the yaml-pinned
     // policy is Low+Never — yaml wins.
     let mut server = make_test_server("srv");
-    server.default_policy = Some(ToolPolicy {
-        risk: RiskLevel::Low,
-        approval: ApprovalRequirement::Never,
-        timeout: 30,
-        sensitive_params: Vec::new(),
-        rate_limit: None,
-        grants: Default::default(),
-    });
+    server.default_policy = Some(
+        ToolPolicy {
+            risk: RiskLevel::Low,
+            approval: ApprovalRequirement::Never,
+            timeout: Some(30),
+            sensitive_params: Vec::new(),
+            rate_limit: None,
+            grants: Default::default(),
+        }
+        .into(),
+    );
     server.tool_metadata.write().unwrap().insert(
         "drop_table".to_string(),
         McpToolMetadata {
@@ -410,7 +416,7 @@ fn server_yaml_policy_overrides_annotations() {
     let p = tool.default_policy();
     assert_eq!(p.risk, RiskLevel::Low);
     assert_eq!(p.approval, ApprovalRequirement::Never);
-    assert_eq!(p.timeout, 30);
+    assert_eq!(p.timeout, Some(30));
 }
 
 // ================================================================
@@ -1632,4 +1638,40 @@ async fn cancelled_recovery_handshake_keeps_the_new_child_owned_but_terminal() {
     assert!(server.process_id().await.is_none());
     assert!(f.has("eof"));
     assert_eq!(f.spawns(), 2);
+}
+
+#[test]
+fn partial_mcp_policies_preserve_annotations_and_server_controls() {
+    let mut server = make_test_server("srv");
+    server.default_policy = Some(serde_yaml::from_str("timeout: 13\nsensitive_params: [token]\nrate_limit: 2\ngrants: {network: {endpoints: []}}").unwrap());
+    server.tool_metadata.write().unwrap().insert(
+        "mutate".into(),
+        McpToolMetadata {
+            description: String::new(),
+            input_schema: json!({"type": "object"}),
+            annotations: Some(McpToolAnnotations {
+                destructive_hint: Some(true),
+                ..Default::default()
+            }),
+        },
+    );
+    let tool = McpTool {
+        server: Arc::new(server),
+        raw_name: "mutate".into(),
+        namespaced_name: "srv__mutate".into(),
+    };
+    let registry = crate::tool::ToolPolicyRegistry::new(std::collections::HashMap::from([(
+        "srv__mutate".into(),
+        serde_yaml::from_str("approval: never").unwrap(),
+    )]));
+    let policy = registry.resolve(&tool);
+    assert_eq!(policy.risk, RiskLevel::High);
+    assert_eq!(policy.approval, ApprovalRequirement::Never);
+    assert_eq!(policy.timeout, Some(13));
+    assert_eq!(policy.sensitive_params, vec!["token"]);
+    assert_eq!(policy.rate_limit, Some(2));
+    assert_eq!(
+        policy.grants.network.unwrap().endpoints.entries(),
+        Some([].as_slice())
+    );
 }

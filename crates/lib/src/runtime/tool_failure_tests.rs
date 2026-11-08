@@ -30,7 +30,7 @@ async fn run(
         name.into(),
         ToolPolicy {
             approval: ApprovalRequirement::Never,
-            timeout: 10,
+            timeout: Some(10),
             grants: Grants {
                 network: Some(NetworkGrant {
                     endpoints: Allowlist::Permissive,
@@ -39,7 +39,8 @@ async fn run(
                 ..Default::default()
             },
             ..Default::default()
-        },
+        }
+        .into(),
     )]));
     let recorder = Arc::new(RecordingRuntime::default());
     let out = tokio::time::timeout(
@@ -496,7 +497,10 @@ async fn mcp_stdio_failed_recovery_preserves_the_original_call_error() {
 /// Run one real native `shell` call under a policy timeout and return its
 /// recorded outcome, model-visible output and the call's wall time.
 #[cfg(unix)]
-async fn run_shell(policy_timeout: u64, args: Value) -> (ToolResultOutcome, String, Duration) {
+async fn run_shell(
+    policy_timeout: Option<u64>,
+    args: Value,
+) -> (ToolResultOutcome, String, Duration) {
     let (_instance, session) = fresh_session().await;
     let registry = Arc::new(ToolRegistry::new());
     registry.register(crate::tools::ShellExec);
@@ -505,13 +509,12 @@ async fn run_shell(policy_timeout: u64, args: Value) -> (ToolResultOutcome, Stri
     mock.push_tool_calls([("call".into(), "shell".into(), args.to_string())]);
     mock.push_text("done");
     let backend = BackendManager::with_mock(mock.clone(), empty_secrets().await);
+    let yaml = policy_timeout.map_or("approval: never".to_string(), |limit| {
+        format!("approval: never\ntimeout: {limit}")
+    });
     let policies = ToolPolicyRegistry::new(std::collections::HashMap::from([(
         "shell".into(),
-        ToolPolicy {
-            approval: ApprovalRequirement::Never,
-            timeout: policy_timeout,
-            ..crate::tools::ShellExec.default_policy()
-        },
+        serde_yaml::from_str(&yaml).unwrap(),
     )]));
     let recorder = Arc::new(RecordingRuntime::default());
     let started = std::time::Instant::now();
@@ -553,9 +556,9 @@ async fn a_shell_policy_timeout_reports_partial_output_and_kills_descendants() {
         "echo started; (sleep 3; echo leaked > '{}') & sleep 30; echo finished",
         leaked.display()
     );
-    let (outcome, output, wall) = run_shell(2, json!({ "command": command })).await;
+    let (outcome, output, wall) = run_shell(Some(2), json!({ "command": command })).await;
     assert_eq!(outcome, ToolResultOutcome::TimedOut, "{output}");
-    assert!(output.starts_with("Tool timed out after 1."), "{output}");
+    assert!(output.starts_with("Tool timed out after 2."), "{output}");
     assert!(output.contains("policy timeout"), "{output}");
     assert!(output.contains("started"), "{output}");
     assert!(!output.contains("finished"), "{output}");
@@ -571,7 +574,7 @@ async fn a_shell_policy_timeout_reports_partial_output_and_kills_descendants() {
 #[tokio::test]
 async fn a_requested_shell_timeout_stops_before_the_policy() {
     let (outcome, output, wall) = run_shell(
-        30,
+        Some(30),
         json!({ "command": "echo partial; sleep 30", "timeout": 0.5 }),
     )
     .await;
@@ -588,7 +591,7 @@ async fn a_requested_shell_timeout_stops_before_the_policy() {
 #[tokio::test]
 async fn a_completed_shell_command_keeps_its_exit_status() {
     let (outcome, output, _) = run_shell(
-        30,
+        Some(30),
         json!({ "command": "echo 'test result: ok. 2 passed'; exit 3", "timeout": 20 }),
     )
     .await;
@@ -597,7 +600,7 @@ async fn a_completed_shell_command_keeps_its_exit_status() {
 }
 
 /// Manual check that a command runs past the former 30s/60s shell limits
-/// when the operator's policy allows it, and still reports its final output,
+/// without an administrator ceiling, and still reports its final output,
 /// exit status and wall time. Minutes long, so ignored by default:
 ///
 /// ```text
@@ -613,7 +616,8 @@ async fn a_shell_command_outlives_the_former_limit() {
         "sleep 65; '{}' --nocapture tools::shell::tests && exit 3",
         std::env::current_exe().unwrap().display()
     );
-    let (outcome, output, wall) = run_shell(600, json!({ "command": command })).await;
+    let (outcome, output, wall) =
+        run_shell(None, json!({ "command": command, "timeout": 600 })).await;
     println!(
         "[outcome] {outcome:?} after {:.1}s\n{output}",
         wall.as_secs_f64()
@@ -623,4 +627,221 @@ async fn a_shell_command_outlives_the_former_limit() {
     assert!(output.contains("test result: ok."), "{output}");
     assert!(output.contains("0 failed"), "{output}");
     assert!(output.ends_with("[exit code 3]"), "{output}");
+}
+
+/// Real runtime call context plus real host execution: a short successful
+/// command alone could not detect a hidden 30/60-second outer deadline.
+struct ObservedShell(Arc<AtomicUsize>);
+
+impl Tool for ObservedShell {
+    fn descriptor(&self) -> crate::tool::ToolDescriptor {
+        crate::tools::ShellExec.descriptor()
+    }
+    fn default_policy(&self) -> ToolPolicy {
+        crate::tools::ShellExec.default_policy()
+    }
+    fn execute<'a>(
+        &'a self,
+        args: Value,
+        ctx: &'a ToolContext,
+    ) -> Pin<Box<dyn Future<Output = Result<String, ToolError>> + Send + 'a>> {
+        assert_eq!(ctx.call_timeout, None, "no implicit shell ceiling");
+        assert!(ctx.call_deadline.is_none(), "no implicit runtime deadline");
+        self.0.fetch_add(1, Ordering::SeqCst);
+        crate::tools::ShellExec.execute(args, ctx)
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn optional_shell_deadlines_are_effective_through_runtime() {
+    for requested in [None, Some(600)] {
+        let (_instance, session) = fresh_session().await;
+        let observed = Arc::new(AtomicUsize::new(0));
+        let registry = Arc::new(ToolRegistry::new());
+        registry.register(ObservedShell(observed.clone()));
+        let ctx = tool_context(session, registry);
+        let mock = Arc::new(MockBackend::new());
+        let mut args = json!({"command": "echo started; sleep 0.15; echo completed; exit 3"});
+        if let Some(seconds) = requested {
+            args["timeout"] = json!(seconds);
+        }
+        mock.push_tool_calls([("call".into(), "shell".into(), args.to_string())]);
+        mock.push_text("done");
+        let backend = BackendManager::with_mock(mock.clone(), empty_secrets().await);
+        let policies = ToolPolicyRegistry::new(std::collections::HashMap::from([(
+            "shell".into(),
+            serde_yaml::from_str("approval: never").unwrap(),
+        )]));
+        let recorder = Arc::new(RecordingRuntime::default());
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            execute_with_recorder(
+                None,
+                vec![RuntimeMessage::User("test".into())],
+                &backend,
+                &crate::test_support::permissive_security(),
+                &ctx,
+                &policies,
+                Some(recorder.clone()),
+                None,
+                None,
+                ModelCallScope::default(),
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(observed.load(Ordering::SeqCst), 1);
+        let records = recorder.records.lock().unwrap();
+        assert!(
+            matches!(&records[1], RuntimeRecord::ToolResult { outcome: ToolResultOutcome::Success, output, .. }
+            if output == "started\ncompleted\n\n[exit code 3]"),
+            "{records:?}"
+        );
+        assert_eq!(mock.pending(), 0);
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn an_excessive_shell_timeout_runs_once_and_stops_at_the_policy() {
+    let directory = tempfile::tempdir().unwrap();
+    let sentinel = directory.path().join("sentinel");
+    let (outcome, output, _) = run_shell(
+        Some(1),
+        json!({
+            "command": format!("echo effect >> '{}'; echo started; sleep 30; echo finished", sentinel.display()), "timeout": 600
+        }),
+    )
+    .await;
+    assert_eq!(outcome, ToolResultOutcome::TimedOut, "{output}");
+    assert!(output.contains("policy timeout of 1s"), "{output}");
+    assert!(output.contains("started"), "{output}");
+    assert!(!output.contains("finished"), "{output}");
+    assert_eq!(std::fs::read_to_string(&sentinel).unwrap(), "effect\n");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn equal_requested_and_policy_shell_timeouts_are_not_shortened() {
+    let (outcome, output, wall) = run_shell(
+        Some(1),
+        json!({
+            "command": "echo partial; sleep 30", "timeout": 1
+        }),
+    )
+    .await;
+    assert_eq!(outcome, ToolResultOutcome::TimedOut, "{output}");
+    assert!(wall >= Duration::from_secs(1), "{wall:?}");
+    assert!(wall < Duration::from_secs(3), "{wall:?}");
+    assert!(output.contains("partial"), "{output}");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn shell_timeout_invokes_effect_once_without_automatic_retry() {
+    let directory = tempfile::tempdir().unwrap();
+    let effects = directory.path().join("effects");
+    let (outcome, output, wall) = run_shell(None, json!({
+        "command": format!("echo effect >> '{}'; echo partial; sleep 30", effects.display()), "timeout": 0.15
+    })).await;
+    assert_eq!(outcome, ToolResultOutcome::TimedOut, "{output}");
+    assert!(wall >= Duration::from_millis(150), "{wall:?}");
+    assert!(wall < Duration::from_secs(3), "{wall:?}");
+    assert!(output.contains("requested timeout of 0.15s"), "{output}");
+    assert_eq!(std::fs::read_to_string(effects).unwrap(), "effect\n");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn shell_cancellation_keeps_partial_output_kills_descendants_and_does_not_retry() {
+    let directory = tempfile::tempdir().unwrap();
+    let ready = directory.path().join("ready");
+    let leaked = directory.path().join("leaked");
+    let not_started = directory.path().join("not-started");
+    let (_instance, session) = fresh_session().await;
+    let registry = Arc::new(ToolRegistry::new());
+    registry.register(crate::tools::ShellExec);
+    let ctx = tool_context(session, registry);
+    let mock = Arc::new(MockBackend::new());
+    mock.push_tool_calls([
+        ("call".into(), "shell".into(), json!({"command": format!(
+            "echo partial; echo effect >> '{}'; (sleep 1; echo leaked > '{}') & sleep 30; echo completed",
+            ready.display(), leaked.display())}).to_string()),
+        ("next".into(), "shell".into(), json!({"command": format!("touch '{}'", not_started.display())}).to_string()),
+    ]);
+    mock.push_text("must not request another model turn");
+    let backend = BackendManager::with_mock(mock.clone(), empty_secrets().await);
+    let policies = ToolPolicyRegistry::new(std::collections::HashMap::from([(
+        "shell".into(),
+        serde_yaml::from_str("approval: never").unwrap(),
+    )]));
+    let recorder = Arc::new(RecordingRuntime::default());
+    let cancel = TurnCancel::new();
+    let stopper = async {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !ready.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        cancel.cancel();
+    };
+    let security = crate::test_support::permissive_security();
+    let runtime = execute_cancellable_with_recorder(
+        None,
+        vec![RuntimeMessage::User("test".into())],
+        &backend,
+        &security,
+        &ctx,
+        &policies,
+        Some(recorder.clone()),
+        None,
+        Some(&cancel),
+        None,
+        ModelCallScope::default(),
+    );
+    let (result, ()) = tokio::time::timeout(Duration::from_secs(7), async {
+        tokio::join!(runtime, stopper)
+    })
+    .await
+    .unwrap();
+    assert!(
+        matches!(result, Err(TurnError::Cancelled { .. })),
+        "{result:?}"
+    );
+    assert_eq!(
+        mock.pending(),
+        1,
+        "no next model request after cancellation"
+    );
+    assert_eq!(std::fs::read_to_string(&ready).unwrap(), "effect\n");
+    let records = recorder.records.lock().unwrap().clone();
+    let results: Vec<_> = records
+        .iter()
+        .filter_map(|record| match record {
+            RuntimeRecord::ToolResult {
+                call_id,
+                output,
+                outcome,
+                ..
+            } => Some((call_id, output, outcome)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(results.len(), 2, "{records:?}");
+    assert_eq!(*results[0].2, ToolResultOutcome::Cancelled);
+    assert!(
+        results[0].1.starts_with(TOOL_CANCELLED_OUTPUT),
+        "{records:?}"
+    );
+    assert!(results[0].1.contains("partial"), "{records:?}");
+    assert!(!results[0].1.contains("[exit code"), "{records:?}");
+    assert_eq!(results[1].1, TOOL_CANCELLED_OUTPUT);
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    assert!(!leaked.exists(), "descendant survived cancellation");
+    assert!(!not_started.exists(), "next call ran after cancellation");
 }

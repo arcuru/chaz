@@ -1638,6 +1638,10 @@ async fn register_one_exposed_session(
                     session_db_id = %r.session_db_id,
                     "enable on-commit sync for exposed session failed: {e}"
                 );
+                // Keep this session eligible for the next agent-registry rescan.
+                // Registering before its signer is discoverable can cache an
+                // empty extension set and leave replies without on-commit sync.
+                return;
             }
             // Proxy tool approvals over the session DB: the runtime
             // blocks on this channel, the proxy writes a request entry,
@@ -2161,6 +2165,19 @@ async fn build_web_search_backends(
         })
         .collect();
     info!(chain = ?chain, "web_search backends");
+
+    // Configuring a backend does not authorize it: the host judges each
+    // request against web_search's grants. Flag a private SearxNG instance
+    // that the policy tier already refuses, so the operator sees the fix at
+    // startup rather than as a failover at search time.
+    let policy_grants = config
+        .security
+        .as_ref()
+        .and_then(|s| s.tool_policies.as_ref())
+        .and_then(|p| p.get("web_search"))
+        .and_then(|p| p.grants.clone())
+        .unwrap_or_default();
+    tools::warn_unauthorized_private_backends(&built, &policy_grants);
     built
 }
 

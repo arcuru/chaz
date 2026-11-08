@@ -51,6 +51,7 @@ async-trait.workspace = true
 # callback without standing up a second peer.
 eidetica = { workspace = true, features = ["testing"] }
 tempfile.workspace = true
+tracing-subscriber.workspace = true
 wat.workspace = true
 wiremock = "0.6"
 

@@ -747,19 +747,21 @@ pub(super) fn ui_chat(f: &mut ratatui::Frame, app: &mut App, ext_segments: &[Str
     let head_skip = scroll.saturating_sub(cache.offsets.get(first).copied().unwrap_or(0));
     let head_skip = head_skip.min(u16::MAX as usize) as u16;
 
-    // Translate cached header clicks into absolute screen regions, skipping
-    // any whose line is currently scrolled out of view.
+    // Include wrapped header rows and right-hand padding, but no body rows.
+    // Clip partially visible headers at both viewport edges.
     let clicks: Vec<ClickRegion> = cache
         .clicks
         .iter()
-        .filter_map(|&(logical_idx, x_offset, target)| {
-            let visual_row = cache.offsets[logical_idx];
-            let row_relative = visual_row.checked_sub(scroll)?;
-            (row_relative < messages_height).then(|| ClickRegion {
-                x: inner_x.saturating_add(x_offset),
-                y: inner_y.saturating_add(row_relative as u16),
-                w: 1,
-                h: 1,
+        .filter_map(|&(logical_idx, target)| {
+            let first_row = cache.offsets[logical_idx];
+            let last_row = cache.offsets[logical_idx + 1];
+            let top = first_row.max(scroll);
+            let bottom = last_row.min(view_end);
+            (top < bottom).then(|| ClickRegion {
+                x: inner_x,
+                y: inner_y.saturating_add((top - scroll) as u16),
+                w: inner_width,
+                h: (bottom - top) as u16,
                 target,
             })
         })
@@ -1094,8 +1096,8 @@ fn render_completion_popup(
 pub(super) struct TranscriptCache {
     key: Option<TranscriptKey>,
     lines: Vec<Line<'static>>,
-    /// (logical line idx, x col offset from inner messages area, target).
-    clicks: Vec<(usize, u16, ClickTarget)>,
+    /// (logical line idx, target). `ui_chat` maps each header to its visible rows.
+    clicks: Vec<(usize, ClickTarget)>,
     /// Cumulative wrapped height before each logical line; one extra
     /// trailing element holds the total. Mirrors ratatui's word wrap by
     /// probing each line on its own, which is how `Paragraph` wraps.
@@ -1186,14 +1188,12 @@ fn build_transcript(
     inner_width: u16,
 ) -> (
     Vec<Line<'static>>,
-    Vec<(usize, u16, ClickTarget)>,
+    Vec<(usize, ClickTarget)>,
     Vec<(usize, String)>,
 ) {
     let mut lines: Vec<Line<'static>> = Vec::new();
     let mut sources = Vec::new();
-    // (logical line idx, x col offset from inner messages area, target).
-    // Translated to absolute ClickRegions after wrap math below.
-    let mut pending_clicks: Vec<(usize, u16, ClickTarget)> = Vec::new();
+    let mut pending_clicks: Vec<(usize, ClickTarget)> = Vec::new();
 
     for (entry_idx, entry) in tab.entries.iter().enumerate() {
         let debug_prefix = if debug_mode {
@@ -1234,13 +1234,7 @@ fn build_transcript(
                     .as_ref()
                     .and_then(|r| r.source.as_ref())
                     .map(|r| format!(" [via {} {}]", r.transport, r.channel))
-                    .unwrap_or_else(|| {
-                        if is_agent {
-                            " [local]".into()
-                        } else {
-                            String::new()
-                        }
-                    });
+                    .unwrap_or_default();
                 let label = format!("{}{}{}:", debug_prefix, entry.sender, source);
 
                 lines.push(Line::from(vec![Span::styled(label, sender_style)]));
@@ -1299,7 +1293,6 @@ fn build_transcript(
             EntryType::Directive => {
                 let expanded = expand_all != tab.expanded_entries.contains(&entry_idx);
                 let icon = if expanded { "▾" } else { "▸" };
-                let icon_col = debug_prefix.chars().count() as u16 + 2; // "  " before icon
                 let first = entry.content.lines().next().unwrap_or("");
                 let head_label = format!("{} (directive)", entry.sender);
                 let header_spans: Vec<Span> = if expanded {
@@ -1317,11 +1310,7 @@ fn build_transcript(
                     ]
                 };
                 lines.push(Line::from(header_spans));
-                pending_clicks.push((
-                    lines.len() - 1,
-                    icon_col,
-                    ClickTarget::ToggleEntryExpanded(entry_idx),
-                ));
+                pending_clicks.push((lines.len() - 1, ClickTarget::ToggleEntryExpanded(entry_idx)));
                 if expanded {
                     for l in display_lines(&entry.content, None) {
                         lines.push(Line::from(vec![Span::styled(format!("      {l}"), dim)]));
@@ -1339,7 +1328,6 @@ fn build_transcript(
                 let tool_style = Style::default().fg(COLOR_TOOL);
                 let expanded = expand_all != tab.expanded_entries.contains(&entry_idx);
                 let icon = if expanded { "▾" } else { "▸" };
-                let icon_col = debug_prefix.chars().count() as u16 + 2;
                 let header_spans: Vec<Span> = if expanded {
                     vec![
                         Span::styled(format!("{debug_prefix}  "), dim),
@@ -1358,11 +1346,7 @@ fn build_transcript(
                     ]
                 };
                 lines.push(Line::from(header_spans));
-                pending_clicks.push((
-                    lines.len() - 1,
-                    icon_col,
-                    ClickTarget::ToggleEntryExpanded(entry_idx),
-                ));
+                pending_clicks.push((lines.len() - 1, ClickTarget::ToggleEntryExpanded(entry_idx)));
                 if expanded {
                     for l in display_lines(&args, None) {
                         lines.push(Line::from(vec![Span::styled(format!("      {l}"), dim)]));
@@ -1385,7 +1369,6 @@ fn build_transcript(
                 } else {
                     dim
                 };
-                let icon_col = debug_prefix.chars().count() as u16 + 2;
                 let header_spans: Vec<Span> = if expanded {
                     vec![
                         Span::styled(format!("{debug_prefix}  "), dim),
@@ -1404,11 +1387,7 @@ fn build_transcript(
                     ]
                 };
                 lines.push(Line::from(header_spans));
-                pending_clicks.push((
-                    lines.len() - 1,
-                    icon_col,
-                    ClickTarget::ToggleEntryExpanded(entry_idx),
-                ));
+                pending_clicks.push((lines.len() - 1, ClickTarget::ToggleEntryExpanded(entry_idx)));
                 if expanded {
                     let body = entry
                         .content
@@ -3397,15 +3376,243 @@ mod transcript_tests {
                     reference(&app, width, messages_h),
                     "width {width}, offset {offset}"
                 );
-                // Every header click target sits on a drawn expand/collapse icon.
+                // A clipped header may start below its icon's logical row.
                 for region in &app.click_regions {
                     if let ClickTarget::ToggleEntryExpanded(_) = region.target {
-                        let cell = terminal.backend().buffer()[(region.x, region.y)].symbol();
-                        assert!(matches!(cell, "▸" | "▾"), "offset {offset}: {cell:?}");
+                        assert_eq!(region.w, width - 2, "offset {offset}");
+                        let row: String = (region.x..region.x + region.w)
+                            .map(|x| terminal.backend().buffer()[(x, region.y)].symbol())
+                            .collect();
+                        assert!(
+                            row.contains('▸') || row.contains('▾') || region.y == 2,
+                            "offset {offset}: {row:?}"
+                        );
                     }
                 }
             }
         }
+    }
+
+    #[tokio::test]
+    async fn header_click_regions_span_the_full_displayed_header_row() {
+        use crate::bridge::tui::ClickRegion;
+
+        // Force wrapping and enough overflow to clip headers at either edge.
+        let base = [
+            entry("user", &"wrap me ".repeat(9), EntryType::Message),
+            entry(
+                "chaz",
+                &format!("shell({})", "x".repeat(80)),
+                EntryType::ToolCall,
+            ),
+            entry(
+                "chaz",
+                &format!("shell: {}", "y".repeat(80)),
+                EntryType::ToolResult,
+            ),
+            entry("system", "be kind", EntryType::Directive),
+            entry("user", "bye", EntryType::Message),
+        ];
+        let entries: Vec<_> = (0..6).flat_map(|_| base.iter().cloned()).collect();
+        let (_instance, mut app) = app_with(entries).await;
+        for (width, height) in [(40u16, 30u16), (24, 20), (72, 30)] {
+            let (inner_x, inner_y, inner_w) = (1usize, 2usize, width as usize - 2);
+            let messages_h = height as usize - 5 - 2; // box minus border
+            let total = {
+                let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+                terminal.draw(|f| ui_chat(f, &mut app, &[])).unwrap();
+                *app.active().live.render.offsets.last().unwrap()
+            };
+            assert!(total > messages_h, "transcript must overflow: {total}");
+
+            let mut wrapped_header_seen = false;
+            for offset in 0..=total as u16 + 3 {
+                app.active_mut().scroll_offset = offset;
+                app.click_regions.clear();
+                let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+                terminal.draw(|f| ui_chat(f, &mut app, &[])).unwrap();
+                let tab = app.active();
+                let cache = &tab.live.render;
+                // Scroll follows the draw's math: transcript plus the activity
+                // line, clipped to the viewport.
+                let activity_h = turn_activity_line(tab.active_turns)
+                    .map_or(0, |l| wrapped_height(&l, inner_w as u16));
+                let scroll = (total + activity_h)
+                    .saturating_sub(messages_h)
+                    .saturating_sub(offset as usize);
+                let view_end = scroll + messages_h;
+                let in_view = |&&(idx, _): &&(usize, ClickTarget)| {
+                    let first_row = cache.offsets[idx];
+                    let last_row = cache.offsets[idx + 1];
+                    first_row.max(scroll) < last_row.min(view_end)
+                };
+                let regions: Vec<ClickRegion> = app
+                    .click_regions
+                    .iter()
+                    .filter(|r| matches!(r.target, ClickTarget::ToggleEntryExpanded(_)))
+                    .copied()
+                    .collect();
+                let visible: Vec<_> = cache.clicks.iter().filter(|c| in_view(c)).collect();
+                assert_eq!(
+                    regions.len(),
+                    visible.len(),
+                    "offset {offset}: exactly the visible headers are clickable"
+                );
+                for (&&(logical_idx, _), region) in visible.iter().zip(&regions) {
+                    let first_row = cache.offsets[logical_idx];
+                    let last_row = cache.offsets[logical_idx + 1];
+                    wrapped_header_seen |= last_row - first_row > 1;
+                    let top = first_row.max(scroll);
+                    let bottom = last_row.min(view_end);
+                    assert!(
+                        top < bottom,
+                        "offset {offset}: off-screen header must not register"
+                    );
+                    assert_eq!(region.x as usize, inner_x, "offset {offset}");
+                    assert_eq!(region.w as usize, inner_w, "offset {offset}");
+                    assert_eq!(
+                        region.y as usize,
+                        inner_y + (top - scroll),
+                        "offset {offset}"
+                    );
+                    assert_eq!(region.h as usize, bottom - top, "offset {offset}");
+                }
+            }
+            assert!(wrapped_header_seen, "test must exercise wrapped headers");
+        }
+    }
+
+    #[tokio::test]
+    async fn clicking_anywhere_on_a_header_toggles_and_other_rows_do_not() {
+        use super::list_tests::mouse;
+        use crate::bridge::tui::input::{MouseOutcome, handle_mouse};
+        use crossterm::event::{MouseButton, MouseEventKind};
+
+        fn click(terminal: &mut Terminal<TestBackend>, app: &mut App, x: u16, y: u16) {
+            assert!(
+                handle_mouse(app, mouse(MouseEventKind::Down(MouseButton::Left), x, y)).is_none()
+            );
+            assert!(
+                handle_mouse(app, mouse(MouseEventKind::Up(MouseButton::Left), x, y)).is_none()
+            );
+            app.click_regions.clear();
+            terminal.draw(|f| ui_chat(f, app, &[])).unwrap();
+        }
+
+        let entries = vec![
+            entry("user", "alpha beta", EntryType::Message),
+            entry("chaz", "shell(echo one)", EntryType::ToolCall),
+            entry("chaz", "shell: one", EntryType::ToolResult),
+            entry("system", "be kind", EntryType::Directive),
+            entry("chaz", "load_skill(example)", EntryType::ToolCall),
+            entry(
+                "chaz",
+                "load_skill: ERROR: missing skill",
+                EntryType::ToolResult,
+            ),
+            entry("user", "gamma delta", EntryType::Message),
+        ];
+        let (_instance, mut app) = app_with(entries).await;
+        let (width, height) = (60, 24);
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|f| ui_chat(f, &mut app, &[])).unwrap();
+
+        for index in 1..=5 {
+            let header = app
+                .click_regions
+                .iter()
+                .find(|r| matches!(r.target, ClickTarget::ToggleEntryExpanded(i) if i == index))
+                .copied()
+                .expect("visible header");
+            let text = &rows(&terminal, header.y, header.y + 1)[0];
+            let icon_x = text.chars().position(|c| matches!(c, '▸' | '✗')).unwrap() as u16;
+            // Exercise padding, label and icon with a redraw after every click.
+            for x in [width - 2, header.x + 4, icon_x] {
+                click(&mut terminal, &mut app, x, header.y);
+                assert_eq!(
+                    app.active().expanded_entries,
+                    HashSet::from([index]),
+                    "entry {index}, column {x}: expands once, release is inert"
+                );
+                click(&mut terminal, &mut app, x, header.y);
+                assert!(
+                    app.active().expanded_entries.is_empty(),
+                    "entry {index}, column {x}: collapses again"
+                );
+            }
+        }
+
+        let screen = rows(&terminal, 0, height);
+        let message_y = screen
+            .iter()
+            .position(|l| l.contains("alpha beta"))
+            .unwrap() as u16;
+        // Neither message text nor the transcript border toggles an entry.
+        click(&mut terminal, &mut app, 5, message_y);
+        click(&mut terminal, &mut app, 0, message_y);
+        assert!(app.active().expanded_entries.is_empty());
+
+        let header = app
+            .click_regions
+            .iter()
+            .find(|r| matches!(r.target, ClickTarget::ToggleEntryExpanded(1)))
+            .copied()
+            .unwrap();
+        click(&mut terminal, &mut app, width - 2, header.y);
+        let screen = rows(&terminal, 0, height);
+        let body_y = screen.iter().position(|l| l.contains("echo one")).unwrap() as u16;
+        click(&mut terminal, &mut app, 5, body_y);
+        assert_eq!(
+            app.active().expanded_entries,
+            HashSet::from([1]),
+            "body click neither collapses nor copies"
+        );
+
+        // Selection starts on message text and crosses a header, as before.
+        let from_y = screen
+            .iter()
+            .position(|l| l.contains("alpha beta"))
+            .unwrap() as u16;
+        let to_y = screen
+            .iter()
+            .position(|l| l.contains("gamma delta"))
+            .unwrap() as u16;
+        let from_x = screen[from_y as usize]
+            .chars()
+            .position(|c| c == 'a')
+            .unwrap() as u16;
+        let to_x = screen[to_y as usize]
+            .chars()
+            .collect::<Vec<_>>()
+            .iter()
+            .rposition(|&c| c == 'a')
+            .unwrap() as u16;
+        assert!(
+            handle_mouse(
+                &mut app,
+                mouse(MouseEventKind::Down(MouseButton::Left), from_x, from_y)
+            )
+            .is_none()
+        );
+        assert!(
+            handle_mouse(
+                &mut app,
+                mouse(MouseEventKind::Drag(MouseButton::Left), from_x, header.y)
+            )
+            .is_none()
+        );
+        let Some(MouseOutcome::Copy(copied)) = handle_mouse(
+            &mut app,
+            mouse(MouseEventKind::Up(MouseButton::Left), to_x, to_y),
+        ) else {
+            panic!("drag across header must copy");
+        };
+        assert_eq!(copied, "alpha beta\ngamma delta");
+        assert_eq!(
+            app.active().expanded_entries,
+            HashSet::from([1]),
+            "drag does not toggle"
+        );
     }
 
     #[tokio::test]

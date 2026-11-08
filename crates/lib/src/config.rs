@@ -1030,7 +1030,7 @@ pub struct SecurityConfig {
     /// Leak detection policy: "redact" (default) or "block"
     pub leak_policy: Option<String>,
     /// Per-tool policy overrides (risk, approval, timeout, sensitive_params, grants)
-    pub tool_policies: Option<std::collections::HashMap<String, crate::tool::ToolPolicy>>,
+    pub tool_policies: Option<std::collections::HashMap<String, crate::tool::ToolPolicyOverride>>,
 }
 
 /// Configuration for a tool profile — controls how tool definitions are presented to the LLM.
@@ -1063,7 +1063,7 @@ pub struct McpServerConfig {
     /// URL for Streamable HTTP transport. When set, `command` is ignored.
     pub url: Option<String>,
     /// Default policy for all tools from this server (overrides MCP baseline)
-    pub default_policy: Option<crate::tool::ToolPolicy>,
+    pub default_policy: Option<crate::tool::ToolPolicyOverride>,
     /// Seconds to allow for starting the server and discovering its tools
     /// before giving up and marking it failed. Startup runs off the boot
     /// path, so without a bound a wedged server would sit in `Starting`

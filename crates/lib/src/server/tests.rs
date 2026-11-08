@@ -12,6 +12,9 @@ mod native_steering_tests;
 #[path = "compaction_tests.rs"]
 mod compaction_tests;
 
+#[path = "meta_tests.rs"]
+mod meta_tests;
+
 use super::*;
 
 // These guards detect stalled fixtures, not runtime latency regressions. LLVM
@@ -2914,6 +2917,156 @@ async fn watcher_registers_exposed_sessions_only() {
 }
 
 #[tokio::test]
+async fn exposed_session_waits_for_sync_signer_before_registration() {
+    use eidetica::auth::types::{
+        DelegatedTreeRef, DelegationStep, PermissionBounds, SigKey, TreeReference,
+    };
+    use eidetica::backend::VerificationStatus;
+    use eidetica::database::DatabaseKey;
+
+    let (instance, server, registry) = server_fixture().await;
+    let agent = crate::session::test_helpers::make_agent_entry(&registry, "alpha").await;
+    server.agent_index().register(agent.clone());
+    let adb = registry
+        .open_agent_db(&agent.db_id, Some(&agent.pubkey))
+        .await
+        .unwrap()
+        .unwrap();
+    let parent = adb.database();
+    // Only the delegated route is held by this peer, like a bridge-created session.
+    let child = eidetica::Database::create(
+        &instance,
+        eidetica::auth::crypto::PrivateKey::generate(),
+        eidetica::crdt::Doc::new(),
+    )
+    .await
+    .unwrap();
+    let txn = child.new_transaction().await.unwrap();
+    txn.get_settings()
+        .unwrap()
+        .add_delegated_tree(DelegatedTreeRef {
+            permission_bounds: PermissionBounds {
+                max: eidetica::auth::Permission::Admin(0),
+                min: None,
+            },
+            tree: TreeReference {
+                root: parent.root_id().clone(),
+                tips: parent.snapshot().await.unwrap().into_tips(),
+            },
+        })
+        .await
+        .unwrap();
+    txn.commit().await.unwrap();
+    let identity = SigKey::Delegation {
+        path: vec![DelegationStep {
+            tree: parent.root_id().clone(),
+            tips: parent.snapshot().await.unwrap().into_tips(),
+        }],
+        hint: SigKey::from_pubkey(&agent.pubkey).hint().clone(),
+    };
+    let key = {
+        let mut user = registry.user_for_tests().await;
+        user.map_key(&agent.pubkey, child.root_id(), identity)
+            .await
+            .unwrap();
+        user.get_signing_key(&agent.pubkey).unwrap()
+    };
+    let id = child.root_id().to_string();
+    adb.expose_session_on(&id, "matrix").await.unwrap();
+    registry
+        .open_session(&id)
+        .await
+        .expect("complete parent permits native discovery");
+    let verified = parent.snapshot().await.unwrap();
+
+    // Real native commits on a second peer, delivered descendant-before-ancestor.
+    let (source, _source_user) = Instance::create_backend(
+        Box::new(InMemory::new()),
+        NewAccount::passwordless("source"),
+    )
+    .await
+    .unwrap();
+    for entry in parent.get_all_entries().await.unwrap() {
+        source
+            .backend()
+            .local_engine()
+            .unwrap()
+            .put(entry)
+            .await
+            .unwrap();
+    }
+    let remote = eidetica::Database::open(&source, parent.root_id())
+        .await
+        .unwrap()
+        .with_key(DatabaseKey::new(key.clone()));
+    assert_eq!(remote.verify().await.unwrap().failed, 0);
+    let txn = remote.new_transaction().await.unwrap();
+    txn.get_store::<eidetica::store::DocStore>("delayed")
+        .await
+        .unwrap()
+        .set_string("stage", "ancestor")
+        .await
+        .unwrap();
+    let ancestor = txn.commit().await.unwrap();
+    let txn = remote.new_transaction().await.unwrap();
+    txn.get_store::<eidetica::store::DocStore>("delayed")
+        .await
+        .unwrap()
+        .set_string("stage", "descendant")
+        .await
+        .unwrap();
+    let descendant = txn.commit().await.unwrap();
+    let engine = instance.backend().local_engine().unwrap();
+    engine
+        .put(remote.get_entry(&descendant).await.unwrap())
+        .await
+        .unwrap();
+    assert_eq!(parent.verify().await.unwrap().failed, 0);
+    assert_eq!(parent.snapshot().await.unwrap(), verified);
+    assert_eq!(
+        engine.get_verification_status(&descendant).await.unwrap(),
+        VerificationStatus::Unverified
+    );
+    assert!(
+        eidetica::Database::find_sigkeys(&instance, child.root_id(), &agent.pubkey)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    // The bound writer survives, but native tracking still requires discovery.
+    registry.open_session_with_signer(&id).await.unwrap();
+    let secrets = crate::security::SecretStore::new(registry.chaz_peer().clone()).await;
+    let backend = crate::backends::BackendManager::new(&None, secrets);
+    super::build::register_exposed_sessions(&server, &registry, &backend).await;
+    assert!(!registry.is_sync_enabled_for(child.root_id()).await.unwrap());
+    assert!(
+        !server.is_watching_session(&id).await,
+        "failed sync setup must not make registration permanent"
+    );
+
+    engine
+        .put(remote.get_entry(&ancestor).await.unwrap())
+        .await
+        .unwrap();
+    let report = parent.verify().await.unwrap();
+    assert_eq!(report.failed, 0);
+    assert_eq!(
+        engine.get_verification_status(&descendant).await.unwrap(),
+        VerificationStatus::Verified
+    );
+    // The existing agent-registry watcher performs this rescan on verified arrival.
+    super::build::register_exposed_sessions(&server, &registry, &backend).await;
+    assert!(registry.is_sync_enabled_for(child.root_id()).await.unwrap());
+    assert!(server.is_watching_session(&id).await);
+    let (_, writer, signer) = registry.open_session_with_signer(&id).await.unwrap();
+    assert_eq!(signer.unwrap().public_key(), key.public_key());
+    assert_eq!(writer.root_id(), child.root_id());
+    assert!(
+        matches!(writer.auth_identity(), Some(SigKey::Delegation { path, .. }) if path.len() == 1 && path[0].tree == *parent.root_id() && path[0].tips == vec![descendant])
+    );
+}
+
+#[tokio::test]
 async fn registry_watcher_rescans_while_initial_recovery_is_blocked() {
     // A restored daemon can have many old exposed sessions. Their bootstrap
     // must not prevent the watcher from reacting to a new bridge exposure.
@@ -4755,6 +4908,7 @@ async fn abort_after_recorded_host_effect_stays_interrupted_until_retry() {
             command: "external-side-effect".into(),
             working_dir: None,
             timeout: None,
+            cancel: None,
         },
         &Default::default(),
     )
@@ -5207,6 +5361,16 @@ async fn targeted_service_client_expands_peer_discovery_only_on_demand() {
 
 #[tokio::test]
 async fn resident_executor_adopts_and_processes_local_client_session() {
+    // Spawned service/callback tasks share this current-thread runtime, so a
+    // thread-local subscriber captures this turn without affecting other tests.
+    let logs = tempfile::NamedTempFile::new().unwrap();
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_max_level(tracing::Level::ERROR)
+        .with_writer(logs.reopen().unwrap())
+        .finish();
+    let _subscriber = tracing::subscriber::set_default(subscriber);
+
     use eidetica::NewAccount;
     use eidetica::backend::database::InMemory;
     use eidetica::service::ServiceServer;
@@ -5258,6 +5422,23 @@ async fn resident_executor_adopts_and_processes_local_client_session() {
     let client = crate::instance::connect_with(&settings, crate::config::ExecutionRole::Client)
         .await
         .unwrap();
+    // Agent DB access requires its bound per-database key, not the login key.
+    // Callback dispatch must not reopen this tree as the connection identity.
+    assert_ne!(agent.pubkey, client.user.get_default_key().unwrap());
+    let unbound = eidetica::Database::open(&client.instance, &agent_db.id())
+        .await
+        .unwrap_err();
+    assert!(unbound.to_string().contains("PermissionDenied"));
+    let client_agent = client.user.open_database(&agent_db.id()).await.unwrap();
+    let (agent_wake_tx, mut agent_wake_rx) = tokio::sync::mpsc::unbounded_channel();
+    let _agent_callback = client_agent
+        .on_write(move |_, _| {
+            agent_wake_tx.send(()).unwrap();
+            std::future::ready(Ok(()))
+        })
+        .await
+        .unwrap();
+
     let client_registry = Arc::new(
         crate::session::SessionRegistry::new(client.instance, client.user, agents.clone())
             .await
@@ -5336,6 +5517,16 @@ async fn resident_executor_adopts_and_processes_local_client_session() {
     drop(executor_registry);
     drop(shutdown);
     task.await.unwrap().unwrap();
+
+    let logs = std::fs::read_to_string(logs.path()).unwrap();
+    assert!(
+        !logs.contains("Failed to open database for callbacks"),
+        "local service turn must not reopen callback trees with the login key: {logs}"
+    );
+    assert!(
+        agent_wake_rx.try_recv().is_ok(),
+        "local session publication must notify the bound Agent DB subscriber"
+    );
 }
 
 #[tokio::test]

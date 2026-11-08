@@ -47,13 +47,17 @@ Each tool has a policy controlling its risk level, approval requirements, and ex
 struct ToolPolicy {
     risk: RiskLevel,              // Low, Medium, High
     approval: ApprovalRequirement, // Never, UnlessAutoApproved, Always
-    timeout: u64,                  // seconds
+    timeout: Option<u64>,          // seconds (None = no deadline)
     sensitive_params: Vec<String>, // redacted in approval display
     rate_limit: Option<u32>,      // max calls per minute (None = unlimited)
 }
 ```
 
-Tools provide a `default_policy()`. Config-level overrides in `security.tool_policies` take precedence. The `ToolPolicyRegistry` resolves the effective policy per tool.
+Tools provide a `default_policy()`. `ToolPolicyOverride` records field presence separately from the resolved `ToolPolicy`; `ToolPolicyRegistry` applies only supplied fields. Nullable timeout/rate-limit fields distinguish omitted inheritance from explicit null removal. MCP server overrides apply the same way over annotation-derived defaults before per-tool overrides.
+
+The runtime installs a deadline only for a finite effective policy. Shell alone defaults to no deadline. Shell caps a requested timeout at the configured ceiling rather than rejecting the call, and reports the configured limit if that ceiling expires. Its host stops at the earlier requested/policy execution limit, kills the process group and drains partial output. The runtime backstop adds only a one-second reporting grace. User cancellation reaches both runtime and host; reporting is bounded by the same grace, skips result hooks, and retains a cancelled result without running subsequent calls. Other tools retain immediate drop-on-cancel behavior.
+
+Durable `job_wait` checkpoints keep their existing finite-policy wire format. Explicitly unbounded policy waits remain resident rather than writing a checkpoint; their observation deadline and cancellation still apply. A resumed finite checkpoint cannot gain time if the current policy is unbounded.
 
 ## ScopedTools and Narrowing
 
@@ -114,7 +118,9 @@ The host enforces grants at the capability boundary — the tool says what it wa
 
 Every host that spawns a local shell goes through `tool_host::run_shell_process`. It starts the process in its own process group, collects stdout and stderr concurrently, and kills the group when the requested `timeout` expires, keeping the output read so far (`ShellOutput::timed_out`, `elapsed`). Dropping the future (a user stop or the runtime's outer timeout) kills the group as well. `BubblewrapToolHost` also unshares the PID namespace, because `--new-session` moves the sandboxed shell out of `bwrap`'s process group. Killing `bwrap` then ends the whole sandboxed tree.
 
-Tools (shell, web, file) call `ctx.host().request()` against the trait, so swapping host implementations needs no tool-code changes; what's missing is the config plumbing to choose anything other than `NativeToolHost`.
+Tools (shell, web_fetch, web_search, file) call `ctx.host().request()` against the trait, so swapping host implementations needs no tool-code changes; what's missing is the config plumbing to choose anything other than `NativeToolHost`.
+
+A source-scan test (`crates/lib/src/routing_guard.rs`) keeps it that way for session-time code: it fails when non-test code under `src/tools/` or `src/extensions/` names a direct OS/network API (`std`/`tokio` `fs`/`process`/`net`, `reqwest`, `File::open`/`create`, `Command::new`). Exemptions name a file, a function and an API, each with a reason, and an exemption that no longer matches fails the test. The only exemptions are the two startup skill-catalog functions in `extensions/skills.rs`. The guard catches accidental regressions; it matches source text, so it is not a sandbox. Grant enforcement is the host's, and daemon infrastructure outside those trees (model providers, embedding, MCP transport, config, secrets) is deliberately not scanned.
 
 A separate WASM-tools path (`crates/lib/src/wasm_host.rs`: `WasmEngine` + `WasmTool`) lets a tool itself live in a Wasmtime sandbox while still routing its capability requests through whichever `ToolHost` chaz is using. The engine is wired but the config-driven loader is future work (the module is `#[allow(dead_code)]` today).
 

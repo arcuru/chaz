@@ -372,9 +372,9 @@ pub struct EndpointPattern {
 ///
 /// Returns the updated map.
 pub fn merge_legacy_security(
-    mut tool_policies: std::collections::HashMap<String, crate::tool::ToolPolicy>,
+    mut tool_policies: std::collections::HashMap<String, crate::tool::ToolPolicyOverride>,
     sec: &crate::config::SecurityConfig,
-) -> std::collections::HashMap<String, crate::tool::ToolPolicy> {
+) -> std::collections::HashMap<String, crate::tool::ToolPolicyOverride> {
     use tracing::warn;
 
     let legacy_shell_allow = sec.shell_allowlist.clone().unwrap_or_default();
@@ -383,7 +383,8 @@ pub fn merge_legacy_security(
 
     if has_legacy_shell {
         let entry = tool_policies.entry("shell".to_string()).or_default();
-        if entry.grants.shell.is_none() {
+        let grants = entry.grants.get_or_insert_with(Grants::default);
+        if grants.shell.is_none() {
             if sec.shell_allowlist.is_some() {
                 warn!(
                     "security.shell_allowlist is deprecated — use security.tool_policies.shell.grants.shell.allow"
@@ -395,7 +396,7 @@ pub fn merge_legacy_security(
                 );
             }
             // Legacy empty allowlist meant allow-all → Permissive.
-            entry.grants.shell = Some(ShellGrant {
+            grants.shell = Some(ShellGrant {
                 allow: if legacy_shell_allow.is_empty() {
                     Allowlist::Permissive
                 } else {
@@ -408,7 +409,8 @@ pub fn merge_legacy_security(
 
     if let Some(legacy_endpoints) = &sec.allowed_endpoints {
         let entry = tool_policies.entry("web_fetch".to_string()).or_default();
-        if entry.grants.network.is_none() {
+        let grants = entry.grants.get_or_insert_with(Grants::default);
+        if grants.network.is_none() {
             warn!(
                 "security.allowed_endpoints is deprecated — use security.tool_policies.web_fetch.grants.network.endpoints"
             );
@@ -420,7 +422,7 @@ pub fn merge_legacy_security(
                     methods: e.methods.clone(),
                 })
                 .collect();
-            entry.grants.network = Some(NetworkGrant {
+            grants.network = Some(NetworkGrant {
                 // Legacy empty list meant allow-all → Permissive.
                 endpoints: if endpoints.is_empty() {
                     Allowlist::Permissive
@@ -452,6 +454,8 @@ mod tests {
         let policy = merged.get("shell").expect("shell policy created");
         let grant = policy
             .grants
+            .as_ref()
+            .unwrap()
             .shell
             .as_ref()
             .expect("shell grant synthesized");
@@ -476,6 +480,8 @@ mod tests {
         let policy = merged.get("web_fetch").expect("web_fetch policy created");
         let grant = policy
             .grants
+            .as_ref()
+            .unwrap()
             .network
             .as_ref()
             .expect("network grant synthesized");
@@ -500,14 +506,21 @@ mod tests {
                     ..Default::default()
                 },
                 ..Default::default()
-            },
+            }
+            .into(),
         );
         let sec = SecurityConfig {
             shell_allowlist: Some(vec!["rm".into()]),
             ..Default::default()
         };
         let merged = merge_legacy_security(existing, &sec);
-        let grant = merged["shell"].grants.shell.as_ref().unwrap();
+        let grant = merged["shell"]
+            .grants
+            .as_ref()
+            .unwrap()
+            .shell
+            .as_ref()
+            .unwrap();
         assert_eq!(grant.allow, Allowlist::Only(vec!["cat".to_string()]));
     }
 

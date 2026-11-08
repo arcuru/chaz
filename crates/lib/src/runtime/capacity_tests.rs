@@ -132,9 +132,10 @@ async fn job_wait_reacquires_after_success_error_and_policy_timeout() {
         let policies = ToolPolicyRegistry::new(std::collections::HashMap::from([(
             "job_wait".into(),
             ToolPolicy {
-                timeout: 1,
+                timeout: Some(1),
                 ..Default::default()
-            },
+            }
+            .into(),
         )]));
         let capacity = ExecutionCapacity::new(semaphore.clone(), permit, claim);
         let task = tokio::spawn(async move {

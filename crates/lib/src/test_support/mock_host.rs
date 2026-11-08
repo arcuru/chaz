@@ -41,6 +41,7 @@ impl MockHost {
                 stderr: stderr.to_string(),
                 exit_code,
                 timed_out: false,
+                cancelled: false,
                 elapsed: std::time::Duration::ZERO,
             })));
     }
@@ -56,6 +57,7 @@ impl MockHost {
                 stderr: String::new(),
                 exit_code: 137,
                 timed_out: true,
+                cancelled: false,
                 elapsed,
             })));
     }

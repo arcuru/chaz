@@ -724,6 +724,8 @@ impl Server {
             routine_engine: self.routine_engine().cloned(),
             observation_deadline: None,
             call_deadline: None,
+            call_timeout: None,
+            call_cancel: None,
         };
 
         let tool_defs = tool_ctx.definitions();

@@ -49,6 +49,7 @@ mod readiness_tests;
 mod reconnect;
 mod refresh;
 mod selection;
+mod session_pages;
 mod startup;
 mod supervised;
 mod theme;
@@ -78,6 +79,7 @@ enum Action {
     ModelsFetched(ModelCatalog),
     SessionLoad(SessionLoad),
     PeerPage(peer_pages::Loaded),
+    SessionPage(session_pages::Loaded),
     JobsLoaded(jobs::Loaded),
     /// A background tab read finished (see [`refresh`]).
     Refresh(refresh::Refresh),
@@ -542,7 +544,7 @@ pub(super) struct Tab {
     /// defaults so live agent edits can re-resolve unpinned models on draw.
     pub model_pin: Option<String>,
     /// Per-entry expand override (entry index → "opposite of `App::expand_all`").
-    /// Empty by default; click on an entry's icon toggles its presence here.
+    /// Empty by default; click on an entry's header row toggles its presence here.
     pub expanded_entries: HashSet<usize>,
     /// Backend-derived state refreshed off the input/render path, plus the
     /// transcript render cache. See [`refresh`].
@@ -756,6 +758,7 @@ pub(super) struct App {
     /// without doing async work mid-frame. `None` outside Session Settings.
     pub(super) session_settings_snapshot: Option<SessionMetaSnapshot>,
     peer_pages: peer_pages::Pages,
+    session_pages: session_pages::Pages,
     /// Sub-cursor inside the Peer → Agents list. Cycles with ↑↓ while
     /// that category is selected; clamped each frame to the live agent
     /// count. Persists across category switches so the user lands back
@@ -902,6 +905,7 @@ impl App {
             model_picker_current_pin: None,
             session_settings_snapshot: None,
             peer_pages: peer_pages::Pages::default(),
+            session_pages: session_pages::Pages::default(),
             settings_return: None,
             peer_settings_index: 0,
             session_settings_index: 0,
