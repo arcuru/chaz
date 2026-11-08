@@ -1,4 +1,4 @@
-//! Exercise live agent defaults across real process and SQLite restarts.
+//! Exercise Chaz client/executor restarts against a SQLite-backed service.
 use eidetica::{Instance, NewAccount, backend::database::Sqlite};
 use serde_json::json;
 use wiremock::{
@@ -93,12 +93,9 @@ async fn live_model_survives_unchanged_config_process_restarts() {
         }
     };
     run(&["--print", "first session"]).await;
-    run(&["cmd", "/agent set chaz model live"]).await;
+    let confirmation = run(&["cmd", "/agent set chaz model live"]).await;
+    assert!(confirmation.contains("Set model=live on agent 'chaz'"));
     let displayed = run(&["cmd", "/model"]).await;
-    assert!(
-        displayed.contains("Current Model: live (agent default)"),
-        "{displayed}"
-    );
     for _ in 0..2 {
         run(&["--print", "new session"]).await;
     }
@@ -107,10 +104,6 @@ async fn live_model_survives_unchanged_config_process_restarts() {
     std::fs::write(&prompt_path, "updated fixture prompt").unwrap();
     run(&["--print", "session after prompt update"]).await;
     let reconciled = run(&["cmd", "/model"]).await;
-    assert!(
-        reconciled.contains("Current Model: baseline (backend default)"),
-        "{reconciled}"
-    );
     let models: Vec<_> = model
         .received_requests()
         .await
@@ -130,5 +123,16 @@ async fn live_model_survives_unchanged_config_process_restarts() {
         .expect("service shutdown deadline")
         .unwrap()
         .unwrap();
+    // Check transport before presentation so a stale display cannot hide
+    // whether the restarted executor actually lost the live model.
+    println!("outgoing models: {models:?}");
     assert_eq!(models, ["baseline", "live", "live", "baseline"]);
+    assert!(
+        displayed.contains("Current Model: live (agent default)"),
+        "{displayed}"
+    );
+    assert!(
+        reconciled.contains("Current Model: baseline (backend default)"),
+        "{reconciled}"
+    );
 }

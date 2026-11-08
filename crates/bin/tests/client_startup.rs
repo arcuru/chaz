@@ -32,7 +32,10 @@ async fn client_readiness_skips_delayed_executor_credentials_and_schedule_bootst
     let (agent_db, pubkey) = create_agent_db(
         &mut user,
         "selected",
-        &AgentDbConfig::default(),
+        &AgentDbConfig {
+            model: Some("display-model".into()),
+            ..Default::default()
+        },
         &AgentMeta {
             display_name: Some("selected".into()),
             ..Default::default()
@@ -124,7 +127,7 @@ eidetica:
   login: {{ username: startup, passwordless: true }}
 agents:
   - name: selected
-    model: display-model
+    model: fallback-model
     autonomous: false
 default_agents: [selected]
 backends:
@@ -215,6 +218,7 @@ schedules:
             "client command /{name} must remain usable"
         );
     }
+    // Client presentation follows persisted config, not the stale YAML template.
     let model =
         chaz_core::commands::dispatch(chaz_core::commands::Command::Model(None), &ctx).await;
     assert!(
