@@ -4451,7 +4451,7 @@ impl Server {
                     content: TURN_STOPPED_MESSAGE.to_string(),
                     timestamp: Utc::now(),
                     entry_type: EntryType::Error,
-                    metadata,
+                    metadata: metadata.map(|metadata| *metadata),
                     routing: None,
                 }), None),
                 Err(runtime::TurnError::ContinuationHeld(reason)) => {

@@ -723,7 +723,7 @@ async fn projection_preserves_steering_boundaries_and_originals() {
         assert_eq!(p.count(), calls.len());
         let observations = recorder.observations.lock().unwrap();
         assert_eq!(observations.len(), calls.len() * 2);
-        for (call, pair) in calls.iter().zip(observations.chunks_exact(2)) {
+        for (call, pair) in calls.iter().zip(observations.as_chunks::<2>().0) {
             assert!(!pair[0].responded);
             assert!(pair[1].responded);
             assert_eq!(pair[0].model_sequence, pair[1].model_sequence);

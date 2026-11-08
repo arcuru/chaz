@@ -505,7 +505,7 @@ impl Handler {
             }
             CommandOutcome::Quit => return,
         };
-        if let Err(e) = msg_say(ctx, channel_id, text).await {
+        if let Err(e) = channel_id.say(&ctx.http, text).await {
             error!("Failed to send command response: {e}");
         }
     }
@@ -552,11 +552,6 @@ async fn charge_message_quota(
         return None;
     }
     Some(limit)
-}
-
-/// Small helper so the various send sites read uniformly.
-async fn msg_say(ctx: &Context, channel_id: ChannelId, text: String) -> serenity::Result<()> {
-    channel_id.say(&ctx.http, text).await.map(|_| ())
 }
 
 /// Help text for `!chaz help` — the shared `/`-vocabulary plus the Discord-local

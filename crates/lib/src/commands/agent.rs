@@ -1151,12 +1151,12 @@ pub(super) async fn agent_home_status(
             let label = meta.name.as_deref().unwrap_or("");
             let row = match ar.home_pubkey.as_deref() {
                 Some(home) if home == my_pk_str => {
-                    format!("    {} {label:<30} {home} ← (me)", &s.session_db_id)
+                    format!("    {} {label:<30} {home} ← (me)", s.session_db_id)
                 }
-                Some(home) => format!("    {} {label:<30} {home}", &s.session_db_id),
+                Some(home) => format!("    {} {label:<30} {home}", s.session_db_id),
                 None => format!(
                     "    {} {label:<30} <unset — legacy, any keyholder>",
-                    &s.session_db_id
+                    s.session_db_id
                 ),
             };
             session_rows.push(row);

@@ -51,7 +51,7 @@ crossterm = { version = "0.28", features = ["event-stream"] }
 nucleo-matcher = "0.3"
 tokio-stream = "0.1"
 tiktoken-rs = "0.11"
-wasmtime = "43"
+wasmtime = "50"
 blake3 = "1"
 sha2 = "0.10"
 base64 = "0.22"

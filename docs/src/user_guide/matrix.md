@@ -335,7 +335,7 @@ Commands are sent as Matrix messages. Session ops go through the same transport-
 
 | Command                        | Description                                                                   |
 | ------------------------------ | ----------------------------------------------------------------------------- |
-| `!chaz approve` / `!chaz deny` | Decide the pending tool approval (or react to the notice with ✅ / ❌ / ⏭)   |
+| `!chaz approve` / `!chaz deny` | Decide the pending tool approval (or react to the notice with ✅ / ❌ / ⏭)    |
 | `!chaz send <msg>`             | One-shot message with no conversation context                                 |
 | `!chaz clear`                  | Ignore all messages before this point                                         |
 | `!chaz rename`                 | Rename the Matrix room based on conversation content (not in workspace chats) |

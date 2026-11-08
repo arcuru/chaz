@@ -10,9 +10,6 @@ ignore = [
     "RUSTSEC-2026-0098", # rustls-webpki URI name constraints
     "RUSTSEC-2026-0099", # rustls-webpki wildcard name constraints
     "RUSTSEC-2026-0104", # rustls-webpki CRL parsing panic
-    "RUSTSEC-2026-0105", # core2 unmaintained + all versions yanked (via cid → eidetica)
-    "RUSTSEC-2026-0118", # hickory-proto NSEC3 closest-encloser unbounded loop
-    "RUSTSEC-2026-0119", # hickory-proto O(n²) name-compression CPU exhaustion
     # Transitive via headjack → matrix-sdk
     "RUSTSEC-2024-0384", # instant unmaintained
     "RUSTSEC-2024-0436", # paste-impl unmaintained
