@@ -555,8 +555,16 @@ async fn charge_message_quota(
 }
 
 /// Small helper so the various send sites read uniformly.
-async fn msg_say(ctx: &Context, channel_id: ChannelId, text: String) -> serenity::Result<()> {
-    channel_id.say(&ctx.http, text).await.map(|_| ())
+async fn msg_say(
+    ctx: &Context,
+    channel_id: ChannelId,
+    text: String,
+) -> Result<(), Box<serenity::Error>> {
+    channel_id
+        .say(&ctx.http, text)
+        .await
+        .map(|_| ())
+        .map_err(Box::new)
 }
 
 /// Help text for `!chaz help` — the shared `/`-vocabulary plus the Discord-local

@@ -246,7 +246,7 @@
         chaz-deny = craneLib.mkCargoDerivation (buildArgs
           // {
             pnameSuffix = "-deny";
-            buildPhaseCargoCommand = "cargo deny check --config .config/deny.toml";
+            buildPhaseCargoCommand = "cargo deny --config .config/deny.toml check";
             nativeBuildInputs = (buildArgs.nativeBuildInputs or []) ++ [pkgs.cargo-deny];
             # cargo-deny needs the full source for config
             src = ./.;

@@ -547,7 +547,9 @@ pub enum TurnError {
     ContinuationHeld(String),
     /// The turn was stopped at the user's request. `metadata` covers the
     /// model calls that completed before the stop.
-    Cancelled { metadata: Option<ResponseMetadata> },
+    Cancelled {
+        metadata: Option<Box<ResponseMetadata>>,
+    },
 }
 
 impl From<String> for TurnError {
@@ -695,7 +697,7 @@ async fn cancelled_outcome(
         return TurnError::Failed(error);
     }
     TurnError::Cancelled {
-        metadata: acc.finalize(),
+        metadata: acc.finalize().map(Box::new),
     }
 }
 

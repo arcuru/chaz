@@ -85,7 +85,7 @@ lint +tools='clippy audit statix deadnix':
                 ;;
             audit)
                 echo "=== Running audit (cargo-deny) ==="
-                cargo deny check --config .config/deny.toml
+                cargo deny --config .config/deny.toml check
                 ;;
             statix)
                 echo "=== Running statix ==="
