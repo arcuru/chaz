@@ -184,16 +184,21 @@ async fn queued_old_catalog_cannot_clear_or_abort_replacement() {
     built.shutdown().await;
 }
 
+// Use the real tab builder so close/draw/exit cases start with the same view ownership.
+async fn session_app(built: &BuiltServer, backend: &BackendManager) -> App {
+    let (_, db) = built.registry.create_session(Some("tui")).await.unwrap();
+    let id = db.root_id().to_string();
+    App::new(
+        HashSet::new(),
+        build_tab(&built.server, backend, db, id).await.unwrap(),
+    )
+}
+
 async fn close_then_next_event(event: Event) {
     let dir = tempfile::tempdir().unwrap();
     let built = runtime(dir.path()).await;
     let backend = BackendManager::new(&None, built.secret_store.clone());
-    let (_, db) = built.registry.create_session(Some("tui")).await.unwrap();
-    let id = db.root_id().to_string();
-    let mut app = App::new(
-        HashSet::new(),
-        build_tab(&built.server, &backend, db, id).await.unwrap(),
-    );
+    let mut app = session_app(&built, &backend).await;
     let (approval, _) = mpsc::channel(8);
     let (notify, _) = mpsc::channel(64);
     let (models, _) = mpsc::channel(4);
@@ -372,12 +377,7 @@ async fn pending_exit_banner_wins_in_all_modes_without_consuming_edits() {
     let dir = tempfile::tempdir().unwrap();
     let built = runtime(dir.path()).await;
     let backend = BackendManager::new(&None, built.secret_store.clone());
-    let (_, db) = built.registry.create_session(Some("tui")).await.unwrap();
-    let id = db.root_id().to_string();
-    let mut app = App::new(
-        HashSet::new(),
-        build_tab(&built.server, &backend, db, id).await.unwrap(),
-    );
+    let mut app = session_app(&built, &backend).await;
     app.input = "composer-draft".into();
     operations::submit(
         &mut app,
@@ -691,245 +691,251 @@ fn steering_frame(app: &mut App, markers: &[&str], gray: bool) -> String {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn shared_steering_chat_and_job_frames_promote_before_response_refresh_and_reopen() {
+async fn shared_steering_chat_frames_promote_before_response_refresh_and_reopen() {
+    steering_promotion_refresh_and_reopen(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shared_steering_job_frames_promote_before_response_refresh_and_reopen() {
+    steering_promotion_refresh_and_reopen(true).await;
+}
+
+async fn steering_promotion_refresh_and_reopen(is_job: bool) {
     use chaz_core::session::jobs::JobState;
     use std::time::Duration;
-    for is_job in [false, true] {
-        let mut stub = steering_http_stub().await;
-        let port = stub.port;
-        let calls = stub.calls.clone();
-        let started = stub.started.clone();
-        let release = stub.release.clone();
-        let dir = tempfile::tempdir().unwrap();
-        let built = runtime_with_stub(dir.path(), Some(port)).await;
-        let server = &built.server;
-        tokio::time::timeout(Duration::from_secs(10), async {
-            while !server.is_startup_ready() {
-                tokio::task::yield_now().await;
-            }
-        })
+    let mut stub = steering_http_stub().await;
+    let port = stub.port;
+    let calls = stub.calls.clone();
+    let started = stub.started.clone();
+    let release = stub.release.clone();
+    let dir = tempfile::tempdir().unwrap();
+    let built = runtime_with_stub(dir.path(), Some(port)).await;
+    let server = &built.server;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !server.is_startup_ready() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let backend = BackendManager::new(&Some(steering_backend(port)), built.secret_store.clone());
+    let (parent, parent_db) = server.registry().create_session(Some("tui")).await.unwrap();
+    let agent = server.agent_index().find_by_name("a").unwrap();
+    server
+        .registry()
+        .attach_agent_to_session(&parent.0, &agent)
         .await
         .unwrap();
-        let backend =
-            BackendManager::new(&Some(steering_backend(port)), built.secret_store.clone());
-        let (parent, parent_db) = server.registry().create_session(Some("tui")).await.unwrap();
-        let agent = server.agent_index().find_by_name("a").unwrap();
+    let (id, db) = if is_job {
+        let id = server
+            .submit_agent_job(&parent.0, "a", "frame original")
+            .await
+            .unwrap();
+        let (_, db) = server.registry().open_job_session(&id).await.unwrap();
+        (id, db)
+    } else {
         server
-            .registry()
-            .attach_agent_to_session(&parent.0, &agent)
+            .register_session(&parent_db, backend.clone(), Some("a".into()), None)
             .await
             .unwrap();
-        let (id, db) = if is_job {
-            let id = server
-                .submit_agent_job(&parent.0, "a", "frame original")
-                .await
-                .unwrap();
-            let (_, db) = server.registry().open_job_session(&id).await.unwrap();
-            (id, db)
-        } else {
-            server
-                .register_session(&parent_db, backend.clone(), Some("a".into()), None)
-                .await
-                .unwrap();
-            let mut session = Session::new(parent.clone(), parent_db.clone()).await;
-            session
-                .add_entry(SessionEntry {
-                    sender: "user".into(),
-                    content: "frame original".into(),
-                    timestamp: chrono::Utc::now(),
-                    entry_type: EntryType::Message,
-                    metadata: None,
-                    routing: None,
-                })
-                .await
-                .unwrap();
-            (parent.0, parent_db)
-        };
-        tokio::time::timeout(Duration::from_secs(10), started[0].acquire())
-            .await
-            .unwrap()
-            .unwrap()
-            .forget();
-        let (notify, _) = mpsc::channel(64);
-        let tab = if is_job {
-            jobs::open_tab(server, &backend, &id, notify.clone())
-                .await
-                .unwrap()
-        } else {
-            build_tab(server, &backend, db.clone(), id.clone())
-                .await
-                .unwrap()
-        };
-        let mut app = App::new(HashSet::from(["a".into()]), tab);
-        let (approval, _) = mpsc::channel(8);
-        let (models, _) = mpsc::channel(4);
-        let (rows, _) = mpsc::channel(4);
-        app.input = "frame steering one".into();
-        app.cursor = app.input.len();
-        assert!(
-            input::handle_chat_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT))
-                .is_none()
-        );
-        app.input.push_str("frame steering two");
-        app.cursor = app.input.len();
-        let action =
-            input::handle_chat_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
-                .unwrap();
-        handle_chat_action(
-            action,
-            &mut app,
-            server,
-            &backend,
-            &built.secret_store,
-            &approval,
-            &notify,
-            &models,
-            &rows,
-        );
-        let result = tokio::time::timeout(Duration::from_secs(10), app.operations.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        operations::apply(&mut app, result);
-        let mut pending = build_tab(server, &backend, db.clone(), id.clone())
+        let mut session = Session::new(parent.clone(), parent_db.clone()).await;
+        session
+            .add_entry(SessionEntry {
+                sender: "user".into(),
+                content: "frame original".into(),
+                timestamp: chrono::Utc::now(),
+                entry_type: EntryType::Message,
+                metadata: None,
+                routing: None,
+            })
             .await
             .unwrap();
-        if is_job {
-            pending.job = Some(jobs::JobTab {
-                state: Some(JobState::StartedUnknown {
-                    attempt_id: Session::steering_attempts(&db)
-                        .await
-                        .unwrap()
-                        .pop()
-                        .unwrap(),
-                    activity_recent: true,
-                }),
-                details: false,
-            });
-        }
-        app.tabs[0] = pending;
-        assert_eq!(app.tabs[0].live.telemetry.as_ref().unwrap().totals.calls, 1);
-        steering_frame(
-            &mut app,
-            &["frame steering one", "frame steering two"],
-            true,
-        );
-        assert_eq!(calls.lock().unwrap().len(), 1);
-        release[0].add_permits(1);
-        tokio::time::timeout(Duration::from_secs(10), started[1].acquire())
+        (parent.0, parent_db)
+    };
+    tokio::time::timeout(Duration::from_secs(10), started[0].acquire())
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+    let (notify, _) = mpsc::channel(64);
+    let tab = if is_job {
+        jobs::open_tab(server, &backend, &id, notify.clone())
             .await
             .unwrap()
-            .unwrap()
-            .forget();
-        // Actual background refresh is exercised, then close/reopen through each real opener.
-        let (tx, mut rx) = mpsc::channel(8);
-        refresh::request(&mut app, &id, refresh::RefreshKind::Session, &tx);
-        let result = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+    } else {
+        build_tab(server, &backend, db.clone(), id.clone())
             .await
             .unwrap()
+    };
+    let mut app = App::new(HashSet::from(["a".into()]), tab);
+    let (approval, _) = mpsc::channel(8);
+    let (models, _) = mpsc::channel(4);
+    let (rows, _) = mpsc::channel(4);
+    app.input = "frame steering one".into();
+    app.cursor = app.input.len();
+    assert!(
+        input::handle_chat_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT))
+            .is_none()
+    );
+    app.input.push_str("frame steering two");
+    app.cursor = app.input.len();
+    let action =
+        input::handle_chat_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
             .unwrap();
-        refresh::apply(&mut app, result, |_, _| refresh::Resolved {
-            effective_model: "stub".into(),
-            context_budget: 32_000,
-            roster: vec![],
-        });
-        assert_eq!(app.tabs[0].live.telemetry.as_ref().unwrap().totals.calls, 2);
-        assert!(app.tabs[0].live.telemetry.as_ref().unwrap().last_calls["a"].context_estimated);
-        let screen = steering_frame(
-            &mut app,
-            &[
-                "frame provisional",
-                "frame steering one",
-                "frame steering two",
-            ],
-            false,
-        );
-        assert!(screen.find("frame provisional") < screen.find("frame steering one"));
-        assert!(
-            !screen.contains("frame continued"),
-            "promotion cannot wait for response"
-        );
-        app.close_tab_at(0);
-        let reopened = if is_job {
-            jobs::open_tab(server, &backend, &id, notify).await.unwrap()
-        } else {
-            build_tab(server, &backend, db.clone(), id.clone())
-                .await
-                .unwrap()
-        };
-        app.push_tab(reopened);
-        assert_eq!(app.tabs[0].live.telemetry.as_ref().unwrap().totals.calls, 2);
-        steering_frame(
-            &mut app,
-            &[
-                "frame provisional",
-                "frame steering one",
-                "frame steering two",
-            ],
-            false,
-        );
-        let requests = calls.lock().unwrap().clone();
-        assert!(
-            !requests[0]["messages"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|m| m["content"]
-                    .as_str()
-                    .is_some_and(|t| t.contains("frame steering")))
-        );
-        let messages = requests[1]["messages"].as_array().unwrap();
-        assert_eq!(messages[messages.len() - 2]["content"], "frame provisional");
-        assert_eq!(
-            messages[messages.len() - 1]["content"],
-            "frame steering one\nframe steering two"
-        );
-        release[1].add_permits(1);
-        (&mut stub.task.0).await.unwrap();
-        if is_job {
-            assert!(
-                server
-                    .wait_job(&id, Duration::from_secs(10))
+    handle_chat_action(
+        action,
+        &mut app,
+        server,
+        &backend,
+        &built.secret_store,
+        &approval,
+        &notify,
+        &models,
+        &rows,
+    );
+    let result = tokio::time::timeout(Duration::from_secs(10), app.operations.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    operations::apply(&mut app, result);
+    let mut pending = build_tab(server, &backend, db.clone(), id.clone())
+        .await
+        .unwrap();
+    if is_job {
+        pending.job = Some(jobs::JobTab {
+            state: Some(JobState::StartedUnknown {
+                attempt_id: Session::steering_attempts(&db)
                     .await
                     .unwrap()
-                    .state
-                    .is_terminal()
-            );
-        }
-        tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                if Session::steering_attempts(&db).await.unwrap().is_empty() {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap();
-        let mut final_tab = build_tab(server, &backend, db, id.clone()).await.unwrap();
-        if is_job {
-            final_tab.job = Some(jobs::JobTab {
-                state: Some(JobState::Succeeded {
-                    text: Some("frame continued".into()),
-                }),
-                details: false,
-            });
-        }
-        app.tabs[0] = final_tab;
-        assert_eq!(
-            app.tabs[0].live.telemetry.as_ref().unwrap().totals.calls,
-            2,
-            "steering display and terminal settlement cannot duplicate usage"
-        );
-        let screen = steering_frame(
-            &mut app,
-            &["frame provisional", "frame steering one", "frame continued"],
-            false,
-        );
-        assert!(screen.find("frame steering one") < screen.find("frame continued"));
-        assert_eq!(calls.lock().unwrap().len(), 2);
-        built.shutdown().await;
+                    .pop()
+                    .unwrap(),
+                activity_recent: true,
+            }),
+            details: false,
+        });
     }
+    app.tabs[0] = pending;
+    assert_eq!(app.tabs[0].live.telemetry.as_ref().unwrap().totals.calls, 1);
+    steering_frame(
+        &mut app,
+        &["frame steering one", "frame steering two"],
+        true,
+    );
+    assert_eq!(calls.lock().unwrap().len(), 1);
+    release[0].add_permits(1);
+    tokio::time::timeout(Duration::from_secs(10), started[1].acquire())
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+    // Actual background refresh is exercised, then close/reopen through each real opener.
+    let (tx, mut rx) = mpsc::channel(8);
+    refresh::request(&mut app, &id, refresh::RefreshKind::Session, &tx);
+    let result = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    refresh::apply(&mut app, result, |_, _| refresh::Resolved {
+        effective_model: "stub".into(),
+        context_budget: 32_000,
+        roster: vec![],
+    });
+    assert_eq!(app.tabs[0].live.telemetry.as_ref().unwrap().totals.calls, 2);
+    assert!(app.tabs[0].live.telemetry.as_ref().unwrap().last_calls["a"].context_estimated);
+    let screen = steering_frame(
+        &mut app,
+        &[
+            "frame provisional",
+            "frame steering one",
+            "frame steering two",
+        ],
+        false,
+    );
+    assert!(screen.find("frame provisional") < screen.find("frame steering one"));
+    assert!(
+        !screen.contains("frame continued"),
+        "promotion cannot wait for response"
+    );
+    app.close_tab_at(0);
+    let reopened = if is_job {
+        jobs::open_tab(server, &backend, &id, notify).await.unwrap()
+    } else {
+        build_tab(server, &backend, db.clone(), id.clone())
+            .await
+            .unwrap()
+    };
+    app.push_tab(reopened);
+    assert_eq!(app.tabs[0].live.telemetry.as_ref().unwrap().totals.calls, 2);
+    steering_frame(
+        &mut app,
+        &[
+            "frame provisional",
+            "frame steering one",
+            "frame steering two",
+        ],
+        false,
+    );
+    let requests = calls.lock().unwrap().clone();
+    assert!(
+        !requests[0]["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m["content"]
+                .as_str()
+                .is_some_and(|t| t.contains("frame steering")))
+    );
+    let messages = requests[1]["messages"].as_array().unwrap();
+    assert_eq!(messages[messages.len() - 2]["content"], "frame provisional");
+    assert_eq!(
+        messages[messages.len() - 1]["content"],
+        "frame steering one\nframe steering two"
+    );
+    release[1].add_permits(1);
+    (&mut stub.task.0).await.unwrap();
+    if is_job {
+        assert!(
+            server
+                .wait_job(&id, Duration::from_secs(10))
+                .await
+                .unwrap()
+                .state
+                .is_terminal()
+        );
+    }
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if Session::steering_attempts(&db).await.unwrap().is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let mut final_tab = build_tab(server, &backend, db, id.clone()).await.unwrap();
+    if is_job {
+        final_tab.job = Some(jobs::JobTab {
+            state: Some(JobState::Succeeded {
+                text: Some("frame continued".into()),
+            }),
+            details: false,
+        });
+    }
+    app.tabs[0] = final_tab;
+    assert_eq!(
+        app.tabs[0].live.telemetry.as_ref().unwrap().totals.calls,
+        2,
+        "steering display and terminal settlement cannot duplicate usage"
+    );
+    let screen = steering_frame(
+        &mut app,
+        &["frame provisional", "frame steering one", "frame continued"],
+        false,
+    );
+    assert!(screen.find("frame steering one") < screen.find("frame continued"));
+    assert_eq!(calls.lock().unwrap().len(), 2);
+    built.shutdown().await;
 }
 
 #[tokio::test]
