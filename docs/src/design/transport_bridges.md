@@ -168,8 +168,13 @@ The daemon closes the loop in `watch_agent_session_registries`
 
 `register_exposed_sessions` is **self-healing**: if a freshly-exposed session's
 DB hasn't synced over yet, `open_session` fails, the ref is skipped, and the next
-registry sync-write re-runs the scan and retries. Registration is idempotent
-(`register_session` early-returns for an already-watched session).
+registry sync-write re-runs the scan and retries. On-commit sync setup must also
+succeed before the daemon registers the session. Incomplete delegated-parent
+ancestry can temporarily hide its signer from native discovery even while a
+previously bound writer still works. The session stays unwatched until a later
+agent-DB write triggers a successful rescan, rather than retaining a runtime
+without reply sync or with an empty cached extension set. Registration is
+idempotent (`register_session` early-returns for an already-watched session).
 
 ## Outbound: durable delivery onto the transport
 

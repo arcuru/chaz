@@ -2917,6 +2917,156 @@ async fn watcher_registers_exposed_sessions_only() {
 }
 
 #[tokio::test]
+async fn exposed_session_waits_for_sync_signer_before_registration() {
+    use eidetica::auth::types::{
+        DelegatedTreeRef, DelegationStep, PermissionBounds, SigKey, TreeReference,
+    };
+    use eidetica::backend::VerificationStatus;
+    use eidetica::database::DatabaseKey;
+
+    let (instance, server, registry) = server_fixture().await;
+    let agent = crate::session::test_helpers::make_agent_entry(&registry, "alpha").await;
+    server.agent_index().register(agent.clone());
+    let adb = registry
+        .open_agent_db(&agent.db_id, Some(&agent.pubkey))
+        .await
+        .unwrap()
+        .unwrap();
+    let parent = adb.database();
+    // Only the delegated route is held by this peer, like a bridge-created session.
+    let child = eidetica::Database::create(
+        &instance,
+        eidetica::auth::crypto::PrivateKey::generate(),
+        eidetica::crdt::Doc::new(),
+    )
+    .await
+    .unwrap();
+    let txn = child.new_transaction().await.unwrap();
+    txn.get_settings()
+        .unwrap()
+        .add_delegated_tree(DelegatedTreeRef {
+            permission_bounds: PermissionBounds {
+                max: eidetica::auth::Permission::Admin(0),
+                min: None,
+            },
+            tree: TreeReference {
+                root: parent.root_id().clone(),
+                tips: parent.snapshot().await.unwrap().into_tips(),
+            },
+        })
+        .await
+        .unwrap();
+    txn.commit().await.unwrap();
+    let identity = SigKey::Delegation {
+        path: vec![DelegationStep {
+            tree: parent.root_id().clone(),
+            tips: parent.snapshot().await.unwrap().into_tips(),
+        }],
+        hint: SigKey::from_pubkey(&agent.pubkey).hint().clone(),
+    };
+    let key = {
+        let mut user = registry.user_for_tests().await;
+        user.map_key(&agent.pubkey, child.root_id(), identity)
+            .await
+            .unwrap();
+        user.get_signing_key(&agent.pubkey).unwrap()
+    };
+    let id = child.root_id().to_string();
+    adb.expose_session_on(&id, "matrix").await.unwrap();
+    registry
+        .open_session(&id)
+        .await
+        .expect("complete parent permits native discovery");
+    let verified = parent.snapshot().await.unwrap();
+
+    // Real native commits on a second peer, delivered descendant-before-ancestor.
+    let (source, _source_user) = Instance::create_backend(
+        Box::new(InMemory::new()),
+        NewAccount::passwordless("source"),
+    )
+    .await
+    .unwrap();
+    for entry in parent.get_all_entries().await.unwrap() {
+        source
+            .backend()
+            .local_engine()
+            .unwrap()
+            .put(entry)
+            .await
+            .unwrap();
+    }
+    let remote = eidetica::Database::open(&source, parent.root_id())
+        .await
+        .unwrap()
+        .with_key(DatabaseKey::new(key.clone()));
+    assert_eq!(remote.verify().await.unwrap().failed, 0);
+    let txn = remote.new_transaction().await.unwrap();
+    txn.get_store::<eidetica::store::DocStore>("delayed")
+        .await
+        .unwrap()
+        .set_string("stage", "ancestor")
+        .await
+        .unwrap();
+    let ancestor = txn.commit().await.unwrap();
+    let txn = remote.new_transaction().await.unwrap();
+    txn.get_store::<eidetica::store::DocStore>("delayed")
+        .await
+        .unwrap()
+        .set_string("stage", "descendant")
+        .await
+        .unwrap();
+    let descendant = txn.commit().await.unwrap();
+    let engine = instance.backend().local_engine().unwrap();
+    engine
+        .put(remote.get_entry(&descendant).await.unwrap())
+        .await
+        .unwrap();
+    assert_eq!(parent.verify().await.unwrap().failed, 0);
+    assert_eq!(parent.snapshot().await.unwrap(), verified);
+    assert_eq!(
+        engine.get_verification_status(&descendant).await.unwrap(),
+        VerificationStatus::Unverified
+    );
+    assert!(
+        eidetica::Database::find_sigkeys(&instance, child.root_id(), &agent.pubkey)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    // The bound writer survives, but native tracking still requires discovery.
+    registry.open_session_with_signer(&id).await.unwrap();
+    let secrets = crate::security::SecretStore::new(registry.chaz_peer().clone()).await;
+    let backend = crate::backends::BackendManager::new(&None, secrets);
+    super::build::register_exposed_sessions(&server, &registry, &backend).await;
+    assert!(!registry.is_sync_enabled_for(child.root_id()).await.unwrap());
+    assert!(
+        !server.is_watching_session(&id).await,
+        "failed sync setup must not make registration permanent"
+    );
+
+    engine
+        .put(remote.get_entry(&ancestor).await.unwrap())
+        .await
+        .unwrap();
+    let report = parent.verify().await.unwrap();
+    assert_eq!(report.failed, 0);
+    assert_eq!(
+        engine.get_verification_status(&descendant).await.unwrap(),
+        VerificationStatus::Verified
+    );
+    // The existing agent-registry watcher performs this rescan on verified arrival.
+    super::build::register_exposed_sessions(&server, &registry, &backend).await;
+    assert!(registry.is_sync_enabled_for(child.root_id()).await.unwrap());
+    assert!(server.is_watching_session(&id).await);
+    let (_, writer, signer) = registry.open_session_with_signer(&id).await.unwrap();
+    assert_eq!(signer.unwrap().public_key(), key.public_key());
+    assert_eq!(writer.root_id(), child.root_id());
+    assert!(
+        matches!(writer.auth_identity(), Some(SigKey::Delegation { path, .. }) if path.len() == 1 && path[0].tree == *parent.root_id() && path[0].tips == vec![descendant])
+    );
+}
+
+#[tokio::test]
 async fn registry_watcher_rescans_while_initial_recovery_is_blocked() {
     // A restored daemon can have many old exposed sessions. Their bootstrap
     // must not prevent the watcher from reacting to a new bridge exposure.
