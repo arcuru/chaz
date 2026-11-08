@@ -235,6 +235,8 @@ For a disposable failure/recovery example:
 
 3. Inspect the result before making further edits. Restart or a later DB event also retries pending projection, using the same DB-to-folder path. The TUI offers outward retry with `p`; `r` opens the folder/DB diff and `R`, then `y`, confirms a full reload. There is no global-YAML Pick/Reseed operation.
 
+Before committing a folder reload, Chaz records which referenced files belong to that candidate revision. If this recovery intent cannot be saved, reload fails without committing. After an interruption, projection adopts those files only when the accepted DB revision matches the recorded candidate; a refused or uncommitted reload does not make its draft files managed.
+
 Do not edit or delete `.projection.json` to clear an error. It binds the folder identity, last completed settings/source revision and pending work. Chaz refuses unrelated pre-existing directories and untracked files at a new projection target rather than overwriting them. Preserve those files outside the managed location and retry; only previously tracked obsolete sources are eligible for removal.
 
 ### Migration and writer compatibility
