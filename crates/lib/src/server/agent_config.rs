@@ -158,6 +158,15 @@ impl Server {
         mode: ProjectionMode,
     ) -> anyhow::Result<AgentConfigOutcome> {
         crate::agent_bundle::validate(cfg)?;
+        if mode == ProjectionMode::Import
+            && let Some(folders) = folders
+        {
+            folders
+                .prepare_import_locked(name, &db.id().to_string(), cfg)
+                .context(
+                    "reload recovery intent could not be recorded; configuration not committed",
+                )?;
+        }
         let changed = cfg != old;
         if changed {
             db.write_config(cfg).await?;
@@ -168,9 +177,6 @@ impl Server {
         let projection_error = folders
             .and_then(|folders| {
                 let project = || -> anyhow::Result<()> {
-                    if mode == ProjectionMode::Import {
-                        folders.adopt_imported_sources_locked(name, &db.id().to_string(), cfg)?;
-                    }
                     folders.project_locked(
                         name,
                         &db.id().to_string(),

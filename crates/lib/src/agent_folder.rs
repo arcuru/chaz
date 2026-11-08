@@ -25,6 +25,15 @@ struct Projection {
     managed: BTreeSet<String>,
     pending: Option<String>,
     pending_files: BTreeSet<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    import: Option<ImportIntent>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ImportIntent {
+    revision: String,
+    files: BTreeSet<String>,
 }
 
 impl AgentFolders {
@@ -128,6 +137,11 @@ impl AgentFolders {
                 validate_source_path(path)?;
             }
         }
+        if let Some(import) = &state.import {
+            for path in &import.files {
+                validate_source_path(path)?;
+            }
+        }
         Ok(state)
     }
 
@@ -174,13 +188,23 @@ impl AgentFolders {
             state
         };
         if !force && state.completed.as_ref() == Some(&revision) && state.pending.is_none() {
+            if state.import.take().is_some() {
+                atomic_write(&folder.join(STATE), &serde_json::to_vec(&state)?)?;
+            }
             return Ok(false);
         }
 
         let mut files: BTreeMap<String, String> = sources.files.clone();
         files.insert("agent.yaml".into(), serde_yaml::to_string(&document)?);
-        let previously_managed: BTreeSet<_> =
+        let mut previously_managed: BTreeSet<_> =
             state.managed.union(&state.pending_files).cloned().collect();
+        // A reload records custody before committing. Only the exact accepted
+        // revision can promote it; a rejected import must not adopt its drafts.
+        if let Some(import) = &state.import
+            && import.revision == revision
+        {
+            previously_managed.extend(import.files.iter().cloned());
+        }
         // Persist outward-repair intent even when target preflight fails. Do
         // not claim new files as managed until collision checks succeed.
         state.pending = Some(revision.clone());
@@ -207,6 +231,7 @@ impl AgentFolders {
             }
         }
         state.pending_files = files.keys().cloned().collect();
+        state.import = None;
         atomic_write(&folder.join(STATE), &serde_json::to_vec(&state)?)?;
         for (relative, contents) in &files {
             let path = folder.join(relative);
@@ -226,10 +251,9 @@ impl AgentFolders {
         Ok(true)
     }
 
-    /// Only a successful explicit local reload may adopt newly referenced
-    /// files. Persist that custody after the DB commit, before projection, so
-    /// recovery does not mistake accepted operator sources for unrelated files.
-    pub fn adopt_imported_sources_locked(
+    /// Persist reload intent before the DB commit. Recovery adopts these
+    /// paths only if the authoritative DB accepts this exact revision.
+    pub fn prepare_import_locked(
         &self,
         name: &str,
         id: &str,
@@ -241,8 +265,10 @@ impl AgentFolders {
             .prompt_sources
             .as_ref()
             .context("missing source bundle")?;
-        state.pending = Some(revision(&AgentDocument::from_config(id, cfg), sources)?);
-        state.pending_files.extend(sources.files.keys().cloned());
+        state.import = Some(ImportIntent {
+            revision: revision(&AgentDocument::from_config(id, cfg), sources)?,
+            files: sources.files.keys().cloned().collect(),
+        });
         atomic_write(&folder.join(STATE), &serde_json::to_vec(&state)?)
     }
 
@@ -491,6 +517,72 @@ mod tests {
             .unwrap();
         assert!(!folder.join("prompts/one.md").exists());
         assert!(folder.join("notes.txt").exists());
+    }
+
+    #[test]
+    fn interrupted_reload_recovers_only_accepted_import_custody() {
+        for committed in [true, false] {
+            let root = tempfile::tempdir().unwrap();
+            let folders = AgentFolders::new(root.path().join("agents"));
+            let cfg = config();
+            let lock = folders.lock("stable").unwrap();
+            folders
+                .project_locked("helper", "stable", &cfg, false)
+                .unwrap();
+            let folder = folders.folder("helper", "stable");
+            std::fs::write(folder.join("prompts/added.md"), "NEW SOURCE").unwrap();
+            let mut document = AgentDocument::from_config("stable", &cfg);
+            document.system_prompt_files.push("prompts/added.md".into());
+            let draft = serde_yaml::to_string(&document).unwrap();
+            std::fs::write(folder.join("agent.yaml"), &draft).unwrap();
+            let imported = folders.read_locked("helper", "stable", &cfg).unwrap();
+            folders
+                .prepare_import_locked("helper", "stable", &imported)
+                .unwrap();
+            // Stop before export. The DB either accepted the imported revision
+            // or still contains the original; the durable journal must handle both.
+            drop(lock);
+            let restarted = AgentFolders::new(folders.root.clone());
+            let _lock = restarted.lock("stable").unwrap();
+            if committed {
+                assert!(
+                    restarted
+                        .project_locked("helper", "stable", &imported, false)
+                        .unwrap()
+                );
+                assert_eq!(
+                    restarted
+                        .read_locked("helper", "stable", &imported)
+                        .unwrap(),
+                    imported
+                );
+            } else {
+                assert!(
+                    !restarted
+                        .project_locked("helper", "stable", &cfg, false)
+                        .unwrap()
+                );
+                assert_eq!(
+                    std::fs::read_to_string(folder.join("agent.yaml")).unwrap(),
+                    draft
+                );
+                let mut changed = cfg.clone();
+                changed.model = Some("another accepted revision".into());
+                restarted
+                    .project_locked("helper", "stable", &changed, false)
+                    .unwrap();
+                assert_eq!(
+                    std::fs::read_to_string(folder.join("prompts/added.md")).unwrap(),
+                    "NEW SOURCE"
+                );
+                assert!(
+                    restarted
+                        .project_locked("helper", "stable", &imported, false)
+                        .is_err(),
+                    "an uncommitted import must not adopt an otherwise unrelated file"
+                );
+            }
+        }
     }
 
     #[test]
