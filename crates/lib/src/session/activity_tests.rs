@@ -55,6 +55,7 @@ async fn activity_polling_component_baseline() {
         for active in [false, true] {
             let (owner, mut user, reads) = counting_eidetica().await;
             let mut dbs = Vec::new();
+            let mut observed_at = Vec::new();
             for _ in 0..16 {
                 let db = seed(&mut user, history).await;
                 if active {
@@ -65,6 +66,9 @@ async fn activity_polling_component_baseline() {
                         .await
                         .unwrap();
                 }
+                // This observes fixed fixtures, not heartbeat/expiry behavior.
+                // Slow RPC measurement must not age an active fixture past its TTL.
+                observed_at.push(Utc::now());
                 dbs.push(db);
             }
             for db in &dbs {
@@ -80,9 +84,13 @@ async fn activity_polling_component_baseline() {
             let before = (reads.count(), reads.activity_tables());
             let started = Instant::now();
             for _ in 0..10 {
-                for db in &dbs {
+                for (db, now) in dbs.iter().zip(&observed_at) {
                     assert_eq!(
-                        Session::active_turn_attempts(db).await.unwrap().len(),
+                        Session::turn_activity(db)
+                            .await
+                            .unwrap()
+                            .active_at(*now)
+                            .count(),
                         usize::from(active)
                     );
                 }
@@ -100,8 +108,8 @@ async fn activity_polling_component_baseline() {
             let before = (reads.count(), reads.activity_tables());
             let started = Instant::now();
             for _ in 0..10 {
-                for value in &values {
-                    assert_eq!(value.active_at(Utc::now()).count(), usize::from(active));
+                for (value, now) in values.iter().zip(&observed_at) {
+                    assert_eq!(value.active_at(*now).count(), usize::from(active));
                 }
             }
             eprintln!(
@@ -160,9 +168,13 @@ async fn activity_polling_component_baseline() {
             let before = (rpcs.load(Ordering::SeqCst), reads.activity_tables());
             let started = Instant::now();
             for _ in 0..10 {
-                for db in &remote {
+                for (db, now) in remote.iter().zip(&observed_at) {
                     assert_eq!(
-                        Session::active_turn_attempts(db).await.unwrap().len(),
+                        Session::turn_activity(db)
+                            .await
+                            .unwrap()
+                            .active_at(*now)
+                            .count(),
                         usize::from(active)
                     );
                 }
@@ -184,8 +196,8 @@ async fn activity_polling_component_baseline() {
             let before = (rpcs.load(Ordering::SeqCst), reads.activity_tables());
             let started = Instant::now();
             for _ in 0..10 {
-                for value in &values {
-                    assert_eq!(value.active_at(Utc::now()).count(), usize::from(active));
+                for (value, now) in values.iter().zip(&observed_at) {
+                    assert_eq!(value.active_at(*now).count(), usize::from(active));
                 }
             }
             eprintln!(
