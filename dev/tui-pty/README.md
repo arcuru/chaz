@@ -44,7 +44,11 @@ The final Ctrl+C while busy must exit successfully, leave the alternate screen,
 and restore canonical input and echo.
 This covers user-event cancellation of the active session attempt, not rollback
 of effects or recursive cancellation of durable child jobs.
-Widget snapshots remain the faster rendering tests.
+Focused Rust tests cover picker visibility, selection and resizing without
+pinning entire screens to golden files.
+The emulator repairs pyte 0.8.2's orphan continuation cells when a wide glyph is
+overwritten, matching a terminal's clearing behavior without changing valid
+wide-cell stubs. Its minimal overwrite case is checked alongside the negative controls.
 
 Additional regressions stop the test-owned IPC process beyond the read timeout
 while Enter, Session Settings and hub create/open actions are pending; local
@@ -70,6 +74,10 @@ On lifecycle failure, `target/tui-pty-failures/<timestamp>/` contains `pty.raw`,
 `requests.json`, and the run's `chaz-tui` log. Inspect the original unittest traceback first; artifact
 write errors are reported separately and do not replace it. Negative-control
 artifacts are checked inside disposable directories and then deleted.
+
+Selection regressions copy styled Unicode table cells through both the decoded
+OSC 52 request and an isolated tmux paste buffer. Scroll filler uses explicit
+Markdown hard breaks so soft-break joining cannot make the scroll check vacuous.
 
 Interaction regressions request real approval-gated shell tools from the local
 stub and explicitly deny each prompt before and after `/join`, including an
