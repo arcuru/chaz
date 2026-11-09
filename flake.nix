@@ -60,10 +60,8 @@
         # Use the toolchain with the crane helper functions
         craneLib = (inputs.crane.mkLib pkgs).overrideToolchain toolChain;
 
-        # Source filtering — Rust/Cargo files, plus `.snap` fixtures that
-        # `cleanCargoSource` would otherwise drop. Without the snapshots, insta
-        # has no baseline in the sandbox and every widget snapshot test fails as
-        # a "new snapshot" (only `+new results`, no `-old`).
+        # Keep the persisted-session compatibility fixture alongside Rust/Cargo
+        # sources; cleanCargoSource would otherwise drop its `.snap` extension.
         src = lib.cleanSourceWith {
           src = craneLib.path ./.;
           filter = path: type:
@@ -211,7 +209,6 @@
             export HOME="$test_home"
             export LD_LIBRARY_PATH="${commonArgs.LD_LIBRARY_PATH}''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
             export SSL_CERT_FILE="${testArgs.SSL_CERT_FILE}"
-            export INSTA_WORKSPACE_ROOT="$PWD"
             cargo-nextest nextest run \
               --archive-file ${chaz-test-archive}/archive.tar.zst \
               --workspace-remap "$PWD" \

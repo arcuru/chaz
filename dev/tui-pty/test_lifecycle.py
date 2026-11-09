@@ -6,6 +6,7 @@
 
 import codecs
 import pyte
+from wcwidth import wcwidth
 import errno
 import fcntl
 import hashlib
@@ -42,13 +43,27 @@ spec.loader.exec_module(stub)
 CSI = re.compile(rb"\x1b\[[0-?]*[ -/]*[@-~]")
 
 
+class PtyScreen(pyte.Screen):
+    @property
+    def display(self):
+        # A terminal clears a wide glyph's continuation when its lead is
+        # overwritten. pyte 0.8.2 leaves an empty orphan, then indexes data[0]
+        # in display. Repair only those orphans; valid wide-cell stubs stay.
+        for row in self.buffer.values():
+            for x, cell in list(row.items()):
+                if cell.data == "" and (x == 0 or not row[x - 1].data
+                                        or wcwidth(row[x - 1].data[0]) != 2):
+                    row[x] = cell._replace(data=" ")
+        return super().display
+
+
 class PtyProcess:
     def __init__(self, command, env, cwd):
         self.raw = bytearray()
         self.checkpoints = []
         self.command = [str(arg) for arg in command]
         self.master, self.slave = pty.openpty()
-        self.screen = pyte.Screen(40, 16)
+        self.screen = PtyScreen(40, 16)
         self.stream = pyte.Stream(self.screen)
         self.decoder = codecs.getincrementaldecoder("utf-8")("replace")
         self.resize(40, 16)
@@ -169,6 +184,12 @@ class PtyProcess:
 
 class Lifecycle(unittest.TestCase):
     def test_negative_controls(self):
+        screen = PtyScreen(8, 2)
+        stream = pyte.Stream(screen)
+        stream.feed("界")
+        self.assertEqual(screen.display[0], "界      ")
+        stream.feed("\x1b[1Gx")
+        self.assertEqual(screen.display[0], "x       ")
         for code, reason in [("pass", "child exited"), ("import time; time.sleep(60)", "deadline")]:
             with self.subTest(reason=reason), tempfile.TemporaryDirectory() as directory:
                 process = PtyProcess([sys.executable, "-c", code], {}, directory)

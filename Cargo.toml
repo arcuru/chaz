@@ -45,9 +45,9 @@ meval = "0.2"
 reqwest = "0.12"
 url = "2"
 uuid = { version = "1", features = ["v4"] }
-ratatui = { version = "0.29", features = ["unstable-rendered-line-info"] }
-pulldown-cmark = { version = "0.13", default-features = false }
-crossterm = { version = "0.28", features = ["event-stream"] }
+ratatui = { version = "0.30", default-features = false, features = ["crossterm", "underline-color", "layout-cache", "unstable-rendered-line-info"] }
+tui-markdown = { version = "=0.3.13", default-features = false }
+crossterm = { version = "0.29", features = ["event-stream"] }
 nucleo-matcher = "0.3"
 tokio-stream = "0.1"
 tiktoken-rs = "0.11"

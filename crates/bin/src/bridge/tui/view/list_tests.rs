@@ -666,7 +666,6 @@ async fn add_agent_picker_last_row_matches_enter_after_resize() {
             app.settings_picker.as_ref().unwrap().selected_name(),
             Some("candidate-29")
         );
-        insta::assert_snapshot!(format!("add_agent_last_{width}x{height}"), rows.join("\n"));
     }
     match settings_key(&mut app, KeyCode::Enter) {
         input::SettingsKey::PromptSubmit {

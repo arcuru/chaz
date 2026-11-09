@@ -113,6 +113,7 @@ An ordinary launch opens the [session hub](#session-hub) rather than any convers
 | Content                                  | Display                                                                                                   |
 | ---------------------------------------- | --------------------------------------------------------------------------------------------------------- |
 | Message Markdown                         | Headings, bold/italic emphasis, ordered/nested lists and readable links                                   |
+| GFM pipe tables                          | Library-rendered headers, rows, inline styles and column alignment; narrow panes may wrap the box         |
 | Inline and fenced code                   | Accent text on a dark background; code indentation and literal escapes are retained                       |
 | Collapsed tool entry                     | One-line preview, capped at 90 characters plus an ellipsis                                                |
 | Expanded tool result                     | Indented plain text, with line breaks; complete JSON becomes an indented outline with decoded text values |
@@ -175,6 +176,56 @@ structure. `/raw` still shows the stored entry representation.
    `{"text":"one\n…`, expansion cannot recover the missing bytes. Ask the tool
    for a smaller page or shorter result and expand the next complete result.
    Merely toggling expansion does not repair clipped JSON or rerun the tool.
+
+## Tables follow the pane
+
+Message Markdown is rendered by `tui-markdown`, using Chaz's colors and code
+background without syntax highlighting. Chaz passes the available pane width to
+the library and rebuilds tables on resize; scrolling reuses the rendered text.
+Lists, blockquotes and table layout follow the library's behavior. A soft line
+break becomes a space.
+
+A table's minimum column widths, padding and borders can exceed the pane width.
+In that case the transcript may wrap the box and misalign its borders. Tabs and
+quarantined characters can also affect alignment. Widen the terminal if needed;
+Chaz does not rewrite the Markdown or substitute another table layout.
+
+Terminal controls remain quarantined in display and clipboard text. Selection
+copies rendered table text, including selected borders and padding. Stored
+messages and Matrix delivery do not change.
+
+### Walkthrough: a table, then a narrow pane
+
+1. Open a message containing this table:
+
+   ```markdown
+   | Priority | Level  |   Note |
+   | :------- | :----: | -----: |
+   | P0       | **A2** | `a\|b` |
+   | P2       |   A1   |   日 é |
+   ```
+
+   At a normal width it reads:
+
+   ```text
+   ┌──────────┬───────┬──────┐
+   │ Priority │ Level │ Note │
+   ├──────────┼───────┼──────┤
+   │ P0       │  A2   │  a|b │
+   │ P2       │  A1   │ 日 é │
+   └──────────┴───────┴──────┘
+   ```
+
+   `A2` is bold, the middle column is centered, and the last is right-aligned.
+   A pipe in a table cell must be escaped even inside inline code.
+
+2. Shrink the terminal. The library wraps cell contents where possible. Below
+   the table's minimum width, the box itself may wrap; widen the terminal again
+   to make it readable. Resizing does not edit the message.
+
+3. Select visible text after the resize; resizing or replacing a streamed
+   message clears the old selection. A partial table can appear as plain
+   Markdown until its delimiter row is valid.
 
 ## Context usage
 
@@ -411,8 +462,8 @@ Mouse capture sends ordinary drags to Chaz rather than the terminal's native
 selection. Chaz selects **message bodies**, including multiline code and external
 bridge message bodies. Sender labels, timestamps, borders, separators, tool audit
 rows and live activity are not copied. Selection follows the displayed message
-body: Markdown delimiters and code fences are omitted, while code indentation,
-source Unicode spelling and line breaks remain. Visual soft wraps do not add
+body: formatted Markdown delimiters and code fences are omitted, while code
+indentation, safe source Unicode spelling and rendered line breaks remain. Visual soft wraps do not add
 newlines. Quarantined terminal controls stay neutralized when copied.
 Select after scrolling to an older message, or hold the drag and use the wheel
 before releasing. There is no edge-hover auto-scroll. A plain click does not copy.

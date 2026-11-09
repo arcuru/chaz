@@ -1,10 +1,10 @@
 //! Display-only projections of message Markdown and tool output.
 //! Stored entries and runtime/wire serialization remain untouched.
 
-use pulldown_cmark::{Event, LinkType, Parser, Tag, TagEnd};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use serde_json::Value;
+use tui_markdown::{Options, StyleSheet};
 use unicode_normalization::UnicodeNormalization;
 
 use super::theme;
@@ -82,193 +82,144 @@ fn write_value(value: &Value, depth: usize, output: &mut String) {
     }
 }
 
-#[derive(Default)]
-struct MarkdownLines {
-    lines: Vec<(Line<'static>, String)>,
-    spans: Vec<Span<'static>>,
-    copy: String,
-    indent: String,
-}
+/// Only Chaz presentation choices live here; Markdown interpretation and table
+/// layout belong to tui-markdown. In particular, highlighting is not enabled.
+#[derive(Clone)]
+struct ChazStyles;
 
-impl MarkdownLines {
-    fn text(&mut self, text: &str, style: Style) {
-        for (i, part) in text.split('\n').enumerate() {
-            if i > 0 {
-                self.newline();
-            }
-            if !part.is_empty() {
-                if self.spans.is_empty() {
-                    self.spans.push(Span::raw(self.indent.clone()));
-                    self.copy.push_str(&self.indent);
-                }
-                let safe = safe_line(part);
-                self.copy.push_str(&copy_line(part, &safe));
-                self.spans.push(Span::styled(safe, style));
-            }
-        }
+impl StyleSheet for ChazStyles {
+    fn heading(&self, _level: u8) -> Style {
+        theme::accent_bold()
     }
-
-    fn newline(&mut self) {
-        self.lines.push((
-            Line::from(std::mem::take(&mut self.spans)),
-            std::mem::take(&mut self.copy),
-        ));
+    fn heading_marker(&self, _level: u8) -> &str {
+        ""
     }
-
-    fn finish_line(&mut self) {
-        if !self.spans.is_empty() {
-            self.newline();
-        }
+    fn code(&self) -> Style {
+        theme::accent().bg(theme::BAR_BG)
     }
-
-    fn block_break(&mut self) {
-        self.finish_line();
-        if self
-            .lines
-            .last()
-            .is_some_and(|(line, _)| !line.spans.is_empty())
-        {
-            self.lines.push((Line::default(), String::new()));
-        }
+    fn code_block_fence(&self) -> &str {
+        ""
+    }
+    fn link(&self) -> Style {
+        theme::accent().add_modifier(Modifier::UNDERLINED)
+    }
+    fn blockquote(&self) -> Style {
+        Style::default()
+    }
+    fn list_marker(&self) -> Style {
+        theme::dim()
+    }
+    fn table_header(&self) -> Style {
+        theme::accent_bold()
+    }
+    fn table_border(&self) -> Style {
+        theme::dim()
+    }
+    fn html(&self) -> Style {
+        Style::default()
     }
 }
 
-/// CommonMark events become existing theme styles and Ratatui spans. Wrapping,
-/// viewport caching and scrolling remain the transcript renderer's job.
-pub(super) fn markdown(content: &str) -> Vec<(Line<'static>, String)> {
-    let mut out = MarkdownLines::default();
-    let mut styles = vec![Style::default()];
-    let mut lists: Vec<Option<u64>> = Vec::new();
-    let mut links = Vec::new();
-    let mut indents = Vec::new();
-    // Let CommonMark handle tabs and line endings; quarantine emitted text,
-    // including decoded entities and link targets, before it reaches the screen.
-    for event in Parser::new(content) {
-        let style = *styles.last().unwrap();
-        match event {
-            Event::Start(tag) => {
-                let next_style = match tag {
-                    Tag::Paragraph => {
-                        if lists.is_empty() {
-                            out.block_break();
-                        }
-                        style
-                    }
-                    Tag::Heading { .. } => {
-                        out.block_break();
-                        style.patch(theme::accent_bold())
-                    }
-                    Tag::CodeBlock(_) => {
-                        out.finish_line();
-                        style.patch(theme::accent().bg(theme::BAR_BG))
-                    }
-                    Tag::List(start) => {
-                        if lists.is_empty() {
-                            out.block_break();
-                        } else {
-                            out.finish_line();
-                        }
-                        lists.push(start);
-                        style
-                    }
-                    Tag::Item => {
-                        out.finish_line();
-                        indents.push(out.indent.clone());
-                        let marker = match lists.last_mut() {
-                            Some(Some(n)) => {
-                                let marker = format!("{n}. ");
-                                *n = n.saturating_add(1);
-                                marker
-                            }
-                            _ => "• ".into(),
-                        };
-                        out.text(&marker, theme::dim());
-                        out.indent.push_str(&" ".repeat(marker.chars().count()));
-                        style
-                    }
-                    Tag::BlockQuote(_) => {
-                        out.block_break();
-                        indents.push(out.indent.clone());
-                        out.indent.push_str("│ ");
-                        style
-                    }
-                    Tag::Emphasis => style.add_modifier(Modifier::ITALIC),
-                    Tag::Strong => style.add_modifier(Modifier::BOLD),
-                    Tag::Link {
-                        link_type,
-                        dest_url,
-                        ..
-                    }
-                    | Tag::Image {
-                        link_type,
-                        dest_url,
-                        ..
-                    } => {
-                        links.push(
-                            if matches!(link_type, LinkType::Autolink | LinkType::Email) {
-                                String::new()
-                            } else {
-                                dest_url.to_string()
-                            },
-                        );
-                        style
-                            .patch(theme::accent())
-                            .add_modifier(Modifier::UNDERLINED)
-                    }
-                    _ => style,
-                };
-                styles.push(next_style);
+/// Library output is still untrusted display text: quarantine decoded entities,
+/// link targets and code, then retain safe original spelling for clipboard use.
+/// The caller's width-keyed transcript cache owns resize invalidation.
+pub(super) fn markdown(content: &str, width: u16) -> Vec<(Line<'static>, String)> {
+    let options = Options::new(ChazStyles).table_width(width.saturating_sub(2));
+    let text = tui_markdown::from_str_with_options(content, &options);
+    text.lines
+        .into_iter()
+        .map(|line| {
+            let mut copy = String::new();
+            let mut spans = Vec::with_capacity(line.spans.len() + 1);
+            if !line.spans.is_empty() {
+                spans.push(Span::raw("  "));
             }
-            Event::End(tag) => {
-                match tag {
-                    TagEnd::Paragraph
-                    | TagEnd::Heading(_)
-                    | TagEnd::CodeBlock
-                    | TagEnd::HtmlBlock => out.finish_line(),
-                    TagEnd::Item | TagEnd::BlockQuote(_) => {
-                        out.finish_line();
-                        out.indent = indents.pop().unwrap();
-                    }
-                    TagEnd::List(_) => {
-                        lists.pop();
-                        if lists.is_empty() {
-                            out.block_break();
-                        }
-                    }
-                    TagEnd::Link | TagEnd::Image => {
-                        if let Some(url) = links.pop().filter(|url| !url.is_empty()) {
-                            out.text(&format!(" ({url})"), style);
-                        }
-                    }
-                    _ => {}
+            for span in line.spans {
+                let safe = safe_line(&span.content);
+                copy.push_str(&copy_line(&span.content, &safe));
+                spans.push(Span::styled(safe, span.style));
+            }
+            (Line::from(spans).style(line.style), copy)
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::{
+        buffer::Buffer,
+        layout::Rect,
+        text::Text,
+        widgets::{Paragraph, Widget, Wrap},
+    };
+    use unicode_width::UnicodeWidthStr;
+
+    fn screen(input: &str, width: u16) -> String {
+        let text = Text::from(
+            markdown(input, width)
+                .into_iter()
+                .map(|(line, _)| line)
+                .collect::<Vec<_>>(),
+        );
+        let paragraph = Paragraph::new(text).wrap(Wrap { trim: false });
+        let height = paragraph.line_count(width).max(1) as u16;
+        let area = Rect::new(0, 0, width, height);
+        let mut buffer = Buffer::empty(area);
+        paragraph.render(area, &mut buffer);
+        (0..height)
+            .map(|y| {
+                let mut row = String::new();
+                let mut x = 0;
+                while x < width {
+                    let symbol = buffer[(x, y)].symbol();
+                    row.push_str(symbol);
+                    x += symbol.width().max(1) as u16;
                 }
-                styles.pop();
+                row.trim_end().to_owned()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn library_output_is_quarantined_for_display_and_copy() {
+        for cell in [
+            "&#27;[2J",
+            "&#10;next",
+            "&#9;tab",
+            "[link](a&#27;b)",
+            "[link](a&#x202e;b)",
+            "`a\tb`",
+            "a\u{1b}[31m",
+        ] {
+            let input = format!("| Head | Other |\n|---|---|\n| {cell} | END |");
+            for width in [12, 24, 80] {
+                let display = screen(&input, width);
+                assert!(!display.chars().any(|c| c.is_control() && c != '\n'));
+                assert!(!display.contains('\u{202e}'));
+                let copy = markdown(&input, width)
+                    .into_iter()
+                    .map(|(_, copy)| copy)
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                if width == 80 {
+                    assert!(copy.contains("END"), "{cell:?}: {copy:?}");
+                }
+                assert!(
+                    !copy
+                        .chars()
+                        .any(|c| c.is_control() && c != '\n' && c != '\t')
+                );
+                assert!(!copy.contains('\u{202e}'));
             }
-            Event::Text(text) | Event::Html(text) | Event::InlineHtml(text) => {
-                out.text(&text, style)
-            }
-            Event::Code(text) => out.text(&text, style.patch(theme::accent().bg(theme::BAR_BG))),
-            Event::SoftBreak | Event::HardBreak => out.newline(),
-            Event::Rule => {
-                out.block_break();
-                out.text("───", theme::dim());
-                out.block_break();
-            }
-            _ => {}
         }
+        // Outside tables the final projection still quarantines decoded text,
+        // code and link destinations, not just the raw Markdown source.
+        let display = screen("safe &#27;[2J [link](a&#x202e;b) `a\u{1b}b`", 80);
+        assert!(
+            display.contains("�[2J") && display.contains("a�b"),
+            "{display}"
+        );
     }
-    out.finish_line();
-    while out
-        .lines
-        .last()
-        .is_some_and(|(line, _)| line.spans.is_empty())
-    {
-        out.lines.pop();
-    }
-    for (line, _) in &mut out.lines {
-        if !line.spans.is_empty() {
-            line.spans.insert(0, Span::raw("  "));
-        }
-    }
-    out.lines
 }

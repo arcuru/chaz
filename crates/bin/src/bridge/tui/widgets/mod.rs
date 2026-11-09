@@ -19,7 +19,7 @@ mod sidebar;
 mod status_strip;
 
 #[cfg(test)]
-mod snapshot_tests;
+mod tests;
 
 pub(super) use header::header;
 pub(super) use inline_edit::inline_edit_prompt;

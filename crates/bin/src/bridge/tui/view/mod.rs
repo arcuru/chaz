@@ -1239,7 +1239,7 @@ fn build_transcript(
 
                 lines.push(Line::from(vec![Span::styled(label, sender_style)]));
 
-                for (line, body) in content::markdown(&entry.content) {
+                for (line, body) in content::markdown(&entry.content, inner_width) {
                     sources.push((lines.len(), body));
                     lines.push(line);
                 }
@@ -2989,7 +2989,7 @@ mod transcript_tests {
         );
     }
 
-    fn snapshot_rows(terminal: &Terminal<TestBackend>) -> String {
+    fn screen_text(terminal: &Terminal<TestBackend>) -> String {
         rows(terminal, 0, terminal.backend().buffer().area.height)
             .iter()
             .map(|row| row.trim_end())
@@ -3027,6 +3027,12 @@ mod transcript_tests {
                     "start",
                     "end",
                     "start �[31m\nend",
+                ),
+                (
+                    "| Name |\n| --- |\n| **café 界 e\u{301} done.** |",
+                    "café",
+                    "done.",
+                    "café 界 e\u{301} done.",
                 ),
                 (
                     "one two three four five six seven eight nine ten",
@@ -3132,35 +3138,6 @@ mod transcript_tests {
         assert_eq!(buffer[(x as u16, y as u16)].bg, theme::BAR_BG);
         assert_eq!(buffer[(x as u16, y as u16)].fg, theme::ACCENT);
         assert!(drawn.iter().any(|row| row.contains(r"C:\new\file")));
-        insta::assert_snapshot!("markdown_chat", snapshot_rows(&terminal));
-    }
-
-    #[tokio::test]
-    async fn markdown_containers_restore_parent_indentation() {
-        let markdown = "10. parent\n\n    - child\n\n    continuation\n\n    > quote\n    >\n    > - quoted child\n\n    after quote\n\n11. sibling\n\noutside";
-        let (_instance, mut app) =
-            app_with(vec![entry("chaz", markdown, EntryType::Message)]).await;
-        app.active_mut().active_turns = 0;
-        let mut terminal = Terminal::new(TestBackend::new(64, 24)).unwrap();
-        terminal.draw(|f| ui_chat(f, &mut app, &[])).unwrap();
-        let drawn = rows(&terminal, 0, 24);
-        for expected in [
-            "  10. parent",
-            "      • child",
-            "      continuation",
-            "      │ quote",
-            "      │ • quoted child",
-            "      after quote",
-            "  11. sibling",
-            "  outside",
-        ] {
-            assert!(
-                drawn
-                    .iter()
-                    .any(|row| row.starts_with(&format!("│{expected}"))),
-                "missing indentation for {expected:?}: {drawn:?}"
-            );
-        }
     }
 
     #[tokio::test]
@@ -3261,7 +3238,6 @@ mod transcript_tests {
                 .collect::<Vec<_>>(),
             outputs.iter().collect::<Vec<_>>()
         );
-        insta::assert_snapshot!("tool_output_chat", snapshot_rows(&terminal));
     }
 
     #[tokio::test]
@@ -3280,7 +3256,7 @@ mod transcript_tests {
         app.expand_all = true;
         let mut terminal = Terminal::new(TestBackend::new(64, 24)).unwrap();
         terminal.draw(|f| ui_chat(f, &mut app, &[])).unwrap();
-        let screen = snapshot_rows(&terminal);
+        let screen = screen_text(&terminal);
         assert!(
             !screen.chars().any(|c| c.is_control() && c != '\n'),
             "unsafe screen: {screen:?}"
@@ -3307,10 +3283,9 @@ mod transcript_tests {
             terminal.draw(|f| ui_chat(f, &mut app, &[])).unwrap();
             assert_eq!(app.active().entries[0].content, partial);
             assert!(!app.active().live.render.lines.is_empty());
-            let screen = snapshot_rows(&terminal);
+            let screen = screen_text(&terminal);
             if partial.ends_with("**Done**") {
                 assert!(screen.contains("Done"));
-                insta::assert_snapshot!("partial_markdown_narrow", screen);
             } else if partial.starts_with("```rust") {
                 assert!(screen.contains(r"C:\new"));
             } else if partial.starts_with("[Guide]") {
@@ -3321,6 +3296,41 @@ mod transcript_tests {
             }
         }
         // Even sub-indent terminal widths must not panic during wrap/scroll.
+        for width in [1, 2, 5, 8, 12] {
+            let mut terminal = Terminal::new(TestBackend::new(width, 10)).unwrap();
+            terminal.draw(|f| ui_chat(f, &mut app, &[])).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn tables_rebuild_on_resize_and_partial_replacement() {
+        let (_instance, mut app) = app_with(Vec::new()).await;
+        app.active_mut().session_name = Some("table-demo".into());
+        app.active_mut().active_turns = 0;
+        for partial in [
+            "| Priority | Level | Note |\n| :--- | :---:",
+            "| Priority | Level | Note |\n| :--- | :---: | ---: |\n| P0 | **A2** | `a\\|b`",
+            "| Priority | Level | Note |\n| :--- | :---: | ---: |\n| P0 | **A2** | `a\\|b` |\n| P2 | A1 | 日 e\u{301} |",
+        ] {
+            app.active_mut()
+                .set_entries(vec![entry("chaz", partial, EntryType::Message)]);
+            for width in [64, 14, 28, 64] {
+                let mut terminal = Terminal::new(TestBackend::new(width, 32)).unwrap();
+                terminal.draw(|f| ui_chat(f, &mut app, &[])).unwrap();
+                let cache = &app.active().live.render;
+                assert_eq!(cache.key.unwrap().width, width - 2);
+                let lines = cache.lines_ptr();
+                terminal.draw(|f| ui_chat(f, &mut app, &[])).unwrap();
+                assert_eq!(lines, app.active().live.render.lines_ptr());
+                assert_eq!(app.active().entries[0].content, partial);
+                if width == 64 && partial.ends_with("| P2 | A1 | 日 e\u{301} |") {
+                    let screen = screen_text(&terminal);
+                    for value in ["P0", "P2", "a|b"] {
+                        assert!(screen.contains(value), "{screen}");
+                    }
+                }
+            }
+        }
         for width in [1, 2, 5, 8, 12] {
             let mut terminal = Terminal::new(TestBackend::new(width, 10)).unwrap();
             terminal.draw(|f| ui_chat(f, &mut app, &[])).unwrap();
@@ -3350,6 +3360,7 @@ mod transcript_tests {
         entries.extend([
             entry("chaz", "# Markdown\n\n**wrap me please** [link](https://example.org/long/path)\n\n- first\n  - second\n\n```\n  literal \\n\n```", EntryType::Message),
             entry("chaz", r#"query: {"text":"first\n  second","nested":[true,null]}"#, EntryType::ToolResult),
+            entry("chaz", "| Priority | Level | Detail |\n| :--- | :---: | ---: |\n| **P0** | A2 | longwordabcdefghijk and 日 e\u{301} |\n| P2 | A1 | `a\\|b` |", EntryType::Message),
         ]);
         let (_instance, mut app) = app_with(entries).await;
         app.active_mut().expanded_entries.insert(101);

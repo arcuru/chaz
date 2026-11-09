@@ -18,6 +18,7 @@ import threading
 import time
 import unittest
 import unicodedata
+from wcwidth import wcswidth
 from http.server import HTTPServer
 
 sys.dont_write_bytecode = True
@@ -58,8 +59,10 @@ class Interactions(unittest.TestCase):
         ordinary = "Selection ordinary café 界 e\u0301."
         screen_ordinary = unicodedata.normalize("NFC", ordinary)
         code = 'fn main() {\n    println!("hello");\n}'
-        reply = ordinary + "\n\n```rust\n" + code + "\n```\n" + "\n".join(
-            f"history filler {i:02}" for i in range(35))
+        table_text = "table café 界 e\u0301 END"
+        reply = (ordinary + "\n\n```rust\n" + code + "\n```\n\n"
+                 + "| Name |\n| --- |\n| **" + table_text + "** |\n\n"
+                 + "  \n".join(f"history filler {i:02}" for i in range(35)))
 
         class Handler(stub.Handler):
             def log_message(self, *_):
@@ -142,7 +145,7 @@ default_agents: [chaz]
                     for row, line in enumerate(process.screen.display):
                         column = line.find(fragment)
                         if column >= 0:
-                            return column + 1, row + 1
+                            return wcswidth(line[:column]) + 1, row + 1
                     self.fail(f"missing selectable fragment {fragment!r}")
 
                 results = []
@@ -181,6 +184,9 @@ default_agents: [chaz]
                 start = position("fn main() {")
                 end = position("}")
                 drag(start, end, code)
+                start = position("table café")
+                end = position("END")
+                drag(start, (end[0] + 2, end[1]), table_text)
                 out.mkdir(parents=True, exist_ok=True)
                 (out / "clipboard.json").write_text(json.dumps(results, ensure_ascii=False, indent=2))
                 process.capture(out)
