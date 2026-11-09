@@ -98,6 +98,31 @@ Supported legacy ambient metadata formats remain accepted. Malformed metadata
 stays write-blocking; these APIs provide no automatic repair or reset policy.
 Tolerant routing reads do not authorize a later write from defaulted state.
 
+## Provider catalog is not session authority
+
+The library's AgentDB `providers` store is a `Table<ProviderRef>` keyed logically
+by stable Provider DB root (`db_id`). Its display label, optional peer key and
+transport/address pairs are mutable routing metadata, never operating-key proof.
+`config.value` retains the existing JSON-blob encoding, with a backward-compatible
+`default_providers: Vec<String>` field. Native AgentDB Write may edit both;
+Read may inspect but not mutate them.
+
+`upsert_provider` replaces rows only for the specified root. `remove_provider`
+deletes its rows and prunes its default IDs in one native AgentDB transaction,
+without touching any session. These config edits preserve unrelated/unknown JSON
+fields and refuse unreadable state. This is not a global CRDT lock: concurrent
+or later sync may produce dangling defaults or conflicting rows.
+
+The pure `select_providers` function validates the catalog and effective ID set,
+deduplicates identical records, and sorts by root. Invalid/unknown selected IDs
+or conflicting same-root metadata fail closed; labels and legacy agent defaults
+are never fallback identities. See the [API reference and walkthrough](../user_guide/agents.md#provider-catalog-library-metadata-only).
+
+This is metadata construction only. No session creation, auto-attachment, native
+grants, Provider lifecycle, offer/result consumption, or resource execution is
+wired to these APIs. Catalog removal is not session revocation; protected session
+policy remains a separate Admin-only concern.
+
 ## Session Lifecycle
 
 ```mermaid
