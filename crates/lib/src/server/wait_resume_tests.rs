@@ -309,6 +309,194 @@ fn finished_checkpoint(mut checkpoint: JobWaitCheckpoint) -> JobWaitCheckpoint {
     checkpoint
 }
 
+/// Pause `record_active` before it writes any activation events. Arming after
+/// installation keeps extension discovery unchanged and controls only session
+/// registration. Leave the async workers free to run catch-up while the
+/// synchronous trait method waits, bounded if the test never opens the gate.
+#[derive(Default)]
+struct ActivationGate {
+    pause: std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+    reached: tokio::sync::Notify,
+}
+
+impl crate::extension::Extension for ActivationGate {
+    fn name(&self) -> &'static str {
+        "activation-gate"
+    }
+
+    fn supported_hooks(&self) -> &[crate::extension::HookKind] {
+        &[]
+    }
+
+    fn extension_ref(&self) -> crate::extension::ExtensionRef {
+        let pause = self.pause.lock().unwrap().take();
+        if let Some(release) = pause {
+            self.reached.notify_one();
+            tokio::task::block_in_place(|| release.recv_timeout(ASYNC_TEST_TIMEOUT).unwrap());
+        }
+        crate::extension::ExtensionRef::builtin("activation-gate")
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn registration_initializes_context_before_checkpoint_catch_up() {
+    let fx = Fixture::new("registration-order").await;
+    let gate = Arc::new(ActivationGate::default());
+    let mut hub = crate::test_support::context_hub().await;
+    hub.install_all(vec![gate.clone()]).await.unwrap();
+    let mock = Arc::new(MockBackend::new());
+    mock.push_text("continued after activation");
+    let process = fx.start_with_hub(mock.clone(), Arc::new(hub)).await;
+    let registry = process.server.registry.clone();
+    let (sid, db) = registry
+        .create_session(Some("registration-order"))
+        .await
+        .unwrap();
+    registry
+        .attach_agent_to_session(&sid.0, &fx.agent)
+        .await
+        .unwrap();
+    let mut session = Session::new(sid.clone(), db.clone()).await;
+    session.ensure_turn_schema_baseline().await.unwrap();
+    let request = session
+        .add_entry(SessionEntry {
+            sender: "user".into(),
+            content: "continue the wait".into(),
+            timestamp: Utc::now(),
+            entry_type: EntryType::Directive,
+            metadata: None,
+            routing: None,
+        })
+        .await
+        .unwrap();
+    let snapshot = db.snapshot().await.unwrap();
+    let attempt = session.start_turn_attempt(request.clone()).await.unwrap();
+    let (_, _, arguments) = wait_call("missing-child", 30);
+    session
+        .append_turn_transcript(
+            TurnTranscriptRecord {
+                identity: None,
+                request_id: request.clone(),
+                attempt_id: attempt.attempt_id.clone(),
+                sequence: 0,
+                timestamp: Utc::now(),
+                message: TurnTranscriptMessage::ModelResponse {
+                    model_sequence: 0,
+                    content: None,
+                    tool_calls: vec![runtime::ToolCallRequest {
+                        id: "wait".into(),
+                        name: "job_wait".into(),
+                        arguments: arguments.clone(),
+                    }],
+                    provider_extra: Default::default(),
+                    metadata: None,
+                    terminal: false,
+                },
+            },
+            vec![],
+        )
+        .await
+        .unwrap();
+    let now = Utc::now();
+    let checkpoint = JobWaitCheckpoint::new(
+        request,
+        attempt.attempt_id.clone(),
+        "default".into(),
+        snapshot,
+        runtime::JobWaitIntent {
+            model_sequence: 0,
+            call_index: 0,
+            call_id: "wait".into(),
+            arguments,
+            child_session_db_id: "missing-child".into(),
+            checkpointed_at: now,
+            deadline: now + chrono::Duration::seconds(30),
+            policy_timeout_seconds: 300,
+        },
+    );
+    session
+        .record_job_wait_checkpoint(&checkpoint)
+        .await
+        .unwrap();
+    let history = wait_history(&db).await;
+    assert!(crate::extension::read_active(&db).await.unwrap().is_empty());
+
+    let (release, receiver) = std::sync::mpsc::channel();
+    *gate.pause.lock().unwrap() = Some(receiver);
+    let registration = tokio::spawn({
+        let server = process.server.clone();
+        let db = db.clone();
+        let backend = BackendManager::with_mock(
+            mock.clone(),
+            crate::security::SecretStore::new(registry.chaz_peer().clone()).await,
+        );
+        async move { server.register_session(&db, backend, None, None).await }
+    });
+    tokio::time::timeout(ASYNC_TEST_TIMEOUT, gate.reached.notified())
+        .await
+        .unwrap();
+    // Give catch-up a complete processing opportunity while activation is
+    // paused. With watch-before-claim this consumes the checkpoint and fails
+    // context selection; a late activation cannot repair that held attempt.
+    process.server.process_session(&sid.0).await.unwrap();
+    await_no_processing(&process.server, &sid.0).await;
+    let consumed_early = process
+        .server
+        .considered_wait_checkpoints
+        .lock()
+        .unwrap()
+        .contains(&checkpoint.key());
+    let history_while_paused = wait_history(&db).await;
+    assert!(mock.recorded_calls().is_empty());
+    release.send(()).unwrap();
+    tokio::time::timeout(ASYNC_TEST_TIMEOUT, registration)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(
+        !consumed_early,
+        "registration catch-up consumed a checkpoint before context activation"
+    );
+    assert_eq!(
+        history_while_paused, history,
+        "initialization must not advance the interrupted attempt"
+    );
+
+    await_calls(&mock, 1).await;
+    await_no_processing(&process.server, &sid.0).await;
+    assert!(wait_result(&mock.recorded_calls()[0]).contains("Tool error"));
+    assert_eq!(
+        checkpoints(&db).await,
+        [finished_checkpoint(checkpoint.clone())]
+    );
+    let completed = Session::new(sid.clone(), db.clone()).await;
+    assert!(matches!(
+        completed
+            .turn_state_for_entry(&attempt.request_id, &Default::default())
+            .await
+            .unwrap(),
+        TurnRequestState::Completed { .. }
+    ));
+    let final_history = wait_history(&db).await;
+    assert!(
+        history
+            .iter()
+            .all(|(id, bytes)| final_history.get(id) == Some(bytes)),
+        "signed history remains unchanged"
+    );
+    process.register_parent(&db, &mock).await;
+    process.server.process_session(&sid.0).await.unwrap();
+    await_no_processing(&process.server, &sid.0).await;
+    assert_eq!(
+        mock.recorded_calls().len(),
+        1,
+        "registration must not replay the wait"
+    );
+    assert_eq!(wait_history(&db).await, final_history);
+    process.server.shutdown().await;
+}
+
 async fn job_count(server: &Server) -> usize {
     server
         .registry()

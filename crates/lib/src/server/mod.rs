@@ -917,6 +917,9 @@ pub struct Server {
     prompt_cache: Arc<std::sync::Mutex<HashMap<String, String>>>,
     /// Per-session runtime state keyed by session_db_id
     sessions: Arc<Mutex<HashMap<String, SessionRuntime>>>,
+    /// Serialize registration through initialization, including repeat callers
+    /// that would otherwise skip an in-progress runtime claim under Auto.
+    registration_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     /// Track which session DBs have server callbacks registered
     watched: Arc<Mutex<std::collections::HashSet<String>>>,
     /// Sessions currently being processed (prevents concurrent agent runs per session)
@@ -1088,6 +1091,7 @@ impl Server {
             model_fetch_inflight: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
             prompt_cache: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sessions: Arc::new(Mutex::new(HashMap::new())),
+            registration_locks: Mutex::new(HashMap::new()),
             watched: Arc::new(Mutex::new(std::collections::HashSet::new())),
             processing: Arc::new(Mutex::new(std::collections::HashSet::new())),
             turns: Arc::new(Mutex::new(HashMap::new())),
@@ -2202,18 +2206,26 @@ impl Server {
         if crate::session::jobs::is_job_session(session_db).await {
             anyhow::bail!("job session requires executor admission");
         }
-        let session = Session::new(
-            ConversationId(session_db.root_id().to_string()),
-            session_db.clone(),
-        )
-        .await;
+        let session_db_id = session_db.root_id().to_string();
+        let registration = self
+            .registration_locks
+            .lock()
+            .await
+            .entry(session_db_id.clone())
+            .or_default()
+            .clone();
+        let _registration = registration.lock().await;
+        let session = Session::new(ConversationId(session_db_id), session_db.clone()).await;
         session.ensure_turn_schema_baseline().await?;
         let agent_name = agent_override
             .clone()
             .unwrap_or_else(|| "agent".to_string());
-        self.watch_session(session_db, backend, agent_override, approval_tx)
-            .await?;
+        // Initialize extension activation before installing callbacks or queuing
+        // catch-up. A resumed wait consumes its checkpoint once per process,
+        // even if required context selection refuses the uninitialized set.
         self.claim_runtime(session_db, agent_name, 0, self.runtime_mode())
+            .await?;
+        self.watch_session(session_db, backend, agent_override, approval_tx)
             .await?;
         Ok(())
     }
