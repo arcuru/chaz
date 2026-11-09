@@ -432,6 +432,14 @@ There are two logs, with deliberately different shapes:
   written. `read_disabled(agent_db)` folds it into the set of names the
   agent has opted out of. An agent with no records filters nothing.
 
+Executor registration serializes initialization per session and finishes
+`session_start`, including activation recording and the active-set cache refresh,
+before installing the watcher and queuing catch-up. An overlapping registration
+waits for that initialization, even when its `Auto` runtime claim would be skipped.
+`watch_session` alone remains transport-only; it does not activate extensions.
+Explicit deactivations survive registration, and required context selection still
+refuses dispatch when its provider is inactive.
+
 **Intersection rule.** The effective set is
 `session_active − agent_disabled`: both scopes must agree, and an agent
 can only _narrow_ — never widen past what the session allows. This gives
