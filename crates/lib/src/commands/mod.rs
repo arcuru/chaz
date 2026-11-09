@@ -174,12 +174,10 @@ pub enum Command {
         field: String,
         value: String,
     },
-    /// Re-read the on-disk chaz yaml and re-run the hash-gated agent
-    /// reconcile. `Some(ref)` scopes to one agent; `None` reloads every
-    /// declared agent. Same semantics as the startup reconcile — yaml fields
-    /// and the resolved system prompt refresh into the DB, live `/agent set`
-    /// edits survive when yaml is unchanged.
+    /// Validate and replace the editable scope from a managed agent folder.
     AgentReload(Option<String>),
+    /// Retry outward projection from accepted DB config (never import files).
+    AgentProject(String),
     /// Print this peer's default pubkey so an agent owner can paste it
     /// into `/agent invite` on their peer.
     Pubkey,
@@ -376,7 +374,7 @@ pub enum CommandOutcome {
 }
 
 /// Ownership and hosted-index gates shared by every dispatch entry point.
-async fn preflight(cmd: &Command, server: &Server) -> Option<CommandOutcome> {
+async fn preflight(cmd: &Command, server: &Arc<Server>) -> Option<CommandOutcome> {
     if (service_owner_only(cmd) || extension_service_owner_only(cmd))
         && server.registry().instance().remote_connection().is_some()
     {
@@ -400,7 +398,11 @@ pub async fn dispatch_without_session(
 ) -> Result<CommandOutcome, Command> {
     if !matches!(
         cmd,
-        Command::NewSession(_) | Command::SwitchSession(_) | Command::AgentSet { .. }
+        Command::NewSession(_)
+            | Command::SwitchSession(_)
+            | Command::AgentSet { .. }
+            | Command::AgentReload(_)
+            | Command::AgentProject(_)
     ) {
         return Err(cmd);
     }
@@ -417,6 +419,12 @@ pub async fn dispatch_without_session(
             field,
             value,
         } => Box::pin(agent::agent_set(&agent_ref, &field, &value, server)).await,
+        Command::AgentReload(agent_ref) => {
+            Box::pin(agent::agent_reload(agent_ref.as_deref(), server)).await
+        }
+        Command::AgentProject(agent_ref) => {
+            Box::pin(agent::agent_project(&agent_ref, server)).await
+        }
         _ => unreachable!("filtered above"),
     })
 }
@@ -475,7 +483,10 @@ pub async fn dispatch(cmd: Command, ctx: &CommandContext<'_>) -> CommandOutcome 
             value,
         } => Box::pin(agent::agent_set(&agent_ref, &field, &value, ctx.server)).await,
         Command::AgentReload(agent_ref) => {
-            Box::pin(agent::agent_reload(agent_ref.as_deref(), ctx)).await
+            Box::pin(agent::agent_reload(agent_ref.as_deref(), ctx.server)).await
+        }
+        Command::AgentProject(agent_ref) => {
+            Box::pin(agent::agent_project(&agent_ref, ctx.server)).await
         }
         Command::Pubkey => Box::pin(agent::pubkey(ctx)).await,
         Command::AgentInvite {
@@ -524,6 +535,8 @@ pub async fn dispatch(cmd: Command, ctx: &CommandContext<'_>) -> CommandOutcome 
 fn command_needs_complete_hosted_indices(command: &Command) -> bool {
     match command {
         Command::AgentHosted
+        | Command::AgentReload(_)
+        | Command::AgentProject(_)
         | Command::AgentHomeStatus(None)
         | Command::SharingRequests
         | Command::SharingStatus => true,

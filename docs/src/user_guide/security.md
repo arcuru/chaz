@@ -38,6 +38,18 @@ Two more orthogonal layers wrap everything:
 
 The capability boundary is the **`ToolHost`** trait. The default `NativeToolHost` runs in-process and enforces grants; future hosts (WASM, bubblewrap) will swap in stronger isolation without any tool-code changes. Session-time tool code never calls OS APIs directly — it requests a `Capability::Shell|FileRead|FileWrite|HttpRequest` from the host, and a source-scan test fails the build if tool or extension code reintroduces a direct client ([architecture](../architecture/tools.md#toolhost)). Grants bound what tools do; they do not bound the daemon's own connections to its model providers — see [Not an air-gap](#not-an-air-gap-what-tool-grants-do-not-cover).
 
+## Agent configuration is operator-owned
+
+Managed agent settings and prompt-source folders are an administration interface, not model memory. Trusted local clients and remote bridges retain their existing key/ownership checks and administration access. Models have read-only Chaz queries, not settings mutation or general slash-command dispatch. Reply text is never interpreted as an operator command.
+
+The model file-tool host denies writes to the managed root, including traversal, symlink and hardlink aliases, while preserving ordinary granted workspace writes. Operator commits and folder projection bypass that model-only interface. This is a narrower check than the general advisory filesystem grants described below.
+
+**Native same-user shell and trusted native extensions are not isolated.** They can bypass the direct file-tool boundary. This feature adds no OS sandbox, login-role system or separate host-owned grant registry. Removing `shell` from a model's tool list can reduce that escape route, but does not isolate other same-user code.
+
+Restrictions remain in operator-controlled agent configuration and synchronize with it. Reload is a full scoped replacement: omitting `capabilities` removes the agent-wide ceiling, and omitting `grants` removes its per-tool overrides. This is an operator action, not an automatic grant to a model; other host/tool/session limits still apply. Trusted remote clients have the same existing administration path as local ones, not a new local-only privilege.
+
+Prompt-source synchronization is also data disclosure to authorized agent peers. Only explicitly referenced files are copied, but their full text travels with the agent; do not put credentials in prompt sources. This interface does not export credentials, login configuration, keys or arbitrary neighboring files. See [Agent folders](agents.md#operator-owned-not-model-editable) for the editable scope and [writer compatibility](agents.md#migration-and-writer-compatibility) before upgrading or rolling back.
+
 ## Tool Approval
 
 Each tool has a default approval requirement that can be overridden in config:

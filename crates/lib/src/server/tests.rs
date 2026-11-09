@@ -1,5 +1,8 @@
 //! Unit tests for the agent server. Extracted from `mod.rs`.
 
+#[path = "agent_folder_tests.rs"]
+mod agent_folder_tests;
+
 #[path = "job_monitor_tests.rs"]
 mod job_monitor_tests;
 
@@ -1262,8 +1265,24 @@ async fn hydrate_returns_input_when_agent_not_in_index() {
     assert_eq!(result.max_spawn_depth, 7);
 }
 
+fn prompt_probe_agent(name: &str) -> crate::agent::Agent {
+    crate::agent::Agent::from_db_config(name, &AgentDbConfig::default())
+}
+
+async fn seed_like_bootstrap(
+    server: &Server,
+    registry: &crate::session::SessionRegistry,
+    ac: &crate::config::AgentConfig,
+) -> crate::agent_db::AgentDb {
+    let (_, db) = seed_agent(server, registry, &ac.name).await;
+    db.write_config(&AgentDbConfig::from_agent_config(ac))
+        .await
+        .unwrap();
+    db
+}
+
 #[tokio::test]
-async fn reconcile_resolves_prompt_into_blob_and_is_gated() {
+async fn seed_completion_pins_prompt_once_and_never_reapplies_files() {
     let (_instance, server, registry) = server_fixture().await;
 
     // A yaml agent whose entire system prompt comes from a file (no inline
@@ -1276,160 +1295,136 @@ async fn reconcile_resolves_prompt_into_blob_and_is_gated() {
         prompt_path.display()
     ))
     .unwrap();
+    let db = seed_like_bootstrap(&server, &registry, &ac).await;
 
-    // Bootstrap the agent DB the way startup would: declarative config
-    // (paths), but no resolved-prompt ref yet.
-    let (db, pubkey) = {
-        let mut user = registry.user_for_tests().await;
-        create_agent_db(
-            &mut user,
-            "chaz",
-            &crate::agent_db::AgentDbConfig::from_agent_config(&ac),
-            &AgentMeta {
-                display_name: Some("chaz".to_string()),
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap()
-    };
-    server.agent_index().register(DbEntry {
-        db_id: db.id(),
-        display_name: "chaz".to_string(),
-        pubkey,
-    });
-
-    // First reconcile applies and sets the prompt ref.
-    assert!(server.reconcile_agent_from_yaml(&ac).await.unwrap());
-    let cfg = db.read_config().await.unwrap();
-    assert!(cfg.system_prompt_ref.is_some(), "ref set after reconcile");
-    assert!(cfg.applied_config_hash.is_some());
-
-    // Hydration resolves the prompt from the blob (config has no inline text).
-    let input = crate::agent::Agent {
-        name: "chaz".to_string(),
-        system_prompt: String::new(),
-        system_prompt_files: vec![],
-        default_model: None,
-        allowed_tools: None,
-        workers: HashMap::new(),
-        max_spawn_depth: 10,
-        autonomous: false,
-        presets: HashMap::new(),
-        tool_profile: None,
-        max_context_tokens: None,
-        capabilities: crate::grants::Grants::default(),
-        grants: HashMap::new(),
-    };
-    let hydrated = server.hydrate_agent_from_db(input.clone()).await;
+    // Startup finishes the seed: the prompt resolves into the blob store.
+    assert!(server.complete_agent_seed("chaz").await.unwrap());
+    let seeded = db.read_config().await.unwrap();
+    assert!(seeded.system_prompt_ref.is_some(), "ref set after seeding");
+    assert_eq!(seeded.applied_config_hash, None, "no yaml gate is recorded");
+    let hydrated = server
+        .hydrate_agent_from_db(prompt_probe_agent("chaz"))
+        .await;
     assert_eq!(hydrated.system_prompt, "You are Chaz. Operating manual v1.");
 
-    // Unchanged yaml + file → gate matches → no-op.
-    assert!(!server.reconcile_agent_from_yaml(&ac).await.unwrap());
-
-    // Editing the file content makes the resolved prompt change, so
-    // reconcile applies again and hydration reflects the new text.
+    // Restarting with an edited prompt file changes nothing: the seed is done.
     std::fs::write(&prompt_path, "You are Chaz. Operating manual v2!").unwrap();
-    assert!(server.reconcile_agent_from_yaml(&ac).await.unwrap());
-    let hydrated2 = server.hydrate_agent_from_db(input).await;
-    assert_eq!(
-        hydrated2.system_prompt,
-        "You are Chaz. Operating manual v2!"
-    );
+    assert!(!server.complete_agent_seed("chaz").await.unwrap());
+    assert_eq!(db.read_config().await.unwrap(), seeded);
+    let hydrated = server
+        .hydrate_agent_from_db(prompt_probe_agent("chaz"))
+        .await;
+    assert_eq!(hydrated.system_prompt, "You are Chaz. Operating manual v1.");
+
+    // Re-setting the files is the explicit way to pick up new contents.
+    let mut refreshed = db.read_config().await.unwrap();
+    server.refresh_prompt_ref(&mut refreshed).await.unwrap();
+    db.write_config(&refreshed).await.unwrap();
+    let hydrated = server
+        .hydrate_agent_from_db(prompt_probe_agent("chaz"))
+        .await;
+    assert_eq!(hydrated.system_prompt, "You are Chaz. Operating manual v2!");
 }
 
 #[tokio::test]
-async fn reload_config_for_rereads_yaml_from_disk() {
-    // `/agent reload` path: a config file on disk drives the reconcile via
-    // the server-held config path, not a pre-parsed Config in hand.
+async fn seed_completion_leaves_existing_and_legacy_agents_untouched() {
     let (_instance, server, registry) = server_fixture().await;
-
-    let dir = tempfile::tempdir().unwrap();
-    let prompt_path = dir.path().join("AGENTS.md");
-    std::fs::write(&prompt_path, "Chaz manual v1.").unwrap();
-    let config_path = dir.path().join("config.yaml");
-    let write_config = |body: &str| {
-        std::fs::write(
-                &config_path,
-                format!(
-                    "homeserver_url: http://localhost\nusername: test\nagents:\n  - name: chaz\n    system_prompt_files: [\"{}\"]\n{}",
-                    prompt_path.display(),
-                    body
-                ),
-            )
+    let ac: crate::config::AgentConfig =
+        serde_yaml::from_str("name: alpha\nsystem_prompt: yaml prompt\nmodel: yaml-model\n")
             .unwrap();
-    };
-    write_config("");
-    server.set_config_path(config_path.clone());
+    let db = seed_like_bootstrap(&server, &registry, &ac).await;
+    assert!(server.complete_agent_seed("alpha").await.unwrap());
 
-    // Bootstrap the agent DB the way startup would.
-    let ac: crate::config::AgentConfig = serde_yaml::from_str(&format!(
-        "name: chaz\nsystem_prompt_files: [\"{}\"]\n",
-        prompt_path.display()
-    ))
-    .unwrap();
-    let (db, pubkey) = {
-        let mut user = registry.user_for_tests().await;
-        create_agent_db(
-            &mut user,
-            "chaz",
-            &crate::agent_db::AgentDbConfig::from_agent_config(&ac),
-            &AgentMeta {
-                display_name: Some("chaz".to_string()),
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap()
-    };
-    server.agent_index().register(DbEntry {
-        db_id: db.id(),
-        display_name: "chaz".to_string(),
-        pubkey,
-    });
+    // A legacy row: an older chaz recorded an applied-config hash, and the
+    // user has since edited fields, including back to their defaults.
+    let mut legacy = db.read_config().await.unwrap();
+    legacy.applied_config_hash = Some("legacy-hash".into());
+    legacy.model = None;
+    legacy.system_prompt = String::new();
+    legacy.tools = Some(vec![]);
+    db.write_config(&legacy).await.unwrap();
 
-    // Scoped reload applies and reports the change.
-    let report = server.reload_config_for(Some("chaz")).await.unwrap();
-    assert_eq!(report.changed, vec!["chaz".to_string()]);
-    assert_eq!(report.considered, 1);
+    assert!(!server.complete_agent_seed("alpha").await.unwrap());
+    assert_eq!(db.read_config().await.unwrap(), legacy);
 
-    // A second reload with the file unchanged is a gated no-op.
-    let report2 = server.reload_config_for(Some("chaz")).await.unwrap();
-    assert!(report2.changed.is_empty());
-    assert_eq!(report2.considered, 1);
+    // An agent with no prompt at all has nothing to seed and is not written.
+    let empty: crate::config::AgentConfig = serde_yaml::from_str("name: bare\n").unwrap();
+    let bare = seed_like_bootstrap(&server, &registry, &empty).await;
+    let before = bare.read_config().await.unwrap();
+    assert!(!server.complete_agent_seed("bare").await.unwrap());
+    assert_eq!(bare.read_config().await.unwrap(), before);
 
-    // Editing the prompt file and reloading reaches hydration.
-    std::fs::write(&prompt_path, "Chaz manual v2!").unwrap();
-    let report3 = server.reload_config_for(None).await.unwrap();
-    assert_eq!(report3.changed, vec!["chaz".to_string()]);
-    let input = crate::agent::Agent {
-        name: "chaz".to_string(),
-        system_prompt: String::new(),
-        system_prompt_files: vec![],
-        default_model: None,
-        allowed_tools: None,
-        workers: HashMap::new(),
-        max_spawn_depth: 10,
-        autonomous: false,
-        presets: HashMap::new(),
-        tool_profile: None,
-        max_context_tokens: None,
-        capabilities: crate::grants::Grants::default(),
-        grants: HashMap::new(),
-    };
-    let hydrated = server.hydrate_agent_from_db(input).await;
-    assert_eq!(hydrated.system_prompt, "Chaz manual v2!");
-
-    // A name that isn't in the yaml is considered zero times.
-    let missing = server.reload_config_for(Some("ghost")).await.unwrap();
-    assert_eq!(missing.considered, 0);
-    assert!(missing.changed.is_empty());
+    // Unknown names are a no-op, not an error.
+    assert!(!server.complete_agent_seed("ghost").await.unwrap());
 }
 
 #[tokio::test]
-async fn reload_config_for_errors_without_config_path() {
+async fn reload_config_for_imports_hosted_folders_and_reports_partial_batches() {
+    let (_instance, server, registry) = server_fixture().await;
+    let dir = tempfile::tempdir().unwrap();
+    server.set_agent_config_root(dir.path().join("agents"));
+    for name in ["alpha", "same"] {
+        let ac: crate::config::AgentConfig =
+            serde_yaml::from_str(&format!("name: {name}\nmodel: m1\n")).unwrap();
+        seed_like_bootstrap(&server, &registry, &ac).await;
+    }
+    server.initialize_agent_folders().await;
+    let entry = server.agent_index().find_by_name("alpha").unwrap();
+    let folder = server
+        .agent_folders()
+        .unwrap()
+        .folder("alpha", &entry.db_id.to_string());
+    std::fs::write(
+        folder.join("agent.yaml"),
+        format!(
+            "version: 1\nagent_id: {}\nmodel: replacement\n",
+            entry.db_id
+        ),
+    )
+    .unwrap();
+    let same = server.agent_index().find_by_name("same").unwrap();
+    let other = server
+        .agent_folders()
+        .unwrap()
+        .folder("same", &same.db_id.to_string());
+    std::fs::write(other.join("agent.yaml"), "invalid: [").unwrap();
+    let report = server.reload_config_for(None).await.unwrap();
+    assert_eq!(report.considered, 2);
+    assert_eq!(report.applied, vec![("alpha".into(), true)]);
+    assert_eq!(report.failed.len(), 1);
+    assert_eq!(report.failed[0].0, "same");
+    assert_eq!(
+        server
+            .agents()
+            .get("alpha")
+            .unwrap()
+            .default_model
+            .as_deref(),
+        Some("replacement")
+    );
+    assert_eq!(
+        server
+            .agents()
+            .get("same")
+            .unwrap()
+            .default_model
+            .as_deref(),
+        Some("m1")
+    );
+    assert_eq!(
+        server
+            .reload_config_for(Some("ghost"))
+            .await
+            .unwrap()
+            .considered,
+        0
+    );
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn reload_config_for_requires_explicit_library_folder_root() {
     let (_instance, server, _registry) = server_fixture().await;
-    // No set_config_path call → reload is unavailable.
     assert!(server.reload_config_for(None).await.is_err());
 }
 
@@ -8068,6 +8063,7 @@ async fn a_stop_that_lands_before_the_turn_starts_still_stops_it() {
                 manager,
                 attempt.clone(),
                 SpawnContext {
+                    worker_prompt: None,
                     job_projection: None,
                     job_retry: None,
                     job_incarnation: None,
@@ -9212,6 +9208,7 @@ async fn job_wait_executor_shutdown_and_observed_yield_stop_observation_or_reacq
                     backend,
                     attempt.clone(),
                     SpawnContext {
+                        worker_prompt: None,
                         // Identity only: without job authority no queue
                         // projection is reconciled.
                         job_projection: claim_loss

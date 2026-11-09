@@ -156,6 +156,28 @@ external effects. See [Session Model](sessions.md#durable-turn-recovery).
 
 **Source**: `crates/lib/src/server.rs`
 
+### Agent configuration: accepted bundle and local projection
+
+Agent configuration is synchronized data with an explicit filesystem editing interface. It is separate from session history and from peer/provider configuration in the global YAML. The [operator guide](../user_guide/agents.md#yaml-seeds-the-agent-db-decides) gives the editing procedure; the implementation has three boundaries:
+
+1. **One coherent DB value.** `AgentDbConfig` stores typed settings and `PromptSources` in the same serialized value in the Agent DB's `config` DocStore. A read cannot combine a setting from one committed revision with source text from another. The bundle retains individual normalized relative paths and UTF-8 texts, not just an assembled prompt or a pointer into unsynchronized `chaz_peer` storage. Parent and worker runtime prompts are derived from this accepted snapshot. Extension prompt augmentation remains a later context-assembly step.
+2. **One trusted update path.** `server/agent_config.rs` serializes each agent's operator updates, explicit imports and projection. Scalar/inline edits reuse accepted source texts; only an explicit source-list import or full folder reload reads files. `AgentDocument` defines the replacement scope, excluding identity, bookkeeping and unrelated resource state. Reload parses/validates metadata, nested fields and every referenced source before the DB write. Key/ownership and attenuation checks remain in place; the model query surface gains no mutating command.
+3. **Recoverable, peer-local projection.** `AgentFolders` exports `agent.yaml` and source files under a local identity-derived directory. A file lock serializes trusted processes using that root. The deterministic projection identity hashes the sorted document/source representation, not the entire DB tip. Existing DB notifications therefore catch local and synced configuration changes without memory/history writes clobbering local drafts or creating a DB feedback loop. Projection itself writes no Agent DB data.
+
+The default executable setup supplies a writable local root; library servers do not implicitly write to the user's home. Roots, file locks and `.projection.json` stay local to the filesystem. The journal records the full agent identity, last completed content identity, managed files and pending projection. An unrelated directory or untracked target-file collision is refused rather than adopted.
+
+#### Import and projection are different failure domains
+
+The DB commit and filesystem writes are not one atomic transaction. After acceptance, the runtime uses the new DB configuration even if outward projection fails. The projector persists pending intent, preflights targets, atomically replaces individual files, removes only obsolete tracked sources, and marks completion last. `/agent project` retries outward using the latest accepted DB state. Reload refuses an incomplete or behind-DB projection rather than consuming a half-written folder. No recovery path imports stale files automatically.
+
+Startup subscribes to Agent DB notifications before reading/projecting the latest config. When the completed config/source identity is unchanged and no projection is pending, it leaves local drafts untouched, including invalid YAML. Changed accepted data or a pending journal triggers outward projection. There is no file watcher and no import on restart.
+
+Legacy migration is the one-time DB-format transition, not routine projection: it preserves the saved effective parent prompt exactly, retaining original fragments only when they reproduce it. Otherwise it stores the saved text as a verbatim source. Missing saved content or unrecoverable worker sources blocks migration without replacing legacy data. Execution on a folder-configured peer refuses an unmigrated agent instead of guessing a prompt. All configuration-writing peers must be upgraded before using bundles; rolling back binaries does not revert synchronized data.
+
+The model-facing host separately denies direct file-tool writes to the managed root and aliases. This does not isolate native same-user shell or trusted extensions; see the [security boundary](../user_guide/security.md#agent-configuration-is-operator-owned).
+
+**Source**: `crates/lib/src/agent_bundle.rs`, `agent_folder.rs`, `agent_db.rs`, `server/agent_config.rs`, `agent.rs`, and `tool_host.rs`.
+
 ### Runtime
 
 The ReAct loop (`runtime::execute`) drives agent reasoning:
@@ -193,6 +215,9 @@ crates/lib/src/
   util.rs              Shared utilities
   agent.rs             Agent definitions, AgentRegistry, spawn permissions
   agent_db.rs          Living Agents — AgentDb (config/memory/meta/history/memory_banks/skills/schedules stores)
+  agent_bundle.rs      Scoped agent document, synchronized prompt sources, validation and exact-preserving migration
+  agent_folder.rs      Peer-local identity-bound folders, projection journal and outward recovery
+  server/agent_config.rs Operator update/commit/project path and config-notification handling
   memory_bank_db.rs    Standalone Memory Bank DBs (parallel to agent_db)
   skill_bank_db.rs     Standalone Skill Bank DBs (parallel to memory_bank_db)
   db_kind.rs           meta.kind + display_name markers on entity DBs

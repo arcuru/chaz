@@ -29,6 +29,10 @@ impl Server {
         // read_config defaults only for a genuinely absent payload. Open, read,
         // type and decode errors stay unprefixed so adoption holds retryably.
         let config = db.read_config().await.with_context(unavailable)?;
+        anyhow::ensure!(
+            self.agent_folders().is_none() || config.prompt_sources.is_some(),
+            "job authority unavailable: agent configuration migration blocked"
+        );
         Ok(self
             .agents
             .build_from_db_config(&entry.display_name, &config))
@@ -439,6 +443,7 @@ impl Server {
             super::SessionRuntime {
                 backend: self.default_backend.clone(),
                 agent_override: Some(accepted.definition.target.clone()),
+                worker_prompt: None,
                 approval_tx: None,
                 call_depth: accepted.definition.call_depth,
                 max_call_depth: accepted.definition.max_call_depth,

@@ -9,12 +9,9 @@ use std::path::{Path, PathBuf};
 /// order — files first, the inline string last. `~` / `~/…` are expanded
 /// against the home directory.
 ///
-/// A file that can't be read is logged at `warn` and skipped, so a stale or
-/// missing path degrades the prompt rather than failing agent construction.
-/// Called from the runtime `Agent` / `Worker` constructors, so the files are
-/// re-read whenever an agent is (re)built — including the per-message
-/// `hydrate_agent_from_db` path — keeping edits to the prompt files live
-/// without a restart.
+/// Legacy/config-seed constructor fallback only: unreadable files are logged
+/// and skipped. Managed folder import is strict and bundle-backed runtime
+/// construction never calls this resolver for accepted sources.
 pub(crate) fn resolve_system_prompt(inline: &str, files: &[PathBuf]) -> String {
     let mut parts: Vec<String> = Vec::with_capacity(files.len() + 1);
     for path in files {
@@ -144,6 +141,13 @@ impl Worker {
     }
 
     pub fn from_worker_db_config(cfg: &crate::agent_db::WorkerDbConfig) -> Self {
+        Self::from_worker_sources(cfg, None)
+    }
+
+    fn from_worker_sources(
+        cfg: &crate::agent_db::WorkerDbConfig,
+        sources: Option<&crate::agent_bundle::PromptSources>,
+    ) -> Self {
         let system_prompt_files: Vec<PathBuf> = cfg
             .system_prompt_files
             .clone()
@@ -152,7 +156,15 @@ impl Worker {
             .collect();
         Worker {
             name: cfg.name.clone(),
-            system_prompt: resolve_system_prompt(&cfg.system_prompt, &system_prompt_files),
+            system_prompt: match sources {
+                Some(sources) => crate::agent_bundle::assemble(
+                    &cfg.system_prompt,
+                    &cfg.system_prompt_files,
+                    sources,
+                )
+                .expect("validated synchronized worker sources"),
+                None => resolve_system_prompt(&cfg.system_prompt, &system_prompt_files),
+            },
             system_prompt_files,
             default_model: cfg.model.clone(),
             allowed_tools: cfg.tools.clone(),
@@ -214,7 +226,12 @@ impl Agent {
         let workers = cfg
             .workers
             .iter()
-            .map(|wc| (wc.name.clone(), Worker::from_worker_db_config(wc)))
+            .map(|wc| {
+                (
+                    wc.name.clone(),
+                    Worker::from_worker_sources(wc, cfg.prompt_sources.as_ref()),
+                )
+            })
             .collect();
         let system_prompt_files: Vec<PathBuf> = cfg
             .system_prompt_files
@@ -224,12 +241,17 @@ impl Agent {
             .collect();
         Agent {
             name: name.to_string(),
-            // Inline only here; the resolved prompt (files folded in) is
-            // fetched from the prompt blob store by `system_prompt_ref` in
-            // `Server::hydrate_agent_from_db`, which avoids re-reading the files
-            // each turn. `from_agent_config` (the yaml/registry path for
-            // DB-less agents) still resolves files directly.
-            system_prompt: cfg.system_prompt.clone(),
+            // Bundle-backed parent and workers derive from the same accepted
+            // config. Legacy configs still resolve their snapshot in Server.
+            system_prompt: match &cfg.prompt_sources {
+                Some(sources) => crate::agent_bundle::assemble(
+                    &cfg.system_prompt,
+                    &cfg.system_prompt_files,
+                    sources,
+                )
+                .expect("validated synchronized parent sources"),
+                None => cfg.system_prompt.clone(),
+            },
             system_prompt_files,
             default_model: cfg.model.clone(),
             allowed_tools: cfg.tools.clone(),

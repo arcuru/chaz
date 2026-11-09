@@ -166,6 +166,79 @@ impl NativeToolHost {
     }
 }
 
+/// Native model file writes cannot mutate operator-owned agent folders.
+/// Trusted administration bypasses this wrapper; same-user shell is not isolated.
+pub struct AgentConfigToolHost {
+    inner: std::sync::Arc<dyn ToolHost>,
+    root: std::sync::Arc<std::sync::RwLock<Option<std::path::PathBuf>>>,
+}
+
+impl AgentConfigToolHost {
+    pub fn new(root: std::path::PathBuf) -> Self {
+        Self::with_root_cell(
+            std::sync::Arc::new(NativeToolHost),
+            std::sync::Arc::new(std::sync::RwLock::new(Some(root))),
+        )
+    }
+
+    pub(crate) fn with_root_cell(
+        inner: std::sync::Arc<dyn ToolHost>,
+        root: std::sync::Arc<std::sync::RwLock<Option<std::path::PathBuf>>>,
+    ) -> Self {
+        Self { inner, root }
+    }
+
+    fn check_managed_write(&self, path: &str) -> Result<(), ToolError> {
+        let Some(configured_root) = self.root.read().expect("agent config root lock").clone()
+        else {
+            return Ok(());
+        };
+        let target = resolve_write_path(std::path::Path::new(path))
+            .map_err(|e| ToolError::Execution(format!("Cannot resolve write path: {e}")))?;
+        let root = resolve_write_path(&configured_root)
+            .map_err(|e| ToolError::Execution(format!("Cannot resolve managed root: {e}")))?;
+        // Protect both the named managed path and aliases resolving into it:
+        // a managed symlink pointing outward must not make its own path writable.
+        let named_target = normalize_lexical(
+            &std::path::absolute(path).map_err(|e| ToolError::Execution(e.to_string()))?,
+        );
+        let named_root = normalize_lexical(
+            &std::path::absolute(&configured_root)
+                .map_err(|e| ToolError::Execution(e.to_string()))?,
+        );
+        let alias = named_target.starts_with(&named_root)
+            || target.starts_with(&root)
+            || hardlink_in(&target, &root).map_err(|e| {
+                ToolError::Execution(format!("Cannot check managed file alias: {e}"))
+            })?;
+        if alias {
+            return Err(ToolError::Execution(
+                "Agent configuration is operator-owned; use the trusted administration interface"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl ToolHost for AgentConfigToolHost {
+    fn request<'a>(
+        &'a self,
+        capability: &'a Capability,
+        grants: &'a Grants,
+    ) -> Pin<Box<dyn Future<Output = Result<CapabilityResult, ToolError>> + Send + 'a>> {
+        Box::pin(async move {
+            if let Capability::FileWrite { path, .. } = capability {
+                self.check_managed_write(path)?;
+            }
+            self.inner.request(capability, grants).await
+        })
+    }
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+}
+
 impl ToolHost for NativeToolHost {
     fn request<'a>(
         &'a self,
@@ -215,6 +288,70 @@ impl ToolHost for NativeToolHost {
     fn name(&self) -> &str {
         "native"
     }
+}
+
+// Resolve aliases at the actual write boundary, including nonexistent leaves.
+// Native same-user shell is deliberately outside this file-tool guarantee.
+fn resolve_write_path(path: &std::path::Path) -> std::io::Result<std::path::PathBuf> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let mut ancestor = absolute.as_path();
+    let mut missing = Vec::new();
+    loop {
+        match std::fs::canonicalize(ancestor) {
+            Ok(mut resolved) => {
+                for part in missing.iter().rev() {
+                    resolved.push(part);
+                }
+                return Ok(normalize_lexical(&resolved));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                missing.push(ancestor.file_name().ok_or(e)?.to_owned());
+                ancestor = ancestor.parent().expect("absolute ancestor");
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+#[cfg(unix)]
+fn hardlink_in(target: &std::path::Path, root: &std::path::Path) -> std::io::Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = match std::fs::metadata(target) {
+        Ok(meta) if meta.is_file() && meta.nlink() > 1 => meta,
+        Ok(_) => return Ok(false),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e),
+    };
+    let mut dirs = vec![root.to_path_buf()];
+    while let Some(dir) = dirs.pop() {
+        let entries = match std::fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e),
+        };
+        for entry in entries {
+            let entry = entry?;
+            let candidate = std::fs::symlink_metadata(entry.path())?;
+            if candidate.is_dir() {
+                dirs.push(entry.path());
+            } else if candidate.is_file()
+                && candidate.dev() == meta.dev()
+                && candidate.ino() == meta.ino()
+            {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+#[cfg(not(unix))]
+fn hardlink_in(_: &std::path::Path, _: &std::path::Path) -> std::io::Result<bool> {
+    Ok(false)
 }
 
 // ── Capability implementations ───────────────────────────────────

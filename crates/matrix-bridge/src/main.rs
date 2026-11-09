@@ -217,6 +217,15 @@ async fn main() -> anyhow::Result<()> {
     // agents, security) the runtime needs, and once for the bridge's own
     // section (label, unlock_password, logins).
     let mut config: Config = serde_yaml::from_str(&contents)?;
+    if config.agent_config_dir.is_none() {
+        config.agent_config_dir = Some(
+            dirs::config_dir()
+                .ok_or_else(|| anyhow::anyhow!("no user config directory; set agent_config_dir"))?
+                .join("chaz/agents")
+                .display()
+                .to_string(),
+        );
+    }
     let bridge_cfg: MatrixBridgeConfig = serde_yaml::from_str(&contents)?;
     bridge_cfg.warn_literal_secret_permissions(&config_path);
 

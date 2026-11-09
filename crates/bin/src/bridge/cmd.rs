@@ -107,6 +107,20 @@ impl Bridge for CommandBridge {
             return Self::run_session_independent(cmd, server.registry()).await;
         }
 
+        let cmd = match shared_commands::dispatch_without_session(cmd, &server).await {
+            Ok(CommandOutcome::Text(text)) => {
+                println!("{text}");
+                return Ok(());
+            }
+            Ok(CommandOutcome::Error(error)) => anyhow::bail!("{error}"),
+            Ok(CommandOutcome::SessionSwitched(session)) => {
+                println!("{}", session.session_db_id);
+                return Ok(());
+            }
+            Ok(_) => return Ok(()),
+            Err(cmd) => cmd,
+        };
+
         let (_conv_id, session_db) =
             super::cli::resolve_cli_session(&server, self.session_name.as_deref()).await?;
         server.load_session_entities(&session_db).await?;

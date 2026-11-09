@@ -279,6 +279,15 @@ pub fn parse(input: &str) -> Parsed {
         let r = arg.trim();
         return Parsed::Command(Command::AgentReload((!r.is_empty()).then(|| r.to_string())));
     }
+    if let Some(arg) = text.strip_prefix("/agent project ") {
+        let r = arg.trim();
+        if !r.is_empty() {
+            return Parsed::Command(Command::AgentProject(r.into()));
+        }
+    }
+    if text == "/agent project" {
+        return Parsed::Usage("Usage: /agent project <name|db_id>".into());
+    }
     if text == "/agent hosted" {
         return Parsed::Command(Command::AgentHosted);
     }
