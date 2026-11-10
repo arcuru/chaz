@@ -110,18 +110,18 @@ An ordinary launch opens the [session hub](#session-hub) rather than any convers
 
 ## Reading messages and tool output
 
-| Content / control              | Display or action                                                               |
-| ------------------------------ | ------------------------------------------------------------------------------- |
-| Message Markdown               | Headings, emphasis, lists, readable links and indented code                     |
+| Content / control              | Display or action                                                                                 |
+| ------------------------------ | ------------------------------------------------------------------------------------------------- |
+| Message Markdown               | Headings, emphasis, lists, readable links and indented code                                       |
 | GFM pipe tables                | Library-rendered headers, rows, inline styles and column alignment; narrow panes may wrap the box |
-| Inline and fenced code         | Accent text on a dark background; code indentation and literal escapes are retained |
-| Collapsed tool run             | Two clipped rows: agent, run label, call count, lifecycle and outcome counts    |
-| Click either run-summary row   | Show or hide that run's tools; agent prose stays visible                        |
-| Click a nested tool header     | Show or hide complete recorded arguments, result and provenance                 |
-| `Ctrl+O` or `/expand`          | Invert the global expansion default for runs, items and directives              |
-| Expanded JSON                  | An indented outline with decoded string values; malformed JSON stays plain text |
-| `/debug` with an item expanded | Original argument/result spelling, still sanitized                              |
-| Unpaired audit entry           | Identity unavailable; expandable independently, never paired by proximity       |
+| Inline and fenced code         | Accent text on a dark background; code indentation and literal escapes are retained               |
+| Collapsed tool run             | Two clipped rows: agent, run label, call count, lifecycle and outcome counts                      |
+| Click either run-summary row   | Show or hide that run's tools; agent prose stays visible                                          |
+| Click a nested tool header     | Show or hide complete recorded arguments, result and provenance                                   |
+| `Ctrl+O` or `/expand`          | Invert the global expansion default for runs, items and directives                                |
+| Expanded JSON                  | An indented outline with decoded string values; malformed JSON stays plain text                   |
+| `/debug` with an item expanded | Original argument/result spelling, still sanitized                                                |
+| Unpaired audit entry           | Identity unavailable; expandable independently, never paired by proximity                         |
 
 ## Tool runs follow evidence, not adjacency
 

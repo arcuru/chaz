@@ -1276,7 +1276,7 @@ fn build_transcript(
                 lines.push(Line::from(vec![Span::styled(label, sender_style)]));
 
                 for (line, body) in content::markdown(&entry.content, inner_width) {
-                    sources.push((lines.len(), body));
+                    sources.push((lines.len(), 2, body));
                     lines.push(line);
                 }
                 lines.push(Line::from(""));
@@ -3656,7 +3656,8 @@ mod transcript_tests {
         ) else {
             panic!("drag across header must copy");
         };
-        assert_eq!(copied, "alpha beta\ngamma delta");
+        // Headers remain excluded; the expanded tool body is now selectable.
+        assert_eq!(copied, "alpha beta\nshell(echo one)\ngamma delta");
         assert_eq!(
             app.active().expanded_entries,
             HashSet::from([1]),

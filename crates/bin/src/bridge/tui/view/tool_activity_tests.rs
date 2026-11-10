@@ -621,7 +621,7 @@ async fn nested_tool_toggles_refresh_keyboard_mouse_and_copy_keep_identity() {
         record(&attempt, 0, model(0, 2, "Agent commentary")),
     )
     .await;
-    let output = "start\n\twide 界 e\u{301} and literal \\n\nend \u{1b}[31m";
+    let output = "start\n\n\twide 界 e\u{301} and literal \\n\n  indented\nend \u{1b}[31m";
     append(
         &session,
         record(
@@ -723,6 +723,16 @@ async fn nested_tool_toggles_refresh_keyboard_mouse_and_copy_keep_identity() {
         };
         let start = position("start");
         let end = position("end �[31m");
+        assert_eq!(
+            drawn[usize::from(start.1) + 1].trim_matches(['│', ' ']),
+            "",
+            "a real blank line must survive JSON decoding and terminal rendering"
+        );
+        if width == 100 {
+            assert!(drawn[usize::from(start.1) + 2].starts_with("│          wide"));
+            assert!(drawn[usize::from(start.1) + 3].starts_with("│        indented"));
+            assert!(drawn[usize::from(start.1) + 2].contains("literal \\n"));
+        }
         // Tool body/provenance rows are not toggle hits, even when wrapped.
         assert!(!app.click_regions.iter().any(|r| r.hit(start.0, start.1)));
         let before = app.active().live.expanded_tools.clone();
@@ -743,7 +753,7 @@ async fn nested_tool_toggles_refresh_keyboard_mouse_and_copy_keep_identity() {
         };
         assert_eq!(
             copied,
-            "start\n\twide 界 e\u{301} and literal \\n\nend �[31m"
+            "start\n\n\twide 界 e\u{301} and literal \\n\n  indented\nend �[31m"
         );
         assert_eq!(app.active().live.expanded_tools, before);
         let ptr = app.active().live.render.lines_ptr();
@@ -770,13 +780,27 @@ async fn nested_tool_toggles_refresh_keyboard_mouse_and_copy_keep_identity() {
         record(
             &attempt,
             2,
-            result(0, 1, "late result", ToolResultOutcome::Success),
+            result(
+                0,
+                1,
+                "late result\n\n  literal \\n",
+                ToolResultOutcome::Success,
+            ),
         ),
     )
     .await;
     reload(&mut app).await;
     assert_eq!(app.active().live.tool_activity.items[1].key, key);
-    draw(&mut app, 80, 60);
+    let terminal = draw(&mut app, 80, 60);
+    let drawn = rows(&terminal, 0, 60);
+    assert!(
+        drawn
+            .windows(3)
+            .any(|lines| lines[0].starts_with("│      late result")
+                && lines[1].trim_matches(['│', ' ']).is_empty()
+                && lines[2].starts_with("│        literal \\n")),
+        "plain text preserves newlines and indentation without unescaping literal backslashes: {drawn:?}"
+    );
     assert_eq!(
         text(&app).matches("late result").count(),
         2,

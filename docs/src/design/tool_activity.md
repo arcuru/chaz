@@ -46,12 +46,12 @@ This forty-column excerpt comes from the native-snapshot TUI buffer fixture
 The compact tool rows stay at two; prose remains outside collapse.
 
 ```text
-chaz [local] [R1 e0]:
+chaz [R1 e0]:
   I will inspect these files.
 
 ▸ … R1 chaz · 48 tools · attempt acti…
   0 done · 0 failed · 0 cancelled · 4…
-chaz [local] [R1 e1]:
+chaz [R1 e1]:
   First checks are back; looking
 further.
 ```
