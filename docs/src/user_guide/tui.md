@@ -110,57 +110,123 @@ An ordinary launch opens the [session hub](#session-hub) rather than any convers
 
 ## Reading messages and tool output
 
-| Content                                  | Display                                                                                                   |
-| ---------------------------------------- | --------------------------------------------------------------------------------------------------------- |
-| Message Markdown                         | Headings, bold/italic emphasis, ordered/nested lists and readable links                                   |
-| GFM pipe tables                          | Library-rendered headers, rows, inline styles and column alignment; narrow panes may wrap the box         |
-| Inline and fenced code                   | Accent text on a dark background; code indentation and literal escapes are retained                       |
-| Collapsed tool entry                     | One-line preview, capped at 90 characters plus an ellipsis                                                |
-| Expanded tool result                     | Indented plain text, with line breaks; complete JSON becomes an indented outline with decoded text values |
-| Click anywhere on a `▸` / `▾` header row | Expand or collapse that entry                                                                             |
-| `Ctrl+O` or `/expand`                    | Toggle expansion for all tool entries and directives                                                      |
+| Content / control              | Display or action                                                                                 |
+| ------------------------------ | ------------------------------------------------------------------------------------------------- |
+| Message Markdown               | Headings, emphasis, lists, readable links and indented code                                       |
+| GFM pipe tables                | Library-rendered headers, rows, inline styles and column alignment; narrow panes may wrap the box |
+| Inline and fenced code         | Accent text on a dark background; code indentation and literal escapes are retained               |
+| Collapsed tool run             | Two clipped rows: agent, run label, call count, lifecycle and outcome counts                      |
+| Click either run-summary row   | Show or hide that run's tools; agent prose stays visible                                          |
+| Click a nested tool header     | Show or hide complete recorded arguments, result and provenance                                   |
+| `Ctrl+O` or `/expand`          | Invert the global expansion default for runs, items and directives                                |
+| Expanded JSON                  | An indented outline with decoded string values; malformed JSON stays plain text                   |
+| `/debug` with an item expanded | Original argument/result spelling, still sanitized                                                |
+| Unpaired audit entry           | Identity unavailable; expandable independently, never paired by proximity                         |
+
+## Tool runs follow evidence, not adjacency
+
+A tool run belongs to one request, attempt, execution branch and agent in this
+session.
+Its two-row summary appears at its first identified invocation and stays the
+same height as calls arrive, including while the attempt is active.
+Long summaries are clipped to the pane width; expand to read all counts and
+open an item for full identities.
+`R1`, `R2`, and so on are local display labels, not execution IDs.
+Other attempts and concurrent agents have separate summaries.
+
+Collapsing hides only identified tools, wherever they occur in the transcript.
+All commentary, final answers, errors, approvals and stop requests stay in place.
+Expanded tools stay at their invocation positions rather than moving across
+commentary.
+Each header's `e0.1→e3` records invocation event/index and result event: a result
+shown with an earlier invocation may have arrived after intervening prose.
+Known commentary carries the same run/event label.
+There is no second standalone copy of a paired result.
+
+A compact item selects an argument such as `path`, `command`, `query` or `url`,
+not necessarily all its arguments.
+Generic objects and arrays show field/item counts; open the item to read them.
+An invocation without a result says `awaiting result` only while its attempt
+has fresh activity evidence.
+That is not proof this particular tool is executing.
+After expiry it says `activity unknown`; after a completed unbranched attempt
+it says `missing result`.
+A competing branch's completed attempt does not prove this branch finished.
+`stop requested` is not cancellation acknowledgement, and cancellation never
+changes a previously successful tool result into a cancelled result.
+The run's lifecycle and its call outcome counts are separate facts.
+There is no recorded tool-output streaming variant: an awaiting item updates
+when its settled result is available, without inventing partial-output status.
+
+Expansion choices are local to the open tab and follow stable identities across
+refreshes and inserted command output.
+Closing and reopening the tab resets those choices, not the history.
+The outer toggle retains inner choices.
+Global expansion inverts the default at both levels, retaining individual
+opposite-of-default choices just like directives.
+`Ctrl+T` still creates a new session; it does not expand anything.
+Each collapsible header is a full-row click target, including its label,
+right-hand space and wrapped continuation rows.
+Scrolling and resizing keep the target aligned with the displayed header;
+detail and provenance lines are not toggles.
 
 ## Formatting is a view, not a rewrite
 
-Messages use Markdown styling automatically. Links show their label and target;
-they do not launch a browser. Tool output is **not** Markdown, so shell syntax,
-asterisks and code remain text. Both wrap to the pane's width and use the same
-history scrolling as other entries.
+Messages use Markdown styling automatically.
+Links show their label and target; they do not launch a browser.
+Tool output is **not** Markdown, so shell syntax, asterisks and code remain text.
+Both wrap to the pane's width and use ordinary history scrolling.
+Expanded argument/result bodies can be selected and copied without the UI's
+indentation or soft-wrap newlines.
 
-Each collapsible header is a full-row click target, including its label,
-right-hand space and wrapped continuation rows. Only the header toggles: clicks
-on expanded body text do not collapse it. Scrolling and resizing keep the target
-aligned with the displayed header; keyboard toggles and text selection are unchanged.
+Expanded results preserve actual newlines, blank lines and indentation.
+Complete JSON string values become text with real line breaks; an intentionally
+literal backslash-n stays literal.
+The TUI does not decode nested JSON inside a text value, repair incomplete JSON,
+or guess at escapes in ordinary text.
+Empty results remain distinct from absent results.
+The outline is for reading, not for copying as valid JSON; use `/debug` and
+expand for original recorded spelling.
+Terminal controls are quarantined after decoding and remain neutralized on copy.
 
-The TUI decodes a tool result only when its body is a complete JSON value.
-JSON string values become text with real line breaks; an intentionally literal
-backslash-n stays literal. It does not decode nested JSON inside a text value,
-or guess at escapes in ordinary text. Empty strings, objects and arrays remain
-visible in structured output. The outline is for reading, not for copying as
-valid JSON. Terminal controls are quarantined after decoding.
+Stored history, model payloads and runtime output limits do not change.
+Identified modern results use the complete native record, not its potentially
+500-character audit preview.
+“Complete” means everything the runtime retained, not output already removed
+by a tool's own limits.
+Old or ambiguous audit rows say `unpaired / identity unavailable`; result
+expansion warns `Stored preview only; full evidence unavailable`.
+They are not assigned to the nearest call or agent.
+Use `/debug` with an unpaired result expanded to see its complete stored row,
+including any prefix the normal view treats as a tool name.
+`/raw` still dumps stored entries, which may contain previews rather than the
+full native result.
+A failed evidence read keeps the last coherent view with `⚠ refresh failed`
+until a background retry succeeds.
 
-Stored entries, wire payloads and output limits do not change. A successful tool
-result's stored display preview can already be clipped at 500 characters.
-If clipping makes JSON incomplete, the TUI shows that preview as plain text,
-including its escapes and truncation marker, rather than guessing the missing
-structure. `/raw` still shows the stored entry representation.
+### Walkthrough: inspect parallel calls and a missing result
 
-### Walkthrough: read an escaped result
-
-1. Send a message containing `# Report`, `**bold**`, `*italic*` and an inline
-   code span. The message shows a styled heading and emphasis; code such as
-   `C:\new\file` keeps its backslashes.
-2. Suppose a tool returns this complete JSON body:
-
-   ```json
-   { "text": "one\n  two", "literal": "keep \\n" }
-   ```
-
-   The collapsed row starts with `▸ query` and a short preview. Click anywhere
-   on its header row, or press `Ctrl+O` to expand all entries. The body reads:
+1. Suppose an agent invokes two queries in one attempt.
+   With a wide enough pane, the default view includes:
 
    ```text
-     ▾ query
+   ▸ … R1 chaz · 2 tools · attempt active
+     0 done · 0 failed · 0 cancelled · 2 without result · 0 unknown
+   ```
+
+   The summary stays two rows even if this attempt later makes dozens of calls.
+   Commentary and the final answer remain outside it.
+
+2. Click either summary row.
+   Two nested headers appear at their invocation positions.
+   If the second query returns first, its header says `done [e0.1→e1]` while
+   the first remains `awaiting result [e0.0→?]`.
+   Click the second header to read its arguments and result, including all
+   recorded text beyond the audit preview.
+   For a complete result `{"text":"one\n  two","literal":"keep \\n"}`,
+   the body reads:
+
+   ```text
          {
            "literal": keep \n
            "text": one
@@ -168,14 +234,26 @@ structure. `/raw` still shows the stored entry representation.
          }
    ```
 
-   `two` occupies a separate line, while `keep \n` remains on one line.
-   Clicking the body leaves it expanded. To collapse an entry you opened by
-   mistake, click its header again.
+   `two` occupies a separate line; the literal `\n` does not.
+   Clicking the body leaves it expanded; click its header again to collapse it.
+   Toggle `/debug` to inspect the original JSON spelling.
 
-3. If the preview ends midway through JSON, for example
-   `{"text":"one\n…`, expansion cannot recover the missing bytes. Ask the tool
-   for a smaller page or shorter result and expand the next complete result.
-   Merely toggling expansion does not repair clipped JSON or rerun the tool.
+3. Close the run and reopen it.
+   The second item's detail choice is retained.
+   Use `Ctrl+O` or `/expand` to invert the global default without sending a
+   message, rerunning a tool or creating a tab.
+4. If the attempt completes without the first result, that item says
+   `missing result`, not `done`.
+   A later identity-matched result updates the same item.
+   If activity merely expires, read `activity unknown` as uncertainty and
+   inspect the executor rather than assuming completion or automatically retrying
+   a possibly side-effecting tool.
+5. On older display-only history, independently expand the explicitly unpaired
+   result.
+   If its stored preview ends midway through JSON, such as `{"text":"one\n…`,
+   toggling cannot recover missing bytes or repair the JSON.
+   Request a smaller page or inspect the original output source as appropriate;
+   the TUI never pairs that preview by adjacency or reruns the tool for you.
 
 ## Tables follow the pane
 
@@ -460,10 +538,10 @@ Mouse capture is enabled. Click on completion rows, help-overlay command rows, a
 
 Mouse capture sends ordinary drags to Chaz rather than the terminal's native
 selection. Chaz selects **message bodies**, including multiline code and external
-bridge message bodies. Sender labels, timestamps, borders, separators, tool audit
-rows and live activity are not copied. Selection follows the displayed message
-body: formatted Markdown delimiters and code fences are omitted, while code
-indentation, safe source Unicode spelling and rendered line breaks remain. Visual soft wraps do not add
+bridge message bodies, plus expanded tool argument/result bodies. Sender labels,
+timestamps, borders, separators, tool headers/provenance and live activity are not copied. Selection follows the displayed message
+body: Markdown delimiters and code fences are omitted, while code indentation,
+source Unicode spelling and line breaks remain. Visual soft wraps do not add
 newlines. Quarantined terminal controls stay neutralized when copied.
 Select after scrolling to an older message, or hold the drag and use the wheel
 before releasing. There is no edge-hover auto-scroll. A plain click does not copy.
@@ -527,8 +605,8 @@ position. Settings and the model picker do not create sessions on `Ctrl+T`; pres
 `Esc` to return first. Help and rename overlays keep keyboard focus.
 
 `Ctrl+O` changes only the chat display, just like `/expand`. It expands or collapses
-tool calls, tool results and directives without changing stored or model-facing
-history. `Ctrl+R` still refreshes the catalog in the model picker. Plain `r` still
+tool runs, nested call/result items and directives without changing stored or
+model-facing history. `Ctrl+R` still refreshes the catalog in the model picker. Plain `r` still
 renames a session in the hub and keeps its existing Settings actions.
 These bindings are built in; the TUI has no configurable keymap.
 
@@ -549,8 +627,9 @@ Wait for the backend or the pending action before retrying.
 
 Toggle with `Ctrl+D` or `/debug`. When active:
 
-- Every entry shows its timestamp and type (e.g., `[10:30:00 Message]`)
-- Tool result previews expand from 120 to 500 characters
+- Ordinary entries show timestamp and type (e.g., `[10:30:00 Message]`)
+- Expanded identified tool items retain event positions, full identities and timestamps
+- Expanded argument/result bodies use original recorded spelling rather than a decoded outline
 - The status bar shows `DEBUG`
 
 This is useful for understanding the session entry flow, correlating with log output, and debugging agent behavior.

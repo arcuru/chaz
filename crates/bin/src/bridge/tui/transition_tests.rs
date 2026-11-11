@@ -1092,3 +1092,75 @@ async fn opened_tab_checks_writes_whose_notifications_arrived_before_insertion()
     drop(app);
     built.shutdown().await;
 }
+
+#[tokio::test]
+async fn nested_tool_initial_and_reopened_tab_preserve_evidence_not_expansion() {
+    use chaz_core::session::{
+        TurnCallIdentity, TurnRequestId, TurnTranscriptMessage, TurnTranscriptRecord,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let built = runtime(dir.path()).await;
+    let backend = BackendManager::new(&None, built.secret_store.clone());
+    let (_, db) = built.registry.create_session(Some("tui")).await.unwrap();
+    let id = db.root_id().to_string();
+    let session = Session::new(chaz_core::types::ConversationId(id.clone()), db.clone()).await;
+    let attempt = session
+        .start_turn_attempt(TurnRequestId::parse("request"))
+        .await
+        .unwrap();
+    let call = chaz_core::runtime::ToolCallRequest {
+        id: "call".into(),
+        name: "query".into(),
+        arguments: "{}".into(),
+    };
+    session
+        .append_turn_transcript(
+            TurnTranscriptRecord {
+                request_id: attempt.request_id,
+                attempt_id: attempt.attempt_id,
+                sequence: 0,
+                timestamp: chrono::Utc::now(),
+                identity: Some(TurnCallIdentity {
+                    agent: "chaz".into(),
+                    requested_model: "fixture".into(),
+                    execution_id: None,
+                }),
+                message: TurnTranscriptMessage::ModelResponse {
+                    model_sequence: 0,
+                    content: None,
+                    tool_calls: vec![call],
+                    provider_extra: Default::default(),
+                    metadata: None,
+                    terminal: false,
+                },
+            },
+            vec![SessionEntry {
+                sender: "chaz".into(),
+                content: "query({})".into(),
+                timestamp: chrono::Utc::now(),
+                entry_type: EntryType::ToolCall,
+                metadata: None,
+                routing: None,
+            }],
+        )
+        .await
+        .unwrap();
+    for _ in 0..2 {
+        let mut tab = build_tab(&built.server, &backend, db.clone(), id.clone())
+            .await
+            .unwrap();
+        assert_eq!(tab.live.tool_activity.items.len(), 1);
+        assert_eq!(tab.live.entry_ids.len(), tab.entries.len());
+        assert!(tab.live.tool_activity.runs[0].active);
+        assert!(tab.live.expanded_runs.is_empty());
+        assert!(tab.live.expanded_tools.is_empty());
+        tab.live
+            .expanded_runs
+            .insert(tab.live.tool_activity.runs[0].key.clone());
+        tab.live
+            .expanded_tools
+            .insert(tab.live.tool_activity.items[0].key.clone());
+        // Closing this tab drops choices, never the persisted call.
+    }
+    built.shutdown().await;
+}

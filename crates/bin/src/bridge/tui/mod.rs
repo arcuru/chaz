@@ -53,6 +53,7 @@ mod session_pages;
 mod startup;
 mod supervised;
 mod theme;
+mod tool_activity;
 #[cfg(test)]
 mod transition_tests;
 mod view;
@@ -465,6 +466,8 @@ pub(super) enum ClickTarget {
     /// given index. Inverts against `App::expand_all`, so the click always
     /// produces the opposite of whatever's currently rendered.
     ToggleEntryExpanded(usize),
+    ToggleToolRun(usize),
+    ToggleToolItem(usize),
     /// Select model picker row `i` (index into `App::model_list`).
     ModelPickerSelect(usize),
     /// Jump to Settings sidebar category `i` and pin focus to the sidebar.
@@ -1894,6 +1897,9 @@ async fn tab_from_snapshot(
         expanded_entries: HashSet::new(),
         live: {
             let mut live = refresh::TabLive::with_meta(meta, snapshot.telemetry);
+            live.tool_activity = snapshot.tool_activity;
+            live.tool_activity.age(&evidence, chrono::Utc::now());
+            live.entry_ids = snapshot.entry_ids.into_iter().map(Some).collect();
             live.activity_evidence = Some(evidence);
             live.covered = Some(snapshot.tips);
             live.steering = snapshot.steering;
@@ -2681,6 +2687,8 @@ mod session_picker_tests {
                         session_db_id: loaded_id,
                         ticket,
                         snapshot: Ok(Box::new(refresh::SessionSnapshot {
+                            entry_ids: Vec::new(),
+                            tool_activity: Default::default(),
                             tips: eidetica::Snapshot::EMPTY,
                             steering: None,
                             input_attempt: None,

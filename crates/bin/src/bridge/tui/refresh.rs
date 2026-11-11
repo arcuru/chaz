@@ -74,6 +74,10 @@ impl RefreshSlot {
 #[derive(Default)]
 pub(super) struct TabLive {
     pub(super) covered: Option<eidetica::Snapshot>,
+    pub(super) entry_ids: Vec<Option<String>>,
+    pub(super) tool_activity: tool_activity::ToolActivity,
+    pub(super) expanded_runs: HashSet<tool_activity::RunKey>,
+    pub(super) expanded_tools: HashSet<tool_activity::CallKey>,
     pub(super) steering: Option<chaz_core::session::steering::SteeringView>,
     pub(super) input_attempt: Option<String>,
     pub(super) inputs: Vec<chaz_core::session::steering::JobInput>,
@@ -156,6 +160,8 @@ pub(super) struct SessionSnapshot {
     pub(super) input_attempt: Option<String>,
     pub(super) inputs: Vec<chaz_core::session::steering::JobInput>,
     pub(super) entries: Vec<SessionEntry>,
+    pub(super) entry_ids: Vec<String>,
+    pub(super) tool_activity: tool_activity::ToolActivity,
     pub(super) telemetry: chaz_core::session::usage::SessionTelemetry,
     pub(super) meta: SessionMeta,
     pub(super) active_turns: Result<TurnActivity, String>,
@@ -251,8 +257,16 @@ pub(super) fn request_tick(app: &mut App, tx: &mpsc::Sender<Refresh>) -> bool {
 pub(super) fn age_activity(app: &mut App, now: chrono::DateTime<chrono::Utc>) -> bool {
     let mut redraw = false;
     for tab in &mut app.tabs {
+        if tab.live.unbound {
+            continue;
+        }
+        if let Some(evidence) = &tab.live.activity_evidence
+            && tab.live.tool_activity.age(evidence, now)
+        {
+            tab.live.transcript_rev = tab.live.transcript_rev.wrapping_add(1);
+            redraw = true;
+        }
         if tab.job.is_none()
-            && !tab.live.unbound
             && let Some(evidence) = &tab.live.activity_evidence
         {
             let n = evidence.active_at(now).count();
@@ -285,12 +299,18 @@ impl Tab {
         self.live.transcript_rev = self.live.transcript_rev.wrapping_add(1);
     }
 
-    pub(super) fn set_entries(&mut self, mut entries: Vec<SessionEntry>) {
-        entries.extend(self.live.local_entries.iter().cloned());
-        // Stable sort preserves backend row order on timestamp ties while
-        // retaining local command output between subsequent persisted rows.
-        entries.sort_by_key(|e| e.timestamp);
-        self.entries = entries;
+    #[cfg(test)]
+    pub(super) fn set_entries(&mut self, entries: Vec<SessionEntry>) {
+        self.set_identified_entries(entries, Vec::new());
+    }
+
+    fn set_identified_entries(&mut self, entries: Vec<SessionEntry>, ids: Vec<String>) {
+        let mut ids = ids.into_iter();
+        let mut rows: Vec<_> = entries.into_iter().map(|e| (ids.next(), e)).collect();
+        rows.extend(self.live.local_entries.iter().cloned().map(|e| (None, e)));
+        // Sort the identity with its row; local output never acquires provenance.
+        rows.sort_by_key(|(_, entry)| entry.timestamp);
+        (self.live.entry_ids, self.entries) = rows.into_iter().unzip();
         self.live.telemetry = None;
         self.touch_transcript();
     }
@@ -298,11 +318,16 @@ impl Tab {
     pub(super) fn add_local(&mut self, entry: SessionEntry) {
         self.live.local_entries.push(entry.clone());
         self.entries.push(entry);
+        self.live.entry_ids.push(None);
         self.touch_transcript();
     }
 
     pub(super) fn clear_view(&mut self) {
         self.entries.clear();
+        self.live.entry_ids.clear();
+        self.live.tool_activity = Default::default();
+        self.live.expanded_runs.clear();
+        self.live.expanded_tools.clear();
         self.live.telemetry = None;
         self.live.local_entries.clear();
         self.scroll_offset = 0;
@@ -493,6 +518,18 @@ pub(super) async fn snapshot_from_session(
     tips: eidetica::Snapshot,
 ) -> anyhow::Result<SessionSnapshot> {
     let entries = session.entries().to_vec();
+    let entry_ids = session
+        .entries_with_ids()
+        .map(|(id, _)| id.as_str().to_owned())
+        .collect();
+    let tool_activity = tool_activity::ToolActivity::load(
+        db,
+        &tips,
+        session
+            .entries_with_ids()
+            .map(|(id, entry)| (id.as_str(), entry)),
+    )
+    .await?;
     let telemetry = chaz_core::session::usage::telemetry_at_snapshot(db, &tips, &entries).await?;
     let meta = chaz_core::session::try_read_meta_at(db, &tips).await?;
     let steering = Session::steering_view_at(db, &tips).await?;
@@ -508,6 +545,8 @@ pub(super) async fn snapshot_from_session(
         steering: Some(steering),
         tips,
         entries,
+        entry_ids,
+        tool_activity,
         telemetry,
         meta,
     })
@@ -597,6 +636,10 @@ fn apply_active_turns(
     match active_turns {
         Ok(evidence) => {
             let n = evidence.active_at(chrono::Utc::now()).count();
+            let tool_changed = tab.live.tool_activity.age(&evidence, chrono::Utc::now());
+            if tool_changed {
+                tab.touch_transcript();
+            }
             tab.live.activity_evidence = Some(evidence);
             let approval_closed = tab
                 .pending_approval
@@ -605,7 +648,10 @@ fn apply_active_turns(
             if approval_closed {
                 tab.pending_approval = None;
             }
-            let changed = tab.active_turns != n || tab.live.error.is_some() || approval_closed;
+            let changed = tool_changed
+                || tab.active_turns != n
+                || tab.live.error.is_some()
+                || approval_closed;
             tab.active_turns = n;
             record_error(tab, RefreshKind::Activity, None);
             changed
@@ -770,6 +816,8 @@ fn apply_session_snapshot(
         input_attempt,
         inputs,
         entries,
+        entry_ids,
+        tool_activity,
         telemetry,
         meta,
         active_turns,
@@ -785,7 +833,8 @@ fn apply_session_snapshot(
     tab.live.steering = steering;
     tab.live.input_attempt = input_attempt;
     tab.live.inputs = inputs;
-    tab.set_entries(entries);
+    tab.set_identified_entries(entries, entry_ids);
+    tab.live.tool_activity = tool_activity;
     tab.live.telemetry = Some(telemetry);
     tab.session_name = meta.name.clone();
     tab.model_pin = meta
@@ -796,6 +845,9 @@ fn apply_session_snapshot(
     tab.context_budget = context_budget;
     tab.roster = roster;
     apply_active_turns(tab, ticket, active_turns);
+    if let Some(activity) = &tab.live.activity_evidence {
+        tab.live.tool_activity.age(activity, chrono::Utc::now());
+    }
     let db_id = tab.session_db_id.clone();
     let entry_count = tab.entries.len();
 
@@ -921,6 +973,8 @@ mod tests {
             session_db_id: id.into(),
             ticket,
             snapshot: Ok(Box::new(SessionSnapshot {
+                entry_ids: Vec::new(),
+                tool_activity: Default::default(),
                 tips: eidetica::Snapshot::EMPTY,
                 steering: None,
                 input_attempt: None,

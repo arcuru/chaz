@@ -32,15 +32,27 @@ struct Cell {
 #[derive(Default, Debug)]
 pub(super) struct CopyText {
     width: u16,
-    lines: BTreeMap<usize, String>,
+    lines: BTreeMap<usize, (String, usize)>,
     /// First visual row of each source line -> its logical line.
     starts: BTreeMap<usize, usize>,
 }
 
 impl CopyText {
+    #[cfg(test)]
     pub(super) fn add(&mut self, line: usize, visual_row: usize, text: &str, width: u16) {
+        self.add_indented(line, visual_row, text, width, 2);
+    }
+
+    pub(super) fn add_indented(
+        &mut self,
+        line: usize,
+        visual_row: usize,
+        text: &str,
+        width: u16,
+        indent: usize,
+    ) {
         self.width = width;
-        self.lines.insert(line, text.to_owned());
+        self.lines.insert(line, (text.to_owned(), indent));
         self.starts.insert(visual_row, line);
     }
 
@@ -68,13 +80,13 @@ impl CopyText {
 
     /// Ratatui's wrapped rows of one source line, each `width` cells wide.
     fn rows(&self, line: usize) -> Vec<Vec<Cell>> {
-        let (Some(text), width) = (self.lines.get(&line), self.width) else {
+        let (Some((text, indent)), width) = (self.lines.get(&line), self.width) else {
             return Vec::new();
         };
         if width == 0 {
             return Vec::new();
         }
-        let decorated = format!("  {text}");
+        let decorated = format!("{}{text}", " ".repeat(*indent));
         // Map display-normalized graphemes back to original source bytes. Only
         // touched lines allocate this map, retaining lazy viewport-sized work.
         let mut display = String::new();
@@ -120,11 +132,11 @@ impl CopyText {
                 let cell = Cell {
                     start: Point {
                         line,
-                        byte: source.start.saturating_sub(2).min(text.len()),
+                        byte: source.start.saturating_sub(*indent).min(text.len()),
                     },
                     end: Point {
                         line,
-                        byte: source.end.saturating_sub(2).min(text.len()),
+                        byte: source.end.saturating_sub(*indent).min(text.len()),
                     },
                 };
                 cells.extend(std::iter::repeat_n(cell, glyph.width().max(1)));
@@ -142,7 +154,7 @@ impl CopyText {
                         .range(..byte)
                         .next_back()
                         .map_or(0, |(_, source)| source.end)
-                        .saturating_sub(2)
+                        .saturating_sub(*indent)
                         .min(text.len())
                 },
             };
@@ -155,7 +167,7 @@ impl CopyText {
     fn text(&self, start: Point, end: Point) -> String {
         self.lines
             .range(start.line..=end.line)
-            .map(|(&line, text)| {
+            .map(|(&line, (text, _))| {
                 let from = if line == start.line { start.byte } else { 0 };
                 let to = if line == end.line {
                     end.byte

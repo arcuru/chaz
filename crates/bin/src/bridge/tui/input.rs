@@ -575,6 +575,28 @@ pub(super) fn handle_mouse(app: &mut App, m: MouseEvent) -> Option<MouseOutcome>
                 tab.touch_transcript();
             }
         }
+        ClickTarget::ToggleToolRun(i) => {
+            if let Some(tab) = app.current_mut()
+                && let Some(run) = tab.live.tool_activity.runs.get(i)
+            {
+                let key = run.key.clone();
+                if !tab.live.expanded_runs.remove(&key) {
+                    tab.live.expanded_runs.insert(key);
+                }
+                tab.touch_transcript();
+            }
+        }
+        ClickTarget::ToggleToolItem(i) => {
+            if let Some(tab) = app.current_mut()
+                && let Some(item) = tab.live.tool_activity.items.get(i)
+            {
+                let key = item.key.clone();
+                if !tab.live.expanded_tools.remove(&key) {
+                    tab.live.expanded_tools.insert(key);
+                }
+                tab.touch_transcript();
+            }
+        }
         ClickTarget::ModelPickerSelect(i) => {
             // Same dance as the session picker: first click selects, second
             // click on the same row commits. `i` indexes the filtered

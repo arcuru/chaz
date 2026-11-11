@@ -359,7 +359,13 @@ context:
                 self.assertEqual(len(job_calls), 1, "viewer/steering must not run or interrupt a job")
                 release.set()
                 self.assertTrue(continued.wait(20), "steering must reach the actual next request")
-                process.expect("calculate")  # Persisted live job tool activity, not a fixture row.
+                process.expect("R1 chaz · 1 tools")
+                process.expect_absent("calculate")  # Identified tools start inside the collapsed run.
+                summary_row = next(y for y, line in enumerate(process.screen.display, 1)
+                                   if "R1 chaz" in line)
+                process.send(f"\x1b[<0;2;{summary_row}M\x1b[<0;2;{summary_row}m")
+                process.expect("calculate")  # Expanding recovers persisted tool activity.
+                process.screen_capture(evidence, "observer-expanded-tool-run")
                 process.expect("PTY steering input")
                 self.assertEqual("\n".join(process.screen.display).count("PTY steering input"), 1)
                 self.assertNotIn("continued job terminal", "\n".join(process.screen.display))
