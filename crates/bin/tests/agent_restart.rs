@@ -46,7 +46,6 @@ async fn live_model_survives_unchanged_config_process_restarts() {
         "state_dir":dir.path().join("state"), "execution":"executor",
         "eidetica":{"connection":connection, "login":{"username":"fixture", "passwordless":true}},
         "backends":[{"name":"stub", "type":"openaicompatible", "api_base":format!("{}/v1",model.uri()), "api_key":"fixture", "models":[{"name":"baseline"},{"name":"live"}]}],
-        "agents":[{"name":"chaz", "system_prompt_files":[prompt_path], "tools":[]}],
         "default_agents":["chaz"]
     });
     let config_path = dir.path().join("config.yaml");
@@ -92,6 +91,16 @@ async fn live_model_survives_unchanged_config_process_restarts() {
             stdout
         }
     };
+    // Root config defines no agents: create the hosted Agent DB first.
+    let created = run(&[
+        "cmd",
+        &format!(
+            "/agent new chaz system_prompt_files={}",
+            prompt_path.display()
+        ),
+    ])
+    .await;
+    assert!(created.contains("chaz"), "{created}");
     run(&["--print", "first session"]).await;
     let confirmation = run(&["cmd", "/agent set chaz model live"]).await;
     assert!(confirmation.contains("Set model=live on agent 'chaz'"));
@@ -99,11 +108,11 @@ async fn live_model_survives_unchanged_config_process_restarts() {
     for _ in 0..2 {
         run(&["--print", "new session"]).await;
     }
-    // Root YAML is only a seed: editing its prompt source must not clear
-    // the accepted live model on restart or import an unaccepted prompt.
+    // Editing the prompt file after creation must not clear the accepted
+    // live model on restart or import an unaccepted prompt.
     std::fs::write(&prompt_path, "updated fixture prompt").unwrap();
-    run(&["--print", "session after seed prompt edit"]).await;
-    let after_seed_edit = run(&["cmd", "/model"]).await;
+    run(&["--print", "session after prompt file edit"]).await;
+    let after_prompt_edit = run(&["cmd", "/model"]).await;
     let requests = model.received_requests().await.unwrap();
     let completions: Vec<_> = requests
         .iter()
@@ -139,7 +148,7 @@ async fn live_model_survives_unchanged_config_process_restarts() {
         "{displayed}"
     );
     assert!(
-        after_seed_edit.contains("Current Model: live (agent default)"),
-        "{after_seed_edit}"
+        after_prompt_edit.contains("Current Model: live (agent default)"),
+        "{after_prompt_edit}"
     );
 }
