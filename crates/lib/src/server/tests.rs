@@ -1224,6 +1224,25 @@ async fn hydrate_picks_up_db_config_edits() {
     .await
     .unwrap();
 
+    // Opening a session refreshes its selected agent before commands or the
+    // TUI read the registry, without waiting for an executor turn.
+    let (session_id, session_db) = registry.create_session(Some("tui")).await.unwrap();
+    let entry = server.agent_index().find_by_name("alpha").unwrap();
+    registry
+        .attach_agent_to_session(&session_id.0, &entry)
+        .await
+        .unwrap();
+    server.load_session_entities(&session_db).await.unwrap();
+    assert_eq!(
+        server
+            .agents()
+            .get("alpha")
+            .unwrap()
+            .default_model
+            .as_deref(),
+        Some("sonnet")
+    );
+
     stale.default_model = Some("opus".to_string()); // re-enter with stale snapshot
     let hydrated_v2 = server.hydrate_agent_from_db(stale).await;
     assert_eq!(hydrated_v2.default_model.as_deref(), Some("sonnet"));

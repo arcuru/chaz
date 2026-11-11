@@ -1427,6 +1427,13 @@ impl Server {
         )
         .await?;
         drop(user);
+        // A targeted client may be opening these agents for the first time.
+        // Refresh their display/runtime snapshots, not just their index rows.
+        for (_, name) in explicit_agents {
+            if let Some(agent) = self.agents.get(&name) {
+                self.hydrate_agent_from_db(agent).await;
+            }
+        }
         Box::pin(self.initialize_agent_folders()).await;
         Ok(stats)
     }

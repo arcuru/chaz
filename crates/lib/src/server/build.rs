@@ -984,6 +984,14 @@ pub async fn build(
     if executor_components {
         server.mark_startup_pending();
     }
+    // Commands and the TUI read this registry before the first agent turn.
+    // Indexing a persisted DB alone leaves them showing YAML defaults after
+    // restart, even though execution hydrates the live config from that DB.
+    for entry in server.agent_index().list() {
+        if let Some(agent) = server.agents().get(&entry.display_name) {
+            server.hydrate_agent_from_db(agent).await;
+        }
+    }
     server_slot.set(server.clone());
 
     // Apply operator multi-agent tuning before the bridge starts
