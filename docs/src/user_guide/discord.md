@@ -50,8 +50,6 @@ Discord-specific configuration and behavior.
    backends:
      - name: openai
        api_key: ${OPENAI_API_KEY}
-   agents:
-     - name: chaz
    ```
 
    `bot_token` accepts a `${ENV}` reference or literal; when omitted it falls

@@ -144,6 +144,21 @@ Set your API key:
 export OPENROUTER_API_KEY="sk-or-..."
 ```
 
+## Create your first agent
+
+`config.yaml` holds local runner settings only — it defines no agents.
+Agents live in their own Agent DBs, and a fresh store hosts none.
+Create the first one through administration; no model call is made:
+
+```bash
+chaz --config config.yaml cmd '/agent new chaz model=anthropic/claude-sonnet-4'
+chaz --config config.yaml cmd "/agent set chaz system_prompt You are Chaz, a helpful assistant."
+```
+
+Name it in `default_agents: [chaz]` if you want new sessions to attach it explicitly; with no defaults, a new session attaches the first hosted agent by name.
+`/agent hosted` lists the agent's managed folder for larger edits such as workers.
+See [Startup and the first agent](agents.md#startup-and-the-first-agent).
+
 ## Running the TUI
 
 The TUI is the default — just run chaz with no other mode flag:

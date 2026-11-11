@@ -482,7 +482,7 @@ See [Extensions](extensions.md). Extensions can also register their own slash co
 
 1. Per-agent session override — `SessionMeta.agent_models[agent_name]`
 2. Session-wide pin — `SessionMeta.model`
-3. The agent's `default_model` from its DB config (seeded from YAML `agents[].model`)
+3. The agent's `default_model` from its DB config (`/agent new … model=` or `/agent set`)
 4. The backend's default model
 
 `/model` (no args) names which source wins for the _current agent_, so the display always matches what the next message will actually run.

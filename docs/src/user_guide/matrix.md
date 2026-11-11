@@ -73,8 +73,6 @@ Example with a shared room:
    backends:
      - name: openai
        api_key: ${OPENAI_API_KEY}
-   agents:
-     - name: chaz
    ```
 
    `execution:` and `eidetica:` are the connector settings every Chaz process

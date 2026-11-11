@@ -122,39 +122,11 @@ backends:
     models:
       - name: llama3
 
-# Agent definitions. Each agent's system prompt comes from `system_prompt:`
-# (inline string) and/or `system_prompt_files:` (file paths whose contents
-# are concatenated, then the inline string is appended).
-#
-# YAML `agents:` is a *first-boot template only* — the per-agent eidetica
-# DB (AgentDb) is the runtime source of truth afterwards. Use `/agent set`
-# or edit the projected agent.yaml/prompts and explicitly `/agent reload`.
-# Accepted edits sync through the Agent DB and project to each peer's folder;
-# this global seed is never written back. See `user_guide/agents.md`.
-agents:
-  - name: chaz
-    system_prompt: "You are Chaz, a helpful AI assistant."
-    max_spawn_depth: 10
-    tools: null # null = all tools
-    # Workers — configured one-shot LLM calls owned by this Agent.
-    # Each is invocable via `spawn_worker(name=…)` from this Agent only.
-    workers:
-      - name: researcher
-        system_prompt: "You are a research assistant. Use web_fetch to find information."
-        max_spawn_depth: 20
-        tools: ["web_fetch", "calculate", "get_time"]
-      - name: coder
-        # Pull repo-level instructions from a file; layer inline guidance on top.
-        system_prompt_files: ["~/code/myproject/AGENTS.md"]
-        system_prompt: "Edit files in-place; never rewrite from scratch."
-        max_spawn_depth: 15
-        tools: ["shell", "read_file", "write_file", "calculate"]
-    # Auto-attach memory/skill banks at agent bootstrap. Missing banks are
-    # warned and skipped; default_memory_banks auto-creates missing banks.
-    default_memory_banks: ["chaz-notes"]
-    # default_skill_banks: ["coding-skills"]
-    # Allow this agent to run without user input (scheduled wakes)
-    # autonomous: false
+# Agents are not defined here: they live in their own Agent DBs and are
+# created with `/agent new` or `/agent import` (see `user_guide/agents.md`).
+# A legacy `agents:` block refuses startup with migration steps.
+# Runner preferences name hosted agents:
+default_agents: [chaz]
 
 # Security
 security:
@@ -574,11 +546,11 @@ change the effective fallback model and protocol even with pinned agents.
 
 There are three distinct locations, not three competing configurations:
 
-| Location                         | What belongs there                                         | How changes take effect                                                            |
-| -------------------------------- | ---------------------------------------------------------- | ---------------------------------------------------------------------------------- |
-| Global YAML passed to `--config` | Peer/provider/bridge setup and `agents:` seeds             | Agent entries initialize new DBs only; existing agents are not reseeded on restart |
-| Synchronized Agent DB            | Accepted per-agent settings and parent/worker source texts | Trusted command/TUI edits or explicit folder reload; runtime reads this state      |
-| Peer-local managed agent folder  | Editable `agent.yaml` and individual prompt copies         | Files are drafts until `/agent reload`; DB changes project outward automatically   |
+| Location                         | What belongs there                                          | How changes take effect                                                          |
+| -------------------------------- | ----------------------------------------------------------- | -------------------------------------------------------------------------------- |
+| Global YAML passed to `--config` | Peer/provider/bridge setup; `default_agents`/`agent_groups` | Local runner settings only; defines no agents (a legacy `agents:` block refuses) |
+| Synchronized Agent DB            | Accepted per-agent settings and parent/worker source texts  | Trusted command/TUI edits or explicit folder reload; runtime reads this state    |
+| Peer-local managed agent folder  | Editable `agent.yaml` and individual prompt copies          | Files are drafts until `/agent reload`; DB changes project outward automatically |
 
 ### `agent_config_dir`
 
@@ -587,21 +559,27 @@ The top-level `agent_config_dir` selects the writable root for managed agent fol
 ```yaml
 # Peer-local config.yaml, not a managed agent.yaml
 agent_config_dir: "/home/operator/.config/chaz/agents"
-agents:
-  - name: helper
-    system_prompt_files: ["/home/operator/prompts/system.md"]
-    system_prompt: "Answer concisely."
 ```
 
-This external prompt is a one-shot imported copy for a new agent, not a live include. Subsequent edits to the original file or seed do not update an existing agent. Edit its managed copy and reload, or explicitly reimport the source list with `/agent set helper system_prompt_files /home/operator/prompts/system.md`. Originals, including read-only/Nix files, are never projection targets.
+```bash
+chaz --config config.yaml cmd '/agent new helper system_prompt_files=/home/operator/prompts/system.md'
+```
+
+This external prompt is a one-shot imported copy for the new agent, not a live include. Subsequent edits to the original file do not update the agent. Edit its managed copy and reload, or explicitly reimport the source list with `/agent set helper system_prompt_files /home/operator/prompts/system.md`. Originals, including read-only/Nix files, are never projection targets.
 
 Startup migrates existing agents' saved prompts when recoverable and projects accepted DB state outward; it never imports local folder drafts. `agent.yaml` is a scoped replacement document with required `version` and full `agent_id`, not another global configuration file: it has no `agents:` wrapper, provider credentials or `agent_config_dir`. See the [folder reference and defaults](agents.md#folder-reference-and-omission-defaults), [editing walkthrough](agents.md#walkthrough-edit-a-prompt-and-a-worker) and [migration/old-writer limits](agents.md#migration-and-writer-compatibility).
 
-### Per-agent seed fields
+### Legacy root `agents:` blocks
+
+Root config no longer defines agents. A non-empty `agents:` block stops every entry point (TUI, daemon, `cmd`, `--print`, `usage` and the transport bridges) before any state is opened, naming the listed agents and the migration steps; see the [migration walkthrough](agents.md#walkthrough-first-agent-and-legacy-agents-migration). Delete the block. Agents that `/agent hosted` already lists keep everything from their Agent DB. Create any others with `/agent new`, move their settings into the managed folder and `/agent reload`; replace `default_memory_banks` with `/memory grant <bank> <agent> write`.
+
+### Per-agent settings
+
+These settings live in each agent's Agent DB. Scalar fields can be given to `/agent new <name> key=value` and changed with `/agent set`; edit the rest in the managed `agent.yaml` and `/agent reload`.
 
 | Field                  | Type                   | Notes                                                                                                                                             |
 | ---------------------- | ---------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `name`                 | string                 | Required. Display name; also the lookup key for `default_agents`, `/agent add`, schedules.                                                        |
+| `name`                 | string                 | The `/agent new` name. Display name; also the lookup key for `default_agents`, `/agent add`, schedules.                                           |
 | `system_prompt`        | string                 | Inline system prompt. Appended after `system_prompt_files` content when both are set.                                                             |
 | `system_prompt_files`  | list of paths          | Seed/import sources copied into the Agent DB; ordered before inline text. External paths support `~`; managed-folder references must be relative. |
 | `model`                | string                 | Default model (e.g. `openrouter:anthropic/claude-sonnet-4`). Backend prefix required when ambiguous.                                              |
@@ -612,8 +590,8 @@ Startup migrates existing agents' saved prompts when recoverable and projects ac
 | `max_context_tokens`   | int                    | Per-agent override of `context.max_context_tokens`.                                                                                               |
 | `tool_profile`         | string                 | References a key in top-level `tool_profiles`.                                                                                                    |
 | `grants`               | map<tool, Grants>      | Per-tool grant overrides (shell allow/deny, network endpoints, fs paths). Merged per-kind over policy.                                            |
-| `default_memory_banks` | list of bank names     | Auto-attached at first boot. Missing banks are auto-created.                                                                                      |
-| `default_skill_banks`  | list of bank names     | Auto-attached at first boot. Missing banks are warned and skipped.                                                                                |
+| `default_memory_banks` | list of bank names     | Retained legacy data; startup no longer attaches banks. Grant with `/memory grant <bank> <agent> write`; stored attachments survive restarts.     |
+| `default_skill_banks`  | list of bank names     | Retained legacy data; not applied at startup.                                                                                                     |
 | `presets`              | map<name, AgentPreset> | Named Worker bundles; spawn depth and tools apply. Model/role suffix propagation is unsupported. Not a `spawn_agent` argument.                    |
 
 ### Worker fields
@@ -642,21 +620,18 @@ incoming message has no `@mention` and no explicit `/agent host`, the
 resolution chain picks the first authorized agent on the session.
 
 ```yaml
-agents:
-  - name: chaz
-  - name: researcher
-
 default_agents: [chaz, researcher]
 ```
 
-Each name must match an entry in `agents:`. Names that don't have a
-hosted Agent DB yet (configured in YAML but not yet bootstrapped) are
-skipped silently with a debug log — the rest still attach. Per-agent
+Each name refers to an agent hosted on this peer (created with
+`/agent new` or `/agent import`). A name with no hosted Agent DB logs
+one warning at startup and is skipped — the rest still attach. Per-agent
 attach failures are logged but don't unwind the rest, so session
-creation never fails because of `default_agents`.
+creation never fails because of `default_agents`. The first hosted
+entry is also the fallback routing agent.
 
-Absent or empty `default_agents:` falls back to the legacy
-single-default behavior: attach only `agents.first()`. Existing
+Absent or empty `default_agents:` attaches the first hosted agent by
+name; a peer hosting no agents attaches nothing. Existing
 sessions are unaffected — auto-attach is a creation-time mechanism, so
 sessions created before this field was set keep their current
 participant list. Bring them up to date by re-running `/agent add
@@ -666,15 +641,11 @@ participant list. Bring them up to date by re-running `/agent add
 
 Named alternatives to `default_agents`, chosen when a session is
 created: `/new <group>`. Each value is an ordered agent list with the
-same semantics as `default_agents` — names must match entries in
-`agents:`, and the first entry effectively becomes the routing host.
+same semantics as `default_agents` — names refer to hosted agents (an
+unhosted member logs a startup warning and never attaches), and the
+first entry effectively becomes the routing host.
 
 ```yaml
-agents:
-  - name: chaz
-  - name: researcher
-  - name: critic
-
 default_agents: [chaz]
 
 agent_groups:

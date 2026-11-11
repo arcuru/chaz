@@ -203,8 +203,6 @@ eidetica:
 backends:
   - name: openai
     api_key: ${OPENAI_API_KEY}
-agents:
-  - name: chaz
 ```
 
 Secret fields (`unlock_password`, the Matrix `password`, the Discord
