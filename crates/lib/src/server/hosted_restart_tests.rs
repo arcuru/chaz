@@ -541,10 +541,10 @@ async fn hosted_agents_survive_restart_without_root_definitions() {
         assert!(runtime.workers.contains_key("writer"));
         let (_, db) = open_agent(&built, "alpha").await;
         assert_eq!(db.list_memory_banks().await.unwrap(), bank_refs);
-        assert_eq!(
-            db.list_session_refs().await.unwrap()[0].session_db_id,
-            session_id.0
-        );
+        // Table rows have no stable order; alpha also joined later sessions.
+        let refs = db.list_session_refs().await.unwrap();
+        assert!(refs.iter().any(|r| r.session_db_id == session_id.0));
+        assert!(refs.iter().any(|r| r.session_db_id == fresh));
         drop(db);
         stop(built, service).await;
     }
