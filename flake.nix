@@ -236,7 +236,8 @@
             cargoArtifacts = coverageArtifacts;
             # Since 0.37.4, the LLVM timeout covers a whole test binary, not one test.
             # Allow the instrumented core suite (~8 minutes on 8 threads) to finish.
-            cargoTarpaulinExtraArgs = "--workspace --skip-clean --output-dir $out --out lcov --engine llvm --timeout 900 --exclude-files target/* --exclude-files target-test/*";
+            # Match the coverage runner's parallelism even on larger local machines.
+            cargoTarpaulinExtraArgs = "--workspace --skip-clean --output-dir $out --out lcov --engine llvm --timeout 900 --exclude-files target/* --exclude-files target-test/* -- --test-threads=8";
             nativeBuildInputs = testArgs.nativeBuildInputs or [] ++ [pkgs.cargo-tarpaulin];
             # Skip installing the post-coverage cargo cache (~1.8GB tarball that nothing reuses).
             doInstallCargoArtifacts = false;

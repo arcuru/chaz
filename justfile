@@ -66,9 +66,9 @@ e2e-keys:
 
 # Generate code coverage report (lcov + html into ./coverage/)
 coverage:
-    # Match Nix's whole-binary LLVM budget; individual test guards are unchanged.
+    # Match Nix's whole-binary LLVM budget and coverage-runner parallelism.
     cargo tarpaulin --workspace --output-dir coverage --out lcov --out html --engine llvm --timeout 900 --skip-clean \
-        --exclude-files 'target/*' --exclude-files 'target-test/*'
+        --exclude-files 'target/*' --exclude-files 'target-test/*' -- --test-threads=8
 
 # =============================================================================
 # Linting (Static Analysis)
