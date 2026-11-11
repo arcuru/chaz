@@ -15,7 +15,7 @@ from http.server import HTTPServer
 sys.dont_write_bytecode = True
 
 from test_interactions import environment, evidence
-from test_lifecycle import BINARY, FIXTURE, PtyProcess, stub
+from test_lifecycle import BINARY, FIXTURE, PtyProcess, create_agent, stub
 
 
 class Telemetry(unittest.TestCase):

@@ -23,7 +23,7 @@ from http.server import HTTPServer
 
 sys.dont_write_bytecode = True
 
-from test_lifecycle import BINARY, FIXTURE, ROOT, TARGET, PtyProcess, stub
+from test_lifecycle import BINARY, FIXTURE, ROOT, TARGET, PtyProcess, create_agent, stub
 
 
 def environment(home):
