@@ -75,7 +75,7 @@ eidetica:
   login: {{ username: startup, passwordless: true }}
 agents:
   - name: selected
-    model: display-model
+    model: fallback-model
     autonomous: false
 default_agents: [selected]
 backends:
@@ -130,7 +130,10 @@ impl StartupFixture {
         let (agent_db, pubkey) = create_agent_db(
             &mut user,
             "selected",
-            &AgentDbConfig::default(),
+            &AgentDbConfig {
+                model: Some("display-model".into()),
+                ..Default::default()
+            },
             &AgentMeta {
                 display_name: Some("selected".into()),
                 ..Default::default()
@@ -260,6 +263,7 @@ impl StartupFixture {
                 "client command /{name} must remain usable"
             );
         }
+        // Client presentation follows persisted config, not the stale YAML seed.
         let model =
             chaz_core::commands::dispatch(chaz_core::commands::Command::Model(None), &ctx).await;
         assert!(
