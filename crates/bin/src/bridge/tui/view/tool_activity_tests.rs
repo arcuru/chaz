@@ -833,10 +833,6 @@ async fn nested_tool_toggles_refresh_keyboard_mouse_and_copy_keep_identity() {
             .output,
         serde_json::to_string(output).unwrap()
     );
-    session
-        .add_entry(entry("chaz", "Final answer", EntryType::Message))
-        .await
-        .unwrap();
 }
 
 #[tokio::test]
@@ -914,6 +910,7 @@ async fn nested_tool_evidence_failure_retains_view_and_retry_recovers() {
 #[tokio::test]
 async fn nested_tool_legacy_history_is_unpaired_and_full_available_text_expandable() {
     let raw = "arbitrary_tool({\"path\":\"unfinished\n  exact raw suffix)";
+    let raw_result = "{\"output\": \"unfinished\\n\n  exact result suffix";
     let (_instance, mut app) = app_with(Vec::new()).await;
     let mut session = Session::new(
         chaz_core::types::ConversationId("legacy".into()),
@@ -946,6 +943,27 @@ async fn nested_tool_legacy_history_is_unpaired_and_full_available_text_expandab
     assert!(source.contains("  exact raw suffix)"));
     assert!(source.contains("ALL prose remains"));
     assert_eq!(app.active().entries[0].content, raw);
+
+    // An unknown audit shape may contain ": " without a tool-name envelope.
+    // Debug expansion must retain all of it rather than guessing a prefix.
+    session
+        .add_entry(entry("chaz", raw_result, EntryType::ToolResult))
+        .await
+        .unwrap();
+    reload(&mut app).await;
+    app.debug_mode = true;
+    let terminal = draw(&mut app, 100, 50);
+    for line in raw.split('\n') {
+        assert!(text(&app).contains(&format!("      {line}")));
+    }
+    for line in raw_result.split('\n') {
+        assert!(
+            rows(&terminal, 0, 50)
+                .iter()
+                .any(|row| row.starts_with(&format!("│      {line}"))),
+            "raw audit content lost: {line:?}"
+        );
+    }
 }
 
 #[tokio::test]

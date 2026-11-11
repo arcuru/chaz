@@ -197,6 +197,8 @@ by a tool's own limits.
 Old or ambiguous audit rows say `unpaired / identity unavailable`; result
 expansion warns `Stored preview only; full evidence unavailable`.
 They are not assigned to the nearest call or agent.
+Use `/debug` with an unpaired result expanded to see its complete stored row,
+including any prefix the normal view treats as a tool name.
 `/raw` still dumps stored entries, which may contain previews rather than the
 full native result.
 A failed evidence read keeps the last coherent view with `⚠ refresh failed`

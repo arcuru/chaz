@@ -30,7 +30,8 @@ full identity and counts.
 The bound is per identified run, not per session: two concurrent agents and two
 adjacent attempts must still have separate headers.
 
-Expanded runs reveal one compact row per invocation at its original location.
+Expanded runs reveal one compact header per invocation at its original location;
+these headers wrap to fit the pane.
 Expanding an item reveals complete recorded arguments, result, outcome and
 provenance.
 The outer toggle retains inner choices.
@@ -89,14 +90,14 @@ Every paired item exposes invocation/result event positions even when its body
 is collapsed; the line above illustrates the full provenance on expansion.
 Known interleaved `TurnContext` prose receives the same run/event label, without
 changing its content or order.
-Debug details include full identities and timestamps.
+Expanded details include full identities and timestamps.
 Unknown provenance is labelled unknown, never assigned to the nearest agent.
 There is no second rendered copy of a consumed result.
 
 ## Read the evidence that already exists
 
-The existing TUI receives `SessionEntry` values without their row identities.
-Those values alone cannot safely pair tools.
+`SessionEntry` values alone cannot safely pair tools.
+The TUI also carries their native row identities and a snapshot-local projection.
 Successful display results are also truncated to 500 characters by
 `server::display_entries_for_record`.
 Neither parsing `name(args)` nor joining adjacent rows can recover the missing
@@ -171,11 +172,6 @@ Counts describe identified calls in that run, not unpaired rows elsewhere in the
 transcript.
 Missing associations must not be disguised as complete coverage.
 
-Native-storage prototyping confirmed that this key shape survives reopening,
-keeps reused provider IDs separate across attempts, and recovers full results
-when their display rows contain only previews.
-This establishes the source contract's feasibility, not production TUI acceptance.
-
 ### Incomplete and older data
 
 If a call or result cannot be identified unambiguously, keep its original audit
@@ -184,6 +180,8 @@ expandable.
 Do not group unknown rows into a purported turn or pair them by adjacency.
 An older display-only result can be incomplete; say `stored preview only` when
 full evidence is absent rather than pretending to recover its missing suffix.
+Debug expansion shows the complete stored row, without guessing which prefix is
+a tool name.
 Malformed argument JSON is plain text, not repaired JSON.
 Unknown outcomes stay unknown with retained payload; they are not successes.
 Conflicting duplicate identities stay visible as unpaired evidence rather than
@@ -283,23 +281,10 @@ geometry, not duplicate or absorb it.
 Before final integration, recheck that source and test both nested headers and
 body exclusions against the actual inherited geometry.
 
-## Bounded implementation and verification
+## Verification
 
-1. Add a TUI-local evidence projection and pinned-snapshot hydration, retaining
-   row IDs, exact associations, full recorded output and conservative status.
-   Test native writer/readback, content offsets, same IDs in different
-   attempts/executions/agents, missing results, unknown outcomes and fallback.
-2. Connect the projection to the existing transcript builder and input targets.
-   Add two-row summaries, distributed nested items, stable expansion overrides,
-   chronological labels, readable/raw details and selection mappings.
-   Leave all prose and unrelated audit rendering intact.
-3. Add the user-guide reference, conceptual section and walkthrough, including
-   a missing-result or unpaired-history recovery example.
-   Replace these illustrative layouts with actual rendered acceptance evidence.
-
-The implementation acceptance suite must exercise the real snapshot loader,
-transcript builder, `TestBackend`, input handlers and copy path, not just a
-parallel mock renderer:
+The TUI's `tool_activity_tests` modules exercise the native snapshot loader,
+transcript builder, `TestBackend`, input handlers and copy path:
 
 - 2, 48 and 96 calls, before and after results, with equal compact tool height;
   repeated interleaved prose, final answers and concurrent/adjacent runs.
@@ -314,11 +299,6 @@ parallel mock renderer:
   headers/body negatives, drag/copy, scrolling, wrapped lines, Unicode and
   narrow/resized terminals; clipped summaries and expanded full/raw recovery.
 - Cache reuse on input-only frames and unchanged source payloads after display.
-
-Retain focused test logs and representative actual buffers, run `just doc build`,
-then the normal `nix develop .# -c just fix` and
-`nix develop .# -c just nix full` gates on the finished implementation.
-Design-prototype checks do not substitute for any of those gates.
 
 ## Rejected alternatives
 

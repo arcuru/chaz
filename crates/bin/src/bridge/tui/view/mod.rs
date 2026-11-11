@@ -1425,12 +1425,18 @@ fn build_transcript(
                 lines.push(Line::from(header_spans));
                 pending_clicks.push((lines.len() - 1, ClickTarget::ToggleEntryExpanded(entry_idx)));
                 if expanded {
-                    let body = entry
-                        .content
-                        .split_once(": ")
-                        .map(|(_, b)| b)
-                        .unwrap_or(&entry.content);
-                    let body = body.strip_prefix("ERROR: ").unwrap_or(body);
+                    // Without native identity the envelope is only a guess.
+                    // Debug must retain the complete stored row for recovery.
+                    let body = if debug_mode {
+                        entry.content.as_str()
+                    } else {
+                        let body = entry
+                            .content
+                            .split_once(": ")
+                            .map(|(_, b)| b)
+                            .unwrap_or(&entry.content);
+                        body.strip_prefix("ERROR: ").unwrap_or(body)
+                    };
                     lines.push(Line::from(Span::styled(
                         "    Stored preview only; full evidence unavailable",
                         dim,
