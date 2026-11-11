@@ -400,6 +400,9 @@ pub async fn dispatch_without_session(
         cmd,
         Command::NewSession(_)
             | Command::SwitchSession(_)
+            | Command::AgentNew { .. }
+            | Command::AgentImport { .. }
+            | Command::AgentHosted
             | Command::AgentSet { .. }
             | Command::AgentReload(_)
             | Command::AgentProject(_)
@@ -425,6 +428,13 @@ pub async fn dispatch_without_session(
         Command::AgentProject(agent_ref) => {
             Box::pin(agent::agent_project(&agent_ref, server)).await
         }
+        Command::AgentNew { name, overrides } => {
+            Box::pin(agent::agent_new(&name, &overrides, server)).await
+        }
+        Command::AgentImport { ticket, permission } => {
+            Box::pin(agent::agent_import(&ticket, permission, server)).await
+        }
+        Command::AgentHosted => Box::pin(agent::agent_hosted(server)).await,
         _ => unreachable!("filtered above"),
     })
 }
@@ -468,14 +478,14 @@ pub async fn dispatch(cmd: Command, ctx: &CommandContext<'_>) -> CommandOutcome 
         Command::AgentSetHost(arg) => Box::pin(agent::agent_set_host(arg.as_deref(), ctx)).await,
         Command::AgentSetBurst(n) => Box::pin(agent::agent_set_burst(n, ctx)).await,
         Command::AgentNew { name, overrides } => {
-            Box::pin(agent::agent_new(&name, &overrides, ctx)).await
+            Box::pin(agent::agent_new(&name, &overrides, ctx.server)).await
         }
         Command::AgentShare(r) => Box::pin(agent::agent_share(&r, ctx)).await,
         Command::AgentUnshare(r) => Box::pin(agent::agent_unshare(&r, ctx)).await,
         Command::AgentImport { ticket, permission } => {
-            Box::pin(agent::agent_import(&ticket, permission, ctx)).await
+            Box::pin(agent::agent_import(&ticket, permission, ctx.server)).await
         }
-        Command::AgentHosted => Box::pin(agent::agent_hosted(ctx)).await,
+        Command::AgentHosted => Box::pin(agent::agent_hosted(ctx.server)).await,
         Command::AgentDelete(r) => Box::pin(agent::agent_delete(&r, ctx)).await,
         Command::AgentSet {
             agent_ref,

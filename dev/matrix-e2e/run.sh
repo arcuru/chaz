@@ -20,7 +20,7 @@
 #
 # Usage:
 #   dev/matrix-e2e/run.sh [--keep] [--timeout SECONDS] [--verbose]
-#                         [--transport http|iroh] [--legacy-max-iterations N] [--real-model]
+#                         [--transport http|iroh] [--real-model]
 #
 #   --real-model run the opt-in capped smoke instead of the stub suite (see README)
 #   --keep      leave the workspace in place and print its path
@@ -28,9 +28,6 @@
 #   --verbose   stream component logs to stderr as they are written
 #   --transport eidetica sync transport between the two peers (default http).
 #               `iroh` reaches public relay infrastructure — see above.
-#
-#   --legacy-max-iterations render the retired agent config key for regression
-#                          discrimination; current Chaz ignores it, not a cap.
 #
 # Requires `synapse_homeserver`, `register_new_matrix_user`, `curl`, `jq`, and
 # `python3` on PATH — `just e2e` supplies them. Binaries default to
@@ -42,7 +39,6 @@ KEEP=0
 VERBOSE=0
 REPLY_TIMEOUT=120
 TRANSPORT="http"
-LEGACY_MAX_ITERATIONS=""
 REAL_MODEL=0
 while [[ $# -gt 0 ]]; do
 	case "$1" in
@@ -63,14 +59,6 @@ while [[ $# -gt 0 ]]; do
 			echo "--timeout requires a whole number of seconds, got: $REPLY_TIMEOUT" >&2
 			exit 2
 		fi
-		shift
-		;;
-	--legacy-max-iterations)
-		[[ $# -ge 2 && $2 =~ ^[0-9]+$ ]] || {
-			echo "--legacy-max-iterations requires a whole number" >&2
-			exit 2
-		}
-		LEGACY_MAX_ITERATIONS="$2"
 		shift
 		;;
 	--transport)
@@ -278,7 +266,7 @@ mkdir -p "$XDG_CONFIG_HOME" "$FIXTURE_HOME"
 
 log "workspace: $WORKSPACE"
 log "synapse :$SYNAPSE_PORT  stub-llm :$STUB_PORT  daemon-sync :$DAEMON_SYNC_PORT  bridge-sync :$BRIDGE_SYNC_PORT"
-log "transport: $TRANSPORT; legacy max_iterations: ${LEGACY_MAX_ITERATIONS:-absent} (ignored by current config)"
+log "transport: $TRANSPORT"
 
 # Both peers are direct Eidetica owners with explicit connector settings. In
 # http mode the bridge binds only loopback HTTP, so the run stays hermetic; in
@@ -436,13 +424,6 @@ backends:
     models:
       - name: "$MODEL_NAME"
 
-agents:
-  - name: chaz
-    model: "$MODEL_NAME"
-${LEGACY_MAX_ITERATIONS:+    max_iterations: $LEGACY_MAX_ITERATIONS}
-    system_prompt: |
-      You are a test fixture.
-
 default_agents: [chaz]
 EOF
 
@@ -451,6 +432,11 @@ log "initialising daemon Eidetica store"
 nix run "$EIDETICA_FLAKE" -- \
 	daemon --data-dir "$WORKSPACE/state-daemon" init --username chaz --passwordless \
 	>>"$WORKSPACE/bringup.log" 2>&1 || fail "could not initialise daemon Eidetica store (see $WORKSPACE/bringup.log)"
+# Agents live in their Agent DBs, never in root config: create the fixture
+# agent through administration, with no model turn.
+log "creating the fixture agent"
+HOME="$FIXTURE_HOME" "$CHAZ_BIN" --config "$DAEMON_CONFIG" cmd "/agent new chaz model=$MODEL_NAME system_prompt=fixture" \
+	>>"$WORKSPACE/bringup.log" 2>&1 || fail "/agent new failed (see $WORKSPACE/bringup.log)"
 # The bridge's store is provisioned the same explicit way: the connector
 # never creates one, and the legacy `chaz-matrix` login is what its config
 # names.
@@ -479,8 +465,6 @@ label: e2e-matrix
 state_dir: "$WORKSPACE/state-bridge"
 $BRIDGE_EIDETICA
 logins: []
-agents:
-  - name: chaz
 EOF
 
 BRIDGE_KEY="$("$CHAZ_MATRIX_BIN" --config "$BRIDGE_CONFIG" --print-pubkey 2>>"$WORKSPACE/bringup.log")"
@@ -545,9 +529,6 @@ logins:
     password: "$AGENT_PASSWORD"
     allow_list: "$PUPPET_MXID"
     workspace_manager: "$PUPPET_MXID"
-
-agents:
-  - name: chaz
 EOF
 
 # ------------------------------------------------------------- processes -----

@@ -142,7 +142,14 @@ impl AuthorityFixture {
         mock.push_text("finished");
         let (server, mock) = published_executor_using_mock_and_hub(
             &self.settings,
-            Arc::new(AgentRegistry::from_config(&self.yaml)),
+            Arc::new(AgentRegistry::from_db_configs(
+                self.yaml.agents.as_ref().unwrap().iter().map(|cfg| {
+                    (
+                        cfg.name.as_str(),
+                        crate::agent_db::AgentDbConfig::from_agent_config(cfg),
+                    )
+                }),
+            )),
             self.entries[0].clone(),
             mock,
             Arc::new(crate::test_support::context_hub().await),

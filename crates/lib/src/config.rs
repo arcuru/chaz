@@ -28,20 +28,22 @@ pub struct Config {
     pub chat_summary_model: Option<String>,
     /// Backend configuration
     pub backends: Option<Vec<Backend>>,
-    /// Agent definitions
+    /// Legacy agent definitions. Agents live only in their hosted Agent DBs;
+    /// a non-empty block refuses startup with migration guidance
+    /// ([`reject_legacy_agents`]) instead of being silently ignored.
     pub agents: Option<Vec<AgentConfig>>,
     /// Names of agents auto-attached to every freshly-created session, in
-    /// order. Names must match an entry in `agents:`. Absent or empty
-    /// falls back to attaching just the first agent in `agents:` (legacy
-    /// single-default behavior). The first entry effectively becomes the
+    /// order. Names resolve against this peer's hosted Agent DBs; a name with
+    /// no hosted agent is skipped with a startup warning. Absent or empty
+    /// falls back to attaching the first hosted agent by name. The first entry effectively becomes the
     /// routing host — when an incoming message has no `@mention` and no
     /// explicit `host_agent_db_id`, resolution picks the first authorized
     /// agent on the session, which is whichever appears first here.
     pub default_agents: Option<Vec<String>>,
     /// Named alternatives to `default_agents`, selectable when a session is
     /// created (`/new <group>`). Each value is an ordered list of agent
-    /// names with the same semantics as `default_agents` — names must
-    /// match an entry in `agents:`, and the first entry effectively
+    /// names with the same semantics as `default_agents` — names resolve
+    /// against hosted Agent DBs, and the first entry effectively
     /// becomes the routing host. A group named in `/new` replaces
     /// `default_agents` for that session; it is not merged with it.
     pub agent_groups: Option<HashMap<String, Vec<String>>>,
@@ -1470,6 +1472,33 @@ fn known_config_keys() -> HashSet<&'static str> {
     }
 
     keys
+}
+
+/// Refuse a root config that still defines agents.
+///
+/// Root config holds local runner settings only; hosted Agent DBs are the
+/// sole agent authority, and startup neither creates nor updates agents from
+/// YAML. Ignoring the block would silently drop definitions that used to seed
+/// new agents, so startup stops with the migration steps instead. Nothing has
+/// been opened or written when this fails.
+pub fn reject_legacy_agents(config: &Config) -> anyhow::Result<()> {
+    let Some(agents) = config.agents.as_deref().filter(|agents| !agents.is_empty()) else {
+        return Ok(());
+    };
+    let names: Vec<&str> = agents.iter().map(|agent| agent.name.as_str()).collect();
+    anyhow::bail!(
+        "root config defines agents ({names}), but agents now live only in their Agent DBs: \
+         chaz no longer creates, updates or attaches banks to agents from root config.\n\
+         Remove the `agents:` block, then for each listed agent:\n\
+         - already hosted (shown by `chaz cmd '/agent hosted'`): nothing else to do; its Agent DB \
+         keeps its identity, settings, prompts, sessions and memory-bank attachments.\n\
+         - not hosted: create it with `chaz cmd '/agent new NAME'`, copy its settings into the \
+         managed folder that `/agent hosted` lists, apply them with `chaz cmd '/agent reload NAME'`, \
+         and replace each `default_memory_banks` entry with `/memory new BANK` (if needed) and \
+         `/memory grant BANK NAME write`.\n\
+         `default_agents` and `agent_groups` stay in root config and name hosted agents.",
+        names = names.join(", ")
+    )
 }
 
 /// Compare the YAML document's key paths against the known registry and

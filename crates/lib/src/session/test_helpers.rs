@@ -6,7 +6,6 @@
 use super::*;
 use crate::agent::AgentRegistry;
 use crate::agent_db::{AgentDbConfig, AgentMeta, create_agent_db};
-use crate::config::{AgentConfig, Config};
 use crate::hosted_index::{DbEntry, HostedIndex};
 use eidetica::backend::database::InMemory;
 use eidetica::{Instance, NewAccount};
@@ -28,24 +27,19 @@ pub(crate) async fn test_session_db() -> (Instance, eidetica::AccountSession, ei
     (instance, user, db)
 }
 
-pub(crate) fn agent_cfg(name: &str) -> AgentConfig {
-    AgentConfig {
-        name: name.to_string(),
-        system_prompt: Some("You are a test agent.".to_string()),
-        system_prompt_files: None,
-        model: None,
-        tools: None,
-        workers: None,
-        max_spawn_depth: None,
-        autonomous: false,
-        presets: None,
-        tool_profile: None,
-        max_context_tokens: None,
-        capabilities: None,
-        grants: None,
-        default_memory_banks: None,
-        default_skill_banks: None,
+/// Runtime registry with test agents, as startup builds from hosted DBs.
+fn agents_named(names: &[&str]) -> Arc<AgentRegistry> {
+    let agents = Arc::new(AgentRegistry::default());
+    for name in names {
+        let cfg = AgentDbConfig {
+            system_prompt: "You are a test agent.".to_string(),
+            ..AgentDbConfig::default()
+        };
+        agents
+            .register(crate::agent::Agent::from_db_config(name, &cfg))
+            .unwrap();
     }
+    agents
 }
 
 /// Registry containing only the bare-bones `"default"` agent — useful
@@ -92,11 +86,7 @@ pub(crate) async fn make_registry_with_alpha_agent() -> (Instance, Arc<SessionRe
             .await
             .unwrap();
 
-    let cfg = Config {
-        agents: Some(vec![agent_cfg("alpha")]),
-        ..Config::default()
-    };
-    let agents = Arc::new(AgentRegistry::from_config(&cfg));
+    let agents = agents_named(&["alpha"]);
     let registry = Arc::new(
         SessionRegistry::new(instance.clone(), user, agents)
             .await
@@ -115,11 +105,7 @@ pub(crate) async fn make_registry_with_two_agents() -> (Instance, Arc<SessionReg
             .await
             .unwrap();
 
-    let cfg = Config {
-        agents: Some(vec![agent_cfg("alpha"), agent_cfg("beta")]),
-        ..Config::default()
-    };
-    let agents = Arc::new(AgentRegistry::from_config(&cfg));
+    let agents = agents_named(&["alpha", "beta"]);
     let registry = Arc::new(
         SessionRegistry::new(instance.clone(), user, agents)
             .await

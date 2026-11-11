@@ -35,7 +35,7 @@ pub(super) async fn fixture_with_extensions(
     )
     .await
     .unwrap();
-    let agents = Arc::new(AgentRegistry::from_config(&Config::default()));
+    let agents = Arc::new(AgentRegistry::default());
     for i in 0..30 {
         let cfg = AgentDbConfig {
             workers: if i % 3 == 0 {

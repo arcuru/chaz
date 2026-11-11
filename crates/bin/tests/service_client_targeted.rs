@@ -56,15 +56,9 @@ async fn repeated_catalog_commands_do_not_create_sessions_and_agents_stay_sessio
         .unwrap();
     }
     let registry = Arc::new(
-        SessionRegistry::new(
-            owner.clone(),
-            user,
-            Arc::new(AgentRegistry::from_config(
-                &chaz_core::config::Config::default(),
-            )),
-        )
-        .await
-        .unwrap(),
+        SessionRegistry::new(owner.clone(), user, Arc::new(AgentRegistry::default()))
+            .await
+            .unwrap(),
     );
     let (_, selected) = registry.create_session(Some("fixture")).await.unwrap();
     let selected_id = selected.root_id().to_string();
@@ -104,7 +98,7 @@ async fn repeated_catalog_commands_do_not_create_sessions_and_agents_stay_sessio
     std::fs::write(
         &config_path,
         format!(
-            "state_dir: {}\nexecution: client\neidetica:\n  connection: unix://{}\n  login:\n    username: targeted-cli\n    passwordless: true\nagents:\n  - name: selected\n    system_prompt: test\n    autonomous: false\n  - name: overridden\n    system_prompt: test\n    autonomous: false\ndefault_agents: [selected]\n",
+            "state_dir: {}\nexecution: client\neidetica:\n  connection: unix://{}\n  login:\n    username: targeted-cli\n    passwordless: true\ndefault_agents: [selected]\n",
             state_dir.display(),
             socket.display()
         ),

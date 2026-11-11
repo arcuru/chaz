@@ -98,15 +98,11 @@ backends:
     api_key: not-a-real-key
     models:
       - name: stub
-agents:
-  - name: chaz
-    model: stub
-    tools: []
-    system_prompt: You are a disposable test fixture.
 default_agents: [chaz]
 ''')
                 subprocess.run([FIXTURE, home / "fixture.db"], env=env, cwd=home,
                                check=True, timeout=20, capture_output=True)
+                create_agent(config, env, home, "model=stub tools= system_prompt=fixture")
                 command = [BINARY, "--config", config, "--session", "selection"]
                 if multiplexed:
                     socket_dir = Path(os.environ.get("TUI_TMUX_SOCKET_DIR", "/tmp/chaz-tmux-sockets"))
@@ -261,11 +257,6 @@ backends:
     api_key: not-a-real-key
     models:
       - name: stub
-agents:
-  - name: chaz
-    model: stub
-    tools: [shell]
-    system_prompt: You are a disposable test fixture.
 default_agents: [chaz]
 security:
   tool_policies:
@@ -274,6 +265,7 @@ security:
 ''')
                 subprocess.run([FIXTURE, home / "fixture.db"], env=env, cwd=home, check=True,
                                timeout=20, capture_output=True)
+                create_agent(config, env, home, "model=stub tools=shell system_prompt=fixture")
                 process = PtyProcess([BINARY, "--config", config, "--session", "approval"], env, home)
                 try:
                     process.resize(120, 40)

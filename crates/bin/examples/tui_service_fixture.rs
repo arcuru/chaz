@@ -2,7 +2,6 @@
 use chaz_core::{
     agent::AgentRegistry,
     agent_db::{AgentDbConfig, AgentMeta, create_agent_db},
-    config::Config,
     extension::{ExtensionOutput, write_extension_outputs},
     hosted_index::DbEntry,
     session::{EntryType, Session, SessionEntry, SessionRegistry},
@@ -32,12 +31,8 @@ async fn main() -> anyhow::Result<()> {
         },
     )
     .await?;
-    let registry = SessionRegistry::new(
-        owner.clone(),
-        user,
-        Arc::new(AgentRegistry::from_config(&Config::default())),
-    )
-    .await?;
+    let registry =
+        SessionRegistry::new(owner.clone(), user, Arc::new(AgentRegistry::default())).await?;
     let (conv, db) = registry.create_session(Some("tui")).await?;
     let id = db.root_id().to_string();
     registry

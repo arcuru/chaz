@@ -190,6 +190,9 @@ async fn main() -> anyhow::Result<()> {
     // directories. A missing or mixed migration config must be a read-only
     // failure, not the first mutation of a replacement layout.
     instance::required_settings(&config)?;
+    // Agents live in their Agent DBs; a legacy root `agents:` block stops
+    // here, read-only, with its migration steps.
+    config::reject_legacy_agents(&config)?;
 
     // Warn about unrecognised YAML keys before proceeding.
     let unknown = config::check_unknown_config_keys(&contents);
@@ -321,10 +324,8 @@ async fn main() -> anyhow::Result<()> {
             _ => None,
         })
     {
-        let agents = std::sync::Arc::new(agent::AgentRegistry::from_config(&config));
-        if agents.is_empty() {
-            agents.register_default_chaz(&config)?;
-        }
+        // Session listing reads only the catalog; it needs no runtime agents.
+        let agents = std::sync::Arc::new(agent::AgentRegistry::default());
         let registry =
             session::SessionRegistry::new(connected.instance, connected.user, agents).await?;
         return bridge::cmd::CommandBridge::run_session_independent(command, &registry).await;
@@ -348,14 +349,10 @@ async fn main() -> anyhow::Result<()> {
     // ceiling; one-shot command mode further suppresses all execution work.
     let t = Instant::now();
     let build_options = if cmd_args.is_some() || args.print {
-        let bootstrap_agents = args.print
-            || (cmd_args.is_some()
-                && capabilities.ownership() == instance::InstanceOwnership::Direct);
         let mut options = server::BuildOptions::local_oneshot(
             config_path.clone(),
             capabilities,
             args.print,
-            bootstrap_agents,
             extra_auto_approved_tools,
             if args.print {
                 server::McpReadiness::AwaitReady
@@ -500,10 +497,8 @@ async fn run_usage_subcommand(args: UsageArgs, config: &Config) -> anyhow::Resul
 
     let connected = instance::connect(config).await?;
 
-    let agent_registry = std::sync::Arc::new(agent::AgentRegistry::from_config(config));
-    if agent_registry.is_empty() {
-        agent_registry.register_default_chaz(config)?;
-    }
+    // Usage reads the session catalog; it needs no runtime agents.
+    let agent_registry = std::sync::Arc::new(agent::AgentRegistry::default());
     let registry =
         session::SessionRegistry::new(connected.instance, connected.user, agent_registry).await?;
 

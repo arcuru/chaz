@@ -84,15 +84,11 @@ backends:
         context_window: 10000
         price_input: 2.0
         price_output: 4.0
-agents:
-  - name: chaz
-    model: gpt-sol-latest
-    tools: [calculate]
-    system_prompt: You are a disposable test fixture.
 default_agents: [chaz]
 ''')
                 subprocess.run([FIXTURE, home / "fixture.db"], env=env, cwd=home, check=True,
                                timeout=20, capture_output=True)
+                create_agent(config, env, home, "model=gpt-sol-latest tools=calculate system_prompt=fixture")
                 command = [BINARY, "--config", config, "--session", "telemetry"]
                 process = PtyProcess(command, env, home)
                 process.resize(180, 35)
@@ -206,17 +202,13 @@ backends:
     models:
       - name: stub
         context_window: 10000
-agents:
-  - name: chaz
-    model: stub
-    tools: []
-    system_prompt: You are a disposable test fixture.
 default_agents: [chaz]
 agent_groups:
   inspection: [chaz]
 ''')
                 subprocess.run([FIXTURE, home / "fixture.db"], env=env, cwd=home,
                                check=True, timeout=20, capture_output=True)
+                create_agent(config, env, home, "model=stub tools= system_prompt=fixture")
                 process = PtyProcess([BINARY, "--config", config, "--session", "context"], env, home)
                 process.resize(180, 40)
                 process.expect_screen("Ctrl+S settings")

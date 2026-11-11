@@ -1284,8 +1284,17 @@ async fn hydrate_returns_input_when_agent_not_in_index() {
     assert_eq!(result.max_spawn_depth, 7);
 }
 
-fn prompt_probe_agent(name: &str) -> crate::agent::Agent {
-    crate::agent::Agent::from_db_config(name, &AgentDbConfig::default())
+/// The runtime registry startup builds from Agent DBs created with `config`'s
+/// agent fixtures.
+fn seed_registry(config: &crate::config::Config) -> AgentRegistry {
+    AgentRegistry::from_db_configs(
+        config
+            .agents
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|cfg| (cfg.name.as_str(), AgentDbConfig::from_agent_config(cfg))),
+    )
 }
 
 async fn seed_like_bootstrap(
@@ -1298,83 +1307,6 @@ async fn seed_like_bootstrap(
         .await
         .unwrap();
     db
-}
-
-#[tokio::test]
-async fn seed_completion_pins_prompt_once_and_never_reapplies_files() {
-    let (_instance, server, registry) = server_fixture().await;
-
-    // A yaml agent whose entire system prompt comes from a file (no inline
-    // `system_prompt`) — the exact shape of the Chaz config.
-    let dir = tempfile::tempdir().unwrap();
-    let prompt_path = dir.path().join("AGENTS.md");
-    std::fs::write(&prompt_path, "You are Chaz. Operating manual v1.").unwrap();
-    let ac: crate::config::AgentConfig = serde_yaml::from_str(&format!(
-        "name: chaz\nsystem_prompt_files: [\"{}\"]\n",
-        prompt_path.display()
-    ))
-    .unwrap();
-    let db = seed_like_bootstrap(&server, &registry, &ac).await;
-
-    // Startup finishes the seed: the prompt resolves into the blob store.
-    assert!(server.complete_agent_seed("chaz").await.unwrap());
-    let seeded = db.read_config().await.unwrap();
-    assert!(seeded.system_prompt_ref.is_some(), "ref set after seeding");
-    assert_eq!(seeded.applied_config_hash, None, "no yaml gate is recorded");
-    let hydrated = server
-        .hydrate_agent_from_db(prompt_probe_agent("chaz"))
-        .await;
-    assert_eq!(hydrated.system_prompt, "You are Chaz. Operating manual v1.");
-
-    // Restarting with an edited prompt file changes nothing: the seed is done.
-    std::fs::write(&prompt_path, "You are Chaz. Operating manual v2!").unwrap();
-    assert!(!server.complete_agent_seed("chaz").await.unwrap());
-    assert_eq!(db.read_config().await.unwrap(), seeded);
-    let hydrated = server
-        .hydrate_agent_from_db(prompt_probe_agent("chaz"))
-        .await;
-    assert_eq!(hydrated.system_prompt, "You are Chaz. Operating manual v1.");
-
-    // Re-setting the files is the explicit way to pick up new contents.
-    let mut refreshed = db.read_config().await.unwrap();
-    server.refresh_prompt_ref(&mut refreshed).await.unwrap();
-    db.write_config(&refreshed).await.unwrap();
-    let hydrated = server
-        .hydrate_agent_from_db(prompt_probe_agent("chaz"))
-        .await;
-    assert_eq!(hydrated.system_prompt, "You are Chaz. Operating manual v2!");
-}
-
-#[tokio::test]
-async fn seed_completion_leaves_existing_and_legacy_agents_untouched() {
-    let (_instance, server, registry) = server_fixture().await;
-    let ac: crate::config::AgentConfig =
-        serde_yaml::from_str("name: alpha\nsystem_prompt: yaml prompt\nmodel: yaml-model\n")
-            .unwrap();
-    let db = seed_like_bootstrap(&server, &registry, &ac).await;
-    assert!(server.complete_agent_seed("alpha").await.unwrap());
-
-    // A legacy row: an older chaz recorded an applied-config hash, and the
-    // user has since edited fields, including back to their defaults.
-    let mut legacy = db.read_config().await.unwrap();
-    legacy.applied_config_hash = Some("legacy-hash".into());
-    legacy.model = None;
-    legacy.system_prompt = String::new();
-    legacy.tools = Some(vec![]);
-    db.write_config(&legacy).await.unwrap();
-
-    assert!(!server.complete_agent_seed("alpha").await.unwrap());
-    assert_eq!(db.read_config().await.unwrap(), legacy);
-
-    // An agent with no prompt at all has nothing to seed and is not written.
-    let empty: crate::config::AgentConfig = serde_yaml::from_str("name: bare\n").unwrap();
-    let bare = seed_like_bootstrap(&server, &registry, &empty).await;
-    let before = bare.read_config().await.unwrap();
-    assert!(!server.complete_agent_seed("bare").await.unwrap());
-    assert_eq!(bare.read_config().await.unwrap(), before);
-
-    // Unknown names are a no-op, not an error.
-    assert!(!server.complete_agent_seed("ghost").await.unwrap());
 }
 
 #[tokio::test]
@@ -7141,7 +7073,7 @@ async fn accepted_job_restart_uses_agent_db_depth_not_yaml() {
         };
         let (executor, mock) = published_executor_with_mock(
             &settings,
-            Arc::new(AgentRegistry::from_config(&config)),
+            Arc::new(seed_registry(&config)),
             entries[0].clone(),
         )
         .await;
@@ -7207,7 +7139,7 @@ async fn accepted_job_restart_uses_agent_db_depth_not_yaml() {
 
         // A new executor rebuilds the registry from unchanged YAML, not the old
         // process's /agent set-updated runtime entries. The service retains the DBs.
-        let fresh_agents = Arc::new(AgentRegistry::from_config(&config));
+        let fresh_agents = Arc::new(seed_registry(&config));
         assert_eq!(fresh_agents.get("default").unwrap().max_spawn_depth, 2);
         assert_eq!(fresh_agents.get("target").unwrap().max_spawn_depth, 2);
         let (restarted, next_mock) =
@@ -9222,7 +9154,7 @@ async fn job_wait_executor_shutdown_and_observed_yield_stop_observation_or_reacq
                 .spawn_agent_task(
                     sid.0.clone(),
                     session,
-                    server.agents.default_agent().clone(),
+                    server.agents.default_agent().unwrap(),
                     None,
                     backend,
                     attempt.clone(),
