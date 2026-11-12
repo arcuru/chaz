@@ -407,8 +407,11 @@ per-turn context path. `fire_<kind>` skips handlers whose owner isn't in
 the set; `try_dispatch_command` returns `None` for inactive owners;
 `ScopedTools` hides inactive owners' tools from the LLM entirely.
 
-MCP-loaded tools register with `owner: None` — they're always available,
-not subject to the extension lifecycle.
+MCP-loaded tools register in the shared `ToolRegistry` with
+`owner: Some("mcp-<server_name>")`. They pass the same per-session
+active-extension filter as built-in extension tools: the named MCP owner
+must be in the effective set. Asynchronous startup affects when the tools
+appear, not their ownership or filtering.
 
 ## Activation event log
 
