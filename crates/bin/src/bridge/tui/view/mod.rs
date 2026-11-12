@@ -1834,7 +1834,7 @@ pub(super) fn ui_picker(f: &mut ratatui::Frame, app: &mut App) {
 
             let agent_str = info.agent_name.as_deref().unwrap_or("default");
             let title = match &info.name {
-                Some(n) => format!("\"{n}\""),
+                Some(n) => format!("\"{}\"", content::safe_line(n)),
                 None => short_session_id(&info.session_db_id),
             };
             let bridge = info.bridge.as_str();
@@ -1898,6 +1898,7 @@ pub(super) fn ui_picker(f: &mut ratatui::Frame, app: &mut App) {
                 Some(description) => {
                     // Clip by terminal cells after the indent so wide text
                     // still ends in an ellipsis instead of being cut silently.
+                    let description = content::safe_line(description);
                     let avail = (inner_w as usize).saturating_sub(4);
                     let shown = if description.width() > avail {
                         let mut cells = 0;
@@ -1911,7 +1912,7 @@ pub(super) fn ui_picker(f: &mut ratatui::Frame, app: &mut App) {
                         clipped.push('…');
                         clipped
                     } else {
-                        description.clone()
+                        description
                     };
                     lines.push(Line::from(vec![Span::styled(
                         format!("    {shown}"),
