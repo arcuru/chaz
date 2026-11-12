@@ -64,6 +64,8 @@ struct Pending {
     ticket: u64,
     origin: Origin,
     write: bool,
+    /// Last refresh ticket issued before this action started running.
+    read_fence: u64,
     /// Original accepted draft retained until its outcome is known.
     input: Option<String>,
     work: Option<Work>,
@@ -154,6 +156,7 @@ impl Operations {
     }
     pub(super) fn submit(
         &mut self,
+        read_fence: u64,
         origin: Origin,
         write: bool,
         input: Option<String>,
@@ -170,21 +173,25 @@ impl Operations {
             ticket: self.next_ticket,
             origin,
             write,
+            read_fence: 0,
             input,
             work: Some(Box::pin(work)),
         });
         self.exit_confirm = false;
         self.notice = None;
-        self.start();
+        self.start(read_fence);
         true
     }
-    fn start(&mut self) {
+    /// Run the next queued action. `read_fence` is the newest refresh ticket
+    /// issued so far: reads up to it were requested before this action ran.
+    fn start(&mut self, read_fence: u64) {
         if self.task.is_some() {
             return;
         }
         let Some(mut pending) = self.queue.pop_front() else {
             return;
         };
+        pending.read_fence = read_fence;
         self.current_ticket = Some(pending.ticket);
         self.current_origin = Some(pending.origin.clone());
         self.current_input = pending.input.clone();
@@ -291,7 +298,7 @@ pub(super) fn cancel_closed_reads(app: &mut App) {
         app.operations.current_ticket = None;
         app.operations.current_origin = None;
         app.operations.started = None;
-        app.operations.start();
+        app.operations.start(app.refresh_ticket);
     }
 }
 
@@ -331,7 +338,8 @@ pub(super) fn submit(
         return;
     }
     let origin = Origin::capture(app);
-    app.operations.submit(origin, write, input, work);
+    app.operations
+        .submit(app.refresh_ticket, origin, write, input, work);
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -383,6 +391,7 @@ pub(super) fn apply(app: &mut App, completion: Completion) -> Invalidation {
     app.operations.exit_confirm = false;
     app.operations.notice = None;
     let Completion { pending, result } = completion;
+    let (write, read_fence) = (pending.write, pending.read_fence);
     let (result, global) = match result {
         Ok(Effect::Global(effect)) => (Ok(*effect), true),
         result => (result, false),
@@ -543,8 +552,27 @@ pub(super) fn apply(app: &mut App, completion: Completion) -> Invalidation {
             _ => unreachable!("backend outcome must be prepared before application"),
         },
     }
-    app.operations.start();
+    if write {
+        supersede_reads(app, &invalidation, read_fence);
+    }
+    app.operations.start(app.refresh_ticket);
     invalidation
+}
+
+/// Reads requested before a completed write started may not include it; their
+/// results must not replace what this completion applied (see `refresh`).
+fn supersede_reads(app: &mut App, invalidation: &Invalidation, fence: u64) {
+    for tab in &mut app.tabs {
+        let scoped = match invalidation {
+            Invalidation::None => false,
+            Invalidation::Session(id) => tab.session_db_id == *id,
+            Invalidation::All => true,
+        };
+        if scoped {
+            tab.live.reload.supersede_through(fence);
+            tab.live.job.supersede_through(fence);
+        }
+    }
 }
 
 /// Show a command result in its originating view, or as a notice without one.

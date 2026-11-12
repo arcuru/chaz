@@ -17,6 +17,11 @@
 //! by index) and its ticket is the one the slot is waiting for, so a result
 //! for a closed, replaced or superseded request is discarded instead of
 //! overwriting newer state or landing on another session.
+//!
+//! A completed local write supersedes session/job reads requested before the
+//! write started: their snapshot may predate it, so applying one could undo
+//! state the completion already showed (a rename, say). Such a result is
+//! discarded and its slot always issues the follow-up instead.
 
 use super::*;
 use chaz_core::session::TurnActivity;
@@ -27,6 +32,7 @@ use chaz_core::session::TurnActivity;
 pub(super) struct RefreshSlot {
     in_flight: Option<u64>,
     dirty: bool,
+    superseded: bool,
     task: Option<tokio::task::JoinHandle<()>>,
 }
 
@@ -51,16 +57,25 @@ impl RefreshSlot {
         true
     }
 
+    /// A write that started after ticket `fence` was issued has completed.
+    /// A running read requested no later than that may not include it.
+    pub(super) fn supersede_through(&mut self, fence: u64) {
+        if self.in_flight.is_some_and(|t| t <= fence) {
+            self.superseded = true;
+        }
+    }
+
     /// Release the slot for a completed read. `None` means the result is
-    /// stale and must be dropped; `Some(follow_up)` says whether a request
-    /// arrived meanwhile and another read is needed.
-    fn finish(&mut self, ticket: u64) -> Option<bool> {
+    /// stale and must be dropped; `Some((apply, follow_up))` says whether the
+    /// result may be applied and whether another read is needed.
+    fn finish(&mut self, ticket: u64) -> Option<(bool, bool)> {
         if self.in_flight != Some(ticket) {
             return None;
         }
         self.in_flight = None;
         self.task = None;
-        Some(std::mem::take(&mut self.dirty))
+        let superseded = std::mem::take(&mut self.superseded);
+        Some((!superseded, std::mem::take(&mut self.dirty) || superseded))
     }
 
     #[cfg(test)]
@@ -709,10 +724,17 @@ pub(super) fn apply(
         RefreshKind::Activity => &mut live.activity,
         RefreshKind::Job => &mut live.job,
     };
-    let Some(again) = slot.finish(ticket) else {
+    let Some((fresh, again)) = slot.finish(ticket) else {
         return Applied::default();
     };
     let follow_up = again.then(|| (session_db_id.clone(), kind));
+    if !fresh {
+        // Possibly pre-write: keep the visible view until the follow-up.
+        return Applied {
+            redraw: false,
+            follow_up,
+        };
+    }
 
     let redraw = match msg {
         Refresh::Unchanged { .. } => {

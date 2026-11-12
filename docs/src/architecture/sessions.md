@@ -146,7 +146,10 @@ rereading the native Verified view only on invalidation, initial load or a
 failed-read retry. Timers still expire orphaned claims without any write;
 future timestamps remain invisible until the local clock reaches them.
 Subscriptions precede initial observation, and writes during a read leave one
-coalesced follow-up. Event cursor tips are invalidation hints, not read views
+coalesced follow-up. When a local TUI write completes, a session read requested
+before that write started is discarded in favour of the follow-up, so its
+possibly older view cannot undo what the completion already showed (a rename,
+for example). Event cursor tips are invalidation hints, not read views
 or authorization. Matrix observers are owned by their bridge generation and
 cancel pending reads on shutdown before the next generation is installed. This
 bounded presentation lease is not the session-wide `claim_runtime` lease and

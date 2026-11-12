@@ -795,3 +795,199 @@ async fn hydration_equal_frontier_is_not_cached_authority() {
         }
     }
 }
+
+/// Start a session read that captures the stored view now and returns it
+/// only once released, like a slow backend read that predates a later write.
+async fn paused_read(
+    app: &mut App,
+    id: &str,
+    tx: &mpsc::Sender<Refresh>,
+    error: bool,
+) -> oneshot::Sender<()> {
+    let db = app.tabs[app.tab_index_for(id).unwrap()].session_db.clone();
+    let (release, gate) = oneshot::channel::<()>();
+    let (read, captured) = oneshot::channel::<()>();
+    let session_db_id = id.to_owned();
+    request_with(
+        app,
+        id,
+        RefreshKind::Session,
+        tx,
+        move |ticket| async move {
+            let snapshot = load_session_snapshot("fixture", db).await;
+            let _ = read.send(());
+            let _ = gate.await;
+            Refresh::Session {
+                session_db_id,
+                ticket,
+                snapshot: if error {
+                    Err("synthetic partial read".into())
+                } else {
+                    snapshot.map(Box::new)
+                },
+            }
+        },
+    );
+    captured.await.unwrap();
+    release
+}
+
+/// Run one local rename through the operation queue, including its write
+/// notification's coalesced request, and apply its completion (and the
+/// active tab's unpaused status read it requests).
+async fn rename(
+    app: &mut App,
+    idx: usize,
+    name: &str,
+    tx: &mpsc::Sender<Refresh>,
+    rx: &mut mpsc::Receiver<Refresh>,
+) {
+    let db = app.tabs[idx].session_db.clone();
+    let id = app.tabs[idx].session_db_id.clone();
+    let (notified, mut events) = mpsc::unbounded_channel();
+    let subscription = db
+        .on_write(move |_, _| {
+            let tx = notified.clone();
+            async move {
+                let _ = tx.send(());
+                Ok(())
+            }
+        })
+        .await
+        .unwrap();
+    app.set_active_tab(idx);
+    let (name, renamed) = (name.to_owned(), id.clone());
+    operations::submit(app, true, None, async move {
+        chaz_core::session::update_meta_on_db(&db, |m| m.name = Some(name.clone()))
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(operations::Effect::Renamed {
+            id: renamed,
+            name: Some(name),
+        })
+    });
+    events.recv().await.unwrap();
+    request(app, &id, RefreshKind::Session, tx);
+    let completion = app.operations.recv().await.unwrap();
+    let invalidation = operations::apply(app, completion);
+    operations::refresh_after(app, invalidation, tx);
+    while app.tabs[idx].live.status.is_pending() {
+        let msg = next(rx).await;
+        assert!(matches!(msg, Refresh::Status { .. }), "paused read escaped");
+        apply(app, msg, resolved);
+    }
+    drop(subscription);
+}
+
+/// Apply results (and their follow-ups) until the tab's slot is idle.
+async fn settle(app: &mut App, tx: &mpsc::Sender<Refresh>, rx: &mut mpsc::Receiver<Refresh>) {
+    while app.tabs.iter().any(|t| t.live.reload.is_pending()) {
+        if let Some((id, kind)) = apply(app, next(rx).await, resolved).follow_up {
+            request(app, &id, kind, tx);
+        }
+    }
+}
+
+#[tokio::test]
+async fn hydration_pre_write_read_cannot_regress_completed_write() {
+    let (_owner, mut user, _reads) = counting_eidetica().await;
+    let mut app = App::hub(HashSet::new());
+    for _ in 0..2 {
+        let db = seed(&mut user, 4).await;
+        app.push_tab(tab(&db.root_id().to_string(), db));
+    }
+    let ids: Vec<_> = app.tabs.iter().map(|t| t.session_db_id.clone()).collect();
+    let (tx, mut rx) = mpsc::channel(64);
+    for id in &ids {
+        round(&mut app, id, &tx, &mut rx).await;
+    }
+    let name = |app: &App, i: usize| app.tabs[i].session_name.clone();
+
+    // Control: with no local write, a paused read still applies.
+    update_meta_on_db_name(&app.tabs[0].session_db, "remote").await;
+    let release = paused_read(&mut app, &ids[0], &tx, false).await;
+    release.send(()).unwrap();
+    assert_eq!(
+        apply(&mut app, next(&mut rx).await, resolved).follow_up,
+        None
+    );
+    assert_eq!(name(&app, 0).as_deref(), Some("remote"));
+
+    // The case: a read captured before the write completes after it.
+    let release_old = paused_read(&mut app, &ids[0], &tx, false).await;
+    // Control: an unrelated tab's pre-write read is not superseded.
+    let release_other = paused_read(&mut app, &ids[1], &tx, false).await;
+    rename(&mut app, 0, "local", &tx, &mut rx).await;
+    assert_eq!(name(&app, 0).as_deref(), Some("local"));
+    release_other.send(()).unwrap();
+    assert_eq!(
+        apply(&mut app, next(&mut rx).await, resolved).follow_up,
+        None
+    );
+    assert!(!app.tabs[1].live.pending(), "unrelated tab was reloaded");
+    release_old.send(()).unwrap();
+    let applied = apply(&mut app, next(&mut rx).await, resolved);
+    assert_eq!(
+        name(&app, 0).as_deref(),
+        Some("local"),
+        "pre-write read regressed the completed rename"
+    );
+    let (id, kind) = applied
+        .follow_up
+        .expect("superseded read lost its follow-up");
+    // The follow-up shows the write without any further notification.
+    request(&mut app, &id, kind, &tx);
+    let msg = next(&mut rx).await;
+    assert!(
+        matches!(msg, Refresh::Session { .. }),
+        "follow-up suppressed"
+    );
+    assert_eq!(apply(&mut app, msg, resolved).follow_up, None);
+    assert_eq!(name(&app, 0).as_deref(), Some("local"));
+
+    // A failed pre-write read is discarded too: it neither reports nor marks
+    // freshness, and the follow-up rebuilds instead of matching coverage.
+    let release = paused_read(&mut app, &ids[0], &tx, true).await;
+    rename(&mut app, 0, "second", &tx, &mut rx).await;
+    release.send(()).unwrap();
+    assert!(
+        apply(&mut app, next(&mut rx).await, resolved)
+            .follow_up
+            .is_some()
+    );
+    assert!(!app.tabs[0].live.failed(RefreshKind::Session));
+    assert_eq!(name(&app, 0).as_deref(), Some("second"));
+    // A write during the follow-up supersedes it as well, and so on.
+    let release = paused_read(&mut app, &ids[0], &tx, false).await;
+    rename(&mut app, 0, "third", &tx, &mut rx).await;
+    release.send(()).unwrap();
+    settle(&mut app, &tx, &mut rx).await;
+    assert_eq!(name(&app, 0).as_deref(), Some("third"));
+    assert!(!app.tabs[0].live.failed(RefreshKind::Session));
+
+    // Reconnect resets the slot: a superseded result arriving late is
+    // dropped and the fresh read applies normally.
+    let release = paused_read(&mut app, &ids[0], &tx, false).await;
+    rename(&mut app, 0, "fourth", &tx, &mut rx).await;
+    app.tabs[0].live.cancel_reads();
+    drop(release);
+    round(&mut app, &ids[0], &tx, &mut rx).await;
+    assert_eq!(name(&app, 0).as_deref(), Some("fourth"));
+
+    // Closing the tab aborts its superseded read; a reopened view starts clean.
+    let db = app.tabs[0].session_db.clone();
+    let release = paused_read(&mut app, &ids[0], &tx, false).await;
+    rename(&mut app, 0, "fifth", &tx, &mut rx).await;
+    app.tabs.remove(0);
+    let _ = release.send(());
+    app.push_tab(tab(&ids[0], db));
+    round(&mut app, &ids[0], &tx, &mut rx).await;
+    let i = app.tab_index_for(&ids[0]).unwrap();
+    assert_eq!(name(&app, i).as_deref(), Some("fifth"));
+}
+
+async fn update_meta_on_db_name(db: &eidetica::Database, name: &str) {
+    chaz_core::session::update_meta_on_db(db, |m| m.name = Some(name.into()))
+        .await
+        .unwrap();
+}
