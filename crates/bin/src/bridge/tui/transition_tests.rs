@@ -13,12 +13,17 @@ async fn runtime(dir: &std::path::Path) -> BuiltServer {
 }
 
 async fn runtime_with_stub(dir: &std::path::Path, stub_port: Option<u16>) -> BuiltServer {
-    let (instance, user) = Instance::create_backend(
+    let (instance, mut user) = Instance::create_backend(
         Box::new(InMemory::new()),
         NewAccount::passwordless("ui-transitions"),
     )
     .await
     .unwrap();
+    for name in ["a", "b", "c"] {
+        chaz_core::agent_db::ensure_agent_db(&mut user, name)
+            .await
+            .unwrap();
+    }
     let mut config: Config = serde_yaml::from_str(&format!(
         r#"execution: client
 state_dir: {0}
@@ -27,10 +32,6 @@ eidetica:
   login:
     username: ui-transitions
     passwordless: true
-agents:
-  - name: a
-  - name: b
-  - name: c
 default_agents: [a, b]
 "#,
         dir.display()
@@ -47,7 +48,6 @@ default_agents: [a, b]
         BuildOptions {
             config_path: dir.join("config.yaml"),
             run_routine_engine: false,
-            bootstrap_agents_from_config: stub_port.is_some(),
             run_agent_loop: stub_port.is_some(),
             extra_auto_approved_tools: Vec::new(),
             mcp_readiness: McpReadiness::Deferred,

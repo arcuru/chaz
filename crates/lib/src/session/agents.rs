@@ -325,6 +325,8 @@ impl SessionRegistry {
     ///    sessions keep working until migrated.
     /// 4. Default agent.
     ///
+    /// `None` only when this peer hosts no agent at all.
+    ///
     /// Mention-aware turn-taking lives in [`Self::resolve_agent_for_entry`];
     /// this method just picks the first matching authorized agent.
     pub async fn resolve_agent(
@@ -332,29 +334,29 @@ impl SessionRegistry {
         session_db_id: &str,
         override_name: Option<&str>,
         agent_index: &crate::hosted_index::HostedIndex,
-    ) -> Agent {
+    ) -> Option<Agent> {
         if let Some(name) = override_name
             && let Some(agent) = self.agents.get(name)
         {
-            return agent.clone();
+            return Some(agent);
         }
 
         let Ok((_conv_id, db)) = self.open_session(session_db_id).await else {
-            return self.agents.default_agent().clone();
+            return self.agents.default_agent();
         };
 
         if let Some(agent) = self.resolve_from_auth(&db, agent_index).await {
-            return agent;
+            return Some(agent);
         }
 
         let meta = read_meta_from_db(&db).await;
         if let Some(agent_name) = meta.agent_name.as_deref()
             && let Some(agent) = self.agents.get(agent_name)
         {
-            return agent.clone();
+            return Some(agent);
         }
 
-        self.agents.default_agent().clone()
+        self.agents.default_agent()
     }
 
     /// Look up the first agent authorized on this session via key-possession.
@@ -421,22 +423,22 @@ impl SessionRegistry {
     /// 3. `SessionMeta.host_agent_db_id` if it points at an authorized agent.
     /// 4. First authorized agent on the session (key-possession routing).
     /// 5. Legacy `SessionMeta.agent_name`.
-    /// 6. Default agent.
+    /// 6. Default agent; `None` only when this peer hosts no agent.
     pub async fn resolve_agent_for_entry(
         &self,
         session_db_id: &str,
         override_name: Option<&str>,
         agent_index: &crate::hosted_index::HostedIndex,
         trigger_text: Option<&str>,
-    ) -> Agent {
+    ) -> Option<Agent> {
         if let Some(name) = override_name
             && let Some(agent) = self.agents.get(name)
         {
-            return agent.clone();
+            return Some(agent);
         }
 
         let Ok((_conv_id, db)) = self.open_session(session_db_id).await else {
-            return self.agents.default_agent().clone();
+            return self.agents.default_agent();
         };
 
         let authorized = self.authorized_agents(&db, agent_index).await;
@@ -450,7 +452,7 @@ impl SessionRegistry {
                     .find(|e| e.display_name.eq_ignore_ascii_case(mention))
                     && let Some(agent) = self.agents.get(&entry.display_name)
                 {
-                    return agent.clone();
+                    return Some(agent);
                 }
             }
             // A human addressed `@someone` but no attached agent matched.
@@ -476,24 +478,24 @@ impl SessionRegistry {
             && let Some(entry) = authorized.iter().find(|e| e.db_id.to_string() == host_id)
             && let Some(agent) = self.agents.get(&entry.display_name)
         {
-            return agent.clone();
+            return Some(agent);
         }
 
         // (4) first authorized agent.
         if let Some(entry) = authorized.first()
             && let Some(agent) = self.agents.get(&entry.display_name)
         {
-            return agent.clone();
+            return Some(agent);
         }
 
         // (5) legacy agent_name.
         if let Some(name) = meta.agent_name.as_deref()
             && let Some(agent) = self.agents.get(name)
         {
-            return agent.clone();
+            return Some(agent);
         }
 
-        self.agents.default_agent().clone()
+        self.agents.default_agent()
     }
 
     /// Chat-room (agent→agent) resolution. Returns the agent an `@mention`
@@ -796,7 +798,7 @@ mod tests {
         .unwrap();
 
         let resolved = registry.resolve_agent(&session_id, None, &index).await;
-        assert_eq!(resolved.name, "alpha");
+        assert_eq!(resolved.unwrap().name, "alpha");
     }
 
     #[tokio::test]
@@ -813,7 +815,7 @@ mod tests {
         .unwrap();
 
         let resolved = registry.resolve_agent(&session_id, None, &index).await;
-        assert_eq!(resolved.name, "alpha");
+        assert_eq!(resolved.unwrap().name, "alpha");
     }
 
     #[tokio::test]
@@ -891,13 +893,13 @@ mod tests {
         let resolved = registry
             .resolve_agent_for_entry(&session_id, None, &index, Some("yo @beta what's up"))
             .await;
-        assert_eq!(resolved.name, "beta");
+        assert_eq!(resolved.unwrap().name, "beta");
 
         // Mentioning @alpha picks alpha.
         let resolved = registry
             .resolve_agent_for_entry(&session_id, None, &index, Some("hey @alpha"))
             .await;
-        assert_eq!(resolved.name, "alpha");
+        assert_eq!(resolved.unwrap().name, "alpha");
     }
 
     #[tokio::test]
@@ -931,7 +933,7 @@ mod tests {
         let resolved = registry
             .resolve_agent_for_entry(&session_id, None, &index, Some("hello everyone"))
             .await;
-        assert_eq!(resolved.name, "beta");
+        assert_eq!(resolved.unwrap().name, "beta");
     }
 
     #[tokio::test]
@@ -957,7 +959,7 @@ mod tests {
         let resolved = registry
             .resolve_agent_for_entry(&session_id, Some("alpha"), &index, Some("@beta help"))
             .await;
-        assert_eq!(resolved.name, "alpha");
+        assert_eq!(resolved.unwrap().name, "alpha");
     }
 
     #[tokio::test]
@@ -977,7 +979,7 @@ mod tests {
         let resolved = registry
             .resolve_agent_for_entry(&session_id, None, &index, Some("@gamma huh?"))
             .await;
-        assert_eq!(resolved.name, "alpha");
+        assert_eq!(resolved.unwrap().name, "alpha");
     }
 
     #[tokio::test]

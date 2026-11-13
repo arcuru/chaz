@@ -45,7 +45,7 @@ struct Args {
     /// Path to the bridge config file. When unset, falls back to
     /// `$XDG_CONFIG_HOME/chaz/discord-bridge.yaml`. The file carries both the
     /// bridge's own settings (`label`, `unlock_password`, `logins`) and the
-    /// chaz config the runtime needs (`backends`, `agents`, `security`).
+    /// chaz config the runtime needs (`backends`, `security`).
     #[arg(short, long)]
     config: Option<PathBuf>,
 }
@@ -73,9 +73,12 @@ async fn main() -> anyhow::Result<()> {
     let contents = std::fs::read_to_string(&config_path)?;
 
     // Parse the same bytes twice: once as the full chaz config (backends,
-    // agents, security) the runtime needs, and once for the bridge's own
+    // security) the runtime needs, and once for the bridge's own
     // section (label, unlock_password, logins).
     let mut config: Config = serde_yaml::from_str(&contents)?;
+    // Agents live in their Agent DBs; refuse a legacy root `agents:` block
+    // before connecting or bootstrapping anything.
+    chaz_core::config::reject_legacy_agents(&config)?;
     if config.agent_config_dir.is_none() {
         config.agent_config_dir = Some(
             dirs::config_dir()

@@ -356,7 +356,7 @@ fn apply_agent_new_overrides(
 pub(super) async fn agent_new(
     name: &str,
     overrides: &[(String, String)],
-    ctx: &CommandContext<'_>,
+    server: &std::sync::Arc<crate::server::Server>,
 ) -> CommandOutcome {
     let name = name.trim();
     if name.is_empty() {
@@ -365,7 +365,7 @@ pub(super) async fn agent_new(
 
     // Reject duplicates at the registry level early — create_new_agent_db also
     // rejects at the DB-name level, but this catches in-memory collisions too.
-    if ctx.server.agents().get(name).is_some() {
+    if server.agents().get(name).is_some() {
         return CommandOutcome::Error(format!("Agent '{name}' already registered"));
     }
 
@@ -373,7 +373,7 @@ pub(super) async fn agent_new(
     if let Err(msg) = apply_agent_new_overrides(&mut cfg, overrides) {
         return CommandOutcome::Error(msg);
     }
-    if ctx.server.agent_folders().is_some()
+    if server.agent_folders().is_some()
         && let Err(e) = crate::agent_bundle::import_sources(&mut cfg)
     {
         return CommandOutcome::Error(format!("Invalid agent prompt sources: {e:#}"));
@@ -383,8 +383,7 @@ pub(super) async fn agent_new(
         ..Default::default()
     };
 
-    let (agent_db, pubkey) = match ctx
-        .server
+    let (agent_db, pubkey) = match server
         .registry()
         .create_new_agent_db(name, &cfg, &meta)
         .await
@@ -395,28 +394,26 @@ pub(super) async fn agent_new(
     let db_id = agent_db.id();
 
     // Register in the peer-local agent index.
-    ctx.server
-        .agent_index()
-        .register(crate::hosted_index::DbEntry {
-            db_id: db_id.clone(),
-            display_name: name.to_string(),
-            pubkey: pubkey.clone(),
-        });
+    server.agent_index().register(crate::hosted_index::DbEntry {
+        db_id: db_id.clone(),
+        display_name: name.to_string(),
+        pubkey: pubkey.clone(),
+    });
 
     // Build a runtime Agent so the AgentRegistry can resolve it — makes the
     // agent spawnable + attachable by display name for the rest of this session.
-    let runtime_agent = ctx.server.agents().build_from_db_config(name, &cfg);
-    if let Err(e) = ctx.server.agents().register(runtime_agent) {
+    let runtime_agent = server.agents().build_from_db_config(name, &cfg);
+    if let Err(e) = server.agents().register(runtime_agent) {
         return CommandOutcome::Error(format!(
             "Agent DB created + indexed but runtime registry rejected: {e}"
         ));
     }
 
-    if ctx.server.agent_folders().is_some() {
-        if let Err(e) = ctx.server.watch_agent_config(name).await {
+    if server.agent_folders().is_some() {
+        if let Err(e) = server.watch_agent_config(name).await {
             return CommandOutcome::Error(format!("Agent created, but config watch failed: {e:#}"));
         }
-        match ctx.server.project_agent_config(name, false).await {
+        match server.project_agent_config(name, false).await {
             Ok(outcome) if outcome.projection_error.is_none() => {}
             Ok(outcome) => {
                 return CommandOutcome::Error(format!(
@@ -513,7 +510,7 @@ pub(super) async fn agent_unshare(agent_ref: &str, ctx: &CommandContext<'_>) -> 
 pub(super) async fn agent_import(
     ticket_str: &str,
     permission: CoOwnerPermission,
-    ctx: &CommandContext<'_>,
+    server: &std::sync::Arc<crate::server::Server>,
 ) -> CommandOutcome {
     let ticket: eidetica::sync::DatabaseTicket = match ticket_str.parse() {
         Ok(t) => t,
@@ -526,8 +523,7 @@ pub(super) async fn agent_import(
     // ran /agent invite), sync proceeds and we land in `Approved`. Otherwise
     // eidetica queues a pending request and the owner has to /sharing approve
     // before this peer can pull entries; we tell the user to re-run.
-    match ctx
-        .server
+    match server
         .registry()
         .request_db_access(&ticket, eidetica_perm)
         .await
@@ -545,7 +541,7 @@ pub(super) async fn agent_import(
         Err(e) => return CommandOutcome::Error(format!("Bootstrap failed: {e}")),
     }
 
-    let agent_db = match ctx.server.registry().open_agent_db(&db_id, None).await {
+    let agent_db = match server.registry().open_agent_db(&db_id, None).await {
         Ok(Some(db)) => db,
         Ok(None) => {
             return CommandOutcome::Error(format!(
@@ -575,7 +571,7 @@ pub(super) async fn agent_import(
     // into session AuthSettings later. `open_agent_db` above already proved
     // a key exists; this second lookup is just to get the pubkey out.
     let pubkey =
-        match ctx.server.registry().find_key_for_db(&db_id).await {
+        match server.registry().find_key_for_db(&db_id).await {
             Ok(Some(k)) => k,
             _ => return CommandOutcome::Error(
                 "Expected a key for this DB (open_agent_db succeeded) but find_key returned None"
@@ -583,36 +579,31 @@ pub(super) async fn agent_import(
             ),
         };
 
-    ctx.server
-        .agent_index()
-        .register(crate::hosted_index::DbEntry {
-            db_id: db_id.clone(),
-            display_name: display_name.clone(),
-            pubkey,
-        });
+    server.agent_index().register(crate::hosted_index::DbEntry {
+        db_id: db_id.clone(),
+        display_name: display_name.clone(),
+        pubkey,
+    });
 
     // Upsert into the runtime registry so re-importing a previously-seen
     // agent refreshes its config from the synced DB (model/tools/role may
     // have changed upstream since the last import).
-    let runtime_agent = ctx
-        .server
-        .agents()
-        .build_from_db_config(&display_name, &cfg);
-    ctx.server.agents().upsert(runtime_agent);
+    let runtime_agent = server.agents().build_from_db_config(&display_name, &cfg);
+    server.agents().upsert(runtime_agent);
 
-    if let Err(e) = ctx.server.registry().enable_sync_for(&db_id).await {
+    if let Err(e) = server.registry().enable_sync_for(&db_id).await {
         return CommandOutcome::Error(format!(
             "Imported agent '{display_name}' (DB {db_id}) but failed to enable ongoing sync: {e}"
         ));
     }
 
-    if ctx.server.agent_folders().is_some() {
-        if let Err(e) = ctx.server.watch_agent_config(&display_name).await {
+    if server.agent_folders().is_some() {
+        if let Err(e) = server.watch_agent_config(&display_name).await {
             return CommandOutcome::Error(format!(
                 "Imported, but configuration watch failed: {e:#}"
             ));
         }
-        match ctx.server.project_agent_config(&display_name, false).await {
+        match server.project_agent_config(&display_name, false).await {
             Ok(outcome) if outcome.projection_error.is_none() => {}
             Ok(outcome) => {
                 return CommandOutcome::Error(format!(
@@ -633,11 +624,11 @@ pub(super) async fn agent_import(
     ))
 }
 
-pub(super) async fn agent_hosted(ctx: &CommandContext<'_>) -> CommandOutcome {
-    if let Err(e) = ctx.server.ensure_hosted_indices_complete().await {
+pub(super) async fn agent_hosted(server: &std::sync::Arc<crate::server::Server>) -> CommandOutcome {
+    if let Err(e) = server.ensure_hosted_indices_complete().await {
         return CommandOutcome::Error(format!("Failed to load hosted agents: {e}"));
     }
-    let entries = ctx.server.agent_index().list();
+    let entries = server.agent_index().list();
     if entries.is_empty() {
         return CommandOutcome::Text("No Living Agents hosted on this peer.".to_string());
     }
@@ -648,7 +639,7 @@ pub(super) async fn agent_hosted(ctx: &CommandContext<'_>) -> CommandOutcome {
                 "  {} ({})\n    {}",
                 e.display_name,
                 e.db_id,
-                ctx.server.agent_folder_status(&e.display_name)
+                server.agent_folder_status(&e.display_name)
             )
         })
         .collect();

@@ -23,8 +23,7 @@ use crate::config::{self, Config};
 use crate::server::Server;
 use crate::{
     agent, agent_db, backends, commands, db_kind, embedding, extension, extensions, grants,
-    hosted_index, keyed_sync, mcp, memory_bank_db, routine, security, session, tool, tool_host,
-    tools,
+    hosted_index, keyed_sync, mcp, routine, security, session, tool, tool_host, tools,
 };
 
 /// Knobs [`build`] can't infer from [`Config`] — behavior a one-shot CLI run and
@@ -36,13 +35,6 @@ pub struct BuildOptions {
     /// Spawn the routine engine (heartbeats + schedulers) and register every
     /// hosted session/agent with it. Off for one-shot CLI runs.
     pub run_routine_engine: bool,
-    /// Materialize an eidetica AgentDb per config-declared agent (minting one
-    /// locally on this peer). True for the chaz daemon, which owns its agents.
-    /// A standalone bridge sets this **false**: it owns no agents — it
-    /// either ticket-bootstraps agent DBs as a direct owner or opens them
-    /// through the shared service. Minting locally
-    /// here would fork a second, divergent agent DB against the daemon's.
-    pub bootstrap_agents_from_config: bool,
     /// Spawn the agent-running `processing_loop`. True for the chaz daemon,
     /// which runs agents. A standalone (dumb) bridge sets this **false**: it
     /// proxies inbound messages into session DBs and delivers replies back to
@@ -77,7 +69,6 @@ impl BuildOptions {
         Self {
             config_path,
             run_routine_engine: executor,
-            bootstrap_agents_from_config: executor,
             run_agent_loop: executor,
             extra_auto_approved_tools,
             mcp_readiness,
@@ -89,15 +80,11 @@ impl BuildOptions {
     }
 
     /// Options for one-shot local entry points. `--print` needs one agent
-    /// turn and may perform first-boot agent setup; `cmd` must never start
-    /// queued turns or autonomous work. A direct owner may still bootstrap
-    /// its config-declared agents for first-boot administration, while a
-    /// service client must not.
+    /// turn; `cmd` must never start queued turns or autonomous work.
     pub fn local_oneshot(
         config_path: PathBuf,
         capabilities: crate::instance::InstanceCapabilities,
         run_agent_loop: bool,
-        bootstrap_agents_from_config: bool,
         extra_auto_approved_tools: Vec<String>,
         mcp_readiness: McpReadiness,
     ) -> Self {
@@ -105,7 +92,6 @@ impl BuildOptions {
         Self {
             config_path,
             run_routine_engine: false,
-            bootstrap_agents_from_config: executor && bootstrap_agents_from_config,
             run_agent_loop: executor && run_agent_loop,
             extra_auto_approved_tools,
             mcp_readiness,
@@ -167,7 +153,7 @@ mod build_options_tests {
         let error = build(&mut config, instance, user, opts)
             .await
             .err()
-            .expect("runtime build must reject an absent role before bootstrapping agents");
+            .expect("runtime build must reject an absent role before opening state");
         assert!(
             error.to_string().contains("missing required `execution:"),
             "unexpected build error: {error:#}"
@@ -180,37 +166,11 @@ mod build_options_tests {
             PathBuf::from("config.yaml"),
             capabilities(ExecutionRole::Executor),
             false,
-            false,
             Vec::new(),
             McpReadiness::Deferred,
         );
         assert!(!options.run_agent_loop);
         assert!(!options.run_routine_engine);
-        assert!(!options.bootstrap_agents_from_config);
-    }
-
-    #[test]
-    fn direct_owner_command_mode_may_bootstrap_without_running_turns() {
-        let config = EideticaConfig {
-            connection: "sqlite:///tmp/chaz-test.db".into(),
-            login: EideticaLoginConfig {
-                username: "chaz".into(),
-                password: None,
-                passwordless: true,
-            },
-            sync: None,
-        };
-        let options = BuildOptions::local_oneshot(
-            PathBuf::from("config.yaml"),
-            crate::instance::capabilities_for_test(&config, ExecutionRole::Executor),
-            false,
-            true,
-            Vec::new(),
-            McpReadiness::Deferred,
-        );
-        assert!(!options.run_agent_loop);
-        assert!(!options.run_routine_engine);
-        assert!(options.bootstrap_agents_from_config);
     }
 
     #[test]
@@ -219,13 +179,11 @@ mod build_options_tests {
             PathBuf::from("config.yaml"),
             capabilities(ExecutionRole::Client),
             true,
-            true,
             Vec::new(),
             McpReadiness::AwaitReady,
         );
         assert!(!options.run_agent_loop);
         assert!(!options.run_routine_engine);
-        assert!(!options.bootstrap_agents_from_config);
     }
 
     #[tokio::test]
@@ -242,7 +200,6 @@ mod build_options_tests {
             BuildOptions {
                 config_path: f.dir.path().join("config.yaml"),
                 run_routine_engine: false,
-                bootstrap_agents_from_config: false,
                 run_agent_loop: true,
                 extra_auto_approved_tools: Vec::new(),
                 mcp_readiness: McpReadiness::Deferred,
@@ -323,7 +280,6 @@ eidetica:
             BuildOptions {
                 config_path: PathBuf::from("config.yaml"),
                 run_routine_engine: false,
-                bootstrap_agents_from_config: false,
                 run_agent_loop: false,
                 extra_auto_approved_tools: Vec::new(),
                 mcp_readiness: McpReadiness::Deferred,
@@ -356,7 +312,6 @@ eidetica:
                 built.registry.clone(),
                 config.clone(),
                 backends::BackendManager::new(&None, built.secret_store.clone()),
-                Vec::new(),
                 false,
                 false,
                 McpReadiness::Deferred,
@@ -450,17 +405,16 @@ impl BuiltServer {
 pub async fn build(
     config: &mut Config,
     instance: eidetica::Instance,
-    mut user: eidetica::AccountSession,
+    user: eidetica::AccountSession,
     opts: BuildOptions,
 ) -> anyhow::Result<BuiltServer> {
     let mut tasks = Vec::new();
     let execution = crate::instance::required_settings(config)?.1;
+    crate::config::reject_legacy_agents(config)?;
     let executor_components = execution == crate::config::ExecutionRole::Executor;
-    if !executor_components
-        && (opts.run_agent_loop || opts.run_routine_engine || opts.bootstrap_agents_from_config)
-    {
+    if !executor_components && (opts.run_agent_loop || opts.run_routine_engine) {
         anyhow::bail!(
-            "execution role and runtime options disagree: clients cannot run agents, tools, routines, schedules, or agent bootstrap"
+            "execution role and runtime options disagree: clients cannot run agents, tools, routines, or schedules"
         );
     }
     // Wall-clock instrumentation for the critical-path build. Individual
@@ -468,51 +422,9 @@ pub async fn build(
     // gateway-blocking prefix so regressions are visible in the log.
     let build_start = Instant::now();
 
-    let t = Instant::now();
-    let agent_registry = std::sync::Arc::new(agent::AgentRegistry::from_config(config));
-    if agent_registry.is_empty() {
-        agent_registry.register_default_chaz(config)?;
-    }
-    info!(
-        agents = agent_registry.names().len(),
-        elapsed_ms = t.elapsed().as_millis() as u64,
-        "Agent registry initialized"
-    );
-
-    // Materialize an eidetica DB per yaml-declared agent. Idempotent on
-    // re-runs (yaml is a first-boot template; AgentDb is the source of
-    // truth afterwards). Skipped for a standalone bridge, which owns no
-    // agents: it either ticket-bootstraps (direct owner) or shares the
-    // service login. Minting here could fork a divergent agent DB; the
-    // hosted index below discovers the existing DBs.
-    let mut new_agent_seeds = Vec::new();
-    if opts.bootstrap_agents_from_config {
-        let t = Instant::now();
-        let bootstrapped = agent_db::bootstrap_from_config(&mut user, config).await?;
-        new_agent_seeds.extend(
-            bootstrapped
-                .iter()
-                .filter(|(_, agent)| agent.created)
-                .map(|(name, _)| name.clone()),
-        );
-        if !bootstrapped.is_empty() {
-            info!(
-                count = bootstrapped.len(),
-                elapsed_ms = t.elapsed().as_millis() as u64,
-                "Agent DBs bootstrapped from config"
-            );
-        }
-
-        // Every AgentRegistry entry needs an AgentDb so per-agent memory tools
-        // resolve. The default `chaz` agent (when no yaml `agents:` block) has
-        // no bootstrap entry — ensure one exists.
-        for name in agent_registry.names() {
-            if !bootstrapped.contains_key(&name) {
-                let bs = agent_db::ensure_agent_db(&mut user, &name).await?;
-                info!(agent = %name, db_id = %bs.db.id(), "Created default Agent DB");
-            }
-        }
-    }
+    // Hosted Agent DBs are the only agent authority; the registry is filled
+    // from them once the hosted index is built below.
+    let agent_registry = std::sync::Arc::new(agent::AgentRegistry::default());
 
     let t = Instant::now();
     let registry = session::SessionRegistry::new(instance, user, agent_registry.clone()).await?;
@@ -563,8 +475,7 @@ pub async fn build(
     let configured_defaults = peer_default_agents
         .clone()
         .or_else(|| config.default_agents.clone())
-        .filter(|names| !names.is_empty())
-        .unwrap_or_else(|| vec![agent_registry.default_agent().name]);
+        .unwrap_or_default();
     info!(
         elapsed_ms = t.elapsed().as_millis() as u64,
         "Startup: peer defaults loaded"
@@ -572,7 +483,9 @@ pub async fn build(
     let t = Instant::now();
     let (agent_index_store, memory_bank_index_store, skill_bank_index_store) = {
         let user = registry.user_lock().await;
-        if opts.targeted_session.is_some() {
+        // Without configured defaults a targeted client cannot name the
+        // agents a new session attaches, so it indexes every hosted agent.
+        if opts.targeted_session.is_some() && !configured_defaults.is_empty() {
             let (agents, memory_banks, skill_banks, _) =
                 hosted_index::build_targeted(&user, &targeted_agents, &configured_defaults).await?;
             (agents, memory_banks, skill_banks)
@@ -595,85 +508,6 @@ pub async fn build(
         warn_unset_home_pubkey_on_coowned(&registry, &agent_index_store).await;
     }
 
-    // Attach default memory banks declared in agent configs. Idempotent —
-    // already-attached banks are skipped (grant_on_memory_bank is idempotent,
-    // and attach_memory_bank overwrites by name). Missing banks/agents are
-    // logged at warn and skipped so a typo in config doesn't fail startup.
-    if opts.bootstrap_agents_from_config
-        && let Some(agent_configs) = &config.agents
-    {
-        for ac in agent_configs {
-            if let Some(banks) = &ac.default_memory_banks {
-                for bank_name in banks {
-                    let Some(agent_entry) = agent_index_store.find_by_name(&ac.name) else {
-                        warn!(agent = %ac.name, bank = %bank_name, "Agent not in index; skipping default bank attach");
-                        continue;
-                    };
-                    let bank_entry = match memory_bank_index_store.find_by_name(bank_name) {
-                        Some(e) => e,
-                        None => {
-                            // Auto-create the bank if it doesn't exist
-                            let meta = memory_bank_db::MemoryBankMeta {
-                                display_name: Some(bank_name.clone()),
-                                description: Some(
-                                    "Auto-created from default_memory_banks config".into(),
-                                ),
-                            };
-                            match registry.create_new_memory_bank(bank_name, &meta).await {
-                                Ok((bank, pubkey)) => {
-                                    let entry = hosted_index::DbEntry {
-                                        db_id: bank.id(),
-                                        display_name: bank_name.clone(),
-                                        pubkey,
-                                    };
-                                    memory_bank_index_store.register(entry.clone());
-                                    info!(bank = %bank_name, "Auto-created default memory bank");
-                                    entry
-                                }
-                                Err(e) => {
-                                    warn!(agent = %ac.name, bank = %bank_name, error = %e, "Failed to auto-create default bank");
-                                    continue;
-                                }
-                            }
-                        }
-                    };
-                    let key_label = format!("memory:{}:{}", bank_name, ac.name);
-                    if let Err(e) = registry
-                        .grant_on_memory_bank(
-                            &bank_entry.db_id,
-                            &agent_entry.pubkey,
-                            &key_label,
-                            agent_db::BankPermission::Write,
-                        )
-                        .await
-                    {
-                        warn!(agent = %ac.name, bank = %bank_name, error = %e, "Failed to grant bank access");
-                        continue;
-                    }
-                    match registry
-                        .open_agent_db(&agent_entry.db_id, Some(&agent_entry.pubkey))
-                        .await
-                    {
-                        Ok(Some(agent_db)) => {
-                            let ref_entry = agent_db::MemoryBankRef {
-                                name: bank_name.clone(),
-                                db_id: bank_entry.db_id.to_string(),
-                                permission: agent_db::BankPermission::Write,
-                            };
-                            if let Err(e) = agent_db.attach_memory_bank(ref_entry).await {
-                                warn!(agent = %ac.name, bank = %bank_name, error = %e, "Failed to attach bank ref; auth already granted");
-                            } else {
-                                info!(agent = %ac.name, bank = %bank_name, "Attached default memory bank");
-                            }
-                        }
-                        _ => {
-                            warn!(agent = %ac.name, "Cannot open agent DB for default bank attach");
-                        }
-                    }
-                }
-            }
-        }
-    }
     // Frontends still need backend credentials for explicit model-catalog
     // requests. Keep their hydration here; web search and embedding below are
     // execution-only and must not delay a client or write its tool credentials.
@@ -975,22 +809,27 @@ pub async fn build(
         mcp_registry.clone(),
         executor,
     );
-    if opts.targeted_session.is_none() {
+    let targeted_indices = opts.targeted_session.is_some() && !configured_defaults.is_empty();
+    if !targeted_indices {
         server.mark_hosted_indices_complete();
+    }
+    // Build the runtime registry from accepted Agent DB configuration before
+    // any command, frontend or turn reads it.
+    let agents_start = Instant::now();
+    Box::pin(server.load_hosted_agents(server.agent_index().list(), &configured_defaults)).await;
+    info!(
+        agents = server.agents().names().len(),
+        elapsed_ms = agents_start.elapsed().as_millis() as u64,
+        "Startup: hosted agents registered"
+    );
+    if server.agents().is_empty() && !targeted_indices {
+        info!("No hosted agents yet; create one with `/agent new NAME` or `/agent import TICKET`");
     }
     // Close the processing gate before the first await below can schedule the
     // resident session-adoption watcher. On restart that watcher scans durable
     // queued turns immediately; none may run until agent config is reconciled.
     if executor_components {
         server.mark_startup_pending();
-    }
-    // Commands and the TUI read this registry before the first agent turn.
-    // Indexing a persisted DB alone leaves them showing YAML defaults after
-    // restart, even though execution hydrates the live config from that DB.
-    for entry in server.agent_index().list() {
-        if let Some(agent) = server.agents().get(&entry.display_name) {
-            server.hydrate_agent_from_db(agent).await;
-        }
     }
     server_slot.set(server.clone());
 
@@ -1047,29 +886,13 @@ pub async fn build(
             groups = ?names,
             "Applied agent_groups — selectable with /new <group>"
         );
-        // A member with no `agents:` entry can never resolve to a hosted
-        // Agent DB, so `/new <group>` would report success and hand back a
-        // session with fewer agents than asked for. Auto-attach only
-        // debug-logs the skip, so say it once here where it is actionable.
-        if let Some(agent_configs) = &config.agents {
-            let known: std::collections::HashSet<&str> =
-                agent_configs.iter().map(|a| a.name.as_str()).collect();
-            for group in &names {
-                let unknown: Vec<&str> = groups[*group]
-                    .iter()
-                    .map(String::as_str)
-                    .filter(|m| !known.contains(m))
-                    .collect();
-                if !unknown.is_empty() {
-                    warn!(
-                        group = %group,
-                        members = %unknown.join(", "),
-                        "agent_groups member(s) have no `agents:` entry — they will not attach"
-                    );
-                }
-            }
-        }
         server.set_agent_groups(groups);
+    }
+    // Default and group names are runner preferences resolved against hosted
+    // Agent DBs. A name with no hosted agent never attaches, and auto-attach
+    // only debug-logs the skip, so say it once here where it is actionable.
+    if !targeted_indices {
+        warn_unhosted_agent_references(&server);
     }
 
     // Fast-start: the server is now fully constructed and the spawn-tool
@@ -1103,7 +926,6 @@ pub async fn build(
                 registry,
                 deferred_config,
                 default_backend,
-                new_agent_seeds,
                 run_routine_engine,
                 run_agent_loop,
                 mcp_readiness,
@@ -1141,11 +963,9 @@ pub async fn build(
 ///
 /// 1. `warm_model_windows` — best-effort; the per-turn budget falls back
 ///    to the static default until this lands, so a miss is tolerated.
-/// 2. `complete_agent_seeds` — resolves the system prompt of agents seeded
-///    from yaml that have no prompt pointer yet; never re-applies yaml to an
-///    existing agent. `mark_startup_ready` runs immediately after
-///    so held turns release the moment agent config is consistent, before
-///    the (slower) schedule + routine work below.
+/// 2. `mark_startup_ready` — after MCP readiness when a one-shot needs it,
+///    so held turns release before the (slower) schedule + routine work
+///    below. Hosted agents were already registered from their Agent DBs.
 /// 3. Schedule materialization + routine engine — long-lived background
 ///    services; nothing user-facing waits on them.
 ///
@@ -1157,7 +977,6 @@ async fn run_deferred_startup(
     registry: Arc<session::SessionRegistry>,
     config: Config,
     default_backend: backends::BackendManager,
-    new_agent_seeds: Vec<String>,
     run_routine_engine: bool,
     run_agent_loop: bool,
     mcp_readiness: McpReadiness,
@@ -1185,17 +1004,6 @@ async fn run_deferred_startup(
         return;
     }
 
-    // 2. Finish seeding newly bootstrapped yaml agents (resolve their system
-    //    prompt into the blob store), then open the gate. Existing agents keep
-    //    their DB config: yaml only seeds.
-    if !new_agent_seeds.is_empty() {
-        let t = Instant::now();
-        server.complete_agent_seeds(&new_agent_seeds).await;
-        info!(
-            elapsed_ms = t.elapsed().as_millis() as u64,
-            "Deferred: completed agent seeds from config"
-        );
-    }
     // 2b. A one-shot run gets a single turn, so it must not start that turn
     //     against a half-loaded tool list. Reuse the turn gate rather than
     //     adding a second one: `process_session` already parks here, so the
@@ -1231,10 +1039,19 @@ async fn run_deferred_startup(
                 continue;
             }
             // Owning agent: explicit `agent:` else the peer's default.
-            let owner_ref = cfg
-                .agent
-                .clone()
-                .unwrap_or_else(|| server.agents().default_agent().name);
+            let Some(owner_ref) = cfg.agent.clone().or_else(|| {
+                server
+                    .default_agents()
+                    .into_iter()
+                    .next()
+                    .or_else(|| server.agents().default_agent().map(|agent| agent.name))
+            }) else {
+                error!(
+                    schedule = %cfg.name,
+                    "Schedule names no agent and this peer hosts none; skipping"
+                );
+                continue;
+            };
             let entry = match server.agent_index().find_by_name(&owner_ref).or_else(|| {
                 eidetica::entry::ID::parse(&owner_ref)
                     .ok()
@@ -2006,6 +1823,35 @@ async fn pull_session_tree_from_agent_peers(
         }
     }
     info!(session_db_id, peer = %winner, "Pulled exposed session tree from peer");
+}
+
+/// Warn once for each runner default/group member with no hosted Agent DB.
+fn warn_unhosted_agent_references(server: &Server) {
+    let hosted = server.agent_index();
+    let missing = |names: &[String]| -> Vec<String> {
+        names
+            .iter()
+            .filter(|name| hosted.find_by_name(name).is_none())
+            .cloned()
+            .collect()
+    };
+    let unknown = missing(&server.default_agents());
+    if !unknown.is_empty() {
+        warn!(
+            agents = %unknown.join(", "),
+            "default_agents name(s) with no hosted Agent DB will not attach; create them with /agent new or /agent import"
+        );
+    }
+    for group in server.agent_group_names() {
+        let unknown = missing(&server.agent_group(&group).unwrap_or_default());
+        if !unknown.is_empty() {
+            warn!(
+                group = %group,
+                members = %unknown.join(", "),
+                "agent_groups member(s) with no hosted Agent DB will not attach"
+            );
+        }
+    }
 }
 
 /// Startup migration WARN: any locally-hosted agent that is co-owned

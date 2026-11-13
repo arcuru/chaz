@@ -15,10 +15,26 @@ async fn print_normal_and_bridge_error_exits_explicitly_close_mcp_before_return(
             dir.path().join("eidetica.db").display()
         );
         let backend = Sqlite::connect(&connection).await.unwrap();
-        let (owner, user) =
+        let (owner, mut user) =
             Instance::create_backend(Box::new(backend), NewAccount::passwordless("fixture"))
                 .await
                 .unwrap();
+        // Agents live in their Agent DBs, never in root config.
+        chaz_core::agent_db::create_agent_db(
+            &mut user,
+            "chaz",
+            &chaz_core::agent_db::AgentDbConfig {
+                model: Some("stub".into()),
+                system_prompt: "fixture".into(),
+                ..Default::default()
+            },
+            &chaz_core::agent_db::AgentMeta {
+                display_name: Some("chaz".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
         // Only the CLI opens this direct-owner store while it runs.
         drop(user);
         drop(owner);
@@ -41,7 +57,7 @@ async fn print_normal_and_bridge_error_exits_explicitly_close_mcp_before_return(
             "state_dir":dir.path().join("state"), "execution":"executor",
             "eidetica":{"connection":connection, "login":{"username":"fixture", "passwordless":true}},
             "backends":[{"name":"stub", "type":"openaicompatible", "api_base":format!("{}/v1",model.uri()), "api_key":"not-a-real-key", "models":[{"name":"stub"}]}],
-            "agents":[{"name":"chaz", "model":"stub", "system_prompt":"fixture"}], "default_agents":["chaz"],
+            "default_agents":["chaz"],
             "mcp_servers":[{"name":"fixture", "command":"python3", "args":["-u","-c",MCP, dir.path()], "startup_timeout_secs":3}]
         });
         let config_path = dir.path().join("config.yaml");

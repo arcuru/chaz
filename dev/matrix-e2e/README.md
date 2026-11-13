@@ -155,9 +155,6 @@ Before starting it, the compact/send case must receive its own matched results
 and durably finish; an older Matrix-send result is not a barrier.
 Spawned processes and administration use a disposable HOME so host-global
 skills do not enter the model fixture.
-Use `just e2e --legacy-max-iterations 10` to render the retired config key in
-a disposable agent. It must still finish twelve rounds: `max_iterations` is
-ignored by current YAML and AgentDb config, not an active turn cap.
 
 ### Encrypted rooms
 
@@ -404,11 +401,11 @@ The bridge keeps its key across restarts, so it should come straight back
 without re-authorization. A restart that asks to be approved again is a
 regression in exactly the identity handling this harness pre-authorizes.
 
-**A different agent or model** means editing the daemon config heredoc. The
-`agents:` block there is a first-boot template — the agent DB is the runtime
-source of truth, so changing the YAML for an already-populated `state_dir`
-changes nothing. Test workspaces are fresh every run, so this only bites when
-reusing a `--keep` workspace.
+**A different agent or model** means editing the `/agent new` bring-up
+command (agent settings) or the daemon config heredoc (backends). Root config
+defines no agents — the agent DB is the only source of truth, so rerunning
+bring-up against an already-populated `--keep` workspace fails because the
+agent already exists; use `/agent set` there instead.
 
 **A tool call** is driven by the message body. `stub_llm.py` answers with a
 `tool_calls` response when a user message asks for one, and with the

@@ -217,18 +217,7 @@ Detached skill bank 'ops' from this session.
 
 ## Configuration
 
-Auto-attach skill banks at agent bootstrap:
-
-```yaml
-agents:
-  - name: sre-agent
-    system_prompt: "You triage prod issues."
-    default_skill_banks:
-      - ops
-      - postgres-runbook
-```
-
-Each named bank must already exist on this peer (created with `/skills new` or imported). Missing names are logged at WARN and skipped — a typo in config doesn't fail startup.
+Root config does not attach skill banks to agents. Attach a bank for a session with `/skills attach`; a legacy per-agent `default_skill_banks` value is preserved in the Agent DB but not applied at startup.
 
 ## See also
 

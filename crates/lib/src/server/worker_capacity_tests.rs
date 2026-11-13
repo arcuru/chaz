@@ -24,7 +24,7 @@ async fn worker_fixture() -> (
     .await
     .unwrap();
     server
-        .hydrate_agent_from_db(server.agents.default_agent().clone())
+        .hydrate_agent_from_db(server.agents.default_agent().unwrap())
         .await;
     let slot = crate::instance::ServerSlot::default();
     slot.set(server.clone());

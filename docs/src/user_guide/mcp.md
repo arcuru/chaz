@@ -206,13 +206,12 @@ Use `describe_tool` for on-demand discovery when tools are in Brief or Summary m
 Agents can reference MCP tools by exact name or glob pattern:
 
 ```yaml
-agents:
-  - name: coder
-    allowed_tools:
-      - shell
-      - read_file
-      - write_file
-      - "filesystem__*" # All filesystem MCP tools
+# coder's managed agent.yaml — apply with `/agent reload coder`
+allowed_tools:
+  - shell
+  - read_file
+  - write_file
+  - "filesystem__*" # All filesystem MCP tools
 ```
 
 See [Agents](agents.md) for details on tool narrowing.
@@ -253,9 +252,8 @@ The shortest "agent reads a file through MCP" path:
 5. To narrow which agents can see an MCP namespace, add a glob to the agent's `allowed_tools`:
 
    ```yaml
-   agents:
-     - name: notetaker
-       allowed_tools: ["read_file", "filesystem__*"]
+   # notetaker's managed agent.yaml — apply with `/agent reload notetaker`
+   allowed_tools: ["read_file", "filesystem__*"]
    ```
 
    `filesystem__*` matches every tool that namespace exposes — present or future. The same glob form works in [tool profiles](tools.md#tool-profiles) for controlling how the LLM sees the tool definitions.

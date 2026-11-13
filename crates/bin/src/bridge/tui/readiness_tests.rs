@@ -228,7 +228,7 @@ async fn runtime(dir: &std::path::Path, probe: Arc<Probe>) -> BuiltServer {
         .unwrap();
     }
     let mut config: Config = serde_yaml::from_str(&format!(
-        "execution: client\nstate_dir: {0}\neidetica:\n  connection: sqlite://{0}/unused.db\n  login:\n    username: session-readiness\n    passwordless: true\nagents:\n  - name: default\n  - name: selected\ndefault_agents: [default]\nagent_groups:\n  chosen: [selected]\n",
+        "execution: client\nstate_dir: {0}\neidetica:\n  connection: sqlite://{0}/unused.db\n  login:\n    username: session-readiness\n    passwordless: true\ndefault_agents: [default]\nagent_groups:\n  chosen: [selected]\n",
         dir.display()
     )).unwrap();
     chaz_core::server::build(
@@ -238,7 +238,6 @@ async fn runtime(dir: &std::path::Path, probe: Arc<Probe>) -> BuiltServer {
         BuildOptions {
             config_path: dir.join("config.yaml"),
             run_routine_engine: false,
-            bootstrap_agents_from_config: false,
             run_agent_loop: false,
             extra_auto_approved_tools: Vec::new(),
             mcp_readiness: McpReadiness::Deferred,

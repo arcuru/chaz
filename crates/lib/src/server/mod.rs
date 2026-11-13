@@ -1187,6 +1187,12 @@ impl Server {
         for entry in skill_banks.list() {
             self.skill_bank_index.register(entry);
         }
+        let unregistered = agents
+            .list()
+            .into_iter()
+            .filter(|entry| self.agents.get(&entry.display_name).is_none())
+            .collect();
+        Box::pin(self.load_hosted_agents(unregistered, &self.default_agents())).await;
         self.hosted_indices_complete.store(true, Ordering::Release);
         Box::pin(self.initialize_agent_folders()).await;
         Ok(())
@@ -1428,12 +1434,17 @@ impl Server {
         .await?;
         drop(user);
         // A targeted client may be opening these agents for the first time.
-        // Refresh their display/runtime snapshots, not just their index rows.
-        for (_, name) in explicit_agents {
-            if let Some(agent) = self.agents.get(&name) {
+        // Refresh the snapshots of agents already loaded, and register this
+        // session's newly indexed agents from their DB configuration.
+        let mut unregistered = Vec::new();
+        for (id, name) in &explicit_agents {
+            if let Some(agent) = self.agents.get(name) {
                 self.hydrate_agent_from_db(agent).await;
+            } else if let Some(entry) = self.agent_index.find_by_id(id) {
+                unregistered.push(entry);
             }
         }
+        Box::pin(self.load_hosted_agents(unregistered, &[])).await;
         Box::pin(self.initialize_agent_folders()).await;
         Ok(stats)
     }
@@ -1445,19 +1456,18 @@ impl Server {
     /// works, but `/agents` reports "none attached" and the per-agent
     /// model picker has no agent scopes.
     ///
-    /// Source of truth is `Config.default_agents` (set via
+    /// Source of truth is the runner's default agents (set via
     /// `set_default_agents`). When that list is empty, falls back to
-    /// attaching `AgentRegistry::default_agent()` — the first agent in
-    /// `agents:`.
+    /// attaching `AgentRegistry::default_agent()` — the first hosted agent
+    /// by name — and to nothing on a peer hosting no agents.
     ///
     /// Called from user-facing creation paths (TUI `/new`, CLI session
     /// create, TUI startup default). Not called from
     /// `create_child_session` — spawned children are agent-driven and
     /// shouldn't inherit the default unconditionally.
     ///
-    /// Skips silently when an agent isn't in the hosted index (e.g.
-    /// configured in YAML but its Living Agent DB hasn't been created
-    /// yet). Per-agent attach failures are logged but don't unwind the
+    /// Skips silently when a named agent isn't in the hosted index (startup
+    /// already warned about it). Per-agent attach failures are logged but don't unwind the
     /// rest. Returns the list of successfully-attached names in order.
     pub async fn auto_attach_default_agent(&self, session_db_id: &str) -> Vec<String> {
         self.auto_attach_agents(session_db_id, None).await
@@ -1501,8 +1511,8 @@ impl Server {
             // An explicitly-selected but empty group means "no agents",
             // not "fall back to the default".
             return Vec::new();
-        } else if !self.agents.is_empty() {
-            vec![self.agents.default_agent().name]
+        } else if let Some(agent) = self.agents.default_agent() {
+            vec![agent.name]
         } else {
             return Vec::new();
         };
@@ -1648,6 +1658,58 @@ impl Server {
         rebuilt
     }
 
+    /// Register runtime agents for hosted Agent DB `entries` from their
+    /// accepted DB configuration. Root runner config defines no agents, so
+    /// this is how startup (and a client widening its targeted indices)
+    /// recovers every hosted agent's settings, prompts and identity.
+    ///
+    /// `preferred` (the runner's default agents) registers first, so the
+    /// registry's fallback agent is the first hosted default; the rest follow
+    /// by name. An Agent DB this peer cannot open or read is skipped with a
+    /// warning: it stays in the hosted index for `/agent hosted`, but no turn
+    /// can run against a guessed configuration.
+    pub async fn load_hosted_agents(
+        &self,
+        mut entries: Vec<crate::hosted_index::DbEntry>,
+        preferred: &[String],
+    ) {
+        entries.retain(|entry| !entry.display_name.is_empty());
+        entries.sort_by_cached_key(|entry| {
+            (
+                preferred
+                    .iter()
+                    .position(|name| *name == entry.display_name)
+                    .unwrap_or(usize::MAX),
+                entry.display_name.clone(),
+            )
+        });
+        for entry in entries {
+            let name = &entry.display_name;
+            let config = match self
+                .registry
+                .open_agent_db(&entry.db_id, Some(&entry.pubkey))
+                .await
+            {
+                Ok(Some(db)) => db.read_config().await,
+                Ok(None) => {
+                    tracing::warn!(agent = %name, db_id = %entry.db_id, "hosted agent has no usable key on this peer; not registered");
+                    continue;
+                }
+                Err(error) => Err(error),
+            };
+            match config {
+                Ok(cfg) => {
+                    let mut agent = self.agents.build_from_db_config(name, &cfg);
+                    agent.system_prompt = self.resolve_db_prompt(&cfg).await;
+                    self.agents.upsert(agent);
+                }
+                Err(error) => {
+                    tracing::warn!(agent = %name, db_id = %entry.db_id, %error, "hosted agent configuration unreadable; not registered")
+                }
+            }
+        }
+    }
+
     /// Resolve the system prompt for a DB-backed agent. The normal path reads
     /// the resolved text from the prompt blob store by `system_prompt_ref` (no
     /// per-turn file IO). When no ref is set yet — a freshly bootstrapped agent
@@ -1786,43 +1848,6 @@ impl Server {
         Ok(report)
     }
 
-    /// Finish seeding a yaml-declared agent: when its DB config has no
-    /// resolved-prompt pointer yet, resolve the prompt the DB config itself
-    /// declares (inline `system_prompt` + `system_prompt_files`) into the blob
-    /// store and record the pointer.
-    ///
-    /// This is the second half of first-boot seeding — `bootstrap_from_config`
-    /// creates the DB from yaml but can't reach the prompt store. It never
-    /// reads yaml values into an existing agent: every other field is left
-    /// exactly as stored, and an agent that already has a pointer is untouched.
-    /// The startup caller passes only agents created in this boot, never an
-    /// existing DB, even if it has no pointer. Returns `Ok(true)` when it wrote.
-    /// A config that can't be read is an error, never a default to write over.
-    pub async fn complete_agent_seed(&self, name: &str) -> anyhow::Result<bool> {
-        let Some(entry) = self.agent_index.find_by_name(name) else {
-            return Ok(false);
-        };
-        let Some(db) = self
-            .registry
-            .open_agent_db(&entry.db_id, Some(&entry.pubkey))
-            .await?
-        else {
-            return Ok(false);
-        };
-
-        let current = db.read_config().await?;
-        if current.prompt_sources.is_some() || current.system_prompt_ref.is_some() {
-            return Ok(false);
-        }
-        let mut seeded = current.clone();
-        self.refresh_prompt_ref(&mut seeded).await?;
-        if seeded.system_prompt_ref.is_none() {
-            return Ok(false);
-        }
-        db.write_config(&seeded).await?;
-        Ok(true)
-    }
-
     /// Compare pending folder settings AND source contents against the coherent
     /// accepted DB config. This operation never applies either representation.
     pub async fn agent_diff(
@@ -1847,29 +1872,6 @@ impl Server {
         let current = db.read_config().await?;
         let pending = folders.read_locked(name, &id, &current)?;
         Ok(Some(crate::agent_diff::diff_agent(&pending, &current)))
-    }
-
-    /// Finish seeding the agents created during this boot (see
-    /// [`Self::complete_agent_seed`]). Run once at startup, after bootstrap.
-    /// Yaml values are never re-applied to an existing agent here. A per-agent
-    /// failure is logged and skipped — one bad entry doesn't abort the rest.
-    pub async fn complete_agent_seeds(&self, names: &[String]) {
-        let mut seeded = 0usize;
-        for name in names {
-            match self.complete_agent_seed(name).await {
-                Ok(true) => {
-                    seeded += 1;
-                    tracing::info!(agent = %name, "resolved seeded agent's system prompt");
-                }
-                Ok(false) => {}
-                Err(e) => {
-                    tracing::warn!(agent = %name, error = %e, "agent seed completion failed")
-                }
-            }
-        }
-        if seeded > 0 {
-            tracing::info!(agents = seeded, "completed agent seeds from yaml");
-        }
     }
 
     pub fn registry(&self) -> &SessionRegistry {
@@ -3073,16 +3075,24 @@ impl Server {
         // human/Directive path runs the full resolution precedence.
         let agent = match agent_to_agent_target {
             Some(a) => a,
-            None => {
-                self.registry
-                    .resolve_agent_for_entry(
+            None => match Box::pin(self.registry.resolve_agent_for_entry(
+                session_db_id,
+                agent_override.as_deref(),
+                &self.agent_index,
+                Some(&latest.content),
+            ))
+            .await
+            {
+                Some(agent) => agent,
+                None => {
+                    warn!(
                         session_db_id,
-                        agent_override.as_deref(),
-                        &self.agent_index,
-                        Some(&latest.content),
-                    )
-                    .await
-            }
+                        "No hosted agent can answer; create one with /agent new NAME or /agent import TICKET"
+                    );
+                    self.processing.lock().await.remove(session_db_id);
+                    return Ok(None);
+                }
+            },
         };
 
         // Live hydration: if the resolved agent has a Living Agent DB
@@ -3416,20 +3426,21 @@ impl Server {
             release().await;
             return Ok(Some(None));
         };
-        let agent = self
-            .registry
-            .resolve_agent_for_entry(
-                session_db_id,
-                agent_override.as_deref(),
-                &self.agent_index,
-                Some(&request.entry.content),
-            )
-            .await;
-        if agent.name != plan.checkpoint.agent_name {
-            release().await;
-            hold("request now resolves to a different Agent");
-            return Ok(None);
-        }
+        let agent = match Box::pin(self.registry.resolve_agent_for_entry(
+            session_db_id,
+            agent_override.as_deref(),
+            &self.agent_index,
+            Some(&request.entry.content),
+        ))
+        .await
+        {
+            Some(agent) if agent.name == plan.checkpoint.agent_name => agent,
+            _ => {
+                release().await;
+                hold("request now resolves to a different Agent");
+                return Ok(None);
+            }
+        };
         let agent = match self.agent_for_execution(agent).await {
             Ok(agent) => agent,
             Err(error) => {
@@ -4536,7 +4547,7 @@ impl Drop for ActivityHeartbeat {
 }
 
 #[cfg(test)]
-mod seed_restart_tests;
+mod hosted_restart_tests;
 #[cfg(test)]
 mod telemetry_tests;
 #[cfg(test)]

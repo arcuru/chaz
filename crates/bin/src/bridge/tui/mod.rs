@@ -1866,15 +1866,23 @@ async fn tab_from_snapshot(
     let roster = build_roster(server, backend, &meta);
     let session_name = meta.name.clone();
     // Reopening a session must honor persisted pins just like a live refresh.
-    let requested_model = meta
-        .resolve_model_for_agent(&agent.name)
-        .or(agent.default_model.as_deref());
+    // A peer hosting no agent yet still opens sessions for administration.
+    let agent_name = agent
+        .as_ref()
+        .map(|agent| agent.name.clone())
+        .unwrap_or_default();
+    let requested_model = meta.resolve_model_for_agent(&agent_name).or(agent
+        .as_ref()
+        .and_then(|agent| agent.default_model.as_deref()));
     let effective_model = backend.resolve_model_name(requested_model);
     let context_model = requested_model
         .map(str::to_string)
         .or_else(|| backend.default_model())
         .unwrap_or_default();
-    let context_budget = server.effective_context_budget(&context_model, agent.max_context_tokens);
+    let context_budget = server.effective_context_budget(
+        &context_model,
+        agent.as_ref().and_then(|agent| agent.max_context_tokens),
+    );
     let entries = snapshot.entries;
     let evidence = snapshot.active_turns?;
     let active_turns = evidence.active_at(chrono::Utc::now()).count();
@@ -1886,13 +1894,13 @@ async fn tab_from_snapshot(
         scroll_offset: 0,
         pending_approval: None,
         active_turns,
-        current_agent: agent.name.clone(),
+        current_agent: agent_name.clone(),
         session_name,
         effective_model,
         roster,
         context_budget,
         model_pin: meta
-            .resolve_model_for_agent(&agent.name)
+            .resolve_model_for_agent(&agent_name)
             .map(str::to_string),
         expanded_entries: HashSet::new(),
         live: {

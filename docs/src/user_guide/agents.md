@@ -4,59 +4,112 @@ Chaz Agents have persistent identity as _Living Agents_ — each Agent is its ow
 
 An **Agent** is a first-class entity (Chaz, Scout). A Worker — declared under an Agent's `workers:` list — is something different: a configured one-shot LLM call with no keys and no persistent identity, invocable from that Agent only via `spawn_worker`. The four-tier conceptual model (Peer / Agent / Worker / Resource) sits behind the names but isn't load-bearing for day-to-day yaml editing.
 
-YAML `agents:` config is the bootstrap path: at startup, chaz materializes an Agent DB for each yaml entry that doesn't have one yet, seeding its `config` and `meta` stores from the yaml. Worker templates declared under an Agent travel with that Agent's DB as part of its config. After that the DB decides — see [YAML seeds, the Agent DB decides](#yaml-seeds-the-agent-db-decides).
+Agents are created through administration, not root configuration: `/agent new` creates an Agent DB on this peer and `/agent import` joins one shared from another peer. Root `config.yaml` holds only local runner settings (backends, connections, paths, bridges) plus runner preferences such as `default_agents` that _name_ hosted agents. Worker templates declared under an Agent travel with that Agent's DB as part of its config. See [Startup and the first agent](#startup-and-the-first-agent) and [The Agent DB decides](#the-agent-db-decides).
 
-## Defining Agents (bootstrap via YAML)
+## Creating agents
+
+| Command                                       | Effect                                                                                                             |
+| --------------------------------------------- | ------------------------------------------------------------------------------------------------------------------ |
+| `/agent new <name> [k=v ...]`                 | Create a hosted Agent DB with scalar settings (`model`, `tools`, `system_prompt_files`, …) and its managed folder. |
+| `/agent import <ticket> [admin\|write\|read]` | Host an agent shared from another peer.                                                                            |
+| `/agent set <ref> <field> <value>`            | Change one scalar setting; takes effect on the next message.                                                       |
+| `/agent reload [ref]`                         | Apply edits made in the managed folder (`agent.yaml` plus prompt files), such as workers, grants or presets.       |
+| `/agent hosted`                               | List hosted agents and their managed folder paths.                                                                 |
+
+All of these run without an open conversation or a running agent, from the TUI or as `chaz cmd '/agent …'`.
+Larger structures such as workers and presets are edited in the agent's managed `agent.yaml`; a parent with two workers looks like:
 
 ```yaml
-agents:
-  - name: chaz
-    # System prompt — `system_prompt_files` are concatenated first, then
-    # `system_prompt` is appended.
-    system_prompt_files:
-      - ~/AGENTS.md # Tilde expands to $HOME
-    system_prompt: |
-      Stay terse on Matrix.
-    max_spawn_depth: 10 # Max nested spawn depth. Tool calls are not capped.
-    tools: null # null = all tools, or list specific tools
-    # Worker templates this Agent can invoke via `spawn_worker(name=…)`.
-    # Workers have no identity of their own; entries written during a
-    # Worker invocation are signed by this Agent's key.
-    workers:
-      - name: researcher
-        system_prompt: "You are a researcher. Cite primary sources."
-        max_spawn_depth: 20
-        tools:
-          - web_fetch
-          - calculate
-          - get_time
-          - remember
-          - recall
-
-      - name: coder
-        system_prompt: "You are a careful Rust engineer. Edit files in-place; don't rewrite from scratch."
-        max_spawn_depth: 15
-        tools:
-          - shell
-          - read_file
-          - write_file
-          - calculate
-          - "filesystem.*" # Glob: all tools from "filesystem" MCP server
-        presets:
-          quick:
-            max_spawn_depth: 5
-          deep:
-            max_spawn_depth: 30
+# <managed folder>/agent.yaml — then run `/agent reload chaz`
+version: 1
+agent_id: <full agent DB ID, already present in the projected file>
+system_prompt_files: [prompts/parent-0.md]
+system_prompt: |
+  Stay terse on Matrix.
+max_spawn_depth: 10 # Max nested spawn depth. Tool calls are not capped.
+# Worker templates this Agent can invoke via `spawn_worker(name=…)`.
+# Workers have no identity of their own; entries written during a
+# Worker invocation are signed by this Agent's key.
+workers:
+  - name: researcher
+    system_prompt: "You are a researcher. Cite primary sources."
+    max_spawn_depth: 20
+    tools: [web_fetch, calculate, get_time, remember, recall]
+  - name: coder
+    system_prompt: "You are a careful Rust engineer. Edit files in-place; don't rewrite from scratch."
+    max_spawn_depth: 15
+    tools: [shell, read_file, write_file, calculate, "filesystem.*"]
+    presets:
+      quick:
+        max_spawn_depth: 5
+      deep:
+        max_spawn_depth: 30
 ```
 
-At startup, each yaml entry becomes an Agent DB named `agent:<display_name>` on first boot only. Edit live config with `/agent set <ref> <field> <value>`, which takes effect on the next message (no restart needed) via runtime hydration from the DB.
+Each agent is an Agent DB named `agent:<display_name>`. Edit live config with `/agent set <ref> <field> <value>`, which takes effect on the next message (no restart needed) via runtime hydration from the DB.
 
-## YAML seeds, the Agent DB decides
+## Startup and the first agent
+
+Startup builds the runtime agent list from the Agent DBs this peer hosts — the account's key/index machinery, not a YAML list.
+Each hosted agent is registered from its accepted DB configuration before any command, frontend or turn reads it, so a restart keeps every setting, prompt, identity, session and memory-bank attachment, and changing nothing in `config.yaml` is the normal case.
+
+What is automatic and what you touch:
+
+- **Automatic:** discovering hosted agents, registering them with their accepted settings and prompts, and projecting each to its managed folder.
+- **Yours:** creating agents (`/agent new`, `/agent import`), editing them (`/agent set`, folder + `/agent reload`) and granting banks (`/memory grant`).
+- **Runner preferences:** `default_agents` and `agent_groups` name hosted agents. A name with no hosted Agent DB logs one startup warning and never attaches. Without `default_agents`, new sessions attach the first hosted agent by name.
+
+A fresh store hosts no agents. That is a usable state, not an error: the TUI and `chaz cmd` start, sessions can be listed, and `/agent new` or `/agent import` creates the first agent. Nothing is fabricated — a message in a session with no agent logs `No hosted agent can answer` and gets no reply.
+
+A root config that still contains an `agents:` block **refuses to start**, before opening any state, and names the listed agents with the migration steps. The block is never applied, used to seed new agents, or silently ignored. Agents that are already hosted need nothing but deleting the block; agents that are not hosted are created explicitly. See the [migration walkthrough](#walkthrough-first-agent-and-legacy-agents-migration).
+
+### Walkthrough: first agent and legacy `agents:` migration
+
+1. Start from a fresh store with a runner config containing `default_agents: [chaz]` and no `agents:` block.
+
+   ```text
+   $ chaz --config config.yaml cmd '/agent hosted'
+   No Living Agents hosted on this peer.
+   ```
+
+2. Create the first agent. No model is called:
+
+   ```text
+   $ chaz --config config.yaml cmd '/agent new chaz model=stub'
+   Created Living Agent 'chaz' (DB: bafyr4iaguar5…). Attach to a session with /agent add chaz.
+   $ chaz --config config.yaml cmd '/agent set chaz model live'
+   Set model=live on agent 'chaz' (takes effect next message)
+   ~/.config/chaz/agents/chaz-8320030b55bfca68 (projected; local edits import only on reload)
+   ```
+
+3. Every later process starts from the Agent DB, with nothing added to `config.yaml`:
+
+   ```text
+   $ chaz --config config.yaml cmd '/model'
+   Current Model: live (agent default)
+   ```
+
+4. Failure path — an old config still defines agents:
+
+   ```text
+   $ chaz --config legacy.yaml cmd '/agent hosted'
+   Error: root config defines agents (chaz, helper), but agents now live only in their Agent DBs: chaz no longer creates, updates or attaches banks to agents from root config.
+   Remove the `agents:` block, then for each listed agent:
+   - already hosted (shown by `chaz cmd '/agent hosted'`): nothing else to do; its Agent DB keeps its identity, settings, prompts, sessions and memory-bank attachments.
+   - not hosted: create it with `chaz cmd '/agent new NAME'`, copy its settings into the managed folder that `/agent hosted` lists, apply them with `chaz cmd '/agent reload NAME'`, and replace each `default_memory_banks` entry with `/memory new BANK` (if needed) and `/memory grant BANK NAME write`.
+   `default_agents` and `agent_groups` stay in root config and name hosted agents.
+   ```
+
+   The process exits non-zero and nothing was written: `chaz` keeps `model: live` even though the stale block says otherwise.
+
+5. Recover by deleting the block. `chaz` is already hosted, so it needs nothing more. `helper` is not, so create it with `chaz cmd '/agent new helper'`, copy its old settings into the folder that `/agent hosted` lists, then `chaz cmd '/agent reload helper'`. For an old `default_memory_banks: [notes]` entry run `/memory new notes` (only if the bank does not exist) and `/memory grant notes helper write`.
+
+## The Agent DB decides
 
 Agent settings need to survive restarts, travel to co-owning peers and remain editable without a conversation. Chaz uses the Agent DB as the accepted configuration and a **managed configuration folder** as the operator's local editor. The folder is not a second authority or a live directory watched by the runtime.
 
 ```text
-Global config.yaml agents: ── first creation only ──> Agent DB
+/agent new · /agent import ───── create or join ───> Agent DB
 Trusted commands / TUI ───── validate and commit ───> Agent DB
 
 Agent DB settings + source texts ──> next-turn parent/worker prompts
@@ -68,7 +121,7 @@ Agent DB settings + source texts ──> next-turn parent/worker prompts
 Agent DB <── validate and commit <── explicit /agent reload
 ```
 
-Global `agents:` YAML initializes a new agent once. Editing or removing that seed later does not replace the existing agent's settings, identity or resources. The seed file is never written back, so it can remain read-only or Nix-managed. Providers, bridges, peer settings and startup bank attachment still use their existing configuration paths.
+Root config never defines, seeds or updates an agent, and is never written back, so it can remain read-only or Nix-managed. Providers, bridges and peer settings keep their existing configuration paths.
 
 ### Find the folder
 
@@ -84,7 +137,7 @@ agents/
     .projection.json
 ```
 
-This is an illustrative first-import layout: the directory suffix is 16 hex characters derived from the full DB identity. Parent seed sources become `prompts/parent-0.md`, `parent-1.md`, and so on; worker seed sources become `prompts/worker-<worker-index>-<file-index>.md`. Later explicit parent imports use `prompts/import-<index>-<content-hash>.md`. You can choose other normalized relative paths when editing the folder. Read the actual lists in `agent.yaml`, not a guessed filename.
+This is an illustrative first-import layout: the directory suffix is 16 hex characters derived from the full DB identity. Parent sources imported at creation become `prompts/parent-0.md`, `parent-1.md`, and so on; worker sources become `prompts/worker-<worker-index>-<file-index>.md`. Later explicit parent imports use `prompts/import-<index>-<content-hash>.md`. You can choose other normalized relative paths when editing the folder. Read the actual lists in `agent.yaml`, not a guessed filename.
 
 The readable folder name is not authority. `agent.yaml` binds to the full stable Agent DB ID; keep its `version: 1` and `agent_id` unchanged. Chaz refuses a directory belonging to another identity or an unrelated pre-existing directory. `.projection.json` is recovery bookkeeping, not an editable setting.
 
@@ -294,7 +347,7 @@ A session's _authoritative_ participant list is its eidetica AuthSettings. Addin
 
 ### Auto-attach on new sessions
 
-Freshly-created sessions auto-attach a configured roster so `/agents` and the model picker reflect routing reality on the very first message. The list is `Config.default_agents` (see [`configuration.md`](configuration.md#default_agents)) — typically the same agent(s) you message most often. Without that config, just the first agent in `agents:` is attached.
+Freshly-created sessions auto-attach a configured roster so `/agents` and the model picker reflect routing reality on the very first message. The list is `Config.default_agents` (see [`configuration.md`](configuration.md#default_agents)) — typically the same agent(s) you message most often, resolved against hosted Agent DBs. Without that config, the first hosted agent by name is attached; a peer hosting no agents attaches nothing.
 
 This runs at session-creation time only (TUI `/new`, the hub's "New session" row, a TUI launch prompt, or `--session` creating an absent name). It does **not** mutate existing sessions — those keep whatever participant list they already have. Spawned child sessions (`spawn_agent` / `spawn_worker`) also skip auto-attach since they're agent-driven and inherit context from the parent rather than the default.
 
@@ -380,7 +433,7 @@ For a solo agent (one peer holds the key), none of this applies — you'll never
 
 You don't have to do anything for the common cases. Two defaults handle them:
 
-- **On `/agent new`** (and yaml bootstrap), the creator becomes the **agent-level** home. Used only by `Fresh` schedule fires, where no session exists yet to carry a per-session value.
+- **On `/agent new`**, the creator becomes the **agent-level** home. Used only by `Fresh` schedule fires, where no session exists yet to carry a per-session value.
 - **On every `/agent add`** (or any other attach), the attaching peer becomes the **per-session** home for that (session, agent) pair. Subsequent re-attaches don't change it — only `/agent rehost` does.
 
 So if Alice creates `alpha` and attaches it to her DM, Alice is the home. If she invites Bob and Bob attaches `alpha` to _his_ DM, Bob is the home for _his_ DM. They can both edit `alpha`'s config and memory; their DMs don't fight over execution.
@@ -477,7 +530,7 @@ When a message arrives on a multi-agent session, routing picks one agent in this
 3. **Host agent** (`SessionMeta.host_agent_db_id`) if that agent is still attached.
 4. First attached agent in AuthSettings order.
 5. Legacy `SessionMeta.agent_name` (pre-Living-Agents sessions).
-6. Default agent from yaml.
+6. Default agent: the first configured `default_agents` entry that is hosted, else the first hosted agent by name. With no hosted agent, nothing answers.
 
 Mentions are case-insensitive and match exact display names. No prefix matching.
 
@@ -717,7 +770,7 @@ There is no iteration cap, no "you are stuck in a loop" prompt, and no forced no
 
 What still bounds a turn is per call, not per turn: tool approval (`Deny` and approval timeouts come back to the model as tool results), per-tool `rate_limit`, per-tool timeouts, grants, and the spawn-depth ceiling above. Tool errors are also returned to the model as results, so it can recover or stop. To limit a noisy tool, set a `rate_limit` or require approval for it; see [Tool Rate Limiting](security.md#tool-rate-limiting) and [Tool Approval](security.md#tool-approval).
 
-Use `max_spawn_depth` in YAML, `/agent set`, presets, and `spawn_worker`. The old `max_iterations` setting is ignored like any unknown config field; it is not migrated or aliased. Set `max_spawn_depth` explicitly if you need a non-default ceiling.
+Use `max_spawn_depth` in the managed `agent.yaml`, `/agent set`, presets, and `spawn_worker`. The old `max_iterations` setting is ignored like any unknown config field; it is not migrated or aliased. Set `max_spawn_depth` explicitly if you need a non-default ceiling.
 
 ## Presets
 
@@ -873,8 +926,6 @@ An agent moves through a small number of states, and the commands that drive tho
 
 ```mermaid
 stateDiagram-v2
-    [*] --> Declared: yaml agents: entry
-    Declared --> Hosted: bootstrap creates AgentDb + key
     [*] --> Hosted: /agent new <name>
     Hosted --> Attached: /agent add <ref>
     Attached --> Running: message / Directive arrives
@@ -900,24 +951,14 @@ This walks through the full lifecycle against the TUI. Matrix uses the same comm
 
 ### 1. Create the agent
 
-Either declare it in yaml (bootstrapped once, on first start):
-
-```yaml
-agents:
-  - name: researcher
-    system_prompt: "You are a research assistant. Cite primary sources."
-    max_spawn_depth: 20
-    tools: [web_fetch, calculate, remember, recall]
-```
-
-…or create one live:
+Create it live — there is no root-config alternative:
 
 ```text
 /agent new researcher max_spawn_depth=20 tools=web_fetch,calculate,remember,recall
 /agent set researcher system_prompt "You are a research assistant. Cite primary sources."
 ```
 
-`/agent new` parses `k=v` overrides by whitespace, so values can't contain spaces — set a multi-word `system_prompt` in a follow-up `/agent set` (which takes the remainder of the line verbatim). Either path produces an Agent DB (`agent:researcher`) signed by a fresh per-agent key, plus a row in the local `agents` index.
+`/agent new` parses `k=v` overrides by whitespace, so values can't contain spaces — set a multi-word `system_prompt` in a follow-up `/agent set` (which takes the remainder of the line verbatim). This produces an Agent DB (`agent:researcher`) signed by a fresh per-agent key, plus a row in the local `agents` index.
 
 ### 2. Tweak config without restarting
 

@@ -229,17 +229,10 @@ backends:
     models:
       - name: anthropic/claude-sonnet-4
 
-# Agent definitions
-agents:
-  - name: chaz
-    system_prompt: "You are Chaz, a helpful Matrix assistant."
-    allowed_tools: null # null = all tools
-    # Worker templates — invocable from this Agent via `spawn_worker(name=…)`.
-    workers:
-      - name: researcher
-        system_prompt: "You are a focused research assistant. Use web_fetch and calculate to answer questions concisely."
-        max_spawn_depth: 20
-        tools: ["web_fetch", "calculate", "get_time"]
+# Agents are not defined here. Create one with
+#   chaz --config config.yaml cmd '/agent new chaz'
+# and edit it with /agent set or its managed folder + /agent reload.
+default_agents: [chaz]
 
 # Security settings
 security:
@@ -260,14 +253,13 @@ security:
           allow_private: false # SSRF blocking (default)
 
 
-# Per-agent grant overlays are merged per-kind over the config above:
-# agents:
-#   - name: researcher
-#     grants:
-#       web_fetch:
-#         network:
-#           endpoints:
-#             - host: "*.wikipedia.org"
+# Per-agent grant overlays (in that agent's managed agent.yaml, applied with
+# /agent reload) are merged per-kind over the config above:
+# grants:
+#   web_fetch:
+#     network:
+#       endpoints:
+#         - host: "*.wikipedia.org"
 ```
 
 ## Install

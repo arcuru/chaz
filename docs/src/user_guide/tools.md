@@ -633,11 +633,9 @@ tool_profiles:
       "filesystem.*": brief
       "github.*": summary
       shell: hidden
-
-agents:
-  - name: skim
-    tool_profile: compact
 ```
+
+An agent opts in from its settings, for example `/agent set skim tool_profile compact`.
 
 The `compact` profile here shows full schemas for built-ins, brief schemas for the filesystem MCP namespace, name-only for github, and drops `shell` entirely.
 
@@ -686,7 +684,7 @@ What this gets you:
 
 - `shell` accepts `git status`, `ls -la`, `cat /etc/hosts`, but the host **denies** `git push && rm foo` because the denylist matches `rm` in the second segment of the pipeline. Empty grant or missing `grants.shell` = permissive (the host enforces nothing).
 - `web_fetch` can GET `https://api.github.com/...` and any path under `https://*.example.com/v1/...`, but is denied other hosts entirely; private IPs (`127.0.0.1`, `10.0.0.0/8`, internal hostnames) are blocked regardless.
-- Want a specific agent to be tighter still? Re-declare the same `grants:` block under `agents: - name: <agent>` — that overlay replaces the resolved policy's grants per-kind for that agent only.
+- Want a specific agent to be tighter still? Declare the same `grants:` block in that agent's managed `agent.yaml` and `/agent reload` it — that overlay replaces the resolved policy's grants per-kind for that agent only.
 
 The legacy `security.shell_allowlist` / `security.shell_denylist` / `security.allowed_endpoints` fields still work but are deprecated; they're synthesised into the new grant shape at startup with a one-time `warn!`.
 

@@ -69,15 +69,9 @@ async fn service_cli_unshare_commits_preferences_and_preserves_owner_gates() {
     let (skills, _) = create_skill_bank(&mut user, "ops", &SkillBankMeta::default())
         .await
         .unwrap();
-    let registry = SessionRegistry::new(
-        owner.clone(),
-        user,
-        Arc::new(AgentRegistry::from_config(
-            &chaz_core::config::Config::default(),
-        )),
-    )
-    .await
-    .unwrap();
+    let registry = SessionRegistry::new(owner.clone(), user, Arc::new(AgentRegistry::default()))
+        .await
+        .unwrap();
     let (_, session) = registry.create_session(Some("fixture")).await.unwrap();
     let sid = session.root_id().to_string();
     registry
@@ -128,7 +122,7 @@ async fn service_cli_unshare_commits_preferences_and_preserves_owner_gates() {
     std::fs::write(
         &config,
         format!(
-            "state_dir: {}\nexecution: client\neidetica:\n  connection: unix://{}\n  login:\n    username: preferences\n    passwordless: true\nagents:\n  - name: selected\n    system_prompt: test\n    autonomous: false\nbackends: []\nmcp_servers: []\n",
+            "state_dir: {}\nexecution: client\neidetica:\n  connection: unix://{}\n  login:\n    username: preferences\n    passwordless: true\nbackends: []\nmcp_servers: []\n",
             dir.path().join("state").display(),
             socket.display(),
         ),

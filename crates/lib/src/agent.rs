@@ -1,4 +1,4 @@
-use crate::config::{AgentConfig, AgentPreset, Config, WorkerConfig};
+use crate::config::AgentPreset;
 use crate::grants::Grants;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -118,28 +118,6 @@ pub struct Worker {
 }
 
 impl Worker {
-    pub fn from_worker_config(cfg: &WorkerConfig) -> Self {
-        let system_prompt_files: Vec<PathBuf> = cfg
-            .system_prompt_files
-            .clone()
-            .unwrap_or_default()
-            .into_iter()
-            .map(PathBuf::from)
-            .collect();
-        Worker {
-            name: cfg.name.clone(),
-            system_prompt: resolve_system_prompt(
-                &cfg.system_prompt.clone().unwrap_or_default(),
-                &system_prompt_files,
-            ),
-            system_prompt_files,
-            default_model: cfg.model.clone(),
-            allowed_tools: cfg.tools.clone(),
-            max_spawn_depth: cfg.max_spawn_depth,
-            presets: cfg.presets.clone().unwrap_or_default(),
-        }
-    }
-
     pub fn from_worker_db_config(cfg: &crate::agent_db::WorkerDbConfig) -> Self {
         Self::from_worker_sources(cfg, None)
     }
@@ -185,41 +163,6 @@ pub struct ResolvedOverrides {
 }
 
 impl Agent {
-    fn from_agent_config(agent_config: &AgentConfig, _config: &Config) -> Self {
-        let workers = agent_config
-            .workers
-            .as_deref()
-            .unwrap_or(&[])
-            .iter()
-            .map(|wc| (wc.name.clone(), Worker::from_worker_config(wc)))
-            .collect();
-        let system_prompt_files: Vec<PathBuf> = agent_config
-            .system_prompt_files
-            .clone()
-            .unwrap_or_default()
-            .into_iter()
-            .map(PathBuf::from)
-            .collect();
-        Agent {
-            name: agent_config.name.clone(),
-            system_prompt: resolve_system_prompt(
-                &agent_config.system_prompt.clone().unwrap_or_default(),
-                &system_prompt_files,
-            ),
-            system_prompt_files,
-            default_model: agent_config.model.clone(),
-            allowed_tools: agent_config.tools.clone(),
-            workers,
-            max_spawn_depth: agent_config.max_spawn_depth.unwrap_or(10),
-            autonomous: agent_config.autonomous,
-            presets: agent_config.presets.clone().unwrap_or_default(),
-            tool_profile: agent_config.tool_profile.clone(),
-            max_context_tokens: agent_config.max_context_tokens,
-            capabilities: agent_config.capabilities.clone().unwrap_or_default(),
-            grants: agent_config.grants.clone().unwrap_or_default(),
-        }
-    }
-
     /// Build a runtime Agent from a Living Agent's DB config. Used by
     /// `/agent new` and `/agent import`.
     pub fn from_db_config(name: &str, cfg: &crate::agent_db::AgentDbConfig) -> Self {
@@ -344,37 +287,20 @@ fn intersect_tools(base: &Option<Vec<String>>, override_tools: &[String]) -> Vec
     }
 }
 
-/// Registry of named agents. Callers (production: `main.rs`) are
-/// responsible for ensuring at least one agent is registered before the
-/// registry is used for routing — `default_agent()` panics on empty.
+/// Registry of runtime agents, built at startup from the Agent DBs this
+/// peer hosts (see `Server::load_hosted_agents`). Root runner config defines
+/// no agents, so the registry may legitimately be empty on a fresh peer until
+/// `/agent new` or `/agent import` registers the first one.
 ///
 /// Backed by a `RwLock` so agents can be registered at runtime (via
-/// `/agent new`); yaml-bootstrapped agents land here at startup, and
-/// subsequently-created Living Agents join via [`AgentRegistry::register`].
+/// `/agent new` / `/agent import`) and refreshed by live hydration.
 /// All read accessors clone out `Agent` values — Agent is cheap to clone.
+#[derive(Default)]
 pub struct AgentRegistry {
     agents: std::sync::RwLock<Vec<Agent>>,
 }
 
 impl AgentRegistry {
-    /// Build the registry from config. Maps `config.agents` 1:1 — an
-    /// absent or empty list yields an empty registry. The `chaz`-with-no-
-    /// `agents:`-block UX lives in `main.rs`, which calls
-    /// [`AgentRegistry::register_default_chaz`] when this returns empty.
-    pub fn from_config(config: &Config) -> Self {
-        let agents = config
-            .agents
-            .as_deref()
-            .unwrap_or(&[])
-            .iter()
-            .map(|ac| Agent::from_agent_config(ac, config))
-            .collect();
-
-        Self {
-            agents: std::sync::RwLock::new(agents),
-        }
-    }
-
     /// Build a registry containing a single bare-bones agent named
     /// `"default"`. Test-only seam: anywhere production code expects a
     /// non-empty registry to satisfy a type, this is the cheapest way to
@@ -400,42 +326,30 @@ impl AgentRegistry {
         }
     }
 
-    /// Synthesize and register a `"chaz"` agent as the fallback when no
-    /// agents are declared in config. Called by `main.rs` when
-    /// [`from_config`] yields an empty registry.
-    pub fn register_default_chaz(&self, _config: &Config) -> anyhow::Result<()> {
-        self.register(Agent {
-            name: "chaz".to_string(),
-            system_prompt: String::new(),
-            system_prompt_files: vec![],
-            default_model: None,
-            allowed_tools: None,
-            workers: HashMap::new(),
-            max_spawn_depth: 10,
-            autonomous: false,
-            presets: HashMap::new(),
-            tool_profile: None,
-            max_context_tokens: None,
-            capabilities: Grants::default(),
-            grants: HashMap::new(),
-        })
-    }
-
-    /// Whether the registry has zero agents. Production uses this at
-    /// startup to decide whether to synthesize the legacy default
-    /// `"chaz"` agent.
+    /// Whether the registry has zero agents (a fresh peer before its first
+    /// `/agent new` or `/agent import`).
     pub fn is_empty(&self) -> bool {
         self.agents.read().unwrap().is_empty()
     }
 
-    /// Get the default agent (first in the list). Panics if the registry is
-    /// empty — callers rely on `from_config` always seeding at least one.
-    pub fn default_agent(&self) -> Agent {
-        let agents = self.agents.read().unwrap();
-        agents
-            .first()
-            .cloned()
-            .expect("AgentRegistry always has at least one agent")
+    /// Test seam: the registry startup builds from these hosted Agent DB
+    /// configurations, in order.
+    #[cfg(test)]
+    pub(crate) fn from_db_configs<'a>(
+        configs: impl IntoIterator<Item = (&'a str, crate::agent_db::AgentDbConfig)>,
+    ) -> Self {
+        let registry = Self::default();
+        for (name, cfg) in configs {
+            registry.upsert(Agent::from_db_config(name, &cfg));
+        }
+        registry
+    }
+
+    /// The fallback agent: the first registered entry. Startup registers the
+    /// runner's configured default agents first, so this is the first
+    /// configured default when it is hosted. `None` when no agent is hosted.
+    pub fn default_agent(&self) -> Option<Agent> {
+        self.agents.read().unwrap().first().cloned()
     }
 
     /// Look up an agent by name. Returns a cloned `Agent` to keep callers
@@ -489,21 +403,6 @@ impl AgentRegistry {
     /// Delegates to [`Agent::from_db_config`].
     pub fn build_from_db_config(&self, name: &str, cfg: &crate::agent_db::AgentDbConfig) -> Agent {
         Agent::from_db_config(name, cfg)
-    }
-
-    /// Build a runtime `Agent` by looking up `name` in `config.agents`.
-    /// Public reload path — used by the TUI's Peer→Agents `[r]` action so
-    /// edits to system_prompt / default_model / tools / etc. in the yaml
-    /// can be applied to one agent without restarting chaz. DB-side
-    /// state for Living Agents is left alone; yaml only owns the
-    /// declarative fields. Returns `None` when no yaml entry matches.
-    pub fn build_from_yaml(&self, name: &str, config: &Config) -> Option<Agent> {
-        config
-            .agents
-            .as_deref()?
-            .iter()
-            .find(|a| a.name == name)
-            .map(|ac| Agent::from_agent_config(ac, config))
     }
 }
 

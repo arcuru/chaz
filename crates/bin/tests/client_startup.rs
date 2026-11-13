@@ -73,10 +73,6 @@ execution: client
 eidetica:
   connection: unix://{}
   login: {{ username: startup, passwordless: true }}
-agents:
-  - name: selected
-    model: fallback-model
-    autonomous: false
 default_agents: [selected]
 backends:
   - name: catalog
@@ -141,13 +137,10 @@ impl StartupFixture {
         )
         .await
         .unwrap();
-        let registry = SessionRegistry::new(
-            owner.clone(),
-            user,
-            Arc::new(AgentRegistry::from_config(&Config::default())),
-        )
-        .await
-        .unwrap();
+        let registry =
+            SessionRegistry::new(owner.clone(), user, Arc::new(AgentRegistry::default()))
+                .await
+                .unwrap();
         let (_, db) = registry.create_session(Some("fixture")).await.unwrap();
         let sid = db.root_id().to_string();
         registry
@@ -191,7 +184,6 @@ impl StartupFixture {
         let mut opts = BuildOptions::local_oneshot(
             self.dir.path().join("config.yaml"),
             connected.capabilities,
-            false,
             false,
             Vec::new(),
             McpReadiness::Deferred,
@@ -263,7 +255,7 @@ impl StartupFixture {
                 "client command /{name} must remain usable"
             );
         }
-        // Client presentation follows persisted config, not the stale YAML seed.
+        // Client presentation follows the hosted Agent DB's persisted config.
         let model =
             chaz_core::commands::dispatch(chaz_core::commands::Command::Model(None), &ctx).await;
         assert!(

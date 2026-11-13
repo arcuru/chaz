@@ -19,7 +19,7 @@
 // allow dead_code to keep the API surface stable.
 #![allow(dead_code)]
 
-use crate::config::{AgentConfig, AgentPreset, Config, WorkerConfig};
+use crate::config::{AgentConfig, AgentPreset, WorkerConfig};
 use crate::grants::Grants;
 use crate::routine::Trigger;
 use crate::routine::types::next_interval_fire;
@@ -77,10 +77,10 @@ pub struct AgentMeta {
     pub avatar: Option<String>,
 }
 
-/// Serializable agent definition. Mirrors the runtime-relevant fields of
-/// [`AgentConfig`]. A yaml `agents:` entry seeds this once, when the Agent DB
-/// is created; afterwards this stored config is authoritative and yaml edits
-/// reach it only through an explicit user action.
+/// Serializable agent definition: the authoritative per-agent settings.
+/// Created by `/agent new` (or synced in by `/agent import`) and changed only
+/// through explicit operator commands or a managed-folder reload; root runner
+/// config defines no agents. Field shapes mirror the legacy [`AgentConfig`].
 ///
 /// Workers declared under an Agent are mirrored into [`Self::workers`].
 /// Workers do NOT get their own AgentDb rows; they're configured tools
@@ -129,10 +129,11 @@ pub struct AgentDbConfig {
     pub capabilities: Grants,
     #[serde(default)]
     pub grants: HashMap<String, Grants>,
-    /// Memory banks to auto-attach at agent bootstrap. Mirrors [`AgentConfig::default_memory_banks`].
+    /// Retained legacy bank names. Startup does not attach them; attachments
+    /// are explicit (`/memory grant`) and stored in the `memory_banks` store.
     #[serde(default)]
     pub default_memory_banks: Vec<String>,
-    /// Skill banks to auto-attach at agent bootstrap. Mirrors [`AgentConfig::default_skill_banks`].
+    /// Retained legacy skill-bank names; preserved, not applied at startup.
     #[serde(default)]
     pub default_skill_banks: Vec<String>,
 }
@@ -1091,13 +1092,8 @@ pub struct BootstrappedAgent {
 }
 
 /// Ensure the given agent has an AgentDb on this peer. Creates one with
-/// default config/meta if it doesn't exist. Idempotent.
-///
-/// The `remember`/`recall` tools rely on every `AgentRegistry` entry
-/// having a matching DB so they can write to `AgentDb::memory`. The
-/// default `chaz` agent isn't in yaml `agents:`, so `bootstrap_from_config`
-/// alone doesn't cover it — `main.rs` calls this for every registry entry
-/// after bootstrap.
+/// default config/meta if it doesn't exist. Idempotent. Test and fixture
+/// setup only: production creates agents through `/agent new`.
 pub async fn ensure_agent_db(
     user: &mut AccountSession,
     display_name: &str,
@@ -1123,57 +1119,6 @@ pub async fn ensure_agent_db(
     })
 }
 
-/// Bootstrap: materialize an Agent DB for each yaml agent entry.
-///
-/// yaml `agents:` is a **template** — it seeds new DBs but does not
-/// overwrite existing ones. On a re-run with a pre-existing DB, this
-/// function reuses the DB as-is; any `/agent set` edits or synced config
-/// from other peers survive restarts. AgentDb is the source of truth
-/// post-bootstrap (live hydration reads config per-message).
-pub async fn bootstrap_from_config(
-    user: &mut AccountSession,
-    config: &Config,
-) -> anyhow::Result<HashMap<String, BootstrappedAgent>> {
-    let mut out = HashMap::new();
-    let Some(agent_configs) = config.agents.as_ref() else {
-        return Ok(out);
-    };
-
-    for ac in agent_configs {
-        let agent = match find_agent_db(user, &ac.name).await {
-            Some((db, pubkey)) => {
-                info!(agent = %ac.name, db_id = %db.id(), "Reusing existing Agent DB (yaml is template; DB config preserved)");
-                db.ensure_stores().await?;
-                BootstrappedAgent {
-                    db,
-                    pubkey,
-                    created: false,
-                }
-            }
-            None => {
-                let mut agent_cfg = AgentDbConfig::from_agent_config(ac);
-                if config.agent_config_dir.is_some() {
-                    crate::agent_bundle::import_sources(&mut agent_cfg)?;
-                }
-                let meta = AgentMeta {
-                    display_name: Some(ac.name.clone()),
-                    ..Default::default()
-                };
-                let (db, pubkey) = create_agent_db(user, &ac.name, &agent_cfg, &meta).await?;
-                BootstrappedAgent {
-                    db,
-                    pubkey,
-                    created: true,
-                }
-            }
-        };
-
-        out.insert(ac.name.clone(), agent);
-    }
-
-    Ok(out)
-}
-
 fn validate_schedule_trigger(trigger: &Trigger) -> anyhow::Result<()> {
     let Trigger::Interval { period } = trigger else {
         return Ok(());
@@ -1193,7 +1138,6 @@ fn validate_schedule_trigger(trigger: &Trigger) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{AgentConfig, Config};
     use eidetica::backend::database::InMemory;
     use eidetica::{Instance, NewAccount};
 
@@ -1206,33 +1150,6 @@ mod tests {
                 .await
                 .unwrap();
         user
-    }
-
-    fn empty_config_with_agents(agents: Vec<AgentConfig>) -> Config {
-        Config {
-            agents: Some(agents),
-            ..Config::default()
-        }
-    }
-
-    fn agent_cfg(name: &str) -> AgentConfig {
-        AgentConfig {
-            name: name.to_string(),
-            system_prompt: Some("You are a helpful assistant.".to_string()),
-            system_prompt_files: None,
-            model: Some("sonnet".to_string()),
-            tools: Some(vec!["get_time".into(), "calculate".into()]),
-            workers: None,
-            max_spawn_depth: Some(15),
-            autonomous: false,
-            presets: None,
-            tool_profile: None,
-            max_context_tokens: None,
-            capabilities: None,
-            grants: None,
-            default_memory_banks: None,
-            default_skill_banks: None,
-        }
     }
 
     #[tokio::test]
@@ -1433,84 +1350,6 @@ mod tests {
         assert_eq!(agent_db.read_config().await.unwrap(), cfg);
         assert_eq!(agent_db.read_meta().await.unwrap(), meta);
     }
-
-    #[tokio::test]
-    async fn bootstrap_is_idempotent() {
-        let mut user = test_peer_user().await;
-        let config = empty_config_with_agents(vec![agent_cfg("alpha"), agent_cfg("beta")]);
-
-        let first = bootstrap_from_config(&mut user, &config).await.unwrap();
-        assert_eq!(first.len(), 2);
-        let alpha_id_1 = first["alpha"].db.id();
-        let beta_id_1 = first["beta"].db.id();
-        let alpha_key_1 = first["alpha"].pubkey.clone();
-
-        // Same yaml → same DBs and same pubkeys (no new ones created).
-        let second = bootstrap_from_config(&mut user, &config).await.unwrap();
-        assert_eq!(second["alpha"].db.id(), alpha_id_1);
-        assert_eq!(second["beta"].db.id(), beta_id_1);
-        assert_eq!(second["alpha"].pubkey, alpha_key_1);
-
-        // And no extra keys were generated on the second pass.
-        // (Creator key on create_database, one key per agent created on first pass.)
-        let keys = user.list_keys().unwrap();
-        // 1 default login key + 2 agent keys from first bootstrap.
-        assert_eq!(keys.len(), 3);
-    }
-
-    #[tokio::test]
-    async fn bootstrap_preserves_db_config_on_rerun() {
-        // yaml is a template: once a DB exists, subsequent boots must not
-        // overwrite its config — `/agent set` edits and synced DB state
-        // need to survive restarts.
-        let mut user = test_peer_user().await;
-        let mut cfg = agent_cfg("chatter");
-        cfg.max_spawn_depth = Some(5);
-        let config = empty_config_with_agents(vec![cfg]);
-        let dbs = bootstrap_from_config(&mut user, &config).await.unwrap();
-        let id = dbs["chatter"].db.id();
-        assert_eq!(
-            dbs["chatter"]
-                .db
-                .read_config()
-                .await
-                .unwrap()
-                .max_spawn_depth,
-            Some(5)
-        );
-
-        // Simulate a `/agent set` edit that bumps max_spawn_depth past yaml.
-        dbs["chatter"]
-            .db
-            .write_config(&AgentDbConfig {
-                max_spawn_depth: Some(77),
-                ..dbs["chatter"].db.read_config().await.unwrap()
-            })
-            .await
-            .unwrap();
-
-        // yaml changes to something else entirely; re-bootstrap must not clobber.
-        let mut cfg2 = agent_cfg("chatter");
-        cfg2.max_spawn_depth = Some(99);
-        let config2 = empty_config_with_agents(vec![cfg2]);
-        let dbs2 = bootstrap_from_config(&mut user, &config2).await.unwrap();
-
-        assert_eq!(dbs2["chatter"].db.id(), id);
-        assert_eq!(
-            dbs2["chatter"]
-                .db
-                .read_config()
-                .await
-                .unwrap()
-                .max_spawn_depth,
-            Some(77),
-            "yaml should not overwrite existing DB config"
-        );
-    }
-
-    // -------------------------------------------------------------------------
-    // Memory bank references
-    // -------------------------------------------------------------------------
 
     /// Helper: build a fresh peer + create one AgentDb. Returns `(user,
     /// db)` — the `user` must outlive the `db` or eidetica's Instance

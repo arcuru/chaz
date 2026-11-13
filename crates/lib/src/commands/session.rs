@@ -105,7 +105,7 @@ pub(super) async fn new_session(group: Option<&str>, server: &Server) -> Command
         session_db_id,
         conv_id,
         db,
-        agent_name: agent.name,
+        agent_name: agent.map(|agent| agent.name).unwrap_or_default(),
         session_name: None,
     }))
 }
@@ -167,7 +167,7 @@ pub(super) async fn switch_session(identifier: &str, server: &Server) -> Command
         session_db_id,
         conv_id,
         db,
-        agent_name: agent.name,
+        agent_name: agent.map(|agent| agent.name).unwrap_or_default(),
         session_name: meta.name,
     }))
 }
