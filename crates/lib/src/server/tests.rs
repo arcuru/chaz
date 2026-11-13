@@ -2933,7 +2933,7 @@ async fn watcher_registers_exposed_sessions_only() {
 }
 
 #[tokio::test]
-async fn exposed_session_waits_for_sync_signer_before_registration() {
+async fn exposed_session_uses_verified_sync_signer_during_partial_sync() {
     use eidetica::auth::types::{
         DelegatedTreeRef, DelegationStep, PermissionBounds, SigKey, TreeReference,
     };
@@ -3043,21 +3043,26 @@ async fn exposed_session_waits_for_sync_signer_before_registration() {
         engine.get_verification_status(&descendant).await.unwrap(),
         VerificationStatus::Unverified
     );
+    let discovered = eidetica::Database::find_sigkeys(&instance, child.root_id(), &agent.pubkey)
+        .await
+        .unwrap();
     assert!(
-        eidetica::Database::find_sigkeys(&instance, child.root_id(), &agent.pubkey)
-            .await
-            .unwrap()
-            .is_empty()
+        !discovered.is_empty(),
+        "verified signer remains discoverable"
     );
-    // The bound writer survives, but native tracking still requires discovery.
+    assert!(discovered.iter().all(|(identity, _)| {
+        matches!(identity, SigKey::Delegation { path, .. } if path.len() == 1 && path[0].tree == *parent.root_id() && path[0].tips == verified.tips())
+    }));
+    // Registration uses the accepted parent state, never the pending raw tip.
     registry.open_session_with_signer(&id).await.unwrap();
     let secrets = crate::security::SecretStore::new(registry.chaz_peer().clone()).await;
     let backend = crate::backends::BackendManager::new(&None, secrets);
     super::build::register_exposed_sessions(&server, &registry, &backend).await;
-    assert!(!registry.is_sync_enabled_for(child.root_id()).await.unwrap());
-    assert!(
-        !server.is_watching_session(&id).await,
-        "failed sync setup must not make registration permanent"
+    assert!(registry.is_sync_enabled_for(child.root_id()).await.unwrap());
+    assert!(server.is_watching_session(&id).await);
+    assert_eq!(
+        engine.get_verification_status(&descendant).await.unwrap(),
+        VerificationStatus::Unverified
     );
 
     engine
