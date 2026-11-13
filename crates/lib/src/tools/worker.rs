@@ -194,14 +194,10 @@ impl Tool for SpawnWorker {
                 None => ctx.tools.clone(),
             };
 
-            // `resolved_model` and `role_suffix` are computed above for
-            // forward-compat but currently unused: propagating spawn-time
-            // overrides into the child's `SessionRuntime` needs a separate
-            // expansion of `register_child_session` (and matching pickup in
-            // `spawn_agent_task`), parked for follow-up.
-            let _ = resolved_model;
-            let _ = role_suffix;
-
+            // The resolved model and preset role_suffix propagate into the
+            // child's `SessionRuntime` below: `spawn_agent_task` applies
+            // them per turn, so the child's LLM request carries the
+            // resolved model and the suffix rides on the worker prompt.
             let parent_session_db_id = {
                 let s = ctx.session.lock().await;
                 s.database().root_id().to_string()
@@ -219,7 +215,10 @@ impl Tool for SpawnWorker {
             // No ephemeral keypair: entries on the child are signed by the
             // parent Agent's key via the delegation chain. The resolved
             // `max_spawn_depth` value is the child's spawn-depth ceiling;
-            // it does not bound the child's tool-calling loop.
+            // it does not bound the child's tool-calling loop. The resolved
+            // model (template → preset → inline) overrides the agent default
+            // in the child's LLM request; the preset `role_suffix` is appended
+            // to the worker system prompt by `spawn_agent_task`.
             let (conversation_id, session_db, mut completion_rx) = server
                 .register_child_session_with_prompt(
                     &ctx.agent_name,
@@ -230,6 +229,8 @@ impl Tool for SpawnWorker {
                     child_tools,
                     Some(&parent_session_db_id),
                     Some(worker.system_prompt.clone()),
+                    resolved_model,
+                    role_suffix,
                 )
                 .await
                 .map_err(|e| format!("Failed to create child session: {e}"))?;

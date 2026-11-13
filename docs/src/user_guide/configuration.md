@@ -632,7 +632,7 @@ signed by the parent Agent's key. Lookup is per-Agent; Chaz's
 | `model`               | string                 | Accepted but not yet propagated to the child runtime; the parent Agent's model is used.                                                     |
 | `tools`               | list of tool names     | Narrows the parent Agent's tool list. May include other Worker names; recursion bounded by depth.                                           |
 | `max_spawn_depth`     | int                    | Maximum nested spawn depth of this Worker's child session. Falls back to the parent Agent's value. Does not cap the Worker's tool calls.    |
-| `presets`             | map<name, AgentPreset> | Selectable via `spawn_worker`'s `preset` arg. Spawn depth and tools apply; model and `role_suffix` propagation remain unsupported.          |
+| `presets`             | map<name, AgentPreset> | Selectable via `spawn_worker`'s `preset` arg. Spawn depth, tools, `model` and `role_suffix` apply to the child session.                     |
 
 ### `default_agents`
 

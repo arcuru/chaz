@@ -633,6 +633,11 @@ struct SessionRuntime {
     backend: BackendManager,
     agent_override: Option<String>,
     worker_prompt: Option<String>,
+    /// Resolved spawn-time model override for a Worker child session
+    /// (template → preset → inline). `None` keeps the session/agent default.
+    worker_model: Option<String>,
+    /// Preset `role_suffix` to append to the Worker's system prompt.
+    worker_role_suffix: Option<String>,
     approval_tx: Option<mpsc::Sender<ApprovalExchange>>,
     /// Spawn nesting depth (0 for bridge-originated sessions)
     call_depth: usize,
@@ -647,6 +652,11 @@ struct SessionRuntime {
 /// Context for spawned agent tasks (call depth, tool scope, completion signal).
 struct SpawnContext {
     worker_prompt: Option<String>,
+    /// Resolved spawn-time model override for the Worker child
+    /// (`register_child_session_with_prompt` is the only producer).
+    worker_model: Option<String>,
+    /// Preset `role_suffix` appended to `worker_prompt`.
+    worker_role_suffix: Option<String>,
     job_projection: Option<(eidetica::Database, String, String)>,
     job_incarnation: Option<String>,
     /// Explicit retry command identity for a job execution branch; ordinary
@@ -2103,6 +2113,8 @@ impl Server {
                     backend,
                     agent_override,
                     worker_prompt: None,
+                    worker_model: None,
+                    worker_role_suffix: None,
                     approval_tx,
                     call_depth: 0,
                     max_call_depth: 0,
@@ -2435,6 +2447,8 @@ impl Server {
             parent_tools,
             parent_session_db_id,
             None,
+            None,
+            None,
         )
         .await
     }
@@ -2450,6 +2464,8 @@ impl Server {
         parent_tools: ScopedTools,
         parent_session_db_id: Option<&str>,
         worker_prompt: Option<String>,
+        worker_model: Option<String>,
+        worker_role_suffix: Option<String>,
     ) -> anyhow::Result<(ConversationId, eidetica::Database, mpsc::Receiver<()>)> {
         if !self.executor_authorized {
             anyhow::bail!("client server cannot create agent execution sessions");
@@ -2475,6 +2491,8 @@ impl Server {
                     backend,
                     agent_override: Some(agent_name.to_string()),
                     worker_prompt,
+                    worker_model,
+                    worker_role_suffix,
                     approval_tx,
                     call_depth,
                     max_call_depth,
@@ -3035,6 +3053,8 @@ impl Server {
                     m.approval_tx.clone(),
                     SpawnContext {
                         worker_prompt: m.worker_prompt.clone(),
+                        worker_model: m.worker_model.clone(),
+                        worker_role_suffix: m.worker_role_suffix.clone(),
                         job_projection: None,
                         job_retry: None,
                         job_incarnation: job_authority
@@ -3398,6 +3418,8 @@ impl Server {
                     m.approval_tx.clone(),
                     SpawnContext {
                         worker_prompt: m.worker_prompt.clone(),
+                        worker_model: m.worker_model.clone(),
+                        worker_role_suffix: m.worker_role_suffix.clone(),
                         job_projection: None,
                         job_retry: None,
                         job_incarnation: job.map(|_| self.job_incarnation.clone()),
@@ -3856,10 +3878,27 @@ impl Server {
     ) {
         let agent_name = agent.name.clone();
         let agent_identity = self.agent_index.find_by_name(&agent_name);
-        let system_prompt = spawn
-            .worker_prompt
-            .clone()
-            .unwrap_or_else(|| agent.system_prompt.clone());
+        // A Worker child's system prompt is the template prompt with the
+        // preset's `role_suffix` appended (when one was resolved). Spawn is
+        // the only producer of `worker_prompt`, and it is always `Some`
+        // (possibly empty) from `spawn_worker`; a suffix without a prompt
+        // still stands on its own rather than pulling the parent's prompt in.
+        let system_prompt = match (
+            spawn.worker_prompt.clone(),
+            spawn.worker_role_suffix.as_deref(),
+        ) {
+            (Some(prompt), Some(suffix)) if !suffix.trim().is_empty() => {
+                if prompt.trim().is_empty() {
+                    suffix.to_string()
+                } else {
+                    format!("{prompt}\n\n{suffix}")
+                }
+            }
+            (Some(prompt), _) => prompt,
+            (None, Some(suffix)) => suffix.to_string(),
+            (None, None) => agent.system_prompt.clone(),
+        };
+        let worker_model = spawn.worker_model.clone();
         let default_model = agent.default_model.clone();
         let allowed_tools = agent.allowed_tools.clone();
         let session_capabilities = session.read_meta().await.capabilities;
@@ -4162,8 +4201,11 @@ impl Server {
                 let session_model = meta
                     .resolve_model_for_agent(&agent_name)
                     .map(str::to_string);
-                let budget_model =
-                    budget_model_id(&backend, session_model.as_deref(), default_model.as_deref());
+                let budget_model = budget_model_id(
+                    &backend,
+                    session_model.as_deref(),
+                    worker_model.as_deref().or(default_model.as_deref()),
+                );
                 // First use of a model we don't have a window for yet: learn it
                 // in the background so the next turn budgets window-aware.
                 if let Some(m) = budget_model.as_deref() {
@@ -4212,9 +4254,10 @@ impl Server {
                     return;
                 }
             };
-            // Per-agent override > session pin > agent default. See
-            // `run_schedule_turn` for the matching path on scheduled fires.
-            let effective_model = session_model.or(default_model);
+            // Per-agent override > session pin > Worker spawn override >
+            // agent default. See `run_schedule_turn` for the matching path on
+            // scheduled fires.
+            let effective_model = session_model.or(worker_model).or(default_model);
 
             if assembled.truncated {
                 info!(

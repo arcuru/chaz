@@ -8083,6 +8083,8 @@ async fn a_stop_that_lands_before_the_turn_starts_still_stops_it() {
                 attempt.clone(),
                 SpawnContext {
                     worker_prompt: None,
+                    worker_model: None,
+                    worker_role_suffix: None,
                     job_projection: None,
                     job_retry: None,
                     job_incarnation: None,
@@ -9228,6 +9230,8 @@ async fn job_wait_executor_shutdown_and_observed_yield_stop_observation_or_reacq
                     attempt.clone(),
                     SpawnContext {
                         worker_prompt: None,
+                        worker_model: None,
+                        worker_role_suffix: None,
                         // Identity only: without job authority no queue
                         // projection is reconciled.
                         job_projection: claim_loss
@@ -9625,6 +9629,8 @@ async fn required_context_strategy_refuses_and_recovers_on_the_executor() {
 mod wait_resume;
 #[path = "worker_capacity_tests.rs"]
 mod worker_capacity_tests;
+#[path = "worker_model_tests.rs"]
+mod worker_model_tests;
 
 #[tokio::test]
 async fn chat_steering_same_attempt_fifo_promotes_before_response_and_replays() {

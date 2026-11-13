@@ -444,6 +444,8 @@ impl Server {
                 backend: self.default_backend.clone(),
                 agent_override: Some(accepted.definition.target.clone()),
                 worker_prompt: None,
+                worker_model: None,
+                worker_role_suffix: None,
                 approval_tx: None,
                 call_depth: accepted.definition.call_depth,
                 max_call_depth: accepted.definition.max_call_depth,
