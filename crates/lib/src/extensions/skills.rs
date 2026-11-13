@@ -310,12 +310,18 @@ impl crate::extension::ExtensionInstance for SkillsGlobalInstance {
 
     fn tools(&self) -> Vec<Arc<dyn Tool>> {
         vec![
-            Arc::new(SkillListTool {
-                registry: self.disk.clone(),
-            }),
-            Arc::new(SkillSearchTool {
-                registry: self.disk.clone(),
-            }),
+            Arc::new(SkillListTool(DiscoveryInputs {
+                disk: self.disk.clone(),
+                registry: self.registry.clone(),
+                agent_index: self.agent_index.clone(),
+                skill_bank_index: self.skill_bank_index.clone(),
+            })),
+            Arc::new(SkillSearchTool(DiscoveryInputs {
+                disk: self.disk.clone(),
+                registry: self.registry.clone(),
+                agent_index: self.agent_index.clone(),
+                skill_bank_index: self.skill_bank_index.clone(),
+            })),
             Arc::new(SkillShowTool {
                 disk: self.disk.clone(),
                 registry: self.registry.clone(),
@@ -373,6 +379,9 @@ impl crate::extension::ExtensionInstance for SkillsInstance {
 pub(crate) struct CatalogEntry {
     pub name: String,
     pub description: String,
+    /// Trigger keyword hints. Only the disk source carries these — DB
+    /// skill rows have no trigger field, so their entries are empty.
+    pub triggers: Vec<String>,
     pub requires_tools: Vec<String>,
     pub body: String,
     /// Provenance label — kept for future UI / debugging surfaces.
@@ -421,6 +430,7 @@ async fn compose_catalog(
                 entries.push(CatalogEntry {
                     name: s.name.clone(),
                     description: s.description.clone(),
+                    triggers: s.triggers.clone(),
                     requires_tools: s.requires_tools.clone(),
                     body: s.body.clone(),
                     source: SkillSource::Disk,
@@ -440,6 +450,7 @@ async fn compose_catalog(
                 entries.push(CatalogEntry {
                     name: s.name,
                     description: s.description,
+                    triggers: Vec::new(),
                     requires_tools: Vec::new(),
                     body: s.body,
                     source: SkillSource::Agent,
@@ -464,6 +475,7 @@ async fn compose_catalog(
                         entries.push(CatalogEntry {
                             name: s.name,
                             description: s.description,
+                            triggers: Vec::new(),
                             requires_tools: Vec::new(),
                             body: s.body,
                             source: SkillSource::Bank {
@@ -492,6 +504,7 @@ async fn compose_catalog(
                 entries.push(CatalogEntry {
                     name: s.name,
                     description: s.description,
+                    triggers: Vec::new(),
                     requires_tools: Vec::new(),
                     body: s.body,
                     source: SkillSource::SessionBank {
@@ -685,9 +698,49 @@ impl PromptAugmentation for SkillsPromptAugmentation {
 
 // ── Skill management tools ──────────────────────────────────────────
 
-struct SkillListTool {
-    registry: Arc<std::sync::RwLock<SkillRegistry>>,
+/// Shared call-time catalog assembly for the discovery surfaces. Reads
+/// the session's attached banks at call time (the tool instances are
+/// global; per-session state lives on the session DB) and composes the
+/// four-source catalog for the active agent — the same resolution
+/// `skill_show` and prompt augmentation use, so discovery and
+/// activation always agree.
+struct DiscoveryInputs {
+    disk: Arc<std::sync::RwLock<SkillRegistry>>,
+    registry: Arc<SessionRegistry>,
+    agent_index: HostedIndex,
+    skill_bank_index: HostedIndex,
 }
+
+impl DiscoveryInputs {
+    async fn catalog(&self, ctx: &crate::tool::ToolContext) -> Vec<CatalogEntry> {
+        let agent = ctx.agent_name.clone();
+        let session_attached_banks: Vec<String> = {
+            let session = ctx.session.lock().await;
+            let db = session.database();
+            let settings = crate::extension::read_settings(db, "skills").await;
+            settings
+                .get("attached_banks")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        compose_catalog(
+            &self.disk,
+            &self.registry,
+            &self.agent_index,
+            &self.skill_bank_index,
+            &agent,
+            &session_attached_banks,
+        )
+        .await
+    }
+}
+
+struct SkillListTool(DiscoveryInputs);
 
 impl Tool for SkillListTool {
     fn descriptor(&self) -> ToolDescriptor {
@@ -715,25 +768,29 @@ impl Tool for SkillListTool {
         ctx: &'a crate::tool::ToolContext,
     ) -> Pin<Box<dyn Future<Output = Result<String, ToolError>> + Send + 'a>> {
         let available = available_tool_names(ctx);
-        let items: Vec<String> = {
-            let registry = self.registry.read().unwrap();
-            let skills = registry.list();
-            skills
+        Box::pin(async move {
+            let items: Vec<String> = self
+                .0
+                .catalog(ctx)
+                .await
                 .iter()
-                .filter(|s| skill_is_usable(&s.name, &s.requires_tools, &available, "skill_list"))
+                .filter(|e| skill_is_usable(&e.name, &e.requires_tools, &available, "skill_list"))
                 .enumerate()
-                .map(|(i, s)| {
+                .map(|(i, e)| {
+                    let triggers = if e.triggers.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" (triggers: {})", e.triggers.join(", "))
+                    };
                     format!(
-                        "{}. **{}** — {} (triggers: {})\n",
+                        "{}. **{}** — {}{}\n",
                         i + 1,
-                        s.name,
-                        s.description,
-                        s.triggers.join(", ")
+                        e.name,
+                        e.description,
+                        triggers
                     )
                 })
-                .collect()
-        };
-        Box::pin(async move {
+                .collect();
             if items.is_empty() {
                 Ok("(no skills loaded)".to_string())
             } else {
@@ -750,9 +807,7 @@ impl Tool for SkillListTool {
     }
 }
 
-struct SkillSearchTool {
-    registry: Arc<std::sync::RwLock<SkillRegistry>>,
-}
+struct SkillSearchTool(DiscoveryInputs);
 
 impl Tool for SkillSearchTool {
     fn descriptor(&self) -> ToolDescriptor {
@@ -779,19 +834,23 @@ impl Tool for SkillSearchTool {
         arguments: Value,
         ctx: &'a crate::tool::ToolContext,
     ) -> Pin<Box<dyn Future<Output = Result<String, ToolError>> + Send + 'a>> {
-        let query = arguments["query"].as_str().unwrap_or("").to_string();
+        let query = arguments["query"].as_str().unwrap_or("").to_lowercase();
         let available = available_tool_names(ctx);
-        let items: Vec<String> = {
-            let registry = self.registry.read().unwrap();
-            let results = registry.search(&query);
-            results
-                .iter()
-                .filter(|s| skill_is_usable(&s.name, &s.requires_tools, &available, "skill_search"))
-                .enumerate()
-                .map(|(i, s)| format!("{}. **{}** — {}\n", i + 1, s.name, s.description))
-                .collect()
-        };
         Box::pin(async move {
+            let items: Vec<String> = self
+                .0
+                .catalog(ctx)
+                .await
+                .iter()
+                .filter(|e| {
+                    e.name.to_lowercase().contains(&query)
+                        || e.description.to_lowercase().contains(&query)
+                        || e.triggers.iter().any(|t| t.contains(&query))
+                })
+                .filter(|e| skill_is_usable(&e.name, &e.requires_tools, &available, "skill_search"))
+                .enumerate()
+                .map(|(i, e)| format!("{}. **{}** — {}\n", i + 1, e.name, e.description))
+                .collect();
             if items.is_empty() {
                 Ok(format!("No skills matching \"{query}\""))
             } else {
@@ -1753,6 +1812,7 @@ mod tests {
         CatalogEntry {
             name: name.into(),
             description: description.into(),
+            triggers: Vec::new(),
             requires_tools: requires_tools.iter().map(|tool| (*tool).into()).collect(),
             body: String::new(),
             source: SkillSource::Disk,
@@ -1884,11 +1944,29 @@ mod tests {
         Arc::new(registry)
     }
 
+    /// Disk-only discovery inputs against a fresh registry — the base
+    /// case; DB-fixture tests build richer inputs inline.
+    async fn discovery_inputs(skills: Vec<Skill>) -> DiscoveryInputs {
+        let (_i, registry) = fresh_session_registry().await;
+        DiscoveryInputs {
+            disk: shared_registry(skills),
+            registry,
+            agent_index: crate::hosted_index::HostedIndex::empty("agent"),
+            skill_bank_index: crate::hosted_index::HostedIndex::empty("skill_bank"),
+        }
+    }
+
+    async fn list_tool(skills: Vec<Skill>) -> SkillListTool {
+        SkillListTool(discovery_inputs(skills).await)
+    }
+
+    async fn search_tool(skills: Vec<Skill>) -> SkillSearchTool {
+        SkillSearchTool(discovery_inputs(skills).await)
+    }
+
     #[tokio::test]
     async fn skill_list_descriptor_and_low_risk() {
-        let t = SkillListTool {
-            registry: shared_registry(vec![]),
-        };
+        let t = list_tool(vec![]).await;
         let d = t.descriptor();
         assert_eq!(d.name, "skill_list");
         // No required arguments.
@@ -1898,9 +1976,7 @@ mod tests {
 
     #[tokio::test]
     async fn skill_list_empty_registry_returns_sentinel() {
-        let t = SkillListTool {
-            registry: shared_registry(vec![]),
-        };
+        let t = list_tool(vec![]).await;
         let (_i, session) = fresh_session().await;
         let ctx = tool_context(session, Arc::new(crate::tool::ToolRegistry::new()));
         let out = t.execute(serde_json::json!({}), &ctx).await.unwrap();
@@ -1909,12 +1985,11 @@ mod tests {
 
     #[tokio::test]
     async fn skill_list_populated_renders_numbered_entries_with_triggers() {
-        let t = SkillListTool {
-            registry: shared_registry(vec![
-                skill("nix", "Nix tips", &["flake", "nixos"], "body"),
-                skill("rust", "Rust building", &["cargo"], "body"),
-            ]),
-        };
+        let t = list_tool(vec![
+            skill("nix", "Nix tips", &["flake", "nixos"], "body"),
+            skill("rust", "Rust building", &["cargo"], "body"),
+        ])
+        .await;
         let (_i, session) = fresh_session().await;
         let ctx = tool_context(session, Arc::new(crate::tool::ToolRegistry::new()));
         let out = t.execute(serde_json::json!({}), &ctx).await.unwrap();
@@ -1925,9 +2000,7 @@ mod tests {
 
     #[tokio::test]
     async fn skill_search_descriptor_requires_query() {
-        let t = SkillSearchTool {
-            registry: shared_registry(vec![]),
-        };
+        let t = search_tool(vec![]).await;
         let d = t.descriptor();
         assert_eq!(d.name, "skill_search");
         let required = d.parameters["required"].as_array().expect("required[]");
@@ -1937,9 +2010,7 @@ mod tests {
 
     #[tokio::test]
     async fn skill_search_no_match_returns_helpful_message() {
-        let t = SkillSearchTool {
-            registry: shared_registry(vec![skill("nix", "Nix tips", &["flake"], "body")]),
-        };
+        let t = search_tool(vec![skill("nix", "Nix tips", &["flake"], "body")]).await;
         let (_i, session) = fresh_session().await;
         let ctx = tool_context(session, Arc::new(crate::tool::ToolRegistry::new()));
         let out = t
@@ -1952,12 +2023,11 @@ mod tests {
 
     #[tokio::test]
     async fn skill_search_matches_render_as_numbered_list() {
-        let t = SkillSearchTool {
-            registry: shared_registry(vec![
-                skill("nix", "Nix tips", &["flake"], "body"),
-                skill("rust", "Rust", &["cargo"], "body"),
-            ]),
-        };
+        let t = search_tool(vec![
+            skill("nix", "Nix tips", &["flake"], "body"),
+            skill("rust", "Rust", &["cargo"], "body"),
+        ])
+        .await;
         let (_i, session) = fresh_session().await;
         let ctx = tool_context(session, Arc::new(crate::tool::ToolRegistry::new()));
         let out = t
@@ -1970,12 +2040,11 @@ mod tests {
 
     #[tokio::test]
     async fn skill_list_hides_skill_whose_required_tool_is_unavailable() {
-        let t = SkillListTool {
-            registry: shared_registry(vec![
-                skill("nix", "Nix tips", &[], "body"),
-                skill_needing("deploy", "Needs shell", &["shell"]),
-            ]),
-        };
+        let t = list_tool(vec![
+            skill("nix", "Nix tips", &[], "body"),
+            skill_needing("deploy", "Needs shell", &["shell"]),
+        ])
+        .await;
         let (_i, session) = fresh_session().await;
         let ctx = tool_context(session, registry_offering(&[]));
         let out = t.execute(serde_json::json!({}), &ctx).await.unwrap();
@@ -1985,9 +2054,7 @@ mod tests {
 
     #[tokio::test]
     async fn skill_list_shows_skill_whose_required_tool_is_registered() {
-        let t = SkillListTool {
-            registry: shared_registry(vec![skill_needing("deploy", "Needs shell", &["shell"])]),
-        };
+        let t = list_tool(vec![skill_needing("deploy", "Needs shell", &["shell"])]).await;
         let (_i, session) = fresh_session().await;
         let ctx = tool_context(session, registry_offering(&["shell"]));
         let out = t.execute(serde_json::json!({}), &ctx).await.unwrap();
@@ -1996,12 +2063,11 @@ mod tests {
 
     #[tokio::test]
     async fn skill_search_hides_skill_whose_required_tool_is_unavailable() {
-        let t = SkillSearchTool {
-            registry: shared_registry(vec![
-                skill("deploy-notes", "Deploy notes", &[], "body"),
-                skill_needing("deploy", "Needs shell", &["shell"]),
-            ]),
-        };
+        let t = search_tool(vec![
+            skill("deploy-notes", "Deploy notes", &[], "body"),
+            skill_needing("deploy", "Needs shell", &["shell"]),
+        ])
+        .await;
         let (_i, session) = fresh_session().await;
         let ctx = tool_context(session, registry_offering(&[]));
         let out = t
@@ -2048,6 +2114,297 @@ mod tests {
         let parsed: Value = serde_json::from_str(&out).expect("valid JSON payload");
         assert_eq!(parsed["name"], "deploy");
         assert_eq!(parsed["text"], "body");
+    }
+
+    // ── DB-backed discovery fixtures ────────────────────────────────
+
+    /// Insert a skill row into a DB's `skills` store (agent DB or skill
+    /// bank) through the same eidetica Table machinery `read_skill_rows`
+    /// uses.
+    async fn put_skill_row(db: &eidetica::Database, name: &str, description: &str, body: &str) {
+        use eidetica::store::Table;
+        let txn = db.new_transaction().await.unwrap();
+        let store = txn
+            .get_store::<Table<crate::agent_db::Skill>>(crate::agent_db::SKILLS_STORE)
+            .await
+            .unwrap();
+        store
+            .insert(crate::agent_db::Skill {
+                name: name.into(),
+                description: description.into(),
+                body: body.into(),
+                timestamp: chrono::Utc::now(),
+                tags: Vec::new(),
+            })
+            .await
+            .unwrap();
+        txn.commit().await.unwrap();
+    }
+
+    /// Discovery + show tools against a real (in-memory) eidetica stack:
+    /// agent `test-agent` with one private DB skill, a granted shared
+    /// bank with one skill, and a session-attached bank (attached on
+    /// `session`'s settings DB) with one skill.
+    async fn db_backed_tools(
+        disk: Vec<Skill>,
+        session: &Arc<tokio::sync::Mutex<crate::session::Session>>,
+    ) -> (SkillListTool, SkillSearchTool, SkillShowTool) {
+        let (_i, registry) = fresh_session_registry().await;
+
+        let (agent_db, agent_pubkey) = registry
+            .create_new_agent_db(
+                "test-agent",
+                &crate::agent_db::AgentDbConfig::default(),
+                &crate::agent_db::AgentMeta {
+                    display_name: Some("test-agent".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        put_skill_row(
+            agent_db.database(),
+            "private-skill",
+            "Agent-owned skill",
+            "private body",
+        )
+        .await;
+
+        let (bank_db, bank_pubkey) = registry
+            .create_new_skill_bank(
+                "shared-bank",
+                &crate::skill_bank_db::SkillBankMeta::default(),
+            )
+            .await
+            .unwrap();
+        put_skill_row(
+            bank_db.database(),
+            "bank-skill",
+            "Shared bank skill",
+            "bank body",
+        )
+        .await;
+        agent_db
+            .attach_skill_bank(crate::agent_db::SkillBankRef {
+                name: "shared-bank".into(),
+                db_id: bank_db.id().to_string(),
+                permission: crate::agent_db::BankPermission::Read,
+            })
+            .await
+            .unwrap();
+
+        let (session_bank_db, session_bank_pubkey) = registry
+            .create_new_skill_bank(
+                "session-bank",
+                &crate::skill_bank_db::SkillBankMeta::default(),
+            )
+            .await
+            .unwrap();
+        put_skill_row(
+            session_bank_db.database(),
+            "session-skill",
+            "Session bank skill",
+            "session body",
+        )
+        .await;
+
+        {
+            let s = session.lock().await;
+            crate::extension::write_settings(
+                s.database(),
+                "skills",
+                serde_json::json!({ "attached_banks": ["session-bank"] }),
+            )
+            .await
+            .unwrap();
+        }
+
+        let agent_index = crate::hosted_index::HostedIndex::empty("agent");
+        agent_index.register(crate::hosted_index::DbEntry {
+            db_id: agent_db.id(),
+            display_name: "test-agent".into(),
+            pubkey: agent_pubkey,
+        });
+        let skill_bank_index = crate::hosted_index::HostedIndex::empty("skill_bank");
+        for (db, pubkey, name) in [
+            (&bank_db, bank_pubkey, "shared-bank"),
+            (&session_bank_db, session_bank_pubkey, "session-bank"),
+        ] {
+            skill_bank_index.register(crate::hosted_index::DbEntry {
+                db_id: db.id(),
+                display_name: name.into(),
+                pubkey,
+            });
+        }
+
+        let inputs = DiscoveryInputs {
+            disk: shared_registry(disk),
+            registry,
+            agent_index,
+            skill_bank_index,
+        };
+        let show = SkillShowTool {
+            disk: inputs.disk.clone(),
+            registry: inputs.registry.clone(),
+            agent_index: inputs.agent_index.clone(),
+            skill_bank_index: inputs.skill_bank_index.clone(),
+        };
+        (
+            SkillListTool(DiscoveryInputs {
+                disk: inputs.disk.clone(),
+                registry: inputs.registry.clone(),
+                agent_index: inputs.agent_index.clone(),
+                skill_bank_index: inputs.skill_bank_index.clone(),
+            }),
+            SkillSearchTool(DiscoveryInputs {
+                disk: inputs.disk.clone(),
+                registry: inputs.registry.clone(),
+                agent_index: inputs.agent_index.clone(),
+                skill_bank_index: inputs.skill_bank_index.clone(),
+            }),
+            show,
+        )
+    }
+
+    #[tokio::test]
+    async fn skill_list_covers_agent_bank_and_session_bank_skills() {
+        let (_i, session) = fresh_session().await;
+        let (list, _search, _show) = db_backed_tools(vec![], &session).await;
+        let ctx = tool_context(session, Arc::new(crate::tool::ToolRegistry::new()));
+        let out = list.execute(serde_json::json!({}), &ctx).await.unwrap();
+        assert!(out.contains("**private-skill** — Agent-owned skill"));
+        assert!(out.contains("**bank-skill** — Shared bank skill"));
+        assert!(out.contains("**session-skill** — Session bank skill"));
+    }
+
+    #[tokio::test]
+    async fn skill_search_covers_agent_bank_and_session_bank_skills() {
+        let (_i, session) = fresh_session().await;
+        let (_list, search, _show) = db_backed_tools(vec![], &session).await;
+        let ctx = tool_context(session, Arc::new(crate::tool::ToolRegistry::new()));
+        for (query, expected) in [
+            ("private", "private-skill"),
+            ("Shared", "bank-skill"),
+            ("Session bank", "session-skill"),
+        ] {
+            let out = search
+                .execute(serde_json::json!({ "query": query }), &ctx)
+                .await
+                .unwrap();
+            assert!(out.contains(expected), "query {query:?}: {out}");
+        }
+    }
+
+    #[tokio::test]
+    async fn db_skills_reachable_via_skill_show_with_same_discovery() {
+        let (_i, session) = fresh_session().await;
+        let (_list, _search, show) = db_backed_tools(vec![], &session).await;
+        let ctx = tool_context(session, Arc::new(crate::tool::ToolRegistry::new()));
+        for (name, body) in [
+            ("private-skill", "private body"),
+            ("bank-skill", "bank body"),
+            ("session-skill", "session body"),
+        ] {
+            let out = show
+                .execute(serde_json::json!({ "name": name }), &ctx)
+                .await
+                .unwrap();
+            let parsed: Value = serde_json::from_str(&out).expect("valid JSON payload");
+            assert_eq!(parsed["name"], name);
+            assert_eq!(parsed["text"], body);
+        }
+    }
+
+    #[tokio::test]
+    async fn disk_definition_wins_name_collision_across_list_search_show() {
+        let (_i, session) = fresh_session().await;
+        let disk = vec![skill("private-skill", "Disk definition", &[], "disk body")];
+        let (list, search, show) = db_backed_tools(disk, &session).await;
+        let ctx = tool_context(session, Arc::new(crate::tool::ToolRegistry::new()));
+
+        let listed = list.execute(serde_json::json!({}), &ctx).await.unwrap();
+        assert!(listed.contains("Disk definition"));
+        assert!(!listed.contains("Agent-owned skill"));
+
+        let searched = search
+            .execute(serde_json::json!({ "query": "disk" }), &ctx)
+            .await
+            .unwrap();
+        assert!(searched.contains("private-skill"));
+
+        let shown = show
+            .execute(serde_json::json!({ "name": "private-skill" }), &ctx)
+            .await
+            .unwrap();
+        assert!(shown.contains("disk body"));
+    }
+
+    #[tokio::test]
+    async fn other_agent_does_not_acquire_agent_or_granted_bank_skills() {
+        let (_i, session) = fresh_session().await;
+        let (list, search, _show) = db_backed_tools(vec![], &session).await;
+        let mut ctx = tool_context(session, Arc::new(crate::tool::ToolRegistry::new()));
+        ctx.agent_name = "other-agent".into();
+
+        let listed = list.execute(serde_json::json!({}), &ctx).await.unwrap();
+        assert!(
+            !listed.contains("private-skill") && !listed.contains("bank-skill"),
+            "other agent must not see agent-owned or granted-bank skills: {listed}"
+        );
+        // Session-attached banks are session-scoped by design — every
+        // agent in the session keeps seeing them.
+        assert!(listed.contains("session-skill"));
+
+        for query in ["private", "Shared"] {
+            let out = search
+                .execute(serde_json::json!({ "query": query }), &ctx)
+                .await
+                .unwrap();
+            assert!(out.contains("No skills matching"), "{query:?}: {out}");
+        }
+    }
+
+    #[tokio::test]
+    async fn prompt_catalog_agrees_with_list_for_db_skills() {
+        let (_i, _session) = fresh_session().await;
+        // Rebuild the same fixture through SessionSkills to compare the
+        // prompt-augmentation surface with skill_list.
+        let (_i2, registry) = fresh_session_registry().await;
+        let (agent_db, agent_pubkey) = registry
+            .create_new_agent_db(
+                "test-agent",
+                &crate::agent_db::AgentDbConfig::default(),
+                &crate::agent_db::AgentMeta::default(),
+            )
+            .await
+            .unwrap();
+        put_skill_row(
+            agent_db.database(),
+            "private-skill",
+            "Agent-owned skill",
+            "private body",
+        )
+        .await;
+        let agent_index = crate::hosted_index::HostedIndex::empty("agent");
+        agent_index.register(crate::hosted_index::DbEntry {
+            db_id: agent_db.id(),
+            display_name: "test-agent".into(),
+            pubkey: agent_pubkey,
+        });
+        let inputs = Arc::new(SessionSkills {
+            disk: shared_registry(vec![]),
+            registry,
+            agent_index,
+            skill_bank_index: crate::hosted_index::HostedIndex::empty("skill_bank"),
+            session_attached_banks: Vec::new(),
+        });
+        let aug = SkillsPromptAugmentation { inputs };
+        let out = aug
+            .augment_system_prompt("test-agent", &[], &[])
+            .await
+            .unwrap()
+            .expect("non-empty augmentation");
+        assert!(out.contains("- **private-skill** — Agent-owned skill"));
     }
 
     // ── PromptAugmentation (2) ───────────────────────────────────────
