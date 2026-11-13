@@ -68,6 +68,54 @@ still controls agent processing.
    An existing named session that cannot be opened is never replaced with a
    new one.
 
+## Compose while a new session opens
+
+`Ctrl+T`, the hub's **New session** row, and `/new [group]` open a loading
+composer immediately after the action is accepted.
+You can type while creation, agent loading, observation setup and the first
+transcript read run in the background.
+This composer is local UI state, not an empty session database or a ready backend.
+`Enter` leaves the draft unsent until the real session is ready.
+
+| Control or display                       | Behavior while opening                                                   |
+| ---------------------------------------- | ------------------------------------------------------------------------ |
+| `Creating session…`                      | The accepted creation is queued or running                               |
+| `Loading session… (ID)`                  | Creation resolved; observation and session data are loading              |
+| Typing, arrows, `Alt+Enter`              | Edit the new draft without touching another conversation's draft         |
+| `Ctrl+P` or `Esc`                        | Return to the hub without cancelling creation                            |
+| `Ctrl+T` or **New session** from the hub | Return to the existing loading/failed composer; do not create again      |
+| `Session not ready: …`                   | Keep the editable draft and report the error; do not retry automatically |
+| `Ctrl+W` in a failed composer            | Discard that draft after the action settles and return to the hub        |
+
+On success, the new tab adopts the draft and cursor unchanged.
+If you have moved elsewhere, the tab keeps the draft without stealing focus.
+Existing conversations retain their own drafts throughout.
+A failure can happen after the database was created, so inspect the hub before
+trying again.
+Hiding a loading composer never rolls back a write; `Ctrl+W` hides it without
+discarding the draft while the action is still pending.
+The usual pending-write warning and double-quit confirmation still apply.
+
+### Walkthrough: create during a slow load
+
+1. From an existing chat, press `Ctrl+T` while storage is slow.
+   The new view shows `New session · loading` and `Creating session…`.
+   Type `Review these changes`; it appears immediately, while the old
+   conversation's unsent input stays with that conversation.
+2. Press `Enter` before loading completes.
+   The footer still says `Draft not submitted`.
+   When the view shows `Loading session… (ID)`, keep editing.
+   On success the normal chat appears with the edited draft, still unsent.
+3. To keep working elsewhere, press `Ctrl+P` during loading and open another
+   conversation.
+   Completion adds the new tab without moving you away from that conversation.
+   Select the new tab to find your draft.
+4. If instead the view reports `Session not ready: …`, the draft remains editable.
+   Press `Ctrl+P` to inspect the hub; return with **New session** to recover the
+   draft, not to retry creation.
+   Copy it before using `Ctrl+W` to discard the failed view, then explicitly open
+   the existing session or request another new one after resolving the error.
+
 ## Interface Layout
 
 ```text

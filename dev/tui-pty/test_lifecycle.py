@@ -383,6 +383,9 @@ default_agents: [chaz]
                 other = "ABCDEFGHIJKLMNO"
                 process.send(other + "X\x7f")  # DEL still edits; it is not Ctrl+H.
                 process.expect(other)
+                # The loading composer also accepts typing, but tab navigation
+                # starts only after its real destination is ready.
+                process.expect_screen("ctx ")
                 for shortcut, draft in [("\x08", "pty-café"), ("\x0c", other),
                                         ("\x0c", "pty-café"), ("\x08", other)]:
                     offset = len(process.raw)
@@ -741,6 +744,9 @@ eidetica:
                 offset = len(process.raw); process.send("\x10")
                 process.expect_screen("New session", timeout=1)
                 process.send("n")  # queues create/open behind the accepted write
+                process.expect_screen("Draft not submitted", timeout=1)
+                process.send("\x10")  # loading composer → hub, without cancelling creation
+                process.expect_screen("+ New session", timeout=1)
                 offset = len(process.raw); process.send("s")
                 process.expect_screen("Backends", timeout=1)
                 offset = len(process.raw); process.send("\x1b")

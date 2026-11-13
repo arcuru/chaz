@@ -40,6 +40,7 @@ use tokio_stream::StreamExt;
 #[path = "../../../../lib/src/test_support/counting_backend.rs"]
 mod activity_backend;
 mod bridge_impl;
+mod creation;
 mod input;
 mod jobs;
 mod operations;
@@ -119,6 +120,7 @@ pub(super) struct SessionFill {
 pub(super) enum TuiMode {
     Jobs,
     Chat,
+    NewSession,
     SessionPicker,
     ModelPicker,
     Settings(SettingsScope),
@@ -637,6 +639,7 @@ pub(super) struct App {
     pub(super) click_regions: Vec<ClickRegion>,
     pub(super) input: String,
     command_input: Option<String>,
+    creation: Option<creation::View>,
     pub(super) cursor: usize,
     /// Active slash-command completion popup, if any. Recomputed on every
     /// input edit (see `input::recompute_completion`).
@@ -849,6 +852,7 @@ impl App {
             click_regions: Vec::new(),
             input: String::new(),
             command_input: None,
+            creation: None,
             cursor: 0,
             completion: None,
             completion_dismissed: false,
@@ -1035,7 +1039,10 @@ impl App {
         self.backend_available
             && (matches!(
                 self.mode,
-                TuiMode::Jobs | TuiMode::SessionPicker | TuiMode::Settings(SettingsScope::Peer)
+                TuiMode::NewSession
+                    | TuiMode::Jobs
+                    | TuiMode::SessionPicker
+                    | TuiMode::Settings(SettingsScope::Peer)
             ) || (self.mode == TuiMode::ModelPicker
                 && matches!(self.model_picker_scope, ModelPickerScope::AgentGlobal(_)))
                 || self.current().is_none_or(|tab| !tab.live.unbound))
@@ -1048,6 +1055,21 @@ impl App {
 
     pub(super) fn current_mut(&mut self) -> Option<&mut Tab> {
         self.tabs.get_mut(self.active_tab)
+    }
+
+    /// Only conversation-scoped views navigate with their selected tab.
+    /// Installing the first tab in the background must not invalidate a newer
+    /// hub open request merely because `current()` now has a cached tab.
+    fn focused_incarnation(&self) -> Option<u64> {
+        let scoped = matches!(
+            self.mode,
+            TuiMode::Chat | TuiMode::Settings(SettingsScope::Session)
+        ) || (self.mode == TuiMode::ModelPicker
+            && !matches!(self.model_picker_scope, ModelPickerScope::AgentGlobal(_)));
+        scoped
+            .then(|| self.current())
+            .flatten()
+            .map(|t| t.live.incarnation)
     }
 
     /// Whether the focused conversation is waiting on a tool approval.
@@ -1089,7 +1111,13 @@ impl App {
     }
 
     /// Open a conversation view and focus it with an empty composer.
-    pub(super) fn push_tab(&mut self, mut tab: Tab) {
+    pub(super) fn push_tab(&mut self, tab: Tab) {
+        self.insert_tab(tab);
+        self.set_active_tab(self.tabs.len() - 1);
+    }
+
+    /// Install observation state without stealing focus from a newer view.
+    fn insert_tab(&mut self, mut tab: Tab) {
         tab.live.input_retry = self
             .jobs
             .publications
@@ -1099,7 +1127,6 @@ impl App {
         self.refresh_ticket += 1;
         tab.live.incarnation = self.refresh_ticket;
         self.tabs.push(tab);
-        self.set_active_tab(self.tabs.len() - 1);
     }
 
     /// Close one conversation view. The stored session, its attachments and
@@ -1130,9 +1157,10 @@ impl App {
             TuiMode::ModelPicker => {
                 !matches!(self.model_picker_scope, ModelPickerScope::AgentGlobal(_))
             }
-            TuiMode::Jobs | TuiMode::SessionPicker | TuiMode::Settings(SettingsScope::Peer) => {
-                false
-            }
+            TuiMode::NewSession
+            | TuiMode::Jobs
+            | TuiMode::SessionPicker
+            | TuiMode::Settings(SettingsScope::Peer) => false,
         };
         if self.tabs.is_empty() && needs_conversation {
             self.settings_return = None;

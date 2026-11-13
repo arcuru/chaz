@@ -320,6 +320,72 @@ eidetica:
         self.quit()
         print("STARTUP LOAD ERROR CONTRACT: PASS; live error, same session after repair/relaunch, no submitted draft")
 
+    def test_background_first_tab_keeps_a_newer_hub_open_request(self):
+        armed = threading.Event()
+        self.launch(lambda r: armed.is_set() and "AuthenticatedDb" in r
+                    and "SubmitSignedEntry" in r["AuthenticatedDb"]["op"])
+        self.process.expect_screen("Sessions", timeout=15)
+        self.process.expect_screen("service-fixture", timeout=15)
+        armed.set()
+        self.process.send("n")
+        self.held()
+        self.process.send("draft-from-loading")
+        self.process.expect_screen("draft-from-loading", timeout=1)
+        self.process.send("\x10")  # Ctrl+P: no conversation tab is open yet
+        self.process.expect_screen("Sessions", timeout=1)
+        self.process.send("\x1b[B\r")  # open the existing session behind creation
+        self.process.expect_screen("2 action(s) pending", timeout=1)
+        self.gate.release.set()
+        self.process.expect_screen("SERVICE-CACHED-TRANSCRIPT", timeout=15)
+        self.process.expect_screen("Ctrl+S settings", timeout=1)
+        self.assertNotIn("draft-from-loading", "\n".join(self.process.screen.display))
+        self.process.send("\x0c")  # Ctrl+L: created tab retains its own draft
+        self.process.expect_screen("draft-from-loading", timeout=1)
+        self.assertNotIn("SERVICE-CACHED-TRANSCRIPT", "\n".join(self.process.screen.display))
+        self.assertEqual(self.control("sessions", "SESSIONS"), "SESSIONS 2")
+        self.quit()
+        print("BACKGROUND FIRST TAB CONTRACT: PASS; newer hub navigation honored, creation draft isolated")
+
+    def test_new_session_composer_is_editable_before_creation_finishes(self):
+        # Database creation submits a signed genesis entry; there is no
+        # separate CreateDatabase RPC in the native storage protocol.
+        self.new_session_loading_case(lambda r: "AuthenticatedDb" in r and "SubmitSignedEntry" in r["AuthenticatedDb"]["op"])
+
+    def test_new_session_composer_is_editable_before_hydration_finishes(self):
+        self.new_session_loading_case(lambda r: "AuthenticatedDb" in r and '"entries"' in json.dumps(r))
+
+    def new_session_loading_case(self, predicate):
+        armed = threading.Event()
+        self.launch(lambda r: armed.is_set() and predicate(r), "--session", "service-fixture")
+        self.process.expect_screen("SERVICE-CACHED-TRANSCRIPT", timeout=15)
+        self.process.expect_screen("Ctrl+S settings", timeout=1)
+        self.process.send("old-draft")
+        self.process.expect_screen("old-draft", timeout=1)
+        armed.set()
+        self.process.send("\x14")  # Ctrl+T
+        self.held()
+        self.process.expect_screen("New session · loading", timeout=1)
+        self.process.send("new-界EDIT\x7f!\r")
+        self.process.expect_screen("new-界EDI!", timeout=1)
+        self.assertNotIn("old-draft", "\n".join(self.process.screen.display))
+        self.assertEqual(self.control("entries", "ENTRIES"), "ENTRIES 1")
+        self.process.send("\x10")  # Ctrl+P: hide, not cancel
+        self.process.expect_screen("Sessions", timeout=1)
+        self.process.send("\x14")  # Ctrl+T: same pending composer, not a new write
+        self.process.expect_screen("new-界EDI!", timeout=1)
+        self.assertFalse(self.gate.release.is_set())
+        self.process.capture(self.out / "loading-composer")
+        self.gate.release.set()
+        self.process.expect_screen("Ctrl+S settings", timeout=15)
+        self.process.expect_screen("new-界EDI!", timeout=1)
+        self.assertEqual(self.control("sessions", "SESSIONS"), "SESSIONS 2")
+        self.process.send("\x08")  # Ctrl+H: return to original conversation
+        self.process.expect_screen("SERVICE-CACHED-TRANSCRIPT", timeout=1)
+        self.process.expect_screen("old-draft", timeout=1)
+        self.assertNotIn("new-界EDI!", "\n".join(self.process.screen.display))
+        self.quit()
+        print("NEW SESSION COMPOSER CONTRACT: PASS; editable before held IPC, unsent draft retained, no duplicate or cross-session input")
+
     def test_login_error_is_visible_and_does_not_restore_a_live_terminal(self):
         self.launch(lambda r: False, "--session", "must-not-create", "retained", username="absent-user")
         self.process.expect_screen("Startup failed", timeout=10)
