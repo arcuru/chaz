@@ -7,6 +7,7 @@
 pub(crate) mod harness;
 pub(crate) mod mock_backend;
 pub(crate) mod mock_host;
+pub(crate) mod roots_backend;
 
 pub(crate) use harness::*;
 pub(crate) use mock_backend::*;

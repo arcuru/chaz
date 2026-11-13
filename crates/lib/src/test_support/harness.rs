@@ -49,6 +49,14 @@ pub(crate) async fn fresh_eidetica() -> (Instance, AccountSession) {
     (instance, user)
 }
 
+/// Initialize the login's bookkeeping roots as its owner, before any service
+/// client connects. Service clients require roots that already exist.
+pub(crate) async fn provision_roots(user: &mut AccountSession) {
+    crate::session::roots::open(user, crate::session::roots::RootSetup::Initialize)
+        .await
+        .unwrap();
+}
+
 /// Re-deliver a database's current tips as if they had arrived from a peer:
 /// demote them to `Unverified`, then re-run the local verification pass.
 ///
