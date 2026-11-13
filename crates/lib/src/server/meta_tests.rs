@@ -140,8 +140,7 @@ async fn heartbeat_pass_reads_meta_once_and_next_callback_observes_late_stop() {
                 connection: format!("unix://{}", proxy_socket.display()),
                 login: crate::config::EideticaLoginConfig {
                     username: "test".into(),
-                    password: None,
-                    passwordless: true,
+                    password: Some("test-password".into()),
                 },
                 sync: None,
             };

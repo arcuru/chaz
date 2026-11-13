@@ -91,10 +91,12 @@ mod tests {
     // alive — the `Database` borrows the instance backend, which is dropped
     // (and the DB invalidated: "Instance has been dropped") if they fall.
     async fn fresh_db() -> (Instance, eidetica::AccountSession, Database) {
-        let (instance, mut user) =
-            Instance::create_backend(Box::new(InMemory::new()), NewAccount::passwordless("t"))
-                .await
-                .unwrap();
+        let (instance, mut user) = Instance::create_backend(
+            Box::new(InMemory::new()),
+            NewAccount::with_password("t", "test-password"),
+        )
+        .await
+        .unwrap();
         let key = user.get_default_key().unwrap();
         let mut settings = eidetica::crdt::Doc::new();
         settings.set("name", "chaz_peer");

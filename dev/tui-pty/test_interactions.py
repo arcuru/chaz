@@ -90,7 +90,7 @@ eidetica:
   connection: "sqlite://{home}/fixture.db"
   login:
     username: pty-test
-    passwordless: true
+    password: test-password
 backends:
   - name: stub
     type: openaicompatible
@@ -253,7 +253,7 @@ eidetica:
   connection: "sqlite://{home}/fixture.db"
   login:
     username: pty-test
-    passwordless: true
+    password: test-password
 backends:
   - name: stub
     type: openaicompatible
@@ -329,7 +329,7 @@ eidetica:
   connection: unix://{home}/service.sock
   login:
     username: pty-service
-    passwordless: true
+    password: test-password
 ''')
                 owner = subprocess.Popen([TARGET / "debug/examples/tui_service_fixture", home / "service.sock"],
                                          env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,

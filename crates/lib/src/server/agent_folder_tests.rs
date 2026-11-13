@@ -457,10 +457,12 @@ async fn folder_two_peer_sync_reconstructs_sources_without_feedback() {
         .unwrap();
     owner_sync.accept_connections().await.unwrap();
     let address = Address::http(owner_sync.get_server_address_for("http").await.unwrap());
-    let (peer, mut peer_user) =
-        Instance::create_backend(Box::new(InMemory::new()), NewAccount::passwordless("peer"))
-            .await
-            .unwrap();
+    let (peer, mut peer_user) = Instance::create_backend(
+        Box::new(InMemory::new()),
+        NewAccount::with_password("peer", "test-password"),
+    )
+    .await
+    .unwrap();
     peer.enable_sync().await.unwrap();
     let peer_key = peer_user.get_default_key().unwrap();
     let peer_signing = peer_user.get_signing_key(&peer_key).unwrap();

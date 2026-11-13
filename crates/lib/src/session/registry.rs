@@ -1295,7 +1295,7 @@ mod tests {
         let socket = dir.path().join("job.sock");
         let (owner, _) = Instance::create_backend(
             Box::new(InMemory::new()),
-            NewAccount::passwordless("job-test"),
+            NewAccount::with_password("job-test", "test-password"),
         )
         .await
         .unwrap();
@@ -1306,8 +1306,7 @@ mod tests {
             connection: format!("unix://{}", socket.display()),
             login: crate::config::EideticaLoginConfig {
                 username: "job-test".into(),
-                password: None,
-                passwordless: true,
+                password: Some("test-password".into()),
             },
             sync: None,
         };

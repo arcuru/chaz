@@ -905,7 +905,7 @@ mod tests {
     pub(super) async fn app_with_tabs(ids: &[&str]) -> (Instance, App) {
         let (instance, mut user) = Instance::create_backend(
             Box::new(InMemory::new()),
-            NewAccount::passwordless("tab-refresh"),
+            NewAccount::with_password("tab-refresh", "test-password"),
         )
         .await
         .unwrap();
@@ -1503,7 +1503,7 @@ mod tests {
         let socket = dir.path().join("fixture.sock");
         let (owner, mut user) = Instance::create_backend(
             Box::new(InMemory::new()),
-            NewAccount::passwordless("failure-fixture"),
+            NewAccount::with_password("failure-fixture", "test-password"),
         )
         .await
         .unwrap();
@@ -1541,8 +1541,7 @@ mod tests {
             connection: format!("unix://{}", socket.display()),
             login: EideticaLoginConfig {
                 username: "failure-fixture".into(),
-                password: None,
-                passwordless: true,
+                password: Some("test-password".into()),
             },
             sync: None,
         };
@@ -1867,7 +1866,7 @@ mod activity_regressions {
             for original in &tabs {
                 let db = if let Some(client) = &client {
                     client
-                        .login_account("test", None)
+                        .login_account("test", "test-password")
                         .await
                         .unwrap()
                         .open_database(original.session_db.root_id())

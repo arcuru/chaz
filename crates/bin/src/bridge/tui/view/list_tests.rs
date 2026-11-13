@@ -31,7 +31,7 @@ pub(super) async fn fixture_with_extensions(
 ) -> (Instance, Arc<Server>, BackendManager, App) {
     let (instance, user) = Instance::create_backend(
         Box::new(InMemory::new()),
-        NewAccount::passwordless("list-frames"),
+        NewAccount::with_password("list-frames", "test-password"),
     )
     .await
     .unwrap();

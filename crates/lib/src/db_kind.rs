@@ -105,10 +105,12 @@ mod tests {
     use eidetica::{Instance, NewAccount};
 
     async fn fresh_db() -> (Instance, eidetica::AccountSession, Database) {
-        let (instance, mut user) =
-            Instance::create_backend(Box::new(InMemory::new()), NewAccount::passwordless("t"))
-                .await
-                .unwrap();
+        let (instance, mut user) = Instance::create_backend(
+            Box::new(InMemory::new()),
+            NewAccount::with_password("t", "test-password"),
+        )
+        .await
+        .unwrap();
         let key = user.get_default_key().unwrap();
         let mut s = eidetica::crdt::Doc::new();
         s.set("name", "x");

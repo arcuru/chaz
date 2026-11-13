@@ -769,10 +769,12 @@ mod tests {
         Arc<TokioMutex<Session>>,
     ) {
         let backend = InMemory::new();
-        let (instance, user) =
-            Instance::create_backend(Box::new(backend), NewAccount::passwordless("test"))
-                .await
-                .unwrap();
+        let (instance, user) = Instance::create_backend(
+            Box::new(backend),
+            NewAccount::with_password("test", "test-password"),
+        )
+        .await
+        .unwrap();
         let agents_reg = Arc::new(AgentRegistry::with_default_agent());
         let registry = Arc::new(
             SessionRegistry::new(instance.clone(), user, agents_reg)

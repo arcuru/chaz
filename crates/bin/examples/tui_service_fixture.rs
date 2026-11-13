@@ -19,7 +19,7 @@ async fn main() -> anyhow::Result<()> {
     let socket = std::env::args().nth(1).expect("socket path required");
     let (owner, mut user) = Instance::create_backend(
         Box::new(InMemory::new()),
-        NewAccount::passwordless("pty-service"),
+        NewAccount::with_password("pty-service", "test-password"),
     )
     .await?;
     let (agent_db, pubkey) = create_agent_db(

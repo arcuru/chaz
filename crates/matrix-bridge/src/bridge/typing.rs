@@ -146,7 +146,7 @@ mod tests {
     async fn fixture() -> (Instance, Session) {
         let (owner, mut user) = Instance::create_backend(
             Box::new(InMemory::new()),
-            NewAccount::passwordless("typing"),
+            NewAccount::with_password("typing", "test-password"),
         )
         .await
         .unwrap();
@@ -404,7 +404,10 @@ mod tests {
         let client = Instance::connect(format!("unix://{}", socket.display()))
             .await
             .unwrap();
-        let user = client.login_account("typing", None).await.unwrap();
+        let user = client
+            .login_account("typing", "test-password")
+            .await
+            .unwrap();
         let remote = user.open_database(&root).await.unwrap();
         let mut old = Driver::start(remote, Arc::new(Semaphore::new(100))).await;
         assert_eq!(old.observed.recv().await, Some(true));
@@ -430,7 +433,10 @@ mod tests {
         let client = Instance::connect(format!("unix://{}", socket.display()))
             .await
             .unwrap();
-        let user = client.login_account("typing", None).await.unwrap();
+        let user = client
+            .login_account("typing", "test-password")
+            .await
+            .unwrap();
         let remote = user.open_database(&root).await.unwrap();
         let mut replacement = Driver::start(remote, Arc::new(Semaphore::new(100))).await;
         assert_eq!(replacement.observed.recv().await, Some(true));

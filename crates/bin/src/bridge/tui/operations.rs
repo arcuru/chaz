@@ -766,7 +766,7 @@ mod tests {
     async fn app() -> App {
         let (_instance, mut user) = eidetica::Instance::create_backend(
             Box::new(eidetica::backend::database::InMemory::new()),
-            eidetica::NewAccount::passwordless("actions"),
+            eidetica::NewAccount::with_password("actions", "test-password"),
         )
         .await
         .unwrap();

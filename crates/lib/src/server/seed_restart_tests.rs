@@ -44,7 +44,7 @@ impl Disk {
     /// file and parse it the way the daemon does.
     fn config(&self, agents_yaml: &str) -> Config {
         let body = format!(
-            "execution: executor\neidetica:\n  connection: \"{}\"\n  login: {{ username: chaz, passwordless: true }}\nagents:\n{agents_yaml}",
+            "execution: executor\neidetica:\n  connection: \"{}\"\n  login: {{ username: chaz, password: test-password }}\nagents:\n{agents_yaml}",
             format_args!("unix://{}", self.socket.display())
         );
         std::fs::write(&self.config_path, &body).unwrap();
@@ -62,7 +62,7 @@ async fn boot(disk: &Disk, mut config: Config, first: bool) -> (BuiltServer, Ser
                     .await
                     .unwrap(),
             ),
-            eidetica::NewAccount::passwordless("chaz"),
+            eidetica::NewAccount::with_password("chaz", "test-password"),
         )
         .await
         .unwrap();
@@ -94,7 +94,10 @@ async fn boot(disk: &Disk, mut config: Config, first: bool) -> (BuiltServer, Ser
     let instance = Instance::connect(&format!("unix://{}", disk.socket.display()))
         .await
         .unwrap();
-    let user = instance.login_account("chaz", None).await.unwrap();
+    let user = instance
+        .login_account("chaz", "test-password")
+        .await
+        .unwrap();
     let built = Box::pin(build(
         &mut config,
         instance,

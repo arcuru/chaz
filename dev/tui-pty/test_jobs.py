@@ -203,7 +203,7 @@ eidetica:
   connection: "unix://{socket}"
   login:
     username: pty-test
-    passwordless: true
+    password: test-password
 backends:
   - name: stub
     type: openaicompatible

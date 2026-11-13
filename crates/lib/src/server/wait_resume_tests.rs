@@ -155,10 +155,12 @@ impl Fixture {
     async fn new(name: &str) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join(format!("{name}.sock"));
-        let (owner, mut user) =
-            Instance::create_backend(Box::new(InMemory::new()), NewAccount::passwordless(name))
-                .await
-                .unwrap();
+        let (owner, mut user) = Instance::create_backend(
+            Box::new(InMemory::new()),
+            NewAccount::with_password(name, "test-password"),
+        )
+        .await
+        .unwrap();
         let (agent_db, pubkey) = create_agent_db(
             &mut user,
             "default",
@@ -179,8 +181,7 @@ impl Fixture {
                 connection: format!("unix://{}", socket.display()),
                 login: crate::config::EideticaLoginConfig {
                     username: name.into(),
-                    password: None,
-                    passwordless: true,
+                    password: Some("test-password".into()),
                 },
                 sync: None,
             },

@@ -394,9 +394,12 @@ mod tests {
     /// need a [`Sync`] handle can enable sync on the same instance.
     async fn test_instance() -> (Instance, AccountSession) {
         let backend = InMemory::new();
-        Instance::create_backend(Box::new(backend), NewAccount::passwordless("test"))
-            .await
-            .unwrap()
+        Instance::create_backend(
+            Box::new(backend),
+            NewAccount::with_password("test", "test-password"),
+        )
+        .await
+        .unwrap()
     }
 
     async fn test_user() -> AccountSession {

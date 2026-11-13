@@ -944,10 +944,12 @@ pub(super) async fn server_fixture_backend(
     backend_override: Option<BackendManager>,
 ) -> (Instance, Arc<Server>, Arc<crate::session::SessionRegistry>) {
     let backend = InMemory::new();
-    let (instance, user) =
-        Instance::create_backend(Box::new(backend), NewAccount::passwordless("test"))
-            .await
-            .unwrap();
+    let (instance, user) = Instance::create_backend(
+        Box::new(backend),
+        NewAccount::with_password("test", "test-password"),
+    )
+    .await
+    .unwrap();
     let agents = Arc::new(AgentRegistry::with_default_agent());
     let registry = Arc::new(
         crate::session::SessionRegistry::new(instance.clone(), user, agents.clone())
@@ -2931,7 +2933,7 @@ async fn watcher_registers_exposed_sessions_only() {
 }
 
 #[tokio::test]
-async fn exposed_session_waits_for_sync_signer_before_registration() {
+async fn exposed_session_uses_verified_sync_signer_during_partial_sync() {
     use eidetica::auth::types::{
         DelegatedTreeRef, DelegationStep, PermissionBounds, SigKey, TreeReference,
     };
@@ -2996,7 +2998,7 @@ async fn exposed_session_waits_for_sync_signer_before_registration() {
     // Real native commits on a second peer, delivered descendant-before-ancestor.
     let (source, _source_user) = Instance::create_backend(
         Box::new(InMemory::new()),
-        NewAccount::passwordless("source"),
+        NewAccount::with_password("source", "test-password"),
     )
     .await
     .unwrap();
@@ -3041,21 +3043,26 @@ async fn exposed_session_waits_for_sync_signer_before_registration() {
         engine.get_verification_status(&descendant).await.unwrap(),
         VerificationStatus::Unverified
     );
+    let discovered = eidetica::Database::find_sigkeys(&instance, child.root_id(), &agent.pubkey)
+        .await
+        .unwrap();
     assert!(
-        eidetica::Database::find_sigkeys(&instance, child.root_id(), &agent.pubkey)
-            .await
-            .unwrap()
-            .is_empty()
+        !discovered.is_empty(),
+        "verified signer remains discoverable"
     );
-    // The bound writer survives, but native tracking still requires discovery.
+    assert!(discovered.iter().all(|(identity, _)| {
+        matches!(identity, SigKey::Delegation { path, .. } if path.len() == 1 && path[0].tree == *parent.root_id() && path[0].tips == verified.tips())
+    }));
+    // Registration uses the accepted parent state, never the pending raw tip.
     registry.open_session_with_signer(&id).await.unwrap();
     let secrets = crate::security::SecretStore::new(registry.chaz_peer().clone()).await;
     let backend = crate::backends::BackendManager::new(&None, secrets);
     super::build::register_exposed_sessions(&server, &registry, &backend).await;
-    assert!(!registry.is_sync_enabled_for(child.root_id()).await.unwrap());
-    assert!(
-        !server.is_watching_session(&id).await,
-        "failed sync setup must not make registration permanent"
+    assert!(registry.is_sync_enabled_for(child.root_id()).await.unwrap());
+    assert!(server.is_watching_session(&id).await);
+    assert_eq!(
+        engine.get_verification_status(&descendant).await.unwrap(),
+        VerificationStatus::Unverified
     );
 
     engine
@@ -5034,7 +5041,7 @@ async fn shared_service_clients_observe_durable_attempt_completion() {
     let socket = dir.path().join("eidetica.sock");
     let (owner, mut owner_user) = Instance::create_backend(
         Box::new(InMemory::new()),
-        NewAccount::passwordless("shared"),
+        NewAccount::with_password("shared", "test-password"),
     )
     .await
     .unwrap();
@@ -5052,8 +5059,7 @@ async fn shared_service_clients_observe_durable_attempt_completion() {
         connection: url.clone(),
         login: crate::config::EideticaLoginConfig {
             username: "shared".into(),
-            password: None,
-            passwordless: true,
+            password: Some("test-password".into()),
         },
         sync: None,
     };
@@ -5228,7 +5234,7 @@ async fn populated_service_targeted_indices_resume_and_create_without_history_op
     let socket = dir.path().join("eidetica-targeted.sock");
     let (owner, mut owner_user) = Instance::create_backend(
         Box::new(InMemory::new()),
-        NewAccount::passwordless("targeted"),
+        NewAccount::with_password("targeted", "test-password"),
     )
     .await
     .unwrap();
@@ -5287,8 +5293,7 @@ async fn populated_service_targeted_indices_resume_and_create_without_history_op
         connection: format!("unix://{}", socket.display()),
         login: crate::config::EideticaLoginConfig {
             username: "targeted".into(),
-            password: None,
-            passwordless: true,
+            password: Some("test-password".into()),
         },
         sync: None,
     };
@@ -5322,7 +5327,7 @@ async fn targeted_service_client_expands_peer_discovery_only_on_demand() {
 
     let (instance, mut user) = Instance::create_backend(
         Box::new(InMemory::new()),
-        NewAccount::passwordless("targeted"),
+        NewAccount::with_password("targeted", "test-password"),
     )
     .await
     .unwrap();
@@ -5394,7 +5399,7 @@ async fn resident_executor_adopts_and_processes_local_client_session() {
     let socket = dir.path().join("resident-executor.sock");
     let (owner, mut owner_user) = Instance::create_backend(
         Box::new(InMemory::new()),
-        NewAccount::passwordless("resident"),
+        NewAccount::with_password("resident", "test-password"),
     )
     .await
     .unwrap();
@@ -5421,8 +5426,7 @@ async fn resident_executor_adopts_and_processes_local_client_session() {
         connection: format!("unix://{}", socket.display()),
         login: crate::config::EideticaLoginConfig {
             username: "resident".into(),
-            password: None,
-            passwordless: true,
+            password: Some("test-password".into()),
         },
         sync: None,
     };
@@ -5554,7 +5558,7 @@ async fn service_restart_reopens_and_reconciles_persisted_work() {
     let socket = dir.path().join("eidetica-restart.sock");
     let (owner, _owner_user) = Instance::create_backend(
         Box::new(InMemory::new()),
-        NewAccount::passwordless("restart"),
+        NewAccount::with_password("restart", "test-password"),
     )
     .await
     .unwrap();
@@ -5569,8 +5573,7 @@ async fn service_restart_reopens_and_reconciles_persisted_work() {
         connection: format!("unix://{}", socket.display()),
         login: crate::config::EideticaLoginConfig {
             username: "restart".into(),
-            password: None,
-            passwordless: true,
+            password: Some("test-password".into()),
         },
         sync: None,
     };
@@ -5738,10 +5741,12 @@ async fn direct_peer_sync_preserves_request_identity_and_completion_with_stop_re
     use eidetica::sync::Address;
     use eidetica::sync::transports::http::HttpTransport;
 
-    let (owner, mut owner_user) =
-        Instance::create_backend(Box::new(InMemory::new()), NewAccount::passwordless("owner"))
-            .await
-            .unwrap();
+    let (owner, mut owner_user) = Instance::create_backend(
+        Box::new(InMemory::new()),
+        NewAccount::with_password("owner", "test-password"),
+    )
+    .await
+    .unwrap();
     owner.enable_sync().await.unwrap();
     let owner_key = owner_user.get_default_key().unwrap();
     let owner_db = owner_user
@@ -5765,10 +5770,12 @@ async fn direct_peer_sync_preserves_request_identity_and_completion_with_stop_re
     owner_sync.accept_connections().await.unwrap();
     let address = Address::http(owner_sync.get_server_address_for("http").await.unwrap());
 
-    let (peer, mut peer_user) =
-        Instance::create_backend(Box::new(InMemory::new()), NewAccount::passwordless("peer"))
-            .await
-            .unwrap();
+    let (peer, mut peer_user) = Instance::create_backend(
+        Box::new(InMemory::new()),
+        NewAccount::with_password("peer", "test-password"),
+    )
+    .await
+    .unwrap();
     peer.enable_sync().await.unwrap();
     let peer_key = peer_user.get_default_key().unwrap();
     let peer_signing = peer_user.get_signing_key(&peer_key).unwrap();
@@ -6052,7 +6059,7 @@ async fn shared_login_transport_and_observer_frontends_keep_independent_progress
     let socket = dir.path().join("eidetica.sock");
     let (owner, mut owner_user) = Instance::create_backend(
         Box::new(InMemory::new()),
-        NewAccount::passwordless("shared"),
+        NewAccount::with_password("shared", "test-password"),
     )
     .await
     .unwrap();
@@ -6070,8 +6077,7 @@ async fn shared_login_transport_and_observer_frontends_keep_independent_progress
         connection: url.clone(),
         login: crate::config::EideticaLoginConfig {
             username: "shared".into(),
-            password: None,
-            passwordless: true,
+            password: Some("test-password".into()),
         },
         sync: None,
     };
@@ -6509,8 +6515,7 @@ async fn published_job_admission_uses_one_scope_snapshot_during_attachment() {
                 connection: format!("unix://{}", proxy_socket.display()),
                 login: crate::config::EideticaLoginConfig {
                     username: "test".into(),
-                    password: None,
-                    passwordless: true,
+                    password: Some("test-password".into()),
                 },
                 sync: None,
             };
@@ -6679,7 +6684,7 @@ async fn published_job_is_adopted_without_creating_another_child() {
         let socket = dir.path().join("published.sock");
         let (owner, mut user) = Instance::create_backend(
             Box::new(InMemory::new()),
-            NewAccount::passwordless("job-test"),
+            NewAccount::with_password("job-test", "test-password"),
         )
         .await
         .unwrap();
@@ -6716,8 +6721,7 @@ async fn published_job_is_adopted_without_creating_another_child() {
             connection: format!("unix://{}", socket.display()),
             login: crate::config::EideticaLoginConfig {
                 username: "job-test".into(),
-                password: None,
-                passwordless: true,
+                password: Some("test-password".into()),
             },
             sync: None,
         };
@@ -7099,7 +7103,7 @@ async fn accepted_job_restart_uses_agent_db_depth_not_yaml() {
         let socket = dir.path().join("job-depth.sock");
         let (owner, mut user) = Instance::create_backend(
             Box::new(InMemory::new()),
-            NewAccount::passwordless("job-depth"),
+            NewAccount::with_password("job-depth", "test-password"),
         )
         .await
         .unwrap();
@@ -7134,8 +7138,7 @@ async fn accepted_job_restart_uses_agent_db_depth_not_yaml() {
             connection: format!("unix://{}", socket.display()),
             login: crate::config::EideticaLoginConfig {
                 username: "job-depth".into(),
-                password: None,
-                passwordless: true,
+                password: Some("test-password".into()),
             },
             sync: None,
         };
@@ -7303,7 +7306,7 @@ async fn client_submission_publishes_one_child_then_executor_runs_it() {
     let (owner, agent, foreign_home) = Box::pin(async {
         let (owner, mut user) = Instance::create_backend(
             Box::new(InMemory::new()),
-            NewAccount::passwordless("submitter"),
+            NewAccount::with_password("submitter", "test-password"),
         )
         .await
         .unwrap();
@@ -7346,8 +7349,7 @@ async fn client_submission_publishes_one_child_then_executor_runs_it() {
                 connection: format!("unix://{}", socket.display()),
                 login: crate::config::EideticaLoginConfig {
                     username: "submitter".into(),
-                    password: None,
-                    passwordless: true,
+                    password: Some("test-password".into()),
                 },
                 sync: None,
             };
@@ -8449,7 +8451,7 @@ async fn sole_job_settles_after_former_claim_ttl_without_ownership_writes() {
     let socket = dir.path().join("delayed-settlement.sock");
     let (owner, mut user) = Instance::create_backend(
         Box::new(InMemory::new()),
-        NewAccount::passwordless("delayed-settlement"),
+        NewAccount::with_password("delayed-settlement", "test-password"),
     )
     .await
     .unwrap();
@@ -8531,8 +8533,7 @@ async fn sole_job_settles_after_former_claim_ttl_without_ownership_writes() {
         connection: format!("unix://{}", proxy_socket.display()),
         login: crate::config::EideticaLoginConfig {
             username: "delayed-settlement".into(),
-            password: None,
-            passwordless: true,
+            password: Some("test-password".into()),
         },
         sync: None,
     };
@@ -8678,7 +8679,7 @@ async fn running_job_branch_gets_one_parallel_notice_and_still_delivers() {
     let socket = dir.path().join("parallel-notice.sock");
     let (owner, mut user) = Instance::create_backend(
         Box::new(InMemory::new()),
-        NewAccount::passwordless("parallel-notice"),
+        NewAccount::with_password("parallel-notice", "test-password"),
     )
     .await
     .unwrap();
@@ -8705,8 +8706,7 @@ async fn running_job_branch_gets_one_parallel_notice_and_still_delivers() {
         connection: format!("unix://{}", socket.display()),
         login: crate::config::EideticaLoginConfig {
             username: "parallel-notice".into(),
-            password: None,
-            passwordless: true,
+            password: Some("test-password".into()),
         },
         sync: None,
     };
@@ -8877,7 +8877,7 @@ async fn ten_job_wait_parents_yield_capacity_and_reacquire_before_continuing() {
     let socket = dir.path().join("wait-capacity.sock");
     let (owner, mut user) = Instance::create_backend(
         Box::new(InMemory::new()),
-        NewAccount::passwordless("wait-capacity"),
+        NewAccount::with_password("wait-capacity", "test-password"),
     )
     .await
     .unwrap();
@@ -8904,8 +8904,7 @@ async fn ten_job_wait_parents_yield_capacity_and_reacquire_before_continuing() {
         connection: format!("unix://{}", socket.display()),
         login: crate::config::EideticaLoginConfig {
             username: "wait-capacity".into(),
-            password: None,
-            passwordless: true,
+            password: Some("test-password".into()),
         },
         sync: None,
     };

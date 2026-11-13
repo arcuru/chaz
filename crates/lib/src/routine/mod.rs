@@ -98,10 +98,12 @@ mod tests {
     use std::time::Duration;
 
     async fn fixture_db() -> (Instance, Database) {
-        let (instance, mut user) =
-            Instance::create_backend(Box::new(InMemory::new()), NewAccount::passwordless("test"))
-                .await
-                .unwrap();
+        let (instance, mut user) = Instance::create_backend(
+            Box::new(InMemory::new()),
+            NewAccount::with_password("test", "test-password"),
+        )
+        .await
+        .unwrap();
         let key = user.get_default_key().unwrap();
         let mut metadata = Doc::new();
         metadata.set("name", "session");

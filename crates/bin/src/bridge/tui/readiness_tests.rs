@@ -46,6 +46,22 @@ struct Storage {
 // one blocked historical open. Default trait fallbacks would change the fixture.
 #[async_trait::async_trait]
 impl BackendImpl for Storage {
+    async fn local_account_record(&self, name: &str) -> eidetica::Result<Option<Vec<u8>>> {
+        self.inner.local_account_record(name).await
+    }
+    async fn compare_exchange_local_account_record(
+        &self,
+        name: &str,
+        expected: Option<&[u8]>,
+        replacement: &[u8],
+    ) -> eidetica::Result<bool> {
+        self.inner
+            .compare_exchange_local_account_record(name, expected, replacement)
+            .await
+    }
+    async fn local_account_names(&self) -> eidetica::Result<Vec<String>> {
+        self.inner.local_account_names().await
+    }
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
@@ -210,7 +226,7 @@ async fn runtime(dir: &std::path::Path, probe: Arc<Probe>) -> BuiltServer {
             inner: InMemory::new(),
             probe,
         }),
-        NewAccount::passwordless("session-readiness"),
+        NewAccount::with_password("session-readiness", "test-password"),
     )
     .await
     .unwrap();
@@ -228,7 +244,7 @@ async fn runtime(dir: &std::path::Path, probe: Arc<Probe>) -> BuiltServer {
         .unwrap();
     }
     let mut config: Config = serde_yaml::from_str(&format!(
-        "execution: client\nstate_dir: {0}\neidetica:\n  connection: sqlite://{0}/unused.db\n  login:\n    username: session-readiness\n    passwordless: true\nagents:\n  - name: default\n  - name: selected\ndefault_agents: [default]\nagent_groups:\n  chosen: [selected]\n",
+        "execution: client\nstate_dir: {0}\neidetica:\n  connection: sqlite://{0}/unused.db\n  login:\n    username: session-readiness\n    password: test-password\nagents:\n  - name: default\n  - name: selected\ndefault_agents: [default]\nagent_groups:\n  chosen: [selected]\n",
         dir.display()
     )).unwrap();
     chaz_core::server::build(

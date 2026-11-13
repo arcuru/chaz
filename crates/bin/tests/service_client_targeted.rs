@@ -16,7 +16,7 @@ async fn repeated_catalog_commands_do_not_create_sessions_and_agents_stay_sessio
     let socket = dir.path().join("eidetica.sock");
     let (owner, mut user) = Instance::create_backend(
         Box::new(InMemory::new()),
-        NewAccount::passwordless("targeted-cli"),
+        NewAccount::with_password("targeted-cli", "test-password"),
     )
     .await
     .unwrap();
@@ -104,7 +104,7 @@ async fn repeated_catalog_commands_do_not_create_sessions_and_agents_stay_sessio
     std::fs::write(
         &config_path,
         format!(
-            "state_dir: {}\nexecution: client\neidetica:\n  connection: unix://{}\n  login:\n    username: targeted-cli\n    passwordless: true\nagents:\n  - name: selected\n    system_prompt: test\n    autonomous: false\n  - name: overridden\n    system_prompt: test\n    autonomous: false\ndefault_agents: [selected]\n",
+            "state_dir: {}\nexecution: client\neidetica:\n  connection: unix://{}\n  login:\n    username: targeted-cli\n    password: test-password\nagents:\n  - name: selected\n    system_prompt: test\n    autonomous: false\n  - name: overridden\n    system_prompt: test\n    autonomous: false\ndefault_agents: [selected]\n",
             state_dir.display(),
             socket.display()
         ),

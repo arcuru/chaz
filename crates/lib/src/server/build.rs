@@ -127,8 +127,7 @@ mod build_options_tests {
             connection: "unix:///tmp/chaz-test.sock".into(),
             login: EideticaLoginConfig {
                 username: "chaz".into(),
-                password: None,
-                passwordless: true,
+                password: Some("test-password".into()),
             },
             sync: None,
         };
@@ -142,7 +141,7 @@ mod build_options_tests {
 
         let (instance, user) = eidetica::Instance::create_backend(
             Box::new(InMemory::new()),
-            NewAccount::passwordless("fixture"),
+            NewAccount::with_password("fixture", "test-password"),
         )
         .await
         .unwrap();
@@ -151,8 +150,7 @@ mod build_options_tests {
                 connection: "memory://fixture".into(),
                 login: EideticaLoginConfig {
                     username: "fixture".into(),
-                    password: None,
-                    passwordless: true,
+                    password: Some("test-password".into()),
                 },
                 sync: None,
             }),
@@ -195,8 +193,7 @@ mod build_options_tests {
             connection: "sqlite:///tmp/chaz-test.db".into(),
             login: EideticaLoginConfig {
                 username: "chaz".into(),
-                password: None,
-                passwordless: true,
+                password: Some("test-password".into()),
             },
             sync: None,
         };
@@ -233,7 +230,7 @@ mod build_options_tests {
         use crate::mcp::{McpServerStatus, test_support::Fixture};
         let f = Fixture::new("eof");
         let (instance, user) = crate::test_support::fresh_eidetica().await;
-        let mut config: Config = serde_yaml::from_str("execution: executor\neidetica:\n  connection: sqlite:///tmp/unused-fixture.db\n  login: {username: test, passwordless: true}\n").unwrap();
+        let mut config: Config = serde_yaml::from_str("execution: executor\neidetica:\n  connection: sqlite:///tmp/unused-fixture.db\n  login: {username: test, password: test-password}\n").unwrap();
         config.mcp_servers = Some(vec![f.config.clone()]);
         let mut built = build(
             &mut config,
@@ -312,7 +309,7 @@ mod build_options_tests {
 execution: client
 eidetica:
   connection: sqlite:///tmp/unused-fixture.db
-  login: { username: test, passwordless: true }
+  login: { username: test, password: test-password }
 "#,
         )
         .unwrap();

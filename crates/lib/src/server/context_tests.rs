@@ -134,8 +134,7 @@ async fn context_command_service_client_delivers_once_without_executor_authority
         connection: format!("unix://{}", socket.display()),
         login: crate::config::EideticaLoginConfig {
             username: "test".into(),
-            password: None,
-            passwordless: true,
+            password: Some("test-password".into()),
         },
         sync: None,
     };

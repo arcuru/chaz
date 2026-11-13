@@ -340,10 +340,12 @@ mod tests {
     use eidetica::{Instance, NewAccount};
 
     async fn fresh_user() -> (Instance, eidetica::AccountSession) {
-        let (instance, user) =
-            Instance::create_backend(Box::new(InMemory::new()), NewAccount::passwordless("t"))
-                .await
-                .unwrap();
+        let (instance, user) = Instance::create_backend(
+            Box::new(InMemory::new()),
+            NewAccount::with_password("t", "test-password"),
+        )
+        .await
+        .unwrap();
         (instance, user)
     }
 

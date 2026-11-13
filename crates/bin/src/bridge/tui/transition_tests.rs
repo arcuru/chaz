@@ -15,7 +15,7 @@ async fn runtime(dir: &std::path::Path) -> BuiltServer {
 async fn runtime_with_stub(dir: &std::path::Path, stub_port: Option<u16>) -> BuiltServer {
     let (instance, user) = Instance::create_backend(
         Box::new(InMemory::new()),
-        NewAccount::passwordless("ui-transitions"),
+        NewAccount::with_password("ui-transitions", "test-password"),
     )
     .await
     .unwrap();
@@ -26,7 +26,7 @@ eidetica:
   connection: sqlite://{0}/unused.db
   login:
     username: ui-transitions
-    passwordless: true
+    password: test-password
 agents:
   - name: a
   - name: b

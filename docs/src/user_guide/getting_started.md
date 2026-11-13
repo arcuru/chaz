@@ -118,7 +118,7 @@ eidetica:
   connection: "sqlite:///path/to/state/eidetica.db"
   login:
     username: chaz
-    passwordless: true
+    password: your-eidetica-password
 
 backends:
   - name: openrouter

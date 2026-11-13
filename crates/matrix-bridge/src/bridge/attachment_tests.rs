@@ -26,7 +26,7 @@ impl Fixture {
     async fn new() -> Self {
         let (instance, mut user) = Instance::create_backend(
             Box::new(InMemory::new()),
-            NewAccount::passwordless("attachment"),
+            NewAccount::with_password("attachment", "test-password"),
         )
         .await
         .unwrap();

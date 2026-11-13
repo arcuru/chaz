@@ -2812,10 +2812,14 @@ async fn settings_session_inspector_queries_coalesce_timeout_cancel_and_reject_s
 
 #[tokio::test]
 async fn settings_session_inspector_sharing_checked_selected_row_and_no_writes() {
-    use eidetica::{Store, store::DocStore};
-    let (_instance, server, backend, mut app) = fixture().await;
+    let (instance, server, backend, mut app) = fixture().await;
     let db = app.active().session_db.clone();
     let id = db.root_id();
+    let record_name = format!(
+        "account-state:{}",
+        server.registry().user_lock().await.login_id()
+    );
+    let storage = instance.backend().local_engine().unwrap();
     for enabled in [true, false] {
         server
             .registry()
@@ -2833,6 +2837,7 @@ async fn settings_session_inspector_sharing_checked_selected_row_and_no_writes()
             .database()
             .clone();
         let account_before = account_db.snapshot().await.unwrap();
+        let local_before = storage.local_account_record(&record_name).await.unwrap();
         let seen = load_session_page(&mut app, &server, &backend, 5).await;
         assert!(
             seen.contains(if enabled {
@@ -2850,33 +2855,27 @@ async fn settings_session_inspector_sharing_checked_selected_row_and_no_writes()
         assert!(seen.contains("Delegated authority is not inspected"));
         assert_eq!(db.snapshot().await.unwrap(), before);
         assert_eq!(account_db.snapshot().await.unwrap(), account_before);
+        assert_eq!(
+            storage.local_account_record(&record_name).await.unwrap(),
+            local_before
+        );
     }
-    let account_db = server
-        .registry()
-        .user_lock()
-        .await
-        .account()
-        .database()
-        .clone();
-    // Only the selected tracked row is decoded; unrelated bad rows cannot poison it.
-    let txn = account_db.new_transaction().await.unwrap();
-    let rows = DocStore::load(&txn, "databases".into()).await.unwrap();
-    rows.set("unrelated", "SECRET_BAD_UNRELATED_JSON")
-        .await
-        .unwrap();
-    txn.commit().await.unwrap();
-    let seen = load_session_page(&mut app, &server, &backend, 5).await;
-    assert!(seen.contains("Local sync preference: disabled"));
-    assert!(!seen.contains("SECRET_"));
-    // A malformed selected row is failure, not missing or a disabled preference.
-    let txn = account_db.new_transaction().await.unwrap();
-    DocStore::load(&txn, "databases".into())
+    // Tracking now lives in a native local-account record, not the account DAG.
+    // Corrupt that source directly to preserve the failure-vs-absence check.
+    let before = storage
+        .local_account_record(&record_name)
         .await
         .unwrap()
-        .set(id.to_string(), "SECRET_BROKEN_ROW")
-        .await
         .unwrap();
-    txn.commit().await.unwrap();
+    let mut state: serde_json::Value = serde_json::from_slice(&before).unwrap();
+    state["databases"][id.to_string()] = serde_json::json!("SECRET_BROKEN_ROW");
+    let broken = serde_json::to_vec(&state).unwrap();
+    assert!(
+        storage
+            .compare_exchange_local_account_record(&record_name, Some(&before), &broken)
+            .await
+            .unwrap()
+    );
     let seen = load_session_page(&mut app, &server, &backend, 5).await;
     assert!(
         seen.contains("Local sync preference: Failed to read source"),
@@ -2891,14 +2890,17 @@ async fn settings_session_inspector_sharing_checked_selected_row_and_no_writes()
         seen.contains("Direct key status: Active"),
         "independent key group lost: {seen}"
     );
-    let txn = account_db.new_transaction().await.unwrap();
-    DocStore::load(&txn, "databases".into())
-        .await
+    state["databases"]
+        .as_object_mut()
         .unwrap()
-        .delete(id.to_string())
-        .await
-        .unwrap();
-    txn.commit().await.unwrap();
+        .remove(&id.to_string());
+    let untracked = serde_json::to_vec(&state).unwrap();
+    assert!(
+        storage
+            .compare_exchange_local_account_record(&record_name, Some(&broken), &untracked)
+            .await
+            .unwrap()
+    );
     let seen = load_session_page(&mut app, &server, &backend, 5).await;
     assert!(seen.contains("Not tracked by this account"), "{seen}");
     assert!(!seen.contains("Local sync preference: disabled"));

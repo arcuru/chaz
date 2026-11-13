@@ -29,7 +29,7 @@ impl AuthorityFixture {
         let socket = dir.path().join("authority.sock");
         let (owner, mut user) = Instance::create_backend(
             Box::new(InMemory::new()),
-            NewAccount::passwordless("job-authority"),
+            NewAccount::with_password("job-authority", "test-password"),
         )
         .await
         .unwrap();
@@ -81,8 +81,7 @@ impl AuthorityFixture {
                 connection: format!("unix://{}", socket.display()),
                 login: crate::config::EideticaLoginConfig {
                     username: "job-authority".into(),
-                    password: None,
-                    passwordless: true,
+                    password: Some("test-password".into()),
                 },
                 sync: None,
             },

@@ -1535,10 +1535,12 @@ mod tests {
     /// tests can seed agents/banks through the command itself.
     async fn fixture() -> (Instance, Arc<SessionRegistry>, MemoryCommand) {
         let backend = InMemory::new();
-        let (instance, user) =
-            Instance::create_backend(Box::new(backend), NewAccount::passwordless("test"))
-                .await
-                .unwrap();
+        let (instance, user) = Instance::create_backend(
+            Box::new(backend),
+            NewAccount::with_password("test", "test-password"),
+        )
+        .await
+        .unwrap();
         let agents = Arc::new(AgentRegistry::with_default_agent());
         let registry = Arc::new(
             SessionRegistry::new(instance.clone(), user, agents)

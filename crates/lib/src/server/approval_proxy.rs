@@ -218,7 +218,7 @@ mod tests {
         };
         let (instance, mut user) = eidetica::Instance::create_backend(
             Box::new(eidetica::backend::database::InMemory::new()),
-            eidetica::NewAccount::passwordless("proxy"),
+            eidetica::NewAccount::with_password("proxy", "test-password"),
         )
         .await
         .unwrap();
@@ -334,14 +334,19 @@ mod tests {
                 .tips()
                 .contains(&pending_id)
         );
-        // Native discovery reads raw delegation tips and suppresses the
-        // resolution error, reproducing the misleading missing-writer result.
+        // Native discovery now shares the accepted-state resolver. Pending raw
+        // tips must neither hide the verified signer nor become its authority.
+        let discovered = Database::find_sigkeys(&instance, old.root_id(), &key.public_key())
+            .await
+            .unwrap();
         assert!(
-            Database::find_sigkeys(&instance, old.root_id(), &key.public_key())
-                .await
-                .unwrap()
-                .is_empty()
+            discovered
+                .iter()
+                .any(|(identity, _)| Some(identity) == old.auth_identity())
         );
+        assert!(discovered.iter().all(|(identity, _)| {
+            matches!(identity, eidetica::auth::types::SigKey::Delegation { path, .. } if path.len() == 1 && path[0].tips == verified.tips())
+        }));
 
         let writer = current_session_writer(&old, Some(&key))
             .await
@@ -879,8 +884,7 @@ mod tests {
                 connection: format!("unix://{}", socket.display()),
                 login: crate::config::EideticaLoginConfig {
                     username: "test".into(),
-                    password: None,
-                    passwordless: true,
+                    password: Some("test-password".into()),
                 },
                 sync: None,
             },

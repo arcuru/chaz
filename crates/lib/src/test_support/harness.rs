@@ -42,10 +42,12 @@ impl RuntimeRecorder for RecordingRuntime {
 
 /// Open a fresh in-memory eidetica instance with one logged-in user.
 pub(crate) async fn fresh_eidetica() -> (Instance, AccountSession) {
-    let (instance, user) =
-        Instance::create_backend(Box::new(InMemory::new()), NewAccount::passwordless("test"))
-            .await
-            .unwrap();
+    let (instance, user) = Instance::create_backend(
+        Box::new(InMemory::new()),
+        NewAccount::with_password("test", "test-password"),
+    )
+    .await
+    .unwrap();
     (instance, user)
 }
 

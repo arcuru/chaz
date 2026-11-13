@@ -180,14 +180,12 @@ fn redact_connection_url(connection: &str) -> String {
 
 /// Login credentials for an existing Eidetica user.
 #[derive(Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct EideticaLoginConfig {
     pub username: String,
-    /// Plain native password. Secret-reference infrastructure is deliberately
-    /// outside this connector slice.
+    /// Non-empty native password, required by the connector. Secret-reference
+    /// infrastructure is deliberately outside this connector slice.
     pub password: Option<String>,
-    /// Explicit opt-in to a passwordless Eidetica login.
-    #[serde(default)]
-    pub passwordless: bool,
 }
 
 impl std::fmt::Debug for EideticaLoginConfig {
@@ -195,7 +193,6 @@ impl std::fmt::Debug for EideticaLoginConfig {
         f.debug_struct("EideticaLoginConfig")
             .field("username", &self.username)
             .field("password", &self.password.as_ref().map(|_| "<redacted>"))
-            .field("passwordless", &self.passwordless)
             .finish()
     }
 }
@@ -1420,7 +1417,6 @@ fn known_config_keys() -> HashSet<&'static str> {
         "eidetica.login",
         "eidetica.login.username",
         "eidetica.login.password",
-        "eidetica.login.passwordless",
         "eidetica.sync",
         "eidetica.sync.iroh",
         "eidetica.sync.http_listen",
@@ -2444,6 +2440,13 @@ agents:
     }
 
     #[test]
+    fn retired_passwordless_login_is_rejected() {
+        let yaml = "username: chaz\npassword: secret\npasswordless: true\n";
+        let error = serde_yaml::from_str::<EideticaLoginConfig>(yaml).unwrap_err();
+        assert!(error.to_string().contains("unknown field `passwordless`"));
+    }
+
+    #[test]
     fn eidetica_block_is_known() {
         let yaml = r#"
 execution: executor
@@ -2451,7 +2454,7 @@ eidetica:
   connection: memory://
   login:
     username: chaz
-    passwordless: true
+    password: test-password
   sync:
     iroh: true
     http_listen: 127.0.0.1:8765
@@ -2507,8 +2510,7 @@ eidetica:
                 connection: connection.into(),
                 login: EideticaLoginConfig {
                     username: "chaz".into(),
-                    password: None,
-                    passwordless: true,
+                    password: Some("test-password".into()),
                 },
                 sync: None,
             };
@@ -2548,8 +2550,7 @@ eidetica:
                 connection: "postgres://user:p@ss@db/chaz".into(),
                 login: EideticaLoginConfig {
                     username: "u".into(),
-                    password: None,
-                    passwordless: true,
+                    password: Some("test-password".into()),
                 },
                 sync: None,
             }

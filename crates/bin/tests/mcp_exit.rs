@@ -15,10 +15,12 @@ async fn print_normal_and_bridge_error_exits_explicitly_close_mcp_before_return(
             dir.path().join("eidetica.db").display()
         );
         let backend = Sqlite::connect(&connection).await.unwrap();
-        let (owner, user) =
-            Instance::create_backend(Box::new(backend), NewAccount::passwordless("fixture"))
-                .await
-                .unwrap();
+        let (owner, user) = Instance::create_backend(
+            Box::new(backend),
+            NewAccount::with_password("fixture", "test-password"),
+        )
+        .await
+        .unwrap();
         // Only the CLI opens this direct-owner store while it runs.
         drop(user);
         drop(owner);
@@ -39,7 +41,7 @@ async fn print_normal_and_bridge_error_exits_explicitly_close_mcp_before_return(
         Mock::given(method("GET")).and(path("/v1/models")).respond_with(ResponseTemplate::new(200).set_body_json(json!({"object":"list", "data":[{"id":"stub", "object":"model", "created":0, "owned_by":"fixture"}]}))).mount(&model).await;
         let config = json!({
             "state_dir":dir.path().join("state"), "execution":"executor",
-            "eidetica":{"connection":connection, "login":{"username":"fixture", "passwordless":true}},
+            "eidetica":{"connection":connection, "login":{"username":"fixture", "password":"test-password"}},
             "backends":[{"name":"stub", "type":"openaicompatible", "api_base":format!("{}/v1",model.uri()), "api_key":"not-a-real-key", "models":[{"name":"stub"}]}],
             "agents":[{"name":"chaz", "model":"stub", "system_prompt":"fixture"}], "default_agents":["chaz"],
             "mcp_servers":[{"name":"fixture", "command":"python3", "args":["-u","-c",MCP, dir.path()], "startup_timeout_secs":3}]
