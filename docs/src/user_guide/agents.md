@@ -137,7 +137,7 @@ Reload replaces this complete editable scope, not the whole Agent DB. **Omitting
 
 `false`, empty lists and values equal to a default are real values. Nullable fields also accept explicit `null`. Existing host/tool/session restrictions and capability attenuation still apply after an agent-specific restriction is removed.
 
-Worker entries accept `name` (required, unique), `system_prompt`, `system_prompt_files`, `model`, `tools`, `max_spawn_depth` and `presets`. Files are ordered before inline text, just as for the parent. Worker prompts reach the child model request; the child still uses the parent agent's identity and existing tool/ownership restrictions. An omitted `system_prompt` defaults to empty text; with no prompt files either, the worker sends no system prompt, never the parent's. Worker model overrides and preset `role_suffix` are accepted settings but are not yet propagated to the child runtime.
+Worker entries accept `name` (required, unique), `system_prompt`, `system_prompt_files`, `model`, `tools`, `max_spawn_depth` and `presets`. Files are ordered before inline text, just as for the parent. Worker prompts reach the child model request; the child still uses the parent agent's identity and existing tool/ownership restrictions. An omitted `system_prompt` defaults to empty text; with no prompt files either, the worker sends no system prompt, never the parent's. Worker model overrides (template → preset → inline) change the child session's model request; a preset `role_suffix` is appended to the worker's system prompt. An unsupported model fails the child turn visibly — it never silently falls back to another model.
 
 Reload is **replacement, not a patch or a merge**. Deleting `workers` removes all worker templates. Deleting `capabilities` removes the agent-wide ceiling, and deleting `grants` removes its per-tool overrides. For example, omitting a previous `capabilities.network.endpoints: []` no longer expresses deny-all networking at the agent tier. Review the entire document, especially restrictions, before applying it; remaining host/tool/session limits still apply.
 
@@ -731,7 +731,7 @@ presets:
     max_spawn_depth: 30
 ```
 
-Presets are available to Worker templates; spawn depth and tools apply. Worker model overrides (template, preset or inline) and preset `role_suffix` are not yet propagated to the child runtime: the parent's model is used and no role suffix is appended. `spawn_agent` does not accept a per-call preset or model override.
+Presets are available to Worker templates; spawn depth, tools, `model` and `role_suffix` all apply to the child session. The resolved model follows template → preset → inline precedence (an inline `model` arg wins over the preset, while the preset's `role_suffix` still rides on the worker's system prompt). `spawn_agent` does not accept a per-call preset or model override.
 
 ## Agent jobs: submit and observe
 

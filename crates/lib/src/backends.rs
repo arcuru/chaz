@@ -191,6 +191,10 @@ pub trait LLMBackend {
 /// implements this narrower interface — which is exactly what `BackendManager`
 /// needs for its ReAct-loop call sites.
 pub trait BackendDispatch: Send + Sync {
+    /// The backend's own default model, used when a caller requests none.
+    fn default_model(&self) -> Option<String> {
+        None
+    }
     fn execute<'a>(
         &'a self,
         context: &'a ChatContext,
@@ -626,6 +630,15 @@ impl BackendManager {
     /// Resolve a model name: strip backend prefix, fall back to default.
     pub fn resolve_model_name(&self, model: Option<&str>) -> String {
         if self.backends.is_empty() {
+            // A mock-only manager has no catalog to resolve against; echo the
+            // requested model (or the mock's own default) so recorded calls
+            // reflect what the caller actually requested.
+            if let Some(mock) = &self.mock {
+                if let Some(m) = model {
+                    return m.to_string();
+                }
+                return mock.default_model().unwrap_or_default();
+            }
             return String::new();
         }
         let backend = self.select_backend_for_model(model);
