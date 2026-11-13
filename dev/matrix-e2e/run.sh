@@ -716,7 +716,7 @@ DM_SESSION_ID="$(sed -E $'s/\x1B\[[0-9;]*[[:alpha:]]//g' "$WORKSPACE/bridge.log"
 [[ "$DM_SESSION_ID" =~ ^[a-z0-9]+$ ]] || fail "could not identify disposable DM session ID"
 completed_attempts() {
     local peer="${1:-daemon}"
-    sqlite3 -readonly "$WORKSPACE/state-$peer/eidetica.db" \
+    sqlite3 -readonly "$WORKSPACE/state-$peer/eidetica.db.cache" \
     "select count(distinct json_extract(cast(r.record_value as text),'\$.attempt_id'))
      from store_state_namespaces n join store_state_records r on n.namespace_id=r.namespace_id
      where n.database_id='$DM_SESSION_ID' and n.store_name='turn_attempts'
@@ -724,7 +724,7 @@ completed_attempts() {
 }
 # Scope completion to the exact request, not earlier replies or tool results.
 completed_request() {
-    sqlite3 -readonly "$WORKSPACE/state-daemon/eidetica.db" \
+    sqlite3 -readonly "$WORKSPACE/state-daemon/eidetica.db.cache" \
     "select count(distinct a.record_key)
      from store_state_namespaces en join store_state_records e on en.namespace_id=e.namespace_id
      join store_state_namespaces an on an.database_id=en.database_id
@@ -1109,7 +1109,7 @@ wait_for "current ReAct compact result" "$REPLY_TIMEOUT" \
 wait_for "ReAct compact attempt completed" 60 completed_request "react test"
 grep -q "stub_llm: ReAct: explicit send completed, returning local final" "$WORKSPACE/stub-llm.log" ||
     fail "ReAct explicit send did not complete"
-[[ "$(sqlite3 -readonly "$WORKSPACE/state-daemon/eidetica.db" \
+[[ "$(sqlite3 -readonly "$WORKSPACE/state-daemon/eidetica.db.cache" \
     "select count(distinct r.record_key)
      from store_state_namespaces n join store_state_records r on n.namespace_id=r.namespace_id
      where n.database_id='$DM_SESSION_ID' and n.store_name='entries'
@@ -1270,7 +1270,7 @@ printf '\033[1;32mPASS\033[0m — encrypted cases passed (plain message, command
 # reached its final write; a later distinguishable encrypted reply is a barrier.
 scheduled_completed() {
     local mode="$1"
-    sqlite3 "$WORKSPACE/state-daemon/eidetica.db" \
+    sqlite3 "$WORKSPACE/state-daemon/eidetica.db.cache" \
     "select count(distinct e.record_key)
      from store_state_namespaces fn join store_state_records f on fn.namespace_id=f.namespace_id
      join store_state_namespaces en on en.database_id=json_extract(cast(f.record_value as text),'\$.target.session_db_id')
