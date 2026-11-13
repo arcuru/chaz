@@ -174,15 +174,30 @@ async fn hub_frames_fit_supported_sizes_with_unicode_rows() {
             name: Some("café 界 e\u{301}".into()),
         }],
     );
-    for (w, h) in [(80, 24), (120, 40), (40, 8)] {
-        let screen = frame(&mut app, &server, &backend, w, h);
-        let lines: Vec<_> = screen.lines().collect();
-        assert_eq!(lines.len(), h as usize);
-        assert!(screen.contains("New session"), "{w}x{h}: {screen}");
-        assert!(screen.contains("café 界"), "{w}x{h}: {screen}");
-        let footer = lines.last().unwrap();
-        assert!(footer.contains("n new"), "{w}x{h} footer: {footer:?}");
-        assert!(!footer.contains("Esc back"), "{w}x{h} footer: {footer:?}");
+    // Synced metadata can bypass local write validation. Test the displayed
+    // cells, including visible evidence of controls rather than silent removal.
+    for (suffix, shown) in [("", ""), (" \u{202e}\u{1b}", " ��")] {
+        app.session_list[0].name = Some(format!("café 界 e\u{301}{suffix}"));
+        app.session_list[0].description = Some(format!("Résumé 界 e\u{301}{suffix}"));
+        for (w, h) in [(80, 24), (120, 40), (40, 8)] {
+            let screen = frame(&mut app, &server, &backend, w, h);
+            // The frame helper includes the blank continuation cell of 界.
+            assert!(
+                screen.contains(&format!("\"café 界  é{shown}\"")),
+                "{w}x{h}: {screen}"
+            );
+            assert!(
+                screen.contains(&format!("Résumé 界  é{shown}")),
+                "{w}x{h}: {screen}"
+            );
+            assert!(!screen.contains(['\u{202e}', '\u{1b}']), "{screen:?}");
+            let lines: Vec<_> = screen.lines().collect();
+            assert_eq!(lines.len(), h as usize);
+            assert!(screen.contains("New session"), "{w}x{h}: {screen}");
+            let footer = lines.last().unwrap();
+            assert!(footer.contains("n new"), "{w}x{h} footer: {footer:?}");
+            assert!(!footer.contains("Esc back"), "{w}x{h} footer: {footer:?}");
+        }
     }
 }
 
