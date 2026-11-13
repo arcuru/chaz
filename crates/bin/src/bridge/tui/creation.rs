@@ -80,6 +80,8 @@ pub(super) fn opened(app: &mut App, ticket: u64, tab: Tab) {
         return;
     }
     let view = app.creation.take().unwrap();
+    tracing::info!(ticket, session_db_id = %tab.session_db_id,
+        agent = %tab.current_agent, "TUI session composer ready");
     let id = tab.session_db_id.clone();
     let focus = app.mode == TuiMode::NewSession;
     // Background completion must retain the destination and its draft even if
