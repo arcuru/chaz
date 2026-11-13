@@ -369,6 +369,7 @@ pub(super) fn ui(
     match app.mode {
         TuiMode::Jobs => super::jobs::draw(f, app),
         TuiMode::Chat => ui_chat(f, app, &ext_segments),
+        TuiMode::NewSession => super::creation::draw(f, app),
         TuiMode::SessionPicker => ui_picker(f, app),
         TuiMode::ModelPicker => ui_model_picker(f, app),
         TuiMode::Settings(scope) => settings::ui_settings(f, app, scope, server, backend, config),
@@ -962,7 +963,25 @@ fn render_composer(f: &mut ratatui::Frame, area: Rect, composer: &composer::Comp
 
 /// Render the loading draft without a database-backed tab.
 pub(super) fn ui_loading(f: &mut ratatui::Frame, app: &App, label: &str, status: &str) {
-    let composer = composer::layout(&app.input, app.cursor, f.area().width.saturating_sub(2));
+    ui_loading_draft(
+        f,
+        &app.input,
+        app.cursor,
+        label,
+        status,
+        "Draft not submitted · Ctrl+C quit",
+    );
+}
+
+pub(super) fn ui_loading_draft(
+    f: &mut ratatui::Frame,
+    input: &str,
+    cursor: usize,
+    label: &str,
+    status: &str,
+    footer: &str,
+) {
+    let composer = composer::layout(input, cursor, f.area().width.saturating_sub(2));
     let height = (composer
         .lines
         .len()
@@ -985,7 +1004,7 @@ pub(super) fn ui_loading(f: &mut ratatui::Frame, app: &App, label: &str, status:
         ),
         chunks[1],
     );
-    widgets::status_strip(f, chunks[2], "Draft not submitted · Ctrl+C quit");
+    widgets::status_strip(f, chunks[2], footer);
     render_composer(f, chunks[3], &composer, " > ");
 }
 

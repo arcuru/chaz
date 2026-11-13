@@ -16,8 +16,9 @@ pub(super) struct Origin {
 impl Origin {
     pub(super) fn capture(app: &App) -> Self {
         Self {
-            tab: app
-                .current()
+            tab: (app.mode != TuiMode::NewSession)
+                .then(|| app.current())
+                .flatten()
                 .map(|t| (t.session_db_id.clone(), t.live.incarnation)),
             navigation: app.navigation_generation,
             mode: app.mode,
@@ -297,9 +298,10 @@ pub(super) fn cancel_closed_reads(app: &mut App) {
 /// Prioritize the accepted creation over historical presentation reads. A
 /// metadata open can hold the same account-session lock that database creation needs.
 pub(super) fn begin_creation(app: &mut App) -> bool {
-    if app.operations.is_creating_session() {
+    if app.creation.is_some() {
+        app.mode = TuiMode::NewSession;
         app.operations.notice =
-            Some("Session creation already pending — not accepted again".into());
+            Some("Session creation already pending or failed — not accepted again".into());
         return false;
     }
     if !app.backend_ready() || !app.operations.has_capacity() {
@@ -313,6 +315,7 @@ pub(super) fn begin_creation(app: &mut App) -> bool {
     app.session_catalog_loading = true;
     let ticket = app.operations.next_ticket + 1;
     app.operations.creation_ticket = Some(ticket);
+    creation::begin(app, ticket);
     tracing::info!(ticket, "TUI new session requested");
     true
 }
@@ -388,9 +391,9 @@ pub(super) fn apply(app: &mut App, completion: Completion) -> Invalidation {
     let target = pending.origin.tab_index(app);
     // Creation stays admitted only while its accepted action continues below
     // (a new destination still preparing); every other settlement releases it.
-    let continues = nav_valid
-        && matches!(&result, Ok(Effect::Open(open))
-            if app.tab_index_for(&open.switch.session_db_id).is_none());
+    let creating = creation::matches(app, pending.ticket);
+    let continues = matches!(&result, Ok(Effect::Open(open))
+        if creating || (nav_valid && app.tab_index_for(&open.switch.session_db_id).is_none()));
     if app.operations.creation_ticket == Some(pending.ticket) && !continues {
         app.operations.creation_ticket = None;
         app.session_catalog_loading = false;
@@ -412,6 +415,7 @@ pub(super) fn apply(app: &mut App, completion: Completion) -> Invalidation {
     };
     match result {
         Err(error) => {
+            creation::failed(app, pending.ticket, &error);
             if let Some(i) = target {
                 app.tabs[i].live.input_feedback = error.clone();
                 app.tabs[i].touch_transcript();
@@ -444,7 +448,15 @@ pub(super) fn apply(app: &mut App, completion: Completion) -> Invalidation {
             }
         }
         Ok(Effect::Open(open)) => {
-            if nav_valid {
+            if creating {
+                if let Some(view) = app.creation.as_mut() {
+                    view.status = format!("Loading session… ({})", open.switch.session_db_id);
+                }
+                app.operations.queue.push_front(Pending {
+                    work: Some(Box::pin(open.prepare())),
+                    ..pending
+                });
+            } else if nav_valid {
                 if let Some(i) = app.tab_index_for(&open.switch.session_db_id) {
                     app.set_active_tab(i);
                     app.mode = TuiMode::Chat;
@@ -460,7 +472,10 @@ pub(super) fn apply(app: &mut App, completion: Completion) -> Invalidation {
         }
         Ok(Effect::Opened(tab)) => {
             app.session_list_fresh = false;
-            if nav_valid {
+            if creating {
+                invalidation = Invalidation::Session(tab.session_db_id.clone());
+                creation::opened(app, pending.ticket, *tab);
+            } else if nav_valid {
                 // Notifications delivered before insertion could not find a tab.
                 // Check again after insertion, even when its first read succeeded.
                 invalidation = Invalidation::Session(tab.session_db_id.clone());
@@ -802,6 +817,68 @@ mod tests {
     }
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    #[tokio::test]
+    async fn failed_creation_retains_its_editable_draft_without_touching_the_old_session() {
+        for panic in [false, true] {
+            let mut app = app().await;
+            app.input = "old draft".into();
+            app.cursor = 3;
+            if panic {
+                // A dead cached tab must not block independent creation from
+                // the hub after the global backend has recovered.
+                app.active_mut().live.unbound = true;
+                app.mode = TuiMode::SessionPicker;
+            }
+            assert!(begin_creation(&mut app));
+            assert!(app.backend_ready());
+            let ticket = app.creation.as_ref().unwrap().ticket;
+            let (release, gate) = oneshot::channel();
+            submit(&mut app, true, Some("/new".into()), async move {
+                gate.await.unwrap();
+                if panic {
+                    panic!("creation fixture panic")
+                }
+                Err("fixture connection lost".into())
+            });
+            for c in "new-é界".chars() {
+                creation::handle_key(&mut app, key(KeyCode::Char(c)));
+            }
+            creation::handle_key(&mut app, key(KeyCode::Enter));
+            assert!(app.operations.is_creating_session());
+            release.send(()).unwrap();
+            complete(&mut app).await;
+            let view = app.creation.as_ref().unwrap();
+            assert_eq!(view.ticket, ticket);
+            assert_eq!(view.input, "new-é界");
+            assert!(
+                view.status
+                    .contains(if panic { "panicked" } else { "connection lost" })
+            );
+            assert_eq!(app.input, "old draft");
+            assert_eq!(app.cursor, 3);
+            assert!(app.active().entries.is_empty());
+            assert!(app.active().live.input_feedback.is_empty());
+            assert!(!app.operations.is_creating_session());
+            assert!(
+                !begin_creation(&mut app),
+                "failure silently retried creation"
+            );
+            creation::handle_key(&mut app, key(KeyCode::Char('!')));
+            assert_eq!(app.creation.as_ref().unwrap().input, "new-é界!");
+            // An unrelated completion cannot settle or replace this view.
+            submit(&mut app, true, None, async { Ok(Effect::Sent) });
+            complete(&mut app).await;
+            assert_eq!(app.creation.as_ref().unwrap().input, "new-é界!");
+            assert!(app.operations.indicator().contains("outcome unknown"));
+            creation::handle_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL),
+            );
+            assert!(app.creation.is_none());
+            assert_eq!(app.input, "old draft");
+        }
     }
 
     #[tokio::test]

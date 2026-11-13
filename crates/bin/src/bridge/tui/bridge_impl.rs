@@ -269,6 +269,11 @@ impl TuiBridge {
                             && key.modifiers.contains(KeyModifiers::CONTROL)
                         {
                             app.should_quit = app.operations.request_exit();
+                        } else if app.mode == TuiMode::NewSession {
+                            creation::handle_key(&mut app, key);
+                            if app.mode == TuiMode::SessionPicker {
+                                open_session_picker(&mut app, server, &session_rows_tx);
+                            }
                         } else if app.settings_too_small() && key.code != KeyCode::Esc {
                             // Only safe cancellation and the existing quit path remain live.
                             continue;
@@ -326,7 +331,10 @@ impl TuiBridge {
                                 TuiMode::SessionPicker => {
                                     app.open_settings(SettingsScope::Peer, TuiMode::SessionPicker);
                                 }
-                                TuiMode::Jobs | TuiMode::ModelPicker | TuiMode::Settings(_) => {}
+                                TuiMode::NewSession
+                                | TuiMode::Jobs
+                                | TuiMode::ModelPicker
+                                | TuiMode::Settings(_) => {}
                             }
                         } else if key.code == KeyCode::Char('p')
                             && key.modifiers.contains(KeyModifiers::CONTROL)
@@ -336,7 +344,7 @@ impl TuiBridge {
                             // conversation, or reloads a hub that has none (or
                             // whose catalog failed to load).
                             match app.mode {
-                                TuiMode::Jobs => {
+                                TuiMode::NewSession | TuiMode::Jobs => {
                                     open_session_picker(&mut app, server, &session_rows_tx)
                                 }
                                 TuiMode::Chat => {
@@ -389,6 +397,7 @@ impl TuiBridge {
                                 input::OverlayKey::NotConsumed => {}
                             }
                             match app.mode {
+                                TuiMode::NewSession => creation::handle_key(&mut app, key),
                                 TuiMode::Jobs => jobs::handle_key(
                                     &mut app, key, server, &backend, notify_tx, &jobs_tx,
                                 ),
