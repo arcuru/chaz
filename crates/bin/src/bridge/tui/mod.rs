@@ -2393,7 +2393,7 @@ mod session_picker_tests {
     pub(super) async fn test_tab() -> Tab {
         let (_instance, mut user) = Instance::create_backend(
             Box::new(InMemory::new()),
-            NewAccount::passwordless("lazy-picker"),
+            NewAccount::with_password("lazy-picker", "test-password"),
         )
         .await
         .unwrap();
@@ -2462,7 +2462,7 @@ mod session_picker_tests {
         // picker tests only inspect tab metadata, not session DB writes.
         let (_instance, mut user) = Instance::create_backend(
             Box::new(InMemory::new()),
-            NewAccount::passwordless("live-tab"),
+            NewAccount::with_password("live-tab", "test-password"),
         )
         .await
         .unwrap();
@@ -2542,7 +2542,7 @@ mod session_picker_tests {
         // Unlike metadata-only picker tests, activity refresh needs a live DB.
         let (_instance, mut user) = Instance::create_backend(
             Box::new(InMemory::new()),
-            NewAccount::passwordless("approval-tab"),
+            NewAccount::with_password("approval-tab", "test-password"),
         )
         .await
         .unwrap();

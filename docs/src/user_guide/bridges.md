@@ -106,7 +106,7 @@ As its own Eidetica peer (the layout the setup below describes):
 execution: client
 eidetica:
   connection: "sqlite:///var/lib/chaz-matrix/eidetica.db"
-  login: { username: chaz-matrix, passwordless: true }
+  login: { username: chaz-matrix, password: your-eidetica-password }
   sync:
     iroh: true # and/or http_listen for the loopback transport
 ```
@@ -125,7 +125,7 @@ Sharing the Eidetica daemon's login with the executor:
 execution: client
 eidetica:
   connection: "unix:///run/eidetica/service.sock"
-  login: { username: chaz, passwordless: true }
+  login: { username: chaz, password: your-eidetica-password }
 ```
 
 A service client holds the agent databases already, so the `ticket:` field on
@@ -198,7 +198,7 @@ state_dir: /var/lib/chaz-matrix
 execution: client
 eidetica:
   connection: "sqlite:///var/lib/chaz-matrix/eidetica.db"
-  login: { username: chaz-matrix, passwordless: true }
+  login: { username: chaz-matrix, password: your-eidetica-password }
   sync: { iroh: true }
 backends:
   - name: openai

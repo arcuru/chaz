@@ -13,12 +13,16 @@ async fn main() -> anyhow::Result<()> {
     let (instance, user) = if std::env::args().nth(2).is_some() {
         Instance::create_backend(
             Box::new(InMemory::new()),
-            NewAccount::passwordless("pty-test"),
+            NewAccount::with_password("pty-test", "test-password"),
         )
         .await?
     } else {
         let backend = Sqlite::connect(&format!("sqlite://{path}?mode=rwc")).await?;
-        Instance::create_backend(Box::new(backend), NewAccount::passwordless("pty-test")).await?
+        Instance::create_backend(
+            Box::new(backend),
+            NewAccount::with_password("pty-test", "test-password"),
+        )
+        .await?
     };
     drop(user);
     if let Some(socket) = std::env::args().nth(2) {

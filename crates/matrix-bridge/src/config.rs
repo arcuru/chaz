@@ -198,10 +198,12 @@ mod tests {
 
     async fn test_bridge_db() -> (AccountSession, BridgeDb) {
         let backend = InMemory::new();
-        let (_instance, mut user) =
-            Instance::create_backend(Box::new(backend), NewAccount::passwordless("test"))
-                .await
-                .unwrap();
+        let (_instance, mut user) = Instance::create_backend(
+            Box::new(backend),
+            NewAccount::with_password("test", "test-password"),
+        )
+        .await
+        .unwrap();
         let (db, _) = create_bridge_db(&mut user, "matrix").await.unwrap();
         (user, db)
     }

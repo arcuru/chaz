@@ -576,10 +576,12 @@ async fn durable_context_pinned_view_and_peer_update_reconstruct_coherently() {
         .unwrap();
     sync.accept_connections().await.unwrap();
     let address = Address::http(sync.get_server_address_for("http").await.unwrap());
-    let (peer, mut user) =
-        Instance::create_backend(Box::new(InMemory::new()), NewAccount::passwordless("peer"))
-            .await
-            .unwrap();
+    let (peer, mut user) = Instance::create_backend(
+        Box::new(InMemory::new()),
+        NewAccount::with_password("peer", "test-password"),
+    )
+    .await
+    .unwrap();
     peer.enable_sync().await.unwrap();
     let key = user.get_default_key().unwrap();
     let signing = user.get_signing_key(&key).unwrap();
@@ -834,7 +836,7 @@ async fn durable_context_sqlite_reopen_with_fresh_host_reuses_committed_receipt(
     let (root, before, messages, sources) = {
         let (instance, mut user) = Instance::create_backend(
             Box::new(Sqlite::connect(&url).await.unwrap()),
-            NewAccount::passwordless("durable"),
+            NewAccount::with_password("durable", "test-password"),
         )
         .await
         .unwrap();
@@ -882,7 +884,10 @@ async fn durable_context_sqlite_reopen_with_fresh_host_reuses_committed_receipt(
         )
     };
     let instance = Instance::connect(&url).await.unwrap();
-    let user = instance.login_account("durable", None).await.unwrap();
+    let user = instance
+        .login_account("durable", "test-password")
+        .await
+        .unwrap();
     let db = user.open_database(&root).await.unwrap();
     let mut fresh = Fixture::new(true, "ok").await;
     fresh.session = Arc::new(tokio::sync::Mutex::new(

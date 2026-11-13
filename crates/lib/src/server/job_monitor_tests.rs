@@ -18,7 +18,7 @@ async fn service_steering(
     let socket = dir.path().join("monitor.sock");
     let (owner, mut user) = Instance::create_backend(
         Box::new(InMemory::new()),
-        NewAccount::passwordless("monitor"),
+        NewAccount::with_password("monitor", "test-password"),
     )
     .await
     .unwrap();
@@ -26,7 +26,7 @@ async fn service_steering(
         user.admin()
             .await
             .unwrap()
-            .create_account(NewAccount::passwordless(name))
+            .create_account(NewAccount::with_password(name, "test-password"))
             .await
             .unwrap();
     }
@@ -53,8 +53,7 @@ async fn service_steering(
         connection: format!("unix://{}", socket.display()),
         login: crate::config::EideticaLoginConfig {
             username: "monitor".into(),
-            password: None,
-            passwordless: true,
+            password: Some("test-password".into()),
         },
         sync: None,
     };

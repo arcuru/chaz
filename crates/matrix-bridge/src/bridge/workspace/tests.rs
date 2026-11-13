@@ -218,10 +218,12 @@ struct Harness {
 }
 
 async fn harness(version: &str) -> Harness {
-    let (instance, mut user) =
-        Instance::create_backend(Box::new(InMemory::new()), NewAccount::passwordless("t"))
-            .await
-            .unwrap();
+    let (instance, mut user) = Instance::create_backend(
+        Box::new(InMemory::new()),
+        NewAccount::with_password("t", "test-password"),
+    )
+    .await
+    .unwrap();
     let mut settings = eidetica::crdt::Doc::new();
     settings.set("name", "chaz_peer");
     let key = user.get_default_key().unwrap();

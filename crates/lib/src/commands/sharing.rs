@@ -525,10 +525,12 @@ mod tests {
         eidetica::Database,
     ) {
         let backend = InMemory::new();
-        let (instance, user) =
-            Instance::create_backend(Box::new(backend), NewAccount::passwordless("test"))
-                .await
-                .unwrap();
+        let (instance, user) = Instance::create_backend(
+            Box::new(backend),
+            NewAccount::with_password("test", "test-password"),
+        )
+        .await
+        .unwrap();
         if sync_enabled {
             instance.enable_sync().await.unwrap();
         }

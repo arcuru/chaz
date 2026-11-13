@@ -73,7 +73,7 @@ eidetica:
   connection: "sqlite://{home}/fixture.db"
   login:
     username: pty-test
-    passwordless: true
+    password: test-password
 backends:
   - name: stub
     type: openaicompatible
@@ -197,7 +197,7 @@ eidetica:
   connection: "sqlite://{home}/fixture.db"
   login:
     username: pty-test
-    passwordless: true
+    password: test-password
 backends:
   - name: stub
     type: openaicompatible

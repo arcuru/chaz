@@ -157,7 +157,7 @@ async fn activity_polling_component_baseline() {
             let client = eidetica::Instance::connect(format!("unix://{}", proxy_socket.display()))
                 .await
                 .unwrap();
-            let remote_user = client.login_account("test", None).await.unwrap();
+            let remote_user = client.login_account("test", "test-password").await.unwrap();
             let mut remote = Vec::new();
             for db in &dbs {
                 remote.push(remote_user.open_database(db.root_id()).await.unwrap());
@@ -256,7 +256,7 @@ async fn activity_subscription_initial_read_and_remote_completion_use_native_vis
             None
         };
         let observed = if let Some(remote) = &remote {
-            let remote_user = remote.login_account("test", None).await.unwrap();
+            let remote_user = remote.login_account("test", "test-password").await.unwrap();
             let key = remote_user.find_keys_by_display_name("activity-member")[0].clone();
             remote_user
                 .open_database_with_key(db.root_id(), &key)

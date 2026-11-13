@@ -139,7 +139,7 @@ eidetica:
   connection: "unix://{self.home}/proxy.sock"
   login:
     username: {username}
-    passwordless: true
+    password: test-password
 ''')
         self.started = time.monotonic()
         self.process = PtyProcess([BINARY, "--config", config, *args], self.env, self.home)

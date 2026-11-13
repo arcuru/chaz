@@ -670,10 +670,12 @@ mod tests {
     }
 
     async fn fixture() -> Fixture {
-        let (instance, mut user) =
-            Instance::create_backend(Box::new(InMemory::new()), NewAccount::passwordless("peer"))
-                .await
-                .unwrap();
+        let (instance, mut user) = Instance::create_backend(
+            Box::new(InMemory::new()),
+            NewAccount::with_password("peer", "test-password"),
+        )
+        .await
+        .unwrap();
         let key = user.get_default_key().unwrap();
         let session_db = user.create_database(Doc::new(), &key).await.unwrap();
         let peer_db = user.create_database(Doc::new(), &key).await.unwrap();

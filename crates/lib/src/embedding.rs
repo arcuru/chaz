@@ -430,10 +430,12 @@ mod tests {
     async fn empty_secret_store() -> SecretStore {
         use eidetica::backend::database::InMemory;
         use eidetica::{Instance, NewAccount};
-        let (_instance, mut user) =
-            Instance::create_backend(Box::new(InMemory::new()), NewAccount::passwordless("t"))
-                .await
-                .unwrap();
+        let (_instance, mut user) = Instance::create_backend(
+            Box::new(InMemory::new()),
+            NewAccount::with_password("t", "test-password"),
+        )
+        .await
+        .unwrap();
         let key = user.get_default_key().unwrap();
         let mut s = eidetica::crdt::Doc::new();
         s.set("name", "central");

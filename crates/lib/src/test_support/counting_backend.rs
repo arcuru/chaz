@@ -55,7 +55,7 @@ pub(crate) async fn counting_eidetica() -> (Instance, AccountSession, EntryReads
             inner: InMemory::new(),
             reads: reads.clone(),
         }),
-        NewAccount::passwordless("test"),
+        NewAccount::with_password("test", "test-password"),
     )
     .await
     .unwrap();

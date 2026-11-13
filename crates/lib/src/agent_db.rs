@@ -1201,10 +1201,12 @@ mod tests {
     /// logged-in account session against it. Each test gets an isolated peer.
     async fn test_peer_user() -> AccountSession {
         let backend = InMemory::new();
-        let (_instance, user) =
-            Instance::create_backend(Box::new(backend), NewAccount::passwordless("test"))
-                .await
-                .unwrap();
+        let (_instance, user) = Instance::create_backend(
+            Box::new(backend),
+            NewAccount::with_password("test", "test-password"),
+        )
+        .await
+        .unwrap();
         user
     }
 

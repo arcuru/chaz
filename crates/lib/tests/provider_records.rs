@@ -42,9 +42,11 @@ async fn native_provider_service_parity() -> anyhow::Result<()> {
 }
 
 async fn proof() -> anyhow::Result<()> {
-    let (owner, mut user) =
-        Instance::create_backend(Box::new(InMemory::new()), NewAccount::passwordless("proof"))
-            .await?;
+    let (owner, mut user) = Instance::create_backend(
+        Box::new(InMemory::new()),
+        NewAccount::with_password("proof", "test-password"),
+    )
+    .await?;
     let admin = user.get_default_key()?;
     let provider = user.create_database(Doc::new(), &admin).await?;
     let session = user.create_database(Doc::new(), &admin).await?;
@@ -123,7 +125,7 @@ async fn proof() -> anyhow::Result<()> {
 
     user.admin()
         .await?
-        .create_account(NewAccount::passwordless("reader"))
+        .create_account(NewAccount::with_password("reader", "test-password"))
         .await?;
     let dir = tempfile::tempdir()?;
     let socket = dir.path().join("proof.sock");
@@ -131,7 +133,7 @@ async fn proof() -> anyhow::Result<()> {
     let (shutdown, receiver) = watch::channel(());
     let running = tokio::spawn(service.run(receiver));
     let remote = Instance::connect(format!("unix://{}", socket.display())).await?;
-    let login = remote.login_account("reader", None).await?;
+    let login = remote.login_account("reader", "test-password").await?;
     let admin_error = login.admin().await.expect_err("reader is not a host admin");
     assert!(
         admin_error.to_string().contains("[auth::PermissionDenied]"),

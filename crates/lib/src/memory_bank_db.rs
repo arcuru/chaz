@@ -133,10 +133,12 @@ mod tests {
 
     async fn test_user() -> AccountSession {
         let backend = InMemory::new();
-        let (_instance, user) =
-            Instance::create_backend(Box::new(backend), NewAccount::passwordless("test"))
-                .await
-                .unwrap();
+        let (_instance, user) = Instance::create_backend(
+            Box::new(backend),
+            NewAccount::with_password("test", "test-password"),
+        )
+        .await
+        .unwrap();
         user
     }
 

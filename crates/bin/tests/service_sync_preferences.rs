@@ -47,7 +47,7 @@ async fn service_cli_unshare_commits_preferences_and_preserves_owner_gates() {
     let socket = dir.path().join("eidetica.sock");
     let (owner, mut user) = Instance::create_backend(
         Box::new(InMemory::new()),
-        NewAccount::passwordless("preferences"),
+        NewAccount::with_password("preferences", "test-password"),
     )
     .await
     .unwrap();
@@ -128,7 +128,7 @@ async fn service_cli_unshare_commits_preferences_and_preserves_owner_gates() {
     std::fs::write(
         &config,
         format!(
-            "state_dir: {}\nexecution: client\neidetica:\n  connection: unix://{}\n  login:\n    username: preferences\n    passwordless: true\nagents:\n  - name: selected\n    system_prompt: test\n    autonomous: false\nbackends: []\nmcp_servers: []\n",
+            "state_dir: {}\nexecution: client\neidetica:\n  connection: unix://{}\n  login:\n    username: preferences\n    password: test-password\nagents:\n  - name: selected\n    system_prompt: test\n    autonomous: false\nbackends: []\nmcp_servers: []\n",
             dir.path().join("state").display(),
             socket.display(),
         ),

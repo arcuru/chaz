@@ -2326,7 +2326,7 @@ mod tests {
 
         let (_instance, mut user) = Instance::create_backend(
             Box::new(InMemory::new()),
-            NewAccount::passwordless("typing-test"),
+            NewAccount::with_password("typing-test", "test-password"),
         )
         .await
         .unwrap();

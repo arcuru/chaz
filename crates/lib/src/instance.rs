@@ -435,15 +435,8 @@ fn validate(config: &EideticaConfig) -> Result<(), ConnectError> {
             "`eidetica.login.username` must not be empty".into(),
         ));
     }
-    match (&config.login.password, config.login.passwordless) {
-        (Some(_), true) => Err(ConnectError::Config(
-            "set either `eidetica.login.password` or `passwordless: true`, not both".into(),
-        )),
-        (None, false) => Err(ConnectError::Config(
-            "set `eidetica.login.password` or explicitly opt into `passwordless: true`".into(),
-        )),
-        _ => Ok(()),
-    }
+    login_password(&config.login)?;
+    Ok(())
 }
 
 fn is_service_connection(connection: &str) -> bool {
@@ -453,12 +446,20 @@ fn is_service_connection(connection: &str) -> bool {
         .is_some_and(|(scheme, _)| scheme.eq_ignore_ascii_case("unix"))
 }
 
+fn login_password(config: &EideticaLoginConfig) -> Result<&str, ConnectError> {
+    config
+        .password
+        .as_deref()
+        .filter(|password| !password.is_empty())
+        .ok_or_else(|| ConnectError::Config("set a non-empty `eidetica.login.password`".into()))
+}
+
 async fn login(
     instance: &Instance,
     config: &EideticaLoginConfig,
 ) -> Result<AccountSession, ConnectError> {
     instance
-        .login_account(&config.username, config.password.as_deref())
+        .login_account(&config.username, login_password(config)?)
         .await
         .map_err(|source| ConnectError::Login {
             username: config.username.clone(),
@@ -520,8 +521,7 @@ mod tests {
             connection,
             login: EideticaLoginConfig {
                 username: username.into(),
-                password: None,
-                passwordless: true,
+                password: Some("test-password".into()),
             },
             sync: None,
         }
@@ -532,7 +532,7 @@ mod tests {
         let path = dir.path().join("eidetica.json");
         let (instance, mut user) = Instance::create_backend(
             Box::new(InMemory::new()),
-            NewAccount::passwordless(username),
+            NewAccount::with_password(username, "test-password"),
         )
         .await
         .unwrap();
@@ -568,7 +568,7 @@ mod tests {
         let socket = dir.path().join("service.sock");
         let (instance, _) = Instance::create_backend(
             Box::new(InMemory::new()),
-            NewAccount::passwordless(username),
+            NewAccount::with_password(username, "test-password"),
         )
         .await
         .unwrap();
@@ -582,7 +582,7 @@ mod tests {
     }
 
     #[test]
-    fn required_boundary_rejects_missing_and_mixed_settings() {
+    fn required_boundary_rejects_missing_settings_and_empty_passwords() {
         let missing = Config::default();
         assert!(
             required_settings(&missing)
@@ -591,25 +591,23 @@ mod tests {
                 .contains("missing `eidetica`")
         );
 
-        let yaml = r#"
-execution: executor
-eidetica:
-  connection: memory://
-  login:
-    username: chaz
-    password: secret
-    passwordless: true
-"#;
-        let mixed: Config = serde_yaml::from_str(yaml).unwrap();
-        assert!(
-            required_settings(&mixed)
-                .unwrap_err()
-                .to_string()
-                .contains("not both")
-        );
+        for password in [None, Some("")] {
+            let mut config = Config {
+                execution: Some(ExecutionRole::Executor),
+                eidetica: Some(settings("memory://".into(), "chaz")),
+                ..Config::default()
+            };
+            config.eidetica.as_mut().unwrap().login.password = password.map(str::to_owned);
+            assert!(
+                required_settings(&config)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("non-empty `eidetica.login.password`")
+            );
+        }
 
         let no_role: Config = serde_yaml::from_str(
-            "eidetica:\n  connection: memory://\n  login:\n    username: chaz\n    passwordless: true\n",
+            "eidetica:\n  connection: memory://\n  login:\n    username: chaz\n    password: test-password\n",
         )
         .unwrap();
         assert!(
@@ -655,7 +653,7 @@ eidetica:
             "unix:///run/eidetica/service.sock",
         ] {
             let yaml = format!(
-                "execution: executor\neidetica:\n  connection: {connection}\n  login:\n    username: chaz\n    passwordless: true\n"
+                "execution: executor\neidetica:\n  connection: {connection}\n  login:\n    username: chaz\n    password: test-password\n"
             );
             let config: Config = serde_yaml::from_str(&yaml).unwrap();
             assert_eq!(required_settings(&config).unwrap().0.connection, connection);
@@ -740,10 +738,12 @@ eidetica:
         let backend = eidetica::backend::database::Sqlite::connect(&url)
             .await
             .unwrap();
-        let (created, user) =
-            Instance::create_backend(Box::new(backend), NewAccount::passwordless("legacy-chaz"))
-                .await
-                .unwrap();
+        let (created, user) = Instance::create_backend(
+            Box::new(backend),
+            NewAccount::with_password("legacy-chaz", "test-password"),
+        )
+        .await
+        .unwrap();
         let identity = user.get_default_key().unwrap();
         drop(user);
         drop(created);
@@ -781,15 +781,20 @@ eidetica:
     async fn bad_direct_login_is_actionable() {
         let (_dir, _, _) = populated_snapshot("real-user").await;
         let path = _dir.path().join("eidetica.json");
-        let error = connect_with(
-            &settings(format!("memory://{}", path.display()), "wrong-user"),
-            ExecutionRole::Client,
-        )
-        .await
-        .err()
-        .expect("an unknown direct login must be rejected");
-        assert!(matches!(error, ConnectError::Login { .. }));
-        assert!(error.to_string().contains("wrong-user"));
+        for (username, password) in [
+            ("wrong-user", "test-password"),
+            ("real-user", "wrong-password"),
+        ] {
+            let mut config = settings(format!("memory://{}", path.display()), username);
+            config.login.password = Some(password.into());
+            let error = connect_with(&config, ExecutionRole::Client)
+                .await
+                .err()
+                .expect("invalid direct credentials must be rejected");
+            assert!(matches!(error, ConnectError::Login { .. }));
+            assert!(error.to_string().contains(username));
+            assert!(!error.to_string().contains(password));
+        }
     }
 
     #[tokio::test]
@@ -834,7 +839,10 @@ eidetica:
     #[tokio::test]
     async fn service_clients_share_login_and_open_per_database_keys() {
         let (_dir, shutdown, task, server, url) = service_fixture("shared-chaz").await;
-        let mut owner_user = server.login_account("shared-chaz", None).await.unwrap();
+        let mut owner_user = server
+            .login_account("shared-chaz", "test-password")
+            .await
+            .unwrap();
         let key = owner_user.add_private_key(Some("agent-key")).await.unwrap();
         let db = owner_user.create_database(Doc::new(), &key).await.unwrap();
         let root = db.root_id().clone();
@@ -919,7 +927,7 @@ eidetica:
         assert!(error.to_string().contains("owner-only"));
         assert_eq!(server.id(), before_identity);
         server
-            .login_account("shared-chaz", None)
+            .login_account("shared-chaz", "test-password")
             .await
             .expect("rejected client settings must leave the daemon usable");
         assert!(
@@ -946,13 +954,19 @@ eidetica:
         ));
 
         let (_server_dir, shutdown, task, _server, url) = service_fixture("real-user").await;
-        assert!(matches!(
-            connect_with(&settings(url, "wrong-user"), ExecutionRole::Client)
+        for (username, password) in [
+            ("wrong-user", "test-password"),
+            ("real-user", "wrong-password"),
+        ] {
+            let mut config = settings(url.clone(), username);
+            config.login.password = Some(password.into());
+            let error = connect_with(&config, ExecutionRole::Client)
                 .await
                 .err()
-                .expect("a bad service login must fail"),
-            ConnectError::Login { .. }
-        ));
+                .expect("invalid service credentials must be rejected");
+            assert!(matches!(error, ConnectError::Login { .. }));
+            assert!(!error.to_string().contains(password));
+        }
         drop(shutdown);
         task.await.unwrap().unwrap();
     }
@@ -1006,7 +1020,7 @@ eidetica:
         let socket = dir.path().join("service.sock");
         let (owner, _) = Instance::create_backend(
             Box::new(InMemory::new()),
-            NewAccount::passwordless("shared-chaz"),
+            NewAccount::with_password("shared-chaz", "test-password"),
         )
         .await
         .unwrap();
@@ -1218,7 +1232,7 @@ eidetica:
         let _ = std::fs::remove_file(&socket);
         let (instance, _) = Instance::create_backend(
             Box::new(InMemory::new()),
-            NewAccount::passwordless("shared"),
+            NewAccount::with_password("shared", "test-password"),
         )
         .await
         .unwrap();

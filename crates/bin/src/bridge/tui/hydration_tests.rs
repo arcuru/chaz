@@ -160,7 +160,7 @@ async fn hydration_service_rpc_counts_and_unchanged_views() {
     let client = eidetica::Instance::connect(format!("unix://{}", proxy_socket.display()))
         .await
         .unwrap();
-    let user = client.login_account("test", None).await.unwrap();
+    let user = client.login_account("test", "test-password").await.unwrap();
     let mut app = App::hub(HashSet::new());
     for db in &dbs {
         let remote = user.open_database(db.root_id()).await.unwrap();
@@ -259,7 +259,7 @@ async fn hydration_callbacks_during_load_remote_hints_and_teardown() {
             None
         };
         let observed = if let Some(client) = &client {
-            let user = client.login_account("test", None).await.unwrap();
+            let user = client.login_account("test", "test-password").await.unwrap();
             let key = user.find_keys_by_display_name("view-member")[0].clone();
             user.open_database_with_key(db.root_id(), &key)
                 .await
@@ -700,10 +700,16 @@ async fn hydration_equal_frontier_is_not_cached_authority() {
         user.admin()
             .await
             .unwrap()
-            .create_account(eidetica::NewAccount::passwordless("reader"))
+            .create_account(eidetica::NewAccount::with_password(
+                "reader",
+                "test-password",
+            ))
             .await
             .unwrap();
-        let mut reader = owner.login_account("reader", None).await.unwrap();
+        let mut reader = owner
+            .login_account("reader", "test-password")
+            .await
+            .unwrap();
         let key = reader.add_private_key(Some("view-reader")).await.unwrap();
         let txn = db.new_transaction().await.unwrap();
         txn.get_settings()
@@ -735,7 +741,10 @@ async fn hydration_equal_frontier_is_not_cached_authority() {
             None
         };
         let observed = if let Some(client) = &client {
-            let reader = client.login_account("reader", None).await.unwrap();
+            let reader = client
+                .login_account("reader", "test-password")
+                .await
+                .unwrap();
             let key = reader.find_keys_by_display_name("view-reader")[0].clone();
             reader
                 .open_database_with_key(db.root_id(), &key)

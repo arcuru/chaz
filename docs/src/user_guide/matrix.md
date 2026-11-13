@@ -68,7 +68,7 @@ Example with a shared room:
    execution: client
    eidetica:
      connection: "sqlite:///var/lib/chaz-matrix/eidetica.db"
-     login: { username: chaz-matrix, passwordless: true }
+     login: { username: chaz-matrix, password: your-eidetica-password }
      sync: { iroh: true }
    backends:
      - name: openai

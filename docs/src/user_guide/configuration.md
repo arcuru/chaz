@@ -11,11 +11,14 @@ requires an explicit Eidetica connection, existing login, and execution role.
 commands without executing agent work.
 
 Chaz logs into the configured Eidetica account with `Instance::login_account`
-and keeps the returned `AccountSession`. The upstream API replaces `User` /
-`NewUser` with `AccountSession` / `NewAccount`; the YAML `login` fields and
-stored Chaz data names are unchanged. Database operations still use that
-account's selected per-database key and native identity, not a host-admin fallback.
-This dependency update performs no account or production-state conversion.
+and keeps the returned `AccountSession`. Set `login.username` and a non-empty
+`login.password` matching an existing account. Passwordless login is no longer
+supported; the retired `login.passwordless` setting is rejected. Provision a
+password-protected account with the Eidetica CLI before connecting Chaz.
+Database operations still use that account's selected per-database key and native
+identity, not a host-admin fallback. This dependency update performs no account or
+production-state conversion. Historical Eidetica credential records are not
+converted automatically; back up existing stores before upgrading.
 
 Debug output masks password-bearing connection URL userinfo and the values of
 `user`, `password`, and `sslpassword` query parameters. Other query parameters
@@ -27,7 +30,7 @@ Direct ownership keeps Eidetica in this process:
 execution: executor
 eidetica:
   connection: "sqlite:///var/lib/chaz/eidetica.db"
-  login: { username: chaz, passwordless: true }
+  login: { username: chaz, password: your-eidetica-password }
   sync:
     iroh: true
     http_listen: 127.0.0.1:8765
@@ -40,7 +43,7 @@ the Eidetica daemon owns transports, peers, tickets, and bootstrap:
 execution: client
 eidetica:
   connection: "unix:///run/eidetica/service.sock"
-  login: { username: chaz, passwordless: true }
+  login: { username: chaz, password: your-eidetica-password }
 ```
 
 The connector never creates a store or user and never falls back from a failed
@@ -95,7 +98,7 @@ eidetica:
   connection: "sqlite:///path/to/state/eidetica.db"
   login:
     username: chaz
-    passwordless: true
+    password: your-eidetica-password
 
 # Logs and other Chaz-local files (does not select the Eidetica database)
 state_dir: "/path/to/state" # Default: $XDG_STATE_HOME/chaz

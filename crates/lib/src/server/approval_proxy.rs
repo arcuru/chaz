@@ -218,7 +218,7 @@ mod tests {
         };
         let (instance, mut user) = eidetica::Instance::create_backend(
             Box::new(eidetica::backend::database::InMemory::new()),
-            eidetica::NewAccount::passwordless("proxy"),
+            eidetica::NewAccount::with_password("proxy", "test-password"),
         )
         .await
         .unwrap();
@@ -879,8 +879,7 @@ mod tests {
                 connection: format!("unix://{}", socket.display()),
                 login: crate::config::EideticaLoginConfig {
                     username: "test".into(),
-                    password: None,
-                    passwordless: true,
+                    password: Some("test-password".into()),
                 },
                 sync: None,
             },

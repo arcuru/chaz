@@ -15,7 +15,7 @@ async fn live_model_survives_unchanged_config_process_restarts() {
     );
     let (owner, user) = Instance::create_backend(
         Box::new(Sqlite::connect(&connection).await.unwrap()),
-        NewAccount::passwordless("fixture"),
+        NewAccount::with_password("fixture", "test-password"),
     )
     .await
     .unwrap();
@@ -44,7 +44,7 @@ async fn live_model_survives_unchanged_config_process_restarts() {
     std::fs::write(&prompt_path, "fixture prompt").unwrap();
     let config = json!({
         "state_dir":dir.path().join("state"), "execution":"executor",
-        "eidetica":{"connection":connection, "login":{"username":"fixture", "passwordless":true}},
+        "eidetica":{"connection":connection, "login":{"username":"fixture", "password":"test-password"}},
         "backends":[{"name":"stub", "type":"openaicompatible", "api_base":format!("{}/v1",model.uri()), "api_key":"fixture", "models":[{"name":"baseline"},{"name":"live"}]}],
         "agents":[{"name":"chaz", "system_prompt_files":[prompt_path], "tools":[]}],
         "default_agents":["chaz"]

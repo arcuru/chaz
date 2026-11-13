@@ -24,10 +24,12 @@ pub(in crate::commands) async fn fixture() -> (
     eidetica::Database,
 ) {
     let backend = InMemory::new();
-    let (instance, user) =
-        Instance::create_backend(Box::new(backend), NewAccount::passwordless("test"))
-            .await
-            .unwrap();
+    let (instance, user) = Instance::create_backend(
+        Box::new(backend),
+        NewAccount::with_password("test", "test-password"),
+    )
+    .await
+    .unwrap();
     let agents = Arc::new(AgentRegistry::with_default_agent());
     let registry = Arc::new(
         crate::session::SessionRegistry::new(instance.clone(), user, agents.clone())

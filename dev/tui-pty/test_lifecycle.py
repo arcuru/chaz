@@ -291,7 +291,7 @@ eidetica:
   connection: "sqlite://{home}/fixture.db"
   login:
     username: pty-test
-    passwordless: true
+    password: test-password
 backends:
   - name: stub
     type: openaicompatible
@@ -623,7 +623,7 @@ default_agents: [chaz]
             if "LD_LIBRARY_PATH" in os.environ:
                 env["LD_LIBRARY_PATH"] = os.environ["LD_LIBRARY_PATH"]
             config = home / "config.yaml"
-            config.write_text(f"execution: client\nstate_dir: {home}/state\neidetica:\n  connection: sqlite://{home}/fixture.db\n  login:\n    username: pty-test\n    passwordless: true\n")
+            config.write_text(f"execution: client\nstate_dir: {home}/state\neidetica:\n  connection: sqlite://{home}/fixture.db\n  login:\n    username: pty-test\n    password: test-password\n")
             subprocess.run([FIXTURE, home / "fixture.db"], env=env, cwd=home, check=True, timeout=20, capture_output=True)
             # One terminal write queues all input before the loop can redraw.
             # The mouse case forces the intermediate pre-click draw too.
@@ -701,7 +701,7 @@ eidetica:
   connection: "unix://{home}/service.sock"
   login:
     username: pty-service
-    passwordless: true
+    password: test-password
 ''')
             owner = subprocess.Popen([fixture, home / "service.sock"], env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
             def owner_reply(expected):

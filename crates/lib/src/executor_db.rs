@@ -253,10 +253,12 @@ mod tests {
 
     #[tokio::test]
     async fn stable_queue_adopts_orphan_and_agent_key_can_read() {
-        let (_instance, mut user) =
-            Instance::create_backend(Box::new(InMemory::new()), NewAccount::passwordless("q"))
-                .await
-                .unwrap();
+        let (_instance, mut user) = Instance::create_backend(
+            Box::new(InMemory::new()),
+            NewAccount::with_password("q", "test-password"),
+        )
+        .await
+        .unwrap();
         let (parent_agent, _) = crate::agent_db::create_agent_db(
             &mut user,
             "A",
@@ -325,7 +327,7 @@ mod tests {
     async fn raced_incarnations_converge_and_reject_a_wrong_identity() {
         let (instance, mut user) = Instance::create_backend(
             Box::new(InMemory::new()),
-            NewAccount::passwordless("executor-race"),
+            NewAccount::with_password("executor-race", "test-password"),
         )
         .await
         .unwrap();
@@ -337,7 +339,10 @@ mod tests {
         )
         .await
         .unwrap();
-        let mut stale = instance.login_account("executor-race", None).await.unwrap();
+        let mut stale = instance
+            .login_account("executor-race", "test-password")
+            .await
+            .unwrap();
         let peer = user.get_default_key().unwrap();
         let name = format!("executor:{}:{peer}", agent.database().root_id());
         let mut settings = eidetica::crdt::Doc::new();
@@ -421,10 +426,12 @@ mod tests {
 
     #[tokio::test]
     async fn no_pointer_to_wrong_kind_or_pending_row() {
-        let (_instance, mut user) =
-            Instance::create_backend(Box::new(InMemory::new()), NewAccount::passwordless("q"))
-                .await
-                .unwrap();
+        let (_instance, mut user) = Instance::create_backend(
+            Box::new(InMemory::new()),
+            NewAccount::with_password("q", "test-password"),
+        )
+        .await
+        .unwrap();
         let (agent, key) = crate::agent_db::create_agent_db(
             &mut user,
             "B",

@@ -45,7 +45,7 @@ Discord-specific configuration and behavior.
    execution: client
    eidetica:
      connection: "sqlite:///var/lib/chaz-discord/eidetica.db"
-     login: { username: chaz-discord, passwordless: true }
+     login: { username: chaz-discord, password: your-eidetica-password }
      sync: { iroh: true }
    backends:
      - name: openai

@@ -72,7 +72,7 @@ fn startup_config(proxy_socket: &Path) -> Config {
 execution: client
 eidetica:
   connection: unix://{}
-  login: {{ username: startup, passwordless: true }}
+  login: {{ username: startup, password: test-password }}
 agents:
   - name: selected
     model: fallback-model
@@ -123,7 +123,7 @@ impl StartupFixture {
         let proxy_socket = dir.path().join("proxy.sock");
         let (owner, mut user) = Instance::create_backend(
             Box::new(InMemory::new()),
-            NewAccount::passwordless("startup"),
+            NewAccount::with_password("startup", "test-password"),
         )
         .await
         .unwrap();

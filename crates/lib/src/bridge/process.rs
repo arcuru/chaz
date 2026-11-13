@@ -68,7 +68,7 @@ pub fn connector_example(transport: BridgeTransport, state_dir: &Path) -> String
          \x20 connection: \"sqlite://{store}\"\n\
          \x20 login:\n\
          \x20   username: {username}\n\
-         \x20   passwordless: true\n\
+         \x20   password: your-eidetica-password\n\
          \x20 sync:\n\
          \x20   iroh: true\n\
          \n\
@@ -79,7 +79,7 @@ pub fn connector_example(transport: BridgeTransport, state_dir: &Path) -> String
          \x20 connection: \"unix:///run/eidetica/service.sock\"\n\
          \x20 login:\n\
          \x20   username: chaz\n\
-         \x20   passwordless: true\n\
+         \x20   password: your-eidetica-password\n\
          \n\
          Nothing is created or moved implicitly; a store that does not exist yet \
          is provisioned with the Eidetica CLI first.",
@@ -405,7 +405,7 @@ mod tests {
 execution: client
 eidetica:
   connection: "unix:///nonexistent/service.sock"
-  login: { username: chaz, passwordless: true }
+  login: { username: chaz, password: test-password }
 "#;
         let config: Config = serde_yaml::from_str(yaml).unwrap();
         let error = match connect(&config, MATRIX, dir.path()).await {
@@ -437,7 +437,7 @@ eidetica:
         let socket = dir.path().join("service.sock");
         let (owner, _) = Instance::create_backend(
             Box::new(InMemory::new()),
-            NewAccount::passwordless("shared"),
+            NewAccount::with_password("shared", "test-password"),
         )
         .await
         .unwrap();
@@ -448,8 +448,7 @@ eidetica:
             connection,
             login: crate::config::EideticaLoginConfig {
                 username: "shared".into(),
-                password: None,
-                passwordless: true,
+                password: Some("test-password".into()),
             },
             sync: None,
         };
@@ -462,7 +461,7 @@ eidetica:
         let snapshot = dir.path().join("direct.json");
         let (direct_owner, _) = Instance::create_backend(
             Box::new(InMemory::new()),
-            NewAccount::passwordless("shared"),
+            NewAccount::with_password("shared", "test-password"),
         )
         .await
         .unwrap();

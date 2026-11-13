@@ -425,7 +425,7 @@ eidetica:
   connection: "sqlite://$WORKSPACE/state-daemon/eidetica.db"
   login:
     username: chaz
-    passwordless: true
+    password: test-password
 $(printf '%b' "$EIDETICA_SYNC_DAEMON")
 
 backends:
@@ -449,14 +449,14 @@ EOF
 mkdir -p "$WORKSPACE/state-daemon" "$WORKSPACE/state-bridge"
 log "initialising daemon Eidetica store"
 nix run "$EIDETICA_FLAKE" -- \
-	daemon --data-dir "$WORKSPACE/state-daemon" init --username chaz --passwordless \
+	daemon --data-dir "$WORKSPACE/state-daemon" init --username chaz --password test-password \
 	>>"$WORKSPACE/bringup.log" 2>&1 || fail "could not initialise daemon Eidetica store (see $WORKSPACE/bringup.log)"
 # The bridge's store is provisioned the same explicit way: the connector
 # never creates one, and the legacy `chaz-matrix` login is what its config
 # names.
 log "initialising bridge Eidetica store"
 nix run "$EIDETICA_FLAKE" -- \
-	daemon --data-dir "$WORKSPACE/state-bridge" init --username chaz-matrix --passwordless \
+	daemon --data-dir "$WORKSPACE/state-bridge" init --username chaz-matrix --password test-password \
 	>>"$WORKSPACE/bringup.log" 2>&1 || fail "could not initialise bridge Eidetica store (see $WORKSPACE/bringup.log)"
 
 # The bridge's connector block, shared by both renderings of its config.
@@ -465,7 +465,7 @@ eidetica:
   connection: \"sqlite://$WORKSPACE/state-bridge/eidetica.db\"
   login:
     username: chaz-matrix
-    passwordless: true
+    password: test-password
 $(printf '%b' "$EIDETICA_SYNC_BRIDGE")"
 
 # ------------------------------------------------------------- bring-up ------

@@ -2264,7 +2264,7 @@ mod chat_frame_tests {
     async fn test_app(input: &str, cursor: usize) -> App {
         let (_instance, mut user) = Instance::create_backend(
             Box::new(InMemory::new()),
-            NewAccount::passwordless("composer-frame"),
+            NewAccount::with_password("composer-frame", "test-password"),
         )
         .await
         .unwrap();
@@ -2324,7 +2324,7 @@ mod chat_frame_tests {
         let mut app = test_app("", 0).await;
         let (_instance, mut user) = Instance::create_backend(
             Box::new(InMemory::new()),
-            NewAccount::passwordless("observer-frame"),
+            NewAccount::with_password("observer-frame", "test-password"),
         )
         .await
         .unwrap();
@@ -2924,7 +2924,7 @@ mod transcript_tests {
     pub(super) async fn app_with(entries: Vec<SessionEntry>) -> (Instance, App) {
         let (instance, mut user) = Instance::create_backend(
             Box::new(InMemory::new()),
-            NewAccount::passwordless("transcript-frame"),
+            NewAccount::with_password("transcript-frame", "test-password"),
         )
         .await
         .unwrap();

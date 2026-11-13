@@ -17,10 +17,12 @@ use std::sync::Arc;
 /// use (dropping the Instance closes the backend and invalidates the handle).
 pub(crate) async fn test_session_db() -> (Instance, eidetica::AccountSession, eidetica::Database) {
     let backend = InMemory::new();
-    let (instance, mut user) =
-        Instance::create_backend(Box::new(backend), NewAccount::passwordless("test"))
-            .await
-            .unwrap();
+    let (instance, mut user) = Instance::create_backend(
+        Box::new(backend),
+        NewAccount::with_password("test", "test-password"),
+    )
+    .await
+    .unwrap();
     let key = user.get_default_key().unwrap();
     let mut settings = eidetica::crdt::Doc::new();
     settings.set("name", "test-session");
@@ -53,10 +55,12 @@ pub(crate) fn agent_cfg(name: &str) -> AgentConfig {
 /// resolution but still need `default_agent()` to succeed if hit.
 pub(crate) async fn make_registry() -> (Instance, Arc<SessionRegistry>) {
     let backend = InMemory::new();
-    let (instance, user) =
-        Instance::create_backend(Box::new(backend), NewAccount::passwordless("test"))
-            .await
-            .unwrap();
+    let (instance, user) = Instance::create_backend(
+        Box::new(backend),
+        NewAccount::with_password("test", "test-password"),
+    )
+    .await
+    .unwrap();
     let agents = Arc::new(AgentRegistry::with_default_agent());
     let registry = SessionRegistry::new(instance.clone(), user, agents)
         .await
@@ -70,10 +74,12 @@ pub(crate) async fn make_registry() -> (Instance, Arc<SessionRegistry>) {
 /// those error out with "Sync not enabled" otherwise.
 pub(crate) async fn make_registry_with_sync() -> (Instance, Arc<SessionRegistry>) {
     let backend = InMemory::new();
-    let (instance, user) =
-        Instance::create_backend(Box::new(backend), NewAccount::passwordless("test"))
-            .await
-            .unwrap();
+    let (instance, user) = Instance::create_backend(
+        Box::new(backend),
+        NewAccount::with_password("test", "test-password"),
+    )
+    .await
+    .unwrap();
     instance.enable_sync().await.unwrap();
     let agents = Arc::new(AgentRegistry::with_default_agent());
     let registry = SessionRegistry::new(instance.clone(), user, agents)
@@ -87,10 +93,12 @@ pub(crate) async fn make_registry_with_sync() -> (Instance, Arc<SessionRegistry>
 pub(crate) async fn make_registry_with_alpha_agent() -> (Instance, Arc<SessionRegistry>, HostedIndex)
 {
     let backend = InMemory::new();
-    let (instance, user) =
-        Instance::create_backend(Box::new(backend), NewAccount::passwordless("test"))
-            .await
-            .unwrap();
+    let (instance, user) = Instance::create_backend(
+        Box::new(backend),
+        NewAccount::with_password("test", "test-password"),
+    )
+    .await
+    .unwrap();
 
     let cfg = Config {
         agents: Some(vec![agent_cfg("alpha")]),
@@ -110,10 +118,12 @@ pub(crate) async fn make_registry_with_alpha_agent() -> (Instance, Arc<SessionRe
 pub(crate) async fn make_registry_with_two_agents() -> (Instance, Arc<SessionRegistry>, HostedIndex)
 {
     let backend = InMemory::new();
-    let (instance, user) =
-        Instance::create_backend(Box::new(backend), NewAccount::passwordless("test"))
-            .await
-            .unwrap();
+    let (instance, user) = Instance::create_backend(
+        Box::new(backend),
+        NewAccount::with_password("test", "test-password"),
+    )
+    .await
+    .unwrap();
 
     let cfg = Config {
         agents: Some(vec![agent_cfg("alpha"), agent_cfg("beta")]),
