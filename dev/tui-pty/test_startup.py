@@ -320,6 +320,32 @@ eidetica:
         self.quit()
         print("STARTUP LOAD ERROR CONTRACT: PASS; live error, same session after repair/relaunch, no submitted draft")
 
+    def test_background_first_tab_keeps_a_newer_hub_open_request(self):
+        armed = threading.Event()
+        self.launch(lambda r: armed.is_set() and "AuthenticatedDb" in r
+                    and "SubmitSignedEntry" in r["AuthenticatedDb"]["op"])
+        self.process.expect_screen("Sessions", timeout=15)
+        self.process.expect_screen("service-fixture", timeout=15)
+        armed.set()
+        self.process.send("n")
+        self.held()
+        self.process.send("draft-from-loading")
+        self.process.expect_screen("draft-from-loading", timeout=1)
+        self.process.send("\x10")  # Ctrl+P: no conversation tab is open yet
+        self.process.expect_screen("Sessions", timeout=1)
+        self.process.send("\x1b[B\r")  # open the existing session behind creation
+        self.process.expect_screen("2 action(s) pending", timeout=1)
+        self.gate.release.set()
+        self.process.expect_screen("SERVICE-CACHED-TRANSCRIPT", timeout=15)
+        self.process.expect_screen("Ctrl+S settings", timeout=1)
+        self.assertNotIn("draft-from-loading", "\n".join(self.process.screen.display))
+        self.process.send("\x0c")  # Ctrl+L: created tab retains its own draft
+        self.process.expect_screen("draft-from-loading", timeout=1)
+        self.assertNotIn("SERVICE-CACHED-TRANSCRIPT", "\n".join(self.process.screen.display))
+        self.assertEqual(self.control("sessions", "SESSIONS"), "SESSIONS 2")
+        self.quit()
+        print("BACKGROUND FIRST TAB CONTRACT: PASS; newer hub navigation honored, creation draft isolated")
+
     def test_new_session_composer_is_editable_before_creation_finishes(self):
         # Database creation submits a signed genesis entry; there is no
         # separate CreateDatabase RPC in the native storage protocol.

@@ -257,7 +257,7 @@ impl TuiBridge {
 
                 let navigation_before = (
                     app.mode,
-                    app.current().map(|t| t.live.incarnation),
+                    app.focused_incarnation(),
                     app.peer_settings_index,
                     app.session_settings_index,
                     app.peer_agents_cursor,
@@ -682,7 +682,7 @@ impl TuiBridge {
 
                 let navigation_after = (
                     app.mode,
-                    app.current().map(|t| t.live.incarnation),
+                    app.focused_incarnation(),
                     app.peer_settings_index,
                     app.session_settings_index,
                     app.peer_agents_cursor,

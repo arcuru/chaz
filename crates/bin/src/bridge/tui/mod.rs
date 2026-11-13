@@ -1057,6 +1057,21 @@ impl App {
         self.tabs.get_mut(self.active_tab)
     }
 
+    /// Only conversation-scoped views navigate with their selected tab.
+    /// Installing the first tab in the background must not invalidate a newer
+    /// hub open request merely because `current()` now has a cached tab.
+    fn focused_incarnation(&self) -> Option<u64> {
+        let scoped = matches!(
+            self.mode,
+            TuiMode::Chat | TuiMode::Settings(SettingsScope::Session)
+        ) || (self.mode == TuiMode::ModelPicker
+            && !matches!(self.model_picker_scope, ModelPickerScope::AgentGlobal(_)));
+        scoped
+            .then(|| self.current())
+            .flatten()
+            .map(|t| t.live.incarnation)
+    }
+
     /// Whether the focused conversation is waiting on a tool approval.
     pub(super) fn has_pending_approval(&self) -> bool {
         self.current()
