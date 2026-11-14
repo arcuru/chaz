@@ -337,6 +337,14 @@ async fn new_open_switch_and_close_preserve_sessions_drafts_and_scroll() {
     }
     input::handle_chat_key(&mut app, key(KeyCode::Left));
     let (draft, cursor) = (app.input.clone(), app.cursor);
+    // Retain a valid scroll position: an empty transcript has no scrollback.
+    app.active_mut().set_entries(
+        (0..100)
+            .map(|i| {
+                super::transcript_tests::entry("user", &format!("history {i}"), EntryType::Message)
+            })
+            .collect(),
+    );
     app.active_mut().scroll_offset = 5;
 
     // Hub → another stored session: a fresh composer there.

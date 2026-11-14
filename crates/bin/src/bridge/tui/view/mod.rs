@@ -3410,8 +3410,8 @@ mod transcript_tests {
 
         // A megabyte of synthetic nested output, never a real session transcript.
         let output = serde_json::json!({
-            "history": (0..10_000).map(|i| serde_json::json!({
-                "event": i, "snapshot": {"text": "synthetic payload ".repeat(6)}
+            "history": (0..2_000).map(|i| serde_json::json!({
+                "event": i, "snapshot": {"text": "synthetic payload ".repeat(40)}
             })).collect::<Vec<_>>()
         });
         let mut entries = transcript(50);
