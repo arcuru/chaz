@@ -32,6 +32,13 @@ impl Default for Probe {
     }
 }
 impl Probe {
+    async fn wait(&self, id: &ID) {
+        let blocked = self.blocked.lock().unwrap().as_ref() == Some(id);
+        if blocked {
+            self.entered.notify_one();
+            let _permit = self.release.acquire().await.unwrap();
+        }
+    }
     fn record(&self, id: &ID) {
         if self.roots.lock().unwrap().contains(id) {
             self.accessed.lock().unwrap().insert(id.clone());
@@ -67,11 +74,7 @@ impl BackendImpl for Storage {
     }
     async fn get(&self, id: &ID) -> eidetica::Result<Entry> {
         self.probe.record(id);
-        let blocked = self.probe.blocked.lock().unwrap().as_ref() == Some(id);
-        if blocked {
-            self.probe.entered.notify_one();
-            let _permit = self.probe.release.acquire().await.unwrap();
-        }
+        self.probe.wait(id).await;
         self.inner.get(id).await
     }
     async fn get_verification_status(&self, id: &ID) -> eidetica::Result<VerificationStatus> {
@@ -95,6 +98,7 @@ impl BackendImpl for Storage {
     }
     async fn snapshot(&self, tree: &ID) -> eidetica::Result<Snapshot> {
         self.probe.record(tree);
+        self.probe.wait(tree).await;
         self.inner.snapshot(tree).await
     }
     async fn store_snapshot(&self, tree: &ID, store: &str) -> eidetica::Result<Snapshot> {
@@ -179,6 +183,7 @@ impl BackendImpl for Storage {
         request: &StoreStateRequest,
     ) -> eidetica::Result<Option<RecordView>> {
         self.probe.record(&request.database);
+        self.probe.wait(&request.database).await;
         self.inner.resolve_store_state(request).await
     }
     async fn begin_store_state_staging(
@@ -538,7 +543,11 @@ async fn creation_survives_navigation_without_replay_or_focus_theft() {
     release.send(()).unwrap();
     settle(&mut app).await;
     assert_eq!(app.mode, TuiMode::Settings(SettingsScope::Peer));
-    assert!(app.tabs.is_empty());
+    assert_eq!(
+        app.tabs.len(),
+        1,
+        "destination retained without moving focus"
+    );
     assert!(!app.operations.is_creating_session());
     let sessions = server.registry().list_sessions().await.unwrap();
     assert_eq!(sessions.len(), 1);
@@ -628,6 +637,19 @@ async fn creation_admission_preserves_drafts_and_releases_only_its_own_ticket() 
             assert_eq!(server.registry().list_sessions().await.unwrap().len(), 1);
             assert_eq!(app.active().current_agent, "default");
             assert!(app.operations.indicator().contains("Unknown agent group"));
+            assert!(
+                app.creation
+                    .as_ref()
+                    .unwrap()
+                    .status
+                    .contains("Unknown agent group")
+            );
+            // Failed creation keeps an editable draft until explicitly discarded.
+            creation::handle_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL),
+            );
+            assert!(app.creation.is_none());
         } else {
             assert_eq!(server.registry().list_sessions().await.unwrap().len(), 2);
             assert_eq!(app.active().current_agent, "selected");
@@ -670,4 +692,109 @@ async fn creation_admission_preserves_drafts_and_releases_only_its_own_ticket() 
     assert_eq!(server.registry().list_sessions().await.unwrap().len(), 3);
     drop(app);
     built.shutdown().await;
+}
+
+#[tokio::test]
+async fn new_session_composer_precedes_creation_and_hydration_and_keeps_drafts_scoped() {
+    for navigate_away in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let probe = Arc::new(Probe::default());
+        let built = runtime(dir.path(), probe.clone()).await;
+        let server = &built.server;
+        let backend = BackendManager::new(&None, built.secret_store.clone());
+        let mut app = App::hub(HashSet::new());
+        new_session(&mut app, server, &backend);
+        settle(&mut app).await;
+        let old_id = app.active().session_db_id.clone();
+        app.input = "old conversation draft".into();
+        app.cursor = 3;
+
+        // Hold the FIFO before database creation, not a presentation-only read.
+        let (release, gate) = oneshot::channel();
+        operations::submit(&mut app, true, None, async move {
+            gate.await.unwrap();
+            Ok(operations::Effect::Sent)
+        });
+        new_session(&mut app, server, &backend);
+        assert_eq!(app.mode, TuiMode::NewSession);
+        assert!(!app.ensure_view(), "loading view requires no database");
+        for c in "draft-é界".chars() {
+            creation::handle_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE),
+            );
+        }
+        creation::handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        creation::handle_key(&mut app, KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        assert!(frame(&mut app, server, &backend).contains("draft-é界"));
+        assert_eq!(app.input, "old conversation draft");
+        assert_eq!(app.cursor, 3);
+        assert_eq!(server.registry().list_sessions().await.unwrap().len(), 1);
+        assert!(app.operations.is_creating_session());
+        release.send(()).unwrap();
+        let completion = app.operations.recv().await.unwrap();
+        operations::apply(&mut app, completion); // preceding FIFO action
+        let completion = app.operations.recv().await.unwrap(); // creation resolved
+        let indices = server.registry().list_sessions().await.unwrap();
+        let new_id = indices
+            .iter()
+            .find(|s| s.session_db_id != old_id)
+            .unwrap()
+            .session_db_id
+            .clone();
+        *probe.blocked.lock().unwrap() = Some(ID::parse(&new_id).unwrap());
+        operations::apply(&mut app, completion); // observation/hydration now blocked
+        tokio::time::timeout(std::time::Duration::from_secs(2), probe.entered.notified())
+            .await
+            .unwrap();
+        assert!(frame(&mut app, server, &backend).contains("Loading session"));
+        creation::handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('!'), KeyModifiers::NONE),
+        );
+        let expected = ("draft-é!界".to_string(), "draft-é!".len());
+        assert_eq!(app.creation.as_ref().unwrap().input, expected.0);
+        assert_eq!(app.creation.as_ref().unwrap().cursor, expected.1);
+        assert!(
+            app.operations.is_creating_session(),
+            "hydration released creation custody"
+        );
+        assert_eq!(app.tabs.len(), 1, "incomplete tab exposed as ready");
+        if navigate_away {
+            creation::handle_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
+            );
+            app.mode = TuiMode::Chat; // return from the hub to the old conversation
+            app.navigation_generation += 1;
+            input::handle_chat_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Char('X'), KeyModifiers::NONE),
+            );
+        }
+        *probe.blocked.lock().unwrap() = None;
+        probe.release.add_permits(1);
+        settle(&mut app).await;
+        assert!(app.creation.is_none());
+        assert!(!app.operations.is_creating_session());
+        assert_eq!(app.tabs.len(), 2);
+        if navigate_away {
+            assert_eq!(app.active().session_db_id, old_id, "completion stole focus");
+            assert_eq!(app.input, "oldX conversation draft");
+            assert_eq!(app.cursor, 4);
+            app.set_active_tab(app.tab_index_for(&new_id).unwrap());
+        } else {
+            assert_eq!(app.drafts[&old_id], ("old conversation draft".into(), 3));
+        }
+        assert_eq!(app.active().session_db_id, new_id);
+        assert_eq!((app.input.clone(), app.cursor), expected);
+        assert!(app.active().live.observation.is_some());
+        assert!(
+            app.active().entries.is_empty(),
+            "Enter submitted a loading draft"
+        );
+        assert!(frame(&mut app, server, &backend).contains("draft-é!界"));
+        drop(app);
+        built.shutdown().await;
+    }
 }

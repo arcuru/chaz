@@ -528,6 +528,14 @@ pub(super) fn handle_mouse(app: &mut App, m: MouseEvent) -> Option<MouseOutcome>
         ClickTarget::HelpCommand(template) => {
             // Insert the template into the input box and close the overlay so
             // the user can edit and submit. Cursor goes to end.
+            if app.mode == TuiMode::NewSession {
+                if let Some(view) = app.creation.as_mut() {
+                    view.input = template.to_string();
+                    view.cursor = view.input.len();
+                }
+                app.overlay = None;
+                return None;
+            }
             app.input = template.to_string();
             app.cursor = app.input.len();
             app.overlay = None;
@@ -788,7 +796,7 @@ pub(super) fn handle_chat_key(app: &mut App, key: KeyEvent) -> Option<ChatAction
                     Some(ChatAction::Dispatch(
                         chaz_core::commands::Command::NewSession(_)
                     ))
-                ) && app.operations.is_creating_session();
+                ) && app.creation.is_some();
                 if backend_action
                     && (!app.backend_ready() || !app.operations.has_capacity() || creation_pending)
                 {
@@ -799,7 +807,7 @@ pub(super) fn handle_chat_key(app: &mut App, key: KeyEvent) -> Option<ChatAction
                     app.command_input = None;
                     app.operations.notice = Some(
                         if creation_pending {
-                            "Session creation already pending — draft not submitted"
+                            "Session creation already pending or failed — draft not submitted"
                         } else {
                             "Backend unavailable or action queue full — draft not submitted"
                         }
@@ -873,6 +881,22 @@ pub(super) fn handle_chat_key(app: &mut App, key: KeyEvent) -> Option<ChatAction
 
 /// Shared local editing before and after the launch has a database handle.
 pub(super) fn edit_draft(app: &mut App, key: KeyEvent) -> bool {
+    let changes_text = matches!(key.code, KeyCode::Char(_))
+        || (key.code == KeyCode::Backspace && app.cursor > 0)
+        || (key.code == KeyCode::Enter
+            && key
+                .modifiers
+                .intersects(KeyModifiers::ALT | KeyModifiers::SHIFT));
+    let edited = edit_text(&mut app.input, &mut app.cursor, key);
+    if changes_text {
+        app.completion_dismissed = false;
+        recompute_completion(app);
+    }
+    edited
+}
+
+/// Shared local editor for ready, startup and new-session composers.
+pub(super) fn edit_text(input: &mut String, cursor: &mut usize, key: KeyEvent) -> bool {
     match key.code {
         // Hard line break. `Alt+Enter` is the portable binding: without the
         // keyboard-enhancement protocol a terminal sends bare `\r` for
@@ -885,33 +909,27 @@ pub(super) fn edit_draft(app: &mut App, key: KeyEvent) -> bool {
                 .modifiers
                 .intersects(KeyModifiers::ALT | KeyModifiers::SHIFT) =>
         {
-            app.input.insert(app.cursor, '\n');
-            app.cursor += 1;
-            app.completion_dismissed = false;
-            recompute_completion(app);
+            input.insert(*cursor, '\n');
+            *cursor += 1;
         }
         KeyCode::Char(c) => {
-            app.input.insert(app.cursor, c);
-            app.cursor += c.len_utf8();
-            app.completion_dismissed = false;
-            recompute_completion(app);
+            input.insert(*cursor, c);
+            *cursor += c.len_utf8();
         }
         KeyCode::Backspace => {
-            if app.cursor > 0 {
-                let prev = app.input[..app.cursor]
+            if *cursor > 0 {
+                let prev = input[..*cursor]
                     .grapheme_indices(true)
                     .next_back()
                     .map(|(i, _)| i)
                     .unwrap_or(0);
-                app.input.drain(prev..app.cursor);
-                app.cursor = prev;
-                app.completion_dismissed = false;
-                recompute_completion(app);
+                input.drain(prev..*cursor);
+                *cursor = prev;
             }
         }
         KeyCode::Left => {
-            if app.cursor > 0 {
-                app.cursor = app.input[..app.cursor]
+            if *cursor > 0 {
+                *cursor = input[..*cursor]
                     .grapheme_indices(true)
                     .next_back()
                     .map(|(i, _)| i)
@@ -919,19 +937,19 @@ pub(super) fn edit_draft(app: &mut App, key: KeyEvent) -> bool {
             }
         }
         KeyCode::Right => {
-            if app.cursor < app.input.len() {
-                app.cursor = app.input[app.cursor..]
+            if *cursor < input.len() {
+                *cursor = input[*cursor..]
                     .grapheme_indices(true)
                     .nth(1)
-                    .map(|(i, _)| app.cursor + i)
-                    .unwrap_or(app.input.len());
+                    .map(|(i, _)| *cursor + i)
+                    .unwrap_or(input.len());
             }
         }
         KeyCode::Home => {
-            app.cursor = 0;
+            *cursor = 0;
         }
         KeyCode::End => {
-            app.cursor = app.input.len();
+            *cursor = input.len();
         }
         _ => return false,
     }
