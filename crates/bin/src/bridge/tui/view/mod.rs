@@ -730,9 +730,12 @@ pub(super) fn ui_chat(f: &mut ratatui::Frame, app: &mut App, ext_segments: &[Str
         .map_or(0, |l| wrapped_height(l, inner_width));
     let content_height = transcript_height + activity_height;
     let messages_height = messages_height as usize;
-    let scroll = content_height
-        .saturating_sub(messages_height)
-        .saturating_sub(scroll_offset as usize);
+    // Collapsing output or resizing can leave a bottom-relative offset beyond
+    // the new top. Persist the clamp so down-scroll responds immediately rather
+    // than paying off thousands of invisible rows before the viewport moves.
+    let max_scroll = content_height.saturating_sub(messages_height);
+    let scroll_offset = (scroll_offset as usize).min(max_scroll) as u16;
+    let scroll = max_scroll - scroll_offset as usize;
     let view_end = scroll + messages_height;
     // First logical line whose wrapped rows reach past `scroll`.
     let first = cache.offsets[1..].partition_point(|&end| end <= scroll);
@@ -780,6 +783,7 @@ pub(super) fn ui_chat(f: &mut ratatui::Frame, app: &mut App, ext_segments: &[Str
     };
     let operation_indicator = app.operations.indicator();
     let _ = tab;
+    app.tabs[active_tab].scroll_offset = scroll_offset;
     app.click_regions.extend(clicks);
 
     let messages = Paragraph::new(visible)
@@ -3397,6 +3401,145 @@ mod transcript_tests {
         let (_, summary, _) = summarize_tool_result(&format!("query: {output}"));
         assert!(summary.contains("one two"));
         assert_eq!(ellipsize(&summary, 90).chars().count(), 91);
+    }
+
+    #[tokio::test]
+    async fn collapsing_large_output_keeps_scroll_navigation_live() {
+        use super::super::input::{handle_chat_key, handle_mouse};
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
+
+        // A megabyte of synthetic nested output, never a real session transcript.
+        let output = serde_json::json!({
+            "history": (0..10_000).map(|i| serde_json::json!({
+                "event": i, "snapshot": {"text": "synthetic payload ".repeat(6)}
+            })).collect::<Vec<_>>()
+        });
+        let mut entries = transcript(50);
+        entries.push(entry(
+            "chaz",
+            &format!("query: {output}"),
+            EntryType::ToolResult,
+        ));
+        entries.extend(transcript(50));
+        let (_instance, mut app) = app_with(entries).await;
+        app.active_mut().active_turns = 0;
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        let draw = |app: &mut App, terminal: &mut Terminal<TestBackend>| {
+            app.click_regions.clear();
+            terminal.draw(|f| ui_chat(f, app, &[])).unwrap();
+            rows(terminal, 2, 18)
+        };
+        let key = |app: &mut App, code, modifiers| {
+            handle_chat_key(app, KeyEvent::new(code, modifiers));
+        };
+        let wheel = |app: &mut App, kind| {
+            handle_mouse(
+                app,
+                MouseEvent {
+                    kind,
+                    column: 40,
+                    row: 10,
+                    modifiers: KeyModifiers::NONE,
+                },
+            );
+        };
+
+        for _ in 0..3 {
+            key(&mut app, KeyCode::Char('o'), KeyModifiers::CONTROL);
+            draw(&mut app, &mut terminal);
+            let expanded_height = *app.active().live.render.offsets.last().unwrap();
+            assert!(expanded_height > 10_000);
+            // Put the viewport inside the output that Ctrl+O is about to hide.
+            app.active_mut().scroll_offset = 5_000;
+            draw(&mut app, &mut terminal);
+            key(&mut app, KeyCode::Char('o'), KeyModifiers::CONTROL);
+            let collapsed = draw(&mut app, &mut terminal);
+            let max = app
+                .active()
+                .live
+                .render
+                .offsets
+                .last()
+                .unwrap()
+                .saturating_sub(17);
+            assert!(max > 20 && max < 5_000);
+            assert!(
+                app.active().scroll_offset as usize <= max,
+                "collapse retained an unreachable offset: {} > {max}",
+                app.active().scroll_offset
+            );
+            wheel(&mut app, MouseEventKind::ScrollDown);
+            let scrolled = draw(&mut app, &mut terminal);
+            assert_ne!(
+                collapsed, scrolled,
+                "one wheel step must move the transcript"
+            );
+            key(&mut app, KeyCode::PageDown, KeyModifiers::NONE);
+            assert_ne!(
+                scrolled,
+                draw(&mut app, &mut terminal),
+                "paging must also work"
+            );
+        }
+
+        // Header clicks use the same clamp, not only the global Ctrl+O path.
+        for _ in 0..2 {
+            draw(&mut app, &mut terminal);
+            let cache = &app.active().live.render;
+            let header = cache
+                .clicks
+                .iter()
+                .find_map(|&(line, target)| {
+                    matches!(target, ClickTarget::ToggleEntryExpanded(50)).then_some(line)
+                })
+                .unwrap();
+            app.active_mut().scroll_offset = cache
+                .offsets
+                .last()
+                .unwrap()
+                .saturating_sub(17)
+                .saturating_sub(cache.offsets[header])
+                as u16;
+            draw(&mut app, &mut terminal);
+            let region = app
+                .click_regions
+                .iter()
+                .find(|r| matches!(r.target, ClickTarget::ToggleEntryExpanded(50)))
+                .copied()
+                .expect("tool header must be visible and clickable");
+            handle_mouse(
+                &mut app,
+                MouseEvent {
+                    kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                    column: region.x,
+                    row: region.y,
+                    modifiers: KeyModifiers::NONE,
+                },
+            );
+            let before = draw(&mut app, &mut terminal);
+            wheel(&mut app, MouseEventKind::ScrollDown);
+            assert_ne!(before, draw(&mut app, &mut terminal));
+        }
+        assert!(app.active().expanded_entries.is_empty());
+
+        // Scrolling past the top must not accumulate invisible wheel/key debt.
+        app.active_mut().scroll_offset = u16::MAX;
+        let top = draw(&mut app, &mut terminal);
+        key(&mut app, KeyCode::Down, KeyModifiers::NONE);
+        assert_ne!(top, draw(&mut app, &mut terminal));
+        wheel(&mut app, MouseEventKind::ScrollUp);
+        assert_eq!(top, draw(&mut app, &mut terminal));
+        // Reaching the bottom intentionally keeps following new entries.
+        app.active_mut().scroll_offset = 0;
+        let bottom = draw(&mut app, &mut terminal);
+        app.active_mut()
+            .entries
+            .push(entry("user", "new tail marker", EntryType::Message));
+        app.active_mut().touch_transcript();
+        assert_ne!(bottom, draw(&mut app, &mut terminal));
+        assert_eq!(app.active().scroll_offset, 0);
+        key(&mut app, KeyCode::Char('x'), KeyModifiers::NONE);
+        assert_eq!(app.input, "x", "the composer must remain editable");
     }
 
     #[tokio::test]
