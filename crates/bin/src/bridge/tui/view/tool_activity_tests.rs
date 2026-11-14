@@ -420,7 +420,7 @@ async fn nested_tool_run_identity_separates_attempt_branch_agent_and_request() {
     }
     reload(&mut app).await;
     assert_eq!(app.active().live.tool_activity.runs.len(), 4);
-    app.expand_all = true;
+    app.active_mut().expand_all = true;
     draw(&mut app, 120, 90);
     let source = text(&app);
     for n in 0..4 {
@@ -535,10 +535,10 @@ async fn nested_tool_outcomes_missing_expiry_and_stop_request_are_honest() {
         .await;
     }
     reload(&mut app).await;
-    app.expand_all = true;
+    app.active_mut().expand_all = true;
     draw(&mut app, 100, 90);
     let source = text(&app);
-    app.expand_all = false;
+    app.active_mut().expand_all = false;
     draw(&mut app, 3, 90);
     let header = app.active().live.render.clicks[0].0;
     assert_eq!(
@@ -546,7 +546,7 @@ async fn nested_tool_outcomes_missing_expiry_and_stop_request_are_honest() {
         "!",
         "failure marker survives a one-cell pane"
     );
-    app.expand_all = true;
+    app.active_mut().expand_all = true;
     assert!(source.contains("stop requested by user"));
     assert!(source.contains("outcome unknown"));
     assert!(source.contains("Result: Success"));
@@ -692,7 +692,7 @@ async fn nested_tool_toggles_refresh_keyboard_mouse_and_copy_keep_identity() {
         &mut app,
         KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL),
     );
-    assert!(app.expand_all);
+    assert!(app.active().expand_all);
     // Local command rows sort with persisted rows but have no evidence ID.
     let mut local = entry("system", "local output", EntryType::Message);
     local.timestamp = attempt.started_at - chrono::Duration::seconds(1);
@@ -821,7 +821,7 @@ async fn nested_tool_toggles_refresh_keyboard_mouse_and_copy_keep_identity() {
     app.input = "/expand".into();
     app.cursor = app.input.len();
     input::handle_chat_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-    assert!(!app.expand_all);
+    assert!(!app.active().expand_all);
     let stored = refresh::load_session_snapshot("tools", session.database().clone())
         .await
         .unwrap();
@@ -935,7 +935,7 @@ async fn nested_tool_legacy_history_is_unpaired_and_full_available_text_expandab
         .unwrap();
     reload(&mut app).await;
     assert!(app.active().live.tool_activity.runs.is_empty());
-    app.expand_all = true;
+    app.active_mut().expand_all = true;
     draw(&mut app, 80, 40);
     let source = text(&app);
     assert_eq!(source.matches("unpaired / identity unavailable").count(), 2);
@@ -981,7 +981,7 @@ async fn nested_tool_wrapped_scrolled_header_hits_exclude_provenance_and_bodies(
     append(&session, record(&attempt, 0, model(0, 2, "commentary"))).await;
     reload(&mut app).await;
     app.active_mut().active_turns = 0;
-    app.expand_all = true;
+    app.active_mut().expand_all = true;
     for width in [20, 40, 80] {
         app.active_mut().scroll_offset = 0;
         draw(&mut app, width, 24);

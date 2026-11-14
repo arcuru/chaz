@@ -463,8 +463,8 @@ pub(super) enum ClickTarget {
     /// Close tab at the given index.
     TabClose(usize),
     /// Flip the per-entry expand override on the active tab's entry at the
-    /// given index. Inverts against `App::expand_all`, so the click always
-    /// produces the opposite of whatever's currently rendered.
+    /// given index. Inverts against the tab's `expand_all` default, so the
+    /// click always produces the opposite of whatever's currently rendered.
     ToggleEntryExpanded(usize),
     ToggleToolRun(usize),
     ToggleToolItem(usize),
@@ -529,9 +529,15 @@ pub(super) struct Tab {
     /// Session/per-agent pin, retaining any backend prefix. Kept separate from
     /// defaults so live agent edits can re-resolve unpinned models on draw.
     pub model_pin: Option<String>,
-    /// Per-entry expand override (entry index → "opposite of `App::expand_all`").
-    /// Empty by default; click on an entry's header row toggles its presence here.
+    /// Per-entry expand override (entry index → "opposite of the tab's
+    /// `expand_all` default"). Empty by default; click on an entry's header
+    /// row toggles its presence here.
     pub expanded_entries: HashSet<usize>,
+    /// This session's expansion default: when true, tool calls / tool
+    /// results / directives render their full content; when false (the
+    /// default), they collapse to a one-line summary. Toggled by Ctrl+O or
+    /// `/expand` for the active session only — every tab keeps its own.
+    pub expand_all: bool,
     /// Backend-derived state refreshed off the input/render path, plus the
     /// transcript render cache. See [`refresh`].
     pub(in crate::bridge::tui) live: refresh::TabLive,
@@ -655,10 +661,6 @@ pub(super) struct App {
     /// path; the deferred at-startup work clears it once the gate opens.
     /// Defaults `true` so steady-state and tests show no indicator.
     pub(super) startup_ready: bool,
-    /// When true, tool calls / tool results / directives render their full
-    /// content. When false (default), they collapse to a one-line summary.
-    /// Toggled by Ctrl+O or `/expand`.
-    pub(super) expand_all: bool,
     pub(super) session_list: Vec<SessionInfo>,
     /// Whether the current catalog snapshot is reusable on the next open.
     pub(super) session_list_fresh: bool,
@@ -859,7 +861,6 @@ impl App {
             backend_available: true,
             debug_mode: false,
             startup_ready: true,
-            expand_all: false,
             session_list: Vec::new(),
             session_list_fresh: false,
             session_indices: HashMap::new(),
@@ -1027,6 +1028,14 @@ impl App {
 
     pub(super) fn active_mut(&mut self) -> &mut Tab {
         &mut self.tabs[self.active_tab]
+    }
+
+    /// Toggle the active session's tool-expansion default (Ctrl+O /
+    /// `/expand`). Session-local: only this tab's rendering changes; every
+    /// other open session keeps its own setting.
+    pub(super) fn toggle_expand_all(&mut self) {
+        let tab = self.active_mut();
+        tab.expand_all = !tab.expand_all;
     }
 
     /// Admission must not capture a known-dead per-tab DB after the global
@@ -1895,6 +1904,7 @@ async fn tab_from_snapshot(
             .resolve_model_for_agent(&agent.name)
             .map(str::to_string),
         expanded_entries: HashSet::new(),
+        expand_all: false,
         live: {
             let mut live = refresh::TabLive::with_meta(meta, snapshot.telemetry);
             live.tool_activity = snapshot.tool_activity;
@@ -2417,6 +2427,7 @@ mod session_picker_tests {
             context_budget: 0,
             model_pin: None,
             expanded_entries: HashSet::new(),
+            expand_all: false,
             live: Default::default(),
         }
     }

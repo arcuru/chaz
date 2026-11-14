@@ -612,8 +612,8 @@ pub(super) fn ui_chat(f: &mut ratatui::Frame, app: &mut App, ext_segments: &[Str
     let inner_width = messages_area.width.saturating_sub(2);
     let messages_height = messages_area.height.saturating_sub(2);
 
-    let (debug_mode, expand_all) = (app.debug_mode, app.expand_all);
     let active_tab = app.active_tab;
+    let (debug_mode, expand_all) = (app.debug_mode, app.tabs[active_tab].expand_all);
     refresh_transcript(
         &mut app.tabs[active_tab],
         &app.agent_names,
@@ -814,7 +814,11 @@ pub(super) fn ui_chat(f: &mut ratatui::Frame, app: &mut App, ext_segments: &[Str
     }
 
     let debug_indicator = if app.debug_mode { " | DEBUG" } else { "" };
-    let expand_indicator = if app.expand_all { " | EXP" } else { "" };
+    let expand_indicator = if app.active().expand_all {
+        " | EXP"
+    } else {
+        ""
+    };
     // Fast-start: the TUI draws before the deferred at-startup work (agent
     // reconcile) finishes. Surface that so a held first turn doesn't look
     // like a hang. Clears itself once the gate opens.
@@ -1325,7 +1329,7 @@ fn build_transcript(
             }
             EntryType::MatrixSent | EntryType::Unknown { .. } => {} // Inert audit records.
             // Directives, ToolCall, ToolResult are collapsible. Per-entry
-            // override flips the global default (`expand_all`).
+            // override flips the session's default (`expand_all`).
             EntryType::Directive => {
                 let expanded = expand_all != tab.expanded_entries.contains(&entry_idx);
                 let icon = if expanded { "▾" } else { "▸" };
@@ -2288,6 +2292,7 @@ mod chat_frame_tests {
             roster: Vec::new(),
             context_budget: 0,
             expanded_entries: HashSet::new(),
+            expand_all: false,
             live: Default::default(),
         };
         let mut app = App::new(HashSet::new(), tab);
@@ -2948,6 +2953,7 @@ mod transcript_tests {
             roster: Vec::new(),
             context_budget: 0,
             expanded_entries: HashSet::new(),
+            expand_all: false,
             live: Default::default(),
         };
         tab.set_entries(entries);
@@ -3198,7 +3204,7 @@ mod transcript_tests {
         ])
         .await;
         app.active_mut().active_turns = 0;
-        app.expand_all = true;
+        app.active_mut().expand_all = true;
         let mut terminal = Terminal::new(TestBackend::new(64, 20)).unwrap();
         terminal.draw(|f| ui_chat(f, &mut app, &[])).unwrap();
         let drawn = rows(&terminal, 0, 20);
@@ -3245,7 +3251,7 @@ mod transcript_tests {
         let (_instance, mut app) = app_with(entries).await;
         app.active_mut().session_name = Some("render-demo".into());
         app.active_mut().active_turns = 0;
-        app.expand_all = true;
+        app.active_mut().expand_all = true;
         let mut terminal = Terminal::new(TestBackend::new(64, 60)).unwrap();
         terminal.draw(|f| ui_chat(f, &mut app, &[])).unwrap();
         let drawn = rows(&terminal, 0, 60);
@@ -3298,7 +3304,7 @@ mod transcript_tests {
             ),
         ])
         .await;
-        app.expand_all = true;
+        app.active_mut().expand_all = true;
         let mut terminal = Terminal::new(TestBackend::new(64, 24)).unwrap();
         terminal.draw(|f| ui_chat(f, &mut app, &[])).unwrap();
         let screen = screen_text(&terminal);
@@ -3695,7 +3701,7 @@ mod transcript_tests {
         let rebuilt = app.active().live.render.lines_ptr();
         assert_ne!(rebuilt, built);
         assert!(rows(&terminal, 0, 30).join("\n").contains("new message"));
-        app.expand_all = true;
+        app.active_mut().expand_all = true;
         terminal.draw(|f| ui_chat(f, &mut app, &[])).unwrap();
         assert_ne!(app.active().live.render.lines_ptr(), rebuilt);
     }
