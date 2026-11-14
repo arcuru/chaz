@@ -183,6 +183,10 @@ impl MockBackend {
 }
 
 impl BackendDispatch for MockBackend {
+    fn default_model(&self) -> Option<String> {
+        Some(self.default_model.clone())
+    }
+
     fn execute<'a>(
         &'a self,
         context: &'a crate::backends::ChatContext,
