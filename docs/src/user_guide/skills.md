@@ -76,13 +76,13 @@ No bodies. No keyword scoring. The LLM picks based on the descriptions and calls
 
 These are registered with the runtime so the LLM can invoke them like any other tool. All three are low-risk (read-only catalog access).
 
-| Tool           | What it does                                                           |
-| -------------- | ---------------------------------------------------------------------- |
-| `skill_list`   | List loaded **disk** skills with name, description, and triggers       |
-| `skill_search` | Substring-search disk skills by name, description, or trigger keyword  |
-| `skill_show`   | Resolve a name against all four sources and return the full skill body |
+| Tool           | What it does                                                                                              |
+| -------------- | --------------------------------------------------------------------------------------------------------- |
+| `skill_list`   | List available skills (all sources) with name, description, and triggers (disk skills only have triggers) |
+| `skill_search` | Substring-search available skills (all sources) by name, description, or trigger keyword                  |
+| `skill_show`   | Resolve a name against all four sources and return the full skill body                                    |
 
-`skill_list` and `skill_search` currently only see disk skills; `skill_show` walks all four sources in the priority order above. (This asymmetry is a known v1 limitation — bodies are reachable from anywhere; the listing tools haven't been unified yet.)
+All three tools resolve skills through the same four-source composition (disk → agent-private → granted banks → session-attached banks, first definition wins), so the in-prompt catalog, `skill_list`/`skill_search`, and `skill_show` always agree on what is available and which definition of a duplicated name wins. Skills whose `requires_tools` list names tools the agent does not have are suppressed from every discovery surface the same way.
 
 ## The `/skills` commands
 
