@@ -119,6 +119,7 @@ pub(super) async fn fixture_with_extensions(
         context_budget: 0,
         model_pin: None,
         expanded_entries: HashSet::new(),
+        expand_all: false,
         live: Default::default(),
     };
     let mut app = App::new(HashSet::new(), tab);

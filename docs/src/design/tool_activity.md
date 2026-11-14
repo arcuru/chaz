@@ -35,7 +35,8 @@ these headers wrap to fit the pane.
 Expanding an item reveals complete recorded arguments, result, outcome and
 provenance.
 The outer toggle retains inner choices.
-The existing `Ctrl+O` and `/expand` global override applies to both levels;
+The existing `Ctrl+O` and `/expand` override — now a per-session default —
+applies to both levels;
 `Ctrl+T` remains new-tab, not expansion.
 No new keyboard mode, inspector pane, persistence preference or summarizer is
 needed.

@@ -752,7 +752,7 @@ async fn session_shortcuts_create_focus_and_retain_the_previous_conversation() {
         action,
         ChatAction::Dispatch(Command::NewSession(None))
     ));
-    assert!(!app.expand_all, "Ctrl+T still toggles expansion");
+    assert!(!app.active().expand_all, "Ctrl+T still toggles expansion");
     handle_chat_action(
         action, &mut app, &server, &backend, &secrets, &approval, &notify, &models, &rows,
     );
@@ -777,10 +777,14 @@ async fn session_shortcuts_create_focus_and_retain_the_previous_conversation() {
     let expand_key = KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL);
     for expanded in [true, false] {
         assert!(input::handle_chat_key(&mut app, expand_key).is_none());
-        assert_eq!(app.expand_all, expanded);
+        assert_eq!(app.active().expand_all, expanded);
         let old_key = KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL);
         assert!(input::handle_chat_key(&mut app, old_key).is_none());
-        assert_eq!(app.expand_all, expanded, "Ctrl+R still toggles expansion");
+        assert_eq!(
+            app.active().expand_all,
+            expanded,
+            "Ctrl+R still toggles expansion"
+        );
         let screen = frame(&mut app, &server, &backend, 160, 30);
         assert_eq!(screen.contains(" | EXP"), expanded, "{screen}");
     }
@@ -797,6 +801,51 @@ async fn session_shortcuts_create_focus_and_retain_the_previous_conversation() {
     assert_eq!(app.tabs.len(), 3);
     assert_eq!(app.active_tab, 2);
     assert_eq!(session_ids(&server).await.len(), before.len() + 2);
+}
+
+#[tokio::test]
+async fn expand_toggle_is_session_local() {
+    use super::super::handle_chat_action;
+
+    let (_instance, server, backend, mut app) = fixture().await;
+    let (approval, notify, _) = channels();
+    let (models, _) = mpsc::channel(4);
+    let (rows, _) = mpsc::channel(128);
+    let secrets = SecretStore::new(server.registry().chaz_peer().clone()).await;
+
+    // A second session in its own tab.
+    let new_key = KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL);
+    let action = input::handle_chat_key(&mut app, new_key).unwrap();
+    handle_chat_action(
+        action, &mut app, &server, &backend, &secrets, &approval, &notify, &models, &rows,
+    );
+    settle(&mut app).await;
+    assert_eq!(app.tabs.len(), 2);
+
+    // Toggling Ctrl+O in the active (second) session expands only that tab.
+    let expand_key = KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL);
+    assert!(input::handle_chat_key(&mut app, expand_key).is_none());
+    assert!(app.active().expand_all);
+    assert!(
+        !app.tabs[0].expand_all,
+        "first session must keep its own default"
+    );
+    assert!(frame(&mut app, &server, &backend, 160, 30).contains(" | EXP"));
+
+    // The first session is unchanged when it becomes the active one: no EXP
+    // indicator, and toggling it does not disturb the second session.
+    super::super::cycle_tab(&mut app, -1);
+    assert!(!frame(&mut app, &server, &backend, 160, 30).contains(" | EXP"));
+    assert!(input::handle_chat_key(&mut app, expand_key).is_none());
+    assert!(app.active().expand_all);
+    assert!(app.tabs[1].expand_all, "second session keeps its expansion");
+
+    // `/expand` is per-session too: submitting it in the first session
+    // collapses that tab only, leaving the second session expanded.
+    app.input = "/expand".into();
+    assert!(input::handle_chat_key(&mut app, key(KeyCode::Enter)).is_none());
+    assert!(!app.active().expand_all);
+    assert!(app.tabs[1].expand_all, "second session keeps its expansion");
 }
 
 #[tokio::test]
@@ -822,7 +871,7 @@ async fn session_shortcuts_respect_modes_and_modals() {
             ));
         }
         assert!(app.overlay.is_some());
-        assert!(!app.expand_all);
+        assert!(!app.active().expand_all);
         if let Some(Overlay::RenamePrompt { input, .. }) = &app.overlay {
             assert_eq!(input, "draft");
         }
@@ -841,7 +890,7 @@ async fn session_shortcuts_respect_modes_and_modals() {
         assert!(input::handle_chat_key(&mut app, ctrl(c)).is_none());
         assert!(app.has_pending_approval());
     }
-    assert!(!app.expand_all);
+    assert!(!app.active().expand_all);
     assert!(decision_rx.try_recv().is_err());
     app.active_mut().pending_approval = None;
 
@@ -892,7 +941,7 @@ async fn session_shortcuts_respect_modes_and_modals() {
     input::handle_picker_key(&mut app, key(KeyCode::Char('r')));
     assert!(matches!(app.overlay, Some(Overlay::RenamePrompt { .. })));
     assert_eq!(app.tabs.len(), 1);
-    assert!(!app.expand_all);
+    assert!(!app.active().expand_all);
     assert!(
         input::command_catalog()
             .iter()

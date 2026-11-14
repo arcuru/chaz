@@ -118,7 +118,7 @@ An ordinary launch opens the [session hub](#session-hub) rather than any convers
 | Collapsed tool run             | Two clipped rows: agent, run label, call count, lifecycle and outcome counts                      |
 | Click either run-summary row   | Show or hide that run's tools; agent prose stays visible                                          |
 | Click a nested tool header     | Show or hide complete recorded arguments, result and provenance                                   |
-| `Ctrl+O` or `/expand`          | Invert the global expansion default for runs, items and directives                                |
+| `Ctrl+O` or `/expand`          | Invert this session's expansion default for runs, items and directives                            |
 | Expanded JSON                  | An indented outline with decoded string values; malformed JSON stays plain text                   |
 | `/debug` with an item expanded | Original argument/result spelling, still sanitized                                                |
 | Unpaired audit entry           | Identity unavailable; expandable independently, never paired by proximity                         |
@@ -240,8 +240,8 @@ until a background retry succeeds.
 
 3. Close the run and reopen it.
    The second item's detail choice is retained.
-   Use `Ctrl+O` or `/expand` to invert the global default without sending a
-   message, rerunning a tool or creating a tab.
+   Use `Ctrl+O` or `/expand` to invert this session's default without sending
+   a message, rerunning a tool or creating a tab.
 4. If the attempt completes without the first result, that item says
    `missing result`, not `done`.
    A later identity-matched result updates the same item.
@@ -606,7 +606,8 @@ position. Settings and the model picker do not create sessions on `Ctrl+T`; pres
 
 `Ctrl+O` changes only the chat display, just like `/expand`. It expands or collapses
 tool runs, nested call/result items and directives without changing stored or
-model-facing history. `Ctrl+R` still refreshes the catalog in the model picker. Plain `r` still
+model-facing history. The default is per session: each open tab remembers its own
+expansion setting, so toggling never disturbs another session's transcript. `Ctrl+R` still refreshes the catalog in the model picker. Plain `r` still
 renames a session in the hub and keeps its existing Settings actions.
 These bindings are built in; the TUI has no configurable keymap.
 
@@ -614,7 +615,8 @@ These bindings are built in; the TUI has no configurable keymap.
 2. Run `/name first`, then press `Ctrl+T` again. The new tab is focused and the
    `first` tab remains open. Press `Ctrl+H` to return to `first`.
 3. Press `Ctrl+O`. The status bar adds `EXP`; press it again to collapse the
-   transcript. This does not create a tab.
+   transcript. This does not create a tab and leaves the `first` tab's own
+   expansion setting untouched.
 4. Open help with `F1` and press `Ctrl+T`. No session opens while help owns the
    keyboard. Press `Esc`, then `Ctrl+T` to create the next session.
 

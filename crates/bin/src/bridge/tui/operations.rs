@@ -792,6 +792,7 @@ mod tests {
                 context_budget: 0,
                 model_pin: None,
                 expanded_entries: HashSet::new(),
+                expand_all: false,
                 live: Default::default(),
             },
         )
@@ -1026,7 +1027,7 @@ mod tests {
         app.input = "/expand".into();
         app.cursor = app.input.len();
         input::handle_chat_key(&mut app, key(KeyCode::Enter));
-        assert!(app.expand_all);
+        assert!(app.active().expand_all);
         app.backend_available = true;
         for _ in 0..CAPACITY {
             submit(&mut app, true, None, std::future::pending());

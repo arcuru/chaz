@@ -937,6 +937,7 @@ mod tests {
             roster: Vec::new(),
             context_budget: 0,
             expanded_entries: HashSet::new(),
+            expand_all: false,
             live: TabLive::default(),
         }
     }

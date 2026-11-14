@@ -745,7 +745,7 @@ pub(super) fn handle_chat_key(app: &mut App, key: KeyEvent) -> Option<ChatAction
                 ));
             }
             KeyCode::Char('o') => {
-                app.expand_all = !app.expand_all;
+                app.toggle_expand_all();
                 return None;
             }
             KeyCode::Char('r') => return None,
@@ -959,7 +959,7 @@ fn parse_chat_line(app: &mut App, text: &str) -> Option<ChatAction> {
             return None;
         }
         "/expand" => {
-            app.expand_all = !app.expand_all;
+            app.toggle_expand_all();
             return None;
         }
         "/raw" => {
