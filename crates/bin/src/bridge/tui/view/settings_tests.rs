@@ -2999,3 +2999,77 @@ async fn agent_diff_cursor_keeps_workers_and_values_visible() {
     }
     server.shutdown().await;
 }
+
+#[tokio::test]
+async fn reasoning_keys_settings_and_status_share_the_current_session() {
+    use chaz_core::{
+        commands::Command,
+        config::{Backend, ReasoningEffort},
+    };
+    let backend_config: Backend = serde_yaml::from_str("type: openaicompatible\nmodels:\n  - name: reasoner\n    reasoning: {effort: high, supported_efforts: [low, high]}\n").unwrap();
+    let (_instance, server, backend, mut app) =
+        super::list_tests::fixture_with_extensions(Some(vec![backend_config]), vec![]).await;
+    app.mode = TuiMode::Chat;
+    app.active_mut().live.meta.reasoning_overrides.insert(
+        backend.reasoning_key(None).unwrap(),
+        Some(ReasoningEffort::Low),
+    );
+    let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+    let rows = draw(&mut terminal, &mut app, &server, &backend);
+    assert!(contains(&rows, "reasoning: low"), "{rows:?}");
+    assert_eq!(
+        app.active()
+            .live
+            .reasoning
+            .as_ref()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .effort,
+        Some(ReasoningEffort::Low)
+    );
+    app.active_mut().session_name = Some("long-name ".repeat(40));
+    let mut narrow = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    let rows = draw(&mut narrow, &mut app, &server, &backend);
+    assert!(contains(&rows, "reasoning: low"), "{rows:?}");
+    app.active_mut().session_name = None;
+    app.input = "/model".into();
+    app.cursor = app.input.len();
+    let draft = app.input.clone();
+    assert!(
+        matches!(input::handle_chat_key(&mut app, KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT)), Some(super::super::ChatAction::Dispatch(Command::Reasoning(Some(arg)))) if arg == "cycle")
+    );
+    assert_eq!(app.input, draft);
+    open(&mut app, SettingsScope::Session, 2);
+    let rows = draw(&mut terminal, &mut app, &server, &backend);
+    assert!(
+        contains(&rows, "Current-agent reasoning: low (session)"),
+        "{rows:?}"
+    );
+    for (keycode, arg) in [
+        (KeyCode::Char('r'), "cycle"),
+        (KeyCode::Char('p'), "provider"),
+        (KeyCode::Char('d'), "default"),
+    ] {
+        assert!(
+            matches!(key(&mut app, keycode), input::SettingsKey::DispatchCommand(Command::Reasoning(Some(a))) if a == arg)
+        );
+    }
+    // Shift+Tab in Settings still navigates categories, not reasoning.
+    assert!(matches!(
+        key(&mut app, KeyCode::BackTab),
+        input::SettingsKey::None
+    ));
+    assert_eq!(app.session_settings_index, 1);
+    // A dead backend never accepts a keyboard mutation or consumes the draft.
+    app.mode = TuiMode::Chat;
+    app.backend_available = false;
+    assert!(
+        input::handle_chat_key(
+            &mut app,
+            KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT)
+        )
+        .is_none()
+    );
+    assert_eq!(app.input, draft);
+}

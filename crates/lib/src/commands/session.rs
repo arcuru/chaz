@@ -950,3 +950,104 @@ mod listing_tests {
         );
     }
 }
+
+/// Settings, Shift+Tab and text commands all use this same persisted operation.
+pub(super) async fn reasoning(arg: Option<String>, ctx: &CommandContext<'_>) -> CommandOutcome {
+    match reasoning_result(arg, ctx).await {
+        Ok(text) => CommandOutcome::Text(text),
+        Err(error) => CommandOutcome::Error(error.to_string()),
+    }
+}
+
+async fn reasoning_result(arg: Option<String>, ctx: &CommandContext<'_>) -> anyhow::Result<String> {
+    use crate::config::ReasoningEffort;
+    let session = Session::try_new(
+        ConversationId(ctx.session_db_id.into()),
+        ctx.session_db.clone(),
+    )
+    .await?;
+    let meta = session.try_read_meta().await?;
+    let agent_default = ctx
+        .server
+        .agents()
+        .get(ctx.current_agent)
+        .and_then(|a| a.default_model.clone());
+    let model = meta
+        .resolve_model_for_agent(ctx.current_agent)
+        .or(agent_default.as_deref());
+    let scoped = ctx
+        .backend
+        .with_reasoning_overrides(meta.reasoning_overrides.clone());
+    // Default/provider are also recovery paths for a stale override after config edits.
+    let key = ctx
+        .backend
+        .reasoning_key(model)
+        .ok_or_else(|| anyhow::anyhow!("No backends configured"))?;
+    let defaults = ctx
+        .backend
+        .with_reasoning_overrides([(key.clone(), None)].into())
+        .reasoning_state(model)
+        .map_err(anyhow::Error::msg)?;
+    let arg = arg.as_deref().map(str::to_ascii_lowercase);
+    let mut overrides = meta.reasoning_overrides.clone();
+    match arg.as_deref() {
+        None | Some("") => {}
+        Some("default" | "reset") => {
+            overrides.remove(&key);
+        }
+        Some("provider") => {
+            overrides.insert(key, None);
+        }
+        Some("cycle") => {
+            anyhow::ensure!(
+                !defaults.supported.is_empty(),
+                "No supported reasoning efforts declared for this model"
+            );
+            let current = scoped
+                .reasoning_state(model)
+                .map_err(anyhow::Error::msg)?
+                .effort;
+            let options: Vec<Option<ReasoningEffort>> = std::iter::once(None)
+                .chain(defaults.supported.iter().copied().map(Some))
+                .collect();
+            let i = options.iter().position(|e| *e == current).unwrap_or(0);
+            overrides.insert(key, options[(i + 1) % options.len()]);
+        }
+        Some(value) => {
+            let effort = ReasoningEffort::ALL.into_iter().find(|e| e.as_str() == value)
+                .ok_or_else(|| anyhow::anyhow!("Usage: /reasoning [default|provider|cycle|none|minimal|low|medium|high|xhigh|max]"))?;
+            anyhow::ensure!(
+                defaults.supported.contains(&effort),
+                "Reasoning '{}' is unsupported for this model",
+                effort.as_str()
+            );
+            overrides.insert(key, Some(effort));
+        }
+    }
+    let state = ctx
+        .backend
+        .with_reasoning_overrides(overrides.clone())
+        .reasoning_state(model)
+        .map_err(anyhow::Error::msg)?;
+    if arg.as_deref().is_some_and(|s| !s.is_empty()) {
+        session
+            .update_meta(|meta| meta.reasoning_overrides = overrides)
+            .await?;
+    }
+    let supported = state
+        .supported
+        .iter()
+        .map(|e| e.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    Ok(format!(
+        "Reasoning: {}\nSupported: provider{}{}\n/reasoning default restores configured defaults; changes apply to subsequent turns for this model in this session.",
+        state.label(),
+        if supported.is_empty() { "" } else { ", " },
+        supported
+    ))
+}
+
+#[cfg(test)]
+#[path = "reasoning_tests.rs"]
+mod reasoning_tests;

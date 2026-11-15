@@ -1756,3 +1756,53 @@ inclusion unconfirmed`. A returned response changes the receipt to
    actual reconnect, the same observer and draft recover without another job turn.
    A stale start is not an invitation to replay: inspect the attempt before
    using the separate explicit retry workflow outside the job observer.
+
+## Reasoning without leaving the conversation
+
+The status bar's `reasoning: high` (or another effort) is the current chat agent's next-turn selection.
+`reasoning: provider` means no effort control will be sent; `reasoning: invalid` means resolution failed and a request will refuse rather than silently dropping the setting.
+Use `/reasoning` for the effective level, its source, and supported options.
+Defaults and capability declarations are described in [Reasoning defaults and session overrides](configuration.md#reasoning-defaults-and-session-overrides).
+
+| Control                           | Action                                                                                                      |
+| --------------------------------- | ----------------------------------------------------------------------------------------------------------- |
+| `Shift+Tab` in chat               | Cycle provider-default and the supported levels for this model in this session; preserve the composer draft |
+| `/reasoning <level>`              | Select a declared effort, including explicit `none` when supported                                          |
+| `/reasoning provider`             | Send no effort field, even if configured defaults specify one                                               |
+| `/reasoning default` (or `reset`) | Remove this model's session override and inherit configured defaults                                        |
+| `/settings` → Models → `r`        | Cycle reasoning for the **current chat agent's** effective model                                            |
+| `/settings` → Models → `p` / `d`  | Select provider default / restore configured defaults for that model                                        |
+
+Settings labels the reasoning target separately from the highlighted model-pin scope.
+It does not edit reasoning for another highlighted agent.
+In Settings, `Shift+Tab` still navigates categories; in chat it cycles reasoning even while a command-completion popup is open.
+Up/Down still select completions.
+An unavailable backend or full action queue refuses changes without consuming the draft.
+The status updates after the saved metadata is observed; a running turn keeps its original snapshot.
+
+### Walkthrough: high by default, low for a quick question
+
+1. Configure `default_reasoning: high` and the `example/model` capability list from the configuration example above, then open a conversation with that model.
+   `/reasoning` begins with:
+   ```text
+   Reasoning: high (global default)
+   Supported: provider, none, low, medium, high
+   ```
+2. Open `/settings` → Models and press `r`.
+   The cycle wraps from high to provider default; press `r` again for `none`, then again for `low`.
+   Return to chat: the status bar shows `reasoning: low`.
+   Your next question retains the conversation context and sends `reasoning_effort: "low"`.
+   `Shift+Tab` in chat advances from low to medium without submitting the composer.
+3. Try `/reasoning xhigh` on this model:
+   ```text
+   Reasoning 'xhigh' is unsupported for this model
+   ```
+   The saved selection stays unchanged and no provider probe is sent.
+   Select `/reasoning default` to recover the configured high preference:
+   ```text
+   Reasoning: high (global default)
+   ```
+4. Select `/reasoning low`, switch to another model, then switch back.
+   This model still shows low; reopening this session also restores it.
+   Another conversation still uses its own defaults or saved selections.
+   If an operator later removes low from the declared capabilities, requests refuse until you select a valid value or use `/reasoning provider` or `/reasoning default`.

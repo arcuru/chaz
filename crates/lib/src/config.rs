@@ -28,6 +28,9 @@ pub struct Config {
     pub chat_summary_model: Option<String>,
     /// Backend configuration
     pub backends: Option<Vec<Backend>>,
+    /// Default reasoning effort for models that declare supported efforts.
+    /// Omit to preserve provider defaults; per-model defaults take precedence.
+    pub default_reasoning: Option<ReasoningEffort>,
     /// Agent definitions
     pub agents: Option<Vec<AgentConfig>>,
     /// Names of agents auto-attached to every freshly-created session, in
@@ -741,10 +744,10 @@ impl Backend {
         let effort = reasoning.effort;
         match (self.api_for_model(model), reasoning.format) {
             (ModelApi::ChatCompletions, None | Some(ReasoningFormat::OpenRouter)) => {
-                Ok(Some(ReasoningControl::Object(effort)))
+                Ok(effort.map(ReasoningControl::Object))
             }
             (ModelApi::ChatCompletions, Some(ReasoningFormat::OpenAI)) => {
-                Ok(Some(ReasoningControl::TopLevel(effort)))
+                Ok(effort.map(ReasoningControl::TopLevel))
             }
             (api, Some(format)) => Err(format!(
                 "backend '{}' model '{model}': reasoning.format '{}' selects a Chat Completions field, but the model's API is '{}'. Remove reasoning.format; {}",
@@ -756,7 +759,7 @@ impl Backend {
                     _ => "Chaz sends no reasoning control on native Anthropic Messages",
                 },
             )),
-            (ModelApi::Responses, None) => Ok(Some(ReasoningControl::Object(effort))),
+            (ModelApi::Responses, None) => Ok(effort.map(ReasoningControl::Object)),
             (ModelApi::AnthropicMessages, None) => Ok(None),
         }
     }
@@ -790,12 +793,13 @@ pub fn reasoning_report(backends: &[Backend]) -> ReasoningReport {
                     control.field(),
                     control.effort().as_str(),
                 )),
-                Ok(None) => report.not_sent.push(format!(
+                Ok(None) if reasoning.effort.is_some() => report.not_sent.push(format!(
                     "backend '{name}' model '{}': reasoning.effort={} is not sent; Chaz has no reasoning control for the {} API, so the provider default applies",
                     model.name,
-                    reasoning.effort.as_str(),
+                    reasoning.effort.map(ReasoningEffort::as_str).unwrap_or("provider"),
                     api.as_str(),
                 )),
+                Ok(None) => {},
                 Err(message) => report.conflicts.push(message),
             }
         }
@@ -809,8 +813,8 @@ pub struct Model {
     pub name: String,
     /// Request API override for this exact model id on its backend.
     pub api: Option<ModelApi>,
-    /// Reasoning effort for requests to this model. Omit to send no
-    /// reasoning control and leave the provider's default unchanged.
+    /// Reasoning defaults, capabilities and Chat dialect for this model.
+    /// Omit to send no reasoning control; session selections require known capabilities.
     pub reasoning: Option<ReasoningConfig>,
     /// Input token price in USD per million tokens, if known. Surfaced in
     /// the TUI model picker; optional because backends typically don't
@@ -838,14 +842,19 @@ pub struct Model {
 /// Reasoning settings for one configured model.
 ///
 /// This is deliberately model-scoped: one backend commonly serves models
-/// with different reasoning defaults. The configured value applies to every
-/// request for the named model; there is no per-request override.
+/// with different reasoning capabilities. Session overrides take precedence
+/// over this default without changing the backend configuration.
 #[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
 pub struct ReasoningConfig {
     /// How hard the provider should think for this model. Which values a
     /// provider accepts, and whether `none` disables thinking, depends on
     /// the model, API and provider.
-    pub effort: ReasoningEffort,
+    #[serde(default)]
+    pub effort: Option<ReasoningEffort>,
+    /// Explicit capability list. Absent: only the configured effort is known.
+    /// Empty: no supported effort controls. No model-name heuristics are used.
+    #[serde(default)]
+    pub supported_efforts: Option<Vec<ReasoningEffort>>,
     /// Chat Completions wire field for `effort`. Omit to keep the legacy
     /// `reasoning: {effort}` object. Only valid when the model's effective
     /// API is Chat Completions; native APIs use their own encoding.
@@ -856,7 +865,7 @@ pub struct ReasoningConfig {
 /// Reasoning effort levels Chaz can send. Unknown strings fail config
 /// parsing. Chaz forwards the value unchanged (Responses refuses `max` before
 /// sending); the provider decides what each level means for a model.
-#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "lowercase")]
 pub enum ReasoningEffort {
     None,
@@ -869,6 +878,15 @@ pub enum ReasoningEffort {
 }
 
 impl ReasoningEffort {
+    pub const ALL: [Self; 7] = [
+        Self::None,
+        Self::Minimal,
+        Self::Low,
+        Self::Medium,
+        Self::High,
+        Self::XHigh,
+        Self::Max,
+    ];
     pub fn as_str(self) -> &'static str {
         match self {
             Self::None => "none",
@@ -1208,6 +1226,7 @@ fn known_config_keys() -> HashSet<&'static str> {
         "state_dir",
         "agent_config_dir",
         "chat_summary_model",
+        "default_reasoning",
         "backends",
         "agents",
         "default_agents",
@@ -1263,6 +1282,7 @@ fn known_config_keys() -> HashSet<&'static str> {
         "backends[].models[].reasoning",
         "backends[].models[].reasoning.effort",
         "backends[].models[].reasoning.format",
+        "backends[].models[].reasoning.supported_efforts",
         "backends[].models[].price_input",
         "backends[].models[].price_output",
         "backends[].models[].price_cache_read",
@@ -1759,7 +1779,8 @@ backends:
         assert_eq!(
             b.models.as_ref().unwrap()[0].reasoning,
             Some(ReasoningConfig {
-                effort: ReasoningEffort::None,
+                supported_efforts: None,
+                effort: Some(ReasoningEffort::None),
                 format: None,
             })
         );

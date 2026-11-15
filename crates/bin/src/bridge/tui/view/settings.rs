@@ -1712,6 +1712,11 @@ pub(super) fn render_session_models(
         }
     };
 
+    let reasoning = match app.current().and_then(|tab| tab.live.reasoning.as_ref()) {
+        Some(Ok(state)) => format!("Current-agent reasoning: {}", state.label()),
+        Some(Err(error)) => format!("Current-agent reasoning: {error}"),
+        None => "Current-agent reasoning: awaiting snapshot".into(),
+    };
     let total_rows = 1 + snapshot.agents.len();
     let cursor = app.session_models_cursor.min(total_rows.saturating_sub(1));
 
@@ -1735,6 +1740,8 @@ pub(super) fn render_session_models(
             "  ─────",
             Style::default().fg(theme::DIM),
         )]),
+        Line::from(reasoning),
+        Line::from("  Reasoning: r cycle · p provider · d defaults"),
         Line::from(""),
     ];
 

@@ -138,6 +138,10 @@ pub(super) fn command_catalog() -> Vec<(&'static str, &'static str)> {
             "/model ",
             "show, or set <id> | <agent> <id> | <agent> clear",
         ),
+        (
+            "/reasoning ",
+            "show/set effort, provider, default or cycle (Shift+Tab)",
+        ),
         ("/role ", "show, select, or define a role"),
         ("/backend ", "add a custom backend (<name> <url> <key>)"),
         ("/backends", "list known backends and models"),
@@ -831,13 +835,16 @@ pub(super) fn handle_chat_key(app: &mut App, key: KeyEvent) -> Option<ChatAction
             }
         }
         KeyCode::BackTab => {
-            // Shift+Tab moves the selection up, mirroring Up.
-            if let Some(c) = app.completion.as_mut() {
-                let n = c.matches.len();
-                if n > 0 {
-                    c.selected = (c.selected + n - 1) % n;
-                }
+            if !app.backend_ready() || !app.operations.has_capacity() {
+                app.operations.notice = Some(
+                    "Backend unavailable or action queue full — reasoning change not submitted"
+                        .into(),
+                );
+                return None;
             }
+            return Some(ChatAction::Dispatch(
+                chaz_core::commands::Command::Reasoning(Some("cycle".into())),
+            ));
         }
         KeyCode::Up => {
             // When the completion popup is open, arrows move the selection;
@@ -1197,6 +1204,27 @@ pub(super) fn handle_settings_key(
     }
     let cur = app.settings_index(scope);
     let inner_list_len = settings_inner_list_len(app, scope, cur);
+    // Reasoning always targets the current chat agent's effective model, not
+    // the highlighted model-pin scope. The page labels that distinction.
+    if scope == SettingsScope::Session
+        && matches!(
+            super::SessionSettingsCategory::ALL.get(cur),
+            Some(super::SessionSettingsCategory::Models)
+        )
+        && matches!(key.code, KeyCode::Char('r' | 'p' | 'd'))
+        && !key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+    {
+        let arg = match key.code {
+            KeyCode::Char('r') => "cycle",
+            KeyCode::Char('p') => "provider",
+            _ => "default",
+        };
+        return SettingsKey::DispatchCommand(chaz_core::commands::Command::Reasoning(Some(
+            arg.into(),
+        )));
+    }
 
     // Per-category direct-action keys ([a]/[d] on the Session Agents
     // list, [r] on the Peer Agents list). Check before falling through

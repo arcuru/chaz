@@ -102,6 +102,7 @@ pub(super) struct TabLive {
     /// read cannot clear it or make cached data pass for fresh data.
     pub(super) error: Option<String>,
     errors: [Option<String>; 4],
+    pub(super) reasoning: Option<Result<chaz_core::backends::ReasoningState, String>>,
     pub(super) meta: SessionMeta,
     pub(super) telemetry: Option<chaz_core::session::usage::SessionTelemetry>,
     /// View-local command/error output is not stored in the session DB.

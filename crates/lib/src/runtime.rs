@@ -1388,6 +1388,16 @@ async fn run_turn(
     resume: Option<RuntimeResume>,
     scope: ModelCallScope,
 ) -> Result<RuntimeOutcome, TurnError> {
+    let reasoning = tool_ctx
+        .session
+        .lock()
+        .await
+        .try_read_meta()
+        .await
+        .map_err(|e| format!("Failed to read session reasoning: {e}"))?
+        .reasoning_overrides;
+    let turn_backend = backend.with_reasoning_overrides(reasoning);
+    let backend = &turn_backend;
     let resolved_model = backend.resolve_model_name(model);
     if let Some(resume) = &resume {
         // Before capability errors, projector/hooks, approval, observation or retirement.

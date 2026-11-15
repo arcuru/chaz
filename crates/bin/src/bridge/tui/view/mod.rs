@@ -328,6 +328,11 @@ pub(super) fn ui(
             .model_pin
             .as_deref()
             .or_else(|| agent.as_ref().and_then(|a| a.default_model.as_deref()));
+        tab.live.reasoning = Some(
+            backend
+                .with_reasoning_overrides(tab.live.meta.reasoning_overrides.clone())
+                .reasoning_state(requested_model),
+        );
         tab.effective_model = backend.resolve_model_name(requested_model);
         let context_model = requested_model
             .map(str::to_string)
@@ -861,9 +866,19 @@ pub(super) fn ui_chat(f: &mut ratatui::Frame, app: &mut App, ext_segments: &[Str
         format!(" | agent: {current_agent}{model_segment}")
     };
 
+    let reasoning_segment = match &app.active().live.reasoning {
+        Some(Ok(state)) => format!(
+            " | reasoning: {}",
+            state.effort.map(|e| e.as_str()).unwrap_or("provider")
+        ),
+        Some(Err(_)) => " | reasoning: invalid".into(),
+        None => String::new(),
+    };
+
     // A normal-width toolbar must keep the numeric pair visible even when a
     // session has a long name. Clip only the label, using terminal-cell widths.
-    let label_width = (chunks[4].width as usize).saturating_sub(ctx_segment.width() + 1);
+    let label_width = (chunks[4].width as usize)
+        .saturating_sub(ctx_segment.width() + reasoning_segment.width() + 1);
     let session_label = if session_label.width() > label_width {
         let mut cells = 0;
         let mut label: String = session_label
@@ -882,7 +897,7 @@ pub(super) fn ui_chat(f: &mut ratatui::Frame, app: &mut App, ext_segments: &[Str
     };
     let make_status = |agent_segment: &str| {
         format!(
-            " {session_label}{ctx_segment}{agent_segment}{usage_segment}{debug_indicator}{expand_indicator}{startup_indicator}{refresh_indicator}{operation_indicator}"
+            " {session_label}{ctx_segment}{reasoning_segment}{agent_segment}{usage_segment}{debug_indicator}{expand_indicator}{startup_indicator}{refresh_indicator}{operation_indicator}"
         )
     };
     let mut status_text = if app.active().job.is_some() {

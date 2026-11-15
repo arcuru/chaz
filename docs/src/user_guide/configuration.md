@@ -403,10 +403,16 @@ backends:
         reasoning: { effort: none }
 ```
 
-| Field                                  | Default                     | Meaning                                                                                                                                         |
-| -------------------------------------- | --------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
-| `backends[].models[].reasoning.effort` | Omitted: no control sent    | `none`, `minimal`, `low`, `medium`, `high`, `xhigh` or `max`, forwarded unchanged. Which values a model accepts is up to its provider.          |
-| `backends[].models[].reasoning.format` | Omitted: `reasoning` object | Chat Completions only. `openrouter` sends `reasoning: {"effort": …}`; `openai` sends top-level `reasoning_effort`. Unknown values fail parsing. |
+| Field                                  | Default                            | Meaning                                                                                                                                         |
+| -------------------------------------- | ---------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
+| `backends[].models[].reasoning.effort` | Omitted: inherit global preference | `none`, `minimal`, `low`, `medium`, `high`, `xhigh` or `max`, forwarded unchanged. Which values a model accepts is up to its provider.          |
+| `backends[].models[].reasoning.format` | Omitted: `reasoning` object        | Chat Completions only. `openrouter` sends `reasoning: {"effort": …}`; `openai` sends top-level `reasoning_effort`. Unknown values fail parsing. |
+
+`default_reasoning` is an optional global preference (for example `high`).
+`backends[].models[].reasoning.supported_efforts` declares the exact supported levels for that route.
+If the list is omitted, only the configured `effort` is known to be supported; an empty list enables no effort choices.
+Omitting the entire `reasoning` block leaves capabilities unknown and sends no control, even with a global preference.
+Unknown level names fail configuration parsing.
 
 What reaches the wire depends on the model's effective API (see [Choosing an API](#choosing-an-api-without-renaming-models)):
 
@@ -427,7 +433,8 @@ Supported levels depend on the model, the API and the provider, and change over 
 
 - `none` is not a universal off switch. Some models reject it (OpenRouter marks them `mandatory`), some cannot stop thinking at all, and native Anthropic effort has no `none`.
 - A provider may map an unsupported level to the nearest supported one (OpenRouter documents this), return HTTP 400, or ignore a field it does not know.
-- Chaz never translates a level, guesses a format from a URL, host or model name, or retries a rejected request without the control. Any of those would silently change cost and behavior.
+- Chaz never translates an explicit selection, guesses a format from a URL, host or model name, or retries a rejected request without the control.
+  A global preference is clamped within the declared supported levels before selection, as described below. Any of those would silently change cost and behavior.
 
 **Format is explicit.** OpenRouter's Chat dialect is a `reasoning` object; OpenAI Chat Completions and several OpenAI-compatible servers document a top-level `reasoning_effort` string instead.
 Omitting `format` keeps the `reasoning` object Chaz has always sent, byte for byte.
@@ -441,13 +448,73 @@ A model on `type: anthropic` with `reasoning` configured starts with a warning a
 A gateway that _forces_ a field overwrites whatever Chaz sent, and Chaz cannot see that.
 Chaz reports what it sent, not what reached the model.
 
-**What you see.** At startup the executor logs one line per configured model: `sends <field>=<value>` at info, the Anthropic warning, or the refusal.
+**What you see.** At startup the executor logs one line per explicitly configured per-model effort: `sends <field>=<value>` at info, the Anthropic warning, or the refusal.
 When a provider rejects a request that carried a control, the error keeps the provider's message and adds the field and value sent, without claiming that field was the cause.
 A provider body that is not OpenAI-shaped (for example a bare 422) is kept as a single-line excerpt of at most 500 characters, with the backend's credential redacted, rather than replaced by a parser error.
 Rejections stay non-retryable.
 Reasoning token counts appear in usage only when the provider reports them; a missing count is unknown, not zero.
 
-These settings live in the executor's YAML and take effect after restart.
+These defaults and capability declarations live in the executor's YAML and take effect after restart.
+[Session controls](tui.md#reasoning-without-leaving-the-conversation) take effect without restarting.
+The TUI reports the next turn's resolved selection, not proof that a provider honored it.
+
+## Reasoning defaults and session overrides
+
+A reasoning preference is not a task's autonomy or judgment level.
+It controls only the provider's thinking effort on a model request.
+Chaz follows Pi's supported-level cycling model, but does not assume Pi's model catalog or its `off` encoding applies to every OpenAI-compatible gateway.
+Declare capabilities and the Chat dialect explicitly:
+
+```yaml
+default_reasoning: high
+backends:
+  - name: proxy
+    type: openaicompatible
+    api_base: http://127.0.0.1:18081/v1
+    models:
+      - name: example/model
+        reasoning:
+          format: openai
+          supported_efforts: [none, low, medium, high]
+      - name: example/other-model
+        api: responses
+        reasoning:
+          effort: low
+          supported_efforts: [low, high, xhigh]
+```
+
+For a given backend/model pair, precedence is:
+
+1. The current session's saved override, including explicit `provider` (send no effort field).
+2. That model's configured `reasoning.effort`.
+3. `default_reasoning`, clamped to the nearest declared level at or above the preference, or the highest declared level if none is above it.
+4. Provider default (no effort field).
+
+`high` is a useful interactive preference; it is not forced onto models with unknown capabilities.
+The cycle order is `provider`, `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, skipping undeclared levels.
+Responses additionally excludes `max`; native Anthropic currently has no effort mapping and offers only provider default.
+An explicit unsupported level is refused, not clamped or silently retried.
+A saved override made invalid by later capability changes blocks requests until you select a valid level, select `provider`, or reset to valid configured defaults.
+A protocol/format conflict must be fixed in YAML.
+
+Overrides are stored in the session DB's `meta.reasoning_overrides` map, keyed by the backend/model pair.
+They survive reopening and sync with that session; another conversation is unchanged.
+Every agent in this conversation using that same backend/model pair shares its override.
+A model switch uses the destination model's saved selection or defaults; switching back restores the original model's selection.
+`/reasoning default` removes only the current model's override, not other models' selections.
+`/reasoning provider` explicitly suppresses configured effort; it is different from `none`, which is an effort value sent on the wire.
+
+Each runtime invocation snapshots the session overrides before dispatch.
+A resumed invocation takes a fresh snapshot.
+Changes affect subsequent turns, not the retries or tool rounds of an already-running turn.
+Conversation entries and context are not cleared.
+Auxiliary completions inside that turn use the snapshot; standalone summarization uses its configured defaults.
+This feature does not edit Agent DB defaults or managed agent folders.
+
+Upgrade every executing peer before using these controls in a shared session, and keep the client/executor capability declarations and defaults consistent.
+Older executors ignore the new metadata and cannot honor it; older metadata writers preserve the extra key but do not interpret it.
+Rolling back an executor does not remove saved overrides.
+The client displays its local configuration's resolution; it cannot certify a different executor's configuration or a gateway's forced override.
 
 ### Walkthrough: one gateway, two reasoning dialects
 
@@ -520,7 +587,9 @@ The live catalog supplies picker entries and model information, not an allowlist
 A model override works whether its ID appears in the live catalog or only in YAML.
 Models discovered without an override, or supplied manually, use the backend default.
 
-These settings live in the executor's YAML and take effect after restart.
+These defaults and capability declarations live in the executor's YAML and take effect after restart.
+[Session controls](tui.md#reasoning-without-leaving-the-conversation) take effect without restarting.
+The TUI reports the next turn's resolved selection, not proof that a provider honored it.
 Changing only `api` on an existing model row does not change agent defaults stored in AgentDb, the model selected for a session, or model naming: one backend uses raw IDs, multiple backends still use `backend:model`.
 Discovery continues through the backend type's catalog endpoint using the same credentials, even when its request API is set to Responses.
 

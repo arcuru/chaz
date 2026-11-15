@@ -803,7 +803,7 @@ pub async fn build(
 
     // Default backend used for schedule-fired Fresh sessions and as a
     // fallback when a Pinned session has no registered SessionRuntime.
-    let default_backend = backends::BackendManager::new(&config.backends, secret_store.clone());
+    let default_backend = backends::BackendManager::from_config(config, secret_store.clone());
 
     // Create the ToolRegistry early — before extension install — so
     // MCP extensions can register tools asynchronously off the critical

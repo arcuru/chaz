@@ -533,3 +533,20 @@ text or replay the affected attempt's structured history. They hold an affected
 checkpoint rather than partially resuming it. Older executors do not implement
 Chat steering, so mixed writers can leave published input unapplied. There is
 no automatic negotiation or migration of existing history.
+
+## Model-bound reasoning selection
+
+Session metadata stores `reasoning_overrides` as a JSON map from the serialized `[backend-name, raw-model-id]` pair to an effort string or null.
+An absent key inherits configuration; null explicitly requests provider default, while the string `"none"` is a provider effort value.
+Old sessions omit the map and remain readable.
+Older readers ignore this additive key, and older metadata writers preserve unknown keys, but older executors do not apply it; all executing peers must be upgraded before users rely on the feature.
+
+The shared reasoning command resolves the same current-agent model chain as runtime and validates selections before saving.
+The TUI's settings actions and Shift+Tab submit that command through its ordered, target-bound operation queue.
+Presentation resolves against cached session metadata and live local configuration without render-time I/O.
+
+At runtime entry, strict metadata reading snapshots the map into a cloned BackendManager for that invocation, including on a resumed turn.
+Model routing remains unchanged; dispatch produces an effective cloned backend config for the existing Chat or Responses serializer.
+Explicit model capabilities constrain overrides; API restrictions still apply.
+No shared manager is mutated, so another conversation cannot inherit the selection.
+Tool rounds, retries and turn-local auxiliary calls retain the snapshot; the next turn observes later edits.

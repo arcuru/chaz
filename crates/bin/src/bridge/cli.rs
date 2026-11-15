@@ -90,7 +90,7 @@ impl Bridge for CliBridge {
             resolve_cli_session(&server, self.session_name.as_deref()).await?;
         server.load_session_entities(&session_db).await?;
 
-        let backend = BackendManager::new(&self.config.backends, self.secrets.clone());
+        let backend = BackendManager::from_config(&self.config, self.secrets.clone());
 
         if server.is_executor_authorized() {
             // Approval channel = None → auto-deny any tool needing approval.
