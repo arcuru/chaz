@@ -12,7 +12,7 @@ use serde_json::{Map, Value};
 use crate::{
     backends::{ChatContext, LLMBackend},
     cache::{CacheAnchor, CacheControl, CacheOptions},
-    config::{Backend, ReasoningControl, ReasoningEffort},
+    config::{Backend, ChatTokenLimit, ReasoningControl, ReasoningEffort},
     error::LlmError,
     runtime::{LLMResponse, ResponseMetadata, RuntimeMessage, TokenUsage, ToolCallRequest},
     security::SecretStore,
@@ -57,6 +57,8 @@ struct ChatRequest<'a> {
     usage: UsageOpts,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_completion_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_tokens: Option<u32>,
 }
 
 /// `reasoning: {"effort": …}` (OpenRouter's Chat object).
@@ -457,6 +459,7 @@ impl OpenAI {
             reasoning_effort,
             usage: UsageOpts { include: true },
             max_completion_tokens: None,
+            max_tokens: None,
         }
     }
 
@@ -535,7 +538,14 @@ impl OpenAI {
         }
 
         let mut request = self.build_chat_request(messages, tools, model, cache, reasoning);
-        request.max_completion_tokens = max_output_tokens;
+        // Send only the configured dialect: some compatible servers ignore the
+        // modern field, while OpenAI reasoning models reject the legacy one.
+        match self.backend.chat_token_limit {
+            ChatTokenLimit::MaxCompletionTokens => {
+                request.max_completion_tokens = max_output_tokens
+            }
+            ChatTokenLimit::MaxTokens => request.max_tokens = max_output_tokens,
+        }
         let timeout = self.backend.request_timeout();
         let response: Value = tokio::time::timeout(
             timeout,

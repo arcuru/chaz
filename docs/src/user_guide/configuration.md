@@ -420,6 +420,56 @@ The setting applies only to the named model; models on the same backend may use 
 Live-discovered or unlisted models send no reasoning control.
 See [Reasoning controls are requests, not guarantees](#reasoning-controls-are-requests-not-guarantees) for what a provider does with them.
 
+## Auxiliary output limits use an explicit Chat dialect
+
+| Field                         | Default                 | Meaning                                                                                              |
+| ----------------------------- | ----------------------- | ---------------------------------------------------------------------------------------------------- |
+| `backends[].chat_token_limit` | `max_completion_tokens` | Output-limit wire field for bounded Chat Completions calls: `max_completion_tokens` or `max_tokens`. |
+
+Bounded auxiliary calls (including session naming and summaries) send exactly one output-limit field.
+The existing default is retained for OpenAI, whose reasoning models do not support the legacy `max_tokens` field.
+For servers that require `max_tokens`, select `chat_token_limit: max_tokens` on that backend.
+DeepSeek documents this legacy field; OpenRouter documents it alongside a `max_completion_tokens` alias.
+This chooses the spelling, not the budget: the auxiliary caller's ceiling is still bounded by `backends[].max_tokens` when configured.
+Normal Chat Completions turns still send neither output-limit field; Responses and Anthropic Messages keep their native fields unchanged.
+The setting is backend-wide; use separate named backend routes if a gateway's models need different spellings.
+Chaz does not guess from URLs or model names, send both fields, change reasoning effort, or retry with another spelling after rejection.
+A provider that ignores its documented field cannot be forced to enforce the ceiling by Chaz.
+
+### Walkthrough: a legacy-compatible naming backend
+
+1. Select the documented field in the executor's YAML and restart the executor:
+
+   ```yaml
+   backends:
+     - name: compatible
+       type: openaicompatible
+       api_base: http://127.0.0.1:8080/v1
+       api_key: "${COMPATIBLE_API_KEY}"
+       chat_token_limit: max_tokens
+   ```
+
+2. In an unnamed session, select that route for naming and enable it:
+
+   ```text
+   /extensions set session_naming model compatible:example-model
+   Set session_naming.model = "compatible:example-model"
+   /extensions set session_naming enabled true
+   Set session_naming.enabled = true
+   ```
+
+   After a successful reply, naming sends one tool-free request with `max_tokens: 128` (or a smaller configured backend ceiling), not `max_completion_tokens`.
+
+3. If the provider rejects the field, naming records `status: failed` without failing the main reply or retrying the request.
+   Check that backend/model's documented dialect, correct `chat_token_limit`, restart the executor, then explicitly allow another naming attempt:
+
+   ```text
+   /extensions set session_naming attempted false
+   Set session_naming.attempted = false
+   ```
+
+   The next eligible reply can try once with the corrected dialect.
+
 ## Reasoning controls are requests, not guarantees
 
 `reasoning.effort` tells Chaz which field to send. The provider decides what it means.
