@@ -775,6 +775,66 @@ Cancelling these presentation reads does not resolve backend-wide storage stalls
    when creation completes. Press `Esc` to return to the hub and open the newly
    stored session. Navigation does not undo the write or steal focus back.
 
+## Inspecting Worker transcripts
+
+| Control or display                                 | Meaning                                                              |
+| -------------------------------------------------- | -------------------------------------------------------------------- |
+| `[spawn]` in the session hub                       | A locally indexed Worker session; not proof of its parent or outcome |
+| Select the row, or `/join <name-or-ID>` from chat  | Open or focus an inspection-only transcript tab                      |
+| `Worker transcript · inspection only`              | No composer, stop, retry, approval or session-settings controls      |
+| `Esc` or `Ctrl+P` in the inspector                 | Open the session hub                                                 |
+| `Ctrl+H` / `Ctrl+L`, `Ctrl+W`                      | Switch tabs, or close this local view                                |
+| Arrows, PageUp/PageDown, `Ctrl+O`, mouse selection | Read, expand and copy the original transcript                        |
+
+A Worker template is configuration; its child session is a stored transcript.
+Inspecting that transcript does not invoke the template, register an executor,
+attach an Agent or submit another Directive, even in an executor-capable TUI.
+Recorded activity is not proof that a remote process is still running.
+A parent tool timeout does not prove the child stopped.
+This view does not infer ancestry from permission delegation or identify a final
+result from a parent's success.
+Exact parent grouping and linked summaries are not available yet.
+
+Separate TUI and daemon processes using the same Eidetica service and login
+share a local catalog.
+The visible hub refreshes when that catalog changes, and on explicit entry.
+Refresh retains the selected session by ID; lazy metadata loads do not reorder it.
+A read failure retains the cached rows with an error rather than showing an
+empty catalog.
+Independent peers still need the existing explicit sharing/sync procedure;
+listing or opening does not acquire a missing remote database.
+
+Inspection currently requires existing Write authority (Admin also works),
+because native record reads can materialize caches.
+It is not a Read-only permission feature.
+An already-bound narrower or delegated identity is never replaced with a broader
+key to make inspection succeed.
+Unsupported delegated-service permission checks report unavailable instead.
+
+### Walkthrough: inspect a daemon-created Worker
+
+1. Leave the TUI hub open while its same-login daemon invokes `spawn_worker`.
+   A new `[spawn]` row appears without restarting the TUI.
+   Select that row and press Enter.
+   The tab shows:
+
+   ```text
+   Worker transcript · inspection only
+   Recorded activity is not proof of liveness; legacy ancestry unknown
+   ```
+
+2. Read the submitted Directive and subsequent transcript entries.
+   Use `Ctrl+O` to expand tool details and the usual mouse selection to copy.
+   There is no message composer; typing cannot start another turn.
+   Close with `Ctrl+W` or switch back to an open parent tab with `Ctrl+H`.
+   Its unsent draft remains intact.
+3. Reopen the child from the hub after completion or a daemon restart.
+   This reads the stored transcript; it does not reconstruct a Worker runtime.
+   If opening fails, the hub retains its row and shows
+   `Failed to switch session: …`.
+   Restore the service or existing authorized access, then select the row again.
+   Do not invoke another Worker merely because its transcript was unavailable.
+
 ## Settings
 
 Settings has two separate scopes: **Peer** covers this process's hosted agents and configuration; **Session** covers the active conversation's roster and model overrides. A per-agent Session model override does not change that agent's DB default. Peer → Agents can change the DB default, which applies wherever a session override does not win.

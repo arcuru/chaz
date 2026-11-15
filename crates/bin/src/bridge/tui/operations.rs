@@ -625,14 +625,10 @@ impl Context {
                     | Command::SwitchSession(_)
             );
         let target_id = target.as_ref().map(|t| t.id.clone());
-        let outcome = if matches!(cmd, Command::SwitchSession(_)) {
+        let outcome = if let Command::SwitchSession(identifier) = cmd {
             let server = self.server.clone();
-            supervised::read(async move {
-                commands::dispatch_without_session(cmd, &server)
-                    .await
-                    .map_err(|_| "Session command needs a conversation".to_owned())
-            })
-            .await?
+            supervised::read(async move { Ok(workers::switch_session(&identifier, &server).await) })
+                .await?
         } else {
             match commands::dispatch_without_session(cmd, &self.server).await {
                 Ok(outcome) => outcome,
@@ -726,6 +722,19 @@ pub(super) fn resolved_open(
 }
 impl Open {
     async fn prepare(self) -> Result<Effect, String> {
+        if chaz_core::session::workers::is_worker_session(&self.switch.db)
+            .await
+            .map_err(|e| e.to_string())?
+        {
+            return workers::open_tab(
+                &self.server,
+                &self.backend,
+                &self.switch.session_db_id,
+                self.notify_tx,
+            )
+            .await
+            .map(|tab| Effect::Opened(Box::new(tab)));
+        }
         if chaz_core::session::jobs::is_job_session(&self.switch.db).await {
             return jobs::open_tab(
                 &self.server,

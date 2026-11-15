@@ -45,7 +45,7 @@ async fn reopen(
         let opened = if job {
             opener.registry().open_job_session(&target).await
         } else {
-            opener.registry().open_session(&target).await
+            opener.registry().open_session_for_inspection(&target).await
         };
         opened.map(|(_, db)| db).map_err(|e| e.to_string())
     })
@@ -59,7 +59,11 @@ async fn reopen(
             // like construction; a read deadline is not rollback authority.
             // Keep the large registration future off the worker's stack.
             let observation = supervised::work(Box::pin(async move {
-                if job {
+                if job
+                    || chaz_core::session::workers::is_worker_session(&observed)
+                        .await
+                        .map_err(|e| e.to_string())?
+                {
                     jobs::observe(&observed, notify_tx)
                         .await
                         .map_err(|e| e.to_string())

@@ -956,3 +956,125 @@ async fn session_shortcuts_respect_modes_and_modals() {
             .any(|(cmd, hint)| *cmd == "/expand" && hint.contains("Ctrl+O"))
     );
 }
+
+#[tokio::test]
+async fn worker_hub_open_is_inspection_only_and_preserves_parent_draft() {
+    use super::super::{ChatAction, Command, handle_chat_action, workers};
+    let (_instance, server, backend, mut app) = fixture().await;
+    let parent = app.active().session_db_id.clone();
+    app.input = "retained parent draft".into();
+    app.cursor = app.input.len();
+    let (id, child) = server
+        .registry()
+        .create_child_session(&parent, Some("spawn:legacy-worker"))
+        .await
+        .unwrap();
+    let mut session = chaz_core::session::Session::try_new(id.clone(), child.clone())
+        .await
+        .unwrap();
+    session
+        .add_entry(chaz_core::session::SessionEntry {
+            sender: "submitter".into(),
+            content: "original Worker assignment".into(),
+            timestamp: chrono::Utc::now(),
+            entry_type: chaz_core::session::EntryType::Directive,
+            metadata: None,
+            routing: None,
+        })
+        .await
+        .unwrap();
+    let before = child.snapshot().await.unwrap();
+    let (approval, notify, rows) = channels();
+    let models = mpsc::channel(8).0;
+    let secrets = SecretStore::new(server.registry().chaz_peer().clone()).await;
+    open_session_picker(&mut app, &server, &rows);
+    dispatch_picker_selection(
+        id.0.clone(),
+        &mut app,
+        &server,
+        &backend,
+        &approval,
+        &notify,
+    );
+    settle(&mut app).await;
+    assert!(app.active().live.worker_observer);
+    assert!(!server.is_watching_session(&id.0).await);
+    assert!(server.runtime_owner_of(&id.0).is_none());
+    for size in [(80, 24), (40, 12)] {
+        let screen = frame(&mut app, &server, &backend, size.0, size.1);
+        assert!(screen.contains("Worker transcript"), "{screen}");
+        assert!(
+            screen.contains("original") && screen.contains("Worker assignment"),
+            "{screen}"
+        );
+        assert!(
+            !screen.contains(" > "),
+            "inspector has a composer: {screen}"
+        );
+    }
+    for code in [KeyCode::Char('x'), KeyCode::Enter, KeyCode::Char('/')] {
+        assert!(input::handle_chat_key(&mut app, key(code)).is_none());
+    }
+    assert!(app.input.is_empty());
+    for action in [
+        ChatAction::SendMessage("must not execute".into()),
+        ChatAction::Dispatch(Command::Stop),
+        ChatAction::Dispatch(Command::RetryInterrupted("unknown".into())),
+        ChatAction::OpenSettings(SettingsScope::Session),
+    ] {
+        handle_chat_action(
+            action, &mut app, &server, &backend, &secrets, &approval, &notify, &models, &rows,
+        );
+        assert!(!app.operations.is_pending());
+    }
+    assert_eq!(child.snapshot().await.unwrap(), before);
+    assert!(
+        matches!(workers::switch_session(&id.0, &server).await, chaz_core::commands::CommandOutcome::SessionSwitched(switch) if switch.session_db_id == id.0)
+    );
+    app.set_active_tab(0);
+    assert_eq!(app.active().session_db_id, parent);
+    assert_eq!(app.input, "retained parent draft");
+}
+
+#[tokio::test]
+async fn catalog_refresh_keeps_cursor_identity_and_retains_invalidations_during_read() {
+    use super::super::{CatalogLoadOutcome, apply_session_catalog, apply_session_catalog_result};
+    let (_instance, server, _backend, _) = fixture().await;
+    let mut app = App::hub(HashSet::new());
+    app.mode = TuiMode::SessionPicker;
+    apply_session_catalog(&mut app, server.registry().list_sessions().await.unwrap());
+    app.picker_index = 1;
+    let selected = app.picker_selection();
+    server.registry().create_session(Some("tui")).await.unwrap();
+    app.session_catalog_invalidated = true;
+    let generation = app.session_generation;
+    assert!(matches!(
+        apply_session_catalog_result(
+            &mut app,
+            generation,
+            Ok(server.registry().list_sessions().await.unwrap())
+        ),
+        CatalogLoadOutcome::Loaded
+    ));
+    assert_eq!(app.picker_selection(), selected);
+    assert!(
+        !app.session_list_fresh,
+        "in-flight invalidation must schedule one follow-up"
+    );
+    let retained = app.session_list.len();
+    assert!(matches!(
+        apply_session_catalog_result(&mut app, generation, Err("offline".into())),
+        CatalogLoadOutcome::Failed
+    ));
+    assert_eq!(app.session_list.len(), retained);
+    assert_eq!(app.picker_selection(), selected);
+    app.session_rows_loading.insert(selected.clone());
+    let (tx, _rx) = mpsc::channel(8);
+    super::super::refresh_session_catalog(&mut app, &server, &tx);
+    assert!(
+        app.session_rows_loading.is_empty(),
+        "retired row tasks must not monopolize the metadata limit"
+    );
+    assert_ne!(app.session_generation, generation);
+    assert_eq!(app.picker_selection(), selected);
+}

@@ -59,6 +59,7 @@ mod tool_activity;
 mod transition_tests;
 mod view;
 mod widgets;
+mod workers;
 
 pub struct TuiBridge {
     config: Config,
@@ -75,6 +76,7 @@ enum Action {
     /// A session DB fired an on_write callback — payload is the
     /// session_db_id so we can refresh the right tab.
     SessionChanged(String),
+    CatalogChanged,
     ApprovalRequest(TaggedApproval),
     /// A background catalog fetch finished. `Ok` carries the live model
     /// list (already merged with cache); `Err` carries a display message.
@@ -665,7 +667,7 @@ pub(super) struct App {
     /// Defaults `true` so steady-state and tests show no indicator.
     pub(super) startup_ready: bool,
     pub(super) session_list: Vec<SessionInfo>,
-    /// Whether the current catalog snapshot is reusable on the next open.
+    /// Whether the current catalog snapshot has no pending invalidation.
     pub(super) session_list_fresh: bool,
     /// Catalog rows retained by id so visible metadata requests never need to
     /// re-list the catalog.
@@ -673,6 +675,7 @@ pub(super) struct App {
     pub(super) session_fill: Option<SessionFill>,
     pub(super) session_generation: u64,
     pub(super) session_catalog_loading: bool,
+    session_catalog_invalidated: bool,
     pub(super) session_picker_error: Option<String>,
     /// One-shot result shown in the hub footer (a failed open or create);
     /// cleared by the next hub key.
@@ -871,6 +874,7 @@ impl App {
             session_fill: None,
             session_generation: 0,
             session_catalog_loading: false,
+            session_catalog_invalidated: false,
             session_picker_error: None,
             hub_notice: None,
             drafts: HashMap::new(),
@@ -1446,6 +1450,14 @@ async fn setup_session(
         !chaz_core::session::jobs::is_job_session(session_db).await,
         "job sessions must be opened as observers"
     );
+    anyhow::ensure!(
+        !chaz_core::session::workers::is_worker_session(session_db).await?
+            && !server
+                .registry()
+                .is_indexed_worker_session(&session_db_id)
+                .await?,
+        "Worker sessions must be opened as observers"
+    );
     server.load_session_entities(session_db).await?;
     static NEXT_OBSERVATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     let observation_id = NEXT_OBSERVATION.fetch_add(1, Ordering::Relaxed);
@@ -1668,7 +1680,17 @@ fn open_session_picker(
     app.session_row_errors.clear();
     app.hub_notice = None;
 
-    if app.session_list_fresh {
+    // Explicit entry refreshes even if no write notification was observed.
+    app.session_list_fresh = false;
+    refresh_session_catalog(app, server, session_rows_tx);
+}
+
+fn refresh_session_catalog(
+    app: &mut App,
+    server: &Arc<Server>,
+    session_rows_tx: &mpsc::Sender<SessionLoad>,
+) {
+    if app.session_catalog_loading || !app.backend_available {
         return;
     }
     if app.operations.is_creating_session() {
@@ -1676,7 +1698,11 @@ fn open_session_picker(
         return;
     }
 
-    // Retain the previous catalog while an explicit retry is pending.
+    // Retire old visible-row reads too: dropping their tasks without clearing
+    // the loading IDs would leave those rows permanently in flight.
+    app.cancel_session_fill();
+    // Retain rows and selection while the coalesced read is pending.
+    app.session_catalog_invalidated = false;
     app.session_catalog_loading = true;
     let registry = server.registry_arc();
     spawn_session_catalog_load(app, session_rows_tx.clone(), async move {
@@ -1715,6 +1741,7 @@ where
 }
 
 fn apply_session_catalog(app: &mut App, indices: Vec<SessionIndex>) {
+    let selected = app.picker_selection();
     let mut cached: HashMap<String, SessionInfo> = std::mem::take(&mut app.session_list)
         .into_iter()
         .filter(|row| row.loaded)
@@ -1733,7 +1760,13 @@ fn apply_session_catalog(app: &mut App, indices: Vec<SessionIndex>) {
         })
         .collect();
     commands::sort_session_infos(&mut app.session_list);
-    app.session_list_fresh = true;
+    app.picker_index = app
+        .session_list
+        .iter()
+        .position(|row| row.session_db_id == selected)
+        .map(|i| i + 1)
+        .unwrap_or(0);
+    app.session_list_fresh = !app.session_catalog_invalidated;
     app.session_catalog_loading = false;
 }
 
@@ -1971,7 +2004,7 @@ fn ensure_view(app: &mut App, server: &Arc<Server>, session_rows_tx: &mpsc::Send
     {
         // Settings can interrupt the initial catalog load. Resume it when
         // the hub becomes visible, without rendering an incomplete empty list.
-        open_session_picker(app, server, session_rows_tx);
+        refresh_session_catalog(app, server, session_rows_tx);
     }
 }
 
@@ -2003,6 +2036,20 @@ fn handle_chat_action(
     models_tx: &mpsc::Sender<ModelCatalog>,
     session_rows_tx: &mpsc::Sender<SessionLoad>,
 ) {
+    if app.current().is_some_and(|tab| tab.live.worker_observer)
+        && !matches!(
+            action,
+            ChatAction::OpenPicker
+                | ChatAction::OpenJobs
+                | ChatAction::Dispatch(Command::Quit | Command::SwitchSession(_))
+        )
+    {
+        show_error(
+            app,
+            "Worker transcript is inspection-only; action not submitted".into(),
+        );
+        return;
+    }
     if app.current().is_some_and(|tab| tab.job.is_some())
         && !matches!(
             action,
@@ -2136,14 +2183,10 @@ fn dispatch_picker_selection(
     let approval_tx = approval_tx.clone();
     let notify_tx = notify_tx.clone();
     operations::submit(app, write, None, async move {
-        let outcome = if matches!(cmd, Command::SwitchSession(_)) {
+        let outcome = if let Command::SwitchSession(identifier) = cmd {
             let server = server.clone();
-            supervised::read(async move {
-                commands::dispatch_without_session(cmd, &server)
-                    .await
-                    .map_err(|_| "Session command needs an open conversation".to_owned())
-            })
-            .await?
+            supervised::read(async move { Ok(workers::switch_session(&identifier, &server).await) })
+                .await?
         } else {
             commands::dispatch_without_session(cmd, &server)
                 .await

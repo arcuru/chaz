@@ -119,6 +119,7 @@ impl TuiBridge {
         // counts). Tasks are owned by their tab's slots; the channel adds
         // bounded backpressure when many open tabs finish together.
         let (refresh_tx, mut refresh_rx) = mpsc::channel::<refresh::Refresh>(64);
+        let mut catalog_changes = server.registry().catalog_changes();
 
         // An ordinary launch opens the hub — even on an empty install — and
         // creates nothing. The catalog loads in the background.
@@ -145,6 +146,7 @@ impl TuiBridge {
         let mut needs_draw = true;
         'run: loop {
             operations::cancel_closed_reads(&mut app);
+            ensure_view(&mut app, server, &session_rows_tx);
             peer_pages::update(&mut app, server, &peer_pages_tx);
             session_pages::update(&mut app, server, &backend, &session_pages_tx);
             if !app.backend_available
@@ -216,6 +218,7 @@ impl TuiBridge {
                     Some(msg) = app.operations.recv() => Action::Operation(msg),
                     Some(msg) = refresh_rx.recv() => Action::Refresh(msg),
                     Some(id) = notify_rx.recv() => Action::SessionChanged(id),
+                    Ok(()) = catalog_changes.changed() => Action::CatalogChanged,
                     Some(msg) = approval_rx.recv() => Action::ApprovalRequest(msg),
                     Some(res) = models_rx.recv() => Action::ModelsFetched(res),
                     Some(load) = session_rows_rx.recv() => Action::SessionLoad(load),
@@ -263,6 +266,10 @@ impl TuiBridge {
                     app.peer_agents_cursor,
                 );
                 match action {
+                    Action::CatalogChanged => {
+                        app.session_list_fresh = false;
+                        app.session_catalog_invalidated = true;
+                    }
                     Action::Key(key) => {
                         app.selection.clear();
                         if key.code == KeyCode::Char('c')
@@ -554,6 +561,7 @@ impl TuiBridge {
                             match result {
                                 Ok(mut replacement) => {
                                     *server = replacement.built.server.clone();
+                                    catalog_changes = server.registry().catalog_changes();
                                     self.secrets = replacement.built.secret_store.clone();
                                     backend = BackendManager::new(
                                         &self.config.backends,

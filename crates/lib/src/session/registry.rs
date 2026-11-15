@@ -58,6 +58,9 @@ pub struct SessionRegistry {
     new_session_rx: Mutex<Option<mpsc::Receiver<NewSessionEvent>>>,
     /// Serialize local explicit renames with extension fill-if-unnamed writes.
     name_lock: Mutex<()>,
+    /// Coalesced read-side invalidation, independent of the resident's single
+    /// new-session receiver. Observers never consume execution notifications.
+    catalog_changed: tokio::sync::watch::Sender<()>,
     /// Sessions created by a local service client may predate the daemon's
     /// in-memory per-DB key mapping. Keep the already-keyed daemon handle so
     /// later opens use the same signing identity.
@@ -127,6 +130,8 @@ impl SessionRegistry {
             "Session registry chaz_peer ready"
         );
         let (new_session_tx, new_session_rx) = mpsc::channel(64);
+        let (catalog_changed, _) = tokio::sync::watch::channel(());
+        let catalog_notify = catalog_changed.clone();
 
         // Watch the chaz_group for writes (including remote sync).
         // On each write, re-scan the sessions index and fire events for each known session.
@@ -135,6 +140,7 @@ impl SessionRegistry {
         let stage = Instant::now();
         chaz_group
             .on_write(move |event, db| {
+                catalog_notify.send_replace(());
                 tracing::debug!(
                     source = ?event.source(),
                     "chaz_group write; rescanning the sessions index"
@@ -174,6 +180,7 @@ impl SessionRegistry {
             new_session_tx,
             new_session_rx: Mutex::new(Some(new_session_rx)),
             name_lock: Mutex::new(()),
+            catalog_changed,
             local_client_sessions: Mutex::new(std::collections::HashMap::new()),
             locally_created_sessions: Mutex::new(std::collections::HashSet::new()),
             channel_create_locks: Mutex::new(std::collections::HashMap::new()),
@@ -196,6 +203,11 @@ impl SessionRegistry {
     /// Take the new-session event receiver. Can only be called once.
     pub async fn subscribe_new_sessions(&self) -> Option<mpsc::Receiver<NewSessionEvent>> {
         self.new_session_rx.lock().await.take()
+    }
+
+    /// Subscribe without taking the resident executor's notification receiver.
+    pub fn catalog_changes(&self) -> tokio::sync::watch::Receiver<()> {
+        self.catalog_changed.subscribe()
     }
 
     /// Group-level routing/metadata DB. Holds session/channel/name indices

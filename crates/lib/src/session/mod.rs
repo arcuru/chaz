@@ -44,6 +44,7 @@ mod transport;
 pub mod usage;
 pub(crate) mod wait_resume;
 pub(crate) mod wire;
+pub mod workers;
 
 use wire::session_wire_enum;
 

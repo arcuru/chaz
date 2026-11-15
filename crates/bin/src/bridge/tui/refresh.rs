@@ -73,6 +73,8 @@ impl RefreshSlot {
 /// `Tab` literal only needs `live: TabLive::default()`.
 #[derive(Default)]
 pub(super) struct TabLive {
+    /// Inspection-only Worker: no composer, steering, settings or runtime registration.
+    pub(super) worker_observer: bool,
     pub(super) covered: Option<eidetica::Snapshot>,
     pub(super) entry_ids: Vec<Option<String>>,
     pub(super) tool_activity: tool_activity::ToolActivity,

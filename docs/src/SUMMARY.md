@@ -43,3 +43,4 @@
 - [Checkpointed Job Waits](design/checkpointed_waits.md)
 - [Automatic Compaction](design/autocompaction.md)
 - [Nested Tool Activity](design/tool_activity.md)
+- [Inspecting Worker Sessions](design/worker_sessions.md)

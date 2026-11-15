@@ -588,13 +588,23 @@ pub(super) fn ui_chat(f: &mut ratatui::Frame, app: &mut App, ext_segments: &[Str
         Constraint::Length(approval_h),
         Constraint::Length(ext_status_h),
         Constraint::Length(1),
-        Constraint::Length(composer_h),
+        Constraint::Length(if app.active().live.worker_observer {
+            1
+        } else {
+            composer_h
+        }),
     ])
     .split(f.area());
 
     render_tab_bar(f, app, chunks[0]);
 
-    let messages_area = if app.active().job.is_some() {
+    let messages_area = if app.active().live.worker_observer {
+        let observer =
+            Layout::vertical([Constraint::Length(2), Constraint::Min(0)]).split(chunks[1]);
+        f.render_widget(Paragraph::new("Worker transcript · inspection only\nRecorded activity is not proof of liveness; legacy ancestry unknown")
+            .style(theme::text_on_bar()), observer[0]);
+        observer[1]
+    } else if app.active().job.is_some() {
         let observer = Layout::vertical([
             Constraint::Length(3.min(chunks[1].height.saturating_sub(3))),
             Constraint::Min(0),
@@ -885,7 +895,7 @@ pub(super) fn ui_chat(f: &mut ratatui::Frame, app: &mut App, ext_segments: &[Str
             " {session_label}{ctx_segment}{agent_segment}{usage_segment}{debug_indicator}{expand_indicator}{startup_indicator}{refresh_indicator}{operation_indicator}"
         )
     };
-    let mut status_text = if app.active().job.is_some() {
+    let mut status_text = if app.active().job.is_some() || app.active().live.worker_observer {
         format!("{operation_indicator}{refresh_indicator} | {session_label}")
     } else if let Some(notice) = &app.operations.notice {
         format!(" ⚠ {notice}{refresh_indicator}")
@@ -934,6 +944,14 @@ pub(super) fn ui_chat(f: &mut ratatui::Frame, app: &mut App, ext_segments: &[Str
     );
     f.render_widget(status, chunks[4]);
 
+    if app.active().live.worker_observer {
+        f.render_widget(
+            Paragraph::new("Esc / Ctrl+P sessions · Ctrl+H/L tabs · Ctrl+O expand · scroll / copy")
+                .style(theme::dim()),
+            chunks[5],
+        );
+        return;
+    }
     render_composer(
         f,
         chunks[5],

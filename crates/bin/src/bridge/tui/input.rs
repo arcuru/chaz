@@ -727,6 +727,30 @@ fn handle_approval_key(app: &mut App, key: KeyEvent) -> bool {
 }
 
 pub(super) fn handle_chat_key(app: &mut App, key: KeyEvent) -> Option<ChatAction> {
+    // Inspectors retain scrolling/expansion and global navigation, but never
+    // admit editor, approval, stop or retry actions, even for an active child.
+    if app.active().live.worker_observer {
+        match key.code {
+            KeyCode::Up => {
+                app.active_mut().scroll_offset = app.active().scroll_offset.saturating_add(3)
+            }
+            KeyCode::Down => {
+                app.active_mut().scroll_offset = app.active().scroll_offset.saturating_sub(3)
+            }
+            KeyCode::PageUp => {
+                app.active_mut().scroll_offset = app.active().scroll_offset.saturating_add(20)
+            }
+            KeyCode::PageDown => {
+                app.active_mut().scroll_offset = app.active().scroll_offset.saturating_sub(20)
+            }
+            KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                app.toggle_expand_all()
+            }
+            KeyCode::Esc => return Some(ChatAction::OpenPicker),
+            _ => {}
+        }
+        return None;
+    }
     // Stop is a user event even during approval; don't turn Esc into a deny.
     if key.code == KeyCode::Esc {
         if app.completion.is_some() {

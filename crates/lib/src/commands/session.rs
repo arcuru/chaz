@@ -51,7 +51,11 @@ pub async fn try_load_session_metadata(
     registry: &SessionRegistry,
     index: SessionIndex,
 ) -> anyhow::Result<SessionInfo> {
-    let (_conv_id, db) = registry.open_session(&index.session_db_id).await?;
+    let (_conv_id, db) = if crate::session::workers::is_worker_source(index.source.as_deref()) {
+        registry.open_worker_session(&index.session_db_id).await?
+    } else {
+        registry.open_session(&index.session_db_id).await?
+    };
     let meta = crate::session::try_read_meta_from_db(&db).await?;
     Ok(SessionInfo {
         session_db_id: index.session_db_id,
