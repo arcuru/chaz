@@ -434,7 +434,7 @@ Supported levels depend on the model, the API and the provider, and change over 
 - `none` is not a universal off switch. Some models reject it (OpenRouter marks them `mandatory`), some cannot stop thinking at all, and native Anthropic effort has no `none`.
 - A provider may map an unsupported level to the nearest supported one (OpenRouter documents this), return HTTP 400, or ignore a field it does not know.
 - Chaz never translates an explicit selection, guesses a format from a URL, host or model name, or retries a rejected request without the control.
-  A global preference is clamped within the declared supported levels before selection, as described below. Any of those would silently change cost and behavior.
+  A global preference is clamped within the declared supported levels before selection, as described below.
 
 **Format is explicit.** OpenRouter's Chat dialect is a `reasoning` object; OpenAI Chat Completions and several OpenAI-compatible servers document a top-level `reasoning_effort` string instead.
 Omitting `format` keeps the `reasoning` object Chaz has always sent, byte for byte.
@@ -587,9 +587,7 @@ The live catalog supplies picker entries and model information, not an allowlist
 A model override works whether its ID appears in the live catalog or only in YAML.
 Models discovered without an override, or supplied manually, use the backend default.
 
-These defaults and capability declarations live in the executor's YAML and take effect after restart.
-[Session controls](tui.md#reasoning-without-leaving-the-conversation) take effect without restarting.
-The TUI reports the next turn's resolved selection, not proof that a provider honored it.
+These settings live in the executor's YAML and take effect after restart.
 Changing only `api` on an existing model row does not change agent defaults stored in AgentDb, the model selected for a session, or model naming: one backend uses raw IDs, multiple backends still use `backend:model`.
 Discovery continues through the backend type's catalog endpoint using the same credentials, even when its request API is set to Responses.
 
