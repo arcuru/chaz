@@ -157,7 +157,11 @@ fn jobs_context_counts_titles_and_wait_uncertainty_are_separate() {
     let mut app = app(vec![origin, parent, child]);
     select(&mut app.jobs, 1);
     let (text, _) = frame(&mut app, 120, 35);
-    assert!(text.contains("1 jobs · 0 finished · 0 queued · 1 unresolved · 2 context"));
+    assert!(text.contains("1 jobs · 2 context"));
+    assert!(text.contains("Counted as: child wait recorded"));
+    assert!(text.contains("Started · child wait recorded"));
+    assert!(text.contains("1 child wait recorded"));
+    assert!(!text.contains("0 queued"));
     assert!(text.contains("From: Plan the migration"));
     assert!(text.contains("Children (1): Measure SQLite latency"));
     assert!(text.contains("Wait recorded (unfinished): Measure SQLite latency"));
@@ -173,6 +177,101 @@ fn jobs_context_counts_titles_and_wait_uncertainty_are_separate() {
             .0
             .contains("Wait finished: Measure SQLite latency")
     );
+}
+
+#[test]
+fn jobs_counts_partition_recorded_evidence_without_promising_execution() {
+    let mut nodes = vec![
+        node("pending", "Await acceptance", Some(JobState::Pending)),
+        node("queued", "Await executor", Some(JobState::Queued)),
+        node(
+            "active",
+            "Inspect recent activity",
+            Some(JobState::StartedUnknown {
+                attempt_id: "current".into(),
+                activity_recent: true,
+            }),
+        ),
+        node(
+            "waiting",
+            "Inspect child wait",
+            Some(JobState::Running {
+                attempt_id: "current".into(),
+            }),
+        ),
+        node(
+            "uncertain",
+            "Inspect old activity",
+            Some(JobState::StartedUnknown {
+                attempt_id: "current".into(),
+                activity_recent: false,
+            }),
+        ),
+        node(
+            "interrupted",
+            "Inspect before retry",
+            Some(JobState::Interrupted {
+                attempt_id: "current".into(),
+            }),
+        ),
+        node(
+            "finished",
+            "Read result",
+            Some(JobState::Succeeded { text: None }),
+        ),
+        node("unavailable", "Cannot read source", Some(JobState::Queued)),
+    ];
+    let wait = JobWait {
+        attempt_id: "current".into(),
+        child_id: "queued".into(),
+        deadline_at: chrono::Utc::now() - chrono::Duration::seconds(1),
+        finished: false,
+    };
+    // An unfinished row is evidence even after its deadline, not a live wait.
+    nodes[3].waits = vec![wait.clone(), wait.clone()];
+    nodes[4].waits = vec![wait.clone()];
+    nodes[6].waits = vec![wait.clone()];
+    nodes[7].unavailable = Some("source refused".into());
+    let mut context = nodes[3].clone();
+    context.session_db_id = "context".into();
+    context.claimed = false;
+    nodes.push(context);
+    let mut app = app(nodes);
+    select(&mut app.jobs, 3);
+    for (w, h) in [(40, 24), (80, 24), (120, 35), (180, 45)] {
+        let text = frame(&mut app, w, h).0;
+        let words = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(words.contains("8 jobs · 1 context"), "{text}");
+        for group in [
+            "pending",
+            "queued",
+            "activity recorded",
+            "child wait recorded",
+            "uncertain",
+            "interrupted",
+            "finished",
+            "unavailable",
+        ] {
+            assert!(words.contains(&format!("1 {group}")), "{text}");
+        }
+        assert!(!text.contains("unresolved"));
+        if w >= 80 {
+            assert!(text.contains("recorded, not proven live"), "{text}");
+            assert!(
+                text.contains("current wait not") && text.contains("proven"),
+                "{text}"
+            );
+        }
+    }
+    // Finished waits and waits from previous attempts do not mask recent activity.
+    app.jobs.data.nodes[3].waits[0].finished = true;
+    app.jobs.data.nodes[3].waits[1].attempt_id = "earlier".into();
+    assert_eq!(evidence_group(&app.jobs.data.nodes[3]), "activity recorded");
+    app.jobs.data.nodes[3].state = None;
+    assert_eq!(evidence_group(&app.jobs.data.nodes[3]), "unavailable");
+    // Terminal fallback rows stay gaps, not apparently verified completions.
+    app.jobs.data.nodes[7].state = Some(JobState::Succeeded { text: None });
+    assert_eq!(evidence_group(&app.jobs.data.nodes[7]), "unavailable");
 }
 
 #[test]
