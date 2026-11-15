@@ -716,9 +716,9 @@ impl BackendManager {
                 message: "No backends configured".into(),
             });
         }
-        let backend = self.select_backend_for_model(model);
+        let backend = self.request_backend(model)?;
         if backend.api_for_model(resolved_model) == ModelApi::Responses {
-            crate::responses::Responses::new(backend, &self.secrets)
+            crate::responses::Responses::new(&backend, &self.secrets)
                 .validate_request(messages, resolved_model)?;
         } else {
             crate::responses::validate_foreign_history(messages)?;

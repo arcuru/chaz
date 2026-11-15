@@ -701,6 +701,74 @@ async fn session_reasoning_reaches_real_runtime_and_plain_wire_on_each_api() {
         .unwrap_err();
         assert!(error.contains("unsupported"), "{error}");
         assert_eq!(bodies(&server).await.len(), 8);
+        if api == ModelApi::Responses {
+            // A valid session selection must replace even an invalid configured
+            // effort in Responses preflight, not only in the HTTP serializer.
+            let mut changed = config.clone();
+            let reasoning = changed.backends.as_mut().unwrap()[0]
+                .models
+                .as_mut()
+                .unwrap()[0]
+                .reasoning
+                .as_mut()
+                .unwrap();
+            reasoning.effort = Some(ReasoningEffort::Max);
+            reasoning
+                .supported_efforts
+                .as_mut()
+                .unwrap()
+                .push(ReasoningEffort::Max);
+            let changed = BackendManager::from_config(&changed, empty_secrets().await);
+            let (_instance, recovery) = fresh_session().await;
+            let recovery_ctx = tool_context(recovery.clone(), Arc::new(ToolRegistry::new()));
+            assert!(
+                crate::runtime::execute(
+                    Some("stub:test-model"),
+                    user(),
+                    &changed,
+                    &permissive_security(),
+                    &recovery_ctx,
+                    &ToolPolicyRegistry::empty(),
+                    None,
+                    None
+                )
+                .await
+                .unwrap_err()
+                .contains("unsupported")
+            );
+            assert_eq!(bodies(&server).await.len(), 8);
+            for selected in [None, Some(ReasoningEffort::High)] {
+                recovery
+                    .lock()
+                    .await
+                    .update_meta(|m| {
+                        m.reasoning_overrides.insert(key.clone(), selected);
+                    })
+                    .await
+                    .unwrap();
+                crate::runtime::execute(
+                    Some("stub:test-model"),
+                    user(),
+                    &changed,
+                    &permissive_security(),
+                    &recovery_ctx,
+                    &ToolPolicyRegistry::empty(),
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+                let all = bodies(&server).await;
+                assert_eq!(
+                    all.last()
+                        .unwrap()
+                        .pointer("/reasoning/effort")
+                        .and_then(Value::as_str),
+                    selected.map(ReasoningEffort::as_str)
+                );
+            }
+        }
+        let sent_count = bodies(&server).await.len();
         // A malformed persisted control fails closed, rather than reverting to default.
         let db = session.lock().await.database().clone();
         let txn = db.new_transaction().await.unwrap();
@@ -726,6 +794,6 @@ async fn session_reasoning_reaches_real_runtime_and_plain_wire_on_each_api() {
             .unwrap_err()
             .contains("Failed to read session reasoning")
         );
-        assert_eq!(bodies(&server).await.len(), 8);
+        assert_eq!(bodies(&server).await.len(), sent_count);
     }
 }
