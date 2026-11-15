@@ -608,6 +608,66 @@ pub(super) fn clip(text: &str, width: usize) -> String {
     out
 }
 
+// These are mutually exclusive snapshot-evidence groups, not runtime phases.
+fn evidence_group(node: &JobMonitorNode) -> &'static str {
+    if !node.claimed {
+        return "context";
+    }
+    if node.unavailable.is_some() {
+        return "unavailable";
+    }
+    match node.state.as_ref() {
+        Some(JobState::Pending) => "pending",
+        Some(JobState::Queued) => "queued",
+        Some(
+            JobState::Running { .. }
+            | JobState::StartedUnknown {
+                activity_recent: true,
+                ..
+            },
+        ) => {
+            if node.waits.iter().any(|wait| {
+                !wait.finished && Some(wait.attempt_id.as_str()) == attempt_id(node.state.as_ref())
+            }) {
+                "child wait recorded"
+            } else {
+                "activity recorded"
+            }
+        }
+        Some(JobState::StartedUnknown {
+            activity_recent: false,
+            ..
+        }) => "uncertain",
+        Some(JobState::Interrupted { .. }) => "interrupted",
+        Some(JobState::Succeeded { .. } | JobState::Failed { .. } | JobState::Rejected { .. }) => {
+            "finished"
+        }
+        None => "unavailable",
+    }
+}
+
+fn evidence_counts(nodes: &[JobMonitorNode]) -> String {
+    [
+        "pending",
+        "queued",
+        "activity recorded",
+        "child wait recorded",
+        "uncertain",
+        "interrupted",
+        "finished",
+        "unavailable",
+    ]
+    .into_iter()
+    .map(|group| {
+        format!(
+            "{} {group}",
+            nodes.iter().filter(|n| evidence_group(n) == group).count()
+        )
+    })
+    .collect::<Vec<_>>()
+    .join(" · ")
+}
+
 fn node_status(node: &JobMonitorNode) -> String {
     if node.unavailable.is_some() {
         format!(
@@ -619,6 +679,8 @@ fn node_status(node: &JobMonitorNode) -> String {
             Some(state) => format!("Context · unclaimed · {}", state_label(Some(state))),
             None => "Context · not a job".into(),
         }
+    } else if evidence_group(node) == "child wait recorded" {
+        "Started · child wait recorded".into()
     } else {
         state_label(node.state.as_ref()).into()
     }
@@ -633,11 +695,25 @@ fn relationship_title(nodes: &[JobMonitorNode], id: &str) -> String {
 }
 
 fn detail_lines(jobs: &JobsView, node: &JobMonitorNode) -> Vec<Line<'static>> {
-    let mut lines = Vec::new();
+    // Repeat the full status in the scrollable body; pane titles can be clipped.
+    let mut lines = vec![
+        Line::styled(
+            node_title(node),
+            if jobs.details {
+                theme::accent_bold()
+            } else {
+                Style::default().add_modifier(Modifier::BOLD)
+            },
+        ),
+        Line::from(format!(
+            "Recorded status: {}",
+            state_label(node.state.as_ref())
+        )),
+        Line::from(format!("Counted as: {}", evidence_group(node))),
+    ];
     if jobs.details {
         // Technical view is explicit; no Debug formatting, even here.
         lines.extend([
-            Line::styled(node_title(node), theme::accent_bold()),
             Line::from(format!("Session: {}", node.session_db_id)),
             Line::from(format!("Executor: {}", node.executor)),
             Line::from(format!(
@@ -671,10 +747,6 @@ fn detail_lines(jobs: &JobsView, node: &JobMonitorNode) -> Vec<Line<'static>> {
             lines.push(Line::from(format!("Source: {source}")));
         }
     } else {
-        lines.push(Line::styled(
-            node_title(node),
-            Style::default().add_modifier(Modifier::BOLD),
-        ));
         if node.claimed {
             lines.push(Line::styled(format!("Agent: {}", node.agent), theme::dim()));
         }
@@ -790,27 +862,21 @@ pub(super) fn draw(f: &mut ratatui::Frame, app: &mut App) {
     let jobs = &mut app.jobs;
     let nodes = &jobs.data.nodes;
     let total = nodes.iter().filter(|n| n.claimed).count();
-    let finished = nodes
-        .iter()
-        .filter(|n| n.claimed && n.state.as_ref().is_some_and(JobState::is_terminal))
-        .count();
-    let queued = nodes
-        .iter()
-        .filter(|n| n.claimed && matches!(n.state, Some(JobState::Pending | JobState::Queued)))
-        .count();
-    let counts = format!(
-        "{total} jobs · {finished} finished · {queued} queued · {} unresolved · {} context",
-        total.saturating_sub(finished + queued),
-        nodes.len() - total
-    );
+    let counts = format!("{total} jobs · {} context", nodes.len() - total);
+    let evidence = Paragraph::new(evidence_counts(nodes))
+        .wrap(Wrap { trim: true })
+        .style(theme::dim());
+    let evidence_height = evidence.line_count(f.area().width).min(u16::MAX as usize) as u16;
     let panes = Layout::vertical([
         Constraint::Length(1),
+        Constraint::Length(evidence_height),
         Constraint::Length(1),
         Constraint::Min(0),
         Constraint::Length(1),
     ])
     .split(f.area());
     widgets::header(f, panes[0], "Jobs", Some(&counts), None);
+    f.render_widget(evidence, panes[1]);
     let age = jobs
         .data
         .observed_at
@@ -840,12 +906,12 @@ pub(super) fn draw(f: &mut ratatui::Frame, app: &mut App) {
         } else {
             theme::dim()
         }),
-        panes[1],
+        panes[2],
     );
-    let columns = if panes[2].width >= 110 {
-        Layout::horizontal([Constraint::Percentage(46), Constraint::Percentage(54)]).split(panes[2])
+    let columns = if panes[3].width >= 110 {
+        Layout::horizontal([Constraint::Percentage(46), Constraint::Percentage(54)]).split(panes[3])
     } else {
-        Layout::vertical([Constraint::Percentage(35), Constraint::Percentage(65)]).split(panes[2])
+        Layout::vertical([Constraint::Percentage(35), Constraint::Percentage(65)]).split(panes[3])
     };
     let row_height = if columns[0].height >= 6 { 2 } else { 1 };
     let window = view::ListWindow::uniform(
@@ -967,7 +1033,7 @@ pub(super) fn draw(f: &mut ratatui::Frame, app: &mut App) {
     };
     widgets::status_strip(
         f,
-        panes[3],
+        panes[4],
         &format!("{}{help}", app.operations.indicator()),
     );
 }

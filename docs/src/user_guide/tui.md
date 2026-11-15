@@ -1581,8 +1581,26 @@ explicitly unavailable; the monitor does not guess its authority.
 The tree uses task titles, preserves ancestry and sibling order, and highlights
 the selected row in bold. Its second line names the recorded status and Agent.
 The header counts only jobs in the executor projection; **Context** rows
-(originating conversations and references outside that projection) have a separate count. A completed job says
-**Completed**, not “claimed.” Missing data says **Unavailable**, not “no jobs.”
+(originating conversations and references outside that projection) have a separate count.
+The wrapped count line partitions those jobs by recorded evidence, not process liveness:
+
+| Count               | Evidence in the snapshot                                                                 |
+| ------------------- | ---------------------------------------------------------------------------------------- |
+| pending             | Request awaiting acceptance                                                              |
+| queued              | Accepted, no start recorded                                                              |
+| activity recorded   | Executor reported active or recent activity, without an unfinished wait for that attempt |
+| child wait recorded | Same activity evidence plus at least one unfinished `job_wait` for that attempt          |
+| uncertain           | Started, without recent activity evidence                                                |
+| interrupted         | Executor explicitly reported an interrupted attempt; inspect before retrying             |
+| finished            | Completed, failed or rejected                                                            |
+| unavailable         | Missing status or unreadable source, even if the projection retains an old status        |
+
+Each job contributes once; multiple wait records do not multiply the job count.
+Context references are excluded even if they have job status or waits.
+A completed job says **Completed**, not “claimed.”
+Missing data says **Unavailable**, not “no jobs.”
+The selected task repeats its full recorded status and **Counted as** group in the
+scrollable body, so a clipped row or heading does not hide the distinction.
 
 Wide terminals show the tree and selected task side by side. Below 110 columns
 they stack, leaving the detail pane the larger share. The detail starts with
@@ -1595,7 +1613,14 @@ diagnostics and full recent records; press it again to return to the task.
 job is proven running. **Started · status uncertain** has no such recent evidence.
 Wait labels come from entered, bounded `job_wait` calls, not model intentions.
 **Wait recorded (unfinished)** is persisted evidence, not proof the execution is
-still waiting. The freshness line shows snapshot age or a stale refresh failure;
+still waiting, even if the deadline has passed. **Started · child wait recorded**
+distinguishes that evidence from other recent activity; it does not assert that
+the child is still running or blocking the parent. Finished waits and waits from
+earlier attempts remain inspectable but do not change the activity count.
+A start without recent activity stays **uncertain**, even with unfinished waits.
+The count line describes the retained snapshot, not elapsed-time reclassification;
+press `r` for a new observation. No bucket is an “executing now” count.
+The freshness line shows snapshot age or a stale refresh failure;
 unavailable sources stay visible. No progress, ETA or heartbeat is invented.
 This view does not fetch remote databases or request access automatically.
 
@@ -1718,6 +1743,35 @@ inclusion unconfirmed`. A returned response changes the receipt to
    dispatch failure instead can leave normal-colored text with `Uncertain` in
    `F2` details. Neither outcome is confirmation of remote delivery or a reason
    to replay automatically. Recover the text and make an explicit next action.
+
+### Walkthrough: account for a parent and child
+
+1. In a disposable local setup with existing Write authority, submit a parent
+   job that spawns a child and enters `job_wait`. Open `/jobs` and press `r`.
+   If the snapshot contains recent parent activity, its unfinished wait and a
+   queued child, the header reads `2 jobs · 1 context` (the originating chat).
+   The count line reads:
+
+   ```text
+   0 pending · 1 queued · 0 activity recorded · 1 child wait recorded · 0 uncertain · 0 interrupted · 0 finished · 0 unavailable
+   ```
+
+   These values are an illustrative snapshot, not guaranteed scheduling order.
+   Select the parent: `Started · child wait recorded` and
+   `Counted as: child wait recorded` distinguish it from the queued child.
+   Its preview names the child under `Children` and `Wait recorded (unfinished)`.
+   `Enter` opens the parent's transcript without acquiring execution.
+
+2. Return to Jobs after both jobs finish and press `r`. The same two jobs now
+   contribute to `2 finished`; the originating chat remains context. Old wait
+   records remain inspectable but do not turn a finished job back into a wait.
+3. If refresh fails, `Stale · refresh failed/timed out` leaves the old counts
+   visible, not a new claim about execution. Restore the disposable service
+   connection and press `r`. A readable start with no recent activity counts
+   as `uncertain`, not active; an unreadable job counts as `unavailable`, not
+   queued or finished merely because its projection retains that old status.
+   Select it and press `d` for source diagnostics; do not retry work based on
+   an old count alone.
 
 ### Walkthrough: steer, then inspect
 
