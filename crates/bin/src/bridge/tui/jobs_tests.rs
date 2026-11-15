@@ -161,6 +161,7 @@ fn jobs_context_counts_titles_and_wait_uncertainty_are_separate() {
     assert!(text.contains("Counted as: child wait recorded"));
     assert!(text.contains("Started · child wait recorded"));
     assert!(text.contains("1 child wait recorded"));
+    assert!(!text.contains("0 queued"));
     assert!(text.contains("From: Plan the migration"));
     assert!(text.contains("Children (1): Measure SQLite latency"));
     assert!(text.contains("Wait recorded (unfinished): Measure SQLite latency"));

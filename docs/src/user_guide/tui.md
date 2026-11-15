@@ -1595,6 +1595,7 @@ The wrapped count line partitions those jobs by recorded evidence, not process l
 | finished            | Completed, failed or rejected                                                            |
 | unavailable         | Missing status or unreadable source, even if the projection retains an old status        |
 
+Only nonzero groups are shown, leaving room for inspection on small terminals.
 Each job contributes once; multiple wait records do not multiply the job count.
 Context references are excluded even if they have job status or waits.
 A completed job says **Completed**, not “claimed.”
@@ -1753,7 +1754,7 @@ inclusion unconfirmed`. A returned response changes the receipt to
    The count line reads:
 
    ```text
-   0 pending · 1 queued · 0 activity recorded · 1 child wait recorded · 0 uncertain · 0 interrupted · 0 finished · 0 unavailable
+   1 queued · 1 child wait recorded
    ```
 
    These values are an illustrative snapshot, not guaranteed scheduling order.

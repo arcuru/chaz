@@ -658,11 +658,9 @@ fn evidence_counts(nodes: &[JobMonitorNode]) -> String {
         "unavailable",
     ]
     .into_iter()
-    .map(|group| {
-        format!(
-            "{} {group}",
-            nodes.iter().filter(|n| evidence_group(n) == group).count()
-        )
+    .filter_map(|group| {
+        let count = nodes.iter().filter(|n| evidence_group(n) == group).count();
+        (count > 0).then(|| format!("{count} {group}"))
     })
     .collect::<Vec<_>>()
     .join(" · ")
@@ -866,7 +864,11 @@ pub(super) fn draw(f: &mut ratatui::Frame, app: &mut App) {
     let evidence = Paragraph::new(evidence_counts(nodes))
         .wrap(Wrap { trim: true })
         .style(theme::dim());
-    let evidence_height = evidence.line_count(f.area().width).min(u16::MAX as usize) as u16;
+    let evidence_height = if total == 0 {
+        0
+    } else {
+        evidence.line_count(f.area().width).min(u16::MAX as usize) as u16
+    };
     let panes = Layout::vertical([
         Constraint::Length(1),
         Constraint::Length(evidence_height),
