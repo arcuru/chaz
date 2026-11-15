@@ -231,6 +231,7 @@ impl TuiBridge {
                                 &mut app, server, &backend, approval_tx, notify_tx, connection_tx,
                             );
                             needs_draw |= refresh::request_tick(&mut app, &refresh_tx);
+                            needs_draw |= refresh::refresh_budget(&mut app, server, &backend);
                         }
                         if app.backend_available && probe_task.is_none()
                             && server.registry().instance().remote_connection().is_some()

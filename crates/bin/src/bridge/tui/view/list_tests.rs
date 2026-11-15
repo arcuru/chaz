@@ -570,6 +570,13 @@ async fn toolbar_context_reopen_honors_pins_and_refreshes_runtime_budget() {
             ..Default::default()
         })
         .await;
+    // The idle loop must request a frame even without a session notification.
+    assert!(super::super::refresh::refresh_budget(
+        &mut app, &server, &backend
+    ));
+    assert!(!super::super::refresh::refresh_budget(
+        &mut app, &server, &backend
+    ));
     let mut terminal = Terminal::new(TestBackend::new(100, 16)).unwrap();
     let screen = draw(&mut terminal, &mut app, &server, &backend).join("\n");
     assert!(screen.contains("ctx unknown/2M tok"), "{screen}");

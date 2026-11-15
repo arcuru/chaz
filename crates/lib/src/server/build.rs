@@ -1136,7 +1136,7 @@ pub async fn build(
 /// fast-start block at the end of [`build`]). Clients stop after step 1;
 /// the remaining steps belong to executors. Order matters:
 ///
-/// 1. `warm_model_windows` — best-effort; the per-turn budget falls back
+/// 1. `watch_model_windows` — best-effort; the per-turn budget falls back
 ///    to the static default until this lands, so a miss is tolerated.
 /// 2. `complete_agent_seeds` — resolves the system prompt of agents seeded
 ///    from yaml that have no prompt pointer yet; never re-applies yaml to an
@@ -1165,7 +1165,10 @@ async fn run_deferred_startup(
     // 1. Seed the context-window overlay from the persisted in-use model
     //    store. No-op on a fresh machine until a model is used or picked.
     let t = Instant::now();
-    server.warm_model_windows().await;
+    if let Err(error) = server.watch_model_windows().await {
+        tracing::warn!(%error, "Cannot watch model metadata; loading startup snapshot only");
+        server.warm_model_windows().await;
+    }
     info!(
         elapsed_ms = t.elapsed().as_millis() as u64,
         "Deferred: warmed model windows"

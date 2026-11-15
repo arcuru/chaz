@@ -75,10 +75,14 @@ ever required in config.
 
 ## How the runtime uses it
 
-- At startup, `Server::warm_model_windows` reads `context_windows()` into the
-  default backend's overlay (`BackendManager::set_model_windows`). The overlay
-  lives behind a shared `Arc`, so it also reaches every per-session worker
-  backend cloned from the default.
+- At startup, `Server::watch_model_windows` subscribes to peer DB writes before
+  warming the default backend's overlay from the persisted in-use metadata.
+  Subsequent writes coalesce into background reads, so another client learning
+  or replacing metadata also updates already-open clients on the same service.
+  The subscription and reader belong to the server generation and stop at shutdown.
+  The overlay lives behind a shared `Arc`, so it also reaches every per-session
+  worker backend cloned from the default. A replacement with no window removes
+  the old learned window; explicit YAML windows still win.
 - `BackendManager::context_window` resolves in two tiers: a YAML-declared
   `context_window:` (explicit operator intent — wins), then the overlay (the
   zero-config path). `None` only when neither knows the model, in which case the

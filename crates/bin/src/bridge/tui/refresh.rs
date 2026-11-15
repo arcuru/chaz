@@ -766,6 +766,36 @@ pub(super) struct Resolved {
     pub(super) roster: Vec<RosterAgent>,
 }
 
+/// Metadata and agent defaults can change without a session write. Also run
+/// this on the idle tick so convergence does not depend on keyboard input or
+/// an unrelated transcript refresh. All lookups here are in-memory.
+pub(super) fn refresh_budget(app: &mut App, server: &Server, backend: &BackendManager) -> bool {
+    let Some(tab) = app.current_mut() else {
+        return false;
+    };
+    let agent = server.agents().get(&tab.current_agent);
+    let requested_model = tab
+        .model_pin
+        .as_deref()
+        .or_else(|| agent.as_ref().and_then(|a| a.default_model.as_deref()));
+    let model = backend.resolve_model_name(requested_model);
+    let context_model = requested_model
+        .map(str::to_string)
+        .or_else(|| backend.default_model())
+        .unwrap_or_default();
+    let cap = agent.and_then(|a| a.max_context_tokens);
+    let budget = server.effective_context_budget(&context_model, cap);
+    let changed = tab.effective_model != model || tab.context_budget != budget;
+    tab.effective_model = model;
+    tab.context_budget = budget;
+    for row in &mut tab.roster {
+        if row.name == tab.current_agent {
+            row.model.clone_from(&tab.effective_model);
+        }
+    }
+    changed
+}
+
 /// Resolve the tab's display values from fresh meta. If `/model X` or
 /// `/model <agent> Y` ran on this session (or a remote peer pinned a model),
 /// the effective model moves; the per-agent override beats the session pin

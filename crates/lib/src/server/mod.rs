@@ -1890,8 +1890,8 @@ impl Server {
     /// `model_info_store` into the default backend's overlay, so window-aware
     /// budgeting works with zero config (no `context_window:` hand-edited into
     /// YAML). Idempotent and cheap — one DB read of the `chaz_peer`
-    /// `model_info` store. Call once at startup, before the bridge delivers
-    /// messages. A miss (no model used on this machine yet) is a no-op: the
+    /// `model_info` store. Used by the startup watch and on subsequent peer
+    /// writes. A miss (no model used on this machine yet) is a no-op: the
     /// runtime falls back to the static budget until a model is used or picked,
     /// at which point [`ensure_model_window_cached`](Self::ensure_model_window_cached)
     /// populates the store for next time.
@@ -1908,6 +1908,34 @@ impl Server {
         if n > 0 {
             tracing::info!(models = n, "Warmed context-window overlay from model store");
         }
+    }
+
+    /// Keep the process-local overlay current when another service client
+    /// learns or replaces model metadata. Subscribe before the initial read so
+    /// startup cannot miss a concurrent write. Call once per server generation.
+    pub async fn watch_model_windows(&self) -> anyhow::Result<()> {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let subscription = self
+            .registry
+            .chaz_peer()
+            .on_write(move |_, _| {
+                // Coalesce bursts without blocking a database commit on a reader.
+                let _ = tx.try_send(());
+                Box::pin(async { Ok(()) })
+            })
+            .await?;
+        self.warm_model_windows().await;
+        let weak = self.self_ref.clone();
+        self.track_task(tokio::spawn(async move {
+            let _subscription = subscription;
+            while rx.recv().await.is_some() {
+                let Some(server) = weak.upgrade() else {
+                    break;
+                };
+                server.warm_model_windows().await;
+            }
+        }));
+        Ok(())
     }
 
     /// If `model`'s context window isn't known yet, fetch its info from the

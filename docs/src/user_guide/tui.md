@@ -383,8 +383,11 @@ The denominator is the runtime's effective **input** context budget, not the
 output-token cap. Configured model windows take precedence over discovered
 windows; an explicit agent cap can lower the budget. When the model window is
 unknown, the configured input-budget fallback still applies. A zero budget is
-shown as `unknown`. The bar refreshes model defaults, learned windows and caps
-on redraw. Long session names are clipped to keep the pair visible.
+shown as `unknown`. Already-open clients follow updates to the peer's stored
+in-use model metadata, including windows learned by another client or the executor.
+The bar refreshes model defaults, learned windows and caps on redraw and on its
+five-second idle tick; reopening is not required. Long session names are clipped
+to keep the pair visible.
 
 For example:
 
@@ -401,7 +404,13 @@ For example:
 4. While the request is pending, the numerator is locally estimated. If the
    provider omits usage, that estimate remains; a later report replaces it. An agent cap of 16,000 changes the denominator
    to `16k`, including after reopening the session.
-5. If a later call fails or you stop the turn, already reported usage remains
+5. Leave a second client open on the same session, then select a model with a
+   newly discovered window in the first client. Both show the same denominator
+   within the idle refresh interval, subject to the same agent cap. If updated
+   metadata no longer includes a window, both use the configured fallback (or
+   explicit cap), not the old learned maximum. This shares metadata only among
+   clients connected to the same peer service, not across independent peers.
+6. If a later call fails or you stop the turn, already reported usage remains
    recorded. Reopening or reconnecting reloads it from the session; during a
    failed background read the last-good display stays visible with
    `⚠ refresh failed` until a successful refresh.

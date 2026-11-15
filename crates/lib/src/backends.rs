@@ -499,6 +499,8 @@ impl BackendManager {
     pub fn insert_model_info(&self, info: ModelInfo) {
         if let Some(window) = info.context_window {
             self.insert_model_window(info.id.clone(), window);
+        } else {
+            self.model_windows.write().unwrap().remove(&info.id);
         }
         self.model_info
             .write()

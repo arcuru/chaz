@@ -320,27 +320,7 @@ pub(super) fn ui(
     // can show the "reconciling agents…" indicator until the deferred
     // at-startup work releases it.
     app.startup_ready = server.is_startup_ready();
-    // Catalog discovery and agent-default edits need not write the session DB.
-    // Resolve pins against live defaults, windows and caps on every draw.
-    if let Some(tab) = app.current_mut() {
-        let agent = server.agents().get(&tab.current_agent);
-        let requested_model = tab
-            .model_pin
-            .as_deref()
-            .or_else(|| agent.as_ref().and_then(|a| a.default_model.as_deref()));
-        tab.effective_model = backend.resolve_model_name(requested_model);
-        let context_model = requested_model
-            .map(str::to_string)
-            .or_else(|| backend.default_model())
-            .unwrap_or_default();
-        let cap = agent.and_then(|a| a.max_context_tokens);
-        tab.context_budget = server.effective_context_budget(&context_model, cap);
-        for row in &mut tab.roster {
-            if row.name == tab.current_agent {
-                row.model.clone_from(&tab.effective_model);
-            }
-        }
-    }
+    super::refresh::refresh_budget(app, server, backend);
 
     // Refresh peer-side caches whenever any Settings page is up. The Peer
     // Settings views index into these directly for action keys ([r]

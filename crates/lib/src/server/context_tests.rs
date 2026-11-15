@@ -390,3 +390,113 @@ fn parsed_command(text: &str) -> crate::commands::Command {
     };
     command
 }
+
+/// Two already-open service clients must observe metadata learned by another
+/// client, not keep their startup-only overlays until the process is reopened.
+#[tokio::test]
+async fn model_windows_converge_across_existing_service_clients() {
+    use crate::backends::ModelInfo;
+    use crate::model_info_store::ModelInfoStore;
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("model-info.sock");
+    let (owner, _) = crate::test_support::fresh_eidetica().await;
+    let service = eidetica::service::ServiceServer::bind(owner, &socket)
+        .await
+        .unwrap();
+    let (shutdown, receiver) = tokio::sync::watch::channel(());
+    let task = tokio::spawn(service.run(receiver));
+    let settings = crate::config::EideticaConfig {
+        connection: format!("unix://{}", socket.display()),
+        login: crate::config::EideticaLoginConfig {
+            username: "test".into(),
+            password: Some("test-password".into()),
+        },
+        sync: None,
+    };
+    async fn client(settings: &crate::config::EideticaConfig) -> Arc<Server> {
+        let connected =
+            crate::instance::connect_with(settings, crate::config::ExecutionRole::Client)
+                .await
+                .unwrap();
+        let registry = Arc::new(
+            SessionRegistry::new(
+                connected.instance,
+                connected.user,
+                Arc::new(AgentRegistry::with_default_agent()),
+            )
+            .await
+            .unwrap(),
+        );
+        context_extension_server(registry, None).await
+    }
+    let existing = client(&settings).await;
+    let (_, session) = existing
+        .registry
+        .create_session(Some("window-test"))
+        .await
+        .unwrap();
+    let session_id = session.root_id().to_string();
+    let writer = client(&settings).await;
+    assert_eq!(
+        writer
+            .registry
+            .open_session(&session_id)
+            .await
+            .unwrap()
+            .1
+            .root_id(),
+        session.root_id()
+    );
+    existing.watch_model_windows().await.unwrap();
+    assert_eq!(
+        existing.effective_context_budget("catalog-model", None),
+        128_000
+    );
+    let store = ModelInfoStore::new(writer.registry.chaz_peer().clone());
+    for window in [Some(1_050_000), Some(256_000), None] {
+        store
+            .put(&ModelInfo {
+                id: "catalog-model".into(),
+                context_window: window,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        // A fresh client sees the persisted update before any model request.
+        let fresh = client(&settings).await;
+        fresh.registry.open_session(&session_id).await.unwrap();
+        fresh.warm_model_windows().await;
+        let expected = window.map(|w| w as usize).unwrap_or(128_000);
+        assert_eq!(
+            fresh.effective_context_budget("catalog-model", None),
+            expected
+        );
+        fresh.shutdown().await;
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while existing.effective_context_budget("catalog-model", None) != expected {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("existing client retained its startup model window");
+        // This is the same overlay and clamp used for request packing, not
+        // merely a patched status-bar denominator.
+        assert_eq!(
+            resolve_context_max_tokens(&existing.default_backend, Some("catalog-model"), None)
+                .unwrap_or(existing.context_config.max_context_tokens),
+            expected
+        );
+        assert_eq!(
+            existing.effective_context_budget("catalog-model", Some(16_000)),
+            16_000
+        );
+        assert_eq!(
+            existing.effective_context_budget("unknown-model", None),
+            128_000
+        );
+    }
+    existing.shutdown().await;
+    writer.shutdown().await;
+    drop(shutdown);
+    task.await.unwrap().unwrap();
+}
