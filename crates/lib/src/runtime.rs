@@ -670,10 +670,16 @@ async fn finalize_outcome(
     cancel: Option<&TurnCancel>,
 ) -> RuntimeOutcome {
     if let (Some(hub), Some(ctx)) = (hub, ctx) {
-        let public = crate::extension::turn::public_messages(request.0, &outcome.body);
         until_cancelled(
             cancel,
-            hub.fire_turn_complete(ctx, public, request.1, backend, security, cancel),
+            hub.fire_turn_complete(
+                ctx,
+                || crate::extension::turn::public_messages(request.0, &outcome.body),
+                request.1,
+                backend,
+                security,
+                cancel,
+            ),
         )
         .await;
         hub.fire_agent_end(ctx).await;
