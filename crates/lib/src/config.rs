@@ -646,6 +646,18 @@ pub struct Backend {
     /// `max_output_tokens`; Chat Completions ignores this field.
     #[serde(default)]
     pub max_tokens: Option<u32>,
+    /// Wire field for bounded Chat Completions output. Normal turns are unchanged.
+    #[serde(default)]
+    pub chat_token_limit: ChatTokenLimit,
+}
+
+/// Explicit Chat Completions dialect; never inferred from a URL or model name.
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ChatTokenLimit {
+    #[default]
+    MaxCompletionTokens,
+    MaxTokens,
 }
 
 impl std::fmt::Debug for Backend {
@@ -662,6 +674,7 @@ impl std::fmt::Debug for Backend {
             .field("request_timeout", &self.request_timeout)
             .field("max_retries", &self.max_retries)
             .field("max_tokens", &self.max_tokens)
+            .field("chat_token_limit", &self.chat_token_limit)
             .finish()
     }
 }
@@ -680,6 +693,7 @@ impl Backend {
             request_timeout: None,
             max_retries: None,
             max_tokens: None,
+            chat_token_limit: ChatTokenLimit::default(),
         }
     }
 
@@ -1252,6 +1266,7 @@ fn known_config_keys() -> HashSet<&'static str> {
         "backends[].request_timeout",
         "backends[].max_retries",
         "backends[].max_tokens",
+        "backends[].chat_token_limit",
     ] {
         keys.insert(k);
     }
@@ -1755,6 +1770,16 @@ backends:
         assert_eq!(b.api_key.as_deref(), Some("${OPENROUTER_KEY}"));
         assert_eq!(b.request_timeout().as_secs(), 60);
         assert_eq!(b.max_retries(), 5);
+        assert_eq!(b.chat_token_limit, ChatTokenLimit::MaxCompletionTokens);
+        let legacy: Backend =
+            serde_yaml::from_str("type: openaicompatible\nchat_token_limit: max_tokens\n").unwrap();
+        assert_eq!(legacy.chat_token_limit, ChatTokenLimit::MaxTokens);
+        assert!(
+            serde_yaml::from_str::<Backend>(
+                "type: openaicompatible\nchat_token_limit: unsupported\n"
+            )
+            .is_err()
+        );
         assert_eq!(b.models.as_ref().unwrap().len(), 2);
         assert_eq!(
             b.models.as_ref().unwrap()[0].reasoning,

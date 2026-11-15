@@ -661,6 +661,7 @@ It is active by default but **makes no model calls until you enable it on a sess
 | `/name`                               | —       | Clear the name; does not reset the naming attempt.                                                                                       |
 
 The first eligible turn spends at most one auxiliary completion: 128 output tokens and a 10-second deadline, without tools or retries.
+For Chat Completions servers that require the legacy `max_tokens` field, configure the backend's [auxiliary output-limit dialect](configuration.md#auxiliary-output-limits-use-an-explicit-chat-dialect); the default remains `max_completion_tokens`.
 Naming runs in the background: neither the successful reply nor its end hooks wait for the auxiliary completion.
 Observations serialize per session, so a later turn cannot start a second naming call while the first is pending.
 The attempt marker persists with the session, so restarting the daemon, clearing the name, or removing/re-adding the extension does not repeat inference.

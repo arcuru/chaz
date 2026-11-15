@@ -1168,14 +1168,17 @@ mod tests {
 
     #[tokio::test]
     async fn bounded_completion_sends_native_limits_without_tools_or_policy_override() {
+        use crate::config::ChatTokenLimit::{MaxCompletionTokens, MaxTokens};
         use wiremock::{
             Mock, MockServer, ResponseTemplate,
             matchers::{method, path},
         };
-        for api in [
-            ModelApi::ChatCompletions,
-            ModelApi::AnthropicMessages,
-            ModelApi::Responses,
+        for (api, token_field, backend_limit) in [
+            (ModelApi::ChatCompletions, MaxCompletionTokens, Some(64)),
+            (ModelApi::ChatCompletions, MaxTokens, Some(64)),
+            (ModelApi::ChatCompletions, MaxTokens, None),
+            (ModelApi::AnthropicMessages, MaxCompletionTokens, Some(64)),
+            (ModelApi::Responses, MaxCompletionTokens, Some(64)),
         ] {
             let kind = if api == ModelApi::AnthropicMessages {
                 BackendType::Anthropic
@@ -1207,7 +1210,8 @@ mod tests {
                 .await;
             let mut config = Backend::new(kind.clone());
             config.name = Some("route".into());
-            config.max_tokens = Some(64);
+            config.max_tokens = backend_limit;
+            config.chat_token_limit = token_field;
             config.api_base = Some(format!("{}/v1", server.uri()));
             config.api_key = Some("test-key".into());
             config.models = Some(vec![Model {
@@ -1249,17 +1253,39 @@ mod tests {
                 assert_eq!(body["reasoning"]["effort"], "high");
                 assert_eq!(normal["max_output_tokens"], 64);
             } else {
-                assert_eq!(body["max_completion_tokens"], 64);
+                let (sent, omitted) = match token_field {
+                    MaxCompletionTokens => ("max_completion_tokens", "max_tokens"),
+                    MaxTokens => ("max_tokens", "max_completion_tokens"),
+                };
+                assert_eq!(body[sent], backend_limit.unwrap_or(128));
+                assert!(body.get(omitted).is_none());
                 assert_eq!(body["reasoning"]["effort"], "high");
                 assert!(normal.get("max_completion_tokens").is_none());
+                assert!(normal.get("max_tokens").is_none());
             }
         }
     }
 
     #[tokio::test]
     async fn bounded_completion_never_uses_sdk_retries_on_rate_or_server_errors() {
+        use crate::config::ChatTokenLimit::{MaxCompletionTokens, MaxTokens};
         use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
-        for status in [429, 500] {
+        for (status, token_field, sent, omitted) in [
+            (
+                429,
+                MaxCompletionTokens,
+                "max_completion_tokens",
+                "max_tokens",
+            ),
+            (
+                500,
+                MaxCompletionTokens,
+                "max_completion_tokens",
+                "max_tokens",
+            ),
+            (429, MaxTokens, "max_tokens", "max_completion_tokens"),
+            (500, MaxTokens, "max_tokens", "max_completion_tokens"),
+        ] {
             let server = MockServer::start().await;
             Mock::given(method("POST"))
                 .respond_with(ResponseTemplate::new(status).set_body_json(serde_json::json!({
@@ -1270,6 +1296,7 @@ mod tests {
             config.api_key = Some("test-key".into());
             config.request_timeout = Some(2);
             config.max_retries = Some(9);
+            config.chat_token_limit = token_field;
             let manager = BackendManager::new(&Some(vec![config]), empty_secrets().await);
             assert!(
                 manager
@@ -1281,11 +1308,11 @@ mod tests {
                     .await
                     .is_err()
             );
-            assert_eq!(
-                server.received_requests().await.unwrap().len(),
-                1,
-                "SDK retried HTTP {status}"
-            );
+            let requests = server.received_requests().await.unwrap();
+            assert_eq!(requests.len(), 1, "SDK retried HTTP {status}");
+            let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+            assert_eq!(body[sent], 128);
+            assert!(body.get(omitted).is_none());
         }
     }
 
