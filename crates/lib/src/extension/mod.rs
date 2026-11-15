@@ -1608,7 +1608,7 @@ impl ExtensionHub {
     pub async fn fire_turn_complete(
         &self,
         ctx: &HookContext,
-        messages: Vec<RuntimeMessage>,
+        messages: impl FnOnce() -> Vec<RuntimeMessage> + Send,
         tools: &[crate::tool::ToolDefinition],
         backend: &crate::backends::BackendManager,
         security: &crate::security::SecurityContext,
@@ -1617,6 +1617,16 @@ impl ExtensionHub {
         let Some(registry) = self.session_registry.as_ref() else {
             return;
         };
+        // The turn's authority is an upper bound: no later session/agent
+        // change can activate an observer absent here. Include scoped factories,
+        // whose instances may not exist yet, rather than the Global hook index.
+        if !self.extensions.iter().any(|extension| {
+            let manifest = extension.manifest();
+            ctx.active_extensions.contains(&manifest.name)
+                && manifest.supported_hooks.contains(&HookKind::TurnComplete)
+        }) {
+            return;
+        }
         let db = ctx.session.lock().await.database().clone();
         let id = db.root_id().to_string();
         // The caller must hold a session this peer can open with its keys.
@@ -1646,6 +1656,7 @@ impl ExtensionHub {
         if endpoints.is_empty() {
             return;
         }
+        let messages = messages();
         let registry = registry.clone();
         let backend = backend.clone();
         let security = security.clone();

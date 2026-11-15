@@ -1592,7 +1592,7 @@ async fn queued_turn_complete_rechecks_session_and_agent_revocation() {
                 let _ = wait.await;
             });
         ready.await.unwrap();
-        hub.fire_turn_complete(&ctx, vec![], &[], &backend, &permissive_security(), None)
+        hub.fire_turn_complete(&ctx, Vec::new, &[], &backend, &permissive_security(), None)
             .await;
         assert_eq!(calls.load(Ordering::SeqCst), 0);
         if case != "allowed" {
@@ -1664,7 +1664,7 @@ async fn turn_complete_failures_do_not_block_later_endpoints() {
             Arc::new(MockBackend::new()),
             empty_secrets().await,
         );
-        hub.fire_turn_complete(&ctx, vec![], &[], &backend, &permissive_security(), None)
+        hub.fire_turn_complete(&ctx, Vec::new, &[], &backend, &permissive_security(), None)
             .await;
         tokio::time::timeout(
             std::time::Duration::from_secs(20),
@@ -1677,5 +1677,95 @@ async fn turn_complete_failures_do_not_block_later_endpoints() {
             if failure == "construct-panic" { 1 } else { 2 },
             "{failure}"
         );
+    }
+}
+
+#[tokio::test]
+async fn turn_complete_projects_only_for_eligible_scoped_endpoints() {
+    use crate::test_support::{MockBackend, empty_secrets, permissive_security};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    for case in ["no-hook", "inactive", "revoked", "allowed"] {
+        let mut hub = test_hub().await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let instances = Arc::new(AtomicUsize::new(0));
+        let mut extension = TestExt::new("observer")
+            .scopes(vec![instance::Scope::PerSession])
+            .instantiation_counter(instances.clone());
+        if case != "no-hook" {
+            extension = extension.turn_complete(Arc::new(TurnProbe {
+                calls: calls.clone(),
+                failure: "",
+            }));
+        }
+        hub.install_all(vec![Arc::new(extension)]).await.unwrap();
+        let (conv, db) = hub
+            .session_registry
+            .as_ref()
+            .unwrap()
+            .create_session(None)
+            .await
+            .unwrap();
+        hub.record_active(&db).await.unwrap();
+        if case == "revoked" {
+            append_event(
+                &db,
+                ExtensionEvent::Deactivated {
+                    name: "observer".into(),
+                    timestamp: Utc::now() + chrono::Duration::seconds(1),
+                },
+            )
+            .await
+            .unwrap();
+        }
+        let ctx = HookContext {
+            agent_name: "test-agent".into(),
+            model: None,
+            call_depth: 0,
+            session: Arc::new(Mutex::new(Session::new(conv, db).await)),
+            active_extensions: if case == "inactive" {
+                HashSet::new()
+            } else {
+                all_active(&["observer"])
+            },
+            routine_engine: None,
+        };
+        let backend = crate::backends::BackendManager::with_mock(
+            Arc::new(MockBackend::new()),
+            empty_secrets().await,
+        );
+        let projections = AtomicUsize::new(0);
+        // An irrelevant observer must not even acquire the session lock.
+        let guard = if matches!(case, "no-hook" | "inactive") {
+            Some(ctx.session.lock().await)
+        } else {
+            None
+        };
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            hub.fire_turn_complete(
+                &ctx,
+                || {
+                    projections.fetch_add(1, Ordering::SeqCst);
+                    vec![RuntimeMessage::Assistant("reply".into())]
+                },
+                &[],
+                &backend,
+                &permissive_security(),
+                None,
+            ),
+        )
+        .await
+        .expect("irrelevant observer must not prepare the session");
+        drop(guard);
+        hub.drain_turn_complete().await;
+        let eligible = usize::from(case == "allowed");
+        assert_eq!(projections.load(Ordering::SeqCst), eligible, "{case}");
+        assert_eq!(calls.load(Ordering::SeqCst), eligible, "{case}");
+        if matches!(case, "no-hook" | "inactive") {
+            assert_eq!(instances.load(Ordering::SeqCst), 0, "{case}");
+        } else {
+            assert_eq!(instances.load(Ordering::SeqCst), 1, "{case}");
+        }
     }
 }
