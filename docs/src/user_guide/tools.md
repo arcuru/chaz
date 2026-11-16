@@ -623,15 +623,15 @@ Tool profiles control **how** each tool's definition is presented to the LLM —
 - **Summary** — name only, parameters trimmed to an empty schema. The LLM has to call `describe_tool` to learn more.
 - **Hidden** — not sent to the LLM at all. The tool stays callable if the agent already knows about it.
 
-Profiles live under top-level `tool_profiles:` in config and are referenced by name from an agent or preset. The resolution order for a tool is **exact name → glob prefix (`namespace.*`) → profile default**.
+Profiles live under top-level `tool_profiles:` in config and are referenced by name from an agent or preset. The resolution order for a tool is **exact name → glob prefix (`namespace__*`) → profile default**.
 
 ```yaml
 tool_profiles:
   compact:
     default: full
     tools:
-      "filesystem.*": brief
-      "github.*": summary
+      "filesystem__*": brief
+      "github__*": summary
       shell: hidden
 
 agents:
