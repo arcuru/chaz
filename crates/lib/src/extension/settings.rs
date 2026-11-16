@@ -158,10 +158,10 @@ pub(super) async fn update_settings_in<R>(
         for key in before.keys().filter(|key| !after.contains_key(*key)) {
             delta.set(field_key(key), NativeValue::Deleted);
         }
-        if !delta.is_empty() {
-            store.set_node(ext, delta).await?;
-        }
-    } else if before != after {
+        // before != after already proves a change. Native is_empty() hides
+        // tombstones, so it must not discard a deletion-only delta.
+        store.set_node(ext, delta).await?;
+    } else {
         store.set(ext, replacement(&after)?).await?;
     }
     Ok((result, true))

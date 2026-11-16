@@ -69,6 +69,16 @@ async fn native_settings_retained_conversion_is_explicit_atomic_and_lossless() {
     assert_eq!(got["a.b"], json!({"only":2}));
     assert!(got.get("").is_none());
     assert_eq!(got["雪"], value["雪"]);
+    // A removal without any accompanying set is still a real native delta.
+    update_settings(&db, "memory", true, |v| {
+        v.as_object_mut().unwrap().remove("enabled");
+        Ok(())
+    })
+    .await
+    .unwrap();
+    let removed = read_settings_checked(&db, "memory").await.unwrap();
+    assert!(removed.get("enabled").is_none());
+    assert_eq!(removed["雪"], value["雪"]);
     write_settings(&db, "memory", json!({})).await.unwrap();
     assert_eq!(
         read_settings_checked(&db, "memory").await.unwrap(),
