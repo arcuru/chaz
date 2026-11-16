@@ -199,11 +199,30 @@ context:
         old.expect("Worker transcript")
         old.expect("CHILD-ASSIGNMENT")
         old.screen_capture(OUT, "old-client-live-child")
+        old.expect("Parent (Alt+P")
         before = len(calls)
         old.send("must-not-submit\r/stop\r")
         old.drain(1)
         assert "must-not-submit" not in "\n".join(old.screen.display)
         assert len(calls) == before == 2, f"inspection executed a call: {len(calls)}"
+        old.send("/parent\r")
+        old.expect("1 linked Workers")
+        old.expect("Worker helper")
+        old.expect("Open child")
+        old.expect("activity recorded")
+        old.screen_capture(OUT, "live-parent-summary")
+        def click_text(p, text):
+            p.expect(text)
+            for y, row in enumerate(p.screen.display):
+                if text in row:
+                    x = row.index(text) + 2
+                    p.send(f"\x1b[<0;{x};{y+1}M\x1b[<0;{x};{y+1}m")
+                    return
+            raise AssertionError("click target not rendered: " + text)
+        click_text(old, "Open child")
+        old.expect("Worker transcript")
+        old.expect("CHILD-ASSIGNMENT")
+        assert len(calls) == before, "summary navigation executed a model call"
         release.set()
         old.expect("CHILD-RESULT")
         old.screen_capture(OUT, "old-client-completed-child")
@@ -222,11 +241,25 @@ context:
             assert outcome["directive_id"] == record["spawn"]["directive_id"]
             assert outcome["terminal"] == "reply"
             assert final_entry["content"] == "CHILD-RESULT"
+        old.expect("2 linked Workers")
+        old.expect("Child result: CHILD-RESULT")
+        old.screen_capture(OUT, "completed-parent-summaries")
+        old.send("/workers\r")
+        old.expect("Workers (parent-filtered)")
+        old.expect("[spawn]")
+        assert "[tui]" not in "\n".join(old.screen.display)
+        old.screen_capture(OUT, "parent-filtered-workers")
+        old.send("\x1b[B\r")
+        old.expect("Worker transcript")
+        old.expect("Parent (Alt+P")
+        old.send("\x1bp")
+        old.expect("PARENT-RESULT")
         old.send("unsent-parent-draft")
         old.expect("unsent-parent-draft")
         old.send("\x10")
         old.expect("[spawn]")
-        old.send("\x1b[B\r")
+        click_text(old, "[spawn]")
+        click_text(old, "[spawn]")
         old.expect("Worker transcript")
         old.expect("CHILD-RESULT")
         old.screen_capture(OUT, "hub-reopened-child")
@@ -252,7 +285,8 @@ context:
         again.expect("[spawn]")
         again.expect("[tui]")
         again.screen_capture(OUT, "reopen-completed-visible")
-        again.send("\x1b[B\r")
+        click_text(again, "[spawn]")
+        click_text(again, "[spawn]")
         again.expect("Worker transcript")
         again.expect("CHILD-RESULT")
         again.screen_capture(OUT, "after-executor-restart-child")
@@ -261,8 +295,70 @@ context:
             again.drain(.05)
         assert len(calls) == 4
         assert worker_records("after-restart") == completed_records, "inspection/restart rewrote native references or results"
+        def fixture_command(command, prefix):
+            service.stdin.write((command + "\n").encode())
+            service.stdin.flush()
+            assert select.select([service.stdout], [], [], 20)[0], command + " deadline"
+            line = service.stdout.readline().decode().strip()
+            assert line.startswith(prefix + " "), line
+            return json.loads(line.removeprefix(prefix + " "))
+        cases = fixture_command("worker-cases", "WORKER-CASES")
+        (OUT / "synthetic-cases.json").write_text(json.dumps(cases, indent=2))
+        old.resize(160, 75)
+        # Return to the ordinary parent with its preserved unsent draft before
+        # issuing a /join. No synthetic fixture session is ever registered.
+        old.expect("unsent-parent-draft")
+        old.send("\x7f" * len("unsent-parent-draft"))
+        old.send("/join evidence-parent\r")
+        old.expect("Worker transcript")
+        old.expect("10 linked Workers")
+        click_text(old, "R1 chaz")
+        for text in ["Open child · failed", "SYNTHETIC-FAILURE", "completed attempt; result unavailable",
+                     "Open child · outcome unknown", "stop request recorded; outcome not recorded",
+                     "cancelled (acknowledged)", "LATER-CHILD-REPLY", "not started; no attempt recorded",
+                     "completed without reply", "transcript unavailable", "Worker origin mismatch"]:
+            old.expect(text)
+        assert "DENIED-SECRET" not in "\n".join(old.screen.display)
+        old.screen_capture(OUT, "synthetic-status-boundaries")
+        before_tips = fixture_command("worker-cases-audit", "WORKER-AUDIT")
+        # Opening a missing/denied reference must not acquire it or change tabs.
+        rows = old.screen.display
+        denied_row = next(y for y, row in enumerate(rows) if "CASE-denied" in row) + 1
+        old.send(f"\x1b[<0;8;{denied_row+1}M\x1b[<0;8;{denied_row+1}m")
+        old.drain(.5)
+        assert "DENIED-SECRET" not in "\n".join(old.screen.display)
+        old.send("/workers\r")
+        old.expect("Workers (parent-filtered)")
+        old.expect("referenced transcript unavailable locally")
+        old.screen_capture(OUT, "unavailable-child-reference")
+        old.send("\x1b")
+        old.expect("Worker transcript")
+        old.send("\x10")
+        old.expect("independent-root")
+        old.expect("legacy-worker")
+        old.expect("legacy ancestry unknown")
+        old.screen_capture(OUT, "roots-legacy-grouping")
+        # Stop and restart only the disposable executor while interrupted child
+        # evidence exists: inspection must not reconstruct narrowed Workers.
+        restarted.terminate()
+        restarted.wait(timeout=5)
+        last_log = (OUT / "executor-cases-restart.log").open("wb")
+        last = subprocess.Popen([CHAZ, "--config", configs["executor"], "daemon"], env=env, cwd=home, stdout=last_log, stderr=last_log)
+        processes.append(last)
+        deadline = time.monotonic() + 30
+        while "chaz daemon ready" not in (OUT / "executor-cases-restart.log").read_text():
+            assert last.poll() is None and time.monotonic() < deadline
+            time.sleep(.05)
+        old.send("\x10")
+        old.expect("outcome unknown")
+        old.expect("completed attempt; result unavailable")
+        old.screen_capture(OUT, "interrupted-after-executor-restart")
+        old.drain(1)
+        assert fixture_command("worker-cases-audit", "WORKER-AUDIT") == before_tips, "inspection/restart mutated a synthetic session"
+        assert len(calls) == 4, "synthetic evidence triggered a model request"
+        (OUT / "synthetic-tips.json").write_text(json.dumps(before_tips, indent=2))
         (OUT / "summary.json").write_text(json.dumps({"result": "passed", "cached_live": "parent and child", "model_calls": len(calls), "inspection_calls": 0, "old_client_join": "inspection-only child", "after_executor_restart": "completed child readable; no calls"}, indent=2))
-        print("PASS: same-service split daemon/TUI discovers live child, stale-client /join and hub reopen are inspection-only, completion/restart readable, parent draft preserved; exact native links and atomic outcomes survive restart; 4 stub calls, 0 inspection calls")
+        print("PASS: same-service split daemon/TUI discovers live child, stale-client /join and hub reopen are inspection-only, completion/restart readable, parent draft preserved; exact native links/outcomes and summary-child-parent navigation, grouped hub and /workers survive restart; failure/missing/interrupted/stop/cancelled/legacy/denied fixtures retained native tips; 4 stub calls, 0 inspection calls")
 finally:
     parent_release.set()
     release.set()

@@ -777,63 +777,98 @@ Cancelling these presentation reads does not resolve backend-wide storage stalls
 
 ## Inspecting Worker transcripts
 
-| Control or display                                                    | Meaning                                                              |
-| --------------------------------------------------------------------- | -------------------------------------------------------------------- |
-| `[spawn]` in the session hub                                          | A locally indexed Worker session; not proof of its parent or outcome |
-| Select the row, `/join <name-or-ID>`, or launch with `--session NAME` | Open or focus an inspection-only transcript tab                      |
-| `Worker transcript · inspection only`                                 | No composer, stop, retry, approval or session-settings controls      |
-| `Esc` or `Ctrl+P` in the inspector                                    | Open the session hub                                                 |
-| `Ctrl+H` / `Ctrl+L`, `Ctrl+W`                                         | Switch tabs, or close this local view                                |
-| Arrows, PageUp/PageDown, `Ctrl+O`, mouse selection                    | Read, expand and copy the original transcript                        |
+| Control or display                                      | Meaning                                                                                        |
+| ------------------------------------------------------- | ---------------------------------------------------------------------------------------------- |
+| `[spawn]` in the session hub                            | A Worker transcript; not proof of completion                                                   |
+| Indented `↳` session row                                | Reciprocal stored parent/child references; independent roots and unknown ancestry stay visible |
+| Select a row, `/join <name-or-ID>`, or `--session NAME` | Open or focus an inspection-only Worker tab                                                    |
+| **Open workers**, `/workers`, or `Alt+W`                | Parent-filtered list of linked children, including unavailable references                      |
+| **Open child** in an expanded tool run                  | Inspect the exact child's initial Directive and full transcript                                |
+| **Parent**, `/parent`, or `Alt+P` in a child            | Return to its exact spawning call when available                                               |
+| `Worker transcript · inspection only`                   | No message composer, stop, retry, approval or session-settings controls                        |
+| `Esc` or `Ctrl+P` in the inspector                      | Open the session hub                                                                           |
+| `Ctrl+H` / `Ctrl+L`, `Ctrl+W`                           | Switch tabs, or close this local view                                                          |
+| Arrows, PageUp/PageDown, `Ctrl+O`, mouse selection      | Read, expand and copy the original transcript                                                  |
+
+### A transcript is not an execution
 
 A Worker template is configuration; its child session is a stored transcript.
-Inspecting that transcript does not invoke the template, register an executor,
-attach an Agent or submit another Directive, even in an executor-capable TUI.
-Recorded activity is not proof that a remote process is still running.
-A parent tool timeout does not prove the child stopped.
-This view does not infer ancestry from permission delegation or identify a final
-result from a parent's success.
-Exact parent grouping and linked summaries are not available yet.
+One native `spawn_worker` call links the parent request, attempt and exact tool
+invocation to that child and its submitted Directive.
+The parent shows the requested name/assignment, child evidence and a short result
+preview. Expand the tool item to retain the original parent-call arguments/result;
+open the child to read its actual assignment and activity.
+A collapsed run stays two rows high, even for many Workers. Its **Open workers**
+row provides the full list without flooding the parent transcript.
 
-Separate TUI and daemon processes using the same Eidetica service and login
-share a local catalog.
-The visible hub refreshes when that catalog changes, and on explicit entry.
-Refresh retains the selected session by ID; lazy metadata loads do not reorder it.
-A read failure retains the cached rows with an error rather than showing an
-empty catalog.
-Independent peers still need the existing explicit sharing/sync procedure;
-listing or opening does not acquire a missing remote database.
+Child status comes from the child's own attempt and terminal references, not the
+parent tool's outcome. A failed or timed-out parent call can have a later child
+reply. `activity recorded` is recent evidence, not proof that a remote process is
+still alive. An interrupted attempt says `outcome unknown`; a completed attempt
+without a usable result reference says `completed attempt; result unavailable`.
+A stop request is not cancellation acknowledgement. Usage remains session-local;
+there is no descendant roll-up.
 
-Inspection currently requires existing Write authority (Admin also works),
-because native record reads can materialize caches.
-It is not a Read-only permission feature.
+Inspection never invokes a template, registers an executor, attaches an Agent or
+submits a Directive, even in an executor-capable TUI. Returning to an already open
+parent preserves its draft and expansion. A parent opened by navigation is also
+inspection-only; navigation does not acquire execution authority.
+The inspector accepts only the local `/parent`, `/workers` and `/sessions`
+navigation commands, not messages or execution commands.
+
+Separate TUI and daemon processes using the same Eidetica service and login share
+a local catalog. The visible hub refreshes on catalog changes and explicit entry.
+Grouping reads small reciprocal references, not every transcript. It preserves
+root ordering and the selected session ID; lazy descriptions cannot reshuffle it.
+Missing parents, conflicting ancestry and legacy Workers without links remain
+navigable roots with an explanation. No historical ancestry is guessed or backfilled.
+The visible transcript refreshes linked child evidence at most once every five
+seconds, with four child reads in flight. Cached read failures are marked stale.
+
+Independent peers still need the existing explicit sharing/sync procedure.
+A synced parent carries references, not permission or automatic child acquisition.
+`/workers` retains an unavailable target; listing or opening never fetches an
+arbitrary remote database or approves a share.
+Inspection requires existing Write authority (Admin also works), because native
+record reads can materialize caches. It is not a Read-only permission feature.
 An already-bound narrower or delegated identity is never replaced with a broader
-key to make inspection succeed.
-Unsupported delegated-service permission checks report unavailable instead.
+key to make inspection succeed. Unsupported delegated-service permission checks
+report unavailable instead.
 
-### Walkthrough: inspect a daemon-created Worker
+### Walkthrough: summary to child and back
 
 1. Leave the TUI hub open while its same-login daemon invokes `spawn_worker`.
-   A new `[spawn]` row appears without restarting the TUI.
-   Select that row and press Enter.
-   The tab shows:
+   A `[spawn]` row appears under the actual parent without restarting the TUI.
+   In the parent's transcript, the collapsed run shows, for example:
 
    ```text
-   Worker transcript · inspection only
-   Recorded activity is not proof of liveness; legacy ancestry unknown
+   ▸ … R1 chaz · 2 tools · attempt active
+     1 linked Workers · Open workers (Alt+W) · 0 done · 0 failed · 0 cancelled · 2 without result · 0 unknown
    ```
 
-2. Read the submitted Directive and subsequent transcript entries.
-   Use `Ctrl+O` to expand tool details and the usual mouse selection to copy.
-   There is no message composer; typing cannot start another turn.
-   Close with `Ctrl+W` or switch back to an open parent tab with `Ctrl+H`.
-   Its unsent draft remains intact.
-3. Reopen the child from the hub after completion or a daemon restart.
-   This reads the stored transcript; it does not reconstruct a Worker runtime.
-   If opening fails, the hub retains its row and shows
-   `Failed to switch session: …`.
-   Restore the service or existing authorized access, then select the row again.
-   Do not invoke another Worker merely because its transcript was unavailable.
+2. Expand the run's first row. The linked item shows:
+
+   ```text
+       Worker helper · requested: CHILD-ASSIGNMENT-1
+       Open child · activity recorded; no terminal result
+   ```
+
+   Click **Open child**, or use `/workers`, arrows and Enter.
+   The full transcript opens with `Worker transcript · inspection only`.
+   Read the submitted Directive and tool activity; normal scrolling and copy work.
+   There is no message composer. `/parent` or `Alt+P` returns to the exact parent
+   call, without losing an existing parent's draft.
+
+3. After the child completes, the parent summary shows `Open child · completed`
+   and its result preview. A daemon restart does not remove the transcript or
+   reconstruct the Worker's runtime. An interrupted child still has no invented
+   success: it shows `outcome unknown` until actual terminal evidence exists.
+4. If the child is absent or access is unavailable, its summary shows
+   `Open child · transcript unavailable: …`; `/workers` retains the reference.
+   Restore the service or use the existing authorized sharing/sync procedure, then
+   reopen. Do not invoke another Worker merely because inspection failed.
+   A legacy `[spawn]` row without references remains inspectable and says
+   `legacy ancestry unknown` rather than inventing a parent.
 
 ## Settings
 

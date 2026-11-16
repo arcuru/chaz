@@ -75,6 +75,8 @@ impl RefreshSlot {
 pub(super) struct TabLive {
     /// Inspection-only Worker: no composer, steering, settings or runtime registration.
     pub(super) worker_observer: bool,
+    pub(super) workers: workers::View,
+    pub(super) jump_call: Option<tool_activity::CallKey>,
     pub(super) covered: Option<eidetica::Snapshot>,
     pub(super) entry_ids: Vec<Option<String>>,
     pub(super) tool_activity: tool_activity::ToolActivity,

@@ -1,9 +1,10 @@
 # Inspecting Worker Sessions
 
-Status: partial implementation. Same-service catalog refresh, inspection-only
-Worker opening, exact native spawn relations, staged publication and atomic
-terminal references are implemented. Parent summaries, grouping and parent
-navigation below remain an implementation contract, not shipped behavior.
+This increment adds same-service catalog refresh, inspection-only Worker opening,
+exact native spawn relations, staged publication, atomic terminal references,
+compact parent summaries, grouped browsing and parent navigation.
+It uses existing native identities and authorization; independent-peer child
+acquisition and a universal work taxonomy remain outside its scope.
 
 A Worker template is configuration, a session is a durable transcript, and a turn
 attempt is an execution of one request in that transcript.
@@ -208,6 +209,9 @@ expanding the run reveals the individual Worker summaries. A parent-filtered
 Worker picker provides the full list without making a large spawn batch an
 unbounded collapsed transcript region.
 Use sanitized, terminal-width-aware previews and existing full-content copy paths.
+The visible transcript polls small child evidence at most once every five seconds,
+with four concurrent reads and one bounded read task; cached activity ages without
+claiming remote liveness. Hub grouping runs only at catalog refresh boundaries.
 A display label or preview is never a session identifier or an instruction.
 
 The hub derives a forest from verified origins, retaining independent roots and

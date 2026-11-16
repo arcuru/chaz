@@ -111,6 +111,7 @@ impl TuiBridge {
         // One-shot-style delivery of background model catalog fetches.
         // Buffered so a force-refresh kicked off mid-render doesn't block.
         let (models_tx, mut models_rx) = mpsc::channel::<ModelCatalog>(4);
+        let (workers_tx, mut workers_rx) = mpsc::channel(8);
         let (session_rows_tx, mut session_rows_rx) = mpsc::channel::<SessionLoad>(128);
         let (peer_pages_tx, mut peer_pages_rx) = mpsc::channel(1);
         let (session_pages_tx, mut session_pages_rx) = mpsc::channel(1);
@@ -146,6 +147,7 @@ impl TuiBridge {
         let mut needs_draw = true;
         'run: loop {
             operations::cancel_closed_reads(&mut app);
+            workers::update(&mut app, server, &workers_tx);
             ensure_view(&mut app, server, &session_rows_tx);
             peer_pages::update(&mut app, server, &peer_pages_tx);
             session_pages::update(&mut app, server, &backend, &session_pages_tx);
@@ -224,8 +226,10 @@ impl TuiBridge {
                     Some(load) = session_rows_rx.recv() => Action::SessionLoad(load),
                     Some(loaded) = peer_pages_rx.recv() => Action::PeerPage(loaded),
                     Some(loaded) = session_pages_rx.recv() => Action::SessionPage(loaded),
+                    Some(loaded) = workers_rx.recv() => Action::WorkersLoaded(loaded),
                     Some(loaded) = jobs_rx.recv() => Action::JobsLoaded(loaded),
                     _ = activity_tick.tick() => {
+                        needs_draw |= workers::age(&mut app);
                         if app.backend_available {
                             if app.mode == TuiMode::Jobs {
                                 jobs::refresh(&mut app, server, &jobs_tx);
@@ -484,6 +488,17 @@ impl TuiBridge {
                     Action::Mouse(m) => {
                         if let Some(outcome) = input::handle_mouse(&mut app, m) {
                             match outcome {
+                                input::MouseOutcome::Chat(action) => handle_chat_action(
+                                    action,
+                                    &mut app,
+                                    server,
+                                    &backend,
+                                    &self.secrets,
+                                    approval_tx,
+                                    notify_tx,
+                                    &models_tx,
+                                    &session_rows_tx,
+                                ),
                                 input::MouseOutcome::Copy(text) => {
                                     if let Err(error) = selection::copy_to(&mut io::stdout(), &text)
                                     {
@@ -667,11 +682,26 @@ impl TuiBridge {
                     }
                     Action::PeerPage(loaded) => peer_pages::apply(&mut app, loaded),
                     Action::SessionPage(loaded) => session_pages::apply(&mut app, loaded),
+                    Action::WorkersLoaded(loaded) => workers::apply(&mut app, loaded),
                     Action::JobsLoaded(loaded) => jobs::apply_loaded(&mut app, loaded),
                     Action::ModelsFetched(res) => {
                         apply_model_catalog(&mut app, res);
                     }
                     Action::SessionLoad(load) => match load {
+                        SessionLoad::Grouped { generation, result } => match result {
+                            Ok((indices, groups)) => {
+                                if matches!(
+                                    apply_session_catalog_result(&mut app, generation, Ok(indices)),
+                                    CatalogLoadOutcome::Loaded
+                                ) {
+                                    workers::group(&mut app, groups);
+                                }
+                            }
+                            Err(error) => {
+                                apply_session_catalog_result(&mut app, generation, Err(error));
+                            }
+                        },
+                        #[cfg(test)]
                         SessionLoad::Catalog { generation, result } => {
                             apply_session_catalog_result(&mut app, generation, result);
                         }

@@ -1027,3 +1027,138 @@ async fn nested_tool_wrapped_scrolled_header_hits_exclude_provenance_and_bodies(
         assert!(!app.active().live.expanded_tools.contains(&key));
     }
 }
+
+#[tokio::test]
+async fn worker_summaries_bind_full_call_keep_parent_prose_and_compact_actions() {
+    use chaz_core::session::worker_links::{WorkerCallSite, WorkerEvidence, WorkerSpawn};
+    let (_instance, mut app) = app_with(vec![]).await;
+    let db = app.active().session_db.clone();
+    let session = Session::new(
+        chaz_core::types::ConversationId(db.root_id().to_string()),
+        db.clone(),
+    )
+    .await;
+    let attempt = session
+        .start_turn_attempt(TurnRequestId::parse("parent"))
+        .await
+        .unwrap();
+    let message = TurnTranscriptMessage::ModelResponse {
+        model_sequence: 1,
+        content: Some("Parent prose survives.".into()),
+        tool_calls: (0..2)
+            .map(|i| ToolCallRequest {
+                id: format!("worker-{i}"),
+                name: "spawn_worker".into(),
+                arguments: format!(r#"{{"name":"helper","task":"assignment {i} 界 \\u001b[31m"}}"#),
+            })
+            .collect(),
+        provider_extra: Default::default(),
+        metadata: None,
+        terminal: false,
+    };
+    append(&session, record(&attempt, 0, message)).await;
+    let spawn = WorkerSpawn {
+        version: 1,
+        spawn_id: "one".into(),
+        child_session_id: "unavailable-target".into(),
+        directive_id: TurnRequestId::parse("directive"),
+        call: WorkerCallSite {
+            request_id: attempt.request_id.clone(),
+            attempt_id: attempt.attempt_id.clone(),
+            execution_id: None,
+            agent: "chaz".into(),
+            model_sequence: 1,
+            call_index: 0,
+            call_id: "worker-0".into(),
+        },
+    };
+    let txn = db.new_transaction().await.unwrap();
+    txn.get_store::<Table<WorkerSpawn>>("worker_spawns_v1")
+        .await
+        .unwrap()
+        .set("one", spawn.clone())
+        .await
+        .unwrap();
+    txn.commit().await.unwrap();
+    reload(&mut app).await;
+    assert!(app.active().live.tool_activity.items[0].worker.is_some());
+    assert!(app.active().live.tool_activity.items[1].worker.is_none());
+    let key = app.active().live.tool_activity.items[0].key.clone();
+    let mut bad = spawn.call.clone();
+    bad.model_sequence += 1;
+    assert!(!key.matches_worker(&bad));
+    bad = spawn.call.clone();
+    bad.execution_id = Some("other".into());
+    assert!(!key.matches_worker(&bad));
+    app.active_mut().live.workers.data.evidence.insert(
+        "one".into(),
+        Ok(WorkerEvidence {
+            state: "failed",
+            result: Some(entry("system", "CHILD-FAILURE", EntryType::Error)),
+            activity_at: None,
+        }),
+    );
+    draw(&mut app, 120, 35);
+    let compact = text(&app);
+    assert!(compact.contains("1 linked Workers · Open workers"));
+    assert!(compact.contains("Parent prose survives."));
+    assert!(!compact.contains("CHILD-FAILURE"));
+    app.active_mut().live.expanded_runs.insert(key.run.clone());
+    app.active_mut().touch_transcript();
+    draw(&mut app, 120, 35);
+    let expanded = text(&app);
+    assert!(
+        expanded.contains("Worker helper · requested: assignment 0"),
+        "{expanded}"
+    );
+    assert!(expanded.contains("Open child · failed"));
+    assert!(expanded.contains("Child result: CHILD-FAILURE"));
+    assert!(expanded.contains("Parent prose survives."));
+    assert!(!expanded.contains('\x1b'));
+    let hit = app
+        .click_regions
+        .iter()
+        .find(|r| matches!(r.target, ClickTarget::OpenWorker(0)))
+        .copied()
+        .unwrap();
+    assert!(matches!(
+        input::handle_mouse(
+            &mut app,
+            mouse(MouseEventKind::Down(MouseButton::Left), hit.x, hit.y)
+        ),
+        Some(input::MouseOutcome::Chat(
+            super::super::ChatAction::OpenWorker(0)
+        ))
+    ));
+    for expand_all in [false, true] {
+        app.active_mut().expand_all = expand_all;
+        super::super::workers::focus(app.active_mut(), key.clone());
+        draw(&mut app, 120, 35);
+        assert!(
+            text(&app).contains("Open child · failed"),
+            "parent focus must reveal its exact call even with global expansion"
+        );
+    }
+    app.active_mut()
+        .live
+        .workers
+        .data
+        .evidence
+        .get_mut("one")
+        .unwrap()
+        .as_mut()
+        .unwrap()
+        .activity_at = Some(Utc::now() - chrono::Duration::minutes(2));
+    app.backend_available = false;
+    assert!(super::super::workers::age(&mut app));
+    draw(&mut app, 120, 35);
+    assert!(text(&app).contains("Open child · outcome unknown"));
+    for width in [1, 3, 20, 40] {
+        draw(&mut app, width, 35);
+        let lines = &app.active().live.render.lines;
+        let child = lines.iter().find(|l| l.to_string().contains("Open child"));
+        if let Some(child) = child {
+            assert!(child.width() <= width as usize);
+        }
+    }
+}

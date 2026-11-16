@@ -601,8 +601,27 @@ pub(super) fn ui_chat(f: &mut ratatui::Frame, app: &mut App, ext_segments: &[Str
     let messages_area = if app.active().live.worker_observer {
         let observer =
             Layout::vertical([Constraint::Length(2), Constraint::Min(0)]).split(chunks[1]);
-        f.render_widget(Paragraph::new("Worker transcript · inspection only\nRecorded activity is not proof of liveness; legacy ancestry unknown")
-            .style(theme::text_on_bar()), observer[0]);
+        let parent = if app.active().live.workers.data.parent.is_some() {
+            "Parent (Alt+P /parent) · Workers (Alt+W /workers)"
+        } else if app.active().live.workers.data.parent_error.is_some() {
+            "Parent unavailable · Workers (Alt+W /workers)"
+        } else {
+            "Legacy ancestry unknown · Workers (Alt+W /workers)"
+        };
+        f.render_widget(
+            Paragraph::new(format!("Worker transcript · inspection only\n{parent}"))
+                .style(theme::text_on_bar()),
+            observer[0],
+        );
+        if observer[0].height > 1 && app.active().live.workers.data.parent.is_some() {
+            app.click_regions.push(ClickRegion {
+                x: observer[0].x,
+                y: observer[0].y + 1,
+                w: observer[0].width.min(30),
+                h: 1,
+                target: ClickTarget::OpenParent,
+            });
+        }
         observer[1]
     } else if app.active().job.is_some() {
         let observer = Layout::vertical([
@@ -632,6 +651,7 @@ pub(super) fn ui_chat(f: &mut ratatui::Frame, app: &mut App, ext_segments: &[Str
         expand_all,
         inner_width,
     );
+    let jump_call = app.active_mut().live.jump_call.take();
     let tab = app.active();
     let activity = tab
         .job
@@ -641,7 +661,7 @@ pub(super) fn ui_chat(f: &mut ratatui::Frame, app: &mut App, ext_segments: &[Str
 
     // Snapshot what we need from `tab` before releasing the borrow so the
     // approval panel can take a &mut borrow of app.click_regions.
-    let scroll_offset = tab.scroll_offset;
+    let mut scroll_offset = tab.scroll_offset;
     // Never surface the full session DB id here — it's long and noisy. Show
     // the alias if set, otherwise a short id prefix; the full id is available
     // via /info and /share when actually needed.
@@ -745,6 +765,22 @@ pub(super) fn ui_chat(f: &mut ratatui::Frame, app: &mut App, ext_segments: &[Str
     // the new top. Persist the clamp so down-scroll responds immediately rather
     // than paying off thousands of invisible rows before the viewport moves.
     let max_scroll = content_height.saturating_sub(messages_height);
+    if let Some(call) = jump_call
+        && let Some(index) = tab
+            .live
+            .tool_activity
+            .items
+            .iter()
+            .position(|i| i.key == call)
+        && let Some((line, _)) = cache
+            .clicks
+            .iter()
+            .find(|(_, target)| matches!(target, ClickTarget::ToggleToolItem(i) if *i == index))
+    {
+        scroll_offset = max_scroll
+            .saturating_sub(cache.offsets[*line])
+            .min(u16::MAX as usize) as u16;
+    }
     let scroll_offset = (scroll_offset as usize).min(max_scroll) as u16;
     let scroll = max_scroll - scroll_offset as usize;
     let view_end = scroll + messages_height;
@@ -946,8 +982,12 @@ pub(super) fn ui_chat(f: &mut ratatui::Frame, app: &mut App, ext_segments: &[Str
 
     if app.active().live.worker_observer {
         f.render_widget(
-            Paragraph::new("Esc / Ctrl+P sessions · Ctrl+H/L tabs · Ctrl+O expand · scroll / copy")
-                .style(theme::dim()),
+            Paragraph::new(if app.input.starts_with('/') {
+                app.input.clone()
+            } else {
+                "Alt+P parent · Alt+W workers · Esc sessions · Ctrl+O expand · scroll / copy".into()
+            })
+            .style(theme::dim()),
             chunks[5],
         );
         return;
@@ -1859,6 +1899,8 @@ pub(super) fn ui_picker(f: &mut ratatui::Frame, app: &mut App) {
             "  Loading sessions…".to_string()
         } else if let Some(error) = &app.session_picker_error {
             format!("  Failed to load sessions: {error} — Ctrl+P retries.")
+        } else if app.workers_filter.is_some() {
+            "  No linked Workers recorded for this parent.".to_string()
         } else {
             "  No saved sessions yet — select \"New session\" above.".to_string()
         };
@@ -1876,6 +1918,17 @@ pub(super) fn ui_picker(f: &mut ratatui::Frame, app: &mut App) {
 
             let marker = if is_selected { "> " } else { "  " };
             let current_marker = if is_current { " *" } else { "" };
+            let depth = app
+                .worker_groups
+                .depths
+                .get(&info.session_db_id)
+                .copied()
+                .unwrap_or(0);
+            let branch = if depth > 0 {
+                format!("{}↳ ", "  ".repeat(depth.min(8) - 1))
+            } else {
+                String::new()
+            };
 
             let agent_str = info.agent_name.as_deref().unwrap_or("default");
             let title = match &info.name {
@@ -1895,11 +1948,11 @@ pub(super) fn ui_picker(f: &mut ratatui::Frame, app: &mut App) {
             let stale_suffix = if row_error { " ⚠ metadata stale" } else { "" };
             let header = if info.loaded {
                 format!(
-                    "{marker}{title}{current_marker} [{bridge}] {agent_str} • {age}{closed_suffix}{stale_suffix}"
+                    "{marker}{branch}{title}{current_marker} [{bridge}] {agent_str} • {age}{closed_suffix}{stale_suffix}"
                 )
             } else {
                 format!(
-                    "{marker}{title}{current_marker} [{bridge}] … • {age}{closed_suffix}{stale_suffix}"
+                    "{marker}{branch}{title}{current_marker} [{bridge}] … • {age}{closed_suffix}{stale_suffix}"
                 )
             };
 
@@ -1939,7 +1992,8 @@ pub(super) fn ui_picker(f: &mut ratatui::Frame, app: &mut App) {
 
             // The row's second line carries the browse-only description, if
             // any; it stays blank otherwise so row height is unchanged.
-            match &info.description {
+            let note = app.worker_groups.notes.get(&info.session_db_id);
+            match note.or(info.description.as_ref()) {
                 Some(description) => {
                     // Clip by terminal cells after the indent so wide text
                     // still ends in an ellipsis instead of being cut silently.
@@ -1975,7 +2029,12 @@ pub(super) fn ui_picker(f: &mut ratatui::Frame, app: &mut App) {
             .border_style(Style::default().fg(COLOR_DIM))
             .title(Span::styled(
                 format!(
-                    " Sessions{} ",
+                    " {}{} ",
+                    if app.workers_filter.is_some() {
+                        "Workers (parent-filtered)"
+                    } else {
+                        "Sessions"
+                    },
                     scroll_indicator(window.first, window.end, app.session_list.len())
                 ),
                 Style::default().fg(COLOR_ACCENT),

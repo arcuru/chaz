@@ -248,10 +248,28 @@ async fn worker_completion_references_exact_final_and_rolls_back_duplicate_settl
     let (_instance, _parent, child, spawn) = fixture().await;
     let mut session =
         Session::new(ConversationId(child.root_id().to_string()), child.clone()).await;
+    let evidence = worker_evidence(&child, &_parent.root_id().to_string(), &spawn)
+        .await
+        .unwrap();
+    assert_eq!(
+        evidence.status(chrono::Utc::now()),
+        "not started; no attempt recorded"
+    );
     let attempt = session
         .start_turn_attempt(spawn.directive_id.clone())
         .await
         .unwrap();
+    let evidence = worker_evidence(&child, &_parent.root_id().to_string(), &spawn)
+        .await
+        .unwrap();
+    assert_eq!(
+        evidence.status(attempt.started_at),
+        "activity recorded; no terminal result"
+    );
+    assert_eq!(
+        evidence.status(attempt.started_at + chrono::Duration::minutes(2)),
+        "outcome unknown"
+    );
     assert!(
         worker_outcome(&child, &attempt.attempt_id, None)
             .await
@@ -274,6 +292,11 @@ async fn worker_completion_references_exact_final_and_rolls_back_duplicate_settl
     assert_eq!(outcome.directive_id, spawn.directive_id);
     assert_eq!(outcome.terminal, WorkerTerminal::Reply);
     assert_eq!(final_entry.unwrap().content, "actual reply");
+    let evidence = worker_evidence(&child, &_parent.root_id().to_string(), &spawn)
+        .await
+        .unwrap();
+    assert_eq!(evidence.status(chrono::Utc::now()), "completed");
+    assert_eq!(evidence.result.unwrap().content, "actual reply");
     assert!(
         worker_outcome(&child, &attempt.attempt_id, Some("wrong-branch"))
             .await
@@ -365,11 +388,18 @@ async fn worker_terminal_evidence_distinguishes_stop_failure_no_reply_and_broken
         let mut session =
             Session::new(ConversationId(child.root_id().to_string()), child.clone()).await;
         let attempt = session
-            .start_turn_attempt(spawn.directive_id)
+            .start_turn_attempt(spawn.directive_id.clone())
             .await
             .unwrap();
         // A stop request is not cancellation acknowledgement or terminal evidence.
         session.request_stop("user").await.unwrap();
+        assert_eq!(
+            worker_evidence(&child, &_parent.root_id().to_string(), &spawn)
+                .await
+                .unwrap()
+                .status(chrono::Utc::now()),
+            "stop request recorded; outcome not recorded"
+        );
         assert!(
             worker_outcome(&child, &attempt.attempt_id, None)
                 .await
@@ -408,6 +438,18 @@ async fn worker_terminal_evidence_distinguishes_stop_failure_no_reply_and_broken
             .unwrap()
             .unwrap();
         assert_eq!(outcome.terminal, terminal);
+        let evidence = worker_evidence(&child, &_parent.root_id().to_string(), &spawn)
+            .await
+            .unwrap();
+        assert_eq!(
+            evidence.state,
+            match terminal {
+                WorkerTerminal::Failed => "failed",
+                WorkerTerminal::Cancelled => "cancelled (acknowledged)",
+                WorkerTerminal::NoReply => "completed without reply",
+                _ => unreachable!(),
+            }
+        );
         outcome.final_entry_id = Some(TurnRequestId::parse("missing-final"));
         let txn = child.new_transaction().await.unwrap();
         txn.get_store::<Table<WorkerOutcome>>(OUTCOMES)
@@ -422,6 +464,26 @@ async fn worker_terminal_evidence_distinguishes_stop_failure_no_reply_and_broken
                 .await
                 .is_err(),
             "missing referenced payload is not an empty success"
+        );
+        assert!(
+            worker_evidence(&child, &_parent.root_id().to_string(), &spawn)
+                .await
+                .is_err()
+        );
+        let txn = child.new_transaction().await.unwrap();
+        txn.get_store::<Table<WorkerOutcome>>(OUTCOMES)
+            .await
+            .unwrap()
+            .delete(&outcome_key(&attempt.attempt_id, None))
+            .await
+            .unwrap();
+        txn.commit().await.unwrap();
+        assert_eq!(
+            worker_evidence(&child, &_parent.root_id().to_string(), &spawn)
+                .await
+                .unwrap()
+                .state,
+            "completed attempt; result unavailable"
         );
     }
 }

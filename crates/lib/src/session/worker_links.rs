@@ -71,6 +71,14 @@ pub async fn worker_spawns(db: &Database) -> anyhow::Result<Vec<WorkerSpawn>> {
     spawns_in_txn(&db.new_transaction().await?).await
 }
 
+/// Read display references from the same snapshot as the parent transcript.
+pub async fn worker_spawns_at(
+    db: &Database,
+    tips: &eidetica::Snapshot,
+) -> anyhow::Result<Vec<WorkerSpawn>> {
+    spawns_in_txn(&db.new_transaction_at(tips).await?).await
+}
+
 async fn spawns_in_txn(txn: &Transaction) -> anyhow::Result<Vec<WorkerSpawn>> {
     let rows = txn
         .get_store::<Table<WorkerSpawn>>(SPAWNS)
@@ -99,6 +107,131 @@ async fn origin_in_txn(txn: &Transaction) -> anyhow::Result<Option<WorkerOrigin>
 
 pub async fn worker_origin(db: &Database) -> anyhow::Result<Option<WorkerOrigin>> {
     origin_in_txn(&db.new_transaction().await?).await
+}
+
+/// Metadata-only reciprocal relation check. This does not prove a native call
+/// or grant target access; transcript projections separately match the full call.
+pub async fn worker_parent(
+    child: &Database,
+    parent: &Database,
+) -> anyhow::Result<Option<WorkerSpawn>> {
+    let Some(origin) = worker_origin(child).await? else {
+        return Ok(None);
+    };
+    anyhow::ensure!(
+        origin.parent_session_id == parent.root_id().to_string()
+            && child.root_id() != parent.root_id(),
+        "Worker parent mismatch"
+    );
+    let txn = parent.new_transaction().await?;
+    let spawn: WorkerSpawn = optional_row(&txn, SPAWNS, &origin.spawn_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("Worker parent reference missing"))?;
+    require_version(spawn.version)?;
+    anyhow::ensure!(
+        spawn.spawn_id == origin.spawn_id && spawn.child_session_id == child.root_id().to_string(),
+        "Worker reciprocal reference mismatch"
+    );
+    Ok(Some(spawn))
+}
+
+/// Evidence, not executor liveness. Retained activity must age at render time.
+#[derive(Clone, Debug)]
+pub struct WorkerEvidence {
+    pub state: &'static str,
+    pub result: Option<SessionEntry>,
+    pub activity_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+impl WorkerEvidence {
+    pub fn status(&self, now: chrono::DateTime<chrono::Utc>) -> &'static str {
+        if let Some(at) = self.activity_at {
+            if super::fresh_activity(at, now) {
+                "activity recorded; no terminal result"
+            } else {
+                "outcome unknown"
+            }
+        } else {
+            self.state
+        }
+    }
+}
+
+/// One coherent child snapshot, scoped to the exact linked Directive. Missing
+/// outcome references and interrupted executions never inherit parent success.
+pub async fn worker_evidence(
+    child: &Database,
+    parent_id: &str,
+    spawn: &WorkerSpawn,
+) -> anyhow::Result<WorkerEvidence> {
+    require_version(spawn.version)?;
+    let txn = child.new_transaction().await?;
+    let origin = origin_in_txn(&txn)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("Worker origin missing"))?;
+    anyhow::ensure!(
+        origin.parent_session_id == parent_id
+            && origin.spawn_id == spawn.spawn_id
+            && spawn.child_session_id == child.root_id().to_string(),
+        "Worker origin mismatch"
+    );
+    let entries = txn.get_store::<Table<SessionEntry>>("entries").await?;
+    anyhow::ensure!(
+        entries.get(spawn.directive_id.as_str()).await?.entry_type == EntryType::Directive,
+        "Worker Directive missing"
+    );
+    let Some(attempt) = latest_attempt_in_txn(&txn, &spawn.directive_id).await? else {
+        return Ok(WorkerEvidence {
+            state: "not started; no attempt recorded",
+            result: None,
+            activity_at: None,
+        });
+    };
+    if attempt.status == super::TurnAttemptStatus::Completed {
+        let Some((outcome, result)) = completed_outcome_in_txn(&txn, &attempt).await? else {
+            return Ok(WorkerEvidence {
+                state: "completed attempt; result unavailable",
+                result: None,
+                activity_at: None,
+            });
+        };
+        let state = match outcome.terminal {
+            WorkerTerminal::Reply => "completed",
+            WorkerTerminal::Failed => "failed",
+            WorkerTerminal::Cancelled => "cancelled (acknowledged)",
+            WorkerTerminal::NoReply => "completed without reply",
+        };
+        return Ok(WorkerEvidence {
+            state,
+            result,
+            activity_at: None,
+        });
+    }
+    let stops = entries
+        .search(|e| {
+            e.entry_type == EntryType::Cancel
+                && serde_json::from_str::<super::CancelRequest>(&e.content).is_ok_and(|r| {
+                    r.request_id == spawn.directive_id && r.attempt_id == attempt.attempt_id
+                })
+        })
+        .await?;
+    if !stops.is_empty() {
+        return Ok(WorkerEvidence {
+            state: "stop request recorded; outcome not recorded",
+            result: None,
+            activity_at: None,
+        });
+    }
+    let heartbeat = optional_row::<chrono::DateTime<chrono::Utc>>(
+        &txn,
+        super::TURN_ACTIVITY_STORE,
+        &attempt.attempt_id,
+    )
+    .await?;
+    Ok(WorkerEvidence {
+        state: "outcome unknown",
+        result: None,
+        activity_at: Some(heartbeat.unwrap_or(attempt.started_at)),
+    })
 }
 
 async fn optional_row<
@@ -356,35 +489,49 @@ pub async fn latest_worker_outcome(
     directive: &TurnRequestId,
 ) -> anyhow::Result<Option<(WorkerOutcome, Option<SessionEntry>)>> {
     let txn = db.new_transaction().await?;
+    let Some(attempt) = latest_attempt_in_txn(&txn, directive).await? else {
+        return Ok(None);
+    };
+    completed_outcome_in_txn(&txn, &attempt).await
+}
+
+async fn latest_attempt_in_txn(
+    txn: &Transaction,
+    directive: &TurnRequestId,
+) -> anyhow::Result<Option<TurnAttempt>> {
     let attempts = txn
         .get_store::<Table<TurnAttempt>>(super::TURN_ATTEMPTS_STORE)
         .await?
-        .search(|attempt| attempt.request_id == *directive)
+        .search(|a| a.request_id == *directive)
         .await?;
     let Some(generation) = attempts.iter().map(|(_, a)| a.generation).max() else {
         return Ok(None);
     };
-    let selected: Vec<_> = attempts
+    let mut selected = attempts
         .into_iter()
-        .filter(|(_, a)| a.generation == generation)
-        .collect();
-    anyhow::ensure!(selected.len() == 1, "conflicting Worker attempts");
-    let attempt = &selected[0].1;
+        .filter(|(_, a)| a.generation == generation);
+    let (_, attempt) = selected.next().expect("known generation");
+    anyhow::ensure!(selected.next().is_none(), "conflicting Worker attempts");
+    Ok(Some(attempt))
+}
+
+async fn completed_outcome_in_txn(
+    txn: &Transaction,
+    attempt: &TurnAttempt,
+) -> anyhow::Result<Option<(WorkerOutcome, Option<SessionEntry>)>> {
     if attempt.status != super::TurnAttemptStatus::Completed {
         return Ok(None);
     }
     let outcomes = txn
         .get_store::<Table<WorkerOutcome>>(OUTCOMES)
         .await?
-        .search(|outcome| {
-            outcome.attempt_id == attempt.attempt_id && outcome.directive_id == *directive
-        })
+        .search(|o| o.directive_id == attempt.request_id && o.attempt_id == attempt.attempt_id)
         .await?;
     anyhow::ensure!(outcomes.len() <= 1, "conflicting Worker execution outcomes");
     let Some((_, outcome)) = outcomes.first() else {
         return Ok(None);
     };
-    worker_outcome_in_txn(&txn, &attempt.attempt_id, outcome.execution_id.as_deref()).await
+    worker_outcome_in_txn(txn, &attempt.attempt_id, outcome.execution_id.as_deref()).await
 }
 
 async fn worker_outcome_in_txn(

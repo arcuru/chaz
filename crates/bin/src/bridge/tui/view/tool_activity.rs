@@ -129,6 +129,11 @@ pub(super) fn render(
     let mut clicks = Vec::new();
     let mut sources = Vec::new();
     if run.calls.first() == Some(&index) {
+        let workers = run
+            .calls
+            .iter()
+            .filter(|&&i| activity.items[i].worker.is_some())
+            .count();
         let (marker, counts) = counts(run, &activity.items);
         for (row, text) in [
             format!(
@@ -138,12 +143,23 @@ pub(super) fn render(
                 run.calls.len(),
                 run.lifecycle()
             ),
-            format!("  {counts}"),
+            if workers > 0 {
+                format!("  {workers} linked Workers · Open workers (Alt+W) · {counts}")
+            } else {
+                format!("  {counts}")
+            },
         ]
         .into_iter()
         .enumerate()
         {
-            clicks.push((lines.len(), ClickTarget::ToggleToolRun(item.run)));
+            clicks.push((
+                lines.len(),
+                if row == 1 && workers > 0 {
+                    ClickTarget::OpenWorkers
+                } else {
+                    ClickTarget::ToggleToolRun(item.run)
+                },
+            ));
             let text = if row == 0 && (1..4).contains(&width) {
                 marker.to_string()
             } else {
@@ -155,6 +171,15 @@ pub(super) fn render(
             )));
         }
         if outer {
+            if let Some(error) = &activity.worker_error {
+                lines.push(Line::from(Span::styled(
+                    clipped(
+                        &format!("    Worker references unavailable: {error}"),
+                        width,
+                    ),
+                    theme::error(),
+                )));
+            }
             lines.push(Line::from(Span::styled(
                 content::safe_line(&format!("    R{run_label}: {} · {counts}", run.lifecycle())),
                 theme::dim(),
@@ -194,6 +219,49 @@ pub(super) fn render(
             Style::default().fg(COLOR_TOOL)
         },
     )));
+    if let Some(spawn) = &item.worker {
+        let requested = serde_json::from_str::<Value>(&item.arguments).unwrap_or(Value::Null);
+        let name = requested
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown template");
+        let task = requested
+            .get("task")
+            .and_then(Value::as_str)
+            .unwrap_or("assignment unavailable");
+        lines.push(Line::from(Span::styled(
+            clipped(&format!("    Worker {name} · requested: {task}"), width),
+            theme::dim(),
+        )));
+        let evidence = tab.live.workers.data.evidence.get(&spawn.spawn_id);
+        let (status, result) = match evidence {
+            Some(Ok(evidence)) => (
+                evidence.status(Utc::now()).to_string(),
+                evidence.result.as_ref().map(|e| e.content.as_str()),
+            ),
+            Some(Err(error)) => (format!("transcript unavailable: {error}"), None),
+            None => ("child evidence not loaded".into(), None),
+        };
+        let stale = if tab.live.workers.error.is_some() {
+            " · stale read"
+        } else {
+            ""
+        };
+        clicks.push((lines.len(), ClickTarget::OpenWorker(index)));
+        lines.push(Line::from(Span::styled(
+            clipped(&format!("    Open child · {status}{stale}"), width),
+            Style::default().fg(COLOR_ACCENT),
+        )));
+        if let Some(result) = result {
+            lines.push(Line::from(Span::styled(
+                clipped(
+                    &format!("    Child result: {}", preview(result, false)),
+                    width,
+                ),
+                theme::dim(),
+            )));
+        }
+    }
     if inner {
         lines.push(Line::from(Span::styled(
             format!(

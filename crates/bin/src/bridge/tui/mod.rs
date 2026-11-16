@@ -85,6 +85,7 @@ enum Action {
     PeerPage(peer_pages::Loaded),
     SessionPage(session_pages::Loaded),
     JobsLoaded(jobs::Loaded),
+    WorkersLoaded(workers::Loaded),
     /// A background tab read finished (see [`refresh`]).
     Refresh(refresh::Refresh),
     Operation(operations::Completion),
@@ -92,6 +93,11 @@ enum Action {
 }
 
 enum SessionLoad {
+    Grouped {
+        generation: u64,
+        result: Result<(Vec<SessionIndex>, workers::Groups), String>,
+    },
+    #[cfg(test)]
     Catalog {
         generation: u64,
         result: Result<Vec<SessionIndex>, String>,
@@ -403,6 +409,9 @@ pub(super) struct SessionMetaSnapshot {
 
 pub(super) enum ChatAction {
     OpenJobs,
+    OpenWorkers,
+    OpenWorker(usize),
+    OpenParent,
     Dispatch(Command),
     OpenPicker,
     /// Open the model picker scoped to `scope`. From `/models` and
@@ -472,6 +481,9 @@ pub(super) enum ClickTarget {
     ToggleEntryExpanded(usize),
     ToggleToolRun(usize),
     ToggleToolItem(usize),
+    OpenWorker(usize),
+    OpenWorkers,
+    OpenParent,
     /// Select model picker row `i` (index into `App::model_list`).
     ModelPickerSelect(usize),
     /// Jump to Settings sidebar category `i` and pin focus to the sidebar.
@@ -667,6 +679,8 @@ pub(super) struct App {
     /// Defaults `true` so steady-state and tests show no indicator.
     pub(super) startup_ready: bool,
     pub(super) session_list: Vec<SessionInfo>,
+    worker_groups: workers::Groups,
+    workers_filter: Option<String>,
     /// Whether the current catalog snapshot has no pending invalidation.
     pub(super) session_list_fresh: bool,
     /// Catalog rows retained by id so visible metadata requests never need to
@@ -869,6 +883,8 @@ impl App {
             debug_mode: false,
             startup_ready: true,
             session_list: Vec::new(),
+            worker_groups: Default::default(),
+            workers_filter: None,
             session_list_fresh: false,
             session_indices: HashMap::new(),
             session_fill: None,
@@ -1673,16 +1689,20 @@ fn open_session_picker(
     server: &Arc<Server>,
     session_rows_tx: &mpsc::Sender<SessionLoad>,
 ) {
+    enter_session_picker(app, None);
+    refresh_session_catalog(app, server, session_rows_tx);
+}
+
+fn enter_session_picker(app: &mut App, filter: Option<String>) {
     app.cancel_session_fill();
+    app.workers_filter = filter;
     app.picker_index = 0;
     app.mode = TuiMode::SessionPicker;
     app.session_picker_error = None;
     app.session_row_errors.clear();
     app.hub_notice = None;
-
     // Explicit entry refreshes even if no write notification was observed.
     app.session_list_fresh = false;
-    refresh_session_catalog(app, server, session_rows_tx);
 }
 
 fn refresh_session_catalog(
@@ -1705,14 +1725,30 @@ fn refresh_session_catalog(
     app.session_catalog_invalidated = false;
     app.session_catalog_loading = true;
     let registry = server.registry_arc();
-    spawn_session_catalog_load(app, session_rows_tx.clone(), async move {
-        registry
-            .list_sessions()
+    let generation = app.session_generation;
+    let filter = app.workers_filter.clone();
+    let tx = session_rows_tx.clone();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let task = supervised::Task(tokio::spawn(async move {
+        let result = supervised::read(async move {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                workers::catalog(&registry, filter.as_deref()),
+            )
             .await
-            .map_err(|error| error.to_string())
+            .unwrap_or_else(|_| Err("Session ancestry read timed out; cached rows stale".into()))
+        })
+        .await;
+        let _ = tx.send(SessionLoad::Grouped { generation, result }).await;
+    }));
+    app.session_fill = Some(SessionFill {
+        generation,
+        cancel,
+        tasks: vec![task],
     });
 }
 
+#[cfg(test)]
 fn spawn_session_catalog_load<F>(app: &mut App, tx: mpsc::Sender<SessionLoad>, load: F)
 where
     F: Future<Output = Result<Vec<SessionIndex>, String>> + Send + 'static,
@@ -2040,6 +2076,9 @@ fn handle_chat_action(
         && !matches!(
             action,
             ChatAction::OpenPicker
+                | ChatAction::OpenWorkers
+                | ChatAction::OpenWorker(_)
+                | ChatAction::OpenParent
                 | ChatAction::OpenJobs
                 | ChatAction::Dispatch(Command::Quit | Command::SwitchSession(_))
         )
@@ -2066,6 +2105,38 @@ fn handle_chat_action(
         return;
     }
     match action {
+        ChatAction::OpenWorkers => workers::open_picker(app, server, session_rows_tx),
+        ChatAction::OpenWorker(index) => {
+            if let Some(spawn) = app
+                .current()
+                .and_then(|t| t.live.tool_activity.items.get(index))
+                .and_then(|i| i.worker.clone())
+            {
+                workers::navigate(
+                    app,
+                    server,
+                    backend,
+                    notify_tx,
+                    workers::Destination::Child(spawn),
+                );
+            }
+        }
+        ChatAction::OpenParent => {
+            if let Some(spawn) = app
+                .current()
+                .and_then(|t| t.live.workers.data.parent.clone())
+            {
+                workers::navigate(
+                    app,
+                    server,
+                    backend,
+                    notify_tx,
+                    workers::Destination::Parent(spawn),
+                );
+            } else {
+                show_error(app, "Parent unavailable or legacy ancestry unknown".into());
+            }
+        }
         ChatAction::OpenJobs => {
             app.mode = TuiMode::Jobs;
         }

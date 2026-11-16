@@ -596,10 +596,12 @@ async fn hub_return_from_settings_restarts_cancelled_catalog_discovery() {
         .await
         .unwrap()
         .unwrap();
-    let SessionLoad::Catalog { generation, result } = load else {
-        panic!("expected catalog")
+    let SessionLoad::Grouped { generation, result } = load else {
+        panic!("expected grouped catalog")
     };
-    super::super::apply_session_catalog_result(&mut app, generation, result);
+    let (indices, groups) = result.unwrap();
+    super::super::apply_session_catalog_result(&mut app, generation, Ok(indices));
+    super::super::workers::group(&mut app, groups);
     assert!(app.session_list_fresh);
     assert_eq!(app.session_list.len(), session_ids(&server).await.len());
     assert!(!app.session_list.is_empty(), "fixture has a stored session");
@@ -1015,6 +1017,11 @@ async fn worker_hub_open_is_inspection_only_and_preserves_parent_draft() {
     for code in [KeyCode::Char('x'), KeyCode::Enter, KeyCode::Char('/')] {
         assert!(input::handle_chat_key(&mut app, key(code)).is_none());
     }
+    assert_eq!(
+        app.input, "/",
+        "observer accepts only a navigation command, not message text"
+    );
+    input::handle_chat_key(&mut app, key(KeyCode::Esc));
     assert!(app.input.is_empty());
     for action in [
         ChatAction::SendMessage("must not execute".into()),

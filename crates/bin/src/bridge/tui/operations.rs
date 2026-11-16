@@ -44,6 +44,7 @@ pub(super) enum Effect {
     Global(Box<Effect>),
     Outcome(CommandOutcome),
     Opened(Box<Tab>),
+    WorkerNavigation(Box<Tab>),
     Open(Box<Open>),
     Sent,
     JobSent(String),
@@ -468,6 +469,25 @@ pub(super) fn apply(app: &mut App, completion: Completion) -> Invalidation {
                         ..pending
                     });
                 }
+            }
+        }
+        Ok(Effect::WorkerNavigation(mut tab)) => {
+            if nav_valid {
+                if let Some(i) = app.tab_index_for(&tab.session_db_id) {
+                    if tab.scroll_offset == u16::MAX {
+                        app.tabs[i].scroll_offset = u16::MAX;
+                    }
+                    if let Some(call) = tab.live.jump_call.take() {
+                        workers::focus(&mut app.tabs[i], call);
+                    }
+                    app.set_active_tab(i);
+                } else {
+                    if let Some(call) = tab.live.jump_call.take() {
+                        workers::focus(&mut tab, call);
+                    }
+                    app.push_tab(*tab);
+                }
+                app.mode = TuiMode::Chat;
             }
         }
         Ok(Effect::Opened(tab)) => {
