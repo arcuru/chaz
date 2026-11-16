@@ -207,7 +207,7 @@ mcp_servers:
 #   brief:
 #     default: full      # full | brief | summary | hidden
 #     tools:
-#       "filesystem.*": summary
+#       "filesystem__*": summary
 #       shell: full
 
 # Scheduled tasks — imported at executor startup as agent-owned schedules in the

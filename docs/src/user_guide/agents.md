@@ -41,7 +41,7 @@ agents:
           - read_file
           - write_file
           - calculate
-          - "filesystem.*" # Glob: all tools from "filesystem" MCP server
+          - "filesystem__*" # Glob: all tools from "filesystem" MCP server
         presets:
           quick:
             max_spawn_depth: 5
