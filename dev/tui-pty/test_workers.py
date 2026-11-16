@@ -114,15 +114,7 @@ backends:
     api_key: synthetic
     models:
       - name: stub
-agents:
-  - name: chaz
-    model: stub
-    tools: [spawn_worker]
-    system_prompt: Deterministic parent.
-    workers:
-      - name: helper
-        system_prompt: Deterministic worker.
-        tools: []
+agent_config_dir: "{home}/agents"
 default_agents: [chaz]
 security:
   auto_approved_tools: [spawn_worker]
@@ -135,6 +127,21 @@ context:
             execution = "client" if role == "client" else "executor"
             config.write_text(f'execution: {execution}\nstate_dir: "{home}/{role}-state"\n' + shared)
             configs[role] = config
+        # First-agent setup is explicit and runs before the daemon owns the store.
+        def admin(command):
+            result = subprocess.run([CHAZ, "--config", configs["executor"], "cmd", command],
+                                    env=env, cwd=home, timeout=30, capture_output=True)
+            assert result.returncode == 0, (command, result.stdout, result.stderr)
+        admin("/agent new chaz model=stub tools=spawn_worker")
+        admin("/agent set chaz system_prompt Deterministic parent.")
+        document, = (home / "agents").glob("*/agent.yaml")
+        text = document.read_text()
+        assert "workers: []" in text, text
+        document.write_text(text.replace("workers: []", '''workers:
+  - name: helper
+    system_prompt: Deterministic worker.
+    tools: []'''))
+        admin("/agent reload chaz")
         thread.start()
         log = (OUT / "executor.log").open("wb")
         executor = subprocess.Popen([CHAZ, "--config", configs["executor"], "daemon"], env=env, cwd=home, stdout=log, stderr=log)

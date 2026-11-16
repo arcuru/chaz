@@ -288,15 +288,14 @@ Paths are normalized lexically before the check — `.`/`..` are resolved and th
 Set an agent-wide ceiling with `capabilities` on the agent — it attenuates every tool the agent uses at once. This is how you build a reusable profile like "no network":
 
 ```yaml
-agents:
-  - name: private
-    tools: ["shell", "read_file", "remember", "recall"]
-    capabilities:
-      network:
-        endpoints: [] # paired with the session/tool layers; see note
-        allow_private: false
-      fs:
-        allow_write: ["/work"] # binds shell AND write_file at once
+# private's managed agent.yaml — apply with `/agent reload private`
+tools: ["shell", "read_file", "remember", "recall"]
+capabilities:
+  network:
+    endpoints: [] # paired with the session/tool layers; see note
+    allow_private: false
+  fs:
+    allow_write: ["/work"] # binds shell AND write_file at once
 ```
 
 The session ceiling lives on the session itself (`SessionMeta.capabilities`) rather than in `config.yaml`, so it travels with the session and applies to whichever agents run in it.
@@ -392,16 +391,15 @@ API keys are stored in eidetica's SecretStore and resolved at the HTTP client bo
 
 Scenario: harden an agent named `researcher` so it can shell out for read-only inspection and fetch from one upstream API, but nothing else.
 
-### 1. Start from the agent definition
+### 1. Start from the agent settings
 
-In `config.yaml`:
+In the agent's settings (create it with `/agent new researcher`, then edit the folder `/agent hosted` lists):
 
 ```yaml
-agents:
-  - name: researcher
-    model: openrouter/openai/gpt-4o-mini
-    system_prompt_files: ["prompts/researcher.md"]
-    tools: ["shell", "read_file", "web_fetch", "remember", "recall"]
+# researcher's managed agent.yaml — apply with `/agent reload researcher`
+model: openrouter/openai/gpt-4o-mini
+system_prompt_files: ["prompts/researcher.md"]
+tools: ["shell", "read_file", "web_fetch", "remember", "recall"]
 ```
 
 `tools:` is the outer envelope (the agent-level tool allow-list). Anything outside this list is invisible to the agent, no matter what `security:` says.
@@ -451,12 +449,11 @@ What just happened, layer by layer:
 The `tool_policies` above bound each tool individually. To guarantee `researcher` can _only_ write under `/work` no matter which tool it reaches the filesystem with — `shell` (via `tee`, `>`) or `write_file` — add an agent-wide ceiling:
 
 ```yaml
-agents:
-  - name: researcher
-    # ...as above...
-    capabilities:
-      fs:
-        allow_write: ["/work"]
+# researcher's managed agent.yaml — apply with `/agent reload researcher`
+# ...as above...
+capabilities:
+  fs:
+    allow_write: ["/work"]
 ```
 
 Now both the `shell` and `write_file` paths are attenuated by `allow_write: ["/work"]` at once. A per-tool `grants.write_file.fs.allow_write: ["/work/out"]` would narrow it _further_ (to `/work/out`), but nothing — not a per-tool grant, not a clever shell redirect — can widen it back beyond `/work`. That is the attenuation guarantee: inner tiers only subtract.

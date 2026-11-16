@@ -21,7 +21,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 
 sys.dont_write_bytecode = True
-from test_lifecycle import BINARY, FIXTURE, ROOT, PtyProcess
+from test_lifecycle import BINARY, FIXTURE, ROOT, PtyProcess, create_agent
 
 
 class JobPtyProcess(PtyProcess):
@@ -211,11 +211,6 @@ backends:
     api_key: not-a-real-key
     models:
       - name: stub
-agents:
-  - name: chaz
-    model: stub
-    tools: [spawn_agent, calculate]
-    system_prompt: You are a deterministic test fixture.
 default_agents: [chaz]
 security:
   auto_approved_tools: [spawn_agent]
@@ -232,6 +227,7 @@ context:
                 service = subprocess.Popen([FIXTURE, home / "fixture.db", socket, "controlled"], env=env, cwd=home, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
                 self.assertTrue(select.select([service.stdout], [], [], 20)[0], "fixture service did not become ready")
                 self.assertEqual(service.stdout.readline().strip(), b"fixture service ready")
+                create_agent(configs["executor"], env, home, "model=stub tools=spawn_agent,calculate system_prompt=fixture")
                 thread.start()
                 executor = subprocess.Popen([BINARY, "--config", configs["executor"], "daemon"], env=env, cwd=home, stdout=log, stderr=log)
                 deadline = time.monotonic() + 20

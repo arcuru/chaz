@@ -139,7 +139,7 @@ impl Bridge for CommandBridge {
             backend: &backend,
             session_db_id: &session_db_id,
             session_db: &session_db,
-            current_agent: &agent.name,
+            current_agent: agent.as_ref().map_or("", |agent| agent.name.as_str()),
             session_name: meta.name.as_deref(),
         };
 

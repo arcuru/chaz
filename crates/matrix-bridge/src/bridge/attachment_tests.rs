@@ -43,13 +43,16 @@ impl Fixture {
         .unwrap();
         instance.enable_sync().await.unwrap();
         let registry = Arc::new(
-            SessionRegistry::new(
-                instance.clone(),
-                user,
-                Arc::new(AgentRegistry::from_config(
-                    &serde_json::from_value(json!({"agents":[{"name":"default"}]})).unwrap(),
-                )),
-            )
+            SessionRegistry::new(instance.clone(), user, {
+                let agents = AgentRegistry::default();
+                agents
+                    .register(chaz_core::agent::Agent::from_db_config(
+                        "default",
+                        &Default::default(),
+                    ))
+                    .unwrap();
+                Arc::new(agents)
+            })
             .await
             .unwrap(),
         );
