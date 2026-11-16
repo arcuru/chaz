@@ -468,13 +468,34 @@ graph LR
 
 ## Per-session settings
 
-Each extension can store a per-session JSON blob keyed by extension name
-in a `DocStore` named `extension_settings` on the session DB. Handlers
-reach it through the host-only `Settings` cap
-(`caps.settings.get/set(...)`), or via the `read_settings` /
-`write_settings` helpers an instance calls at instantiate time (e.g.
-`memory` reads `attached_banks` when building its per-session context
-tail).
+Settings live in the session DB's `extension_settings` DocStore, keyed by extension name, and synchronize with that session.
+Chaz 0.4.0 is the minimum supported reader **and writer** for settings-v1 sessions.
+This is a coordinated cutover, not a mixed-version reader-first rollout; see the [operator procedure](../user_guide/extensions.md#coordinated-settings-cutover).
+
+An object is a native structural `Doc`, with a JSON string per top-level semantic field.
+Field names are encoded as `k` followed by lowercase hexadecimal UTF-8 bytes so literal dots, empty keys and Unicode never become native paths.
+Keeping each value as JSON preserves floats, unsigned integers, null, arrays and complete nested-object replacement without inventing a second JSON merge model.
+Non-object JSON remains a JSON string; checked readers preserve its type rather than silently treating it as defaults.
+
+`read_settings_checked` reads one transaction: absence means `{}`, corruption or backend failure is an error.
+`read_settings` retains the existing lenient display/default behavior.
+The host's turn-complete `update_settings`, `/extensions set`, `/autocompact` and memory/skills attach/detach perform source-bound read/edit/delta writes in one transaction.
+Only changed top-level fields are staged as a non-atomic structural Doc; removed fields get native tombstones, and an unchanged edit is a no-op on settings.
+Different fields survive concurrent writes, including on other handles/peers.
+A nested object or the entire `attached_banks` array is **one** semantic value: competing edits to it may overwrite one another.
+Same-field conflicts use Eidetica's deterministic history composition (height, then entry ID order), not a promise that the last wall-clock command wins.
+No application mutex, distributed CAS or global single-writer routing is involved.
+
+`write_settings` and `HookContext::set_settings` remain deliberate **whole-value replacements**.
+Object replacements use `Doc::atomic()` so omitted fields really disappear; they are not independent-field edits and can conflict with patches.
+Lenient explicit edits can still repair corruption, while checked turn-complete patches refuse it.
+Autocompact's explicit recovery of invalid policy values is retained.
+
+Retained scalar-encoded JSON objects are readable, but ordinary edits refuse them until the explicit offline conversion command runs.
+Conversion validates **every** retained/native value first through the same transaction and commits all converted objects together, or none on error/authorization failure.
+It does not run at startup, during reads or as a lazy write-side fallback: racing copies of the old object would reintroduce lost updates.
+The operator must reconcile all old peer histories and stop/upgrade every sharing client first.
+Old binaries are unsupported after cutover; reverting a binary cannot reverse synchronized data.
 
 ## Extension identity
 

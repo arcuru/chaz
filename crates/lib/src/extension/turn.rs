@@ -162,17 +162,19 @@ impl TurnCompleteContext<'_> {
 
     /// Merge a patch into this extension's current settings.
     pub async fn update_settings(&self, patch: Value) -> anyhow::Result<()> {
-        let mut settings = self.settings().await?;
-        let object = settings
-            .as_object_mut()
-            .ok_or_else(|| anyhow::anyhow!("extension settings must be an object"))?;
-        object.extend(
-            patch
-                .as_object()
-                .ok_or_else(|| anyhow::anyhow!("settings patch must be an object"))?
-                .clone(),
-        );
-        super::write_settings(self.db, self.extension, settings).await
+        super::update_settings(self.db, self.extension, true, |settings| {
+            let object = settings
+                .as_object_mut()
+                .ok_or_else(|| anyhow::anyhow!("extension settings must be an object"))?;
+            object.extend(
+                patch
+                    .as_object()
+                    .ok_or_else(|| anyhow::anyhow!("settings patch must be an object"))?
+                    .clone(),
+            );
+            Ok(())
+        })
+        .await
     }
 
     /// One tool-free model call per endpoint invocation, limited to 10 seconds

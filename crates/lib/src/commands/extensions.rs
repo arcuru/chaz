@@ -48,6 +48,8 @@ pub enum ExtScope {
 #[derive(Debug)]
 pub enum ExtensionsAction {
     List,
+    /// Explicit operator confirmation; all old session-sharing clients must be stopped.
+    MigrateSettings,
     Add(String, ExtScope),
     Remove(String, ExtScope),
     Settings(String),
@@ -61,6 +63,16 @@ pub enum ExtensionsAction {
 pub async fn dispatch(action: ExtensionsAction, ctx: &CommandContext<'_>) -> CommandOutcome {
     match action {
         ExtensionsAction::List => list(ctx).await,
+        ExtensionsAction::MigrateSettings => {
+            match crate::extension::migrate_settings(ctx.session_db).await {
+                Ok(count) => CommandOutcome::Text(format!(
+                    "Converted {count} retained extension settings objects to v1. Only Chaz >= 0.4.0 clients may share this session."
+                )),
+                Err(error) => {
+                    CommandOutcome::Error(format!("Settings conversion aborted: {error}"))
+                }
+            }
+        }
         ExtensionsAction::Add(name, scope) => add(&name, scope, ctx).await,
         ExtensionsAction::Remove(name, scope) => remove(&name, scope, ctx).await,
         ExtensionsAction::Settings(name) => settings(&name, ctx).await,
@@ -287,16 +299,18 @@ async fn set(name: &str, key: &str, value: &str, ctx: &CommandContext<'_>) -> Co
     let parsed_value: serde_json::Value = serde_json::from_str(value)
         .unwrap_or_else(|_| serde_json::Value::String(value.to_string()));
 
-    let mut current = crate::extension::read_settings(ctx.session_db, name).await;
-    if !current.is_object() {
-        current = serde_json::json!({});
-    }
-    current
-        .as_object_mut()
-        .expect("forced object above")
-        .insert(key.to_string(), parsed_value.clone());
-
-    if let Err(e) = crate::extension::write_settings(ctx.session_db, name, current).await {
+    if let Err(e) = crate::extension::update_settings(ctx.session_db, name, false, |current| {
+        if !current.is_object() {
+            *current = serde_json::json!({});
+        }
+        current
+            .as_object_mut()
+            .expect("forced object")
+            .insert(key.to_string(), parsed_value.clone());
+        Ok(())
+    })
+    .await
+    {
         return CommandOutcome::Error(format!("Failed to write settings: {e}"));
     }
     CommandOutcome::Text(format!("Set {name}.{key} = {parsed_value}"))
@@ -902,6 +916,44 @@ mod tests {
     // -------------------------------------------------------------------------
     // settings round-trip
     // -------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn settings_command_converts_retained_objects_before_native_edits() {
+        let f = fixture().await;
+        let context = ctx(&f);
+        let db = context.session_db;
+        let txn = db.new_transaction().await.unwrap();
+        txn.get_store::<eidetica::store::DocStore>(crate::extension::EXTENSION_SETTINGS_STORE)
+            .await
+            .unwrap()
+            .set_string("memory", r#"{"enabled":false,"custom_limit":8}"#)
+            .await
+            .unwrap();
+        txn.commit().await.unwrap();
+        let set = || {
+            Command::Extensions(ExtensionsAction::Set {
+                name: "memory".into(),
+                key: "literal.key".into(),
+                value: "{\"nested\":1}".into(),
+            })
+        };
+        assert!(
+            matches!(dispatch(set(), &context).await, CommandOutcome::Error(e) if e.contains("offline conversion"))
+        );
+        assert!(
+            matches!(dispatch(Command::Extensions(ExtensionsAction::MigrateSettings), &context).await, CommandOutcome::Text(t) if t.starts_with("Converted 1"))
+        );
+        assert!(matches!(
+            dispatch(set(), &context).await,
+            CommandOutcome::Text(_)
+        ));
+        assert_eq!(
+            crate::extension::read_settings_checked(db, "memory")
+                .await
+                .unwrap(),
+            serde_json::json!({"enabled":false,"custom_limit":8,"literal.key":{"nested":1}})
+        );
+    }
 
     #[tokio::test]
     async fn settings_round_trip_via_set_and_settings_subcommands() {

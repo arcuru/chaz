@@ -28,7 +28,11 @@ pub mod hooks;
 pub mod instance;
 pub mod manifest;
 pub mod projection;
+mod settings;
 pub mod turn;
+
+pub(crate) use settings::update_settings;
+pub use settings::{migrate_settings, read_settings, read_settings_checked, write_settings};
 
 #[allow(unused_imports)]
 pub use instance::{CapResolver, ExtensionInstance, PeerHandles, Scope, ScopeCtx, TurnCtx};
@@ -97,49 +101,9 @@ pub enum HookKind {
 /// provenance travels with the session via sync.
 pub const EXTENSIONS_STORE: &str = "extensions";
 
-/// Eidetica `DocStore` name where per-session per-extension settings are
-/// stored. Keys are extension names; values are JSON-serialized settings
-/// blobs. Lives on the session DB so settings travel with the session.
+/// Per-session extension settings. Objects use native settings-v1 fields;
+/// retained JSON scalars remain readable until explicit offline conversion.
 pub const EXTENSION_SETTINGS_STORE: &str = "extension_settings";
-
-/// Read the settings JSON for one extension on this session's DB.
-/// Missing key (or any read error) yields `json!({})` rather than
-/// propagating — settings absence is the normal "no overrides" state.
-pub async fn read_settings(session_db: &Database, ext_name: &str) -> serde_json::Value {
-    read_settings_checked(session_db, ext_name)
-        .await
-        .unwrap_or_else(|_| serde_json::json!({}))
-}
-
-/// Strict call-time settings read: absence means defaults; corrupt/unavailable
-/// settings are a failed step, never silently replaced by permissive defaults.
-pub async fn read_settings_checked(
-    session_db: &Database,
-    ext_name: &str,
-) -> anyhow::Result<serde_json::Value> {
-    let txn = session_db.new_transaction().await?;
-    let store = txn.get_store::<DocStore>(EXTENSION_SETTINGS_STORE).await?;
-    match store.get_string(ext_name).await {
-        Ok(value) => Ok(serde_json::from_str(&value)?),
-        Err(error) if error.is_not_found() => Ok(serde_json::json!({})),
-        Err(error) => Err(error.into()),
-    }
-}
-
-/// Persist settings JSON for one extension on this session's DB.
-/// Overwrites any prior value.
-pub async fn write_settings(
-    session_db: &Database,
-    ext_name: &str,
-    value: serde_json::Value,
-) -> anyhow::Result<()> {
-    let serialized = serde_json::to_string(&value)?;
-    let txn = session_db.new_transaction().await?;
-    let store = txn.get_store::<DocStore>(EXTENSION_SETTINGS_STORE).await?;
-    store.set_string(ext_name, serialized).await?;
-    txn.commit().await?;
-    Ok(())
-}
 
 /// Store name for extension-published outputs on the session DB. Keys are
 /// extension names; values are JSON-serialized [`ExtensionOutput`] blobs.
@@ -518,6 +482,16 @@ impl HookContext {
     pub async fn get_settings(&self, ext_name: &str) -> serde_json::Value {
         let session = self.session.lock().await;
         read_settings(session.database(), ext_name).await
+    }
+
+    /// Edit settings from one transaction, persisting only changed fields.
+    pub(crate) async fn update_settings<R>(
+        &self,
+        ext_name: &str,
+        edit: impl FnOnce(&mut serde_json::Value) -> anyhow::Result<R>,
+    ) -> anyhow::Result<R> {
+        let db = self.session.lock().await.database().clone();
+        update_settings(&db, ext_name, false, edit).await
     }
 
     /// Persist a new settings blob for the named extension on this

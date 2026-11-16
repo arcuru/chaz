@@ -1152,30 +1152,33 @@ impl MemoryCommand {
                 }
             };
 
-        let mut settings = ctx.get_settings("memory").await;
-        let bank_json = serde_json::Value::String(bank_name.clone());
-        let banks_arr = settings
-            .as_object_mut()
-            .and_then(|o| o.get_mut("attached_banks"))
-            .and_then(|v| v.as_array_mut());
-
-        match banks_arr {
-            Some(arr) => {
-                if arr.iter().any(|v| v == &bank_json) {
-                    return ExtensionCommandOutcome::Text(format!(
-                        "{}Bank '{bank_name}' is already attached to this session.",
-                        prelude.map(|p| format!("{p}\n")).unwrap_or_default()
-                    ));
+        let attached = ctx
+            .update_settings("memory", |settings| {
+                if !settings.is_object() {
+                    *settings = serde_json::json!({});
                 }
-                arr.push(bank_json);
-            }
-            None => {
-                settings = serde_json::json!({"attached_banks": [bank_name]});
-            }
-        }
-
-        match ctx.set_settings("memory", settings).await {
-            Ok(()) => ExtensionCommandOutcome::Text(format!(
+                let object = settings.as_object_mut().expect("forced object");
+                let banks = object
+                    .entry("attached_banks")
+                    .or_insert_with(|| serde_json::json!([]));
+                if !banks.is_array() {
+                    *banks = serde_json::json!([]);
+                }
+                let banks = banks.as_array_mut().expect("forced array");
+                let bank = serde_json::Value::String(bank_name.clone());
+                if banks.contains(&bank) {
+                    return Ok(false);
+                }
+                banks.push(bank);
+                Ok(true)
+            })
+            .await;
+        match attached {
+            Ok(false) => ExtensionCommandOutcome::Text(format!(
+                "{}Bank '{bank_name}' is already attached to this session.",
+                prelude.map(|p| format!("{p}\n")).unwrap_or_default()
+            )),
+            Ok(true) => ExtensionCommandOutcome::Text(format!(
                 "{}Attached bank '{bank_name}' to this session. Its memories will be surfaced \
                  in context.",
                 prelude.map(|p| format!("{p}\n")).unwrap_or_default()
@@ -1190,26 +1193,24 @@ async fn detach_cmd(bank_name: &str, ctx: &HookContext) -> ExtensionCommandOutco
         return ExtensionCommandOutcome::Error("Usage: /memory detach <bank_name>".into());
     }
 
-    let mut settings = ctx.get_settings("memory").await;
-    let banks = settings
-        .as_object_mut()
-        .and_then(|o| o.get_mut("attached_banks"))
-        .and_then(|v| v.as_array_mut());
-
-    let banks = match banks {
-        Some(a) => a,
-        None => {
-            return ExtensionCommandOutcome::Text(format!(
-                "Bank '{bank_name}' is not attached to this session."
-            ));
-        }
-    };
-
-    let bank_json = serde_json::Value::String(bank_name.to_string());
-    banks.retain(|v| v != &bank_json);
-
-    match ctx.set_settings("memory", settings).await {
-        Ok(()) => {
+    let detached = ctx
+        .update_settings("memory", |settings| {
+            let Some(banks) = settings
+                .get_mut("attached_banks")
+                .and_then(|v| v.as_array_mut())
+            else {
+                return Ok(false);
+            };
+            let bank = serde_json::Value::String(bank_name.to_string());
+            banks.retain(|v| v != &bank);
+            Ok(true)
+        })
+        .await;
+    match detached {
+        Ok(false) => ExtensionCommandOutcome::Text(format!(
+            "Bank '{bank_name}' is not attached to this session."
+        )),
+        Ok(true) => {
             ExtensionCommandOutcome::Text(format!("Detached bank '{bank_name}' from this session."))
         }
         Err(e) => ExtensionCommandOutcome::Error(format!("Failed to persist: {e}")),
@@ -2068,6 +2069,9 @@ mod tests {
             active_extensions: std::collections::HashSet::new(),
             routine_engine: None,
         };
+        ctx.set_settings("memory", serde_json::json!({"enabled":false,"limit":7}))
+            .await
+            .unwrap();
         cmd.attach_cmd("patrick", &ctx).await;
         match cmd.attach_cmd("patrick", &ctx).await {
             ExtensionCommandOutcome::Text(s) => {
@@ -2075,6 +2079,11 @@ mod tests {
             }
             ExtensionCommandOutcome::Error(e) => panic!("unexpected: {e}"),
         }
+        assert_text(detach_cmd("patrick", &ctx).await, "Detached bank");
+        assert_eq!(
+            ctx.get_settings("memory").await,
+            serde_json::json!({"enabled":false,"limit":7,"attached_banks":[]})
+        );
     }
 
     // ── /memory config: auto_recall_max_chars ────────────────────────────────

@@ -860,7 +860,7 @@ dependencies = [
 
 [[package]]
 name = "chaz"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -894,7 +894,7 @@ dependencies = [
 
 [[package]]
 name = "chaz-core"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "async-openai",
@@ -936,7 +936,7 @@ dependencies = [
 
 [[package]]
 name = "chaz-discord-bridge"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "chaz-core",
@@ -956,7 +956,7 @@ dependencies = [
 
 [[package]]
 name = "chaz-matrix-bridge"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "chaz-core",

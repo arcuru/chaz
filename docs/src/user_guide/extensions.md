@@ -186,6 +186,69 @@ key, overwrite it with `null`:
 /extensions set memory custom_limit null
 ```
 
+## Coordinated settings cutover
+
+| Command / requirement                                | Meaning                                                                                                                                        |
+| ---------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
+| Chaz **0.4.0** or later on every sharing client      | Minimum supported settings-v1 reader and writer, including executors, TUI, CLI, Matrix, Discord and rollback targets.                          |
+| `/extensions migrate-settings --old-clients-stopped` | Explicit offline conversion of all retained settings objects on the selected session; any corrupt value or failed write aborts the conversion. |
+| `/extensions settings <name>`                        | Reads both retained and native settings without converting anything; display remains lenient on read errors.                                   |
+
+Settings are independent **top-level fields**, not one synchronized JSON blob.
+Different fields can be edited concurrently without discarding each other.
+A nested object or an `attached_banks` list is one field: competing writes to that value converge to a native deterministic winner, not necessarily the last wall-clock command.
+Setting a field to `null` stores null; it does not delete it.
+Host APIs that deliberately replace an entire settings object still remove omitted fields.
+Memory/skills attach/detach only change `attached_banks`, and `/autocompact off` only changes `enabled` on a valid policy.
+
+This upgrade requires a coordinated cutover, **not** rolling mixed-version operation.
+Do not start new writers alongside old clients, even on sessions without existing overrides.
+Old Chaz 0.3.x readers cannot read native objects (some silently show defaults), and old writers can replace them with stale scalar JSON.
+No automatic version negotiation or distributed fencing makes that safe.
+The confirmation flag is an operator assertion, not a detector of running peers.
+A source upgrade alone is not authorization to perform a live cutover.
+
+### Walkthrough: convert a retained session safely
+
+1. Plan an approved maintenance window and inventory **every** peer/client sharing the affected sessions, including disconnected peers and rollback binaries.
+   Reconcile/synchronize their pending old writes to a common session frontier while still on old clients, then stop all executors/daemons, TUI/CLI processes, Matrix/Discord bridges and other session-sharing writers/readers.
+   Prevent old clients from reconnecting; if a peer's pending history is unknown, stop here rather than converting a disconnected copy.
+   Back up each peer's complete Eidetica state and record the synchronized frontiers and old/new binary versions.
+2. Install Chaz >= 0.4.0 for **all** clients, without restarting normal execution.
+   Use one nominated upgraded peer's offline `cmd` interface, selecting each retained session explicitly (replace config/session names with your actual ones):
+
+   ```sh
+   chaz --config config.yaml --session work cmd '/extensions migrate-settings --old-clients-stopped'
+   ```
+
+   Expected output for a session with two retained object overrides:
+
+   ```text
+   Converted 2 retained extension settings objects to v1. Only Chaz >= 0.4.0 clients may share this session.
+   ```
+
+   Do not independently convert stale copies on other peers.
+   On a fresh/already converted session, the count is `0`; valid non-object JSON values are preserved unchanged.
+
+3. If conversion fails, no partial conversion is committed.
+   For example, corrupt retained JSON reports an error beginning:
+
+   ```text
+   Error: Settings conversion aborted: invalid settings for extension 'memory'
+   ```
+
+   Keep normal execution stopped, diagnose/repair the identified retained data from the backup using authorized tools, then retry.
+   Omitting the confirmation flag prints usage instead of converting.
+   Ordinary edits to an unconverted object also refuse with `retained extension settings require offline conversion`; no background fallback rewrites it.
+
+4. Synchronize the conversion from the nominated upgraded peer to every other upgraded peer before allowing normal execution again.
+   Verify the settings, especially explicit `enabled: false`, on each peer and reopen the session to confirm them.
+   Then resume only upgraded clients and test an independent-field edit from two clients, for example a label and a custom limit.
+   Repeat for every retained session, including inactive sessions before reopening them.
+5. Do **not** roll back only the binary after conversion: the new data and history have synchronized.
+   Recovery requires keeping incompatible clients stopped and a coordinated restore of the pre-cutover state across all participating peers (or an explicitly designed reverse migration).
+   Reconnecting an old/unrestored replica can reintroduce incompatible writes; keep backups and version/frontier custody until the cutover is accepted.
+
 ## What "active on this session" means
 
 Activation status is **per session**, persisted in the session's

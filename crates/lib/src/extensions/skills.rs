@@ -1465,28 +1465,33 @@ impl SkillCommand {
                 }
             };
 
-        let mut settings = ctx.get_settings("skills").await;
-        let bank_json = serde_json::Value::String(bank_name.clone());
-        let banks_arr = settings
-            .as_object_mut()
-            .and_then(|o| o.get_mut("attached_banks"))
-            .and_then(|v| v.as_array_mut());
-        match banks_arr {
-            Some(arr) => {
-                if arr.iter().any(|v| v == &bank_json) {
-                    return ExtensionCommandOutcome::Text(format!(
-                        "{}Bank '{bank_name}' is already attached to this session.",
-                        prelude.map(|p| format!("{p}\n")).unwrap_or_default()
-                    ));
+        let attached = ctx
+            .update_settings("skills", |settings| {
+                if !settings.is_object() {
+                    *settings = serde_json::json!({});
                 }
-                arr.push(bank_json);
-            }
-            None => {
-                settings = serde_json::json!({"attached_banks": [bank_name]});
-            }
-        }
-        match ctx.set_settings("skills", settings).await {
-            Ok(()) => ExtensionCommandOutcome::Text(format!(
+                let object = settings.as_object_mut().expect("forced object");
+                let banks = object
+                    .entry("attached_banks")
+                    .or_insert_with(|| serde_json::json!([]));
+                if !banks.is_array() {
+                    *banks = serde_json::json!([]);
+                }
+                let banks = banks.as_array_mut().expect("forced array");
+                let bank = serde_json::Value::String(bank_name.clone());
+                if banks.contains(&bank) {
+                    return Ok(false);
+                }
+                banks.push(bank);
+                Ok(true)
+            })
+            .await;
+        match attached {
+            Ok(false) => ExtensionCommandOutcome::Text(format!(
+                "{}Bank '{bank_name}' is already attached to this session.",
+                prelude.map(|p| format!("{p}\n")).unwrap_or_default()
+            )),
+            Ok(true) => ExtensionCommandOutcome::Text(format!(
                 "{}Attached skill bank '{bank_name}' to this session. Its skills will be \
                  surfaced in context.",
                 prelude.map(|p| format!("{p}\n")).unwrap_or_default()
@@ -1500,23 +1505,24 @@ async fn detach_cmd(bank_name: &str, ctx: &HookContext) -> ExtensionCommandOutco
     if bank_name.is_empty() {
         return ExtensionCommandOutcome::Error("Usage: /skills detach <bank_name>".into());
     }
-    let mut settings = ctx.get_settings("skills").await;
-    let banks = settings
-        .as_object_mut()
-        .and_then(|o| o.get_mut("attached_banks"))
-        .and_then(|v| v.as_array_mut());
-    let banks = match banks {
-        Some(a) => a,
-        None => {
-            return ExtensionCommandOutcome::Text(format!(
-                "Bank '{bank_name}' is not attached to this session."
-            ));
-        }
-    };
-    let bank_json = serde_json::Value::String(bank_name.to_string());
-    banks.retain(|v| v != &bank_json);
-    match ctx.set_settings("skills", settings).await {
-        Ok(()) => ExtensionCommandOutcome::Text(format!(
+    let detached = ctx
+        .update_settings("skills", |settings| {
+            let Some(banks) = settings
+                .get_mut("attached_banks")
+                .and_then(|v| v.as_array_mut())
+            else {
+                return Ok(false);
+            };
+            let bank = serde_json::Value::String(bank_name.to_string());
+            banks.retain(|v| v != &bank);
+            Ok(true)
+        })
+        .await;
+    match detached {
+        Ok(false) => ExtensionCommandOutcome::Text(format!(
+            "Bank '{bank_name}' is not attached to this session."
+        )),
+        Ok(true) => ExtensionCommandOutcome::Text(format!(
             "Detached skill bank '{bank_name}' from this session."
         )),
         Err(e) => ExtensionCommandOutcome::Error(format!("Failed to persist: {e}")),
@@ -2114,6 +2120,47 @@ mod tests {
         let parsed: Value = serde_json::from_str(&out).expect("valid JSON payload");
         assert_eq!(parsed["name"], "deploy");
         assert_eq!(parsed["text"], "body");
+    }
+
+    #[tokio::test]
+    async fn skill_attachment_edits_preserve_other_settings() {
+        let (_i, registry) = fresh_session_registry().await;
+        let (_j, session) = fresh_session().await;
+        let cmd = SkillCommand {
+            registry,
+            agent_index: HostedIndex::empty("agent"),
+            skill_bank_index: HostedIndex::empty("skill_bank"),
+        };
+        assert!(matches!(
+            cmd.new_cmd("shared").await,
+            ExtensionCommandOutcome::Text(_)
+        ));
+        let ctx = HookContext {
+            agent_name: "test-agent".into(),
+            model: None,
+            call_depth: 0,
+            session,
+            active_extensions: std::collections::HashSet::new(),
+            routine_engine: None,
+        };
+        ctx.set_settings("skills", serde_json::json!({"enabled":false,"limit":7}))
+            .await
+            .unwrap();
+        assert!(
+            matches!(cmd.attach_cmd("shared", &ctx).await, ExtensionCommandOutcome::Text(t) if t.contains("Attached skill bank"))
+        );
+        let attached = ctx.get_settings("skills").await;
+        assert_eq!(
+            attached,
+            serde_json::json!({"enabled":false,"limit":7,"attached_banks":["shared"]})
+        );
+        assert!(
+            matches!(detach_cmd("shared", &ctx).await, ExtensionCommandOutcome::Text(t) if t.contains("Detached skill bank"))
+        );
+        assert_eq!(
+            ctx.get_settings("skills").await,
+            serde_json::json!({"enabled":false,"limit":7,"attached_banks":[]})
+        );
     }
 
     // ── DB-backed discovery fixtures ────────────────────────────────
