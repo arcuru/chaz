@@ -171,11 +171,12 @@ Repair the two same-service issues rather than inventing a sharing protocol:
   indexed Worker sessions, factored narrowly if useful. This is an explicit
   Worker-observer opening path, not a fallback added to general `open_session`
   and not a replacement for native account-metadata freshness repair.
-  Repair a missing key-map hint only with the same login's existing direct key,
-  validated by
-  the service against the actual child. Mapping is not an auth grant. Do not
-  replace an already bound delegated identity with a broader key or mistake
-  lookup failure for permission to use arbitrary account keys.
+  Recover a missing key-map hint by binding only the observer handle to the
+  same login's existing direct key, validated by the service against the actual
+  child. Do not write an account mapping: the stale snapshot might omit a newer
+  canonical delegated identity. Do not replace an already bound delegated
+  identity with a broader key or mistake lookup failure for permission to use
+  arbitrary account keys.
 - Retain the current native materialization boundary: observation requires
   existing Write authority (Admin allowed) where the service requires it.
   Unsupported delegated service permission resolution must return unavailable,

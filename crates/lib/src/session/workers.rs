@@ -41,20 +41,35 @@ impl SessionRegistry {
         let db = if let Some(db) = bound {
             db
         } else {
-            let mut user = self.user.lock().await;
-            let key = match user.find_key(&root)? {
-                Some(key) => key,
-                None => {
-                    // Same bounded lookup repair as job observation. This is a
-                    // hint, not permission: opening and materializing below
-                    // must still succeed under the actual service auth gate.
-                    let key = user.get_default_key()?;
-                    user.map_key(&key, &root, eidetica::auth::SigKey::from_pubkey(&key))
+            let user = self.user.lock().await;
+            if let Some(key) = user.find_key(&root)? {
+                user.open_database_with_key(&root, &key).await?
+            } else {
+                // Bind only this observer handle. map_key would overwrite a
+                // newer canonical mapping absent from this client's snapshot.
+                let key = user.get_default_key()?;
+                let signer = user.get_signing_key(&key)?;
+                let identity = eidetica::auth::SigKey::from_pubkey(&key);
+                let db = if let Some(connection) = self.instance.remote_connection() {
+                    // The normal keyed open proves possession to the service's
+                    // session keyset; open_remote then validates the same key
+                    // against the actual child, without an account-map write.
+                    user.open_database_with_key(self.chaz_group.root_id(), &key)
                         .await?;
-                    key
-                }
-            };
-            user.open_database_with_key(&root, &key).await?
+                    Database::open_remote(
+                        &self.instance,
+                        connection.clone(),
+                        &root,
+                        identity.clone(),
+                    )
+                    .await?
+                } else {
+                    Database::open(&self.instance, &root).await?
+                };
+                db.with_key(eidetica::database::DatabaseKey::with_identity(
+                    signer, identity,
+                ))
+            }
         };
         super::jobs::require_observer_write(&db).await?;
         anyhow::ensure!(
@@ -164,6 +179,21 @@ mod tests {
         })
         .await
         .unwrap();
+        let canonical_identity = {
+            let mut user = writer.user.lock().await;
+            let key = user.get_default_key().unwrap();
+            let identity = SigKey::Delegation {
+                path: vec![eidetica::auth::types::DelegationStep {
+                    tree: parent.root_id().clone(),
+                    tips: parent.snapshot().await.unwrap().into_tips(),
+                }],
+                hint: SigKey::from_pubkey(&key).hint().clone(),
+            };
+            user.map_key(&key, child.root_id(), identity.clone())
+                .await
+                .unwrap();
+            identity
+        };
         assert!(
             observer.open_session(&id.0).await.is_err(),
             "positive control: stale native hint"
@@ -172,6 +202,19 @@ mod tests {
         assert_eq!(observed.root_id(), child.root_id());
         assert!(is_worker_session(&observed).await.unwrap());
         assert!(observer.open_worker_session(&parent_id.0).await.is_err());
+        // A fresh account read, not the writer's old cache, proves observation
+        // did not replace the newer canonical delegation with a direct hint.
+        let fresh = crate::instance::connect_with(&settings, ExecutionRole::Client)
+            .await
+            .unwrap();
+        assert_eq!(
+            fresh
+                .user
+                .key_mapping(&fresh.user.get_default_key().unwrap(), child.root_id())
+                .unwrap(),
+            Some(canonical_identity)
+        );
+        drop(fresh);
 
         settings.login.username = "unrelated".into();
         let stranger = crate::instance::connect_with(&settings, ExecutionRole::Client)
