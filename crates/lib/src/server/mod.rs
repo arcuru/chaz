@@ -2219,12 +2219,6 @@ impl Server {
         agent_override: Option<String>,
         approval_tx: Option<mpsc::Sender<ApprovalExchange>>,
     ) -> anyhow::Result<()> {
-        if !self.executor_authorized {
-            anyhow::bail!("server has no executor loop");
-        }
-        if crate::session::jobs::is_job_session(session_db).await {
-            anyhow::bail!("job session requires executor admission");
-        }
         let session_db_id = session_db.root_id().to_string();
         let registration = self
             .registration_locks
@@ -2234,6 +2228,26 @@ impl Server {
             .or_default()
             .clone();
         let _registration = registration.lock().await;
+        self.register_session_locked(session_db, backend, agent_override, approval_tx)
+            .await
+    }
+
+    /// Caller holds this session's registration lock, including approval-proxy
+    /// creation on the exposed-session adoption path.
+    async fn register_session_locked(
+        &self,
+        session_db: &eidetica::Database,
+        backend: BackendManager,
+        agent_override: Option<String>,
+        approval_tx: Option<mpsc::Sender<ApprovalExchange>>,
+    ) -> anyhow::Result<()> {
+        if !self.executor_authorized {
+            anyhow::bail!("server has no executor loop");
+        }
+        if crate::session::jobs::is_job_session(session_db).await {
+            anyhow::bail!("job session requires executor admission");
+        }
+        let session_db_id = session_db.root_id().to_string();
         let session = Session::new(ConversationId(session_db_id), session_db.clone()).await;
         session.ensure_turn_schema_baseline().await?;
         let agent_name = agent_override

@@ -15,6 +15,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 use std::time::Instant;
 
 use tracing::{error, info, warn};
@@ -1416,8 +1417,8 @@ async fn run_deferred_startup(
 /// watched, so the daemon's ReAct loop answers it.
 ///
 /// `open_session` on a freshly-exposed session can transiently fail if its DB
-/// hasn't synced over yet; that's fine — the next registry sync-write re-scans
-/// and retries, so registration is self-healing rather than one-shot. Agents
+/// hasn't synced over yet. Shared bounded retries acquire missing data, while
+/// registry signals can discover locally ready sessions without waiting for a dial. Agents
 /// created after startup aren't watched here (config-bootstrapped agents are
 /// all present by now); revisit if runtime agent creation needs it.
 async fn watch_agent_session_registries(
@@ -1480,58 +1481,284 @@ async fn watch_agent_session_registries(
     // A rescan may need to bootstrap several old session trees. Do not await
     // it here: doing so leaves this receiver unable to observe a newly
     // exposed session until every stale peer dial finishes. A bridge event is
-    // the latency-sensitive path, so each debounced signal starts its own
-    // bounded rescan while older recovery work continues in the background.
-    let rescan = || {
+    // the latency-sensitive path, so signals start a bounded rescan while
+    // older recovery work continues in the background.
+    let rescan = |mode| {
         let server = server.clone();
         let registry = registry.clone();
         let default_backend = default_backend.clone();
         async move {
-            register_exposed_sessions(&server, &registry, &default_backend).await;
+            match mode {
+                ExposedScanMode::Recover => {
+                    register_exposed_sessions(&server, &registry, &default_backend).await
+                }
+                ExposedScanMode::Local => {
+                    scan_exposed_sessions(&server, &registry, &default_backend, mode).await
+                }
+            }
         }
     };
     run_exposed_session_rescans(rx, rescan).await;
 }
 
-/// Start the initial registry recovery and every subsequent debounced rescan
-/// without making the event receiver wait for a slow session-tree bootstrap.
+/// Share one bounded network-recovery latch while every registry signal can
+/// discover sessions already available locally, even during a slow peer pull.
 pub(crate) async fn run_exposed_session_rescans<F, Fut>(
     mut rx: tokio::sync::mpsc::Receiver<()>,
     rescan: F,
 ) where
-    F: Fn() -> Fut,
-    Fut: std::future::Future<Output = ()> + Send + 'static,
+    F: Fn(ExposedScanMode) -> Fut,
+    Fut: std::future::Future<Output = RescanOutcome> + Send + 'static,
 {
-    const MAX_IN_FLIGHT: usize = 2;
+    // One recovery and one local discovery may run together. Serializing
+    // acquisition keeps a second scan from dialing the same unavailable peers;
+    // the blocked-recovery/coalescing tests enforce the two-lane bound.
+    const INITIAL_RETRY: Duration = Duration::from_secs(1);
+    const MAX_RETRY: Duration = Duration::from_secs(30);
 
     let mut scans = tokio::task::JoinSet::new();
-    scans.spawn(rescan());
-    let mut pending = false;
+    let mut generation = 1u64;
+    let scan = rescan(ExposedScanMode::Recover);
+    scans.spawn(async move { (generation, scan.await) });
+    let mut local_scans = tokio::task::JoinSet::new();
+    let mut local_pending = false;
+    let mut pending_generation = None;
+    let mut retry_at = None;
+    let mut retry_delay = INITIAL_RETRY;
+    let mut retry_attempt = 0u32;
+    let mut degraded = false;
+    let mut retry_preempted = false;
 
     loop {
         tokio::select! {
             signal = rx.recv() => match signal {
                 Some(()) => {
                     while rx.try_recv().is_ok() {}
-                    if scans.len() < MAX_IN_FLIGHT {
-                        scans.spawn(rescan());
+                    // Local availability must not spend or wait for the network
+                    // retry budget. Even a self-write storm leaves one follow-up
+                    // discovery queued while the current discovery is running.
+                    if local_scans.is_empty() {
+                        local_scans.spawn(rescan(ExposedScanMode::Local));
                     } else {
-                        pending = true;
+                        local_pending = true;
+                    }
+                    if degraded {
+                        // A registry write may reveal that a missing session has
+                        // arrived, but this watcher also observes recovery's own
+                        // local writes. Permit one early retry per backoff window;
+                        // further writes leave the exponential delay intact.
+                        if retry_at.is_some() && !retry_preempted {
+                            retry_at = None;
+                            retry_preempted = true;
+                        } else {
+                            continue;
+                        }
+                    }
+                    generation += 1;
+                    if scans.is_empty() {
+                        tracing::debug!(trigger = "registry", "Starting exposed-session rescan");
+                        let scan_generation = generation;
+                        let scan = rescan(ExposedScanMode::Recover);
+                        scans.spawn(async move { (scan_generation, scan.await) });
+                    } else {
+                        pending_generation = Some(generation);
                     }
                 }
                 None => break,
             },
-            completed = scans.join_next(), if !scans.is_empty() => {
+            completed = local_scans.join_next(), if !local_scans.is_empty() => {
                 if let Some(Err(error)) = completed {
-                    tracing::warn!(%error, "Exposed-session rescan task failed");
+                    tracing::warn!(%error, "Exposed-session local discovery task failed");
                 }
-                if pending {
-                    pending = false;
-                    scans.spawn(rescan());
+                // Discovery never changes acquisition backoff. Only a full
+                // recovery scan can settle that latch; its next clean result
+                // disarms it without re-registering a locally recovered session.
+                if local_pending {
+                    local_pending = false;
+                    local_scans.spawn(rescan(ExposedScanMode::Local));
                 }
-            }
+            },
+            completed = scans.join_next(), if !scans.is_empty() => {
+                match completed {
+                    Some(Ok((_, RescanOutcome::RetryableIncomplete))) => {
+                        // Signals received while a pull was in flight must not
+                        // evade backoff by making every failed result stale.
+                        // Their local-discovery follow-up is still queued.
+                        pending_generation = None;
+                        degraded = true;
+                        if retry_at.is_none() {
+                            retry_at = Some(tokio::time::Instant::now() + retry_delay);
+                            retry_attempt += 1;
+                            tracing::info!(
+                                retry_attempt,
+                                backoff_secs = retry_delay.as_secs(),
+                                outcome = "retryable_incomplete",
+                                "Exposed-session rescan scheduled for retry"
+                            );
+                            retry_delay = retry_delay.saturating_mul(2).min(MAX_RETRY);
+                        }
+                    }
+                    Some(Ok((scan_generation, _))) if scan_generation < generation => {}
+                    Some(Ok((scan_generation, outcome))) => {
+                        debug_assert_eq!(scan_generation, generation);
+                        tracing::debug!(?outcome, "Exposed-session rescan complete");
+                        retry_at = None;
+                        retry_delay = INITIAL_RETRY;
+                        retry_attempt = 0;
+                        degraded = false;
+                        retry_preempted = false;
+                    }
+                    Some(Err(error)) => {
+                        tracing::warn!(%error, "Exposed-session rescan task failed");
+                        retry_at = None;
+                        retry_delay = INITIAL_RETRY;
+                        retry_attempt = 0;
+                        degraded = false;
+                        retry_preempted = false;
+                    }
+                    None => {}
+                }
+                if let Some(scan_generation) = pending_generation.take() {
+                    let scan = rescan(ExposedScanMode::Recover);
+                    scans.spawn(async move { (scan_generation, scan.await) });
+                }
+            },
+            _ = async {
+                if let Some(deadline) = retry_at {
+                    tokio::time::sleep_until(deadline).await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            } => {
+                retry_at = None;
+                retry_preempted = false;
+                generation += 1;
+                if scans.is_empty() {
+                    tracing::debug!(trigger = "retry_timer", "Starting exposed-session rescan");
+                    let scan_generation = generation;
+                    let scan = rescan(ExposedScanMode::Recover);
+                    scans.spawn(async move { (scan_generation, scan.await) });
+                } else {
+                    pending_generation = Some(generation);
+                }
+            },
         }
     }
+
+    scans.abort_all();
+    local_scans.abort_all();
+    while scans.join_next().await.is_some() {}
+    while local_scans.join_next().await.is_some() {}
+}
+
+/// Aggregate result of a full durable-registry scan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RescanOutcome {
+    Clean,
+    PermanentOnly,
+    RetryableIncomplete,
+}
+
+impl RescanOutcome {
+    fn include(&mut self, registration: RegistrationOutcome) {
+        match registration {
+            RegistrationOutcome::RetryableIncomplete => *self = Self::RetryableIncomplete,
+            RegistrationOutcome::PermanentPolicy if *self == Self::Clean => {
+                *self = Self::PermanentOnly
+            }
+            _ => {}
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RegistrationOutcome {
+    Registered,
+    AlreadyComplete,
+    RetryableIncomplete,
+    PermanentPolicy,
+}
+
+/// Preserve Eidetica's typed failure semantics at the acquisition boundary.
+/// Unknown errors are permanent: retry is opt-in rather than a property of
+/// `anyhow::Error` in general.
+pub(crate) fn classify_eidetica_error(error: &anyhow::Error) -> RegistrationOutcome {
+    let Some(error) = error.downcast_ref::<eidetica::Error>() else {
+        return RegistrationOutcome::PermanentPolicy;
+    };
+    classify_eidetica(error)
+}
+
+fn classify_eidetica(error: &eidetica::Error) -> RegistrationOutcome {
+    match error {
+        eidetica::Error::Account(error) => match error.as_ref() {
+            eidetica::account::AccountError::DatabaseAccessPending { .. }
+            | eidetica::account::AccountError::NoKeyForDatabase { .. }
+            | eidetica::account::AccountError::NoSigKeyMapping { .. }
+            | eidetica::account::AccountError::NoSigKeyFound { .. }
+            | eidetica::account::AccountError::KeyNotFound { .. }
+            | eidetica::account::AccountError::DatabaseNotTracked { .. } => {
+                RegistrationOutcome::RetryableIncomplete
+            }
+            _ => RegistrationOutcome::PermanentPolicy,
+        },
+        eidetica::Error::Sync(error) => match error.as_ref() {
+            eidetica::sync::SyncError::Network(_)
+            | eidetica::sync::SyncError::ConnectionFailed { .. }
+            | eidetica::sync::SyncError::Timeout { .. }
+            | eidetica::sync::SyncError::CommandSendError(_)
+            | eidetica::sync::SyncError::TransportInit(_)
+            | eidetica::sync::SyncError::DeviceKeyNotFound { .. }
+            | eidetica::sync::SyncError::PeerNotFound(_)
+            | eidetica::sync::SyncError::EntryNotFound(_)
+            | eidetica::sync::SyncError::NoTransportForAddress { .. } => {
+                RegistrationOutcome::RetryableIncomplete
+            }
+            _ => RegistrationOutcome::PermanentPolicy,
+        },
+        eidetica::Error::Backend(error) => match error.as_ref() {
+            eidetica::backend::BackendError::EntryNotFound { .. } => {
+                RegistrationOutcome::RetryableIncomplete
+            }
+            eidetica::backend::BackendError::FileIo { source }
+                if is_retryable_io_kind(source.kind()) =>
+            {
+                RegistrationOutcome::RetryableIncomplete
+            }
+            _ => RegistrationOutcome::PermanentPolicy,
+        },
+        eidetica::Error::Io(error) if is_retryable_io_kind(error.kind()) => {
+            RegistrationOutcome::RetryableIncomplete
+        }
+        eidetica::Error::Auth(error) if error.is_delegated_tree_unsynced() => {
+            RegistrationOutcome::RetryableIncomplete
+        }
+        _ => RegistrationOutcome::PermanentPolicy,
+    }
+}
+
+fn is_retryable_io_kind(kind: std::io::ErrorKind) -> bool {
+    matches!(
+        kind,
+        std::io::ErrorKind::NotFound
+            | std::io::ErrorKind::ConnectionRefused
+            | std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::NotConnected
+            | std::io::ErrorKind::AddrInUse
+            | std::io::ErrorKind::AddrNotAvailable
+            | std::io::ErrorKind::BrokenPipe
+            | std::io::ErrorKind::WouldBlock
+            | std::io::ErrorKind::TimedOut
+            | std::io::ErrorKind::Interrupted
+    )
+}
+
+/// Local discovery never pulls peers or repairs their relationships.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExposedScanMode {
+    Local,
+    Recover,
 }
 
 /// One rescan pass: for every hosted agent, `register_session` each exposed
@@ -1541,19 +1768,61 @@ pub(crate) async fn register_exposed_sessions(
     server: &Arc<Server>,
     registry: &Arc<session::SessionRegistry>,
     default_backend: &backends::BackendManager,
-) {
+) -> RescanOutcome {
+    scan_exposed_sessions(server, registry, default_backend, ExposedScanMode::Recover).await
+}
+
+pub(crate) async fn scan_exposed_sessions(
+    server: &Arc<Server>,
+    registry: &Arc<session::SessionRegistry>,
+    default_backend: &backends::BackendManager,
+    mode: ExposedScanMode,
+) -> RescanOutcome {
+    let mut outcomes = RescanOutcome::Clean;
     for entry in server.agent_index().list() {
-        let Some(adb) = registry
+        let adb = match registry
             .open_agent_db(&entry.db_id, Some(&entry.pubkey))
             .await
-            .ok()
-            .flatten()
-        else {
-            continue;
+        {
+            Ok(Some(adb)) => adb,
+            Ok(None) => {
+                outcomes.include(RegistrationOutcome::RetryableIncomplete);
+                warn!(agent = %entry.display_name, outcome = "retryable_incomplete", "Agent DB key is not available for exposed-session scan");
+                continue;
+            }
+            Err(error) => {
+                let outcome = classify_eidetica_error(&error);
+                outcomes.include(outcome);
+                warn!(agent = %entry.display_name, ?outcome, %error, "Could not open agent DB for exposed-session scan");
+                continue;
+            }
         };
-        adopt_published_bridge_addresses(registry, &adb).await;
-        let bridge_pubkeys = published_bridge_pubkeys(&adb).await;
-        let refs = adb.list_session_refs().await.unwrap_or_default();
+        if mode == ExposedScanMode::Recover
+            && let Err(error) = adopt_published_bridge_addresses(registry, &adb).await
+        {
+            let outcome = classify_eidetica_error(&error);
+            outcomes.include(outcome);
+            warn!(agent = %entry.display_name, ?outcome, %error, "Could not restore bridge peer relationships");
+            continue;
+        }
+        let bridge_pubkeys = match published_bridge_pubkeys(&adb).await {
+            Ok(keys) => keys,
+            Err(error) => {
+                let outcome = classify_eidetica_error(&error);
+                outcomes.include(outcome);
+                warn!(agent = %entry.display_name, ?outcome, %error, "Could not read published bridge identities");
+                continue;
+            }
+        };
+        let refs = match adb.list_session_refs().await {
+            Ok(refs) => refs,
+            Err(error) => {
+                let outcome = classify_eidetica_error(&error);
+                outcomes.include(outcome);
+                warn!(agent = %entry.display_name, ?outcome, %error, "Could not read exposed-session registry");
+                continue;
+            }
+        };
         // What this peer can actually see in the agent DB registry. A
         // bridge-created session reaches the daemon only through this store, so
         // when a session never registers, the first question is whether the
@@ -1579,8 +1848,8 @@ pub(crate) async fn register_exposed_sessions(
             let entry = &entry;
             let adb = &adb;
             let bridge_pubkeys = &bridge_pubkeys;
-            futures::stream::iter(refs)
-                .for_each_concurrent(MAX_CONCURRENT_SESSION_REGISTRATIONS, |r| async move {
+            let mut registrations = futures::stream::iter(refs)
+                .map(|r| {
                     register_one_exposed_session(
                         server,
                         registry,
@@ -1589,12 +1858,16 @@ pub(crate) async fn register_exposed_sessions(
                         adb,
                         bridge_pubkeys,
                         r,
+                        mode,
                     )
-                    .await;
                 })
-                .await;
+                .buffer_unordered(MAX_CONCURRENT_SESSION_REGISTRATIONS);
+            while let Some(outcome) = registrations.next().await {
+                outcomes.include(outcome);
+            }
         }
     }
+    outcomes
 }
 
 /// Register one bridge-exposed session on this daemon.
@@ -1602,6 +1875,7 @@ pub(crate) async fn register_exposed_sessions(
 /// Split out of the rescan so sessions can be handled concurrently: each one
 /// that has to be pulled costs a full peer deadline, and those costs are
 /// independent of each other.
+#[allow(clippy::too_many_arguments)]
 async fn register_one_exposed_session(
     server: &Arc<Server>,
     registry: &Arc<session::SessionRegistry>,
@@ -1610,21 +1884,24 @@ async fn register_one_exposed_session(
     adb: &crate::agent_db::AgentDb,
     bridge_pubkeys: &std::collections::HashSet<String>,
     r: crate::agent_db::SessionRef,
-) {
+    mode: ExposedScanMode,
+) -> RegistrationOutcome {
     if r.exposed_on.is_empty() {
-        return;
+        return RegistrationOutcome::AlreadyComplete;
     }
     // Both skips below are silent by nature and look identical to "no
     // work to do", which is exactly what made a session that never
     // registered impossible to trace: the counts moved, so the marker
     // had clearly arrived, but nothing said which refs were seen or why
     // each was passed over.
-    if server.is_watching_session(&r.session_db_id).await {
+    if server.is_watching_session(&r.session_db_id).await
+        && server.runtime_owner_of(&r.session_db_id).is_some()
+    {
         tracing::debug!(
             session_db_id = %r.session_db_id,
             "Rescan: exposed session already watched, skipping"
         );
-        return;
+        return RegistrationOutcome::AlreadyComplete;
     }
     tracing::debug!(
         session_db_id = %r.session_db_id,
@@ -1638,12 +1915,64 @@ async fn register_one_exposed_session(
     // sync this agent DB with (the exposing bridge is one of them), then
     // retry. Best-effort — a miss just defers to the next registry rescan.
     let mut opened = registry.open_session_with_signer(&r.session_db_id).await;
-    if opened.is_err() {
-        pull_session_tree_from_agent_peers(registry, entry, adb, &r.session_db_id).await;
-        opened = registry.open_session_with_signer(&r.session_db_id).await;
+    if let Err(error) = &opened {
+        let outcome = classify_eidetica_error(error);
+        if outcome == RegistrationOutcome::PermanentPolicy {
+            return outcome;
+        }
+        // Entries can arrive before AccountSession learns their signing-key
+        // mapping. Discover it locally with the same proven agent key used for
+        // authenticated pulls; tracking validates the tree's current authority.
+        let session_id = match eidetica::entry::ID::parse(&r.session_db_id) {
+            Ok(id) => id,
+            Err(_) => return RegistrationOutcome::PermanentPolicy,
+        };
+        match registry
+            .enable_on_commit_sync_with_key(&session_id, &entry.pubkey)
+            .await
+        {
+            Ok(()) => opened = registry.open_session_with_signer(&r.session_db_id).await,
+            Err(error) => {
+                let outcome = classify_eidetica_error(&error);
+                tracing::debug!(session_db_id = %r.session_db_id, ?outcome, %error,
+                    "Local exposed-session key discovery incomplete");
+                if outcome == RegistrationOutcome::PermanentPolicy {
+                    return outcome;
+                }
+            }
+        }
+        if let Err(error) = &opened {
+            let outcome = classify_eidetica_error(error);
+            if mode == ExposedScanMode::Local || outcome == RegistrationOutcome::PermanentPolicy {
+                return outcome;
+            }
+            let pull =
+                pull_session_tree_from_agent_peers(registry, entry, adb, &r.session_db_id).await;
+            if pull != RegistrationOutcome::Registered {
+                return pull;
+            }
+            opened = registry.open_session_with_signer(&r.session_db_id).await;
+        }
     }
     match opened {
         Ok((conv_id, sdb, signing_key)) => {
+            // Acquisition never holds this guard: local readiness must not wait
+            // behind a peer dial. After opening, both lanes share the existing
+            // registration lock so they cannot spawn duplicate approval proxies.
+            let registration_lock = server
+                .registration_locks
+                .lock()
+                .await
+                .entry(r.session_db_id.clone())
+                .or_default()
+                .clone();
+            let _registration = registration_lock.lock().await;
+            if server.is_watching_session(&r.session_db_id).await
+                && server.runtime_owner_of(&r.session_db_id).is_some()
+            {
+                return RegistrationOutcome::AlreadyComplete;
+            }
+
             // Before anything else: a session the bridge created names the
             // bridge as its home peer, and a bridge runs no agent loop. Take
             // it over now, while adopting it, rather than registering a
@@ -1664,27 +1993,36 @@ async fn register_one_exposed_session(
                 // Keep this session eligible for the next agent-registry rescan.
                 // Registering before its signer is discoverable can cache an
                 // empty extension set and leave replies without on-commit sync.
-                return;
+                return classify_eidetica_error(&e);
             }
             // Proxy tool approvals over the session DB: the runtime
             // blocks on this channel, the proxy writes a request entry,
             // and the exposing bridge renders it + writes the decision.
-            let (approval_tx, approval_tasks) =
-                super::approval_proxy::spawn_session_db_approval_proxy(
-                    sdb.clone(),
-                    entry.display_name.clone(),
-                    server.approval_timeout(),
-                    signing_key,
-                )
-                .await;
-            for task in approval_tasks {
-                server.track_task(task);
-            }
-            if let Err(e) = server
-                .register_session(&sdb, default_backend.clone(), None, Some(approval_tx))
-                .await
-            {
-                warn!(session_db_id = %r.session_db_id, "register exposed session failed: {e}");
+            let registration = if server.is_watching_session(&r.session_db_id).await {
+                server
+                    .claim_runtime(&sdb, entry.display_name.clone(), 0, server.runtime_mode())
+                    .await
+            } else {
+                let (approval_tx, approval_tasks) =
+                    super::approval_proxy::spawn_session_db_approval_proxy(
+                        sdb.clone(),
+                        entry.display_name.clone(),
+                        server.approval_timeout(),
+                        signing_key,
+                    )
+                    .await;
+                for task in approval_tasks {
+                    server.track_task(task);
+                }
+                server
+                    .register_session_locked(&sdb, default_backend.clone(), None, Some(approval_tx))
+                    .await
+                    .map(|()| true)
+            };
+            if let Err(e) = registration {
+                let outcome = classify_eidetica_error(&e);
+                warn!(session_db_id = %r.session_db_id, ?outcome, error = %e, "register exposed session failed");
+                outcome
             } else {
                 info!(
                     session_db_id = %r.session_db_id,
@@ -1735,16 +2073,20 @@ async fn register_one_exposed_session(
                          will run its turns. Repair with `/agent rehost` on that session."
                     );
                 }
+                RegistrationOutcome::Registered
             }
         }
         Err(e) => {
             // Still not openable after a pull attempt (peer unreachable,
             // or the tree genuinely absent) — a later registry sync-write
             // re-triggers this scan and retries.
+            let outcome = classify_eidetica_error(&e);
             tracing::debug!(
                 session_db_id = %r.session_db_id,
-                "Exposed session not openable even after pull; will retry on next registry write: {e}"
+                ?outcome,
+                "Exposed session not openable after pull: {e}"
             );
+            outcome
         }
     }
 }
@@ -1765,8 +2107,8 @@ pub(super) fn bridge_pubkeys_from_logins(
 
 pub(super) async fn published_bridge_pubkeys(
     adb: &crate::agent_db::AgentDb,
-) -> std::collections::HashSet<String> {
-    bridge_pubkeys_from_logins(adb.list_logins().await.unwrap_or_default())
+) -> anyhow::Result<std::collections::HashSet<String>> {
+    Ok(bridge_pubkeys_from_logins(adb.list_logins().await?))
 }
 
 /// Re-host a bridge-created session onto this daemon, if that is what it is.
@@ -1836,15 +2178,15 @@ async fn pull_session_tree_from_agent_peers(
     agent: &crate::hosted_index::DbEntry,
     adb: &crate::agent_db::AgentDb,
     session_db_id: &str,
-) {
+) -> RegistrationOutcome {
     let Some(sync) = registry.instance().sync() else {
-        return;
+        return RegistrationOutcome::PermanentPolicy;
     };
     let session_id = match eidetica::entry::ID::parse(session_db_id) {
         Ok(id) => id,
         Err(e) => {
             tracing::debug!(session_db_id, "invalid session id, cannot pull: {e}");
-            return;
+            return RegistrationOutcome::PermanentPolicy;
         }
     };
     // The session DB is auth-gated, so a plain sync is rejected. Present the
@@ -1863,7 +2205,7 @@ async fn pull_session_tree_from_agent_peers(
                 agent = %agent.display_name,
                 "this peer holds no signing key for the agent; cannot pull: {e}"
             );
-            return;
+            return classify_eidetica_error(&e);
         }
     };
     let key_name = format!("agent:{}", agent.display_name);
@@ -1873,12 +2215,12 @@ async fn pull_session_tree_from_agent_peers(
         Ok(p) => p,
         Err(e) => {
             tracing::debug!(session_db_id, "get_tree_peers failed: {e}");
-            return;
+            return classify_eidetica(&e);
         }
     };
     if peers.is_empty() {
         tracing::debug!(session_db_id, "no peers sync this agent DB; cannot pull");
-        return;
+        return RegistrationOutcome::RetryableIncomplete;
     }
     // Ask the peer most likely to answer first, and ask one at a time.
     //
@@ -1911,12 +2253,17 @@ async fn pull_session_tree_from_agent_peers(
                 ranked.push((info.last_seen, peer_key));
             }
             // No stored info is not a reason to skip it — it just sorts last.
-            _ => ranked.push((String::new(), peer_key)),
+            Ok(None) => ranked.push((String::new(), peer_key)),
+            Err(error) => {
+                let outcome = classify_eidetica(&error);
+                warn!(session_db_id, peer = %peer_key, ?outcome, %error, "Could not read recovery peer policy");
+                return outcome;
+            }
         }
     }
     if ranked.is_empty() {
         tracing::debug!(session_db_id, "no eligible peers to pull from");
-        return;
+        return RegistrationOutcome::PermanentPolicy;
     }
     // ISO-8601 timestamps sort lexicographically, so reversing puts the most
     // recently contacted peer at the front.
@@ -1931,6 +2278,7 @@ async fn pull_session_tree_from_agent_peers(
 
     let mut winner = None;
     let mut tried = Vec::with_capacity(ranked.len());
+    let mut pull_outcome = RegistrationOutcome::PermanentPolicy;
     for (_, peer_key) in &ranked {
         tried.push(peer_key.to_string());
         match sync
@@ -1951,11 +2299,18 @@ async fn pull_session_tree_from_agent_peers(
             // "Refused", "not found", and "never answered" are different
             // diagnoses and only one of them is an authorization problem, so
             // each peer's own outcome is worth a line of its own.
-            Err(e) => info!(
-                peer = %peer_key,
-                session_db_id,
-                "Pull attempt refused by peer: {e}"
-            ),
+            Err(e) => {
+                let outcome = classify_eidetica(&e);
+                if outcome == RegistrationOutcome::RetryableIncomplete {
+                    pull_outcome = outcome;
+                }
+                info!(
+                    peer = %peer_key,
+                    session_db_id,
+                    ?outcome,
+                    "Pull attempt failed: {e}"
+                );
+            }
         }
     }
     let Some(winner) = winner else {
@@ -1965,7 +2320,7 @@ async fn pull_session_tree_from_agent_peers(
             peers = ?tried,
             "No peer served the session tree"
         );
-        return;
+        return pull_outcome;
     };
 
     // The pull moves entries at the sync layer but establishes no User-layer
@@ -1981,6 +2336,7 @@ async fn pull_session_tree_from_agent_peers(
             session_db_id,
             "tracking pulled session under the agent key failed: {e}"
         );
+        return classify_eidetica_error(&e);
     }
     // A successful `sync_tree_with_peer_auth` records the (peer, tree) pair for
     // the peer that answered, but a session can be exposed on more than one
@@ -2003,6 +2359,7 @@ async fn pull_session_tree_from_agent_peers(
         }
     }
     info!(session_db_id, peer = %winner, "Pulled exposed session tree from peer");
+    RegistrationOutcome::Registered
 }
 
 /// Startup migration WARN: any locally-hosted agent that is co-owned
@@ -2221,11 +2578,11 @@ async fn build_web_search_backends(
 async fn adopt_published_bridge_addresses(
     registry: &Arc<session::SessionRegistry>,
     adb: &crate::agent_db::AgentDb,
-) {
+) -> anyhow::Result<()> {
     let Some(sync) = registry.instance().sync() else {
-        return;
+        return Ok(());
     };
-    let logins = adb.list_logins().await.unwrap_or_default();
+    let logins = adb.list_logins().await?;
     for login in logins {
         let Some(pubkey_str) = login.peer_pubkey.as_deref() else {
             continue;
@@ -2241,6 +2598,31 @@ async fn adopt_published_bridge_addresses(
             );
             continue;
         };
+        // A bridge that lost its local state is a new sync peer even if it
+        // retains the same Matrix login. The login pointer is replicated with
+        // the agent DB, but the daemon's peer set is deliberately local, so
+        // merely adding the published address fails with `Peer not found` and
+        // the session tree remains unreachable. Recreate only the peer
+        // relationship needed to exchange this agent DB; session delegation
+        // still decides whether individual session trees may be served.
+        match sync.get_peer_info(&pubkey).await? {
+            Some(info) if matches!(info.status, eidetica::sync::PeerStatus::Blocked) => continue,
+            Some(_) => {}
+            None => {
+                if let Err(error) = sync.register_peer(&pubkey, Some(&login.identifier)).await {
+                    // Registration can race another local owner. Confirm the
+                    // already-existing peer rather than hiding a policy/read failure.
+                    if !matches!(&error, eidetica::Error::Sync(e)
+                        if matches!(e.as_ref(), eidetica::sync::SyncError::PeerAlreadyExists(_)))
+                        || sync.get_peer_info(&pubkey).await?.is_none()
+                    {
+                        return Err(error.into());
+                    }
+                }
+            }
+        }
+        sync.add_tree_sync(&pubkey, adb.database().root_id())
+            .await?;
         let published: Vec<eidetica::sync::peer_types::Address> = login
             .sync_addresses
             .iter()
@@ -2250,13 +2632,7 @@ async fn adopt_published_bridge_addresses(
             .collect();
 
         for addr in &published {
-            if let Err(e) = sync.add_peer_address(&pubkey, addr.clone()).await {
-                tracing::debug!(
-                    login = %login.identifier,
-                    peer = %pubkey,
-                    "could not adopt published bridge address: {e}"
-                );
-            }
+            sync.add_peer_address(&pubkey, addr.clone()).await?;
         }
 
         // Adding is not enough on its own. Addresses accumulate in the order
@@ -2265,8 +2641,8 @@ async fn adopt_published_bridge_addresses(
         // The bridge has just told us the complete set it answers on, so
         // anything else recorded for this identity is from a run that has since
         // gone away — drop it rather than leave it shadowing the live address.
-        let stale: Vec<_> = match sync.get_peer_info(&pubkey).await {
-            Ok(Some(info)) => info
+        let stale: Vec<_> = match sync.get_peer_info(&pubkey).await? {
+            Some(info) => info
                 .addresses
                 .into_iter()
                 .filter(|a| !published.contains(a))
@@ -2274,7 +2650,7 @@ async fn adopt_published_bridge_addresses(
             _ => Vec::new(),
         };
         for addr in stale {
-            if let Ok(true) = sync.remove_peer_address(&pubkey, &addr).await {
+            if sync.remove_peer_address(&pubkey, &addr).await? {
                 tracing::info!(
                     login = %login.identifier,
                     peer = %pubkey,
@@ -2288,6 +2664,199 @@ async fn adopt_published_bridge_addresses(
             peer = %pubkey,
             published = published.len(),
             "Adopted a bridge's published sync addresses"
+        );
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agent_db::LoginRef;
+
+    #[tokio::test]
+    async fn published_replacement_bridge_is_registered_to_serve_the_agent_tree() {
+        let (instance, registry) = crate::session::test_helpers::make_registry_with_sync().await;
+        let sync = instance.sync().expect("sync must be enabled");
+        let agent = crate::session::test_helpers::make_agent_entry(&registry, "alpha").await;
+        let agent_db = registry
+            .open_agent_db(&agent.db_id, Some(&agent.pubkey))
+            .await
+            .unwrap()
+            .unwrap();
+        let replacement = registry
+            .new_ephemeral_key("replacement-bridge")
+            .await
+            .unwrap();
+        agent_db
+            .register_login(LoginRef {
+                kind: "matrix".to_string(),
+                identifier: "@chaz:example".to_string(),
+                bridge_db_id: "sha256:replacement".to_string(),
+                peer_pubkey: Some(replacement.to_string()),
+                agent_pubkey: Some(replacement.to_string()),
+                sync_addresses: vec![("http".to_string(), "127.0.0.1:4242".to_string())],
+            })
+            .await
+            .unwrap();
+
+        assert!(
+            sync.get_tree_peers(agent_db.database().root_id())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        adopt_published_bridge_addresses(&registry, &agent_db)
+            .await
+            .unwrap();
+        assert!(
+            sync.get_tree_peers(agent_db.database().root_id())
+                .await
+                .unwrap()
+                .iter()
+                .any(|peer| peer.public_key() == &replacement),
+            "the replacement bridge must serve the agent tree so the daemon can pull exposed sessions"
+        );
+    }
+
+    #[tokio::test]
+    async fn stopped_bridge_transport_keeps_exposed_session_pull_retryable() {
+        use eidetica::backend::database::InMemory;
+        use eidetica::sync::transports::http::HttpTransport;
+        use eidetica::{Instance, NewAccount};
+
+        let (instance, registry) = crate::session::test_helpers::make_registry_with_sync().await;
+        let sync = instance.sync().unwrap();
+        sync.register_transport("http", HttpTransport::builder())
+            .await
+            .unwrap();
+        let agent = crate::session::test_helpers::make_agent_entry(&registry, "alpha").await;
+        let adb = registry
+            .open_agent_db(&agent.db_id, Some(&agent.pubkey))
+            .await
+            .unwrap()
+            .unwrap();
+
+        let (bridge, _user) = Instance::create_backend(
+            Box::new(InMemory::new()),
+            NewAccount::with_password("bridge", "test-password"),
+        )
+        .await
+        .unwrap();
+        bridge.enable_sync().await.unwrap();
+        let bridge_sync = bridge.sync().unwrap();
+        bridge_sync
+            .register_transport("http", HttpTransport::builder().bind("127.0.0.1:0"))
+            .await
+            .unwrap();
+        bridge_sync.accept_connections().await.unwrap();
+        let address = bridge_sync.get_server_address_for("http").await.unwrap();
+        let peer_key = bridge_sync.get_device_pubkey().unwrap();
+        adb.register_login(LoginRef {
+            kind: "matrix".into(),
+            identifier: "@chaz:example".into(),
+            bridge_db_id: "sha256:bridge".into(),
+            peer_pubkey: Some(peer_key.to_string()),
+            agent_pubkey: None,
+            sync_addresses: vec![("http".into(), address.clone())],
+        })
+        .await
+        .unwrap();
+        adopt_published_bridge_addresses(&registry, &adb)
+            .await
+            .unwrap();
+        bridge_sync.stop_server().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if std::net::TcpListener::bind(&address).is_ok() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("disposable bridge listener must stop");
+
+        let missing = eidetica::entry::ID::from_bytes("bridge-session-not-yet-pulled");
+        let signing_key = registry.signing_key_for(&agent.pubkey).await.unwrap();
+        let error = sync
+            .sync_tree_with_peer_auth(
+                &peer_key,
+                &missing,
+                Some(&signing_key),
+                Some("agent:alpha"),
+                Some(eidetica::auth::types::Permission::Write(10)),
+                None,
+            )
+            .await
+            .unwrap_err();
+        eprintln!("Stopped bridge acquisition trace: {error:?}");
+        assert_eq!(
+            classify_eidetica(&error),
+            RegistrationOutcome::RetryableIncomplete
+        );
+        use tracing::instrument::WithSubscriber;
+        let missing_id = missing.to_string();
+        let outcome = pull_session_tree_from_agent_peers(&registry, &agent, &adb, &missing_id)
+            .with_subscriber(tracing::subscriber::NoSubscriber::default())
+            .await;
+        eprintln!("Chaz stopped-bridge pull outcome with logging disabled: {outcome:?}");
+        assert_eq!(outcome, RegistrationOutcome::RetryableIncomplete);
+    }
+
+    #[tokio::test]
+    async fn published_bridge_repair_is_idempotent_for_an_existing_peer() {
+        let (instance, registry) = crate::session::test_helpers::make_registry_with_sync().await;
+        let sync = instance.sync().expect("sync must be enabled");
+        let agent = crate::session::test_helpers::make_agent_entry(&registry, "alpha").await;
+        let agent_db = registry
+            .open_agent_db(&agent.db_id, Some(&agent.pubkey))
+            .await
+            .unwrap()
+            .unwrap();
+        let bridge = registry.new_ephemeral_key("bridge").await.unwrap();
+        sync.register_peer(&bridge, Some("@chaz:example"))
+            .await
+            .unwrap();
+        agent_db
+            .register_login(LoginRef {
+                kind: "matrix".to_string(),
+                identifier: "@chaz:example".to_string(),
+                bridge_db_id: "sha256:bridge".to_string(),
+                peer_pubkey: Some(bridge.to_string()),
+                agent_pubkey: Some(bridge.to_string()),
+                sync_addresses: vec![("http".to_string(), "127.0.0.1:4242".to_string())],
+            })
+            .await
+            .unwrap();
+
+        adopt_published_bridge_addresses(&registry, &agent_db)
+            .await
+            .unwrap();
+        adopt_published_bridge_addresses(&registry, &agent_db)
+            .await
+            .unwrap();
+
+        let peers = sync
+            .get_tree_peers(agent_db.database().root_id())
+            .await
+            .unwrap();
+        assert_eq!(
+            peers
+                .iter()
+                .filter(|peer| peer.public_key() == &bridge)
+                .count(),
+            1,
+            "restart repair must restore exactly one relationship for an existing peer"
+        );
+        let info = sync.get_peer_info(&bridge).await.unwrap().unwrap();
+        assert_eq!(
+            info.addresses,
+            vec![eidetica::sync::peer_types::Address::new(
+                "http",
+                "127.0.0.1:4242"
+            )],
+            "restart repair must still adopt the current address"
         );
     }
 }

@@ -55,17 +55,17 @@ pub(crate) async fn resolve_cli_session(
     server: &Server,
     session_name: Option<&str>,
 ) -> anyhow::Result<(chaz_core::types::ConversationId, eidetica::Database)> {
+    let registry = server.registry();
     if let Some(name) = session_name {
-        if let Some(id) = server.registry().find_by_name(name).await? {
-            match server.registry().open_session(&id).await {
+        if let Some(id) = registry.find_by_name(name).await? {
+            match registry.open_session(&id).await {
                 Ok(r) => return Ok(r),
                 Err(e) => warn!(id, "Named CLI session '{name}' unreadable, recreating: {e}"),
             }
         }
-        let (conv_id, db) = server.registry().create_session(Some(name)).await?;
+        let (conv_id, db) = registry.create_session(Some(name)).await?;
         let session_db_id = db.root_id().to_string();
-        if let Err(e) = server
-            .registry()
+        if let Err(e) = registry
             .set_session_name(&session_db_id, name.to_string())
             .await
         {
@@ -77,11 +77,19 @@ pub(crate) async fn resolve_cli_session(
         // Ephemeral: create a fresh session every invocation, leave it
         // unnamed. Tagged with source "cli" for debug visibility in session
         // listings.
-        let (conv_id, db) = server.registry().create_session(Some("cli")).await?;
-        let session_db_id = db.root_id().to_string();
-        let _ = server.auto_attach_default_agent(&session_db_id).await;
+        let (conv_id, db) = registry.create_session(Some("cli")).await?;
+        let _ = server
+            .auto_attach_default_agent(&db.root_id().to_string())
+            .await;
         Ok((conv_id, db))
     }
+}
+
+pub(crate) async fn resolve_exact_cli_session(
+    registry: &chaz_core::session::SessionRegistry,
+    session_id: &str,
+) -> anyhow::Result<(chaz_core::types::ConversationId, eidetica::Database)> {
+    registry.open_existing_session_by_id(session_id).await
 }
 
 impl Bridge for CliBridge {
@@ -166,5 +174,86 @@ impl Bridge for CliBridge {
         }
 
         anyhow::bail!("CLI session ended before agent responded")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_exact_cli_session;
+    use chaz_core::agent::AgentRegistry;
+    use chaz_core::config::Config;
+    use chaz_core::session::SessionRegistry;
+    use eidetica::backend::database::InMemory;
+    use eidetica::{Instance, NewAccount};
+    use std::sync::Arc;
+
+    async fn fresh_session_registry() -> (Instance, SessionRegistry) {
+        let (instance, user) = Instance::create_backend(
+            Box::new(InMemory::new()),
+            NewAccount::with_password("test", "test-password"),
+        )
+        .await
+        .unwrap();
+        let registry = SessionRegistry::new(
+            instance.clone(),
+            user,
+            Arc::new(AgentRegistry::from_config(&Config::default())),
+        )
+        .await
+        .unwrap();
+        (instance, registry)
+    }
+
+    #[tokio::test]
+    async fn exact_id_opens_the_existing_session() {
+        let (_instance, registry) = fresh_session_registry().await;
+        let (_conv, db) = registry.create_session(Some("matrix")).await.unwrap();
+        let id = db.root_id().to_string();
+
+        let (resolved, opened) = resolve_exact_cli_session(&registry, &id).await.unwrap();
+
+        assert_eq!(resolved.0, id);
+        assert_eq!(opened.root_id(), db.root_id());
+    }
+
+    #[tokio::test]
+    async fn missing_or_invalid_exact_id_fails_without_creating_a_session() {
+        let (_instance, registry) = fresh_session_registry().await;
+        let before = registry.list_sessions().await.unwrap().len();
+
+        assert!(
+            resolve_exact_cli_session(&registry, "sha256:deadbeefcafe")
+                .await
+                .is_err()
+        );
+        assert!(
+            resolve_exact_cli_session(&registry, "not-an-id")
+                .await
+                .is_err()
+        );
+        assert!(
+            resolve_exact_cli_session(&registry, "script")
+                .await
+                .is_err()
+        );
+        assert_eq!(registry.list_sessions().await.unwrap().len(), before);
+    }
+
+    #[tokio::test]
+    async fn exact_id_rejects_a_marked_non_session_database() {
+        let (_instance, registry) = fresh_session_registry().await;
+        let (_conv, db) = registry.create_session(Some("test")).await.unwrap();
+        let id = db.root_id().to_string();
+        chaz_core::db_kind::write_marker(&db, chaz_core::db_kind::KIND_AGENT, "alpha")
+            .await
+            .unwrap();
+
+        let error = resolve_exact_cli_session(&registry, &id)
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert_eq!(error, format!("Database '{id}' is not a chaz session"));
+        assert_eq!(registry.list_sessions().await.unwrap().len(), 1);
     }
 }

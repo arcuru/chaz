@@ -210,6 +210,7 @@ Any `/command` the TUI accepts can be run non-interactively:
 ```bash
 chaz --config config.yaml cmd '/agents'
 chaz --config config.yaml cmd '/sharing requests'
+chaz --config config.yaml cmd --session-id <session-db-id> '/agent rehost chaz'
 ```
 
 The result goes to stdout, and a command that reports an error exits non-zero,
@@ -220,6 +221,14 @@ run on the Eidetica owner and fail before mutation from a service client. This
 includes memory/skill bank share, unshare, import, and ticket-aware attach;
 ordinary bank list, attach-by-name, detach, and configuration remain native
 session data operations.
+
+Use `cmd --session NAME` to find or create a named session. For a command that
+must act on one known existing session, use `cmd --session-id ID`: it accepts
+only an exact existing session database ID and fails without creating or
+selecting another session when that ID cannot be loaded. For example, passing
+`cmd --session-id not-an-id '/info'` exits non-zero with `Invalid session DB ID`;
+use an ID from `cmd '/sessions'` instead. Both selectors preserve the same
+service-client authority checks as other commands.
 
 ## Single-shot print mode
 

@@ -810,6 +810,58 @@ async fn rehost_session_defaults_to_self_pubkey() {
 }
 
 #[tokio::test]
+async fn rehost_changes_only_the_selected_session() {
+    let (_i, server, registry, secrets, backend, sid, sdb) = fixture().await;
+    let ctx = cmd_ctx(&server, &secrets, &backend, &sid, &sdb);
+    let entry = setup_attached_agent(&server, &registry, &sid, &ctx, "alpha").await;
+
+    let (_other_conv, other_db) = registry.create_session(Some("other")).await.unwrap();
+    let other_id = other_db.root_id().to_string();
+    registry
+        .attach_agent_to_session(&other_id, &entry)
+        .await
+        .unwrap();
+    let original_other_home = crate::session::read_meta_from_db(&other_db).await.agents[0]
+        .home_pubkey
+        .clone();
+
+    let target = registry.new_ephemeral_key("target").await.unwrap();
+    dispatch(
+        Command::AgentInvite {
+            agent_ref: "alpha".to_string(),
+            pubkey: target.to_prefixed_string(),
+            permission: CoOwnerPermission::Admin,
+        },
+        &ctx,
+    )
+    .await;
+    let (_selected_conv, selected_db) = registry.open_existing_session_by_id(&sid).await.unwrap();
+    let selected_ctx = cmd_ctx(&server, &secrets, &backend, &sid, &selected_db);
+    match dispatch(
+        Command::AgentRehost {
+            agent_ref: "alpha".to_string(),
+            pubkey: Some(target.to_prefixed_string()),
+            scope: super::super::RehostScope::Session,
+            clear: false,
+        },
+        &selected_ctx,
+    )
+    .await
+    {
+        CommandOutcome::Text(_) => {}
+        _ => panic!("expected rehost success"),
+    }
+
+    let selected = crate::session::read_meta_from_db(&sdb).await;
+    let untouched = crate::session::read_meta_from_db(&other_db).await;
+    assert_eq!(
+        selected.agents[0].home_pubkey.as_deref(),
+        Some(target.to_string()).as_deref()
+    );
+    assert_eq!(untouched.agents[0].home_pubkey, original_other_home);
+}
+
+#[tokio::test]
 async fn rehost_session_to_explicit_authorized_pubkey() {
     let (_i, server, registry, secrets, backend, sid, sdb) = fixture().await;
     let ctx = cmd_ctx(&server, &secrets, &backend, &sid, &sdb);

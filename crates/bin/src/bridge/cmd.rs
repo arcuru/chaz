@@ -11,9 +11,10 @@
 //! setup out of scripts and tests.
 //!
 //! Session handling matches the CLI bridge: a fresh ephemeral session per
-//! invocation, or a named one reused across invocations via `--session`. Most
-//! commands here are peer-scoped and ignore it, but session-scoped verbs
-//! (`/info`, `/share`) need something to point at.
+//! invocation, or a named one reused across invocations via `--session`.
+//! `--session-id` instead opens one existing session by its exact database ID.
+//! Most commands here are peer-scoped and ignore selection, but session-scoped
+//! verbs (`/info`, `/share`, `/agent rehost`) need something to point at.
 //!
 //! No approval callback is installed, matching `--print`: a command that would
 //! need interactive approval is auto-denied rather than hanging.
@@ -35,6 +36,7 @@ pub struct CommandBridge {
     /// The raw command line, including its leading `/`.
     command: String,
     session_name: Option<String>,
+    session_id: Option<String>,
 }
 
 impl CommandBridge {
@@ -43,12 +45,14 @@ impl CommandBridge {
         secrets: SecretStore,
         command: String,
         session_name: Option<String>,
+        session_id: Option<String>,
     ) -> Self {
         Self {
             config,
             secrets,
             command,
             session_name,
+            session_id,
         }
     }
 
@@ -121,8 +125,10 @@ impl Bridge for CommandBridge {
             Err(cmd) => cmd,
         };
 
-        let (_conv_id, session_db) =
-            super::cli::resolve_cli_session(&server, self.session_name.as_deref()).await?;
+        let (_conv_id, session_db) = match self.session_id.as_deref() {
+            Some(id) => super::cli::resolve_exact_cli_session(server.registry(), id).await?,
+            None => super::cli::resolve_cli_session(&server, self.session_name.as_deref()).await?,
+        };
         server.load_session_entities(&session_db).await?;
         let session_db_id = session_db.root_id().to_string();
 

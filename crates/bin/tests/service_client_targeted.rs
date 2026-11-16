@@ -93,6 +93,11 @@ async fn repeated_catalog_commands_do_not_create_sessions_and_agents_stay_sessio
             .await
             .unwrap();
     }
+    let (_, empty) = registry.create_session(Some("fixture")).await.unwrap();
+    registry
+        .set_session_name(&empty.root_id().to_string(), "empty-session".into())
+        .await
+        .unwrap();
     let initial_count = registry.list_sessions().await.unwrap().len();
 
     let service = ServiceServer::bind(owner, &socket).await.unwrap();
@@ -161,7 +166,53 @@ async fn repeated_catalog_commands_do_not_create_sessions_and_agents_stay_sessio
     );
     assert!(String::from_utf8_lossy(&output.stdout).contains("selected"));
     assert!(elapsed < std::time::Duration::from_secs(10));
+    assert_eq!(
+        chaz_core::session::read_meta_from_db(&selected)
+            .await
+            .agents
+            .len(),
+        1,
+        "opening an existing named session must not attach today's default agent"
+    );
+
+    let (output, elapsed) = run(&["cmd", "/agents", "--session-id", &selected_id]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let agents = String::from_utf8_lossy(&output.stdout);
+    assert!(agents.contains("selected"));
+    assert!(!agents.contains("overridden"));
+    assert!(elapsed < std::time::Duration::from_secs(10));
+    let (output, _) = run(&["cmd", "/info", "--session-id", "not-an-id"]);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("Invalid session DB ID"));
+    let (output, _) = run(&[
+        "cmd",
+        "/info",
+        "--session-id",
+        &selected_id,
+        "--session",
+        "selected-session",
+    ]);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("cannot be used with"));
     assert_eq!(registry.list_sessions().await.unwrap().len(), initial_count);
+
+    let (output, _) = run(&["cmd", "/info", "--session", "empty-session"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        chaz_core::session::read_meta_from_db(&empty)
+            .await
+            .agents
+            .is_empty(),
+        "opening an existing empty named session must not attach a default agent"
+    );
 
     let (output, elapsed) = run(&["cmd", "/agents", "--session", "created-session"]);
     assert!(

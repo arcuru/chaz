@@ -3087,6 +3087,184 @@ async fn exposed_session_uses_verified_sync_signer_during_partial_sync() {
     );
 }
 
+// Retained acquisition-latch tests deliberately ignore local discovery. The
+// combined readiness and concurrency tests below exercise both actual lanes.
+async fn run_recovery_scans<F, Fut>(rx: tokio::sync::mpsc::Receiver<()>, rescan: F)
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = super::build::RescanOutcome> + Send + 'static,
+{
+    super::build::run_exposed_session_rescans(rx, |mode| {
+        let recovery = (mode == super::build::ExposedScanMode::Recover).then(&rescan);
+        async move {
+            match recovery {
+                Some(scan) => scan.await,
+                None => super::build::RescanOutcome::Clean,
+            }
+        }
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn local_discovery_tracks_arrived_session_without_pulling() {
+    use super::build::{ExposedScanMode, RescanOutcome, scan_exposed_sessions};
+    use eidetica::sync::transports::http::HttpTransport;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let (instance, server, registry) = server_fixture().await;
+    instance.enable_sync().await.unwrap();
+    let sync = instance.sync().unwrap();
+    sync.register_transport("http", HttpTransport::builder())
+        .await
+        .unwrap();
+    let agent = crate::session::test_helpers::make_agent_entry(&registry, "alpha").await;
+    server.agent_index().register(agent.clone());
+    let adb = registry
+        .open_agent_db(&agent.db_id, Some(&agent.pubkey))
+        .await
+        .unwrap()
+        .unwrap();
+    let secrets = crate::security::SecretStore::new(registry.chaz_peer().clone()).await;
+    let backend = crate::backends::BackendManager::new(&None, secrets);
+    let (source, _) = Instance::create_backend(
+        Box::new(InMemory::new()),
+        NewAccount::with_password("source", "test-password"),
+    )
+    .await
+    .unwrap();
+    let key = registry.signing_key_for(&agent.pubkey).await.unwrap();
+    let child = eidetica::Database::create(&source, key, eidetica::crdt::Doc::new())
+        .await
+        .unwrap();
+    crate::session::Session::initialize_turn_schema(&child)
+        .await
+        .unwrap();
+    let id = child.root_id().to_string();
+    adb.expose_session_on(&id, "matrix").await.unwrap();
+
+    // A real dial detector, with a positive full-recovery control below. The
+    // listener closes immediately so an accidental pull cannot hang the test.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap().to_string();
+    let peer = registry.new_ephemeral_key("bridge").await.unwrap();
+    sync.register_peer(&peer, Some("bridge")).await.unwrap();
+    sync.add_tree_sync(&peer, adb.database().root_id())
+        .await
+        .unwrap();
+    sync.add_peer_address(
+        &peer,
+        eidetica::sync::peer_types::Address::new("http", &address),
+    )
+    .await
+    .unwrap();
+    let dials = Arc::new(AtomicUsize::new(0));
+    let listener_task = tokio::spawn({
+        let dials = dials.clone();
+        async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                dials.fetch_add(1, Ordering::SeqCst);
+                drop(stream);
+            }
+        }
+    });
+
+    assert_eq!(
+        scan_exposed_sessions(&server, &registry, &backend, ExposedScanMode::Local).await,
+        RescanOutcome::RetryableIncomplete
+    );
+    assert_eq!(dials.load(Ordering::SeqCst), 0);
+    assert!(!server.is_watching_session(&id).await);
+    assert_eq!(
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            scan_exposed_sessions(&server, &registry, &backend, ExposedScanMode::Recover)
+        )
+        .await
+        .unwrap(),
+        RescanOutcome::RetryableIncomplete
+    );
+    assert!(
+        dials.load(Ordering::SeqCst) > 0,
+        "the detector must observe a real recovery dial"
+    );
+    dials.store(0, Ordering::SeqCst);
+
+    // Sync delivers data without an AccountSession key mapping. Local
+    // discovery must establish only proven authority and register immediately.
+    for entry in child.get_all_entries().await.unwrap() {
+        instance
+            .backend()
+            .local_engine()
+            .unwrap()
+            .put(entry)
+            .await
+            .unwrap();
+    }
+    assert!(registry.open_session_with_signer(&id).await.is_err());
+    let registration_lock = server
+        .registration_locks
+        .lock()
+        .await
+        .entry(id.clone())
+        .or_default()
+        .clone();
+    let guard = registration_lock.lock().await;
+    let tasks_before = server.owned_tasks.lock().unwrap().len();
+    let registration = tokio::spawn({
+        let server = server.clone();
+        let registry = registry.clone();
+        let backend = backend.clone();
+        async move {
+            tokio::join!(
+                scan_exposed_sessions(&server, &registry, &backend, ExposedScanMode::Local),
+                scan_exposed_sessions(&server, &registry, &backend, ExposedScanMode::Recover)
+            )
+        }
+    });
+    for _ in 0..32 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        server.owned_tasks.lock().unwrap().len(),
+        tasks_before,
+        "approval proxies must be inside the shared registration guard"
+    );
+    drop(guard);
+    assert_eq!(
+        registration.await.unwrap(),
+        (RescanOutcome::Clean, RescanOutcome::Clean)
+    );
+    assert_eq!(
+        server.owned_tasks.lock().unwrap().len(),
+        tasks_before + 2,
+        "concurrent recovery and discovery must create only one proxy pair"
+    );
+    assert!(server.is_watching_session(&id).await);
+    let owner = server
+        .runtime_owner_of(&id)
+        .expect("local registration must claim runtime");
+    let tasks = server.owned_tasks.lock().unwrap().len();
+    assert_eq!(
+        scan_exposed_sessions(&server, &registry, &backend, ExposedScanMode::Local).await,
+        RescanOutcome::Clean
+    );
+    assert_eq!(server.runtime_owner_of(&id), Some(owner));
+    assert_eq!(
+        server.owned_tasks.lock().unwrap().len(),
+        tasks,
+        "no duplicate approval proxies"
+    );
+    assert_eq!(
+        dials.load(Ordering::SeqCst),
+        0,
+        "local discovery must never dial peers"
+    );
+    listener_task.abort();
+    assert!(listener_task.await.unwrap_err().is_cancelled());
+    server.shutdown().await;
+}
+
 #[tokio::test]
 async fn registry_watcher_rescans_while_initial_recovery_is_blocked() {
     // A restored daemon can have many old exposed sessions. Their bootstrap
@@ -3101,7 +3279,7 @@ async fn registry_watcher_rescans_while_initial_recovery_is_blocked() {
         let release = release.clone();
         let runs = runs.clone();
         async move {
-            super::build::run_exposed_session_rescans(rx, move || {
+            super::build::run_exposed_session_rescans(rx, move |_mode| {
                 let started = started.clone();
                 let release = release.clone();
                 let runs = runs.clone();
@@ -3111,6 +3289,7 @@ async fn registry_watcher_rescans_while_initial_recovery_is_blocked() {
                         started.notify_one();
                         release.notified().await;
                     }
+                    super::build::RescanOutcome::Clean
                 }
             })
             .await;
@@ -3148,7 +3327,7 @@ async fn registry_watcher_bounds_and_coalesces_rescans() {
         let active = active.clone();
         let peak = peak.clone();
         async move {
-            super::build::run_exposed_session_rescans(rx, move || {
+            super::build::run_exposed_session_rescans(rx, move |_mode| {
                 let release = release.clone();
                 let started = started.clone();
                 let active = active.clone();
@@ -3160,6 +3339,7 @@ async fn registry_watcher_bounds_and_coalesces_rescans() {
                     let permit = release.acquire().await.unwrap();
                     permit.forget();
                     active.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                    super::build::RescanOutcome::Clean
                 }
             })
             .await;
@@ -3202,6 +3382,510 @@ async fn registry_watcher_bounds_and_coalesces_rescans() {
     release.add_permits(2);
     drop(tx);
     task.await.unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn registry_watcher_retries_incomplete_scan_without_a_signal() {
+    let (tx, rx) = tokio::sync::mpsc::channel(1);
+    let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let task = tokio::spawn({
+        let runs = runs.clone();
+        async move {
+            run_recovery_scans(rx, move || {
+                let run = runs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async move {
+                    if run == 0 {
+                        super::build::RescanOutcome::RetryableIncomplete
+                    } else {
+                        super::build::RescanOutcome::Clean
+                    }
+                }
+            })
+            .await;
+        }
+    });
+
+    tokio::task::yield_now().await;
+    assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), 1);
+    tokio::time::advance(std::time::Duration::from_secs(1)).await;
+    tokio::task::yield_now().await;
+    assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), 2);
+
+    drop(tx);
+    task.await.unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn retry_backoff_doubles_and_caps_at_thirty_seconds() {
+    let (tx, rx) = tokio::sync::mpsc::channel(1);
+    let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let task = tokio::spawn({
+        let runs = runs.clone();
+        async move {
+            run_recovery_scans(rx, move || {
+                runs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async { super::build::RescanOutcome::RetryableIncomplete }
+            })
+            .await;
+        }
+    });
+
+    tokio::task::yield_now().await;
+    assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), 1);
+    for (delay, expected_runs) in [(1, 2), (2, 3), (4, 4), (8, 5), (16, 6), (30, 7), (30, 8)] {
+        tokio::time::advance(std::time::Duration::from_secs(delay)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            runs.load(std::sync::atomic::Ordering::SeqCst),
+            expected_runs
+        );
+    }
+
+    drop(tx);
+    task.await.unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn retry_timer_registers_once_when_acquisition_becomes_ready() {
+    let (tx, rx) = tokio::sync::mpsc::channel(1);
+    let acquisitions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let registrations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let task = tokio::spawn({
+        let acquisitions = acquisitions.clone();
+        let registrations = registrations.clone();
+        let ready = ready.clone();
+        async move {
+            run_recovery_scans(rx, move || {
+                let acquisitions = acquisitions.clone();
+                let registrations = registrations.clone();
+                let ready = ready.clone();
+                async move {
+                    acquisitions.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    if ready.load(std::sync::atomic::Ordering::SeqCst) {
+                        registrations.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        super::build::RescanOutcome::Clean
+                    } else {
+                        super::build::RescanOutcome::RetryableIncomplete
+                    }
+                }
+            })
+            .await;
+        }
+    });
+
+    tokio::task::yield_now().await;
+    assert_eq!(acquisitions.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(registrations.load(std::sync::atomic::Ordering::SeqCst), 0);
+    ready.store(true, std::sync::atomic::Ordering::SeqCst);
+    tokio::time::advance(std::time::Duration::from_secs(1)).await;
+    tokio::task::yield_now().await;
+    assert_eq!(acquisitions.load(std::sync::atomic::Ordering::SeqCst), 2);
+    assert_eq!(registrations.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    tokio::time::advance(std::time::Duration::from_secs(60)).await;
+    tokio::task::yield_now().await;
+    assert_eq!(registrations.load(std::sync::atomic::Ordering::SeqCst), 1);
+    drop(tx);
+    task.await.unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn registry_watcher_does_not_retry_permanent_failures() {
+    let (tx, rx) = tokio::sync::mpsc::channel(1);
+    let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let task = tokio::spawn({
+        let runs = runs.clone();
+        async move {
+            run_recovery_scans(rx, move || {
+                runs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async { super::build::RescanOutcome::PermanentOnly }
+            })
+            .await;
+        }
+    });
+
+    tokio::task::yield_now().await;
+    tokio::time::advance(std::time::Duration::from_secs(60)).await;
+    tokio::task::yield_now().await;
+    assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    drop(tx);
+    task.await.unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn registry_signal_preempts_retry_without_resetting_backoff() {
+    let (tx, rx) = tokio::sync::mpsc::channel(1);
+    let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let task = tokio::spawn({
+        let runs = runs.clone();
+        async move {
+            run_recovery_scans(rx, move || {
+                runs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async { super::build::RescanOutcome::RetryableIncomplete }
+            })
+            .await;
+        }
+    });
+
+    tokio::task::yield_now().await;
+    tx.send(()).await.unwrap();
+    tokio::task::yield_now().await;
+    assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), 2);
+    tokio::time::advance(std::time::Duration::from_secs(1)).await;
+    tokio::task::yield_now().await;
+    assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), 2);
+    tokio::time::advance(std::time::Duration::from_secs(1)).await;
+    tokio::task::yield_now().await;
+    assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), 3);
+
+    drop(tx);
+    task.await.unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn registry_signal_storm_preserves_retry_backoff() {
+    let (tx, rx) = tokio::sync::mpsc::channel(32);
+    let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let task = tokio::spawn({
+        let runs = runs.clone();
+        async move {
+            run_recovery_scans(rx, move || {
+                runs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async { super::build::RescanOutcome::RetryableIncomplete }
+            })
+            .await;
+        }
+    });
+
+    tokio::task::yield_now().await;
+    for _ in 0..20 {
+        tx.send(()).await.unwrap();
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        runs.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "a signal storm may preempt one retry window, not start a scan per signal"
+    );
+
+    tokio::time::advance(std::time::Duration::from_secs(1)).await;
+    tokio::task::yield_now().await;
+    assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), 2);
+    tokio::time::advance(std::time::Duration::from_secs(1)).await;
+    tokio::task::yield_now().await;
+    assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), 3);
+
+    drop(tx);
+    task.await.unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn registry_storm_then_readiness_signal_registers_without_waiting_for_backoff() {
+    use super::build::RescanOutcome;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    let (tx, rx) = tokio::sync::mpsc::channel(32);
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let registrations = Arc::new(AtomicUsize::new(0));
+    let ready = Arc::new(AtomicBool::new(false));
+    let task = tokio::spawn({
+        let attempts = attempts.clone();
+        let registrations = registrations.clone();
+        let ready = ready.clone();
+        async move {
+            super::build::run_exposed_session_rescans(rx, move |mode| {
+                let attempts = attempts.clone();
+                let registrations = registrations.clone();
+                let ready = ready.clone();
+                async move {
+                    if mode == super::build::ExposedScanMode::Recover {
+                        attempts.fetch_add(1, Ordering::SeqCst);
+                    }
+                    if ready.load(Ordering::SeqCst) {
+                        // Already registered sessions are a no-op on later full scans.
+                        let _ = registrations.compare_exchange(
+                            0,
+                            1,
+                            Ordering::SeqCst,
+                            Ordering::SeqCst,
+                        );
+                        RescanOutcome::Clean
+                    } else {
+                        RescanOutcome::RetryableIncomplete
+                    }
+                }
+            })
+            .await;
+        }
+    });
+
+    tokio::task::yield_now().await;
+    for _ in 0..20 {
+        tx.send(()).await.unwrap();
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        attempts.load(Ordering::SeqCst),
+        2,
+        "storm must stay bounded"
+    );
+    tokio::time::advance(std::time::Duration::from_secs(1)).await;
+    tokio::task::yield_now().await;
+    assert_eq!(
+        attempts.load(Ordering::SeqCst),
+        2,
+        "storm must not reset backoff"
+    );
+
+    // The storm has already consumed the window's early retry. A subsequent
+    // readiness signal must still wake recovery without advancing paused time.
+    ready.store(true, Ordering::SeqCst);
+    tx.send(()).await.unwrap();
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
+    let immediate_registrations = registrations.load(Ordering::SeqCst);
+    assert_eq!(
+        attempts.load(Ordering::SeqCst),
+        2,
+        "local readiness must not dial peers"
+    );
+
+    // Also prove eventual recovery, disarm, and shutdown before reporting an
+    // immediate-wake failure, so the diagnostic distinguishes delay from loss.
+    tokio::time::advance(std::time::Duration::from_secs(1)).await;
+    tokio::task::yield_now().await;
+    assert_eq!(registrations.load(Ordering::SeqCst), 1);
+    tokio::time::advance(std::time::Duration::from_secs(60)).await;
+    tokio::task::yield_now().await;
+    assert_eq!(registrations.load(Ordering::SeqCst), 1);
+    drop(tx);
+    task.await.unwrap();
+    assert_eq!(
+        immediate_registrations, 1,
+        "readiness after a signal storm must not wait for the progressed retry timer"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn registry_signals_during_incomplete_scan_preserve_backoff() {
+    let (tx, rx) = tokio::sync::mpsc::channel(1);
+    let started = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let release_old = Arc::new(tokio::sync::Notify::new());
+    let task = tokio::spawn({
+        let started = started.clone();
+        let release_old = release_old.clone();
+        async move {
+            run_recovery_scans(rx, move || {
+                let run = started.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let release_old = release_old.clone();
+                async move {
+                    if run == 0 {
+                        release_old.notified().await;
+                        super::build::RescanOutcome::RetryableIncomplete
+                    } else {
+                        super::build::RescanOutcome::Clean
+                    }
+                }
+            })
+            .await;
+        }
+    });
+
+    tokio::task::yield_now().await;
+    for _ in 0..20 {
+        tx.send(()).await.unwrap();
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(started.load(std::sync::atomic::Ordering::SeqCst), 1);
+    release_old.notify_one();
+    tokio::task::yield_now().await;
+    assert_eq!(
+        started.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "signals during a failed scan must not bypass its first retry delay"
+    );
+    tokio::time::advance(std::time::Duration::from_secs(1)).await;
+    tokio::task::yield_now().await;
+    assert_eq!(started.load(std::sync::atomic::Ordering::SeqCst), 2);
+    tokio::time::advance(std::time::Duration::from_secs(60)).await;
+    tokio::task::yield_now().await;
+    assert_eq!(started.load(std::sync::atomic::Ordering::SeqCst), 2);
+
+    drop(tx);
+    task.await.unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn registry_watcher_shutdown_cancels_pending_retry() {
+    let (tx, rx) = tokio::sync::mpsc::channel(1);
+    let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let task = tokio::spawn({
+        let runs = runs.clone();
+        async move {
+            run_recovery_scans(rx, move || {
+                runs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async { super::build::RescanOutcome::RetryableIncomplete }
+            })
+            .await;
+        }
+    });
+
+    tokio::task::yield_now().await;
+    drop(tx);
+    task.await.unwrap();
+    tokio::time::advance(std::time::Duration::from_secs(60)).await;
+    assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn registry_watcher_shutdown_aborts_and_drains_active_scans() {
+    struct Dropped(Arc<std::sync::atomic::AtomicUsize>);
+    impl Drop for Dropped {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    let (tx, rx) = tokio::sync::mpsc::channel(1);
+    let started = Arc::new(tokio::sync::Notify::new());
+    let dropped = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let task = tokio::spawn({
+        let started = started.clone();
+        let dropped = dropped.clone();
+        async move {
+            super::build::run_exposed_session_rescans(rx, move |_mode| {
+                let started = started.clone();
+                let guard = Dropped(dropped.clone());
+                async move {
+                    started.notify_one();
+                    std::future::pending::<()>().await;
+                    drop(guard);
+                    super::build::RescanOutcome::Clean
+                }
+            })
+            .await;
+        }
+    });
+
+    tokio::time::timeout(std::time::Duration::from_secs(1), started.notified())
+        .await
+        .expect("initial scan should start");
+    tx.send(()).await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(1), started.notified())
+        .await
+        .expect("local discovery should start beside blocked acquisition");
+    drop(tx);
+    tokio::time::timeout(std::time::Duration::from_secs(1), task)
+        .await
+        .expect("shutdown should not wait for the active scan")
+        .unwrap();
+    assert_eq!(dropped.load(std::sync::atomic::Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn exposed_session_watched_without_runtime_is_claimed_on_rescan() {
+    let (_instance, server, registry) = server_fixture().await;
+    let agent = crate::session::test_helpers::make_agent_entry(&registry, "alpha").await;
+    server.agent_index().register(agent.clone());
+    let (_conv, session_db) = registry.create_session(Some("exposed")).await.unwrap();
+    let sid = session_db.root_id().to_string();
+    registry
+        .attach_agent_to_session(&sid, &agent)
+        .await
+        .unwrap();
+    let adb = registry
+        .open_agent_db(&agent.db_id, Some(&agent.pubkey))
+        .await
+        .unwrap()
+        .unwrap();
+    adb.expose_session_on(&sid, "matrix").await.unwrap();
+    let secrets = crate::security::SecretStore::new(registry.chaz_peer().clone()).await;
+    let backend = crate::backends::BackendManager::new(&None, secrets);
+    server
+        .watch_session(&session_db, backend.clone(), None, None)
+        .await
+        .unwrap();
+    assert!(server.runtime_owner_of(&sid).is_none());
+
+    let outcome = super::build::register_exposed_sessions(&server, &registry, &backend).await;
+
+    assert_ne!(outcome, super::build::RescanOutcome::RetryableIncomplete);
+    assert!(server.runtime_owner_of(&sid).is_some());
+}
+
+#[test]
+fn exposed_session_error_classification_is_typed_and_fail_closed() {
+    use eidetica::sync::SyncError;
+
+    let retryable = [
+        SyncError::PeerNotFound("peer".into()),
+        SyncError::ConnectionFailed {
+            address: "iroh:test".into(),
+            reason: "offline".into(),
+        },
+        SyncError::TransportInit("transport unavailable".into()),
+        SyncError::EntryNotFound(eidetica::entry::ID::from_bytes("missing-root")),
+    ];
+    for error in retryable {
+        let error = anyhow::Error::new(eidetica::Error::Sync(Box::new(error)));
+        assert_eq!(
+            super::build::classify_eidetica_error(&error),
+            super::build::RegistrationOutcome::RetryableIncomplete
+        );
+    }
+
+    let permanent = [
+        SyncError::PermissionDenied("blocked".into()),
+        SyncError::AuthenticationFailed("bad signature".into()),
+        SyncError::ProtocolMismatch {
+            expected: 1,
+            received: 2,
+        },
+        SyncError::InvalidData("malformed".into()),
+        SyncError::HandshakeFailed("Signature verification failed".into()),
+        SyncError::BackendError("database is corrupt".into()),
+        SyncError::MultipleTransportErrors {
+            errors: vec!["permission denied".into()],
+        },
+    ];
+    for error in permanent {
+        let error = anyhow::Error::new(eidetica::Error::Sync(Box::new(error)));
+        assert_eq!(
+            super::build::classify_eidetica_error(&error),
+            super::build::RegistrationOutcome::PermanentPolicy
+        );
+    }
+
+    assert_eq!(
+        super::build::classify_eidetica_error(&anyhow::anyhow!("unknown")),
+        super::build::RegistrationOutcome::PermanentPolicy,
+        "an erased/unknown anyhow error must not become retryable"
+    );
+
+    for kind in [
+        std::io::ErrorKind::NotFound,
+        std::io::ErrorKind::ConnectionRefused,
+        std::io::ErrorKind::TimedOut,
+    ] {
+        let error = anyhow::Error::new(eidetica::Error::Io(std::io::Error::from(kind)));
+        assert_eq!(
+            super::build::classify_eidetica_error(&error),
+            super::build::RegistrationOutcome::RetryableIncomplete
+        );
+    }
+    for kind in [
+        std::io::ErrorKind::PermissionDenied,
+        std::io::ErrorKind::InvalidData,
+    ] {
+        let error = anyhow::Error::new(eidetica::Error::Io(std::io::Error::from(kind)));
+        assert_eq!(
+            super::build::classify_eidetica_error(&error),
+            super::build::RegistrationOutcome::PermanentPolicy
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

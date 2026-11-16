@@ -160,21 +160,34 @@ The daemon closes the loop in `watch_agent_session_registries`
 1. Install an `on_write` callback on **every hosted agent DB**. eidetica's
    `on_write` fires for **local _and_ remote (synced)** writes, so a bridge's
    `expose_session_on` write — which arrives via sync — triggers it.
-2. Every callback fire (debounced) calls `register_exposed_sessions`, which for
-   each agent walks `list_session_refs()`, skips any ref that is not
-   `exposed_on` anything or is already being watched, opens the session DB, and
-   calls `register_session` — which installs the daemon's normal session
-   processing and makes the ReAct loop answer it.
+2. Start recovery immediately, then coalesce registry signals into two bounded
+   paths: one recovery scan and one local-discovery scan. Both walk the durable
+   `SessionRef` registry; neither keeps a separate pending-session queue.
 
-`register_exposed_sessions` is **self-healing**: if a freshly-exposed session's
-DB hasn't synced over yet, `open_session` fails, the ref is skipped, and the next
-registry sync-write re-runs the scan and retries. On-commit sync setup must also
-succeed before the daemon registers the session. Incomplete delegated-parent
-ancestry can temporarily hide its signer from native discovery even while a
-previously bound writer still works. The session stays unwatched until a later
-agent-DB write triggers a successful rescan, rather than retaining a runtime
-without reply sync or with an empty cached extension set. Registration is
-idempotent (`register_session` early-returns for an already-watched session).
+Local discovery opens sessions whose data has arrived and repairs a missing key
+mapping only when the hosting agent's key proves access to that local tree.
+It never pulls from peers or repairs peer relationships. A registry signal can
+therefore register a locally ready session even while recovery is dialing an
+unavailable peer or waiting for backoff. Each path coalesces writes received
+while busy into one follow-up; they share the existing per-session registration
+lock so concurrent discovery and recovery cannot create duplicate approval
+proxies.
+
+Recovery also restores published bridge peer relationships and attempts
+authenticated session-tree pulls. Retryable incomplete work arms one shared
+process-memory timer: 1, 2, 4, 8, 16, then at most 30 seconds between retries.
+A registry signal may preempt the wait once per backoff window, but does not
+reset the delay. Further signals still run local discovery, not more pulls.
+Signals received during an incomplete pull cannot bypass its backoff either.
+If only remote reachability changes and no local data arrives, acquisition
+remains bounded by that retry policy.
+
+A clean or permanent-only recovery scan disarms the timer; shutdown cancels and
+drains both paths. Explicit security and policy failures are not transient
+readiness. On-commit sync setup must succeed before registration, so incomplete
+signer discovery cannot cache a runtime without reply sync. A watcher without a
+runtime claim remains eligible for recovery. An already-watched, claimed session
+is a no-op on later scans.
 
 ## Outbound: durable delivery onto the transport
 

@@ -20,7 +20,7 @@ eidetica = { git = "https://github.com/arcuru/eidetica", rev = "f5779645b54ff28b
 anyhow = "1"
 async-trait = "0.1"
 thiserror = "2"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "process", "io-util", "time"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "process", "io-util", "time", "test-util"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"

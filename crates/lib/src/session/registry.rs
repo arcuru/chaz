@@ -675,9 +675,11 @@ impl SessionRegistry {
         }
         let root = eidetica::entry::ID::parse(session_db_id)?;
         let user = self.user.lock().await;
-        let key_id = user
-            .find_key(&root)?
-            .ok_or_else(|| anyhow::anyhow!("no session signing key"))?;
+        let key_id = user.find_key(&root)?.ok_or_else(|| {
+            eidetica::Error::from(eidetica::account::AccountError::NoKeyForDatabase {
+                database_id: root.clone(),
+            })
+        })?;
         let db = user.open_database_with_key(&root, &key_id).await?;
         if self.instance.backend().local_engine().is_none()
             || matches!(db.auth_identity(), Some(eidetica::auth::types::SigKey::Delegation { path, .. }) if path.len() > 1)
@@ -730,6 +732,22 @@ impl SessionRegistry {
             .await
             .insert(session_db_id.to_string(), db.clone());
         Ok((ConversationId(session_db_id.to_string()), db))
+    }
+
+    /// Open an existing session by its exact database root ID.
+    ///
+    /// Unlike name-based CLI selection, this never creates a database or
+    /// falls back to another identifier. The kind check also prevents an
+    /// arbitrary accessible database from being treated as a session.
+    pub async fn open_existing_session_by_id(
+        &self,
+        session_db_id: &str,
+    ) -> anyhow::Result<(ConversationId, Database)> {
+        let (conversation_id, db) = self.open_session(session_db_id).await?;
+        match crate::db_kind::read_marker(&db).await {
+            Some((kind, _)) if kind == crate::db_kind::KIND_SESSION => Ok((conversation_id, db)),
+            _ => anyhow::bail!("Database '{session_db_id}' is not a chaz session"),
+        }
     }
 
     // -------------------------------------------------------------------------

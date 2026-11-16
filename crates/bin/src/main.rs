@@ -80,10 +80,16 @@ struct CmdArgs {
     command: String,
 
     /// Named session to run the command against (find-or-create). Peer-scoped
-    /// commands ignore it; session-scoped ones (`/info`, `/share`) need it to
-    /// address anything but a fresh throwaway session.
+    /// commands ignore it; session-scoped ones (`/info`, `/share`, `/agent
+    /// rehost`) need it to address anything but a fresh throwaway session.
     #[arg(long, value_name = "NAME")]
     session: Option<String>,
+
+    /// Existing session database ID to run the command against. This opens
+    /// only that session and fails if it cannot be loaded; it never creates
+    /// a session or falls back to a name.
+    #[arg(long, value_name = "ID", conflicts_with = "session")]
+    session_id: Option<String>,
 }
 
 #[derive(clap::Args)]
@@ -366,7 +372,11 @@ async fn main() -> anyhow::Result<()> {
         options.targeted_session = args
             .session
             .clone()
-            .or_else(|| cmd_args.as_ref().and_then(|args| args.session.clone()))
+            .or_else(|| {
+                cmd_args
+                    .as_ref()
+                    .and_then(|args| args.session_id.clone().or_else(|| args.session.clone()))
+            })
             .or(options.targeted_session);
         options
     } else {
@@ -425,7 +435,13 @@ async fn main() -> anyhow::Result<()> {
         info!("Shutdown signal received; stopping");
         Ok(())
     } else if let Some(a) = cmd_args {
-        let bridge = bridge::cmd::CommandBridge::new(config, secret_store, a.command, a.session);
+        let bridge = bridge::cmd::CommandBridge::new(
+            config,
+            secret_store,
+            a.command,
+            a.session,
+            a.session_id,
+        );
         bridge.run(server).await
     } else if args.print {
         // One-shot: no background bridges; MCP cleanup still runs below.
