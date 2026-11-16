@@ -422,7 +422,7 @@ async fn new_session_preempts_a_blocked_historical_open_without_history_growth()
         app.cancel_session_fill();
         *probe.blocked.lock().unwrap() = None;
         open_session_picker(&mut app, server, &tx);
-        let SessionLoad::Catalog { generation, result } =
+        let SessionLoad::Grouped { generation, result } =
             tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
                 .await
                 .unwrap()
@@ -430,10 +430,12 @@ async fn new_session_preempts_a_blocked_historical_open_without_history_growth()
         else {
             panic!("expected reconciled catalog")
         };
+        let (indices, groups) = result.unwrap();
         assert!(matches!(
-            apply_session_catalog_result(&mut app, generation, result),
+            apply_session_catalog_result(&mut app, generation, Ok(indices)),
             CatalogLoadOutcome::Loaded
         ));
+        workers::group(&mut app, groups);
         assert_eq!(app.session_list.len(), count + 1);
         assert_eq!(
             app.session_list
@@ -554,10 +556,12 @@ async fn creation_survives_navigation_without_replay_or_focus_theft() {
     let created = sessions[0].session_db_id.clone();
     app.close_settings();
     ensure_view(&mut app, server, &tx);
-    let SessionLoad::Catalog { generation, result } = receive(&mut rx).await else {
-        panic!("expected catalog")
+    let SessionLoad::Grouped { generation, result } = receive(&mut rx).await else {
+        panic!("expected grouped catalog")
     };
-    apply_session_catalog_result(&mut app, generation, result);
+    let (indices, groups) = result.unwrap();
+    apply_session_catalog_result(&mut app, generation, Ok(indices));
+    workers::group(&mut app, groups);
     assert_eq!(app.session_list.len(), 1);
     assert_eq!(app.session_list[0].session_db_id, created);
     let (approval, _) = mpsc::channel(8);
