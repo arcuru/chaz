@@ -44,6 +44,7 @@ pub(super) enum Effect {
     Global(Box<Effect>),
     Outcome(CommandOutcome),
     Opened(Box<Tab>),
+    WorkerNavigation(Box<Tab>),
     Open(Box<Open>),
     Sent,
     JobSent(String),
@@ -470,6 +471,25 @@ pub(super) fn apply(app: &mut App, completion: Completion) -> Invalidation {
                 }
             }
         }
+        Ok(Effect::WorkerNavigation(mut tab)) => {
+            if nav_valid {
+                if let Some(i) = app.tab_index_for(&tab.session_db_id) {
+                    if tab.scroll_offset == u16::MAX {
+                        app.tabs[i].scroll_offset = u16::MAX;
+                    }
+                    if let Some(call) = tab.live.jump_call.take() {
+                        workers::focus(&mut app.tabs[i], call);
+                    }
+                    app.set_active_tab(i);
+                } else {
+                    if let Some(call) = tab.live.jump_call.take() {
+                        workers::focus(&mut tab, call);
+                    }
+                    app.push_tab(*tab);
+                }
+                app.mode = TuiMode::Chat;
+            }
+        }
         Ok(Effect::Opened(tab)) => {
             app.session_list_fresh = false;
             if creating {
@@ -625,14 +645,10 @@ impl Context {
                     | Command::SwitchSession(_)
             );
         let target_id = target.as_ref().map(|t| t.id.clone());
-        let outcome = if matches!(cmd, Command::SwitchSession(_)) {
+        let outcome = if let Command::SwitchSession(identifier) = cmd {
             let server = self.server.clone();
-            supervised::read(async move {
-                commands::dispatch_without_session(cmd, &server)
-                    .await
-                    .map_err(|_| "Session command needs a conversation".to_owned())
-            })
-            .await?
+            supervised::read(async move { Ok(workers::switch_session(&identifier, &server).await) })
+                .await?
         } else {
             match commands::dispatch_without_session(cmd, &self.server).await {
                 Ok(outcome) => outcome,
@@ -726,6 +742,19 @@ pub(super) fn resolved_open(
 }
 impl Open {
     async fn prepare(self) -> Result<Effect, String> {
+        if chaz_core::session::workers::is_worker_session(&self.switch.db)
+            .await
+            .map_err(|e| e.to_string())?
+        {
+            return workers::open_tab(
+                &self.server,
+                &self.backend,
+                &self.switch.session_db_id,
+                self.notify_tx,
+            )
+            .await
+            .map(|tab| Effect::Opened(Box::new(tab)));
+        }
         if chaz_core::session::jobs::is_job_session(&self.switch.db).await {
             return jobs::open_tab(
                 &self.server,

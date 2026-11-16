@@ -198,10 +198,16 @@ impl Tool for SpawnWorker {
             // child's `SessionRuntime` below: `spawn_agent_task` applies
             // them per turn, so the child's LLM request carries the
             // resolved model and the suffix rides on the worker prompt.
-            let parent_session_db_id = {
-                let s = ctx.session.lock().await;
-                s.database().root_id().to_string()
-            };
+            let parent_db = ctx.session.lock().await.database().clone();
+            let parent_session_db_id = parent_db.root_id().to_string();
+            if ctx.turn_attempt.is_some() && ctx.tool_call_site.is_none() {
+                return Err("Recorded Worker spawn requires its native tool call site".into());
+            }
+            let linked = ctx.tool_call_site.is_some();
+            let mut directive = task.to_string();
+            if let Some(ctx_str) = context_str {
+                directive = format!("{directive}\n\nContext: {ctx_str}");
+            }
 
             info!(
                 worker = %name,
@@ -219,42 +225,32 @@ impl Tool for SpawnWorker {
             // model (template → preset → inline) overrides the agent default
             // in the child's LLM request; the preset `role_suffix` is appended
             // to the worker system prompt by `spawn_agent_task`.
-            let (conversation_id, session_db, mut completion_rx) = server
-                .register_child_session_with_prompt(
+            let (conversation_id, session_db, mut completion_rx, directive_id) = server
+                .register_worker_request(
+                    &parent_db,
+                    SessionEntry {
+                        sender: ctx.agent_name.clone(),
+                        content: directive,
+                        timestamp: chrono::Utc::now(),
+                        entry_type: EntryType::Directive,
+                        metadata: None,
+                        routing: None,
+                    },
+                    ctx.tool_call_site.clone(),
                     &ctx.agent_name,
                     self.backend.clone(),
                     self.security.approval_callback.clone(),
                     ctx.call_depth + 1,
                     resolved_max_spawn_depth as usize,
                     child_tools,
-                    Some(&parent_session_db_id),
-                    Some(worker.system_prompt.clone()),
+                    worker.system_prompt.clone(),
                     resolved_model,
                     role_suffix,
                 )
                 .await
-                .map_err(|e| format!("Failed to create child session: {e}"))?;
+                .map_err(|e| format!("Failed to submit worker '{name}': {e}"))?;
 
             let child_session_db_id = conversation_id.0.clone();
-
-            // Build directive: task + optional context.
-            let mut directive = task.to_string();
-            if let Some(ctx_str) = context_str {
-                directive = format!("{directive}\n\nContext: {ctx_str}");
-            }
-
-            let mut session = Session::new(conversation_id.clone(), session_db).await;
-            session
-                .add_entry(SessionEntry {
-                    sender: ctx.agent_name.clone(),
-                    content: directive,
-                    timestamp: chrono::Utc::now(),
-                    entry_type: EntryType::Directive,
-                    metadata: None,
-                    routing: None,
-                })
-                .await
-                .map_err(|e| format!("Failed to write directive for worker '{name}': {e}"))?;
 
             if is_async {
                 return Ok(format!(
@@ -268,8 +264,31 @@ impl Tool for SpawnWorker {
             let completion = completion_rx.recv().await;
             completion.ok_or_else(|| "Worker dropped without completing".to_string())?;
 
-            // Re-read session for the response.
-            let session = Session::new(conversation_id, session.database().clone()).await;
+            // Recorded native calls resolve the exact atomic outcome, never a
+            // newer transcript row or the parent tool call's own success.
+            if linked {
+                let Some((outcome, final_entry)) =
+                    crate::session::worker_links::latest_worker_outcome(&session_db, &directive_id)
+                        .await
+                        .map_err(|e| {
+                            format!("Worker result unavailable in {child_session_db_id}: {e}")
+                        })?
+                else {
+                    return Err(format!(
+                        "Worker result unavailable in {child_session_db_id}: no committed outcome"
+                    )
+                    .into());
+                };
+                return match (outcome.terminal, final_entry) {
+                    (crate::session::worker_links::WorkerTerminal::Reply, Some(entry)) => {
+                        Ok(entry.content)
+                    }
+                    (_, Some(entry)) => Err(entry.content.into()),
+                    _ => Err("Worker completed without a reply".into()),
+                };
+            }
+            // Direct helpers outside a persisted runtime retain unknown origin.
+            let session = Session::new(conversation_id, session_db).await;
             match session.latest_entry() {
                 Some(e) if e.entry_type == EntryType::Message => Ok(e.content.clone()),
                 Some(e) if e.entry_type == EntryType::Error => Err(e.content.clone().into()),

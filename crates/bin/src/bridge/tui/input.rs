@@ -33,6 +33,8 @@ pub(super) fn command_catalog() -> Vec<(&'static str, &'static str)> {
         ("# Session", ""),
         ("/sessions", "open session picker"),
         ("/jobs", "open Jobs ancestry and wait monitor"),
+        ("/workers", "inspect this session's linked Workers"),
+        ("/parent", "return to the exact spawning call (Alt+P)"),
         ("/new", "create a new session [agent group] (Ctrl+T)"),
         ("/groups", "list configured agent groups"),
         ("/join ", "switch to session by name or DB ID"),
@@ -364,6 +366,7 @@ pub(super) fn handle_overlay_key(app: &mut App, key: KeyEvent) -> OverlayKey {
 /// its own because they need cross-module context (command dispatch, session
 /// switching, etc.). None for the common no-op path.
 pub(super) enum MouseOutcome {
+    Chat(ChatAction),
     Copy(String),
     /// Open the currently selected session picker row — equivalent to
     /// pressing Enter.
@@ -583,6 +586,9 @@ pub(super) fn handle_mouse(app: &mut App, m: MouseEvent) -> Option<MouseOutcome>
                 tab.touch_transcript();
             }
         }
+        ClickTarget::OpenWorkers => return Some(MouseOutcome::Chat(ChatAction::OpenWorkers)),
+        ClickTarget::OpenParent => return Some(MouseOutcome::Chat(ChatAction::OpenParent)),
+        ClickTarget::OpenWorker(i) => return Some(MouseOutcome::Chat(ChatAction::OpenWorker(i))),
         ClickTarget::ToggleToolRun(i) => {
             if let Some(tab) = app.current_mut()
                 && let Some(run) = tab.live.tool_activity.runs.get(i)
@@ -727,6 +733,71 @@ fn handle_approval_key(app: &mut App, key: KeyEvent) -> bool {
 }
 
 pub(super) fn handle_chat_key(app: &mut App, key: KeyEvent) -> Option<ChatAction> {
+    if key.modifiers.contains(KeyModifiers::ALT) {
+        match key.code {
+            KeyCode::Char('p') => return Some(ChatAction::OpenParent),
+            KeyCode::Char('w') => return Some(ChatAction::OpenWorkers),
+            _ => {}
+        }
+    }
+    // Inspectors retain scrolling/expansion and global navigation, but never
+    // admit editor, approval, stop or retry actions, even for an active child.
+    if app.active().live.worker_observer {
+        if key.code == KeyCode::Char('/') || app.input.starts_with('/') {
+            match key.code {
+                KeyCode::Char(c) if c.is_ascii_alphabetic() || c == '/' => {
+                    app.input.push(c);
+                    app.cursor = app.input.len();
+                }
+                KeyCode::Backspace => {
+                    app.input.pop();
+                    app.cursor = app.input.len();
+                }
+                KeyCode::Esc => {
+                    app.input.clear();
+                    app.cursor = 0;
+                }
+                KeyCode::Enter => {
+                    let command = std::mem::take(&mut app.input);
+                    app.cursor = 0;
+                    return match command.as_str() {
+                        "/parent" => Some(ChatAction::OpenParent),
+                        "/workers" => Some(ChatAction::OpenWorkers),
+                        "/sessions" => Some(ChatAction::OpenPicker),
+                        _ => {
+                            show_error(
+                                app,
+                                "Inspection-only: /parent, /workers or /sessions".into(),
+                            );
+                            None
+                        }
+                    };
+                }
+                _ => {}
+            }
+            return None;
+        }
+        match key.code {
+            KeyCode::Up => {
+                app.active_mut().scroll_offset = app.active().scroll_offset.saturating_add(3)
+            }
+            KeyCode::Down => {
+                app.active_mut().scroll_offset = app.active().scroll_offset.saturating_sub(3)
+            }
+            KeyCode::PageUp => {
+                app.active_mut().scroll_offset = app.active().scroll_offset.saturating_add(20)
+            }
+            KeyCode::PageDown => {
+                app.active_mut().scroll_offset = app.active().scroll_offset.saturating_sub(20)
+            }
+            KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                app.toggle_expand_all()
+            }
+            KeyCode::Esc => return Some(ChatAction::OpenPicker),
+            _ => {}
+        }
+        return None;
+    }
     // Stop is a user event even during approval; don't turn Esc into a deny.
     if key.code == KeyCode::Esc {
         if app.completion.is_some() {
@@ -966,6 +1037,8 @@ fn parse_chat_line(app: &mut App, text: &str) -> Option<ChatAction> {
     match text {
         "/sessions" | "/s" => return Some(ChatAction::OpenPicker),
         "/jobs" => return Some(ChatAction::OpenJobs),
+        "/workers" => return Some(ChatAction::OpenWorkers),
+        "/parent" => return Some(ChatAction::OpenParent),
         "/models" => return Some(ChatAction::OpenModelsSettings),
         "/settings" => return Some(ChatAction::OpenSettings(SettingsScope::Session)),
         "/clear" => {
@@ -1875,6 +1948,8 @@ mod tests {
         const VIEW_LOCAL: &[&str] = &[
             "/sessions",
             "/jobs",
+            "/workers",
+            "/parent",
             "/models",
             "/settings",
             "/clear",

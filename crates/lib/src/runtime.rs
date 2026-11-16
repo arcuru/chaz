@@ -1641,6 +1641,7 @@ async fn run_prepared_turn(
                     "{model_sequence}:{}:{}",
                     resume.call_index, call.id
                 ));
+                call_ctx.set_tool_call_site(model_sequence, resume.call_index, &call.id);
                 call_ctx.grants = tool_ctx.resolve_call_grants(&policy.grants, &call.name);
                 call_ctx.observation_deadline = Some(resume.deadline);
                 // The remaining policy budget, not a fresh one: an expired
@@ -2149,6 +2150,7 @@ async fn run_prepared_turn(
                                 tool_ctx.resolve_call_grants(&policy.grants, &call.name);
                             call_ctx.tool_call_key =
                                 Some(format!("{model_sequence}:{call_index}:{}", call.id));
+                            call_ctx.set_tool_call_site(model_sequence, call_index, &call.id);
                             call_ctx.grants = call_grants;
                             if call.name == JOB_WAIT_TOOL
                                 && let Ok((child, seconds)) =

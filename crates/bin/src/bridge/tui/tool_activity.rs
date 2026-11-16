@@ -68,6 +68,7 @@ pub(super) struct ToolItem {
     pub name: String,
     pub arguments: String,
     pub result: Option<ToolResult>,
+    pub worker: Option<chaz_core::session::worker_links::WorkerSpawn>,
 }
 
 #[derive(Debug)]
@@ -92,6 +93,21 @@ impl ToolRun {
         } else {
             "activity unknown"
         }
+    }
+}
+
+impl CallKey {
+    pub(super) fn matches_worker(
+        &self,
+        call: &chaz_core::session::worker_links::WorkerCallSite,
+    ) -> bool {
+        self.run.request == call.request_id.as_str()
+            && self.run.attempt == call.attempt_id
+            && self.run.execution == call.execution_id
+            && self.run.agent == call.agent
+            && self.model_sequence == call.model_sequence
+            && self.index == call.call_index
+            && self.id == call.call_id
     }
 }
 
@@ -123,6 +139,7 @@ pub(super) struct ToolActivity {
     pub runs: Vec<ToolRun>,
     pub items: Vec<ToolItem>,
     pub rows: HashMap<String, ToolRow>,
+    pub worker_error: Option<String>,
 }
 
 struct Invocation {
@@ -163,11 +180,28 @@ impl ToolActivity {
             .await?
             .search(|_| true)
             .await?;
-        Ok(Self::project(
+        let mut projection = Self::project(
             entries,
             records.into_iter().map(|(_, record)| record),
             attempts.into_iter().map(|(_, attempt)| attempt),
-        ))
+        );
+        match chaz_core::session::worker_links::worker_spawns_at(db, tips).await {
+            Ok(spawns) => {
+                for item in &mut projection.items {
+                    let matches: Vec<_> = spawns
+                        .iter()
+                        .filter(|s| item.name == "spawn_worker" && item.key.matches_worker(&s.call))
+                        .collect();
+                    if matches.len() == 1 {
+                        item.worker = Some(matches[0].clone());
+                    } else if matches.len() > 1 {
+                        projection.worker_error = Some("conflicting Worker references".into());
+                    }
+                }
+            }
+            Err(error) => projection.worker_error = Some(error.to_string()),
+        }
+        Ok(projection)
     }
 
     fn project<'a>(
@@ -322,6 +356,7 @@ impl ToolActivity {
                 ordinal: projection.runs[run].calls.len(),
                 position: call.position,
                 name: call.name,
+                worker: None,
                 arguments: call.arguments,
                 result: response.map(|response| {
                     if by_id.contains_key(response.row.as_str()) {

@@ -59,6 +59,7 @@ mod tool_activity;
 mod transition_tests;
 mod view;
 mod widgets;
+mod workers;
 
 pub struct TuiBridge {
     config: Config,
@@ -75,6 +76,7 @@ enum Action {
     /// A session DB fired an on_write callback — payload is the
     /// session_db_id so we can refresh the right tab.
     SessionChanged(String),
+    CatalogChanged,
     ApprovalRequest(TaggedApproval),
     /// A background catalog fetch finished. `Ok` carries the live model
     /// list (already merged with cache); `Err` carries a display message.
@@ -83,6 +85,7 @@ enum Action {
     PeerPage(peer_pages::Loaded),
     SessionPage(session_pages::Loaded),
     JobsLoaded(jobs::Loaded),
+    WorkersLoaded(workers::Loaded),
     /// A background tab read finished (see [`refresh`]).
     Refresh(refresh::Refresh),
     Operation(operations::Completion),
@@ -90,6 +93,11 @@ enum Action {
 }
 
 enum SessionLoad {
+    Grouped {
+        generation: u64,
+        result: Result<(Vec<SessionIndex>, workers::Groups), String>,
+    },
+    #[cfg(test)]
     Catalog {
         generation: u64,
         result: Result<Vec<SessionIndex>, String>,
@@ -401,6 +409,9 @@ pub(super) struct SessionMetaSnapshot {
 
 pub(super) enum ChatAction {
     OpenJobs,
+    OpenWorkers,
+    OpenWorker(usize),
+    OpenParent,
     Dispatch(Command),
     OpenPicker,
     /// Open the model picker scoped to `scope`. From `/models` and
@@ -470,6 +481,9 @@ pub(super) enum ClickTarget {
     ToggleEntryExpanded(usize),
     ToggleToolRun(usize),
     ToggleToolItem(usize),
+    OpenWorker(usize),
+    OpenWorkers,
+    OpenParent,
     /// Select model picker row `i` (index into `App::model_list`).
     ModelPickerSelect(usize),
     /// Jump to Settings sidebar category `i` and pin focus to the sidebar.
@@ -665,7 +679,9 @@ pub(super) struct App {
     /// Defaults `true` so steady-state and tests show no indicator.
     pub(super) startup_ready: bool,
     pub(super) session_list: Vec<SessionInfo>,
-    /// Whether the current catalog snapshot is reusable on the next open.
+    worker_groups: workers::Groups,
+    workers_filter: Option<String>,
+    /// Whether the current catalog snapshot has no pending invalidation.
     pub(super) session_list_fresh: bool,
     /// Catalog rows retained by id so visible metadata requests never need to
     /// re-list the catalog.
@@ -673,6 +689,7 @@ pub(super) struct App {
     pub(super) session_fill: Option<SessionFill>,
     pub(super) session_generation: u64,
     pub(super) session_catalog_loading: bool,
+    session_catalog_invalidated: bool,
     pub(super) session_picker_error: Option<String>,
     /// One-shot result shown in the hub footer (a failed open or create);
     /// cleared by the next hub key.
@@ -866,11 +883,14 @@ impl App {
             debug_mode: false,
             startup_ready: true,
             session_list: Vec::new(),
+            worker_groups: Default::default(),
+            workers_filter: None,
             session_list_fresh: false,
             session_indices: HashMap::new(),
             session_fill: None,
             session_generation: 0,
             session_catalog_loading: false,
+            session_catalog_invalidated: false,
             session_picker_error: None,
             hub_notice: None,
             drafts: HashMap::new(),
@@ -1446,6 +1466,14 @@ async fn setup_session(
         !chaz_core::session::jobs::is_job_session(session_db).await,
         "job sessions must be opened as observers"
     );
+    anyhow::ensure!(
+        !chaz_core::session::workers::is_worker_session(session_db).await?
+            && !server
+                .registry()
+                .is_indexed_worker_session(&session_db_id)
+                .await?,
+        "Worker sessions must be opened as observers"
+    );
     server.load_session_entities(session_db).await?;
     static NEXT_OBSERVATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     let observation_id = NEXT_OBSERVATION.fetch_add(1, Ordering::Relaxed);
@@ -1507,7 +1535,7 @@ async fn open_named_session(server: &Server, name: &str) -> anyhow::Result<eidet
     if let Some(id) = server.registry().find_by_name(name).await? {
         let (_conv_id, db) = server
             .registry()
-            .open_session(&id)
+            .open_session_for_inspection(&id)
             .await
             .with_context(|| format!("Failed to open session '{name}'"))?;
         return Ok(db);
@@ -1661,14 +1689,28 @@ fn open_session_picker(
     server: &Arc<Server>,
     session_rows_tx: &mpsc::Sender<SessionLoad>,
 ) {
+    enter_session_picker(app, None);
+    refresh_session_catalog(app, server, session_rows_tx);
+}
+
+fn enter_session_picker(app: &mut App, filter: Option<String>) {
     app.cancel_session_fill();
+    app.workers_filter = filter;
     app.picker_index = 0;
     app.mode = TuiMode::SessionPicker;
     app.session_picker_error = None;
     app.session_row_errors.clear();
     app.hub_notice = None;
+    // Explicit entry refreshes even if no write notification was observed.
+    app.session_list_fresh = false;
+}
 
-    if app.session_list_fresh {
+fn refresh_session_catalog(
+    app: &mut App,
+    server: &Arc<Server>,
+    session_rows_tx: &mpsc::Sender<SessionLoad>,
+) {
+    if app.session_catalog_loading || !app.backend_available {
         return;
     }
     if app.operations.is_creating_session() {
@@ -1676,17 +1718,44 @@ fn open_session_picker(
         return;
     }
 
-    // Retain the previous catalog while an explicit retry is pending.
+    // Retire old visible-row reads too: dropping their tasks without clearing
+    // the loading IDs would leave those rows permanently in flight.
+    app.cancel_session_fill();
+    // Retain rows and selection while the coalesced read is pending.
+    app.session_catalog_invalidated = false;
     app.session_catalog_loading = true;
     let registry = server.registry_arc();
-    spawn_session_catalog_load(app, session_rows_tx.clone(), async move {
-        registry
-            .list_sessions()
+    let generation = app.session_generation;
+    let filter = app.workers_filter.clone();
+    let tx = session_rows_tx.clone();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let task = supervised::Task(tokio::spawn(async move {
+        let started = std::time::Instant::now();
+        let result = supervised::read(async move {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                workers::catalog(&registry, filter.as_deref()),
+            )
             .await
-            .map_err(|error| error.to_string())
+            .unwrap_or_else(|_| Err("Session ancestry read timed out; cached rows stale".into()))
+        })
+        .await;
+        tracing::info!(
+            generation,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            success = result.is_ok(),
+            "TUI session catalog completed"
+        );
+        let _ = tx.send(SessionLoad::Grouped { generation, result }).await;
+    }));
+    app.session_fill = Some(SessionFill {
+        generation,
+        cancel,
+        tasks: vec![task],
     });
 }
 
+#[cfg(test)]
 fn spawn_session_catalog_load<F>(app: &mut App, tx: mpsc::Sender<SessionLoad>, load: F)
 where
     F: Future<Output = Result<Vec<SessionIndex>, String>> + Send + 'static,
@@ -1715,6 +1784,7 @@ where
 }
 
 fn apply_session_catalog(app: &mut App, indices: Vec<SessionIndex>) {
+    let selected = app.picker_selection();
     let mut cached: HashMap<String, SessionInfo> = std::mem::take(&mut app.session_list)
         .into_iter()
         .filter(|row| row.loaded)
@@ -1733,7 +1803,13 @@ fn apply_session_catalog(app: &mut App, indices: Vec<SessionIndex>) {
         })
         .collect();
     commands::sort_session_infos(&mut app.session_list);
-    app.session_list_fresh = true;
+    app.picker_index = app
+        .session_list
+        .iter()
+        .position(|row| row.session_db_id == selected)
+        .map(|i| i + 1)
+        .unwrap_or(0);
+    app.session_list_fresh = !app.session_catalog_invalidated;
     app.session_catalog_loading = false;
 }
 
@@ -1971,7 +2047,7 @@ fn ensure_view(app: &mut App, server: &Arc<Server>, session_rows_tx: &mpsc::Send
     {
         // Settings can interrupt the initial catalog load. Resume it when
         // the hub becomes visible, without rendering an incomplete empty list.
-        open_session_picker(app, server, session_rows_tx);
+        refresh_session_catalog(app, server, session_rows_tx);
     }
 }
 
@@ -2003,6 +2079,23 @@ fn handle_chat_action(
     models_tx: &mpsc::Sender<ModelCatalog>,
     session_rows_tx: &mpsc::Sender<SessionLoad>,
 ) {
+    if app.current().is_some_and(|tab| tab.live.worker_observer)
+        && !matches!(
+            action,
+            ChatAction::OpenPicker
+                | ChatAction::OpenWorkers
+                | ChatAction::OpenWorker(_)
+                | ChatAction::OpenParent
+                | ChatAction::OpenJobs
+                | ChatAction::Dispatch(Command::Quit | Command::SwitchSession(_))
+        )
+    {
+        show_error(
+            app,
+            "Worker transcript is inspection-only; action not submitted".into(),
+        );
+        return;
+    }
     if app.current().is_some_and(|tab| tab.job.is_some())
         && !matches!(
             action,
@@ -2019,6 +2112,38 @@ fn handle_chat_action(
         return;
     }
     match action {
+        ChatAction::OpenWorkers => workers::open_picker(app, server, session_rows_tx),
+        ChatAction::OpenWorker(index) => {
+            if let Some(spawn) = app
+                .current()
+                .and_then(|t| t.live.tool_activity.items.get(index))
+                .and_then(|i| i.worker.clone())
+            {
+                workers::navigate(
+                    app,
+                    server,
+                    backend,
+                    notify_tx,
+                    workers::Destination::Child(spawn),
+                );
+            }
+        }
+        ChatAction::OpenParent => {
+            if let Some(spawn) = app
+                .current()
+                .and_then(|t| t.live.workers.data.parent.clone())
+            {
+                workers::navigate(
+                    app,
+                    server,
+                    backend,
+                    notify_tx,
+                    workers::Destination::Parent(spawn),
+                );
+            } else {
+                show_error(app, "Parent unavailable or legacy ancestry unknown".into());
+            }
+        }
         ChatAction::OpenJobs => {
             app.mode = TuiMode::Jobs;
         }
@@ -2136,14 +2261,10 @@ fn dispatch_picker_selection(
     let approval_tx = approval_tx.clone();
     let notify_tx = notify_tx.clone();
     operations::submit(app, write, None, async move {
-        let outcome = if matches!(cmd, Command::SwitchSession(_)) {
+        let outcome = if let Command::SwitchSession(identifier) = cmd {
             let server = server.clone();
-            supervised::read(async move {
-                commands::dispatch_without_session(cmd, &server)
-                    .await
-                    .map_err(|_| "Session command needs an open conversation".to_owned())
-            })
-            .await?
+            supervised::read(async move { Ok(workers::switch_session(&identifier, &server).await) })
+                .await?
         } else {
             commands::dispatch_without_session(cmd, &server)
                 .await

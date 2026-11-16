@@ -67,6 +67,69 @@ async fn main() -> anyhow::Result<()> {
         )]),
     )
     .await?;
+    if std::env::args().nth(2).as_deref() == Some("worker-links") {
+        // Literal side-store fixture is also read by the supported older binary.
+        // It must not change how either version reads the original transcript.
+        let (_, child) = registry
+            .create_child_session(&id, Some("spawn:fixture-spawn"))
+            .await?;
+        registry
+            .set_session_name(&child.root_id().to_string(), "worker-compatibility".into())
+            .await?;
+        let rows: Vec<serde_json::Value> = serde_json::from_str(include_str!(
+            "../../lib/src/session/fixtures/worker-links.snap"
+        ))?;
+        for row in rows {
+            let target = if row["store"] == "worker_spawns_v1" {
+                &db
+            } else {
+                &child
+            };
+            let mut value = row["value"].clone();
+            if row["store"] == "worker_spawns_v1" {
+                value["child_session_id"] = child.root_id().to_string().into();
+            }
+            if row["store"] == "worker_origin_v1" {
+                value["parent_session_id"] = id.clone().into();
+            }
+            let txn = target.new_transaction().await?;
+            txn.get_store::<eidetica::store::Table<serde_json::Value>>(
+                row["store"].as_str().unwrap(),
+            )
+            .await?
+            .set(row["id"].as_str().unwrap(), value)
+            .await?;
+            txn.commit().await?;
+        }
+        let txn = child.new_transaction().await?;
+        let entries = txn
+            .get_store::<eidetica::store::Table<SessionEntry>>("entries")
+            .await?;
+        let mut directive = entry("COMPAT-CHILD-ASSIGNMENT");
+        directive.entry_type = EntryType::Directive;
+        entries.set("child-directive", directive).await?;
+        entries
+            .set("child-final", entry("COMPAT-CHILD-RESULT"))
+            .await?;
+        txn.get_store::<eidetica::store::Table<chaz_core::session::TurnAttempt>>("turn_attempts")
+            .await?
+            .set(
+                "child-attempt",
+                chaz_core::session::TurnAttempt {
+                    attempt_id: "child-attempt".into(),
+                    request_id: chaz_core::session::TurnRequestId::parse("child-directive"),
+                    started_at: chrono::Utc::now(),
+                    generation: 1,
+                    status: chaz_core::session::TurnAttemptStatus::Completed,
+                    completed_at: Some(chrono::Utc::now()),
+                },
+            )
+            .await?;
+        txn.commit().await?;
+        session
+            .add_entry(entry("COMPAT-PARENT-AFTER-SIDE-RECORDS"))
+            .await?;
+    }
     let agents_json = serde_json::to_string(&session.try_read_meta().await?.agents)?;
     let service = ServiceServer::bind(owner.clone(), &socket).await?;
     let (shutdown, receiver) = watch::channel(());

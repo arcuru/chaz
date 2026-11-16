@@ -58,6 +58,9 @@ pub struct SessionRegistry {
     new_session_rx: Mutex<Option<mpsc::Receiver<NewSessionEvent>>>,
     /// Serialize local explicit renames with extension fill-if-unnamed writes.
     name_lock: Mutex<()>,
+    /// Coalesced read-side invalidation, independent of the resident's single
+    /// new-session receiver. Observers never consume execution notifications.
+    catalog_changed: tokio::sync::watch::Sender<()>,
     /// Sessions created by a local service client may predate the daemon's
     /// in-memory per-DB key mapping. Keep the already-keyed daemon handle so
     /// later opens use the same signing identity.
@@ -127,6 +130,8 @@ impl SessionRegistry {
             "Session registry chaz_peer ready"
         );
         let (new_session_tx, new_session_rx) = mpsc::channel(64);
+        let (catalog_changed, _) = tokio::sync::watch::channel(());
+        let catalog_notify = catalog_changed.clone();
 
         // Watch the chaz_group for writes (including remote sync).
         // On each write, re-scan the sessions index and fire events for each known session.
@@ -135,6 +140,7 @@ impl SessionRegistry {
         let stage = Instant::now();
         chaz_group
             .on_write(move |event, db| {
+                catalog_notify.send_replace(());
                 tracing::debug!(
                     source = ?event.source(),
                     "chaz_group write; rescanning the sessions index"
@@ -174,6 +180,7 @@ impl SessionRegistry {
             new_session_tx,
             new_session_rx: Mutex::new(Some(new_session_rx)),
             name_lock: Mutex::new(()),
+            catalog_changed,
             local_client_sessions: Mutex::new(std::collections::HashMap::new()),
             locally_created_sessions: Mutex::new(std::collections::HashSet::new()),
             channel_create_locks: Mutex::new(std::collections::HashMap::new()),
@@ -196,6 +203,11 @@ impl SessionRegistry {
     /// Take the new-session event receiver. Can only be called once.
     pub async fn subscribe_new_sessions(&self) -> Option<mpsc::Receiver<NewSessionEvent>> {
         self.new_session_rx.lock().await.take()
+    }
+
+    /// Subscribe without taking the resident executor's notification receiver.
+    pub fn catalog_changes(&self) -> tokio::sync::watch::Receiver<()> {
+        self.catalog_changed.subscribe()
     }
 
     /// Group-level routing/metadata DB. Holds session/channel/name indices
@@ -367,11 +379,22 @@ impl SessionRegistry {
         &self,
         prepared: PreparedAgentJob,
     ) -> anyhow::Result<ConversationId> {
-        let id = prepared.db.root_id().to_string();
+        self.publish_prepared_session(&prepared.db, &prepared.source)
+            .await
+    }
+
+    /// Shared catalog publication; preparation in the source DB must finish first.
+    pub(crate) async fn publish_prepared_session(
+        &self,
+        db: &Database,
+        source: &str,
+    ) -> anyhow::Result<ConversationId> {
+        let id = db.root_id().to_string();
+        let source = source.to_string();
         let txn = self.chaz_group.new_transaction().await?;
         txn.get_store::<DocStore>(STORE_SESSIONS)
             .await?
-            .set_string(&id, &prepared.source)
+            .set_string(&id, &source)
             .await?;
         txn.get_store::<DocStore>(STORE_SESSION_CATALOG)
             .await?
@@ -379,8 +402,8 @@ impl SessionRegistry {
                 &id,
                 serde_json::to_string(&SessionCatalogEntry {
                     session_db_id: id.clone(),
-                    source: Some(prepared.source.clone()),
-                    bridge: BridgeKind::from_source(Some(&prepared.source)),
+                    source: Some(source.clone()),
+                    bridge: BridgeKind::from_source(Some(&source)),
                     created_at: Utc::now(),
                     status: SessionStatus::Active,
                 })?,
@@ -393,7 +416,7 @@ impl SessionRegistry {
             .insert(id.clone());
         let _ = self.new_session_tx.try_send(NewSessionEvent {
             session_db_id: id.clone(),
-            source: Some(prepared.source),
+            source: Some(source),
         });
         Ok(ConversationId(id))
     }
@@ -542,6 +565,49 @@ impl SessionRegistry {
         );
 
         Ok((conv_id, child_db))
+    }
+
+    /// Allocate an unindexed Worker using the actual parent's bound handle.
+    /// Catalog publication and runtime installation are separate later effects.
+    pub(crate) async fn prepare_worker_session(
+        &self,
+        parent: &Database,
+        source: &str,
+    ) -> anyhow::Result<Database> {
+        let db = {
+            let mut user = self.user.lock().await;
+            let mut settings = eidetica::crdt::Doc::new();
+            settings.set("name", format!("session:{source}"));
+            let key = user.get_default_key()?;
+            user.create_database(settings, &key).await?
+        };
+        let setup = async {
+            super::Session::initialize_turn_schema(&db).await?;
+            crate::db_kind::write_marker(&db, crate::db_kind::KIND_SESSION, source).await?;
+            let txn = db.new_transaction().await?;
+            txn.get_settings()?
+                .add_delegated_tree(DelegatedTreeRef {
+                    permission_bounds: PermissionBounds {
+                        max: Permission::Admin(0),
+                        min: None,
+                    },
+                    tree: TreeReference {
+                        root: parent.root_id().clone(),
+                        tips: parent.snapshot().await?.into_tips(),
+                    },
+                })
+                .await?;
+            txn.commit().await?;
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        setup.map_err(|error| {
+            anyhow::anyhow!(
+                "Unindexed Worker child {} preparation failed (preserved): {error}",
+                db.root_id()
+            )
+        })?;
+        Ok(db)
     }
 
     /// Open an existing session database by its eidetica root ID.

@@ -30,22 +30,42 @@ pub(super) enum ResultMessage {
     },
 }
 
+/// View intent survives service generations; database kind alone cannot
+/// distinguish an ordinary parent opened for inspection from a composer tab.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum Mode {
+    Session,
+    Job,
+    Inspection,
+}
+impl Mode {
+    fn of(tab: &Tab) -> Self {
+        if tab.job.is_some() {
+            Self::Job
+        } else if tab.live.worker_observer {
+            Self::Inspection
+        } else {
+            Self::Session
+        }
+    }
+}
+
 async fn reopen(
     server: Arc<Server>,
     backend: BackendManager,
     id: String,
     incarnation: u64,
-    job: bool,
+    mode: Mode,
     approval_tx: mpsc::Sender<TaggedApproval>,
     notify_tx: mpsc::Sender<String>,
 ) -> Reopened {
     let opener = server.clone();
     let target = id.clone();
     let result = supervised::read(async move {
-        let opened = if job {
+        let opened = if mode == Mode::Job {
             opener.registry().open_job_session(&target).await
         } else {
-            opener.registry().open_session(&target).await
+            opener.registry().open_session_for_inspection(&target).await
         };
         opened.map(|(_, db)| db).map_err(|e| e.to_string())
     })
@@ -59,7 +79,11 @@ async fn reopen(
             // like construction; a read deadline is not rollback authority.
             // Keep the large registration future off the worker's stack.
             let observation = supervised::work(Box::pin(async move {
-                if job {
+                if mode != Mode::Session
+                    || chaz_core::session::workers::is_worker_session(&observed)
+                        .await
+                        .map_err(|e| e.to_string())?
+                {
                     jobs::observe(&observed, notify_tx)
                         .await
                         .map_err(|e| e.to_string())
@@ -94,7 +118,7 @@ pub(super) fn spawn_rebuild(
     let tabs = app
         .tabs
         .iter()
-        .map(|t| (t.session_db_id.clone(), t.live.incarnation, t.job.is_some()))
+        .map(|t| (t.session_db_id.clone(), t.live.incarnation, Mode::of(t)))
         .collect();
     let tx = tx.clone();
     let approval_tx = approval_tx.clone();
@@ -139,7 +163,7 @@ pub(super) async fn rebuild(
     old: Option<BuiltServer>,
     mut config: Config,
     path: PathBuf,
-    tabs: Vec<(String, u64, bool)>,
+    tabs: Vec<(String, u64, Mode)>,
     approval_tx: mpsc::Sender<TaggedApproval>,
     notify_tx: mpsc::Sender<String>,
 ) -> Result<Box<Replacement>, (String, bool)> {
@@ -168,14 +192,14 @@ pub(super) async fn rebuild(
         })?;
     let backend = BackendManager::new(&config.backends, built.secret_store.clone());
     let mut reopened = Vec::new();
-    for (id, incarnation, job) in tabs {
+    for (id, incarnation, mode) in tabs {
         reopened.push(
             reopen(
                 built.server.clone(),
                 backend.clone(),
                 id,
                 incarnation,
-                job,
+                mode,
                 approval_tx.clone(),
                 notify_tx.clone(),
             )
@@ -272,7 +296,7 @@ pub(super) fn request_tabs(
         tab.live.rebind_ticket = Some(ticket);
         let id = tab.session_db_id.clone();
         let incarnation = tab.live.incarnation;
-        let job = tab.job.is_some();
+        let mode = Mode::of(tab);
         let server = server.clone();
         let backend = backend.clone();
         let approval_tx = approval_tx.clone();
@@ -284,7 +308,7 @@ pub(super) fn request_tabs(
                 backend,
                 id,
                 incarnation,
-                job,
+                mode,
                 approval_tx,
                 notify_tx,
             )

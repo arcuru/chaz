@@ -253,6 +253,19 @@ async fn initialize(
             .await
             .map(Some);
         }
+        if chaz_core::session::workers::is_worker_session(&db)
+            .await
+            .map_err(|e| e.to_string())?
+        {
+            return workers::open_tab(
+                &built.server,
+                &backend,
+                &db.root_id().to_string(),
+                notify_tx,
+            )
+            .await
+            .map(Some);
+        }
         let observation =
             setup_session(&built.server, &db, backend.clone(), approval_tx, notify_tx)
                 .await

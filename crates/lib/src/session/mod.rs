@@ -44,6 +44,8 @@ mod transport;
 pub mod usage;
 pub(crate) mod wait_resume;
 pub(crate) mod wire;
+pub mod worker_links;
+pub mod workers;
 
 use wire::session_wire_enum;
 
@@ -1895,6 +1897,7 @@ impl Session {
             crate::session::jobs::write_job_result_in_txn(&txn, &result).await?;
         }
         let mut committed_entries = Vec::new();
+        let has_final = final_entry.is_some();
         if final_entry.is_some() || outbound.is_some() {
             let entries = txn
                 .get_store::<Table<SessionEntry>>(&self.store_name)
@@ -1904,6 +1907,18 @@ impl Session {
                 committed_entries.push((TurnRequestId::parse(id), entry));
             }
         }
+        worker_links::complete_in_txn(
+            &txn,
+            attempt,
+            branch,
+            if has_final {
+                committed_entries.first().map(|(id, entry)| (id, entry))
+            } else {
+                None
+            },
+            transcript.as_ref(),
+        )
+        .await?;
         txn.get_store::<Table<TurnAttempt>>(TURN_ATTEMPTS_STORE)
             .await?
             .set(completed.attempt_id.clone(), completed)

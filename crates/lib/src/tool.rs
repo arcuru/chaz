@@ -339,6 +339,13 @@ fn strip_param_descriptions(params: &Value) -> Value {
 /// Reserved terminal action; the runtime handles it without executing a tool.
 pub const NO_REPLY_TOOL: &str = "no_reply";
 
+/// Persisted execution identity known by the server before a model call.
+#[derive(Clone, Debug)]
+pub struct ToolAttemptIdentity {
+    pub attempt_id: String,
+    pub execution_id: Option<String>,
+}
+
 /// Context provided by the runtime to tools during execution.
 #[derive(Clone)]
 pub struct ToolContext {
@@ -352,6 +359,10 @@ pub struct ToolContext {
     pub turn_request_id: Option<crate::session::TurnRequestId>,
     // Stable model-response call site, set by the runtime before dispatch.
     pub tool_call_key: Option<String>,
+    /// Native attempt/branch, absent for non-persisted callers.
+    pub turn_attempt: Option<ToolAttemptIdentity>,
+    /// Exact tool invocation, filled by the runtime (never parsed from an opaque key).
+    pub tool_call_site: Option<crate::session::worker_links::WorkerCallSite>,
     /// Runtime-owned capacity handle, populated for each turn's tool call.
     pub observation_yield: Option<crate::runtime::ObservationYield>,
     /// Current spawn depth (0 = root agent from bridge)
@@ -411,6 +422,24 @@ pub struct ToolContext {
 }
 
 impl ToolContext {
+    pub(crate) fn set_tool_call_site(&mut self, sequence: u64, index: usize, call_id: &str) {
+        self.tool_call_site = self
+            .turn_request_id
+            .as_ref()
+            .zip(self.turn_attempt.as_ref())
+            .map(
+                |(request, attempt)| crate::session::worker_links::WorkerCallSite {
+                    request_id: request.clone(),
+                    attempt_id: attempt.attempt_id.clone(),
+                    execution_id: attempt.execution_id.clone(),
+                    agent: self.agent_name.clone(),
+                    model_sequence: sequence,
+                    call_index: index,
+                    call_id: call_id.to_string(),
+                },
+            );
+    }
+
     /// Yield capacity only after submission/effects are complete. From here
     /// until return, the tool may only observe; the runtime reacquires outside
     /// the tool timeout before processing the result. No-op on non-turn callers.

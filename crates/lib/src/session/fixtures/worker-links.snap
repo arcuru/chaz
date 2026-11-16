@@ -1,0 +1,38 @@
+[
+  {
+    "store": "worker_spawns_v1",
+    "id": "fixture-spawn",
+    "value": {
+      "version": 1,
+      "spawn_id": "fixture-spawn",
+      "call": {
+        "request_id": "parent-request",
+        "attempt_id": "parent-attempt",
+        "execution_id": null,
+        "agent": "chaz",
+        "model_sequence": 0,
+        "call_index": 0,
+        "call_id": "fixture-call"
+      },
+      "child_session_id": "CHILD",
+      "directive_id": "child-directive"
+    }
+  },
+  {
+    "store": "worker_origin_v1",
+    "id": "origin",
+    "value": {"version": 1, "parent_session_id": "PARENT", "spawn_id": "fixture-spawn"}
+  },
+  {
+    "store": "worker_outcomes_v1",
+    "id": "[\"child-attempt\",null]",
+    "value": {
+      "version": 1,
+      "directive_id": "child-directive",
+      "attempt_id": "child-attempt",
+      "execution_id": null,
+      "terminal": "reply",
+      "final_entry_id": "child-final"
+    }
+  }
+]
