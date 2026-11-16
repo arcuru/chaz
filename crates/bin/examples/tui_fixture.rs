@@ -52,6 +52,22 @@ async fn main() -> anyhow::Result<()> {
                                     "expected explicit start"
                                 );
                             }
+                            Some("close-worker-parent") => {
+                                use chaz_core::{agent::AgentRegistry, session::{SessionRegistry, worker_links}};
+                                let user = instance.login_account("pty-test", "test-password").await?;
+                                let registry = SessionRegistry::new(instance.clone(), user, std::sync::Arc::new(AgentRegistry::from_config(&chaz_core::config::Config::default()))).await?;
+                                let mut closed = Vec::new();
+                                for row in registry.list_sessions().await? {
+                                    if row.source.as_deref() == Some("tui") {
+                                        let (_, parent) = registry.open_session(&row.session_db_id).await?;
+                                        if !worker_links::worker_spawns(&parent).await?.is_empty() {
+                                            registry.mark_session_closed(&row.session_db_id).await?;
+                                            closed.push(row.session_db_id);
+                                        }
+                                    }
+                                }
+                                println!("CLOSED-PARENTS {}", serde_json::to_string(&closed)?);
+                            }
                             Some("worker-cases") => {
                                 println!("WORKER-CASES {}", worker_cases(&instance).await?);
                             }

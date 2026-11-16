@@ -65,6 +65,15 @@ pub(super) struct View {
     pub error: Option<String>,
     task: Option<supervised::Task<()>>,
     last: Option<std::time::Instant>,
+    generation: u64,
+}
+impl View {
+    pub(super) fn cancel(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
+        self.task = None;
+        self.last = None;
+        self.error = Some("Worker reference binding changed; cached evidence stale".into());
+    }
 }
 #[derive(Default)]
 pub(super) struct Data {
@@ -75,6 +84,7 @@ pub(super) struct Data {
 pub(super) struct Loaded {
     id: String,
     incarnation: u64,
+    generation: u64,
     result: Result<Data, String>,
 }
 
@@ -97,6 +107,7 @@ pub(super) fn update(app: &mut App, server: &Arc<Server>, tx: &mpsc::Sender<Load
         return;
     }
     view.last = Some(std::time::Instant::now());
+    let generation = view.generation;
     let id = tab.session_db_id.clone();
     let incarnation = tab.live.incarnation;
     let db = tab.session_db.clone();
@@ -115,16 +126,17 @@ pub(super) fn update(app: &mut App, server: &Arc<Server>, tx: &mpsc::Sender<Load
             .send(Loaded {
                 id,
                 incarnation,
+                generation,
                 result,
             })
             .await;
     })));
 }
 pub(super) fn apply(app: &mut App, loaded: Loaded) {
-    let Some(i) = app
-        .tab_index_for(&loaded.id)
-        .filter(|&i| app.tabs[i].live.incarnation == loaded.incarnation)
-    else {
+    let Some(i) = app.tab_index_for(&loaded.id).filter(|&i| {
+        app.tabs[i].live.incarnation == loaded.incarnation
+            && app.tabs[i].live.workers.generation == loaded.generation
+    }) else {
         return;
     };
     let tab = &mut app.tabs[i];
@@ -481,6 +493,37 @@ pub(super) fn focus(tab: &mut Tab, call: tool_activity::CallKey) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn worker_read_from_retired_binding_cannot_clear_stale_evidence() {
+        let mut app = App::new(
+            HashSet::new(),
+            super::super::session_picker_tests::test_tab().await,
+        );
+        let id = app.active().session_db_id.clone();
+        let incarnation = app.active().live.incarnation;
+        let generation = app.active().live.workers.generation;
+        app.active_mut().live.cancel_reads();
+        apply(
+            &mut app,
+            Loaded {
+                id,
+                incarnation,
+                generation,
+                result: Ok(Data::default()),
+            },
+        );
+        assert!(
+            app.active()
+                .live
+                .workers
+                .error
+                .as_ref()
+                .unwrap()
+                .contains("stale")
+        );
+        assert_ne!(app.active().live.workers.generation, generation);
+    }
+
     #[test]
     fn grouped_workers_preserve_roots_selection_and_conflicted_or_legacy_rows() {
         let mut app = App::hub(HashSet::new());

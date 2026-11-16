@@ -127,6 +127,7 @@ pub(super) struct TabLive {
 
 impl TabLive {
     pub(super) fn cancel_reads(&mut self) {
+        self.workers.cancel();
         self.reload = RefreshSlot::default();
         self.status = RefreshSlot::default();
         self.activity = RefreshSlot::default();
@@ -1638,7 +1639,11 @@ mod tests {
             None,
             config,
             dir.path().join("config.yaml"),
-            vec![(id.to_string(), app.active().live.incarnation, false)],
+            vec![(
+                id.to_string(),
+                app.active().live.incarnation,
+                reconnect::Mode::Session,
+            )],
             approval_tx,
             notify_tx,
         )

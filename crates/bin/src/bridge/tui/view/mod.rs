@@ -932,7 +932,17 @@ pub(super) fn ui_chat(f: &mut ratatui::Frame, app: &mut App, ext_segments: &[Str
         )
     };
     let mut status_text = if app.active().job.is_some() || app.active().live.worker_observer {
-        format!("{operation_indicator}{refresh_indicator} | {session_label}")
+        let feedback = if app.active().live.worker_observer
+            && app.operations.notice.is_none()
+            && !app.active().live.input_feedback.is_empty()
+        {
+            format!(" | {}", app.active().live.input_feedback)
+        } else {
+            String::new()
+        };
+        content::safe_line(&format!(
+            "{operation_indicator}{feedback}{refresh_indicator} | {session_label}"
+        ))
     } else if let Some(notice) = &app.operations.notice {
         format!(" ⚠ {notice}{refresh_indicator}")
     } else {

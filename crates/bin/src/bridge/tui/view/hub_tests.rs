@@ -1085,3 +1085,51 @@ async fn catalog_refresh_keeps_cursor_identity_and_retains_invalidations_during_
     assert_ne!(app.session_generation, generation);
     assert_eq!(app.picker_selection(), selected);
 }
+
+#[tokio::test]
+async fn worker_parent_observer_rebind_never_installs_an_ordinary_session_watcher() {
+    let (_instance, server, backend, mut app) = fixture().await;
+    let id = app.active().session_db_id.clone();
+    let before = app.active().session_db.snapshot().await.unwrap();
+    app.active_mut().live.worker_observer = true; // Ordinary parent opened by navigation.
+    app.active_mut().live.rebind_needed = true;
+    assert!(
+        !server.is_watching_session(&id).await,
+        "positive unregistered control"
+    );
+    let (approval, notify, _) = channels();
+    let (tx, mut rx) = mpsc::channel(8);
+    super::super::reconnect::request_tabs(&mut app, &server, &backend, &approval, &notify, &tx);
+    let super::super::reconnect::ResultMessage::Tab { ticket, reopened } = rx.recv().await.unwrap()
+    else {
+        panic!("expected rebind");
+    };
+    super::super::reconnect::apply_retry(&mut app, ticket, *reopened);
+    assert!(app.active().live.observation.is_some());
+    assert!(!app.active().live.rebind_needed);
+    assert!(
+        !server.is_watching_session(&id).await,
+        "inspection-only parent acquired an ordinary watcher during rebind"
+    );
+    assert!(server.runtime_owner_of(&id).is_none());
+    assert_eq!(app.active().session_db.snapshot().await.unwrap(), before);
+}
+
+#[tokio::test]
+async fn worker_inspector_navigation_errors_and_unavailable_anchor_are_visible() {
+    let (_instance, server, backend, mut app) = fixture().await;
+    app.active_mut().live.worker_observer = true;
+    app.operations.notice = Some("navigation denied; read failed; cached data retained".into());
+    let screen = frame(&mut app, &server, &backend, 140, 24);
+    assert!(
+        screen.contains("navigation denied"),
+        "operation indicator must show current refusal: {screen}"
+    );
+    app.operations.notice = None;
+    app.active_mut().live.input_feedback = "Parent opened; exact spawning item unavailable".into();
+    let screen = frame(&mut app, &server, &backend, 140, 24);
+    assert!(
+        screen.contains("exact spawning item unavailable"),
+        "fallback navigation feedback is hidden: {screen}"
+    );
+}

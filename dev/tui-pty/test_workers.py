@@ -130,7 +130,7 @@ context:
   reserved_output_tokens: 512
 '''
         configs = {}
-        for role in ["client", "executor", "executor-inspector"]:
+        for role in ["client", "executor", "executor-inspector", "rebind-inspector"]:
             config = home / f"{role}.yaml"
             execution = "client" if role == "client" else "executor"
             config.write_text(f'execution: {execution}\nstate_dir: "{home}/{role}-state"\n' + shared)
@@ -257,6 +257,7 @@ context:
         old.send("unsent-parent-draft")
         old.expect("unsent-parent-draft")
         old.send("\x10")
+        old.expect("[tui]")  # Wait for the unfiltered catalog, not cached /workers rows.
         old.expect("[spawn]")
         click_text(old, "[spawn]")
         click_text(old, "[spawn]")
@@ -267,7 +268,7 @@ context:
         old.expect("Worker transcript")
         old.expect("CHILD-RESULT")
         old.screen_capture(OUT, "narrow-child")
-        old.send("\x17")
+        old.send("\x1bp")  # Several children may be open; return by exact parent, not tab adjacency.
         old.expect("unsent-parent-draft")
         executor.terminate()
         executor.wait(timeout=5)
@@ -302,14 +303,50 @@ context:
             line = service.stdout.readline().decode().strip()
             assert line.startswith(prefix + " "), line
             return json.loads(line.removeprefix(prefix + " "))
+        # A closed ordinary parent is deliberately ineligible for automatic
+        # resident adoption. Any watcher/claim in this fresh executor-capable
+        # inspector would therefore have been caused by viewing or rebinding it.
+        closed = fixture_command("close-worker-parent", "CLOSED-PARENTS")
+        assert closed == [completed_records[0]["parent"]]
+        rebind = open_tui("rebind", "rebind-inspector")
+        click_text(rebind, "[spawn]")
+        click_text(rebind, "[spawn]")
+        rebind.expect("Parent (Alt+P")
+        rebind.send("/parent\r")
+        rebind.expect("Worker transcript")
+        rebind.expect("PARENT-RESULT")
+        rebind.screen_capture(OUT, "new-parent-inspector")
+        rebind_tips = fixture_command("worker-cases-audit", "WORKER-AUDIT")
+        service.stdin.write(b"stop\n")
+        service.stdin.flush()
+        assert select.select([service.stdout], [], [], 20)[0]
+        assert service.stdout.readline().strip() == b"fixture service stopped"
+        rebind.expect("Backend disconnected", timeout=30)
+        service.stdin.write(b"start\n")
+        service.stdin.flush()
+        assert select.select([service.stdout], [], [], 20)[0]
+        assert service.stdout.readline().strip() == b"fixture service ready"
+        rebind.expect_absent("Backend disconnected", timeout=30)
+        rebind.expect_absent("refresh failed", timeout=30)
+        rebind.expect("Worker transcript")
+        rebind.expect("PARENT-RESULT")
+        rebind.screen_capture(OUT, "new-parent-inspector-after-service-rebind")
+        rebind.drain(1)
+        assert fixture_command("worker-cases-audit", "WORKER-AUDIT") == rebind_tips
+        rebind_logs = "\n".join(f.read_text() for f in (home / "rebind-inspector-state").glob("*.log"))
+        for line in rebind_logs.splitlines():
+            assert not (closed[0] in line and ("Server watching session" in line or "Server claimed session runtime" in line)), "parent observer acquired execution on service rebind: " + line
+        assert len(calls) == 4
         cases = fixture_command("worker-cases", "WORKER-CASES")
         (OUT / "synthetic-cases.json").write_text(json.dumps(cases, indent=2))
+        # Use a fresh client after the deliberate service outage; other TUIs
+        # can still be recovering their own bindings. Select the fixture parent
+        # from its actual rendered hub rather than submitting during recovery.
+        old = open_tui("synthetic-cases")
         old.resize(160, 75)
-        # Return to the ordinary parent with its preserved unsent draft before
-        # issuing a /join. No synthetic fixture session is ever registered.
-        old.expect("unsent-parent-draft")
-        old.send("\x7f" * len("unsent-parent-draft"))
-        old.send("/join evidence-parent\r")
+        old.expect("evidence-parent")
+        click_text(old, "evidence-parent")
+        click_text(old, "evidence-parent")
         old.expect("Worker transcript")
         old.expect("10 linked Workers")
         click_text(old, "R1 chaz")
@@ -325,7 +362,8 @@ context:
         rows = old.screen.display
         denied_row = next(y for y, row in enumerate(rows) if "CASE-denied" in row) + 1
         old.send(f"\x1b[<0;8;{denied_row+1}M\x1b[<0;8;{denied_row+1}m")
-        old.drain(.5)
+        old.expect("read failed; cached data retained")
+        old.screen_capture(OUT, "denied-navigation-visible-refusal")
         assert "DENIED-SECRET" not in "\n".join(old.screen.display)
         old.send("/workers\r")
         old.expect("Workers (parent-filtered)")
@@ -354,11 +392,19 @@ context:
         old.expect("completed attempt; result unavailable")
         old.screen_capture(OUT, "interrupted-after-executor-restart")
         old.drain(1)
-        assert fixture_command("worker-cases-audit", "WORKER-AUDIT") == before_tips, "inspection/restart mutated a synthetic session"
+        after_tips = fixture_command("worker-cases-audit", "WORKER-AUDIT")
+        (OUT / "synthetic-tips-before.json").write_text(json.dumps(before_tips, indent=2))
+        (OUT / "synthetic-tips-after.json").write_text(json.dumps(after_tips, indent=2))
+        # Ordinary roots can receive legitimate resident-adoption/schema writes
+        # from the restarted executor. The non-executing synthetic parent and
+        # its available children must remain byte-identical; do not mistake
+        # unrelated runtime startup for an inspection effect.
+        immutable = {cases["parent"], *cases["children"].values()} & before_tips.keys()
+        changed = [sid for sid in immutable if after_tips.get(sid) != before_tips[sid]]
+        assert not changed, "inspection/restart mutated synthetic Worker sessions: " + repr(changed)
         assert len(calls) == 4, "synthetic evidence triggered a model request"
-        (OUT / "synthetic-tips.json").write_text(json.dumps(before_tips, indent=2))
         (OUT / "summary.json").write_text(json.dumps({"result": "passed", "cached_live": "parent and child", "model_calls": len(calls), "inspection_calls": 0, "old_client_join": "inspection-only child", "after_executor_restart": "completed child readable; no calls"}, indent=2))
-        print("PASS: same-service split daemon/TUI discovers live child, stale-client /join and hub reopen are inspection-only, completion/restart readable, parent draft preserved; exact native links/outcomes and summary-child-parent navigation, grouped hub and /workers survive restart; failure/missing/interrupted/stop/cancelled/legacy/denied fixtures retained native tips; 4 stub calls, 0 inspection calls")
+        print("PASS: same-service split daemon/TUI discovers live child, stale-client /join and hub reopen are inspection-only, completion/restart readable, parent draft preserved; exact native links/outcomes and summary-child-parent navigation, grouped hub and /workers survive restart; new ordinary-parent inspector survives service rebind without watcher/runtime; failure/missing/interrupted/stop/cancelled/legacy/denied fixtures retained native tips; 4 stub calls, 0 inspection calls")
 finally:
     parent_release.set()
     release.set()
@@ -377,7 +423,7 @@ finally:
     if thread.is_alive():
         http.shutdown()
     http.server_close()
-    for role in ["client", "executor", "executor-inspector"]:
+    for role in ["client", "executor", "executor-inspector", "rebind-inspector"]:
         for log in (Path(home_owner.name) / f"{role}-state").glob("*.log*"):
             target = OUT / f"{role}-logs" / log.name
             target.parent.mkdir(parents=True, exist_ok=True)
