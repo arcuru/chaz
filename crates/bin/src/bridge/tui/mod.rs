@@ -1730,6 +1730,7 @@ fn refresh_session_catalog(
     let tx = session_rows_tx.clone();
     let cancel = Arc::new(AtomicBool::new(false));
     let task = supervised::Task(tokio::spawn(async move {
+        let started = std::time::Instant::now();
         let result = supervised::read(async move {
             tokio::time::timeout(
                 std::time::Duration::from_secs(10),
@@ -1739,6 +1740,12 @@ fn refresh_session_catalog(
             .unwrap_or_else(|_| Err("Session ancestry read timed out; cached rows stale".into()))
         })
         .await;
+        tracing::info!(
+            generation,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            success = result.is_ok(),
+            "TUI session catalog completed"
+        );
         let _ = tx.send(SessionLoad::Grouped { generation, result }).await;
     }));
     app.session_fill = Some(SessionFill {
