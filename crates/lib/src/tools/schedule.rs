@@ -817,6 +817,8 @@ mod tests {
             agent_identity: None,
             turn_request_id: None,
             tool_call_key: None,
+            turn_attempt: None,
+            tool_call_site: None,
             observation_yield: None,
             call_depth: 0,
             max_call_depth: 10,

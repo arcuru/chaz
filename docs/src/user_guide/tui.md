@@ -777,14 +777,14 @@ Cancelling these presentation reads does not resolve backend-wide storage stalls
 
 ## Inspecting Worker transcripts
 
-| Control or display                                 | Meaning                                                              |
-| -------------------------------------------------- | -------------------------------------------------------------------- |
-| `[spawn]` in the session hub                       | A locally indexed Worker session; not proof of its parent or outcome |
-| Select the row, or `/join <name-or-ID>` from chat  | Open or focus an inspection-only transcript tab                      |
-| `Worker transcript · inspection only`              | No composer, stop, retry, approval or session-settings controls      |
-| `Esc` or `Ctrl+P` in the inspector                 | Open the session hub                                                 |
-| `Ctrl+H` / `Ctrl+L`, `Ctrl+W`                      | Switch tabs, or close this local view                                |
-| Arrows, PageUp/PageDown, `Ctrl+O`, mouse selection | Read, expand and copy the original transcript                        |
+| Control or display                                                    | Meaning                                                              |
+| --------------------------------------------------------------------- | -------------------------------------------------------------------- |
+| `[spawn]` in the session hub                                          | A locally indexed Worker session; not proof of its parent or outcome |
+| Select the row, `/join <name-or-ID>`, or launch with `--session NAME` | Open or focus an inspection-only transcript tab                      |
+| `Worker transcript · inspection only`                                 | No composer, stop, retry, approval or session-settings controls      |
+| `Esc` or `Ctrl+P` in the inspector                                    | Open the session hub                                                 |
+| `Ctrl+H` / `Ctrl+L`, `Ctrl+W`                                         | Switch tabs, or close this local view                                |
+| Arrows, PageUp/PageDown, `Ctrl+O`, mouse selection                    | Read, expand and copy the original transcript                        |
 
 A Worker template is configuration; its child session is a stored transcript.
 Inspecting that transcript does not invoke the template, register an executor,

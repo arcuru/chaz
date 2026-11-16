@@ -653,7 +653,7 @@ struct SessionRuntime {
 struct SpawnContext {
     worker_prompt: Option<String>,
     /// Resolved spawn-time model override for the Worker child
-    /// (`register_child_session_with_prompt` is the only producer).
+    /// (`register_worker_request` is the only producer).
     worker_model: Option<String>,
     /// Preset `role_suffix` appended to `worker_prompt`.
     worker_role_suffix: Option<String>,
@@ -2438,35 +2438,6 @@ impl Server {
         parent_tools: ScopedTools,
         parent_session_db_id: Option<&str>,
     ) -> anyhow::Result<(ConversationId, eidetica::Database, mpsc::Receiver<()>)> {
-        self.register_child_session_with_prompt(
-            agent_name,
-            backend,
-            approval_tx,
-            call_depth,
-            max_call_depth,
-            parent_tools,
-            parent_session_db_id,
-            None,
-            None,
-            None,
-        )
-        .await
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn register_child_session_with_prompt(
-        &self,
-        agent_name: &str,
-        backend: BackendManager,
-        approval_tx: Option<mpsc::Sender<ApprovalExchange>>,
-        call_depth: usize,
-        max_call_depth: usize,
-        parent_tools: ScopedTools,
-        parent_session_db_id: Option<&str>,
-        worker_prompt: Option<String>,
-        worker_model: Option<String>,
-        worker_role_suffix: Option<String>,
-    ) -> anyhow::Result<(ConversationId, eidetica::Database, mpsc::Receiver<()>)> {
         if !self.executor_authorized {
             anyhow::bail!("client server cannot create agent execution sessions");
         }
@@ -2479,8 +2450,106 @@ impl Server {
             }
             None => self.registry.create_session(Some(&source)).await?,
         };
-        let session_db_id = session_db.root_id().to_string();
+        self.install_child_runtime(
+            conversation_id,
+            session_db,
+            agent_name,
+            backend,
+            approval_tx,
+            call_depth,
+            max_call_depth,
+            parent_tools,
+            None,
+            None,
+            None,
+        )
+        .await
+    }
 
+    /// Native submission publishes a fully prepared transcript reference before
+    /// any callback, runtime claim or model/tool execution can observe its request.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn register_worker_request(
+        &self,
+        parent: &eidetica::Database,
+        directive: SessionEntry,
+        call: Option<crate::session::worker_links::WorkerCallSite>,
+        agent_name: &str,
+        backend: BackendManager,
+        approval_tx: Option<mpsc::Sender<ApprovalExchange>>,
+        call_depth: usize,
+        max_call_depth: usize,
+        parent_tools: ScopedTools,
+        worker_prompt: String,
+        worker_model: Option<String>,
+        worker_role_suffix: Option<String>,
+    ) -> anyhow::Result<(
+        ConversationId,
+        eidetica::Database,
+        mpsc::Receiver<()>,
+        TurnRequestId,
+    )> {
+        anyhow::ensure!(
+            self.executor_authorized,
+            "client server cannot create Worker execution sessions"
+        );
+        if let Some(call) = &call {
+            anyhow::ensure!(
+                !crate::session::worker_links::worker_spawns(parent)
+                    .await?
+                    .iter()
+                    .any(|spawn| spawn.call == *call),
+                "Worker invocation already recorded; inspect its existing child instead of replaying creation"
+            );
+        }
+        let spawn_id = uuid::Uuid::new_v4().to_string();
+        let source = format!("spawn:{spawn_id}");
+        let child = self
+            .registry
+            .prepare_worker_session(parent, &source)
+            .await?;
+        let id = child.root_id().to_string();
+        let setup = async {
+            let directive_id = crate::session::worker_links::prepare_directive(
+                &child, parent, &spawn_id, directive, call.is_some(),
+            ).await?;
+            if let Some(call) = call {
+                crate::session::worker_links::publish_spawn(parent, &child, &spawn_id, directive_id.clone(), call).await?;
+            }
+            let conversation = self.registry.publish_prepared_session(&child, &source).await?;
+            info!(parent_session_db_id = %parent.root_id(), child_session_db_id = %id, "Published prepared Worker child");
+            let result = self.install_child_runtime(
+                conversation, child.clone(), agent_name, backend, approval_tx,
+                call_depth, max_call_depth, parent_tools, Some(worker_prompt), worker_model, worker_role_suffix,
+            ).await?;
+            // The Directive predates the callback; wake explicitly rather than
+            // rewriting it. Generic resident adoption always excludes spawn:.
+            self.notify_tx.send(ProcessingCommand::Wake(id.clone())).await?;
+            Ok::<_, anyhow::Error>((result.0, result.1, result.2, directive_id))
+        }.await;
+        setup.map_err(|error| {
+            anyhow::anyhow!(
+                "Worker child {id} setup failed (preserved; do not replay creation): {error}"
+            )
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn install_child_runtime(
+        &self,
+        conversation_id: ConversationId,
+        session_db: eidetica::Database,
+        agent_name: &str,
+        backend: BackendManager,
+        approval_tx: Option<mpsc::Sender<ApprovalExchange>>,
+        call_depth: usize,
+        max_call_depth: usize,
+        parent_tools: ScopedTools,
+        worker_prompt: Option<String>,
+        worker_model: Option<String>,
+        worker_role_suffix: Option<String>,
+    ) -> anyhow::Result<(ConversationId, eidetica::Database, mpsc::Receiver<()>)> {
+        let session_db_id = session_db.root_id().to_string();
         let (completion_tx, completion_rx) = mpsc::channel(1);
 
         {
@@ -4135,6 +4204,10 @@ impl Server {
                 agent_identity,
                 turn_request_id: Some(attempt.request_id.clone()),
                 tool_call_key: None,
+                turn_attempt: Some(crate::tool::ToolAttemptIdentity {
+                    attempt_id: attempt.attempt_id.clone(), execution_id: branch_id.clone(),
+                }),
+                tool_call_site: None,
                 observation_yield: None,
                 call_depth: spawn.call_depth,
                 max_call_depth,

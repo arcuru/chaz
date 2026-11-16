@@ -1519,7 +1519,7 @@ async fn open_named_session(server: &Server, name: &str) -> anyhow::Result<eidet
     if let Some(id) = server.registry().find_by_name(name).await? {
         let (_conv_id, db) = server
             .registry()
-            .open_session(&id)
+            .open_session_for_inspection(&id)
             .await
             .with_context(|| format!("Failed to open session '{name}'"))?;
         return Ok(db);

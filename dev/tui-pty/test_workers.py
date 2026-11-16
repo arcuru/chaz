@@ -93,6 +93,16 @@ try:
         processes.append(service)
         assert select.select([service.stdout], [], [], 20)[0], "service did not become ready"
         assert service.stdout.readline().strip() == b"fixture service ready"
+        def worker_records(label):
+            service.stdin.write(b"worker-records\n")
+            service.stdin.flush()
+            assert select.select([service.stdout], [], [], 20)[0], "metadata read deadline"
+            line = service.stdout.readline().decode().strip()
+            assert line.startswith("WORKER-RECORDS "), line
+            records = json.loads(line.removeprefix("WORKER-RECORDS "))
+            records.sort(key=lambda record: record["spawn"]["spawn_id"])
+            (OUT / f"{label}-records.json").write_text(json.dumps(records, indent=2))
+            return records
         shared = f'''unlock_password: pty-fixture-only
 eidetica:
   connection: "unix://{socket}"
@@ -177,6 +187,11 @@ context:
         p.expect("[spawn]")
         p.expect("[tui]")
         p.screen_capture(OUT, "original-live-refreshed")
+        live_records = worker_records("live")
+        assert len(live_records) == 1
+        assert live_records[0]["outcome"] is None
+        assert live_records[0]["spawn"]["call"]["call_id"] == "native-spawn-1"
+        assert live_records[0]["origin"]["parent_session_id"] == live_records[0]["parent"]
         # The hub was loaded before child creation and has not been reopened.
         clean_log = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", (OUT / "executor.log").read_text())
         child = re.search(r"child_session_db_id=(bafyr[a-z0-9]+)", clean_log).group(1)
@@ -199,6 +214,14 @@ context:
             p.drain(.05)
             assert time.monotonic() < deadline, "visible hub did not discover second child"
         p.screen_capture(OUT, "multiple-children")
+        completed_records = worker_records("completed")
+        assert len(completed_records) == 2
+        assert {r["spawn"]["call"]["call_index"] for r in completed_records} == {0, 1}
+        for record in completed_records:
+            outcome, final_entry = record["outcome"]
+            assert outcome["directive_id"] == record["spawn"]["directive_id"]
+            assert outcome["terminal"] == "reply"
+            assert final_entry["content"] == "CHILD-RESULT"
         old.send("unsent-parent-draft")
         old.expect("unsent-parent-draft")
         old.send("\x10")
@@ -237,8 +260,9 @@ context:
         while time.monotonic() < deadline:
             again.drain(.05)
         assert len(calls) == 4
+        assert worker_records("after-restart") == completed_records, "inspection/restart rewrote native references or results"
         (OUT / "summary.json").write_text(json.dumps({"result": "passed", "cached_live": "parent and child", "model_calls": len(calls), "inspection_calls": 0, "old_client_join": "inspection-only child", "after_executor_restart": "completed child readable; no calls"}, indent=2))
-        print("PASS: same-service split daemon/TUI discovers live child, stale-client /join and hub reopen are inspection-only, completion/restart readable, parent draft preserved; 4 stub calls, 0 inspection calls")
+        print("PASS: same-service split daemon/TUI discovers live child, stale-client /join and hub reopen are inspection-only, completion/restart readable, parent draft preserved; exact native links and atomic outcomes survive restart; 4 stub calls, 0 inspection calls")
 finally:
     parent_release.set()
     release.set()

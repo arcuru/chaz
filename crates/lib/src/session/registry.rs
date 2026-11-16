@@ -379,11 +379,22 @@ impl SessionRegistry {
         &self,
         prepared: PreparedAgentJob,
     ) -> anyhow::Result<ConversationId> {
-        let id = prepared.db.root_id().to_string();
+        self.publish_prepared_session(&prepared.db, &prepared.source)
+            .await
+    }
+
+    /// Shared catalog publication; preparation in the source DB must finish first.
+    pub(crate) async fn publish_prepared_session(
+        &self,
+        db: &Database,
+        source: &str,
+    ) -> anyhow::Result<ConversationId> {
+        let id = db.root_id().to_string();
+        let source = source.to_string();
         let txn = self.chaz_group.new_transaction().await?;
         txn.get_store::<DocStore>(STORE_SESSIONS)
             .await?
-            .set_string(&id, &prepared.source)
+            .set_string(&id, &source)
             .await?;
         txn.get_store::<DocStore>(STORE_SESSION_CATALOG)
             .await?
@@ -391,8 +402,8 @@ impl SessionRegistry {
                 &id,
                 serde_json::to_string(&SessionCatalogEntry {
                     session_db_id: id.clone(),
-                    source: Some(prepared.source.clone()),
-                    bridge: BridgeKind::from_source(Some(&prepared.source)),
+                    source: Some(source.clone()),
+                    bridge: BridgeKind::from_source(Some(&source)),
                     created_at: Utc::now(),
                     status: SessionStatus::Active,
                 })?,
@@ -405,7 +416,7 @@ impl SessionRegistry {
             .insert(id.clone());
         let _ = self.new_session_tx.try_send(NewSessionEvent {
             session_db_id: id.clone(),
-            source: Some(prepared.source),
+            source: Some(source),
         });
         Ok(ConversationId(id))
     }
@@ -554,6 +565,49 @@ impl SessionRegistry {
         );
 
         Ok((conv_id, child_db))
+    }
+
+    /// Allocate an unindexed Worker using the actual parent's bound handle.
+    /// Catalog publication and runtime installation are separate later effects.
+    pub(crate) async fn prepare_worker_session(
+        &self,
+        parent: &Database,
+        source: &str,
+    ) -> anyhow::Result<Database> {
+        let db = {
+            let mut user = self.user.lock().await;
+            let mut settings = eidetica::crdt::Doc::new();
+            settings.set("name", format!("session:{source}"));
+            let key = user.get_default_key()?;
+            user.create_database(settings, &key).await?
+        };
+        let setup = async {
+            super::Session::initialize_turn_schema(&db).await?;
+            crate::db_kind::write_marker(&db, crate::db_kind::KIND_SESSION, source).await?;
+            let txn = db.new_transaction().await?;
+            txn.get_settings()?
+                .add_delegated_tree(DelegatedTreeRef {
+                    permission_bounds: PermissionBounds {
+                        max: Permission::Admin(0),
+                        min: None,
+                    },
+                    tree: TreeReference {
+                        root: parent.root_id().clone(),
+                        tips: parent.snapshot().await?.into_tips(),
+                    },
+                })
+                .await?;
+            txn.commit().await?;
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        setup.map_err(|error| {
+            anyhow::anyhow!(
+                "Unindexed Worker child {} preparation failed (preserved): {error}",
+                db.root_id()
+            )
+        })?;
+        Ok(db)
     }
 
     /// Open an existing session database by its eidetica root ID.

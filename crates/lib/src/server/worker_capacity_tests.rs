@@ -618,3 +618,252 @@ async fn worker_stop_observation_and_reacquisition(user_stop: bool) {
         slot.clear();
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn native_worker_links_precede_execution_and_resolve_each_exact_result() {
+    use crate::session::worker_links::*;
+    let (_owner, server, slot, child) = worker_fixture().await;
+    child.push_text("first child result");
+    child.push_text("second child result");
+    let gate = child.block_next_call();
+    let mock = Arc::new(MockBackend::new());
+    for task in ["first assignment", "second assignment"] {
+        // Providers may reuse a call ID in another model response. The full
+        // native call site must keep these two creations distinct.
+        mock.push_tool_calls([(
+            "reused-call".into(),
+            "spawn_worker".into(),
+            serde_json::json!({"name":"helper","task":task}).to_string(),
+        )]);
+    }
+    mock.push_text("parent complete");
+    let (sid, db) = server
+        .registry
+        .create_session(Some("worker-parent"))
+        .await
+        .unwrap();
+    let (security, approval_task) =
+        crate::test_support::security_with_decision(crate::bridge::ApprovalDecision::Approve);
+    server
+        .register_session(
+            &db,
+            BackendManager::with_mock(
+                mock.clone(),
+                crate::security::SecretStore::new(server.registry.chaz_peer().clone()).await,
+            ),
+            Some("default".into()),
+            security.approval_callback,
+        )
+        .await
+        .unwrap();
+    let mut session = Session::new(sid.clone(), db.clone()).await;
+    let request = session
+        .add_entry(SessionEntry {
+            sender: "user".into(),
+            content: "delegate".into(),
+            timestamp: Utc::now(),
+            entry_type: EntryType::Directive,
+            metadata: None,
+            routing: None,
+        })
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(10), gate.wait_started())
+        .await
+        .unwrap();
+    let first = worker_spawns(&db).await.unwrap();
+    assert_eq!(
+        first.len(),
+        1,
+        "parent reference must already exist before child calls its model"
+    );
+    assert_eq!(first[0].call.request_id, request);
+    assert_eq!(first[0].call.agent, "default");
+    assert_eq!(first[0].call.execution_id, None);
+    let (_, child_db) = server
+        .registry
+        .open_session(&first[0].child_session_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        verify_worker_spawn(&db, &child_db, &first[0])
+            .await
+            .unwrap()
+            .content,
+        "first assignment"
+    );
+    assert!(
+        latest_worker_outcome(&child_db, &first[0].directive_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    gate.release();
+    await_no_processing(&server, &sid.0).await;
+    let mut links = worker_spawns(&db).await.unwrap();
+    links.sort_by_key(|link| link.call.model_sequence);
+    assert_eq!(links.len(), 2);
+    assert_ne!(links[0].spawn_id, links[1].spawn_id);
+    assert_ne!(links[0].child_session_id, links[1].child_session_id);
+    for (index, link) in links.iter().enumerate() {
+        assert_eq!(link.call.call_id, "reused-call");
+        assert_eq!(link.call.call_index, 0);
+        assert_eq!(link.call.model_sequence, index as u64);
+        assert_eq!(
+            link.call.attempt_id,
+            session.attempts_for_test().await[0].attempt_id
+        );
+        let (_, child_db) = server
+            .registry
+            .open_session(&link.child_session_id)
+            .await
+            .unwrap();
+        verify_worker_spawn(&db, &child_db, link).await.unwrap();
+        let (outcome, result) = latest_worker_outcome(&child_db, &link.directive_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(outcome.terminal, WorkerTerminal::Reply);
+        assert_eq!(
+            result.unwrap().content,
+            ["first child result", "second child result"][index]
+        );
+    }
+    assert_eq!(mock.recorded_calls().len(), 3);
+    assert_eq!(child.recorded_calls().len(), 2);
+    let tool_results: Vec<_> = mock
+        .recorded_calls()
+        .last()
+        .unwrap()
+        .messages
+        .iter()
+        .filter_map(|m| match m {
+            runtime::RuntimeMessage::ToolResult { content, .. } => Some(content.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(tool_results[0].contains("first child result"));
+    assert!(tool_results[1].contains("second child result"));
+    approval_task.abort();
+    server.shutdown().await;
+    slot.clear();
+}
+
+#[tokio::test]
+async fn prepared_worker_reference_and_catalog_are_not_execution_requests() {
+    use crate::session::worker_links::*;
+    let (_owner, server, slot, model) = worker_fixture().await;
+    let (_, parent) = server
+        .registry
+        .create_session(Some("parent"))
+        .await
+        .unwrap();
+    let child = server
+        .registry
+        .prepare_worker_session(&parent, "spawn:prepared-only")
+        .await
+        .unwrap();
+    let directive = prepare_directive(
+        &child,
+        &parent,
+        "prepared-only",
+        SessionEntry {
+            sender: "default".into(),
+            content: "do not execute".into(),
+            timestamp: Utc::now(),
+            entry_type: EntryType::Directive,
+            metadata: None,
+            routing: None,
+        },
+        true,
+    )
+    .await
+    .unwrap();
+    assert!(
+        !server
+            .registry
+            .list_sessions()
+            .await
+            .unwrap()
+            .iter()
+            .any(|row| row.session_db_id == child.root_id().to_string())
+    );
+    assert!(
+        server
+            .sessions
+            .lock()
+            .await
+            .get(&child.root_id().to_string())
+            .is_none()
+    );
+    // Failure to find the recorded invocation cannot publish a parent link.
+    let bad_call = WorkerCallSite {
+        request_id: TurnRequestId::parse("missing"),
+        attempt_id: "missing".into(),
+        execution_id: None,
+        agent: "default".into(),
+        model_sequence: 0,
+        call_index: 0,
+        call_id: "missing".into(),
+    };
+    assert!(
+        publish_spawn(&parent, &child, "prepared-only", directive, bad_call)
+            .await
+            .is_err()
+    );
+    assert!(worker_spawns(&parent).await.unwrap().is_empty());
+    server
+        .registry
+        .publish_prepared_session(&child, "spawn:prepared-only")
+        .await
+        .unwrap();
+    // Exercise the resident's actual adoption decision after publication. A
+    // catalog entry or a backlink must not recreate template/tool authority.
+    let row = server
+        .registry
+        .list_sessions()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|row| row.session_db_id == child.root_id().to_string())
+        .unwrap();
+    let observer_registry = Arc::new(
+        crate::session::SessionRegistry::new(
+            server.registry.instance().clone(),
+            server
+                .registry
+                .instance()
+                .login_account("test", "test-password")
+                .await
+                .unwrap(),
+            server.agents.clone(),
+        )
+        .await
+        .unwrap(),
+    );
+    let (_second_owner, observer, _) = server_fixture_from_registry(observer_registry).await;
+    assert!(observer.adopt_local_client_session(row).await);
+    assert!(
+        observer
+            .sessions
+            .lock()
+            .await
+            .get(&child.root_id().to_string())
+            .is_none()
+    );
+    observer.shutdown().await;
+    let session = Session::new(ConversationId(child.root_id().to_string()), child.clone()).await;
+    assert_eq!(session.entries().len(), 1);
+    assert!(session.attempts_for_test().await.is_empty());
+    assert!(model.recorded_calls().is_empty());
+    assert!(
+        server
+            .sessions
+            .lock()
+            .await
+            .get(&child.root_id().to_string())
+            .is_none()
+    );
+    server.shutdown().await;
+    slot.clear();
+}

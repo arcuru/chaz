@@ -1,9 +1,9 @@
 # Inspecting Worker Sessions
 
-Status: partial implementation. Same-service catalog refresh and inspection-only
-Worker opening are implemented. Exact spawn relations, terminal references,
-parent summaries, grouping and parent navigation below remain an implementation
-contract, not shipped behavior.
+Status: partial implementation. Same-service catalog refresh, inspection-only
+Worker opening, exact native spawn relations, staged publication and atomic
+terminal references are implemented. Parent summaries, grouping and parent
+navigation below remain an implementation contract, not shipped behavior.
 
 A Worker template is configuration, a session is a durable transcript, and a turn
 attempt is an execution of one request in that transcript.
