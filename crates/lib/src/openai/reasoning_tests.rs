@@ -26,7 +26,11 @@ fn model(name: &str, api: Option<ModelApi>, reasoning: Option<ReasoningConfig>) 
 }
 
 fn effort(effort: ReasoningEffort, format: Option<ReasoningFormat>) -> Option<ReasoningConfig> {
-    Some(ReasoningConfig { effort, format })
+    Some(ReasoningConfig {
+        effort: Some(effort),
+        format,
+        supported_efforts: None,
+    })
 }
 
 fn backend(server: &MockServer, kind: BackendType, models: Vec<Model>) -> Backend {
@@ -529,4 +533,267 @@ async fn http_200_error_envelopes_keep_their_classification() {
             .starts_with("Invalid request: Response deserialize error")
     );
     assert!(!error.to_string().contains("secret transcript"), "{error}");
+}
+
+#[tokio::test]
+async fn session_reasoning_reaches_real_runtime_and_plain_wire_on_each_api() {
+    use crate::{
+        config::Config,
+        test_support::{fresh_session, permissive_security, tool_context},
+        tool::{ToolPolicyRegistry, ToolRegistry},
+    };
+    use std::sync::Arc;
+    for (api, format, endpoint, response, field) in [
+        (
+            ModelApi::ChatCompletions,
+            None,
+            "/v1/chat/completions",
+            chat_ok(),
+            "reasoning",
+        ),
+        (
+            ModelApi::ChatCompletions,
+            Some(ReasoningFormat::OpenAI),
+            "/v1/chat/completions",
+            chat_ok(),
+            "reasoning_effort",
+        ),
+        (
+            ModelApi::Responses,
+            None,
+            "/v1/responses",
+            responses_ok(),
+            "reasoning",
+        ),
+    ] {
+        let server = MockServer::start().await;
+        stub(
+            &server,
+            endpoint,
+            ResponseTemplate::new(200).set_body_json(response),
+        )
+        .await;
+        let config = Config {
+            default_reasoning: Some(ReasoningEffort::High),
+            backends: Some(vec![backend(
+                &server,
+                BackendType::OpenAICompatible,
+                vec![model(
+                    "test-model",
+                    Some(api),
+                    Some(ReasoningConfig {
+                        effort: None,
+                        format,
+                        supported_efforts: Some(vec![
+                            ReasoningEffort::None,
+                            ReasoningEffort::Low,
+                            ReasoningEffort::High,
+                        ]),
+                    }),
+                )],
+            )]),
+            ..Default::default()
+        };
+        let manager = BackendManager::from_config(&config, empty_secrets().await);
+        let (_instance, session) = fresh_session().await;
+        let ctx = tool_context(session.clone(), Arc::new(ToolRegistry::new()));
+        let key = manager.reasoning_key(Some("stub:test-model")).unwrap();
+        let history = vec![
+            RuntimeMessage::User("retained context".into()),
+            RuntimeMessage::User("new question".into()),
+        ];
+        for (selection, expected) in [
+            (Some(Some(ReasoningEffort::Low)), Some("low")),
+            (Some(None), None),
+            (Some(Some(ReasoningEffort::None)), Some("none")),
+            (None, Some("high")),
+        ] {
+            session
+                .lock()
+                .await
+                .update_meta(|m| {
+                    if let Some(effort) = selection {
+                        m.reasoning_overrides.insert(key.clone(), effort);
+                    } else {
+                        m.reasoning_overrides.remove(&key);
+                    }
+                })
+                .await
+                .unwrap();
+            crate::runtime::execute(
+                Some("stub:test-model"),
+                history.clone(),
+                &manager,
+                &permissive_security(),
+                &ctx,
+                &ToolPolicyRegistry::empty(),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+            let all = bodies(&server).await;
+            let body = all.last().unwrap();
+            let sent = if field == "reasoning_effort" {
+                body.get(field).and_then(Value::as_str)
+            } else {
+                body.pointer("/reasoning/effort").and_then(Value::as_str)
+            };
+            assert_eq!(sent, expected, "{api:?}: {body}");
+            assert_eq!(
+                body.get(if field == "reasoning" {
+                    "reasoning_effort"
+                } else {
+                    "reasoning"
+                }),
+                None
+            );
+            let encoded = body.to_string();
+            assert!(
+                encoded.contains("retained context") && encoded.contains("new question"),
+                "context lost: {body}"
+            );
+            // The no-tools/legacy path resolves the identical turn-local preference.
+            let overrides = session
+                .lock()
+                .await
+                .try_read_meta()
+                .await
+                .unwrap()
+                .reasoning_overrides;
+            manager
+                .with_reasoning_overrides(overrides)
+                .execute(&plain("stub:test-model"))
+                .await
+                .unwrap();
+            let all = bodies(&server).await;
+            let body = all.last().unwrap();
+            let sent = if field == "reasoning_effort" {
+                body.get(field).and_then(Value::as_str)
+            } else {
+                body.pointer("/reasoning/effort").and_then(Value::as_str)
+            };
+            assert_eq!(sent, expected, "plain {api:?}: {body}");
+        }
+        assert_eq!(bodies(&server).await.len(), 8);
+        // A rejected capability never escapes to the network. The positive calls
+        // above prove this recording server would observe a request.
+        session
+            .lock()
+            .await
+            .update_meta(|m| {
+                m.reasoning_overrides
+                    .insert(key.clone(), Some(ReasoningEffort::Max));
+            })
+            .await
+            .unwrap();
+        let error = crate::runtime::execute(
+            Some("stub:test-model"),
+            history,
+            &manager,
+            &permissive_security(),
+            &ctx,
+            &ToolPolicyRegistry::empty(),
+            None,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("unsupported"), "{error}");
+        assert_eq!(bodies(&server).await.len(), 8);
+        if api == ModelApi::Responses {
+            // A valid session selection must replace even an invalid configured
+            // effort in Responses preflight, not only in the HTTP serializer.
+            let mut changed = config.clone();
+            let reasoning = changed.backends.as_mut().unwrap()[0]
+                .models
+                .as_mut()
+                .unwrap()[0]
+                .reasoning
+                .as_mut()
+                .unwrap();
+            reasoning.effort = Some(ReasoningEffort::Max);
+            reasoning
+                .supported_efforts
+                .as_mut()
+                .unwrap()
+                .push(ReasoningEffort::Max);
+            let changed = BackendManager::from_config(&changed, empty_secrets().await);
+            let (_instance, recovery) = fresh_session().await;
+            let recovery_ctx = tool_context(recovery.clone(), Arc::new(ToolRegistry::new()));
+            assert!(
+                crate::runtime::execute(
+                    Some("stub:test-model"),
+                    user(),
+                    &changed,
+                    &permissive_security(),
+                    &recovery_ctx,
+                    &ToolPolicyRegistry::empty(),
+                    None,
+                    None
+                )
+                .await
+                .unwrap_err()
+                .contains("unsupported")
+            );
+            assert_eq!(bodies(&server).await.len(), 8);
+            for selected in [None, Some(ReasoningEffort::High)] {
+                recovery
+                    .lock()
+                    .await
+                    .update_meta(|m| {
+                        m.reasoning_overrides.insert(key.clone(), selected);
+                    })
+                    .await
+                    .unwrap();
+                crate::runtime::execute(
+                    Some("stub:test-model"),
+                    user(),
+                    &changed,
+                    &permissive_security(),
+                    &recovery_ctx,
+                    &ToolPolicyRegistry::empty(),
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+                let all = bodies(&server).await;
+                assert_eq!(
+                    all.last()
+                        .unwrap()
+                        .pointer("/reasoning/effort")
+                        .and_then(Value::as_str),
+                    selected.map(ReasoningEffort::as_str)
+                );
+            }
+        }
+        let sent_count = bodies(&server).await.len();
+        // A malformed persisted control fails closed, rather than reverting to default.
+        let db = session.lock().await.database().clone();
+        let txn = db.new_transaction().await.unwrap();
+        txn.get_store::<eidetica::store::DocStore>("meta")
+            .await
+            .unwrap()
+            .set_string("reasoning_overrides", "invalid-json")
+            .await
+            .unwrap();
+        txn.commit().await.unwrap();
+        assert!(
+            crate::runtime::execute(
+                Some("stub:test-model"),
+                user(),
+                &manager,
+                &permissive_security(),
+                &ctx,
+                &ToolPolicyRegistry::empty(),
+                None,
+                None
+            )
+            .await
+            .unwrap_err()
+            .contains("Failed to read session reasoning")
+        );
+        assert_eq!(bodies(&server).await.len(), sent_count);
+    }
 }

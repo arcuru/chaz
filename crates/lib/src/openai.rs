@@ -1296,7 +1296,8 @@ mod tests {
             name: "test-model".into(),
             api: None,
             reasoning: reasoning.map(|effort| crate::config::ReasoningConfig {
-                effort,
+                effort: Some(effort),
+                supported_efforts: None,
                 format: None,
             }),
             price_input: None,

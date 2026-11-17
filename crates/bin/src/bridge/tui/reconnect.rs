@@ -190,7 +190,7 @@ pub(super) async fn rebuild(
             });
             (e.to_string(), transient)
         })?;
-    let backend = BackendManager::new(&config.backends, built.secret_store.clone());
+    let backend = BackendManager::from_config(&config, built.secret_store.clone());
     let mut reopened = Vec::new();
     for (id, incarnation, mode) in tabs {
         reopened.push(

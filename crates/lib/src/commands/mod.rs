@@ -244,6 +244,8 @@ pub enum Command {
 
     // --- LLM configuration (per-session) ---
     Model(Option<String>),
+    /// Current session, effective current-agent model only.
+    Reasoning(Option<String>),
     /// Per-agent model override scoped to the current session. `Some(id)`
     /// pins that agent to the given model id; `None` clears the override
     /// so the agent falls back to the session-wide pin / its own default.
@@ -297,6 +299,7 @@ pub const BUILTIN_COMMAND_NAMES: &[&str] = &[
     "rename",
     "role",
     "model",
+    "reasoning",
     "channels",
     "agents",
     "pubkey",
@@ -518,6 +521,7 @@ pub async fn dispatch(cmd: Command, ctx: &CommandContext<'_>) -> CommandOutcome 
         Command::SharingReject(id) => Box::pin(sharing::sharing_reject(&id, ctx)).await,
         Command::SharingStatus => Box::pin(sharing::sharing_status(ctx)).await,
         Command::Extensions(action) => Box::pin(extensions::dispatch(action, ctx)).await,
+        Command::Reasoning(arg) => Box::pin(session::reasoning(arg, ctx)).await,
         Command::Model(arg) => Box::pin(session::model(arg, ctx)).await,
         Command::AgentModel { agent, model } => {
             Box::pin(session::agent_model(&agent, model, ctx)).await

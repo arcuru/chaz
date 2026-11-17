@@ -479,6 +479,10 @@ pub struct SessionMeta {
     /// Stored as a JSON map in the meta DocStore under `agent_models`.
     #[serde(default)]
     pub agent_models: HashMap<String, String>,
+    /// Model-bound session reasoning overrides. Missing key inherits defaults;
+    /// a null value explicitly requests provider default (not effort `none`).
+    #[serde(default)]
+    pub reasoning_overrides: HashMap<String, Option<crate::config::ReasoningEffort>>,
     pub role_name: Option<String>,
     pub role_prompt: Option<String>,
     pub backend_name: Option<String>,
@@ -2461,6 +2465,9 @@ pub async fn read_meta_from_db(database: &Database) -> SessionMeta {
         host_agent_db_id: text("host_agent_db_id"),
         model: text("model"),
         agent_models,
+        reasoning_overrides: text("reasoning_overrides")
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default(),
         role_name: text("role_name"),
         role_prompt: text("role_prompt"),
         backend_name: text("backend_name"),
@@ -2508,6 +2515,7 @@ pub async fn try_read_meta_at(
         host_agent_db_id: text("host_agent_db_id")?,
         model: text("model")?,
         agent_models: json(text("agent_models")?)?,
+        reasoning_overrides: json(text("reasoning_overrides")?)?,
         role_name: text("role_name")?,
         role_prompt: text("role_prompt")?,
         backend_name: text("backend_name")?,
@@ -2565,6 +2573,10 @@ where
         let json = serde_json::to_string(&current.agent_models)?;
         store.set_string("agent_models", json).await?;
     }
+    let reasoning = (!current.reasoning_overrides.is_empty())
+        .then(|| serde_json::to_string(&current.reasoning_overrides))
+        .transpose()?;
+    write_field(&store, "reasoning_overrides", reasoning.as_deref()).await?;
     let participation = current
         .ambient_participation
         .as_ref()

@@ -632,6 +632,7 @@ impl Context {
                     | Command::ClearSessionName
                     | Command::DescribeSession(_)
                     | Command::ClearSessionDescription
+                    | Command::Reasoning(_)
                     | Command::Model(_)
                     | Command::AgentModel { .. }
                     | Command::AgentAdd(_)
@@ -797,6 +798,7 @@ pub(super) fn command_is_read(cmd: &Command) -> bool {
             | Command::AgentsList
             | Command::AgentRoom
             | Command::ListChannels
+            | Command::Reasoning(None)
             | Command::Model(None)
     )
 }

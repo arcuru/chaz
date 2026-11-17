@@ -228,11 +228,11 @@ pub async fn get_backend(
     if let Some(config_backends) = &config.backends {
         backends.extend(config_backends.clone());
     }
-    if backends.is_empty() {
-        BackendManager::new(&None, secrets.clone())
-    } else {
-        BackendManager::new(&Some(backends), secrets.clone())
-    }
+    let config = Config {
+        backends: (!backends.is_empty()).then_some(backends),
+        ..config.clone()
+    };
+    BackendManager::from_config(&config, secrets.clone())
 }
 
 /// Try to clean up the response from the model containing a summary

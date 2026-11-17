@@ -1,3 +1,6 @@
+mod reasoning;
+pub use reasoning::ReasoningState;
+
 /// Manage all the backends for chaz.
 ///
 /// This module is responsible for handling dispatch, validation, and general management for all the different backends
@@ -268,6 +271,8 @@ pub struct BackendManager {
     backends: Vec<Backend>,
     secrets: SecretStore,
     session_scope: Option<(String, String)>,
+    default_reasoning: Option<crate::config::ReasoningEffort>,
+    reasoning_overrides: HashMap<String, Option<crate::config::ReasoningEffort>>,
     /// Optional override used by integration tests to bypass the OpenAI dispatch
     /// path. When set, `chat_with_tools_for_model` and `supports_tools_for_model`
     /// route through this trait object instead of constructing an `OpenAI` from
@@ -343,6 +348,8 @@ impl BackendManager {
             backends: backends.as_ref().cloned().unwrap_or_default(),
             secrets,
             session_scope: None,
+            default_reasoning: None,
+            reasoning_overrides: HashMap::new(),
             mock: None,
             model_windows: Arc::new(RwLock::new(HashMap::new())),
             model_info: Arc::new(RwLock::new(HashMap::new())),
@@ -365,6 +372,8 @@ impl BackendManager {
             backends: Vec::new(),
             secrets,
             session_scope: None,
+            default_reasoning: None,
+            reasoning_overrides: HashMap::new(),
             mock: Some(mock),
             model_windows: Arc::new(RwLock::new(HashMap::new())),
             model_info: Arc::new(RwLock::new(HashMap::new())),
@@ -582,12 +591,6 @@ impl BackendManager {
         }
     }
 
-    /// Select the backend based on the model name in a ChatContext.
-    /// Used by legacy code paths (Matrix commands, /compact).
-    fn select_backend(&self, context: &ChatContext) -> &Backend {
-        self.select_backend_for_model(context.model.as_deref())
-    }
-
     /// Execute a ChatContext (simple, no tools).
     /// Used by Matrix commands and /compact — not by the runtime.
     pub async fn execute(&self, context: &ChatContext) -> Result<String, LlmError> {
@@ -599,9 +602,9 @@ impl BackendManager {
                 message: "No backends configured".to_string(),
             });
         }
-        let backend = self.select_backend(context);
+        let backend = self.request_backend(context.model.as_deref())?;
         let model = self.resolve_model_name(context.model.as_deref());
-        BackendClient::for_model(backend, &self.secrets, &model)?
+        BackendClient::for_model(&backend, &self.secrets, &model)?
             .execute(context)
             .await
     }
@@ -622,9 +625,9 @@ impl BackendManager {
         if self.backends.is_empty() {
             return Ok(false);
         }
-        let backend = self.select_backend_for_model(model);
         let resolved = self.resolve_model_name(model);
-        Ok(BackendClient::for_model(backend, &self.secrets, &resolved)?.supports_tools())
+        let backend = self.request_backend(model)?;
+        Ok(BackendClient::for_model(&backend, &self.secrets, &resolved)?.supports_tools())
     }
 
     /// Resolve a model name: strip backend prefix, fall back to default.
@@ -713,9 +716,9 @@ impl BackendManager {
                 message: "No backends configured".into(),
             });
         }
-        let backend = self.select_backend_for_model(model);
+        let backend = self.request_backend(model)?;
         if backend.api_for_model(resolved_model) == ModelApi::Responses {
-            crate::responses::Responses::new(backend, &self.secrets)
+            crate::responses::Responses::new(&backend, &self.secrets)
                 .validate_request(messages, resolved_model)?;
         } else {
             crate::responses::validate_foreign_history(messages)?;
@@ -754,8 +757,8 @@ impl BackendManager {
             });
         }
         let resolved = self.resolve_model_name(model);
-        let backend = self.select_backend_for_model(model);
-        let client = BackendClient::for_model(backend, &self.secrets, &resolved)?;
+        let backend = self.request_backend(model)?;
+        let client = BackendClient::for_model(&backend, &self.secrets, &resolved)?;
         let cache = crate::extensions::context::default_cache_options();
         let limit = Some(max_output_tokens.min(backend.max_output_tokens()));
         with_backend!(client,
@@ -804,7 +807,8 @@ impl BackendManager {
             .session_scope
             .as_ref()
             .map(|(session, caller)| self.secrets.session_cache_key(session, caller, backend));
-        let client = BackendClient::for_model(backend, &self.secrets, resolved_model)?;
+        let backend = self.request_backend(model)?;
+        let client = BackendClient::for_model(&backend, &self.secrets, resolved_model)?;
         if backend.api_for_model(resolved_model) != ModelApi::Responses {
             crate::responses::validate_foreign_history(messages)?;
         }
@@ -1218,7 +1222,8 @@ mod tests {
                 name: "test-model".into(),
                 api: Some(api),
                 reasoning: Some(crate::config::ReasoningConfig {
-                    effort: crate::config::ReasoningEffort::High,
+                    supported_efforts: None,
+                    effort: Some(crate::config::ReasoningEffort::High),
                     format: None,
                 }),
                 price_input: None,

@@ -87,6 +87,7 @@ pub fn parse(input: &str) -> Parsed {
         // No-arg `/description` clears it, mirroring `/name`; `/info` shows it.
         "/description" => return Parsed::Command(Command::ClearSessionDescription),
         "/role" => return Parsed::Command(Command::Role(None)),
+        "/reasoning" => return Parsed::Command(Command::Reasoning(None)),
         "/model" => return Parsed::Command(Command::Model(None)),
         "/channels" => return Parsed::Command(Command::ListChannels),
         "/agents" => return Parsed::Command(Command::AgentsList),
@@ -437,6 +438,9 @@ pub fn parse(input: &str) -> Parsed {
             Parsed::Command(Command::Sync(ticket.to_string()))
         };
     }
+    if let Some(arg) = text.strip_prefix("/reasoning ") {
+        return Parsed::Command(Command::Reasoning(Some(arg.trim().to_string())));
+    }
     if let Some(arg) = text.strip_prefix("/model ") {
         let trimmed = arg.trim();
         if trimmed.is_empty() {
@@ -597,6 +601,16 @@ mod tests {
         match cmd("/rename foo") {
             Command::NameSession(n) => assert_eq!(n, "foo"),
             other => panic!("expected NameSession, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reasoning_show_and_selection_are_shared_commands() {
+        assert!(matches!(cmd("/reasoning"), Command::Reasoning(None)));
+        for arg in ["high", "provider", "default", "cycle"] {
+            assert!(
+                matches!(cmd(&format!("/reasoning {arg}")), Command::Reasoning(Some(value)) if value == arg)
+            );
         }
     }
 

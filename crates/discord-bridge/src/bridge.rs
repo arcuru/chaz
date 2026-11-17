@@ -459,7 +459,7 @@ impl Handler {
             )
             .await?;
         let session_db_id = session_db.root_id().to_string();
-        let backend = BackendManager::new(&self.config.backends, self.secrets.clone());
+        let backend = BackendManager::from_config(&self.config, self.secrets.clone());
         let meta = chaz_core::session::read_meta_from_db(&session_db).await;
         let agent = self
             .server

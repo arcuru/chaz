@@ -107,7 +107,7 @@ impl TuiBridge {
     ) -> anyhow::Result<Option<String>> {
         let mut reconnect_allowed = true;
         let mut app = app;
-        let mut backend = BackendManager::new(&self.config.backends, self.secrets.clone());
+        let mut backend = BackendManager::from_config(&self.config, self.secrets.clone());
         // One-shot-style delivery of background model catalog fetches.
         // Buffered so a force-refresh kicked off mid-render doesn't block.
         let (models_tx, mut models_rx) = mpsc::channel::<ModelCatalog>(4);
@@ -578,8 +578,8 @@ impl TuiBridge {
                                     *server = replacement.built.server.clone();
                                     catalog_changes = server.registry().catalog_changes();
                                     self.secrets = replacement.built.secret_store.clone();
-                                    backend = BackendManager::new(
-                                        &self.config.backends,
+                                    backend = BackendManager::from_config(
+                                        &self.config,
                                         self.secrets.clone(),
                                     );
                                     reconnect::apply(&mut app, &mut replacement);

@@ -62,7 +62,8 @@ async fn ordered_wire_replay_keeps_every_item_and_call_id() {
     let mut config = backend(&format!("{}/v1/", server.uri()));
     config.max_tokens = Some(1234);
     config.models.as_mut().unwrap()[0].reasoning = Some(ReasoningConfig {
-        effort: ReasoningEffort::XHigh,
+        supported_efforts: None,
+        effort: Some(ReasoningEffort::XHigh),
         format: None,
     });
     let client = Responses::new(&config, &secrets);
@@ -441,7 +442,8 @@ async fn unsupported_reasoning_and_corrupt_replay_fail_before_http() {
     let server = MockServer::start().await;
     let mut config = backend(&server.uri());
     config.models.as_mut().unwrap()[0].reasoning = Some(ReasoningConfig {
-        effort: ReasoningEffort::Max,
+        supported_efforts: None,
+        effort: Some(ReasoningEffort::Max),
         format: None,
     });
     let client = Responses::new(&config, &empty_secrets().await);
