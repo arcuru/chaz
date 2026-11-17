@@ -160,19 +160,13 @@ impl TurnCompleteContext<'_> {
         super::read_settings_checked(self.db, self.extension).await
     }
 
-    /// Merge a patch into this extension's current settings.
+    /// Assign top-level fields in this extension's settings. Nested objects and
+    /// arrays in the patch replace the whole field rather than recursively merge.
     pub async fn update_settings(&self, patch: Value) -> anyhow::Result<()> {
-        let mut settings = self.settings().await?;
-        let object = settings
-            .as_object_mut()
-            .ok_or_else(|| anyhow::anyhow!("extension settings must be an object"))?;
-        object.extend(
-            patch
-                .as_object()
-                .ok_or_else(|| anyhow::anyhow!("settings patch must be an object"))?
-                .clone(),
-        );
-        super::write_settings(self.db, self.extension, settings).await
+        let patch = patch
+            .as_object()
+            .ok_or_else(|| anyhow::anyhow!("settings patch must be an object"))?;
+        super::patch_settings(self.db, self.extension, true, patch.clone()).await
     }
 
     /// One tool-free model call per endpoint invocation, limited to 10 seconds

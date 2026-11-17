@@ -364,6 +364,13 @@ pub fn parse(input: &str) -> Parsed {
             Parsed::Command(Command::Extensions(ExtensionsAction::Remove(name, scope)))
         };
     }
+    if text.starts_with("/extensions migrate-settings") {
+        return if text == "/extensions migrate-settings --old-clients-stopped" {
+            Parsed::Command(Command::Extensions(ExtensionsAction::MigrateSettings))
+        } else {
+            Parsed::Usage("Offline conversion only: stop and upgrade ALL session-sharing clients to Chaz >= 0.4.0, back up all peers, then use /extensions migrate-settings --old-clients-stopped".into())
+        };
+    }
     if let Some(arg) = text.strip_prefix("/extensions settings ") {
         let name = arg.trim();
         return if name.is_empty() {
@@ -741,6 +748,14 @@ mod tests {
             Command::Extensions(ExtensionsAction::List)
         ));
         assert!(usage("/extensions add ").starts_with("Usage: /extensions add"));
+        assert!(matches!(
+            cmd("/extensions migrate-settings --old-clients-stopped"),
+            Command::Extensions(ExtensionsAction::MigrateSettings)
+        ));
+        assert!(usage("/extensions migrate-settings").contains("stop and upgrade ALL"));
+        assert!(
+            usage("/extensions migrate-settings --unknown").contains("Offline conversion only")
+        );
     }
 
     #[test]

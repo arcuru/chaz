@@ -26,9 +26,16 @@ pub(crate) struct EntryReads(
     Arc<AtomicUsize>,
     Arc<AtomicUsize>,
     Arc<std::sync::Mutex<std::collections::BTreeMap<String, usize>>>,
+    Arc<std::sync::Mutex<Option<String>>>,
 );
 
 impl EntryReads {
+    /// Inject a missing backend resource only at one store's state resolution.
+    #[allow(dead_code)] // This fixture is also included by the binary's tests.
+    pub(crate) fn fail_store_reads(&self, store: Option<&str>) {
+        *self.3.lock().unwrap() = store.map(str::to_owned);
+    }
+
     pub(crate) fn activity_tables(&self) -> usize {
         self.1.load(Ordering::SeqCst)
     }
@@ -191,6 +198,12 @@ impl BackendImpl for Counting {
         &self,
         request: &StoreStateRequest,
     ) -> eidetica::Result<Option<RecordView>> {
+        if self.reads.3.lock().unwrap().as_deref() == Some(request.store.as_str()) {
+            return Err(eidetica::backend::errors::BackendError::EntryNotFound {
+                id: request.database.clone(),
+            }
+            .into());
+        }
         if matches!(request.store.as_str(), "turn_attempts" | "turn_activity") {
             self.reads.1.fetch_add(1, Ordering::SeqCst);
         }
