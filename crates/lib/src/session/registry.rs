@@ -8,6 +8,7 @@ use chrono::{DateTime, Utc};
 
 use eidetica::Database;
 use eidetica::auth::types::{DelegatedTreeRef, Permission, PermissionBounds, TreeReference};
+use eidetica::crdt::doc::Value;
 use eidetica::store::{DocStore, Table};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -366,12 +367,38 @@ impl SessionRegistry {
             doc.len() == 1,
             "invalid published job: requires exactly one request record"
         );
-        let json: String = doc
+        let value = doc
             .get("v1")
-            .ok_or_else(|| anyhow::anyhow!("invalid published job: request is missing"))?
-            .try_into()?;
-        serde_json::from_str(&json)
-            .map_err(|error| anyhow::anyhow!("invalid published job: malformed request: {error}"))
+            .ok_or_else(|| anyhow::anyhow!("invalid published job: request is missing"))?;
+        match value {
+            Value::Text(json) => serde_json::from_str(json).map_err(|error| {
+                anyhow::anyhow!("invalid published job: malformed request: {error}")
+            }),
+            Value::Doc(record) => {
+                let (
+                    Some(Value::Text(parent_id)),
+                    Some(Value::Text(target)),
+                    Some(Value::Text(task)),
+                ) = (
+                    record.get("parent_id"),
+                    record.get("target"),
+                    record.get("task"),
+                )
+                else {
+                    anyhow::bail!("invalid published job: malformed native request");
+                };
+                anyhow::ensure!(
+                    record.is_atomic() && record.len() == 3,
+                    "invalid published job: malformed native request"
+                );
+                Ok(JobRequest {
+                    parent_id: parent_id.clone(),
+                    target: target.clone(),
+                    task: task.clone(),
+                })
+            }
+            _ => anyhow::bail!("unsupported job request representation"),
+        }
     }
 
     /// Publish only a fully prepared handle to both existing catalog stores.
