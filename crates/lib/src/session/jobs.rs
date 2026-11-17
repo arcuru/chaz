@@ -2,7 +2,7 @@
 
 use super::SessionRegistry;
 use crate::grants::Grants;
-use eidetica::crdt::doc::Value;
+use eidetica::crdt::{Doc, doc::Value};
 use eidetica::store::DocStore;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -211,11 +211,24 @@ pub(crate) async fn write_job_result_in_txn(
     txn: &eidetica::transaction::Transaction,
     result: &JobResult,
 ) -> anyhow::Result<()> {
+    // Replace the receipt as a unit; an attempt or execution ID cannot
+    // merge independently of the terminal it identifies.
+    let mut record = Doc::atomic();
+    record.set("attempt_id", result.attempt_id.as_str());
+    record.set("execution_id", text_or_null(result.execution_id.as_deref()));
+    match &result.terminal {
+        JobTerminal::Success { text } => record.set("text", text_or_null(text.as_deref())),
+        JobTerminal::Failure { message } => record.set("message", message.as_str()),
+    };
     txn.get_store::<DocStore>(JOB_RESULT)
         .await?
-        .set_string("v1", serde_json::to_string(result)?)
+        .set_node("v1", record)
         .await?;
     Ok(())
+}
+
+fn text_or_null(value: Option<&str>) -> Value {
+    value.map_or(Value::Null, Value::from)
 }
 
 pub(crate) async fn status_from_db(
@@ -520,7 +533,40 @@ pub(crate) async fn write_job_wait(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use eidetica::{Instance, NewAccount, backend::database::Sqlite, crdt::Doc};
+    use eidetica::{Instance, NewAccount, backend::database::Sqlite};
+
+    #[tokio::test]
+    async fn job_result_writer_stages_whole_native_records() {
+        let (_instance, _user, db) = crate::session::test_helpers::test_session_db().await;
+        let txn = db.new_transaction().await.unwrap();
+        let store = txn.get_store::<DocStore>(JOB_RESULT).await.unwrap();
+        for (terminal, execution_id) in [
+            (
+                JobTerminal::Failure {
+                    message: "error".into(),
+                },
+                Some("branch".into()),
+            ),
+            (JobTerminal::Success { text: None }, None),
+            (
+                JobTerminal::Success {
+                    text: Some(String::new()),
+                },
+                Some("other".into()),
+            ),
+        ] {
+            let result = JobResult {
+                attempt_id: "attempt".into(),
+                execution_id,
+                terminal,
+            };
+            write_job_result_in_txn(&txn, &result).await.unwrap();
+            let value = store.get("v1").await.unwrap();
+            assert!(matches!(value, Value::Doc(record) if record.is_atomic()));
+            assert_eq!(read_job_result_in_txn(&txn).await.unwrap(), Some(result));
+        }
+        assert_eq!(read_job_result(&db).await.unwrap(), None);
+    }
 
     #[tokio::test]
     async fn job_record_readers_preserve_legacy_and_native_after_sqlite_reopen() {

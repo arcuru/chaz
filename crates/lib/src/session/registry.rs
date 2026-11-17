@@ -8,7 +8,7 @@ use chrono::{DateTime, Utc};
 
 use eidetica::Database;
 use eidetica::auth::types::{DelegatedTreeRef, Permission, PermissionBounds, TreeReference};
-use eidetica::crdt::doc::Value;
+use eidetica::crdt::{Doc, doc::Value};
 use eidetica::store::{DocStore, Table};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -328,16 +328,14 @@ impl SessionRegistry {
                 },
             })
             .await?;
+        // Keep the request one whole value, staged with delegation and Directive.
+        let mut request = Doc::atomic();
+        request.set("parent_id", parent_id);
+        request.set("target", target);
+        request.set("task", task);
         txn.get_store::<DocStore>(JOB_REQUEST_STORE)
             .await?
-            .set_string(
-                "v1",
-                serde_json::to_string(&JobRequest {
-                    parent_id: parent_id.to_string(),
-                    target: target.to_string(),
-                    task: task.to_string(),
-                })?,
-            )
+            .set_node("v1", request)
             .await?;
         txn.get_store::<Table<super::SessionEntry>>("entries")
             .await?
@@ -1483,9 +1481,9 @@ mod tests {
             .get_all()
             .await
             .unwrap();
-        let request: String = doc.get("v1").unwrap().try_into().unwrap();
+        assert!(doc.get("v1").unwrap().as_doc().unwrap().is_atomic());
         assert_eq!(
-            serde_json::from_str::<JobRequest>(&request).unwrap(),
+            SessionRegistry::read_job_request(&child).await.unwrap(),
             JobRequest {
                 parent_id,
                 target: "default".into(),
