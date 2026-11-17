@@ -18,7 +18,7 @@ const NUMBER: &str = "~number";
 
 // The pinned Doc API interprets every dotted key as a path, with no literal-key
 // setter. Keep ordinary/empty/Unicode keys native; escape only dots and '~'.
-fn field_key(key: &str) -> String {
+pub(super) fn field_key(key: &str) -> String {
     if !key.contains('.') && !key.starts_with('~') {
         return key.to_owned();
     }
@@ -42,7 +42,7 @@ fn unhex(hex: &str) -> anyhow::Result<String> {
     Ok(String::from_utf8(bytes)?)
 }
 
-fn decode_field_key(key: &str) -> anyhow::Result<String> {
+pub(super) fn decode_field_key(key: &str) -> anyhow::Result<String> {
     let decoded = match key.strip_prefix('~') {
         Some(hex) => unhex(hex)?,
         None => key.to_owned(),
@@ -51,7 +51,7 @@ fn decode_field_key(key: &str) -> anyhow::Result<String> {
     Ok(decoded)
 }
 
-fn encode(value: &Value) -> NativeValue {
+pub(super) fn encode(value: &Value) -> NativeValue {
     match value {
         Value::Null => NativeValue::Null,
         Value::Bool(v) => NativeValue::Bool(*v),
@@ -87,7 +87,7 @@ fn encode(value: &Value) -> NativeValue {
     }
 }
 
-fn decode(value: &NativeValue) -> anyhow::Result<Value> {
+pub(super) fn decode(value: &NativeValue) -> anyhow::Result<Value> {
     Ok(match value {
         NativeValue::Null => Value::Null,
         NativeValue::Bool(v) => Value::Bool(*v),
@@ -100,10 +100,18 @@ fn decode(value: &NativeValue) -> anyhow::Result<Value> {
             );
             if let Some(NativeValue::List(list)) = doc.get(ARRAY) {
                 Value::Array(list.iter().map(decode).collect::<Result<_, _>>()?)
-            } else if let Some(NativeValue::Text(number)) = doc.get(NUMBER) {
+            } else if let Some(NativeValue::Text(decimal)) = doc.get(NUMBER) {
                 let number: serde_json::Number =
-                    number.parse().context("invalid settings number")?;
+                    decimal.parse().context("invalid settings number")?;
                 anyhow::ensure!(number.as_i64().is_none(), "noncanonical settings number");
+                // The default JSON parser validates syntax but can round a
+                // float's shortest decimal to a neighboring binary value.
+                let number = if number.is_f64() {
+                    serde_json::Number::from_f64(decimal.parse()?)
+                        .context("invalid settings float")?
+                } else {
+                    number
+                };
                 Value::Number(number)
             } else {
                 anyhow::bail!("invalid settings value wrapper");
@@ -147,14 +155,14 @@ fn decode_retained(value: &NativeValue) -> anyhow::Result<Value> {
     }
 }
 
-async fn stored(store: &DocStore, ext: &str) -> anyhow::Result<Option<NativeValue>> {
-    match store.get(ext).await {
+pub(super) async fn stored(store: &DocStore, field: &str) -> anyhow::Result<Option<NativeValue>> {
+    match store.get(field).await {
         Ok(value) => Ok(Some(value)),
         // Backend EntryNotFound is an unreadable history, not an absent key.
         Err(error)
             if matches!(&error, eidetica::Error::Store(inner)
             if matches!(inner.as_ref(), eidetica::store::StoreError::KeyNotFound { store: name, key }
-                if name == store.name() && key == ext)) =>
+                if name == store.name() && key == field)) =>
         {
             Ok(None)
         }
