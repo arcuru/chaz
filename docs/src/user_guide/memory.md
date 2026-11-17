@@ -286,7 +286,7 @@ Writes from either peer replicate bidirectionally.
 /memory revoke project-notes beta
 ```
 
-`beta`'s pubkey is stripped from the bank's AuthSettings, and its `memory_banks` ref is removed. Past entries remain — memory is append-only.
+`beta`'s pubkey is stripped from the bank's AuthSettings, and its `memory_banks` ref is removed. Past entries remain — revoking access does not delete stored memory.
 
 ## Agent-DB-as-Bank
 
