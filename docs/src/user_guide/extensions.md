@@ -222,6 +222,8 @@ A source upgrade alone is not authorization to perform a live cutover.
    Reconcile/synchronize their pending old writes to a common session frontier while still on old clients, then stop all executors/daemons, TUI/CLI processes, Matrix/Discord bridges and other session-sharing writers/readers.
    Prevent old clients from reconnecting; if a peer's pending history is unknown, stop here rather than converting a disconnected copy.
    Back up each peer's complete Eidetica state and record the synchronized frontiers and old/new binary versions.
+   Check the original extension names too: old clients interpreted dots as storage paths.
+   If any retained extension name contained dots, stop and verify/repair its old keys from the catalog and backup before automatic conversion; the converter cannot reconstruct ambiguous historical names.
 2. Install Chaz >= 0.4.0 for **all** clients, without restarting normal execution.
    Use one nominated upgraded peer's offline `cmd` interface, selecting each retained session explicitly (replace config/session names with your actual ones):
 
