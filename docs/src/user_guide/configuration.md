@@ -690,6 +690,13 @@ sessions created before this field was set keep their current
 participant list. Bring them up to date by re-running `/agent add
 <name>` manually.
 
+An override saved in TUI **Peer Settings → Defaults** applies to clients using
+that peer's backend and takes precedence over this YAML setting. An empty saved
+list still overrides YAML and uses the single-agent fallback. When no override
+is stored, YAML applies again. A read error logs `Unreadable peer default agents;
+using config fallback`; it does not erase the override, and saving or clearing
+the unreadable value is refused.
+
 ### `agent_groups`
 
 Named alternatives to `default_agents`, chosen when a session is
@@ -891,6 +898,33 @@ Chaz persists all data in the state directory:
 - Headjack session data (Matrix sync token, device keys)
 
 The state directory defaults to `$XDG_STATE_HOME/chaz`. Override with `state_dir` in config.
+
+### Local catalog and defaults upgrade
+
+Chaz reads old JSON catalog rows and peer defaults as well as the native v1
+format. Normal writes use v1; startup does not run a bulk migration. For
+example, editing the default list in Peer Settings replaces that override with
+v1, and a client reconnecting to the same backend reads the updated list.
+Catalog entries that predate the format remain visible in `/sessions`. A
+routing entry without a catalog row shows no creation time.
+
+1. Before the first v1 write, stop processes using the affected backend, take a
+   consistent backup, and upgrade all Chaz readers and writers that share it.
+   Include the executor, bridges, and local clients connected through the
+   Eidetica service. Older Chaz versions expect text at these keys and cannot
+   use v1 values. Other peers syncing only the session DBs do not share this
+   cutover requirement for the local stores.
+2. With the upgraded clients, check `/sessions` for an existing session and
+   check Peer Settings → Defaults. On a disposable copy, update the list and
+   reconnect a client to confirm it keeps the same order. Saving an empty list
+   should suppress the YAML list, not restore it.
+3. If a row logs `Malformed catalog entry` or the defaults log the warning
+   above, do not infer from a visible fallback that the record can be safely
+   rewritten. Preserve the affected state and recover the row or override
+   from a verified backup with the backend offline. Binary-only rollback does
+   not undo v1 writes; to return to pre-v1 binaries, restore a consistent
+   pre-cutover backup after accounting for any writes since that backup. Do not
+   delete or recreate session DBs to repair local catalog values.
 
 ## Native Responses conversations
 

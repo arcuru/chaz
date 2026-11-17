@@ -4,7 +4,7 @@ use super::Server;
 use crate::grants::Grants;
 use crate::session::JobRequest;
 use crate::session::jobs::{AcceptedAgentJob, StagedAgentDefinition, read_accepted_job};
-use crate::session::{EntryType, Session};
+use crate::session::{EntryType, Session, SessionCatalogEntry, SessionStatus};
 use crate::tool::ScopedTools;
 use crate::types::ConversationId;
 use anyhow::Context as _;
@@ -204,18 +204,12 @@ impl Server {
             .get_all()
             .await?;
         let route: Option<String> = routing.get(&id).map(|value| value.try_into()).transpose()?;
-        let catalog_json: Option<String> =
-            catalog.get(&id).map(|value| value.try_into()).transpose()?;
-        let entry: Option<crate::session::SessionCatalogEntry> = catalog_json
-            .as_deref()
-            .map(serde_json::from_str)
-            .transpose()
-            .map_err(|error| anyhow::anyhow!("invalid published job: catalog: {error}"))?;
+        let entry = SessionCatalogEntry::from_catalog(&catalog, &id)
+            .map_err(|error| anyhow::anyhow!("invalid published job: {error:#}"))?;
         anyhow::ensure!(
             route.as_deref() == Some(label.as_str())
-                && entry.is_some_and(|row| row.session_db_id == id
-                    && row.source.as_deref() == Some(label.as_str())
-                    && row.status == crate::session::SessionStatus::Active),
+                && entry.is_some_and(|row| row.source.as_deref() == Some(label.as_str())
+                    && row.status == SessionStatus::Active),
             "invalid published job: catalog differs"
         );
         let txn = db.new_transaction().await?;

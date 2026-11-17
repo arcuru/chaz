@@ -98,7 +98,7 @@ async fn repeated_catalog_commands_do_not_create_sessions_and_agents_stay_sessio
     std::fs::write(
         &config_path,
         format!(
-            "state_dir: {}\nexecution: client\neidetica:\n  connection: unix://{}\n  login:\n    username: targeted-cli\n    password: test-password\ndefault_agents: [selected]\n",
+            "state_dir: {}\nexecution: client\neidetica:\n  connection: unix://{}\n  login:\n    username: targeted-cli\n    password: test-password\ndefault_agents: [selected, overridden]\n",
             state_dir.display(),
             socket.display()
         ),
@@ -188,6 +188,35 @@ async fn repeated_catalog_commands_do_not_create_sessions_and_agents_stay_sessio
     assert!(!command_log.contains("Built hosted indices from user.databases()"));
     assert!(command_log.contains("tracked_catalog_reads=0 agent_database_opens=1"));
     assert!(command_log.contains("tracked_catalog_reads=1 agent_database_opens=1"));
+
+    // Each CLI invocation reconnects to the same backend. An empty stored
+    // override takes the single-agent fallback; deleting it restores YAML.
+    registry.save_peer_default_agents(&[]).await.unwrap();
+    let (output, _) = run(&["cmd", "/agents", "--session", "empty-defaults"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let roster = String::from_utf8_lossy(&output.stdout);
+    assert!(roster.contains("Agents on this session:"));
+    assert_eq!(
+        roster.lines().filter(|line| line.starts_with("  ")).count(),
+        1
+    );
+
+    registry.clear_peer_default_agents().await.unwrap();
+    let (output, _) = run(&["cmd", "/agents", "--session", "yaml-defaults"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let roster = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        roster.contains("  selected") && roster.contains("  overridden"),
+        "{roster}"
+    );
 
     drop(shutdown);
     service_task.await.unwrap().unwrap();

@@ -5669,23 +5669,29 @@ async fn service_restart_reopens_and_reconciles_persisted_work() {
 async fn direct_peer_sync_preserves_request_identity_and_completion_with_stop_records() {
     use eidetica::auth::Permission;
     use eidetica::auth::types::AuthKey;
-    use eidetica::crdt::Doc;
     use eidetica::sync::Address;
     use eidetica::sync::transports::http::HttpTransport;
 
-    let (owner, mut owner_user) = Instance::create_backend(
+    let (owner, owner_user) = Instance::create_backend(
         Box::new(InMemory::new()),
         NewAccount::with_password("owner", "test-password"),
     )
     .await
     .unwrap();
     owner.enable_sync().await.unwrap();
-    let owner_key = owner_user.get_default_key().unwrap();
-    let owner_db = owner_user
-        .create_database(Doc::new(), &owner_key)
+    let agents = Arc::new(AgentRegistry::with_default_agent());
+    let registry = Arc::new(
+        crate::session::SessionRegistry::new(owner.clone(), owner_user, agents.clone())
+            .await
+            .unwrap(),
+    );
+    // Create through the registry so the generic watcher leaves ownership to
+    // this test's explicit mock-backed registration.
+    let (session_id, owner_db) = registry.create_session(Some("cli")).await.unwrap();
+    registry
+        .save_peer_default_agents(&["owner-only".into()])
         .await
         .unwrap();
-    Session::initialize_turn_schema(&owner_db).await.unwrap();
     let txn = owner_db.new_transaction().await.unwrap();
     txn.get_settings()
         .unwrap()
@@ -5739,12 +5745,9 @@ async fn direct_peer_sync_preserves_request_identity_and_completion_with_stop_re
         .unwrap();
     let peer_db = peer_user.open_database(owner_db.root_id()).await.unwrap();
 
-    let agents = Arc::new(AgentRegistry::with_default_agent());
-    let registry = Arc::new(
-        crate::session::SessionRegistry::new(owner.clone(), owner_user, agents)
-            .await
-            .unwrap(),
-    );
+    let peer_registry = crate::session::SessionRegistry::new(peer.clone(), peer_user, agents)
+        .await
+        .unwrap();
     let server = server_fixture_from_registry(registry.clone()).await.1;
     let mock = Arc::new(crate::test_support::MockBackend::new());
     mock.push_text("synced response");
@@ -5850,6 +5853,16 @@ async fn direct_peer_sync_preserves_request_identity_and_completion_with_stop_re
             .iter()
             .any(|entry| entry.content == "synced response")
     );
+    assert_eq!(
+        registry.list_sessions().await.unwrap()[0].session_db_id,
+        session_id.0
+    );
+    assert_eq!(
+        registry.load_peer_default_agents().await,
+        Some(vec!["owner-only".into()])
+    );
+    assert!(peer_registry.list_sessions().await.unwrap().is_empty());
+    assert_eq!(peer_registry.load_peer_default_agents().await, None);
     drop(server);
     owner_sync.stop_server().await.unwrap();
 }
@@ -6603,6 +6616,59 @@ async fn published_job_admission_rejects_malformed_or_untrusted_scope() {
             "{field}={value} must not authorize execution"
         );
         assert!(!server.is_watching_session(&id.0).await, "{field}={value}");
+    }
+}
+
+#[tokio::test]
+async fn published_job_admission_refuses_catalog_corruption_and_routing_mismatch() {
+    use eidetica::store::DocStore;
+
+    let (_owner, server, registry) = server_fixture().await;
+    server.shutdown().await;
+    let (agent, _) = seed_agent(&server, &registry, "default").await;
+    let (parent_id, _) = registry.create_session(Some("cli")).await.unwrap();
+    registry
+        .attach_agent_to_session(&parent_id.0, &agent)
+        .await
+        .unwrap();
+
+    for (store_name, reason) in [
+        ("session_catalog", "invalid catalog status"),
+        ("sessions", "catalog differs"),
+    ] {
+        let prepared = registry
+            .prepare_agent_job(&parent_id.0, "default", "one task")
+            .await
+            .unwrap();
+        let child = prepared.db.clone();
+        let id = registry.publish_agent_job(prepared).await.unwrap();
+        let txn = registry.chaz_group().new_transaction().await.unwrap();
+        let store = txn.get_store::<DocStore>(store_name).await.unwrap();
+        if store_name == "session_catalog" {
+            let mut row = store.get_node(&id.0).await.unwrap();
+            row.set("status", "unknown");
+            store.set_node(&id.0, row).await.unwrap();
+        } else {
+            store.set_string(&id.0, "unrelated").await.unwrap();
+        }
+        txn.commit().await.unwrap();
+
+        assert!(server.register_accepted_job(&child).await.unwrap());
+        let rejection = crate::session::jobs::read_job_rejection(&child)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            rejection.contains(reason),
+            "unexpected rejection: {rejection}"
+        );
+        assert!(
+            crate::session::jobs::read_accepted_job(&child)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(!server.is_watching_session(&id.0).await);
     }
 }
 
