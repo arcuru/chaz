@@ -761,3 +761,27 @@ selected sources and recorded bytes reconstruct every decision. The generic
 host's integrity, current-authority and final-budget gates apply unchanged.
 Actual recovery executes a normal owner-attributed tool, not a privileged
 built-in path, and never re-executes the source tool.
+
+## Standalone native memory import
+
+`extension::memory_import` supplies an opaque `NativeMemoryImport` host-side
+endpoint for trusted same-account clients.
+Like scoped agent-state administration, its scope is a guardrail, not a sandbox.
+Unlike `MemoryAccess`, it is not advertised through the capability resolver or
+model tools: only explicit native construction from an authenticated account and
+caller-supplied agent/bank/owner/layout scope grants these operations.
+There is no ambient manifest/Read-grant promotion and no external loader.
+It can be used without constructing extension instances, peer handles or a Server.
+
+The host resolves exact catalog-tracked identities, authorizes bank Read before
+attaching the agent reference, and writes the completion marker last.
+A later missing/revoked reference or grant refuses reattachment.
+Every replacement revalidates the bound identities and current ownership/ACL.
+Within the bank transaction it validates the intended set and existing namespace,
+reconciles stable rows, and saves source/hash state together.
+Semantic no-ops do not commit; foreign rows and existing compatible persisted
+layouts are retained.
+Native callers serialize setup/ACL writers; this is not a cross-database atomic
+bootstrap or isolation from hostile same-user code.
+See [native source mirrors](../user_guide/memory.md#native-source-mirrors-are-owner-operations)
+for the input reference, model and standalone consumer walkthrough.

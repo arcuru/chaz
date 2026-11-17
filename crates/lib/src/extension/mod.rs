@@ -27,6 +27,7 @@ pub(crate) mod hook_bridge;
 pub mod hooks;
 pub mod instance;
 pub mod manifest;
+pub mod memory_import;
 pub mod projection;
 pub mod turn;
 
