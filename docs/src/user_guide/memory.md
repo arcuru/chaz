@@ -102,7 +102,7 @@ When the `memory` extension is active, chaz automatically searches the agent's o
 
 1. Up to 5 recent conversation messages are joined newest-first, tokenized, and stopwords removed. The first 10 remaining tokens form the query, giving the current prompt priority.
 2. The agent's own `memory` store is searched with BM25 + cosine hybrid ranking.
-3. Every attached bank (via `/memory attach` or `default_memory_banks`) is searched the same way.
+3. Every attached bank (via `/memory attach` or a persistent `/memory grant`) is searched the same way.
 4. Up to 3 results per store (configurable) are formatted and appended.
 
 ```text
@@ -125,20 +125,14 @@ Banks must be explicitly attached to participate in auto-recall (even if the age
 /memory detach project-conventions
 ```
 
-**Per-agent (persistent)** — declare in `config.yaml` to auto-attach at startup:
+**Per-agent (persistent)** — grant the agent the bank once:
 
-```yaml
-agents:
-  - name: chaz
-    system_prompt: "You are Chaz..."
-    default_memory_banks:
-      - project-conventions
-      - shared-facts
+```text
+/memory new project-conventions      # only if the bank doesn't exist yet
+/memory grant project-conventions chaz write
 ```
 
-`default_memory_banks` are read from the yaml and applied at each startup. They grant Write access and write a `MemoryBankRef` to the agent DB — idempotent across restarts.
-
-Missing banks are auto-created on first startup — no manual `/memory new` needed for banks listed in `default_memory_banks`. The same bank name can appear on multiple agents to share it between them.
+The grant writes the bank's AuthSettings and a `MemoryBankRef` into the agent DB, so the attachment survives restarts and travels with the agent. Root config does not attach banks: the old per-agent `default_memory_banks` YAML list is gone with root agent definitions, and a config still carrying it refuses to start with these steps (see [legacy root `agents:` blocks](configuration.md#legacy-root-agents-blocks)). The same bank can be granted to several agents to share it between them.
 
 ### Auto-recall configuration
 

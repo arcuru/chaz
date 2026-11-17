@@ -24,7 +24,7 @@ pub(super) async fn switch_session(identifier: &str, server: &Server) -> Command
                 session_db_id: id,
                 conv_id,
                 db,
-                agent_name: agent.name.clone(),
+                agent_name: agent.map(|agent| agent.name).unwrap_or_default(),
                 session_name: meta.name,
             },
         )))

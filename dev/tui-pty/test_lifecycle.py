@@ -43,6 +43,15 @@ spec.loader.exec_module(stub)
 CSI = re.compile(rb"\x1b\[[0-?]*[ -/]*[@-~]")
 
 
+def create_agent(config, env, home, overrides):
+    """Create the fixture agent through administration, never a model turn.
+
+    Agents live in Agent DBs; root config only names them in default_agents.
+    """
+    subprocess.run([BINARY, "--config", config, "cmd", "/agent new chaz " + overrides],
+                   env=env, cwd=home, check=True, timeout=30, capture_output=True)
+
+
 class PtyScreen(pyte.Screen):
     @property
     def display(self):
@@ -299,10 +308,6 @@ backends:
     api_key: not-a-real-key
     models:
       - name: stub
-agents:
-  - name: chaz
-    model: stub
-    system_prompt: You are a test fixture.
 default_agents: [chaz]
 ''')
             def sessions():
@@ -338,6 +343,7 @@ default_agents: [chaz]
             try:
                 subprocess.run([FIXTURE, home / "fixture.db"], env=env, cwd=home,
                                check=True, timeout=20, capture_output=True)
+                create_agent(config, env, home, "model=stub system_prompt=fixture")
                 thread.start()
                 # An ordinary launch on an empty install shows a usable hub and
                 # creates nothing.

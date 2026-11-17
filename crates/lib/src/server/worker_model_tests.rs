@@ -29,7 +29,7 @@ async fn spawn_with(
     base.workers = vec![worker];
     adb.write_config(&base).await.unwrap();
     server
-        .hydrate_agent_from_db(server.agents.default_agent().clone())
+        .hydrate_agent_from_db(server.agents.default_agent().unwrap())
         .await;
     let (sid, db) = server
         .registry

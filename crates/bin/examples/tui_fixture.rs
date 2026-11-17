@@ -55,7 +55,7 @@ async fn main() -> anyhow::Result<()> {
                             Some("close-worker-parent") => {
                                 use chaz_core::{agent::AgentRegistry, session::{SessionRegistry, worker_links}};
                                 let user = instance.login_account("pty-test", "test-password").await?;
-                                let registry = SessionRegistry::new(instance.clone(), user, std::sync::Arc::new(AgentRegistry::from_config(&chaz_core::config::Config::default()))).await?;
+                                let registry = SessionRegistry::new(instance.clone(), user, std::sync::Arc::new(AgentRegistry::default())).await?;
                                 let mut closed = Vec::new();
                                 for row in registry.list_sessions().await? {
                                     if row.source.as_deref() == Some("tui") {
@@ -77,7 +77,7 @@ async fn main() -> anyhow::Result<()> {
                             Some("worker-records") => {
                                 use chaz_core::{agent::AgentRegistry, session::{SessionRegistry, worker_links}};
                                 let user = instance.login_account("pty-test", "test-password").await?;
-                                let registry = SessionRegistry::new(instance.clone(), user, std::sync::Arc::new(AgentRegistry::from_config(&chaz_core::config::Config::default()))).await?;
+                                let registry = SessionRegistry::new(instance.clone(), user, std::sync::Arc::new(AgentRegistry::default())).await?;
                                 let mut records = Vec::new();
                                 for row in registry.list_sessions().await? {
                                     let (_, parent) = registry.open_session(&row.session_db_id).await?;
@@ -136,9 +136,7 @@ async fn worker_cases(instance: &Instance) -> anyhow::Result<serde_json::Value> 
         .await?
         .create_account(NewAccount::with_password("case-stranger", "test-password"))
         .await?;
-    let agents = Arc::new(AgentRegistry::from_config(
-        &chaz_core::config::Config::default(),
-    ));
+    let agents = Arc::new(AgentRegistry::default());
     let registry = SessionRegistry::new(instance.clone(), user, agents.clone()).await?;
     let (_, parent) = registry.create_session(Some("spawn:case-parent")).await?;
     let parent_id = parent.root_id().to_string();
@@ -387,9 +385,7 @@ async fn worker_audit(instance: &Instance) -> anyhow::Result<serde_json::Value> 
     let registry = SessionRegistry::new(
         instance.clone(),
         user,
-        std::sync::Arc::new(AgentRegistry::from_config(
-            &chaz_core::config::Config::default(),
-        )),
+        std::sync::Arc::new(AgentRegistry::default()),
     )
     .await?;
     let mut tips = std::collections::BTreeMap::new();
