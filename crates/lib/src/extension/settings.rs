@@ -2,6 +2,7 @@
 //! Retained formats are read-only until explicit coordinated offline conversion.
 
 use super::EXTENSION_SETTINGS_STORE;
+use crate::native_doc::{WIDE_NUMBER as NUMBER, decode_field_key, field_key, unhex, wide_number};
 use anyhow::Context;
 use eidetica::crdt::{
     Doc,
@@ -14,42 +15,6 @@ use serde_json::Value;
 const RETAINED_STORE: &str = "extension_settings";
 // Reserved native keys cannot collide with application keys (which escape '~').
 const ARRAY: &str = "~array";
-const NUMBER: &str = "~number";
-
-// The pinned Doc API interprets every dotted key as a path, with no literal-key
-// setter. Keep ordinary/empty/Unicode keys native; escape only dots and '~'.
-fn field_key(key: &str) -> String {
-    if !key.contains('.') && !key.starts_with('~') {
-        return key.to_owned();
-    }
-    use std::fmt::Write;
-    let mut encoded = String::from("~");
-    for byte in key.bytes() {
-        write!(encoded, "{byte:02x}").expect("String write");
-    }
-    encoded
-}
-
-fn unhex(hex: &str) -> anyhow::Result<String> {
-    anyhow::ensure!(
-        hex.len().is_multiple_of(2) && hex.is_ascii(),
-        "invalid escaped settings key"
-    );
-    let bytes = (0..hex.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16))
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(String::from_utf8(bytes)?)
-}
-
-fn decode_field_key(key: &str) -> anyhow::Result<String> {
-    let decoded = match key.strip_prefix('~') {
-        Some(hex) => unhex(hex)?,
-        None => key.to_owned(),
-    };
-    anyhow::ensure!(field_key(&decoded) == key, "noncanonical settings key");
-    Ok(decoded)
-}
 
 fn encode(value: &Value) -> NativeValue {
     match value {
@@ -61,9 +26,7 @@ fn encode(value: &Value) -> NativeValue {
             None => {
                 // Native Value has only i64: From<f64> truncates and From<u64>
                 // wraps. A tagged decimal preserves these unsupported numbers.
-                let mut doc = Doc::atomic();
-                doc.set(NUMBER, v.to_string());
-                NativeValue::Doc(doc)
+                NativeValue::Doc(wide_number(v))
             }
         },
         Value::Array(values) => {
