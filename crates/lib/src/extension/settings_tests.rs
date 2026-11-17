@@ -570,3 +570,78 @@ async fn native_settings_field_assignment_replaces_nested_objects_and_lists() {
         .unwrap();
     assert_eq!(db.snapshot().await.unwrap(), before);
 }
+
+#[tokio::test]
+async fn native_settings_nested_creation_preserves_independent_children() {
+    for reverse in [false, true] {
+        let (_inst, db) = make_session_db().await;
+        let snapshot = db.snapshot().await.unwrap();
+        let a = db.new_transaction_at(&snapshot).await.unwrap();
+        let b = db.new_transaction_at(&snapshot).await.unwrap();
+        update_settings_in(&a, "memory", true, true, |v| {
+            v["nested"]["left"] = json!(1);
+            Ok(())
+        })
+        .await
+        .unwrap();
+        update_settings_in(&b, "memory", true, true, |v| {
+            v["nested"]["right"] = json!(2);
+            Ok(())
+        })
+        .await
+        .unwrap();
+        if reverse {
+            b.commit().await.unwrap();
+            a.commit().await.unwrap();
+        } else {
+            a.commit().await.unwrap();
+            b.commit().await.unwrap();
+        }
+        assert_eq!(
+            read_settings_checked(&db, "memory").await.unwrap(),
+            json!({"nested":{"left":1,"right":2}})
+        );
+    }
+}
+
+#[tokio::test]
+async fn native_settings_backend_missing_resource_is_not_a_missing_key() {
+    let (_inst, mut user, faults) =
+        crate::test_support::counting_backend::counting_eidetica().await;
+    let key = user.get_default_key().unwrap();
+    let db = user.create_database(Doc::new(), &key).await.unwrap();
+    legacy(&db, "memory", r#"{"enabled":true}"#).await;
+    write_settings(&db, "memory", json!({"enabled":false}))
+        .await
+        .unwrap();
+    assert_eq!(
+        read_settings_checked(&db, "memory").await.unwrap(),
+        json!({"enabled":false})
+    );
+    let txn = db.new_transaction().await.unwrap();
+    let store = txn
+        .get_store::<DocStore>(EXTENSION_SETTINGS_STORE)
+        .await
+        .unwrap();
+    faults.fail_store_reads(Some(EXTENSION_SETTINGS_STORE));
+    let error = store.get("memory").await.unwrap_err();
+    assert!(matches!(error, eidetica::Error::Backend(_)) && error.is_not_found());
+    assert!(
+        read_settings_checked(&db, "memory").await.is_err(),
+        "backend failure must not expose the stale retained enabled:true"
+    );
+    assert_eq!(read_settings(&db, "memory").await, json!({}));
+    assert!(
+        update_settings(&db, "memory", true, |v| {
+            v["enabled"] = json!(true);
+            Ok(())
+        })
+        .await
+        .is_err()
+    );
+    faults.fail_store_reads(None);
+    assert_eq!(
+        read_settings_checked(&db, "memory").await.unwrap(),
+        json!({"enabled":false})
+    );
+}

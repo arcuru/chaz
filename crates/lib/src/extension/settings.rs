@@ -8,7 +8,7 @@ use eidetica::crdt::{
     doc::{List, Value as NativeValue},
 };
 use eidetica::store::DocStore;
-use eidetica::{Database, Transaction};
+use eidetica::{Database, Store, Transaction};
 use serde_json::Value;
 
 const RETAINED_STORE: &str = "extension_settings";
@@ -150,7 +150,14 @@ fn decode_retained(value: &NativeValue) -> anyhow::Result<Value> {
 async fn stored(store: &DocStore, ext: &str) -> anyhow::Result<Option<NativeValue>> {
     match store.get(ext).await {
         Ok(value) => Ok(Some(value)),
-        Err(error) if error.is_not_found() => Ok(None),
+        // Backend EntryNotFound is an unreadable history, not an absent key.
+        Err(error)
+            if matches!(&error, eidetica::Error::Store(inner)
+            if matches!(inner.as_ref(), eidetica::store::StoreError::KeyNotFound { store: name, key }
+                if name == store.name() && key == ext)) =>
+        {
+            Ok(None)
+        }
         Err(error) => Err(error.into()),
     }
 }
@@ -201,6 +208,11 @@ fn delta(before: &Value, after: &Value, recursive: bool) -> NativeValue {
             if before.get(key) != Some(value) {
                 let value = match before.get(key) {
                     Some(old) if recursive => delta(old, value, true),
+                    // Independent additions can share a previously absent parent.
+                    // Only assignment/replacement APIs make that parent atomic.
+                    None if recursive && value.is_object() => {
+                        delta(&serde_json::json!({}), value, true)
+                    }
                     _ => encode(value),
                 };
                 doc.set(field_key(key), value);

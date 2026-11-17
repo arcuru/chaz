@@ -210,7 +210,8 @@ Memory/skills attach/detach only change `attached_banks`, and `/autocompact off`
 
 This upgrade requires a coordinated cutover, **not** rolling mixed-version operation.
 Do not start new writers alongside old clients, even on sessions without existing overrides.
-Old Chaz 0.3.x readers cannot read native objects (some silently show defaults), and old writers can replace them with stale scalar JSON.
+Old Chaz 0.3.x clients only see the retained store, not native-v2 overrides.
+They can show stale settings or defaults and write divergent retained values that new clients no longer use.
 No automatic version negotiation or distributed fencing makes that safe.
 The confirmation flag is an operator assertion, not a detector of running peers.
 A source upgrade alone is not authorization to perform a live cutover.
