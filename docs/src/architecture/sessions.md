@@ -313,6 +313,35 @@ recorded session ID; they never mint a replacement after a failed lookup.
 The journal is management state, not a second transcript or outbound router.
 See [Matrix workspace contracts](../design/matrix_workspace.md#contracts).
 
+### Transport attachment storage
+
+`transport_bindings` is in the synchronized session DB. The existing JSON
+tuple key names the exact `(transport, login, channel)`; dots retain their
+existing DocStore path semantics. The value is a version-1 atomic Doc with a
+native `conversational_replies` boolean. The legacy transport-name strings
+(Matrix enabled, Discord disabled) and JSON capability strings remain
+readable. Lookup does not change historical entries; new binds and explicit
+reply-capable rebinds write the native value at the same key. Exact detach
+removes that binding regardless of its representation. A malformed value
+occupies its key but cannot authorize routing. Competing bindings still
+require explicit detach or migration; none is chosen by iteration order.
+
+The bridge's workspace is a separate peer-local DocStore. It replaces one
+version-1 atomic Doc per login; nested Docs and ordered Lists hold its room
+index and operation journal. A step name such as `room.create` is a value in
+a step row, not a DocStore path. Counters use native signed integers where
+representable; larger legacy `u64` counters use decimal text only for those
+fields. No field or list element is independently merged. Neither store
+changes the conversation Store or Matrix event format.
+
+At the pinned Eidetica API, the Doc `Codec` encodes native variants as subtree
+bytes, and the enclosing entry uses canonical DAG-CBOR for IDs and signing.
+The schema versions above belong to Chaz records, not the Doc codec or entry
+wire format. Conversion adds ordinary signed entries on writes; it does not
+re-encode, re-hash or rewrite old entries. See the
+[Matrix cutover and recovery notes](../user_guide/matrix.md#upgrading-workspace-and-attachment-storage)
+before enabling writers that use the new format.
+
 See [Matrix Bot](../user_guide/matrix.md#attached-rooms-and-reply-routing).
 
 ### Named Sessions

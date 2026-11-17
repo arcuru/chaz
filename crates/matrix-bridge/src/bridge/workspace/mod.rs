@@ -20,23 +20,21 @@
 //! registry implementations.
 
 pub(crate) mod live;
+mod storage;
 
 use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 use std::sync::{Arc, RwLock};
 
-use eidetica::Database;
-use eidetica::store::DocStore;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
+
+pub(crate) use storage::WorkspaceStore;
 
 /// Custom state event type carried by every room the workspace creates. Its
 /// content names the workspace, operation and role; it holds no secret and,
 /// like all room state, is not end-to-end encrypted.
 pub(crate) const MARKER_TYPE: &str = "dev.chaz.workspace";
-
-/// Peer-local (`chaz_peer`) store holding one record per login.
-const STORE: &str = "matrix_workspace";
 
 /// Name given to the Space and Lobby at setup.
 const SPACE_NAME: &str = "Chaz";
@@ -279,48 +277,6 @@ impl WorkspaceState {
     fn alloc_op(&mut self) -> String {
         self.next_op += 1;
         format!("op-{}", self.next_op)
-    }
-}
-
-/// Durable record in the peer-local, never-synced `chaz_peer` DB.
-#[derive(Clone)]
-pub(crate) struct WorkspaceStore {
-    db: Database,
-    key: String,
-}
-
-impl WorkspaceStore {
-    pub(crate) fn new(db: Database, login_id: &str) -> Self {
-        use sha2::Digest;
-        // Login IDs contain dots, which DocStore would read as nested paths.
-        let digest = sha2::Sha256::digest(login_id.as_bytes());
-        let key: String = digest.iter().take(16).map(|b| format!("{b:02x}")).collect();
-        Self {
-            db,
-            key: format!("ws-{key}"),
-        }
-    }
-
-    async fn load(&self) -> anyhow::Result<Option<WorkspaceState>> {
-        let txn = self.db.new_transaction().await?;
-        let store = txn.get_store::<DocStore>(STORE).await?;
-        match store.get_string(&self.key).await {
-            Ok(json) => Ok(Some(serde_json::from_str(&json).map_err(|e| {
-                anyhow::anyhow!("workspace record is malformed ({e}); refusing to guess")
-            })?)),
-            Err(e) if e.is_not_found() => Ok(None),
-            Err(e) => Err(e.into()),
-        }
-    }
-
-    async fn save(&self, state: &WorkspaceState) -> anyhow::Result<()> {
-        let txn = self.db.new_transaction().await?;
-        let store = txn.get_store::<DocStore>(STORE).await?;
-        store
-            .set_string(&self.key, serde_json::to_string(state)?)
-            .await?;
-        txn.commit().await?;
-        Ok(())
     }
 }
 

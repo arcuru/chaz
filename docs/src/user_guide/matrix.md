@@ -712,6 +712,33 @@ is an operation (`op-N`) with saved step progress:
 V1 has no archive, threaded Inbox, existing-room adoption, nested Spaces or
 model-driven management.
 
+### Upgrading workspace and attachment storage
+
+Upgrade all Chaz peers that open or route the affected sessions together,
+including their bridges and daemon, before resuming activity. Keep a
+pre-upgrade backup of the bridge's peer-local database as well as the
+affected session data. The new code reads both older formats without
+changing them on startup. A workspace progress save or a binding write
+stores the new format at the same key. There is no bulk migration or
+second, independently writable copy.
+
+Do not point an older binary at databases that have native records. It
+can refuse a workspace snapshot or miss a synced attachment and create a
+second session. Reinstalling an old binary is not a data rollback; only
+state from before native writes is compatible with it. Keep newer data
+and reconcile any effects made since a backup before considering a restore.
+
+After an upgrade, check `!chaz workspace status` and `!chaz chat list` for
+the same operation and room IDs before retrying anything. Retry an
+interrupted operation by its existing `op-N`; do not repeat setup or create
+a replacement chat. If startup reports corrupt or unreadable workspace
+state, preserve the peer-local database and recover access to the original
+record with a compatible binary. Existing room markers are not a backup of
+the journal. For conflicting ordinary room bindings use `!chaz detach
+<exact-session-db-id>` in the original room only after identifying the
+binding to remove. Do not detach or replace a workspace chat to repair an
+unreadable binding.
+
 ### Walkthrough: a workspace with one interrupted chat
 
 1. Set `workspace_manager: "@you:example"` on the bot's login and restart the
