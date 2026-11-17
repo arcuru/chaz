@@ -53,18 +53,18 @@ agent responding in this session:
 
 ```
 Extensions on this peer (✓ = live for agent 'chaz' this session; ✗ = disabled for this agent):
-  ✓ baseline_context [0.3.0] — —
-  ✓ core [0.3.0] — Tool
-  ✓ path_normalizer [0.3.0] — ToolCall
-  ✓ security_warnings [0.3.0] — ToolResult
-  ✓ fs [0.3.0] — Tool
-  ✓ system [0.3.0] — Tool
-  ✓ web [0.3.0] — Tool
-  ✓ memory [0.3.0] — Command, Tool
-  ✓ skills [0.3.0] — Command, Tool
-  ✓ agent_schedule [0.3.0] — —
-  ✓ mcp-filesystem [0.3.0] — Tool
-  ✗ schedule [0.3.0] — Command, Tool  (session: on, agent: off)
+  ✓ baseline_context [0.4.0] — —
+  ✓ core [0.4.0] — Tool
+  ✓ path_normalizer [0.4.0] — ToolCall
+  ✓ security_warnings [0.4.0] — ToolResult
+  ✓ fs [0.4.0] — Tool
+  ✓ system [0.4.0] — Tool
+  ✓ web [0.4.0] — Tool
+  ✓ memory [0.4.0] — Command, Tool
+  ✓ skills [0.4.0] — Command, Tool
+  ✓ agent_schedule [0.4.0] — —
+  ✓ mcp-filesystem [0.4.0] — Tool
+  ✗ schedule [0.4.0] — Command, Tool  (session: on, agent: off)
 ```
 
 The version in brackets is the chaz binary version that registered the
@@ -186,6 +186,78 @@ key, overwrite it with `null`:
 /extensions set memory custom_limit null
 ```
 
+## Coordinated settings cutover
+
+| Command / requirement                                | Meaning                                                                                                                                       |
+| ---------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
+| Chaz **0.4.0** or later on every sharing client      | Minimum supported native-v2 settings reader and writer, including executors, TUI, CLI, Matrix, Discord and rollback targets.                  |
+| `/extensions migrate-settings --old-clients-stopped` | Explicit offline conversion of all retained settings values on the selected session; any corrupt value or failed write aborts the conversion. |
+| `/extensions settings <name>`                        | Reads both retained and native settings without converting anything; display remains lenient on read errors.                                  |
+
+Settings are native Eidetica values and nested documents, not JSON strings hidden inside documents.
+Different fields can be edited concurrently without discarding each other, including internal edits to independent nested paths.
+The JSON you see in commands is an input/output format.
+See the [native schema](../architecture/extensions.md#per-session-settings) for the pinned API's numeric, dotted-key and array limitations and their lossless representations.
+
+`/extensions set` and turn-complete patches **assign** each supplied field as a whole.
+For example, setting `options` to `{"limit":4}` removes old children of `options` that are not supplied; it does not recursively merge them.
+Arrays are also whole values: shortening a list removes its old tail.
+Competing assignments to the same field converge to Eidetica's deterministic winner, not necessarily the last wall-clock command.
+Literal keys such as `a.b` remain literal, not nested path commands.
+Setting a field to `null` stores null; it does not delete it.
+Host APIs that deliberately replace an entire settings object still remove omitted fields.
+Memory/skills attach/detach only change `attached_banks`, and `/autocompact off` only changes `enabled` on a valid policy.
+
+This upgrade requires a coordinated cutover, **not** rolling mixed-version operation.
+Do not start new writers alongside old clients, even on sessions without existing overrides.
+Old Chaz 0.3.x readers cannot read native objects (some silently show defaults), and old writers can replace them with stale scalar JSON.
+No automatic version negotiation or distributed fencing makes that safe.
+The confirmation flag is an operator assertion, not a detector of running peers.
+A source upgrade alone is not authorization to perform a live cutover.
+
+### Walkthrough: convert a retained session safely
+
+1. Plan an approved maintenance window and inventory **every** peer/client sharing the affected sessions, including disconnected peers and rollback binaries.
+   Reconcile/synchronize their pending old writes to a common session frontier while still on old clients, then stop all executors/daemons, TUI/CLI processes, Matrix/Discord bridges and other session-sharing writers/readers.
+   Prevent old clients from reconnecting; if a peer's pending history is unknown, stop here rather than converting a disconnected copy.
+   Back up each peer's complete Eidetica state and record the synchronized frontiers and old/new binary versions.
+2. Install Chaz >= 0.4.0 for **all** clients, without restarting normal execution.
+   Use one nominated upgraded peer's offline `cmd` interface, selecting each retained session explicitly (replace config/session names with your actual ones):
+
+   ```sh
+   chaz --config config.yaml --session work cmd '/extensions migrate-settings --old-clients-stopped'
+   ```
+
+   Expected output for a session with two retained overrides:
+
+   ```text
+   Converted 2 retained extension settings values to native v2. Only Chaz >= 0.4.0 clients may share this session.
+   ```
+
+   Do not independently convert stale copies on other peers.
+   On a fresh/already converted session, the count is `0`.
+   Conversion preserves scalar, object and array values, including explicit nulls and numeric precision; it also accepts the earlier hex-key/JSON-leaf format.
+   Retained stores/history are not deleted, but native overrides take precedence and old clients must stay stopped.
+
+3. If conversion fails, no partial conversion is committed.
+   For example, corrupt retained JSON reports an error beginning:
+
+   ```text
+   Error: Settings conversion aborted: invalid settings for extension 'memory'
+   ```
+
+   Keep normal execution stopped, diagnose/repair the identified retained data from the backup using authorized tools, then retry.
+   Omitting the confirmation flag prints usage instead of converting.
+   Ordinary edits to an unconverted value also refuse with `retained extension settings require offline conversion`; no background fallback rewrites it.
+
+4. Synchronize the conversion from the nominated upgraded peer to every other upgraded peer before allowing normal execution again.
+   Verify the settings, especially explicit `enabled: false`, on each peer and reopen the session to confirm them.
+   Then resume only upgraded clients and test an independent-field edit from two clients, for example a label and a custom limit.
+   Repeat for every retained session, including inactive sessions before reopening them.
+5. Do **not** roll back only the binary after conversion: the new data and history have synchronized.
+   Recovery requires keeping incompatible clients stopped and a coordinated restore of the pre-cutover state across all participating peers (or an explicitly designed reverse migration).
+   Reconnecting an old/unrestored replica can reintroduce incompatible writes; keep backups and version/frontier custody until the cutover is accepted.
+
 ## What "active on this session" means
 
 Activation status is **per session**, persisted in the session's
@@ -298,7 +370,7 @@ Scenario: three agents (`chaz`, `nova`, `archivist`) share one Matrix room. You 
 2. Verify with `/extensions`. While `nova` is responding you'll see:
 
    ```
-   ✗ schedule [0.3.0] — Command, Tool  (session: on, agent: off)
+   ✗ schedule [0.4.0] — Command, Tool  (session: on, agent: off)
    ```
 
    Switch the responding agent to `chaz` (`@chaz: …` in the room) and run `/extensions` again — `schedule` is `✓` for `chaz`. The opt-out only narrows `nova`.
@@ -443,7 +515,7 @@ The host reads a coherent Eidetica view. The extension chooses scoped references
 the host renders transport framing, complete native exchanges and durable text,
 and assigns source identities. The selected name and settings are recorded in
 session-backed, agent/extension-scoped `context_selections` state. Session settings
-remain in `extension_settings` and are read anew each turn. Neither is a saved
+remain in `extension_settings_v2` and are read anew each turn. Neither is a saved
 model request or an execution grant. There is no projection cache.
 
 Native memory recall still uses its existing activation, bank eligibility,

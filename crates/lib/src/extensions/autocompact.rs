@@ -10,7 +10,7 @@ use crate::extension::instance::{ExtensionInstance, InstantiateFuture, ScopeCtx}
 use crate::extension::manifest::ExtensionManifest;
 use crate::extension::{
     Extension, ExtensionCommand, ExtensionCommandOutcome, ExtensionRef, HookContext, HookKind,
-    read_settings_checked, write_settings,
+    read_settings_checked, update_settings,
 };
 use crate::runtime::autocompact::{DEFAULT_TRIGGER_PERCENT, Policy, Status};
 use eidetica::Database;
@@ -71,7 +71,10 @@ impl Settings {
 }
 
 async fn read(db: &Database) -> anyhow::Result<Settings> {
-    let value = read_settings_checked(db, NAME).await?;
+    parse_settings(read_settings_checked(db, NAME).await?)
+}
+
+fn parse_settings(value: Value) -> anyhow::Result<Settings> {
     let settings: Settings = if value.as_object().is_some_and(|o| o.is_empty()) {
         Settings::default()
     } else {
@@ -197,43 +200,43 @@ struct AutocompactCommand;
 impl AutocompactCommand {
     async fn run(&self, args: &str, ctx: &HookContext) -> ExtensionCommandOutcome {
         let db = ctx.session.lock().await.database().clone();
-        let mut settings = match read(&db).await {
-            Ok(settings) => settings,
-            // A corrupt blob is reported, and only an explicit new value
-            // below replaces it.
-            Err(error) if args.is_empty() => {
-                return ExtensionCommandOutcome::Error(format!(
+        if args.is_empty() {
+            return match read(&db).await {
+                Ok(settings) => ExtensionCommandOutcome::Text(describe(&settings, &db, ctx).await),
+                Err(error) => ExtensionCommandOutcome::Error(format!(
                     "autocompact settings are unreadable: {error}"
-                ));
+                )),
+            };
+        }
+        let result = update_settings(&db, NAME, false, |value| {
+            // An explicit new policy repairs invalid settings as before. Valid
+            // policies keep omitted defaults omitted, so an 'off' writes only
+            // 'enabled', not a stale copy of every other operator choice.
+            if parse_settings(value.clone()).is_err() {
+                *value = serde_json::to_value(Settings::default())?;
             }
-            Err(_) => Settings::default(),
-        };
-        let message = match args {
-            "" => return ExtensionCommandOutcome::Text(describe(&settings, &db, ctx).await),
-            "off" => {
-                settings.enabled = false;
-                "Autocompaction off. Existing history and manual /compact are unchanged."
-                    .to_string()
-            }
-            "on" => {
-                settings.enabled = true;
-                settings.trigger_tokens = None;
-                format!(
-                    "Autocompaction on at {DEFAULT_TRIGGER_PERCENT}% of the model context window."
-                )
-            }
-            length => match parse_length(length) {
-                Ok(tokens) => {
-                    settings.enabled = true;
-                    settings.trigger_tokens = Some(tokens);
+            let object = value.as_object_mut().expect("valid policy is an object");
+            let message = match args {
+                "off" => {
+                    object.insert("enabled".into(), Value::Bool(false));
+                    "Autocompaction off. Existing history and manual /compact are unchanged.".to_string()
+                }
+                "on" => {
+                    object.insert("enabled".into(), Value::Bool(true));
+                    object.insert("trigger_tokens".into(), Value::Null);
+                    format!("Autocompaction on at {DEFAULT_TRIGGER_PERCENT}% of the model context window.")
+                }
+                length => {
+                    let tokens = parse_length(length).map_err(|e| anyhow::anyhow!("{e}\n{USAGE}"))?;
+                    object.insert("enabled".into(), Value::Bool(true));
+                    object.insert("trigger_tokens".into(), serde_json::json!(tokens));
                     format!("Autocompaction on at {tokens} tokens of model-facing context.")
                 }
-                Err(error) => return ExtensionCommandOutcome::Error(format!("{error}\n{USAGE}")),
-            },
-        };
-        let value = serde_json::to_value(&settings).expect("settings serialize");
-        match write_settings(&db, NAME, value).await {
-            Ok(()) => ExtensionCommandOutcome::Text(message),
+            };
+            Ok(message)
+        }).await;
+        match result {
+            Ok(message) => ExtensionCommandOutcome::Text(message),
             Err(error) => ExtensionCommandOutcome::Error(format!(
                 "failed to save autocompact settings: {error}"
             )),
@@ -297,6 +300,7 @@ impl ExtensionCommand for AutocompactCommand {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::extension::write_settings;
 
     #[test]
     fn parses_plain_and_thousands_lengths() {
@@ -359,7 +363,18 @@ mod tests {
             policy(&db).await.unwrap().unwrap().trigger_tokens,
             Some(27_000)
         );
+        write_settings(
+            &db,
+            NAME,
+            serde_json::json!({"enabled":true,"trigger_tokens":27000,"keep_recent_tokens":12345}),
+        )
+        .await
+        .unwrap();
         invoke("off", &session).await.unwrap();
+        assert_eq!(
+            read_settings_checked(&db, NAME).await.unwrap(),
+            serde_json::json!({"enabled":false,"trigger_tokens":27000,"keep_recent_tokens":12345})
+        );
         assert_eq!(policy(&db).await.unwrap(), None);
         invoke("on", &session).await.unwrap();
         assert_eq!(policy(&db).await.unwrap().unwrap().trigger_tokens, None);

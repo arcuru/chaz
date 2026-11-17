@@ -657,7 +657,10 @@ async fn scoped_api_limits_calls_and_settings_and_supports_no_tools_turns() {
     txn.get_store::<eidetica::store::DocStore>(crate::extension::EXTENSION_SETTINGS_STORE)
         .await
         .unwrap()
-        .set_string("session_naming", "{broken")
+        .set(
+            "session_naming",
+            eidetica::crdt::doc::Value::List(Default::default()),
+        )
         .await
         .unwrap();
     txn.commit().await.unwrap();
@@ -668,10 +671,10 @@ async fn scoped_api_limits_calls_and_settings_and_supports_no_tools_turns() {
         txn.get_store::<eidetica::store::DocStore>(crate::extension::EXTENSION_SETTINGS_STORE)
             .await
             .unwrap()
-            .get_string("session_naming")
+            .get("session_naming")
             .await
             .unwrap(),
-        "{broken"
+        eidetica::crdt::doc::Value::List(Default::default())
     );
 
     // No session/agent pin: the backend default still has a known window.
@@ -818,7 +821,10 @@ async fn naming_refuses_corrupt_settings_and_live_revocation() {
             txn.get_store::<DocStore>(crate::extension::EXTENSION_SETTINGS_STORE)
                 .await
                 .unwrap()
-                .set_string("session_naming", "{broken")
+                .set(
+                    "session_naming",
+                    eidetica::crdt::doc::Value::List(Default::default()),
+                )
                 .await
                 .unwrap();
             txn.commit().await.unwrap();

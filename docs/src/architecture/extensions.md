@@ -468,13 +468,51 @@ graph LR
 
 ## Per-session settings
 
-Each extension can store a per-session JSON blob keyed by extension name
-in a `DocStore` named `extension_settings` on the session DB. Handlers
-reach it through the host-only `Settings` cap
-(`caps.settings.get/set(...)`), or via the `read_settings` /
-`write_settings` helpers an instance calls at instantiate time (e.g.
-`memory` reads `attached_banks` when building its per-session context
-tail).
+Settings synchronize with the session in its `extension_settings_v2` DocStore.
+Chaz 0.4.0 is the minimum supported reader **and writer** for native-v2 sessions.
+This is a coordinated cutover, not mixed-version operation; see the [operator procedure](../user_guide/extensions.md#coordinated-settings-cutover).
+JSON remains the host/API representation, not the persistence format.
+
+| API value                                    | Native representation                                              |
+| -------------------------------------------- | ------------------------------------------------------------------ |
+| Null, boolean, signed 64-bit integer, string | `Value::Null`, `Bool`, `Int`, `Text`                               |
+| Object                                       | Recursive `Doc` with native child values                           |
+| Array                                        | Native `List` inside an atomic `Doc` under reserved key `~array`   |
+| Float or unsigned integer above `i64::MAX`   | Decimal `Text` inside an atomic `Doc` under reserved key `~number` |
+
+The wrappers address limitations of the pinned Eidetica API, not an alternative JSON storage format.
+`Value` has no float or unsigned integer variant; its numeric `From` implementations truncate/wrap, so Chaz does not use them for those values.
+A `List` merges by position and has no atomic replacement mode.
+Settings arrays, including `attached_banks`, are complete values; an atomic wrapper prevents shortened lists retaining stale tails or concurrent attachment lists being combined incorrectly.
+
+Ordinary keys, empty keys and Unicode stay unchanged.
+Only keys containing dots or starting with `~` use `~` followed by lowercase hexadecimal UTF-8 bytes.
+The pinned `Doc` setters interpret dots as paths and offer no literal dotted-key setter, including through `FromIterator` or `PathBuf`.
+Escaping `~` prevents collisions with wrappers and escaped keys.
+The same rule applies to extension names, keeping a literal dotted name separate from a nested path.
+
+`read_settings_checked` uses one transaction: absence means `{}`, corruption or backend failure is an error.
+`read_settings` retains lenient display/default behavior.
+All production editors use a source-bound transaction, without a mutex, custom merge engine or distributed CAS.
+Internal read/edit operations emit native deltas only for changed paths, recursively through objects; removals emit native tombstones.
+Independent nested edits survive on separate handles/peers, and unchanged edits write nothing.
+Same-path conflicts converge under Eidetica's deterministic history composition (height, then entry ID order), not wall-clock command order.
+
+Assignment is different from editing subfields.
+`/extensions set` and turn-complete patches assign complete top-level values; supplied objects and lists **replace** those fields.
+They use native atomic Docs, including empty objects and list wrappers, so omitted children disappear.
+`write_settings` and `HookContext::set_settings` replace the entire extension's settings.
+These intentional replacements can conflict with concurrent edits in the replaced subtree.
+Memory/skills attachment changes replace only `attached_banks`; autocompact edits only changed policy paths.
+Checked turn patches refuse corruption; lenient explicit edits can repair it, including autocompact's existing invalid-policy recovery.
+
+Retained scalar JSON and the earlier hex-key/JSON-leaf format in `extension_settings` are read-only conversion inputs.
+An existing native-v2 override takes precedence; readers never copy retained state and new writes never update the old store.
+Ordinary edits refuse valid retained settings until explicit offline conversion; deliberate whole-value replacement can supersede them.
+Conversion validates every effective native/retained override and commits all conversions together, or none on corruption/authorization failure.
+It preserves the old store/history rather than deleting data and never runs at startup or lazily during reads/edits.
+The operator must synchronize all pending histories, stop/upgrade every sharing client, convert once, and distribute that conversion before resuming.
+Old binaries are unsupported afterwards; binary rollback cannot reverse synchronized data.
 
 ## Extension identity
 

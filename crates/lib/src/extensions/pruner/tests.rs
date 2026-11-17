@@ -819,10 +819,13 @@ async fn pruner_optional_source_and_settings_failure_keep_all_required_transform
                 .await
                 .unwrap();
         } else {
-            txn.get_store::<DocStore>("extension_settings")
+            txn.get_store::<DocStore>(crate::extension::EXTENSION_SETTINGS_STORE)
                 .await
                 .unwrap()
-                .set_string("context_prune", "invalid-json")
+                .set(
+                    "context_prune",
+                    eidetica::crdt::doc::Value::List(Default::default()),
+                )
                 .await
                 .unwrap();
         }
