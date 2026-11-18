@@ -1,7 +1,7 @@
 //! Explicit `kind` + `display_name` markers on every entity DB's `meta`
 //! store so the in-memory `HostedIndex` can classify a tracked database
-//! without inferring from `_settings.name` or deserializing entity-specific
-//! JSON blobs.
+//! without inferring from `_settings.name` or decoding entity-specific
+//! metadata records.
 //!
 //! Written once at DB creation (`create_agent_db`, `create_memory_bank`,
 //! `create_session`). Read by the cache builder when walking
@@ -9,7 +9,7 @@
 //! belongs in and what name to file it under.
 //!
 //! Stored as top-level keys in the `meta` DocStore — distinct from the
-//! JSON-blob `value` key the rest of `meta` uses, so adding them doesn't
+//! `value` key the rest of `meta` uses, so adding them doesn't
 //! force a schema change on `AgentMeta` / `MemoryBankMeta` / `SessionMeta`.
 
 use eidetica::Database;
