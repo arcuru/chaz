@@ -1,12 +1,19 @@
 //! Hermetic workspace tests: a fake homeserver and fake session registry,
-//! with the real persisted record in an in-memory Eidetica DB.
+//! with real Eidetica persistence and a disk/service reopen for recovery.
 
 use super::*;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Mutex as StdMutex;
 
-use eidetica::backend::database::InMemory;
+use eidetica::backend::{
+    BackendImpl,
+    database::{InMemory, Sqlite},
+};
+use eidetica::crdt::{Doc, doc::Value};
+use eidetica::store::DocStore;
 use eidetica::{Instance, NewAccount};
+
+use super::storage::STORE;
 
 const MANAGER: &str = "@patrick:example.org";
 const BOT: &str = "@chaz:example.org";
@@ -218,13 +225,15 @@ struct Harness {
 }
 
 async fn harness(version: &str) -> Harness {
-    let (instance, mut user) = Instance::create_backend(
-        Box::new(InMemory::new()),
-        NewAccount::with_password("t", "test-password"),
-    )
-    .await
-    .unwrap();
-    let mut settings = eidetica::crdt::Doc::new();
+    harness_on(Box::new(InMemory::new()), version).await
+}
+
+async fn harness_on(backend: Box<dyn BackendImpl>, version: &str) -> Harness {
+    let (instance, mut user) =
+        Instance::create_backend(backend, NewAccount::with_password("t", "test-password"))
+            .await
+            .unwrap();
+    let mut settings = Doc::new();
     settings.set("name", "chaz_peer");
     let key = user.get_default_key().unwrap();
     let db = user.create_database(settings, &key).await.unwrap();
@@ -461,10 +470,24 @@ async fn a_record_for_another_identity_or_a_malformed_record_refuses() {
         h.store.save(&state).await.unwrap();
     }
     let txn = h.store.db.new_transaction().await.unwrap();
+    let records = txn.get_store::<DocStore>(STORE).await.unwrap();
+    let mut bad = records.get_node(&h.store.key).await.unwrap();
+    records.set_string(&h.store.key, "{not json").await.unwrap();
+    txn.commit().await.unwrap();
+    let err = open(&h.store, &h.hs, &h.reg, AGENT, Some(MANAGER))
+        .await
+        .err()
+        .unwrap();
+    assert!(err.to_string().contains("malformed"), "{err}");
+
+    // Incomplete native state must fail this login's startup. The other
+    // login's independent key still has no record.
+    bad.remove("state.operations");
+    let txn = h.store.db.new_transaction().await.unwrap();
     txn.get_store::<DocStore>(STORE)
         .await
         .unwrap()
-        .set_string(&h.store.key, "{not json")
+        .set(&h.store.key, bad)
         .await
         .unwrap();
     txn.commit().await.unwrap();
@@ -472,7 +495,17 @@ async fn a_record_for_another_identity_or_a_malformed_record_refuses() {
         .await
         .err()
         .unwrap();
-    assert!(err.to_string().contains("malformed"), "{err}");
+    assert!(
+        format!("{err:#}").contains("missing workspace field operations"),
+        "{err:#}"
+    );
+    assert!(
+        WorkspaceStore::new(h.store.db.clone(), "@other:example.org")
+            .load()
+            .await
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[tokio::test]
@@ -572,7 +605,17 @@ async fn repeated_and_concurrent_delivery_of_one_request_creates_one_chat() {
 
 #[tokio::test]
 async fn a_lost_create_response_is_reconciled_never_reposted() {
-    let h = harness("12").await;
+    use eidetica::service::ServiceServer;
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::Duration;
+
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let url = format!(
+        "sqlite://{}?mode=rwc",
+        dir.path().join("workspace.db").display()
+    );
+    let h = harness_on(Box::new(Sqlite::connect(&url).await.unwrap()), "12").await;
     h.setup().await;
     h.hs.0
         .lock()
@@ -598,11 +641,56 @@ async fn a_lost_create_response_is_reconciled_never_reposted() {
     let held = h.lobby("workspace retry op-2").await;
     assert!(held.contains("cannot check rooms"), "{held}");
     assert_eq!(h.posts(), 3, "a lookup failure never repeats createRoom");
-    // Restart: a fresh engine reloads the record and reconciles by marker.
-    let posts = h.posts();
-    let ws = open(&h.store, &h.hs, &h.reg, AGENT, Some(MANAGER))
+
+    // Verify the writer, not just its reader: nested records/lists and a
+    // native counter must be visible through the pinned DocStore codec.
+    let txn = h.store.db.new_transaction().await.unwrap();
+    let records = txn.get_store::<DocStore>(STORE).await.unwrap();
+    let native = records
+        .get_node(&h.store.key)
+        .await
+        .expect("native workspace Doc");
+    assert!(native.is_atomic());
+    assert_eq!(native.get("state.next_op"), Some(&Value::Int(2)));
+    assert!(native.get("state.operations").unwrap().as_list().is_some());
+    // The pre-upgrade reader is not a supported rollback reader.
+    assert!(records.get_string(&h.store.key).await.is_err());
+
+    // Install the historical JSON snapshot as if the older bridge had stopped
+    // at this point. Reopen the disk, use a new service client, then reconcile.
+    let state = h.state().await;
+    records
+        .set_string(&h.store.key, serde_json::to_string(&state).unwrap())
         .await
         .unwrap();
+    txn.commit().await.unwrap();
+    let sid = h.store.db.root_id().clone();
+    let posts = h.posts();
+    let hs = h.hs.clone();
+    let reg = h.reg.clone();
+    drop(records);
+    drop(h);
+    let reopened = tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            match Instance::connect(&url).await {
+                Ok(instance) => break instance,
+                Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
+            }
+        }
+    })
+    .await
+    .expect("SQLite instance was not released");
+    let socket = dir.path().join("workspace.sock");
+    let service = ServiceServer::bind(reopened, &socket).await.unwrap();
+    let (stop, stopped) = tokio::sync::watch::channel(());
+    let task = tokio::spawn(service.run(stopped));
+    let client = Instance::connect(format!("unix://{}", socket.display()))
+        .await
+        .unwrap();
+    let user = client.login_account("t", "test-password").await.unwrap();
+    let store = WorkspaceStore::new(user.open_database(&sid).await.unwrap(), LOGIN);
+    assert_eq!(store.load().await.unwrap(), Some(state));
+    let ws = open(&store, &hs, &reg, AGENT, Some(MANAGER)).await.unwrap();
     let reply = ws
         .handle(Request {
             sender: MANAGER,
@@ -614,10 +702,37 @@ async fn a_lost_create_response_is_reconciled_never_reposted() {
         .await
         .unwrap();
     assert!(reply.contains("done"), "{reply}");
-    assert_eq!(h.posts(), posts, "the create was not sent again");
-    let state = h.state().await;
+    assert_eq!(
+        hs.0.lock().unwrap().posts,
+        posts,
+        "the create was not sent again"
+    );
+    assert_eq!(reg.0.lock().unwrap().creates, 1);
+    let mut state = store.load().await.unwrap().unwrap();
     assert_eq!(state.chats.len(), 1);
     assert!(state.chats[0].ready);
+    assert_eq!(state.op("op-2").unwrap().last_error, None);
+
+    // A full replacement cannot retain a previous list tail, and a counter
+    // past i64::MAX still round-trips (without an unchecked signed cast).
+    state.operations.pop();
+    state.next_op = u64::MAX;
+    store.save(&state).await.unwrap();
+    let txn = store.db.new_transaction().await.unwrap();
+    let records = txn.get_store::<DocStore>(STORE).await.unwrap();
+    assert!(records.get_node(&store.key).await.unwrap().is_atomic());
+    assert_eq!(store.load().await.unwrap(), Some(state));
+
+    drop(stop);
+    tokio::time::timeout(Duration::from_secs(10), task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(
+        store.load().await.is_err(),
+        "unavailable storage is not absence"
+    );
 }
 
 #[tokio::test]

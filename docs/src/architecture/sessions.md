@@ -29,7 +29,11 @@ remain distinct requests.
 
 Only `Message`, `Directive`, and `Summary` entries enter the conversation portion of the LLM context as ordinary messages. The context builder maps senders to roles: entries from the current agent become `assistant` messages, all others become `user` messages.
 
-The **system prompt is assembled fresh every turn** from accepted Agent DB configuration and its synchronized individual source texts, plus `PromptAugmentation` contributions and any multi-agent room note. Settings and sources are read coherently from one config blob; migrated agents do not depend on another peer's unsynchronized prompt store or pending local files. Worker invocations carry the selected template's resolved prompt into their child runtime without changing identity, ownership or capability attenuation. There is no per-session persona snapshot. Operator commands project outward, explicit `/agent reload` imports the managed folder, and startup never imports a draft; see [Agent folders](../user_guide/agents.md#two-representations-one-accepted-configuration).
+The **system prompt is assembled fresh every turn** from accepted Agent DB configuration and its synchronized individual source texts, plus `PromptAugmentation` contributions and any multi-agent room note. Settings and sources are read from one atomic config record; migrated agents do not depend on another peer's unsynchronized prompt store or pending local files. Worker invocations carry the selected template's resolved prompt into their child runtime without changing identity, ownership or capability attenuation. There is no per-session persona snapshot. Operator commands project outward, explicit `/agent reload` imports the managed folder, and startup never imports a draft; see [Agent folders](../user_guide/agents.md#two-representations-one-accepted-configuration).
+
+The Agent DB `config` store and the agent and bank `meta` stores retain Eidetica's `docstore:v0` type. At `value`, Chaz reads legacy JSON Text or an atomic Doc with `version: Int(1)` and a nested `fields` Doc. The store and driver (`AgentDb`, `MemoryBankDb`, or `SkillBankDb`) determine the field schema. Display metadata is independent of the top-level routing and home-key markers. Nested Docs and Lists are complete values inside the atomic boundary; competing writes resolve to one record, never a mix of settings, grants and sources. Fields use native nulls, booleans, text and signed 64-bit integers. The pinned API interprets dotted keys as paths, so dotted keys and keys beginning with `~` use the same `~` plus UTF-8 hex escape as extension settings. An unsigned integer above `i64::MAX` uses the existing `~number` decimal Text tag; Chaz does not truncate it. Legacy snapshot IDs retain their Eidetica string form.
+
+The `Doc` codec serializes typed values into subtree bytes; the enclosing entry uses DAG-CBOR for its content ID and signing representation. New writes append entries without changing the registered store type, database root, or historical entries and their signatures. The codec is not a Chaz JSON-text record or a promise of equal entry IDs for equal logical configurations. See [upgrade and recovery](../user_guide/agents.md#upgrading-agent-and-bank-records) for reader compatibility.
 
 `ToolCall`, `ToolResult`, `Ack`, and `Error` entries are excluded from the LLM context. The runtime maintains its active ReAct history in memory. Structured completed model responses and tool results are also written to the attempt's `turn_transcript` store. On a later turn, the context builder joins visible request row IDs to their selected completed attempt at one Eidetica snapshot. It replays complete native exchanges, including non-terminal assistant text and paired call/results, in request and attempt order, after the triggering request message.
 Responses final-entry metadata also restores complete terminal output and its host-owned replay origin at the assistant entry's position; see [stateless Responses replay](react.md#stateless-responses-replay). An interrupted attempt is not replayed into later turns, and older retry attempts are never included. The executor resumes one kind of interrupted attempt: one whose newest `job_wait_checkpoints` row is the pending end of its own strictly paired transcript (see Agent jobs below). Session-level tool entries remain display projections, never input for reconstruction.
@@ -313,6 +317,35 @@ recorded session ID; they never mint a replacement after a failed lookup.
 The journal is management state, not a second transcript or outbound router.
 See [Matrix workspace contracts](../design/matrix_workspace.md#contracts).
 
+### Transport attachment storage
+
+`transport_bindings` is in the synchronized session DB. The existing JSON
+tuple key names the exact `(transport, login, channel)`; dots retain their
+existing DocStore path semantics. The value is a version-1 atomic Doc with a
+native `conversational_replies` boolean. The legacy transport-name strings
+(Matrix enabled, Discord disabled) and JSON capability strings remain
+readable. Lookup does not change historical entries; new binds and explicit
+reply-capable rebinds write the native value at the same key. Exact detach
+removes that binding regardless of its representation. A malformed value
+occupies its key but cannot authorize routing. Competing bindings still
+require explicit detach or migration; none is chosen by iteration order.
+
+The bridge's workspace is a separate peer-local DocStore. It replaces one
+version-1 atomic Doc per login; nested Docs and ordered Lists hold its room
+index and operation journal. A step name such as `room.create` is a value in
+a step row, not a DocStore path. Counters use native signed integers where
+representable; larger legacy `u64` counters use decimal text only for those
+fields. No field or list element is independently merged. Neither store
+changes the conversation Store or Matrix event format.
+
+At the pinned Eidetica API, the Doc `Codec` encodes native variants as subtree
+bytes, and the enclosing entry uses canonical DAG-CBOR for IDs and signing.
+The schema versions above belong to Chaz records, not the Doc codec or entry
+wire format. Conversion adds ordinary signed entries on writes; it does not
+re-encode, re-hash or rewrite old entries. See the
+[Matrix cutover and recovery notes](../user_guide/matrix.md#upgrading-workspace-and-attachment-storage)
+before enabling writers that use the new format.
+
 See [Matrix Bot](../user_guide/matrix.md#attached-rooms-and-reply-routing).
 
 ### Named Sessions
@@ -407,6 +440,8 @@ Agent jobs are admitted only for Agents hosted by the local executor. Their chil
 `spawn_agent` submits one durable Agent job, not a workflow graph. The submitter prepares one child session DB with parent delegation, a request record and exactly one Directive before publishing its ID to the existing watched catalog. An unpublished child is inert; a published child is `Pending` until an executor checks its parent, hosted target/home and broad scope, then pins inherited per-tool grants, capability and depth ceilings and records acceptance in the **same** DB. Invalid requests become `Rejected` without running. Submission returns the DB ID after publication, not after acceptance or execution. A lost creation response requires inspecting the indexed jobs before another submission; there is no stable parent request key or automatic submission retry. Same-login local clients can create and observe jobs but cannot admit or execute them. Narrow, workspace and private scopes are rejected in v1.
 
 Admission and accepted-chain revalidation read the current hosted parent and target AgentDb configs. An unreadable config (open, read, type or decode failure) holds retryably, without falling back to YAML or a cached Agent snapshot. A genuinely absent config payload on an existing hosted Agent retains native defaults; a missing hosted Agent is not that case. Recovery rechecks the original accepted authority and child identity rather than rewriting grants or creating a replacement child.
+
+The request and terminal receipt each occupy one `v1` slot in their existing DocStore (`job_request` or `job_result`). Readers accept the historical JSON text or a native Eidetica atomic Doc. Chaz writes each Doc in full, so a new record replaces the old one at once; a receipt's attempt and execution IDs do not merge separately from its terminal. The representation is not an authorization check. The request still has to match the delegated parent and Directive, and the receipt still belongs to the completion transaction. The execution protocol, acceptance record and transcript baseline do not change.
 
 After `Pending` admission or `Rejected` refusal, job status comes from the accepted Directive's attempt and typed terminal receipt: queued, running, started-unknown (a client cannot prove liveness), interrupted (executor sees a start without completion), succeeded, or failed. At most ten turns hold runtime permits for actual execution; accepted jobs wait **queued before starting an attempt** when capacity is full. An in-Agent `job_wait` yields its permit during observation without releasing its processing reservation, attempt, or execution branch. It reacquires before result hooks, further tools, or model requests, including after tool errors and timeouts. The execution branch's yield watcher covers observation and reacquisition; a fresh ordering check after reacquisition prevents continuation once an earlier branch has been observed. Cancellation drops the turn's permit or pending acquisition. After restart, queued jobs are adopted; a started attempt without completion is not replayed automatically. Inspect it and explicitly retry if appropriate, since effects may already have occurred. `job_wait` only observes and a timeout does not cancel.
 

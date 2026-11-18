@@ -1,6 +1,6 @@
 //! Portable, coherent agent settings and explicitly referenced prompt sources.
 //!
-//! The source bundle travels inside the config blob, so a snapshot cannot pair
+//! The source bundle travels inside the config record, so a snapshot cannot pair
 //! settings from one transaction with source text from another. Filesystem
 //! import and projection are operator interfaces, never runtime prompt inputs.
 

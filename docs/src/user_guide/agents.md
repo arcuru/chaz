@@ -306,7 +306,7 @@ Trusted CLI/TUI and remote bridges retain their existing administration access a
 
 ## System Prompts
 
-For migrated agents, typed settings and a versioned bundle of individual source texts live in the same synchronized config blob and are read from one coherent snapshot. The runtime assembles parent and worker prompts from those accepted sources, not pending local files or another peer's unsynchronized `chaz_peer` prompt store. Historical prompt stores are preserved for migration, not used as new bundle dependencies.
+For migrated agents, typed settings and a versioned bundle of individual source texts live in the same synchronized config record. The runtime assembles parent and worker prompts from those accepted sources, not pending local files or another peer's unsynchronized `chaz_peer` prompt store. Historical prompt stores are preserved for migration, not used as new bundle dependencies.
 
 Files are concatenated in list order, with trailing file whitespace trimmed and empty fragments skipped, then nonempty inline text is appended with `\n\n` separators. Migration's exact saved-source preservation is the exception described above. Changing inline text does not flatten separate fragments, and editing a non-prompt setting never imports pending prompt files.
 
@@ -327,19 +327,27 @@ Older configs used a top-level `roles:` block and an `agent.role:` reference. Th
 
 Each Agent DB contains the following well-known stores:
 
-| Store            | Kind                         | Contents                                                                                                       |
-| ---------------- | ---------------------------- | -------------------------------------------------------------------------------------------------------------- |
-| `config`         | DocStore                     | Serialized `AgentDbConfig`: scoped settings plus versioned individual prompt sources in the same coherent blob |
-| `memory`         | `Table<MemoryEntry>`         | The agent's own persistent key-value facts (written by `remember`, read by `recall`)                           |
-| `meta`           | DocStore                     | `AgentMeta`: display_name, description, capabilities, avatar, agent-level `home_pubkey`                        |
-| `history`        | `Table<SessionHistoryEntry>` | Sessions this agent has participated in (appended on attach)                                                   |
-| `memory_banks`   | `Table<MemoryBankRef>`       | Refs to shared memory banks this agent has been granted access to (name, db_id, permission)                    |
-| `schedules`      | `Table<Schedule>`            | Agent-owned cron, interval, and one-shot wakes — see [Schedules](#schedules) below                             |
-| `schedule_fires` | `Table<...>`                 | Per-fire records (cost, errors) for schedules — used by the standalone fire path for attribution               |
-| `skills`         | `Table<Skill>`               | Agent-local skills (prompt fragments) attached as private context                                              |
-| `skill_banks`    | `Table<SkillBankRef>`        | Refs to shared skill banks this agent has been granted access to                                               |
+| Store            | Kind                         | Contents                                                                                         |
+| ---------------- | ---------------------------- | ------------------------------------------------------------------------------------------------ |
+| `config`         | DocStore                     | One atomic `AgentDbConfig` record: settings and individual prompt sources                        |
+| `memory`         | `Table<MemoryEntry>`         | The agent's own persistent key-value facts (written by `remember`, read by `recall`)             |
+| `meta`           | DocStore                     | Atomic display metadata record; separate `kind`, `display_name` and `home_pubkey` markers        |
+| `history`        | `Table<SessionHistoryEntry>` | Sessions this agent has participated in (appended on attach)                                     |
+| `memory_banks`   | `Table<MemoryBankRef>`       | Refs to shared memory banks this agent has been granted access to (name, db_id, permission)      |
+| `schedules`      | `Table<Schedule>`            | Agent-owned cron, interval, and one-shot wakes — see [Schedules](#schedules) below               |
+| `schedule_fires` | `Table<...>`                 | Per-fire records (cost, errors) for schedules — used by the standalone fire path for attribution |
+| `skills`         | `Table<Skill>`               | Agent-local skills (prompt fragments) attached as private context                                |
+| `skill_banks`    | `Table<SkillBankRef>`        | Refs to shared skill banks this agent has been granted access to                                 |
 
 The peer maintains two **in-memory** indices (`hosted_index::HostedIndex`) — one for Living Agents and one for standalone Memory Bank DBs — built once at startup by walking eidetica's `user.databases()` and reading each DB's `meta.kind` marker (`agent` / `bank` / `session`, written at creation time). Both indices map `db_id ↔ display_name ↔ pubkey`. They exist because eidetica has no inverse "list DBs this key can access" query, and routing reads them on every session entry. Mutations from `/agent new`, `/memory new`, `/agent delete`, etc. update the cache directly. There is no persistent mirror — eidetica's key store is the single source of truth for "which DBs does this peer host."
+
+### Upgrading agent and bank records
+
+Chaz writes agent config and agent, memory-bank, and skill-bank display metadata as native Eidetica documents. Each write replaces one complete record. Deleting a preset or prompt source in an accepted reload removes it from the active config; Eidetica does not merge the removed field back from the previous revision.
+
+1. Before enabling the new version, synchronize the participating peers, keep pre-upgrade backups, and take old Chaz clients offline. Upgrade **readers as well as writers**, including any bridge or executor that opens these databases. Old clients cannot read a native record, and an old client with write access can still overwrite it.
+2. Open the databases with upgraded clients. Existing JSON records still read in place. New databases and the next actual write to each old record use the native format. Checking `/agent hosted` or projecting an unchanged configuration does not convert it. A valid changed `/agent reload` writes native config and projects it normally. Agent and bank IDs, access, and attachments stay the same.
+3. If a record cannot be decoded, keep its database and history. For managed agents, check `/agent hosted` for the affected agent and fix the reader or recover the last trusted configuration from a matching backup or historical snapshot. Do not reset the agent or import a local draft to hide the error. Prefer recovery with upgraded clients. If reverting to older binaries after a native write, a binary downgrade alone is not enough: preserve the newer data, and restore and verify a consistent pre-upgrade backup in isolation before letting old clients reconnect.
 
 ## Session participation
 
@@ -801,6 +809,14 @@ Presets are available to Worker templates; spawn depth, tools, `model` and `role
 The result is `{"session_db_id":"<child DB ID>","state":"pending"}`. Keep that handle. `job_status({"session_db_id":"<child DB ID>"})` reads the state; `job_wait({"session_db_id":"<child DB ID>","timeout_seconds":30})` waits up to 30 seconds, then returns the current state without canceling the job (1–240 seconds; default 30). The status is typed: `Pending` before executor acceptance, `Rejected { message }` on refusal, `Queued`, `Running { attempt_id }`, `StartedUnknown { attempt_id, activity_recent }` for a client that cannot tell whether a start is still active, `Interrupted { attempt_id }` for an executor observing an abandoned attempt, `Succeeded { text }`, or `Failed { message }`. A failed job is not a successful answer. Check the state rather than treating a wait timeout as completion.
 
 A queued job can be adopted after executor restart. An attempt that started but has no completion is **not** automatically replayed: model or tool effects may already have happened. The only automatic continuation is an exact checkpointed `job_wait`, which observes again without repeating anything; see [Resuming a checkpointed wait after restart](#resuming-a-checkpointed-wait-after-restart). Inspect its status and transcript, open the child session, and use `/interrupted` to find the request ID before deciding whether `/retry <request_id>` is safe; do not submit a new task to guess whether the old one ran. If creation or publication returns an uncertain outcome, inspect the session catalog for the published job before submitting again. There is no stable parent request key or automatic submission retry; an unpublished prepared DB is inert and may require manual inspection. [Execution ordering](#parallel-executions-of-one-job) is cooperative, not fencing: concurrent executors can overlap and effects are not exactly-once.
+
+### Upgrading job storage
+
+New job requests and terminal receipts use native Eidetica records. Compatible Chaz builds read both formats without converting old jobs. Older builds that only read JSON text cannot read a native request or receipt.
+
+1. Before any native writer starts, move every Chaz process that reads these job sessions to a build that reads both formats but still writes JSON text. Include submitters, executors, TUI/CLI clients and any peers or tools that read the job stores. Keep this reader-only build available for rollback and take a backup before cutover.
+2. Once no incompatible process can access those sessions, upgrade the job writers. They use the native format on subsequent submissions or settlements; existing records are not rewritten.
+3. If a job fails to open or its status fails to load after the switch, check the reader version before doing anything to the job. After a native write, roll back to the reader-only build, not to a JSON-only build. Do not clear receipts or resubmit jobs to make them readable. A backup from before the switch does not contain jobs or results written since then.
 
 ### Waiting without holding a slot
 

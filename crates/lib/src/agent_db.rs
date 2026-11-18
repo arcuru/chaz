@@ -10,10 +10,8 @@
 //! - `meta`    (DocStore) — display name, description, capabilities, avatar
 //! - `history` (Table<SessionHistoryEntry>) — sessions this agent participated in
 //!
-//! **Config/meta encoding note:** both stores hold a single JSON-serialized
-//! blob under key `"value"`. This keeps the schema tractable for nested
-//! types (presets, grants, tool lists). Per-field storage may be revisited
-//! later if partial CRDT merges become important.
+//! Config and display metadata each live in a versioned, atomic Doc under
+//! `"value"`. The old JSON Text in that slot is still readable.
 
 // Some read-side helpers are only exercised by tests / external integrations;
 // allow dead_code to keep the API surface stable.
@@ -537,22 +535,22 @@ impl AgentDb {
     }
 
     pub async fn read_config(&self) -> anyhow::Result<AgentDbConfig> {
-        let cfg = read_blob(&self.database, CONFIG_STORE).await?;
+        let cfg = crate::agent_record::read(&self.database, CONFIG_STORE).await?;
         crate::agent_bundle::validate(&cfg)?;
         Ok(cfg)
     }
 
     pub async fn write_config(&self, cfg: &AgentDbConfig) -> anyhow::Result<()> {
         crate::agent_bundle::validate(cfg)?;
-        write_blob(&self.database, CONFIG_STORE, cfg).await
+        crate::agent_record::write(&self.database, CONFIG_STORE, cfg).await
     }
 
     pub async fn read_meta(&self) -> anyhow::Result<AgentMeta> {
-        read_blob(&self.database, META_STORE).await
+        crate::agent_record::read(&self.database, META_STORE).await
     }
 
     pub async fn write_meta(&self, meta: &AgentMeta) -> anyhow::Result<()> {
-        write_blob(&self.database, META_STORE, meta).await
+        crate::agent_record::write(&self.database, META_STORE, meta).await
     }
 
     /// Touch every well-known store so it exists in the DB. Safe to call
@@ -989,7 +987,7 @@ impl AgentDb {
     }
 }
 
-/// Generic read of a JSON blob from a DocStore. Missing blob → `Default::default()`.
+/// Legacy JSON read for the old memory-bank reference fallback.
 pub(crate) async fn read_blob<T>(database: &Database, store_name: &str) -> anyhow::Result<T>
 where
     T: serde::de::DeserializeOwned + Default,
@@ -1001,22 +999,6 @@ where
         Err(e) if e.is_not_found() => Ok(T::default()),
         Err(e) => Err(e.into()),
     }
-}
-
-pub(crate) async fn write_blob<T>(
-    database: &Database,
-    store_name: &str,
-    value: &T,
-) -> anyhow::Result<()>
-where
-    T: serde::Serialize,
-{
-    let json = serde_json::to_string(value)?;
-    let txn = database.new_transaction().await?;
-    let store = txn.get_store::<DocStore>(store_name).await?;
-    store.set_string(BLOB_KEY, json).await?;
-    txn.commit().await?;
-    Ok(())
 }
 
 /// DB name used in eidetica settings — `find_database` idempotency key.
@@ -1157,22 +1139,20 @@ mod tests {
     #[tokio::test]
     async fn config_round_trip() {
         let mut user = test_peer_user().await;
-        let cfg = AgentDbConfig {
-            system_prompt: "You are a researcher.".to_string(),
-            system_prompt_files: vec![],
-            model: Some("opus".to_string()),
-            tools: Some(vec!["web_fetch".into()]),
-            workers: vec![],
-            max_spawn_depth: Some(40),
-            autonomous: true,
-            presets: HashMap::new(),
-            tool_profile: Some("deep".to_string()),
-            max_context_tokens: Some(200_000),
-            grants: HashMap::new(),
-            default_memory_banks: vec![],
-            default_skill_banks: vec![],
-            ..Default::default()
-        };
+        let mut cfg: AgentDbConfig = serde_json::from_value(serde_json::json!({
+            "system_prompt": "Research prompt.",
+            "system_prompt_files": ["notes.v1.md"],
+            "prompt_sources": {"version": 1, "files": {"notes.v1.md": "First\n\n"}},
+            "model": null,
+            "tools": ["web_fetch", "calculate"],
+            "workers": [{"name": "helper", "tools": []}],
+            "max_spawn_depth": u32::MAX,
+            "autonomous": true,
+            "presets": { "p": {}, "p.deep": {}, "": {}, "~number": {}, "研究": {} },
+            "grants": {"mcp.tool": {"shell": {"allow": []}, "network": {}}}
+        }))
+        .unwrap();
+        cfg.max_context_tokens = Some(usize::MAX);
         let meta = AgentMeta {
             display_name: Some("researcher".to_string()),
             description: Some("digs into sources".to_string()),
@@ -1186,12 +1166,27 @@ mod tests {
 
         assert_eq!(db.read_config().await.unwrap(), cfg);
         assert_eq!(db.read_meta().await.unwrap(), meta);
+        let txn = db.database().new_transaction().await.unwrap();
+        let store = txn.get_store::<DocStore>(CONFIG_STORE).await.unwrap();
+        let record = store.get_node("value").await.unwrap();
+        assert!(record.is_atomic());
+        assert_eq!(record.get_as::<i64>("version"), Some(1));
+        let fields = record.get("fields").unwrap().as_doc().unwrap();
+        assert!(fields.get("model").unwrap().is_null());
+        assert_eq!(
+            fields.get_as::<i64>("max_spawn_depth"),
+            Some(u32::MAX.into())
+        );
+        assert_eq!(fields.get("tools").unwrap().as_list().unwrap().len(), 2);
+        assert!(fields.get("prompt_sources").unwrap().as_doc().is_some());
+        // The app record intentionally fails the old Text-only reader.
+        assert!(!store.get_string("value").await.unwrap_err().is_not_found());
         // Returned pubkey is an actual key the user holds for this DB.
         assert_eq!(user.find_key(&db.id()).unwrap(), Some(pubkey));
     }
 
     #[tokio::test]
-    async fn blob_reads_default_only_when_missing() {
+    async fn record_reads_default_only_when_missing() {
         use crate::memory_bank_db::{MemoryBankDb, MemoryBankMeta};
         use crate::skill_bank_db::{SkillBankDb, SkillBankMeta};
 
@@ -1214,7 +1209,7 @@ mod tests {
         }
         txn.commit().await.unwrap();
 
-        // A present non-string value is a storage error, not a missing blob.
+        // A present scalar of the wrong type is a storage error, not absence.
         for error in [
             agent.read_config().await.unwrap_err(),
             agent.read_meta().await.unwrap_err(),
@@ -1231,7 +1226,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn blob_reads_propagate_json_errors() {
+    async fn legacy_record_reads_propagate_json_errors() {
         use crate::memory_bank_db::MemoryBankDb;
         use crate::skill_bank_db::SkillBankDb;
 
@@ -1260,33 +1255,88 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn blob_write_preserves_key_store_and_single_commit() {
+    async fn native_write_leaves_signed_legacy_history_and_metadata_markers_intact() {
+        use eidetica::crdt::{Codec, doc::Value};
+
         let (_user, agent) = peer_with_agent_db().await;
         let database = agent.database();
-        let value = serde_json::json!({"nested": {"list": [1, "two"], "enabled": true}});
-
-        for (name, other) in [("config", "meta"), ("meta", "config")] {
-            let txn = database.new_transaction().await.unwrap();
-            let other_store = txn.get_store::<DocStore>(other).await.unwrap();
-            let other_before = other_store.get_string("value").await.unwrap();
-            let before = database.snapshot().await.unwrap();
-
-            write_blob(database, name, &value).await.unwrap();
-
-            let after = database.snapshot().await.unwrap();
-            assert_eq!(after.tips().len(), 1);
-            let entry = database.get_entry(after.tips()[0].clone()).await.unwrap();
-            assert_eq!(entry.parents().unwrap(), before.into_tips());
-
-            let txn = database.new_transaction().await.unwrap();
-            let store = txn.get_store::<DocStore>(name).await.unwrap();
-            assert_eq!(
-                store.get_string("value").await.unwrap(),
-                serde_json::to_string(&value).unwrap()
-            );
-            let other_store = txn.get_store::<DocStore>(other).await.unwrap();
-            assert_eq!(other_store.get_string("value").await.unwrap(), other_before);
+        let txn = database.new_transaction().await.unwrap();
+        let legacy_cfg =
+            r#"{"system_prompt":"old","presets":{"obsolete":{}},"tools":["one","two"]}"#;
+        let legacy_meta = r#"{"display_name":"label","description":"legacy"}"#;
+        for (name, json) in [(CONFIG_STORE, legacy_cfg), (META_STORE, legacy_meta)] {
+            txn.get_store::<DocStore>(name)
+                .await
+                .unwrap()
+                .set_string("value", json)
+                .await
+                .unwrap();
         }
+        let old_id = txn.commit().await.unwrap();
+        let old_tip = database.snapshot().await.unwrap();
+        let old_entry = database.get_entry(old_id.clone()).await.unwrap();
+        let old_bytes = old_entry.to_dagcbor().unwrap();
+        let cfg = agent.read_config().await.unwrap();
+        let meta = agent.read_meta().await.unwrap();
+        assert_eq!(cfg.system_prompt, "old");
+        assert_eq!(meta.description.as_deref(), Some("legacy"));
+        assert_eq!(
+            database.snapshot().await.unwrap(),
+            old_tip,
+            "read must not convert"
+        );
+        let home = crate::db_kind::read_agent_home_pubkey(database).await;
+
+        agent.write_config(&cfg).await.unwrap();
+        let after = database.snapshot().await.unwrap();
+        let [tip] = after.tips() else {
+            panic!("expected one write")
+        };
+        let entry = database.get_entry(tip.clone()).await.unwrap();
+        assert_eq!(entry.parents().unwrap(), old_tip.tips());
+        assert_eq!(entry.subtrees(), [CONFIG_STORE]);
+        assert!(database.verify_entry_signature(tip.clone()).await.unwrap());
+        assert_eq!(ID::from_dagcbor_bytes(entry.to_dagcbor().unwrap()), *tip);
+        let delta = Doc::decode(entry.data(CONFIG_STORE).unwrap()).unwrap();
+        assert!(matches!(delta.get("value"), Some(Value::Doc(doc)) if doc.is_atomic()));
+        assert_eq!(agent.read_config().await.unwrap(), cfg);
+        assert_eq!(agent.read_meta().await.unwrap(), meta);
+
+        let replacement = AgentDbConfig {
+            tools: Some(vec![]),
+            ..Default::default()
+        };
+        agent.write_config(&replacement).await.unwrap();
+        assert_eq!(agent.read_config().await.unwrap(), replacement);
+
+        agent.write_meta(&AgentMeta::default()).await.unwrap();
+        assert_eq!(agent.read_meta().await.unwrap(), AgentMeta::default());
+        assert_eq!(crate::db_kind::read_agent_home_pubkey(database).await, home);
+        assert_eq!(
+            crate::db_kind::read_marker(database).await,
+            Some(("agent".into(), "alpha".into()))
+        );
+
+        let historical = database.new_transaction_at(&old_tip).await.unwrap();
+        for (name, json) in [(CONFIG_STORE, legacy_cfg), (META_STORE, legacy_meta)] {
+            let store = historical.get_store::<DocStore>(name).await.unwrap();
+            assert_eq!(store.get_string("value").await.unwrap(), json);
+        }
+        assert!(
+            database
+                .verify_entry_signature(old_id.clone())
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            database
+                .get_entry(old_id)
+                .await
+                .unwrap()
+                .to_dagcbor()
+                .unwrap(),
+            old_bytes
+        );
     }
 
     #[tokio::test]
@@ -1310,7 +1360,9 @@ mod tests {
                 "presets": {"deep": {"max_iterations": 30}}
             }]
         });
-        write_blob(db.database(), CONFIG_STORE, &raw).await.unwrap();
+        crate::agent_record::write(db.database(), CONFIG_STORE, &raw)
+            .await
+            .unwrap();
         let cfg = db.read_config().await.unwrap();
         assert_eq!(cfg.max_spawn_depth, None);
         assert_eq!(cfg.presets["deep"].max_spawn_depth, None);

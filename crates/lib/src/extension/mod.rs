@@ -38,6 +38,7 @@ pub(crate) use settings::{patch_settings, update_settings};
 pub use instance::{CapResolver, ExtensionInstance, PeerHandles, Scope, ScopeCtx, TurnCtx};
 
 use crate::hosted_index::HostedIndex;
+use crate::native_doc::{decode_field_key, field_key};
 use crate::routine::RoutineScope;
 use crate::runtime::RuntimeMessage;
 use crate::session::{Session, SessionRegistry};
@@ -147,7 +148,7 @@ impl ExtensionOutput {
     fn to_native(&self) -> Doc {
         let mut status = Doc::new();
         for (label, text) in &self.status {
-            status.set(settings::field_key(label), text.clone());
+            status.set(field_key(label), text.clone());
         }
         // A publication replaces the whole output, including omitted labels.
         let mut record = Doc::atomic();
@@ -176,7 +177,7 @@ impl ExtensionOutput {
                 .iter()
                 .map(|(label, text)| {
                     let text = text.as_text().context("expected status text")?;
-                    Ok((settings::decode_field_key(label)?, text.to_owned()))
+                    Ok((decode_field_key(label)?, text.to_owned()))
                 })
                 .collect::<anyhow::Result<_>>()?,
         })

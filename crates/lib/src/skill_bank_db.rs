@@ -19,7 +19,8 @@
 
 #![allow(dead_code)]
 
-use crate::agent_db::{Skill, read_blob, write_blob};
+use crate::agent_db::Skill;
+use crate::agent_record;
 use eidetica::AccountSession;
 use eidetica::Database;
 use eidetica::auth::crypto::PublicKey;
@@ -60,11 +61,11 @@ impl SkillBankDb {
     }
 
     pub async fn read_meta(&self) -> anyhow::Result<SkillBankMeta> {
-        read_blob(&self.database, META_STORE).await
+        agent_record::read(&self.database, META_STORE).await
     }
 
     pub async fn write_meta(&self, meta: &SkillBankMeta) -> anyhow::Result<()> {
-        write_blob(&self.database, META_STORE, meta).await
+        agent_record::write(&self.database, META_STORE, meta).await
     }
 
     /// Touch every well-known store so it exists in the DB. Safe to call
