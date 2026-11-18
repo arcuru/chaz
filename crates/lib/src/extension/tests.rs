@@ -322,17 +322,86 @@ fn status_doc(key: &str, text: &str) -> ExtensionOutput {
 
 #[tokio::test]
 async fn extension_outputs_round_trip_and_idempotent_write() {
+    use eidetica::crdt::traits::Codec;
     let (_inst, db) = make_session_db().await;
-    let mut fresh = BTreeMap::new();
-    fresh.insert("core".to_string(), status_doc("mcp", "3 mcp"));
+    let empty = db.snapshot().await.unwrap();
+    assert!(try_read_extension_outputs(&db).await.unwrap().is_empty());
+    write_extension_outputs(&db, &BTreeMap::new())
+        .await
+        .unwrap();
+    assert_eq!(db.snapshot().await.unwrap(), empty);
 
-    write_extension_outputs(&db, &fresh).await.unwrap();
-    assert_eq!(read_extension_outputs(&db).await, fresh);
+    let old = r#"{"status":{"old":"3 mcp"}}"#;
+    let txn = db.new_transaction().await.unwrap();
+    txn.get_store::<DocStore>(EXTENSION_OUTPUTS_STORE)
+        .await
+        .unwrap()
+        .set_string("core", old)
+        .await
+        .unwrap();
+    let old_id = txn.commit().await.unwrap();
+    let old_bytes = db.get_entry(&old_id).await.unwrap().to_dagcbor().unwrap();
+    let before = db.snapshot().await.unwrap();
+    let legacy = BTreeMap::from([("core".into(), status_doc("old", "3 mcp"))]);
+    assert_eq!(try_read_extension_outputs(&db).await.unwrap(), legacy);
+    write_extension_outputs(&db, &legacy).await.unwrap();
+    assert_eq!(
+        db.snapshot().await.unwrap(),
+        before,
+        "no format-only rewrite"
+    );
 
-    // Write-on-change: rewriting the identical map is a no-op and the
-    // store still reads back the same value.
+    let fresh = BTreeMap::from([(
+        "core".into(),
+        ExtensionOutput {
+            status: BTreeMap::from([
+                ("a.b".into(), r#"{"opaque":[2]}"#.into()),
+                ("a".into(), "distinct".into()),
+                ("~array".into(), "reserved prefix".into()),
+                ("".into(), "雪".into()),
+            ]),
+        },
+    )]);
     write_extension_outputs(&db, &fresh).await.unwrap();
-    assert_eq!(read_extension_outputs(&db).await, fresh);
+    assert_eq!(try_read_extension_outputs(&db).await.unwrap(), fresh);
+    let published = db.snapshot().await.unwrap();
+    let new_id = &published.tips()[0];
+    let entry = db.get_entry(new_id).await.unwrap();
+    let delta = Doc::decode(entry.data(EXTENSION_OUTPUTS_STORE).unwrap()).unwrap();
+    let record = delta.get("core").and_then(NativeValue::as_doc).unwrap();
+    assert!(record.is_atomic());
+    assert_eq!(record.get_as::<i64>("version"), Some(1));
+    let status = record.get("status").and_then(NativeValue::as_doc).unwrap();
+    assert_eq!(status.get_as::<&str>("~612e62"), Some(r#"{"opaque":[2]}"#));
+    assert!(db.verify_entry_signature(new_id).await.unwrap());
+
+    let txn = db.new_transaction().await.unwrap();
+    assert!(
+        txn.get_store::<DocStore>(EXTENSION_OUTPUTS_STORE)
+            .await
+            .unwrap()
+            .get_string("core")
+            .await
+            .is_err(),
+        "predecessor can't read a native output as Text"
+    );
+    write_extension_outputs(&db, &fresh).await.unwrap();
+    assert_eq!(db.snapshot().await.unwrap(), published);
+    assert_eq!(
+        db.get_entry(&old_id).await.unwrap().to_dagcbor().unwrap(),
+        old_bytes
+    );
+    let historical = db.new_transaction_at(&before).await.unwrap();
+    assert_eq!(
+        historical
+            .get_store::<DocStore>(EXTENSION_OUTPUTS_STORE)
+            .await
+            .unwrap()
+            .get_string("core")
+            .await
+            .unwrap(),
+        old
+    );
 }
 
 #[tokio::test]
@@ -349,7 +418,186 @@ async fn extension_outputs_drops_vanished_extension() {
     let mut one = BTreeMap::new();
     one.insert("core".to_string(), status_doc("mcp", "2 mcp"));
     write_extension_outputs(&db, &one).await.unwrap();
-    assert_eq!(read_extension_outputs(&db).await, one);
+    assert_eq!(try_read_extension_outputs(&db).await.unwrap(), one);
+    let after = db.snapshot().await.unwrap();
+    let txn = db.new_transaction().await.unwrap();
+    let store = txn
+        .get_store::<DocStore>(EXTENSION_OUTPUTS_STORE)
+        .await
+        .unwrap();
+    assert!(store.get_all().await.unwrap().is_tombstone("memory"));
+    write_extension_outputs(&db, &one).await.unwrap();
+    assert_eq!(db.snapshot().await.unwrap(), after);
+}
+
+#[tokio::test]
+async fn extension_outputs_strict_read_rejects_bad_records_and_missing_backend_data() {
+    let (_inst, mut user, faults) =
+        crate::test_support::counting_backend::counting_eidetica().await;
+    let db = user
+        .create_database(Doc::new(), &user.get_default_key().unwrap())
+        .await
+        .unwrap();
+    let valid = BTreeMap::from([("core".into(), status_doc("mode", "on"))]);
+    write_extension_outputs(&db, &valid).await.unwrap();
+    faults.fail_store_reads(Some(EXTENSION_OUTPUTS_STORE));
+    assert!(try_read_extension_outputs(&db).await.is_err());
+    faults.fail_store_reads(None);
+    assert_eq!(try_read_extension_outputs(&db).await.unwrap(), valid);
+
+    let mut unsupported = ExtensionOutput::default().to_native();
+    unsupported.set("version", 2_i64);
+    let txn = db.new_transaction().await.unwrap();
+    let store = txn
+        .get_store::<DocStore>(EXTENSION_OUTPUTS_STORE)
+        .await
+        .unwrap();
+    store.set_string("bad-retained", "{invalid").await.unwrap();
+    txn.commit().await.unwrap();
+    assert!(try_read_extension_outputs(&db).await.is_err());
+    let txn = db.new_transaction().await.unwrap();
+    let store = txn
+        .get_store::<DocStore>(EXTENSION_OUTPUTS_STORE)
+        .await
+        .unwrap();
+    store.delete("bad-retained").await.unwrap();
+    store
+        .set_node("unknown-version", unsupported)
+        .await
+        .unwrap();
+    txn.commit().await.unwrap();
+    assert!(try_read_extension_outputs(&db).await.is_err());
+    assert_eq!(read_extension_outputs(&db).await, valid);
+}
+
+#[tokio::test]
+async fn native_publications_sync_as_whole_records_and_reopen() {
+    use context_strategy::CONTEXT_SELECTIONS_STORE;
+    use eidetica::{
+        Instance, NewAccount,
+        auth::{Permission, types::AuthKey},
+        backend::database::InMemory,
+        sync::{Address, transports::http::HttpTransport},
+    };
+    use serde_json::json;
+
+    let (owner, owner_user, db) = crate::session::test_helpers::test_session_db().await;
+    let hub = crate::test_support::context_hub().await;
+    let selected = "baseline_context";
+    let tuple = r#"["agent","baseline_context"]"#;
+    let owner_output = BTreeMap::from([("core".into(), status_doc("owner", "online"))]);
+    let peer_output = BTreeMap::from([("core".into(), status_doc("peer", "busy"))]);
+    let owner_settings = json!({"owner": [true, 1]});
+    let peer_settings = json!({"peer": [false]});
+    owner.enable_sync().await.unwrap();
+    let txn = db.new_transaction().await.unwrap();
+    txn.get_settings()
+        .unwrap()
+        .set_global_auth_key(AuthKey::active(None, Permission::Write(0)))
+        .await
+        .unwrap();
+    txn.commit().await.unwrap();
+    // Each store has a common ancestor; subsequent publications fork on two peers.
+    write_extension_outputs(
+        &db,
+        &BTreeMap::from([("core".into(), status_doc("before", "sync"))]),
+    )
+    .await
+    .unwrap();
+    hub.record_context_selection(&db, "agent", selected, &json!({"before":1}))
+        .await
+        .unwrap();
+    db.share().await.unwrap();
+    let sync = owner.sync().unwrap();
+    sync.register_transport("http", HttpTransport::builder().bind("127.0.0.1:0"))
+        .await
+        .unwrap();
+    sync.accept_connections().await.unwrap();
+    let address = Address::http(sync.get_server_address_for("http").await.unwrap());
+    let (peer, mut user) = Instance::create_backend(
+        Box::new(InMemory::new()),
+        NewAccount::with_password("peer", "test-password"),
+    )
+    .await
+    .unwrap();
+    peer.enable_sync().await.unwrap();
+    let key = user.get_default_key().unwrap();
+    let signing = user.get_signing_key(&key).unwrap();
+    let ps = peer.sync().unwrap();
+    ps.register_transport("http", HttpTransport::builder())
+        .await
+        .unwrap();
+    ps.sync_with_peer_for_bootstrap_with_key(
+        &address,
+        db.root_id(),
+        &signing,
+        &key.to_string(),
+        Permission::Write(10),
+    )
+    .await
+    .unwrap();
+    ps.flush().await.unwrap();
+    let (identity, _) = Database::find_sigkeys(&peer, db.root_id(), &key)
+        .await
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+    user.map_key(&key, db.root_id(), identity).await.unwrap();
+    let peer_db = user.open_database(db.root_id()).await.unwrap();
+
+    write_extension_outputs(&db, &owner_output).await.unwrap();
+    hub.record_context_selection(&db, "agent", selected, &owner_settings)
+        .await
+        .unwrap();
+    write_extension_outputs(&peer_db, &peer_output)
+        .await
+        .unwrap();
+    hub.record_context_selection(&peer_db, "agent", selected, &peer_settings)
+        .await
+        .unwrap();
+    for _ in 0..2 {
+        ps.sync_with_peer(&address, Some(db.root_id()))
+            .await
+            .unwrap();
+        ps.flush().await.unwrap();
+    }
+    drop(peer_db);
+    let local = owner_user.open_database(db.root_id()).await.unwrap();
+    let remote = user.open_database(db.root_id()).await.unwrap();
+    let outputs = try_read_extension_outputs(&local).await.unwrap();
+    assert_eq!(try_read_extension_outputs(&remote).await.unwrap(), outputs);
+    assert!([owner_output, peer_output].contains(&outputs));
+    let mut records = Vec::new();
+    for handle in [&local, &remote] {
+        let txn = handle.new_transaction().await.unwrap();
+        let row = txn
+            .get_store::<DocStore>(CONTEXT_SELECTIONS_STORE)
+            .await
+            .unwrap()
+            .get_node(tuple)
+            .await
+            .unwrap();
+        assert!(row.is_atomic());
+        assert_eq!(row.get_as::<&str>("extension"), Some(selected));
+        records.push(settings::decode(row.get("settings").unwrap()).unwrap());
+    }
+    assert_eq!(records[0], records[1]);
+    assert!([owner_settings, peer_settings].contains(&records[0]));
+
+    write_extension_outputs(&local, &BTreeMap::new())
+        .await
+        .unwrap();
+    ps.sync_with_peer(&address, Some(db.root_id()))
+        .await
+        .unwrap();
+    ps.flush().await.unwrap();
+    assert!(
+        try_read_extension_outputs(&remote)
+            .await
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[tokio::test]

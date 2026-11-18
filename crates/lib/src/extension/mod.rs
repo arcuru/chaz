@@ -38,12 +38,15 @@ pub(crate) use settings::{patch_settings, update_settings};
 pub use instance::{CapResolver, ExtensionInstance, PeerHandles, Scope, ScopeCtx, TurnCtx};
 
 use crate::hosted_index::HostedIndex;
+use crate::native_doc::{decode_field_key, field_key};
 use crate::routine::RoutineScope;
 use crate::runtime::RuntimeMessage;
 use crate::session::{Session, SessionRegistry};
 use crate::tool::Tool;
+use anyhow::Context;
 use chrono::{DateTime, Utc};
 use eidetica::Database;
+use eidetica::crdt::{Doc, doc::Value as NativeValue};
 use eidetica::store::{DocStore, Table};
 use futures::FutureExt;
 use futures::future::join_all;
@@ -106,7 +109,7 @@ pub const EXTENSIONS_STORE: &str = "extensions";
 pub const EXTENSION_SETTINGS_STORE: &str = "extension_settings_v2";
 
 /// Store name for extension-published outputs on the session DB. Keys are
-/// extension names; values are JSON-serialized [`ExtensionOutput`] blobs.
+/// extension names; values are versioned atomic Docs (or retained JSON Text).
 /// The read-direction twin of [`EXTENSION_SETTINGS_STORE`]: the daemon
 /// writes, frontends read. Lives on the session DB so a split
 /// (out-of-process) frontend that already holds the session open consumes
@@ -141,25 +144,63 @@ pub struct ExtensionOutput {
     pub status: BTreeMap<String, String>,
 }
 
-/// Read every extension's published outputs from this session's DB, keyed
-/// by extension name. Missing store / parse errors yield an empty map —
-/// absence is the normal "nothing published yet" state.
+impl ExtensionOutput {
+    fn to_native(&self) -> Doc {
+        let mut status = Doc::new();
+        for (label, text) in &self.status {
+            status.set(field_key(label), text.clone());
+        }
+        // A publication replaces the whole output, including omitted labels.
+        let mut record = Doc::atomic();
+        record.set("version", 1_i64);
+        record.set("status", status);
+        record
+    }
+
+    fn from_stored(value: &NativeValue) -> anyhow::Result<Self> {
+        if let NativeValue::Text(json) = value {
+            return Ok(serde_json::from_str(json)?);
+        }
+        let record = value
+            .as_doc()
+            .context("expected an extension output record")?;
+        anyhow::ensure!(
+            record.is_atomic() && record.len() == 2 && record.get_as::<i64>("version") == Some(1),
+            "invalid or unsupported extension output record"
+        );
+        let status = record
+            .get("status")
+            .and_then(NativeValue::as_doc)
+            .context("expected a status document")?;
+        Ok(Self {
+            status: status
+                .iter()
+                .map(|(label, text)| {
+                    let text = text.as_text().context("expected status text")?;
+                    Ok((decode_field_key(label)?, text.to_owned()))
+                })
+                .collect::<anyhow::Result<_>>()?,
+        })
+    }
+}
+
+async fn load_extension_outputs(session_db: &Database) -> anyhow::Result<Doc> {
+    let txn = session_db.new_transaction().await?;
+    Ok(txn
+        .get_store::<DocStore>(EXTENSION_OUTPUTS_STORE)
+        .await?
+        .get_all()
+        .await?)
+}
+
+/// Read the available outputs, skipping malformed records. A failed store
+/// read returns an empty map; use the fallible API to detect either failure.
 pub async fn read_extension_outputs(session_db: &Database) -> BTreeMap<String, ExtensionOutput> {
-    let Ok(txn) = session_db.new_transaction().await else {
-        return BTreeMap::new();
-    };
-    let Ok(store) = txn.get_store::<DocStore>(EXTENSION_OUTPUTS_STORE).await else {
-        return BTreeMap::new();
-    };
-    let Ok(doc) = store.get_all().await else {
+    let Ok(doc) = load_extension_outputs(session_db).await else {
         return BTreeMap::new();
     };
     doc.iter()
-        .filter_map(|(ext, value)| {
-            let json: String = value.try_into().ok()?;
-            let parsed = serde_json::from_str::<ExtensionOutput>(&json).ok()?;
-            Some((ext.clone(), parsed))
-        })
+        .filter_map(|(ext, value)| Some((ext.clone(), ExtensionOutput::from_stored(value).ok()?)))
         .collect()
 }
 
@@ -168,48 +209,46 @@ pub async fn read_extension_outputs(session_db: &Database) -> BTreeMap<String, E
 pub async fn try_read_extension_outputs(
     session_db: &Database,
 ) -> anyhow::Result<BTreeMap<String, ExtensionOutput>> {
-    let txn = session_db.new_transaction().await?;
-    let doc = txn
-        .get_store::<DocStore>(EXTENSION_OUTPUTS_STORE)
+    load_extension_outputs(session_db)
         .await?
-        .get_all()
-        .await?;
-    doc.iter()
+        .iter()
         .map(|(ext, value)| {
-            let json: String = value.try_into()?;
-            Ok((ext.clone(), serde_json::from_str(&json)?))
+            let output = ExtensionOutput::from_stored(value)
+                .with_context(|| format!("invalid published output for extension '{ext}'"))?;
+            Ok((ext.clone(), output))
         })
         .collect()
 }
 
-/// Materialize the daemon-collected extension outputs into this session's
-/// DB, one JSON doc per extension. Write-on-change: reads the current
-/// store and only opens a write transaction when something differs, so an
-/// unchanged turn appends no entry to the session DAG.
+/// Publish changed outputs and remove vanished ones in one transaction. An
+/// unchanged turn appends no entry, even if the retained records are JSON Text.
 pub async fn write_extension_outputs(
     session_db: &Database,
     fresh: &BTreeMap<String, ExtensionOutput>,
 ) -> anyhow::Result<()> {
-    let current = read_extension_outputs(session_db).await;
-    if current == *fresh {
-        return Ok(());
-    }
     let txn = session_db.new_transaction().await?;
     let store = txn.get_store::<DocStore>(EXTENSION_OUTPUTS_STORE).await?;
+    let doc = store.get_all().await?;
+    let current: BTreeMap<_, _> = doc
+        .iter()
+        .filter_map(|(ext, value)| Some((ext, ExtensionOutput::from_stored(value).ok()?)))
+        .collect();
+    let mut changed = false;
     for (ext, output) in fresh {
         if current.get(ext) != Some(output) {
-            store
-                .set_string(ext, serde_json::to_string(output)?)
-                .await?;
+            store.set_node(ext, output.to_native()).await?;
+            changed = true;
         }
     }
-    // Drop extensions that no longer publish anything.
-    for ext in current.keys() {
+    // As before, don't infer a vanished publisher from an unreadable record.
+    for ext in current.into_keys() {
         if !fresh.contains_key(ext) {
-            store.delete(ext).await?;
+            changed |= store.delete(ext).await?;
         }
     }
-    txn.commit().await?;
+    if changed {
+        txn.commit().await?;
+    }
     Ok(())
 }
 

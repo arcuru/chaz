@@ -748,6 +748,31 @@ storage-read optimization is separate work, not a second authoritative transcrip
 Tests measure returned Table row/byte volume separately from selection elapsed
 cost; this is not a measurement of physical backend I/O or provider cache hits.
 
+### Published outputs and selection records
+
+`extension_outputs` and `context_selections` keep their session-bound DocStores
+and the `docstore:v0` Eidetica type. An output key is the publisher name; a
+selection key is the existing JSON tuple of agent and selected extension. The
+pinned DocStore still treats dots in store keys as path separators. This change
+neither rekeys those records nor repairs ambiguous historical keys.
+
+New values are atomic Docs with an integer `version: 1`. An output has a
+`status` Doc of text segments. A selection has an `extension` string and a
+complete `settings` value using the same [native value encoding](#per-session-settings)
+as session settings, not its patch semantics. Dotted and reserved-prefix status
+labels use the same literal-key escapes. Text segments are opaque, even when
+one happens to contain JSON. The outer atomic Doc prevents concurrent versions
+of the same record from merging individual fields. A publisher's removal writes
+a tombstone; unchanged records don't advance the DAG.
+
+The DocStore codec encodes tagged Eidetica values as subtree bytes. The entry
+embeds those bytes in DAG-CBOR for content IDs and signatures; Chaz does not
+recode old entries. A pinned snapshot can still read its old Text value. Current
+readers accept retained Text and v1. Strict status reads report invalid or
+unavailable records instead of clearing the frontend's last good status. A
+failed required selection write still stops assembly. A selection record is
+not an activation event, request cache, or execution grant.
+
 `ContextTailCall` replaces the native recall endpoint's loose argument pair with
 agent/session/request identity and the same recent-text input. Current activation
 and declarations gate the production call; errors, panic and timeout discard only

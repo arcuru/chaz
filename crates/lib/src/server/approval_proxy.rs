@@ -371,6 +371,7 @@ mod tests {
     #[tokio::test]
     async fn context_selection_refreshes_the_held_signer_without_reloading_context() {
         use crate::context::ContextBuilder;
+        use crate::extension::context_strategy::CONTEXT_SELECTIONS_STORE;
         use crate::runtime::RuntimeMessage;
         use eidetica::store::DocStore;
         let (_instance, _user, identity, old, key) = delegated_proxy_fixture().await;
@@ -421,14 +422,15 @@ mod tests {
         );
         let txn = old.new_transaction().await.unwrap();
         let selected = txn
-            .get_store::<DocStore>("context_selections")
+            .get_store::<DocStore>(CONTEXT_SELECTIONS_STORE)
             .await
             .unwrap();
         assert!(
             selected
-                .get_string("[\"host\",\"baseline_context\"]")
+                .get_node("[\"host\",\"baseline_context\"]")
                 .await
-                .is_ok()
+                .unwrap()
+                .is_atomic()
         );
         assert!(Session::renew_turn_activity(&old, "missing").await.is_err());
     }

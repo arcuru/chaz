@@ -407,14 +407,16 @@ async fn ephemeral_recall_reopen_settings_and_live_required_revocation() {
     );
     let txn = db.new_transaction().await.unwrap();
     let state = txn
-        .get_store::<DocStore>("context_selections")
+        .get_store::<DocStore>(CONTEXT_SELECTIONS_STORE)
         .await
         .unwrap()
-        .get_string(serde_json::to_string(&("test-agent", "baseline_context")).unwrap())
+        .get(serde_json::to_string(&("test-agent", "baseline_context")).unwrap())
         .await
         .unwrap();
-    println!("SELECTION_STATE {state}");
-    assert!(state.contains("one_hour"));
+    assert_eq!(
+        selection_settings(&state, "baseline_context").unwrap(),
+        json!({"cache": {"anchors": ["system", {"message": 1}], "ttl": "one_hour"}})
+    );
     // A successful assembly is not a frozen permission to run the strategy.
     crate::extension::append_event(
         &db,
@@ -434,6 +436,183 @@ async fn ephemeral_recall_reopen_settings_and_live_required_revocation() {
             .contains("required context strategy")
     );
     assert!(mock.recorded_calls().is_empty());
+}
+
+#[tokio::test]
+async fn context_selection_uses_the_same_scoped_key_and_keeps_unchanged_snapshots() {
+    let (_inst, mut user, faults) =
+        crate::test_support::counting_backend::counting_eidetica().await;
+    let key = user.get_default_key().unwrap();
+    let db = user.create_database(Doc::new(), &key).await.unwrap();
+    let other_session = user.create_database(Doc::new(), &key).await.unwrap();
+    let hub = context_hub().await;
+    let agent = r#"a,"雪\b"#;
+    let selected = "baseline_context";
+    let tuple = serde_json::to_string(&(agent, selected)).unwrap();
+    let txn = db.new_transaction().await.unwrap();
+    let store = txn
+        .get_store::<DocStore>(CONTEXT_SELECTIONS_STORE)
+        .await
+        .unwrap();
+    let old = r#"{"extension":"baseline_context","settings":{"old":true}}"#;
+    store.set_string(&tuple, old).await.unwrap();
+    txn.commit().await.unwrap();
+    let before = db.snapshot().await.unwrap();
+    hub.record_context_selection(&db, agent, selected, &json!({"old":true}))
+        .await
+        .unwrap();
+    assert_eq!(db.snapshot().await.unwrap(), before);
+
+    let value = json!({"a.b":[null, false, {"": u64::MAX, "雪": i64::MIN}],
+        "a":{"b":"distinct"}, "~number":"literal", "zero":-0.0,
+        "fraction": f64::from_bits(0x20fd5db43a776693)});
+    hub.record_context_selection(&db, agent, selected, &value)
+        .await
+        .unwrap();
+    let after = db.snapshot().await.unwrap();
+    let txn = db.new_transaction().await.unwrap();
+    let store = txn
+        .get_store::<DocStore>(CONTEXT_SELECTIONS_STORE)
+        .await
+        .unwrap();
+    let record = store.get(&tuple).await.unwrap();
+    assert_eq!(
+        selection_settings(&record, selected).unwrap().to_string(),
+        value.to_string()
+    );
+    assert_eq!(
+        record
+            .as_doc()
+            .unwrap()
+            .get("settings")
+            .unwrap()
+            .type_name(),
+        "doc"
+    );
+    assert!(
+        store.get_string(&tuple).await.is_err(),
+        "predecessor refuses the converted key"
+    );
+    hub.record_context_selection(&db, agent, selected, &value)
+        .await
+        .unwrap();
+    assert_eq!(
+        db.snapshot().await.unwrap(),
+        after,
+        "no new entry for the same settings, including lists and floats"
+    );
+    let txn = db.new_transaction_at(&before).await.unwrap();
+    assert_eq!(
+        txn.get_store::<DocStore>(CONTEXT_SELECTIONS_STORE)
+            .await
+            .unwrap()
+            .get_string(&tuple)
+            .await
+            .unwrap(),
+        old
+    );
+
+    assert!(
+        hub.record_context_selection(&db, agent, "not-granted", &value)
+            .await
+            .is_err()
+    );
+    assert_eq!(db.snapshot().await.unwrap(), after);
+    hub.record_context_selection(&db, "other-agent", selected, &json!({"different":1}))
+        .await
+        .unwrap();
+    let txn = db.new_transaction().await.unwrap();
+    assert_eq!(
+        txn.get_store::<DocStore>(CONTEXT_SELECTIONS_STORE)
+            .await
+            .unwrap()
+            .get(&tuple)
+            .await
+            .unwrap(),
+        record
+    );
+    let txn = other_session.new_transaction().await.unwrap();
+    assert!(
+        txn.get_store::<DocStore>(CONTEXT_SELECTIONS_STORE)
+            .await
+            .unwrap()
+            .get_all()
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    let mut positive_zero = value.clone();
+    positive_zero["zero"] = json!(0.0);
+    let before_zero = db.snapshot().await.unwrap();
+    hub.record_context_selection(&db, agent, selected, &positive_zero)
+        .await
+        .unwrap();
+    assert_ne!(db.snapshot().await.unwrap(), before_zero);
+
+    // A missing backend resource is not an absent selection; do not overwrite it.
+    let before_fault = db.snapshot().await.unwrap();
+    faults.fail_store_reads(Some(CONTEXT_SELECTIONS_STORE));
+    let err = hub
+        .record_context_selection(&db, agent, selected, &json!({}))
+        .await
+        .unwrap_err();
+    assert!(
+        err.downcast_ref::<eidetica::Error>()
+            .is_some_and(eidetica::Error::is_not_found)
+    );
+    faults.fail_store_reads(None);
+    assert_eq!(db.snapshot().await.unwrap(), before_fault);
+
+    // A database read grant is sufficient to inspect state, not to change it.
+    let txn = db.new_transaction().await.unwrap();
+    txn.get_settings()
+        .unwrap()
+        .set_auth_key(
+            &key,
+            eidetica::auth::types::AuthKey::active(None, eidetica::auth::Permission::Read),
+        )
+        .await
+        .unwrap();
+    txn.commit().await.unwrap();
+    let db = user.open_database(db.root_id()).await.unwrap();
+    let before_denial = db.snapshot().await.unwrap();
+    assert!(
+        hub.record_context_selection(&db, agent, selected, &json!({}))
+            .await
+            .is_err()
+    );
+    assert_eq!(db.snapshot().await.unwrap(), before_denial);
+}
+
+#[tokio::test]
+async fn corrupt_native_selection_stops_required_assembly() {
+    let (_i, session) = fresh_session().await;
+    let session = session.lock().await;
+    let db = session.database();
+    let hub = Arc::new(context_hub().await);
+    hub.record_active(db).await.unwrap();
+    let build = || assembled(hub.clone(), &session, "policy", Some("request"));
+    build()
+        .await
+        .expect("required strategy is otherwise healthy");
+    let txn = db.new_transaction().await.unwrap();
+    let mut invalid = Doc::atomic();
+    invalid.set("version", 2_i64);
+    txn.get_store::<DocStore>(CONTEXT_SELECTIONS_STORE)
+        .await
+        .unwrap()
+        .set_node(r#"["test-agent","baseline_context"]"#, invalid)
+        .await
+        .unwrap();
+    txn.commit().await.unwrap();
+    let before = db.snapshot().await.unwrap();
+    let error = match build().await {
+        Err(error) => error,
+        Ok(_) => panic!("assembly must not authorize a request after a failed selection write"),
+    };
+    assert!(error.to_string().contains("unsupported context selection"));
+    assert_eq!(db.snapshot().await.unwrap(), before);
 }
 
 #[tokio::test]

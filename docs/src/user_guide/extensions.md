@@ -520,6 +520,8 @@ and assigns source identities. The selected name and settings are recorded in
 session-backed, agent/extension-scoped `context_selections` state. Session settings
 remain in `extension_settings_v2` and are read anew each turn. Neither is a saved
 model request or an execution grant. There is no projection cache.
+See [upgrading session readers](#upgrading-session-readers) before sharing a session
+with a daemon that writes native records.
 
 Native memory recall still uses its existing activation, bank eligibility,
 query extraction and per-bank search budgets. Its typed invocation carries the
@@ -537,6 +539,42 @@ prove a provider cache hit, and the default policy is unchanged.
 If an optional durable contribution is revoked, the host removes its message
 anchors and remaps the remaining anchors before projection. A projector that
 changes message positions must update its returned cache indices as well.
+
+## Upgrading session readers
+
+| Session record       | What it holds                                                           | When it changes                                                     |
+| -------------------- | ----------------------------------------------------------------------- | ------------------------------------------------------------------- |
+| `extension_outputs`  | Each publisher's status-bar labels and text.                            | A changed publication replaces it; a vanished publisher is removed. |
+| `context_selections` | The strategy name and settings last recorded for an agent and strategy. | A successful selection with different settings replaces the record. |
+
+These stores use versioned native Eidetica records. New Chaz binaries also read
+retained JSON-text records. There is no conversion command or background rewrite:
+unchanged records keep their original format until replaced or removed. The session
+DAG and its old entries are not rewritten. This is separate from
+[`/extensions migrate-settings`](#coordinated-settings-cutover).
+
+1. Before starting a daemon or other executor with native writers, upgrade every
+   client that reads or writes these stores on shared sessions, including the TUI.
+   Keep a consistent pre-cutover backup if you need to roll back the binaries.
+2. Reopen a session with the upgraded TUI and send a normal turn. Status still
+   appears in the strip, and the configured strategy still controls selection.
+   A recorded selection does not grant the strategy permission to run.
+3. If a client was missed, an old TUI can fail to refresh a converted status row,
+   and an old executor can stop before a model call when its selection has already
+   been converted. An old executor reports:
+
+   ```text
+   Type mismatch in store 'context_selections': expected String, found Doc
+   ```
+
+   Upgrade the missed client rather than clearing a store. An old lenient reader may
+   just omit the native status rows, so a blank strip does not prove no one published.
+
+Once native writes have occurred, switching binaries back does not roll back the
+session. Keep the newer record readers, or restore the pre-cutover data on all
+sharing peers as a coordinated recovery; that loses later changes. Do not rejoin
+peers that still hold the newer history to the restored session. Mixed old/new
+writers and in-place downgrade are not supported.
 
 ## Walkthrough: change cache settings and recover a disabled strategy
 

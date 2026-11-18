@@ -5,13 +5,36 @@
 #[cfg(test)]
 mod tests;
 
-use super::{ExtensionHub, caps::CapFuture, projection::PROJECTOR_TIMEOUT};
+use super::{ExtensionHub, caps::CapFuture, projection::PROJECTOR_TIMEOUT, settings};
 use crate::{cache::CacheOptions, context::ContextBuilder, session::EntryType};
+use anyhow::Context;
+use eidetica::crdt::{Doc, doc::Value as NativeValue};
 use eidetica::store::DocStore;
 use futures::FutureExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{collections::HashSet, panic::AssertUnwindSafe, sync::Arc};
+
+pub(crate) const CONTEXT_SELECTIONS_STORE: &str = "context_selections";
+
+fn selection_settings(record: &NativeValue, selected: &str) -> anyhow::Result<Value> {
+    let record = record
+        .as_doc()
+        .context("expected a context selection record")?;
+    anyhow::ensure!(
+        record.is_atomic() && record.len() == 3 && record.get_as::<i64>("version") == Some(1),
+        "invalid or unsupported context selection record"
+    );
+    anyhow::ensure!(
+        record.get("extension").and_then(NativeValue::as_text) == Some(selected),
+        "context selection record does not match its extension key"
+    );
+    settings::decode(
+        record
+            .get("settings")
+            .context("missing context selection settings")?,
+    )
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -192,19 +215,33 @@ impl ExtensionHub {
                 .is_some_and(|g| g.extension == selected),
             "context selection not granted"
         );
-        let value = serde_json::to_string(
-            &serde_json::json!({"extension": selected, "settings": settings}),
-        )?;
         let key = serde_json::to_string(&(agent, selected))?;
         let txn = db.new_transaction().await?;
-        let store = txn.get_store::<DocStore>("context_selections").await?;
-        match store.get_string(&key).await {
-            Ok(old) if old == value => return Ok(()),
-            Ok(_) => {}
-            Err(error) if error.is_not_found() => {}
-            Err(error) => return Err(error.into()),
+        let store = txn.get_store::<DocStore>(CONTEXT_SELECTIONS_STORE).await?;
+        let unchanged = match settings::stored(&store, &key).await? {
+            // Keep the predecessor's exact no-op check on retained Text.
+            Some(NativeValue::Text(old)) => {
+                let expected = serde_json::to_string(
+                    &serde_json::json!({"extension": selected, "settings": settings}),
+                )?;
+                old == expected
+            }
+            // Compare serialized settings, as before (e.g. -0.0 vs 0.0), not
+            // the native List's generated position IDs.
+            Some(old) => {
+                serde_json::to_vec(&selection_settings(&old, selected)?)?
+                    == serde_json::to_vec(settings)?
+            }
+            None => false,
+        };
+        if unchanged {
+            return Ok(());
         }
-        store.set_string(key, value).await?;
+        let mut record = Doc::atomic();
+        record.set("version", 1_i64);
+        record.set("extension", selected);
+        record.set("settings", settings::encode(settings));
+        store.set_node(key, record).await?;
         txn.commit().await?;
         Ok(())
     }
