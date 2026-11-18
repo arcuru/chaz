@@ -21,16 +21,17 @@ use crate::types::ConversationId;
 use eidetica::Database;
 use eidetica::crdt::Doc;
 use eidetica::crdt::doc::Value;
-use eidetica::store::DocStore;
-use serde::{Deserialize, Serialize};
+use eidetica::store::{DocStore, StoreError};
+use serde::Deserialize;
 use tracing::info;
 
 use super::registry::SessionRegistry;
 
 /// Per-session DocStore holding this session's transport bindings, keyed by
-/// [`channel_key`] → the transport name (informational; the key is the
-/// authoritative, reversible record).
+/// [`channel_key`] → the versioned capability record. The key alone names
+/// the destination; the record must not provide a second identity.
 pub(super) const STORE_TRANSPORT_BINDINGS: &str = "transport_bindings";
+const BINDING_VERSION: i64 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransportAttachment {
@@ -40,9 +41,36 @@ pub struct TransportAttachment {
     pub conversational_replies: bool,
 }
 
-#[derive(Serialize, Deserialize)]
-struct BindingCapabilities {
-    conversational_replies: bool,
+fn binding_value(conversational_replies: bool) -> Value {
+    let mut record = Doc::atomic();
+    record.set("version", BINDING_VERSION);
+    record.set("conversational_replies", conversational_replies);
+    Value::Doc(record)
+}
+
+fn binding_replies(value: &Value, transport: &str) -> anyhow::Result<bool> {
+    match value {
+        // Compatibility with the pre-capability pilot. Discord remains on
+        // its original delivery path.
+        Value::Text(raw) if raw == transport => Ok(transport == "matrix"),
+        Value::Text(raw) => {
+            #[derive(Deserialize)]
+            struct LegacyCapabilities {
+                conversational_replies: bool,
+            }
+            Ok(serde_json::from_str::<LegacyCapabilities>(raw)?.conversational_replies)
+        }
+        Value::Doc(record) if record.is_atomic() => {
+            anyhow::ensure!(
+                record.get("version") == Some(&Value::Int(BINDING_VERSION)),
+                "unsupported transport binding version"
+            );
+            record
+                .get_as::<bool>("conversational_replies")
+                .ok_or_else(|| anyhow::anyhow!("invalid transport binding capabilities"))
+        }
+        _ => anyhow::bail!("invalid transport binding record"),
+    }
 }
 
 /// The sole external attachment, if any. Never guess among ambiguous legacy
@@ -51,7 +79,8 @@ struct BindingCapabilities {
 pub async fn session_attachment(db: &Database) -> anyhow::Result<Option<TransportAttachment>> {
     let txn = db.new_transaction().await?;
     let store = txn.get_store::<DocStore>(STORE_TRANSPORT_BINDINGS).await?;
-    let bindings = binding_keys(&store.get_all().await?);
+    let doc = store.get_all().await?;
+    let bindings = binding_keys(&doc);
     anyhow::ensure!(
         bindings.len() <= 1,
         "session has multiple external bindings; detach or migrate explicitly"
@@ -59,14 +88,10 @@ pub async fn session_attachment(db: &Database) -> anyhow::Result<Option<Transpor
     let Some((transport, login_id, channel)) = bindings.into_iter().next() else {
         return Ok(None);
     };
-    let raw = store
-        .get_string(&channel_key(&transport, &login_id, &channel))
-        .await?;
-    let conversational_replies = if raw == transport {
-        transport == "matrix" // compatibility with the already-live pilot
-    } else {
-        serde_json::from_str::<BindingCapabilities>(&raw)?.conversational_replies
-    };
+    let raw = doc
+        .get(channel_key(&transport, &login_id, &channel))
+        .ok_or_else(|| anyhow::anyhow!("transport binding key could not be resolved"))?;
+    let conversational_replies = binding_replies(raw, &transport)?;
     Ok(Some(TransportAttachment {
         transport,
         login_id,
@@ -91,7 +116,7 @@ fn parse_channel_key(key: &str) -> Option<(String, String, String)> {
 }
 
 /// DocStore interprets dots in keys as nested paths. MXIDs and room IDs
-/// contain domains, so get_all() must walk leaves and reconstruct each path.
+/// contain domains, so get_all() must walk branches and reconstruct each path.
 fn binding_keys(doc: &Doc) -> Vec<(String, String, String)> {
     fn walk(doc: &Doc, prefix: &str, out: &mut Vec<(String, String, String)>) {
         for (part, value) in doc.iter() {
@@ -100,14 +125,13 @@ fn binding_keys(doc: &Doc) -> Vec<(String, String, String)> {
             } else {
                 format!("{prefix}.{part}")
             };
-            match value {
-                Value::Doc(child) => walk(child, &key, out),
-                Value::Text(_) => {
-                    if let Some(binding) = parse_channel_key(&key) {
-                        out.push(binding);
-                    }
-                }
-                _ => {}
+            // Check identity before recursing: a complete tuple is the key
+            // even when its value is a Doc or corrupt. Corruption must not
+            // free an occupied attachment or hide it from explicit detach.
+            if let Some(binding) = parse_channel_key(&key) {
+                out.push(binding);
+            } else if let Value::Doc(child) = value {
+                walk(child, &key, out);
             }
         }
     }
@@ -138,7 +162,10 @@ pub async fn bind_transport(
         "session has a different or conflicting external attachment; detach or migrate explicitly"
     );
     store
-        .set_string(channel_key(transport, login_id, channel), transport)
+        .set(
+            channel_key(transport, login_id, channel),
+            binding_value(transport == "matrix"),
+        )
         .await?;
     txn.commit().await?;
     info!(
@@ -162,7 +189,8 @@ pub async fn bind_conversational_transport(
 ) -> anyhow::Result<()> {
     let txn = db.new_transaction().await?;
     let store = txn.get_store::<DocStore>(STORE_TRANSPORT_BINDINGS).await?;
-    let bindings = binding_keys(&store.get_all().await?);
+    let doc = store.get_all().await?;
+    let bindings = binding_keys(&doc);
     anyhow::ensure!(
         bindings.len() <= 1
             && bindings.iter().all(|binding| binding
@@ -174,13 +202,11 @@ pub async fn bind_conversational_transport(
         "session has a different or conflicting external attachment; detach or migrate explicitly"
     );
     let key = channel_key(transport, login_id, channel);
-    let value = serde_json::to_string(&BindingCapabilities {
-        conversational_replies: true,
-    })?;
-    if store.get_string(&key).await.ok().as_deref() == Some(value.as_str()) {
+    let value = binding_value(true);
+    if doc.get(&key) == Some(&value) {
         return Ok(());
     }
-    store.set_string(key, value).await?;
+    store.set(key, value).await?;
     txn.commit().await?;
     info!(transport, login_id, channel, session_db_id = %db.root_id(),
         "Channel bound to session");
@@ -229,10 +255,19 @@ pub async fn is_bound(
             "conflicting legacy Matrix bindings; explicit migration required"
         );
     }
-    Ok(store
-        .get_string(&channel_key(transport, login_id, channel))
-        .await
-        .is_ok())
+    match store.get(channel_key(transport, login_id, channel)).await {
+        Ok(value) => {
+            binding_replies(&value, transport)?;
+            Ok(true)
+        }
+        Err(e)
+            if matches!(&e, eidetica::Error::Store(err)
+            if matches!(err.as_ref(), StoreError::KeyNotFound { .. })) =>
+        {
+            Ok(false)
+        }
+        Err(e) => Err(e.into()),
+    }
 }
 
 /// Every `(transport, login_id, channel)` triple `session_db` is bound to.
@@ -786,6 +821,104 @@ mod tests {
             !unbind_transport(&db, "matrix", "@bot:s", "!r:s")
                 .await
                 .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn binding_capabilities_upgrade_in_place_without_freeing_corrupt_identity() {
+        let (_inst, reg) = make_registry().await;
+        let (_, db) = reg.create_session(Some("legacy")).await.unwrap();
+        let login = "@bot:example.com";
+        let room = "!one:example.com";
+        let key = channel_key("matrix", login, room);
+        let txn = db.new_transaction().await.unwrap();
+        let store = txn
+            .get_store::<DocStore>(STORE_TRANSPORT_BINDINGS)
+            .await
+            .unwrap();
+        store
+            .set_string(&key, r#"{"conversational_replies":false}"#)
+            .await
+            .unwrap();
+        let legacy = txn.commit().await.unwrap();
+        let legacy_bytes = db
+            .get_entry(&legacy)
+            .await
+            .unwrap()
+            .canonical_bytes()
+            .unwrap();
+        assert!(
+            !session_attachment(&db)
+                .await
+                .unwrap()
+                .unwrap()
+                .conversational_replies
+        );
+        assert!(is_bound(&db, "matrix", login, room).await.unwrap());
+
+        bind_conversational_transport(&db, "matrix", login, room)
+            .await
+            .unwrap();
+        let snapshot = db.snapshot().await.unwrap();
+        bind_conversational_transport(&db, "matrix", login, room)
+            .await
+            .unwrap();
+        assert_eq!(
+            db.snapshot().await.unwrap(),
+            snapshot,
+            "exact native rebind is a no-op"
+        );
+        let txn = db.new_transaction().await.unwrap();
+        let store = txn
+            .get_store::<DocStore>(STORE_TRANSPORT_BINDINGS)
+            .await
+            .unwrap();
+        let record = store.get_node(&key).await.expect("native binding Doc");
+        assert!(record.is_atomic());
+        assert_eq!(record.get("version"), Some(&Value::Int(1)));
+        assert_eq!(
+            record.get("conversational_replies"),
+            Some(&Value::Bool(true))
+        );
+        assert!(store.get_string(&key).await.is_err()); // pre-upgrade reader
+        let reopened = reg.open_session(&db.root_id().to_string()).await.unwrap().1;
+        let entry = reopened.get_entry(&legacy).await.unwrap();
+        assert_eq!(entry.id(), legacy);
+        assert_eq!(entry.canonical_bytes().unwrap(), legacy_bytes);
+        assert!(reopened.verify_entry_signature(&legacy).await.unwrap());
+        let attachment = session_attachment(&reopened).await.unwrap().unwrap();
+        assert_eq!(
+            (attachment.login_id.as_str(), attachment.channel.as_str()),
+            (login, room)
+        );
+        assert!(attachment.conversational_replies);
+
+        let mut future = record;
+        future.set("version", 2);
+        store.set(&key, future).await.unwrap();
+        txn.commit().await.unwrap();
+        assert!(session_attachment(&db).await.is_err());
+        assert!(is_bound(&db, "matrix", login, room).await.is_err());
+        assert!(
+            !is_bound(&db, "matrix", "@other:example.com", room)
+                .await
+                .unwrap()
+        );
+        assert!(
+            bind_transport(&db, "matrix", login, "!other:example.com")
+                .await
+                .is_err()
+        );
+        assert!(unbind_transport(&db, "matrix", login, room).await.unwrap());
+        assert!(session_attachment(&db).await.unwrap().is_none());
+
+        bind_transport(&db, "discord", "bot", "room").await.unwrap();
+        assert!(
+            !session_attachment(&db)
+                .await
+                .unwrap()
+                .unwrap()
+                .conversational_replies
         );
     }
 
