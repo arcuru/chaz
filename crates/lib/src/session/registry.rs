@@ -8,6 +8,7 @@ use chrono::{DateTime, Utc};
 
 use eidetica::Database;
 use eidetica::auth::types::{DelegatedTreeRef, Permission, PermissionBounds, TreeReference};
+use eidetica::crdt::{Doc, doc::Value};
 use eidetica::store::{DocStore, Table};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -327,16 +328,14 @@ impl SessionRegistry {
                 },
             })
             .await?;
+        // Keep the request one whole value, staged with delegation and Directive.
+        let mut request = Doc::atomic();
+        request.set("parent_id", parent_id);
+        request.set("target", target);
+        request.set("task", task);
         txn.get_store::<DocStore>(JOB_REQUEST_STORE)
             .await?
-            .set_string(
-                "v1",
-                serde_json::to_string(&JobRequest {
-                    parent_id: parent_id.to_string(),
-                    target: target.to_string(),
-                    task: task.to_string(),
-                })?,
-            )
+            .set_node("v1", request)
             .await?;
         txn.get_store::<Table<super::SessionEntry>>("entries")
             .await?
@@ -366,12 +365,38 @@ impl SessionRegistry {
             doc.len() == 1,
             "invalid published job: requires exactly one request record"
         );
-        let json: String = doc
+        let value = doc
             .get("v1")
-            .ok_or_else(|| anyhow::anyhow!("invalid published job: request is missing"))?
-            .try_into()?;
-        serde_json::from_str(&json)
-            .map_err(|error| anyhow::anyhow!("invalid published job: malformed request: {error}"))
+            .ok_or_else(|| anyhow::anyhow!("invalid published job: request is missing"))?;
+        match value {
+            Value::Text(json) => serde_json::from_str(json).map_err(|error| {
+                anyhow::anyhow!("invalid published job: malformed request: {error}")
+            }),
+            Value::Doc(record) => {
+                let (
+                    Some(Value::Text(parent_id)),
+                    Some(Value::Text(target)),
+                    Some(Value::Text(task)),
+                ) = (
+                    record.get("parent_id"),
+                    record.get("target"),
+                    record.get("task"),
+                )
+                else {
+                    anyhow::bail!("invalid published job: malformed native request");
+                };
+                anyhow::ensure!(
+                    record.is_atomic() && record.len() == 3,
+                    "invalid published job: malformed native request"
+                );
+                Ok(JobRequest {
+                    parent_id: parent_id.clone(),
+                    target: target.clone(),
+                    task: task.clone(),
+                })
+            }
+            _ => anyhow::bail!("unsupported job request representation"),
+        }
     }
 
     /// Publish only a fully prepared handle to both existing catalog stores.
@@ -1456,9 +1481,9 @@ mod tests {
             .get_all()
             .await
             .unwrap();
-        let request: String = doc.get("v1").unwrap().try_into().unwrap();
+        assert!(doc.get("v1").unwrap().as_doc().unwrap().is_atomic());
         assert_eq!(
-            serde_json::from_str::<JobRequest>(&request).unwrap(),
+            SessionRegistry::read_job_request(&child).await.unwrap(),
             JobRequest {
                 parent_id,
                 target: "default".into(),

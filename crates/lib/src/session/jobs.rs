@@ -2,6 +2,7 @@
 
 use super::SessionRegistry;
 use crate::grants::Grants;
+use eidetica::crdt::{Doc, doc::Value};
 use eidetica::store::DocStore;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -169,23 +170,65 @@ pub(crate) async fn read_job_result_in_txn(
         .await?
         .get_all()
         .await?;
-    doc.get("v1")
-        .map(|value| -> anyhow::Result<JobResult> {
-            let json: String = value.try_into()?;
-            Ok(serde_json::from_str(&json)?)
-        })
-        .transpose()
+    match doc.get("v1") {
+        None if doc.is_empty() => Ok(None),
+        None => anyhow::bail!("unsupported job result record"),
+        Some(Value::Text(json)) => Ok(Some(serde_json::from_str(json)?)),
+        Some(Value::Doc(record)) => {
+            anyhow::ensure!(
+                record.is_atomic() && record.len() == 3,
+                "malformed native job result"
+            );
+            let Some(Value::Text(attempt_id)) = record.get("attempt_id") else {
+                anyhow::bail!("malformed native job result: invalid attempt_id");
+            };
+            let execution_id = match record.get("execution_id") {
+                Some(Value::Text(id)) => Some(id.clone()),
+                Some(Value::Null) => None,
+                _ => anyhow::bail!("malformed native job result: invalid execution_id"),
+            };
+            let terminal = match (record.get("text"), record.get("message")) {
+                (Some(Value::Text(text)), None) => JobTerminal::Success {
+                    text: Some(text.clone()),
+                },
+                (Some(Value::Null), None) => JobTerminal::Success { text: None },
+                (None, Some(Value::Text(message))) => JobTerminal::Failure {
+                    message: message.clone(),
+                },
+                _ => anyhow::bail!("malformed native job result: invalid terminal"),
+            };
+            Ok(Some(JobResult {
+                attempt_id: attempt_id.clone(),
+                terminal,
+                execution_id,
+            }))
+        }
+        _ => anyhow::bail!("unsupported job result representation"),
+    }
 }
 
 pub(crate) async fn write_job_result_in_txn(
     txn: &eidetica::transaction::Transaction,
     result: &JobResult,
 ) -> anyhow::Result<()> {
+    // Replace the receipt as a unit; an attempt or execution ID cannot
+    // merge independently of the terminal it identifies.
+    let mut record = Doc::atomic();
+    record.set("attempt_id", result.attempt_id.as_str());
+    record.set("execution_id", text_or_null(result.execution_id.as_deref()));
+    match &result.terminal {
+        JobTerminal::Success { text } => record.set("text", text_or_null(text.as_deref())),
+        JobTerminal::Failure { message } => record.set("message", message.as_str()),
+    };
     txn.get_store::<DocStore>(JOB_RESULT)
         .await?
-        .set_string("v1", serde_json::to_string(result)?)
+        .set_node("v1", record)
         .await?;
     Ok(())
+}
+
+fn text_or_null(value: Option<&str>) -> Value {
+    value.map_or(Value::Null, Value::from)
 }
 
 pub(crate) async fn status_from_db(
@@ -485,4 +528,167 @@ pub(crate) async fn write_job_wait(
         .await?;
     txn.commit().await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use eidetica::{Instance, NewAccount, backend::database::Sqlite};
+
+    #[tokio::test]
+    async fn job_result_writer_stages_whole_native_records() {
+        let (_instance, _user, db) = crate::session::test_helpers::test_session_db().await;
+        let txn = db.new_transaction().await.unwrap();
+        let store = txn.get_store::<DocStore>(JOB_RESULT).await.unwrap();
+        for (terminal, execution_id) in [
+            (
+                JobTerminal::Failure {
+                    message: "error".into(),
+                },
+                Some("branch".into()),
+            ),
+            (JobTerminal::Success { text: None }, None),
+            (
+                JobTerminal::Success {
+                    text: Some(String::new()),
+                },
+                Some("other".into()),
+            ),
+        ] {
+            let result = JobResult {
+                attempt_id: "attempt".into(),
+                execution_id,
+                terminal,
+            };
+            write_job_result_in_txn(&txn, &result).await.unwrap();
+            let value = store.get("v1").await.unwrap();
+            assert!(matches!(value, Value::Doc(record) if record.is_atomic()));
+            assert_eq!(read_job_result_in_txn(&txn).await.unwrap(), Some(result));
+        }
+        assert_eq!(read_job_result(&db).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn job_record_readers_preserve_legacy_and_native_after_sqlite_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let url = format!("sqlite://{}?mode=rwc", dir.path().join("jobs.db").display());
+        let (instance, mut user) = Instance::create_backend(
+            Box::new(Sqlite::connect(&url).await.unwrap()),
+            NewAccount::with_password("jobs", "test-password"),
+        )
+        .await
+        .unwrap();
+        let key = user.get_default_key().unwrap();
+        let legacy = user.create_database(Doc::new(), &key).await.unwrap();
+        let native = user.create_database(Doc::new(), &key).await.unwrap();
+        let legacy_id = legacy.root_id().clone();
+        let native_id = native.root_id().clone();
+        // Literal historical bytes, including a receipt predating execution IDs.
+        let txn = legacy.new_transaction().await.unwrap();
+        txn.get_store::<DocStore>("job_request")
+            .await
+            .unwrap()
+            .set_string(
+                "v1",
+                r#"{"parent_id":"parent","target":"default","task":"a.b\n雪"}"#,
+            )
+            .await
+            .unwrap();
+        txn.get_store::<DocStore>(JOB_RESULT)
+            .await
+            .unwrap()
+            .set_string(
+                "v1",
+                r#"{"attempt_id":"original-attempt","terminal":{"Success":{"text":null}}}"#,
+            )
+            .await
+            .unwrap();
+        txn.commit().await.unwrap();
+
+        // Independent native fixtures let reader-only builds verify the new form
+        // without needing to enable either writer.
+        let txn = native.new_transaction().await.unwrap();
+        let mut record = Doc::atomic();
+        record.set("parent_id", "parent");
+        record.set("target", "default");
+        record.set("task", "a.b\n雪");
+        txn.get_store::<DocStore>("job_request")
+            .await
+            .unwrap()
+            .set_node("v1", record)
+            .await
+            .unwrap();
+        let mut record = Doc::atomic();
+        record.set("attempt_id", "bound-attempt");
+        record.set("execution_id", "bound-branch");
+        record.set("message", "opaque \"error\" 雪");
+        txn.get_store::<DocStore>(JOB_RESULT)
+            .await
+            .unwrap()
+            .set_node("v1", record)
+            .await
+            .unwrap();
+        txn.commit().await.unwrap();
+        drop((native, legacy, user, instance));
+
+        let instance = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            loop {
+                match Instance::connect(&url).await {
+                    Ok(instance) => break instance,
+                    Err(_) => tokio::time::sleep(std::time::Duration::from_millis(20)).await,
+                }
+            }
+        })
+        .await
+        .expect("SQLite instance was not released");
+        let user = instance
+            .login_account("jobs", "test-password")
+            .await
+            .unwrap();
+        let legacy = user.open_database(&legacy_id).await.unwrap();
+        let native = user.open_database(&native_id).await.unwrap();
+        let old_request = SessionRegistry::read_job_request(&legacy).await.unwrap();
+        assert_eq!(old_request.task, "a.b\n雪");
+        assert_eq!(
+            SessionRegistry::read_job_request(&native).await.unwrap(),
+            old_request
+        );
+        assert_eq!(
+            read_job_result(&legacy).await.unwrap(),
+            Some(JobResult {
+                attempt_id: "original-attempt".into(),
+                terminal: JobTerminal::Success { text: None },
+                execution_id: None,
+            })
+        );
+        assert_eq!(
+            read_job_result(&native).await.unwrap(),
+            Some(JobResult {
+                attempt_id: "bound-attempt".into(),
+                terminal: JobTerminal::Failure {
+                    message: "opaque \"error\" 雪".into()
+                },
+                execution_id: Some("bound-branch".into()),
+            })
+        );
+        let txn = native.new_transaction().await.unwrap();
+        for name in ["job_request", JOB_RESULT] {
+            let store = txn.get_store::<DocStore>(name).await.unwrap();
+            // The pre-conversion reader's exact operation cannot treat a
+            // native value as absent (which could reopen a completed job).
+            assert!(String::try_from(store.get_all().await.unwrap().get("v1").unwrap()).is_err());
+            store.set_node("v1", Doc::atomic()).await.unwrap();
+        }
+        // A whole malformed replacement cannot inherit fields and look valid.
+        assert!(read_job_result_in_txn(&txn).await.is_err());
+        txn.commit().await.unwrap();
+        assert!(read_job_result(&native).await.is_err());
+        assert!(
+            SessionRegistry::read_job_request(&native)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("malformed native request")
+        );
+    }
 }
