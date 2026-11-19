@@ -380,9 +380,14 @@ async fn preflight(cmd: &Command, server: &Arc<Server>) -> Option<CommandOutcome
     {
         return Some(CommandOutcome::Error(owner_redirect(cmd)));
     }
-    if command_needs_complete_hosted_indices(cmd)
-        && let Err(e) = server.ensure_hosted_indices_complete().await
-    {
+    let discovery = if matches!(cmd, Command::AgentReload(_) | Command::AgentProject(_)) {
+        server.load_hosted_indices().await
+    } else if command_needs_complete_hosted_indices(cmd) {
+        server.ensure_hosted_indices_complete().await
+    } else {
+        Ok(())
+    };
+    if let Err(e) = discovery {
         return Some(CommandOutcome::Error(format!(
             "Failed to load hosted entities: {e}"
         )));
@@ -545,8 +550,6 @@ pub async fn dispatch(cmd: Command, ctx: &CommandContext<'_>) -> CommandOutcome 
 fn command_needs_complete_hosted_indices(command: &Command) -> bool {
     match command {
         Command::AgentHosted
-        | Command::AgentReload(_)
-        | Command::AgentProject(_)
         | Command::AgentHomeStatus(None)
         | Command::SharingRequests
         | Command::SharingStatus => true,

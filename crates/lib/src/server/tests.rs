@@ -1343,9 +1343,9 @@ async fn reload_config_for_imports_hosted_folders_and_reports_partial_batches() 
     std::fs::write(other.join("agent.yaml"), "invalid: [").unwrap();
     let report = server.reload_config_for(None).await.unwrap();
     assert_eq!(report.considered, 2);
-    assert_eq!(report.applied, vec![("alpha".into(), true)]);
+    assert_eq!(report.applied, vec![(entry, true)]);
     assert_eq!(report.failed.len(), 1);
-    assert_eq!(report.failed[0].0, "same");
+    assert_eq!(report.failed[0].0, same);
     assert_eq!(
         server
             .agents()
@@ -1366,7 +1366,7 @@ async fn reload_config_for_imports_hosted_folders_and_reports_partial_batches() 
     );
     assert_eq!(
         server
-            .reload_config_for(Some("ghost"))
+            .reload_config_for(Some(&eidetica::entry::ID::from_bytes("ghost")))
             .await
             .unwrap()
             .considered,

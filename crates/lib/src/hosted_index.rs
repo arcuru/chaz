@@ -116,6 +116,18 @@ impl HostedIndex {
             .cloned()
     }
 
+    /// Administrative lookups that cannot pick a name collision's routing winner.
+    pub(crate) fn entries_named(&self, name: &str) -> Vec<DbEntry> {
+        self.inner
+            .read()
+            .expect("HostedIndex lock poisoned")
+            .by_id
+            .values()
+            .filter(|entry| entry.display_name == name)
+            .cloned()
+            .collect()
+    }
+
     pub fn find_by_pubkey(&self, pubkey: &PublicKey) -> Option<DbEntry> {
         self.inner
             .read()

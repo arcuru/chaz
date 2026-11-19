@@ -184,6 +184,167 @@ async fn record_model_prompts(
 }
 
 #[tokio::test]
+async fn same_name_agents_keep_separate_managed_folders() {
+    use crate::commands::{Command, CommandOutcome, dispatch_without_session};
+
+    let (_instance, server, registry) = server_fixture().await;
+    let (first, first_db) = seed_agent(&server, &registry, "shared").await;
+    let (second, second_db) = seed_agent(&server, &registry, "shared").await;
+    assert_ne!(first.db_id, second.db_id);
+    server.agent_index().unregister(&second.db_id);
+    server.agent_index().register(first.clone());
+    let first_id = first.db_id.to_string();
+    let second_id = second.db_id.to_string();
+    let local = tempfile::tempdir().unwrap();
+    server.set_agent_config_root(local.path().join("agents"));
+    let text = async |cmd| match dispatch_without_session(cmd, &server).await.unwrap() {
+        CommandOutcome::Text(output) => output,
+        CommandOutcome::Error(error) => panic!("{error}"),
+        _ => panic!("expected text outcome"),
+    };
+    // A targeted client must discover both DBs to reject a bare name, but
+    // that discovery must not migrate or project either DB as a side effect.
+    let first_before = first_db.database().snapshot().await.unwrap();
+    let second_before = second_db.database().snapshot().await.unwrap();
+    for command in [
+        Command::AgentProject("shared".into()),
+        Command::AgentReload(Some("shared".into())),
+    ] {
+        assert!(matches!(
+            dispatch_without_session(command, &server).await.unwrap(),
+            CommandOutcome::Error(message)
+                if message.contains("ambiguous") && message.contains("/agent hosted")
+        ));
+        assert!(server.agents().get("shared").is_none());
+        assert!(!folder(&server, &first).exists());
+        assert!(!folder(&server, &second).exists());
+        assert_eq!(first_db.database().snapshot().await.unwrap(), first_before);
+        assert_eq!(
+            second_db.database().snapshot().await.unwrap(),
+            second_before
+        );
+    }
+
+    // The first exact project before the ordinary startup projection must
+    // not initialize or migrate the other identity.
+    let first_path = folder(&server, &first);
+    let second_path = folder(&server, &second);
+    // Make the name-only routing winner the other DB, regardless of catalog order.
+    server.agent_index().register(second.clone());
+    let project = || Command::AgentProject(first_id.clone());
+    assert!(
+        text(project())
+            .await
+            .contains(&first_path.display().to_string())
+    );
+    assert!(!second_path.exists());
+    assert_eq!(
+        second_db.database().snapshot().await.unwrap(),
+        second_before
+    );
+
+    // Startup projects the other DB and subscribes each DB separately.
+    server.ensure_hosted_indices_complete().await.unwrap();
+    let first_yaml = first_path.join("agent.yaml");
+    let second_yaml = second_path.join("agent.yaml");
+    let first_accepted = first_db.read_config().await.unwrap();
+    let valid_first = std::fs::read_to_string(&first_yaml).unwrap();
+    assert!(valid_first.contains(&first_id));
+    assert!(
+        std::fs::read_to_string(&second_yaml)
+            .unwrap()
+            .contains(&second_id)
+    );
+
+    // A real DB write that only the first watcher receives fails projection.
+    // The other DB's healthy path/status must not be overwritten.
+    std::fs::remove_file(&first_yaml).unwrap();
+    std::fs::create_dir(&first_yaml).unwrap();
+    let mut changed = first_accepted.clone();
+    changed.model = Some("db-first".into());
+    first_db.write_config(&changed).await.unwrap();
+    let first_row = format!("shared ({first_id})\n    {}", first_path.display());
+    let second_row = format!(
+        "shared ({second_id})\n    {} (projected;",
+        second_path.display()
+    );
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let hosted = text(Command::AgentHosted).await;
+            if hosted.contains(&format!("{first_row} (projection/migration blocked:")) {
+                assert!(hosted.contains(&second_row), "{hosted}");
+                assert!(
+                    hosted.contains(&format!("retry /agent project {first_id}")),
+                    "{hosted}"
+                );
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("first DB projection failure was not reported");
+
+    std::fs::remove_dir(&first_yaml).unwrap();
+    let second_cfg = second_db.read_config().await.unwrap();
+    let second_draft = format!("version: 1\nagent_id: {second_id}\nmodel: second-draft\n");
+    std::fs::write(&second_yaml, &second_draft).unwrap();
+    assert!(
+        text(project())
+            .await
+            .contains(&first_path.display().to_string())
+    );
+    assert!(
+        std::fs::read_to_string(&first_yaml)
+            .unwrap()
+            .contains("db-first")
+    );
+    assert_eq!(std::fs::read_to_string(&second_yaml).unwrap(), second_draft);
+    assert_eq!(first_db.read_config().await.unwrap(), changed);
+    assert_eq!(second_db.read_config().await.unwrap(), second_cfg);
+
+    std::fs::write(
+        &first_yaml,
+        format!("version: 1\nagent_id: {first_id}\nmodel: first-draft\n"),
+    )
+    .unwrap();
+    let report = text(Command::AgentReload(Some(first_id.clone()))).await;
+    assert!(
+        report.contains(&format!("shared ({first_id}):")),
+        "{report}"
+    );
+    assert!(
+        report.contains(&first_path.display().to_string()),
+        "{report}"
+    );
+    assert!(!report.contains(&second_id), "{report}");
+    assert_eq!(
+        first_db.read_config().await.unwrap().model.as_deref(),
+        Some("first-draft")
+    );
+    assert_eq!(second_db.read_config().await.unwrap(), second_cfg);
+    assert_eq!(
+        server.agents().get("shared").unwrap().default_model,
+        second_cfg.model
+    );
+    assert_eq!(std::fs::read_to_string(&second_yaml).unwrap(), second_draft);
+    let report = text(Command::AgentReload(None)).await;
+    assert!(
+        report.contains(&format!("shared ({first_id}): already matches")),
+        "{report}"
+    );
+    assert!(
+        report.contains(&format!("shared ({second_id}): reloaded")),
+        "{report}"
+    );
+    assert_eq!(
+        second_db.read_config().await.unwrap().model.as_deref(),
+        Some("second-draft")
+    );
+    server.shutdown().await;
+}
+
+#[tokio::test]
 async fn folder_reload_drives_parent_and_worker_recorded_model_prompts() {
     let (_instance, server, registry) = server_fixture().await;
     let external = tempfile::tempdir().unwrap();
@@ -197,7 +358,7 @@ async fn folder_reload_drives_parent_and_worker_recorded_model_prompts() {
     let worker_file = folder.join(&accepted.workers[0].system_prompt_files[0]);
     std::fs::write(&parent_file, "DRAFT").unwrap();
     let no_op = server
-        .update_agent_config("alpha", false, false, |_| Ok(()))
+        .update_agent_config(&entry.db_id, false, false, |_| Ok(()))
         .await
         .unwrap();
     assert!(!no_op.changed);
@@ -210,14 +371,14 @@ async fn folder_reload_drives_parent_and_worker_recorded_model_prompts() {
     .unwrap();
     assert!(
         !server
-            .project_agent_config("alpha", false)
+            .project_agent_config(&entry.db_id, false)
             .await
             .unwrap()
             .changed
     );
     assert_eq!(std::fs::read_to_string(&parent_file).unwrap(), "DRAFT");
     let outcome = server
-        .update_agent_config("alpha", false, false, |cfg| {
+        .update_agent_config(&entry.db_id, false, false, |cfg| {
             cfg.model = Some("new-model".into());
             Ok(())
         })
@@ -239,11 +400,11 @@ async fn folder_reload_drives_parent_and_worker_recorded_model_prompts() {
     // Content-only edits, with no path change, become active only on reload.
     std::fs::write(&parent_file, "NEW PARENT\n").unwrap();
     std::fs::write(&worker_file, "NEW WORKER\n").unwrap();
-    let diff = server.agent_diff("alpha").await.unwrap().unwrap();
+    let diff = server.agent_diff(&entry.db_id).await.unwrap().unwrap();
     assert!(diff.rows.iter().any(
         |r| r.label == "prompt_contents" && r.status == crate::agent_diff::FieldStatus::Changed
     ));
-    let reload = server.reload_agent_folder("alpha").await.unwrap();
+    let reload = server.reload_agent_folder(&entry.db_id).await.unwrap();
     assert!(reload.changed && reload.projection_error.is_none());
     let cfg = db.read_config().await.unwrap();
     assert_eq!(cfg.system_prompt_files, accepted.system_prompt_files);
@@ -295,7 +456,7 @@ async fn folder_migration_preserves_saved_text_and_unavailable_snapshot_blocks()
     let local = tempfile::tempdir().unwrap();
     let external = tempfile::NamedTempFile::new().unwrap();
     std::fs::write(external.path(), "SAVED FILE\n").unwrap();
-    let (_entry, db) = seed_agent(&server, &registry, "alpha").await;
+    let (entry, db) = seed_agent(&server, &registry, "alpha").await;
     let mut legacy = db.read_config().await.unwrap();
     legacy.system_prompt = "INLINE WITH TRAILING  \n".into();
     legacy.system_prompt_files = vec![external.path().display().to_string()];
@@ -305,7 +466,10 @@ async fn folder_migration_preserves_saved_text_and_unavailable_snapshot_blocks()
     db.write_config(&legacy).await.unwrap();
     std::fs::write(external.path(), "EXTERNAL EDIT MUST NOT BECOME ACTIVE").unwrap();
     server.set_agent_config_root(local.path().join("agents"));
-    let outcome = server.project_agent_config("alpha", false).await.unwrap();
+    let outcome = server
+        .project_agent_config(&entry.db_id, false)
+        .await
+        .unwrap();
     assert!(outcome.flattened);
     let migrated = db.read_config().await.unwrap();
     assert_eq!(migrated.applied_config_hash, legacy.applied_config_hash);
@@ -325,7 +489,7 @@ async fn folder_migration_preserves_saved_text_and_unavailable_snapshot_blocks()
     missing.write_config(&unrecoverable).await.unwrap();
     let before = missing.database().snapshot().await.unwrap();
     let error = server
-        .project_agent_config("missing", false)
+        .project_agent_config(&entry.db_id, false)
         .await
         .unwrap_err();
     assert!(
@@ -373,7 +537,7 @@ async fn folder_failures_preserve_active_state_and_committed_projection_is_repai
         std::fs::write(&yaml_path, &invalid).unwrap();
         let before = db.database().snapshot().await.unwrap();
         assert!(
-            server.reload_agent_folder("alpha").await.is_err(),
+            server.reload_agent_folder(&entry.db_id).await.is_err(),
             "accepted invalid document"
         );
         assert_eq!(db.database().snapshot().await.unwrap(), before);
@@ -386,13 +550,13 @@ async fn folder_failures_preserve_active_state_and_committed_projection_is_repai
     std::fs::write(&yaml_path, &valid).unwrap();
     let source = folder.join(&cfg.system_prompt_files[0]);
     std::fs::remove_file(&source).unwrap();
-    assert!(server.reload_agent_folder("alpha").await.is_err());
+    assert!(server.reload_agent_folder(&entry.db_id).await.is_err());
     assert_eq!(db.read_config().await.unwrap(), cfg);
     // A real filesystem type failure occurs AFTER the DB accepts a scalar
     // edit. The journal remembers outward intent; reload must refuse it.
     std::fs::create_dir(&source).unwrap();
     let outcome = server
-        .update_agent_config("alpha", false, false, |cfg| {
+        .update_agent_config(&entry.db_id, false, false, |cfg| {
             cfg.model = Some("committed".into());
             Ok(())
         })
@@ -403,14 +567,17 @@ async fn folder_failures_preserve_active_state_and_committed_projection_is_repai
         db.read_config().await.unwrap().model.as_deref(),
         Some("committed")
     );
-    assert!(server.agent_folder_status("alpha").contains("blocked"));
-    assert!(server.reload_agent_folder("alpha").await.is_err());
+    assert!(server.agent_folder_status(&entry.db_id).contains("blocked"));
+    assert!(server.reload_agent_folder(&entry.db_id).await.is_err());
     let journal: serde_json::Value =
         serde_json::from_slice(&std::fs::read(folder.join(".projection.json")).unwrap()).unwrap();
     assert!(journal["pending"].is_string());
     std::fs::remove_dir(&source).unwrap();
     std::fs::write(folder.join("notes.txt"), "UNRELATED").unwrap();
-    let repaired = server.project_agent_config("alpha", false).await.unwrap();
+    let repaired = server
+        .project_agent_config(&entry.db_id, false)
+        .await
+        .unwrap();
     assert!(!repaired.changed && repaired.projection_error.is_none());
     assert_eq!(std::fs::read_to_string(&source).unwrap(), "FIRST\n");
     assert_eq!(
@@ -540,7 +707,7 @@ async fn folder_two_peer_sync_reconstructs_sources_without_feedback() {
     );
     let before = peer_db.database().snapshot().await.unwrap();
     peer_server
-        .project_agent_config("alpha", false)
+        .project_agent_config(&entry.db_id, false)
         .await
         .unwrap();
     assert_eq!(
@@ -571,7 +738,7 @@ async fn folder_two_peer_sync_reconstructs_sources_without_feedback() {
     assert_eq!(peer_db.read_config().await.unwrap(), changed);
     let synced_tip = peer_db.database().snapshot().await.unwrap();
     peer_server
-        .project_agent_config("alpha", false)
+        .project_agent_config(&entry.db_id, false)
         .await
         .unwrap();
     assert_eq!(peer_db.database().snapshot().await.unwrap(), synced_tip);
@@ -584,7 +751,7 @@ async fn folder_two_peer_sync_reconstructs_sources_without_feedback() {
         .await
         .unwrap();
     peer_server
-        .project_agent_config("alpha", false)
+        .project_agent_config(&entry.db_id, false)
         .await
         .unwrap();
     assert_eq!(std::fs::read_to_string(&target).unwrap(), "KEEP DRAFT");
@@ -631,7 +798,7 @@ async fn folder_replacement_adopts_only_explicit_sources_and_resets_scope() {
     std::fs::create_dir(folder.join("operator")).unwrap();
     std::fs::write(folder.join("operator/new.md"), "NEW EXPLICIT SOURCE\n").unwrap();
     std::fs::write(folder.join("agent.yaml"), format!("version: 1\nagent_id: {}\nsystem_prompt_files: [operator/new.md]\nmodel: null\ntools: []\nautonomous: false\nmax_spawn_depth: 10\n", entry.db_id)).unwrap();
-    let outcome = server.reload_agent_folder("alpha").await.unwrap();
+    let outcome = server.reload_agent_folder(&entry.db_id).await.unwrap();
     assert!(
         outcome.changed && outcome.projection_error.is_none(),
         "{outcome:?}"
@@ -756,7 +923,7 @@ async fn folder_rejected_commit_keeps_sources_runtime_and_projection_unchanged()
     assert!(db.write_config(&attempted).await.is_err());
     assert!(
         server
-            .update_agent_config("alpha", false, false, |cfg| {
+            .update_agent_config(&entry.db_id, false, false, |cfg| {
                 *cfg = attempted;
                 Ok(())
             })

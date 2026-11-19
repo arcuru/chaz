@@ -13,8 +13,9 @@ Agents are created through administration, not root configuration: `/agent new` 
 | `/agent new <name> [k=v ...]`                 | Create a hosted Agent DB with scalar settings (`model`, `tools`, `system_prompt_files`, …) and its managed folder. |
 | `/agent import <ticket> [admin\|write\|read]` | Host an agent shared from another peer.                                                                            |
 | `/agent set <ref> <field> <value>`            | Change one scalar setting; takes effect on the next message.                                                       |
-| `/agent reload [ref]`                         | Apply edits made in the managed folder (`agent.yaml` plus prompt files), such as workers, grants or presets.       |
-| `/agent hosted`                               | List hosted agents and their managed folder paths.                                                                 |
+| `/agent reload [ref]`                         | Apply edits from the managed folder. Use a unique name or full Agent DB ID, or omit `ref` to reload all.           |
+| `/agent project <ref>`                        | Repair a managed folder from the accepted DB. Use a unique name or full Agent DB ID.                               |
+| `/agent hosted`                               | List hosted agents by DB ID, with their own folder paths and projection status.                                    |
 
 All of these run without an open conversation or a running agent, from the TUI or as `chaz cmd '/agent …'`.
 Larger structures such as workers and presets are edited in the agent's managed `agent.yaml`; a parent with two workers looks like:
@@ -126,6 +127,8 @@ Root config never defines, seeds or updates an agent, and is never written back,
 ### Find the folder
 
 Each hosted agent has a **managed configuration folder** backed by its synchronized Agent DB. Use `/agent hosted` or **Settings → Peer → Agents** to find its exact path and projection status. Executables default to `$XDG_CONFIG_HOME/chaz/agents` (usually `~/.config/chaz/agents`); set the peer-local `agent_config_dir` to choose another writable root. Library callers must inject a disposable or operator-selected root themselves.
+
+If two hosted DBs have the same display name, `/agent hosted` lists them separately with their own folder and status. `/agent project <ref>` and `/agent reload [ref]` refuse ambiguous names; copy the full ID from the intended row. A full ID is never retried as a name, even if that DB is no longer hosted. Peer Settings has one row per display name, so use the commands when the row is ambiguous.
 
 ```text
 agents/
@@ -274,7 +277,7 @@ For a disposable failure/recovery example:
 1. Replace a previously managed prompt file with a directory, then change a scalar setting through `/agent set`. A typical result is:
 
    ```text
-   Agent DB committed (effective next message), but folder projection failed: ... Retry /agent project helper — do not reload stale files.
+   Agent DB committed (effective next message), but folder projection failed: ... Retry /agent project <agent-db-id> — do not reload stale files.
    ```
 
 2. Move the obstructing directory out of the managed folder, then run `/agent project helper`. Success reports:
@@ -287,6 +290,14 @@ For a disposable failure/recovery example:
    The restored file comes from the committed DB, not from the obstruction or a draft. Do not use reload as repair: that would try to import local state, and a recorded incomplete projection refuses it.
 
 3. Inspect the result before making further edits. Restart or a later DB event also retries pending projection, using the same DB-to-folder path. The TUI offers outward retry with `p`; `r` opens the folder/DB diff and `R`, then `y`, confirms a full reload. There is no global-YAML Pick/Reseed operation.
+
+4. If another hosted DB is also named `helper`, `/agent project helper` and `/agent reload helper` both report:
+
+   ```text
+   Agent name 'helper' is ambiguous; use an Agent DB ID from /agent hosted
+   ```
+
+   Match the path you intend to repair with its row in `/agent hosted`. Copy that row's full ID into `/agent project <agent-db-id>` to repair only that folder, or `/agent reload <agent-db-id>` to apply edits from only that folder.
 
 Before committing a folder reload, Chaz records which referenced files belong to that candidate revision. If this recovery intent cannot be saved, reload fails without committing. After an interruption, projection adopts those files only when the accepted DB revision matches the recorded candidate; a refused or uncommitted reload does not make its draft files managed.
 

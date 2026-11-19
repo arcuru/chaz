@@ -557,6 +557,7 @@ async fn settings_modals_keep_reader_position_and_own_background_input() {
             0 => {
                 app.agent_diff = Some(AgentDiffView {
                     agent_name: "agent-00".into(),
+                    db_id: eidetica::entry::ID::from_bytes("agent-00"),
                     diff: chaz_core::agent_diff::diff_agent(
                         &AgentDbConfig::default(),
                         &AgentDbConfig::default(),
@@ -1217,6 +1218,7 @@ async fn settings_too_small_freezes_modals_and_refuses_invisible_submit_or_confi
             0 => {
                 app.agent_diff = Some(AgentDiffView {
                     agent_name: "agent-00".into(),
+                    db_id: eidetica::entry::ID::from_bytes("agent-00"),
                     diff: chaz_core::agent_diff::diff_agent(
                         &AgentDbConfig::default(),
                         &AgentDbConfig::default(),
@@ -2927,6 +2929,7 @@ async fn agent_diff_view_requires_confirmed_full_reload() {
     app.settings_focus = SettingsFocus::Content;
     app.agent_diff = Some(AgentDiffView {
         agent_name: "agent-00".into(),
+        db_id: eidetica::entry::ID::from_bytes("agent-00"),
         diff: chaz_core::agent_diff::diff_agent(
             &AgentDbConfig::default(),
             &AgentDbConfig::default(),
@@ -2952,7 +2955,7 @@ async fn agent_diff_view_requires_confirmed_full_reload() {
     assert_eq!(app.agent_diff.as_ref().unwrap().mode, AgentDiffMode::View);
     key(&mut app, KeyCode::Char('R'));
     assert!(
-        matches!(key(&mut app, KeyCode::Char('y')), input::SettingsKey::ReloadAgentFolder { name } if name == "agent-00")
+        matches!(key(&mut app, KeyCode::Char('y')), input::SettingsKey::ReloadAgentFolder { db_id } if db_id == eidetica::entry::ID::from_bytes("agent-00"))
     );
     assert!(app.agent_diff.is_none());
     server.shutdown().await;
@@ -2985,7 +2988,7 @@ async fn agent_diff_cursor_keeps_workers_and_values_visible() {
         .unwrap();
     app.agent_diff = Some(AgentDiffView {
         agent_name: "alpha".into(),
-
+        db_id: eidetica::entry::ID::from_bytes("alpha"),
         diff,
         cursor,
         mode: AgentDiffMode::View,

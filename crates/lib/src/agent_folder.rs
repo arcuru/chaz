@@ -111,7 +111,7 @@ impl AgentFolders {
         let folder = self.folder(name, id);
         match self.read_state(&folder, id) {
             Ok(state) if state.pending.is_some() => format!(
-                "{} (projection pending; retry /agent project {name})",
+                "{} (projection pending; retry /agent project {id})",
                 folder.display()
             ),
             Ok(state) if state.completed.is_some() => format!(
@@ -284,7 +284,7 @@ impl AgentFolders {
         let state = self.read_state(&folder, id)?;
         ensure!(
             state.pending.is_none() && state.completed.is_some(),
-            "projection incomplete at {}; run /agent project {name} before reload",
+            "projection incomplete at {}; run /agent project {id} before reload",
             folder.display()
         );
         let sources = old
@@ -294,7 +294,7 @@ impl AgentFolders {
         let accepted_revision = revision(&AgentDocument::from_config(id, old), sources)?;
         ensure!(
             state.completed.as_ref() == Some(&accepted_revision),
-            "folder is behind accepted DB configuration at {}; run /agent project {name} before reload",
+            "folder is behind accepted DB configuration at {}; run /agent project {id} before reload",
             folder.display()
         );
         let path = folder.join("agent.yaml");
