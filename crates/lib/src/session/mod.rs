@@ -8,7 +8,7 @@
 //! state. Bridge delivery progress is peer-local, outside this database.
 //!
 //! The registry (inside `chaz_group`) holds only indices: `sessions`,
-//! `session_names`. Canonical per-session config lives in each session's own
+//! `session_catalog`, and `session_names`. Canonical per-session config lives in each session's own
 //! DB (`SessionMeta`) so it syncs with the session — including its transport
 //! bindings (`transport` module).
 //!
@@ -546,7 +546,8 @@ impl SessionMeta {
 /// Combines the lightweight routing index (`sessions` DocStore: id→source)
 /// with the richer catalog metadata (`session_catalog` DocStore: bridge,
 /// created_at, status). Legacy sessions registered before the catalog
-/// existed surface here with `bridge = Other` and `created_at = None`.
+/// existed surface here with a bridge derived from the origin tag and
+/// `created_at = None`.
 #[derive(Debug, Clone)]
 pub struct SessionIndex {
     pub session_db_id: String,
@@ -618,15 +619,14 @@ pub enum SessionStatus {
 /// A row in the user-central session catalog.
 ///
 /// Stored in `chaz_group`'s `session_catalog` DocStore (one entry per session
-/// ever created on this peer). Caches only fields that don't drift after
-/// creation. Mutable names come from the companion `session_names` index;
-/// agent metadata remains canonical in each session DB and is loaded on demand.
+/// known to this peer). Mutable names come from the companion `session_names`
+/// index; agent metadata remains canonical in each session DB and is loaded on
+/// demand.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionCatalogEntry {
     pub session_db_id: String,
     pub source: Option<String>,
-    /// Persisted to existing session DBs under the JSON key `gateway`; the
-    /// `serde(rename)` preserves the on-disk format across the type rename.
+    /// The retained JSON format used the key `gateway`; keep it readable.
     #[serde(rename = "gateway")]
     pub bridge: BridgeKind,
     pub created_at: DateTime<Utc>,

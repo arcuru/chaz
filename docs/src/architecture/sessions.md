@@ -271,19 +271,24 @@ topology adds multi-executor election or fencing.
 
 ## Session Registry
 
-A session is identified solely by the root ID of its own eidetica `Database`. The `SessionRegistry` holds two index stores inside the peer-local `chaz_group` DB — nothing load-bearing about a session lives here:
+A session is identified solely by the root ID of its own Eidetica `Database`. The `SessionRegistry` keeps local discovery and routing in `chaz_group`:
 
 - **`sessions`**: every known `session_db_id` → origin tag (for debugging/listing)
+- **`session_catalog`**: `session_db_id` → bridge, origin, creation time and status
 - **`session_names`**: human-friendly `name` → `session_db_id`
 
 The canonical per-session configuration (name, agent, model, role, backend) lives in each session's own DB under a `meta` DocStore as a `SessionMeta`. Because it lives in the session, it syncs with the session via eidetica — sharing a session also shares its config.
+
+The catalog v1 row is a native atomic Doc with an integer `version`, `session_db_id`, `source` (text or null), `bridge`, `created_at` (RFC 3339 text), and `status`. Replacing a row cannot merge fields from two revisions. Creation, adoption and job publication write the routing index and catalog row in the same transaction. Published job inspection requires a readable, active row whose ID and source agree with the expected job and routing index. Listings can still show routing-only metadata when a row is missing or malformed; catalog mutations do not use this fallback.
+
+The separate `chaz_peer` DB stores `peer_defaults/default_agents` as a v1 atomic Doc containing `version` and a native ordered `names` list. A replacement takes the whole list, including an empty one; deleting the key removes the override. Neither local store is synced to another peer. The encoding changes application values inside DocStore, not Eidetica's entry encoding, CIDs, signatures, or any existing session DB format. See [cutover and recovery](../user_guide/configuration.md#local-catalog-and-defaults-upgrade).
 
 ```mermaid
 graph LR
     ROOM["Matrix room !r:ex.org"] -->|one binding| DB1[(Session DB A<br/>entries + meta + binding)]
     NAME["name 'daily-standup'"] -->|session_names| DB1
     SID2["spawn:abc-123"] --> DB2[(Session DB B)]
-    REG[(Registry<br/>sessions + names only)] -.-> NAME
+    REG[(Registry<br/>sessions + catalog + names)] -.-> NAME
 ```
 
 ### Matrix channels

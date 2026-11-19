@@ -4,11 +4,15 @@
 
 use crate::agent::AgentRegistry;
 use crate::types::ConversationId;
+use anyhow::Context as _;
 use chrono::{DateTime, Utc};
 
 use eidetica::Database;
 use eidetica::auth::types::{DelegatedTreeRef, Permission, PermissionBounds, TreeReference};
-use eidetica::crdt::{Doc, doc::Value};
+use eidetica::crdt::{
+    Doc,
+    doc::{List, Value},
+};
 use eidetica::store::{DocStore, Table};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -83,8 +87,91 @@ pub(super) const STORE_SESSIONS: &str = "sessions";
 pub(super) const STORE_SESSION_NAMES: &str = "session_names";
 /// User-central session catalog. Companion to `STORE_SESSIONS`; the routing
 /// index there stays a cheap id→source map, while this store holds rich
-/// per-session metadata (bridge, created_at, status) as JSON.
+/// per-session metadata as a versioned, atomic Doc.
 pub(super) const STORE_SESSION_CATALOG: &str = "session_catalog";
+const CATALOG_VERSION: i64 = 1;
+
+impl SessionCatalogEntry {
+    fn to_native(&self) -> Doc {
+        // Replacements must not merge a source, bridge or status from another row revision.
+        let mut row = Doc::atomic();
+        row.set("version", CATALOG_VERSION);
+        row.set("session_db_id", self.session_db_id.as_str());
+        row.set(
+            "source",
+            self.source.clone().map_or(Value::Null, Value::Text),
+        );
+        row.set("bridge", self.bridge.as_str());
+        row.set("created_at", self.created_at.to_rfc3339());
+        row.set(
+            "status",
+            match self.status {
+                SessionStatus::Active => "active",
+                SessionStatus::Closed => "closed",
+            },
+        );
+        row
+    }
+
+    /// Decode one row without treating malformed data as a missing row. The
+    /// caller chooses whether to degrade the result for a display-only read.
+    pub(crate) fn from_catalog(catalog: &Doc, id: &str) -> anyhow::Result<Option<Self>> {
+        catalog
+            .get(id)
+            .map(|value| {
+                let row = Self::decode_stored(value)
+                    .with_context(|| format!("unreadable session catalog row {id}"))?;
+                anyhow::ensure!(
+                    row.session_db_id == id,
+                    "session catalog row ID differs from its key: {id}"
+                );
+                Ok(row)
+            })
+            .transpose()
+    }
+
+    fn decode_stored(value: &Value) -> anyhow::Result<Self> {
+        let doc = match value {
+            // Retained rows use the `gateway` field and may omit `status`.
+            Value::Text(json) => return Ok(serde_json::from_str(json)?),
+            Value::Doc(doc) => doc,
+            _ => anyhow::bail!("invalid session catalog value type"),
+        };
+        anyhow::ensure!(
+            doc.get("version").and_then(Value::as_int) == Some(CATALOG_VERSION),
+            "unsupported session catalog version"
+        );
+        anyhow::ensure!(
+            doc.is_atomic() && doc.len() == 6,
+            "invalid native session catalog record"
+        );
+        let text = |key| {
+            doc.get(key)
+                .and_then(Value::as_text)
+                .with_context(|| format!("invalid or missing catalog field {key}"))
+        };
+        let bridge = text("bridge")?;
+        Ok(Self {
+            session_db_id: text("session_db_id")?.to_owned(),
+            source: match doc.get("source") {
+                Some(Value::Text(source)) => Some(source.clone()),
+                Some(Value::Null) => None,
+                _ => anyhow::bail!("invalid or missing catalog source"),
+            },
+            bridge: BridgeKind::from_filter_str(bridge)
+                .filter(|kind| kind.as_str() == bridge)
+                .context("invalid catalog bridge")?,
+            created_at: text("created_at")?
+                .parse()
+                .context("invalid catalog timestamp")?,
+            status: match text("status")? {
+                "active" => SessionStatus::Active,
+                "closed" => SessionStatus::Closed,
+                _ => anyhow::bail!("invalid catalog status"),
+            },
+        })
+    }
+}
 
 const JOB_REQUEST_STORE: &str = "job_request";
 
@@ -102,12 +189,44 @@ pub(crate) struct PreparedAgentJob {
     source: String,
 }
 
-/// Peer-runtime overrides that survive restart. v1 holds one key
-/// (`default_agents`) edited by the Peer Settings page; the slot is
-/// shared with future peer-scoped configuration overrides. Stored on
-/// `chaz_peer` (per-machine), not the cross-peer `chaz_group`.
+/// Peer-runtime overrides edited by Peer Settings, kept in `chaz_peer`.
 const STORE_PEER_DEFAULTS: &str = "peer_defaults";
 const KEY_DEFAULT_AGENTS: &str = "default_agents";
+const DEFAULT_AGENTS_VERSION: i64 = 1;
+
+async fn read_peer_default_agents(store: &DocStore) -> anyhow::Result<Option<Vec<String>>> {
+    let doc = store.get_all().await?;
+    let names = match doc.get(KEY_DEFAULT_AGENTS) {
+        None => return Ok(None),
+        Some(Value::Text(json)) => {
+            serde_json::from_str(json).context("invalid retained peer default agents")?
+        }
+        Some(Value::Doc(value)) => {
+            anyhow::ensure!(
+                value.get("version").and_then(Value::as_int) == Some(DEFAULT_AGENTS_VERSION),
+                "unsupported peer default agents version"
+            );
+            anyhow::ensure!(
+                value.is_atomic() && value.len() == 2,
+                "invalid native peer default agents record"
+            );
+            value
+                .get("names")
+                .and_then(Value::as_list)
+                .context("invalid peer default agents list")?
+                .iter()
+                .map(|value| {
+                    value
+                        .as_text()
+                        .map(str::to_owned)
+                        .context("peer default agent name must be text")
+                })
+                .collect::<anyhow::Result<_>>()?
+        }
+        _ => anyhow::bail!("invalid peer default agents value type"),
+    };
+    Ok(Some(names))
+}
 
 impl SessionRegistry {
     pub async fn new(
@@ -417,21 +536,23 @@ impl SessionRegistry {
         let id = db.root_id().to_string();
         let source = source.to_string();
         let txn = self.chaz_group.new_transaction().await?;
+        let catalog = txn.get_store::<DocStore>(STORE_SESSION_CATALOG).await?;
+        SessionCatalogEntry::from_catalog(&catalog.get_all().await?, &id)?;
         txn.get_store::<DocStore>(STORE_SESSIONS)
             .await?
             .set_string(&id, &source)
             .await?;
-        txn.get_store::<DocStore>(STORE_SESSION_CATALOG)
-            .await?
-            .set_string(
+        catalog
+            .set_node(
                 &id,
-                serde_json::to_string(&SessionCatalogEntry {
+                SessionCatalogEntry {
                     session_db_id: id.clone(),
                     source: Some(source.clone()),
                     bridge: BridgeKind::from_source(Some(&source)),
                     created_at: Utc::now(),
                     status: SessionStatus::Active,
-                })?,
+                }
+                .to_native(),
             )
             .await?;
         txn.commit().await?;
@@ -491,8 +612,9 @@ impl SessionRegistry {
                 .set_string(&session_db_id, source.unwrap_or(""))
                 .await?;
             let catalog = txn.get_store::<DocStore>(STORE_SESSION_CATALOG).await?;
-            let catalog_json = serde_json::to_string(&catalog_entry)?;
-            catalog.set_string(&session_db_id, catalog_json).await?;
+            catalog
+                .set_node(&session_db_id, catalog_entry.to_native())
+                .await?;
             txn.commit().await?;
         }
 
@@ -788,24 +910,17 @@ impl SessionRegistry {
         for (key, value) in routing_doc.iter() {
             let routing_source: Option<String> =
                 value.try_into().ok().filter(|s: &String| !s.is_empty());
-            let entry = match catalog_doc.get(key) {
-                Some(v) => {
-                    let json: Option<String> = v.try_into().ok();
-                    json.as_deref().and_then(|s| {
-                        serde_json::from_str::<SessionCatalogEntry>(s)
-                            .map_err(|e| {
-                                warn!(session_db_id = %key, "Malformed catalog entry: {e}");
-                                e
-                            })
-                            .ok()
-                    })
+            let entry = match SessionCatalogEntry::from_catalog(&catalog_doc, key) {
+                Ok(entry) => entry,
+                Err(error) => {
+                    warn!(session_db_id = %key, "Malformed catalog entry: {error:#}");
+                    None
                 }
-                None => None,
             };
             let (source, bridge, created_at, status) = match entry {
                 Some(e) => (e.source, e.bridge, Some(e.created_at), e.status),
                 None => {
-                    // Legacy: synthesize from routing-index source only.
+                    // Display only: synthesize from routing-index source only.
                     let g = BridgeKind::from_source(routing_source.as_deref());
                     (routing_source, g, None, SessionStatus::Active)
                 }
@@ -851,7 +966,9 @@ impl SessionRegistry {
         source: Option<&str>,
         started_at: Option<DateTime<Utc>>,
     ) -> anyhow::Result<()> {
-        let existing = self.read_session_catalog_entry(session_db_id).await;
+        let txn = self.chaz_group.new_transaction().await?;
+        let catalog = txn.get_store::<DocStore>(STORE_SESSION_CATALOG).await?;
+        let existing = SessionCatalogEntry::from_catalog(&catalog.get_all().await?, session_db_id)?;
         let source = source
             .map(|s| s.to_string())
             .or_else(|| existing.as_ref().and_then(|e| e.source.clone()));
@@ -866,14 +983,13 @@ impl SessionRegistry {
                 .map_or(SessionStatus::Active, |e| e.status),
             source,
         };
-        let txn = self.chaz_group.new_transaction().await?;
         let sessions = txn.get_store::<DocStore>(STORE_SESSIONS).await?;
         sessions
             .set_string(session_db_id, catalog_entry.source.as_deref().unwrap_or(""))
             .await?;
-        let catalog = txn.get_store::<DocStore>(STORE_SESSION_CATALOG).await?;
-        let catalog_json = serde_json::to_string(&catalog_entry)?;
-        catalog.set_string(session_db_id, catalog_json).await?;
+        catalog
+            .set_node(session_db_id, catalog_entry.to_native())
+            .await?;
         txn.commit().await?;
 
         info!(
@@ -885,18 +1001,6 @@ impl SessionRegistry {
         Ok(())
     }
 
-    /// Read one row out of the session catalog, or `None` when the session has
-    /// no row yet or the stored JSON no longer parses.
-    async fn read_session_catalog_entry(&self, session_db_id: &str) -> Option<SessionCatalogEntry> {
-        let txn = self.chaz_group.new_transaction().await.ok()?;
-        let store = txn
-            .get_store::<DocStore>(STORE_SESSION_CATALOG)
-            .await
-            .ok()?;
-        let json = store.get_string(session_db_id).await.ok()?;
-        serde_json::from_str(&json).ok()
-    }
-
     /// Mark a session as closed in the catalog (no row removal — Patrick's
     /// "find all sessions" design treats history as append-only).
     ///
@@ -905,6 +1009,17 @@ impl SessionRegistry {
     /// Sync cleanup runs even when the session is already closed (remove_tree_sync
     /// on a non-existent relationship is a no-op).
     pub async fn mark_session_closed(&self, session_db_id: &str) -> anyhow::Result<()> {
+        let txn = self.chaz_group.new_transaction().await?;
+        let store = txn.get_store::<DocStore>(STORE_SESSION_CATALOG).await?;
+        let existing = SessionCatalogEntry::from_catalog(&store.get_all().await?, session_db_id)?;
+        if let Some(mut entry) = existing
+            && entry.status != SessionStatus::Closed
+        {
+            entry.status = SessionStatus::Closed;
+            store.set_node(session_db_id, entry.to_native()).await?;
+            txn.commit().await?;
+        }
+
         // Tree-sync cleanup: unregister the (peer, session) pairs so dead
         // relationships don't accumulate in the sync engine over time.
         // Scope fence: tree half only — no peer-identity reaping here.
@@ -945,21 +1060,6 @@ impl SessionRegistry {
                 );
             }
         }
-
-        let txn = self.chaz_group.new_transaction().await?;
-        let store = txn.get_store::<DocStore>(STORE_SESSION_CATALOG).await?;
-        let Ok(json) = store.get_string(session_db_id).await else {
-            return Ok(());
-        };
-        let mut entry: SessionCatalogEntry = serde_json::from_str(&json)?;
-        if entry.status == SessionStatus::Closed {
-            return Ok(());
-        }
-        entry.status = SessionStatus::Closed;
-        store
-            .set_string(session_db_id, serde_json::to_string(&entry)?)
-            .await?;
-        txn.commit().await?;
         Ok(())
     }
 
@@ -1065,10 +1165,19 @@ impl SessionRegistry {
     /// should fall back to the yaml `default_agents:` block. An empty
     /// vec is an explicit "no defaults" override.
     pub async fn load_peer_default_agents(&self) -> Option<Vec<String>> {
-        let txn = self.chaz_peer.new_transaction().await.ok()?;
-        let store = txn.get_store::<DocStore>(STORE_PEER_DEFAULTS).await.ok()?;
-        let raw = store.get_string(KEY_DEFAULT_AGENTS).await.ok()?;
-        serde_json::from_str::<Vec<String>>(&raw).ok()
+        let result = async {
+            let txn = self.chaz_peer.new_transaction().await?;
+            let store = txn.get_store::<DocStore>(STORE_PEER_DEFAULTS).await?;
+            read_peer_default_agents(&store).await
+        }
+        .await;
+        match result {
+            Ok(names) => names,
+            Err(error) => {
+                warn!("Unreadable peer default agents; using config fallback: {error:#}");
+                None
+            }
+        }
     }
 
     /// Persist a new peer-level `default_agents` list, overwriting any
@@ -1078,8 +1187,15 @@ impl SessionRegistry {
     pub async fn save_peer_default_agents(&self, names: &[String]) -> anyhow::Result<()> {
         let txn = self.chaz_peer.new_transaction().await?;
         let store = txn.get_store::<DocStore>(STORE_PEER_DEFAULTS).await?;
-        let json = serde_json::to_string(names)?;
-        store.set_string(KEY_DEFAULT_AGENTS, &json).await?;
+        read_peer_default_agents(&store).await?;
+        // An ordered list is replaced as a unit, not merged by positions.
+        let mut value = Doc::atomic();
+        value.set("version", DEFAULT_AGENTS_VERSION);
+        value.set(
+            "names",
+            names.iter().cloned().map(Value::Text).collect::<List>(),
+        );
+        store.set_node(KEY_DEFAULT_AGENTS, value).await?;
         txn.commit().await?;
         Ok(())
     }
@@ -1089,8 +1205,10 @@ impl SessionRegistry {
     pub async fn clear_peer_default_agents(&self) -> anyhow::Result<()> {
         let txn = self.chaz_peer.new_transaction().await?;
         let store = txn.get_store::<DocStore>(STORE_PEER_DEFAULTS).await?;
-        let _ = store.delete(KEY_DEFAULT_AGENTS).await;
-        txn.commit().await?;
+        if read_peer_default_agents(&store).await?.is_some() {
+            store.delete(KEY_DEFAULT_AGENTS).await?;
+            txn.commit().await?;
+        }
         Ok(())
     }
 }
@@ -1156,6 +1274,177 @@ mod tests {
         assert_eq!(bare.bridge, BridgeKind::Other);
         assert_eq!(bare.source, None);
         assert!(bare.created_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn retained_catalog_rows_stay_readable_and_convert_only_on_write() {
+        let (_instance, registry) = make_registry().await;
+        let (id, session) = registry
+            .create_session(Some("matrix:!room:example.com"))
+            .await
+            .unwrap();
+        let txn = registry.chaz_group.new_transaction().await.unwrap();
+        let store = txn
+            .get_store::<DocStore>(STORE_SESSION_CATALOG)
+            .await
+            .unwrap();
+        assert!(store.delete(&id.0).await.unwrap());
+        txn.commit().await.unwrap();
+
+        // A pre-catalog routing row is still listable without opening the session.
+        let fallback = registry.list_sessions().await.unwrap().pop().unwrap();
+        assert_eq!(fallback.bridge, BridgeKind::Matrix);
+        assert_eq!(fallback.created_at, None);
+
+        let txn = registry.chaz_group.new_transaction().await.unwrap();
+        let store = txn
+            .get_store::<DocStore>(STORE_SESSION_CATALOG)
+            .await
+            .unwrap();
+        let stamp = "2025-01-02T03:04:05.123456789Z";
+        let legacy = format!(
+            r#"{{"session_db_id":"{id}","source":"matrix:!room:example.com","gateway":"Matrix","created_at":"{stamp}"}}"#
+        );
+        store.set_string(&id.0, &legacy).await.unwrap();
+        txn.commit().await.unwrap();
+        let historical = registry.chaz_group.snapshot().await.unwrap();
+        let session_before = session.snapshot().await.unwrap();
+
+        let listed = registry.list_sessions().await.unwrap().pop().unwrap();
+        assert_eq!(listed.created_at, Some(stamp.parse().unwrap()));
+        assert_eq!(listed.status, SessionStatus::Active);
+        assert_eq!(registry.chaz_group.snapshot().await.unwrap(), historical);
+
+        registry.mark_session_closed(&id.0).await.unwrap();
+        let txn = registry.chaz_group.new_transaction().await.unwrap();
+        let store = txn
+            .get_store::<DocStore>(STORE_SESSION_CATALOG)
+            .await
+            .unwrap();
+        let native = store.get_node(&id.0).await.unwrap();
+        assert!(native.is_atomic());
+        assert_eq!(native.get("version"), Some(&Value::Int(1)));
+        assert_eq!(native.get("status"), Some(&Value::Text("closed".into())));
+        assert!(
+            store.get_string(&id.0).await.is_err(),
+            "pre-cutover readers expected text"
+        );
+        let closed = registry.list_sessions().await.unwrap().pop().unwrap();
+        assert_eq!(closed.status, SessionStatus::Closed);
+        assert_eq!(closed.created_at, listed.created_at);
+        assert_eq!(closed.source, listed.source);
+        assert_eq!(closed.bridge, listed.bridge);
+
+        let txn = registry
+            .chaz_group
+            .new_transaction_at(&historical)
+            .await
+            .unwrap();
+        let store = txn
+            .get_store::<DocStore>(STORE_SESSION_CATALOG)
+            .await
+            .unwrap();
+        assert_eq!(store.get_string(&id.0).await.unwrap(), legacy);
+        assert_eq!(session.snapshot().await.unwrap(), session_before);
+    }
+
+    #[tokio::test]
+    async fn malformed_catalog_can_list_but_cannot_be_overwritten() {
+        let (_instance, registry) = make_registry().await;
+        let (id, session) = registry.create_session(Some("cli")).await.unwrap();
+        let txn = registry.chaz_group.new_transaction().await.unwrap();
+        let store = txn
+            .get_store::<DocStore>(STORE_SESSION_CATALOG)
+            .await
+            .unwrap();
+        let mut row = store.get_node(&id.0).await.unwrap();
+        row.set("version", 2_i64);
+        store.set_node(&id.0, row).await.unwrap();
+        txn.commit().await.unwrap();
+        let before = registry.chaz_group.snapshot().await.unwrap();
+
+        let listed = registry.list_sessions().await.unwrap().pop().unwrap();
+        assert_eq!(listed.source.as_deref(), Some("cli"));
+        assert_eq!(listed.created_at, None);
+        for result in [
+            registry
+                .upsert_session_catalog(&id.0, Some("tui"), None)
+                .await,
+            registry.mark_session_closed(&id.0).await,
+            registry
+                .publish_prepared_session(&session, "spawn:replacement")
+                .await
+                .map(|_| ()),
+        ] {
+            assert!(
+                format!("{:#}", result.unwrap_err())
+                    .contains("unsupported session catalog version")
+            );
+        }
+        assert_eq!(registry.chaz_group.snapshot().await.unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn peer_defaults_round_trip_and_replace_as_one_native_value() {
+        let (_instance, registry) = make_registry().await;
+        let txn = registry.chaz_peer.new_transaction().await.unwrap();
+        let store = txn
+            .get_store::<DocStore>(STORE_PEER_DEFAULTS)
+            .await
+            .unwrap();
+        let legacy = r#"["z","a.本","z",""]"#;
+        store.set_string(KEY_DEFAULT_AGENTS, legacy).await.unwrap();
+        txn.commit().await.unwrap();
+        let names = registry.load_peer_default_agents().await.unwrap();
+        assert_eq!(names, ["z", "a.本", "z", ""]);
+
+        registry.save_peer_default_agents(&names).await.unwrap();
+        let txn = registry.chaz_peer.new_transaction().await.unwrap();
+        let store = txn
+            .get_store::<DocStore>(STORE_PEER_DEFAULTS)
+            .await
+            .unwrap();
+        let doc = store.get_node(KEY_DEFAULT_AGENTS).await.unwrap();
+        assert!(doc.is_atomic());
+        assert_eq!(doc.get("version"), Some(&Value::Int(1)));
+        assert_eq!(
+            doc.get("names").unwrap().as_list().unwrap().to_vec(),
+            names.iter().cloned().map(Value::Text).collect::<Vec<_>>()
+        );
+        assert_eq!(registry.load_peer_default_agents().await, Some(names));
+
+        registry.save_peer_default_agents(&[]).await.unwrap();
+        assert_eq!(registry.load_peer_default_agents().await, Some(vec![]));
+        registry.clear_peer_default_agents().await.unwrap();
+        assert_eq!(registry.load_peer_default_agents().await, None);
+    }
+
+    #[tokio::test]
+    async fn corrupt_peer_defaults_refuse_save_and_clear() {
+        let (_instance, registry) = make_registry().await;
+        let txn = registry.chaz_peer.new_transaction().await.unwrap();
+        let store = txn
+            .get_store::<DocStore>(STORE_PEER_DEFAULTS)
+            .await
+            .unwrap();
+        let mut doc = Doc::atomic();
+        doc.set("version", DEFAULT_AGENTS_VERSION);
+        doc.set("names", [Value::Int(42)].into_iter().collect::<List>());
+        store.set_node(KEY_DEFAULT_AGENTS, doc).await.unwrap();
+        txn.commit().await.unwrap();
+        let before = registry.chaz_peer.snapshot().await.unwrap();
+
+        assert_eq!(registry.load_peer_default_agents().await, None);
+        for result in [
+            registry.save_peer_default_agents(&[]).await,
+            registry.clear_peer_default_agents().await,
+        ] {
+            assert_eq!(
+                result.unwrap_err().to_string(),
+                "peer default agent name must be text"
+            );
+        }
+        assert_eq!(registry.chaz_peer.snapshot().await.unwrap(), before);
     }
 
     #[tokio::test]
