@@ -23,7 +23,8 @@ pub(crate) struct BackendProbe {
     trees: Arc<Mutex<BTreeSet<ID>>>,
     methods: Arc<Mutex<BTreeMap<&'static str, usize>>>,
     fail_get: Arc<Mutex<Option<ID>>>,
-    fail_put: Arc<Mutex<Option<(ID, usize)>>>,
+    fail_put: Arc<Mutex<Option<ID>>>,
+    fail_local_account_write: Arc<AtomicBool>,
 }
 
 impl BackendProbe {
@@ -54,9 +55,14 @@ impl BackendProbe {
         *self.fail_get.lock().unwrap() = id;
     }
 
-    /// Fail one write to a tree after `skip` matching writes succeed.
-    pub(crate) fn fail_put(&self, tree: ID, skip: usize) {
-        *self.fail_put.lock().unwrap() = Some((tree, skip));
+    /// Fail the next write to this tree.
+    pub(crate) fn fail_put(&self, tree: ID) {
+        *self.fail_put.lock().unwrap() = Some(tree);
+    }
+
+    /// Fail the next installation-local account record replacement.
+    pub(crate) fn fail_local_account_write(&self) {
+        self.fail_local_account_write.store(true, Ordering::SeqCst);
     }
 
     fn op(&self, method: &'static str) {
@@ -105,6 +111,16 @@ impl<B: BackendImpl> BackendImpl for CountingBackend<B> {
         expected: Option<&[u8]>,
         replacement: &[u8],
     ) -> Result<bool> {
+        if self
+            .probe
+            .fail_local_account_write
+            .swap(false, Ordering::SeqCst)
+        {
+            return Err(eidetica::backend::BackendError::StateInconsistency {
+                reason: "injected local account write failure".into(),
+            }
+            .into());
+        }
         self.inner
             .compare_exchange_local_account_record(name, expected, replacement)
             .await
@@ -199,17 +215,12 @@ impl<B: BackendImpl> BackendImpl for CountingBackend<B> {
         self.probe.entry(&entry);
         {
             let mut failure = self.probe.fail_put.lock().unwrap();
-            if let Some((tree, skip)) = failure.as_mut()
-                && entry.root().as_ref() == Some(tree)
-            {
-                if *skip == 0 {
-                    *failure = None;
-                    return Err(eidetica::backend::BackendError::StateInconsistency {
-                        reason: "injected root write failure".into(),
-                    }
-                    .into());
+            if failure.is_some() && entry.root().as_ref() == failure.as_ref() {
+                *failure = None;
+                return Err(eidetica::backend::BackendError::StateInconsistency {
+                    reason: "injected root write failure".into(),
                 }
-                *skip -= 1;
+                .into());
             }
         }
         self.inner.put(entry).await

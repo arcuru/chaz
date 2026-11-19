@@ -686,7 +686,7 @@ async fn failed_reference_write_reports_created_id_and_retry_requires_repair() {
     .await
     .unwrap();
     // Root creation's tracking write succeeds; publication of its reference fails.
-    probe.fail_put(user.account().id().clone(), 1);
+    probe.fail_put(user.account().id().clone());
     let error = roots::open(&mut user, RootSetup::Initialize)
         .await
         .err()
@@ -739,7 +739,7 @@ async fn creation_tracking_failure_is_reported_without_using_an_untracked_root()
         .all_roots()
         .await
         .unwrap();
-    probe.fail_put(user.account().id().clone(), 0);
+    probe.fail_local_account_write();
     let error = roots::open(&mut user, RootSetup::Initialize)
         .await
         .err()
@@ -756,10 +756,6 @@ async fn creation_tracking_failure_is_reported_without_using_an_untracked_root()
         .filter(|id| !before.contains(id))
         .cloned()
         .collect();
-    eprintln!(
-        "creation failure: {error}; orphan roots: {orphan:?}; tracked roots: {:?}",
-        user.databases().await.unwrap()
-    );
     assert!(
         matches!(
             &error,
@@ -771,7 +767,9 @@ async fn creation_tracking_failure_is_reported_without_using_an_untracked_root()
         "{error}"
     );
     assert!(
-        error.to_string().contains("injected root write failure"),
+        error
+            .to_string()
+            .contains("injected local account write failure"),
         "{error}"
     );
     // Initial creation has no application data yet. A failed tracking write
