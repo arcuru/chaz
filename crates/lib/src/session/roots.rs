@@ -176,8 +176,8 @@ pub enum RootsError {
     #[error("Chaz {kind} reference already names {existing}; it was not changed to {requested}")]
     AlreadyReferenced {
         kind: RootKind,
-        existing: ID,
-        requested: ID,
+        existing: Box<ID>,
+        requested: Box<ID>,
     },
     /// A tracked database could be an old root, but could not be inspected.
     #[error(
@@ -332,8 +332,8 @@ pub async fn record(user: &AccountSession, kind: RootKind, id: &ID) -> Result<()
         Ok(Some(existing)) => {
             return Err(RootsError::AlreadyReferenced {
                 kind,
-                existing,
-                requested: id.clone(),
+                existing: Box::new(existing),
+                requested: Box::new(id.clone()),
             });
         }
         Ok(None) => {}
