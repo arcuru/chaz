@@ -4307,12 +4307,11 @@ impl Server {
                     budget_model.as_deref(),
                     max_context_tokens,
                 );
-                let mut builder = ContextBuilder::new(&view.entries, &agent_name, &system_prompt, &context_config);
+                let mut builder = ContextBuilder::from_history(&view, &agent_name, &system_prompt, &context_config);
                 if let Some(attachment) = &attachment {
                     builder = builder.with_attachment(attachment);
                 }
                 let assembled = builder.with_tools(&tool_defs)
-                        .with_context_view(&view)
                         .with_max_tokens_override(max_tokens_override)
                         .with_room_participants(&roster)
                         .with_extension_hub(spawn_extensions.clone())

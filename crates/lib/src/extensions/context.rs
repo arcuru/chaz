@@ -76,60 +76,55 @@ impl ContextStrategy for BaselineContext {
                 .try_fold(0, |sum, item| ctx.cost(item).map(|cost| sum + cost))?
                 + ctx.tools_cost();
             let remaining = call.budget_tokens.saturating_sub(used);
-            let all: Vec<_> = ctx.entries().collect();
+            let all: Vec<_> = ctx.groups().collect();
             let start = all
                 .iter()
-                .rposition(|(_, kind)| *kind == EntryType::Summary)
+                .rposition(|group| *group.kind == EntryType::Summary)
                 .unwrap_or(0);
             let candidates = &all[start..];
             let mut selected = Vec::new();
             let mut tokens = 0;
             let mut oldest_date = None;
-            for (index, kind) in candidates.iter().rev() {
-                let date = ctx.entry_date(*index)?;
-                let cost = ctx.cost(&ContextItem::Entry(*index))?
-                    + if oldest_date == Some(date) {
+            for group in candidates.iter().rev() {
+                let cost = ctx.cost(&ContextItem::Entry(group.index))?
+                    + if oldest_date == Some(group.date) {
                         0
                     } else {
-                        ctx.cost(&ContextItem::Date(*index))?
+                        ctx.cost(&ContextItem::Date(group.index))?
                     };
                 if tokens + cost > remaining && !selected.is_empty() {
                     break;
                 }
                 tokens += cost;
-                selected.push(*index);
-                oldest_date = Some(date);
-                if *kind == EntryType::Summary {
-                    break;
-                }
+                selected.push(group);
+                oldest_date = Some(group.date);
             }
             selected.reverse();
             plan.truncated = selected.len() < candidates.len();
             let mut spare = remaining.saturating_sub(tokens);
             let mut replay = std::collections::HashMap::new();
-            for index in selected.iter().rev() {
+            for group in selected.iter().rev() {
                 let item = ContextItem::Exchange {
-                    entry: *index,
+                    entry: group.index,
                     budget: spare,
                 };
                 let cost = ctx.cost(&item)?;
                 if cost > 0 {
                     spare = spare.saturating_sub(cost);
-                    replay.insert(*index, item);
+                    replay.insert(group.index, item);
                 }
             }
             if ctx.has_instructions() {
                 plan.items.push(ContextItem::Instructions);
             }
             let mut previous_date = None;
-            for index in selected {
-                let date = ctx.entry_date(index)?;
-                if previous_date != Some(date) {
-                    plan.items.push(ContextItem::Date(index));
+            for group in selected {
+                if previous_date != Some(group.date) {
+                    plan.items.push(ContextItem::Date(group.index));
                 }
-                previous_date = Some(date);
-                plan.items.push(ContextItem::Entry(index));
-                if let Some(item) = replay.remove(&index) {
+                previous_date = Some(group.date);
+                plan.items.push(ContextItem::Entry(group.index));
+                if let Some(item) = replay.remove(&group.index) {
                     plan.items.push(item);
                 }
             }

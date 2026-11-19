@@ -165,8 +165,8 @@ async fn assembled(
         .into_iter()
         .map(|r| r.name().to_string())
         .collect();
-    ContextBuilder::new(
-        &view.entries,
+    ContextBuilder::from_history(
+        &view,
         "test-agent",
         prompt,
         &ContextConfig {
@@ -174,7 +174,6 @@ async fn assembled(
             reserved_output_tokens: 256,
         },
     )
-    .with_context_view(&view)
     .with_extension_hub(hub)
     .with_session_db(session.database())
     .with_invocation(&active, request)
@@ -914,8 +913,8 @@ async fn fixed_cold_reconstruction_elapsed_and_logical_database_read_volume() {
                 .unwrap();
             let read_elapsed = start.elapsed();
             let strategy_start = std::time::Instant::now();
-            let built = ContextBuilder::new(
-                &view.entries,
+            let built = ContextBuilder::from_history(
+                &view,
                 "test-agent",
                 "policy",
                 &ContextConfig {
@@ -923,16 +922,21 @@ async fn fixed_cold_reconstruction_elapsed_and_logical_database_read_volume() {
                     reserved_output_tokens: 256,
                 },
             )
-            .with_context_view(&view)
             .with_session_db(&db)
             .with_extension_hub(hub)
             .try_build()
             .await
             .unwrap();
-            assert_eq!(view.entries.len(), n);
-            assert_eq!(view.tool_history.iter().flatten().count(), 3 * n);
+            assert_eq!(view.groups.len(), n);
+            assert_eq!(
+                view.groups
+                    .iter()
+                    .map(|group| group.transcript.len())
+                    .sum::<usize>(),
+                3 * n
+            );
             assert!(built.messages.contains(&RuntimeMessage::User(
-                view.entries.last().unwrap().content.clone()
+                view.entries().next_back().unwrap().content.clone()
             )));
             println!(
                 "RECONSTRUCTION {}",
@@ -965,8 +969,7 @@ async fn baseline_tool_rounds_retry_and_originals_keep_the_selected_prefix() {
         .await
         .unwrap();
     let defs = ctx.definitions();
-    let built = ContextBuilder::new(&view.entries, "test-agent", "policy", &Default::default())
-        .with_context_view(&view)
+    let built = ContextBuilder::from_history(&view, "test-agent", "policy", &Default::default())
         .with_tools(&defs)
         .with_extension_hub(hub.clone())
         .with_session_db(&db)
@@ -1023,7 +1026,7 @@ async fn baseline_tool_rounds_retry_and_originals_keep_the_selected_prefix() {
         .context_view_at(db.snapshot().await.unwrap())
         .await
         .unwrap();
-    assert_eq!(current.entries.len(), view.entries.len());
+    assert_eq!(current.groups.len(), view.groups.len());
     assert!(current.contributions.is_empty());
     println!("TOOL_LOOP_RETRY {calls:?}");
 }

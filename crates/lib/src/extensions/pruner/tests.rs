@@ -204,8 +204,8 @@ impl Fixture {
             .context_view_at(self.db.snapshot().await.unwrap())
             .await
             .unwrap();
-        ContextBuilder::new(
-            &view.entries,
+        ContextBuilder::from_history(
+            &view,
             "test-agent",
             "fixture instructions",
             &ContextConfig {
@@ -213,7 +213,6 @@ impl Fixture {
                 reserved_output_tokens: 256,
             },
         )
-        .with_context_view(&view)
         .with_tools(&self.ctx.definitions())
         .with_extension_hub(self.hub.clone())
         .with_session_db(&self.db)

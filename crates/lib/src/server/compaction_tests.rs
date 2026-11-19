@@ -226,15 +226,13 @@ async fn turn_context_keeps_only_current_and_queued_requests_past_a_summary() {
         .turn_context_view_at(snapshot.clone(), &current, |name| name == "alpha")
         .await
         .unwrap();
-    assert_eq!(view.entry_ids.len(), view.entries.len());
-    assert_eq!(view.tool_history.len(), view.entries.len());
     for id in [&current, &queued] {
-        let position = view
-            .entry_ids
+        let group = view
+            .groups
             .iter()
-            .position(|row| row.as_ref() == Some(id))
+            .find(|row| row.entry_id() == Some(id))
             .unwrap();
-        assert!(view.tool_history[position].is_empty());
+        assert!(group.protected && group.transcript.is_empty());
     }
     // Later completion must not change classification in the pinned view.
     let attempt = session.start_turn_attempt(queued).await.unwrap();
@@ -243,18 +241,10 @@ async fn turn_context_keeps_only_current_and_queued_requests_past_a_summary() {
         .turn_context_view_at(snapshot, &current, |name| name == "alpha")
         .await
         .unwrap();
-    assert_eq!(view.entry_ids, pinned.entry_ids);
-    assert_eq!(
-        view.entries
-            .iter()
-            .map(|row| &row.content)
-            .collect::<Vec<_>>(),
-        pinned
-            .entries
-            .iter()
-            .map(|row| &row.content)
-            .collect::<Vec<_>>()
-    );
+    assert!(view.groups.iter().zip(&pinned.groups).all(|(a, b)| {
+        a.origin == b.origin && a.protected == b.protected && a.entry.content == b.entry.content
+    }));
+    assert_eq!(view.groups.len(), pinned.groups.len());
     let contents = |entries: Vec<SessionEntry>| {
         entries
             .into_iter()
@@ -269,8 +259,11 @@ async fn turn_context_keeps_only_current_and_queued_requests_past_a_summary() {
     let turn = contents(turn);
     let boundary = turn.iter().position(|c| c == "SUMMARY").unwrap();
     assert_eq!(&turn[boundary..], ["SUMMARY", "CURRENT", "LATER"]);
-    let pinned = contents(pinned.entries);
-    let boundary = pinned.iter().position(|c| c == "SUMMARY").unwrap();
+    let pinned: Vec<_> = pinned
+        .entries()
+        .map(|entry| entry.content.as_str())
+        .collect();
+    let boundary = pinned.iter().position(|c| *c == "SUMMARY").unwrap();
     assert_eq!(
         &pinned[boundary..],
         ["SUMMARY", "CURRENT", "QUEUED", "LATER"]
@@ -308,7 +301,10 @@ async fn native_compact_keeps_current_and_queued_requests_it_covered() {
         })
         .await
         .unwrap();
-    let command = session.start_turn_attempt(command_id).await.unwrap();
+    let command = session
+        .start_turn_attempt(command_id.clone())
+        .await
+        .unwrap();
     session
         .complete_command_attempt(
             &command,
@@ -327,12 +323,24 @@ async fn native_compact_keeps_current_and_queued_requests_it_covered() {
             .map(|entry| entry.content)
             .collect::<Vec<_>>()
     };
-    let (turn, _) = session
-        .turn_context_with_tool_history(&current, |name| name == "alpha")
+    let view = session
+        .turn_context_view_at(
+            session.database().snapshot().await.unwrap(),
+            &current,
+            |name| name == "alpha",
+        )
         .await
         .unwrap();
     assert_eq!(
-        contents(turn),
+        view.groups[0].origin,
+        Some(crate::session::HistoryOrigin::CompactCommand(
+            command_id.to_string()
+        ))
+    );
+    assert_eq!(
+        view.entries()
+            .map(|entry| entry.content.as_str())
+            .collect::<Vec<_>>(),
         ["NATIVE-SUMMARY", "CURRENT", "QUEUED", "LATER"]
     );
     assert_eq!(

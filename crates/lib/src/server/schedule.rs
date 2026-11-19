@@ -760,8 +760,8 @@ impl Server {
                 budget_model.as_deref(),
                 max_context_tokens,
             );
-            let mut builder = ContextBuilder::new(
-                &view.entries,
+            let mut builder = ContextBuilder::from_history(
+                &view,
                 agent_name,
                 &agent.system_prompt,
                 &self.context_config,
@@ -770,7 +770,6 @@ impl Server {
                 builder = builder.with_attachment(attachment);
             }
             let assembled = builder
-                .with_context_view(&view)
                 .with_tools(&tool_defs)
                 .with_max_tokens_override(max_tokens_override)
                 .with_room_participants(&roster)

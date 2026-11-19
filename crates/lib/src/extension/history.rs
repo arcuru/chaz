@@ -98,8 +98,10 @@ impl ScopedHistory {
     }
 
     async fn records(&self) -> anyhow::Result<Vec<(TurnTranscriptRecord, ToolCallRequest)>> {
-        let snapshot = self.db.snapshot().await?;
-        let history = Session::retained_tool_history_at(&self.db, &snapshot).await?;
+        let history = Session::history(&self.db)
+            .await?
+            .retained_tool_history()
+            .await?;
         // Revalidate authority after the potentially slow retained-store read.
         let current: HashSet<_> = super::read_active(&self.db)
             .await?
@@ -158,11 +160,14 @@ impl ScopedHistory {
         // the visible context but does not itself revoke retained-source access.
         Ok(history
             .into_iter()
-            .filter(|records| crate::context::replay_turn(records, usize::MAX).is_some())
+            .filter(|rows| {
+                crate::context::replay_turn(rows.iter().map(|row| &row.record), usize::MAX)
+                    .is_some()
+            })
             .flat_map(|records| {
                 let calls: Vec<_> = records
                     .iter()
-                    .filter_map(|r| match &r.message {
+                    .filter_map(|r| match &r.record.message {
                         TurnTranscriptMessage::ModelResponse {
                             model_sequence,
                             tool_calls,
@@ -180,7 +185,8 @@ impl ScopedHistory {
                     .collect();
                 records
                     .into_iter()
-                    .filter_map(|r| {
+                    .filter_map(|row| {
+                        let r = row.record;
                         let TurnTranscriptMessage::ToolResult {
                             model_sequence,
                             call_id,

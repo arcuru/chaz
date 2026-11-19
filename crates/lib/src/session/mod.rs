@@ -33,6 +33,7 @@ mod activity_tests;
 mod agents;
 mod bridge_event;
 pub mod execution;
+mod history;
 pub mod jobs;
 mod keys;
 mod registry;
@@ -62,20 +63,7 @@ pub use transport::{
     session_attachment, transport_bindings, unbind_transport,
 };
 
-/// Selected transcript, native exchanges and durable contributions from one
-/// immutable database snapshot. This is a disposable view, not a second store.
-#[derive(Clone, Debug)]
-pub struct SessionContextView {
-    /// Test-only observed rows/serialized bytes returned by reconstruction reads.
-    #[cfg(test)]
-    pub(crate) read_volume: serde_json::Value,
-    pub entry_ids: Vec<Option<TurnRequestId>>,
-    /// Current/retried and still-queued inputs, resolved at the same snapshot.
-    pub protected_inputs: HashSet<TurnRequestId>,
-    pub entries: Vec<SessionEntry>,
-    pub tool_history: Vec<Vec<TurnTranscriptRecord>>,
-    pub contributions: Vec<crate::extension::durable_context::CommittedContribution>,
-}
+pub use history::{ContextGroup, HistoryOrigin, HistoryRead, SessionContextView, TranscriptRow};
 
 /// Type of session entry. Participants (users and agents alike) write entries
 /// to a session. There is no user/agent distinction at the protocol level.
@@ -895,7 +883,12 @@ impl Session {
         database: Database,
         snapshot: &Snapshot,
     ) -> anyhow::Result<Self> {
-        let (entry_ids, entries) = Self::load_entries_at(&database, "entries", snapshot).await?;
+        let (entry_ids, entries) = Self::history_at(&database, snapshot)
+            .await?
+            .entries()
+            .await?
+            .into_iter()
+            .unzip();
         Ok(Self {
             conversation_id,
             database,
@@ -911,26 +904,10 @@ impl Session {
         let Ok(txn) = self.database.new_transaction().await else {
             return;
         };
-        if let Ok(store) = txn.get_store::<Table<SessionEntry>>(&self.store_name).await {
-            match store.search(|_| true).await {
-                Ok(records) => {
-                    let (ids, entries) = sort_persisted_entries(records);
-                    self.entry_ids = ids;
-                    self.entries = entries;
-                }
-                Err(e) => error!("Failed to load session entries from eidetica: {e}"),
-            }
+        match history::entry_rows(&txn, &self.store_name).await {
+            Ok(rows) => (self.entry_ids, self.entries) = rows.into_iter().unzip(),
+            Err(e) => error!("Failed to load session entries from eidetica: {e}"),
         }
-    }
-
-    async fn load_entries_at(
-        database: &Database,
-        store_name: &str,
-        snapshot: &eidetica::Snapshot,
-    ) -> anyhow::Result<(Vec<TurnRequestId>, Vec<SessionEntry>)> {
-        let txn = database.new_transaction_at(snapshot).await?;
-        let store = txn.get_store::<Table<SessionEntry>>(store_name).await?;
-        Ok(sort_persisted_entries(store.search(|_| true).await?))
     }
 
     /// Load the typed transcript view at an immutable Eidetica snapshot.
@@ -938,9 +915,13 @@ impl Session {
         database: &Database,
         snapshot: &Snapshot,
     ) -> anyhow::Result<Vec<SessionEntry>> {
-        Ok(Self::load_entries_at(database, "entries", snapshot)
+        Ok(Self::history_at(database, snapshot)
             .await?
-            .1)
+            .entries()
+            .await?
+            .into_iter()
+            .map(|(_, entry)| entry)
+            .collect())
     }
 
     /// Check whether this database contains any queued durable work at a
@@ -971,125 +952,22 @@ impl Session {
         database: &Database,
         snapshot: &Snapshot,
     ) -> anyhow::Result<Vec<(TurnRequestId, SessionEntry)>> {
-        let (ids, entries) = Self::load_entries_at(database, "entries", snapshot).await?;
-        Ok(ids.into_iter().zip(entries).collect())
+        Self::history_at(database, snapshot).await?.entries().await
     }
 
-    /// Assemble the transcript view using snapshot-backed compact results.
-    /// Coverage is derived from native historical table views; no entry-id
-    /// ancestry is stored alongside the summary.
+    /// Assemble the compacted transcript for legacy callers (e.g. /compact).
     pub async fn context_entries(&self) -> anyhow::Result<Vec<SessionEntry>> {
-        let snapshot = self.database.snapshot().await?;
-        Self::context_entries_at(self.database.clone(), snapshot).await
+        Self::history(&self.database).await?.context_entries().await
     }
 
     pub async fn context_entries_at(
         database: Database,
         snapshot: Snapshot,
     ) -> anyhow::Result<Vec<SessionEntry>> {
-        Ok(
-            Self::context_entries_with_ids_at(database, snapshot, &|_, _| false)
-                .await?
-                .into_iter()
-                .map(|(_, entry)| entry)
-                .collect(),
-        )
-    }
-
-    /// `pending` marks rows a summary must not hide: a native summary keeps
-    /// them although its snapshot covers them, and a positional `Summary` row
-    /// keeps them by moving them directly after itself in session order.
-    async fn context_entries_with_ids_at(
-        database: Database,
-        snapshot: Snapshot,
-        pending: &(dyn Fn(&TurnRequestId, &SessionEntry) -> bool + Sync),
-    ) -> anyhow::Result<Vec<(Option<TurnRequestId>, SessionEntry)>> {
-        let mut rows = Self::compacted_rows_at(database, snapshot, pending).await?;
-        if let Some(boundary) = rows
-            .iter()
-            .rposition(|(_, entry)| entry.entry_type == EntryType::Summary)
-        {
-            let after = rows.split_off(boundary);
-            let (rescued, hidden): (Vec<_>, Vec<_>) = rows
-                .into_iter()
-                .partition(|(id, entry)| id.as_ref().is_some_and(|id| pending(id, entry)));
-            let mut after = after.into_iter();
-            rows = hidden;
-            rows.extend(after.next());
-            rows.extend(rescued);
-            rows.extend(after);
-        }
-        Ok(rows)
-    }
-
-    async fn compacted_rows_at(
-        database: Database,
-        snapshot: Snapshot,
-        pending: &(dyn Fn(&TurnRequestId, &SessionEntry) -> bool + Sync),
-    ) -> anyhow::Result<Vec<(Option<TurnRequestId>, SessionEntry)>> {
-        let txn = database.new_transaction_at(&snapshot).await?;
-        let results = txn
-            .get_store::<Table<SessionCommandResult>>(SESSION_COMMAND_RESULTS_STORE)
+        Self::history_at(&database, &snapshot)
             .await?
-            .search(|result| matches!(result.outcome, SessionCommandOutcome::Compact { .. }))
-            .await?;
-        let mut candidates = Vec::new();
-        let commands = txn
-            .get_store::<Table<SessionCommandRequest>>(SESSION_COMMANDS_STORE)
-            .await?;
-        for (id, result) in results {
-            let SessionCommandOutcome::Compact { summary } = result.outcome else {
-                continue;
-            };
-            let request = commands.get(&id).await?;
-            let SessionCommand::Compact { source_snapshot } = request.command else {
-                continue;
-            };
-            candidates.push((id, result.completed_at, source_snapshot, summary));
-        }
-        let Some(mut selected) = candidates.pop() else {
-            return Ok(Self::entries_with_ids_at_snapshot(&database, &snapshot)
-                .await?
-                .into_iter()
-                .map(|(id, entry)| (Some(id), entry))
-                .collect());
-        };
-        for candidate in candidates {
-            let selected_to_candidate = database.ids_added(&selected.2, &candidate.2).await?;
-            let candidate_to_selected = database.ids_added(&candidate.2, &selected.2).await?;
-            let candidate_covers_more =
-                !selected_to_candidate.is_empty() && candidate_to_selected.is_empty();
-            let incomparable_or_equal =
-                selected_to_candidate.is_empty() == candidate_to_selected.is_empty();
-            if candidate_covers_more
-                || (incomparable_or_equal
-                    && (candidate.1, &candidate.0) > (selected.1, &selected.0))
-            {
-                selected = candidate;
-            }
-        }
-
-        let source_entries = Self::entries_with_ids_at_snapshot(&database, &selected.2).await?;
-        let covered_ids: HashSet<_> = source_entries.iter().map(|(id, _)| id.clone()).collect();
-        let mut entries = vec![(
-            None,
-            SessionEntry {
-                sender: "system".into(),
-                content: selected.3,
-                timestamp: selected.1,
-                entry_type: EntryType::Summary,
-                metadata: None,
-                routing: None,
-            },
-        )];
-        entries.extend(
-            Self::entries_with_ids_at_snapshot(&database, &snapshot)
-                .await?
-                .into_iter()
-                .filter(|(id, entry)| !covered_ids.contains(id) || pending(id, entry))
-                .map(|(id, entry)| (Some(id), entry)),
-        );
-        Ok(entries)
+            .context_entries()
+            .await
     }
 
     /// Identity of native compaction coverage at one immutable snapshot.
@@ -1127,137 +1005,50 @@ impl Session {
         Ok(fence)
     }
 
-    /// One immutable view of compacted entries and selected completed attempts.
+    /// Compatibility projection for flat callers. New selectors use grouped history.
     pub async fn context_with_tool_history(
         &self,
     ) -> anyhow::Result<(Vec<SessionEntry>, Vec<Vec<TurnTranscriptRecord>>)> {
-        let snapshot = self.database.snapshot().await?;
-        let view = self.context_view_at(snapshot).await?;
-        Ok((view.entries, view.tool_history))
+        Ok(Self::history(&self.database)
+            .await?
+            .context()
+            .await?
+            .into_flat())
     }
 
-    /// Compacted context for the request this turn answers, including a retry.
+    /// Compatibility projection for flat callers. New selectors use grouped history.
     pub async fn turn_context_with_tool_history(
         &self,
         current: &TurnRequestId,
         is_agent: impl Fn(&str) -> bool + Sync,
     ) -> anyhow::Result<(Vec<SessionEntry>, Vec<Vec<TurnTranscriptRecord>>)> {
-        let view = self
-            .turn_context_view_at(self.database.snapshot().await?, current, is_agent)
-            .await?;
-        Ok((view.entries, view.tool_history))
+        Ok(Self::history(&self.database)
+            .await?
+            .turn_context(current, is_agent)
+            .await?
+            .into_flat())
     }
 
-    /// Keep the current and still-queued requests visible after a summary,
-    /// using the same immutable view as the rest of the turn context.
+    /// Keep the current and still-queued requests visible at the exact snapshot.
     pub async fn turn_context_view_at(
         &self,
         snapshot: Snapshot,
         current: &TurnRequestId,
         is_agent: impl Fn(&str) -> bool + Sync,
     ) -> anyhow::Result<SessionContextView> {
-        self.context_view_at_for(snapshot, Some(current), &is_agent)
+        Self::history_at(&self.database, &snapshot)
+            .await?
+            .turn_context(current, is_agent)
             .await
     }
 
     /// Read every selected-context store at the supplied immutable snapshot.
     /// A failed read is an error, never an in-memory transcript fallback.
     pub async fn context_view_at(&self, snapshot: Snapshot) -> anyhow::Result<SessionContextView> {
-        self.context_view_at_for(snapshot, None, &|_| true).await
-    }
-
-    async fn context_view_at_for(
-        &self,
-        snapshot: Snapshot,
-        current: Option<&TurnRequestId>,
-        is_agent: &(dyn Fn(&str) -> bool + Sync),
-    ) -> anyhow::Result<SessionContextView> {
-        let txn = self.database.new_transaction_at(&snapshot).await?;
-        let attempts = txn
-            .get_store::<Table<TurnAttempt>>(TURN_ATTEMPTS_STORE)
+        Self::history_at(&self.database, &snapshot)
             .await?
-            .search(|_| true)
-            .await?;
-        #[cfg(test)]
-        let attempt_volume = (attempts.len(), serde_json::to_vec(&attempts)?.len());
-        let states = index_attempt_states(attempts, &HashSet::new());
-        let baseline = match current {
-            Some(_) => {
-                read_turn_baseline_from(&txn.get_store::<DocStore>(META_STORE).await?).await?
-            }
-            None => HashSet::new(),
-        };
-        // An interrupted request stays compacted until explicitly retried.
-        let pending = |id: &TurnRequestId, entry: &SessionEntry| {
-            current.is_some_and(|current| {
-                id == current
-                    || (is_turn_request(id, entry, &baseline, is_agent) && !states.contains_key(id))
-            })
-        };
-        let rows: Vec<_> =
-            Self::context_entries_with_ids_at(self.database.clone(), snapshot.clone(), &pending)
-                .await?
-                .into_iter()
-                .filter(|(_, entry)| entry.entry_type != EntryType::TurnContext)
-                .collect();
-        let contributions =
-            crate::extension::durable_context::read_at(&self.database, &snapshot).await?;
-        let protected_inputs = rows
-            .iter()
-            .filter_map(|(id, entry)| id.as_ref().filter(|id| pending(id, entry)).cloned())
-            .collect();
-        let selected: HashMap<_, _> = states
-            .into_iter()
-            .filter_map(|(id, state)| {
-                if let TurnRequestState::Completed { attempt_id } = state {
-                    Some((id, attempt_id))
-                } else {
-                    None
-                }
-            })
-            .collect();
-        let mut records: HashMap<TurnRequestId, Vec<TurnTranscriptRecord>> = HashMap::new();
-        let transcript_rows = txn
-            .get_store::<Table<TurnTranscriptRecord>>(TURN_TRANSCRIPT_STORE)
-            .await?
-            .search(|_| true)
-            .await?;
-        #[cfg(test)]
-        let read_volume = serde_json::json!({
-            "scope": "context_view Table results only; excludes reopen, metadata, command/state lookups and backend physical I/O",
-            "entry_rows": rows.len(), "entry_bytes": serde_json::to_vec(&rows)?.len(),
-            "attempt_rows": attempt_volume.0, "attempt_bytes": attempt_volume.1,
-            "transcript_rows": transcript_rows.len(), "transcript_bytes": serde_json::to_vec(&transcript_rows)?.len(),
-            "contribution_rows": contributions.len(), "contribution_bytes": serde_json::to_vec(&contributions)?.len(),
-        });
-        for (_, record) in transcript_rows {
-            if selected.get(&record.request_id) == Some(&record.attempt_id) {
-                records
-                    .entry(record.request_id.clone())
-                    .or_default()
-                    .push(record);
-            }
-        }
-        let entry_ids = rows.iter().map(|(id, _)| id.clone()).collect();
-        let (entries, tool_history) = rows
-            .into_iter()
-            .map(|(id, entry)| {
-                let history = id
-                    .as_ref()
-                    .and_then(|id| records.remove(id))
-                    .unwrap_or_default();
-                (entry, history)
-            })
-            .unzip();
-        Ok(SessionContextView {
-            #[cfg(test)]
-            read_volume,
-            entry_ids,
-            protected_inputs,
-            entries,
-            tool_history,
-            contributions,
-        })
+            .context()
+            .await
     }
 
     /// Bridge ingress is a core decision: adapter facts request a wake, but
@@ -1433,8 +1224,11 @@ impl Session {
         is_agent: impl Fn(&str) -> bool,
         live_attempts: &std::collections::HashSet<String>,
     ) -> anyhow::Result<Vec<TurnRequest>> {
-        let (entry_ids, entries) =
-            Self::load_entries_at(&self.database, &self.store_name, &snapshot).await?;
+        let txn = self.database.new_transaction_at(&snapshot).await?;
+        let (entry_ids, entries) = history::entry_rows(&txn, &self.store_name)
+            .await?
+            .into_iter()
+            .unzip();
         let historical = Session {
             conversation_id: self.conversation_id.clone(),
             entries,
@@ -2012,46 +1806,6 @@ impl Session {
         Ok(records)
     }
 
-    /// Retained completed source groups, independent of context compaction.
-    /// This host-only read does not grant access; scoped facilities apply current
-    /// caller/source visibility before returning any recorded bytes.
-    pub(crate) async fn retained_tool_history_at(
-        db: &Database,
-        snapshot: &Snapshot,
-    ) -> anyhow::Result<Vec<Vec<TurnTranscriptRecord>>> {
-        let txn = db.new_transaction_at(snapshot).await?;
-        let states = index_attempt_states(
-            txn.get_store::<Table<TurnAttempt>>(TURN_ATTEMPTS_STORE)
-                .await?
-                .search(|_| true)
-                .await?,
-            &HashSet::new(),
-        );
-        let entries: HashSet<_> = Self::entries_with_ids_at_snapshot(db, snapshot)
-            .await?
-            .into_iter()
-            .filter(|(_, e)| matches!(e.entry_type, EntryType::Message | EntryType::Directive))
-            .map(|(id, _)| id)
-            .collect();
-        let mut groups: HashMap<String, Vec<TurnTranscriptRecord>> = HashMap::new();
-        for (_, record) in txn
-            .get_store::<Table<TurnTranscriptRecord>>(TURN_TRANSCRIPT_STORE)
-            .await?
-            .search(|_| true)
-            .await?
-        {
-            if entries.contains(&record.request_id)
-                && matches!(states.get(&record.request_id), Some(TurnRequestState::Completed { attempt_id }) if attempt_id == &record.attempt_id)
-            {
-                groups
-                    .entry(record.attempt_id.clone())
-                    .or_default()
-                    .push(record);
-            }
-        }
-        Ok(groups.into_values().collect())
-    }
-
     /// Visible, unexpired per-turn claims. Never infer activity from Ack or
     /// session-level runtime ownership. Action callers always read fresh evidence;
     /// presentation clients may retain [`TurnActivity`] between write callbacks.
@@ -2299,38 +2053,6 @@ impl Session {
     {
         update_meta_on_db(&self.database, mutator).await
     }
-}
-
-fn sort_persisted_entries(
-    mut rows: Vec<(String, SessionEntry)>,
-) -> (Vec<TurnRequestId>, Vec<SessionEntry>) {
-    rows.sort_by(|(left_id, left), (right_id, right)| {
-        left.timestamp
-            .cmp(&right.timestamp)
-            .then_with(|| left_id.cmp(right_id))
-    });
-    rows.into_iter()
-        .map(|(id, entry)| {
-            match &entry.entry_type {
-                EntryType::Unknown { kind, .. } => {
-                    warn!(entry_id = %id, kind = %crate::util::truncate_chars(kind, 80),
-                    "Ignoring unknown session entry kind")
-                }
-                EntryType::BridgeEvent if entry.bridge_role().is_none() => {
-                    let detail = entry.bridge_event().map(|event| {
-                        format!(
-                            "version={} role={}",
-                            event.version,
-                            crate::util::truncate_chars(&event.role, 80)
-                        )
-                    });
-                    warn!(entry_id = %id, detail = ?detail, "Ignoring unsupported bridge event");
-                }
-                _ => {}
-            }
-            (TurnRequestId::parse(id), entry)
-        })
-        .unzip()
 }
 
 fn is_turn_request(
@@ -3400,15 +3122,12 @@ mod tests {
             .turn_context_view_at(db.snapshot().await.unwrap(), &new_id, |_| false)
             .await
             .unwrap();
-        let boundary = view
-            .entry_ids
-            .iter()
-            .position(|id| id.as_ref() == Some(&summary_id))
-            .unwrap();
+        let mut ids = view.groups.iter().map(ContextGroup::entry_id);
         assert_eq!(
-            &view.entry_ids[boundary..],
-            &[Some(summary_id), Some(new_id)]
+            ids.find(|id| *id == Some(&summary_id)),
+            Some(Some(&summary_id))
         );
+        assert_eq!(ids.collect::<Vec<_>>(), [Some(&new_id)]);
     }
 
     #[tokio::test]

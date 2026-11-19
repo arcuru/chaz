@@ -547,18 +547,23 @@ pub(super) async fn stop(ctx: &CommandContext<'_>) -> CommandOutcome {
 }
 
 pub(super) async fn print_transcript(ctx: &CommandContext<'_>) -> CommandOutcome {
-    let session = match Session::try_new(
-        ConversationId(ctx.session_db_id.to_string()),
-        ctx.session_db.clone(),
-    )
-    .await
-    {
-        Ok(session) => session,
+    let history = match Session::history(ctx.session_db).await {
+        Ok(history) => history,
         Err(e) => return CommandOutcome::Error(format!("Failed to read session: {e}")),
     };
+    match render_history(&history, ctx.current_agent).await {
+        Ok(text) => CommandOutcome::Text(text),
+        Err(e) => CommandOutcome::Error(format!("Failed to read session: {e}")),
+    }
+}
+
+async fn render_history(
+    history: &crate::session::HistoryRead<'_>,
+    current_agent: &str,
+) -> anyhow::Result<String> {
     let mut buf = String::new();
-    for entry in session.entries() {
-        let label: &str = if entry.sender == ctx.current_agent {
+    for (_, entry) in history.entries().await? {
+        let label: &str = if entry.sender == current_agent {
             "assistant"
         } else {
             entry.sender.as_str()
@@ -576,11 +581,11 @@ pub(super) async fn print_transcript(ctx: &CommandContext<'_>) -> CommandOutcome
             buf.push_str(&format!("{label}{type_label}: {}\n", entry.content));
         }
     }
-    if buf.is_empty() {
-        CommandOutcome::Text("(empty)".to_string())
+    Ok(if buf.is_empty() {
+        "(empty)".into()
     } else {
-        CommandOutcome::Text(buf)
-    }
+        buf
+    })
 }
 
 // -----------------------------------------------------------------------------
@@ -951,6 +956,167 @@ mod listing_tests {
             memory.store_state_record_count(loaded.database().root_id(), "entries"),
             128,
             "negative control: constructing Session materializes transcript rows"
+        );
+    }
+}
+
+#[cfg(test)]
+mod history_tests {
+    use super::*;
+    use crate::config::ContextConfig;
+    use crate::context::ContextBuilder;
+    use crate::extension::projection::ContextSource;
+    use crate::runtime::RuntimeMessage;
+    use crate::session::{SessionEntry, TurnRequestId};
+
+    #[tokio::test]
+    async fn pinned_legacy_history_preserves_print_and_context_after_reopen() {
+        let (instance, _user, db) = crate::session::test_helpers::test_session_db().await;
+        crate::session::compatibility_tests::install_writer_rows(&db).await;
+        let conv = ConversationId(db.root_id().to_string());
+        let mut session = Session::try_new(conv, db.clone()).await.unwrap();
+        let insert = |entry_type, content: &str, day| SessionEntry {
+            sender: "user".into(),
+            content: content.into(),
+            timestamp: format!("2023-11-{day:02}T12:00:00Z").parse().unwrap(),
+            entry_type,
+            routing: None,
+            metadata: None,
+        };
+        let current = session
+            .add_entry(insert(EntryType::Message, "current before summary", 12))
+            .await
+            .unwrap();
+        session.start_turn_attempt(current.clone()).await.unwrap();
+        // One completed attempt falls before the positional cutoff and another
+        // after it, even though both transcript groups have the same dates.
+        let txn = db.new_transaction().await.unwrap();
+        let entries = txn
+            .get_store::<eidetica::store::Table<SessionEntry>>("entries")
+            .await
+            .unwrap();
+        let mut hidden = entries.get("request-cancelled").await.unwrap();
+        hidden.timestamp = "2023-11-12T10:00:00Z".parse().unwrap();
+        entries.set("request-cancelled", hidden).await.unwrap();
+        txn.commit().await.unwrap();
+        session
+            .add_entry(insert(EntryType::Summary, "legacy summary", 13))
+            .await
+            .unwrap();
+        session
+            .add_entry(insert(EntryType::Message, "queued after tools", 15))
+            .await
+            .unwrap();
+        let old = db.snapshot().await.unwrap();
+        session
+            .add_entry(insert(EntryType::Summary, "newer summary", 16))
+            .await
+            .unwrap();
+        let root = db.root_id().clone();
+        let engine = instance.backend().local_engine().unwrap();
+        let live = engine.snapshot(&root).await.unwrap();
+        drop(session);
+        drop(db);
+
+        let reopened = eidetica::Database::open(&instance, &root).await.unwrap();
+        let history = Session::history_at(&reopened, &old).await.unwrap();
+        assert_eq!(history.snapshot(), &old);
+        assert_eq!(
+            render_history(&history, "agent").await.unwrap(),
+            "user: ordinary cancelled conversation\nuser: current before summary\nuser [summary]: legacy summary\nuser: ordinary supported conversation\nuser: queued after tools\n"
+        );
+        let view = history.turn_context(&current, |_| false).await.unwrap();
+        let supported = TurnRequestId::parse("request-supported");
+        let group = view
+            .groups
+            .iter()
+            .find(|g| g.entry_id() == Some(&supported))
+            .unwrap();
+        assert_eq!(
+            group
+                .transcript
+                .iter()
+                .map(|r| r.id.as_deref().unwrap())
+                .collect::<Vec<_>>(),
+            ["supported-0", "supported-1", "supported-2"]
+        );
+        assert!(matches!(
+            group.transcript[1].record.message,
+            crate::session::TurnTranscriptMessage::ToolResult {
+                model_sequence: 0,
+                call_index: 0,
+                ..
+            }
+        ));
+
+        let config = ContextConfig {
+            max_context_tokens: 512,
+            reserved_output_tokens: 0,
+        };
+        let built = ContextBuilder::from_history(&view, "agent", "instructions", &config)
+            .build()
+            .await;
+        let mut layout = Vec::new();
+        for message in &built.messages {
+            layout.push(match message {
+                RuntimeMessage::System(text) | RuntimeMessage::User(text) => text.as_str(),
+                RuntimeMessage::AssistantToolCalls { tool_calls, .. } => {
+                    assert_eq!(tool_calls.len(), 1);
+                    assert_eq!(tool_calls[0].id, "call-supported");
+                    "native call"
+                }
+                RuntimeMessage::ToolResult { call_id, .. } => {
+                    assert_eq!(call_id, "call-supported");
+                    "native result"
+                }
+                other => panic!("unexpected message: {other:?}"),
+            });
+        }
+        assert_eq!(
+            layout,
+            [
+                "instructions",
+                "current_date: 2023-11-13\ntimezone: UTC",
+                "legacy summary",
+                "current_date: 2023-11-12\ntimezone: UTC",
+                "current before summary",
+                "current_date: 2023-11-14\ntimezone: UTC",
+                "ordinary supported conversation",
+                "native call",
+                "native result",
+                "current_date: 2023-11-15\ntimezone: UTC",
+                "queued after tools"
+            ]
+        );
+        assert!(built.sources.contains(&ContextSource::ProtectedInput {
+            id: current.as_str().into()
+        }));
+
+        // Budget exactly enough for the dated rows: keep all history text, but
+        // neither side of the eligible exchange can land alone.
+        let without_exchange: Vec<_> = built
+            .messages
+            .iter()
+            .filter(|m| {
+                !matches!(
+                    m,
+                    RuntimeMessage::AssistantToolCalls { .. } | RuntimeMessage::ToolResult { .. }
+                )
+            })
+            .cloned()
+            .collect();
+        let tight = ContextConfig {
+            max_context_tokens: crate::context::estimate_request_tokens(&without_exchange, &[]),
+            ..config
+        };
+        let built = ContextBuilder::from_history(&view, "agent", "instructions", &tight)
+            .build()
+            .await;
+        assert_eq!(built.messages, without_exchange);
+        assert_eq!(
+            engine.snapshot(&root).await.unwrap(),
+            live,
+            "history reads cannot append any facts"
         );
     }
 }
