@@ -95,6 +95,25 @@ impl<B> CountingBackend<B> {
 
 #[async_trait]
 impl<B: BackendImpl> BackendImpl for CountingBackend<B> {
+    async fn local_account_record(&self, name: &str) -> Result<Option<Vec<u8>>> {
+        self.inner.local_account_record(name).await
+    }
+
+    async fn compare_exchange_local_account_record(
+        &self,
+        name: &str,
+        expected: Option<&[u8]>,
+        replacement: &[u8],
+    ) -> Result<bool> {
+        self.inner
+            .compare_exchange_local_account_record(name, expected, replacement)
+            .await
+    }
+
+    async fn local_account_names(&self) -> Result<Vec<String>> {
+        self.inner.local_account_names().await
+    }
+
     async fn resolve_store_state(&self, request: &StoreStateRequest) -> Result<Option<RecordView>> {
         self.probe.tree("resolve_store_state", &request.database);
         self.inner.resolve_store_state(request).await

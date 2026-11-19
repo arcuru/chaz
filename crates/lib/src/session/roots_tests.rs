@@ -8,13 +8,19 @@ use eidetica::store::DocStore;
 use eidetica::{AccountSession, Database, Instance, NewAccount};
 
 async fn instance() -> (Instance, AccountSession) {
-    Instance::create_backend(Box::new(InMemory::new()), NewAccount::passwordless("chaz"))
-        .await
-        .unwrap()
+    Instance::create_backend(
+        Box::new(InMemory::new()),
+        NewAccount::with_password("chaz", "test-password"),
+    )
+    .await
+    .unwrap()
 }
 
 async fn relogin(instance: &Instance) -> AccountSession {
-    instance.login_account("chaz", None).await.unwrap()
+    instance
+        .login_account("chaz", "test-password")
+        .await
+        .unwrap()
 }
 
 async fn named(user: &mut AccountSession, name: &str) -> Database {
@@ -162,10 +168,13 @@ async fn unavailable_or_unauthorized_target_is_an_error_and_never_replaced() {
     user.admin()
         .await
         .unwrap()
-        .create_account(NewAccount::passwordless("stranger"))
+        .create_account(NewAccount::with_password("stranger", "test-password"))
         .await
         .unwrap();
-    let mut stranger = instance.login_account("stranger", None).await.unwrap();
+    let mut stranger = instance
+        .login_account("stranger", "test-password")
+        .await
+        .unwrap();
     let foreign = named(&mut stranger, "chaz_peer").await.root_id().clone();
     let peer_name = RootKind::Peer.reference_name(&user);
     user.set_reference(REFERENCE_NAMESPACE, "group", &foreign)
@@ -365,10 +374,13 @@ async fn another_installations_peer_reference_never_selects_this_peer() {
     user.admin()
         .await
         .unwrap()
-        .create_account(NewAccount::passwordless("second"))
+        .create_account(NewAccount::with_password("second", "test-password"))
         .await
         .unwrap();
-    let second = instance.login_account("second", None).await.unwrap();
+    let second = instance
+        .login_account("second", "test-password")
+        .await
+        .unwrap();
     assert_ne!(RootKind::Peer.reference_name(&second), name);
     assert_eq!(
         user.reference(REFERENCE_NAMESPACE, "peer-another-installation")
@@ -389,7 +401,7 @@ async fn root_lookup_is_independent_of_unrelated_tracked_databases() {
     let probe = BackendProbe::default();
     let (instance, user) = Instance::create_backend(
         Box::new(CountingBackend::new(InMemory::new(), probe.clone())),
-        NewAccount::passwordless("chaz"),
+        NewAccount::with_password("chaz", "test-password"),
     )
     .await
     .unwrap();
@@ -472,7 +484,7 @@ async fn service_client_opens_owner_initialized_roots() {
     let probe = BackendProbe::default();
     let (owner, _) = Instance::create_backend(
         Box::new(CountingBackend::new(InMemory::new(), probe.clone())),
-        NewAccount::passwordless("chaz"),
+        NewAccount::with_password("chaz", "test-password"),
     )
     .await
     .unwrap();
@@ -482,7 +494,7 @@ async fn service_client_opens_owner_initialized_roots() {
     let url = format!("unix://{}", socket.display());
 
     let client = Instance::connect(&url).await.unwrap();
-    let mut early = client.login_account("chaz", None).await.unwrap();
+    let mut early = client.login_account("chaz", "test-password").await.unwrap();
     assert_eq!(
         RootSetup::for_connection(&client, false),
         RootSetup::RequireExisting
@@ -501,7 +513,7 @@ async fn service_client_opens_owner_initialized_roots() {
         .await
         .unwrap();
 
-    let mut late = client.login_account("chaz", None).await.unwrap();
+    let mut late = client.login_account("chaz", "test-password").await.unwrap();
     let opened = roots::open(&mut late, RootSetup::RequireExisting)
         .await
         .unwrap();
@@ -558,10 +570,13 @@ async fn service_client_opens_owner_initialized_roots() {
         .admin()
         .await
         .unwrap()
-        .create_account(NewAccount::passwordless("stranger"))
+        .create_account(NewAccount::with_password("stranger", "test-password"))
         .await
         .unwrap();
-    let mut stranger = owner.login_account("stranger", None).await.unwrap();
+    let mut stranger = owner
+        .login_account("stranger", "test-password")
+        .await
+        .unwrap();
     let private = named(&mut stranger, "private").await.root_id().clone();
     pending
         .map_key(&key, &private, eidetica::auth::SigKey::from_pubkey(&key))
@@ -637,7 +652,7 @@ async fn initialization_stops_when_a_tracked_root_cannot_be_inspected() {
     let probe = BackendProbe::default();
     let (_instance, mut user) = Instance::create_backend(
         Box::new(CountingBackend::new(InMemory::new(), probe.clone())),
-        NewAccount::passwordless("chaz"),
+        NewAccount::with_password("chaz", "test-password"),
     )
     .await
     .unwrap();
@@ -666,7 +681,7 @@ async fn failed_reference_write_reports_created_id_and_retry_requires_repair() {
     let probe = BackendProbe::default();
     let (instance, mut user) = Instance::create_backend(
         Box::new(CountingBackend::new(InMemory::new(), probe.clone())),
-        NewAccount::passwordless("chaz"),
+        NewAccount::with_password("chaz", "test-password"),
     )
     .await
     .unwrap();
@@ -713,7 +728,7 @@ async fn creation_tracking_failure_is_reported_without_using_an_untracked_root()
     let probe = BackendProbe::default();
     let (instance, mut user) = Instance::create_backend(
         Box::new(CountingBackend::new(InMemory::new(), probe.clone())),
-        NewAccount::passwordless("chaz"),
+        NewAccount::with_password("chaz", "test-password"),
     )
     .await
     .unwrap();
