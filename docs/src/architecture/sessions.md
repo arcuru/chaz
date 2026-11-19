@@ -35,7 +35,7 @@ The Agent DB `config` store and the agent and bank `meta` stores retain Eidetica
 
 The `Doc` codec serializes typed values into subtree bytes; the enclosing entry uses DAG-CBOR for its content ID and signing representation. New writes append entries without changing the registered store type, database root, or historical entries and their signatures. The codec is not a Chaz JSON-text record or a promise of equal entry IDs for equal logical configurations. See [upgrade and recovery](../user_guide/agents.md#upgrading-agent-and-bank-records) for reader compatibility.
 
-`ToolCall`, `ToolResult`, `Ack`, and `Error` entries are excluded from the LLM context. The runtime maintains its active ReAct history in memory. Structured completed model responses and tool results are also written to the attempt's `turn_transcript` store. On a later turn, the context builder joins visible request row IDs to their selected completed attempt at one Eidetica snapshot. It replays complete native exchanges, including non-terminal assistant text and paired call/results, in request and attempt order, after the triggering request message.
+`ToolCall`, `ToolResult`, `Ack`, and `Error` entries are excluded from the LLM context. The runtime maintains its active ReAct history in memory. Structured completed model responses and tool results are also written to the attempt's `turn_transcript` store. `Session::history_at` opens an exact accepted Eidetica snapshot. Its context view joins each visible request row to its selected completed attempt and keeps the native transcript keys and call indices. The context builder replays complete exchanges, including non-terminal assistant text and paired call/results, after the triggering request message.
 Responses final-entry metadata also restores complete terminal output and its host-owned replay origin at the assistant entry's position; see [stateless Responses replay](react.md#stateless-responses-replay). An interrupted attempt is not replayed into later turns, and older retry attempts are never included. The executor resumes one kind of interrupted attempt: one whose newest `job_wait_checkpoints` row is the pending end of its own strictly paired transcript (see Agent jobs below). Session-level tool entries remain display projections, never input for reconstruction.
 
 A context-only external observation or a pending addressed send is a known
@@ -364,9 +364,10 @@ The description is deliberately outside model input. `ContextBuilder`, system pr
 
 ## Context Building
 
-`ContextBuilder` (in `context.rs`) renders a coherent host-owned view. The required
-`baseline_context` extension selects history and layout through public scoped APIs
-within the existing token budget:
+`Session::history` and `Session::history_at` expose the same read-only history API at the current or a pinned frontier.
+`/print` uses the original display rows; `ContextBuilder` renders grouped context, including compact results and protected inputs.
+Neither history read runs a hook or writes a session entry.
+The required `baseline_context` extension selects history and layout through the scoped context API within the existing token budget:
 
 1. Account for system prompt and tool definition tokens first
 2. Resolve a successful `/compact` snapshot boundary, or the most recent legacy `Summary`

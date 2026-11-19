@@ -10,11 +10,14 @@ use crate::config::ContextConfig;
 use crate::extension::ExtensionHub;
 use crate::extension::projection::ContextSource;
 use crate::runtime::RuntimeMessage;
-use crate::session::{EntryType, SessionEntry, TurnTranscriptMessage, TurnTranscriptRecord};
+use crate::session::{
+    ContextGroup, EntryType, SessionContextView, SessionEntry, TranscriptRow,
+    TurnTranscriptMessage, TurnTranscriptRecord,
+};
 use crate::tool::{NO_REPLY_TOOL, ToolDefinition};
 use eidetica::Database;
-use std::collections::HashSet;
 use std::sync::Arc;
+use std::{borrow::Cow, collections::HashSet};
 
 use std::sync::OnceLock;
 use tiktoken_rs::CoreBPE;
@@ -113,10 +116,7 @@ pub struct AssembledContext {
 
 /// Builds LLM context from session entries within a token budget.
 pub struct ContextBuilder<'a> {
-    pub(crate) entries: &'a [SessionEntry],
-    pub(crate) tool_history: Option<&'a [Vec<TurnTranscriptRecord>]>,
-    pub(crate) entry_ids: Option<&'a [Option<crate::session::TurnRequestId>]>,
-    protected_inputs: Option<&'a std::collections::HashSet<crate::session::TurnRequestId>>,
+    pub(crate) groups: Cow<'a, [ContextGroup]>,
     pub(crate) contributions: &'a [crate::extension::durable_context::CommittedContribution],
     pub(crate) agent_name: &'a str,
     system_prompt: &'a str,
@@ -149,12 +149,45 @@ impl<'a> ContextBuilder<'a> {
         system_prompt: &'a str,
         config: &'a ContextConfig,
     ) -> Self {
+        // Compatibility for callers constructing context from unsourced text.
+        let groups = entries
+            .iter()
+            .map(|entry| ContextGroup {
+                origin: None,
+                entry: entry.clone(),
+                protected: false,
+                transcript: Vec::new(),
+            })
+            .collect();
+        Self::from_groups(Cow::Owned(groups), &[], agent_name, system_prompt, config)
+    }
+
+    /// Use a single coherent view for rows, native exchanges and contributions.
+    pub fn from_history(
+        view: &'a SessionContextView,
+        agent_name: &'a str,
+        system_prompt: &'a str,
+        config: &'a ContextConfig,
+    ) -> Self {
+        Self::from_groups(
+            Cow::Borrowed(&view.groups),
+            &view.contributions,
+            agent_name,
+            system_prompt,
+            config,
+        )
+    }
+
+    fn from_groups(
+        groups: Cow<'a, [ContextGroup]>,
+        contributions: &'a [crate::extension::durable_context::CommittedContribution],
+        agent_name: &'a str,
+        system_prompt: &'a str,
+        config: &'a ContextConfig,
+    ) -> Self {
         Self {
-            entries,
-            tool_history: None,
-            entry_ids: None,
-            protected_inputs: None,
-            contributions: &[],
+            groups,
+            contributions,
             agent_name,
             system_prompt,
             tool_defs: &[],
@@ -211,17 +244,23 @@ impl<'a> ContextBuilder<'a> {
         self
     }
 
-    pub fn with_tool_history(mut self, history: &'a [Vec<TurnTranscriptRecord>]) -> Self {
-        self.tool_history = Some(history);
-        self
-    }
-
-    /// Supply the complete selected view from one coherent database snapshot.
-    pub fn with_context_view(mut self, view: &'a crate::session::SessionContextView) -> Self {
-        self.entry_ids = Some(&view.entry_ids);
-        self.protected_inputs = Some(&view.protected_inputs);
-        self.tool_history = Some(&view.tool_history);
-        self.contributions = &view.contributions;
+    /// Compatibility for legacy ad hoc inputs. Snapshot-backed exchanges are
+    /// already paired with their source rows and cannot be replaced here.
+    pub fn with_tool_history(mut self, history: &[Vec<TurnTranscriptRecord>]) -> Self {
+        if let Cow::Owned(groups) = &mut self.groups {
+            let aligned = history.len() == groups.len();
+            for (i, group) in groups.iter_mut().enumerate() {
+                group.transcript = if aligned {
+                    history[i]
+                        .iter()
+                        .cloned()
+                        .map(|record| TranscriptRow { id: None, record })
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+            }
+        }
         self
     }
 
@@ -323,10 +362,11 @@ impl<'a> ContextBuilder<'a> {
         };
         // 1.5. Extensions: skills, memory, etc. inject augmentations.
         let recent_text: Vec<String> = self
-            .entries
+            .groups
             .iter()
             .rev()
             .take(10)
+            .map(|group| &group.entry)
             .filter(|e| matches!(e.entry_type, EntryType::Message | EntryType::Directive))
             .map(|e| e.content.clone())
             .collect();
@@ -398,8 +438,9 @@ impl<'a> ContextBuilder<'a> {
             system: &system_prompt,
             tail: tail_text.as_deref(),
             sent: self
-                .entries
+                .groups
                 .iter()
+                .map(|group| &group.entry)
                 .filter(|e| e.bridge_role() == Some(crate::session::BridgeEventRole::Receipt))
                 .filter_map(|e| e.routing.as_ref()?.reply_to.as_deref())
                 .collect(),
@@ -518,11 +559,8 @@ impl<'a> ContextBuilder<'a> {
                 .map(|t| vec![(RuntimeMessage::User(t.into()), ContextSource::ContextTail)])
                 .unwrap_or_default(),
             ContextItem::Entry(index) => {
-                let entry = self
-                    .entries
-                    .get(*index)
-                    .filter(|e| is_context_entry(e))
-                    .ok_or_else(|| anyhow::anyhow!("foreign context entry"))?;
+                let group = context.group(*index)?;
+                let entry = &group.entry;
                 let text = render_entry(entry, self.attachment, &context.sent);
                 let message = if entry.sender == self.agent_name
                     && entry.bridge_role() != Some(crate::session::BridgeEventRole::Observation)
@@ -562,16 +600,10 @@ impl<'a> ContextBuilder<'a> {
                 } else {
                     RuntimeMessage::User(text)
                 };
-                let source = match self
-                    .entry_ids
-                    .and_then(|ids| ids.get(*index))
-                    .and_then(Option::as_ref)
-                {
-                    Some(id) if self.protected_inputs.is_some_and(|ids| ids.contains(id)) => {
-                        ContextSource::ProtectedInput {
-                            id: id.as_str().into(),
-                        }
-                    }
+                let source = match group.entry_id() {
+                    Some(id) if group.protected => ContextSource::ProtectedInput {
+                        id: id.as_str().into(),
+                    },
                     Some(id) => ContextSource::PersistedSessionEntry {
                         id: id.as_str().into(),
                     },
@@ -584,17 +616,10 @@ impl<'a> ContextBuilder<'a> {
                 vec![(message, source)]
             }
             ContextItem::Exchange { entry, budget } => {
-                anyhow::ensure!(*entry < self.entries.len(), "foreign exchange reference");
-                let records = self
-                    .tool_history
-                    .filter(|h| h.len() == self.entries.len())
-                    .and_then(|h| h.get(*entry));
-                match records.and_then(|r| replay_turn_tagged(r, *budget).map(|g| (r, g))) {
-                    Some((records, group)) => {
-                        let first = records
-                            .iter()
-                            .min_by_key(|r| r.sequence)
-                            .expect("nonempty replay");
+                let transcript = &context.group(*entry)?.transcript;
+                match replay_turn_tagged(transcript.iter().map(|row| &row.record), *budget) {
+                    Some(group) => {
+                        let first = &transcript[0].record;
                         group
                             .into_iter()
                             .map(|(m, sequence)| {
@@ -693,22 +718,22 @@ fn render_entry(
 }
 
 // Reject interrupted or malformed groups instead of inventing tool results.
-pub(crate) fn replay_turn(
-    records: &[TurnTranscriptRecord],
+pub(crate) fn replay_turn<'a>(
+    records: impl IntoIterator<Item = &'a TurnTranscriptRecord>,
     budget: usize,
 ) -> Option<Vec<RuntimeMessage>> {
     replay_turn_tagged(records, budget)
         .map(|group| group.into_iter().map(|(message, _)| message).collect())
 }
 
-fn replay_turn_tagged(
-    records: &[TurnTranscriptRecord],
+fn replay_turn_tagged<'a>(
+    records: impl IntoIterator<Item = &'a TurnTranscriptRecord>,
     budget: usize,
 ) -> Option<Vec<(RuntimeMessage, u64)>> {
-    if records.is_empty() || budget == 0 {
+    if budget == 0 {
         return None;
     }
-    let mut sorted = records.to_vec();
+    let mut sorted: Vec<_> = records.into_iter().collect();
     sorted.sort_by_key(|r| r.sequence);
     let mut messages = Vec::new();
     let mut input_ids = std::collections::HashSet::new();
@@ -1011,11 +1036,15 @@ mod tests {
             .turn_context_view_at(snapshot, &current, |name| name == "test-agent")
             .await
             .unwrap();
-        assert!(view.protected_inputs.contains(&current));
-        assert!(view.protected_inputs.contains(&queued));
+        for id in [&current, &queued] {
+            assert!(
+                view.groups
+                    .iter()
+                    .any(|group| group.entry_id() == Some(id) && group.protected)
+            );
+        }
         let config = default_config();
-        let context = ContextBuilder::new(&view.entries, "test-agent", "sys", &config)
-            .with_context_view(&view)
+        let context = ContextBuilder::from_history(&view, "test-agent", "sys", &config)
             .build()
             .await;
         for id in [&current, &queued] {

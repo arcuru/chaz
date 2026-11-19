@@ -6,7 +6,11 @@
 mod tests;
 
 use super::{ExtensionHub, caps::CapFuture, projection::PROJECTOR_TIMEOUT, settings};
-use crate::{cache::CacheOptions, context::ContextBuilder, session::EntryType};
+use crate::{
+    cache::CacheOptions,
+    context::ContextBuilder,
+    session::{ContextGroup, EntryType},
+};
 use anyhow::Context;
 use eidetica::crdt::{Doc, doc::Value as NativeValue};
 use eidetica::store::DocStore;
@@ -82,23 +86,41 @@ pub struct ScopedContext<'a> {
     pub(crate) tail: Option<&'a str>,
     pub(crate) sent: HashSet<&'a str>,
 }
+/// One eligible row and its date. Its index names the whole group for
+/// entry, date and exchange references in this invocation.
+pub struct ScopedGroup<'a> {
+    pub index: usize,
+    pub kind: &'a EntryType,
+    pub date: chrono::NaiveDate,
+}
+
 impl ScopedContext<'_> {
-    pub fn entries(&self) -> impl DoubleEndedIterator<Item = (usize, EntryType)> + '_ {
+    pub fn groups(&self) -> impl DoubleEndedIterator<Item = ScopedGroup<'_>> + '_ {
         self.builder
-            .entries
+            .groups
             .iter()
             .enumerate()
-            .filter(|(_, e)| crate::context::is_context_entry(e))
-            .map(|(i, e)| (i, e.entry_type.clone()))
+            .filter(|(_, group)| crate::context::is_context_entry(&group.entry))
+            .map(|(index, group)| ScopedGroup {
+                index,
+                kind: &group.entry.entry_type,
+                date: group.entry.timestamp.date_naive(),
+            })
+    }
+    /// Compatibility projection for strategies using entry indices.
+    pub fn entries(&self) -> impl DoubleEndedIterator<Item = (usize, EntryType)> + '_ {
+        self.groups().map(|group| (group.index, group.kind.clone()))
+    }
+    pub(crate) fn group(&self, index: usize) -> anyhow::Result<&ContextGroup> {
+        self.builder
+            .groups
+            .get(index)
+            .filter(|group| crate::context::is_context_entry(&group.entry))
+            .ok_or_else(|| anyhow::anyhow!("foreign context entry"))
     }
     /// Date metadata of an eligible retained row, never the executor's clock.
     pub fn entry_date(&self, index: usize) -> anyhow::Result<chrono::NaiveDate> {
-        self.builder
-            .entries
-            .get(index)
-            .filter(|entry| crate::context::is_context_entry(entry))
-            .map(|entry| entry.timestamp.date_naive())
-            .ok_or_else(|| anyhow::anyhow!("foreign context entry"))
+        Ok(self.group(index)?.entry.timestamp.date_naive())
     }
     pub fn has_instructions(&self) -> bool {
         !self.system.is_empty()

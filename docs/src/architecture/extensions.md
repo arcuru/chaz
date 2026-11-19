@@ -678,9 +678,10 @@ uses the receipt without invoking the extension again; a new request can
 contribute again. An empty batch is also a receipt. Existing sessions need no
 migration. Old transcript encodings are unchanged.
 
-`SessionContextView` reads entries/IDs, compact selection, selected completed
-attempts, contributions and state consistency at one immutable snapshot. Every
-state row must match a committed receipt in that snapshot. A failed read is
+`SessionContextView` groups each context row with its origin, protection status
+and selected completed transcript records. The Session reader loads these
+and the committed contributions at one immutable snapshot. Every contribution
+state row must match a receipt in that snapshot. A failed read is
 not replaced with a resident transcript. There is no projection cache. Sync
 updates appear at the next snapshot; a pinned view remains unchanged. The
 existing runtime claim/turn serialization still owns execution. These stores
@@ -727,10 +728,11 @@ before each logical call; transport retries reuse the accepted request/options.
 
 `ContextStrategyCall` carries identity, budget, the instance's current session
 settings and a read-only `ScopedContext`. Its public selection/hydration methods
-expose only host-selected rows. `ContextPlan` chooses instructions, entry indices,
-stored-date boundaries, bounded native exchanges, ephemeral tail and committed
-contribution references. `ScopedContext::entry_date` reads the selected row's UTC
-date. `ContextItem::Date(index)` renders only that metadata and must immediately
+expose only host-selected rows. `ScopedContext::groups` supplies the row kind,
+UTC date and index for the entry and its exchange. `ContextPlan` chooses
+instructions, entry indices, date boundaries, bounded native exchanges, the
+ephemeral tail and committed contribution references. Existing strategies can
+still use `entries` and `entry_date`. `ContextItem::Date(index)` renders only that metadata and must immediately
 precede `Entry(index)`; its `DateBoundary` provenance does not expose the row body.
 The baseline strategy includes the first retained date and each date change,
 reserving their exact costs before allocating native replay. Custom strategies
@@ -741,10 +743,9 @@ final budgets.
 The built-in `BaselineContext` uses only this public facility. Its algorithm no
 longer lives in `ContextBuilder`.
 
-This migration adds no history hydration pass. The existing coherent
-`SessionContextView` still loads selected completed transcript records eagerly;
-scoped item rendering/replay is lazy and bounded by the chosen budget. Further
-storage-read optimization is separate work, not a second authoritative transcript.
+The Session reader loads completed transcript records eagerly and keeps their
+native row keys through the join. Scoped item rendering and replay are lazy
+and bounded by the chosen budget.
 Tests measure returned Table row/byte volume separately from selection elapsed
 cost; this is not a measurement of physical backend I/O or provider cache hits.
 

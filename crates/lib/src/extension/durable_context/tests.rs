@@ -124,13 +124,12 @@ impl Fixture {
         mock: Arc<MockBackend>,
         budget: usize,
     ) -> Result<runtime::RuntimeOutcome, String> {
-        let assembled = ContextBuilder::new(
-            &view.entries,
+        let assembled = ContextBuilder::from_history(
+            view,
             "test-agent",
             "current instructions",
             &Default::default(),
         )
-        .with_context_view(view)
         .build()
         .await;
         let mut ctx = tool_context(self.session.clone(), Arc::new(ToolRegistry::new()));
@@ -191,7 +190,7 @@ async fn durable_context_retry_reopen_and_new_request_reach_recording_backend() 
     );
     println!(
         "selected database entries: {}",
-        serde_json::to_string(&view.entries).unwrap()
+        serde_json::to_string(&view.entries().collect::<Vec<_>>()).unwrap()
     );
     let id = view.contributions[0].source_id(0);
     let warm = fx.prepare("request-1").await.unwrap();
@@ -237,13 +236,11 @@ async fn durable_context_retry_reopen_and_new_request_reach_recording_backend() 
     assert_eq!(fx.stub.seen.lock().unwrap()[1].1.as_ref().unwrap()["n"], 1);
     assert_eq!(fx.db_rows().await.len(), 2);
     let warm_messages =
-        ContextBuilder::new(&warm.entries, "test-agent", "current", &Default::default())
-            .with_context_view(&warm)
+        ContextBuilder::from_history(&warm, "test-agent", "current", &Default::default())
             .build()
             .await;
     let cold_messages =
-        ContextBuilder::new(&cold.entries, "test-agent", "current", &Default::default())
-            .with_context_view(&cold)
+        ContextBuilder::from_history(&cold, "test-agent", "current", &Default::default())
             .build()
             .await;
     assert_eq!(warm_messages.messages, cold_messages.messages);
@@ -502,7 +499,9 @@ async fn durable_context_compaction_legacy_and_budget_preserve_originals() {
     drop(session);
     let view = fx.prepare(current.as_str()).await.unwrap();
     assert!(
-        view.entry_ids.contains(&Some(current.clone())) && view.entry_ids.contains(&Some(queued))
+        [&current, &queued]
+            .iter()
+            .all(|id| { view.groups.iter().any(|g| g.entry_id() == Some(*id)) })
     );
     let mock = Arc::new(MockBackend::new());
     mock.push_text("ok");
@@ -633,9 +632,9 @@ async fn durable_context_pinned_view_and_peer_update_reconstruct_coherently() {
         .context_view_at(before)
         .await
         .unwrap();
-    assert!(pinned.entries.is_empty() && pinned.contributions.is_empty());
+    assert!(pinned.groups.is_empty() && pinned.contributions.is_empty());
     let next = fx.prepare("local-request").await.unwrap();
-    assert!(next.entries.iter().any(|e| e.content == "PEER UPDATE"));
+    assert!(next.entries().any(|e| e.content == "PEER UPDATE"));
     assert_eq!(next.contributions.len(), 2);
     let mock = Arc::new(MockBackend::new());
     mock.push_text("ok");
@@ -855,13 +854,12 @@ async fn durable_context_sqlite_reopen_with_fresh_host_reuses_committed_receipt(
             .await
             .unwrap();
         let view = fx.prepare("disk-request").await.unwrap();
-        let assembled = ContextBuilder::new(
-            &view.entries,
+        let assembled = ContextBuilder::from_history(
+            &view,
             "test-agent",
             "current instructions",
             &Default::default(),
         )
-        .with_context_view(&view)
         .build()
         .await;
         let mock = Arc::new(MockBackend::new());
@@ -900,13 +898,12 @@ async fn durable_context_sqlite_reopen_with_fresh_host_reuses_committed_receipt(
         0,
         "reopened fresh extension ran despite persisted receipt"
     );
-    let assembled = ContextBuilder::new(
-        &after.entries,
+    let assembled = ContextBuilder::from_history(
+        &after,
         "test-agent",
         "current instructions",
         &Default::default(),
     )
-    .with_context_view(&after)
     .build()
     .await;
     assert_eq!(assembled.sources, sources);

@@ -148,7 +148,13 @@ pub(crate) async fn read_at(
     db: &Database,
     snapshot: &Snapshot,
 ) -> anyhow::Result<Vec<CommittedContribution>> {
-    let txn = db.new_transaction_at(snapshot).await?;
+    read_in(db, &db.new_transaction_at(snapshot).await?).await
+}
+
+pub(crate) async fn read_in(
+    db: &Database,
+    txn: &eidetica::Transaction,
+) -> anyhow::Result<Vec<CommittedContribution>> {
     let mut rows = txn
         .get_store::<Table<CommittedContribution>>(CONTRIBUTIONS_STORE)
         .await?
