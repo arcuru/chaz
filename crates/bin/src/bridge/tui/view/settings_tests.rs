@@ -337,8 +337,15 @@ async fn settings_focus_ladder_category_keys_and_existing_actions() {
                     "{scope:?} category={category} key={code:?}"
                 );
             }
-            let _ = key(&mut app, KeyCode::Enter);
-            if !(scope == SettingsScope::Session && category == 2) {
+            let outcome = key(&mut app, KeyCode::Enter);
+            if scope == SettingsScope::Session
+                && SessionSettingsCategory::ALL[category] == SessionSettingsCategory::Extensions
+            {
+                assert!(matches!(outcome, input::SettingsKey::Field(_)));
+                assert_eq!(app.settings_focus, Category);
+                key(&mut app, KeyCode::Esc);
+                assert!(app.field_sheet.is_none());
+            } else if !(scope == SettingsScope::Session && category == 2) {
                 assert_eq!(
                     app.settings_focus, entry,
                     "{scope:?} category={category} Enter"
@@ -1022,6 +1029,7 @@ async fn settings_compact_empty_missing_and_static_pages_use_full_content_slot()
                         (SettingsScope::Session, 0) => "agent)",
                         (SettingsScope::Session, 1) if !missing => "selected",
                         (SettingsScope::Session, 3..=5) => "result",
+                        (SettingsScope::Session, 6) => "session state.",
                         _ => "coming soon",
                     };
                     assert!(
