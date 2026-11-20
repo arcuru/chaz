@@ -1,4 +1,5 @@
-//! Read-only views of legacy session stores at one accepted main frontier.
+//! Read-only history at one accepted main frontier. This is the format boundary.
+use super::conversation::{self, CallId, CallInput, ConversationInspection, RepresentationId};
 use super::{
     EntryType, META_STORE, SESSION_COMMAND_RESULTS_STORE, SESSION_COMMANDS_STORE, Session,
     SessionCommand, SessionCommandOutcome, SessionCommandRequest, SessionCommandResult,
@@ -13,6 +14,7 @@ use std::{
     collections::{HashMap, HashSet},
     hash::Hash,
 };
+use tokio::sync::OnceCell;
 use tracing::warn;
 
 /// A Session history read using the caller's database handle (and therefore
@@ -21,6 +23,12 @@ pub struct HistoryRead<'a> {
     database: &'a Database,
     snapshot: Snapshot,
     txn: Transaction,
+    format: Format,
+}
+
+enum Format {
+    Legacy,
+    ConversationV1(Box<OnceCell<conversation::ConversationRead>>),
 }
 
 /// Origin of a context row. A virtual summary refers to the compact command
@@ -58,37 +66,141 @@ impl ContextGroup {
     }
 }
 
-/// Selected conversation history and committed contributions, not a store or
-/// an execution grant. The host can attenuate contributions before exposing it.
+/// One context selection unit. Each timeline uses this same ordered list;
+/// a native v1 call and its results occupy one indivisible unit.
+#[derive(Clone, Debug)]
+pub struct HistoryGroup {
+    pub(crate) body: HistoryBody,
+    pub(crate) representation: Option<RepresentationId>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum HistoryBody {
+    Entry(Box<ContextGroup>),
+    Recorded {
+        kind: EntryType,
+        messages: Vec<(crate::runtime::RuntimeMessage, RepresentationId)>,
+    },
+}
+
+impl HistoryGroup {
+    pub(crate) fn legacy(group: ContextGroup) -> Self {
+        Self {
+            body: HistoryBody::Entry(Box::new(group)),
+            representation: None,
+        }
+    }
+
+    pub fn entry_group(&self) -> Option<&ContextGroup> {
+        match &self.body {
+            HistoryBody::Entry(group) => Some(group),
+            HistoryBody::Recorded { .. } => None,
+        }
+    }
+
+    pub fn entry_id(&self) -> Option<&TurnRequestId> {
+        self.entry_group()?.entry_id()
+    }
+
+    /// The Store representation for this timeline group's first member.
+    pub fn representation_id(&self) -> Option<&RepresentationId> {
+        self.representation.as_ref()
+    }
+
+    pub(crate) fn kind(&self) -> Option<&EntryType> {
+        match &self.body {
+            HistoryBody::Entry(group) if crate::context::is_context_entry(&group.entry) => {
+                Some(&group.entry.entry_type)
+            }
+            HistoryBody::Entry(_) => None,
+            HistoryBody::Recorded { kind, .. } => Some(kind),
+        }
+    }
+
+    pub(crate) fn date(&self) -> Option<chrono::NaiveDate> {
+        self.entry_group()
+            .map(|group| group.entry.timestamp.date_naive())
+    }
+
+    pub(crate) fn positional_summary(&self) -> bool {
+        self.representation.is_none() && self.kind() == Some(&EntryType::Summary)
+    }
+}
+
+/// Selected history and committed contributions, not a store or execution grant.
 #[derive(Clone, Debug)]
 pub struct SessionContextView {
-    pub groups: Vec<ContextGroup>,
+    pub groups: Vec<HistoryGroup>,
     pub contributions: Vec<CommittedContribution>,
+    // Needs to survive a v1 view with no visible groups (e.g. replaced all rows).
+    pub(crate) read_only: bool,
+    pub(crate) receipts: Vec<String>,
     #[cfg(test)]
     pub(crate) read_volume: serde_json::Value,
 }
 
 impl SessionContextView {
-    pub fn entries(
-        &self,
-    ) -> impl DoubleEndedIterator<Item = &SessionEntry> + ExactSizeIterator + '_ {
-        self.groups.iter().map(|group| &group.entry)
+    /// Rows with native legacy entry metadata. Use groups for complete context.
+    pub fn entries(&self) -> impl DoubleEndedIterator<Item = &SessionEntry> + '_ {
+        self.groups
+            .iter()
+            .filter_map(|group| Some(&group.entry_group()?.entry))
     }
 
-    pub(super) fn into_flat(self) -> (Vec<SessionEntry>, Vec<Vec<TurnTranscriptRecord>>) {
-        self.groups
+    pub(super) fn into_flat(
+        self,
+    ) -> anyhow::Result<(Vec<SessionEntry>, Vec<Vec<TurnTranscriptRecord>>)> {
+        anyhow::ensure!(
+            !self.read_only,
+            "legacy flat transcript cannot represent v1 history"
+        );
+        Ok(self
+            .groups
             .into_iter()
-            .map(|group| {
-                (
+            .filter_map(|group| match group.body {
+                HistoryBody::Entry(group) => Some((
                     group.entry,
                     group.transcript.into_iter().map(|row| row.record).collect(),
-                )
+                )),
+                _ => None,
             })
-            .unzip()
+            .unzip())
+    }
+}
+
+pub(crate) struct DisplayRow {
+    pub sender: String,
+    pub content: String,
+    pub kind: EntryType,
+}
+
+impl From<SessionEntry> for DisplayRow {
+    fn from(entry: SessionEntry) -> Self {
+        Self {
+            sender: entry.sender,
+            content: entry.content,
+            kind: entry.entry_type,
+        }
     }
 }
 
 impl Session {
+    /// Legacy runtime/ingress gate during the reader-first rollout.
+    pub(crate) async fn require_legacy_history(database: &Database) -> anyhow::Result<()> {
+        Self::history(database).await?.require_legacy()
+    }
+
+    pub(super) async fn legacy_history_transaction(
+        database: &Database,
+    ) -> anyhow::Result<Transaction> {
+        // Use the ordinary writer frontier (with normal signer/verification
+        // behavior), and check exactly the parents to which this write binds.
+        let snapshot = database.snapshot().await?;
+        let read = HistoryRead::open(database, snapshot).await?;
+        read.require_legacy()?;
+        Ok(read.txn)
+    }
+
     /// Open the current accepted history on the caller's database handle.
     pub async fn history(database: &Database) -> anyhow::Result<HistoryRead<'_>> {
         let snapshot = accepted_frontier(database).await?;
@@ -167,10 +279,67 @@ async fn remote_reaches(
 impl HistoryRead<'_> {
     async fn open(database: &Database, snapshot: Snapshot) -> anyhow::Result<HistoryRead<'_>> {
         let txn = database.new_transaction_at(&snapshot).await?;
+        let format = if conversation::contract::has_traces(database, &snapshot, &txn).await? {
+            Format::ConversationV1(Box::default())
+        } else {
+            Format::Legacy
+        };
         Ok(HistoryRead {
             database,
             snapshot,
             txn,
+            format,
+        })
+    }
+
+    async fn conversation(&self) -> anyhow::Result<Option<&conversation::ConversationRead>> {
+        match &self.format {
+            Format::Legacy => Ok(None),
+            Format::ConversationV1(read) => Ok(Some(
+                read.get_or_try_init(|| async {
+                    conversation::open(self.database, &self.snapshot, &self.txn).await
+                })
+                .await?,
+            )),
+        }
+    }
+
+    pub(super) fn require_legacy(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            matches!(self.format, Format::Legacy),
+            "v1 conversation is read-only; this path requires legacy session history"
+        );
+        Ok(())
+    }
+
+    /// Inspect original signed Store atoms, including invalid deltas. No
+    /// effective winner, fallback, write, or execution is implied.
+    pub async fn inspect_conversation(&self) -> anyhow::Result<Option<&ConversationInspection>> {
+        Ok(self.conversation().await?.map(|read| read.inspection()))
+    }
+
+    /// Obtain an immutable preparation at this frontier. The Store validates
+    /// its selection against the original observed snapshot, not this head.
+    pub async fn recorded_call(
+        &self,
+        call: &CallId,
+        attempt: &str,
+    ) -> anyhow::Result<Option<&CallInput>> {
+        Ok(match self.conversation().await? {
+            Some(read) => read.recorded_call(call, attempt)?,
+            None => None,
+        })
+    }
+
+    pub(crate) async fn display_rows(&self) -> anyhow::Result<Vec<DisplayRow>> {
+        Ok(match self.conversation().await? {
+            Some(read) => read.display_rows()?,
+            None => self
+                .entries()
+                .await?
+                .into_iter()
+                .map(|(_, row)| row.into())
+                .collect(),
         })
     }
 
@@ -178,13 +347,18 @@ impl HistoryRead<'_> {
         &self.snapshot
     }
 
-    /// Raw display rows in legacy transcript order, before any compaction.
+    /// Dated legacy rows, before compaction. This API also feeds old transport
+    /// delivery/queue readers and must not pass v1 projections as raw rows.
     pub async fn entries(&self) -> anyhow::Result<Vec<(TurnRequestId, SessionEntry)>> {
+        self.require_legacy()?;
         entry_rows(&self.txn, "entries").await
     }
 
     pub async fn context(&self) -> anyhow::Result<SessionContextView> {
-        self.context_for(None, &|_| true).await
+        match self.conversation().await? {
+            Some(read) => Ok(read.context()?),
+            None => self.context_for(None, &|_| true).await,
+        }
     }
 
     pub async fn turn_context(
@@ -192,12 +366,14 @@ impl HistoryRead<'_> {
         current: &TurnRequestId,
         is_agent: impl Fn(&str) -> bool + Sync,
     ) -> anyhow::Result<SessionContextView> {
+        self.require_legacy()?;
         self.context_for(Some(current), &is_agent).await
     }
 
     pub(super) async fn context_entries(&self) -> anyhow::Result<Vec<SessionEntry>> {
+        self.require_legacy()?;
         Ok(self
-            .compacted_groups(&|_, _| false)
+            .compacted_groups(self.entries().await?, &|_, _| false)
             .await?
             .into_iter()
             .map(|group| group.entry)
@@ -209,6 +385,7 @@ impl HistoryRead<'_> {
     /// rows stay available to custom strategies exactly as before.
     async fn compacted_groups(
         &self,
+        entries: Vec<(TurnRequestId, SessionEntry)>,
         pending: &(dyn Fn(&TurnRequestId, &SessionEntry) -> bool + Sync),
     ) -> anyhow::Result<Vec<ContextGroup>> {
         let results = self
@@ -272,7 +449,7 @@ impl HistoryRead<'_> {
                 transcript: Vec::new(),
             });
         }
-        groups.extend(self.entries().await?.into_iter().filter_map(|(id, entry)| {
+        groups.extend(entries.into_iter().filter_map(|(id, entry)| {
             let protected = pending(&id, &entry);
             (!covered_ids.contains(&id) || protected).then_some(ContextGroup {
                 origin: Some(HistoryOrigin::Entry(id)),
@@ -301,6 +478,26 @@ impl HistoryRead<'_> {
         current: Option<&TurnRequestId>,
         is_agent: &(dyn Fn(&str) -> bool + Sync),
     ) -> anyhow::Result<SessionContextView> {
+        let (groups, contributions, _volume) = self
+            .legacy_context(self.entries().await?, current, is_agent)
+            .await?;
+        Ok(SessionContextView {
+            groups: groups.into_iter().map(HistoryGroup::legacy).collect(),
+            contributions,
+            read_only: false,
+            receipts: Vec::new(),
+            #[cfg(test)]
+            read_volume: _volume,
+        })
+    }
+
+    pub(super) async fn legacy_context(
+        &self,
+        entries: Vec<(TurnRequestId, SessionEntry)>,
+        current: Option<&TurnRequestId>,
+        is_agent: &(dyn Fn(&str) -> bool + Sync),
+    ) -> anyhow::Result<(Vec<ContextGroup>, Vec<CommittedContribution>, ReadVolume)> {
+        self.require_legacy()?;
         let attempts = rows(&self.txn, TURN_ATTEMPTS_STORE).await?;
         #[cfg(test)]
         let attempt_volume = (attempts.len(), serde_json::to_vec(&attempts)?.len());
@@ -313,7 +510,7 @@ impl HistoryRead<'_> {
         };
         // An interrupted request stays compacted until explicitly retried.
         let mut groups = self
-            .compacted_groups(&|id, entry| {
+            .compacted_groups(entries, &|id, entry| {
                 current.is_some_and(|current| {
                     id == current
                         || (is_turn_request(id, entry, &baseline, is_agent)
@@ -339,17 +536,15 @@ impl HistoryRead<'_> {
                 group.transcript = transcript;
             }
         }
-        Ok(SessionContextView {
-            groups,
-            contributions,
-            #[cfg(test)]
-            read_volume,
-        })
+        #[cfg(not(test))]
+        let read_volume = ();
+        Ok((groups, contributions, read_volume))
     }
 
     /// Retained evidence intentionally bypasses compaction; its scoped caller
     /// still checks current participation and source-tool visibility.
     pub(crate) async fn retained_tool_history(&self) -> anyhow::Result<Vec<Vec<TranscriptRow>>> {
+        self.require_legacy()?;
         let states =
             index_attempt_states(rows(&self.txn, TURN_ATTEMPTS_STORE).await?, &HashSet::new());
         let entries: HashSet<_> = self
@@ -376,6 +571,11 @@ impl HistoryRead<'_> {
         .collect())
     }
 }
+
+#[cfg(test)]
+type ReadVolume = serde_json::Value;
+#[cfg(not(test))]
+type ReadVolume = ();
 
 fn selected_transcripts<K: Eq + Hash>(
     rows: Vec<(String, TurnTranscriptRecord)>,

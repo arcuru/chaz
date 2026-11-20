@@ -693,6 +693,7 @@ impl Server {
             current_db.root_id() == session_db.root_id(),
             "schedule target changed"
         );
+        Session::require_legacy_history(&current_db).await?;
         let session_db = &current_db;
         let session = Session::new(conversation_id, current_db.clone())
             .await

@@ -56,6 +56,37 @@ An idle stop records nothing, and the event never enters model context or wakes 
 A stopped attempt completes with a terminal cancellation transcript record and an agent `Error` carrying completed-call usage.
 See [ReAct Runtime → Cancellation](react.md#cancellation) and [TUI → Stopping a Running Turn](../user_guide/tui.md#stopping-a-running-turn).
 
+### ConversationStore v1: reader only
+
+`Session::history_at` binds the read to the caller's Database handle and one
+accepted main frontier. Only that handle selects a format. With no v1 traces
+it runs the legacy interpreter, including its positional summary cutoff,
+completed-attempt join, and native dates. Opening history does not change the
+session's stores or turn baseline.
+
+For a supported descriptor, the ConversationStore interpreter checks signed
+atom deltas and the typed Store materialization. A descriptor pins a legacy
+prefix by database and frontier; the interpreter takes row IDs and native
+exchange members from the existing grouped legacy read. A v1 replacement
+consumes only its named representations, not everything preceding its
+summary. Both formats feed the same context selection API. Native call/result
+groups are indivisible, and v1 records without a recorded date do not invent one.
+
+A missing descriptor on v1 data, an unsupported record, malformed ancestry,
+or an ambiguous replacement refuses the affected effective read rather than
+switching to legacy. Authorized `HistoryRead::inspect_conversation` retains
+atom text and invalid delta bytes even when interpretation refuses.
+`recorded_call` reads the immutable preparation at its original observed
+selection, not the latest context and not a replay or dispatch receipt.
+
+`/print` can show the effective text from reader fixtures. Dated legacy row
+APIs used by queues and transport delivery do not treat v1 projections as
+legacy rows. No production path creates a v1 descriptor, activates a writer,
+or converts existing histories. Turn execution, branch/publication replay and
+other writer-facing v1 capabilities remain separate work. Before enabling any
+v1 writes, all authorized peers and rollback binaries need compatible readers;
+never delete a descriptor to make legacy code accept that history.
+
 ### Assistant `ResponseMetadata`
 
 Every assistant `Message` entry carries an optional `ResponseMetadata`: the model name, an optional provider and response ID, a `TokenUsage` (prompt/completion/cached/cache_creation/reasoning tokens plus an optional `cost_usd`), and any extra wire-format fields the backend retained. This is populated from the `LLMResponse` returned by the configured `LLMBackend` at the moment the assistant turn is committed to the session DB — there is no separate billing log.

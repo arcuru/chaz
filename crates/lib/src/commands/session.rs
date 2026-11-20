@@ -562,20 +562,20 @@ async fn render_history(
     current_agent: &str,
 ) -> anyhow::Result<String> {
     let mut buf = String::new();
-    for (_, entry) in history.entries().await? {
+    for entry in history.display_rows().await? {
         let label: &str = if entry.sender == current_agent {
             "assistant"
         } else {
             entry.sender.as_str()
         };
-        let type_label = match entry.entry_type {
+        let type_label = match entry.kind {
             EntryType::Directive => " [directive]",
             EntryType::Summary => " [summary]",
             EntryType::Error => " [error]",
             _ => "",
         };
         if matches!(
-            entry.entry_type,
+            entry.kind,
             EntryType::Message | EntryType::Directive | EntryType::Summary | EntryType::Error
         ) {
             buf.push_str(&format!("{label}{type_label}: {}\n", entry.content));
@@ -1031,6 +1031,7 @@ mod history_tests {
             .groups
             .iter()
             .find(|g| g.entry_id() == Some(&supported))
+            .and_then(|g| g.entry_group())
             .unwrap();
         assert_eq!(
             group

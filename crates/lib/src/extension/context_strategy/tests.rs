@@ -931,7 +931,7 @@ async fn fixed_cold_reconstruction_elapsed_and_logical_database_read_volume() {
             assert_eq!(
                 view.groups
                     .iter()
-                    .map(|group| group.transcript.len())
+                    .map(|group| group.entry_group().unwrap().transcript.len())
                     .sum::<usize>(),
                 3 * n
             );

@@ -155,6 +155,10 @@ pub enum ContextSource {
         source_id: String,
         extension: String,
     },
+    /// A representation in authorized immutable conversation history.
+    ConversationRepresentation {
+        id: crate::session::RepresentationId,
+    },
     /// A completed native tool exchange replayed from an earlier turn's
     /// transcript.
     ReplayedExchange {
