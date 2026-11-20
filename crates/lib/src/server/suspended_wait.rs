@@ -259,41 +259,39 @@ impl Server {
             .find_map(|record| record.identity.map(|identity| identity.requested_model))
             .unwrap_or_default();
         let session = Arc::new(Mutex::new(session));
-        let recorder = Arc::new(SessionRuntimeRecorder {
-            session: session.clone(),
-            request_id: attempt.request_id.clone(),
-            attempt_id: attempt.attempt_id.clone(),
-            sequence: AtomicU32::new(plan.next_sequence as u32),
-            terminal: std::sync::Mutex::new(None),
-            explicit_bridge_send: AtomicBool::new(false),
-            agent_name: plan.checkpoint.agent_name.clone(),
-            requested_model,
-            context_snapshot: None,
-            can_suspend: false,
-            branch: branch.as_ref().map(|b| b.id.clone()),
-            #[cfg(test)]
-            fail_after: self.transcript_fail_after.clone(),
-        });
+        let recorder = Arc::new(Session::turn_recorder(
+            session.clone(),
+            &attempt,
+            TurnCallIdentity {
+                agent: plan.checkpoint.agent_name.clone(),
+                requested_model,
+                execution_id: branch.map(|b| b.id),
+            },
+            TurnRecorderOptions {
+                next_sequence: plan.next_sequence,
+                #[cfg(test)]
+                fail_after: Some(self.transcript_fail_after.clone()),
+                ..Default::default()
+            },
+        ));
         let metadata = runtime::cancel_suspended_wait(recorder.clone(), plan.runtime)
             .await
             .map_err(|error| anyhow::anyhow!(error))?;
-        let transcript = recorder.terminal.lock().unwrap().take();
         let mut s = session.lock().await;
-        s.complete_turn_attempt_for_branch(
-            &attempt,
-            Some(SessionEntry {
-                sender: plan.checkpoint.agent_name,
-                content: TURN_STOPPED_MESSAGE.into(),
-                timestamp: Utc::now(),
-                entry_type: EntryType::Error,
-                metadata,
-                routing: None,
-            }),
-            None,
-            transcript,
-            branch.as_ref().map(|b| b.id.as_str()),
-        )
-        .await?;
+        recorder
+            .complete(
+                &mut s,
+                Some(SessionEntry {
+                    sender: plan.checkpoint.agent_name,
+                    content: TURN_STOPPED_MESSAGE.into(),
+                    timestamp: Utc::now(),
+                    entry_type: EntryType::Error,
+                    metadata,
+                    routing: None,
+                }),
+                None,
+            )
+            .await?;
         if let Some(job) = job {
             let (queue, agent, peer) = self.record_participating_job(s.database(), &job).await?;
             crate::executor_db::reconcile_job(

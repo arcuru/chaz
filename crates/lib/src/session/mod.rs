@@ -42,6 +42,7 @@ pub(crate) use registry::JobRequest;
 #[cfg(test)]
 pub(crate) use registry::PreparedAgentJob;
 mod transport;
+pub(crate) mod turn_recorder;
 pub mod usage;
 pub(crate) mod wait_resume;
 pub(crate) mod wire;
@@ -1599,7 +1600,7 @@ impl Session {
     /// and its terminal transcript with the completion. The receipt slot is
     /// never replaced: a branch finding another branch's receipt fails here
     /// and keeps its result as undelivered evidence instead.
-    pub(crate) async fn complete_turn_attempt_for_branch(
+    async fn complete_turn_attempt_for_branch(
         &mut self,
         attempt: &TurnAttempt,
         final_entry: Option<SessionEntry>,
@@ -1743,7 +1744,7 @@ impl Session {
 
     /// The branch copy keeps each execution's records separately readable
     /// even when two branches of one attempt reuse a sequence number.
-    pub(crate) async fn append_turn_transcript_for_branch(
+    async fn append_turn_transcript_for_branch(
         &self,
         record: TurnTranscriptRecord,
         display_entries: Vec<SessionEntry>,

@@ -22,11 +22,15 @@ use crate::extension::{ExtensionHub, HookContext};
 use crate::hosted_index::HostedIndex;
 use crate::runtime;
 use crate::security::SecurityContext;
+use crate::session::TurnCallIdentity;
+use crate::session::turn_recorder::{EXECUTION_YIELDED, TurnRecorderOptions};
 use crate::session::{
     EntryType, Session, SessionCommand, SessionCommandOutcome, SessionCommandRequest,
     SessionCommandResult, SessionEntry, SessionRegistry, TurnAttempt, TurnRequestId,
-    TurnRequestState, TurnTranscriptMessage, TurnTranscriptRecord,
+    TurnRequestState,
 };
+#[cfg(test)]
+use crate::session::{TurnTranscriptMessage, TurnTranscriptRecord};
 use crate::tool::{ScopedTools, ToolContext, ToolPolicyRegistry, ToolProfile, ToolRegistry};
 use crate::tool_host::ToolHost;
 use crate::types::ConversationId;
@@ -36,7 +40,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, TryAcquireError, mpsc};
 use tracing::{debug, error, info, warn};
 
@@ -64,317 +68,6 @@ const HOME_SKIP_WARN_THRESHOLD: u32 = 3;
 
 enum ProcessingCommand {
     Wake(String),
-}
-
-struct SessionRuntimeRecorder {
-    session: Arc<Mutex<Session>>,
-    request_id: TurnRequestId,
-    attempt_id: String,
-    sequence: AtomicU32,
-    terminal: std::sync::Mutex<Option<TurnTranscriptRecord>>,
-    explicit_bridge_send: AtomicBool,
-    agent_name: String,
-    requested_model: String,
-    /// The session state this attempt's context was assembled from. Without
-    /// it a wait cannot be reconstructed, so none is checkpointed.
-    context_snapshot: Option<eidetica::Snapshot>,
-    can_suspend: bool,
-    /// The job execution branch whose evidence this recorder writes.
-    branch: Option<String>,
-    #[cfg(test)]
-    fail_after: Arc<std::sync::Mutex<Option<usize>>>,
-}
-
-impl SessionRuntimeRecorder {
-    async fn write_session(&self) -> Result<tokio::sync::MutexGuard<'_, Session>, String> {
-        let mut session = self.session.lock().await;
-        session
-            .refresh_writer()
-            .await
-            .map_err(|error| format!("runtime persistence failed: writer refresh: {error}"))?;
-        Ok(session)
-    }
-}
-
-impl runtime::RuntimeRecorder for SessionRuntimeRecorder {
-    fn can_suspend_job_wait(&self) -> bool {
-        self.can_suspend
-    }
-
-    fn input_boundary<'a>(
-        &'a self,
-        model_sequence: u64,
-        closing: bool,
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<runtime::RuntimeMessage>, String>> + Send + 'a>>
-    {
-        Box::pin(async move {
-            let session = self.write_session().await?;
-            let mut messages: Vec<runtime::RuntimeMessage> =
-                crate::session::steering::input_boundary(
-                    session.database(),
-                    &self.attempt_id,
-                    model_sequence,
-                    closing,
-                )
-                .await
-                .map(|texts| {
-                    texts
-                        .into_iter()
-                        .map(runtime::RuntimeMessage::User)
-                        .collect()
-                })
-                .map_err(|error| {
-                    format!("runtime persistence failed: job input boundary: {error}")
-                })?;
-            // Parallel-execution notices join at the same safe boundary;
-            // a closing boundary never demands another model call for them.
-            if let Some(branch) = &self.branch {
-                if let Some(yielded) =
-                    crate::session::execution::observe(session.database(), branch)
-                        .await
-                        .map_err(|error| format!("execution observation failed: {error}"))?
-                {
-                    return Err(execution_yield_error(&yielded));
-                }
-                messages.extend(
-                    crate::session::execution::take_notices(session.database(), branch, closing)
-                        .await
-                        .map_err(|error| format!("execution notice delivery failed: {error}"))?
-                        .into_iter()
-                        .map(runtime::RuntimeMessage::User),
-                );
-            }
-            Ok(messages)
-        })
-    }
-
-    fn input_dispatch<'a>(
-        &'a self,
-        model_sequence: u64,
-        messages: &'a [runtime::RuntimeMessage],
-        baseline: &'a [runtime::RuntimeMessage],
-    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
-        Box::pin(async move {
-            let inputs = {
-                let session = self.write_session().await?;
-                crate::session::steering::dispatch_inputs(
-                    session.database(),
-                    &self.attempt_id,
-                    model_sequence,
-                    messages,
-                    baseline,
-                )
-                .await
-                .map_err(|e| format!("steering dispatch refused: {e}"))?
-            };
-            if !inputs.is_empty() {
-                self.record(runtime::RuntimeRecord::Steering {
-                    model_sequence,
-                    inputs,
-                })
-                .await?;
-            }
-            Ok(())
-        })
-    }
-
-    fn record<'a>(
-        &'a self,
-        message: runtime::RuntimeRecord,
-    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
-        Box::pin(async move {
-            #[cfg(test)]
-            {
-                let mut remaining = self.fail_after.lock().unwrap();
-                if let Some(value) = remaining.as_mut() {
-                    if *value == 0 {
-                        return Err("injected transcript failure".to_string());
-                    }
-                    *value -= 1;
-                }
-            }
-            if let runtime::RuntimeRecord::ModelResponse { model_sequence, .. } = &message {
-                let session = self.write_session().await?;
-                crate::session::steering::input_call_observed(
-                    session.database(),
-                    &self.attempt_id,
-                    *model_sequence,
-                )
-                .await
-                .map_err(|error| format!("job input receipt: {error}"))?;
-            }
-            let explicit_send = matches!(
-                &message,
-                runtime::RuntimeRecord::ToolResult {
-                    name,
-                    outcome: runtime::ToolResultOutcome::Success,
-                    ..
-                } if name == "matrix__send"
-            );
-            let sequence = self.sequence.fetch_add(1, Ordering::SeqCst) as u64;
-            let message = match message {
-                runtime::RuntimeRecord::Steering {
-                    model_sequence,
-                    inputs,
-                } => TurnTranscriptMessage::Steering {
-                    model_sequence,
-                    inputs,
-                },
-                runtime::RuntimeRecord::Cancelled => TurnTranscriptMessage::Cancelled,
-                runtime::RuntimeRecord::ModelResponse {
-                    model_sequence,
-                    content,
-                    tool_calls,
-                    provider_extra,
-                    metadata,
-                    terminal,
-                } => TurnTranscriptMessage::ModelResponse {
-                    model_sequence,
-                    content,
-                    tool_calls,
-                    provider_extra,
-                    metadata,
-                    terminal,
-                },
-                runtime::RuntimeRecord::ToolResult {
-                    model_sequence,
-                    call_index,
-                    call_id,
-                    name,
-                    output,
-                    outcome,
-                } => TurnTranscriptMessage::ToolResult {
-                    model_sequence,
-                    call_index,
-                    call_id,
-                    name,
-                    output,
-                    outcome,
-                },
-            };
-            let record = TurnTranscriptRecord {
-                request_id: self.request_id.clone(),
-                attempt_id: self.attempt_id.clone(),
-                sequence,
-                timestamp: Utc::now(),
-                identity: Some(crate::session::TurnCallIdentity {
-                    agent: self.agent_name.clone(),
-                    requested_model: self.requested_model.clone(),
-                    execution_id: self.branch.clone(),
-                }),
-                message,
-            };
-            if matches!(
-                record.message,
-                TurnTranscriptMessage::ModelResponse { terminal: true, .. }
-                    | TurnTranscriptMessage::Cancelled
-            ) {
-                // Usage is observable before response hooks or reply preflight
-                // finish. No final Message, completion or outbox is published.
-                self.write_session()
-                    .await?
-                    .append_turn_transcript_for_branch(
-                        record.clone(),
-                        Vec::new(),
-                        self.branch.as_deref(),
-                    )
-                    .await
-                    .map_err(|error| format!("failed to persist terminal telemetry: {error}"))?;
-                *self.terminal.lock().unwrap() = Some(record);
-                return Ok(());
-            }
-            let display_entries = display_entries_for_record(&self.agent_name, &record);
-            self.write_session()
-                .await?
-                .append_turn_transcript_for_branch(record, display_entries, self.branch.as_deref())
-                .await
-                .map_err(|error| format!("failed to persist runtime transcript: {error}"))?;
-            if explicit_send {
-                self.explicit_bridge_send.store(true, Ordering::Release);
-            }
-            Ok(())
-        })
-    }
-
-    fn observe_call<'a>(
-        &'a self,
-        call: crate::session::usage::CallObservation,
-    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
-        Box::pin(async move {
-            let session = self.write_session().await?;
-            crate::session::usage::persist_call(
-                session.database(),
-                &self.attempt_id,
-                self.branch.as_deref(),
-                &self.agent_name,
-                call,
-            )
-            .await
-        })
-    }
-
-    fn checkpoint_job_wait<'a>(
-        &'a self,
-        wait: runtime::JobWaitIntent,
-    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
-        Box::pin(async move {
-            let Some(snapshot) = self.context_snapshot.clone() else {
-                return Err("turn context has no recorded snapshot".into());
-            };
-            let checkpoint = crate::session::wait_resume::JobWaitCheckpoint::new(
-                self.request_id.clone(),
-                self.attempt_id.clone(),
-                self.agent_name.clone(),
-                snapshot,
-                wait,
-            );
-            let session = self.write_session().await?;
-            session
-                .record_job_wait_checkpoint(&checkpoint)
-                .await
-                .map_err(|error| format!("failed to persist job wait checkpoint: {error}"))?;
-            if self.can_suspend {
-                // The tool will not enter until readmission. Keep the same
-                // bounded monitor activity that a resident wait records.
-                session
-                    .start_job_wait(
-                        &self.request_id,
-                        &format!(
-                            "{}:{}:{}",
-                            checkpoint.model_sequence, checkpoint.call_index, checkpoint.call_id
-                        ),
-                        &checkpoint.child_session_db_id,
-                        checkpoint.deadline,
-                    )
-                    .await
-                    .map_err(|error| format!("failed to record entered job wait: {error}"))?;
-            }
-            Ok(())
-        })
-    }
-
-    fn finish_job_wait<'a>(
-        &'a self,
-        model_sequence: u64,
-        call_index: usize,
-    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
-        Box::pin(async move {
-            self.write_session()
-                .await?
-                .finish_job_wait_checkpoint(&self.attempt_id, model_sequence, call_index)
-                .await
-                .map_err(|error| format!("failed to retire job wait checkpoint: {error}"))
-        })
-    }
-}
-
-const EXECUTION_YIELDED: &str = "execution yielded to an earlier branch";
-
-fn execution_yield_error(yielded: &crate::session::execution::ExecutionYield) -> String {
-    format!(
-        "{EXECUTION_YIELDED}: {} (entry {})",
-        yielded.earlier_execution, yielded.earlier_entry
-    )
 }
 
 /// Only the origin of this exact turn may acquire an external destination.
@@ -475,81 +168,6 @@ async fn fresh_attempt_for_request(
         .start_live_attempt(session, request.id.clone())
         .await
         .map(Some)
-}
-
-fn display_entries_for_record(
-    agent_name: &str,
-    record: &TurnTranscriptRecord,
-) -> Vec<SessionEntry> {
-    match &record.message {
-        TurnTranscriptMessage::Cancelled
-        | TurnTranscriptMessage::Unknown { .. }
-        | TurnTranscriptMessage::ToolResult {
-            outcome: runtime::ToolResultOutcome::Unknown { .. },
-            ..
-        } => Vec::new(),
-        TurnTranscriptMessage::Steering { inputs, .. } => inputs
-            .iter()
-            .map(|input| SessionEntry {
-                sender: "user".into(),
-                content: input.text.clone(),
-                timestamp: record.timestamp,
-                entry_type: EntryType::TurnContext,
-                metadata: None,
-                routing: None,
-            })
-            .collect(),
-        TurnTranscriptMessage::ModelResponse {
-            content,
-            tool_calls,
-            ..
-        } => content
-            .iter()
-            .filter(|t| !t.is_empty())
-            .map(|text| SessionEntry {
-                sender: agent_name.into(),
-                content: text.clone(),
-                timestamp: record.timestamp,
-                entry_type: EntryType::TurnContext,
-                metadata: None,
-                routing: None,
-            })
-            .chain(tool_calls.iter().map(|call| SessionEntry {
-                sender: agent_name.to_string(),
-                content: format!("{}({})", call.name, call.arguments),
-                timestamp: record.timestamp,
-                entry_type: EntryType::ToolCall,
-                metadata: None,
-                routing: None,
-            }))
-            .collect(),
-        TurnTranscriptMessage::ToolResult {
-            name,
-            output,
-            outcome,
-            ..
-        } => {
-            let output = if *outcome != runtime::ToolResultOutcome::Success {
-                format!("{name}: ERROR: {output}")
-            } else {
-                let truncated = crate::util::truncate_chars(output, 500);
-                let suffix = if truncated.len() < output.len() {
-                    "…"
-                } else {
-                    ""
-                };
-                format!("{name}: {truncated}{suffix}")
-            };
-            vec![SessionEntry {
-                sender: agent_name.to_string(),
-                content: output,
-                timestamp: record.timestamp,
-                entry_type: EntryType::ToolResult,
-                metadata: None,
-                routing: None,
-            }]
-        }
-    }
 }
 
 /// Pure decider for the per-session home-peer gate. Given a session's
@@ -2512,7 +2130,7 @@ impl Server {
             .await?;
         let id = child.root_id().to_string();
         let setup = async {
-            let directive_id = crate::session::worker_links::prepare_directive(
+            let directive_id = Session::prepare_worker_directive(
                 &child, parent, &spawn_id, directive, call.is_some(),
             ).await?;
             if let Some(call) = call {
@@ -4349,26 +3967,24 @@ impl Server {
                 );
             }
 
-            let recorder = Arc::new(SessionRuntimeRecorder {
-                session: session.clone(),
-                request_id: attempt.request_id.clone(),
-                attempt_id: attempt.attempt_id.clone(),
-                // A resumed attempt appends after its own persisted records.
-                sequence: AtomicU32::new(
-                    resume.as_ref().map_or(0, |plan| plan.next_sequence as u32),
-                ),
-                terminal: std::sync::Mutex::new(None),
-                explicit_bridge_send: AtomicBool::new(
-                    resume.as_ref().is_some_and(|plan| plan.runtime.matrix_send_queued),
-                ),
-                agent_name: agent_name.clone(),
-                requested_model: backend.resolve_model_name(effective_model.as_deref()),
-                context_snapshot,
-                can_suspend: spawn.completion_tx.is_none(),
-                branch: branch_id.clone(),
-                #[cfg(test)]
-                fail_after: transcript_fail_after,
-            });
+            let recorder = Arc::new(Session::turn_recorder(
+                session.clone(),
+                &attempt,
+                TurnCallIdentity {
+                    agent: agent_name.clone(),
+                    requested_model: backend.resolve_model_name(effective_model.as_deref()),
+                    execution_id: branch_id.clone(),
+                },
+                TurnRecorderOptions {
+                    // A resumed attempt appends after its own persisted records.
+                    next_sequence: resume.as_ref().map_or(0, |plan| plan.next_sequence),
+                    explicit_bridge_send: resume.as_ref().is_some_and(|plan| plan.runtime.matrix_send_queued),
+                    context_snapshot,
+                    can_suspend: spawn.completion_tx.is_none(),
+                    #[cfg(test)]
+                    fail_after: Some(transcript_fail_after),
+                },
+            ));
 
             let scope = runtime::ModelCallScope {
                 cache: assembled.cache,
@@ -4451,7 +4067,7 @@ impl Server {
                     (None, None)
                 }
                 Ok(outcome) => {
-                    let outbound = if recorder.explicit_bridge_send.load(Ordering::Acquire) {
+                    let outbound = if recorder.has_explicit_bridge_send() {
                         None
                     } else {
                         match bridge_reply_for_turn(
@@ -4529,19 +4145,10 @@ impl Server {
                 };
                 if let Some(yielded) = undelivered {
                     info!(session_db_id, branch = %id, earlier = %yielded.earlier_execution, "Execution yielded; preserving its result as undelivered evidence");
-                    let transcript = recorder.terminal.lock().unwrap().take();
                     if !persistence_failed
                         && !stopped_by_yield
                         && let Some(terminal) = crate::session::jobs::job_terminal_for(final_entry.as_ref())
-                        && let Err(error) = crate::session::execution::record_undelivered(&claim_db, &crate::session::execution::ExecutionOutcome {
-                            execution_id: id.clone(),
-                            result: crate::session::jobs::JobResult {
-                                attempt_id: attempt.attempt_id.clone(),
-                                terminal,
-                                execution_id: Some(id.clone()),
-                            },
-                            delivered: false,
-                        }, transcript.as_ref()).await
+                        && let Err(error) = recorder.preserve_undelivered(&claim_db, terminal).await
                     {
                         error!(%error, session_db_id, "Failed to preserve yielded execution outcome");
                     }
@@ -4554,23 +4161,11 @@ impl Server {
                     attempt.attempt_id
                 );
             } else {
-                let transcript = recorder.terminal.lock().unwrap().take();
-                let late = branch_id.as_ref().zip(crate::session::jobs::job_terminal_for(final_entry.as_ref()));
-                if let Err(error) = s
-                    .complete_turn_attempt_for_branch(&attempt, final_entry, outbound, transcript.clone(), branch_id.as_deref())
-                    .await
-                {
+                let late = branch_id.as_ref().and_then(|_| crate::session::jobs::job_terminal_for(final_entry.as_ref()));
+                if let Err(error) = recorder.complete(&mut s, final_entry, outbound).await {
                     error!("Failed to complete turn attempt for {session_db_id}: {error}");
-                    if let Some((id, terminal)) = late
-                        && let Err(error) = crate::session::execution::record_undelivered(&claim_db, &crate::session::execution::ExecutionOutcome {
-                            execution_id: id.clone(),
-                            result: crate::session::jobs::JobResult {
-                                attempt_id: attempt.attempt_id.clone(),
-                                terminal,
-                                execution_id: Some(id.clone()),
-                            },
-                            delivered: false,
-                        }, transcript.as_ref()).await
+                    if let Some(terminal) = late
+                        && let Err(error) = recorder.preserve_undelivered(&claim_db, terminal).await
                     {
                         error!(%error, session_db_id, "Failed to preserve undelivered execution outcome");
                     }

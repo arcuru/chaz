@@ -1,5 +1,5 @@
 use super::*;
-use crate::session::{Session, TurnAttemptStatus, TurnCallIdentity};
+use crate::session::{TurnAttemptStatus, TurnCallIdentity};
 use crate::types::ConversationId;
 use serde_json::{Value, json};
 
@@ -34,7 +34,7 @@ async fn fixture() -> (eidetica::Instance, Database, Database, WorkerSpawn) {
         .await
         .unwrap();
     Session::initialize_turn_schema(&child).await.unwrap();
-    let directive_id = prepare_directive(
+    let directive_id = Session::prepare_worker_directive(
         &child,
         &parent,
         "fixture-spawn",
@@ -146,7 +146,7 @@ async fn worker_links_validate_exact_call_and_backlink_without_copying_payloads(
         .create_database(eidetica::crdt::Doc::new(), &key)
         .await
         .unwrap();
-    let repeated_directive = prepare_directive(
+    let repeated_directive = Session::prepare_worker_directive(
         &repeated,
         &parent,
         "another-creation",
