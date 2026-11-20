@@ -458,7 +458,10 @@ pub(super) fn handle_mouse(app: &mut App, m: MouseEvent) -> Option<MouseOutcome>
             } else if app.mode == TuiMode::SessionPicker {
                 app.picker_index = wheel_step(app.picker_index, down, app.picker_len());
             } else if let TuiMode::Settings(scope) = app.mode {
-                if app.agent_diff.is_some() || app.settings_prompt.is_some() {
+                if app.agent_diff.is_some()
+                    || app.settings_prompt.is_some()
+                    || app.field_sheet.is_some()
+                {
                     return None;
                 }
                 app.sync_settings_reader(scope);
@@ -511,6 +514,7 @@ pub(super) fn handle_mouse(app: &mut App, m: MouseEvent) -> Option<MouseOutcome>
     if matches!(app.mode, TuiMode::Settings(_))
         && app.overlay.is_none()
         && (app.agent_diff.is_some()
+            || app.field_sheet.is_some()
             || app.settings_prompt.is_some()
             || app.settings_picker.is_some()
             || app.has_pending_approval())
@@ -1221,6 +1225,8 @@ pub(super) enum SettingsKey {
     /// An identity-based edit, evaluated against the ordered worker's latest
     /// defaults rather than replacing it with a possibly stale UI snapshot.
     EditPeerDefaults(DefaultsEdit),
+    /// Load or edit declared extension preferences for the open field sheet.
+    Field(super::field_sheet::Request),
 }
 
 /// Category/List/Content navigation. Content reads wrapped lines without
@@ -1253,6 +1259,10 @@ pub(super) fn handle_settings_key(
     // row cursor, Esc closes it (not Settings), and r/R/a drive the merge.
     if app.agent_diff.is_some() {
         return handle_agent_diff_key(app, key);
+    }
+    if app.field_sheet.is_some() {
+        return super::field_sheet::handle_key(&mut app.field_sheet, key)
+            .map_or(SettingsKey::None, SettingsKey::Field);
     }
     // When a bottom-strip prompt is active, route keys to it instead of
     // category navigation. Submit returns a PromptSubmit; Esc cancels.
@@ -1325,6 +1335,43 @@ pub(super) fn handle_settings_key(
             }
             _ => {}
         }
+    }
+    // Declared extension preferences: pick an agent, then its field sheet.
+    if matches!(scope, SettingsScope::Peer)
+        && matches!(
+            super::PeerSettingsCategory::ALL.get(cur),
+            Some(super::PeerSettingsCategory::Extensions)
+        )
+        && key.code == KeyCode::Char('e')
+        && !key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+    {
+        if app.extension_agent_targets.is_empty() {
+            app.settings_status = Some("No hosted agents to edit".into());
+        } else {
+            app.field_sheet = Some(super::field_sheet::Sheet::picker(
+                app.extension_agent_targets.clone(),
+            ));
+        }
+        return SettingsKey::None;
+    }
+    if matches!(scope, SettingsScope::Session)
+        && matches!(
+            super::SessionSettingsCategory::ALL.get(cur),
+            Some(super::SessionSettingsCategory::Extensions)
+        )
+        && key.code == KeyCode::Enter
+    {
+        let Some(tab) = app.current() else {
+            return SettingsKey::None;
+        };
+        let request = super::field_sheet::Request::SessionAgents {
+            id: tab.session_db_id.clone(),
+            incarnation: tab.live.incarnation,
+        };
+        app.field_sheet = Some(super::field_sheet::Sheet::picker(Vec::new()));
+        return SettingsKey::Field(request);
     }
     if matches!(scope, SettingsScope::Peer)
         && matches!(

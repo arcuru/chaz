@@ -302,9 +302,9 @@ pub(crate) struct RoundInputs<'a> {
     /// call IDs are not occurrence identities and may legally repeat.
     pub current_exchanges: &'a HashSet<usize>,
     pub budget_tokens: Option<usize>,
-    /// Effective settings per chain extension, resolved for the turn owner
-    /// before the chain runs. A failed read refuses only that step.
-    pub settings: std::collections::HashMap<String, Result<serde_json::Value, String>>,
+    pub hub: &'a super::ExtensionHub,
+    pub session_db: Option<&'a eidetica::Database>,
+    pub agent: Option<&'a crate::hosted_index::DbEntry>,
     pub history: Option<&'a super::history::ScopedHistory>,
 }
 
@@ -345,11 +345,12 @@ async fn run_chain_inner(
         let invoked = tokio::time::timeout(
             PROJECTOR_TIMEOUT,
             AssertUnwindSafe(async {
-                let settings = match inputs.settings.get(&step.extension) {
-                    Some(Ok(settings)) => settings.clone(),
-                    Some(Err(error)) => anyhow::bail!("{error}"),
-                    None => serde_json::json!({}),
-                };
+                // Settings I/O shares the existing per-step timeout and
+                // optional/required failure semantics with the projector.
+                let settings = inputs
+                    .hub
+                    .effective_settings(&step.extension, inputs.session_db, inputs.agent)
+                    .await?;
                 let call = ProjectionCall {
                     agent_name: inputs.agent_name,
                     session_db_id: inputs.session_db_id,

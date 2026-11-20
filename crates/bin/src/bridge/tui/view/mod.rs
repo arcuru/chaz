@@ -351,6 +351,20 @@ pub(super) fn ui(
         let mut names = server.agents().names();
         names.sort();
         app.peer_agents_names = names;
+        if app.mode == TuiMode::Settings(SettingsScope::Peer)
+            && PeerSettingsCategory::ALL.get(app.peer_settings_index)
+                == Some(&PeerSettingsCategory::Extensions)
+        {
+            let mut agents = server.agent_index().list();
+            agents.sort_by(|a, b| (&a.display_name, &a.db_id).cmp(&(&b.display_name, &b.db_id)));
+            app.extension_agent_targets = agents
+                .into_iter()
+                .map(|entry| super::field_sheet::Target::Agent {
+                    db_id: entry.db_id,
+                    name: entry.display_name,
+                })
+                .collect();
+        }
         if !app.operations.is_pending() {
             app.peer_defaults = server.default_agents();
         }

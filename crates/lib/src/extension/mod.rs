@@ -1641,6 +1641,19 @@ impl ExtensionHub {
         security: &crate::security::SecurityContext,
         cancel: Option<&crate::runtime::TurnCancel>,
     ) {
+        self.fire_turn_complete_for((ctx, None), messages, tools, backend, security, cancel)
+            .await;
+    }
+
+    pub(crate) async fn fire_turn_complete_for(
+        &self,
+        (ctx, agent): (&HookContext, Option<&crate::hosted_index::DbEntry>),
+        messages: impl FnOnce() -> Vec<RuntimeMessage> + Send,
+        tools: &[crate::tool::ToolDefinition],
+        backend: &crate::backends::BackendManager,
+        security: &crate::security::SecurityContext,
+        cancel: Option<&crate::runtime::TurnCancel>,
+    ) {
         let Some(registry) = self.session_registry.as_ref() else {
             return;
         };
@@ -1678,7 +1691,11 @@ impl ExtensionHub {
                         .supported_hooks
                         .contains(&HookKind::TurnComplete)
             })
-            .filter_map(|(name, instance)| instance.turn_complete_hook().map(|hook| (name, hook)))
+            .filter_map(|(name, instance)| {
+                let endpoint = instance.turn_complete_hook()?;
+                let declaration = self.registered_setting_fields(&name).cloned();
+                Some((name, endpoint, declaration))
+            })
             .collect();
         if endpoints.is_empty() {
             return;
@@ -1697,46 +1714,11 @@ impl ExtensionHub {
             .and_then(|peer| peer.server_slot.get())
             .map(|server| Arc::downgrade(&server));
         let tools = tools.to_vec();
-        // The running agent's hosted identity, captured as the turn owner.
-        let agent = self
-            .peer_handles
-            .as_ref()
-            .and_then(|peer| peer.agent_index.find_by_name(&agent_name));
-        let declarations: HashMap<String, RegisteredSettingFields> = endpoints
-            .iter()
-            .filter_map(|(name, _)| {
-                self.registered_setting_fields(name)
-                    .map(|declaration| (name.clone(), declaration.clone()))
-            })
-            .collect();
+        // Use the identity bound at turn start, not a display-name lookup
+        // that could find a different Agent DB by the time the turn ends.
+        let agent = agent.cloned();
         let work = async move {
-            for (name, endpoint) in endpoints {
-                let declaration = declarations.get(&name);
-                let agent_settings = match declaration {
-                    Some(_) => match agent_layer(Some(&registry), agent.as_ref(), &name).await {
-                        Ok(settings) => settings,
-                        Err(error) => {
-                            warn!(extension = %name, %error, "Agent settings unavailable; skipping turn-complete endpoint");
-                            continue;
-                        }
-                    },
-                    None => serde_json::json!({}),
-                };
-                let turn = turn::TurnCompleteContext {
-                    agent_name: &agent_name,
-                    model: model.as_deref(),
-                    call_depth,
-                    messages: &messages,
-                    tools: &tools,
-                    extension: &name,
-                    declaration,
-                    agent_settings,
-                    db: &db,
-                    registry: &registry,
-                    backend: &backend,
-                    security: &security,
-                    completion_used: std::sync::atomic::AtomicBool::new(false),
-                };
+            for (name, endpoint, declaration) in endpoints {
                 let fut = AssertUnwindSafe(async {
                     // Queueing must not extend authority past a later revocation.
                     if registry
@@ -1759,6 +1741,25 @@ impl ExtensionHub {
                     if !active.contains(&name) {
                         return Ok(());
                     }
+                    let agent_settings = match &declaration {
+                        Some(_) => agent_layer(Some(&registry), agent.as_ref(), &name).await?,
+                        None => serde_json::json!({}),
+                    };
+                    let turn = turn::TurnCompleteContext {
+                        agent_name: &agent_name,
+                        model: model.as_deref(),
+                        call_depth,
+                        messages: &messages,
+                        tools: &tools,
+                        extension: &name,
+                        declaration: declaration.as_ref(),
+                        agent_settings,
+                        db: &db,
+                        registry: &registry,
+                        backend: &backend,
+                        security: &security,
+                        completion_used: std::sync::atomic::AtomicBool::new(false),
+                    };
                     endpoint.on_turn_complete(&turn).await
                 });
                 match tokio::time::timeout(std::time::Duration::from_secs(15), fut.catch_unwind())

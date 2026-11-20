@@ -214,6 +214,7 @@ pub(super) async fn rebuild(
 
 pub(super) fn disconnect(app: &mut App) {
     app.backend_available = false;
+    app.field_sheet = None;
     jobs::cancel(app);
     app.jobs.error = Some("Backend disconnected; retained snapshot is stale".into());
     app.cancel_session_fill();

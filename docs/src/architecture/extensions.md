@@ -514,6 +514,14 @@ It preserves the old store/history rather than deleting data and never runs at s
 The operator must synchronize all pending histories, stop/upgrade every sharing client, convert once, and distribute that conversion before resuming.
 Old binaries are unsupported afterwards; binary rollback cannot reverse synchronized data.
 
+### Declared preferences
+
+Extensions can opt in to the field editor with `Extension::setting_fields()`.
+The host validates descriptors and their defaults at registration, including command-only registration; no extension instance is needed.
+Session overrides stay in `extension_settings_v2`. Agent defaults use a sibling key in the Agent DB's `config` DocStore, outside the atomic agent definition record.
+The host resolves declared fields for the turn's bound Agent DB and overlays them on raw session settings in memory. Raw inspection and runtime patches still operate on the session document alone.
+See the [extension settings design](../design/extension_settings.md) for the storage and compatibility contract.
+
 ## Extension identity
 
 Every extension carries an `ExtensionRef`, written to the activation log

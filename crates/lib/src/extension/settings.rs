@@ -157,8 +157,8 @@ pub struct SettingRow {
     pub source: SettingLayer,
     /// The edit target has its own value, so Reset is meaningful.
     pub present_at_target: bool,
-    /// The declaration permits editing at the target. Write authority is
-    /// still decided by the database on commit.
+    /// The declaration and current database view permit editing at the target.
+    /// The actual commit rechecks authority.
     pub editable: bool,
 }
 
@@ -196,15 +196,20 @@ fn resolve(
     declaration: &RegisteredSettingFields,
     session: &Value,
     agent: &Value,
-    key: &str,
+    field: &SettingField,
 ) -> (Value, SettingLayer) {
-    if let Some(value) = session.get(key) {
+    if let Some(value) = session.get(field.key) {
         (value.clone(), SettingLayer::Session)
-    } else if let Some(value) = agent.get(key) {
+    } else if let Some(value) = agent
+        .get(field.key)
+        .filter(|_| field.targets.allows(SettingLayer::Agent))
+    {
         (value.clone(), SettingLayer::Agent)
     } else {
-        let value = declaration.default_value(key).cloned();
-        (value.unwrap_or(Value::Null), SettingLayer::Default)
+        (
+            declaration.defaults[field.key].clone(),
+            SettingLayer::Default,
+        )
     }
 }
 
@@ -225,6 +230,10 @@ impl ExtensionHub {
             "session settings target no longer matches the open session"
         );
         self.checked_field(extension, key, SettingLayer::Session, &edit)?;
+        anyhow::ensure!(
+            session_db.current_permission().await?.can_write(),
+            "session settings are read-only"
+        );
         match edit {
             SettingEdit::Set(value) => {
                 patch_settings(
@@ -263,6 +272,10 @@ impl ExtensionHub {
             "agent settings target no longer matches the open agent"
         );
         self.checked_field(extension, key, SettingLayer::Agent, &edit)?;
+        anyhow::ensure!(
+            agent_db.current_permission().await?.can_write(),
+            "agent settings are read-only"
+        );
         let txn = agent_db.new_transaction().await?;
         let before = read_agent_in(&txn, extension).await?;
         let mut after = before.clone();
@@ -324,29 +337,35 @@ impl ExtensionHub {
         let Some(declaration) = self.registered_setting_fields(extension) else {
             return Ok(Vec::new());
         };
-        let session = match session_db {
-            Some(db) => read_settings_checked(db, extension).await?,
-            None => serde_json::json!({}),
+        let (session, retained) = match session_db {
+            Some(db) => read_in(&db.new_transaction().await?, extension).await?,
+            None => (serde_json::json!({}), false),
         };
+        anyhow::ensure!(session.is_object(), "extension settings must be an object");
         let agent = match agent_db {
             Some(db) => read_agent_settings(db, extension).await?,
             None => serde_json::json!({}),
         };
-        let at_target = match target {
-            SettingLayer::Session => &session,
-            _ => &agent,
+        let (at_target, writer) = match target {
+            SettingLayer::Session => (&session, session_db.filter(|_| !retained)),
+            SettingLayer::Agent => (&agent, agent_db),
+            SettingLayer::Default => (&agent, None),
+        };
+        let writable = match writer {
+            Some(db) => db.current_permission().await?.can_write(),
+            None => false,
         };
         Ok(declaration
             .fields()
             .iter()
             .map(|field| {
-                let (value, source) = resolve(declaration, &session, &agent, field.key);
+                let (value, source) = resolve(declaration, &session, &agent, field);
                 SettingRow {
                     field,
                     value,
                     source,
                     present_at_target: at_target.get(field.key).is_some(),
-                    editable: field.targets.allows(target),
+                    editable: writable && field.targets.allows(target),
                 }
             })
             .collect())
@@ -373,7 +392,7 @@ impl ExtensionHub {
             .as_deref()
             .or_else(|| self.peer_handles.as_ref().map(|peer| &*peer.registry));
         let agent = agent_layer(registry, agent, extension).await?;
-        Ok(overlay(declaration, raw, &agent))
+        overlay(declaration, raw, &agent)
     }
 }
 
@@ -400,16 +419,17 @@ pub(crate) fn overlay(
     declaration: &RegisteredSettingFields,
     mut raw: Value,
     agent: &Value,
-) -> Value {
-    if let Some(fields) = raw.as_object_mut() {
-        for field in declaration.fields() {
-            if !fields.contains_key(field.key) {
-                let (value, _) = resolve(declaration, &Value::Null, agent, field.key);
-                fields.insert(field.key.to_owned(), value);
-            }
+) -> anyhow::Result<Value> {
+    let fields = raw
+        .as_object_mut()
+        .context("extension settings must be an object")?;
+    for field in declaration.fields() {
+        if !fields.contains_key(field.key) {
+            let (value, _) = resolve(declaration, &Value::Null, agent, field);
+            fields.insert(field.key.to_owned(), value);
         }
     }
-    raw
+    Ok(raw)
 }
 
 pub(super) fn encode(value: &Value) -> NativeValue {

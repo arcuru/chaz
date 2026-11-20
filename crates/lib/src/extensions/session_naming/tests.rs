@@ -380,8 +380,14 @@ async fn naming_turn_reads_the_turn_owners_agent_preferences_and_session_pins() 
         let mut f = Fixture::new(session).await;
         f.ctx.agent_name = agent.into();
         let entry = crate::session::test_helpers::make_agent_entry(&f.registry, agent).await;
+        f.ctx.agent_identity = Some(entry.clone());
         let index = HostedIndex::empty("agent");
-        index.register(entry.clone());
+        // A directory rename must not take away the preferences from an
+        // already-running turn bound to this DB.
+        index.register(crate::hosted_index::DbEntry {
+            display_name: format!("{agent}-renamed"),
+            ..entry.clone()
+        });
         f.hub = Arc::new(hub_with_agents(f.registry.clone(), index).await);
         f.hub
             .record_active(f.ctx.session.lock().await.database())

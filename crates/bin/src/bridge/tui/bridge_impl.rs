@@ -288,6 +288,10 @@ impl TuiBridge {
                         } else if app.settings_too_small() && key.code != KeyCode::Esc {
                             // Only safe cancellation and the existing quit path remain live.
                             continue;
+                        } else if app.field_sheet.is_some()
+                            && key.modifiers.contains(KeyModifiers::CONTROL)
+                        {
+                            continue;
                         } else if key.code == KeyCode::Char('g')
                             && key.modifiers.contains(KeyModifiers::CONTROL)
                         {

@@ -662,7 +662,7 @@ async fn llm_call_with_retry(
 /// Notify successful-turn observers and end hooks without changing the outcome.
 async fn finalize_outcome(
     hub: Option<&ExtensionHub>,
-    ctx: Option<&HookContext>,
+    (ctx, owner): (Option<&HookContext>, Option<&crate::hosted_index::DbEntry>),
     outcome: RuntimeOutcome,
     request: (&[RuntimeMessage], &[ToolDefinition]),
     backend: &BackendManager,
@@ -672,8 +672,8 @@ async fn finalize_outcome(
     if let (Some(hub), Some(ctx)) = (hub, ctx) {
         until_cancelled(
             cancel,
-            hub.fire_turn_complete(
-                ctx,
+            hub.fire_turn_complete_for(
+                (ctx, owner),
                 || crate::extension::turn::public_messages(request.0, &outcome.body),
                 request.1,
                 backend,
@@ -1079,20 +1079,6 @@ impl<'a> RoundProjector<'a> {
                 matches!(source, ContextSource::CurrentAttempt { .. }).then_some(index)
             })
             .collect();
-        let mut settings = std::collections::HashMap::new();
-        for step in &chain {
-            if !settings.contains_key(&step.extension) {
-                let resolved = hub
-                    .effective_settings(
-                        &step.extension,
-                        self.session_db.as_ref(),
-                        self.tool_ctx.agent_identity.as_ref(),
-                    )
-                    .await
-                    .map_err(|error| format!("{error:#}"));
-                settings.insert(step.extension.clone(), resolved);
-            }
-        }
         let inputs = projection::RoundInputs {
             agent_name: &self.tool_ctx.agent_name,
             session_db_id: self.session_db_id.as_deref(),
@@ -1103,7 +1089,9 @@ impl<'a> RoundProjector<'a> {
             sources: &sources,
             current_exchanges: &current_exchanges,
             budget_tokens: self.scope.request_budget_tokens,
-            settings,
+            hub,
+            session_db: self.session_db.as_ref(),
+            agent: self.tool_ctx.agent_identity.as_ref(),
             history: Some(&history),
         };
         let mut accepted = if self.compactor.is_some() {
@@ -1567,7 +1555,7 @@ async fn run_prepared_turn(
                     }
                     return Ok(finalize_outcome(
                         hub,
-                        hook_ctx.as_ref(),
+                        (hook_ctx.as_ref(), tool_ctx.agent_identity.as_ref()),
                         RuntimeOutcome {
                             body: content,
                             metadata: acc.finalize(),
@@ -1794,7 +1782,7 @@ async fn run_prepared_turn(
                 }
                 return Ok(finalize_outcome(
                     hub,
-                    hook_ctx.as_ref(),
+                    (hook_ctx.as_ref(), tool_ctx.agent_identity.as_ref()),
                     RuntimeOutcome {
                         body: content,
                         metadata: acc.finalize(),
@@ -1839,7 +1827,7 @@ async fn run_prepared_turn(
                 if let Some(RuntimeMessage::ToolResult { content, .. }) = messages.last() {
                     return Ok(finalize_outcome(
                         hub,
-                        hook_ctx.as_ref(),
+                        (hook_ctx.as_ref(), tool_ctx.agent_identity.as_ref()),
                         RuntimeOutcome {
                             body: content.clone(),
                             metadata: acc.finalize(),
@@ -1935,7 +1923,7 @@ async fn run_prepared_turn(
                     }
                     return Ok(finalize_outcome(
                         hub,
-                        hook_ctx.as_ref(),
+                        (hook_ctx.as_ref(), tool_ctx.agent_identity.as_ref()),
                         RuntimeOutcome {
                             body: String::new(),
                             metadata: acc.finalize(),

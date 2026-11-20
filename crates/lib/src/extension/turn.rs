@@ -164,10 +164,10 @@ impl TurnCompleteContext<'_> {
     /// fields resolved from the turn owner's preferences or the defaults.
     pub async fn settings(&self) -> anyhow::Result<Value> {
         let raw = super::read_settings_checked(self.db, self.extension).await?;
-        Ok(match self.declaration {
+        match self.declaration {
             Some(declaration) => super::overlay(declaration, raw, &self.agent_settings),
-            None => raw,
-        })
+            None => Ok(raw),
+        }
     }
 
     /// Assign top-level fields in this extension's settings. Nested objects and
