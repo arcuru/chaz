@@ -302,7 +302,9 @@ pub(crate) struct RoundInputs<'a> {
     /// call IDs are not occurrence identities and may legally repeat.
     pub current_exchanges: &'a HashSet<usize>,
     pub budget_tokens: Option<usize>,
-    pub session_db: Option<&'a eidetica::Database>,
+    /// Effective settings per chain extension, resolved for the turn owner
+    /// before the chain runs. A failed read refuses only that step.
+    pub settings: std::collections::HashMap<String, Result<serde_json::Value, String>>,
     pub history: Option<&'a super::history::ScopedHistory>,
 }
 
@@ -343,8 +345,9 @@ async fn run_chain_inner(
         let invoked = tokio::time::timeout(
             PROJECTOR_TIMEOUT,
             AssertUnwindSafe(async {
-                let settings = match inputs.session_db {
-                    Some(db) => super::read_settings_checked(db, &step.extension).await?,
+                let settings = match inputs.settings.get(&step.extension) {
+                    Some(Ok(settings)) => settings.clone(),
+                    Some(Err(error)) => anyhow::bail!("{error}"),
                     None => serde_json::json!({}),
                 };
                 let call = ProjectionCall {

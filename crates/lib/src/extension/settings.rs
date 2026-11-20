@@ -66,7 +66,7 @@ pub struct SettingField {
 }
 
 /// Validated registration snapshot, available even without an instance.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RegisteredSettingFields {
     fields: &'static [SettingField],
     defaults: serde_json::Map<String, Value>,
@@ -130,6 +130,84 @@ pub enum SettingEdit {
     Reset,
 }
 
+/// The layer a declared field may be edited at, or a value came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettingLayer {
+    Session,
+    Agent,
+    Default,
+}
+
+impl SettingTargets {
+    pub fn allows(self, layer: SettingLayer) -> bool {
+        matches!(
+            (self, layer),
+            (Self::Both, SettingLayer::Session | SettingLayer::Agent)
+                | (Self::Session, SettingLayer::Session)
+                | (Self::Agent, SettingLayer::Agent)
+        )
+    }
+}
+
+/// One declared field for display. Only declared values are returned.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SettingRow {
+    pub field: &'static SettingField,
+    pub value: Value,
+    pub source: SettingLayer,
+    /// The edit target has its own value, so Reset is meaningful.
+    pub present_at_target: bool,
+    /// The declaration permits editing at the target. Write authority is
+    /// still decided by the database on commit.
+    pub editable: bool,
+}
+
+/// Agent preferences live beside, never inside, the atomic `config["value"]`
+/// record, so an old whole-record writer cannot erase them.
+fn agent_key(ext: &str) -> String {
+    format!("extension:{}", field_key(ext))
+}
+
+async fn read_agent_in(txn: &Transaction, ext: &str) -> anyhow::Result<Value> {
+    let store = txn
+        .get_store::<DocStore>(crate::agent_db::CONFIG_STORE)
+        .await?;
+    match stored(&store, &agent_key(ext)).await? {
+        Some(value) => {
+            let value = decode(&value)?;
+            anyhow::ensure!(
+                value.is_object(),
+                "agent extension settings must be an object"
+            );
+            Ok(value)
+        }
+        None => Ok(serde_json::json!({})),
+    }
+}
+
+/// Explicit agent preferences for one extension; absent gives an empty object.
+pub async fn read_agent_settings(agent_db: &Database, ext: &str) -> anyhow::Result<Value> {
+    let txn = agent_db.new_transaction().await?;
+    read_agent_in(&txn, ext).await
+}
+
+/// First present value: session field, then agent preference, then default.
+fn resolve(
+    declaration: &RegisteredSettingFields,
+    session: &Value,
+    agent: &Value,
+    key: &str,
+) -> (Value, SettingLayer) {
+    if let Some(value) = session.get(key) {
+        (value.clone(), SettingLayer::Session)
+    } else if let Some(value) = agent.get(key) {
+        (value.clone(), SettingLayer::Agent)
+    } else {
+        let value = declaration.default_value(key).cloned();
+        (value.unwrap_or(Value::Null), SettingLayer::Default)
+    }
+}
+
 impl ExtensionHub {
     /// Edit one declared field on the already opened session. The caller binds
     /// the ID and session-key handle; commit enforces database authorization.
@@ -146,20 +224,9 @@ impl ExtensionHub {
             session_db.root_id().to_string() == session_db_id,
             "session settings target no longer matches the open session"
         );
-        let field = self
-            .registered_setting_fields(extension)
-            .and_then(|declaration| declaration.field(key))
-            .with_context(|| format!("no declared field {extension}.{key}"))?;
-        anyhow::ensure!(
-            matches!(
-                field.targets,
-                SettingTargets::Session | SettingTargets::Both
-            ),
-            "{extension}.{key} does not allow session overrides"
-        );
+        self.checked_field(extension, key, SettingLayer::Session, &edit)?;
         match edit {
             SettingEdit::Set(value) => {
-                field.kind.validate(&value)?;
                 patch_settings(
                     session_db,
                     extension,
@@ -180,6 +247,169 @@ impl ExtensionHub {
             }
         }
     }
+
+    /// Edit one declared preference in the exact hosted Agent DB the caller
+    /// opened with its held key. There is no session or display-name fallback.
+    pub async fn edit_agent_setting(
+        &self,
+        agent_db_id: &str,
+        agent_db: &Database,
+        extension: &str,
+        key: &str,
+        edit: SettingEdit,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            agent_db.root_id().to_string() == agent_db_id,
+            "agent settings target no longer matches the open agent"
+        );
+        self.checked_field(extension, key, SettingLayer::Agent, &edit)?;
+        let txn = agent_db.new_transaction().await?;
+        let before = read_agent_in(&txn, extension).await?;
+        let mut after = before.clone();
+        let fields = after.as_object_mut().expect("checked object");
+        match edit {
+            SettingEdit::Set(value) => {
+                fields.insert(key.to_owned(), value);
+            }
+            SettingEdit::Reset => {
+                fields.remove(key);
+            }
+        }
+        if before == after {
+            return Ok(());
+        }
+        txn.get_store::<DocStore>(crate::agent_db::CONFIG_STORE)
+            .await?
+            .set(agent_key(extension), delta(&before, &after, false))
+            .await?;
+        txn.commit().await?;
+        Ok(())
+    }
+
+    fn checked_field(
+        &self,
+        extension: &str,
+        key: &str,
+        layer: SettingLayer,
+        edit: &SettingEdit,
+    ) -> anyhow::Result<&'static SettingField> {
+        let field = self
+            .registered_setting_fields(extension)
+            .and_then(|declaration| declaration.field(key))
+            .with_context(|| format!("no declared field {extension}.{key}"))?;
+        anyhow::ensure!(
+            field.targets.allows(layer),
+            "{extension}.{key} does not allow {} settings",
+            match layer {
+                SettingLayer::Agent => "agent",
+                _ => "session overrides",
+            }
+        );
+        if let SettingEdit::Set(value) = edit {
+            field.kind.validate(value)?;
+        }
+        Ok(field)
+    }
+
+    /// Declared rows for display at `target`. A Peer view passes no session;
+    /// a session view names the viewed agent's DB, if it has one. Any read
+    /// failure is an error rather than an absent preference.
+    pub async fn setting_rows(
+        &self,
+        extension: &str,
+        target: SettingLayer,
+        session_db: Option<&Database>,
+        agent_db: Option<&Database>,
+    ) -> anyhow::Result<Vec<SettingRow>> {
+        let Some(declaration) = self.registered_setting_fields(extension) else {
+            return Ok(Vec::new());
+        };
+        let session = match session_db {
+            Some(db) => read_settings_checked(db, extension).await?,
+            None => serde_json::json!({}),
+        };
+        let agent = match agent_db {
+            Some(db) => read_agent_settings(db, extension).await?,
+            None => serde_json::json!({}),
+        };
+        let at_target = match target {
+            SettingLayer::Session => &session,
+            _ => &agent,
+        };
+        Ok(declaration
+            .fields()
+            .iter()
+            .map(|field| {
+                let (value, source) = resolve(declaration, &session, &agent, field.key);
+                SettingRow {
+                    field,
+                    value,
+                    source,
+                    present_at_target: at_target.get(field.key).is_some(),
+                    editable: field.targets.allows(target),
+                }
+            })
+            .collect())
+    }
+
+    /// The settings an extension sees while executing for `agent` in
+    /// `session_db`: raw session fields, including private ones, with each
+    /// absent declared key overlaid in memory. Nothing is written back.
+    pub(crate) async fn effective_settings(
+        &self,
+        extension: &str,
+        session_db: Option<&Database>,
+        agent: Option<&crate::hosted_index::DbEntry>,
+    ) -> anyhow::Result<Value> {
+        let raw = match session_db {
+            Some(db) => read_settings_checked(db, extension).await?,
+            None => serde_json::json!({}),
+        };
+        let Some(declaration) = self.registered_setting_fields(extension) else {
+            return Ok(raw);
+        };
+        let registry = self
+            .session_registry
+            .as_deref()
+            .or_else(|| self.peer_handles.as_ref().map(|peer| &*peer.registry));
+        let agent = agent_layer(registry, agent, extension).await?;
+        Ok(overlay(declaration, raw, &agent))
+    }
+}
+
+/// The turn owner's explicit preferences. A genuinely agentless context has
+/// no agent layer; an expected agent that cannot be opened is an error.
+pub(crate) async fn agent_layer(
+    registry: Option<&crate::session::SessionRegistry>,
+    agent: Option<&crate::hosted_index::DbEntry>,
+    extension: &str,
+) -> anyhow::Result<Value> {
+    let Some(entry) = agent else {
+        return Ok(serde_json::json!({}));
+    };
+    let adb = registry
+        .context("agent settings are unavailable")?
+        .open_agent_db(&entry.db_id, Some(&entry.pubkey))
+        .await?
+        .context("agent settings are unavailable")?;
+    read_agent_settings(adb.database(), extension).await
+}
+
+/// Fill each absent declared key in a raw session object, in memory only.
+pub(crate) fn overlay(
+    declaration: &RegisteredSettingFields,
+    mut raw: Value,
+    agent: &Value,
+) -> Value {
+    if let Some(fields) = raw.as_object_mut() {
+        for field in declaration.fields() {
+            if !fields.contains_key(field.key) {
+                let (value, _) = resolve(declaration, &Value::Null, agent, field.key);
+                fields.insert(field.key.to_owned(), value);
+            }
+        }
+    }
+    raw
 }
 
 pub(super) fn encode(value: &Value) -> NativeValue {

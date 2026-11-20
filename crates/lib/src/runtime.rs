@@ -1079,6 +1079,20 @@ impl<'a> RoundProjector<'a> {
                 matches!(source, ContextSource::CurrentAttempt { .. }).then_some(index)
             })
             .collect();
+        let mut settings = std::collections::HashMap::new();
+        for step in &chain {
+            if !settings.contains_key(&step.extension) {
+                let resolved = hub
+                    .effective_settings(
+                        &step.extension,
+                        self.session_db.as_ref(),
+                        self.tool_ctx.agent_identity.as_ref(),
+                    )
+                    .await
+                    .map_err(|error| format!("{error:#}"));
+                settings.insert(step.extension.clone(), resolved);
+            }
+        }
         let inputs = projection::RoundInputs {
             agent_name: &self.tool_ctx.agent_name,
             session_db_id: self.session_db_id.as_deref(),
@@ -1089,7 +1103,7 @@ impl<'a> RoundProjector<'a> {
             sources: &sources,
             current_exchanges: &current_exchanges,
             budget_tokens: self.scope.request_budget_tokens,
-            session_db: self.session_db.as_ref(),
+            settings,
             history: Some(&history),
         };
         let mut accepted = if self.compactor.is_some() {

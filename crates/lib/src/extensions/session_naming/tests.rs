@@ -25,11 +25,15 @@ struct Fixture {
 }
 
 async fn hub(registry: Arc<SessionRegistry>) -> ExtensionHub {
+    hub_with_agents(registry, HostedIndex::empty("agent")).await
+}
+
+async fn hub_with_agents(registry: Arc<SessionRegistry>, agent_index: HostedIndex) -> ExtensionHub {
     let mut hub = ExtensionHub::new();
     hub.set_session_registry(registry.clone());
     hub.set_peer_handles(Arc::new(PeerHandles {
         registry,
-        agent_index: HostedIndex::empty("agent"),
+        agent_index,
         memory_bank_index: HostedIndex::empty("bank"),
         skill_bank_index: HostedIndex::empty("skill_bank"),
         embedder: None,
@@ -368,6 +372,66 @@ async fn naming_receives_full_public_context_and_persists_canonically() {
 }
 
 #[tokio::test]
+async fn naming_turn_reads_the_turn_owners_agent_preferences_and_session_pins() {
+    use crate::extension::SettingEdit;
+    // Two sessions, each run by a different hosted agent.
+    let mut fixtures = Vec::new();
+    for (agent, session) in [("alpha", json!({})), ("beta", json!({"model": null}))] {
+        let mut f = Fixture::new(session).await;
+        f.ctx.agent_name = agent.into();
+        let entry = crate::session::test_helpers::make_agent_entry(&f.registry, agent).await;
+        let index = HostedIndex::empty("agent");
+        index.register(entry.clone());
+        f.hub = Arc::new(hub_with_agents(f.registry.clone(), index).await);
+        f.hub
+            .record_active(f.ctx.session.lock().await.database())
+            .await
+            .unwrap();
+        let adb = f
+            .registry
+            .open_agent_db(&entry.db_id, Some(&entry.pubkey))
+            .await
+            .unwrap()
+            .unwrap();
+        let id = entry.db_id.to_string();
+        for (key, value) in [
+            ("enabled", json!(true)),
+            ("model", json!(format!("{agent}:namer"))),
+        ] {
+            f.hub
+                .edit_agent_setting(
+                    &id,
+                    adb.database(),
+                    "session_naming",
+                    key,
+                    SettingEdit::Set(value),
+                )
+                .await
+                .unwrap();
+        }
+        fixtures.push(f);
+    }
+    let mut models = Vec::new();
+    for f in &fixtures {
+        f.mock.push_text("main reply");
+        f.mock.push_text("Generated name");
+        f.run(vec![RuntimeMessage::User("request".into())])
+            .await
+            .unwrap();
+        let calls = f.mock.recorded_calls();
+        assert_eq!(calls.len(), 2, "agent enablement reached the naming hook");
+        models.push(calls[1].model.clone());
+        let db = f.ctx.session.lock().await.database().clone();
+        let stored = read_settings(&db, "session_naming").await;
+        // Runtime state is written; the inherited preferences are not copied.
+        assert_eq!(stored["attempted"], true);
+        assert!(stored.get("enabled").is_none());
+    }
+    // Alpha inherits its own model; Beta's session pin (null) selects the turn model.
+    assert_eq!(models, ["alpha:namer", "turn-model"]);
+}
+
+#[tokio::test]
 async fn naming_is_opt_in_and_respects_explicit_names_activation_and_depth() {
     for case in ["disabled", "named", "inactive", "child", "silent"] {
         let mut f = Fixture::new(json!({"enabled": case != "disabled"})).await;
@@ -630,6 +694,8 @@ async fn scoped_api_limits_calls_and_settings_and_supports_no_tools_turns() {
         messages: &messages,
         tools: &[],
         extension: "session_naming",
+        declaration: None,
+        agent_settings: json!({}),
         db: &db,
         registry: &f.registry,
         backend: &f.backend,

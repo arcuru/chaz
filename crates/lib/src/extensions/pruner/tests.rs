@@ -1260,6 +1260,65 @@ async fn pruner_scoped_sources_ungranted_projection_and_incomplete_history() {
 }
 
 #[tokio::test]
+async fn pruner_projector_receives_the_turn_owners_min_bytes_preference() {
+    use crate::extension::SettingEdit;
+    use crate::session::test_helpers::{make_agent_entry, make_registry};
+    let (_instance, registry) = make_registry().await;
+    let (_, db) = registry.create_session(Some("agent-pref")).await.unwrap();
+    let agent = make_agent_entry(&registry, "test-agent").await;
+    registry
+        .attach_agent_to_session(&db.root_id().to_string(), &agent)
+        .await
+        .unwrap();
+    let mut fx = Fixture::new(db.clone(), vec![], vec![grant("context_prune", false)]).await;
+    Arc::get_mut(&mut fx.hub)
+        .unwrap()
+        .set_session_registry(registry.clone());
+    fx.ctx.agent_identity = Some(agent.clone());
+    fx.seed().await;
+    let baseline = fx.assembled().await;
+    fx.settings(true).await;
+    let adb = registry
+        .open_agent_db(&agent.db_id, Some(&agent.pubkey))
+        .await
+        .unwrap()
+        .unwrap();
+    let id = agent.db_id.to_string();
+    let edit = |edit| {
+        fx.hub
+            .edit_agent_setting(&id, adb.database(), "context_prune", "min_bytes", edit)
+    };
+    edit(SettingEdit::Set(json!(1000000))).await.unwrap();
+    let high = text_mock();
+    fx.run(high.clone(), None).await.unwrap();
+    assert_eq!(
+        result(&high.recorded_calls()[0].messages, "old-1"),
+        result(&baseline.messages, "old-1"),
+        "the agent threshold reached the projector"
+    );
+    // The session pin wins, including an explicit zero.
+    write_settings(
+        &fx.db,
+        "context_prune",
+        json!({"enabled": true, "min_bytes": 0}),
+    )
+    .await
+    .unwrap();
+    let pinned = text_mock();
+    fx.run(pinned.clone(), None).await.unwrap();
+    assert!(
+        result(&pinned.recorded_calls()[0].messages, "old-1")
+            .contains("Retained tool result omitted")
+    );
+    assert_eq!(
+        crate::extension::read_settings_checked(&fx.db, "context_prune")
+            .await
+            .unwrap(),
+        json!({"enabled": true, "min_bytes": 0})
+    );
+}
+
+#[tokio::test]
 async fn review_recovery_refuses_after_last_agent_detached() {
     use crate::session::test_helpers::{make_agent_entry, make_registry};
     let (_instance, registry) = make_registry().await;

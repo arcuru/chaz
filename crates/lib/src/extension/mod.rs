@@ -32,10 +32,11 @@ mod settings;
 pub mod turn;
 
 pub use settings::{
-    RegisteredSettingFields, SettingEdit, SettingField, SettingKind, SettingTargets,
-    migrate_settings, read_settings, read_settings_checked, write_settings,
+    RegisteredSettingFields, SettingEdit, SettingField, SettingKind, SettingLayer, SettingRow,
+    SettingTargets, migrate_settings, read_agent_settings, read_settings, read_settings_checked,
+    write_settings,
 };
-pub(crate) use settings::{patch_settings, update_settings};
+pub(crate) use settings::{agent_layer, overlay, patch_settings, update_settings};
 
 #[allow(unused_imports)]
 pub use instance::{CapResolver, ExtensionInstance, PeerHandles, Scope, ScopeCtx, TurnCtx};
@@ -1696,8 +1697,31 @@ impl ExtensionHub {
             .and_then(|peer| peer.server_slot.get())
             .map(|server| Arc::downgrade(&server));
         let tools = tools.to_vec();
+        // The running agent's hosted identity, captured as the turn owner.
+        let agent = self
+            .peer_handles
+            .as_ref()
+            .and_then(|peer| peer.agent_index.find_by_name(&agent_name));
+        let declarations: HashMap<String, RegisteredSettingFields> = endpoints
+            .iter()
+            .filter_map(|(name, _)| {
+                self.registered_setting_fields(name)
+                    .map(|declaration| (name.clone(), declaration.clone()))
+            })
+            .collect();
         let work = async move {
             for (name, endpoint) in endpoints {
+                let declaration = declarations.get(&name);
+                let agent_settings = match declaration {
+                    Some(_) => match agent_layer(Some(&registry), agent.as_ref(), &name).await {
+                        Ok(settings) => settings,
+                        Err(error) => {
+                            warn!(extension = %name, %error, "Agent settings unavailable; skipping turn-complete endpoint");
+                            continue;
+                        }
+                    },
+                    None => serde_json::json!({}),
+                };
                 let turn = turn::TurnCompleteContext {
                     agent_name: &agent_name,
                     model: model.as_deref(),
@@ -1705,6 +1729,8 @@ impl ExtensionHub {
                     messages: &messages,
                     tools: &tools,
                     extension: &name,
+                    declaration,
+                    agent_settings,
                     db: &db,
                     registry: &registry,
                     backend: &backend,
