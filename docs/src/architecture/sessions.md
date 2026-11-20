@@ -587,39 +587,39 @@ keys, an HTTP peer pair and a Unix service. Run it from the workspace root:
 nix run .#test -- -E 'binary(provider_records)' --no-capture
 ```
 
-The proof uses native APIs in this order:
+The fixture checks both operating public keys against the expected Provider's
+settings at issuance. One key writes to the session through a direct grant,
+the other through a bounded `DelegatedTreeRef`. The probe checks historical
+authentication with `verify_entry_signature` and matches the signature to an
+operating key. A different session writer can copy the `provider` and `sender`
+fields and pass session verification, but that entry does not match either
+Provider key.
 
-1. Grant operating keys in a known Provider database, then grant a direct key
-   and a bounded `DelegatedTreeRef` on the session. Authenticate historical
-   entries with `verify_entry_signature`, then match their concrete signatures
-   against the known operating keys. A valid unrelated session writer can copy
-   `provider` and `sender` fields, but not either operating key's signature.
-2. Bootstrap the known Provider before the session, using
-   `sync_with_peer_for_bootstrap_with_key`. Later session entries can arrive
-   before a newer Provider grant. Missing proof leaves them Unverified;
-   an unsigned entry becomes Failed. Neither enters the selection probe.
-3. After acquiring the missing Provider bytes, call `verify()` and reconcile
-   from a fresh Verified `transaction_context`. Resolve the `records` store
-   frontier from that context before `get_store_entries`. Callback brackets
-   can include Failed/Unverified IDs, and later promotion can add no IDs at all;
-   neither brackets nor `ReadScope` on arbitrary raw tips are admission proof.
-4. Check current authority separately. Embedded `current_permission` uses
-   accepted state, not the old tips retained in the signing identity. On the
-   service, `begin_store_state_staging` exercises an actual Write-gated request;
-   the test immediately aborts the empty private cache build. Write is denied
-   after an accepted downgrade, and session Read is denied after revocation.
-   Signed-entry submission is historical-verification-gated, not a substitute
-   for this live permission check.
+The replica bootstraps the Provider before the session with
+`sync_with_peer_for_bootstrap_with_key`. A later session entry arrives before
+the Provider grant it depends on, so that entry stays `Unverified`. An unsigned
+entry becomes `Failed`. The write callbacks can report both IDs, but the
+verified view excludes both. Once the missing grant arrives, `verify()`
+promotes the delegated entry. A snapshot read can also retry verification.
+Promotion adds no IDs to the callback bracket. The probe instead takes a fresh
+`transaction_context` with `ReadScope::Verified` and passes the resulting store
+tips to `get_store_entries`. Passing `ReadScope::Verified` with arbitrary raw
+tips does not filter them.
 
-The selection probe records IDs only; it implements no Provider effects or
-production eligibility policy. The keys, Provider mapping and explicit Read
-actors are fixture inputs, not identity discovery or operator-only membership.
-An unsynchronized replica can still permit an operation using honestly stale
-accepted state. There is no globally latest-state or wall-clock revocation
-promise, automatic dependency acquisition, or concurrent-revocation policy.
-Historical authentication remains valid after current authority is lost.
-The service Write probe does not supply a delegated permission-query API or
-remove the observer guard.
+The probe returns entry IDs; it runs no Provider effects. Old entries still
+verify after revocation, but they do not grant current permission. The embedded
+test checks `current_permission()` against accepted state even when the acting
+identity retains its old delegation tips. The service test checks a real Write
+gate with `begin_store_state_staging` and aborts successful staging without
+publishing anything. After the replica accepts a downgrade, staging is denied
+but Read still works. After revocation, even the delegated Read is denied.
+Signed-entry submission checks historical verification, so it is not a stand-in
+for this Write gate. The delegated-service observer guard still applies.
+
+An unsynchronized replica can still grant Write from its stale accepted state.
+The test uses a known Provider, explicit reader keys and explicit sync; it does
+not define how to discover Providers, fetch dependencies automatically or settle
+concurrent authority changes. It makes no promise of global or timed revocation.
 
 ### Shared active-turn steering
 
