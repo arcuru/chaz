@@ -32,8 +32,9 @@ use tracing::{error, info, warn};
 mod activity_tests;
 mod agents;
 mod bridge_event;
+mod conversation;
 pub mod execution;
-mod history;
+pub(crate) mod history;
 pub mod jobs;
 mod keys;
 mod registry;
@@ -64,7 +65,13 @@ pub use transport::{
     session_attachment, transport_bindings, unbind_transport,
 };
 
-pub use history::{ContextGroup, HistoryOrigin, HistoryRead, SessionContextView, TranscriptRow};
+pub use conversation::{
+    CallId, CallInput, CallMessageBinding, ConversationError, ConversationInspection,
+    ConversationOriginals, FactId, Fidelity, ObservedBinding, RecordRef, RepresentationId,
+};
+pub use history::{
+    ContextGroup, HistoryGroup, HistoryOrigin, HistoryRead, SessionContextView, TranscriptRow,
+};
 
 /// Type of session entry. Participants (users and agents alike) write entries
 /// to a session. There is no user/agent distinction at the protocol level.
@@ -1010,11 +1017,11 @@ impl Session {
     pub async fn context_with_tool_history(
         &self,
     ) -> anyhow::Result<(Vec<SessionEntry>, Vec<Vec<TurnTranscriptRecord>>)> {
-        Ok(Self::history(&self.database)
+        Self::history(&self.database)
             .await?
             .context()
             .await?
-            .into_flat())
+            .into_flat()
     }
 
     /// Compatibility projection for flat callers. New selectors use grouped history.
@@ -1023,11 +1030,11 @@ impl Session {
         current: &TurnRequestId,
         is_agent: impl Fn(&str) -> bool + Sync,
     ) -> anyhow::Result<(Vec<SessionEntry>, Vec<Vec<TurnTranscriptRecord>>)> {
-        Ok(Self::history(&self.database)
+        Self::history(&self.database)
             .await?
             .turn_context(current, is_agent)
             .await?
-            .into_flat())
+            .into_flat()
     }
 
     /// Keep the current and still-queued requests visible at the exact snapshot.
@@ -1100,11 +1107,12 @@ impl Session {
     /// in memory. A write failure is returned rather than logged: callers
     /// awaiting it (tool approvals above all) must know it did not land.
     pub async fn add_entry(&mut self, entry: SessionEntry) -> anyhow::Result<TurnRequestId> {
-        let txn = self
-            .database
-            .new_transaction()
-            .await
-            .map_err(|e| anyhow::anyhow!("failed to create eidetica transaction: {e}"))?;
+        let txn = if conversation::contract::retained_control(&entry) {
+            // Stop/approval observations remain possible without an effective winner.
+            self.database.new_transaction().await?
+        } else {
+            Self::legacy_history_transaction(&self.database).await?
+        };
         let store = txn
             .get_store::<Table<SessionEntry>>(&self.store_name)
             .await
@@ -1143,7 +1151,7 @@ impl Session {
     /// together. An entry from a concurrent branch is not in the baseline and
     /// remains queued after the branches merge.
     pub async fn ensure_turn_schema_baseline(&self) -> anyhow::Result<()> {
-        let txn = self.database.new_transaction().await?;
+        let txn = Self::legacy_history_transaction(&self.database).await?;
         let meta = txn.get_store::<DocStore>(META_STORE).await?;
         if meta
             .get_string(TURN_SCHEMA_KEY)
@@ -1288,7 +1296,7 @@ impl Session {
     /// Repeating the same id with an identical payload is idempotent; changing
     /// the payload under that id is rejected.
     pub async fn submit_command(&self, request: SessionCommandRequest) -> anyhow::Result<()> {
-        let txn = self.database.new_transaction().await?;
+        let txn = Self::legacy_history_transaction(&self.database).await?;
         let store = txn
             .get_store::<Table<SessionCommandRequest>>(SESSION_COMMANDS_STORE)
             .await?;
@@ -1660,7 +1668,7 @@ impl Session {
             completed_at: Some(Utc::now()),
             ..attempt.clone()
         };
-        let txn = self.database.new_transaction().await?;
+        let txn = Self::legacy_history_transaction(&self.database).await?;
         if let Some(accepted) = crate::session::jobs::read_accepted_job(&self.database).await?
             && accepted.directive_id == attempt.request_id.as_str()
         {
@@ -1750,7 +1758,7 @@ impl Session {
         display_entries: Vec<SessionEntry>,
         branch: Option<&str>,
     ) -> anyhow::Result<()> {
-        let txn = self.database.new_transaction().await?;
+        let txn = Self::legacy_history_transaction(&self.database).await?;
         if let Some(branch) = branch {
             execution::transcript_in_txn(&txn, branch, &record).await?;
         }
@@ -1934,7 +1942,7 @@ impl Session {
     }
 
     async fn write_turn_attempt(&self, attempt: &TurnAttempt) -> anyhow::Result<()> {
-        let txn = self.database.new_transaction().await?;
+        let txn = Self::legacy_history_transaction(&self.database).await?;
         txn.get_store::<Table<TurnAttempt>>(TURN_ATTEMPTS_STORE)
             .await?
             .set(&attempt.attempt_id, attempt.clone())
@@ -1970,7 +1978,7 @@ impl Session {
         history: Vec<SessionEntry>,
         join_marker: (&str, &str),
     ) -> anyhow::Result<()> {
-        let txn = self.database.new_transaction().await?;
+        let txn = Self::legacy_history_transaction(&self.database).await?;
         let store = txn
             .get_store::<Table<SessionEntry>>(&self.store_name)
             .await?;
@@ -3123,7 +3131,7 @@ mod tests {
             .turn_context_view_at(db.snapshot().await.unwrap(), &new_id, |_| false)
             .await
             .unwrap();
-        let mut ids = view.groups.iter().map(ContextGroup::entry_id);
+        let mut ids = view.groups.iter().map(HistoryGroup::entry_id);
         assert_eq!(
             ids.find(|id| *id == Some(&summary_id)),
             Some(Some(&summary_id))

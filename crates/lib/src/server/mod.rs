@@ -2538,6 +2538,7 @@ impl Server {
             .registry
             .open_session_with_signer(session_db_id)
             .await?;
+        Session::require_legacy_history(&session_db).await?;
         let job_authority = if crate::session::jobs::is_job_session(&session_db).await {
             Some(
                 self.validate_accepted_job(&session_db)

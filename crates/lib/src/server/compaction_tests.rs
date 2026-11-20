@@ -231,6 +231,7 @@ async fn turn_context_keeps_only_current_and_queued_requests_past_a_summary() {
             .groups
             .iter()
             .find(|row| row.entry_id() == Some(id))
+            .and_then(|row| row.entry_group())
             .unwrap();
         assert!(group.protected && group.transcript.is_empty());
     }
@@ -242,6 +243,7 @@ async fn turn_context_keeps_only_current_and_queued_requests_past_a_summary() {
         .await
         .unwrap();
     assert!(view.groups.iter().zip(&pinned.groups).all(|(a, b)| {
+        let (a, b) = (a.entry_group().unwrap(), b.entry_group().unwrap());
         a.origin == b.origin && a.protected == b.protected && a.entry.content == b.entry.content
     }));
     assert_eq!(view.groups.len(), pinned.groups.len());
@@ -332,7 +334,7 @@ async fn native_compact_keeps_current_and_queued_requests_it_covered() {
         .await
         .unwrap();
     assert_eq!(
-        view.groups[0].origin,
+        view.groups[0].entry_group().unwrap().origin,
         Some(crate::session::HistoryOrigin::CompactCommand(
             command_id.to_string()
         ))

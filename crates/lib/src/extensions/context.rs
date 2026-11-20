@@ -8,7 +8,6 @@ use crate::{
         context_strategy::{ContextItem, ContextPlan, ContextStrategy, ContextStrategyCall},
         manifest::ExtensionManifest,
     },
-    session::EntryType,
 };
 use std::sync::Arc;
 
@@ -79,7 +78,7 @@ impl ContextStrategy for BaselineContext {
             let all: Vec<_> = ctx.groups().collect();
             let start = all
                 .iter()
-                .rposition(|group| *group.kind == EntryType::Summary)
+                .rposition(|group| group.positional_summary)
                 .unwrap_or(0);
             let candidates = &all[start..];
             let mut selected = Vec::new();
@@ -87,7 +86,7 @@ impl ContextStrategy for BaselineContext {
             let mut oldest_date = None;
             for group in candidates.iter().rev() {
                 let cost = ctx.cost(&ContextItem::Entry(group.index))?
-                    + if oldest_date == Some(group.date) {
+                    + if group.date.is_none() || oldest_date == group.date {
                         0
                     } else {
                         ctx.cost(&ContextItem::Date(group.index))?
@@ -97,7 +96,7 @@ impl ContextStrategy for BaselineContext {
                 }
                 tokens += cost;
                 selected.push(group);
-                oldest_date = Some(group.date);
+                oldest_date = group.date.or(oldest_date);
             }
             selected.reverse();
             plan.truncated = selected.len() < candidates.len();
@@ -119,10 +118,10 @@ impl ContextStrategy for BaselineContext {
             }
             let mut previous_date = None;
             for group in selected {
-                if previous_date != Some(group.date) {
+                if group.date.is_some() && previous_date != group.date {
                     plan.items.push(ContextItem::Date(group.index));
+                    previous_date = group.date;
                 }
-                previous_date = Some(group.date);
                 plan.items.push(ContextItem::Entry(group.index));
                 if let Some(item) = replay.remove(&group.index) {
                     plan.items.push(item);

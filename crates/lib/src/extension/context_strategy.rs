@@ -9,7 +9,7 @@ use super::{ExtensionHub, caps::CapFuture, projection::PROJECTOR_TIMEOUT, settin
 use crate::{
     cache::CacheOptions,
     context::ContextBuilder,
-    session::{ContextGroup, EntryType},
+    session::{EntryType, HistoryGroup},
 };
 use anyhow::Context;
 use eidetica::crdt::{Doc, doc::Value as NativeValue};
@@ -91,7 +91,9 @@ pub struct ScopedContext<'a> {
 pub struct ScopedGroup<'a> {
     pub index: usize,
     pub kind: &'a EntryType,
-    pub date: chrono::NaiveDate,
+    pub date: Option<chrono::NaiveDate>,
+    /// A legacy positional cutoff, never an explicit-target summary.
+    pub positional_summary: bool,
 }
 
 impl ScopedContext<'_> {
@@ -100,27 +102,31 @@ impl ScopedContext<'_> {
             .groups
             .iter()
             .enumerate()
-            .filter(|(_, group)| crate::context::is_context_entry(&group.entry))
-            .map(|(index, group)| ScopedGroup {
-                index,
-                kind: &group.entry.entry_type,
-                date: group.entry.timestamp.date_naive(),
+            .filter_map(|(index, group)| {
+                Some(ScopedGroup {
+                    index,
+                    kind: group.kind()?,
+                    date: group.date(),
+                    positional_summary: group.positional_summary(),
+                })
             })
     }
     /// Compatibility projection for strategies using entry indices.
     pub fn entries(&self) -> impl DoubleEndedIterator<Item = (usize, EntryType)> + '_ {
         self.groups().map(|group| (group.index, group.kind.clone()))
     }
-    pub(crate) fn group(&self, index: usize) -> anyhow::Result<&ContextGroup> {
+    pub(crate) fn group(&self, index: usize) -> anyhow::Result<&HistoryGroup> {
         self.builder
             .groups
             .get(index)
-            .filter(|group| crate::context::is_context_entry(&group.entry))
+            .filter(|group| group.kind().is_some())
             .ok_or_else(|| anyhow::anyhow!("foreign context entry"))
     }
     /// Date metadata of an eligible retained row, never the executor's clock.
     pub fn entry_date(&self, index: usize) -> anyhow::Result<chrono::NaiveDate> {
-        Ok(self.group(index)?.entry.timestamp.date_naive())
+        self.group(index)?
+            .date()
+            .ok_or_else(|| anyhow::anyhow!("context group has no recorded date"))
     }
     pub fn has_instructions(&self) -> bool {
         !self.system.is_empty()
