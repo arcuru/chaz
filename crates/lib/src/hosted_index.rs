@@ -17,9 +17,12 @@
 //! restarting. Cross-peer sync of *new* keys mid-runtime is not handled
 //! here — same gap as the prior `DbRegistry` mirror.
 
-use eidetica::AccountSession;
+use crate::agent_db::agent_db_name;
+use crate::db_kind::{KIND_AGENT, read_marker};
+use anyhow::{Context, ensure};
 use eidetica::auth::crypto::PublicKey;
 use eidetica::entry::ID;
+use eidetica::{AccountSession, Database};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -32,6 +35,8 @@ use tracing::{debug, info, warn};
 pub struct TargetedBuildStats {
     pub tracked_catalog_reads: usize,
     pub agent_database_opens: usize,
+    /// Roots checked under the requested agents' keys, but not loaded as agents.
+    pub non_agent_candidate_opens: usize,
 }
 
 /// One row in a hosted-DBs index. Same shape for agents and memory banks.
@@ -126,6 +131,22 @@ impl HostedIndex {
             .filter(|entry| entry.display_name == name)
             .cloned()
             .collect()
+    }
+
+    /// Bridge routing must not pick a winner between distinct roots sharing a name.
+    pub fn find_unique_by_name(&self, name: &str) -> anyhow::Result<Option<DbEntry>> {
+        let inner = self.inner.read().expect("HostedIndex lock poisoned");
+        let mut matches = inner
+            .by_id
+            .values()
+            .filter(|entry| entry.display_name == name);
+        let first = matches.next();
+        ensure!(
+            matches.next().is_none(),
+            "multiple hosted {} databases named {name:?}",
+            self.label
+        );
+        Ok(first.cloned())
     }
 
     pub fn find_by_pubkey(&self, pubkey: &PublicKey) -> Option<DbEntry> {
@@ -229,10 +250,10 @@ pub async fn build_from_user(
 /// session. Explicit agent references come from `SessionMeta`; `agent_names`
 /// are the configured defaults used when the session does not exist yet.
 ///
-/// Unlike [`build_from_user`], this never opens an unrelated tracked DB. A
-/// default agent name needs one read of the user's tracked-DB catalog to map
-/// its `agent:<name>` key to a DB id; selected-session references already carry
-/// their ids and skip even that catalog read.
+/// Unlike [`build_from_user`], this doesn't walk every tracked DB. Selected
+/// session references already carry their IDs. Default names use the tracked
+/// catalog to narrow the search to roots using the corresponding agent keys;
+/// the keys can also be used on sessions, so each candidate must be checked.
 pub async fn build_targeted(
     user: &AccountSession,
     explicit_agents: &[(ID, String)],
@@ -267,7 +288,7 @@ pub async fn extend_targeted(
     skill_banks: &HostedIndex,
 ) -> anyhow::Result<TargetedBuildStats> {
     let mut stats = TargetedBuildStats::default();
-    let mut targeted_agents = Vec::new();
+    let mut targeted_agents: Vec<(DbEntry, Database)> = Vec::new();
 
     for (db_id, display_name) in explicit_agents {
         if let Some(pubkey) = user.find_key(db_id)? {
@@ -276,8 +297,8 @@ pub async fn extend_targeted(
                 display_name: display_name.clone(),
                 pubkey,
             };
-            agents.register(entry.clone());
-            targeted_agents.push(entry);
+            let db = user.open_database_with_key(db_id, &entry.pubkey).await?;
+            targeted_agents.push((entry, db));
         }
     }
 
@@ -285,24 +306,47 @@ pub async fn extend_targeted(
         let tracked = user.databases().await?;
         stats.tracked_catalog_reads = 1;
         for name in agent_names {
-            let key_name = format!("agent:{name}");
-            let keys = user.find_keys_by_display_name(&key_name);
-            if let Some(td) = tracked.iter().find(|td| keys.contains(&td.key_id)) {
+            let db_name = agent_db_name(name);
+            let keys = user.find_keys_by_display_name(&db_name);
+            let mut selected = None;
+            for td in tracked.iter().filter(|td| keys.contains(&td.key_id)) {
+                let db = user
+                    .open_database_with_key(&td.database_id, &td.key_id)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "cannot resolve agent {name:?}: tracked database {} is unavailable",
+                            td.database_id
+                        )
+                    })?;
+                if db.get_name().await? != db_name {
+                    stats.non_agent_candidate_opens += 1;
+                    continue;
+                }
+                ensure!(
+                    read_marker(&db).await.is_some_and(
+                        |(kind, display_name)| kind == KIND_AGENT && display_name == *name
+                    ),
+                    "cannot resolve agent {name:?}: database {} has missing or conflicting agent metadata",
+                    td.database_id
+                );
+                ensure!(
+                    selected.is_none(),
+                    "multiple hosted agent databases named {name:?}"
+                );
                 let entry = DbEntry {
                     db_id: td.database_id.clone(),
                     display_name: name.clone(),
                     pubkey: td.key_id.clone(),
                 };
-                agents.register(entry.clone());
-                targeted_agents.push(entry);
+                selected = Some((entry, db));
             }
+            targeted_agents.extend(selected);
         }
     }
 
-    for entry in targeted_agents {
-        let db = user
-            .open_database_with_key(&entry.db_id, &entry.pubkey)
-            .await?;
+    for (entry, db) in targeted_agents {
+        agents.register(entry);
         stats.agent_database_opens += 1;
         let agent_db = crate::agent_db::AgentDb::from_database(db);
         for bank in agent_db.list_memory_banks().await.unwrap_or_default() {
@@ -337,6 +381,7 @@ pub async fn extend_targeted(
         skill_banks = skill_banks.len(),
         tracked_catalog_reads = stats.tracked_catalog_reads,
         agent_database_opens = stats.agent_database_opens,
+        non_agent_candidate_opens = stats.non_agent_candidate_opens,
         "Built targeted hosted indices"
     );
 
@@ -508,6 +553,115 @@ mod tests {
         assert!(agents.find_by_name("selected").is_some());
         assert_eq!(stats.tracked_catalog_reads, 1);
         assert_eq!(stats.agent_database_opens, 1);
+    }
+
+    #[tokio::test]
+    async fn targeted_default_keeps_matrix_binding_when_sessions_share_its_key() {
+        use crate::db_kind::{KIND_AGENT, KIND_SESSION, write_marker};
+        use crate::session::{EntryType, Session, SessionEntry, SessionRegistry};
+
+        let (instance, mut user) = fresh_user().await;
+        let pubkey = user.add_private_key(Some("agent:selected")).await.unwrap();
+        // AccountSession lists tracked DBs in root-ID order. Put a session
+        // before the owning agent under the same key, as can happen on adoption.
+        let mut pair = Vec::new();
+        for name in ["session:fixture-a", "session:fixture-b"] {
+            let mut settings = eidetica::crdt::Doc::new();
+            settings.set("name", name);
+            pair.push(user.create_database(settings, &pubkey).await.unwrap());
+        }
+        pair.sort_by_key(|db| db.root_id().to_string());
+        let [other, owner]: [_; 2] = pair.try_into().unwrap();
+        write_marker(&other, KIND_SESSION, "fixture").await.unwrap();
+        let txn = owner.new_transaction().await.unwrap();
+        txn.get_settings()
+            .unwrap()
+            .set_name("agent:selected")
+            .await
+            .unwrap();
+        txn.commit().await.unwrap();
+        write_marker(&owner, KIND_AGENT, "selected").await.unwrap();
+        let owner_id = owner.root_id().clone();
+        let agent = DbEntry {
+            db_id: owner_id.clone(),
+            display_name: "selected".into(),
+            pubkey,
+        };
+        let registry = SessionRegistry::new(instance, user, Arc::default())
+            .await
+            .unwrap();
+        let login = "@bot:example";
+        let room = "!room:example";
+        let (conv, established) = registry
+            .get_or_create_conversational_channel_session(&agent, login, "matrix", login, room)
+            .await
+            .unwrap();
+        let established_id = established.root_id().clone();
+        let mut session = Session::new(conv, established).await;
+        session
+            .add_entry(SessionEntry {
+                sender: "user".into(),
+                content: "synthetic prior history".into(),
+                timestamp: chrono::Utc::now(),
+                entry_type: EntryType::Directive,
+                metadata: None,
+                routing: None,
+            })
+            .await
+            .unwrap();
+        let original_count = registry.list_sessions().await.unwrap().len();
+
+        let defaults = ["selected".into()];
+        let (index, _, _, stats) = build_targeted(&*registry.user_lock().await, &[], &defaults)
+            .await
+            .unwrap();
+        let resolved = index.find_unique_by_name("selected").unwrap().unwrap();
+        // Use the same get-or-create path as startup backfill, not just an
+        // index assertion: a wrong root used to provision a second room DB.
+        let (_, routed) = registry
+            .get_or_create_conversational_channel_session(&resolved, login, "matrix", login, room)
+            .await
+            .unwrap();
+        assert_eq!(
+            routed.root_id(),
+            &established_id,
+            "restart replaced the room session; resolved owner was {} instead of {owner_id}",
+            resolved.db_id
+        );
+        assert_eq!(stats.agent_database_opens, 1);
+        assert_eq!(stats.non_agent_candidate_opens, 1);
+        assert_eq!(
+            registry.list_sessions().await.unwrap().len(),
+            original_count
+        );
+        let snapshot = routed.snapshot().await.unwrap();
+        let entries = Session::entries_at_snapshot(&routed, &snapshot)
+            .await
+            .unwrap();
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry.content == "synthetic prior history")
+        );
+
+        // A matching root with missing metadata is not a second viable owner.
+        // Do not fall through to another root when the actual owner is unreadable.
+        let mut user = registry.user_lock().await;
+        let mut settings = eidetica::crdt::Doc::new();
+        settings.set("name", "agent:selected");
+        let rival = user.create_database(settings, &agent.pubkey).await.unwrap();
+        let resolution = build_targeted(&user, &[], &defaults).await;
+        assert!(
+            matches!(resolution, Err(error) if error.to_string().contains("missing or conflicting agent metadata"))
+        );
+
+        write_marker(&rival, KIND_AGENT, "selected").await.unwrap();
+        let resolution = build_targeted(&user, &[], &defaults).await;
+        assert!(
+            matches!(resolution, Err(error) if error.to_string().contains("multiple hosted agent databases"))
+        );
+        let (full, _, _) = build_from_user(&user).await.unwrap();
+        assert!(full.find_unique_by_name("selected").is_err());
     }
 
     #[tokio::test]

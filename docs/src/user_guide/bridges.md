@@ -140,6 +140,13 @@ watchers, startup attachment work, and pending auto-joins before releasing the
 SDK client's store lease; the replacement client never bypasses that lock.
 Bad credentials or invalid configuration fail immediately.
 
+For Matrix, an existing room is looked up only among the sessions exposed by
+its owning Agent DB for that login. A session can use the same key as its owner,
+but it cannot act as the owner. If startup reports `multiple hosted agent databases`
+or missing owner metadata, check `/agent hosted` and the owning Agent DB ID
+before retrying. Restarting does not move or merge sessions that were previously
+created under the wrong database.
+
 ## Fresh-state service rehearsal (no automatic migration)
 
 1. Back up the old Chaz config and Eidetica/bridge state together; keep an

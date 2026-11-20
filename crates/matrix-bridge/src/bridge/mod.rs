@@ -115,10 +115,15 @@ impl MatrixBridge {
 }
 
 /// Resolve this login's owning agent to a [`DbEntry`] against the peer's agent
-/// index. `None` when the agent isn't hosted/synced yet — callers skip the
-/// session work rather than fork a session against a missing agent.
+/// index. Missing or ambiguous ownership cannot authorize room provisioning.
 fn owning_agent_entry(server: &Server, owning_agent: &str) -> Option<DbEntry> {
-    server.agent_index().find_by_name(owning_agent)
+    match server.agent_index().find_unique_by_name(owning_agent) {
+        Ok(entry) => entry,
+        Err(error) => {
+            error!(agent = owning_agent, "Cannot route Matrix login: {error}");
+            None
+        }
+    }
 }
 
 struct BackfilledRoom {
