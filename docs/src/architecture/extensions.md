@@ -1,12 +1,72 @@
 # Extension Framework
 
-Chaz's extension framework is the single surface for adding capabilities
-to an agent: tools, slash commands, lifecycle hooks, routine
-(cron / one-shot) handlers, and per-turn context augmentation all flow
-through it. The framework is built around a two-level model — a static
-**declaration** and a per-scope **runtime instance** — chosen so that
-sandboxed / WASM extensions land on the same shape as today's in-process
-Rust ones.
+The extension framework wires native Rust tools, commands, lifecycle hooks, routines and context endpoints. An extension declares what it can provide; instances publish the actual handlers. See the [operator guide](../user_guide/extensions.md) for built-ins, settings, and activation.
+
+## Author contract
+
+**Live** means dispatched in the current native build, not a stable plugin ABI. Use the public Rust traits in `chaz_core::extension` at the revision you build. Native extensions run as trusted code in the Chaz process. An endpoint's narrow input describes what the host supplies, not what arbitrary Rust in that process can access. Activation, manifests, model tool policy and host grants are separate controls.
+
+### Hooks and registrations
+
+The six drained lifecycle hooks below run inline, in Global registration order, and skip owners outside the hook context's active set. Instance handlers implement `extension::handler::HookHandler*`; the drain adapters consume `HookContext` for dispatch but do not pass it to these handlers. Do not use this API to await UI input. The drain adds no general per-hook timeout or stop polling; notification and result hooks catch panics while polling their futures, not necessarily while constructing them.
+
+| Endpoint / `HookKind`                          | When and in what order                                                                                                                                    | Input → result                                                                                 | Scope, permission and failure                                                                                                                                                                                                                      |
+| ---------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `session_start_hook` / `SessionStart`          | Executor registration, after activation is recorded/refreshed and before the watcher/catch-up starts                                                      | No arguments → `()`                                                                            | Global, active owner. Polling panic logged; this isn't an event on every frontend open.                                                                                                                                                            |
+| `before_agent_start_hook` / `BeforeAgentStart` | After initial context assembly, before the first model request on a fresh tool-capable path; not on checkpoint resume or the no-tools fallback            | No arguments → `Vec<RuntimeMessage>` appended in handler order                                 | Global, active owner. Polling panic discards that handler's messages. Injections are request context, not new session entries.                                                                                                                     |
+| `tool_call_hook` / `ToolCall`                  | After applicable approval and before executing an eligible tool; mutations flow to later handlers                                                         | Tool name, mutable JSON arguments → `Continue` or `Block { reason }`                           | Global, active owner. First block or panic stops the chain and blocks the call. The recorded model call retains original arguments. Current tool visibility and host grants still apply to execution.                                              |
+| `tool_result_hook` / `ToolResult`              | After successful tool execution, before output leak scanning; each handler receives the previous result                                                   | Tool name, output string → replacement string                                                  | Global, active owner. Polling panic keeps the previous string. Not called for a denied, timed-out, or failed tool.                                                                                                                                 |
+| `turn_complete_hook` / `TurnComplete`          | Enqueued on successful runtime completion before `AgentEnd`; background work serialized per session, then sorted by extension name within the observation | [`TurnCompleteContext`](#successful-turn-observation) → success/error, no replacement response | Global, Agent or Session instance; requires the manifest declaration and rechecks keys and activation. Errors/panics/15-second deadline isolate the endpoint. Originating stop or shutdown cancels the observation.                                |
+| `agent_end_hook` / `AgentEnd`                  | Awaited on successful completion or stop of a running turn, not a guaranteed cleanup hook on errors or unloaded waits                                     | No arguments → `()`                                                                            | Global, active owner; polling panic logged. The reply waits for this hook, not for auxiliary `TurnComplete` work.                                                                                                                                  |
+| `session_shutdown_hook` / `SessionShutdown`    | Explicit executor deregistration, after pending successful-turn observations for that session are cancelled and joined                                    | No arguments → `()`                                                                            | Global, active owner; polling panic logged. Not a process-exit guarantee and does not evict the instance.                                                                                                                                          |
+| `tools` / `Tool`                               | Global registration installs definitions; the runtime invokes the tool only when allowed                                                                  | Tool descriptor plus `ToolContext` and JSON arguments at invocation → tool result/error        | Global, owner-attributed. Session/agent activation, scoped tool visibility, approval, host grants, runtime timeout and cancellation still apply.                                                                                                   |
+| `commands` / `Command`                         | Global registration; invoked by the transport-neutral command dispatcher when the user submits the command                                                | Trimmed argument string and `HookContext` → `Text` or `Error`                                  | Global, active owner. Built-in command names are reserved; extension duplicates are first-write-wins. No arbitrary UI callbacks or session-switch return. Client roles install Global command providers only.                                      |
+| `routine_handler` (not a `HookKind`)           | On a due fire, awaited serially by the routine engine; it handles rescheduling and failure accounting                                                     | Extension-defined JSON payload → `Result<()>`                                                  | Global endpoint. Global/session/agent routine storage scope is for the engine, not an instance scope or a grant. Fires bypass the session active set. Errors count toward auto-disable. No generic handler timeout or panic isolation at dispatch. |
+
+Declare supported hook kinds consistently on the factory and in its manifest. The declaration lets the host validate and inspect the catalog and select paths such as command-only install or `TurnComplete`. It is not a sandbox permit: the executor's Global drain registers the slots actually returned by the instance.
+
+### Context and capability endpoints
+
+For composed instances, a session instance wins over an agent instance of the same name, which wins over Global when Global is eligible. Manifest `required_capabilities` and `requested_capabilities` are descriptive, not automatically satisfied imports or runtime grants. The host rejects a host-only capability in `provides_capabilities`.
+
+| Owner / API                                                                                | Status and scope                                                        | Input, result, timing and authority                                                                                                                                                                                                                                                                                                                 |
+| ------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Host: `SessionRead`, `SessionWrite`, `Settings`, `ToolRegistration`, `CommandRegistration` | Structural vocabulary, not callable capability handles                  | Session access comes from the relevant context; tools and commands publish through `ExtensionInstance`. Settings use the host/context operations, not an imported `Settings` trait.                                                                                                                                                                 |
+| Host: `AgentStateAdmin`                                                                    | Callable scoped interface; used by schedule tools                       | Opens permitted agent state under the caller's actual identity and `agent_state_allowlist`, not a manifest's requested `agents` list.                                                                                                                                                                                                               |
+| Extension: `prompt_augmentation`                                                           | Live, Agent/Session only                                                | Agent name, recent text and available tools → optional system text during assembly. Active owners in name order; no general panic/timeout wrapper here, and errors/empty results add nothing.                                                                                                                                                       |
+| Extension: `context_tail`                                                                  | Live, Agent/Session only                                                | `ContextTailCall` with agent/session/request identity and recent text → optional tail in name order. Requires declaration and current activation; errors, panic and timeout omit the tail.                                                                                                                                                          |
+| Extension: `context_strategy`                                                              | Live, composed scope, required                                          | Scoped read-only context, settings, identity and budget → `ContextPlan`. Must match the selected `context_strategy` and be declared and active. Invalid plan, missing provider, error, panic or timeout refuses dispatch. See [Required selection](#required-selection-and-typed-recall).                                                           |
+| Extension: `context_projector`                                                             | Live, composed scope, explicit grant                                    | `ProjectionCall` and request copy → replacement model-facing request before each logical call. Conversation grants before full-context grants, each in configured order. Optional failure keeps the previous accepted request; required failure stops the call. No permission or transcript changes. See [Context projection](#context-projection). |
+| Extension: `durable_context_contributor`                                                   | Live, composed scope, explicit grant                                    | Scoped selected rows, own state and contributions → batch of conversation text and optional next state before assembly. Host commits and reuses the request receipt; optional failed batches are discarded, while required failure or unreadable state stops dispatch. See [Durable context contributions](#durable-context-contributions).         |
+| Extension: `status_segment`                                                                | Live, composed scope                                                    | Agent name → keyed text for frontend display. Refreshed inline on registration/turn assembly and persisted by the host under the publisher's name. Not a model hook; the status refresh does not use the turn's active set.                                                                                                                         |
+| Extension: `memory_access`, `messenger`, `extension_cap(TypeId)`                           | Callable through native resolver; no production caller of that resolver | Instances can publish a typed endpoint. This does not automatically install a tool, route a message, or grant access. Shipped memory tools and bridge routing use their own host paths.                                                                                                                                                             |
+| Instance `shutdown`, external refs and sandbox loading                                     | Reserved / unwired                                                      | No eviction or `shutdown()` invocation, no Git/IPLD/Eidetica extension loader and no WASM plugin runtime. Existing Global hook lifecycle notifications do not imply instance teardown.                                                                                                                                                              |
+
+### Run a minimal extension
+
+Start with the built-in [`path_normalizer`](https://github.com/arcuru/chaz/blob/main/crates/lib/src/extensions/path_normalizer.rs). It has one Global instance, declares `ToolCall`, and exposes one handler that normalizes filesystem `path` arguments. It does not own any tools, ask for capability handles, access the filesystem itself or grant authority to a tool. `all_builtins` wires it in; no plugin loader or config stanza is needed. For a new built-in, follow the same factory → instance → endpoint pattern and add the factory to `all_builtins`.
+
+1. From the repository root, run its handler tests without a model or credentials:
+
+   ```bash
+   nix run .#test -- -E 'test(extensions::path_normalizer::tests)'
+   ```
+
+2. In a disposable local setup from [Getting Started](../user_guide/getting_started.md), write a scratch file and ask the model to read it with a trailing slash. If it emits that `read_file` argument and the host allows the read, the hook strips the slash and the tool returns `extension demo`. The hook leaves root `/` and non-filesystem calls alone.
+
+   ```bash
+   printf 'extension demo\n' > sample.txt
+   chaz --config config.yaml --session extension-demo -p "Test the filesystem extension: call read_file with $PWD/sample.txt/ exactly."
+   ```
+
+3. Disable the hook (not the filesystem tool), inspect the session's effective state, and repeat using the same tool argument:
+
+   ```bash
+   chaz --config config.yaml cmd --session extension-demo '/extensions remove path_normalizer'
+   chaz --config config.yaml cmd --session extension-demo '/extensions list'
+   ```
+
+   The list now shows `path_normalizer` without the `✓` marker. With the same trailing slash, Linux reports `Tool error: Failed to read file: Not a directory (os error 20)` instead of the file contents. Restore normal behavior with `chaz --config config.yaml cmd --session extension-demo '/extensions add path_normalizer'`. A model may correct a bad path on its own, so inspect its original tool call and the first tool result, not just the final response. Use a local stub for deterministic testing.
 
 ## Two-level model
 
@@ -29,8 +89,8 @@ trait Extension: Send + Sync {
     fn manifest(&self) -> ExtensionManifest;      // identity + cap contract
 
     fn scopes(&self) -> &[Scope] { &[Scope::Global] }  // where it lives
-    async fn instantiate(&self, ctx: ScopeCtx)         // build a runtime view
-        -> anyhow::Result<Arc<dyn ExtensionInstance>>;
+    fn instantiate<'a>(&'a self, ctx: ScopeCtx<'a>)
+        -> InstantiateFuture<'a>;
 }
 ```
 
@@ -42,11 +102,11 @@ it once per scope and the resulting instance says _what_ it contributes.
 `Scope` (`instance.rs`) has three values, each with its own lifecycle and
 its own instance map on the hub:
 
-| Scope        | Instances     | Keyed by                   | Populated              | Torn down            |
-| ------------ | ------------- | -------------------------- | ---------------------- | -------------------- |
-| `Global`     | 1 per peer    | extension name             | end of `install_all`   | never (process life) |
-| `PerAgent`   | 1 per agent   | `(agent_db_root_id, name)` | lazily, first turn     | never (cached)       |
-| `PerSession` | 1 per session | `(session_db_id, name)`    | lazily, first dispatch | never (cached)       |
+| Scope        | Instances     | Keyed by                   | Populated              | Eviction |
+| ------------ | ------------- | -------------------------- | ---------------------- | -------- |
+| `Global`     | 1 per peer    | extension name             | end of `install_all`   | none     |
+| `PerAgent`   | 1 per agent   | `(agent_db_root_id, name)` | lazily, first turn     | none     |
+| `PerSession` | 1 per session | `(session_db_id, name)`    | lazily, first dispatch | none     |
 
 An extension that contributes at multiple scopes returns each scope in
 the slice (e.g. `memory` and `skills` are `[Global, PerSession]` — Global
@@ -68,7 +128,7 @@ memory-bank / skill-bank), the embedder, the secret store, the
 `server_cell` back-reference, and the operator `agent_state` allowlist.
 
 There is **no teardown or eviction** for any scope today. Instances are
-cached for the process lifetime. `ExtensionInstance::shutdown()` exists
+cached for the lifetime of the hub. `ExtensionInstance::shutdown()` exists
 on the trait but is never triggered; `session_shutdown` _hooks_ fire but
 do not drop the session's instance.
 
@@ -91,27 +151,6 @@ Per-agent resolution at turn time goes through
 open when no extension opts in. Both helpers no-op when `peer_handles`
 isn't wired (isolated unit tests), so those extensions simply don't
 instantiate there.
-
-## ExtensionInstance endpoints
-
-What an instance exposes back to the host (`instance.rs`). All default to
-empty / `None`:
-
-- **Tools** — `tools() -> Vec<Arc<dyn Tool>>`
-- **Commands** — `commands() -> Vec<(String, Arc<dyn ExtensionCommand>)>`
-- **Per-turn context** — `prompt_augmentation()`, `context_tail()`
-- **Per-model-call projection** — `context_projector()`; invoked only for
-  operator-granted extensions (see [Context projection](#context-projection))
-- **Durable context** — `durable_context_contributor()`; commits intentional
-  text/state before assembly (see [Durable context contributions](#durable-context-contributions))
-- **Extension-to-extension caps** — `memory_access()`, `messenger()`,
-  and the TypeId-keyed escape hatch `extension_cap(type_id)`
-- **Hook handlers** — `before_agent_start_hook()`, `tool_call_hook()`,
-  `tool_result_hook()`, `agent_end_hook()`, `session_start_hook()`,
-  `session_shutdown_hook()`, `turn_complete_hook()`
-- **Selection** — `context_strategy()` (required operator-selected endpoint)
-- **Routine** — `routine_handler()`
-- **Lifecycle** — `shutdown()` (async; not yet triggered)
 
 ## Two dispatch paths
 
@@ -136,8 +175,7 @@ into the hub's legacy registries:
 The runtime's `fire_<kind>` paths then iterate those owner-tagged
 vectors. **Per-agent and per-session instances are not drained** — tools,
 commands, and hooks from non-Global scopes are not wired into dispatch
-yet (see _Deferred_). Only the per-turn context and cap endpoints flow
-from non-Global instances.
+through this path. Scoped instances may still publish live endpoints such as context contributors, status, and `TurnComplete`.
 
 ### 2. Live-instance path (per-turn)
 
@@ -214,59 +252,11 @@ The built-in `session_naming` demonstrates this API with a persisted one-attempt
 
 ## Hook kinds
 
-Every registration is tagged with a `HookKind`, and every extension
-declares in `supported_hooks()` which kinds it intends to use:
-
-```rust,ignore
-enum HookKind {
-    BeforeAgentStart, ToolCall, ToolResult, AgentEnd, TurnComplete,
-    SessionStart, SessionShutdown,
-    Tool, Command,
-}
-```
-
-Declaration drives security (only declared kinds run; for sandboxed
-extensions this becomes the manifest the host inspects before loading),
-efficiency (the hub skips extensions that don't handle a kind), and
-inspection (`/extensions list`).
-
-`tool_call` handlers run in registration order and may mutate arguments.
-The first `Block`, or a panic while constructing or polling a handler, stops the remaining decision hooks and blocks execution.
-On panic, the runtime records the existing `Blocked` result with the extension's name and hook kind; partially mutated arguments are never executed.
-The recorded model request retains its original arguments.
-This does not change notification/result-hook defaults or move the unconditional approval and grant checks.
+Declare the kinds your extension supplies in `supported_hooks()` and the manifest. See [Hooks and registrations](#hooks-and-registrations) for the current dispatch and failure behavior.
 
 ## Capabilities
 
-Caps are the typed services that cross the extension boundary
-(`caps.rs`). They return plain data over `CapFuture<'a, T>` — the seam
-that lets the same shape cross a sandbox boundary later. `CapabilityKind`
-splits them into two ownership groups (`CapabilityKind::is_host_only` is
-authoritative):
-
-- **Host-only** — provided by chaz core; an extension can't publish its
-  own, and a host-only kind in a manifest's `provides_capabilities` is a
-  validation error. The one live host-only cap trait is `AgentStateAdmin`
-  (scoped agent-DB access for the schedule tools, via
-  `ScopedAgentStateAdmin`). The remaining host-only `CapabilityKind`s
-  (`SessionRead`/`SessionWrite`/`Settings`/`ToolRegistration`/
-  `CommandRegistration`) are **declaration vocabulary only** — extensions
-  reach their session and publish tools/commands structurally through the
-  instance model (`ExtensionInstance` endpoints + `ScopeCtx`), not through
-  a cap handle.
-- **Extension-providable** — `Messenger`, `MemoryAccess`,
-  `PromptAugmentation`, `ContextTail`, `StatusSegment`,
-  `ContextProjection`, `DurableContext`. Published by an instance through
-  its endpoints; `PromptAugmentation`/`ContextTail` are consumed directly
-  by context assembly, `Messenger`/`MemoryAccess` are resolvable through
-  the `CapResolver` (no consumer yet). The host invokes context projectors
-  and durable contributors only when the manifest provides the capability
-  **and** the operator granted the extension.
-
-Required/requested capability declarations remain descriptive: nothing
-refuses to load an extension whose `required_capabilities` are absent,
-and `AgentStateAdmin { agents }` is not the live scope source
-(`agent_state_allowlist` is).
+See [Context and capability endpoints](#context-and-capability-endpoints) for the host-only/extension-provided split. `CapabilityKind::is_host_only` in `caps.rs` is the source of truth.
 
 ## Context projection
 
@@ -575,80 +565,11 @@ under the same role, rather than upgrading a client hub to execution authority.
 
 ## Built-in extensions
 
-| Extension           | Scopes                 | Declared hooks    | Routine | What it provides                                                            |
-| ------------------- | ---------------------- | ----------------- | ------- | --------------------------------------------------------------------------- |
-| `baseline_context`  | `Global`               | —                 | —       | Required scoped context selection and default cache options                 |
-| `core`              | `Global`               | `Tool`            | —       | `shell`, `compact`, `spawn_agent`, `job_status`, `job_wait`, `spawn_worker` |
-| `fs`                | `Global`               | `Tool`            | —       | `read_file`, `write_file`, `edit_file`                                      |
-| `system`            | `Global`               | `Tool`            | —       | `get_time`, `calculate`, `describe_tool`                                    |
-| `web`               | `Global`               | `Tool`            | —       | `web_fetch`, `web_search`                                                   |
-| `context`           | `Global`, `PerSession` | `Command`         | —       | `/context` + one-shot per-session context tail carrying the snapshot        |
-| `memory`            | `Global`, `PerSession` | `Tool`, `Command` | —       | memory tools + `/memory` + per-session recall context tail                  |
-| `skills`            | `Global`, `PerSession` | `Tool`, `Command` | —       | skill tools + `/skills` + prompt augmentation                               |
-| `schedule`          | `Global`               | `Tool`, `Command` | yes     | schedule tools + `/schedule`                                                |
-| `agent_schedule`    | `Global`               | —                 | yes     | routine handler for agent-owned schedule fires                              |
-| `path_normalizer`   | `Global`               | `ToolCall`        | —       | strips trailing `/` from filesystem-tool path args                          |
-| `session_naming`    | `Global`               | `TurnComplete`    | —       | Opt-in, one-shot naming via a bounded auxiliary completion                  |
-| `security_warnings` | `Global`               | `ToolResult`      | —       | logs prompt-injection patterns in tool output                               |
-
-The `context` diagnostic command stores the latest snapshot per agent in
-`context_reports` on the session DB. Its per-session tail records the delivered
-report ID in a separate `context_report_deliveries` store, so an acknowledgement
-cannot overwrite a newer report. Session/agent activation filters delivery.
-The tail opens the registry's current authorized session handle each time;
-retaining a handle across turns would also retain its pinned delegation identity.
-`Server::context_budget` exposes existing budget resolution with provenance; it
-does not fetch model information or change runtime budgets. The required
-`baseline_context` strategy remains separate from this optional diagnostic tail.
-
-MCP servers are data-driven, not compile-time: `main.rs` pushes one
-`McpExtension` (`Global`) per configured server, sharing the same
-lifecycle. All built-ins are in the default-active set for new sessions
-("default = everything"); users disable individual ones per session via
-`/extensions remove`.
+See the [operator catalog](../user_guide/extensions.md#built-in-extension-catalog) for built-ins and configured MCP servers. `all_builtins` in `crates/lib/src/extensions/mod.rs` is the native inventory.
 
 ## Adding a new extension
 
-1. Create `crates/lib/src/extensions/my_ext.rs` implementing `Extension`:
-   - return your hook kinds from `supported_hooks()` and build a
-     matching `manifest()`;
-   - declare your `scopes()` (default `[Global]`);
-   - implement `instantiate(ctx)` to return an `ExtensionInstance` that
-     overrides the endpoints you contribute — `tools()`, `commands()`,
-     the `*_hook()` slots, `prompt_augmentation()` / `context_tail()`,
-     `context_projector()`, `memory_access()` / `messenger()`,
-     `routine_handler()`.
-2. Add the module to `crates/lib/src/extensions/mod.rs` and the constructor to the
-   `all_builtins` vec. If it needs shared deps (session registry, agent
-   index, embedder, …), add them to `BuiltinDeps` and thread through
-   `main.rs`.
-3. (Optional) Override `extension_ref()` if the extension's identity
-   isn't `Builtin` — e.g. when implementing a loader for git / IPLD /
-   eidetica refs.
-
-The framework attributes everything the Global instance publishes,
-filters by per-session (and per-agent) active set, and surfaces
-inspection via `/extensions list`. No additional plumbing in `main.rs`
-or the runtime.
-
-## Deferred / reserved
-
-- **Non-Global tools & commands** — instances at `PerAgent` /
-  `PerSession` scope can publish `prompt_augmentation` / `context_tail` /
-  caps, but their `tools()` / `commands()` are not yet wired into
-  dispatch (only Global instances are drained). This waits on
-  dispatch-time tool scoping.
-- **Instance teardown** — `ExtensionInstance::shutdown()` and eviction
-  are unimplemented; instances live for the process. `session_shutdown`
-  _hooks_ fire but don't drop instances.
-- **Non-builtin loading** — only `ExtensionRef::Builtin` is produced.
-  `Eidetica` / `Ipld` / `Git` and a filesystem path are reserved for
-  loader paths that don't exist yet.
-- **WASM / sandboxed extensions** — the real execution mechanism for
-  non-builtin extensions. The whole framework was shaped for it: a
-  declared scope + manifest the host inspects before loading, typed
-  endpoints, and caps returning plain data over `CapFuture` so the same
-  handler shape works across a sandbox boundary.
+See [Run a minimal extension](#run-a-minimal-extension). If the extension needs peer-wide dependencies not already carried by `ScopeCtx`, wire them through `BuiltinDeps` and the server builder. Non-Global tools, commands and the six drained hooks are not dispatched. Instance eviction and non-builtin loaders are not implemented.
 
 ## Durable context contributions
 

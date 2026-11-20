@@ -241,8 +241,8 @@ The user-facing vocabulary is unified on one word: **`schedule`**. The
 `/schedule` command, the `schedule` extension, and the YAML `schedules:`
 key are all the same word. "Timer"/"heartbeat" are retired (a timer
 connotes a countdown alarm; this is a recurring or future invocation of
-an agent — a schedule). See the
-[post-merge gap tracker](../../../../brain/tech/projects/chaz/post-merge-gaps.md).
+an agent — a schedule). For current commands, see
+[Schedules](../user_guide/agents.md#schedules).
 
 ## Open Questions
 

@@ -15,14 +15,14 @@ runtime, then rebuild hooks and reconcile durable request state.
 
 ```mermaid
 graph TD
-    subgraph Bridges
-        MG[MatrixBridge]
-        TG[TuiBridge]
+    subgraph "Frontends and transports"
+        MG[Matrix or Discord bridge]
+        TG[Local TUI or CLI]
     end
 
     subgraph Server
         SV[Server<br/>on_write callbacks]
-        SR[SessionRegistry<br/>indices: sessions, session_names]
+        SR[SessionRegistry<br/>peer-local routing and catalog]
     end
 
     subgraph "Agent Runtime"
@@ -35,8 +35,8 @@ graph TD
         EI[(Per-session DBs<br/>entries + meta)]
         LA[(Living Agent DBs<br/>config, memory, meta, history)]
         MB[(Memory Bank DBs<br/>shared memory)]
-        CG[(chaz_group DB<br/>peer-local: sessions, session_names)]
-        CP[(chaz_peer DB<br/>peer-local: credentials,<br/>routines, schedule_state)]
+        CG[(chaz_group DB<br/>peer-local: routing, names, catalog)]
+        CP[(chaz_peer DB<br/>peer-local: credentials,<br/>defaults, schedule state)]
         HI[HostedIndex<br/>in-memory cache<br/>built from user.databases]
     end
 
@@ -57,28 +57,27 @@ graph TD
     HI -.->|classify by meta.kind| MB
 ```
 
-**Three peer-local layers, none synced:** `user.databases()` (eidetica's catalog of every DB this peer holds keys for) is the source of truth for "which DBs do we host"; `HostedIndex` is an in-memory cache derived from it at startup; `chaz_group` holds session/name indices; `chaz_peer` holds credentials and cron/schedule state. Sync-ful state lives in per-session, per-agent, and per-bank DBs.
+**Three peer-local layers, none synced:** `user.databases()` (eidetica's catalog of every DB this peer holds keys for) is the source of truth for "which DBs do we host"; `HostedIndex` is an in-memory cache derived from it at startup; `chaz_group` holds local routing, name indices and the session catalog; `chaz_peer` holds credentials, peer defaults and runtime bookkeeping. Sync-ful state lives in per-session, per-agent, and per-bank DBs.
 
 ## Key Components
 
 ### Bridges
 
-Bridges translate between a transport (Matrix, terminal) and the session database. They:
+Clients and transport bridges exchange messages through session databases. They:
 
 - Write user messages as `SessionEntry` records to the session DB
 - Register `on_write` callbacks to detect agent responses
 - Deliver responses to their transport
 
-Bridges are transport-specific but the server is transport-agnostic. Adding a new bridge (Slack, Discord, HTTP API) requires implementing the `Bridge` trait and writing/reading session entries.
+Matrix and Discord are separate binaries. Local TUI and CLI live in the main binary. Transport adapters use the session attachment and reply-routing contract, not a UI callback from agent code.
 
-**Design stance — a bridge is a transport, not a CLI mode.** Matrix in particular is "expose this session to a room," not "run chaz in matrix mode." That framing has two consequences:
+**Design stance — a bridge is a transport, not a CLI mode.** Matrix in particular is "expose this session to a room," not "run chaz in matrix mode."
 
-- The CLI surface picks how this process is driven, and nothing else. `chaz` opens the TUI; `-p` runs one turn and exits; `cmd` runs one `/command` and exits; `daemon` runs the peer with no user interface at all, for systemd, containers, and tests that cannot supply the TTY the TUI's raw mode needs. Transport bridges are not modes here — they are separate binaries (`chaz-matrix`, `chaz-discord`) running independently. Direct-owner bridges hold their own keys and reach an agent's database through an access ticket; service-client bridges share the Eidetica daemon's login and do not use tickets. A bridge and a TUI can be up at once, driving the same hosted session through sync or the shared service. One bridge process serves each login, and a login belongs to exactly one agent, declared in that agent's `type`-tagged `logins:` list.
-- Future bridges (HTTP, Slack, …) follow the same rule: their presence in config means "this session is reachable via that transport," not "chaz runs in _that_ mode." `chaz` the binary is always a TUI on a terminal first.
+The CLI surface picks how this process is driven, and nothing else. `chaz` opens the TUI; `-p` runs one turn and exits; `cmd` runs one `/command` and exits; `daemon` runs the peer with no user interface at all, for systemd, containers, and tests that cannot supply the TTY the TUI's raw mode needs. Transport bridges are not modes here — they are separate binaries (`chaz-matrix`, `chaz-discord`) running independently. Direct-owner bridges hold their own keys and reach an agent's database through an access ticket; service-client bridges share the Eidetica daemon's login and do not use tickets. A bridge and a TUI can be up at once, driving the same hosted session through sync or the shared service. One bridge process serves each login, and a login belongs to exactly one agent, declared in that agent's `type`-tagged `logins:` list.
 
-**Multi-agent rooms under the login model (interim).** A login is one agent's real Matrix account, so a room is owned by exactly one login/agent. When other agents participate in that room (e.g. a human `@mention`s one, or the host routes to a guest), their messages egress through the owning agent's single MXID, prefixed `[AgentName]` so readers can tell speakers apart; the owning agent speaks plain. This is the best a normal login can do — one account can only present as itself. It has two known sharp edges: (1) `/agent host` can point the default responder at a non-owner agent, which then answers `[prefixed]` through the owner's MXID — keep host = owner to avoid the confusing mismatch; (2) joining two chaz logins into the _same_ room gives each its own per-`(login_id, room)` session, i.e. parallel conversations — don't; use one login per room plus `@mention` for guests. The clean fix is native per-agent identity via a Matrix **application-service / puppeting gateway** (one connection, a `@chaz_*` ghost user per agent, no prefix hack, no split-brain). That requires a homeserver you administer and a from-scratch AS integration (ruma appservice API + inbound transaction endpoint), so it lands later as its own bridge type — not a change to the login bridge.
+**Multi-agent rooms under the login model (interim).** A login is one agent's real Matrix account, so a room is owned by exactly one login/agent. When other agents participate in that room (e.g. a human `@mention`s one, or the host routes to a guest), their messages egress through the owning agent's single MXID, prefixed `[AgentName]` so readers can tell speakers apart; the owning agent speaks plain. This is the best a normal login can do — one account can only present as itself. It has two known sharp edges: (1) `/agent host` can point the default responder at a non-owner agent, which then answers `[prefixed]` through the owner's MXID — keep host = owner to avoid the confusing mismatch; (2) joining two chaz logins into the _same_ room gives each its own per-`(login_id, room)` session, i.e. parallel conversations — don't; use one login per room plus `@mention` for guests. Chaz does not provide a separate Matrix identity for each agent in this layout.
 
-**Source**: `crates/bin/src/bridge/` (TUI: `tui/mod.rs`, Matrix: `matrix/mod.rs`, CLI: `cli.rs`)
+**Source**: `crates/bin/src/bridge/` (TUI and CLI), `crates/matrix-bridge/` and `crates/discord-bridge/`
 
 ### TUI backend boundary
 
@@ -158,7 +157,7 @@ external effects. See [Session Model](sessions.md#durable-turn-recovery).
 
 ### Agent configuration: accepted bundle and local projection
 
-Agent configuration is synchronized data with an explicit filesystem editing interface. It is separate from session history and from peer/provider configuration in the global YAML. The [operator guide](../user_guide/agents.md#yaml-seeds-the-agent-db-decides) gives the editing procedure; the implementation has three boundaries:
+Agent configuration is synchronized data with an explicit filesystem editing interface. It is separate from session history and from peer/provider configuration in the global YAML. The [operator guide](../user_guide/agents.md#the-agent-db-decides) gives the editing procedure; the implementation has three boundaries:
 
 1. **One coherent DB value.** `AgentDbConfig` stores typed settings and `PromptSources` in the same serialized value in the Agent DB's `config` DocStore. A read cannot combine a setting from one committed revision with source text from another. The bundle retains individual normalized relative paths and UTF-8 texts, not just an assembled prompt or a pointer into unsynchronized `chaz_peer` storage. Parent and worker runtime prompts are derived from this accepted snapshot. Extension prompt augmentation remains a later context-assembly step.
 2. **One trusted update path.** `server/agent_config.rs` serializes each agent's operator updates, explicit imports and projection. Scalar/inline edits reuse accepted source texts; only an explicit source-list import or full folder reload reads files. `AgentDocument` defines the replacement scope, excluding identity, bookkeeping and unrelated resource state. Reload parses/validates metadata, nested fields and every referenced source before the DB write. Key/ownership and attenuation checks remain in place; the model query surface gains no mutating command.
@@ -185,7 +184,7 @@ The ReAct loop (`runtime::execute`) drives agent reasoning:
 1. Build context from session history
 2. Call LLM with tool definitions
 3. If the LLM returns tool calls: check approval, execute with timeout, scan for leaks, feed results back
-4. If the LLM returns text: return as the agent's response; otherwise repeat from step 2 (there is no iteration cap)
+4. On a final response, complete the turn; otherwise continue the tool loop subject to cancellation and runtime guards
 
 The runtime emits `RuntimeEvent`s (ToolCall, ToolResult) via an optional event sink for audit trail logging.
 
@@ -201,7 +200,7 @@ See [Session Model](sessions.md) for details.
 
 Tools implement the `Tool` trait (descriptor + execute). `ToolPolicy` controls risk level, approval requirements, and timeouts. `ScopedTools` provides per-agent tool visibility with transitive narrowing.
 
-Tools access system resources through the `ToolHost` trait — a sandboxed capability boundary. The default `NativeToolHost` executes capabilities in-process with grant enforcement; future WASM and bubblewrap hosts provide VM-level and OS-level sandboxing without changing any tool code.
+Tools access system resources through the `ToolHost` trait. `NativeToolHost` enforces grants in-process. This is not a sandbox for native extensions.
 
 See [Tool System](tools.md) for details.
 
@@ -209,8 +208,7 @@ See [Tool System](tools.md) for details.
 
 ```text
 crates/lib/src/
-  main.rs              CLI, config, eidetica init, extension install, bridge dispatch
-  config.rs            Config types (backends, agents, security, multi_agent, agent_state_allowlist)
+  config.rs            Peer config, backend settings and security policy
   types.rs             ConversationId
   util.rs              Shared utilities
   agent.rs             Agent definitions, AgentRegistry, spawn permissions
@@ -226,15 +224,13 @@ crates/lib/src/
   runtime.rs           ReAct loop, RuntimeEvent, approval gates, leak/injection scanning, loop detector
   context.rs           ContextBuilder — token-budgeted context assembly (tiktoken), room note + augmentation
   tool.rs              Tool trait, ToolPolicy, ToolRegistry, ScopedTools, ToolProfile, ToolError, RateLimiter
-  tool_host.rs         ToolHost trait — sandboxed capability boundary (Native, future WASM/bwrap)
-  bubblewrap_host.rs   ToolHost impl wrapping commands in `bwrap` (OS-level sandbox)
-  wasm_host.rs         ToolHost impl for WASM-sandboxed extensions
+  tool_host.rs         ToolHost trait and native grant enforcement
   grants.rs            Typed capability grants (shell/network/fs)
   error.rs             Error + LlmError (retryable/permanent classification)
   backends.rs          LLMBackend trait, BackendManager, ChatContext
   openai.rs            OpenAI-compatible backend (async-openai byot)
   embedding.rs         Embedder trait + OpenAiEmbedder (for memory/skill semantic search)
-  defaults.rs          Built-in default config and built-in agents (chaz, chazmina, bash, fish, zsh, nu)
+  defaults.rs          Built-in runtime defaults
   routine/             RoutineEngine — sleep-until-next driver for cron, interval + one-shot Routines
     mod.rs             Module root + re-exports
     engine.rs          Engine — register/reload/deregister, fire_due, dispatch through ExtensionHub
@@ -242,7 +238,7 @@ crates/lib/src/
   session/             SessionRegistry, Session, EntryType, SessionMeta
     mod.rs             Public types (EntryType, SessionEntry, AgentRef, SessionMeta) + helpers
     registry.rs        SessionRegistry struct, chaz_group/chaz_peer accessors, session CRUD
-    channels.rs        Matrix channel attach/detach
+    transport.rs         Session attachment and addressed delivery
     agents.rs          attach/detach + turn-taking resolve_agent (home_pubkey set on attach)
     keys.rs            agent DB helpers, ephemeral keys, user_lock accessor
     usage.rs           Per-session/model/total cost rollups from assistant ResponseMetadata
@@ -301,12 +297,5 @@ crates/lib/src/
     parse.rs           JSON-RPC framing
     transport.rs       Stdio + HTTP transports
     server.rs          Tool descriptor + invoke
-  bridge/              Bridge trait + transport implementations
-    mod.rs             Bridge trait, ApprovalExchange
-    cli.rs             One-shot CLI bridge (`chaz prompt …`)
-    tui/               TUI with multi-session tabs, mouse + keyboard nav (mod/input/view)
-    matrix/            Matrix bridge
-      mod.rs           Lifecycle, channel callbacks
-      commands.rs      Matrix-syntax command parsing
-      history.rs       Room history backfill
+  bridge/              Transport-neutral types, including Bridge and ApprovalExchange
 ```

@@ -385,7 +385,7 @@ By default, `spawn_worker` waits for the answer. It keeps the Agent's execution 
 
 ### skill_list / skill_search / skill_show
 
-Progressive-disclosure access to the [skills catalog](memory.md#skills). `skill_list` returns one line per available skill (`name — description`); `skill_search` filters that list by keyword. Neither loads the body. `skill_show` is what actually pulls a skill into the agent's view — call it with the name from the catalog.
+Progressive-disclosure access to the [skills catalog](skills.md#what-the-llm-sees). `skill_list` returns one line per available skill (`name — description`); `skill_search` filters that list by keyword. Neither loads the body. `skill_show` is what actually pulls a skill into the agent's view — call it with the name from the catalog.
 
 ```json
 { "query": "git" }

@@ -53,7 +53,7 @@ graph LR
 ## Why dumb
 
 The earlier split made each bridge its own peer (see
-[Transport Bridges → Why bridges are separate peers](../user_guide/bridges.md#why-bridges-are-separate-peers))
+[Transport Bridges → Why bridges are separate processes](../user_guide/bridges.md#why-bridges-are-separate-processes))
 but the bridge still called `Server::new` with the agent-running loop enabled —
 so a bridge _answered its own messages_. That defeated the point: two peers could
 both run the same agent against the same session and fork it.
