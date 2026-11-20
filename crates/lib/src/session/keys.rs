@@ -1142,6 +1142,135 @@ mod tests {
         assert_eq!(found.bridge_db_id, "bafyrbridgedb");
     }
 
+    /// Both claim formats, and an unsupported one, ride a real authenticated
+    /// bootstrap request between two peers. The claim never changes what is
+    /// granted or withheld: approval grants the requested permission whatever
+    /// the claim, rejection grants nothing, and only a supported claim is
+    /// shown and registered.
+    #[tokio::test]
+    async fn approver_reads_legacy_and_native_claims_from_real_requests() {
+        use crate::agent_db::{
+            AgentDb, AgentDbConfig, AgentMeta, LOGIN_REF_METADATA_KEY, LoginRef, create_agent_db,
+        };
+        use eidetica::crdt::doc::Value;
+        use eidetica::sync::transports::http::HttpTransport;
+
+        let (owner, source) = make_registry_with_sync().await;
+        let (agent_db, _) = create_agent_db(
+            &mut *source.user.lock().await,
+            "chaz",
+            &AgentDbConfig::default(),
+            &AgentMeta::default(),
+        )
+        .await
+        .unwrap();
+        let id = agent_db.id();
+        let owner_sync = owner.sync().unwrap();
+        owner_sync
+            .register_transport("http", HttpTransport::builder().bind("127.0.0.1:0"))
+            .await
+            .unwrap();
+        owner_sync.accept_connections().await.unwrap();
+        let ticket = source.share_for(&id).await.unwrap();
+
+        let login = |identifier: &str| LoginRef {
+            kind: "matrix".to_string(),
+            identifier: identifier.to_string(),
+            bridge_db_id: format!("bafyr{identifier}"),
+            peer_pubkey: None,
+            agent_pubkey: Some(String::new()),
+            sync_addresses: vec![("http".to_string(), "127.0.0.1:1".to_string())],
+        };
+        let legacy = login("@legacy:example");
+        let native = login("@native:example");
+        let unsupported = {
+            let mut doc = login("@future:example").to_native_metadata();
+            let Some(Value::Doc(mut claim)) = doc.get(LOGIN_REF_METADATA_KEY).cloned() else {
+                unreachable!()
+            };
+            claim.set("version", 2);
+            doc.set(LOGIN_REF_METADATA_KEY, claim);
+            doc
+        };
+        let cases = [
+            (legacy.to_metadata().unwrap(), Some(&legacy), true),
+            (native.to_native_metadata(), Some(&native), true),
+            (unsupported, None, true),
+            (login("@rejected:example").to_native_metadata(), None, false),
+        ];
+
+        for (metadata, expected, approve) in cases {
+            let (receiver, target) = make_registry_with_sync().await;
+            receiver
+                .sync()
+                .unwrap()
+                .register_transport("http", HttpTransport::builder())
+                .await
+                .unwrap();
+            let request = |metadata: Option<eidetica::crdt::Doc>| {
+                let (target, ticket) = (target.clone(), ticket.clone());
+                async move {
+                    let mut user = target.user.lock().await;
+                    let key = user.get_default_key().unwrap();
+                    user.request_database_access(
+                        &target.instance.sync().unwrap(),
+                        &ticket,
+                        &key,
+                        Permission::Write(10),
+                        Default::default(),
+                        metadata,
+                    )
+                    .await
+                }
+            };
+            let pending = request(Some(metadata)).await.unwrap_err();
+            assert!(pending.to_string().contains("pending"), "{pending}");
+            let requests = source.pending_bootstrap_requests().await.unwrap();
+            let [(request_id, queued)] = requests.as_slice() else {
+                panic!("expected exactly one pending request");
+            };
+            let shown = queued.metadata.as_ref().and_then(LoginRef::from_metadata);
+            if approve {
+                assert_eq!(shown.as_ref(), expected);
+                source.approve_bootstrap_request(request_id).await.unwrap();
+                request(None).await.unwrap();
+                assert_eq!(
+                    target
+                        .user
+                        .lock()
+                        .await
+                        .open_database(&id)
+                        .await
+                        .unwrap()
+                        .current_permission()
+                        .await
+                        .unwrap(),
+                    Permission::Write(10),
+                    "the claim never changes the grant"
+                );
+            } else {
+                assert!(
+                    shown.is_some(),
+                    "a supported claim is shown before rejection"
+                );
+                source.reject_bootstrap_request(request_id).await.unwrap();
+                assert!(request(None).await.is_err());
+                assert!(target.user.lock().await.open_database(&id).await.is_err());
+            }
+        }
+
+        let mut registered: Vec<_> =
+            AgentDb::from_database(source.user.lock().await.open_database(&id).await.unwrap())
+                .list_logins()
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|login| login.identifier)
+                .collect();
+        registered.sort();
+        assert_eq!(registered, ["@legacy:example", "@native:example"]);
+    }
+
     #[tokio::test]
     async fn approver_registers_nothing_without_login_metadata() {
         use crate::agent_db::{AgentDbConfig, AgentMeta, create_agent_db};

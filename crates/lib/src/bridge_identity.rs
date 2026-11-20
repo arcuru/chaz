@@ -385,7 +385,7 @@ pub async fn establish_login<B: AccessBootstrap>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent_db::{AgentDbConfig, AgentMeta, create_agent_db};
+    use crate::agent_db::{AgentDbConfig, AgentMeta, LOGIN_REF_METADATA_KEY, create_agent_db};
     use crate::bridge_db::create_bridge_db;
     use eidetica::backend::database::InMemory;
     use eidetica::{Instance, NewAccount};
@@ -707,6 +707,130 @@ mod tests {
         };
         let decoded = LoginRef::from_metadata(&login.to_metadata().unwrap()).unwrap();
         assert_eq!(decoded, login);
+    }
+
+    /// Exercises every field shape: present-but-empty versus absent keys, and
+    /// ordered address pairs with a duplicate.
+    fn full_login() -> LoginRef {
+        LoginRef {
+            kind: "matrix".to_string(),
+            identifier: "@chaz.bot:example.org".to_string(),
+            bridge_db_id: "bafyrbridgedb".to_string(),
+            peer_pubkey: Some(String::new()),
+            agent_pubkey: None,
+            sync_addresses: vec![
+                ("iroh".to_string(), "endpoint2".to_string()),
+                ("http".to_string(), "127.0.0.1:9801".to_string()),
+                ("iroh".to_string(), "endpoint2".to_string()),
+            ],
+        }
+    }
+
+    #[test]
+    fn native_login_claim_round_trips_through_the_entry_and_wire_codecs() {
+        use eidetica::crdt::Codec;
+        let login = full_login();
+        let native = login.to_native_metadata();
+        assert_eq!(LoginRef::from_metadata(&native), Some(login.clone()));
+        let stored = Doc::decode(&native.encode().unwrap()).unwrap();
+        assert_eq!(LoginRef::from_metadata(&stored), Some(login.clone()));
+        let wire: Doc = serde_json::from_str(&serde_json::to_string(&native).unwrap()).unwrap();
+        assert_eq!(LoginRef::from_metadata(&wire), Some(login));
+    }
+
+    #[test]
+    fn bridges_still_write_the_claim_older_approvers_read() {
+        let login = full_login();
+        let legacy = login.to_metadata().unwrap();
+        assert!(matches!(
+            legacy.get(LOGIN_REF_METADATA_KEY),
+            Some(eidetica::crdt::doc::Value::Text(_))
+        ));
+        // Exactly what a release without the native reader does with each.
+        assert_eq!(
+            legacy.get_json::<LoginRef>(LOGIN_REF_METADATA_KEY).unwrap(),
+            login
+        );
+        assert!(
+            login
+                .to_native_metadata()
+                .get_json::<LoginRef>(LOGIN_REF_METADATA_KEY)
+                .is_err(),
+            "an old approver sees no claim on a native-only request"
+        );
+    }
+
+    #[test]
+    fn retained_legacy_claim_text_still_decodes() {
+        // Byte-for-byte what bridges have been sending, as a pending request
+        // filed before this reader would still hold it.
+        let mut retained = Doc::new();
+        retained.set(
+            LOGIN_REF_METADATA_KEY,
+            r#"{"kind":"matrix","identifier":"@chaz:example","bridge_db_id":"bafyrbridgedb","agent_pubkey":"ed25519:abc","sync_addresses":[["http","127.0.0.1:9801"]]}"#,
+        );
+        let login = LoginRef::from_metadata(&retained).unwrap();
+        assert_eq!(login.identifier, "@chaz:example");
+        assert_eq!(login.peer_pubkey, None);
+        assert_eq!(login.agent_pubkey.as_deref(), Some("ed25519:abc"));
+        assert_eq!(
+            login.sync_addresses,
+            [("http".to_string(), "127.0.0.1:9801".to_string())]
+        );
+    }
+
+    #[test]
+    fn malformed_or_unsupported_claims_are_ignored_not_reinterpreted() {
+        use eidetica::crdt::doc::{List, Value};
+        let claim = || match full_login()
+            .to_native_metadata()
+            .get(LOGIN_REF_METADATA_KEY)
+        {
+            Some(Value::Doc(claim)) => claim.clone(),
+            _ => unreachable!(),
+        };
+        let wrap = |value: Value| {
+            let mut doc = Doc::new();
+            doc.set(LOGIN_REF_METADATA_KEY, value);
+            doc
+        };
+        let edited = |edit: &dyn Fn(&mut Doc) -> Option<Value>| {
+            let mut claim = claim();
+            edit(&mut claim);
+            wrap(Value::Doc(claim))
+        };
+        assert!(
+            LoginRef::from_metadata(&wrap(Value::Doc(claim()))).is_some(),
+            "the unedited claim decodes"
+        );
+        let mut non_atomic = Doc::new();
+        for (key, value) in claim().iter() {
+            non_atomic.set(key.as_str(), value.clone());
+        }
+        let mut bad_pair = List::new();
+        bad_pair.push(Value::Text("http".into()));
+        let cases = [
+            ("future version", edited(&|c| c.set("version", 2))),
+            ("text version", edited(&|c| c.set("version", "1"))),
+            ("no version", edited(&|c| c.remove("version"))),
+            ("extra field", edited(&|c| c.set("granted", "Admin"))),
+            ("missing field", edited(&|c| c.remove("bridge_db_id"))),
+            (
+                "null identifier",
+                edited(&|c| c.set("identifier", Value::Null)),
+            ),
+            ("numeric key", edited(&|c| c.set("agent_pubkey", 7))),
+            (
+                "pair not a doc",
+                edited(&|c| c.set("sync_addresses", bad_pair.clone())),
+            ),
+            ("non-atomic claim", wrap(Value::Doc(non_atomic))),
+            ("integer value", wrap(Value::Int(1))),
+            ("broken legacy text", wrap(Value::Text("{\"kind\":".into()))),
+        ];
+        for (case, metadata) in cases {
+            assert_eq!(LoginRef::from_metadata(&metadata), None, "{case}");
+        }
     }
 
     #[tokio::test]
