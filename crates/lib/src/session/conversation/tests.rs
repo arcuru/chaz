@@ -1,5 +1,5 @@
 use super::{
-    provenance::{Observation, ProvenanceStore, Record},
+    provenance::{CallMessageBinding, Observation, ProvenanceStore, Record},
     record::*,
     *,
 };
@@ -96,6 +96,27 @@ async fn commit_op(db: &Database, op: &Operation) -> Snapshot {
             .unwrap()
             .doc(),
         op,
+    )
+    .await;
+    Snapshot::from([txn.commit().await.unwrap()])
+}
+
+async fn commit_preparation(db: &Database, input: &CallInput) -> Snapshot {
+    let txn = db
+        .new_transaction_at(&input.observed.frontier)
+        .await
+        .unwrap();
+    stage(
+        txn.get_store::<ProvenanceStore>(provenance::STORE)
+            .await
+            .unwrap()
+            .doc(),
+        &Record {
+            version: 1,
+            observation: Observation::Prepared {
+                input: Box::new(input.clone()),
+            },
+        },
     )
     .await;
     Snapshot::from([txn.commit().await.unwrap()])
@@ -209,21 +230,7 @@ async fn v1_reader_keeps_old_call_and_legacy_prefix_through_signed_merge() {
     assert!(input.representations.contains(&first));
     assert!(input.representations.contains(&second));
     assert!(input.representations.contains(&op.representation_id(0)));
-    let txn = db.new_transaction_at(&before_call).await.unwrap();
-    stage(
-        txn.get_store::<ProvenanceStore>(provenance::STORE)
-            .await
-            .unwrap()
-            .doc(),
-        &Record {
-            version: 1,
-            observation: Observation::Prepared {
-                input: Box::new(input.clone()),
-            },
-        },
-    )
-    .await;
-    let prepared = Snapshot::from([txn.commit().await.unwrap()]);
+    let prepared = commit_preparation(&db, &input).await;
     let replacement = operation(
         &db,
         &prepared,
@@ -533,30 +540,32 @@ async fn v1_reader_replays_complete_native_unit_and_no_undated_boundary() {
             .await
             .is_err()
     );
-    let complete = commit_op(
+    let mut result = operation(
         &db,
-        &operation(
-            &db,
-            &pending,
-            3,
-            Payload::ToolOutcome {
-                execution: ToolExecutionId {
-                    call: ToolCallId {
-                        response: native.fact_id(0),
-                        index: 0,
-                    },
-                    attempt: "attempt".into(),
-                    ordinal: 0,
+        &pending,
+        3,
+        Payload::ToolOutcome {
+            execution: ToolExecutionId {
+                call: ToolCallId {
+                    response: native.fact_id(0),
+                    index: 0,
                 },
-                executed_arguments: "{}".into(),
-                content: "result".into(),
-                outcome: ToolResultOutcome::Success,
+                attempt: "attempt".into(),
+                ordinal: 0,
             },
-            View::ToolResult,
-            vec![],
-        ),
-    )
-    .await;
+            executed_arguments: "{}".into(),
+            content: "result".into(),
+            outcome: ToolResultOutcome::Success,
+        },
+        View::ToolResult,
+        vec![],
+    );
+    result.facts.push(Fact {
+        payload_version: 1,
+        payload: input("addition"),
+    });
+    let addition = result.fact_id(1);
+    let complete = commit_op(&db, &result).await;
     let full = context(&db, &complete, 4096).await;
     assert!(
         matches!(&full.messages[..], [RuntimeMessage::User(_), RuntimeMessage::AssistantToolCalls { .. }, RuntimeMessage::ToolResult { call_id, .. }] if call_id == "same-provider-id")
@@ -570,6 +579,75 @@ async fn v1_reader_replays_complete_native_unit_and_no_undated_boundary() {
         ]
     ));
     assert_eq!(db.snapshot().await.unwrap(), complete);
+
+    let representations = [
+        request.representation_id(0),
+        native.representation_id(0),
+        result.representation_id(0),
+    ];
+    let [request, response, result] = representations
+        .clone()
+        .map(CallMessageBinding::Representation);
+    let added = CallMessageBinding::AcceptedAddition(addition.clone());
+    let mut input = CallInput {
+        call: CallId {
+            request: "request".into(),
+            branch: "branch".into(),
+            model_sequence: 1,
+        },
+        attempt: "attempt".into(),
+        observed: ObservedBinding {
+            database: db.root_id().to_string(),
+            frontier: complete,
+        },
+        representations: representations.into(),
+        renderer_version: 1,
+        context_version: 1,
+        requested_model: "fixture".into(),
+        api: "fixture".into(),
+        effective_nonsecret_settings: BTreeMap::new(),
+        sources: vec![],
+        accepted_additions: vec![addition],
+        messages: vec![
+            request.clone(),
+            added.clone(),
+            response.clone(),
+            result.clone(),
+        ],
+        tools: vec![],
+        fidelity: Fidelity::Approximate,
+        reasons: vec!["fixture has no backend serializer".into()],
+    };
+    let prepared = commit_preparation(&db, &input).await;
+    let history = Session::history_at(&db, &prepared).await.unwrap();
+    assert_eq!(
+        history
+            .recorded_call(&input.call, &input.attempt)
+            .await
+            .unwrap(),
+        Some(&input)
+    );
+
+    for (case, messages) in [
+        (
+            "reversed",
+            vec![request.clone(), result.clone(), response.clone()],
+        ),
+        ("truncated", vec![request.clone(), response.clone()]),
+        ("split", vec![request, response, added, result]),
+    ] {
+        input.messages = messages;
+        let invalid = commit_preparation(&db, &input).await;
+        let before = db.snapshot().await.unwrap();
+        let read = Session::history_at(&db, &invalid).await.unwrap();
+        assert!(
+            read.recorded_call(&input.call, &input.attempt)
+                .await
+                .is_err(),
+            "accepted {case} call binding"
+        );
+        assert_eq!(db.snapshot().await.unwrap(), before);
+    }
 }
 
 #[tokio::test]

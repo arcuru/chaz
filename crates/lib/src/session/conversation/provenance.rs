@@ -39,8 +39,9 @@ pub struct CallInput {
     pub effective_nonsecret_settings: BTreeMap<String, serde_json::Value>,
     pub sources: Vec<RecordRef>,
     pub accepted_additions: Vec<FactId>,
-    /// Ordered model-facing slots. Older synthetic preparations had only the
-    /// selection lists; absence remains explicitly approximate, not guessed.
+    /// Ordered model-facing slots. A nonempty list binds the selected history
+    /// in order, with additions allowed only between intact history groups.
+    /// Older synthetic preparations omit these slots and remain approximate.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub messages: Vec<CallMessageBinding>,
     /// Selected declarations are accepted inputs, not permission to execute.
@@ -246,7 +247,7 @@ fn validate_input(
     conversation.require_descriptor(&observed)?;
     let ops = conversation.operations_in(&observed);
     let selected = view::effective(&ops, &conversation.legacy)?;
-    selected.validate_selection(&input.representations)?;
+    validate_selection(&selected, &input.representations, &input.messages)?;
     // This reader can inspect original accepted facts. Projection/step outputs
     // staged with preparation belong to the later fenced writer integration.
     if input
@@ -257,9 +258,8 @@ fn validate_input(
             .tools
             .iter()
             .any(|id| !input.accepted_additions.contains(id))
-        || input.messages.iter().any(|item| match item {
-            CallMessageBinding::Representation(id) => !input.representations.contains(id),
-            CallMessageBinding::AcceptedAddition(id) => !input.accepted_additions.contains(id),
+        || input.messages.iter().any(|slot| {
+            matches!(slot, CallMessageBinding::AcceptedAddition(id) if !input.accepted_additions.contains(id))
         })
     {
         return Err(Error::InvalidScope(
@@ -267,6 +267,69 @@ fn validate_input(
         ));
     }
     Ok(())
+}
+
+fn validate_selection(
+    selected: &view::ConversationView,
+    mut ids: &[RepresentationId],
+    messages: &[CallMessageBinding],
+) -> Result<()> {
+    use crate::session::history::HistoryBody;
+    let mut slots = messages.iter().map(representation_slot);
+    for group in selected.context_groups()? {
+        let Some(head) = ids.first() else { break };
+        if group.representation.as_ref() != Some(head) {
+            continue;
+        }
+        let len = match &group.body {
+            HistoryBody::Entry(_) => 1,
+            HistoryBody::Recorded { messages, .. } => {
+                if !messages
+                    .iter()
+                    .map(|(_, id)| id)
+                    .eq(ids.iter().take(messages.len()))
+                {
+                    return Err(Error::ExchangeConflict(
+                        "call selects part of a native exchange".into(),
+                    ));
+                }
+                messages.len()
+            }
+        };
+        let (unit, rest) = ids.split_at(len);
+        ids = rest;
+        // Skip additions only before a unit, never inside it.
+        if !messages.is_empty()
+            && !slots
+                .by_ref()
+                .skip_while(Option::is_none)
+                .take(len)
+                .eq(unit.iter().map(Some))
+        {
+            return Err(Error::InvalidScope(
+                "call message slots differ from ordered selection or split a native exchange"
+                    .into(),
+            ));
+        }
+    }
+    if !ids.is_empty() {
+        return Err(Error::InvalidScope(
+            "call representations missing, duplicated or reordered at observed frontier".into(),
+        ));
+    }
+    if slots.any(|slot| slot.is_some()) {
+        return Err(Error::InvalidScope(
+            "call message slots extend beyond selected representations".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn representation_slot(slot: &CallMessageBinding) -> Option<&RepresentationId> {
+    match slot {
+        CallMessageBinding::Representation(id) => Some(id),
+        CallMessageBinding::AcceptedAddition(_) => None,
+    }
 }
 
 fn validate_outcome(

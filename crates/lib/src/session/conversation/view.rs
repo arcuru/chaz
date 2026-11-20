@@ -355,39 +355,6 @@ impl ConversationView {
         Ok(groups)
     }
 
-    pub(super) fn validate_selection(&self, ids: &[RepresentationId]) -> Result<()> {
-        use crate::session::history::HistoryBody;
-        let mut pending = ids;
-        for group in self.context_groups()? {
-            let head = group
-                .representation
-                .as_ref()
-                .expect("anchored conversation group");
-            match &group.body {
-                HistoryBody::Entry(_) if pending.first() == Some(head) => pending = &pending[1..],
-                HistoryBody::Recorded { messages, .. } if pending.first() == Some(head) => {
-                    if !messages
-                        .iter()
-                        .map(|(_, id)| id)
-                        .eq(pending.iter().take(messages.len()))
-                    {
-                        return Err(ConversationError::ExchangeConflict(
-                            "call selects part of a native exchange".into(),
-                        ));
-                    }
-                    pending = &pending[messages.len()..];
-                }
-                _ => {}
-            }
-        }
-        if !pending.is_empty() {
-            return Err(ConversationError::InvalidScope(
-                "call representations missing, duplicated or reordered at observed frontier".into(),
-            ));
-        }
-        Ok(())
-    }
-
     pub(super) fn display_rows(&self) -> Vec<crate::session::history::DisplayRow> {
         use crate::session::{EntryType, history::DisplayRow};
         self.representations
