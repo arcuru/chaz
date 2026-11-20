@@ -143,11 +143,13 @@ async fn context_command_service_client_delivers_once_without_executor_authority
             .await
             .unwrap();
     let capability = connected.capabilities.executor().unwrap();
+    let setup = crate::session::roots::RootSetup::for_connection(&connected.instance, true);
     let registry = Arc::new(
-        crate::session::SessionRegistry::new(
+        crate::session::SessionRegistry::open(
             connected.instance,
             connected.user,
             Arc::new(AgentRegistry::with_default_agent()),
+            setup,
         )
         .await
         .unwrap(),
