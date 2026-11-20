@@ -248,7 +248,7 @@ pub async fn publish_service_login(
     identity: &BridgeIdentity<'_>,
     spec: &LoginSpec,
 ) -> anyhow::Result<()> {
-    let Some(entry) = server.agent_index().find_by_name(&spec.agent) else {
+    let Some(entry) = server.agent_index().find_unique_by_name(&spec.agent)? else {
         warn!(
             login = %spec.login_id,
             agent = %spec.agent,
