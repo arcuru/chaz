@@ -724,6 +724,34 @@ async fn native_worker_links_precede_execution_and_resolve_each_exact_result() {
             .unwrap()
             .unwrap();
         assert_eq!(outcome.terminal, WorkerTerminal::Reply);
+        let reopened = Session::new(
+            ConversationId(link.child_session_id.clone()),
+            child_db.clone(),
+        )
+        .await;
+        let attempt = reopened
+            .read_turn_attempt(&outcome.attempt_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(attempt.request_id, link.directive_id);
+        assert_eq!(outcome.execution_id, None);
+        let completion = crate::session::execution::store_entries_at(
+            &child_db,
+            "worker_outcomes_v1",
+            &child_db.snapshot().await.unwrap(),
+        )
+        .await
+        .unwrap();
+        let [commit] = completion.as_slice() else {
+            panic!("expected one Worker outcome commit");
+        };
+        for store in ["entries", "turn_attempts", "turn_transcript"] {
+            assert!(
+                commit.in_subtree(store),
+                "Worker completion omitted {store}"
+            );
+        }
         assert_eq!(
             result.unwrap().content,
             ["first child result", "second child result"][index]
@@ -763,7 +791,7 @@ async fn prepared_worker_reference_and_catalog_are_not_execution_requests() {
         .prepare_worker_session(&parent, "spawn:prepared-only")
         .await
         .unwrap();
-    let directive = prepare_directive(
+    let directive = Session::prepare_worker_directive(
         &child,
         &parent,
         "prepared-only",

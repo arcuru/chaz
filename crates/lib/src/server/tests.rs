@@ -4267,7 +4267,10 @@ async fn transcript_commits_full_tool_exchange_before_progression() {
     assert!(
         transcript
             .iter()
-            .all(|record| record.request_id == request_id)
+            .enumerate()
+            .all(|(index, record)| record.request_id == request_id
+                && record.attempt_id == attempt.attempt_id
+                && record.sequence == index as u64)
     );
     assert!(matches!(&transcript[0].message,
         crate::session::TurnTranscriptMessage::ModelResponse { tool_calls, .. }
@@ -8248,15 +8251,23 @@ async fn a_user_stop_kills_shell_descendants_and_preserves_native_replay() {
         })
         .collect();
     assert_eq!(cancelled, vec!["shell-1", "shell-2"]);
-    assert!(
-        session
-            .entries()
-            .iter()
-            .find(|entry| is_stop(entry))
-            .unwrap()
+    let terminal = records.last().unwrap();
+    assert_eq!(terminal.request_id, attempts[0].request_id);
+    assert_eq!(terminal.message, TurnTranscriptMessage::Cancelled);
+    let stopped = session
+        .entries()
+        .iter()
+        .find(|entry| is_stop(entry))
+        .unwrap();
+    assert_eq!(
+        stopped
             .metadata
-            .is_some(),
-        "completed model usage survives stop"
+            .as_ref()
+            .unwrap()
+            .turn_attempt_id
+            .as_deref(),
+        Some(attempts[0].attempt_id.as_str()),
+        "completed model usage stays linked to the stopped attempt"
     );
     tokio::time::sleep(std::time::Duration::from_millis(2200)).await;
     assert!(!leaked.exists(), "a stopped shell descendant survived");

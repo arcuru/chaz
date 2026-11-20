@@ -342,22 +342,22 @@ fn recorder(
     session: Arc<Mutex<Session>>,
     attempt: &TurnAttempt,
     snapshot: eidetica::Snapshot,
-    sequence: u32,
-) -> Arc<SessionRuntimeRecorder> {
-    Arc::new(SessionRuntimeRecorder {
+    sequence: u64,
+) -> Arc<crate::session::turn_recorder::TurnRecorder> {
+    Arc::new(Session::turn_recorder(
         session,
-        request_id: attempt.request_id.clone(),
-        attempt_id: attempt.attempt_id.clone(),
-        sequence: AtomicU32::new(sequence),
-        terminal: Default::default(),
-        explicit_bridge_send: AtomicBool::new(false),
-        agent_name: "test-agent".into(),
-        requested_model: "stub".into(),
-        can_suspend: false,
-        context_snapshot: Some(snapshot),
-        branch: None,
-        fail_after: Arc::new(std::sync::Mutex::new(None)),
-    })
+        attempt,
+        TurnCallIdentity {
+            agent: "test-agent".into(),
+            requested_model: "stub".into(),
+            execution_id: None,
+        },
+        TurnRecorderOptions {
+            next_sequence: sequence,
+            context_snapshot: Some(snapshot),
+            ..Default::default()
+        },
+    ))
 }
 struct Wait {
     calls: Arc<AtomicUsize>,
@@ -486,7 +486,7 @@ async fn responses_steering_exact_wait_reopen_keeps_text_origin_and_no_effect_re
     let (resume, sequence) =
         crate::session::wait_resume::plan_job_wait_resume(&checkpoint, &records).unwrap();
     let reopened = Arc::new(Mutex::new(reopened));
-    let record = recorder(reopened.clone(), &attempt, snapshot, sequence as u32);
+    let record = recorder(reopened.clone(), &attempt, snapshot, sequence);
     let ctx = tool_context(reopened.clone(), tools);
     let resumed = tokio::spawn({
         let record = record.clone();

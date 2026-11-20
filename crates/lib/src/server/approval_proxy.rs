@@ -438,9 +438,7 @@ mod tests {
     #[tokio::test]
     async fn active_turn_survives_floor_advances_across_approval_and_settlement() {
         use crate::runtime::{RuntimeRecord, RuntimeRecorder, ToolResultOutcome};
-        use crate::server::SessionRuntimeRecorder;
-        use crate::session::{EntryType, SessionEntry};
-        use std::sync::atomic::{AtomicBool, AtomicU32};
+        use crate::session::{EntryType, SessionEntry, TurnCallIdentity};
         let (_instance, _user, identity, old, key) = delegated_proxy_fixture().await;
         let sid = ConversationId(old.root_id().to_string());
         let entry = |content: &str| SessionEntry {
@@ -456,22 +454,18 @@ mod tests {
             .await
             .with_signing_key(Some(key.clone()));
         let request = session.add_entry(entry("request")).await.unwrap();
-        let attempt = session.start_turn_attempt(request.clone()).await.unwrap();
+        let attempt = session.start_turn_attempt(request).await.unwrap();
         let held = Arc::new(Mutex::new(session));
-        let recorder = SessionRuntimeRecorder {
-            session: held.clone(),
-            request_id: request,
-            attempt_id: attempt.attempt_id.clone(),
-            sequence: AtomicU32::new(0),
-            terminal: Default::default(),
-            explicit_bridge_send: AtomicBool::new(false),
-            agent_name: "host".into(),
-            requested_model: "stub".into(),
-            context_snapshot: None,
-            can_suspend: false,
-            branch: None,
-            fail_after: Default::default(),
-        };
+        let recorder = Session::turn_recorder(
+            held.clone(),
+            &attempt,
+            TurnCallIdentity {
+                agent: "host".into(),
+                requested_model: "stub".into(),
+                execution_id: None,
+            },
+            Default::default(),
+        );
         let (tx, tasks) = spawn_session_db_approval_proxy(
             old.clone(),
             "host".into(),
@@ -532,8 +526,8 @@ mod tests {
                 .any(|e| matches!(e.entry_type, EntryType::ApprovalRequest)),
             "refresh must not reload the held transcript"
         );
-        session
-            .complete_turn_attempt_with_transcript(&attempt, Some(entry("FINAL")), None)
+        recorder
+            .complete(&mut session, Some(entry("FINAL")), None)
             .await
             .unwrap();
         let observed = Session::new(sid, old.clone()).await;

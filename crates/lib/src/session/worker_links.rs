@@ -1,6 +1,6 @@
 //! Optional display references. These records never authorize or restart execution.
 use super::{
-    EntryType, SessionEntry, TurnAttempt, TurnRequestId, TurnTranscriptMessage,
+    EntryType, Session, SessionEntry, TurnAttempt, TurnRequestId, TurnTranscriptMessage,
     TurnTranscriptRecord,
 };
 use eidetica::{Database, store::Table, transaction::Transaction};
@@ -267,39 +267,41 @@ async fn insert_once<
     Ok(())
 }
 
-/// Preparation is unindexed; no callback or execution authority is installed here.
-pub(crate) async fn prepare_directive(
-    child: &Database,
-    parent: &Database,
-    spawn_id: &str,
-    directive: SessionEntry,
-    linked: bool,
-) -> anyhow::Result<TurnRequestId> {
-    anyhow::ensure!(
-        directive.entry_type == EntryType::Directive,
-        "Worker requires a Directive"
-    );
-    let txn = child.new_transaction().await?;
-    let id = txn
-        .get_store::<Table<SessionEntry>>("entries")
-        .await?
-        .insert(directive)
-        .await?;
-    if linked {
-        insert_once(
-            &txn,
-            ORIGIN,
-            "origin",
-            WorkerOrigin {
-                version: VERSION,
-                parent_session_id: parent.root_id().to_string(),
-                spawn_id: spawn_id.into(),
-            },
-        )
-        .await?;
+impl Session {
+    /// Preparation is unindexed; no callback or execution authority is installed here.
+    pub(crate) async fn prepare_worker_directive(
+        child: &Database,
+        parent: &Database,
+        spawn_id: &str,
+        directive: SessionEntry,
+        linked: bool,
+    ) -> anyhow::Result<TurnRequestId> {
+        anyhow::ensure!(
+            directive.entry_type == EntryType::Directive,
+            "Worker requires a Directive"
+        );
+        let txn = child.new_transaction().await?;
+        let id = txn
+            .get_store::<Table<SessionEntry>>("entries")
+            .await?
+            .insert(directive)
+            .await?;
+        if linked {
+            insert_once(
+                &txn,
+                ORIGIN,
+                "origin",
+                WorkerOrigin {
+                    version: VERSION,
+                    parent_session_id: parent.root_id().to_string(),
+                    spawn_id: spawn_id.into(),
+                },
+            )
+            .await?;
+        }
+        txn.commit().await?;
+        Ok(TurnRequestId::parse(id))
     }
-    txn.commit().await?;
-    Ok(TurnRequestId::parse(id))
 }
 
 pub(crate) async fn publish_spawn(

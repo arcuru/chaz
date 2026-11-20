@@ -39,22 +39,19 @@ async fn terminal_telemetry_precedes_publication_and_settles_once() {
     let (_instance, _user, db) = crate::session::test_helpers::test_session_db().await;
     let mut session = Session::new(ConversationId(db.root_id().to_string()), db.clone()).await;
     let request = session.add_entry(message("user", "fixture")).await.unwrap();
-    let attempt = session.start_turn_attempt(request.clone()).await.unwrap();
+    let attempt = session.start_turn_attempt(request).await.unwrap();
     let session = Arc::new(Mutex::new(session));
-    let recorder = SessionRuntimeRecorder {
-        session: session.clone(),
-        request_id: request,
-        attempt_id: attempt.attempt_id.clone(),
-        sequence: AtomicU32::new(0),
-        terminal: Default::default(),
-        explicit_bridge_send: AtomicBool::new(false),
-        agent_name: "host".into(),
+    let identity = TurnCallIdentity {
+        agent: "host".into(),
         requested_model: "gpt-sol-latest".into(),
-        can_suspend: false,
-        context_snapshot: None,
-        branch: None,
-        fail_after: Default::default(),
+        execution_id: None,
     };
+    let recorder = Session::turn_recorder(
+        session.clone(),
+        &attempt,
+        identity.clone(),
+        Default::default(),
+    );
     for (sequence, prompt, terminal) in [(0, 1000, false), (1, 2000, false), (2, 3000, true)] {
         recorder
             .record(RuntimeRecord::ModelResponse {
@@ -85,14 +82,11 @@ async fn terminal_telemetry_precedes_publication_and_settles_once() {
     assert!(!held.entries().iter().any(|entry| entry.content == "FINAL"));
     assert_eq!(Session::active_turn_attempts(&db).await.unwrap().len(), 1);
     let live = observe(&db).await;
-    let terminal = recorder.terminal.lock().unwrap().take().unwrap();
     let mut final_entry = message("host", "FINAL");
     final_entry.metadata = Some(metadata(6000, 300, 3000, 0.03));
     final_entry.metadata.as_mut().unwrap().context_tokens = Some(3000);
-    session
-        .lock()
-        .await
-        .complete_turn_attempt_with_transcript(&attempt, Some(final_entry), Some(terminal))
+    recorder
+        .complete(&mut *session.lock().await, Some(final_entry), None)
         .await
         .unwrap();
     let finalized = observe(&db).await;
@@ -133,13 +127,12 @@ async fn terminal_telemetry_precedes_publication_and_settles_once() {
             .unwrap();
         session.start_turn_attempt(request).await.unwrap()
     };
-    let stopped = SessionRuntimeRecorder {
-        request_id: stopped_attempt.request_id.clone(),
-        attempt_id: stopped_attempt.attempt_id.clone(),
-        sequence: AtomicU32::new(0),
-        terminal: Default::default(),
-        ..recorder
-    };
+    let stopped = Session::turn_recorder(
+        session.clone(),
+        &stopped_attempt,
+        identity,
+        Default::default(),
+    );
     stopped
         .record(RuntimeRecord::ModelResponse {
             model_sequence: 0,
@@ -155,11 +148,8 @@ async fn terminal_telemetry_precedes_publication_and_settles_once() {
     let mut error = message("host", "Stopped.");
     error.entry_type = EntryType::Error;
     error.metadata = Some(metadata(100, 10, 50, 0.01));
-    let terminal = stopped.terminal.lock().unwrap().take();
-    session
-        .lock()
-        .await
-        .complete_turn_attempt_with_transcript(&stopped_attempt, Some(error), terminal)
+    stopped
+        .complete(&mut *session.lock().await, Some(error), None)
         .await
         .unwrap();
     let stopped_totals = observe(&db).await;
