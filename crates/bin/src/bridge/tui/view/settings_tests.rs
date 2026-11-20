@@ -1029,7 +1029,7 @@ async fn settings_compact_empty_missing_and_static_pages_use_full_content_slot()
                         (SettingsScope::Session, 0) => "agent)",
                         (SettingsScope::Session, 1) if !missing => "selected",
                         (SettingsScope::Session, 3..=5) => "result",
-                        (SettingsScope::Session, 6) => "session state.",
+                        (SettingsScope::Session, 6) => "state.",
                         _ => "coming soon",
                     };
                     assert!(
