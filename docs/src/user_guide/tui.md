@@ -512,6 +512,7 @@ See [Extensions](extensions.md). Extensions can also register their own slash co
 | `/extensions remove <name> [agent]`    | Disable an extension                                        |
 | `/extensions settings <name>`          | Print the extension's settings                              |
 | `/extensions set <name> <key> <value>` | Update an extension setting                                 |
+| `/extensions reset <name> <key>`       | Remove one declared session override                        |
 
 ### LLM config
 
@@ -880,7 +881,7 @@ Settings has two separate scopes: **Peer** covers this process's hosted agents a
 | `/models` in chat                  | Session Settings → Models, with the scope list focused |
 | `Ctrl+S` or `s` in the session hub | Peer Settings (no open conversation needed)            |
 
-`Ctrl+S` does nothing while Settings or the model picker is already open. `Ctrl+H` and `Ctrl+L` cycle tabs only in chat, so Settings and pickers retain their conversation caller. Plain `PageUp`/`PageDown` still scroll. Settings remembers its caller: `Esc` returns to chat or the session hub, rather than quitting. At normal terminal sizes the category rail stays on the left and the current page on the right. Navigation starts at **Category**, then enters **List → Content** (static/empty pages skip List); see [Reading Settings details](#reading-settings-details) for all keys and pointer controls. Number keys follow the sidebar order below (`1`–`9` for Peer, `1`–`6` for Session).
+`Ctrl+S` does nothing while Settings or the model picker is already open. `Ctrl+H` and `Ctrl+L` cycle tabs only in chat, so Settings and pickers retain their conversation caller. Plain `PageUp`/`PageDown` still scroll. Settings remembers its caller: `Esc` returns to chat or the session hub, rather than quitting. At normal terminal sizes the category rail stays on the left and the current page on the right. Navigation starts at **Category**, then enters **List → Content** (static/empty pages skip List); see [Reading Settings details](#reading-settings-details) for all keys and pointer controls. Number keys follow the sidebar order below (`1`–`9` for Peer, `1`–`7` for Session).
 
 A model picker returns to its Settings page on selection or `Esc`; canceling writes no model. Add prompts, add-agent pickers and YAML diffs handle `Esc` first, so cancel them before leaving Settings. Exiting Settings does not undo edits already applied.
 
@@ -894,7 +895,7 @@ These tables list every category in sidebar order. Read-only pages are inspector
 | Backends      | Read-only backend names, API base URLs, and configured/known model counts; no credential editor.                                                                                                                                                                                                                                                                                                           |
 | Defaults      | Edit the ordered agents attached to new sessions; the first is the routing host. `a` opens an add prompt, `d` removes the selected row, and `Ctrl+↑` / `Ctrl+↓` reorder it. Changes persist in the peer DB, not YAML, and do not change existing session rosters. Accepted edits apply in order to the latest defaults; a pending add is not lost by a later remove or reorder.                            |
 | Bridges       | Read-only status: TUI active, CLI available, Matrix/Discord external binaries.                                                                                                                                                                                                                                                                                                                             |
-| Extensions    | Read-only current-process registration catalog: names, reference kind/version, registered hooks/tools/commands, and recorded Global install failures. Not an active-instance count; MCP runtime stays on MCP.                                                                                                                                                                                              |
+| Extensions    | Inspect the current registration catalog. Press `e` to pick a hosted agent and edit its [declared extension preferences](extensions.md#editing-extension-preferences). Not an active-instance count; MCP runtime stays on MCP.                                                                                                                                                                             |
 | MCP           | Read-only server list and selected-server status, tools, and failure details.                                                                                                                                                                                                                                                                                                                              |
 | Groups        | Read-only loaded new-session roster templates, ordered members, and current default roster. Not live groups or existing session membership.                                                                                                                                                                                                                                                                |
 | Identity      | Read-only connected account default public key and fingerprint, as in `/pubkey`. No credentials, private keys or key editing.                                                                                                                                                                                                                                                                              |
@@ -908,6 +909,7 @@ These tables list every category in sidebar order. Read-only pages are inspector
 | Routing          | Read-only recorded host/roster, locally indexed Active+Write candidates, home-key comparison, model-resolution inputs and cached TUI agent.    |
 | History          | Read-only counts by entry type and timestamp bounds from the selected tab's already-loaded cache, not database totals.                         |
 | Sharing          | Read-only local sync preference, first account-held public key and its direct auth status/permission; no tickets or permission changes.        |
+| Extensions       | Press `Enter` to view inherited extension preferences as an authorized hosted agent and edit overrides for this whole session.                 |
 
 ### Editing an agent folder from Peer Settings
 

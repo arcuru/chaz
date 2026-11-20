@@ -395,6 +395,21 @@ pub fn parse(input: &str) -> Parsed {
             value: value.to_string(),
         }));
     }
+    if let Some(arg) = text
+        .strip_prefix("/extensions reset ")
+        .or_else(|| (text == "/extensions reset").then_some(""))
+    {
+        let mut parts = arg.split_whitespace();
+        return match (parts.next(), parts.next(), parts.next()) {
+            (Some(name), Some(key), None) => {
+                Parsed::Command(Command::Extensions(ExtensionsAction::Reset {
+                    name: name.to_string(),
+                    key: key.to_string(),
+                }))
+            }
+            _ => Parsed::Usage("Usage: /extensions reset <name> <key>".to_string()),
+        };
+    }
 
     // --- Session ops with arguments ---
     if let Some(arg) = text.strip_prefix("/new ") {
@@ -756,6 +771,22 @@ mod tests {
         assert!(
             usage("/extensions migrate-settings --unknown").contains("Offline conversion only")
         );
+    }
+
+    #[test]
+    fn declared_settings_reset_requires_exactly_name_and_key() {
+        assert!(matches!(
+            cmd("/extensions reset session_naming model"),
+            Command::Extensions(ExtensionsAction::Reset { name, key })
+                if name == "session_naming" && key == "model"
+        ));
+        for input in [
+            "/extensions reset",
+            "/extensions reset session_naming",
+            "/extensions reset session_naming model agent",
+        ] {
+            assert_eq!(usage(input), "Usage: /extensions reset <name> <key>");
+        }
     }
 
     #[test]

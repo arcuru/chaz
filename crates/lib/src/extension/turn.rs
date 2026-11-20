@@ -121,6 +121,10 @@ pub struct TurnCompleteContext<'a> {
     /// Definitions available to the main model, not executable by this endpoint.
     pub tools: &'a [ToolDefinition],
     pub(crate) extension: &'a str,
+    /// Declared public fields and the turn owner's explicit preferences,
+    /// read for this invocation. `settings()` overlays them in memory.
+    pub(crate) declaration: Option<&'a super::RegisteredSettingFields>,
+    pub(crate) agent_settings: Value,
     pub(crate) db: &'a Database,
     pub(crate) registry: &'a SessionRegistry,
     pub(crate) backend: &'a BackendManager,
@@ -156,8 +160,14 @@ impl TurnCompleteContext<'_> {
             .await
     }
 
+    /// Current session fields, including private state, with absent declared
+    /// fields resolved from the turn owner's preferences or the defaults.
     pub async fn settings(&self) -> anyhow::Result<Value> {
-        super::read_settings_checked(self.db, self.extension).await
+        let raw = super::read_settings_checked(self.db, self.extension).await?;
+        match self.declaration {
+            Some(declaration) => super::overlay(declaration, raw, &self.agent_settings),
+            None => Ok(raw),
+        }
     }
 
     /// Assign top-level fields in this extension's settings. Nested objects and

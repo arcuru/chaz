@@ -31,8 +31,12 @@ pub mod projection;
 mod settings;
 pub mod turn;
 
-pub use settings::{migrate_settings, read_settings, read_settings_checked, write_settings};
-pub(crate) use settings::{patch_settings, update_settings};
+pub use settings::{
+    RegisteredSettingFields, SettingEdit, SettingField, SettingKind, SettingLayer, SettingRow,
+    SettingTargets, migrate_settings, read_agent_settings, read_settings, read_settings_checked,
+    write_settings,
+};
+pub(crate) use settings::{agent_layer, overlay, patch_settings, update_settings};
 
 #[allow(unused_imports)]
 pub use instance::{CapResolver, ExtensionInstance, PeerHandles, Scope, ScopeCtx, TurnCtx};
@@ -568,8 +572,8 @@ pub trait ExtensionCommand: Send + Sync {
 }
 
 /// An extension is a compile-time Rust type that hooks into the agent
-/// runtime. Its entire API surface is hook registration: tools, slash
-/// commands, and lifecycle hooks all flow through [`ExtensionHub`].
+/// runtime. Tools, slash commands, lifecycle hooks and public settings
+/// declarations all flow through [`ExtensionHub`].
 /// Implementations are registered in
 /// `src/extensions/mod.rs::register_builtins`.
 pub trait Extension: Send + Sync {
@@ -600,13 +604,16 @@ pub trait Extension: Send + Sync {
         1
     }
 
-    /// Schema defaults for this extension's settings. Returned to callers
-    /// of [`HookContext::get_settings`] when no per-session override has
-    /// been written. Extensions with no configurable settings can leave
-    /// the default `json!({})` — the framework will still hand it back
-    /// uniformly.
+    /// Defaults for the extension's settings, including every declared field.
+    /// This does not seed a settings document or alter raw settings reads.
     fn default_settings(&self) -> serde_json::Value {
         serde_json::json!({})
+    }
+
+    /// Public preferences, independent of activation or instantiation.
+    /// Undeclared keys are not exposed through the generic field editor.
+    fn setting_fields(&self) -> &'static [SettingField] {
+        &[]
     }
 
     // ---- Cap-based install path -----------------------------------------
@@ -727,6 +734,7 @@ pub struct ExtensionInstallFailure {
 /// extensions themselves. Held on `Server` as `Arc<ExtensionHub>`.
 pub struct ExtensionHub {
     extensions: Vec<Arc<dyn Extension>>,
+    setting_fields: HashMap<&'static str, Option<RegisteredSettingFields>>,
     before_agent_start: Vec<RegisteredHook<dyn HookBeforeAgentStart>>,
     tool_call: Vec<RegisteredHook<dyn HookToolCall>>,
     tool_result: Vec<RegisteredHook<dyn HookToolResult>>,
@@ -840,6 +848,7 @@ impl ExtensionHub {
     pub fn new() -> Self {
         Self {
             extensions: Vec::new(),
+            setting_fields: HashMap::new(),
             before_agent_start: Vec::new(),
             tool_call: Vec::new(),
             tool_result: Vec::new(),
@@ -1338,6 +1347,11 @@ impl ExtensionHub {
         self.extensions.iter().map(|e| e.name()).collect()
     }
 
+    /// Validated public preferences for a registered extension, if any.
+    pub fn registered_setting_fields(&self, name: &str) -> Option<&RegisteredSettingFields> {
+        self.setting_fields.get(name).and_then(Option::as_ref)
+    }
+
     /// Snapshot of every Global-scope extension whose `instantiate`
     /// failed or panicked during [`Self::install_all`], sorted by name. Empty when
     /// every Global extension installed cleanly. Queryable after the
@@ -1627,6 +1641,19 @@ impl ExtensionHub {
         security: &crate::security::SecurityContext,
         cancel: Option<&crate::runtime::TurnCancel>,
     ) {
+        self.fire_turn_complete_for((ctx, None), messages, tools, backend, security, cancel)
+            .await;
+    }
+
+    pub(crate) async fn fire_turn_complete_for(
+        &self,
+        (ctx, agent): (&HookContext, Option<&crate::hosted_index::DbEntry>),
+        messages: impl FnOnce() -> Vec<RuntimeMessage> + Send,
+        tools: &[crate::tool::ToolDefinition],
+        backend: &crate::backends::BackendManager,
+        security: &crate::security::SecurityContext,
+        cancel: Option<&crate::runtime::TurnCancel>,
+    ) {
         let Some(registry) = self.session_registry.as_ref() else {
             return;
         };
@@ -1664,7 +1691,11 @@ impl ExtensionHub {
                         .supported_hooks
                         .contains(&HookKind::TurnComplete)
             })
-            .filter_map(|(name, instance)| instance.turn_complete_hook().map(|hook| (name, hook)))
+            .filter_map(|(name, instance)| {
+                let endpoint = instance.turn_complete_hook()?;
+                let declaration = self.registered_setting_fields(&name).cloned();
+                Some((name, endpoint, declaration))
+            })
             .collect();
         if endpoints.is_empty() {
             return;
@@ -1683,21 +1714,11 @@ impl ExtensionHub {
             .and_then(|peer| peer.server_slot.get())
             .map(|server| Arc::downgrade(&server));
         let tools = tools.to_vec();
+        // Use the identity bound at turn start, not a display-name lookup
+        // that could find a different Agent DB by the time the turn ends.
+        let agent = agent.cloned();
         let work = async move {
-            for (name, endpoint) in endpoints {
-                let turn = turn::TurnCompleteContext {
-                    agent_name: &agent_name,
-                    model: model.as_deref(),
-                    call_depth,
-                    messages: &messages,
-                    tools: &tools,
-                    extension: &name,
-                    db: &db,
-                    registry: &registry,
-                    backend: &backend,
-                    security: &security,
-                    completion_used: std::sync::atomic::AtomicBool::new(false),
-                };
+            for (name, endpoint, declaration) in endpoints {
                 let fut = AssertUnwindSafe(async {
                     // Queueing must not extend authority past a later revocation.
                     if registry
@@ -1720,6 +1741,25 @@ impl ExtensionHub {
                     if !active.contains(&name) {
                         return Ok(());
                     }
+                    let agent_settings = match &declaration {
+                        Some(_) => agent_layer(Some(&registry), agent.as_ref(), &name).await?,
+                        None => serde_json::json!({}),
+                    };
+                    let turn = turn::TurnCompleteContext {
+                        agent_name: &agent_name,
+                        model: model.as_deref(),
+                        call_depth,
+                        messages: &messages,
+                        tools: &tools,
+                        extension: &name,
+                        declaration: declaration.as_ref(),
+                        agent_settings,
+                        db: &db,
+                        registry: &registry,
+                        backend: &backend,
+                        security: &security,
+                        completion_used: std::sync::atomic::AtomicBool::new(false),
+                    };
                     endpoint.on_turn_complete(&turn).await
                 });
                 match tokio::time::timeout(std::time::Duration::from_secs(15), fut.catch_unwind())
@@ -1869,14 +1909,28 @@ impl ExtensionHub {
         extensions: Vec<Arc<dyn Extension>>,
         commands_only: bool,
     ) -> anyhow::Result<()> {
-        let manifests: Vec<manifest::ExtensionManifest> =
-            extensions.iter().map(|e| e.manifest()).collect();
-        for m in &manifests {
-            m.validate()?;
-        }
+        let mut declarations = HashMap::new();
         for ext in &extensions {
-            self.extensions.push(ext.clone());
+            ext.manifest().validate()?;
+            let name = ext.name();
+            let declaration = RegisteredSettingFields::validate(ext.as_ref())
+                .with_context(|| format!("invalid setting declaration for extension '{name}'"))?;
+            // Repeated installs are supported, but one registered name cannot
+            // mean two different setting contracts.
+            if let Some(previous) = declarations
+                .get(name)
+                .or_else(|| self.setting_fields.get(name))
+            {
+                anyhow::ensure!(
+                    *previous == declaration,
+                    "conflicting setting declarations for extension '{name}'"
+                );
+            } else {
+                declarations.insert(name, declaration);
+            }
         }
+        self.setting_fields.extend(declarations);
+        self.extensions.extend(extensions.iter().cloned());
 
         let Some(peer) = self.peer_handles.clone() else {
             return Ok(());

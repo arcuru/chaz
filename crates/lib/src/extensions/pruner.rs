@@ -4,7 +4,8 @@ mod tests;
 
 use crate::{
     extension::{
-        Extension, ExtensionInstance, ExtensionRef, HookKind, ScopeCtx,
+        Extension, ExtensionInstance, ExtensionRef, HookKind, ScopeCtx, SettingField, SettingKind,
+        SettingTargets,
         caps::{CapFuture, CapabilityKind},
         manifest::ExtensionManifest,
         projection::{ContextProjector, ContextSource, ProjectedRequest, ProjectionCall},
@@ -17,6 +18,7 @@ use serde_json::{Value, json};
 use std::{future::Future, pin::Pin, sync::Arc};
 
 pub const RECOVERY_TOOL: &str = "tool_history_query";
+const DEFAULT_MIN_BYTES: usize = 16 * 1024;
 pub struct ContextPruner;
 
 #[derive(Deserialize)]
@@ -31,7 +33,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             enabled: false,
-            min_bytes: 16 * 1024,
+            min_bytes: DEFAULT_MIN_BYTES,
             min_savings_bytes: 1024,
             exclude_tools: vec![],
         }
@@ -45,7 +47,19 @@ impl Extension for ContextPruner {
         &[HookKind::Tool]
     }
     fn default_settings(&self) -> Value {
-        json!({"enabled": false, "min_bytes": 16384, "min_savings_bytes": 1024, "exclude_tools": []})
+        json!({"enabled": false, "min_bytes": DEFAULT_MIN_BYTES, "min_savings_bytes": 1024, "exclude_tools": []})
+    }
+    fn setting_fields(&self) -> &'static [SettingField] {
+        &[SettingField {
+            key: "min_bytes",
+            label: "Minimum result bytes",
+            help: "Minimum result size to consider for substitution; does not enable the projector.",
+            kind: SettingKind::Unsigned {
+                min: 0,
+                max: usize::MAX as u64,
+            },
+            targets: SettingTargets::Both,
+        }]
     }
     fn manifest(&self) -> ExtensionManifest {
         ExtensionManifest {

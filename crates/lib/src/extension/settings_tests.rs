@@ -1,6 +1,531 @@
 use super::*;
 use crate::extension::test_doubles::make_session_db;
 use serde_json::json;
+use std::sync::Arc;
+
+const TEST_FIELD: SettingField = SettingField {
+    key: "flag",
+    label: "Flag",
+    help: "An agent-only preference.",
+    kind: SettingKind::Boolean,
+    targets: SettingTargets::Agent,
+};
+
+struct DeclaredSettings(&'static [SettingField], Value);
+
+impl Extension for DeclaredSettings {
+    fn name(&self) -> &'static str {
+        "declared"
+    }
+
+    fn supported_hooks(&self) -> &[crate::extension::HookKind] {
+        &[]
+    }
+
+    fn setting_fields(&self) -> &'static [SettingField] {
+        self.0
+    }
+
+    fn default_settings(&self) -> Value {
+        self.1.clone()
+    }
+}
+
+#[tokio::test]
+async fn declared_settings_validate_before_both_install_paths_register_anything() {
+    const EMPTY_KEY: &[SettingField] = &[SettingField {
+        key: "",
+        ..TEST_FIELD
+    }];
+    const INVALID_BOUNDS: &[SettingField] = &[SettingField {
+        kind: SettingKind::Unsigned { min: 2, max: 1 },
+        ..TEST_FIELD
+    }];
+
+    for commands_only in [true, false] {
+        let mut hub = ExtensionHub::new();
+        for (fields, defaults, expected) in [
+            (EMPTY_KEY, json!({"": false}), "invalid setting key"),
+            (
+                &[TEST_FIELD, TEST_FIELD],
+                json!({"flag": false}),
+                "duplicate setting key",
+            ),
+            (&[TEST_FIELD], json!({}), "missing default"),
+            (&[TEST_FIELD], json!(false), "must be an object"),
+            (&[TEST_FIELD], json!({"flag": 0}), "invalid default"),
+            (
+                INVALID_BOUNDS,
+                json!({"flag": 1}),
+                "invalid unsigned bounds",
+            ),
+        ] {
+            let extensions: Vec<Arc<dyn Extension>> = vec![
+                Arc::new(crate::extensions::session_naming::SessionNaming),
+                Arc::new(DeclaredSettings(fields, defaults)),
+            ];
+            let result = if commands_only {
+                hub.install_commands(extensions).await
+            } else {
+                hub.install_all(extensions).await
+            };
+            let error = result.unwrap_err();
+            assert!(format!("{error:#}").contains(expected), "{error:#}");
+            assert!(hub.extension_names().is_empty());
+            assert!(hub.registered_setting_fields("session_naming").is_none());
+        }
+    }
+}
+
+#[tokio::test]
+async fn declared_settings_command_catalog_is_readable_and_edits_check_target() {
+    let mut hub = ExtensionHub::new();
+    hub.install_commands(vec![
+        Arc::new(crate::extensions::session_naming::SessionNaming),
+        Arc::new(crate::extensions::pruner::ContextPruner),
+        Arc::new(DeclaredSettings(
+            &[TEST_FIELD],
+            json!({"flag": false, "internal": 42}),
+        )),
+    ])
+    .await
+    .unwrap();
+    let naming = hub.registered_setting_fields("session_naming").unwrap();
+    assert_eq!(naming.fields().len(), 2);
+    assert_eq!(naming.default_value("enabled"), Some(&json!(false)));
+    assert_eq!(naming.default_value("model"), Some(&Value::Null));
+    assert!(naming.field("attempted").is_none());
+    let pruner = hub.registered_setting_fields("context_prune").unwrap();
+    assert_eq!(pruner.default_value("min_bytes"), Some(&json!(16384)));
+    assert!(pruner.field("enabled").is_none());
+    assert!(hub.registered_setting_fields("unknown").is_none());
+    let declared = hub.registered_setting_fields("declared").unwrap();
+    assert!(declared.default_value("internal").is_none());
+
+    let (_inst, db) = make_session_db().await;
+    let id = db.root_id().to_string();
+    let before = db.snapshot().await.unwrap();
+    for (target, extension, key, expected) in [
+        ("stale", "session_naming", "enabled", "no longer matches"),
+        (&id, "declared", "flag", "does not allow session overrides"),
+        (&id, "declared", "internal", "no declared field"),
+    ] {
+        for edit in [SettingEdit::Set(json!(true)), SettingEdit::Reset] {
+            let error = hub
+                .edit_session_setting(target, &db, extension, key, edit)
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains(expected), "{error:#}");
+        }
+    }
+    assert_eq!(db.snapshot().await.unwrap(), before);
+}
+
+async fn agent_fixture() -> (
+    eidetica::Instance,
+    Arc<crate::session::SessionRegistry>,
+    ExtensionHub,
+    [(crate::hosted_index::DbEntry, Database); 2],
+) {
+    use crate::session::test_helpers::{make_agent_entry, make_registry};
+    let (instance, registry) = make_registry().await;
+    let mut hub = ExtensionHub::new();
+    hub.set_session_registry(registry.clone());
+    hub.install_commands(vec![
+        Arc::new(crate::extensions::session_naming::SessionNaming),
+        Arc::new(crate::extensions::pruner::ContextPruner),
+    ])
+    .await
+    .unwrap();
+    let mut agents = Vec::new();
+    for name in ["alpha", "beta"] {
+        let entry = make_agent_entry(&registry, name).await;
+        let adb = registry
+            .open_agent_db(&entry.db_id, Some(&entry.pubkey))
+            .await
+            .unwrap()
+            .unwrap();
+        agents.push((entry, adb.database().clone()));
+    }
+    (instance, registry, hub, agents.try_into().unwrap())
+}
+
+async fn effective(
+    hub: &ExtensionHub,
+    ext: &str,
+    session: &Database,
+    agent: &crate::hosted_index::DbEntry,
+) -> Value {
+    hub.effective_settings(ext, Some(session), Some(agent))
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn declared_settings_inherit_per_agent_and_session_pins_win_until_reset() {
+    let (_instance, registry, hub, [(alpha, alpha_db), (beta, beta_db)]) = agent_fixture().await;
+    let (_, shared) = registry.create_session(Some("shared")).await.unwrap();
+    let (_, untouched) = registry.create_session(Some("untouched")).await.unwrap();
+    let alpha_id = alpha.db_id.to_string();
+    let beta_id = beta.db_id.to_string();
+    let set = |v: Value| SettingEdit::Set(v);
+    hub.edit_agent_setting(
+        &alpha_id,
+        &alpha_db,
+        "session_naming",
+        "model",
+        set(json!("alpha:m")),
+    )
+    .await
+    .unwrap();
+    hub.edit_agent_setting(
+        &alpha_id,
+        &alpha_db,
+        "session_naming",
+        "enabled",
+        set(json!(true)),
+    )
+    .await
+    .unwrap();
+    hub.edit_agent_setting(
+        &beta_id,
+        &beta_db,
+        "session_naming",
+        "model",
+        set(json!("beta:m")),
+    )
+    .await
+    .unwrap();
+    hub.edit_agent_setting(
+        &alpha_id,
+        &alpha_db,
+        "context_prune",
+        "min_bytes",
+        set(json!(0)),
+    )
+    .await
+    .unwrap();
+
+    // Reads resolve in memory: no session receives a copy of either layer.
+    let before = (
+        shared.snapshot().await.unwrap(),
+        untouched.snapshot().await.unwrap(),
+    );
+    assert_eq!(
+        effective(&hub, "session_naming", &untouched, &alpha).await,
+        json!({"enabled": true, "model": "alpha:m"})
+    );
+    assert_eq!(
+        effective(&hub, "session_naming", &untouched, &beta).await,
+        json!({"enabled": false, "model": "beta:m"})
+    );
+    assert_eq!(
+        effective(&hub, "context_prune", &untouched, &alpha).await["min_bytes"],
+        json!(0)
+    );
+    assert_eq!(
+        effective(&hub, "context_prune", &untouched, &beta).await["min_bytes"],
+        json!(16384)
+    );
+    let rows = hub
+        .setting_rows(
+            "session_naming",
+            SettingLayer::Session,
+            Some(&untouched),
+            Some(&alpha_db),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        rows.iter()
+            .map(|r| (
+                r.field.key,
+                r.value.clone(),
+                r.source,
+                r.present_at_target,
+                r.editable
+            ))
+            .collect::<Vec<_>>(),
+        vec![
+            ("enabled", json!(true), SettingLayer::Agent, false, true),
+            ("model", json!("alpha:m"), SettingLayer::Agent, false, true),
+        ]
+    );
+    assert_eq!(
+        (
+            shared.snapshot().await.unwrap(),
+            untouched.snapshot().await.unwrap()
+        ),
+        before
+    );
+    assert_eq!(
+        read_settings_checked(&untouched, "session_naming")
+            .await
+            .unwrap(),
+        json!({})
+    );
+
+    // Explicit null/false pins differ from absence and apply to every agent.
+    let shared_id = shared.root_id().to_string();
+    crate::extension::write_settings(&shared, "session_naming", json!({"attempted": true}))
+        .await
+        .unwrap();
+    hub.edit_session_setting(
+        &shared_id,
+        &shared,
+        "session_naming",
+        "model",
+        set(Value::Null),
+    )
+    .await
+    .unwrap();
+    hub.edit_session_setting(
+        &shared_id,
+        &shared,
+        "session_naming",
+        "enabled",
+        set(json!(false)),
+    )
+    .await
+    .unwrap();
+    for agent in [&alpha, &beta] {
+        assert_eq!(
+            effective(&hub, "session_naming", &shared, agent).await,
+            json!({"attempted": true, "enabled": false, "model": null})
+        );
+    }
+
+    // Agent edits reach unpinned sessions on the next read, never pinned fields.
+    hub.edit_agent_setting(
+        &alpha_id,
+        &alpha_db,
+        "session_naming",
+        "model",
+        set(json!("alpha:2")),
+    )
+    .await
+    .unwrap();
+    hub.edit_agent_setting(
+        &alpha_id,
+        &alpha_db,
+        "session_naming",
+        "enabled",
+        set(json!(false)),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        effective(&hub, "session_naming", &untouched, &alpha).await,
+        json!({"enabled": false, "model": "alpha:2"})
+    );
+    assert_eq!(
+        effective(&hub, "session_naming", &shared, &alpha).await["model"],
+        Value::Null
+    );
+
+    // Resetting the shared pin exposes each agent's own value again.
+    hub.edit_session_setting(
+        &shared_id,
+        &shared,
+        "session_naming",
+        "model",
+        SettingEdit::Reset,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        effective(&hub, "session_naming", &shared, &alpha).await["model"],
+        "alpha:2"
+    );
+    assert_eq!(
+        effective(&hub, "session_naming", &shared, &beta).await["model"],
+        "beta:m"
+    );
+    assert_eq!(
+        read_settings_checked(&shared, "session_naming")
+            .await
+            .unwrap(),
+        json!({"attempted": true, "enabled": false})
+    );
+
+    // Agent reset removes only that agent's key; a repeated reset is a no-op.
+    hub.edit_agent_setting(
+        &beta_id,
+        &beta_db,
+        "session_naming",
+        "model",
+        SettingEdit::Reset,
+    )
+    .await
+    .unwrap();
+    let reset = beta_db.snapshot().await.unwrap();
+    hub.edit_agent_setting(
+        &beta_id,
+        &beta_db,
+        "session_naming",
+        "model",
+        SettingEdit::Reset,
+    )
+    .await
+    .unwrap();
+    assert_eq!(beta_db.snapshot().await.unwrap(), reset);
+    assert_eq!(
+        effective(&hub, "session_naming", &untouched, &beta).await["model"],
+        Value::Null
+    );
+    let peer_rows = hub
+        .setting_rows("session_naming", SettingLayer::Agent, None, Some(&beta_db))
+        .await
+        .unwrap();
+    assert!(
+        peer_rows
+            .iter()
+            .all(|r| r.source == SettingLayer::Default && !r.present_at_target)
+    );
+}
+
+#[tokio::test]
+async fn agent_preferences_survive_whole_config_writes_and_refuse_bad_targets() {
+    let (_instance, _registry, hub, [(alpha, alpha_db), (beta, _)]) = agent_fixture().await;
+    let alpha_id = alpha.db_id.to_string();
+    let adb = crate::agent_db::AgentDb::from_database(alpha_db.clone());
+    hub.edit_agent_setting(
+        &alpha_id,
+        &alpha_db,
+        "session_naming",
+        "model",
+        SettingEdit::Set(json!("alpha:m")),
+    )
+    .await
+    .unwrap();
+    // An ordinary whole-record config write (old or new writer) leaves the
+    // sibling preference intact, and the record itself is unchanged.
+    let mut cfg = adb.read_config().await.unwrap();
+    cfg.model = Some("edited:model".into());
+    adb.write_config(&cfg).await.unwrap();
+    assert_eq!(
+        adb.read_config().await.unwrap().model.as_deref(),
+        Some("edited:model")
+    );
+    assert_eq!(
+        read_agent_settings(&alpha_db, "session_naming")
+            .await
+            .unwrap(),
+        json!({"model": "alpha:m"})
+    );
+
+    let before = alpha_db.snapshot().await.unwrap();
+    for (target, ext, key, edit, expected) in [
+        (
+            beta.db_id.to_string(),
+            "session_naming",
+            "model",
+            SettingEdit::Reset,
+            "no longer matches",
+        ),
+        (
+            alpha_id.clone(),
+            "session_naming",
+            "attempted",
+            SettingEdit::Set(json!(false)),
+            "no declared field",
+        ),
+        (
+            alpha_id.clone(),
+            "context_prune",
+            "min_bytes",
+            SettingEdit::Set(json!(-1)),
+            "unsigned integer",
+        ),
+        (
+            alpha_id.clone(),
+            "session_naming",
+            "model",
+            SettingEdit::Set(json!(" ")),
+            "model identifier",
+        ),
+    ] {
+        let error = hub
+            .edit_agent_setting(&target, &alpha_db, ext, key, edit)
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains(expected), "{error:#}");
+    }
+    assert_eq!(alpha_db.snapshot().await.unwrap(), before);
+
+    // Database authorization is final: a read-only key cannot write.
+    let txn = alpha_db.new_transaction().await.unwrap();
+    txn.get_settings()
+        .unwrap()
+        .set_auth_key(
+            &alpha.pubkey,
+            eidetica::auth::types::AuthKey::active(
+                Some("read-only"),
+                eidetica::auth::Permission::Read,
+            ),
+        )
+        .await
+        .unwrap();
+    txn.commit().await.unwrap();
+    let read_only = alpha_db.snapshot().await.unwrap();
+    assert!(
+        hub.edit_agent_setting(
+            &alpha_id,
+            &alpha_db,
+            "session_naming",
+            "model",
+            SettingEdit::Reset
+        )
+        .await
+        .is_err()
+    );
+    assert_eq!(alpha_db.snapshot().await.unwrap(), read_only);
+
+    // Corrupt preferences are an error for reads and edits, not absence.
+    let (_instance2, _registry2, hub2, [(gamma, gamma_db), _]) = agent_fixture().await;
+    let txn = gamma_db.new_transaction().await.unwrap();
+    txn.get_store::<DocStore>(crate::agent_db::CONFIG_STORE)
+        .await
+        .unwrap()
+        .set("extension:session_naming", NativeValue::Text("{}".into()))
+        .await
+        .unwrap();
+    txn.commit().await.unwrap();
+    let (_, session) = _registry2.create_session(Some("s")).await.unwrap();
+    assert!(
+        hub2.effective_settings("session_naming", Some(&session), Some(&gamma))
+            .await
+            .is_err()
+    );
+    assert!(
+        hub2.edit_agent_setting(
+            &gamma.db_id.to_string(),
+            &gamma_db,
+            "session_naming",
+            "model",
+            SettingEdit::Reset
+        )
+        .await
+        .is_err()
+    );
+    // An expected agent that cannot be opened is an error, never another agent.
+    let missing = crate::hosted_index::DbEntry {
+        db_id: session.root_id().clone(),
+        ..gamma.clone()
+    };
+    assert!(
+        hub2.effective_settings("session_naming", Some(&session), Some(&missing))
+            .await
+            .is_err()
+    );
+    // Descriptorless extensions keep the existing raw read.
+    assert_eq!(
+        hub2.effective_settings("unknown", Some(&session), Some(&missing))
+            .await
+            .unwrap(),
+        json!({})
+    );
+}
 
 async fn legacy(db: &Database, ext: &str, text: &str) {
     let txn = db.new_transaction().await.unwrap();

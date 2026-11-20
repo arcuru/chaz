@@ -140,6 +140,25 @@ This is useful when several agents share a room but one of them
 shouldn't, say, touch the scheduler — disable it for that agent without
 affecting the others.
 
+## Editing extension preferences
+
+| Where                         | Keys                                                                                                                           | What changes                                                                                        |
+| ----------------------------- | ------------------------------------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------- |
+| Peer Settings → Extensions    | In the hub, `s`, `5`, then `e`; pick a hosted agent and press `Enter`.                                                         | That agent's default.                                                                               |
+| Session Settings → Extensions | In chat, `Ctrl+S`, `7`, then `Enter`; pick an authorized agent to view as.                                                     | A session override shared by all agents in that session. Picking an agent only changes the preview. |
+| Field sheet                   | `↑`/`↓` select; `Enter` edit or save; `r` then `y` removes the selected override/default; `Esc` cancels a prompt or goes back. | One field at a time. Read-only targets show values without edit controls.                           |
+
+The sheet shows the value and where it came from. A session override wins; otherwise Chaz checks the selected agent's default, then the extension's default. Two agents in the same session can inherit different models. Changing an agent default does not copy it to any session, and sessions with an override keep it. Reset removes only the stored choice at the current scope. It does not mean off, zero, or **Use turn model**.
+
+Only extensions that declare preferences have fields here. The sheet does not show credentials, runtime status or retry markers. Saving a preference does not activate an extension or make a model request. An older executor still uses session settings; upgrade the executors before relying on agent defaults. A retained session settings document can be inspected without writing it; to edit it, follow the [offline conversion procedure](#coordinated-settings-cutover).
+
+### Walkthrough: inherit a naming model, then pin it for one session
+
+1. From the hub open Peer Settings → Extensions and press `e`. Pick `alpha`. Select `session_naming / Model`, press `Enter`, type your configured model ID (for example `demo:small`), and press `Enter` to see `Saved`.
+2. Open a session with `alpha`, then open Session Settings → Extensions and view as `alpha`. The model shows `Agent: alpha`. To use the turn's model in this session instead, edit the field and press `Tab` to select `Use turn model`, then save. The source now says `Session override`.
+3. Select `context_prune / Minimum result bytes` and try `-1`. The sheet shows `Invalid: expected an unsigned integer from 0 to …` and leaves the prompt open. Correct it to a nonnegative byte count or press `Esc` to discard the draft. This setting does not enable pruning.
+4. Return to the naming model and press `r`, then `y`. The `Session override` disappears and the value inherits from `alpha` again. The agent default and existing retry state are unchanged.
+
 ## Inspecting settings
 
 ```
@@ -167,13 +186,20 @@ Merges `key = value` into the named extension's per-session settings.
 - `/extensions set schedule label foo` — `foo` doesn't parse as JSON,
   so it's stored as the string `"foo"`
 
-Each call replaces the value at that key while preserving every other
-key already stored. There's no `/extensions unset` yet — to clear a
-key, overwrite it with `null`:
+Each call replaces just that key. For declared fields, Chaz checks the type and range before it writes. `/extensions reset <name> <key>` removes a declared field's session override; it leaves every other field alone. Storing `null` is **not** a reset.
 
+For example, set a naming model and then remove the override:
+
+```text
+/extensions set session_naming model demo:small
+Set session_naming.model = "demo:small"
+/extensions reset session_naming model
+Reset session_naming.model on this session.
 ```
-/extensions set memory custom_limit null
-```
+
+`/extensions settings session_naming` no longer lists `model`. If you set `model` to `null` instead, the stored field reads `"model": null` (use the turn model). `enabled` requires a boolean: if `enabled 0` is refused, use `enabled false` to turn automatic naming off. None of these commands requests a name.
+
+Undeclared keys keep the raw session setter. They cannot be removed with `/extensions reset`; the extension's own commands and runtime still manage their state.
 
 ## Coordinated settings cutover
 

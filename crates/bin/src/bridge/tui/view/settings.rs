@@ -163,6 +163,14 @@ pub(super) fn ui_settings(
     config: &Config,
 ) {
     app.sync_settings_reader(scope);
+    if app.field_sheet.is_some() {
+        app.click_regions.clear();
+        app.settings_list_area = None;
+        app.settings_reader.viewport = None;
+        render_field_sheet(f, f.area(), app, scope);
+        render_settings_approval(f, app);
+        return;
+    }
     let chunks = Layout::vertical([
         Constraint::Length(1), // header
         Constraint::Min(1),    // sidebar + detail
@@ -271,39 +279,7 @@ pub(super) fn ui_settings(
         app.settings_reader.viewport = None;
     }
 
-    // Approval keys must never act on an unseen request. Reuse the chat panel
-    // over the bottom rows without discarding the underlying reader or draft.
-    let pending = app.current().and_then(|tab| tab.pending_approval.as_ref());
-    let hit_area = if let Some(exchange) = pending {
-        let info = exchange.info.clone();
-        let frame = f.area();
-        let panel = Rect {
-            y: frame.bottom().saturating_sub(frame.height.min(4)),
-            height: frame.height.min(4),
-            ..frame
-        };
-        f.render_widget(Clear, panel);
-        super::render_approval_panel(
-            f,
-            &mut app.click_regions,
-            panel,
-            &info.name,
-            &info.risk_level.to_string(),
-            &info.arguments_display,
-        );
-        panel
-    } else {
-        f.area()
-    };
-    app.click_regions.retain(|r| {
-        r.w > 0
-            && r.h > 0
-            && r.x >= hit_area.x
-            && r.y >= hit_area.y
-            && r.x.saturating_add(r.w) <= hit_area.right()
-            && r.y.saturating_add(r.h) <= hit_area.bottom()
-    });
-    if app.has_pending_approval() {
+    if render_settings_approval(f, app) {
         return;
     }
 
@@ -359,6 +335,20 @@ pub(super) fn ui_settings(
 /// by focus so the user sees which keys are live right now.
 fn settings_status_hint(app: &App, scope: SettingsScope) -> &'static str {
     let cur = app.settings_index(scope);
+    match scope {
+        SettingsScope::Peer
+            if PeerSettingsCategory::ALL.get(cur) == Some(&PeerSettingsCategory::Extensions) =>
+        {
+            return " e edit agent settings · Esc back ";
+        }
+        SettingsScope::Session
+            if SessionSettingsCategory::ALL.get(cur)
+                == Some(&SessionSettingsCategory::Extensions) =>
+        {
+            return " Enter edit session overrides · Esc ";
+        }
+        _ => {}
+    }
     if app.settings_layout == SettingsLayout::Compact {
         return match app.settings_focus {
             SettingsFocus::Content if scope == SettingsScope::Peer && cur == 0 => {
@@ -1437,6 +1427,16 @@ fn render_session_category(
         SessionSettingsCategory::Overview => render_session_overview(f, area, app),
         SessionSettingsCategory::Models => render_session_models(f, area, app, backend),
         SessionSettingsCategory::Agents => render_session_agents(f, area, app, backend),
+        SessionSettingsCategory::Extensions => {
+            let lines = vec![
+                Line::from(vec![Span::styled("  Extensions", theme::accent_bold())]),
+                Line::from("  Session overrides apply to every agent in this session."),
+                Line::from("  Unset fields inherit each agent's default, then the extension's."),
+                Line::from("  Enter pick an agent to view as, then edit overrides."),
+                Line::from("  /extensions settings inspects raw session state."),
+            ];
+            render_content(f, area, app, "Extensions", lines, 1);
+        }
         SessionSettingsCategory::Routing
         | SessionSettingsCategory::History
         | SessionSettingsCategory::Sharing => {
@@ -1884,4 +1884,207 @@ fn render_settings_detail_placeholder(
         )]),
     ];
     render_content(f, area, app, category, lines, 4);
+}
+
+/// A keyboard-only overlay: reserve scope, selected row and prompt before
+/// windowing the list, even when resized to 40×8.
+fn render_field_sheet(f: &mut ratatui::Frame, area: Rect, app: &App, scope: SettingsScope) {
+    use super::super::field_sheet::{self as sheet, Draft, Mode, Target};
+    let Some(s) = app.field_sheet.as_ref() else {
+        return;
+    };
+    let dim = Style::default().fg(theme::DIM);
+    let compact = app.settings_layout == SettingsLayout::Compact;
+    let title = match scope {
+        SettingsScope::Peer => "Peer Settings / Extensions".into(),
+        SettingsScope::Session => {
+            let name = app.current().map(|t| t.title()).unwrap_or_default();
+            format!("Session: {}", sheet::one_line(&name))
+        }
+    };
+    let mut lines = vec![Line::from(Span::styled(title, theme::accent_bold()))];
+    let (hints, detail) = if let Some(target) = &s.target {
+        let name = sheet::one_line(target.label());
+        lines.push(Line::from(match target {
+            Target::Agent { .. } => format!("Agent defaults: {name}"),
+            Target::Session { .. } if compact => format!("Session pin (all) · view: {name}"),
+            Target::Session { .. } => {
+                format!("Session overrides (all agents) · Viewing as: {name}")
+            }
+        }));
+        let selected = s.selected();
+        let (hints, detail) = match (&s.mode, selected) {
+            (Mode::Edit(draft), Some(_)) => match draft {
+                Draft::Bool(on) => (
+                    "Space toggle · Enter save · Esc cancel",
+                    Some(format!("Choice: {}", if *on { "On" } else { "Off" })),
+                ),
+                Draft::Model {
+                    turn_model: true, ..
+                } => (
+                    "Tab model · Enter save · Esc cancel",
+                    Some("Choice: Use turn model".into()),
+                ),
+                Draft::Model { input, .. } => (
+                    "Tab turn · Enter save · Esc cancel",
+                    Some(format!("ID: {}_", sheet::one_line(input))),
+                ),
+                Draft::Number(input) => (
+                    "Digits · Enter save · Esc cancel",
+                    Some(format!("Bytes: {}_", sheet::one_line(input))),
+                ),
+            },
+            (Mode::ConfirmReset, Some(row)) => {
+                let subject = if matches!(target, Target::Agent { .. }) {
+                    "agent default"
+                } else {
+                    "session override"
+                };
+                (
+                    "y remove · n keep · Esc cancel",
+                    Some(format!("Remove {subject} for {}?", row.field.label)),
+                )
+            }
+            (_, _) if s.pending.is_some() => (
+                "Esc back",
+                Some(
+                    if s.rows.is_some() {
+                        "Saving…"
+                    } else {
+                        "Loading…"
+                    }
+                    .into(),
+                ),
+            ),
+            (_, Some(row)) => (
+                if row.editable {
+                    if row.present {
+                        "↑↓ select · Enter edit · r reset · Esc"
+                    } else {
+                        "↑↓ select · Enter edit · Esc back"
+                    }
+                } else {
+                    "↑↓ select · Read only · Esc back"
+                },
+                Some(row.field.help.to_owned()),
+            ),
+            _ => ("Esc back", None),
+        };
+        match &s.rows {
+            Some(Err(error)) => lines.push(Line::from(error.clone())),
+            Some(Ok(rows)) if rows.is_empty() => lines.push(Line::from("No declared preferences")),
+            Some(Ok(_)) if compact => {
+                if let Some(row) = selected {
+                    lines.push(Line::from(format!("> {}", row.field.label)));
+                    lines.push(Line::from(Span::styled(
+                        format!(
+                            "  {} · {}",
+                            sheet::source_label(row, target),
+                            sheet::display(row)
+                        ),
+                        dim,
+                    )));
+                }
+            }
+            Some(Ok(rows)) => {
+                let room = usize::from(area.height.saturating_sub(5));
+                let start = s.cursor.saturating_sub(room.saturating_sub(1));
+                for (i, row) in rows.iter().enumerate().skip(start).take(room) {
+                    let marker = if i == s.cursor { '>' } else { ' ' };
+                    let text = format!(
+                        "{marker} {} / {}  ·  {}  ·  {}",
+                        row.extension,
+                        row.field.label,
+                        sheet::source_label(row, target),
+                        sheet::display(row)
+                    );
+                    lines.push(if i == s.cursor {
+                        Line::from(Span::styled(text, theme::accent_bold()))
+                    } else {
+                        Line::from(text)
+                    });
+                }
+            }
+            None => {}
+        }
+        (hints, detail)
+    } else {
+        lines.push(Line::from(match scope {
+            SettingsScope::Peer => "Edit defaults for agent:",
+            SettingsScope::Session => "View session overrides as:",
+        }));
+        let room = usize::from(area.height.saturating_sub(4));
+        let start = s.pick_cursor.saturating_sub(room.saturating_sub(1));
+        for (i, pick) in s.picks.iter().enumerate().skip(start).take(room) {
+            let marker = if i == s.pick_cursor { '>' } else { ' ' };
+            lines.push(Line::from(format!(
+                "{marker} {}",
+                sheet::one_line(pick.label())
+            )));
+        }
+        if s.pending.is_some() {
+            ("Esc back", Some("Loading authorized agents…".into()))
+        } else if s.picks.is_empty() {
+            ("Esc back", None)
+        } else {
+            ("↑↓ select · Enter open · Esc back", None)
+        }
+    };
+    if let Some(detail) = detail {
+        lines.push(Line::from(detail));
+    }
+    if let Some(notice) = s.notice.as_ref().or(app.operations.notice.as_ref()) {
+        lines.push(Line::from(notice.clone()));
+    }
+    f.render_widget(
+        Paragraph::new(lines),
+        Rect {
+            height: area.height.saturating_sub(1),
+            ..area
+        },
+    );
+    f.render_widget(
+        Paragraph::new(Span::styled(hints, dim)),
+        Rect {
+            y: area.bottom().saturating_sub(1),
+            height: 1,
+            ..area
+        },
+    );
+}
+
+fn render_settings_approval(f: &mut ratatui::Frame, app: &mut App) -> bool {
+    // Approval keys must never act on an unseen request. Reuse the chat panel
+    // over the bottom rows without discarding the underlying reader or draft.
+    let pending = app.current().and_then(|tab| tab.pending_approval.as_ref());
+    let hit_area = if let Some(exchange) = pending {
+        let info = exchange.info.clone();
+        let frame = f.area();
+        let panel = Rect {
+            y: frame.bottom().saturating_sub(frame.height.min(4)),
+            height: frame.height.min(4),
+            ..frame
+        };
+        f.render_widget(Clear, panel);
+        super::render_approval_panel(
+            f,
+            &mut app.click_regions,
+            panel,
+            &info.name,
+            &info.risk_level.to_string(),
+            &info.arguments_display,
+        );
+        panel
+    } else {
+        f.area()
+    };
+    app.click_regions.retain(|r| {
+        r.w > 0
+            && r.h > 0
+            && r.x >= hit_area.x
+            && r.y >= hit_area.y
+            && r.x.saturating_add(r.w) <= hit_area.right()
+            && r.y.saturating_add(r.h) <= hit_area.bottom()
+    });
+    app.has_pending_approval()
 }

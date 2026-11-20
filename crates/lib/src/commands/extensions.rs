@@ -25,10 +25,13 @@
 //! - `/extensions set <name> <key> <value>` — merge `key = value` into
 //!   the per-session settings. `<value>` is JSON-parsed first
 //!   (so `60`, `true`, `"abc"` all work); on parse failure it's stored
-//!   as a plain string.
+//!   as a plain string. Declared fields are validated before writing.
+//! - `/extensions reset <name> <key>` — remove one declared session override.
 
 use super::{CommandContext, CommandOutcome};
-use crate::extension::{ExtensionEvent, ExtensionHub, ExtensionRef, append_event, list_events};
+use crate::extension::{
+    ExtensionEvent, ExtensionHub, ExtensionRef, SettingEdit, append_event, list_events,
+};
 use chrono::{DateTime, Utc};
 
 /// Which activation log an `add`/`remove` targets.
@@ -58,6 +61,10 @@ pub enum ExtensionsAction {
         key: String,
         value: String,
     },
+    Reset {
+        name: String,
+        key: String,
+    },
 }
 
 pub async fn dispatch(action: ExtensionsAction, ctx: &CommandContext<'_>) -> CommandOutcome {
@@ -77,6 +84,7 @@ pub async fn dispatch(action: ExtensionsAction, ctx: &CommandContext<'_>) -> Com
         ExtensionsAction::Remove(name, scope) => remove(&name, scope, ctx).await,
         ExtensionsAction::Settings(name) => settings(&name, ctx).await,
         ExtensionsAction::Set { name, key, value } => set(&name, &key, &value, ctx).await,
+        ExtensionsAction::Reset { name, key } => reset(&name, &key, ctx).await,
     }
 }
 
@@ -299,19 +307,50 @@ async fn set(name: &str, key: &str, value: &str, ctx: &CommandContext<'_>) -> Co
     let parsed_value: serde_json::Value = serde_json::from_str(value)
         .unwrap_or_else(|_| serde_json::Value::String(value.to_string()));
 
-    if let Err(e) = crate::extension::patch_settings(
-        ctx.session_db,
-        name,
-        false,
-        [(key.to_string(), parsed_value.clone())]
-            .into_iter()
-            .collect(),
-    )
-    .await
+    let result = if hub
+        .registered_setting_fields(name)
+        .and_then(|declaration| declaration.field(key))
+        .is_some()
     {
+        hub.edit_session_setting(
+            ctx.session_db_id,
+            ctx.session_db,
+            name,
+            key,
+            SettingEdit::Set(parsed_value.clone()),
+        )
+        .await
+    } else {
+        crate::extension::patch_settings(
+            ctx.session_db,
+            name,
+            false,
+            std::iter::once((key.to_owned(), parsed_value.clone())).collect(),
+        )
+        .await
+    };
+    if let Err(e) = result {
         return CommandOutcome::Error(format!("Failed to write settings: {e}"));
     }
     CommandOutcome::Text(format!("Set {name}.{key} = {parsed_value}"))
+}
+
+async fn reset(name: &str, key: &str, ctx: &CommandContext<'_>) -> CommandOutcome {
+    match ctx
+        .server
+        .extensions()
+        .edit_session_setting(
+            ctx.session_db_id,
+            ctx.session_db,
+            name,
+            key,
+            SettingEdit::Reset,
+        )
+        .await
+    {
+        Ok(()) => CommandOutcome::Text(format!("Reset {name}.{key} on this session.")),
+        Err(e) => CommandOutcome::Error(format!("Failed to reset settings: {e}")),
+    }
 }
 
 fn find_ref(hub: &ExtensionHub, name: &str) -> Option<ExtensionRef> {
@@ -914,6 +953,140 @@ mod tests {
     // -------------------------------------------------------------------------
     // settings round-trip
     // -------------------------------------------------------------------------
+
+    async fn run(line: &str, context: &CommandContext<'_>) -> CommandOutcome {
+        let crate::commands::Parsed::Command(command) = crate::commands::parse(line) else {
+            panic!("expected command: {line}");
+        };
+        dispatch(command, context).await
+    }
+
+    #[tokio::test]
+    async fn declared_settings_commands_pin_and_reset_only_one_native_field() {
+        use serde_json::json;
+
+        let f = fixture().await;
+        let context = ctx(&f);
+        let db = context.session_db;
+        crate::extension::write_settings(
+            db,
+            "session_naming",
+            json!({"attempted": true, "last_usage": {"tokens": 42}}),
+        )
+        .await
+        .unwrap();
+
+        for line in [
+            "/extensions set session_naming model demo:small",
+            "/extensions set session_naming model null",
+            "/extensions set session_naming enabled false",
+            "/extensions set context_prune min_bytes 0",
+        ] {
+            assert!(
+                matches!(run(line, &context).await, CommandOutcome::Text(_)),
+                "{line}"
+            );
+        }
+        assert!(matches!(
+            run("/extensions settings session_naming", &context).await,
+            CommandOutcome::Text(text) if text.contains("\"model\": null") && text.contains("\"attempted\": true")
+        ));
+        assert_eq!(
+            crate::extension::read_settings_checked(db, "session_naming")
+                .await
+                .unwrap(),
+            json!({"model": null, "enabled": false, "attempted": true, "last_usage": {"tokens": 42}})
+        );
+        assert_eq!(
+            crate::extension::read_settings_checked(db, "context_prune")
+                .await
+                .unwrap(),
+            json!({"min_bytes": 0})
+        );
+
+        let pinned = db.snapshot().await.unwrap();
+        assert!(matches!(
+            run("/extensions set session_naming model null", &context).await,
+            CommandOutcome::Text(_)
+        ));
+        for line in [
+            "/extensions set session_naming enabled 0",
+            "/extensions set session_naming model \"  \"",
+            r#"/extensions set session_naming model "demo:one\ntwo""#,
+            "/extensions set context_prune min_bytes -1",
+            "/extensions set context_prune min_bytes 18446744073709551616",
+            "/extensions reset session_naming attempted",
+        ] {
+            assert!(
+                matches!(run(line, &context).await, CommandOutcome::Error(_)),
+                "{line}"
+            );
+        }
+        assert_eq!(db.snapshot().await.unwrap(), pinned);
+
+        let reset = "/extensions reset session_naming model";
+        assert!(matches!(
+            run(reset, &context).await,
+            CommandOutcome::Text(_)
+        ));
+        let removed = db.snapshot().await.unwrap();
+        assert_ne!(removed, pinned);
+        assert!(matches!(
+            run(reset, &context).await,
+            CommandOutcome::Text(_)
+        ));
+        assert_eq!(db.snapshot().await.unwrap(), removed);
+
+        // The raw setter remains available for the private retry marker.
+        assert!(matches!(
+            run("/extensions set session_naming attempted false", &context).await,
+            CommandOutcome::Text(_)
+        ));
+        assert_eq!(
+            crate::extension::read_settings_checked(db, "session_naming")
+                .await
+                .unwrap(),
+            json!({"enabled": false, "attempted": false, "last_usage": {"tokens": 42}})
+        );
+    }
+
+    #[tokio::test]
+    async fn declared_settings_commands_refuse_retained_and_nonobject_settings() {
+        let f = fixture().await;
+        let context = ctx(&f);
+        let db = context.session_db;
+        let txn = db.new_transaction().await.unwrap();
+        txn.get_store::<eidetica::store::DocStore>("extension_settings")
+            .await
+            .unwrap()
+            .set_string("session_naming", r#"{"model":"demo:old","attempted":true}"#)
+            .await
+            .unwrap();
+        txn.commit().await.unwrap();
+
+        let edits = [
+            "/extensions set session_naming model null",
+            "/extensions reset session_naming model",
+        ];
+        let retained = db.snapshot().await.unwrap();
+        for line in edits {
+            assert!(
+                matches!(run(line, &context).await, CommandOutcome::Error(e) if e.contains("offline conversion"))
+            );
+        }
+        assert_eq!(db.snapshot().await.unwrap(), retained);
+
+        crate::extension::write_settings(db, "session_naming", serde_json::Value::Null)
+            .await
+            .unwrap();
+        let nonobject = db.snapshot().await.unwrap();
+        for line in edits {
+            assert!(
+                matches!(run(line, &context).await, CommandOutcome::Error(e) if e.contains("must be an object"))
+            );
+        }
+        assert_eq!(db.snapshot().await.unwrap(), nonobject);
+    }
 
     #[tokio::test]
     async fn settings_command_converts_retained_objects_before_native_edits() {

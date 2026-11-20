@@ -41,6 +41,7 @@ use tokio_stream::StreamExt;
 mod activity_backend;
 mod bridge_impl;
 mod creation;
+mod field_sheet;
 mod input;
 mod jobs;
 mod operations;
@@ -252,6 +253,7 @@ pub(super) enum SessionSettingsCategory {
     Routing,
     History,
     Sharing,
+    Extensions,
 }
 
 impl SessionSettingsCategory {
@@ -262,6 +264,7 @@ impl SessionSettingsCategory {
         Self::Routing,
         Self::History,
         Self::Sharing,
+        Self::Extensions,
     ];
 
     pub(super) fn label(self) -> &'static str {
@@ -272,6 +275,7 @@ impl SessionSettingsCategory {
             Self::Routing => "Routing",
             Self::History => "History",
             Self::Sharing => "Sharing",
+            Self::Extensions => "Extensions",
         }
     }
 }
@@ -778,6 +782,7 @@ pub(super) struct App {
     /// Peer→Agents view and the input handler both index into this so
     /// the cursor row always points at the same agent in both places.
     pub(super) peer_agents_names: Vec<String>,
+    extension_agent_targets: Vec<field_sheet::Target>,
     /// Snapshot of `server.default_agents()` for the Peer→Defaults
     /// editor. Refreshed at the top of each frame so DB writes /
     /// `set_default_agents` calls show up live. Order is the persisted
@@ -820,6 +825,8 @@ pub(super) struct App {
     /// the Agents detail pane and routes keys to its own handler. Mutually
     /// exclusive with the prompt/picker.
     pub(super) agent_diff: Option<AgentDiffView>,
+    /// Declared extension preference sheet; owns keys while open.
+    pub(in crate::bridge::tui) field_sheet: Option<field_sheet::Sheet>,
     /// One-shot status line shown in the Settings status strip in place
     /// of the regular hints. Set by action keys (`[r]` reload, `[d]`
     /// remove, etc.) to confirm what just happened; cleared on the next
@@ -923,6 +930,7 @@ impl App {
             session_settings_index: 0,
             peer_agents_cursor: 0,
             peer_agents_names: Vec::new(),
+            extension_agent_targets: Vec::new(),
             peer_defaults: Vec::new(),
             peer_defaults_cursor: 0,
             peer_mcp_servers: Vec::new(),
@@ -935,6 +943,7 @@ impl App {
             settings_prompt: None,
             settings_picker: None,
             agent_diff: None,
+            field_sheet: None,
             settings_status: None,
             model_picker_caller: TuiMode::Chat,
             settings_focus: SettingsFocus::Category,
@@ -960,6 +969,7 @@ impl App {
         }
         self.settings_reader = SettingsReader::default();
         self.settings_list_area = None;
+        self.field_sheet = None;
         self.settings_return = Some(from);
         self.settings_focus = SettingsFocus::Category;
         self.mode = TuiMode::Settings(scope);
@@ -972,6 +982,7 @@ impl App {
         self.mode = back;
         // Drop any transient Settings sub-state so re-entry starts clean.
         self.agent_diff = None;
+        self.field_sheet = None;
         self.settings_reader = SettingsReader::default();
         self.settings_list_area = None;
         self.click_regions.clear();
@@ -2341,6 +2352,7 @@ fn handle_settings_outcome(
 ) {
     match outcome {
         input::SettingsKey::None => {}
+        input::SettingsKey::Field(request) => field_sheet::submit(app, server, request),
         input::SettingsKey::OpenModelPicker(scope) => {
             let scope = scope.unwrap_or_else(|| models_scope_from_cursor(app));
             handle_chat_action(

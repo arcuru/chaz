@@ -302,7 +302,9 @@ pub(crate) struct RoundInputs<'a> {
     /// call IDs are not occurrence identities and may legally repeat.
     pub current_exchanges: &'a HashSet<usize>,
     pub budget_tokens: Option<usize>,
+    pub hub: &'a super::ExtensionHub,
     pub session_db: Option<&'a eidetica::Database>,
+    pub agent: Option<&'a crate::hosted_index::DbEntry>,
     pub history: Option<&'a super::history::ScopedHistory>,
 }
 
@@ -343,10 +345,12 @@ async fn run_chain_inner(
         let invoked = tokio::time::timeout(
             PROJECTOR_TIMEOUT,
             AssertUnwindSafe(async {
-                let settings = match inputs.session_db {
-                    Some(db) => super::read_settings_checked(db, &step.extension).await?,
-                    None => serde_json::json!({}),
-                };
+                // Settings I/O shares the existing per-step timeout and
+                // optional/required failure semantics with the projector.
+                let settings = inputs
+                    .hub
+                    .effective_settings(&step.extension, inputs.session_db, inputs.agent)
+                    .await?;
                 let call = ProjectionCall {
                     agent_name: inputs.agent_name,
                     session_db_id: inputs.session_db_id,

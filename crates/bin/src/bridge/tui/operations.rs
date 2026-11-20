@@ -60,6 +60,7 @@ pub(super) enum Effect {
     },
     Settings(String),
     Diff(AgentDiffView),
+    Fields(Box<super::field_sheet::Update>),
 }
 struct Pending {
     ticket: u64,
@@ -326,13 +327,15 @@ pub(super) fn submit(
     write: bool,
     input: Option<String>,
     work: impl Future<Output = Result<Effect, String>> + Send + 'static,
-) {
+) -> Option<u64> {
     if !app.backend_ready() {
         app.operations.notice = Some("Backend unavailable — action not accepted".into());
-        return;
+        return None;
     }
     let origin = Origin::capture(app);
-    app.operations.submit(origin, write, input, work);
+    app.operations
+        .submit(origin, write, input, work)
+        .then_some(app.operations.next_ticket)
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -389,6 +392,13 @@ pub(super) fn apply(app: &mut App, completion: Completion) -> Invalidation {
         result => (result, false),
     };
     let nav_valid = pending.origin.navigation_valid(app);
+    let field_current = app
+        .field_sheet
+        .as_ref()
+        .is_some_and(|sheet| sheet.pending == Some(pending.ticket));
+    if field_current && !nav_valid {
+        app.field_sheet = None;
+    }
     let target = pending.origin.tab_index(app);
     // Creation stays admitted only while its accepted action continues below
     // (a new destination still preparing); every other settlement releases it.
@@ -416,6 +426,12 @@ pub(super) fn apply(app: &mut App, completion: Completion) -> Invalidation {
     };
     match result {
         Err(error) => {
+            if field_current && let Some(sheet) = app.field_sheet.as_mut() {
+                sheet.apply(super::field_sheet::Loaded {
+                    rows: Err("Settings unavailable; reopen to check the current value".into()),
+                    notice: Some("Settings unavailable; reopen to retry".into()),
+                });
+            }
             creation::failed(app, pending.ticket, &error);
             if let Some(i) = target {
                 app.tabs[i].live.input_feedback = error.clone();
@@ -550,6 +566,11 @@ pub(super) fn apply(app: &mut App, completion: Completion) -> Invalidation {
         Ok(Effect::Diff(diff)) => {
             if nav_valid {
                 app.agent_diff = Some(diff);
+            }
+        }
+        Ok(Effect::Fields(loaded)) => {
+            if field_current && let Some(sheet) = app.field_sheet.as_mut() {
+                sheet.complete(*loaded);
             }
         }
         Ok(Effect::Global(_)) => unreachable!("unwrapped above"),

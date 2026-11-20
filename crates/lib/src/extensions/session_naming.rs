@@ -4,7 +4,9 @@ use crate::extension::caps::CapFuture;
 use crate::extension::instance::{ExtensionInstance, InstantiateFuture, ScopeCtx};
 use crate::extension::manifest::ExtensionManifest;
 use crate::extension::turn::{TurnComplete, TurnCompleteContext};
-use crate::extension::{Extension, ExtensionRef, HookKind};
+use crate::extension::{
+    Extension, ExtensionRef, HookKind, SettingField, SettingKind, SettingTargets,
+};
 use serde::Deserialize;
 use serde_json::json;
 use std::sync::Arc;
@@ -17,6 +19,27 @@ impl Extension for SessionNaming {
     }
     fn supported_hooks(&self) -> &[HookKind] {
         &[HookKind::TurnComplete]
+    }
+    fn default_settings(&self) -> serde_json::Value {
+        json!({"enabled": false, "model": null})
+    }
+    fn setting_fields(&self) -> &'static [SettingField] {
+        &[
+            SettingField {
+                key: "enabled",
+                label: "Automatic naming",
+                help: "Automatically name the session on an eligible turn.",
+                kind: SettingKind::Boolean,
+                targets: SettingTargets::Both,
+            },
+            SettingField {
+                key: "model",
+                label: "Model",
+                help: "Model used for naming; null selects the turn model.",
+                kind: SettingKind::NullableModel,
+                targets: SettingTargets::Both,
+            },
+        ]
     }
     fn manifest(&self) -> ExtensionManifest {
         ExtensionManifest {

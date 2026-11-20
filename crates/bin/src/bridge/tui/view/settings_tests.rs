@@ -337,8 +337,15 @@ async fn settings_focus_ladder_category_keys_and_existing_actions() {
                     "{scope:?} category={category} key={code:?}"
                 );
             }
-            let _ = key(&mut app, KeyCode::Enter);
-            if !(scope == SettingsScope::Session && category == 2) {
+            let outcome = key(&mut app, KeyCode::Enter);
+            if scope == SettingsScope::Session
+                && SessionSettingsCategory::ALL[category] == SessionSettingsCategory::Extensions
+            {
+                assert!(matches!(outcome, input::SettingsKey::Field(_)));
+                assert_eq!(app.settings_focus, Category);
+                key(&mut app, KeyCode::Esc);
+                assert!(app.field_sheet.is_none());
+            } else if !(scope == SettingsScope::Session && category == 2) {
                 assert_eq!(
                     app.settings_focus, entry,
                     "{scope:?} category={category} Enter"
@@ -1023,6 +1030,7 @@ async fn settings_compact_empty_missing_and_static_pages_use_full_content_slot()
                         (SettingsScope::Session, 0) => "agent)",
                         (SettingsScope::Session, 1) if !missing => "selected",
                         (SettingsScope::Session, 3..=5) => "result",
+                        (SettingsScope::Session, 6) => "state.",
                         _ => "coming soon",
                     };
                     assert!(
@@ -3000,5 +3008,347 @@ async fn agent_diff_cursor_keeps_workers_and_values_visible() {
             assert!(contains(&rows, expected), "{width}x{height}: {rows:?}");
         }
     }
+    server.shutdown().await;
+}
+
+/// Hosted Agent DBs for the field sheet, registered under existing roster names.
+async fn hosted_agent(server: &Arc<Server>, name: &str) -> chaz_core::hosted_index::DbEntry {
+    let meta = chaz_core::agent_db::AgentMeta {
+        display_name: Some(name.into()),
+        ..Default::default()
+    };
+    let (db, pubkey) = chaz_core::agent_db::create_agent_db(
+        &mut *server.registry().user_lock().await,
+        name,
+        &AgentDbConfig::default(),
+        &meta,
+    )
+    .await
+    .unwrap();
+    let entry = chaz_core::hosted_index::DbEntry {
+        db_id: db.id(),
+        display_name: name.into(),
+        pubkey,
+    };
+    server.agent_index().register(entry.clone());
+    entry
+}
+
+fn submit_field(app: &mut App, server: &Arc<Server>, outcome: input::SettingsKey) {
+    let input::SettingsKey::Field(request) = outcome else {
+        panic!("expected a field request");
+    };
+    super::super::field_sheet::submit(app, server, request);
+}
+
+async fn settle_field(app: &mut App) {
+    let done = tokio::time::timeout(std::time::Duration::from_secs(5), app.operations.recv())
+        .await
+        .expect("field operation settled")
+        .unwrap();
+    super::super::operations::apply(app, done);
+}
+
+async fn drive_field(app: &mut App, server: &Arc<Server>, outcome: input::SettingsKey) {
+    submit_field(app, server, outcome);
+    settle_field(app).await;
+}
+
+fn field_frame(
+    app: &mut App,
+    server: &Arc<Server>,
+    backend: &BackendManager,
+    w: u16,
+    h: u16,
+) -> Vec<String> {
+    let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+    draw(&mut terminal, app, server, backend)
+}
+
+/// Peer agent defaults and session overrides share one typed sheet; inputs
+/// are validated before writes, resets remove only the target layer.
+#[tokio::test]
+async fn field_sheet_edits_agent_defaults_and_session_overrides_with_real_keys() {
+    use chaz_core::extension::{read_agent_settings, read_settings_checked};
+    let (_instance, server, backend, mut app) = super::list_tests::fixture_with_extensions(
+        None,
+        vec![
+            Arc::new(chaz_core::extensions::session_naming::SessionNaming),
+            Arc::new(chaz_core::extensions::pruner::ContextPruner),
+        ],
+    )
+    .await;
+    let alpha = hosted_agent(&server, "agent-00").await;
+    let alpha_db = server
+        .registry()
+        .open_agent_db(&alpha.db_id, Some(&alpha.pubkey))
+        .await
+        .unwrap()
+        .unwrap();
+    let extensions = PeerSettingsCategory::ALL
+        .iter()
+        .position(|c| *c == PeerSettingsCategory::Extensions)
+        .unwrap();
+
+    // Peer → Extensions → e → agent picker → agent defaults.
+    open(&mut app, SettingsScope::Peer, extensions);
+    let rows = field_frame(&mut app, &server, &backend, 100, 30);
+    assert!(contains(&rows, "e edit agent settings"), "{rows:?}");
+    assert!(matches!(
+        key(&mut app, KeyCode::Char('e')),
+        input::SettingsKey::None
+    ));
+    let rows = field_frame(&mut app, &server, &backend, 100, 30);
+    assert!(contains(&rows, "Edit defaults for agent:"), "{rows:?}");
+    let load = key(&mut app, KeyCode::Enter);
+    submit_field(&mut app, &server, load);
+    key(&mut app, KeyCode::Esc);
+    let reload = key(&mut app, KeyCode::Enter);
+    submit_field(&mut app, &server, reload);
+    settle_field(&mut app).await;
+    assert!(
+        app.field_sheet.as_ref().unwrap().rows.is_none(),
+        "retired load must not fill even the same target in a new sheet visit"
+    );
+    settle_field(&mut app).await;
+    let rows = field_frame(&mut app, &server, &backend, 100, 30);
+    for expected in [
+        "Agent defaults: agent-00",
+        "context_prune",
+        "Minimum result bytes",
+        "16384",
+        "Extension default",
+        "Automatic naming",
+        "(turn model)",
+    ] {
+        assert!(contains(&rows, expected), "{expected}: {rows:?}");
+    }
+    assert!(!contains(&rows, "attempted"));
+
+    // An invalid number keeps the prompt open and writes nothing.
+    let before = alpha_db.database().snapshot().await.unwrap();
+    assert!(matches!(
+        key(&mut app, KeyCode::Enter),
+        input::SettingsKey::None
+    ));
+    for _ in 0..5 {
+        key(&mut app, KeyCode::Backspace);
+    }
+    for c in "-1".chars() {
+        key(&mut app, KeyCode::Char(c));
+    }
+    assert!(matches!(
+        key(&mut app, KeyCode::Enter),
+        input::SettingsKey::None
+    ));
+    let rows = field_frame(&mut app, &server, &backend, 100, 30);
+    assert!(
+        contains(&rows, "Invalid: expected an unsigned integer"),
+        "{rows:?}"
+    );
+    assert!(contains(&rows, "Bytes: -1_"), "{rows:?}");
+    assert_eq!(alpha_db.database().snapshot().await.unwrap(), before);
+
+    // Zero is a real value: saved to this agent, selection kept, source shown.
+    key(&mut app, KeyCode::Backspace);
+    key(&mut app, KeyCode::Backspace);
+    key(&mut app, KeyCode::Char('0'));
+    let save = key(&mut app, KeyCode::Enter);
+    drive_field(&mut app, &server, save).await;
+    let rows = field_frame(&mut app, &server, &backend, 100, 30);
+    assert!(contains(&rows, "Saved"), "{rows:?}");
+    assert!(
+        rows.iter().any(|r| r.contains("> ")
+            && r.contains("Minimum result bytes")
+            && r.contains("Agent: agent-00")),
+        "{rows:?}"
+    );
+    assert_eq!(
+        read_agent_settings(alpha_db.database(), "context_prune")
+            .await
+            .unwrap(),
+        serde_json::json!({"min_bytes": 0})
+    );
+
+    // Reset asks with the target visible, then falls back to the default.
+    key(&mut app, KeyCode::Char('r'));
+    let rows = field_frame(&mut app, &server, &backend, 100, 30);
+    assert!(
+        contains(&rows, "Remove agent default for Minimum result bytes?"),
+        "{rows:?}"
+    );
+    let reset = key(&mut app, KeyCode::Char('y'));
+    drive_field(&mut app, &server, reset).await;
+    assert_eq!(
+        read_agent_settings(alpha_db.database(), "context_prune")
+            .await
+            .unwrap(),
+        serde_json::json!({})
+    );
+    // Give the agent a model default for the session view below.
+    key(&mut app, KeyCode::Down);
+    key(&mut app, KeyCode::Down);
+    key(&mut app, KeyCode::Enter);
+    for c in "demo:small".chars() {
+        key(&mut app, KeyCode::Char(c));
+    }
+    let save = key(&mut app, KeyCode::Enter);
+    drive_field(&mut app, &server, save).await;
+    // Esc returns to the picker, then closes the sheet.
+    key(&mut app, KeyCode::Esc);
+    assert!(app.field_sheet.as_ref().unwrap().picking());
+    key(&mut app, KeyCode::Esc);
+    assert!(app.field_sheet.is_none());
+
+    // Session → Extensions: overrides for every agent, viewed as one of them.
+    let session_id = app.active().session_db_id.clone();
+    let session_db = app.active().session_db.clone();
+    server
+        .registry()
+        .attach_agent_to_session(&session_id, &alpha)
+        .await
+        .unwrap();
+    // The authorized picker must not use the stale Settings roster.
+    app.session_settings_snapshot
+        .as_mut()
+        .unwrap()
+        .agents
+        .clear();
+    let extensions = SessionSettingsCategory::ALL.len() - 1;
+    assert_eq!(
+        SessionSettingsCategory::ALL[extensions],
+        SessionSettingsCategory::Extensions
+    );
+    open(&mut app, SettingsScope::Session, extensions);
+    let load_picks = key(&mut app, KeyCode::Enter);
+    drive_field(&mut app, &server, load_picks).await;
+    let rows = field_frame(&mut app, &server, &backend, 100, 30);
+    assert!(contains(&rows, "> agent-00"), "{rows:?}");
+    let load = key(&mut app, KeyCode::Enter);
+    drive_field(&mut app, &server, load).await;
+    let rows = field_frame(&mut app, &server, &backend, 100, 30);
+    assert!(
+        contains(
+            &rows,
+            "Session overrides (all agents) · Viewing as: agent-00"
+        ),
+        "{rows:?}"
+    );
+    assert!(
+        rows.iter().any(|r| r.contains("Model")
+            && r.contains("demo:small")
+            && r.contains("Agent: agent-00")),
+        "{rows:?}"
+    );
+
+    // Pin the model to the turn model (null) for the whole session.
+    for _ in 0..2 {
+        key(&mut app, KeyCode::Down);
+    }
+    key(&mut app, KeyCode::Enter);
+    key(&mut app, KeyCode::Tab);
+    let save = key(&mut app, KeyCode::Enter);
+    drive_field(&mut app, &server, save).await;
+    assert_eq!(
+        read_settings_checked(&session_db, "session_naming")
+            .await
+            .unwrap(),
+        serde_json::json!({"model": null})
+    );
+    assert_eq!(
+        read_agent_settings(alpha_db.database(), "session_naming")
+            .await
+            .unwrap(),
+        serde_json::json!({"model": "demo:small"}),
+        "a session edit never writes the agent"
+    );
+
+    // Compact 40×8 keeps scope, field and source reachable.
+    app.settings_layout = super::super::SettingsLayout::Compact;
+    let rows = field_frame(&mut app, &server, &backend, 40, 8);
+    for expected in [
+        "Session pin (all) · view: agent-00",
+        "> Model",
+        "Session override · (turn model)",
+        "r reset",
+    ] {
+        assert!(contains(&rows, expected), "{expected}: {rows:?}");
+    }
+
+    // Cancel from a 40×8 edit, with an approval owning input in between.
+    key(&mut app, KeyCode::Enter);
+    key(&mut app, KeyCode::Char('x'));
+    let rx = approval(&mut app);
+    field_frame(&mut app, &server, &backend, 40, 8);
+    deny(&mut app, true, rx).await;
+    let rows = field_frame(&mut app, &server, &backend, 40, 8);
+    assert!(contains(&rows, "ID: x_"), "{rows:?}");
+    field_frame(&mut app, &server, &backend, 39, 8);
+    assert!(matches!(
+        key(&mut app, KeyCode::Enter),
+        input::SettingsKey::None
+    ));
+    key(&mut app, KeyCode::Esc);
+    field_frame(&mut app, &server, &backend, 40, 8);
+    assert_eq!(
+        read_settings_checked(&session_db, "session_naming")
+            .await
+            .unwrap(),
+        serde_json::json!({"model":null})
+    );
+
+    // A new tab incarnation of even the same session is a different caller.
+    key(&mut app, KeyCode::Char('r'));
+    let reset = key(&mut app, KeyCode::Char('y'));
+    let pinned = session_db.snapshot().await.unwrap();
+    app.active_mut().live.incarnation += 1;
+    submit_field(&mut app, &server, reset);
+    assert!(!app.operations.is_pending());
+    assert_eq!(session_db.snapshot().await.unwrap(), pinned);
+    assert_eq!(
+        app.field_sheet.as_ref().unwrap().notice.as_deref(),
+        Some("Not saved: the session changed")
+    );
+    key(&mut app, KeyCode::Esc);
+    key(&mut app, KeyCode::Esc);
+    app.close_settings();
+
+    // A read-only agent stays inspectable, but the sheet offers no edit.
+    let txn = alpha_db.database().new_transaction().await.unwrap();
+    txn.get_settings()
+        .unwrap()
+        .set_auth_key(
+            &alpha.pubkey,
+            eidetica::auth::types::AuthKey::active(
+                Some("viewer"),
+                eidetica::auth::Permission::Read,
+            ),
+        )
+        .await
+        .unwrap();
+    txn.commit().await.unwrap();
+    open(
+        &mut app,
+        SettingsScope::Peer,
+        PeerSettingsCategory::ALL
+            .iter()
+            .position(|c| *c == PeerSettingsCategory::Extensions)
+            .unwrap(),
+    );
+    field_frame(&mut app, &server, &backend, 80, 24);
+    key(&mut app, KeyCode::Char('e'));
+    let load = key(&mut app, KeyCode::Enter);
+    drive_field(&mut app, &server, load).await;
+    let rows = field_frame(&mut app, &server, &backend, 40, 8);
+    assert!(contains(&rows, "Read only"), "{rows:?}");
+    assert!(!contains(&rows, "Enter edit"), "{rows:?}");
+    assert!(matches!(
+        key(&mut app, KeyCode::Enter),
+        input::SettingsKey::None
+    ));
+    assert!(matches!(
+        app.field_sheet.as_ref().unwrap().mode,
+        super::super::field_sheet::Mode::View
+    ));
     server.shutdown().await;
 }
