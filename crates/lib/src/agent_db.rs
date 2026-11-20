@@ -21,11 +21,13 @@ use crate::config::{AgentConfig, AgentPreset, WorkerConfig};
 use crate::grants::Grants;
 use crate::routine::Trigger;
 use crate::routine::types::next_interval_fire;
+use anyhow::Context;
 use chrono::{DateTime, Utc};
 use eidetica::AccountSession;
 use eidetica::Database;
 use eidetica::auth::crypto::PublicKey;
 use eidetica::crdt::Doc;
+use eidetica::crdt::doc::{List, Value};
 use eidetica::entry::ID;
 use eidetica::store::{DocStore, Table};
 use serde::{Deserialize, Serialize};
@@ -230,25 +232,119 @@ pub struct LoginRef {
 /// carrying no login is simply absent rather than malformed.
 pub const LOGIN_REF_METADATA_KEY: &str = "chaz_login_ref";
 
+/// Format number of the native login claim stored under
+/// [`LOGIN_REF_METADATA_KEY`]. A Chaz field, independent of Eidetica's own
+/// `Doc` format version and of the sync protocol version.
+const LOGIN_REF_NATIVE_VERSION: i64 = 1;
+
 impl LoginRef {
     /// Encode as bootstrap-request metadata, so a bridge asking for access to
     /// an agent DB can tell the approver which login it is bringing online and
     /// where that login's credentials live. The approver registers the pointer
-    /// on the bridge's behalf, which is what lets the bridge hold `Read` rather
-    /// than `Write` on the agent DB.
+    /// on the bridge's behalf when it approves the request.
+    ///
+    /// Still the legacy JSON-text claim: Chaz releases before the native reader
+    /// show no claim and register no pointer for a native one, yet still let
+    /// the grant proceed. Bridges keep writing this until every approving peer,
+    /// including any rollback binary, reads both formats.
     pub fn to_metadata(&self) -> anyhow::Result<Doc> {
         let mut doc = Doc::new();
         doc.set_json(LOGIN_REF_METADATA_KEY, self)?;
         Ok(doc)
     }
 
-    /// Recover a `LoginRef` from bootstrap-request metadata. `None` when the
-    /// document carries no login pointer (the ordinary case for every other
-    /// kind of access request) or when the value present does not decode —
-    /// this is remote-supplied data, so a malformed payload is ignored rather
-    /// than failing the approval.
+    /// Encode as the native, versioned claim that [`Self::from_metadata`]
+    /// reads alongside the legacy text. No bridge writes this yet; see
+    /// [`Self::to_metadata`].
+    pub fn to_native_metadata(&self) -> Doc {
+        let optional = |value: &Option<String>| value.clone().map_or(Value::Null, Value::Text);
+        let mut addresses = List::new();
+        for (transport, address) in &self.sync_addresses {
+            let mut pair = Doc::atomic();
+            pair.set("transport", transport.as_str());
+            pair.set("address", address.as_str());
+            addresses.push(pair);
+        }
+        let mut claim = Doc::atomic();
+        claim.set("version", LOGIN_REF_NATIVE_VERSION);
+        claim.set("kind", self.kind.as_str());
+        claim.set("identifier", self.identifier.as_str());
+        claim.set("bridge_db_id", self.bridge_db_id.as_str());
+        claim.set("peer_pubkey", optional(&self.peer_pubkey));
+        claim.set("agent_pubkey", optional(&self.agent_pubkey));
+        claim.set("sync_addresses", addresses);
+        let mut doc = Doc::new();
+        doc.set(LOGIN_REF_METADATA_KEY, claim);
+        doc
+    }
+
+    /// Recover a `LoginRef` from bootstrap-request metadata, in either the
+    /// legacy JSON-text or the native format. `None` when the document carries
+    /// no login pointer (the ordinary case for every other kind of access
+    /// request) or when the value present does not decode — this is
+    /// remote-supplied data, so a malformed or unsupported claim is ignored
+    /// rather than failing the approval, and never reinterpreted as another
+    /// format.
     pub fn from_metadata(metadata: &Doc) -> Option<Self> {
-        metadata.get_json::<Self>(LOGIN_REF_METADATA_KEY).ok()
+        let value = metadata.get(LOGIN_REF_METADATA_KEY)?;
+        match Self::decode_claim(value) {
+            Ok(login) => Some(login),
+            Err(error) => {
+                tracing::warn!(
+                    "Ignoring unreadable bridge login claim in access request: {error:#}"
+                );
+                None
+            }
+        }
+    }
+
+    fn decode_claim(value: &Value) -> anyhow::Result<Self> {
+        let claim = match value {
+            Value::Text(json) => return Ok(serde_json::from_str(json)?),
+            Value::Doc(claim) => claim,
+            other => anyhow::bail!("unexpected {} value", other.type_name()),
+        };
+        anyhow::ensure!(
+            claim.get("version").and_then(Value::as_int) == Some(LOGIN_REF_NATIVE_VERSION),
+            "missing or unsupported claim version"
+        );
+        anyhow::ensure!(
+            claim.is_atomic() && claim.len() == 7,
+            "invalid native claim envelope"
+        );
+        let text = |doc: &Doc, key: &str| {
+            doc.get(key)
+                .and_then(Value::as_text)
+                .map(str::to_owned)
+                .with_context(|| format!("invalid or missing claim field {key}"))
+        };
+        let optional = |key: &str| match claim.get(key) {
+            Some(Value::Text(value)) => Ok(Some(value.clone())),
+            Some(Value::Null) => Ok(None),
+            _ => anyhow::bail!("invalid or missing claim field {key}"),
+        };
+        let addresses = match claim.get("sync_addresses") {
+            Some(Value::List(list)) => list,
+            _ => anyhow::bail!("invalid or missing claim field sync_addresses"),
+        };
+        let sync_addresses = addresses
+            .iter_all()
+            .map(|value| {
+                let pair = match value {
+                    Value::Doc(pair) if pair.is_atomic() && pair.len() == 2 => pair,
+                    _ => anyhow::bail!("invalid sync address"),
+                };
+                Ok((text(pair, "transport")?, text(pair, "address")?))
+            })
+            .collect::<anyhow::Result<_>>()?;
+        Ok(Self {
+            kind: text(claim, "kind")?,
+            identifier: text(claim, "identifier")?,
+            bridge_db_id: text(claim, "bridge_db_id")?,
+            peer_pubkey: optional("peer_pubkey")?,
+            agent_pubkey: optional("agent_pubkey")?,
+            sync_addresses,
+        })
     }
 }
 

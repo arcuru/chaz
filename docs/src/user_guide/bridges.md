@@ -331,6 +331,44 @@ is separate and granted by attachment.) The flow mirrors [`/agent import`](sessi
 > is approved instantly — no queue, no restart. The bridge logs its key on
 > startup. See [the preseed flow](session_sharing.md#preseed-flow-still-supported).
 
+## Login claim formats and upgrade order
+
+The login pointer a bridge attaches to its access request (the `claimed` block
+in step 5) is stored under one metadata key, `chaz_login_ref`, in one of two
+formats:
+
+| Format           | Written by           | Read by                           |
+| ---------------- | -------------------- | --------------------------------- |
+| Legacy JSON text | Every current bridge | Every Chaz release                |
+| Native v1 claim  | No bridge yet        | This release onward (dual reader) |
+
+Bridges still write the legacy format. The native claim is a versioned Eidetica
+document; this release only teaches approvers to read it, so a later release can
+switch bridges to it without leaving any approver behind.
+
+The order matters because the claim is display-only. It never decides whether a
+request is granted, and an approver that cannot read it still approves or rejects
+the request normally. What it loses is the information: an older daemon shown a
+native-only request prints no `claimed` block, gives no replacement warning, and
+registers no login pointer on approval. Nothing fails, so nothing warns you.
+
+**Before any bridge writes native claims**, every peer that runs `/sharing
+requests` or `/sharing approve` for an agent a bridge serves must run a release
+with the dual reader — including whichever binary you would roll back to. Rolling
+back further than that is safe only while bridges still write legacy claims.
+
+Upgrading changes no stored data. A request already pending keeps the claim it
+was filed with; it is not rewritten, and you approve or reject it exactly as
+before. A claim that is malformed, or carries a version this release does not
+know, is shown as no claim and logged as `Ignoring unreadable bridge login claim`;
+it is never read as a different format.
+
+**Recovering a request approved without its claim**: the access grant stands, but
+no login pointer was registered. Check the fingerprint you approved against the
+bridge's startup log as usual, then restart the bridge: holding Write, it
+registers its own pointer on the next run. If you did not mean to grant the key,
+revoke it with `/agent revoke-peer <agent> <pubkey>` as for any other grant.
+
 Once approved and connected, operation is transparent: inbound messages are
 written into the per-channel session DBs (which sync to the daemon), the daemon's
 agents respond, and the replies sync back for the bridge to deliver. Day-to-day
@@ -426,6 +464,13 @@ pointer.
 Expected on first run before approval. Run `/sharing requests` then
 `/sharing approve <id>` on the daemon, then restart the bridge. See Setup step 5.
 To avoid the round-trip entirely, preseed with `/agent invite`.
+
+**`/sharing requests` shows a bridge request with no `claimed` block.** The
+request carries no login claim this daemon can read: an older bridge sent none,
+or the claim is malformed or in a format this release does not know (the daemon
+logs `Ignoring unreadable bridge login claim`). Approval still works from the
+fingerprint alone; see [Login claim formats](#login-claim-formats-and-upgrade-order)
+for the upgrade order and recovery.
 
 **"no Matrix/Discord logins are ready."** Every configured login is still
 pending approval (or none are configured). Approve them on the daemon and
