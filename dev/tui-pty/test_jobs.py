@@ -102,6 +102,20 @@ class JobPtyProcess(PtyProcess):
         self.resize_jobs(110, 35)
         self.expect(status)
 
+    def expect_empty_composer(self, timeout=20):
+        deadline = time.monotonic() + timeout
+        while True:
+            self.drain(0.05)
+            top, row, bottom = self.screen.display[-3:]
+            # The observer composer is a bottom-aligned box. Require its top
+            # border too, so a blank last row of a wrapped draft cannot pass.
+            if (top.startswith("╭") and top.endswith("╮")
+                    and re.fullmatch(r"│ +│", row) and re.fullmatch(r"╰─+╯", bottom)):
+                self.checkpoints.append({"seen": "empty composer", "time": time.monotonic()})
+                return
+            if self.child.poll() is not None or time.monotonic() >= deadline:
+                raise AssertionError(f"expected an empty composer; bottom rows: {[top, row, bottom]!r}")
+
     def expect_absent(self, text, timeout=20):
         deadline = time.monotonic() + timeout
         while True:
@@ -350,7 +364,7 @@ context:
                 # The composer has no Ctrl+U binding. Use its supported deletion
                 # key and prove the unsent draft is gone before observing the job.
                 process.send("\x7f" * len("queued-next-draft"))
-                process.expect_absent("queued-next-draft")
+                process.expect_empty_composer()
                 process.screen_capture(evidence, "observer-queued-80x24")
                 self.assertEqual(len(job_calls), 1, "viewer/steering must not run or interrupt a job")
                 release.set()
@@ -380,7 +394,16 @@ context:
                 # Refresh/navigation/close while the continued resident call is blocked.
                 process.send("\x07")
                 process.expect("Tasks")
-                process.send("r")
+                process.expect("sources unavailable · recorded, not proven live")
+                # Hold the disposable service so the pending refresh cannot
+                # finish before it draws. The job text alone can be cached.
+                service.send_signal(signal.SIGSTOP)
+                try:
+                    process.send("r")
+                    process.expect("Refreshing ·", timeout=1)
+                finally:
+                    service.send_signal(signal.SIGCONT)
+                process.expect("0 sources unavailable · recorded, not proven live")
                 process.expect("original job task")
                 process.send("\x1b")
                 process.expect("Job observer")
@@ -472,7 +495,7 @@ context:
                 process.screen_capture(evidence, "observer-generation-recovered")
                 self.assertEqual(len(job_calls), 2, "observer recovery executed a job")
                 process.send("\x7f" * len("offline-cached-draft"))
-                process.expect_absent("offline-cached-draft")
+                process.expect_empty_composer()
                 process.send("\x03")
                 self.assertEqual(process.child.wait(timeout=10), 0)
                 print("JOB MONITOR INTEGRATION CONTRACT: PASS; cached navigation/typing, queued steering/exit, receipts, observer generation recovery, no extra model calls")
