@@ -178,13 +178,20 @@ Merges `key = value` into the named extension's per-session settings.
 - `/extensions set schedule label foo` — `foo` doesn't parse as JSON,
   so it's stored as the string `"foo"`
 
-Each call replaces the value at that key while preserving every other
-key already stored. There's no `/extensions unset` yet — to clear a
-key, overwrite it with `null`:
+Each call replaces just that key. For declared fields, Chaz checks the type and range before it writes. `/extensions reset <name> <key>` removes a declared field's session override; it leaves every other field alone. Storing `null` is **not** a reset.
 
+For example, set a naming model and then remove the override:
+
+```text
+/extensions set session_naming model demo:small
+Set session_naming.model = "demo:small"
+/extensions reset session_naming model
+Reset session_naming.model on this session.
 ```
-/extensions set memory custom_limit null
-```
+
+`/extensions settings session_naming` no longer lists `model`. If you set `model` to `null` instead, the stored field reads `"model": null` (use the turn model). `enabled` requires a boolean: if `enabled 0` is refused, use `enabled false` to turn automatic naming off. None of these commands requests a name.
+
+Undeclared keys keep the raw session setter. They cannot be removed with `/extensions reset`; the extension's own commands and runtime still manage their state.
 
 ## Coordinated settings cutover
 

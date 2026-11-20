@@ -1,6 +1,125 @@
 use super::*;
 use crate::extension::test_doubles::make_session_db;
 use serde_json::json;
+use std::sync::Arc;
+
+const TEST_FIELD: SettingField = SettingField {
+    key: "flag",
+    label: "Flag",
+    help: "An agent-only preference.",
+    kind: SettingKind::Boolean,
+    targets: SettingTargets::Agent,
+};
+
+struct DeclaredSettings(&'static [SettingField], Value);
+
+impl Extension for DeclaredSettings {
+    fn name(&self) -> &'static str {
+        "declared"
+    }
+
+    fn supported_hooks(&self) -> &[crate::extension::HookKind] {
+        &[]
+    }
+
+    fn setting_fields(&self) -> &'static [SettingField] {
+        self.0
+    }
+
+    fn default_settings(&self) -> Value {
+        self.1.clone()
+    }
+}
+
+#[tokio::test]
+async fn declared_settings_validate_before_both_install_paths_register_anything() {
+    const EMPTY_KEY: &[SettingField] = &[SettingField {
+        key: "",
+        ..TEST_FIELD
+    }];
+    const INVALID_BOUNDS: &[SettingField] = &[SettingField {
+        kind: SettingKind::Unsigned { min: 2, max: 1 },
+        ..TEST_FIELD
+    }];
+
+    for commands_only in [true, false] {
+        let mut hub = ExtensionHub::new();
+        for (fields, defaults, expected) in [
+            (EMPTY_KEY, json!({"": false}), "invalid setting key"),
+            (
+                &[TEST_FIELD, TEST_FIELD],
+                json!({"flag": false}),
+                "duplicate setting key",
+            ),
+            (&[TEST_FIELD], json!({}), "missing default"),
+            (&[TEST_FIELD], json!(false), "must be an object"),
+            (&[TEST_FIELD], json!({"flag": 0}), "invalid default"),
+            (
+                INVALID_BOUNDS,
+                json!({"flag": 1}),
+                "invalid unsigned bounds",
+            ),
+        ] {
+            let extensions: Vec<Arc<dyn Extension>> = vec![
+                Arc::new(crate::extensions::session_naming::SessionNaming),
+                Arc::new(DeclaredSettings(fields, defaults)),
+            ];
+            let result = if commands_only {
+                hub.install_commands(extensions).await
+            } else {
+                hub.install_all(extensions).await
+            };
+            let error = result.unwrap_err();
+            assert!(format!("{error:#}").contains(expected), "{error:#}");
+            assert!(hub.extension_names().is_empty());
+            assert!(hub.registered_setting_fields("session_naming").is_none());
+        }
+    }
+}
+
+#[tokio::test]
+async fn declared_settings_command_catalog_is_readable_and_edits_check_target() {
+    let mut hub = ExtensionHub::new();
+    hub.install_commands(vec![
+        Arc::new(crate::extensions::session_naming::SessionNaming),
+        Arc::new(crate::extensions::pruner::ContextPruner),
+        Arc::new(DeclaredSettings(
+            &[TEST_FIELD],
+            json!({"flag": false, "internal": 42}),
+        )),
+    ])
+    .await
+    .unwrap();
+    let naming = hub.registered_setting_fields("session_naming").unwrap();
+    assert_eq!(naming.fields().len(), 2);
+    assert_eq!(naming.default_value("enabled"), Some(&json!(false)));
+    assert_eq!(naming.default_value("model"), Some(&Value::Null));
+    assert!(naming.field("attempted").is_none());
+    let pruner = hub.registered_setting_fields("context_prune").unwrap();
+    assert_eq!(pruner.default_value("min_bytes"), Some(&json!(16384)));
+    assert!(pruner.field("enabled").is_none());
+    assert!(hub.registered_setting_fields("unknown").is_none());
+    let declared = hub.registered_setting_fields("declared").unwrap();
+    assert!(declared.default_value("internal").is_none());
+
+    let (_inst, db) = make_session_db().await;
+    let id = db.root_id().to_string();
+    let before = db.snapshot().await.unwrap();
+    for (target, extension, key, expected) in [
+        ("stale", "session_naming", "enabled", "no longer matches"),
+        (&id, "declared", "flag", "does not allow session overrides"),
+        (&id, "declared", "internal", "no declared field"),
+    ] {
+        for edit in [SettingEdit::Set(json!(true)), SettingEdit::Reset] {
+            let error = hub
+                .edit_session_setting(target, &db, extension, key, edit)
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains(expected), "{error:#}");
+        }
+    }
+    assert_eq!(db.snapshot().await.unwrap(), before);
+}
 
 async fn legacy(db: &Database, ext: &str, text: &str) {
     let txn = db.new_transaction().await.unwrap();

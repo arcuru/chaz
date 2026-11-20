@@ -1,7 +1,7 @@
 //! Native session settings. JSON is the host/API boundary, not the stored value.
 //! Retained formats are read-only until explicit coordinated offline conversion.
 
-use super::EXTENSION_SETTINGS_STORE;
+use super::{EXTENSION_SETTINGS_STORE, Extension, ExtensionHub};
 use crate::native_doc::{WIDE_NUMBER as NUMBER, decode_field_key, field_key, unhex, wide_number};
 use anyhow::Context;
 use eidetica::crdt::{
@@ -15,6 +15,172 @@ use serde_json::Value;
 const RETAINED_STORE: &str = "extension_settings";
 // Reserved native keys cannot collide with application keys (which escape '~').
 const ARRAY: &str = "~array";
+
+/// Accepted JSON types for public extension preferences.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettingKind {
+    Boolean,
+    NullableModel,
+    Unsigned { min: u64, max: u64 },
+}
+
+impl SettingKind {
+    pub fn validate(self, value: &Value) -> anyhow::Result<()> {
+        match self {
+            Self::Boolean => anyhow::ensure!(value.is_boolean(), "expected a boolean"),
+            Self::NullableModel => anyhow::ensure!(
+                value.is_null() || value.as_str().is_some_and(nonblank_line),
+                "expected a nonblank single-line model identifier or null"
+            ),
+            Self::Unsigned { min, max } => anyhow::ensure!(
+                value.as_u64().is_some_and(|n| (min..=max).contains(&n)),
+                "expected an unsigned integer from {min} to {max}"
+            ),
+        }
+        Ok(())
+    }
+}
+
+fn nonblank_line(text: &str) -> bool {
+    !text.trim().is_empty()
+        && !text
+            .chars()
+            .any(|c| c.is_control() || matches!(c, '\u{2028}' | '\u{2029}'))
+}
+
+/// Which layers may be edited. The declaration does not grant write access.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettingTargets {
+    Agent,
+    Session,
+    Both,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SettingField {
+    pub key: &'static str,
+    pub label: &'static str,
+    pub help: &'static str,
+    pub kind: SettingKind,
+    pub targets: SettingTargets,
+}
+
+/// Validated registration snapshot, available even without an instance.
+#[derive(Debug, PartialEq, Eq)]
+pub struct RegisteredSettingFields {
+    fields: &'static [SettingField],
+    defaults: serde_json::Map<String, Value>,
+}
+
+impl RegisteredSettingFields {
+    pub(super) fn validate(ext: &dyn Extension) -> anyhow::Result<Option<Self>> {
+        let fields = ext.setting_fields();
+        if fields.is_empty() {
+            return Ok(None);
+        }
+        let Value::Object(mut defaults) = ext.default_settings() else {
+            anyhow::bail!("default_settings must be an object for declared fields");
+        };
+        let mut saved = serde_json::Map::new();
+        for field in fields {
+            let key = field.key;
+            anyhow::ensure!(
+                !key.is_empty() && !key.chars().any(|c| c.is_whitespace() || c.is_control()),
+                "invalid setting key {key:?}"
+            );
+            anyhow::ensure!(!saved.contains_key(key), "duplicate setting key {key:?}");
+            anyhow::ensure!(
+                nonblank_line(field.label) && nonblank_line(field.help),
+                "setting {key:?} needs a nonblank single-line label and help"
+            );
+            if let SettingKind::Unsigned { min, max } = field.kind {
+                anyhow::ensure!(min <= max, "invalid unsigned bounds for setting {key:?}");
+            }
+            let value = defaults
+                .remove(key)
+                .with_context(|| format!("missing default for setting {key:?}"))?;
+            field
+                .kind
+                .validate(&value)
+                .with_context(|| format!("invalid default for setting {key:?}"))?;
+            saved.insert(key.to_owned(), value);
+        }
+        Ok(Some(Self {
+            fields,
+            defaults: saved,
+        }))
+    }
+
+    pub fn fields(&self) -> &'static [SettingField] {
+        self.fields
+    }
+
+    pub fn field(&self, key: &str) -> Option<&'static SettingField> {
+        self.fields.iter().find(|field| field.key == key)
+    }
+
+    /// `Some(Value::Null)` is a declared null default, not an absent field.
+    pub fn default_value(&self, key: &str) -> Option<&Value> {
+        self.defaults.get(key)
+    }
+}
+
+pub enum SettingEdit {
+    Set(Value),
+    Reset,
+}
+
+impl ExtensionHub {
+    /// Edit one declared field on the already opened session. The caller binds
+    /// the ID and session-key handle; commit enforces database authorization.
+    /// This never falls back to the legacy raw setter.
+    pub async fn edit_session_setting(
+        &self,
+        session_db_id: &str,
+        session_db: &Database,
+        extension: &str,
+        key: &str,
+        edit: SettingEdit,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            session_db.root_id().to_string() == session_db_id,
+            "session settings target no longer matches the open session"
+        );
+        let field = self
+            .registered_setting_fields(extension)
+            .and_then(|declaration| declaration.field(key))
+            .with_context(|| format!("no declared field {extension}.{key}"))?;
+        anyhow::ensure!(
+            matches!(
+                field.targets,
+                SettingTargets::Session | SettingTargets::Both
+            ),
+            "{extension}.{key} does not allow session overrides"
+        );
+        match edit {
+            SettingEdit::Set(value) => {
+                field.kind.validate(&value)?;
+                patch_settings(
+                    session_db,
+                    extension,
+                    true,
+                    std::iter::once((key.to_owned(), value)).collect(),
+                )
+                .await
+            }
+            SettingEdit::Reset => {
+                update_settings(session_db, extension, true, |value| {
+                    value
+                        .as_object_mut()
+                        .context("extension settings must be an object")?
+                        .remove(key);
+                    Ok(())
+                })
+                .await
+            }
+        }
+    }
+}
 
 pub(super) fn encode(value: &Value) -> NativeValue {
     match value {

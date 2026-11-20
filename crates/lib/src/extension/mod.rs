@@ -31,7 +31,10 @@ pub mod projection;
 mod settings;
 pub mod turn;
 
-pub use settings::{migrate_settings, read_settings, read_settings_checked, write_settings};
+pub use settings::{
+    RegisteredSettingFields, SettingEdit, SettingField, SettingKind, SettingTargets,
+    migrate_settings, read_settings, read_settings_checked, write_settings,
+};
 pub(crate) use settings::{patch_settings, update_settings};
 
 #[allow(unused_imports)]
@@ -568,8 +571,8 @@ pub trait ExtensionCommand: Send + Sync {
 }
 
 /// An extension is a compile-time Rust type that hooks into the agent
-/// runtime. Its entire API surface is hook registration: tools, slash
-/// commands, and lifecycle hooks all flow through [`ExtensionHub`].
+/// runtime. Tools, slash commands, lifecycle hooks and public settings
+/// declarations all flow through [`ExtensionHub`].
 /// Implementations are registered in
 /// `src/extensions/mod.rs::register_builtins`.
 pub trait Extension: Send + Sync {
@@ -600,13 +603,16 @@ pub trait Extension: Send + Sync {
         1
     }
 
-    /// Schema defaults for this extension's settings. Returned to callers
-    /// of [`HookContext::get_settings`] when no per-session override has
-    /// been written. Extensions with no configurable settings can leave
-    /// the default `json!({})` — the framework will still hand it back
-    /// uniformly.
+    /// Defaults for the extension's settings, including every declared field.
+    /// This does not seed a settings document or alter raw settings reads.
     fn default_settings(&self) -> serde_json::Value {
         serde_json::json!({})
+    }
+
+    /// Public preferences, independent of activation or instantiation.
+    /// Undeclared keys are not exposed through the generic field editor.
+    fn setting_fields(&self) -> &'static [SettingField] {
+        &[]
     }
 
     // ---- Cap-based install path -----------------------------------------
@@ -727,6 +733,7 @@ pub struct ExtensionInstallFailure {
 /// extensions themselves. Held on `Server` as `Arc<ExtensionHub>`.
 pub struct ExtensionHub {
     extensions: Vec<Arc<dyn Extension>>,
+    setting_fields: HashMap<&'static str, Option<RegisteredSettingFields>>,
     before_agent_start: Vec<RegisteredHook<dyn HookBeforeAgentStart>>,
     tool_call: Vec<RegisteredHook<dyn HookToolCall>>,
     tool_result: Vec<RegisteredHook<dyn HookToolResult>>,
@@ -840,6 +847,7 @@ impl ExtensionHub {
     pub fn new() -> Self {
         Self {
             extensions: Vec::new(),
+            setting_fields: HashMap::new(),
             before_agent_start: Vec::new(),
             tool_call: Vec::new(),
             tool_result: Vec::new(),
@@ -1336,6 +1344,11 @@ impl ExtensionHub {
 
     pub fn extension_names(&self) -> Vec<&'static str> {
         self.extensions.iter().map(|e| e.name()).collect()
+    }
+
+    /// Validated public preferences for a registered extension, if any.
+    pub fn registered_setting_fields(&self, name: &str) -> Option<&RegisteredSettingFields> {
+        self.setting_fields.get(name).and_then(Option::as_ref)
     }
 
     /// Snapshot of every Global-scope extension whose `instantiate`
@@ -1869,14 +1882,28 @@ impl ExtensionHub {
         extensions: Vec<Arc<dyn Extension>>,
         commands_only: bool,
     ) -> anyhow::Result<()> {
-        let manifests: Vec<manifest::ExtensionManifest> =
-            extensions.iter().map(|e| e.manifest()).collect();
-        for m in &manifests {
-            m.validate()?;
-        }
+        let mut declarations = HashMap::new();
         for ext in &extensions {
-            self.extensions.push(ext.clone());
+            ext.manifest().validate()?;
+            let name = ext.name();
+            let declaration = RegisteredSettingFields::validate(ext.as_ref())
+                .with_context(|| format!("invalid setting declaration for extension '{name}'"))?;
+            // Repeated installs are supported, but one registered name cannot
+            // mean two different setting contracts.
+            if let Some(previous) = declarations
+                .get(name)
+                .or_else(|| self.setting_fields.get(name))
+            {
+                anyhow::ensure!(
+                    *previous == declaration,
+                    "conflicting setting declarations for extension '{name}'"
+                );
+            } else {
+                declarations.insert(name, declaration);
+            }
         }
+        self.setting_fields.extend(declarations);
+        self.extensions.extend(extensions.iter().cloned());
 
         let Some(peer) = self.peer_handles.clone() else {
             return Ok(());

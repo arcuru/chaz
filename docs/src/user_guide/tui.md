@@ -512,6 +512,7 @@ See [Extensions](extensions.md). Extensions can also register their own slash co
 | `/extensions remove <name> [agent]`    | Disable an extension                                        |
 | `/extensions settings <name>`          | Print the extension's settings                              |
 | `/extensions set <name> <key> <value>` | Update an extension setting                                 |
+| `/extensions reset <name> <key>`       | Remove one declared session override                        |
 
 ### LLM config
 
