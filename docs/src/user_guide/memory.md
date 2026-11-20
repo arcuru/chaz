@@ -280,7 +280,7 @@ Writes from either peer replicate bidirectionally.
 /memory revoke project-notes beta
 ```
 
-`beta`'s pubkey is stripped from the bank's AuthSettings, and its `memory_banks` ref is removed. Past entries remain — memory is append-only.
+`beta`'s pubkey is stripped from the bank's AuthSettings, and its `memory_banks` ref is removed. Past entries remain — revoking access does not delete stored memory.
 
 ## Agent-DB-as-Bank
 
@@ -370,3 +370,110 @@ All of it was replaced by key-possession on bank DBs.
 
 - **Bank writes are signed by the agent's own key, not a bank-scoped key.** Same limitation as Stage 5 session attachment. eidetica's `open_database_with_key` is now available; chaz hasn't adopted it yet. Doesn't affect authorisation correctness — eidetica still enforces which keys are allowed to write.
 - **No per-entry ACLs.** Permissions are at the bank-DB level: Read or Write on the whole thing.
+
+## Native source mirrors are owner operations
+
+A trusted native client can use `extension::memory_import::NativeMemoryImport`
+to bind one explicitly scoped bank and replace its owned row namespace.
+It uses an already-authenticated Eidetica account, without a Chaz Server,
+session, executor, sync runtime or installed daemon plugin.
+The existing memory extension still supplies recall.
+This is a same-account administrative guardrail, not a new sandbox or a model tool.
+A manifest or agent Read reference does not grant import authority.
+`MemoryAccess` is unchanged.
+
+| Input / operation                    | Meaning                                                                                                                                                      |
+| ------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `MemoryImportScope.agent_name`       | Exact existing native agent name, without `agent:`; no creation or fallback.                                                                                 |
+| `expected_agent_display_name`        | Required value of the agent's saved display metadata.                                                                                                        |
+| `bank_name`                          | Exact bank name, without `memory:`; bootstrap only if no bank, orphaned key or dangling reference exists.                                                    |
+| `owner`, `state_store`, `row_prefix` | Caller-selected persisted ownership marker, DocStore and stable row namespace.                                                                               |
+| `bind(account, scope)`               | Reuse only a compatible private/account-unsynced bank; authorize agent Read before writing its persistent reference, then mark attachment complete.          |
+| `replace_snapshot(snapshot)`         | Validate all rows, replace/remove only this namespace, and commit source/hash state with rows; return inserted/updated/removed counts and state-change flag. |
+| `bank_id()`                          | Identity string only; no raw Chaz database or key handle.                                                                                                    |
+
+The bank stores `owner`, `attached`, `hash` and `source` in the selected DocStore.
+Rows keep caller IDs and tags; their first tag must equal `owner`.
+Existing compatible layouts are reused without migration or bank recreation.
+Other/manual rows survive replacement, including an explicit empty snapshot.
+Equal key/value/tags and source/hash produce no commit; timestamps change only
+when rows change.
+A missing completion marker permits finishing initial setup, not adopting an
+unowned bank.
+After completion, a missing reference or missing/revoked/wider agent grant
+refuses automatic repair or reattachment.
+Every replacement rechecks identity, ownership, sharing, ACL and reference.
+Global/delegated access and unexpected active keys are refused.
+The owner must hold active admin; the selected agent must hold active Read only.
+
+Serialize the importer with other native setup/ACL writers.
+Namespace replacement is one bank transaction, but initial authorization,
+agent reference and completion marker span databases and are deliberately ordered,
+not a distributed transaction.
+Source eligibility, size limits, UTF-8 checks, chunking, hashing, provenance and
+credentials remain client policy.
+Import never embeds data or calls a model/provider.
+For lexical-only recall, the host must also leave its embedder disabled.
+Bank sharing is refused rather than automatically undone.
+
+### Walkthrough: refresh a local mirror and respect detachment
+
+The compilable `crates/lib/examples/memory_import.rs` consumer accepts an explicit
+endpoint/account and a request containing `scope` and `snapshot`.
+Run it against your disposable, already-provisioned Eidetica service;
+the selected agent must already exist.
+
+1. Save a request such as:
+
+   ```json
+   {
+     "scope": {
+       "agent_name": "archivist",
+       "expected_agent_display_name": "Archivist",
+       "bank_name": "source-mirror",
+       "owner": "note-import-v1",
+       "state_store": "note_import",
+       "row_prefix": "note:v1:"
+     },
+     "snapshot": {
+       "source": "notes/lighthouse.md",
+       "hash": "original",
+       "rows": [
+         {
+           "id": "note:v1:0000",
+           "key": "notes/lighthouse.md > Lamp",
+           "value": "Untrusted excerpt: amberlighthouse beacon",
+           "tags": ["note-import-v1", "sha256:original"]
+         }
+       ]
+     }
+   }
+   ```
+
+2. With `MEMORY_IMPORT_PASSWORD` supplied by your local credential policy, run:
+
+   ```text
+   cargo run -p chaz-core --example memory_import -- unix:///path/to/service.sock ACCOUNT request.json
+   inserted=1 updated=0 removed=0 state_changed=true
+   ```
+
+   Repeat the identical request:
+
+   ```text
+   inserted=0 updated=0 removed=0 state_changed=false
+   ```
+
+   Edit the value/hash and refresh to update the existing stable row.
+   Set `rows` to `[]` with your removal hash to remove only importer rows.
+
+3. Explicitly detach the bank reference from the agent, then refresh again:
+
+   ```text
+   Error: bank was detached/revoked; refusing automatic reattachment
+   ```
+
+   Nothing is reattached or imported.
+   Recovery requires an explicit administrator decision to restore the intended
+   reference/grant outside this endpoint; repeated refreshes never revive it.
+   The endpoint likewise refuses sharing or ownership conflicts, rather than
+   repairing them.
