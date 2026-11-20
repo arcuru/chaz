@@ -12,13 +12,9 @@ commands without executing agent work.
 
 Chaz logs into the configured Eidetica account with `Instance::login_account`
 and keeps the returned `AccountSession`. Set `login.username` and a non-empty
-`login.password` matching an existing account. Passwordless login is no longer
-supported; the retired `login.passwordless` setting is rejected. Provision a
-password-protected account with the Eidetica CLI before connecting Chaz.
-Database operations still use that account's selected per-database key and native
-identity, not a host-admin fallback. This dependency update performs no account or
-production-state conversion. Historical Eidetica credential records are not
-converted automatically; back up existing stores before upgrading.
+`login.password` matching an existing account. The password is literal, unlike the backend API key. Restrict permissions on this file. The retired `login.passwordless` setting is rejected. See [Getting Started](getting_started.md#provision-a-local-store) to provision a password-protected account.
+
+Database operations still use that account's selected per-database key and native identity, not a host-admin fallback. Connecting does not convert historical Eidetica credential records. Back up existing stores before upgrading.
 
 Debug output masks password-bearing connection URL userinfo and the values of
 `user`, `password`, and `sslpassword` query parameters. Other query parameters
@@ -83,14 +79,7 @@ operations continue through the service API.
 ## Full Example
 
 ```yaml
-# Matrix connection (not needed for TUI-only or CLI-only modes)
-homeserver_url: https://matrix.org
-username: "chaz"
-password: "hunter2" # If unset, prompted on first run
-allow_list: "@user:matrix.org|@other:matrix.org" # Regex matched against the sender's Matrix ID
-# message_limit: 500           # Optional: per-account message cap while the bot runs (Matrix and Discord)
-# room_size_limit: 100         # Optional: refuse to respond in rooms with more than N members (Matrix only)
-# chat_summary_model: "gpt-4o-mini"  # Optional: separate model for chat summarization
+# Transport logins belong in the standalone bridge configs, not here.
 
 # Process authority and Eidetica connection (required by chaz/TUI/CLI/daemon)
 execution: executor # or client
@@ -892,10 +881,7 @@ cli:
 
 ## State Directory
 
-Chaz persists all data in the state directory:
-
-- `eidetica.db` — SQLite database backing every chaz eidetica DB: per-session DBs, per-agent DBs, per-bank DBs, plus the peer-local `chaz_group` (sessions/channels/names) and `chaz_peer` (credentials/schedule_last_fired/schedule_state) bookkeeping DBs
-- Headjack session data (Matrix sync token, device keys)
+`state_dir` is for logs and other Chaz-local files. It does not select the Eidetica backend; `eidetica.connection` determines where session, agent, bank and peer-local databases live. `agent_config_dir` is separate and holds managed projections of accepted agent configurations. Transport-local state such as Matrix device keys belongs to the bridge process.
 
 The state directory defaults to `$XDG_STATE_HOME/chaz`. Override with `state_dir` in config.
 

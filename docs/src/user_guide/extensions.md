@@ -13,14 +13,13 @@ The `/extensions` command controls activation and settings.
 
 These ship in the chaz binary today. The "Provides" column lists the
 [hook kinds](../architecture/extensions.md#hook-kinds) the extension
-declares — `Tool` and `Command` are the surfaces a user notices; the
-others are runtime hooks that fire around each agent turn.
+declares — `Tool` and `Command` are registrations; the other hook kinds run at specific points in the lifecycle.
 
 | Extension           | Provides                     | What it gives you                                                                                                                                    |
 | ------------------- | ---------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `context_prune`     | Tool, _(context projection)_ | Opt-in historical pointers and `tool_history_query`; see [Pointers instead of old tool payloads](#pointers-instead-of-old-tool-payloads).            |
 | `baseline_context`  | _(context strategy)_         | Required default history/layout selection; see [One required context strategy](#one-required-context-strategy).                                      |
-| `core`              | Tool                         | `shell`, `compact`, `spawn_agent`, `job_status`, `job_wait`, `spawn_worker`. The always-available baseline; disabling it is a footgun.               |
+| `core`              | Tool                         | `shell`, `compact`, `spawn_agent`, `job_status`, `job_wait`, `spawn_worker`. Core execution and orchestration tools.                                 |
 | `system`            | Tool                         | `get_time`, `calculate`, `describe_tool`. Small dependency-free helpers.                                                                             |
 | `fs`                | Tool                         | `read_file`, `write_file`, `edit_file`.                                                                                                              |
 | `web`               | Tool                         | `web_fetch`, `web_search`.                                                                                                                           |
@@ -35,8 +34,7 @@ others are runtime hooks that fire around each agent turn.
 | `autocompact`       | Command                      | `/autocompact`: opt-in summary of older context when a request grows past a size. See [Automatic compaction](#automatic-compaction).                 |
 | `security_warnings` | ToolResult                   | Scans tool output for prompt-injection patterns and logs warnings (warning-only — output is unmodified).                                             |
 
-Disabling an extension hides its tools from the LLM, stops its hooks
-from firing, and disarms its slash commands. The `core` and `system`
+Disabling an extension hides its tools from the LLM and stops its activation-gated hooks and slash commands. It does not stop scheduled routine fires or evict the extension instance. The `core` and `system`
 extensions are practical floors — chaz still runs without them, but
 agents lose `shell`, `spawn_agent`, `get_time`, etc. The configured context
 strategy is different: disabling it stops model dispatch, rather than hiding tools.
@@ -75,12 +73,11 @@ commands, and which only hook into the agent lifecycle.
 The marker reflects the **effective** state for the responding agent:
 
 - `✓` — active for this agent on this session.
-- `✗` — disabled. A trailing `(session: on, agent: off)` means the
-  session has it on but _this agent_ opted out (see
-  [Per-agent scope](#per-agent-scope)); otherwise it's off for the
-  whole session.
+- `✗` — the agent opted out. `(session: on, agent: off)` means the session still has it on for other agents.
+- Blank — not active for the session, with no agent opt-out.
+- `⚠` — the Global instance failed to install.
 
-By default every new session starts with every extension active.
+An executor records the default activation set during session registration. A catalog entry alone does not prove its endpoint is active or granted; for example, model-assisted naming needs its own opt-in.
 
 ## Adding an extension
 
@@ -88,15 +85,7 @@ By default every new session starts with every extension active.
 /extensions add memory
 ```
 
-Activates `memory` on the current session. Takes effect on the **next
-agent turn**:
-
-- The extension's tools become visible to the LLM (added to the tool
-  list it sees in its next response).
-- The extension's `tool_call` / `tool_result` / `before_agent_start`
-  hooks start firing.
-- The extension's slash commands start dispatching (e.g. `/schedule`
-  begins to work).
+Activates `memory` on the current session. This makes its slash command eligible and makes its tools and context tail eligible on the next turn, subject to the responding agent's opt-outs and normal tool permissions.
 
 Re-running `/extensions add` on an already-active extension is a no-op
 and reports back that it's already active.
@@ -270,8 +259,8 @@ disabled and another with it enabled.
 
 When a session is opened on a peer where the binary supports an
 extension that didn't exist when the session was last touched, that
-new extension is default-activated on the first session*start. When a
-session is opened on a peer where the binary is \_missing* an extension
+new extension is default-activated on the first executor registration. When a
+session is opened on a peer where the binary is missing an extension
 that the session had been using, the activation event for that
 extension stays in the log but does nothing — chaz can't load code
 it doesn't have. Re-opening the session on a peer that has the
@@ -412,13 +401,7 @@ prefix:
 
 ## Where extensions come from today
 
-Every extension currently shipped with chaz is compile-time built into
-the binary; the `extension_ref` shown by `/extensions list` records the
-binary version that built it. Future versions will support extensions
-loaded from external sources — eidetica DBs, IPLD addresses, or git
-commits — but those loaders aren't implemented yet. See
-[the architecture doc](../architecture/extensions.md#extension-identity)
-for the shape that machinery will take.
+Native extensions are compiled into the binary. Each configured MCP server also supplies tools through the built-in MCP adapter; that does not load new native hooks. Syncing an activation record does not install code, and Chaz cannot load extension code from Git, IPLD, an Eidetica database, or a WASM file. See the [author contract](../architecture/extensions.md#author-contract) for the Rust interface, lifecycle and runnable example.
 
 ## Durable context is an explicit write
 

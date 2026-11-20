@@ -1,71 +1,32 @@
 # Chaz
 
-Chaz is an AI agent orchestrator for [Matrix](https://matrix.org). It connects to OpenAI-compatible LLM providers and orchestrates Living Agents that reason, act, and use tools in a ReAct loop. Agents, memory banks, and sessions are stored in syncable per-entity eidetica databases, so the same agent (with its system prompt and memories) can co-own conversations across multiple peers.
+Chaz runs AI agents against configured model backends. It stores agents, conversations, and shared resources in [Eidetica](https://github.com/arcuru/eidetica). A conversation can stay local or be shared with other peers; connecting a chat room does not turn every local reply into a public post.
 
-## Key Features
+## What you can do
 
-- **ReAct tool-calling loop** with built-in tools (shell, file I/O, web fetch, search, calculate, time, memory, spawn, compact, schedule, describe) plus external MCP tools.
-- **Living Agents** — per-agent eidetica DBs with system prompt, memory banks, schedules, presets, and co-ownership across peers.
-- **Multi-agent orchestration** with depth limiting, transitive tool narrowing, and a per-room burst budget to backstop runaways.
-- **Persistent, syncable sessions** backed by [eidetica](https://github.com/arcuru/eidetica). Named sessions; share via ticket URLs.
-- **MCP external tools** with auto-restart, policy enforcement, and presentation modes.
-- **TUI, Matrix, and single-shot CLI** bridges over the same session model.
-- **Scheduled, agent-owned wakes** via a cron, fixed-delay interval, and one-shot routine engine (no broadcast directives).
-- **Security controls** — leak detection, SSRF protection, shell allow/deny lists, tool rate limiting, and explicit approval gates.
+| Goal                                   | Shipped behavior                                                                                                                                                                                                                             | Start here                                                                                                                              |
+| -------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
+| Chat locally or from scripts           | Open the TUI session hub, print one response with `-p`, or run an administrative `cmd` without a model call when the command doesn't require one. Run `daemon` for headless execution.                                                       | [Getting Started](user_guide/getting_started.md), [TUI](user_guide/tui.md)                                                              |
+| Choose a model                         | Configure backends locally and choose a model for an agent. The configuration reference describes Chat Completions, Responses, and Anthropic Messages dialects.                                                                              | [Backends](user_guide/configuration.md#backends)                                                                                        |
+| Expose a conversation to chat          | A standalone Matrix or Discord bridge connects a login to an agent. The executor runs turns; the bridge routes messages and addressed replies. A TUI or CLI final stays local by default.                                                    | [Transport Bridges](user_guide/bridges.md), [Matrix](user_guide/matrix.md), [Discord](user_guide/discord.md)                            |
+| Keep or share a conversation           | Reopen persistent sessions, name them, and grant another peer access. The Eidetica connection and keys govern what the peer can open; a session name or ticket is not a model/tool grant.                                                    | [Sharing & Sync](user_guide/session_sharing.md)                                                                                         |
+| Give agents durable identities         | Living Agents keep their accepted configuration in their own databases. They can be shared with co-owners, delegate work to another Agent, or invoke a Worker template without giving it a separate identity.                                | [Agents](user_guide/agents.md)                                                                                                          |
+| Use built-in and external tools        | Model calls can invoke owner-attributed tools for files, shell, web, memory and more. MCP servers add tools through configured transports. Tool visibility, approval and host grants serve different purposes.                               | [Tools](user_guide/tools.md), [MCP](user_guide/mcp.md), [Security](user_guide/security.md)                                              |
+| Reuse knowledge and instructions       | Agents can use their own memory, access granted memory banks, and discover skills from configured sources. Semantic recall depends on optional embedding setup.                                                                              | [Memory](user_guide/memory.md), [Skills](user_guide/skills.md)                                                                          |
+| Run recurring work                     | Agents can own cron, fixed-delay, and one-shot schedules. A schedule runs on an executor; success doesn't automatically send a chat message.                                                                                                 | [Schedules](user_guide/agents.md#schedules)                                                                                             |
+| Control extension and context behavior | Activate extensions by session, narrow them by agent, and edit session settings. Context strategy, projection, and durable contributions have separate host contracts. Model-assisted naming is opt-in and tries once on an unnamed session. | [Extensions](user_guide/extensions.md), [Author contract](architecture/extensions.md#author-contract)                                   |
+| Inspect what happened                  | Use logs, usage rollups, and context-window snapshots. Check durable interrupted attempts before manually retrying effects.                                                                                                                  | [Logging](user_guide/logging.md), [Usage](user_guide/usage.md), [Durable turn recovery](architecture/sessions.md#durable-turn-recovery) |
 
-## Quick Start
+## How the pieces fit
 
-```bash
-# Local TUI (default)
-chaz --config config.yaml
+The TUI, CLI, and transport bridges submit messages to session databases. An executor adopts queued requests, builds context, calls the model, and runs eligible tools under their policies. It writes results to the session. Local clients can observe the result; a transport only delivers replies addressed to its binding.
 
-# Pre-fill the TUI input box with a starting prompt
-chaz --config config.yaml "Summarize today's stand-up."
+A direct Eidetica connection opens a local store. A service connection opens an existing login on an Eidetica daemon. **Connection ownership and execution role are separate:** an executor runs agents and routines; a client can submit or observe work but doesn't run it. [Architecture Overview](architecture/overview.md) explains those boundaries.
 
-# Single-shot print mode (scriptable; one ReAct turn then exit)
-chaz --config config.yaml -p "Summarize today's stand-up."
-
-# Run one /command and exit (scriptable; exits non-zero on error)
-chaz --config config.yaml cmd '/agents'
-
-# Headless daemon (no TUI; for systemd / containers / tests)
-chaz --config config.yaml daemon
-```
-
-Transport bridges are separate binaries running as their own peers —
-start `chaz-matrix` alongside the daemon rather than expecting the agent
-process to spawn it.
-
-`--config` is optional: when omitted, chaz falls back to
-`$XDG_CONFIG_HOME/chaz/config.yaml` (typically `~/.config/chaz/config.yaml`).
-Drop the file there and you can just run `chaz`.
-
-See [Getting Started](user_guide/getting_started.md) for detailed setup instructions.
-
-## How It Works
-
-```mermaid
-graph TD
-    U[User] -->|message| G[Bridge<br/>Matrix / TUI]
-    G -->|writes SessionEntry| S[(Session DB<br/>eidetica)]
-    S -->|on_write| SV[Server]
-    SV -->|spawns| A[Agent Task]
-    A -->|ReAct loop| LLM[LLM Backend<br/>OpenRouter]
-    LLM -->|tool calls| T[Tool System]
-    T -->|results| A
-    A -->|writes response| S
-    S -->|callback| G
-    G -->|delivers| U
-```
-
-Bridges (Matrix, TUI) write messages to per-session eidetica databases. The server watches for new entries via callbacks and spawns agent tasks. Agents run a ReAct loop against an OpenAI-compatible LLM backend, executing tools and writing results back to the session. Bridges detect responses via their own callbacks and deliver them to the user.
-
-## Project Status
-
-Chaz is under active development. The core architecture (sessions, ReAct loop, tools, agents, sync) is functional. See the [architecture overview](architecture/overview.md) for the current state.
+Start with the [local TUI and CLI setup](user_guide/getting_started.md) before adding a transport or shared service. Chaz is experimental; keep backups and check the upgrade notes before opening existing state with a new version.
 
 ## Links
 
 - [GitHub Repository](https://github.com/arcuru/chaz)
 - [Matrix Room: #chaz:jackson.dev](https://matrix.to/#/#chaz:jackson.dev)
-- [Blog Post: Chaz: An LLM <-> Matrix Chatbot](https://jackson.dev/post/chaz/)
+- [Original announcement](https://jackson.dev/post/chaz/)
