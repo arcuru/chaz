@@ -578,6 +578,49 @@ key rather than trusting a label or an ambiguous key-name hint.
 The service's `current_permission()` still cannot resolve a delegated identity
 without a local backend, so the delegated-service observer guard remains.
 
+#### Provider record proof boundary
+
+`crates/lib/tests/provider_records.rs` exercises this boundary with disposable
+keys, an HTTP peer pair and a Unix service. Run it from the workspace root:
+
+```sh
+nix run .#test -- -E 'binary(provider_records)' --no-capture
+```
+
+The proof uses native APIs in this order:
+
+1. Grant operating keys in a known Provider database, then grant a direct key
+   and a bounded `DelegatedTreeRef` on the session. Authenticate historical
+   entries with `verify_entry_signature`, then match their concrete signatures
+   against the known operating keys. A valid unrelated session writer can copy
+   `provider` and `sender` fields, but not either operating key's signature.
+2. Bootstrap the known Provider before the session, using
+   `sync_with_peer_for_bootstrap_with_key`. Later session entries can arrive
+   before a newer Provider grant. Missing proof leaves them Unverified;
+   an unsigned entry becomes Failed. Neither enters the selection probe.
+3. After acquiring the missing Provider bytes, call `verify()` and reconcile
+   from a fresh Verified `transaction_context`. Resolve the `records` store
+   frontier from that context before `get_store_entries`. Callback brackets
+   can include Failed/Unverified IDs, and later promotion can add no IDs at all;
+   neither brackets nor `ReadScope` on arbitrary raw tips are admission proof.
+4. Check current authority separately. Embedded `current_permission` uses
+   accepted state, not the old tips retained in the signing identity. On the
+   service, `begin_store_state_staging` exercises an actual Write-gated request;
+   the test immediately aborts the empty private cache build. Write is denied
+   after an accepted downgrade, and session Read is denied after revocation.
+   Signed-entry submission is historical-verification-gated, not a substitute
+   for this live permission check.
+
+The selection probe records IDs only; it implements no Provider effects or
+production eligibility policy. The keys, Provider mapping and explicit Read
+actors are fixture inputs, not identity discovery or operator-only membership.
+An unsynchronized replica can still permit an operation using honestly stale
+accepted state. There is no globally latest-state or wall-clock revocation
+promise, automatic dependency acquisition, or concurrent-revocation policy.
+Historical authentication remains valid after current authority is lost.
+The service Write probe does not supply a delegated permission-query API or
+remove the observer guard.
+
 ### Shared active-turn steering
 
 Chat and Job observers publish the same `JobInputRequest` through Session's
