@@ -38,6 +38,7 @@
 - [Autonomous Agents in Shared Sessions](design/autonomous_agents.md)
 - [Agent-Owned Schedules](design/agent_schedules.md)
 - [Agent State Admin Capability](design/agent_state_admin.md)
+- [Editing Extension Settings](design/extension_settings.md)
 - [Skills & Prompts](design/skills_and_prompts.md)
 - [Model Info Store](design/model_info_store.md)
 - [Checkpointed Job Waits](design/checkpointed_waits.md)
