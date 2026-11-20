@@ -381,6 +381,7 @@ impl SettingsPicker {
 /// Read-only pending-folder/accepted-DB comparison with confirmed full reload.
 pub(super) struct AgentDiffView {
     pub agent_name: String,
+    pub db_id: eidetica::entry::ID,
     pub diff: chaz_core::agent_diff::AgentDiff,
     pub mode: AgentDiffMode,
     pub cursor: usize,
@@ -2386,9 +2387,21 @@ fn handle_settings_outcome(
         input::SettingsKey::OpenAgentDiff { name } => {
             let server = server.clone();
             operations::submit(app, false, None, async move {
-                match server.agent_diff(&name).await.map_err(|e| e.to_string())? {
+                server
+                    .load_hosted_indices()
+                    .await
+                    .map_err(|e| e.to_string())?;
+                let entry = server
+                    .resolve_agent_folder_name(&name)
+                    .map_err(|e| e.to_string())?;
+                match server
+                    .agent_diff(&entry.db_id)
+                    .await
+                    .map_err(|e| e.to_string())?
+                {
                     Some(diff) => Ok(operations::Effect::Diff(AgentDiffView {
                         agent_name: name,
+                        db_id: entry.db_id,
                         diff,
                         mode: AgentDiffMode::View,
                         cursor: 0,
@@ -2399,14 +2412,30 @@ fn handle_settings_outcome(
                 }
             });
         }
-        input::SettingsKey::ReloadAgentFolder { name } => {
+        input::SettingsKey::ProjectAgentFolder { name } => {
+            let target = operations::Target::capture(app);
+            let ctx = operation_context(server, backend, secrets, approval_tx, notify_tx);
+            let server = server.clone();
+            operations::submit(app, true, None, async move {
+                server
+                    .load_hosted_indices()
+                    .await
+                    .map_err(|e| e.to_string())?;
+                let entry = server
+                    .resolve_agent_folder_name(&name)
+                    .map_err(|e| e.to_string())?;
+                ctx.command(Command::AgentProject(entry.db_id.to_string()), target, None)
+                    .await
+            });
+        }
+        input::SettingsKey::ReloadAgentFolder { db_id } => {
             let target = operations::Target::capture(app);
             let ctx = operation_context(server, backend, secrets, approval_tx, notify_tx);
             operations::submit(
                 app,
                 true,
                 None,
-                ctx.command(Command::AgentReload(Some(name)), target, None),
+                ctx.command(Command::AgentReload(Some(db_id.to_string())), target, None),
             );
         }
         input::SettingsKey::EditPeerDefaults(edit) => {

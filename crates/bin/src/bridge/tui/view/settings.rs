@@ -841,7 +841,11 @@ fn render_peer_agents(
     if let Some(name) = names.get(cursor)
         && server.agent_folders().is_some()
     {
-        detail.insert(0, Line::from(server.agent_folder_status(name)));
+        let status = match server.resolve_agent_folder_name(name) {
+            Ok(entry) => server.agent_folder_status(&entry.db_id),
+            Err(error) => error.to_string(),
+        };
+        detail.insert(0, Line::from(status));
     }
     detail.push(Line::from(""));
     detail.push(Line::from(vec![Span::styled(

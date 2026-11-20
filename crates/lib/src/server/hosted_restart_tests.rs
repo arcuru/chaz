@@ -272,10 +272,11 @@ async fn create_alpha(built: &BuiltServer, prompt_path: &Path) -> AgentDbConfig 
         ..Default::default()
     }];
     write_document(built, "alpha", &cfg).await;
+    let (entry, db) = open_agent(built, "alpha").await;
     assert!(
         built
             .server
-            .reload_agent_folder("alpha")
+            .reload_agent_folder(&entry.db_id)
             .await
             .unwrap()
             .changed
@@ -285,7 +286,6 @@ async fn create_alpha(built: &BuiltServer, prompt_path: &Path) -> AgentDbConfig 
         .create_new_memory_bank("notes", &Default::default())
         .await
         .unwrap();
-    let (entry, db) = open_agent(built, "alpha").await;
     built
         .registry
         .grant_on_memory_bank(
@@ -515,7 +515,11 @@ async fn hosted_agents_survive_restart_without_root_definitions() {
     let mut expected = edited.clone();
     expected.model = Some("m2".into());
     write_document(&built, "alpha", &expected).await;
-    let outcome = built.server.reload_agent_folder("alpha").await.unwrap();
+    let outcome = built
+        .server
+        .reload_agent_folder(&entry.db_id)
+        .await
+        .unwrap();
     assert!(outcome.changed);
     assert!(outcome.projection_error.is_none());
     assert_eq!(read_agent(&built, "alpha").await.1, expected);
@@ -524,7 +528,11 @@ async fn hosted_agents_survive_restart_without_root_definitions() {
         ..Default::default()
     }];
     write_document(&built, "alpha", &expected).await;
-    built.server.reload_agent_folder("alpha").await.unwrap();
+    built
+        .server
+        .reload_agent_folder(&entry.db_id)
+        .await
+        .unwrap();
     let (_, picked) = read_agent(&built, "alpha").await;
     assert_eq!(
         picked, expected,
@@ -679,8 +687,14 @@ async fn unreadable_config_refuses_reload_and_set_without_writes() {
             "fault must reach the reader"
         );
         let before = db.database().snapshot().await.unwrap();
-        assert!(built.server.agent_diff("alpha").await.is_err());
-        assert!(built.server.reload_agent_folder("alpha").await.is_err());
+        assert!(built.server.agent_diff(&entry.db_id).await.is_err());
+        assert!(
+            built
+                .server
+                .reload_agent_folder(&entry.db_id)
+                .await
+                .is_err()
+        );
         assert!(command(&built, Command::AgentReload(None)).await.is_err());
         assert!(set(&built, "model", "replacement").await.is_err());
         assert_eq!(db.database().snapshot().await.unwrap(), before);
@@ -728,7 +742,7 @@ async fn unreadable_config_refuses_reload_and_set_without_writes() {
     let before = db.database().snapshot().await.unwrap();
     let error = set(&built, "model", "replacement").await.unwrap_err();
     assert!(error.contains("Permission denied"), "{error}");
-    assert!(built.server.reload_agent_folder("alpha").await.is_err());
+    assert!(built.server.reload_agent_folder(&db.id()).await.is_err());
     assert_eq!(db.database().snapshot().await.unwrap(), before);
     assert_eq!(db.read_config().await.unwrap(), healthy);
     assert_eq!(

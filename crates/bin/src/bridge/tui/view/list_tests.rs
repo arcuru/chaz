@@ -492,6 +492,7 @@ async fn wheel_ownership_stays_with_modal_or_visible_list() {
     app.overlay = None;
     app.agent_diff = Some(AgentDiffView {
         agent_name: "agent-00".into(),
+        db_id: eidetica::entry::ID::from_bytes("agent-00"),
         diff: chaz_core::agent_diff::diff_agent(
             &AgentDbConfig::default(),
             &AgentDbConfig::default(),

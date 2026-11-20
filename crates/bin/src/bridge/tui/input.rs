@@ -1214,9 +1214,13 @@ pub(super) enum SettingsKey {
     OpenAgentDiff {
         name: String,
     },
+    /// Project from the DB for a named Peer Settings row.
+    ProjectAgentFolder {
+        name: String,
+    },
     /// Confirmed full-scope managed-folder replacement.
     ReloadAgentFolder {
-        name: String,
+        db_id: eidetica::entry::ID,
     },
     /// An identity-based edit, evaluated against the ordered worker's latest
     /// defaults rather than replacing it with a possibly stale UI snapshot.
@@ -1335,7 +1339,7 @@ pub(super) fn handle_settings_key(
     {
         if let Some(name) = app.peer_agents_names.get(app.peer_agents_cursor).cloned() {
             return if key.code == KeyCode::Char('p') {
-                SettingsKey::DispatchCommand(chaz_core::commands::Command::AgentProject(name))
+                SettingsKey::ProjectAgentFolder { name }
             } else {
                 SettingsKey::OpenAgentDiff { name }
             };
@@ -1564,9 +1568,9 @@ fn handle_agent_diff_key(app: &mut App, key: KeyEvent) -> SettingsKey {
     match view.mode {
         AgentDiffMode::ConfirmReload => match key.code {
             KeyCode::Char('y') | KeyCode::Enter => {
-                let name = view.agent_name.clone();
+                let db_id = view.db_id.clone();
                 app.agent_diff = None;
-                SettingsKey::ReloadAgentFolder { name }
+                SettingsKey::ReloadAgentFolder { db_id }
             }
             KeyCode::Char('n') | KeyCode::Esc => {
                 view.mode = AgentDiffMode::View;

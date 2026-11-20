@@ -445,8 +445,8 @@ fn budget_model_id(
 #[derive(Debug, Default, Clone)]
 pub struct ReloadReport {
     pub considered: usize,
-    pub applied: Vec<(String, bool)>,
-    pub failed: Vec<(String, String)>,
+    pub applied: Vec<(crate::hosted_index::DbEntry, bool)>,
+    pub failed: Vec<(crate::hosted_index::DbEntry, String)>,
 }
 
 /// Background half of "learn a model's context window on first use", shared by
@@ -521,6 +521,7 @@ pub struct Server {
     #[allow(dead_code)]
     skill_bank_index: HostedIndex,
     hosted_indices_complete: AtomicBool,
+    hosted_discovery_projection_started: AtomicBool,
     tools: Arc<ToolRegistry>,
     policies: Arc<ToolPolicyRegistry>,
     security: SecurityContext,
@@ -619,7 +620,7 @@ pub struct Server {
     config_path: std::sync::RwLock<Option<std::path::PathBuf>>,
     agent_config_root: Arc<std::sync::RwLock<Option<std::path::PathBuf>>>,
     agent_folders: std::sync::RwLock<Option<Arc<crate::agent_folder::AgentFolders>>>,
-    agent_folder_statuses: std::sync::RwLock<HashMap<String, String>>,
+    agent_folder_statuses: std::sync::RwLock<HashMap<eidetica::entry::ID, (String, String)>>,
     agent_config_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     watched_agent_configs: Mutex<std::collections::HashSet<String>>,
     /// Fail-closed ceiling on a pending tool approval, set once at startup
@@ -707,6 +708,7 @@ impl Server {
             memory_bank_index,
             skill_bank_index,
             hosted_indices_complete: AtomicBool::new(false),
+            hosted_discovery_projection_started: AtomicBool::new(false),
             tools,
             policies,
             security,
@@ -792,6 +794,9 @@ impl Server {
     }
 
     pub fn mark_hosted_indices_complete(&self) {
+        // Full startup already owns initialization through deferred startup.
+        self.hosted_discovery_projection_started
+            .store(true, Ordering::Release);
         self.hosted_indices_complete.store(true, Ordering::Release);
     }
 
@@ -799,6 +804,26 @@ impl Server {
     /// clients skip this at startup, but commands such as `/agent add` and
     /// `/memory list` retain their complete peer-wide view when requested.
     pub async fn ensure_hosted_indices_complete(&self) -> anyhow::Result<()> {
+        self.load_hosted_indices().await?;
+        if !self
+            .hosted_discovery_projection_started
+            .swap(true, Ordering::AcqRel)
+        {
+            let unregistered = self
+                .agent_index
+                .list()
+                .into_iter()
+                .filter(|entry| self.agents.get(&entry.display_name).is_none())
+                .collect();
+            Box::pin(self.load_hosted_agents(unregistered, &self.default_agents())).await;
+            Box::pin(self.initialize_agent_folders()).await;
+        }
+        Ok(())
+    }
+
+    /// Complete discovery without running folder initialization. Managed
+    /// commands must resolve an exact target before any DB or folder write.
+    pub async fn load_hosted_indices(&self) -> anyhow::Result<()> {
         if self.hosted_indices_complete.load(Ordering::Acquire) {
             return Ok(());
         }
@@ -815,14 +840,7 @@ impl Server {
         for entry in skill_banks.list() {
             self.skill_bank_index.register(entry);
         }
-        let unregistered = agents
-            .list()
-            .into_iter()
-            .filter(|entry| self.agents.get(&entry.display_name).is_none())
-            .collect();
-        Box::pin(self.load_hosted_agents(unregistered, &self.default_agents())).await;
         self.hosted_indices_complete.store(true, Ordering::Release);
-        Box::pin(self.initialize_agent_folders()).await;
         Ok(())
     }
 
@@ -1456,21 +1474,38 @@ impl Server {
 
     /// Explicit folder import for hosted agents only. Never reapply global
     /// seed YAML, discover arbitrary directories, or hide partial batch success.
-    pub async fn reload_config_for(&self, only: Option<&str>) -> anyhow::Result<ReloadReport> {
+    pub async fn reload_config_for(
+        &self,
+        only: Option<&eidetica::entry::ID>,
+    ) -> anyhow::Result<ReloadReport> {
         anyhow::ensure!(
             self.agent_folders().is_some(),
             "agent folder interface not configured on this peer"
         );
         let mut report = ReloadReport::default();
         for entry in self.agent_index.list() {
-            if only.is_some_and(|name| name != entry.display_name) {
+            if only.is_some_and(|id| *id != entry.db_id) {
                 continue;
             }
             report.considered += 1;
-            match self.reload_agent_folder(&entry.display_name).await {
-                Ok(outcome) if outcome.projection_error.is_none() => report.applied.push((entry.display_name, outcome.changed)),
-                Ok(outcome) => report.failed.push((entry.display_name, format!("DB committed; folder projection failed: {}. Retry /agent project, not reload", outcome.projection_error.unwrap()))),
-                Err(error) => report.failed.push((entry.display_name, format!("{error:#}"))),
+            // Discovery for folder commands does not start all watches. A
+            // reload subscribes only the selected DB(s), as startup would.
+            if let Err(error) = self.watch_agent_config(&entry.db_id).await {
+                tracing::warn!(db_id = %entry.db_id, %error, "cannot watch agent configuration");
+            }
+            match self.reload_agent_folder(&entry.db_id).await {
+                Ok(outcome) => {
+                    if let Some(error) = outcome.projection_error {
+                        let message = format!(
+                            "DB committed; folder projection failed: {error}. Retry /agent project {}, not reload",
+                            entry.db_id
+                        );
+                        report.failed.push((entry, message));
+                    } else {
+                        report.applied.push((entry, outcome.changed));
+                    }
+                }
+                Err(error) => report.failed.push((entry, format!("{error:#}"))),
             }
         }
         Ok(report)
@@ -1480,12 +1515,12 @@ impl Server {
     /// accepted DB config. This operation never applies either representation.
     pub async fn agent_diff(
         &self,
-        name: &str,
+        db_id: &eidetica::entry::ID,
     ) -> anyhow::Result<Option<crate::agent_diff::AgentDiff>> {
         let Some(folders) = self.agent_folders() else {
             return Ok(None);
         };
-        let Some(entry) = self.agent_index.find_by_name(name) else {
+        let Some(entry) = self.agent_index.find_by_id(db_id) else {
             return Ok(None);
         };
         let id = entry.db_id.to_string();
@@ -1498,7 +1533,7 @@ impl Server {
             return Ok(None);
         };
         let current = db.read_config().await?;
-        let pending = folders.read_locked(name, &id, &current)?;
+        let pending = folders.read_locked(&entry.display_name, &id, &current)?;
         Ok(Some(crate::agent_diff::diff_agent(&pending, &current)))
     }
 
