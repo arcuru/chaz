@@ -56,7 +56,7 @@ An idle stop records nothing, and the event never enters model context or wakes 
 A stopped attempt completes with a terminal cancellation transcript record and an agent `Error` carrying completed-call usage.
 See [ReAct Runtime → Cancellation](react.md#cancellation) and [TUI → Stopping a Running Turn](../user_guide/tui.md#stopping-a-running-turn).
 
-### ConversationStore v1: reader only
+### ConversationStore v1: reads and one fenced writer fixture
 
 `Session::history_at` binds the read to the caller's Database handle and one
 accepted main frontier. Only that handle selects a format. With no v1 traces
@@ -79,13 +79,24 @@ atom text and invalid delta bytes even when interpretation refuses.
 `recorded_call` reads the immutable preparation at its original observed
 selection, not the latest context and not a replay or dispatch receipt.
 
-`/print` can show the effective text from reader fixtures. Dated legacy row
-APIs used by queues and transport delivery do not treat v1 projections as
-legacy rows. No production path creates a v1 descriptor, activates a writer,
-or converts existing histories. Turn execution, branch/publication replay and
-other writer-facing v1 capabilities remain separate work. Before enabling any
-v1 writes, all authorized peers and rollback binaries need compatible readers;
-never delete a descriptor to make legacy code accept that history.
+Only tests can admit a v1 writer, and only on a fresh synthetic session. The
+fixture uses the regular runtime and its attempt-bound recorder with a loopback
+backend, an in-process tool, and one before-agent hook. The Store validates and
+stages data; the host commits it before dispatch or publication. It commits
+the native response, outcome, and compact accounting together. A final reply
+with unchanged text references the response instead of storing another body.
+`/print` renders the committed reply, not an observed model response that has
+yet to settle. Reads do not resume attempts or replay effects.
+
+Dated row APIs used by queues and transport delivery do not present v1
+projections as legacy rows. The fixture's descriptor requires
+`fenced-turn-v1`; readers that do not understand those receipts must refuse the
+effective read. No production path creates this descriptor, enables v1
+writes, or converts existing histories. The fixture does not exercise peer
+writer coordination, durable projection hooks, bridge publication, or waits.
+Before enabling production writes, all authorized peers and rollback binaries
+need compatible readers. Never delete a descriptor to make legacy code accept
+that history.
 
 ### Assistant `ResponseMetadata`
 

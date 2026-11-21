@@ -54,7 +54,7 @@ impl CallObservation {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub(super) struct CallEvidence {
+pub(crate) struct CallEvidence {
     #[serde(default)]
     pub local_estimate: bool,
     pub invocation: String,

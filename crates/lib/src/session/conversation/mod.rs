@@ -1,12 +1,14 @@
-//! Read-only v1 interpreter. Only Session's authorized history handle selects
-//! a format. The Store interprets immutable data; it cannot execute it.
+//! Only Session's authorized history handle selects a format. ConversationStore
+//! validates and interprets immutable data; it does not commit or execute it.
 mod atom;
 pub(super) mod contract;
 mod legacy;
 mod provenance;
 mod record;
+mod turn;
 mod view;
 
+pub(super) mod staging;
 #[cfg(test)]
 mod tests;
 
@@ -63,7 +65,7 @@ impl From<serde_json::Error> for ConversationError {
     }
 }
 
-// Keep the exact Store identities; these adapters have no staging API.
+// Keep the exact Store identities across readers and writers.
 macro_rules! doc_store {
     ($store:ident, $kind:literal) => {
         impl eidetica::Registered for $store {
@@ -169,10 +171,12 @@ impl Originals {
 pub(super) struct ConversationRead {
     inspection: ConversationInspection,
     legacy: legacy::LegacyView,
+    fenced_turn: bool,
+    legacy_frontier: Option<Snapshot>,
     descriptor_entries: BTreeSet<ID>,
     locations: BTreeMap<ID, BTreeSet<String>>,
     operations: BTreeMap<String, Operation>,
-    calls: BTreeMap<(CallId, String), CallInput>,
+    provenance: provenance::Evidence,
 }
 
 impl ConversationRead {
@@ -208,7 +212,26 @@ impl ConversationRead {
         }
         // Even if later concurrent replacements make the current view
         // ambiguous, an independently validated call input is still evidence.
-        Ok(self.calls.get(&(call.clone(), attempt.to_owned())))
+        Ok(self
+            .provenance
+            .calls
+            .get(&(call.clone(), attempt.to_owned())))
+    }
+
+    pub(super) fn accounting(&self) -> Result<Vec<super::usage::CallEvidence>> {
+        if let Some(error) = self.inspection.issues.first() {
+            return Err(error.clone());
+        }
+        Ok(self.provenance.accounting.clone())
+    }
+
+    pub(super) fn legacy_frontier(&self) -> Result<&Snapshot> {
+        if let Some(error) = self.inspection.issues.first() {
+            return Err(error.clone());
+        }
+        self.legacy_frontier
+            .as_ref()
+            .ok_or_else(|| ConversationError::Missing("legacy boundary".into()))
     }
 
     fn require_descriptor(&self, ancestors: &BTreeSet<ID>) -> Result<()> {
@@ -284,6 +307,10 @@ pub(super) async fn open(
     let ancestry = Ancestry::load(db, frontier).await?;
     let (descriptor, descriptor_entries, mut contract) =
         contract::inspect_at(db, frontier, txn, &ancestry).await?;
+    let fenced_turn = descriptor
+        .as_ref()
+        .is_some_and(contract::Descriptor::fenced_turn);
+    let legacy_frontier = descriptor.as_ref().map(|d| d.legacy.frontier.clone());
     let legacy = if let Some(descriptor) = descriptor.filter(|_| contract.issues.is_empty()) {
         match contract::require_unchanged_legacy(db, frontier, &descriptor.legacy, &ancestry).await
         {
@@ -314,10 +341,12 @@ pub(super) async fn open(
             ..Default::default()
         },
         legacy,
+        fenced_turn,
+        legacy_frontier,
         descriptor_entries,
         locations: BTreeMap::new(),
         operations: BTreeMap::new(),
-        calls: BTreeMap::new(),
+        provenance: Default::default(),
     };
     let entries = entries(db, STORE, frontier).await?;
     let mut originals = Originals::default();
@@ -387,9 +416,10 @@ pub(super) async fn open(
             }
         }
     }
-    let (provenance, calls) = provenance::read(db, frontier, txn, &read, &ancestry).await?;
+    let (provenance, evidence) =
+        Box::pin(provenance::read(db, frontier, txn, &read, &ancestry)).await?;
     read.inspection.provenance = provenance.data;
     read.inspection.issues.extend(provenance.issues);
-    read.calls = calls;
+    read.provenance = evidence;
     Ok(read)
 }
