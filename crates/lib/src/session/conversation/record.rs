@@ -145,7 +145,6 @@ pub struct Operation {
 }
 
 impl Operation {
-    #[cfg(test)]
     pub fn fact_id(&self, index: u32) -> FactId {
         FactId {
             database: self.observed.database.clone(),

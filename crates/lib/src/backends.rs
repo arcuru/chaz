@@ -731,6 +731,11 @@ impl BackendManager {
         self.select_backend_for_model(model).max_retries()
     }
 
+    pub(crate) fn model_api(&self, model: Option<&str>, resolved: &str) -> Option<ModelApi> {
+        (self.mock.is_none() && !self.backends.is_empty())
+            .then(|| self.select_backend_for_model(model).api_for_model(resolved))
+    }
+
     /// One tool-free auxiliary call through the configured model route.
     /// No runtime hooks, tools, retries, or Anthropic output-budget raises.
     pub(crate) async fn complete_bounded(

@@ -374,7 +374,7 @@ impl handler::HookHandlerBeforeAgentStart for CountingHook {
     }
 }
 
-pub(super) fn counting_ext(
+pub(crate) fn counting_ext(
     name: &'static str,
     calls: Arc<std::sync::atomic::AtomicUsize>,
 ) -> Arc<dyn Extension> {

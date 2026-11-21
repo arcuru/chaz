@@ -7,6 +7,7 @@ use std::collections::BTreeSet;
 use super::{Ancestry, ConversationError, Originals, Result, atom};
 
 pub(super) const STORE: &str = "conversation_contract_v1";
+pub(super) const FENCED_TURN: &str = "fenced-turn-v1";
 
 /// Context-owned legacy semantic stores covered by this reader increment.
 /// Job/input/auxiliary conversion and full write-door integration remain pending;
@@ -59,7 +60,10 @@ impl Descriptor {
                 "session conversation contract version".into(),
             ));
         }
-        let supported = BTreeSet::from(["append-v1".into(), "replace-v1".into()]);
+        let mut supported = BTreeSet::from(["append-v1".into(), "replace-v1".into()]);
+        if self.fenced_turn() {
+            supported.insert(FENCED_TURN.into());
+        }
         if self.required_operations != supported {
             return Err(ConversationError::Unsupported(
                 "required conversation operation capabilities".into(),
@@ -69,6 +73,10 @@ impl Descriptor {
             return Err(ConversationError::InvalidScope("legacy boundary".into()));
         }
         Ok(())
+    }
+
+    pub(super) fn fenced_turn(&self) -> bool {
+        self.required_operations.contains(FENCED_TURN)
     }
 }
 
@@ -102,6 +110,11 @@ pub(super) async fn inspect_at(
                 {
                     return Err(ConversationError::InvalidScope(
                         "activation boundary outside descriptor Entry ancestry".into(),
+                    ));
+                }
+                if desc.fenced_turn() && desc.legacy.frontier.tips() != [db.root_id().clone()] {
+                    return Err(ConversationError::InvalidScope(
+                        "fenced turn is not on a fresh session".into(),
                     ));
                 }
                 locations.insert(entry.id());

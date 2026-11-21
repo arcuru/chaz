@@ -201,6 +201,15 @@ pub(super) fn fact<'a>(id: &FactId, ops: &'a BTreeMap<String, Operation>) -> Res
 }
 
 fn compatible(view: View, payload: &Payload) -> bool {
+    if let (View::Message(MessageRole::Assistant), Payload::NativeModelResponse { response }) =
+        (view, payload)
+    {
+        return response.tool_calls.is_empty()
+            && response
+                .content
+                .as_ref()
+                .is_some_and(|text| !text.is_empty());
+    }
     matches!(
         (view, payload),
         (View::AuditOnly, _)
@@ -332,7 +341,9 @@ impl ConversationView {
                     representation,
                     fact,
                 } => {
-                    if let Payload::NativeModelResponse { response } = &fact.payload {
+                    if representation.view == View::NativeExchange
+                        && let Payload::NativeModelResponse { response } = &fact.payload
+                    {
                         unit.extend(visible.by_ref().take(response.tool_calls.len()));
                     }
                     let kind = match representation.view {
@@ -385,6 +396,10 @@ impl ConversationView {
                             text,
                             EntryType::Message,
                         ),
+                        (
+                            View::Message(MessageRole::Assistant),
+                            Payload::NativeModelResponse { response },
+                        ) => ("assistant", response.content.as_ref()?, EntryType::Message),
                         (View::Directive, Payload::TransformationOutput { text }) => {
                             ("history", text, EntryType::Directive)
                         }
@@ -491,75 +506,82 @@ fn render_unit(unit: &[&VisibleRepresentation]) -> Result<Vec<(RuntimeMessage, R
                     "legacy row in native unit".into(),
                 ));
             };
-            let message = match (&representation.view, &fact.payload) {
-                (
-                    View::Directive | View::Message(MessageRole::User),
-                    Payload::Input { text, .. },
-                )
-                | (View::Message(MessageRole::User), Payload::PublishedBody { text }) => {
-                    RuntimeMessage::User(text.clone())
-                }
-                (
-                    View::Message(MessageRole::Assistant),
-                    Payload::Input { text, .. } | Payload::PublishedBody { text },
-                ) => RuntimeMessage::Assistant(text.clone()),
-                (View::Directive | View::Summary, Payload::TransformationOutput { text }) => {
-                    // Stored transformation output never becomes system instructions.
-                    RuntimeMessage::User(historical_transformation(text))
-                }
-                (View::NativeExchange, Payload::NativeModelResponse { response }) => {
-                    let provider_extra = response.provider_extra.clone().into_iter().collect();
-                    for (index, call) in response.tool_calls.iter().enumerate() {
-                        calls.insert(
-                            ToolCallId {
-                                response: representation.fact.clone(),
-                                index: index as u32,
-                            },
-                            call,
-                        );
+            let message =
+                match (&representation.view, &fact.payload) {
+                    (
+                        View::Directive | View::Message(MessageRole::User),
+                        Payload::Input { text, .. },
+                    )
+                    | (View::Message(MessageRole::User), Payload::PublishedBody { text }) => {
+                        RuntimeMessage::User(text.clone())
                     }
-                    if response.tool_calls.is_empty() {
-                        RuntimeMessage::AssistantWithExtra {
-                            exchange_id: None,
-                            content: response.content.clone(),
-                            provider_extra,
-                        }
-                    } else {
-                        RuntimeMessage::AssistantToolCalls {
-                            exchange_id: None,
-                            content: response.content.clone(),
-                            tool_calls: response.tool_calls.clone(),
-                            provider_extra,
-                        }
+                    (
+                        View::Message(MessageRole::Assistant),
+                        Payload::Input { text, .. } | Payload::PublishedBody { text },
+                    ) => RuntimeMessage::Assistant(text.clone()),
+                    (
+                        View::Message(MessageRole::Assistant),
+                        Payload::NativeModelResponse { response },
+                    ) => RuntimeMessage::Assistant(response.content.clone().ok_or_else(|| {
+                        ConversationError::Missing("published response body".into())
+                    })?),
+                    (View::Directive | View::Summary, Payload::TransformationOutput { text }) => {
+                        // Stored transformation output never becomes system instructions.
+                        RuntimeMessage::User(historical_transformation(text))
                     }
-                }
-                (
-                    View::ToolResult,
-                    Payload::ToolOutcome {
-                        execution, content, ..
-                    },
-                ) => {
-                    let call = calls
-                        .get(&execution.call)
-                        .ok_or_else(|| ConversationError::Missing("native tool call".into()))?;
-                    RuntimeMessage::ToolResult {
-                        call_id: call.id.clone(),
-                        content: if call.name == crate::tool::NO_REPLY_TOOL {
-                            content.clone()
+                    (View::NativeExchange, Payload::NativeModelResponse { response }) => {
+                        let provider_extra = response.provider_extra.clone().into_iter().collect();
+                        for (index, call) in response.tool_calls.iter().enumerate() {
+                            calls.insert(
+                                ToolCallId {
+                                    response: representation.fact.clone(),
+                                    index: index as u32,
+                                },
+                                call,
+                            );
+                        }
+                        if response.tool_calls.is_empty() {
+                            RuntimeMessage::AssistantWithExtra {
+                                exchange_id: None,
+                                content: response.content.clone(),
+                                provider_extra,
+                            }
                         } else {
-                            crate::runtime::wrap_tool_output(
-                                &call.name,
-                                &crate::runtime::bound_tool_output(content),
-                            )
-                        },
+                            RuntimeMessage::AssistantToolCalls {
+                                exchange_id: None,
+                                content: response.content.clone(),
+                                tool_calls: response.tool_calls.clone(),
+                                provider_extra,
+                            }
+                        }
                     }
-                }
-                _ => {
-                    return Err(ConversationError::Malformed(
-                        "unsupported context representation".into(),
-                    ));
-                }
-            };
+                    (
+                        View::ToolResult,
+                        Payload::ToolOutcome {
+                            execution, content, ..
+                        },
+                    ) => {
+                        let call = calls
+                            .get(&execution.call)
+                            .ok_or_else(|| ConversationError::Missing("native tool call".into()))?;
+                        RuntimeMessage::ToolResult {
+                            call_id: call.id.clone(),
+                            content: if call.name == crate::tool::NO_REPLY_TOOL {
+                                content.clone()
+                            } else {
+                                crate::runtime::wrap_tool_output(
+                                    &call.name,
+                                    &crate::runtime::bound_tool_output(content),
+                                )
+                            },
+                        }
+                    }
+                    _ => {
+                        return Err(ConversationError::Malformed(
+                            "unsupported context representation".into(),
+                        ));
+                    }
+                };
             Ok((message, visible.id.clone()))
         })
         .collect()
