@@ -407,9 +407,11 @@ history view, which reads the session directly.
 
 The bridge runs no agent of its own — it only carries messages. The daemon
 discovers each channel's session (the bridge marks it _exposed_ in the agent DB's
-synced session registry), runs the agent, and writes the reply back. The full
-data flow — session-DB bindings, the registry watch, the reconcile delivery, and
-the approval protocol below — is documented internally in
+synced session registry), runs the agent, and writes the reply back. Each hosted
+Agent DB has its own watch. If one bridge peer is unreachable, the daemon retries
+its missing sessions in the background without holding up registration of
+sessions that are already local. For the discovery, delivery, and approval
+protocols, see
 [Dumb Transport Bridges](../design/transport_bridges.md).
 
 ## Approving tools from a room
@@ -499,6 +501,12 @@ the field from that login; the shared login already holds the agent DB.
 **Credential reads fail after a restart.** The `unlock_password` changed or isn't
 set in the environment. It must match what the store was first sealed with; if
 it's truly lost, delete the bridge's settings DB and re-seed from config.
+
+**A new room's session hasn't reached the daemon yet.** Look for `Retrying
+exposed-session acquisition later` in daemon debug logs. If the peer comes back,
+the next retry can adopt the session without another message or a daemon restart.
+`Session acquisition denied` is different: check agent access rather than waiting
+for another retry.
 
 **Replies don't appear in the room/channel even though the agent ran.** The
 session DB has to sync from the daemon back to the bridge. Confirm both peers are
