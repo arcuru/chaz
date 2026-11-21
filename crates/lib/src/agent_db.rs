@@ -777,10 +777,29 @@ impl AgentDb {
 
     /// List every session attached to this agent.
     pub async fn list_session_refs(&self) -> anyhow::Result<Vec<SessionRef>> {
-        let txn = self.database.new_transaction().await?;
+        let snapshot = self.database.snapshot().await?;
+        self.list_session_refs_at(&snapshot).await
+    }
+
+    pub(crate) async fn list_session_refs_at(
+        &self,
+        snapshot: &eidetica::Snapshot,
+    ) -> anyhow::Result<Vec<SessionRef>> {
+        let txn = self.database.new_transaction_at(snapshot).await?;
         let store = txn.get_store::<Table<SessionRef>>(SESSIONS_STORE).await?;
         let rows = store.search(|_: &SessionRef| true).await?;
         Ok(rows.into_iter().map(|(_, r)| r).collect())
+    }
+
+    /// Revalidate an exposure against the current registry. Concurrent upserts
+    /// may leave multiple rows for an ID; an unexposed row wins over ambiguity.
+    pub(crate) async fn is_session_exposed(&self, session_db_id: &str) -> anyhow::Result<bool> {
+        let txn = self.database.new_transaction().await?;
+        let store = txn.get_store::<Table<SessionRef>>(SESSIONS_STORE).await?;
+        let rows = store
+            .search(|r: &SessionRef| r.session_db_id == session_db_id)
+            .await?;
+        Ok(!rows.is_empty() && rows.iter().all(|(_, row)| !row.exposed_on.is_empty()))
     }
 
     /// Find a single session entry by its `session_db_id`.

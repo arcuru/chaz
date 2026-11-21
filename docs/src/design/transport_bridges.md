@@ -155,26 +155,47 @@ backend see plaintext either way. See [Encrypted Rooms](../user_guide/matrix.md#
 ## The daemon registry-watch
 
 The daemon closes the loop in `watch_agent_session_registries`
-(`server/build.rs`), run once at deferred startup:
+(`server/build.rs`, with the machinery in `server/exposed_sessions.rs`), run once
+at deferred startup. Discovery and acquisition are separate:
 
-1. Install an `on_write` callback on **every hosted agent DB**. eidetica's
-   `on_write` fires for **local _and_ remote (synced)** writes, so a bridge's
-   `expose_session_on` write — which arrives via sync — triggers it.
-2. Every callback fire (debounced) calls `register_exposed_sessions`, which for
-   each agent walks `list_session_refs()`, skips any ref that is not
-   `exposed_on` anything or is already being watched, opens the session DB, and
-   calls `register_session` — which installs the daemon's normal session
-   processing and makes the ReAct loop answer it.
+1. **One watcher per hosted Agent DB.** It reads exposures at a verified
+   snapshot and subscribes with `on_write_at_tips` from that frontier. A second
+   frontier read after subscribing catches writes from the setup gap: neither
+   an embedded callback nor a service subscription promises to replay a write
+   that landed before it was installed. The event's previous and post tips
+   bracket DAG history, not registry rows. After a local or synced write the
+   watcher reads the latest verified state of that agent's registry. Bursts
+   can coalesce; the watcher reports only IDs that became exposed or unexposed.
+2. **One acquisition coordinator for the daemon.** It keeps one pending slot
+   per session DB ID, even when several agents expose that session. An unrelated
+   write doesn't start work or move a retry deadline.
+   - A session already local can register without waiting for a network pull.
+   - A missing session queues its first pull as soon as it is exposed. A
+     separate concurrency limit bounds those pulls.
+   - Retryable failures share one timer (5s doubling to 60s per ID). Every
+     retry checks local state first, so a tree that arrives by another route can
+     be registered without another registry write.
+   - A job session, disabled runtime, or explicit policy denial is not retried.
+     If the final exposure is removed, its pending retry is discarded. An
+     attempt still in flight rechecks the registry before adopting the session.
 
-`register_exposed_sessions` is **self-healing**: if a freshly-exposed session's
-DB hasn't synced over yet, `open_session` fails, the ref is skipped, and the next
-registry sync-write re-runs the scan and retries. On-commit sync setup must also
-succeed before the daemon registers the session. Incomplete delegated-parent
-ancestry can temporarily hide its signer from native discovery even while a
-previously bound writer still works. The session stays unwatched until a later
-agent-DB write triggers a successful rescan, rather than retaining a runtime
-without reply sync or with an empty cached extension set. Registration is
-idempotent (`register_session` early-returns for an already-watched session).
+A transport watch alone is not a runtime claim. Discovery doesn't replace the
+individual session DB watches that drive message processing, and unexposing a
+session does not tear down an existing watch. On restart the daemon rebuilds the
+pending state from the registries; it doesn't persist its retry queue. A new
+Agent DB is watched after the next daemon restart.
+
+There is no pinned Eidetica API returning the merged `SessionRef` rows changed
+between two verified snapshots. The watcher compares complete lists for just
+its own agent. The wire sync error also deliberately hides some authorization
+failures as "tree not found". Chaz does not relax auth or try other credentials
+to resolve that ambiguity; opaque misses stay on the bounded retry schedule.
+
+On-commit sync setup must succeed before the daemon registers the session.
+Incomplete delegated-parent ancestry can temporarily hide its signer from native
+discovery even while a previously bound writer still works; the session stays
+unregistered and is retried on the schedule, rather than retaining a runtime
+without reply sync or with an empty cached extension set.
 
 ## Outbound: durable delivery onto the transport
 
@@ -270,7 +291,7 @@ The runtime is **unchanged**: it still calls
 `security.request_approval(info)`, which sends an `ApprovalExchange` over
 `SecurityContext.approval_callback` and blocks on a oneshot. The only new wiring
 is _what consumes that channel_. For a bridge-exposed session,
-`register_exposed_sessions` hands `register_session` an `approval_tx` produced by
+exposed-session registration hands `register_session` an `approval_tx` produced by
 `spawn_session_db_approval_proxy` (`server/approval_proxy.rs`) instead of `None`.
 
 The proxy runs two tasks per exposed session:
@@ -341,8 +362,8 @@ ask in the first place (see [Security → Tool Approval](../user_guide/security.
 
 - **`on_write` fires on synced writes.** This is the linchpin — the daemon's
   registry-watch and the proxy's decision-resolver both depend on a _remote_
-  peer's write triggering a local callback. Verified against eidetica `e4e9812`;
-  `WriteEvent::source` distinguishes `Local` from `Remote` when a callback cares.
+  peer's write triggering a local callback. `WriteEvent::source` distinguishes
+  `Local` from `Remote` when a callback cares.
 - **Never commit to a tree inside its own `on_write`.** eidetica serializes
   writes per-tree under a lock held across callbacks; a reentrant commit on the
   same tree deadlocks. Every DB write in this design happens _outside_ the
@@ -366,7 +387,7 @@ ask in the first place (see [Security → Tool Approval](../user_guide/security.
 | Session registry / `exposed_on`  | `agent_db.rs` (`SessionRef`, `register_session_ref`, `expose_session_on`)                                      |
 | Transport bindings               | `session::transport` (`bind_transport`, `transport_bindings`)                                                  |
 | Channel→session lookup           | `session::transport` (`get_or_create_channel_session`, `find_channel_session`)                                 |
-| Daemon registry-watch            | `server/build.rs` (`watch_agent_session_registries`, `register_exposed_sessions`)                              |
+| Daemon registry-watch            | `server/build.rs` (`watch_agent_session_registries`, `RegistryAcquirer`), `server/exposed_sessions.rs`         |
 | Outbound delivery                | `chaz_core::bridge::delivery` (`DeliveryReconciler`, `DeliveryStore`, `DeliveryBinding`)                       |
 | Bridge process startup           | `chaz_core::bridge::process` (`connect`, `bring_up_login`, `BridgeGeneration`), `instance::supervise_service`  |
 | Approval entry types + helpers   | `session::EntryType`, `chaz_core::bridge` (`approval_*`, `resolved_decisions`, `unrendered_approval_requests`) |
