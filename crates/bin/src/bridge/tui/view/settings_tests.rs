@@ -345,6 +345,16 @@ async fn settings_focus_ladder_category_keys_and_existing_actions() {
                 assert_eq!(app.settings_focus, Category);
                 key(&mut app, KeyCode::Esc);
                 assert!(app.field_sheet.is_none());
+            } else if scope == SettingsScope::Peer
+                && PeerSettingsCategory::ALL[category] == PeerSettingsCategory::Extensions
+            {
+                assert!(matches!(outcome, input::SettingsKey::None));
+                assert_eq!(app.settings_focus, Category);
+                assert!(app.field_sheet.is_none());
+                assert_eq!(
+                    app.settings_status.as_deref(),
+                    Some("No hosted agents to edit")
+                );
             } else if !(scope == SettingsScope::Session && category == 2) {
                 assert_eq!(
                     app.settings_focus, entry,
@@ -1011,7 +1021,26 @@ async fn settings_compact_empty_missing_and_static_pages_use_full_content_slot()
                     let body = app.settings_reader.viewport.unwrap();
                     assert!(body.height >= 1);
                     if (width, height) == (40, 8) {
-                        assert_eq!(body, Rect::new(0, 3, 40, 4));
+                        let edit_action = match scope {
+                            SettingsScope::Peer
+                                if PeerSettingsCategory::ALL[category]
+                                    == PeerSettingsCategory::Extensions =>
+                            {
+                                Some("Enter  Edit agent defaults")
+                            }
+                            SettingsScope::Session
+                                if SessionSettingsCategory::ALL[category]
+                                    == SessionSettingsCategory::Extensions =>
+                            {
+                                Some("Enter  Edit session overrides")
+                            }
+                            _ => None,
+                        };
+                        let extra = u16::from(edit_action.is_some());
+                        assert_eq!(body, Rect::new(0, 3 + extra, 40, 4 - extra));
+                        if let Some(action) = edit_action {
+                            assert!(contains(&rows, action), "{rows:?}");
+                        }
                     }
                     assert!(
                         !app.click_regions
@@ -3090,16 +3119,19 @@ async fn field_sheet_edits_agent_defaults_and_session_overrides_with_real_keys()
         .position(|c| *c == PeerSettingsCategory::Extensions)
         .unwrap();
 
-    // Peer → Extensions → e → agent picker → agent defaults.
+    // Peer → Extensions → Enter → agent picker → agent defaults.
     open(&mut app, SettingsScope::Peer, extensions);
     let rows = field_frame(&mut app, &server, &backend, 100, 30);
-    assert!(contains(&rows, "e edit agent settings"), "{rows:?}");
+    assert!(contains(&rows, "Enter  Edit agent defaults"), "{rows:?}");
     assert!(matches!(
-        key(&mut app, KeyCode::Char('e')),
+        key(&mut app, KeyCode::Enter),
         input::SettingsKey::None
     ));
     let rows = field_frame(&mut app, &server, &backend, 100, 30);
-    assert!(contains(&rows, "Edit defaults for agent:"), "{rows:?}");
+    assert!(
+        contains(&rows, "Choose a hosted agent to edit:"),
+        "{rows:?}"
+    );
     let load = key(&mut app, KeyCode::Enter);
     submit_field(&mut app, &server, load);
     key(&mut app, KeyCode::Esc);
@@ -3115,11 +3147,10 @@ async fn field_sheet_edits_agent_defaults_and_session_overrides_with_real_keys()
     for expected in [
         "Agent defaults: agent-00",
         "context_prune",
-        "Minimum result bytes",
-        "16384",
-        "Extension default",
+        "> Minimum result bytes",
+        "Effective: 16384",
+        "From: Extension default",
         "Automatic naming",
-        "(turn model)",
     ] {
         assert!(contains(&rows, expected), "{expected}: {rows:?}");
     }
@@ -3146,7 +3177,7 @@ async fn field_sheet_edits_agent_defaults_and_session_overrides_with_real_keys()
         contains(&rows, "Invalid: expected an unsigned integer"),
         "{rows:?}"
     );
-    assert!(contains(&rows, "Bytes: -1_"), "{rows:?}");
+    assert!(contains(&rows, "Draft bytes: -1_"), "{rows:?}");
     assert_eq!(alpha_db.database().snapshot().await.unwrap(), before);
 
     // Zero is a real value: saved to this agent, selection kept, source shown.
@@ -3157,12 +3188,13 @@ async fn field_sheet_edits_agent_defaults_and_session_overrides_with_real_keys()
     drive_field(&mut app, &server, save).await;
     let rows = field_frame(&mut app, &server, &backend, 100, 30);
     assert!(contains(&rows, "Saved"), "{rows:?}");
-    assert!(
-        rows.iter().any(|r| r.contains("> ")
-            && r.contains("Minimum result bytes")
-            && r.contains("Agent: agent-00")),
-        "{rows:?}"
-    );
+    for expected in [
+        "> Minimum result bytes",
+        "Effective: 0",
+        "From: Agent: agent-00",
+    ] {
+        assert!(contains(&rows, expected), "{expected}: {rows:?}");
+    }
     assert_eq!(
         read_agent_settings(alpha_db.database(), "context_prune")
             .await
@@ -3174,7 +3206,7 @@ async fn field_sheet_edits_agent_defaults_and_session_overrides_with_real_keys()
     key(&mut app, KeyCode::Char('r'));
     let rows = field_frame(&mut app, &server, &backend, 100, 30);
     assert!(
-        contains(&rows, "Remove agent default for Minimum result bytes?"),
+        contains(&rows, "Remove agent default and inherit?"),
         "{rows:?}"
     );
     let reset = key(&mut app, KeyCode::Char('y'));
@@ -3234,16 +3266,14 @@ async fn field_sheet_edits_agent_defaults_and_session_overrides_with_real_keys()
         ),
         "{rows:?}"
     );
-    assert!(
-        rows.iter().any(|r| r.contains("Model")
-            && r.contains("demo:small")
-            && r.contains("Agent: agent-00")),
-        "{rows:?}"
-    );
 
     // Pin the model to the turn model (null) for the whole session.
     for _ in 0..2 {
         key(&mut app, KeyCode::Down);
+    }
+    let rows = field_frame(&mut app, &server, &backend, 100, 30);
+    for expected in ["> Model", "Effective: demo:small", "From: Agent: agent-00"] {
+        assert!(contains(&rows, expected), "{expected}: {rows:?}");
     }
     key(&mut app, KeyCode::Enter);
     key(&mut app, KeyCode::Tab);
@@ -3267,9 +3297,10 @@ async fn field_sheet_edits_agent_defaults_and_session_overrides_with_real_keys()
     app.settings_layout = super::super::SettingsLayout::Compact;
     let rows = field_frame(&mut app, &server, &backend, 40, 8);
     for expected in [
-        "Session pin (all) · view: agent-00",
+        "Session overrides (all) · As: agent-00",
         "> Model",
-        "Session override · (turn model)",
+        "Effective: (turn model)",
+        "From: Session override",
         "r reset",
     ] {
         assert!(contains(&rows, expected), "{expected}: {rows:?}");
@@ -3282,7 +3313,13 @@ async fn field_sheet_edits_agent_defaults_and_session_overrides_with_real_keys()
     field_frame(&mut app, &server, &backend, 40, 8);
     deny(&mut app, true, rx).await;
     let rows = field_frame(&mut app, &server, &backend, 40, 8);
-    assert!(contains(&rows, "ID: x_"), "{rows:?}");
+    for expected in [
+        "Effective: (turn model)",
+        "Draft model: x_",
+        "Enter save · Esc cancel",
+    ] {
+        assert!(contains(&rows, expected), "{expected}: {rows:?}");
+    }
     field_frame(&mut app, &server, &backend, 39, 8);
     assert!(matches!(
         key(&mut app, KeyCode::Enter),

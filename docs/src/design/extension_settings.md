@@ -48,7 +48,7 @@ TUI and command clients call the same typed mutation, not separate validators or
 
 ## Keyboard flow
 
-Use the Session Hub, not a resource sidebar. From the hub, `s` opens Peer Settings even with zero conversations. On **Extensions** keep the current registration catalog and add `e Edit agent settings`: pick a hosted agent, then edit its defaults. From chat, `Ctrl+S` → **Extensions** (append after Sharing, leaving keys 1–6 intact) lists authorized agent views for that session. `Enter` on a visible agent opens the same field sheet, with **Session override** as its locked target. No editor for a missing target. Keep registered-but-inactive distinct from disabled fields: editing preferences never activates an extension.
+Use the Session Hub, not a resource sidebar. From the hub, `s` opens Peer Settings even with zero conversations. **Extensions** keeps the registration catalog below **Enter Edit agent defaults**: pick a hosted agent, then edit its defaults. From chat, `Ctrl+S` → **Extensions** (after Sharing, leaving keys 1–6 intact) offers **Enter Edit session overrides**, which lists authorized agent views for that session. `Enter` on a visible agent opens the same field sheet, with **Session override** as its locked target. No editor for a missing target. Keep registered-but-inactive distinct from disabled fields: editing preferences never activates an extension.
 
 Example field sheet, illustrating the session path rather than a screenshot:
 
@@ -79,12 +79,12 @@ The scoped page keeps Category → List → Content focus and normal reader scro
 
 ```text
 Session: work / Extensions
-Session pin (all) · view: Alpha
+Session overrides (all) · As: Alpha
 > Automatic naming
-  off · Session override
-
-Enable on the next eligible turn.
-Enter edit  r reset  Esc back
+Effective: off
+From: Session override
+…
+↑↓ select · Enter edit · r reset · Esc
 ```
 
 Below the supported floor swallow editing keys except safe cancellation. Approvals keep first claim on input and preserve drafts. `Esc` unwinds prompt → sheet → caller, returning through the agent picker when used. Reuse the Settings return target; don't change chat, draft, cursor, or scroll. Load snapshots off the render/input path, keyed by connected server generation, DB ID and tab incarnation where applicable. Retire stale loads/results on navigation or reconnect, and never retry a write against a different target.

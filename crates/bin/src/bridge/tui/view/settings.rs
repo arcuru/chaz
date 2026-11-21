@@ -339,13 +339,13 @@ fn settings_status_hint(app: &App, scope: SettingsScope) -> &'static str {
         SettingsScope::Peer
             if PeerSettingsCategory::ALL.get(cur) == Some(&PeerSettingsCategory::Extensions) =>
         {
-            return " e edit agent settings · Esc back ";
+            return " Enter edit · → read catalog · Esc ";
         }
         SettingsScope::Session
             if SessionSettingsCategory::ALL.get(cur)
                 == Some(&SessionSettingsCategory::Extensions) =>
         {
-            return " Enter edit session overrides · Esc ";
+            return " Enter edit · Esc back ";
         }
         _ => {}
     }
@@ -442,9 +442,27 @@ fn render_peer_category(
                 .into_iter()
                 .map(Line::from)
                 .collect();
+            let area = if category == PeerSettingsCategory::Extensions {
+                extension_edit_entry(f, area, "Edit agent defaults")
+            } else {
+                area
+            };
             render_content(f, area, app, category.label(), lines, 1);
         }
     }
+}
+
+// Keep the primary keyboard action visible while the information pane scrolls.
+fn extension_edit_entry(f: &mut ratatui::Frame, area: Rect, label: &str) -> Rect {
+    let parts = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).split(area);
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(" Enter ", theme::selected()),
+            Span::styled(format!(" {label}"), theme::accent_bold()),
+        ])),
+        parts[0],
+    );
+    parts[1]
 }
 
 /// Peer → Defaults — ordered editable list of agents auto-attached to
@@ -1428,11 +1446,12 @@ fn render_session_category(
         SessionSettingsCategory::Models => render_session_models(f, area, app, backend),
         SessionSettingsCategory::Agents => render_session_agents(f, area, app, backend),
         SessionSettingsCategory::Extensions => {
+            let area = extension_edit_entry(f, area, "Edit session overrides");
             let lines = vec![
                 Line::from(vec![Span::styled("  Extensions", theme::accent_bold())]),
                 Line::from("  Session overrides apply to every agent in this session."),
                 Line::from("  Unset fields inherit each agent's default, then the extension's."),
-                Line::from("  Enter pick an agent to view as, then edit overrides."),
+                Line::from("  Pick an agent to preview its inherited values."),
                 Line::from("  /extensions settings inspects raw session state."),
             ];
             render_content(f, area, app, "Extensions", lines, 1);
@@ -1893,7 +1912,6 @@ fn render_field_sheet(f: &mut ratatui::Frame, area: Rect, app: &App, scope: Sett
     let Some(s) = app.field_sheet.as_ref() else {
         return;
     };
-    let dim = Style::default().fg(theme::DIM);
     let compact = app.settings_layout == SettingsLayout::Compact;
     let title = match scope {
         SettingsScope::Peer => "Peer Settings / Extensions".into(),
@@ -1903,11 +1921,12 @@ fn render_field_sheet(f: &mut ratatui::Frame, area: Rect, app: &App, scope: Sett
         }
     };
     let mut lines = vec![Line::from(Span::styled(title, theme::accent_bold()))];
+    let notice = s.notice.as_ref().or(app.operations.notice.as_ref());
     let (hints, detail) = if let Some(target) = &s.target {
         let name = sheet::one_line(target.label());
         lines.push(Line::from(match target {
             Target::Agent { .. } => format!("Agent defaults: {name}"),
-            Target::Session { .. } if compact => format!("Session pin (all) · view: {name}"),
+            Target::Session { .. } if compact => format!("Session overrides (all) · As: {name}"),
             Target::Session { .. } => {
                 format!("Session overrides (all agents) · Viewing as: {name}")
             }
@@ -1917,32 +1936,32 @@ fn render_field_sheet(f: &mut ratatui::Frame, area: Rect, app: &App, scope: Sett
             (Mode::Edit(draft), Some(_)) => match draft {
                 Draft::Bool(on) => (
                     "Space toggle · Enter save · Esc cancel",
-                    Some(format!("Choice: {}", if *on { "On" } else { "Off" })),
+                    Some(format!("Draft: {}", if *on { "On" } else { "Off" })),
                 ),
                 Draft::Model {
                     turn_model: true, ..
                 } => (
                     "Tab model · Enter save · Esc cancel",
-                    Some("Choice: Use turn model".into()),
+                    Some("Draft: Use turn model".into()),
                 ),
                 Draft::Model { input, .. } => (
-                    "Tab turn · Enter save · Esc cancel",
-                    Some(format!("ID: {}_", sheet::one_line(input))),
+                    "Tab turn model · Enter save · Esc cancel",
+                    Some(format!("Draft model: {}_", sheet::one_line(input))),
                 ),
                 Draft::Number(input) => (
-                    "Digits · Enter save · Esc cancel",
-                    Some(format!("Bytes: {}_", sheet::one_line(input))),
+                    "Enter save · Esc cancel",
+                    Some(format!("Draft bytes: {}_", sheet::one_line(input))),
                 ),
             },
-            (Mode::ConfirmReset, Some(row)) => {
+            (Mode::ConfirmReset, Some(_)) => {
                 let subject = if matches!(target, Target::Agent { .. }) {
                     "agent default"
                 } else {
                     "session override"
                 };
                 (
-                    "y remove · n keep · Esc cancel",
-                    Some(format!("Remove {subject} for {}?", row.field.label)),
+                    "y / Enter remove · Esc cancel",
+                    Some(format!("Remove {subject} and inherit?")),
                 )
             }
             (_, _) if s.pending.is_some() => (
@@ -1973,36 +1992,38 @@ fn render_field_sheet(f: &mut ratatui::Frame, area: Rect, app: &App, scope: Sett
         match &s.rows {
             Some(Err(error)) => lines.push(Line::from(error.clone())),
             Some(Ok(rows)) if rows.is_empty() => lines.push(Line::from("No declared preferences")),
-            Some(Ok(_)) if compact => {
-                if let Some(row) = selected {
-                    lines.push(Line::from(format!("> {}", row.field.label)));
-                    lines.push(Line::from(Span::styled(
-                        format!(
-                            "  {} · {}",
-                            sheet::source_label(row, target),
-                            sheet::display(row)
-                        ),
-                        dim,
-                    )));
-                }
-            }
             Some(Ok(rows)) => {
-                let room = usize::from(area.height.saturating_sub(5));
+                // Reserve the effective value, source, contextual detail,
+                // notice and actions before putting fields in the viewport.
+                let reserved = lines.len()
+                    + 2
+                    + usize::from(detail.is_some())
+                    + usize::from(notice.is_some())
+                    + 1;
+                let room = usize::from(area.height).saturating_sub(reserved);
                 let start = s.cursor.saturating_sub(room.saturating_sub(1));
                 for (i, row) in rows.iter().enumerate().skip(start).take(room) {
-                    let marker = if i == s.cursor { '>' } else { ' ' };
-                    let text = format!(
-                        "{marker} {} / {}  ·  {}  ·  {}",
-                        row.extension,
-                        row.field.label,
-                        sheet::source_label(row, target),
-                        sheet::display(row)
-                    );
-                    lines.push(if i == s.cursor {
-                        Line::from(Span::styled(text, theme::accent_bold()))
-                    } else {
-                        Line::from(text)
-                    });
+                    let active = i == s.cursor;
+                    let marker = if active { '>' } else { ' ' };
+                    let label = format!("{marker} {} ", row.field.label);
+                    lines.push(Line::from(vec![
+                        if active {
+                            Span::styled(label, theme::selected())
+                        } else {
+                            Span::raw(label)
+                        },
+                        Span::styled(format!(" · {}", row.extension), theme::dim()),
+                    ]));
+                }
+                if let Some(row) = selected {
+                    lines.push(Line::from(vec![
+                        Span::raw("Effective: "),
+                        Span::styled(sheet::display(row), theme::accent_bold()),
+                    ]));
+                    lines.push(Line::from(format!(
+                        "From: {}",
+                        sheet::source_label(row, target)
+                    )));
                 }
             }
             None => {}
@@ -2010,17 +2031,20 @@ fn render_field_sheet(f: &mut ratatui::Frame, area: Rect, app: &App, scope: Sett
         (hints, detail)
     } else {
         lines.push(Line::from(match scope {
-            SettingsScope::Peer => "Edit defaults for agent:",
-            SettingsScope::Session => "View session overrides as:",
+            SettingsScope::Peer => "Choose a hosted agent to edit:",
+            SettingsScope::Session => "Choose an agent to preview inheritance:",
         }));
         let room = usize::from(area.height.saturating_sub(4));
         let start = s.pick_cursor.saturating_sub(room.saturating_sub(1));
         for (i, pick) in s.picks.iter().enumerate().skip(start).take(room) {
-            let marker = if i == s.pick_cursor { '>' } else { ' ' };
-            lines.push(Line::from(format!(
-                "{marker} {}",
-                sheet::one_line(pick.label())
-            )));
+            let active = i == s.pick_cursor;
+            let marker = if active { '>' } else { ' ' };
+            let text = format!("{marker} {} ", sheet::one_line(pick.label()));
+            lines.push(Line::from(if active {
+                Span::styled(text, theme::selected())
+            } else {
+                Span::raw(text)
+            }));
         }
         if s.pending.is_some() {
             ("Esc back", Some("Loading authorized agents…".into()))
@@ -2033,9 +2057,10 @@ fn render_field_sheet(f: &mut ratatui::Frame, area: Rect, app: &App, scope: Sett
     if let Some(detail) = detail {
         lines.push(Line::from(detail));
     }
-    if let Some(notice) = s.notice.as_ref().or(app.operations.notice.as_ref()) {
+    if let Some(notice) = notice {
         lines.push(Line::from(notice.clone()));
     }
+    let hint_y = area.y + (lines.len() as u16).min(area.height.saturating_sub(1));
     f.render_widget(
         Paragraph::new(lines),
         Rect {
@@ -2043,13 +2068,14 @@ fn render_field_sheet(f: &mut ratatui::Frame, area: Rect, app: &App, scope: Sett
             ..area
         },
     );
-    f.render_widget(
-        Paragraph::new(Span::styled(hints, dim)),
+    widgets::status_strip(
+        f,
         Rect {
-            y: area.bottom().saturating_sub(1),
+            y: hint_y,
             height: 1,
             ..area
         },
+        hints,
     );
 }
 
