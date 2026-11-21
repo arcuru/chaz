@@ -1053,8 +1053,11 @@ from retained visible assistant text and complete, unambiguous real function
 call/result pairs.
 Foreign reasoning and native item IDs are not forwarded; the stored transcript
 is never rewritten and earlier effects are not rerun.
-Unknown provider output, non-text content, incomplete results or unsupported
-ordering instead produce a conversion error before HTTP.
+Some relays send `status: null` for reasoning items and function calls.
+Chaz treats that like an omitted status, but still requires each function call
+to have its complete recorded result.
+Unknown provider output, non-text content, explicitly incomplete items,
+incomplete results or unsupported ordering produce a conversion error before HTTP.
 A pending native wait is stricter: restore its original API/model/connection
 before resuming, or explicitly interrupt it after inspecting the turn.
 Changing targets cannot reinterpret or retire that checkpoint.

@@ -466,13 +466,15 @@ fn validate_portable_output(
 ) -> Result<(), LlmError> {
     let mut native_calls = Vec::new();
     for item in items {
-        if item
-            .get("status")
-            .is_some_and(|s| s.as_str() != Some("completed"))
-        {
-            return Err(conversion_error("output is not completed"));
+        let kind = item.get("type").and_then(Value::as_str);
+        match item.get("status") {
+            None => {}
+            // Typed relays can serialize these optional statuses as null.
+            Some(Value::Null) if matches!(kind, Some("reasoning" | "function_call")) => {}
+            Some(status) if status.as_str() == Some("completed") => {}
+            _ => return Err(conversion_error("output is not completed")),
         }
-        match item.get("type").and_then(Value::as_str) {
+        match kind {
             Some("reasoning") => {} // Opaque reasoning has no portable meaning.
             Some("message") => {
                 if item["role"] != "assistant" || !native_calls.is_empty() {
