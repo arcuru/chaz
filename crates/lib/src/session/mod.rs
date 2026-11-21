@@ -38,6 +38,9 @@ pub(crate) mod history;
 pub mod jobs;
 mod keys;
 mod registry;
+pub mod roots;
+#[cfg(test)]
+mod roots_tests;
 pub mod steering;
 pub(crate) use registry::JobRequest;
 #[cfg(test)]
@@ -2547,22 +2550,6 @@ pub fn trailing_agent_message_burst(
         }
     }
     burst
-}
-
-/// Find or create a named eidetica database for a user.
-async fn find_or_create_db(
-    user: &mut eidetica::AccountSession,
-    name: &str,
-) -> anyhow::Result<Database> {
-    match user.find_database(name).await {
-        Ok(existing) if !existing.is_empty() => Ok(existing.into_iter().next().unwrap()),
-        _ => {
-            let mut settings = eidetica::crdt::Doc::new();
-            settings.set("name", name);
-            let key_id = user.get_default_key()?;
-            Ok(user.create_database(settings, &key_id).await?)
-        }
-    }
 }
 
 #[cfg(test)]

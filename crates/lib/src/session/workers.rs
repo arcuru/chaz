@@ -109,7 +109,11 @@ impl SessionRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{agent::AgentRegistry, config::ExecutionRole};
+    use crate::{
+        agent::AgentRegistry,
+        config::ExecutionRole,
+        session::roots::{self, RootSetup},
+    };
     use eidetica::{
         Instance, NewAccount,
         auth::types::{AuthKey, Permission, SigKey},
@@ -122,7 +126,7 @@ mod tests {
     async fn worker_observation_repairs_only_missing_same_login_hints_and_fails_closed() {
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("workers.sock");
-        let (owner, admin) = Instance::create_backend(
+        let (owner, mut admin) = Instance::create_backend(
             Box::new(InMemory::new()),
             NewAccount::with_password("worker-owner", "test-password"),
         )
@@ -133,6 +137,17 @@ mod tests {
             .await
             .unwrap()
             .create_account(NewAccount::with_password("unrelated", "test-password"))
+            .await
+            .unwrap();
+        // Provision both logins on the backend; the remote clients only open existing roots.
+        roots::open(&mut admin, RootSetup::Initialize)
+            .await
+            .unwrap();
+        let mut unrelated = owner
+            .login_account("unrelated", "test-password")
+            .await
+            .unwrap();
+        roots::open(&mut unrelated, RootSetup::Initialize)
             .await
             .unwrap();
         let service = ServiceServer::bind(owner, &socket).await.unwrap();

@@ -1,4 +1,5 @@
 //! Exercise Chaz client/executor restarts against a SQLite-backed service.
+use chaz_core::session::roots::{self, RootSetup};
 use eidetica::{Instance, NewAccount, backend::database::Sqlite};
 use serde_json::json;
 use wiremock::{
@@ -13,12 +14,14 @@ async fn live_model_survives_unchanged_config_process_restarts() {
         "sqlite://{}?mode=rwc",
         dir.path().join("eidetica.db").display()
     );
-    let (owner, user) = Instance::create_backend(
+    let (owner, mut user) = Instance::create_backend(
         Box::new(Sqlite::connect(&connection).await.unwrap()),
         NewAccount::with_password("fixture", "test-password"),
     )
     .await
     .unwrap();
+    // The fixture's first Chaz process is a client; initialize as the owner before serving it.
+    roots::open(&mut user, RootSetup::Initialize).await.unwrap();
     drop(user);
     let socket = dir.path().join("eidetica.sock");
     let service = eidetica::service::ServiceServer::bind(owner, &socket)
