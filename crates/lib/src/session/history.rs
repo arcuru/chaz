@@ -213,6 +213,14 @@ impl Session {
         database: &'a Database,
         snapshot: &Snapshot,
     ) -> anyhow::Result<HistoryRead<'a>> {
+        Self::require_accepted_history_frontier(database, snapshot).await?;
+        HistoryRead::open(database, snapshot.clone()).await
+    }
+
+    pub(super) async fn require_accepted_history_frontier(
+        database: &Database,
+        snapshot: &Snapshot,
+    ) -> anyhow::Result<()> {
         let accepted = accepted_frontier(database).await?;
         if snapshot != &accepted {
             let reachable = if let Some(engine) = database.backend()?.local_engine() {
@@ -232,7 +240,7 @@ impl Session {
                 "history frontier is not in the accepted session history"
             );
         }
-        HistoryRead::open(database, snapshot.clone()).await
+        Ok(())
     }
 }
 

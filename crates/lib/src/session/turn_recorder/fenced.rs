@@ -10,7 +10,7 @@ use crate::session::{
 };
 use crate::{
     extension::projection::ContextSource,
-    runtime::{CallPreparation, RuntimeMessage, RuntimeRecord},
+    runtime::{CallPreparation, RuntimeMessage, RuntimeRecord, TurnCancel},
     session::{
         TURN_ATTEMPTS_STORE, TurnAttemptStatus,
         conversation::{
@@ -31,9 +31,11 @@ pub(in crate::session) enum FailCommit {
 }
 
 pub(super) struct FencedTurn {
+    // Only this recorder's commits advance the selected lineage.
     frontier: Snapshot,
     source: Snapshot,
     compaction: Option<Box<compaction::State>>,
+    cancel: Option<TurnCancel>,
     input: RepresentationId,
     next_model: u64,
     pending: Option<usage::CallObservation>,
@@ -55,9 +57,10 @@ impl Session {
         branch: String,
         agent: String,
         entry: SessionEntry,
+        cancel: TurnCancel,
         fail: Option<FailCommit>,
     ) -> anyhow::Result<TurnRecorder> {
-        Self::fenced_fixture(session, branch, agent, entry, fail, false).await
+        Self::fenced_fixture(session, branch, agent, entry, Some(cancel), fail, false).await
     }
 
     pub(in crate::session) async fn start_compacting_fixture(
@@ -66,7 +69,7 @@ impl Session {
         agent: String,
         entry: SessionEntry,
     ) -> anyhow::Result<TurnRecorder> {
-        Self::fenced_fixture(session, branch, agent, entry, None, true).await
+        Self::fenced_fixture(session, branch, agent, entry, None, None, true).await
     }
 
     async fn fenced_fixture(
@@ -74,6 +77,7 @@ impl Session {
         branch: String,
         agent: String,
         entry: SessionEntry,
+        cancel: Option<TurnCancel>,
         fail: Option<FailCommit>,
         compaction: bool,
     ) -> anyhow::Result<TurnRecorder> {
@@ -132,6 +136,7 @@ impl Session {
             source: frontier.clone(),
             frontier,
             compaction: compaction.then(Box::default),
+            cancel,
             input,
             next_model: 0,
             pending: None,
@@ -373,7 +378,7 @@ impl TurnRecorder {
             },
         )
         .await?;
-        state.frontier = Snapshot::from([txn.commit().await?]);
+        Box::pin(state.commit(&session, &self.attempt, txn)).await?;
         let intent = state.transaction(db).await?;
         stage_observation(
             &intent,
@@ -383,7 +388,7 @@ impl TurnRecorder {
             },
         )
         .await?;
-        state.frontier = Snapshot::from([intent.commit().await?]);
+        Box::pin(state.commit(&session, &self.attempt, intent)).await?;
         state.next_model += 1;
         state.pending = Some(call.observation);
         Ok(())
@@ -416,6 +421,12 @@ impl TurnRecorder {
         fenced: &Mutex<FencedTurn>,
         message: RuntimeRecord,
     ) -> anyhow::Result<()> {
+        if matches!(message, RuntimeRecord::Cancelled)
+            && let Some(cancel) = &fenced.lock().await.cancel
+        {
+            ensure!(cancel.is_cancelled(), "unmatched fenced stop");
+            return Ok(());
+        }
         let session = self.write_session().await.map_err(anyhow::Error::msg)?;
         let db = session.database();
         let mut state = fenced.lock().await;
@@ -485,7 +496,7 @@ impl TurnRecorder {
                     state.fail != Some(FailCommit::Response),
                     "injected refusal after staging response and accounting"
                 );
-                state.frontier = Snapshot::from([txn.commit().await?]);
+                Box::pin(state.commit(&session, &self.attempt, txn)).await?;
                 state.responses.insert(model_sequence, response.clone());
                 state
                     .exchanges
@@ -534,7 +545,7 @@ impl TurnRecorder {
                         View::ToolResult,
                     )])
                     .await?;
-                state.frontier = Snapshot::from([txn.commit().await?]);
+                Box::pin(state.commit(&session, &self.attempt, txn)).await?;
                 state
                     .exchanges
                     .get_mut(&model_sequence)
@@ -605,19 +616,49 @@ impl TurnRecorder {
             state.fail != Some(FailCommit::Completion),
             "injected refusal after staging completion"
         );
-        state.frontier = Snapshot::from([txn.commit().await?]);
+        Box::pin(state.commit(session, &self.attempt, txn)).await?;
         Ok(())
     }
 }
 
 impl FencedTurn {
     async fn transaction(&self, db: &Database) -> anyhow::Result<Transaction> {
-        // Single local owner only. This is an observed frontier check, not a
-        // promise of compare-and-swap against distinct writers/peers.
-        ensure!(
-            self.compaction.is_some() || db.snapshot().await? == self.frontier,
-            "fenced turn frontier moved"
-        );
+        if self.compaction.is_none() {
+            Session::require_accepted_history_frontier(db, &self.frontier).await?;
+        }
         Ok(db.new_transaction_at(&self.frontier).await?)
+    }
+
+    async fn commit(
+        &mut self,
+        session: &Session,
+        attempt: &TurnAttempt,
+        txn: Transaction,
+    ) -> anyhow::Result<()> {
+        if let Some(cancel) = &self.cancel {
+            // Eidetica signs against the transaction's historical parents. Check
+            // live authority separately; the synthetic writer does not provide a
+            // distributed compare-and-swap against revocation or cancellation.
+            ensure!(
+                session
+                    .database()
+                    .current_permission()
+                    .await
+                    .context("fenced writer authority unavailable")?
+                    .can_write(),
+                "fenced writer has no current write permission"
+            );
+            ensure!(
+                session
+                    .read_turn_attempt(&attempt.attempt_id)
+                    .await?
+                    .as_ref()
+                    == Some(attempt),
+                "fenced turn no longer owns its attempt"
+            );
+            ensure!(!cancel.is_cancelled(), "fenced turn cancelled");
+        }
+        self.frontier = Snapshot::from([txn.commit().await?]);
+        Ok(())
     }
 }

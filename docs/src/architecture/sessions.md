@@ -88,12 +88,21 @@ with unchanged text references the response instead of storing another body.
 `/print` renders the committed reply, not an observed model response that has
 yet to settle. Reads do not resume attempts or replay effects.
 
+If a correction arrives while a request is in flight in the single-turn
+fixture, the reply still descends from its dispatch intent, not the latest tips.
+The writer checks current permission, its attempt, and cancellation separately
+from that history. A joined read includes both appends once. It does not imply
+that the earlier request saw the correction, or that stable display order
+identifies a reply target.
+
 Dated row APIs used by queues and transport delivery do not present v1
-projections as legacy rows. The fixture's descriptor requires
-`fenced-turn-v1`; readers that do not understand those receipts must refuse the
-effective read. No production path creates this descriptor, enables v1
-writes, or converts existing histories. The fixture does not exercise peer
-writer coordination, durable projection hooks, bridge publication, or waits.
+projections as legacy rows. The single-turn fixture's descriptor requires
+`fenced-turn-v1` and `fenced-input-appends-v1`; readers that do not understand
+these capabilities must refuse the effective read. The second capability admits
+plain user appends, not new attempts. No production path creates this
+descriptor, enables v1 writes, or converts existing histories. The fixture
+does not provide a distributed authority barrier or exercise durable projection
+hooks, bridge publication, or waits.
 Before enabling production writes, all authorized peers and rollback binaries
 need compatible readers. Never delete a descriptor to make legacy code accept
 that history.

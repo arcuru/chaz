@@ -78,7 +78,16 @@ pub(super) fn validate_operations<'a>(
     }
     for op in read.operations.values() {
         if read.fenced_turn {
-            let input = branches.get(&op.branch_id).ok_or_else(|| {
+            let input = branches.get(&op.branch_id);
+            // A plain append contributes history, not another accepted attempt.
+            // Its visibility does not depend on the execution's branch label.
+            if read.fenced_input_appends
+                && !input.is_some_and(|input| input.fact == op.fact_id(0))
+                && is_user_append(op)
+            {
+                continue;
+            }
+            let input = input.ok_or_else(|| {
                 Error::Integrity("operation outside a fenced execution branch".into())
             })?;
             if publications.contains(op.op_id.as_str()) {
@@ -154,6 +163,12 @@ async fn attempt_at(db: &Database, at: &Snapshot, id: &str) -> Result<TurnAttemp
         .await?)
 }
 
+fn is_user_append(op: &Operation) -> bool {
+    op.kind == OperationKind::Append
+        && matches!(&op.facts[..], [Fact { payload: Payload::Input { sender, text }, .. }] if !sender.is_empty() && !text.is_empty())
+        && matches!(&op.outputs[..], [output] if output.fact == op.fact_id(0) && output.view == View::Message(MessageRole::User))
+}
+
 pub(super) async fn validate_input(
     db: &Database,
     read: &ConversationRead,
@@ -161,11 +176,8 @@ pub(super) async fn validate_input(
     input: &AcceptedInput,
 ) -> Result<()> {
     let op = operation_in(read, entry, &input.fact.operation)?;
-    let valid_op = op.kind == OperationKind::Append
-        && op.branch_id == input.branch
-        && input.fact == op.fact_id(0)
-        && matches!(&op.facts[..], [Fact { payload: Payload::Input { sender, text }, .. }] if !sender.is_empty() && !text.is_empty())
-        && matches!(&op.outputs[..], [output] if output.fact == input.fact && output.view == View::Message(MessageRole::User));
+    let valid_op =
+        is_user_append(op) && op.branch_id == input.branch && input.fact == op.fact_id(0);
     if !valid_op || !entry.in_subtree(TURN_ATTEMPTS_STORE) {
         return Err(Error::Integrity(
             "input lacks its atomic fact or attempt".into(),

@@ -89,7 +89,11 @@ fn summary(text: &str) -> Payload {
 }
 
 async fn commit_op(db: &Database, op: &Operation) -> Snapshot {
-    let txn = db.new_transaction_at(&op.observed.frontier).await.unwrap();
+    commit_op_at(db, op, &op.observed.frontier).await
+}
+
+async fn commit_op_at(db: &Database, op: &Operation, at: &Snapshot) -> Snapshot {
+    let txn = db.new_transaction_at(at).await.unwrap();
     stage(
         txn.get_store::<ConversationStore>(STORE)
             .await
@@ -99,6 +103,58 @@ async fn commit_op(db: &Database, op: &Operation) -> Snapshot {
     )
     .await;
     Snapshot::from([txn.commit().await.unwrap()])
+}
+
+#[tokio::test]
+async fn signed_operation_cannot_claim_a_sibling_as_observed() {
+    let (_instance, _account, db) = super::super::test_helpers::test_session_db().await;
+    let base = activate(&db, &db.snapshot().await.unwrap()).await;
+    let correction = commit_op(
+        &db,
+        &operation(
+            &db,
+            &base,
+            1,
+            input("correction"),
+            View::Message(MessageRole::User),
+            vec![],
+        ),
+    )
+    .await;
+    let following = operation(
+        &db,
+        &correction,
+        2,
+        input("follow-up"),
+        View::Message(MessageRole::User),
+        vec![],
+    );
+    // The same binding is valid if the signed Entry really descends from the correction.
+    let valid = commit_op(&db, &following).await;
+    assert!(
+        Session::history_at(&db, &valid)
+            .await
+            .unwrap()
+            .context()
+            .await
+            .is_ok()
+    );
+
+    let forged = commit_op_at(&db, &following, &base).await;
+    assert!(db.verify_entry_signature(&forged.tips()[0]).await.unwrap());
+    let joined = db.snapshot().await.unwrap();
+    assert_eq!(joined.tips().len(), 2);
+    let error = Session::history_at(&db, &joined)
+        .await
+        .unwrap()
+        .context()
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("operation binding outside Entry ancestry")
+    );
 }
 
 async fn commit_preparation(db: &Database, input: &CallInput) -> Snapshot {

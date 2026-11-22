@@ -9,6 +9,7 @@ use super::{Ancestry, ConversationError, Originals, Result, atom};
 pub(super) const STORE: &str = "conversation_contract_v1";
 pub(super) const FENCED_TURN: &str = "fenced-turn-v1";
 pub(super) const FENCED_COMPACTION: &str = "fenced-compaction-v1";
+pub(super) const FENCED_INPUT_APPENDS: &str = "fenced-input-appends-v1";
 
 /// Context-owned legacy semantic stores covered by this reader increment.
 /// Job/input/auxiliary conversion and full write-door integration remain pending;
@@ -64,9 +65,11 @@ impl Descriptor {
         let mut supported = BTreeSet::from(["append-v1".into(), "replace-v1".into()]);
         if self.fenced_turn() {
             supported.insert(FENCED_TURN.into());
-        }
-        if self.fenced_turn() && self.fenced_compaction() {
-            supported.insert(FENCED_COMPACTION.into());
+            if self.fenced_compaction() {
+                supported.insert(FENCED_COMPACTION.into());
+            } else if self.fenced_input_appends() {
+                supported.insert(FENCED_INPUT_APPENDS.into());
+            }
         }
         if self.required_operations != supported {
             return Err(ConversationError::Unsupported(
@@ -85,6 +88,10 @@ impl Descriptor {
 
     pub(super) fn fenced_turn(&self) -> bool {
         self.required_operations.contains(FENCED_TURN)
+    }
+
+    pub(super) fn fenced_input_appends(&self) -> bool {
+        self.required_operations.contains(FENCED_INPUT_APPENDS)
     }
 }
 
