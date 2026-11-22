@@ -2,6 +2,8 @@
 //! loopback backend, a pure hook and an in-process tool. No external transport
 //! or production writer can be selected by this fixture.
 use super::*;
+
+mod compaction;
 use crate::{
     backends::BackendManager,
     commands::{Command, CommandContext, CommandOutcome, command_fixture, dispatch},
@@ -91,18 +93,48 @@ struct Fixture {
     context: ToolContext,
     policies: ToolPolicyRegistry,
     input: Snapshot,
+    budget: Option<usize>,
+    _disk: Option<tempfile::TempDir>,
 }
 
 impl Fixture {
     async fn new(with_tool: bool, fail: Option<fenced::FailCommit>) -> Self {
-        let (instance, _account, db) = crate::session::test_helpers::test_session_db().await;
+        Self::build(with_tool, fail, None, move |req: &Request| {
+            stub_response(with_tool, req)
+        })
+        .await
+    }
+
+    async fn build(
+        with_tool: bool,
+        fail: Option<fenced::FailCommit>,
+        historical_input: Option<&str>,
+        responder: impl wiremock::Respond + 'static,
+    ) -> Self {
+        let disk = historical_input.map(|_| tempfile::tempdir().unwrap());
+        let (instance, db) = match &disk {
+            Some(dir) => Box::pin(sqlite_fixture_db(dir)).await,
+            None => {
+                let (instance, _account, db) =
+                    crate::session::test_helpers::test_session_db().await;
+                (instance, db)
+            }
+        };
         let session = Arc::new(Mutex::new(
             Session::try_new(crate::types::ConversationId("fenced".into()), db.clone())
                 .await
                 .unwrap(),
         ));
-        let recorder = Arc::new(
-            Session::start_fenced_turn(
+        let recorder = Arc::new(match historical_input {
+            Some(text) => Session::start_compacting_fixture(
+                session.clone(),
+                BRANCH.into(),
+                AGENT.into(),
+                message("user", text),
+            )
+            .await
+            .unwrap(),
+            None => Session::start_fenced_turn(
                 session.clone(),
                 BRANCH.into(),
                 AGENT.into(),
@@ -111,13 +143,13 @@ impl Fixture {
             )
             .await
             .unwrap(),
-        );
+        });
         let input = db.snapshot().await.unwrap();
         let mock = MockServer::start().await;
         assert!(mock.address().ip().is_loopback());
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
-            .respond_with(move |req: &Request| stub_response(with_tool, req))
+            .respond_with(responder)
             .mount(&mock)
             .await;
         let mut config = Backend::new(BackendType::OpenAICompatible);
@@ -126,6 +158,9 @@ impl Fixture {
         config.max_retries = Some(0);
         let backend = BackendManager::new(&Some(vec![config]), SecretStore::new(db.clone()).await);
         let tools = Arc::new(ToolRegistry::new());
+        if historical_input.is_some() {
+            tools.register(crate::tools::Compact);
+        }
         let tool = Arc::new(AtomicUsize::new(0));
         let hook = Arc::new(AtomicUsize::new(0));
         let mut hub = context_hub().await;
@@ -144,15 +179,18 @@ impl Fixture {
         });
         context.active_extensions.insert("fenced-hook".into());
         let policies = ToolPolicyRegistry::new(
-            [(
-                TOOL.into(),
-                ToolPolicy {
-                    approval: ApprovalRequirement::Never,
-                    ..Default::default()
-                }
+            [TOOL, "compact"]
+                .map(|name| {
+                    (
+                        name.into(),
+                        ToolPolicy {
+                            approval: ApprovalRequirement::Never,
+                            ..Default::default()
+                        }
+                        .into(),
+                    )
+                })
                 .into(),
-            )]
-            .into(),
         );
         assert_eq!(db.snapshot().await.unwrap(), input);
         Self {
@@ -169,13 +207,15 @@ impl Fixture {
             context,
             policies,
             input,
+            budget: None,
+            _disk: disk,
         }
     }
 
     fn call(&self, model_sequence: u64) -> crate::session::CallId {
         crate::session::CallId {
             request: self.recorder.attempt.request_id.as_str().into(),
-            branch: BRANCH.into(),
+            branch: self.recorder.identity.execution_id.clone().unwrap(),
             model_sequence,
         }
     }
@@ -203,7 +243,7 @@ impl Fixture {
             None,
             ModelCallScope {
                 sources: context.sources,
-                request_budget_tokens: Some(context.request_budget_tokens),
+                request_budget_tokens: self.budget.or(Some(context.request_budget_tokens)),
                 attempt_id: Some(self.recorder.attempt.attempt_id.clone()),
                 ..Default::default()
             },
@@ -245,6 +285,28 @@ impl Fixture {
             .unwrap();
         account.open_database(self.db.root_id()).await.unwrap()
     }
+}
+
+async fn sqlite_fixture_db(dir: &tempfile::TempDir) -> (Instance, Database) {
+    let url = format!(
+        "sqlite://{}?mode=rwc",
+        dir.path().join("fenced.db").display()
+    );
+    let backend = eidetica::backend::database::Sqlite::connect(&url)
+        .await
+        .unwrap();
+    let (instance, mut user) = Instance::create_backend(
+        Box::new(backend),
+        eidetica::NewAccount::with_password("test", "test-password"),
+    )
+    .await
+    .unwrap();
+    let key = user.get_default_key().unwrap();
+    let db = user
+        .create_database(eidetica::crdt::Doc::new(), &key)
+        .await
+        .unwrap();
+    (instance, db)
 }
 
 fn message(sender: &str, text: &str) -> SessionEntry {

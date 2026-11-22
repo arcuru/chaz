@@ -4,7 +4,7 @@ use super::{ConversationError as Error, ConversationRead, Result, record::*};
 use crate::session::{TURN_ATTEMPTS_STORE, TurnAttempt, TurnAttemptStatus};
 use eidetica::{Database, Snapshot, entry::Entry, store::Table};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -63,20 +63,24 @@ pub(super) fn operation_in<'a>(
 
 /// Require the other half of the atomic binding too: inspecting a signed
 /// receipt is not enough if a writer can omit it and leave a visible fact.
-pub(super) fn validate_operations(
+pub(super) fn validate_operations<'a>(
     read: &ConversationRead,
-    input: Option<&AcceptedInput>,
+    inputs: impl Iterator<Item = &'a AcceptedInput>,
     responses: &BTreeSet<FactId>,
     publications: &BTreeSet<&str>,
     accepted_values: &BTreeSet<FactId>,
 ) -> Result<()> {
+    let mut branches = BTreeMap::new();
+    for input in inputs {
+        if branches.insert(&input.branch, input).is_some() {
+            return Err(Error::IdentityConflict("fenced execution branch".into()));
+        }
+    }
     for op in read.operations.values() {
-        if let Some(input) = input {
-            if op.branch_id != input.branch {
-                return Err(Error::Integrity(
-                    "operation outside the fenced execution branch".into(),
-                ));
-            }
+        if read.fenced_turn {
+            let input = branches.get(&op.branch_id).ok_or_else(|| {
+                Error::Integrity("operation outside a fenced execution branch".into())
+            })?;
             if publications.contains(op.op_id.as_str()) {
                 continue;
             }

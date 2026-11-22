@@ -56,7 +56,7 @@ An idle stop records nothing, and the event never enters model context or wakes 
 A stopped attempt completes with a terminal cancellation transcript record and an agent `Error` carrying completed-call usage.
 See [ReAct Runtime → Cancellation](react.md#cancellation) and [TUI → Stopping a Running Turn](../user_guide/tui.md#stopping-a-running-turn).
 
-### ConversationStore v1: reads and one fenced writer fixture
+### ConversationStore v1: reads and fenced writer fixtures
 
 `Session::history_at` binds the read to the caller's Database handle and one
 accepted main frontier. Only that handle selects a format. With no v1 traces
@@ -79,8 +79,8 @@ atom text and invalid delta bytes even when interpretation refuses.
 `recorded_call` reads the immutable preparation at its original observed
 selection, not the latest context and not a replay or dispatch receipt.
 
-Only tests can admit a v1 writer, and only on a fresh synthetic session. The
-fixture uses the regular runtime and its attempt-bound recorder with a loopback
+Only tests can admit a v1 writer. They start from a fresh synthetic session and
+use the regular runtime and its attempt-bound recorder with a loopback
 backend, an in-process tool, and one before-agent hook. The Store validates and
 stages data; the host commits it before dispatch or publication. It commits
 the native response, outcome, and compact accounting together. A final reply
@@ -97,6 +97,27 @@ writer coordination, durable projection hooks, bridge publication, or waits.
 Before enabling production writes, all authorized peers and rollback binaries
 need compatible readers. Never delete a descriptor to make legacy code accept
 that history.
+
+The compaction fixture can accept another request after a completed turn. Its
+`fenced-compaction-v1` capability keeps older readers from interpreting data
+they cannot validate. It does not upgrade the single-turn fixture or migrate a
+real session.
+
+The compaction strategy selects whole historical units from the model's scoped
+view; the attempt-bound recorder checks and stages the explicit members. An
+automatic summary has a signed intent before the model call. The intent pins
+the selected source; the settlement commits a replacement and its receipt
+together, or records that no replacement was applied. A `compact` tool call
+uses the historical units in its own prepared request and binds the local
+replacement to that native call. Neither path authorizes replay.
+
+The next request can use the committed summary without generating it again.
+Originals still belong to their signed history. A sibling append outside the
+named targets survives, and an overlapping replacement does not silently win.
+A current-frontier conflict check is not a compare-and-swap. If competing
+replacements both commit on siblings, inspection retains the originals and
+effective context refuses the conflict. The current request and live tool
+batch are never replacement targets. This is not production writer admission.
 
 ### Assistant `ResponseMetadata`
 

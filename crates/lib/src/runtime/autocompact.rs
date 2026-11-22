@@ -207,11 +207,21 @@ pub(crate) struct Compactor {
     /// State and detail last handed out, so repeats are not rewritten.
     reported: Option<(String, String)>,
     session: Option<(eidetica::Database, Vec<String>)>,
+    scoped: Option<Scoped>,
     invalidated: bool,
     boundary_failure: Option<String>,
     /// Each finished call reports immediately, even if a later segment is
     /// cancelled or invalidated before the preparation completes.
     usage: std::sync::Arc<std::sync::Mutex<Vec<ResponseMetadata>>>,
+}
+
+struct Scoped {
+    db: eidetica::Database,
+    recorder: std::sync::Arc<dyn super::RuntimeRecorder>,
+    eligible: std::collections::BTreeSet<crate::session::RepresentationId>,
+    used: std::collections::BTreeSet<crate::session::RepresentationId>,
+    /// Retained even if the caller drops the boundary future during a wait.
+    intent: Option<String>,
 }
 
 #[derive(Debug)]
@@ -332,10 +342,55 @@ impl Compactor {
             status: None,
             reported: None,
             session: None,
+            scoped: None,
             invalidated: false,
             boundary_failure: None,
             usage: Default::default(),
         })
+    }
+
+    pub(crate) async fn bind_scope(
+        &mut self,
+        recorder: std::sync::Arc<dyn super::RuntimeRecorder>,
+        db: eidetica::Database,
+    ) -> Result<(), String> {
+        let eligible = recorder
+            .context_compaction()
+            .expect("selected compaction capability")
+            .historical_members()
+            .await
+            .map_err(|err| err.to_string())?;
+        self.scoped = Some(Scoped {
+            db,
+            recorder,
+            eligible: eligible.into_iter().collect(),
+            used: Default::default(),
+            intent: None,
+        });
+        Ok(())
+    }
+
+    pub(crate) fn note_replacements(&mut self, edits: &[crate::session::ContextReplacement]) {
+        if let Some(scope) = &mut self.scoped {
+            scope
+                .used
+                .extend(edits.iter().flat_map(|edit| edit.targets.iter().cloned()));
+        }
+    }
+
+    async fn settle_scoped(&mut self, summary: Option<String>) -> Result<(), String> {
+        if let Some(scope) = &mut self.scoped
+            && let Some(intent) = scope.intent.take()
+        {
+            scope
+                .recorder
+                .context_compaction()
+                .expect("selected compaction capability")
+                .settle(intent, summary)
+                .await
+                .map_err(|err| err.to_string())?;
+        }
+        Ok(())
     }
 
     pub(crate) async fn bind_session(&mut self, db: eidetica::Database) -> Result<(), String> {
@@ -345,6 +400,21 @@ impl Compactor {
             .map_err(|e| e.to_string())?;
         self.session = Some((db, fence));
         Ok(())
+    }
+
+    async fn scoped_policy_is_current(&self) -> Result<bool, String> {
+        let Some(scope) = &self.scoped else {
+            return Ok(true);
+        };
+        let name = crate::extensions::autocompact::NAME;
+        let active = crate::extension::read_active(&scope.db)
+            .await
+            .map_err(|e| e.to_string())?;
+        let policy = crate::extensions::autocompact::policy(&scope.db)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(active.iter().any(|extension| extension.name() == name)
+            && policy.as_ref() == Some(&self.policy))
     }
 
     async fn check_fence(&mut self) -> Result<(), String> {
@@ -399,6 +469,10 @@ impl Compactor {
     }
 
     fn protected(&self, index: usize, message: &RuntimeMessage, source: &ContextSource) -> bool {
+        if let Some(scope) = &self.scoped {
+            return !matches!(source, ContextSource::ConversationRepresentation { id }
+                if scope.eligible.contains(id) && !scope.used.contains(id));
+        }
         is_protected_source(source)
             || matches!(message, RuntimeMessage::System(_))
             || (index >= self.input_start && matches!(message, RuntimeMessage::User(_)))
@@ -536,8 +610,21 @@ impl Compactor {
         (cut > floor && !jobs.is_empty()).then_some(jobs)
     }
 
-    fn start(&mut self, messages: &[RuntimeMessage], sources: &[ContextSource], estimate: usize) {
-        let Some(jobs) = self.plan(messages, sources) else {
+    async fn start(
+        &mut self,
+        messages: &[RuntimeMessage],
+        sources: &[ContextSource],
+        estimate: usize,
+    ) {
+        if !matches!(self.scoped_policy_is_current().await, Ok(true)) {
+            self.invalidated = true;
+            self.set_status(
+                "unapplied",
+                "automatic compaction authorization changed".into(),
+            );
+            return;
+        }
+        let Some(mut jobs) = self.plan(messages, sources) else {
             // Keep the last rejection visible instead of replacing it with
             // the expected absence of a fresh range at the same cut.
             if self.exhausted == 0 {
@@ -551,6 +638,50 @@ impl Compactor {
             }
             return;
         };
+        if let Some(scope) = &mut self.scoped {
+            // Reserve one immutable range per preparation. Later safe
+            // boundaries can choose another; no partial multi-call adoption.
+            jobs.truncate(1);
+            let job = &jobs[0];
+            let members = job
+                .covered
+                .iter()
+                .cloned()
+                .zip(&job.sources)
+                .map(|(msg, source)| {
+                    let ContextSource::ConversationRepresentation { id } = source else {
+                        unreachable!("the plan protects unscoped sources");
+                    };
+                    (msg, id.clone())
+                })
+                .collect();
+            let reservation = scope
+                .recorder
+                .context_compaction()
+                .expect("selected compaction capability")
+                .reserve(members)
+                .await;
+            match reservation {
+                Ok(intent) => scope.intent = Some(intent),
+                Err(error) => {
+                    self.exhausted = self.exhausted.max(job.end);
+                    warn!(%error, "Could not reserve automatic context replacement");
+                    self.set_status("unapplied", "compaction source reservation refused".into());
+                    return;
+                }
+            }
+        }
+        if self.scoped.is_some() && !matches!(self.scoped_policy_is_current().await, Ok(true)) {
+            self.invalidated = true;
+            if let Err(error) = self.settle_scoped(None).await {
+                warn!(%error, "Could not settle unused compaction intent");
+            }
+            self.set_status(
+                "unapplied",
+                "automatic compaction authorization changed".into(),
+            );
+            return;
+        }
         let cut = jobs.last().map_or(0, |j| j.end);
         let backend = self.backend.clone();
         let model = self.model.clone();
@@ -594,7 +725,7 @@ impl Compactor {
     }
 
     /// Validate and apply a finished preparation against the current vector.
-    fn settle(
+    async fn settle(
         &mut self,
         pending: Pending,
         result: Result<Vec<String>, String>,
@@ -612,7 +743,10 @@ impl Compactor {
         };
         let summaries = match result {
             Ok(summaries) => summaries,
-            Err(error) => return refuse(self, "failed", error),
+            Err(error) => {
+                self.settle_scoped(None).await?;
+                return refuse(self, "failed", error);
+            }
         };
         // Stale-source rejection: every covered message must be unchanged.
         let stale = pending.jobs.iter().any(|job| {
@@ -624,6 +758,7 @@ impl Compactor {
                     .any(|a| a.start != job.start && a.start < job.end && job.start < a.end)
         });
         if stale {
+            self.settle_scoped(None).await?;
             return refuse(
                 self,
                 "stale",
@@ -646,11 +781,28 @@ impl Compactor {
         let after = estimate_request_tokens(&self.view(messages, sources).messages, tools);
         if after >= before {
             self.applied = previous;
+            self.settle_scoped(None).await?;
             return refuse(
                 self,
                 "no-progress",
                 format!("summary did not shrink the request (~{before} -> ~{after} tokens)"),
             );
+        }
+        if self.scoped.is_some() {
+            self.applied = previous;
+            if !matches!(self.scoped_policy_is_current().await, Ok(true)) {
+                self.invalidated = true;
+                self.settle_scoped(None).await?;
+                return refuse(
+                    self,
+                    "unapplied",
+                    "automatic compaction authorization changed".into(),
+                );
+            }
+            self.exhausted = self.exhausted.max(pending.cut);
+            if let Err(error) = self.settle_scoped(summaries.into_iter().next()).await {
+                return refuse(self, "unapplied", error);
+            }
         }
         info!(before, after, "Applied autocompaction summary");
         let status = self.set_status(
@@ -691,10 +843,18 @@ impl Compactor {
         if self.invalidated {
             return Ok(());
         }
-        self.settle(pending, result, messages, sources, tools)
+        self.settle(pending, result, messages, sources, tools).await
     }
 
     pub(crate) async fn finish_turn(&mut self) {
+        if self.scoped.is_some() {
+            // Stop waiting before recording non-application, and retain the
+            // signed intent even if that recording cannot be confirmed.
+            self.pending = None;
+            if let Err(error) = self.settle_scoped(None).await {
+                warn!(%error, "Could not settle unused compaction intent");
+            }
+        }
         let Some(mut pending) = self.pending.take() else {
             if self.status.as_ref().is_some_and(|s| s.state == "preparing") {
                 self.set_status(
@@ -766,7 +926,7 @@ impl Compactor {
             && self.pending.is_none()
             && (over.is_none() || self.boundary_failure.is_none())
         {
-            self.start(messages, sources, estimate);
+            self.start(messages, sources, estimate).await;
         }
         let Some(hard) = over else {
             return Ok(false);
@@ -914,6 +1074,70 @@ async fn summarize(
         )),
         Err(error) => Err((format!("summary request failed: {error}"), Vec::new())),
     }
+}
+
+/// Remap the already assembled request using committed replacements only.
+/// Removed members never retain cache anchors; a same-looking message cannot
+/// substitute for the representation that actually owns an anchor.
+pub(crate) fn committed_view(
+    messages: &[RuntimeMessage],
+    sources: &[ContextSource],
+    edits: &[crate::session::ContextReplacement],
+) -> Result<Option<View>, String> {
+    if edits.is_empty() {
+        return Ok(None);
+    }
+    let mut slots: Vec<_> = messages
+        .iter()
+        .cloned()
+        .zip(sources.iter().cloned())
+        .map(|(message, source)| Some((message, source, true)))
+        .collect();
+    for edit in edits {
+        let mut positions = slots
+            .iter()
+            .enumerate()
+            .filter_map(|(index, slot)| match slot {
+                Some((_, ContextSource::ConversationRepresentation { id }, _))
+                    if edit.targets.contains(id) =>
+                {
+                    Some(index)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .into_iter();
+        if positions.len() != edit.targets.len() {
+            return Err("committed replacement differs from the selected request members".into());
+        }
+        let first = positions.next().ok_or("empty committed replacement")?;
+        slots[first] = Some((
+            RuntimeMessage::User(format!("{SUMMARY_PREFIX}{}{SUMMARY_SUFFIX}", edit.text)),
+            ContextSource::ConversationRepresentation {
+                id: edit.summary.clone(),
+            },
+            false,
+        ));
+        for index in positions {
+            slots[index] = None;
+        }
+    }
+    let mut view = View {
+        messages: Vec::new(),
+        sources: Vec::new(),
+        compacted: true,
+        index_map: Vec::new(),
+    };
+    for slot in slots {
+        if let Some((message, source, original)) = slot {
+            view.index_map.push(original.then_some(view.messages.len()));
+            view.messages.push(message);
+            view.sources.push(source);
+        } else {
+            view.index_map.push(None);
+        }
+    }
+    Ok(Some(view))
 }
 
 #[cfg(test)]

@@ -32,6 +32,7 @@ use tracing::{error, info, warn};
 mod activity_tests;
 mod agents;
 mod bridge_event;
+mod context_compaction;
 mod conversation;
 pub mod execution;
 pub(crate) mod history;
@@ -68,6 +69,7 @@ pub use transport::{
     session_attachment, transport_bindings, unbind_transport,
 };
 
+pub use context_compaction::{CompactToolScope, ContextCompaction, ContextReplacement};
 pub use conversation::{
     CallId, CallInput, CallMessageBinding, ConversationError, ConversationInspection,
     ConversationOriginals, FactId, Fidelity, ObservedBinding, RecordRef, RepresentationId,

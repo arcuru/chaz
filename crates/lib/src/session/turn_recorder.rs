@@ -34,6 +34,7 @@ pub(crate) struct TurnRecorder {
     fail_after: Option<Arc<std::sync::Mutex<Option<usize>>>>,
     fenced: Option<Mutex<fenced::FencedTurn>>,
     fenced_admitted: AtomicBool,
+    fenced_compaction: bool,
 }
 
 #[derive(Default)]
@@ -66,6 +67,7 @@ impl Session {
             fail_after: options.fail_after,
             fenced: None,
             fenced_admitted: AtomicBool::new(false),
+            fenced_compaction: false,
         }
     }
 }
@@ -137,6 +139,10 @@ impl TurnRecorder {
 }
 
 impl runtime::RuntimeRecorder for TurnRecorder {
+    fn context_compaction(&self) -> Option<&dyn crate::session::ContextCompaction> {
+        self.fenced_compaction.then_some(self)
+    }
+
     fn begin_turn(&self, resuming: bool) -> Result<(), String> {
         if self.fenced.is_some() && (resuming || self.fenced_admitted.swap(true, Ordering::AcqRel))
         {

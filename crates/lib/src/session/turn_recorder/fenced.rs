@@ -2,6 +2,7 @@
 //! only in tests: no config, descriptor, reopened database or retry command
 //! can grant one. All commits are owned here, outside the Store.
 use super::*;
+mod compaction;
 #[cfg(test)]
 use crate::session::{
     TurnRequestId,
@@ -31,6 +32,8 @@ pub(in crate::session) enum FailCommit {
 
 pub(super) struct FencedTurn {
     frontier: Snapshot,
+    source: Snapshot,
+    compaction: Option<Box<compaction::State>>,
     input: RepresentationId,
     next_model: u64,
     pending: Option<usage::CallObservation>,
@@ -54,17 +57,31 @@ impl Session {
         entry: SessionEntry,
         fail: Option<FailCommit>,
     ) -> anyhow::Result<TurnRecorder> {
+        Self::fenced_fixture(session, branch, agent, entry, fail, false).await
+    }
+
+    pub(in crate::session) async fn start_compacting_fixture(
+        session: Arc<Mutex<Self>>,
+        branch: String,
+        agent: String,
+        entry: SessionEntry,
+    ) -> anyhow::Result<TurnRecorder> {
+        Self::fenced_fixture(session, branch, agent, entry, None, true).await
+    }
+
+    async fn fenced_fixture(
+        session: Arc<Mutex<Self>>,
+        branch: String,
+        agent: String,
+        entry: SessionEntry,
+        fail: Option<FailCommit>,
+        compaction: bool,
+    ) -> anyhow::Result<TurnRecorder> {
         let mut session_guard = session.lock().await;
         session_guard.refresh_writer().await?;
         let db = session_guard.database();
         let boundary = Snapshot::from([db.root_id().clone()]);
-        // A fresh DB only, no populated legacy session or interrupted attempt
-        // can go through this path. Check the real history, not the cache.
         let read = Session::history(db).await?;
-        ensure!(
-            read.snapshot() == &boundary && read.entries().await?.is_empty(),
-            "fixture requires a fresh session"
-        );
         ensure!(
             !branch.is_empty()
                 && !agent.is_empty()
@@ -75,37 +92,34 @@ impl Session {
                 && entry.routing.is_none(),
             "fixture requires an unaddressed local message"
         );
-        let txn = db.new_transaction_at(&boundary).await?;
-        stage_descriptor(&txn, db, &boundary).await?;
-        let active = Snapshot::from([txn.commit().await?]);
-        let txn = db.new_transaction_at(&active).await?;
-        let staged = Staging::at(db, &active, &txn, &branch).await?;
-        let input = staged
-            .append(vec![(
-                Payload::Input {
-                    sender: entry.sender,
-                    text: entry.content,
-                },
-                View::Message(MessageRole::User),
-            )])
-            .await?;
-        let accepted = AcceptedInput {
-            fact: input.fact_id(0),
-            branch: branch.clone(),
-            attempt: uuid::Uuid::new_v4().to_string(),
+        let active = if read.snapshot() == &boundary && read.entries().await?.is_empty() {
+            let txn = db.new_transaction_at(&boundary).await?;
+            stage_descriptor(&txn, db, &boundary, compaction).await?;
+            Snapshot::from([txn.commit().await?])
+        } else if compaction {
+            let at = read.snapshot().clone();
+            let txn = db.new_transaction_at(&at).await?;
+            let staged = Staging::at(db, &at, &txn, &branch).await?;
+            ensure!(staged.supports_compaction(), "not a compaction fixture");
+            let attempts = txn
+                .get_store::<Table<TurnAttempt>>(TURN_ATTEMPTS_STORE)
+                .await?;
+            ensure!(
+                attempts
+                    .search(|attempt| attempt.status != TurnAttemptStatus::Completed)
+                    .await?
+                    .is_empty(),
+                "fixture cannot replay an interrupted attempt"
+            );
+            ensure!(
+                !staged.has_branch(&branch),
+                "fixture branch already accepted"
+            );
+            at
+        } else {
+            anyhow::bail!("fixture requires a fresh session");
         };
-        let attempt = TurnAttempt {
-            attempt_id: accepted.attempt.clone(),
-            request_id: TurnRequestId::parse(accepted.request()),
-            started_at: entry.timestamp,
-            generation: 1,
-            status: TurnAttemptStatus::Started,
-            completed_at: None,
-        };
-        let input = accepted.representation();
-        stage_observation(&txn, Observation::InputAccepted { input: accepted }).await?;
-        stage_attempt(&txn, &attempt).await?;
-        let frontier = Snapshot::from([txn.commit().await?]);
+        let (frontier, input, attempt) = accept_fixture_input(db, &active, &branch, entry).await?;
         let identity = TurnCallIdentity {
             agent,
             requested_model: String::new(),
@@ -113,8 +127,11 @@ impl Session {
         };
         drop(session_guard);
         let mut recorder = Self::turn_recorder(session, &attempt, identity, Default::default());
+        recorder.fenced_compaction = compaction;
         recorder.fenced = Some(Mutex::new(FencedTurn {
+            source: frontier.clone(),
             frontier,
+            compaction: compaction.then(Box::default),
             input,
             next_model: 0,
             pending: None,
@@ -127,6 +144,44 @@ impl Session {
         }));
         Ok(recorder)
     }
+}
+
+#[cfg(test)]
+pub(super) async fn accept_fixture_input(
+    db: &Database,
+    active: &Snapshot,
+    branch: &str,
+    entry: SessionEntry,
+) -> anyhow::Result<(Snapshot, RepresentationId, TurnAttempt)> {
+    let txn = db.new_transaction_at(active).await?;
+    let staged = Staging::at(db, active, &txn, branch).await?;
+    let input = staged
+        .append(vec![(
+            Payload::Input {
+                sender: entry.sender,
+                text: entry.content,
+            },
+            View::Message(MessageRole::User),
+        )])
+        .await?;
+    let accepted = AcceptedInput {
+        fact: input.fact_id(0),
+        branch: branch.into(),
+        attempt: uuid::Uuid::new_v4().to_string(),
+    };
+    let attempt = TurnAttempt {
+        attempt_id: accepted.attempt.clone(),
+        request_id: TurnRequestId::parse(accepted.request()),
+        started_at: entry.timestamp,
+        generation: 1,
+        status: TurnAttemptStatus::Started,
+        completed_at: None,
+    };
+    let input = accepted.representation();
+    stage_observation(&txn, Observation::InputAccepted { input: accepted }).await?;
+    stage_attempt(&txn, &attempt).await?;
+    let frontier = Snapshot::from([txn.commit().await?]);
+    Ok((frontier, input, attempt))
 }
 
 async fn stage_attempt(txn: &Transaction, attempt: &TurnAttempt) -> anyhow::Result<()> {
@@ -172,7 +227,7 @@ impl TurnRecorder {
         );
         let sources = call
             .sources
-            .context("fenced turn does not support projection or compaction")?;
+            .context("fenced turn requires signed sources after context selection")?;
         ensure!(
             sources.len() == call.messages.len(),
             "missing model input sources"
@@ -196,6 +251,7 @@ impl TurnRecorder {
         let mut additions = Vec::new();
         let mut new_slots = Vec::new();
         let mut new_values = Vec::new();
+        let mut addition_slot = 0;
         for (index, (source, message)) in sources.iter().zip(call.messages).enumerate() {
             let representation = match source {
                 ContextSource::ConversationRepresentation { id } => id,
@@ -219,7 +275,9 @@ impl TurnRecorder {
                         }
                         _ => anyhow::bail!("unsupported synthetic hook or instruction value"),
                     })?;
-                    if let Some(id) = state.additions.get(&index) {
+                    let slot = addition_slot;
+                    addition_slot += 1;
+                    if let Some(id) = state.additions.get(&slot) {
                         ensure!(
                             staged.payload(id)? == &(Payload::ControlObservation { value }),
                             "accepted addition changed between calls"
@@ -228,7 +286,7 @@ impl TurnRecorder {
                         messages.push(Some(CallMessageBinding::AcceptedAddition(id.clone())));
                     } else {
                         ensure!(sequence == 0, "new addition after first call");
-                        new_slots.push(index);
+                        new_slots.push((slot, index));
                         new_values.push((Payload::ControlObservation { value }, View::AuditOnly));
                         messages.push(None);
                     }
@@ -268,9 +326,9 @@ impl TurnRecorder {
         }
         if !new_values.is_empty() {
             let op = staged.append(new_values).await?;
-            for (i, index) in new_slots.into_iter().enumerate() {
+            for (i, (slot, index)) in new_slots.into_iter().enumerate() {
                 let id = op.fact_id(i.try_into()?);
-                state.additions.insert(index, id.clone());
+                state.additions.insert(slot, id.clone());
                 additions.push(id.clone());
                 messages[index] = Some(CallMessageBinding::AcceptedAddition(id));
             }
@@ -286,7 +344,7 @@ impl TurnRecorder {
         let input = CallInput {
             call: id.clone(),
             attempt: self.attempt.attempt_id.clone(),
-            observed: staged.observed,
+            observed: staged.observed.clone(),
             representations,
             renderer_version: 1,
             context_version: 1,
@@ -304,6 +362,10 @@ impl TurnRecorder {
             fidelity: Fidelity::Approximate,
             reasons: vec!["Accepted inputs and declarations, not serializer byte evidence".into()],
         };
+        staged.validate_preparation(&input)?;
+        if let Some(compaction) = &mut state.compaction {
+            compaction.prepared = Some(input.clone());
+        }
         stage_observation(
             &txn,
             Observation::Prepared {
@@ -553,7 +615,7 @@ impl FencedTurn {
         // Single local owner only. This is an observed frontier check, not a
         // promise of compare-and-swap against distinct writers/peers.
         ensure!(
-            db.snapshot().await? == self.frontier,
+            self.compaction.is_some() || db.snapshot().await? == self.frontier,
             "fenced turn frontier moved"
         );
         Ok(db.new_transaction_at(&self.frontier).await?)
