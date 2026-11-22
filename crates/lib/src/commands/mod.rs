@@ -26,6 +26,8 @@ use crate::types::ConversationId;
 use std::sync::Arc;
 
 mod agent;
+#[cfg(test)]
+pub(crate) use agent::tests::fixture as command_fixture;
 mod extensions;
 mod parse;
 mod session;

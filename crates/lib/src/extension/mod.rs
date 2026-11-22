@@ -2397,6 +2397,8 @@ impl instance::CapResolver for HubCapResolver {
 
 #[cfg(test)]
 mod test_doubles;
+#[cfg(test)]
+pub(crate) use test_doubles::counting_ext;
 
 #[cfg(test)]
 mod tests;

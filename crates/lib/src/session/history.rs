@@ -331,6 +331,29 @@ impl HistoryRead<'_> {
         })
     }
 
+    pub(super) async fn conversation_accounting(
+        &self,
+    ) -> anyhow::Result<Vec<super::usage::CallEvidence>> {
+        Ok(match self.conversation().await? {
+            Some(read) => read.accounting()?,
+            None => Vec::new(),
+        })
+    }
+
+    pub(super) async fn usage_entries(&self) -> anyhow::Result<Vec<SessionEntry>> {
+        let rows = match self.conversation().await? {
+            Some(read) => {
+                let legacy = self
+                    .database
+                    .new_transaction_at(read.legacy_frontier()?)
+                    .await?;
+                entry_rows(&legacy, "entries").await?
+            }
+            None => self.entries().await?,
+        };
+        Ok(rows.into_iter().map(|(_, entry)| entry).collect())
+    }
+
     pub(crate) async fn display_rows(&self) -> anyhow::Result<Vec<DisplayRow>> {
         Ok(match self.conversation().await? {
             Some(read) => read.display_rows()?,

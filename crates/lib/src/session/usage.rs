@@ -13,8 +13,9 @@ use crate::runtime::ResponseMetadata;
 use crate::session::{
     BridgeKind, EntryType, Session, SessionEntry, SessionRegistry, SessionStatus,
 };
+pub(super) use calls::CallEvidence;
+use calls::estimated_cost;
 pub(crate) use calls::reported_fields;
-use calls::{CallEvidence, estimated_cost};
 pub use calls::{CallObservation, EstimatedUsage, UsageCoverage};
 pub(crate) use calls::{SUMMARY_ID, mark_usage_fields, persist as persist_call};
 use chrono::{DateTime, Utc};
@@ -278,17 +279,33 @@ pub(crate) async fn telemetry_filtered_at_snapshot(
     entries: &[SessionEntry],
     filter: &UsageFilter,
 ) -> anyhow::Result<SessionTelemetry> {
+    Box::pin(async {
+        let history = Session::history_at(database, snapshot).await?;
+        telemetry_for_history(database, &history, entries, filter).await
+    })
+    .await
+}
+
+async fn telemetry_for_history(
+    database: &eidetica::Database,
+    history: &super::HistoryRead<'_>,
+    entries: &[SessionEntry],
+    filter: &UsageFilter,
+) -> anyhow::Result<SessionTelemetry> {
     use super::{TURN_TRANSCRIPT_STORE, TurnTranscriptMessage, TurnTranscriptRecord};
     use eidetica::store::Table;
-    let txn = database.new_transaction_at(snapshot).await?;
+    let txn = database.new_transaction_at(history.snapshot()).await?;
     let observations = txn
         .get_store::<Table<CallEvidence>>(calls::STORE)
         .await?
         .search(|_| true)
         .await?;
+    let native = history.conversation_accounting().await?;
     let mut calls: BTreeMap<_, _> = observations
         .into_iter()
-        .map(|(_, row)| {
+        .map(|(_, row)| row)
+        .chain(native)
+        .map(|row| {
             (
                 (
                     row.invocation.clone(),
@@ -569,10 +586,9 @@ pub async fn collect_usage(
             let (conv_id, db) = registry.open_session(&index.session_db_id).await?;
             let session = Session::new(conv_id, db.clone()).await;
             let meta = session.read_meta().await;
-            let snapshot = db.snapshot().await?;
-            let entries = Session::entries_at_snapshot(&db, &snapshot).await?;
-            let telemetry =
-                telemetry_filtered_at_snapshot(&db, &snapshot, &entries, filter).await?;
+            let history = Session::history(&db).await?;
+            let entries = history.usage_entries().await?;
+            let telemetry = telemetry_for_history(&db, &history, &entries, filter).await?;
             for (model, row) in telemetry.per_model {
                 record_model(&mut per_model, &model, |t| {
                     t.add(&UsageTotals {

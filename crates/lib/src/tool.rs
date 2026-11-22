@@ -625,7 +625,8 @@ pub struct ToolApprovalInfo {
 }
 
 /// Serializable tool definition for sending to the LLM
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, serde::Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ToolDefinition {
     pub name: String,
     pub description: String,

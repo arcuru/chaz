@@ -47,6 +47,11 @@ pub enum RuntimeEvent {
 
 /// Awaited persistence boundary for completed runtime messages.
 pub trait RuntimeRecorder: Send + Sync {
+    /// Check recorder admission before runtime hooks or effects.
+    fn begin_turn(&self, _resuming: bool) -> Result<(), String> {
+        Ok(())
+    }
+
     /// Called only at a complete model/tool boundary. A closing boundary may
     /// return input that requires continuing before any terminal publication.
     fn input_boundary<'a>(
@@ -66,6 +71,23 @@ pub trait RuntimeRecorder: Send + Sync {
         _baseline: &'a [RuntimeMessage],
     ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
         Box::pin(async { Ok(()) })
+    }
+
+    /// Accept the final request before dispatch. The default preserves the
+    /// steering and telemetry boundaries used by existing recorders.
+    fn prepare_call<'a>(
+        &'a self,
+        call: CallPreparation<'a>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(async move {
+            self.input_dispatch(
+                call.observation.model_sequence,
+                call.messages,
+                call.baseline,
+            )
+            .await?;
+            self.observe_call(call.observation).await
+        })
     }
 
     fn record<'a>(
@@ -106,6 +128,18 @@ pub trait RuntimeRecorder: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
         Box::pin(async { Ok(()) })
     }
+}
+
+pub struct CallPreparation<'a> {
+    pub observation: crate::session::usage::CallObservation,
+    pub messages: &'a [RuntimeMessage],
+    pub baseline: &'a [RuntimeMessage],
+    /// Aligned only when the host did not replace the request's message slots.
+    pub sources: Option<&'a [ContextSource]>,
+    pub tools: &'a [ToolDefinition],
+    pub cache: &'a crate::cache::CacheOptions,
+    pub max_retries: u32,
+    pub api: Option<crate::config::ModelApi>,
 }
 
 /// The single `job_wait` call a turn is about to run, after approval and
@@ -1183,11 +1217,7 @@ impl<'a> RoundProjector<'a> {
         backend
             .validate_request_replay(model, self.resolved_model, messages)
             .map_err(|error| error.to_string())?;
-        if let Some(recorder) = recorder {
-            recorder
-                .input_dispatch(model_round, messages, baseline)
-                .await?;
-        }
+        let cache = projected.as_ref().map_or(&self.scope.cache, |r| &r.cache);
         let mut observation = crate::session::usage::CallObservation {
             model_sequence: model_round,
             timestamp: chrono::Utc::now(),
@@ -1203,7 +1233,18 @@ impl<'a> RoundProjector<'a> {
             responded: false,
         };
         if let Some(recorder) = recorder {
-            recorder.observe_call(observation.clone()).await?;
+            recorder
+                .prepare_call(CallPreparation {
+                    observation: observation.clone(),
+                    messages,
+                    baseline,
+                    sources: projected.is_none().then_some(sources.as_slice()),
+                    tools,
+                    cache,
+                    max_retries,
+                    api: backend.model_api(model, self.resolved_model),
+                })
+                .await?;
         }
         let response = llm_call_with_retry(
             backend,
@@ -1212,10 +1253,7 @@ impl<'a> RoundProjector<'a> {
             tools,
             self.resolved_model,
             max_retries,
-            projected
-                .as_ref()
-                .map(|r| &r.cache)
-                .unwrap_or(&self.scope.cache),
+            cache,
         )
         .await;
         if let Ok(response) = &response {
@@ -1396,6 +1434,9 @@ async fn run_turn(
     resume: Option<RuntimeResume>,
     scope: ModelCallScope,
 ) -> Result<RuntimeOutcome, TurnError> {
+    if let Some(recorder) = &recorder {
+        recorder.begin_turn(resume.is_some())?;
+    }
     let resolved_model = backend.resolve_model_name(model);
     if let Some(resume) = &resume {
         // Before capability errors, projector/hooks, approval, observation or retirement.

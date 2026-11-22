@@ -1,5 +1,6 @@
 //! Call preparation evidence, pinned to signed ancestry. No replay authority.
-use super::{Ancestry, ConversationError as Error, Result, atom, record::*, view};
+use super::{Ancestry, ConversationError as Error, Result, atom, record::*, turn, view};
+use crate::session::usage::{CallEvidence, CallObservation};
 use eidetica::{Database, Snapshot, Transaction};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -70,18 +71,44 @@ pub enum CallStatus {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", deny_unknown_fields)]
-pub(super) enum Observation {
+pub(in crate::session) enum Observation {
+    InputAccepted {
+        input: turn::AcceptedInput,
+    },
+    TurnCompleted {
+        completion: turn::Completion,
+    },
     #[serde(rename = "CallPrepared")]
-    Prepared { input: Box<CallInput> },
+    Prepared {
+        input: Box<CallInput>,
+    },
     #[serde(rename = "CallDispatchIntent")]
-    DispatchIntent { call: CallId, attempt: String },
+    DispatchIntent {
+        call: CallId,
+        attempt: String,
+    },
     #[serde(rename = "CallOutcome")]
     Outcome {
         call: CallId,
         attempt: String,
         status: CallStatus,
         response: Option<FactId>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        accounting: Option<Box<Accounting>>,
     },
+}
+
+/// Only local estimates/rates live here. Reported usage and opaque provider
+/// data stay on the native response fact in the same signed Entry.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(in crate::session) struct Accounting {
+    pub agent: String,
+    pub timestamp: chrono::DateTime<chrono::Utc>,
+    pub request_budget_tokens: Option<usize>,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub prices: Option<crate::backends::ModelInfo>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -92,13 +119,20 @@ pub(super) struct Record {
 }
 
 impl Observation {
-    fn identity(&self) -> (&CallId, &str, u8) {
-        match self {
+    fn call_key(&self) -> Option<(&CallId, &str, u8)> {
+        Some(match self {
+            Self::InputAccepted { .. } | Self::TurnCompleted { .. } => return None,
             Self::Prepared { input } => (&input.call, &input.attempt, 0),
             Self::DispatchIntent { call, attempt } => (call, attempt, 1),
             Self::Outcome { call, attempt, .. } => (call, attempt, 2),
-        }
+        })
     }
+}
+
+#[derive(Default)]
+pub(super) struct Evidence {
+    pub calls: BTreeMap<(CallId, String), CallInput>,
+    pub accounting: Vec<CallEvidence>,
 }
 
 pub(super) async fn read(
@@ -107,10 +141,12 @@ pub(super) async fn read(
     txn: &Transaction,
     conversation: &super::ConversationRead,
     ancestry: &Ancestry,
-) -> Result<(super::Originals, BTreeMap<(CallId, String), CallInput>)> {
+) -> Result<(super::Originals, Evidence)> {
     let entries = super::entries(db, STORE, frontier).await?;
     let mut originals = super::Originals::default();
     let mut records = BTreeMap::new();
+    let mut inputs = BTreeMap::new();
+    let mut completions = BTreeMap::new();
     for entry in &entries {
         for (hash, text) in originals.delta(entry, STORE)? {
             let record = match atom::decode_v1::<Record>(&text) {
@@ -120,7 +156,23 @@ pub(super) async fn read(
                     continue;
                 }
             };
-            let (call, attempt, kind) = record.observation.identity();
+            let Some((call, attempt, kind)) = record.observation.call_key() else {
+                let conflict = match record.observation {
+                    Observation::InputAccepted { input } => {
+                        inputs.insert(input.request(), (entry, input)).is_some()
+                    }
+                    Observation::TurnCompleted { completion } => completions
+                        .insert(completion.attempt.clone(), (entry, completion))
+                        .is_some(),
+                    _ => unreachable!(),
+                };
+                if conflict {
+                    originals
+                        .issues
+                        .push(Error::IdentityConflict("turn receipt".into()));
+                }
+                continue;
+            };
             let key = (call.clone(), attempt.to_owned(), kind);
             let (prior_hash, locations, _) = records
                 .entry(key)
@@ -140,9 +192,26 @@ pub(super) async fn read(
     {
         originals.issues.push(error);
     }
-    let mut prepared = BTreeMap::new();
+    let mut evidence = Evidence::default();
     if !originals.issues.is_empty() || !conversation.inspection.issues.is_empty() {
-        return Ok((originals, prepared));
+        return Ok((originals, evidence));
+    }
+    let fenced = conversation.fenced_turn;
+    if (fenced && inputs.len() != usize::from(!conversation.operations.is_empty()))
+        || (!fenced && (!inputs.is_empty() || !completions.is_empty()))
+    {
+        originals.issues.push(Error::Integrity(
+            "fenced turn and accepted input differ from descriptor".into(),
+        ));
+        return Ok((originals, evidence));
+    }
+    let mut responses = BTreeSet::new();
+    let mut accounted = BTreeSet::new();
+    let mut accepted_values = BTreeSet::new();
+    for (entry, input) in inputs.values() {
+        if let Err(error) = Box::pin(turn::validate_input(db, conversation, entry, input)).await {
+            originals.issues.push(error);
+        }
     }
     for ((call, attempt, kind), (_, locations, record)) in &records {
         for entry in locations {
@@ -159,7 +228,42 @@ pub(super) async fn read(
             } // byte-identical reimport, original already checked
             let check = match &record.observation {
                 Observation::Prepared { input } => {
-                    validate_input(db, &parents, input, conversation, ancestry)
+                    let receipt = inputs.get(&call.request);
+                    if fenced
+                        && receipt.is_none_or(|(owner, accepted)| {
+                            !parents.contains(owner.id_ref())
+                                || accepted.attempt != *attempt
+                                || accepted.branch != call.branch
+                                || !input.representations.contains(&accepted.representation())
+                        })
+                    {
+                        Err(Error::InvalidScope(
+                            "call is not bound to the accepted turn".into(),
+                        ))
+                    } else {
+                        let result = validate_input(
+                            db,
+                            entry,
+                            &parents,
+                            input,
+                            conversation,
+                            ancestry,
+                            fenced,
+                        );
+                        if fenced && result.is_ok() {
+                            accepted_values.extend(
+                                input
+                                    .accepted_additions
+                                    .iter()
+                                    .filter(|id| {
+                                        turn::operation_in(conversation, entry, &id.operation)
+                                            .is_ok()
+                                    })
+                                    .cloned(),
+                            );
+                        }
+                        result
+                    }
                 }
                 Observation::DispatchIntent { .. } => {
                     if earlier(0) && !earlier(2) {
@@ -171,7 +275,10 @@ pub(super) async fn read(
                     }
                 }
                 Observation::Outcome {
-                    status, response, ..
+                    status,
+                    response,
+                    accounting,
+                    ..
                 } => {
                     if !earlier(0)
                         || ((response.is_some()
@@ -182,8 +289,61 @@ pub(super) async fn read(
                             "outcome lacks original call evidence".into(),
                         ))
                     } else {
-                        validate_outcome(db, entry, call, attempt, *status, response.as_ref())
+                        let input =
+                            match &records[&(call.clone(), attempt.clone(), 0)].2.observation {
+                                Observation::Prepared { input } => input,
+                                _ => unreachable!(),
+                            };
+                        validate_outcome(
+                            conversation,
+                            entry,
+                            call,
+                            attempt,
+                            *status,
+                            response.as_ref(),
+                        )
+                        .and_then(|native| {
+                            if (fenced && *status == CallStatus::Responded && accounting.is_none())
+                                || (!fenced && accounting.is_some())
+                            {
+                                return Err(Error::Missing("atomic call accounting".into()));
+                            }
+                            if let Some(accounting) = accounting {
+                                let Some(native) = native.filter(|_| {
+                                    *status == CallStatus::Responded && !accounting.agent.is_empty()
+                                }) else {
+                                    return Err(Error::Integrity(
+                                        "accounting lacks its observed response".into(),
+                                    ));
+                                };
+                                // The same atom can be imported by multiple branches.
+                                responses.extend(response.iter().cloned());
+                                if accounted.insert((call, attempt)) {
+                                    evidence.accounting.push(CallEvidence {
+                                        local_estimate: true,
+                                        invocation: attempt.clone(),
+                                        branch: Some(call.branch.clone()),
+                                        agent: accounting.agent.clone(),
+                                        call: CallObservation {
+                                            model_sequence: call.model_sequence,
+                                            timestamp: accounting.timestamp,
+                                            requested_model: input.requested_model.clone(),
+                                            request_budget_tokens: accounting.request_budget_tokens,
+                                            input_tokens: accounting.input_tokens,
+                                            output_tokens: Some(accounting.output_tokens),
+                                            prices: accounting.prices.clone(),
+                                            metadata: native.metadata.clone(),
+                                            responded: true,
+                                        },
+                                    });
+                                }
+                            }
+                            Ok(())
+                        })
                     }
+                }
+                Observation::InputAccepted { .. } | Observation::TurnCompleted { .. } => {
+                    unreachable!()
                 }
             };
             if let Err(error) = check {
@@ -191,18 +351,62 @@ pub(super) async fn read(
             }
         }
         if let Observation::Prepared { input } = &record.observation {
-            prepared.insert((call.clone(), attempt.clone()), input.as_ref().clone());
+            evidence
+                .calls
+                .insert((call.clone(), attempt.clone()), input.as_ref().clone());
         }
     }
-    Ok((originals, prepared))
+    let mut publications = BTreeSet::new();
+    for (entry, completion) in completions.values() {
+        let check = async {
+            Box::pin(turn::validate_completion(
+                db,
+                conversation,
+                entry,
+                completion,
+            ))
+            .await?;
+            let Payload::NativeModelResponse { response } =
+                &view::fact(&completion.response, &conversation.operations)?.payload
+            else {
+                return Err(Error::Missing("completion response".into()));
+            };
+            if !inputs.contains_key(&response.call.request)
+                || !responses.contains(&completion.response)
+            {
+                return Err(Error::Integrity(
+                    "completion lacks its accepted input or response outcome".into(),
+                ));
+            }
+            Ok(())
+        }
+        .await;
+        if let Err(error) = check {
+            originals.issues.push(error);
+        } else {
+            publications.insert(completion.publication.as_str());
+        }
+    }
+    if let Err(error) = turn::validate_operations(
+        conversation,
+        inputs.values().next().map(|(_, input)| input),
+        &responses,
+        &publications,
+        &accepted_values,
+    ) {
+        originals.issues.push(error);
+    }
+    Ok((originals, evidence))
 }
 
 fn validate_input(
     db: &Database,
+    entry: &eidetica::entry::Entry,
     parents: &BTreeSet<eidetica::entry::ID>,
     input: &CallInput,
     conversation: &super::ConversationRead,
     ancestry: &Ancestry,
+    fenced: bool,
 ) -> Result<()> {
     if input.observed.database != db.root_id().to_string()
         || input.observed.frontier.is_empty()
@@ -248,12 +452,30 @@ fn validate_input(
     let ops = conversation.operations_in(&observed);
     let selected = view::effective(&ops, &conversation.legacy)?;
     validate_selection(&selected, &input.representations, &input.messages)?;
-    // This reader can inspect original accepted facts. Projection/step outputs
-    // staged with preparation belong to the later fenced writer integration.
+    // An accepted addition belongs to the observed prefix or (for this
+    // fenced attempt) to the exact Entry that first accepts the request.
+    let accepted = |id: &FactId| {
+        view::fact(id, &ops).or_else(|err| {
+            if !fenced {
+                return Err(err);
+            }
+            let op = turn::operation_in(conversation, entry, &id.operation)?;
+            if op.observed != input.observed
+                || op.branch_id != input.call.branch
+                || op.kind != OperationKind::Append
+                || !op.outputs.iter().all(|out| out.view == View::AuditOnly)
+            {
+                return Err(Error::InvalidScope(
+                    "call addition lacks its atomic binding".into(),
+                ));
+            }
+            view::fact(id, &conversation.operations)
+        })
+    };
     if input
         .accepted_additions
         .iter()
-        .any(|id| view::fact(id, &ops).is_err())
+        .any(|id| accepted(id).is_err())
         || input
             .tools
             .iter()
@@ -265,6 +487,40 @@ fn validate_input(
         return Err(Error::InvalidScope(
             "call slot outside original selected input".into(),
         ));
+    }
+    if fenced {
+        if input.api != "chat-completions" || !input.sources.is_empty() {
+            return Err(Error::Unsupported("fenced call input source or API".into()));
+        }
+        let slots = input
+            .messages
+            .iter()
+            .filter_map(|slot| match slot {
+                CallMessageBinding::AcceptedAddition(id) => Some((id, true)),
+                _ => None,
+            })
+            .chain(input.tools.iter().map(|id| (id, false)));
+        let mut used = BTreeSet::new();
+        for (id, is_message) in slots {
+            let Payload::ControlObservation { value } = &accepted(id)?.payload else {
+                return Err(Error::Integrity("invalid accepted request value".into()));
+            };
+            let valid = match serde_json::from_value::<turn::AcceptedValue>(value.clone())? {
+                turn::AcceptedValue::Instruction(_) | turn::AcceptedValue::BeforeAgent(_) => {
+                    is_message
+                }
+                turn::AcceptedValue::Tool(tool) => !is_message && !tool.name.is_empty(),
+            };
+            if !used.insert(id) || !valid {
+                return Err(Error::Integrity("invalid accepted request slot".into()));
+            }
+        }
+        if input.messages.is_empty()
+            || used.len() != input.accepted_additions.len()
+            || input.accepted_additions.iter().collect::<BTreeSet<_>>() != used
+        {
+            return Err(Error::Integrity("incomplete accepted request slots".into()));
+        }
     }
     Ok(())
 }
@@ -332,46 +588,42 @@ fn representation_slot(slot: &CallMessageBinding) -> Option<&RepresentationId> {
     }
 }
 
-fn validate_outcome(
-    db: &Database,
+fn validate_outcome<'a>(
+    read: &'a super::ConversationRead,
     entry: &eidetica::entry::Entry,
     call: &CallId,
     attempt: &str,
     status: CallStatus,
     response: Option<&FactId>,
-) -> Result<()> {
+) -> Result<Option<&'a NativeResponse>> {
     let Some(id) = response else {
         return if status == CallStatus::Responded {
             Err(Error::Missing("call response fact".into()))
         } else {
-            Ok(())
+            Ok(None)
         };
     };
-    if id.database != db.root_id().to_string() || !entry.in_subtree(super::STORE) {
-        return Err(Error::Integrity("response is not in outcome Entry".into()));
-    }
-    let atoms = atom::atoms(&atom::decode_doc(entry.data(super::STORE)?)?)?;
-    for text in atoms.values() {
-        let op: Operation = atom::decode_v1(text)?;
-        if op.op_id != id.operation {
-            continue;
-        }
-        let expected_view = if status == CallStatus::Responded {
-            View::NativeExchange
-        } else {
-            View::AuditOnly
-        };
-        if op.branch_id == call.branch
-            && op.kind == OperationKind::Append
-            && id.index == 0
-            && op.outputs.len() == 1
-            && op.outputs[0].fact == *id
-            && op.outputs[0].view == expected_view
-            && matches!(&op.facts[..], [Fact { payload: Payload::NativeModelResponse { response }, .. }] if &response.call == call && response.attempt == attempt)
-            && !matches!(status, CallStatus::Failed | CallStatus::Uncertain)
-        {
-            return Ok(());
-        }
+    let op = turn::operation_in(read, entry, &id.operation)?;
+    let expected_view = if status == CallStatus::Responded {
+        View::NativeExchange
+    } else {
+        View::AuditOnly
+    };
+    if op.branch_id == call.branch
+        && op.kind == OperationKind::Append
+        && *id == op.fact_id(0)
+        && matches!(&op.outputs[..], [output] if output.fact == *id && output.view == expected_view)
+        && !matches!(status, CallStatus::Failed | CallStatus::Uncertain)
+        && let [
+            Fact {
+                payload: Payload::NativeModelResponse { response },
+                ..
+            },
+        ] = &op.facts[..]
+        && &response.call == call
+        && response.attempt == attempt
+    {
+        return Ok(Some(response));
     }
     Err(Error::Integrity(
         "call outcome differs from its atomic response".into(),

@@ -1,6 +1,6 @@
 //! Persistence for the runtime's awaited recording seam. The executor still
 //! schedules calls, tool effects and publication; this recorder writes the
-//! legacy transcript and its display rows without choosing when to run them.
+//! selected history format without choosing when to run them.
 use super::{
     EntryType, Session, SessionEntry, TurnAttempt, TurnCallIdentity, TurnTranscriptMessage,
     TurnTranscriptRecord, execution, jobs, steering, usage, wait_resume,
@@ -14,7 +14,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use tokio::sync::Mutex;
 
-/// The legacy writer bound to one attempt and one execution branch.
+mod fenced;
+#[cfg(test)]
+mod fenced_tests;
+
+/// The writer bound to one attempt and one execution branch.
 pub(crate) struct TurnRecorder {
     session: Arc<Mutex<Session>>,
     attempt: TurnAttempt,
@@ -28,6 +32,8 @@ pub(crate) struct TurnRecorder {
     can_suspend: bool,
     #[cfg(test)]
     fail_after: Option<Arc<std::sync::Mutex<Option<usize>>>>,
+    fenced: Option<Mutex<fenced::FencedTurn>>,
+    fenced_admitted: AtomicBool,
 }
 
 #[derive(Default)]
@@ -58,6 +64,8 @@ impl Session {
             can_suspend: options.can_suspend,
             #[cfg(test)]
             fail_after: options.fail_after,
+            fenced: None,
+            fenced_admitted: AtomicBool::new(false),
         }
     }
 }
@@ -75,6 +83,9 @@ impl TurnRecorder {
         final_entry: Option<SessionEntry>,
         outbound: Option<SessionEntry>,
     ) -> anyhow::Result<()> {
+        if let Some(fenced) = &self.fenced {
+            return Box::pin(self.fenced_complete(fenced, session, final_entry, outbound)).await;
+        }
         let transcript = self.terminal.lock().unwrap().clone();
         session
             .complete_turn_attempt_for_branch(
@@ -93,6 +104,7 @@ impl TurnRecorder {
         db: &Database,
         terminal: jobs::JobTerminal,
     ) -> anyhow::Result<()> {
+        anyhow::ensure!(self.fenced.is_none(), "fenced turn cannot settle a job");
         let branch =
             self.identity.execution_id.as_ref().ok_or_else(|| {
                 anyhow::anyhow!("undelivered outcome requires an execution branch")
@@ -125,6 +137,35 @@ impl TurnRecorder {
 }
 
 impl runtime::RuntimeRecorder for TurnRecorder {
+    fn begin_turn(&self, resuming: bool) -> Result<(), String> {
+        if self.fenced.is_some() && (resuming || self.fenced_admitted.swap(true, Ordering::AcqRel))
+        {
+            return Err("fenced attempt cannot execute twice or resume".into());
+        }
+        Ok(())
+    }
+
+    fn prepare_call<'a>(
+        &'a self,
+        call: runtime::CallPreparation<'a>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(async move {
+            if let Some(fenced) = &self.fenced {
+                return self
+                    .fenced_prepare(fenced, call)
+                    .await
+                    .map_err(|err| err.to_string());
+            }
+            self.input_dispatch(
+                call.observation.model_sequence,
+                call.messages,
+                call.baseline,
+            )
+            .await?;
+            self.observe_call(call.observation).await
+        })
+    }
+
     fn can_suspend_job_wait(&self) -> bool {
         self.can_suspend
     }
@@ -136,6 +177,9 @@ impl runtime::RuntimeRecorder for TurnRecorder {
     ) -> Pin<Box<dyn Future<Output = Result<Vec<runtime::RuntimeMessage>, String>> + Send + 'a>>
     {
         Box::pin(async move {
+            if self.fenced.is_some() {
+                return Ok(Vec::new()); // no steering or job activity on this fixture
+            }
             let session = self.write_session().await?;
             let mut messages: Vec<runtime::RuntimeMessage> = steering::input_boundary(
                 session.database(),
@@ -207,6 +251,12 @@ impl runtime::RuntimeRecorder for TurnRecorder {
         message: runtime::RuntimeRecord,
     ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
         Box::pin(async move {
+            if let Some(fenced) = &self.fenced {
+                return self
+                    .fenced_record(fenced, message)
+                    .await
+                    .map_err(|err| err.to_string());
+            }
             #[cfg(test)]
             if let Some(counter) = &self.fail_after {
                 let mut remaining = counter.lock().unwrap();
@@ -325,6 +375,12 @@ impl runtime::RuntimeRecorder for TurnRecorder {
         call: usage::CallObservation,
     ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
         Box::pin(async move {
+            if let Some(fenced) = &self.fenced {
+                return self
+                    .fenced_observe(fenced, call)
+                    .await
+                    .map_err(|err| err.to_string());
+            }
             let session = self.write_session().await?;
             usage::persist_call(
                 session.database(),
@@ -342,6 +398,9 @@ impl runtime::RuntimeRecorder for TurnRecorder {
         wait: runtime::JobWaitIntent,
     ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
         Box::pin(async move {
+            if self.fenced.is_some() {
+                return Err("fenced turn cannot checkpoint a job wait".into());
+            }
             let Some(snapshot) = self.context_snapshot.clone() else {
                 return Err("turn context has no recorded snapshot".into());
             };
