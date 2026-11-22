@@ -174,6 +174,7 @@ pub(super) struct ConversationRead {
     legacy: legacy::LegacyView,
     fenced_turn: bool,
     fenced_compaction: bool,
+    fenced_input_appends: bool,
     legacy_frontier: Option<Snapshot>,
     descriptor_entries: BTreeSet<ID>,
     locations: BTreeMap<ID, BTreeSet<String>>,
@@ -315,6 +316,9 @@ pub(super) async fn open(
     let fenced_compaction = descriptor
         .as_ref()
         .is_some_and(contract::Descriptor::fenced_compaction);
+    let fenced_input_appends = descriptor
+        .as_ref()
+        .is_some_and(contract::Descriptor::fenced_input_appends);
     let legacy_frontier = descriptor.as_ref().map(|d| d.legacy.frontier.clone());
     let legacy = if let Some(descriptor) = descriptor.filter(|_| contract.issues.is_empty()) {
         match contract::require_unchanged_legacy(db, frontier, &descriptor.legacy, &ancestry).await
@@ -348,6 +352,7 @@ pub(super) async fn open(
         legacy,
         fenced_turn,
         fenced_compaction,
+        fenced_input_appends,
         legacy_frontier,
         descriptor_entries,
         locations: BTreeMap::new(),

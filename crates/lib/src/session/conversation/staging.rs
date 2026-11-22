@@ -43,9 +43,11 @@ pub(in crate::session) async fn stage_descriptor(
         "replace-v1".into(),
         contract::FENCED_TURN.into(),
     ]);
-    if compaction {
-        required_operations.insert(contract::FENCED_COMPACTION.into());
-    }
+    required_operations.insert(if compaction {
+        contract::FENCED_COMPACTION.into()
+    } else {
+        contract::FENCED_INPUT_APPENDS.into()
+    });
     atom_in(
         &txn.get_store::<contract::ContractStore>(contract::STORE)
             .await?,

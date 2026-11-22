@@ -10,7 +10,7 @@ use crate::{
     config::{Backend, BackendType, ContextConfig},
     context::ContextBuilder,
     extension::{ExtensionHub, counting_ext},
-    runtime::{ModelCallScope, RuntimeOutcome, execute_with_recorder},
+    runtime::{ModelCallScope, RuntimeOutcome, TurnCancel, execute_cancellable_with_recorder},
     security::SecretStore,
     test_support::{MockHost, context_hub, permissive_security, tool_context_with_host},
     tool::{
@@ -19,11 +19,13 @@ use crate::{
     },
 };
 use eidetica::{
-    Instance,
+    Instance, NewAccount,
+    backend::database::InMemory,
+    entry::{Entry, ID},
     store::{DocStore, Table},
 };
 use serde_json::{Value, json};
-use std::sync::atomic::AtomicUsize;
+use std::{sync::atomic::AtomicUsize, time::Duration};
 use wiremock::{
     Mock, MockServer, Request, ResponseTemplate,
     matchers::{method, path},
@@ -34,6 +36,7 @@ const MODEL: &str = "fenced-fixture";
 const BRANCH: &str = "fixture-execution";
 const TOOL: &str = "fake_add";
 const BODY: &str = "Four.";
+const CORRECTION: &str = "Correction: use 2 + 3 instead.";
 
 struct Add(Arc<AtomicUsize>);
 impl Tool for Add {
@@ -95,6 +98,7 @@ struct Fixture {
     input: Snapshot,
     budget: Option<usize>,
     _disk: Option<tempfile::TempDir>,
+    cancel: TurnCancel,
 }
 
 impl Fixture {
@@ -125,6 +129,7 @@ impl Fixture {
                 .await
                 .unwrap(),
         ));
+        let cancel = TurnCancel::new();
         let recorder = Arc::new(match historical_input {
             Some(text) => Session::start_compacting_fixture(
                 session.clone(),
@@ -139,6 +144,7 @@ impl Fixture {
                 BRANCH.into(),
                 AGENT.into(),
                 message("user", "2 + 2"),
+                cancel.clone(),
                 fail,
             )
             .await
@@ -209,6 +215,7 @@ impl Fixture {
             input,
             budget: None,
             _disk: disk,
+            cancel,
         }
     }
 
@@ -231,7 +238,7 @@ impl Fixture {
         let context = ContextBuilder::from_history(&view, AGENT, "Fixture instructions", &config)
             .build()
             .await;
-        execute_with_recorder(
+        execute_cancellable_with_recorder(
             Some(MODEL),
             context.messages,
             &self.backend,
@@ -240,6 +247,7 @@ impl Fixture {
             &self.policies,
             Some(self.recorder.clone()),
             Some(&self.hub),
+            (!self.recorder.fenced_compaction).then_some(&self.cancel),
             None,
             ModelCallScope {
                 sources: context.sources,
@@ -249,6 +257,7 @@ impl Fixture {
             },
         )
         .await
+        .map_err(|err| err.to_string())
     }
 
     async fn complete(&self, text: &str) -> anyhow::Result<()> {
@@ -307,6 +316,337 @@ async fn sqlite_fixture_db(dir: &tempfile::TempDir) -> (Instance, Database) {
         .await
         .unwrap();
     (instance, db)
+}
+
+/// Wait for the serializer's actual request (not just prepare/intent), then
+/// hold back its response until the other writer commits. Wiremock handles
+/// requests on its own thread, so this does not block the runtime under test.
+async fn pause_first_call(
+    fx: &Fixture,
+    with_tool: bool,
+) -> (
+    tokio::sync::oneshot::Receiver<Value>,
+    std::sync::mpsc::Sender<()>,
+) {
+    use std::sync::Mutex;
+
+    let (seen, request) = tokio::sync::oneshot::channel();
+    let (release, wait) = std::sync::mpsc::channel();
+    let barrier = Mutex::new(Some((seen, wait)));
+    fx.mock.reset().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(move |req: &Request| {
+            if let Some((seen, wait)) = barrier.lock().unwrap().take()
+                && (seen.send(req.body_json().unwrap()).is_err()
+                    || wait.recv_timeout(Duration::from_secs(30)).is_err())
+            {
+                return ResponseTemplate::new(500);
+            }
+            stub_response(with_tool, req)
+        })
+        .mount(&fx.mock)
+        .await;
+    (request, release)
+}
+
+async fn append_correction(db: &Database, at: &Snapshot) -> ID {
+    use crate::session::conversation::staging::{MessageRole, Payload, Staging, View};
+
+    let txn = db.new_transaction_at(at).await.unwrap();
+    Staging::at(db, at, &txn, "independent-user")
+        .await
+        .unwrap()
+        .append(vec![(
+            Payload::Input {
+                sender: "user".into(),
+                text: CORRECTION.into(),
+            },
+            View::Message(MessageRole::User),
+        )])
+        .await
+        .unwrap();
+    txn.commit().await.unwrap()
+}
+
+#[tokio::test]
+async fn fenced_v1_reply_keeps_its_intent_when_the_same_store_moves() {
+    Box::pin(concurrent_reply()).await;
+}
+
+async fn concurrent_reply() {
+    let fx = Box::pin(Fixture::new(true, None)).await;
+    let (request, release) = pause_first_call(&fx, true).await;
+    let (result, (intent, correction)) = tokio::join!(Box::pin(fx.run()), async {
+        let request = tokio::time::timeout(Duration::from_secs(30), request)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(request["messages"][1]["content"], "2 + 2");
+        assert!(!request.to_string().contains(CORRECTION));
+        let [intent]: [ID; 1] = fx
+            .db
+            .snapshot()
+            .await
+            .unwrap()
+            .into_tips()
+            .try_into()
+            .unwrap();
+        let writer = fx.reopened().await;
+        let correction = Box::pin(append_correction(&writer, &fx.input)).await;
+        assert_eq!(
+            writer.snapshot().await.unwrap(),
+            Snapshot::from([intent.clone(), correction.clone()])
+        );
+        release.send(()).unwrap();
+        (intent, correction)
+    });
+    let output = result.unwrap();
+    assert_eq!(output.body, BODY);
+    Box::pin(fx.complete(&output.body)).await.unwrap();
+    let reopened = fx.reopened().await;
+    let joined = reopened.snapshot().await.unwrap();
+    let reply = joined
+        .tips()
+        .iter()
+        .find(|tip| **tip != correction)
+        .unwrap();
+    let reply_at = Snapshot::from([reply.clone()]);
+    let correction_at = Snapshot::from([correction.clone()]);
+    assert_eq!(joined, Snapshot::from([reply.clone(), correction.clone()]));
+    assert_eq!(
+        reopened
+            .get_entry(&correction)
+            .await
+            .unwrap()
+            .parents()
+            .unwrap(),
+        fx.input.tips()
+    );
+
+    let chain = linear_entries(&reopened, reply).await;
+    assert!(chain.iter().all(|entry| entry.id_ref() != &correction));
+    let response = chain
+        .windows(2)
+        .find(|pair| pair[0].id_ref() == &intent)
+        .map(|pair| &pair[1])
+        .unwrap();
+    assert_eq!(response.parents().unwrap(), [intent]);
+    assert!(response.in_subtree("conversation_v1"));
+    assert!(response.in_subtree("conversation_provenance_v1"));
+
+    let wire = Box::pin(fx.assert_effects(2, 1, 1)).await;
+    assert!(
+        wire.iter()
+            .all(|request| !request.to_string().contains(CORRECTION))
+    );
+    Box::pin(check_readback(&fx, &reopened, &reply_at, &wire)).await;
+    Box::pin(check_readback(&fx, &reopened, &joined, &wire)).await;
+    let corrected = Session::history_at(&reopened, &correction_at)
+        .await
+        .unwrap();
+    assert!(
+        corrected
+            .recorded_call(&fx.call(0), &fx.recorder.attempt.attempt_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    let on_reply = Box::pin(prepare_c(&reopened, &reply_at)).await;
+    let on_correction = Box::pin(prepare_c(&reopened, &correction_at)).await;
+    let on_both = Box::pin(prepare_c(&reopened, &joined)).await;
+    assert!(!on_reply.to_string().contains(CORRECTION));
+    assert!(!on_correction.to_string().contains(BODY));
+    let messages = on_both["messages"].as_array().unwrap();
+    for text in ["2 + 2", CORRECTION, BODY] {
+        assert_eq!(
+            messages.iter().filter(|msg| msg["content"] == text).count(),
+            1
+        );
+    }
+    let native = messages
+        .iter()
+        .position(|msg| !msg["tool_calls"].is_null())
+        .unwrap();
+    assert_eq!(messages[native]["tool_calls"][0]["id"], "wire-1");
+    assert_eq!(messages[native + 1]["tool_call_id"], "wire-1");
+    assert!(
+        messages[native + 1]["content"]
+            .as_str()
+            .unwrap()
+            .contains("\n4\n")
+    );
+    let rendered = Box::pin(print(&reopened)).await;
+    assert_eq!(
+        rendered,
+        format!("user: 2 + 2\nuser: {CORRECTION}\nassistant: {BODY}\n")
+    );
+
+    // Keep the same signed bytes; the second peer receives the full reply
+    // lineage first and the correction last. Verify rather than asserting trust.
+    let (peer, _) = Instance::create_backend(
+        Box::new(InMemory::new()),
+        NewAccount::passwordless("reverse-arrival"),
+    )
+    .await
+    .unwrap();
+    let written = chain.len();
+    for entry in chain {
+        peer.backend().put(entry).await.unwrap();
+    }
+    let reversed = Database::open(&peer, reopened.root_id()).await.unwrap();
+    let report = reversed.verify().await.unwrap();
+    assert_eq!(
+        (report.verified, report.failed, report.still_unverified),
+        (written, 0, 0)
+    );
+    assert_eq!(reversed.snapshot().await.unwrap(), reply_at);
+    reversed
+        .insert_raw(reopened.get_entry(&correction).await.unwrap())
+        .await
+        .unwrap();
+    let report = reversed.verify().await.unwrap();
+    assert_eq!(
+        (report.verified, report.failed, report.still_unverified),
+        (1, 0, 0)
+    );
+    assert_eq!(reversed.snapshot().await.unwrap(), joined);
+    assert_eq!(Box::pin(print(&reversed)).await, rendered);
+    assert_eq!(Box::pin(prepare_c(&reversed, &joined)).await, on_both);
+    Box::pin(check_readback(&fx, &reversed, &joined, &wire)).await;
+
+    assert!(
+        Box::pin(fx.run())
+            .await
+            .unwrap_err()
+            .contains("cannot execute twice")
+    );
+    assert!(Box::pin(fx.complete(BODY)).await.is_err());
+    Box::pin(fx.assert_effects(2, 1, 1)).await;
+    assert_eq!(reopened.snapshot().await.unwrap(), joined);
+    assert_eq!(reversed.snapshot().await.unwrap(), joined);
+
+    println!("Joined /print:\n{rendered}Prepared C (not dispatched):\n{on_both}");
+}
+
+async fn linear_entries(db: &Database, tip: &ID) -> Vec<Entry> {
+    let mut tip = tip.clone();
+    let mut entries = Vec::new();
+    loop {
+        let entry = db.get_entry(&tip).await.unwrap();
+        let parents = entry.parents().unwrap();
+        entries.push(entry);
+        if tip == *db.root_id() {
+            break;
+        }
+        [tip] = parents.try_into().unwrap();
+    }
+    entries.reverse();
+    entries
+}
+
+async fn prepare_c(db: &Database, at: &Snapshot) -> Value {
+    let history = Session::history_at(db, at)
+        .await
+        .unwrap()
+        .context()
+        .await
+        .unwrap();
+    let context = ContextBuilder::from_history(&history, AGENT, "", &ContextConfig::default())
+        .build()
+        .await;
+    // The real Chat Completions serializer, without dispatching another call.
+    crate::openai::serialize_cache_fixture(
+        &context.messages,
+        &[],
+        &Default::default(),
+        false,
+        MODEL,
+    )
+    .await
+}
+
+#[tokio::test]
+async fn fenced_v1_refuses_a_reply_after_writer_revocation() {
+    Box::pin(refuse_withdrawn_authority(true)).await;
+}
+
+#[tokio::test]
+async fn fenced_v1_refuses_a_reply_after_attempt_settled_elsewhere() {
+    Box::pin(refuse_withdrawn_authority(false)).await;
+}
+
+async fn refuse_withdrawn_authority(revoke_key: bool) {
+    let fx = Box::pin(Fixture::new(true, None)).await;
+    let (request, release) = pause_first_call(&fx, true).await;
+    let (result, (latest, reason)) = tokio::join!(Box::pin(fx.run()), async {
+        tokio::time::timeout(Duration::from_secs(30), request)
+            .await
+            .unwrap()
+            .unwrap();
+        let txn = fx.db.new_transaction().await.unwrap();
+        let reason = if revoke_key {
+            let writer = fx
+                .db
+                .auth_identity()
+                .unwrap()
+                .hint()
+                .pubkey
+                .as_ref()
+                .unwrap();
+            txn.get_settings()
+                .unwrap()
+                .revoke_auth_key(writer)
+                .await
+                .unwrap();
+            "fenced writer"
+        } else {
+            let mut attempt = fx.recorder.attempt.clone();
+            attempt.status = crate::session::TurnAttemptStatus::Completed;
+            attempt.completed_at = Some(Utc::now());
+            txn.get_store::<Table<TurnAttempt>>(crate::session::TURN_ATTEMPTS_STORE)
+                .await
+                .unwrap()
+                .set(&attempt.attempt_id, attempt.clone())
+                .await
+                .unwrap();
+            "no longer owns its attempt"
+        };
+        let latest = Snapshot::from([txn.commit().await.unwrap()]);
+        assert_eq!(
+            fx.db
+                .current_permission()
+                .await
+                .is_ok_and(|p| p.can_write()),
+            !revoke_key
+        );
+        release.send(()).unwrap();
+        (latest, reason)
+    });
+    assert!(result.unwrap_err().contains(reason));
+    assert_eq!(fx.db.snapshot().await.unwrap(), latest);
+    Box::pin(fx.assert_effects(1, 0, 1)).await;
+}
+
+#[tokio::test]
+async fn fenced_v1_cancelled_in_flight_does_not_record_or_run_tools() {
+    let fx = Box::pin(Fixture::new(true, None)).await;
+    let (request, release) = pause_first_call(&fx, true).await;
+    let (result, before_stop) = tokio::join!(Box::pin(fx.run()), async {
+        tokio::time::timeout(Duration::from_secs(30), request)
+            .await
+            .unwrap()
+            .unwrap();
+        let at = fx.db.snapshot().await.unwrap();
+        assert!(fx.cancel.cancel());
+        release.send(()).unwrap();
+        at
+    });
+    assert!(result.unwrap_err().contains("cancelled"));
+    assert!(Box::pin(fx.complete(BODY)).await.is_err());
+    assert_eq!(fx.db.snapshot().await.unwrap(), before_stop);
+    Box::pin(fx.assert_effects(1, 0, 1)).await;
 }
 
 fn message(sender: &str, text: &str) -> SessionEntry {
@@ -626,6 +966,7 @@ async fn fenced_v1_dropped_completion_does_not_publish_or_replay() {
             BRANCH.into(),
             AGENT.into(),
             message("user", "replay"),
+            TurnCancel::new(),
             None
         ))
         .await
