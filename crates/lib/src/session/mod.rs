@@ -366,6 +366,10 @@ pub struct EntryRouting {
     /// transport/login/channel this entry arrived on, and from whom.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<TransportRef>,
+    /// Passive Matrix cache facts from the same ingress as `source`, not a
+    /// current room record or permission to query Matrix.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub matrix_room: Option<MatrixRoomObservation>,
     /// Adapter-supplied ambient candidate; the core verifies current policy.
     #[serde(
         default,
@@ -389,6 +393,15 @@ pub struct EntryRouting {
     /// `(transport, login_id)`. Empty for the implicit reply-to-source path.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub destinations: Vec<TransportRef>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MatrixRoomObservation {
+    pub name: Option<String>,
+    pub workspace_chat: bool,
+    pub join_rule: Option<String>,
+    pub history_visibility: Option<String>,
+    pub encrypted: Option<bool>,
 }
 
 fn is_false(value: &bool) -> bool {
@@ -1095,6 +1108,9 @@ impl Session {
                 || ambient_participation_for_entry(&self.database, &entry).await);
         if !allowed {
             let timestamp = entry.timestamp;
+            if let Some(routing) = &mut entry.routing {
+                routing.matrix_room = None;
+            }
             entry = SessionEntry::new_bridge_event(
                 entry.sender,
                 BridgeEventRole::Observation,
@@ -3687,10 +3703,7 @@ mod tests {
                     sender_display: None,
                     message_id: Some("$evt".to_string()),
                 }),
-                reply_to: None,
-                outbound_id: None,
-                destinations: Vec::new(),
-                ambient_candidate: false,
+                ..Default::default()
             }),
         };
         let json = serde_json::to_string(&entry).unwrap();

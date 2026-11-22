@@ -1648,12 +1648,12 @@ ws_state "$SPACE_ID" | jq -e --arg c "$CHAT_ID" 'map(select(.type == "m.space.ch
 	fail "the Space does not list the chat"
 LOBBY_REPLIES="$(probe --dir "$SIGNED_DIR" wire --room "$LOBBY_ID" --sender "$AGENT_MXID")"
 ws_say "$CHAT_ID" "workspace chat ping"
-ws_expect "$CHAT_ID" "$MARKER"
+ws_expect "$CHAT_ID" "$MARKER room-info-verified"
 [[ "$(probe --dir "$SIGNED_DIR" wire --room "$LOBBY_ID" --sender "$AGENT_MXID")" -eq "$LOBBY_REPLIES" ]] ||
 	fail "the chat's reply also reached the Lobby"
 CHAT_BINDINGS="$(grep -F "Channel bound to session" "$BRIDGE_LOG" | grep -cF "$CHAT_ID")"
 [[ $CHAT_BINDINGS -eq 1 ]] || fail "expected one session binding for the chat, found $CHAT_BINDINGS"
-printf '\033[1;32mPASS\033[0m — new chat: private, linked from the Space, answered in its own room only, one session\n' >&2
+printf '\033[1;32mPASS\033[0m — new chat: private, linked from the Space, room facts verified by the stub, replied only here\n' >&2
 
 log "workspace: second chat has independent history and addressed replies"
 ws_say "$LOBBY_ID" "!chaz chat new Trip plans"

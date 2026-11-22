@@ -3,6 +3,7 @@ mod attachment_tests;
 pub(crate) mod client;
 mod commands;
 mod history;
+mod room_info;
 mod typing;
 mod workspace;
 
@@ -1522,6 +1523,9 @@ impl Bridge for MatrixBridge {
                         }
                         if !wake {
                             tracing::debug!(room_id, "Recorded unaddressed Matrix observation");
+                        } else {
+                            entry.routing.as_mut().unwrap().matrix_room =
+                                room_info::observe(&room, managed_chat).await;
                         }
                         if let Err(e) = session.add_bridge_input(entry, wake).await {
                             error!("Failed to record inbound message: {e}");
