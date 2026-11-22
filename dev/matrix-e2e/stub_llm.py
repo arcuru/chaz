@@ -327,6 +327,30 @@ class Handler(BaseHTTPRequestHandler):
                             if isinstance(msg, dict) and msg.get("role") == "user"
                             and isinstance(msg.get("content"), str)
                             and not msg["content"].startswith("## Relevant Memories")), "")
+        if "workspace chat ping" in latest_user:
+            if not has_tool_result and "matrix__room_info" in tools:
+                self._fixture_reply(name="matrix__room_info", arguments={}, call_id="workspace-room-info")
+                return
+            result = messages[-1]
+            prefix = '<tool_output tool="matrix__room_info">\n'
+            content = result.get("content", "")
+            if (result.get("role") == "tool" and result.get("tool_call_id") == "workspace-room-info"
+                    and content.startswith(prefix) and content.endswith("\n</tool_output>")):
+                info = json.loads(content.removeprefix(prefix).removesuffix("\n</tool_output>"))
+                room = info.get("observed_room") or {}
+                if (room.get("name") == "Bike repair"
+                        and room.get("workspace_mode") == "workspace_chat"
+                        and room.get("join_rule") == "invite"
+                        and room.get("history_visibility") == "joined"
+                        and room.get("encrypted") is True
+                        and info["thread_mode"] is None and info["actual_audience"] is None
+                        and info["actions"]["default_final_queues_room_reply"] is True
+                        and info["actions"]["matrix__send_can_queue_room_post"] is True
+                        and info["actions"]["no_reply"] is True):
+                    self._fixture_reply(content=self.server.reply + " room-info-verified")
+                    return
+            self._send({"error": "workspace room-info result missing or incorrect"}, status=400)
+            return
         if "workspace approval probe" in latest_user:
             if has_tool_result:
                 result = messages[-1]

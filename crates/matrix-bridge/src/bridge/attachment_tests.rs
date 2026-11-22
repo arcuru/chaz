@@ -137,6 +137,10 @@ impl Fixture {
 }
 
 async fn mock_room() -> (MockServer, Room) {
+    mock_room_with_state(Vec::new()).await
+}
+
+async fn mock_room_with_state(state: Vec<serde_json::Value>) -> (MockServer, Room) {
     let http = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path_regex("/_matrix/client/versions"))
@@ -162,6 +166,10 @@ async fn mock_room() -> (MockServer, Room) {
         }}}
     });
     sync["rooms"]["join"][OTHER_ROOM] = sync["rooms"]["join"][ROOM].clone();
+    sync["rooms"]["join"][ROOM]["state"]["events"]
+        .as_array_mut()
+        .unwrap()
+        .extend(state);
     Mock::given(method("GET"))
         .and(path_regex("/_matrix/client/v3/sync"))
         .respond_with(ResponseTemplate::new(200).set_body_json(sync))
@@ -206,6 +214,49 @@ async fn mock_room() -> (MockServer, Room) {
         .get_room(&matrix_sdk::ruma::RoomId::parse(ROOM).unwrap())
         .unwrap();
     (http, room)
+}
+
+#[tokio::test]
+async fn room_info_observes_explicit_cached_state_without_fetching() {
+    let events = [
+        ("name", json!({"name":"Bike repair"})),
+        ("join_rules", json!({"join_rule":"invite"})),
+        ("history_visibility", json!({"history_visibility":"joined"})),
+        ("encryption", json!({"algorithm":"m.megolm.v1.aes-sha2"})),
+    ]
+    .into_iter()
+    .map(|(kind, content)| {
+        json!({
+            "type": format!("m.room.{kind}"), "state_key": "", "sender": LOGIN,
+            "event_id": format!("${kind}"), "origin_server_ts": 3, "content": content,
+        })
+    })
+    .collect();
+    let (http, room) = mock_room_with_state(events).await;
+    let facts = room_info::observe(&room, true).await.unwrap();
+    assert_eq!(facts.name.as_deref(), Some("Bike repair"));
+    assert!(facts.workspace_chat);
+    assert_eq!(facts.join_rule.as_deref(), Some("invite"));
+    assert_eq!(facts.history_visibility.as_deref(), Some("joined"));
+    assert_eq!(facts.encrypted, Some(true));
+
+    let other = room
+        .client()
+        .get_room(&matrix_sdk::ruma::RoomId::parse(OTHER_ROOM).unwrap())
+        .unwrap();
+    let facts = room_info::observe(&other, false).await.unwrap();
+    assert_eq!(facts.name, None);
+    assert!(!facts.workspace_chat);
+    assert_eq!(facts.join_rule, None);
+    assert_eq!(facts.history_visibility, None);
+    assert_eq!(facts.encrypted, None);
+    assert!(
+        http.received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .all(|request| !request.url.path().contains("/state"))
+    );
 }
 
 fn approval_request() -> chaz_core::session::SessionEntry {

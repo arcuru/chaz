@@ -394,6 +394,7 @@ reported rather than claiming detach succeeded.
 | Normal final on a TUI/local/schedule turn  | Saved locally only, even in a Matrix-bound session                                                           |
 | `no_reply({})` in a Matrix-bound session   | Terminal action: no final message and no room post                                                           |
 | `matrix__send({"body":"text"})`            | Explicit/proactive room send; on a Matrix-origin turn it counts as the reply and the later final stays local |
+| `matrix__room_info({})`                    | Describe this turn's attached Matrix room using cached observations and report the agent's reply actions     |
 
 The daemon commits a Matrix-origin final, its addressed generic `BridgeEvent` outbound row,
 and its completed turn attempt atomically. The bridge delivers only addressed
@@ -420,6 +421,40 @@ that agent to produce a local final; burst limits still apply. The model-facing
 local turns, to keep the tool list stable; non-Matrix-origin finals never auto-post.
 A model without tool-calling support cannot safely choose `no_reply` and is
 rejected for a Matrix-bound turn rather than silently posting a fallback answer.
+
+### What the agent knows about this room
+
+Ask the agent in a Matrix chat: “Where are we, who can see this, and what can
+you do here?” The agent can call `matrix__room_info({})` without naming a room
+or login. The bridge includes a small observation with the incoming turn;
+the executor only returns it for that exact turn if the agent still owns
+the login and the session is still attached to the same room. The tool never
+fetches from the homeserver or looks through older turns for room facts.
+
+The observation can include the room's literal name, whether it's an ordinary
+room or workspace chat, the cached join rule and history visibility, and
+whether the Matrix SDK observed encryption. These are settings, not a list of
+viewers or a privacy guarantee. A missing field is unknown; the tool doesn't
+substitute defaults or infer who can read a message, including who has keys
+or copies. Chaz does not report thread mode here. The tool also says whether
+a normal final queues a room reply by default and whether the agent can
+choose `no_reply` or call `matrix__send`. An explicit send still takes the
+place of the normal room reply. Queuing is not proof of delivery.
+
+#### Walkthrough: ask in a named chat, then from the TUI
+
+1. In an encrypted workspace chat named **Bike repair**, ask “Where are we,
+   who can see this, and what can you do here?” With the room state synced,
+   the answer might be: “This is Bike repair, a workspace chat. The bridge
+   observed invite-only joins, joined-member history and encryption. I can't
+   tell who can actually read this. I can reply here or stay silent.”
+2. Open the same session in the TUI and ask again. The tool returns
+   `"observed_room":null`: the TUI turn did not bring a Matrix observation.
+   A normal final stays local. Ask again **in Matrix** for a new observation;
+   an older answer is not a fresh room reading.
+3. If the session no longer has a Matrix attachment owned by that agent, the
+   tool returns `"attachment":"unknown"` and no room facts or actions. It
+   won't look up another room, even if the agent has another login.
 
 ### Recovering a legacy binding
 
