@@ -19,6 +19,17 @@ use wiremock::{
     matchers::{method, path},
 };
 
+fn output_with_null_statuses() -> Vec<Value> {
+    let mut items = output();
+    // A typed Responses relay can serialize omitted optional statuses as null.
+    for item in &mut items {
+        if matches!(item["type"].as_str(), Some("reasoning" | "function_call")) {
+            item["status"] = Value::Null;
+        }
+    }
+    items
+}
+
 async fn completed_change(change: &str) {
     let source = MockServer::start().await;
     let destination = MockServer::start().await;
@@ -27,7 +38,9 @@ async fn completed_change(change: &str) {
     config.name = Some("west".into());
     Mock::given(method("POST"))
         .and(path("/responses"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(response(output())))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(response(output_with_null_statuses())),
+        )
         .with_priority(1)
         .up_to_n_times(1)
         .expect(1)
@@ -189,7 +202,7 @@ async fn completed_change(change: &str) {
     if change == "same" {
         assert_eq!(
             &input[2..7],
-            output(),
+            output_with_null_statuses(),
             "exact ordered call output after reopen"
         );
         assert!(
@@ -259,6 +272,12 @@ async fn origin_unsafe_foreign_history_refuses_before_http() {
         vec![json!({"type":"provider_extension", "state":"unportable"})],
         output(),
         vec![
+            json!({"type":"message", "role":"assistant", "status":null, "content":[{"type":"output_text","text":"visible"}]}),
+        ],
+        vec![
+            json!({"type":"message", "role":"assistant", "status":"incomplete", "content":[{"type":"output_text","text":"visible"}]}),
+        ],
+        vec![
             json!({"type":"message", "role":"assistant", "status":4, "content":[{"type":"output_text","text":"visible"}]}),
         ],
         vec![
@@ -299,7 +318,9 @@ async fn origin_completed_conversion_to_chat_and_anthropic_is_preflighted() {
     let config = native_backend(&server.uri());
     Mock::given(method("POST"))
         .and(path("/responses"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(response(output())))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(response(output_with_null_statuses())),
+        )
         .expect(1)
         .mount(&server)
         .await;
