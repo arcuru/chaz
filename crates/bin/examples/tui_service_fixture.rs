@@ -44,7 +44,7 @@ async fn main() -> anyhow::Result<()> {
             &DbEntry {
                 db_id: agent_db.id(),
                 display_name: "chaz".into(),
-                pubkey,
+                pubkey: pubkey.clone(),
             },
         )
         .await?;
@@ -62,7 +62,28 @@ async fn main() -> anyhow::Result<()> {
         )]),
     )
     .await?;
-    if std::env::args().nth(2).as_deref() == Some("worker-links") {
+    let mode = std::env::args().nth(2);
+    let mut secondary = if mode.as_deref() == Some("outage") {
+        let (conv, db) = registry.create_session(Some("tui")).await?;
+        let id = db.root_id().to_string();
+        registry.set_session_name(&id, "secondary".into()).await?;
+        registry
+            .attach_agent_to_session(
+                &id,
+                &DbEntry {
+                    db_id: agent_db.id(),
+                    display_name: "chaz".into(),
+                    pubkey,
+                },
+            )
+            .await?;
+        let mut session = Session::new(conv, db).await;
+        session.add_entry(entry("SECONDARY-CACHED")).await?;
+        Some(session)
+    } else {
+        None
+    };
+    if mode.as_deref() == Some("worker-links") {
         // Literal side-store fixture is also read by the supported older binary.
         // It must not change how either version reads the original transcript.
         let (_, child) = registry
@@ -178,6 +199,9 @@ async fn main() -> anyhow::Result<()> {
             }
             "append" => {
                 session.add_entry(entry("RECOVERY-VISIBLE")).await?;
+                if let Some(secondary) = secondary.as_mut() {
+                    secondary.add_entry(entry("SECONDARY-FRESH")).await?;
+                }
                 write_extension_outputs(
                     &db,
                     &BTreeMap::from([(

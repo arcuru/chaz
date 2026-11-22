@@ -1623,7 +1623,7 @@ mod tests {
         app.input = "draft-during-loss-界".into();
         app.cursor = app.input.len();
         app.active_mut().scroll_offset = 20;
-        reconnect::disconnect(&mut app);
+        reconnect::disconnect(&mut app, "Backend disconnected");
         let config = Config {
             execution: Some(ExecutionRole::Client),
             eidetica: Some(config),
@@ -1642,23 +1642,26 @@ mod tests {
         })
         .await
         .unwrap();
-        let mut replacement = reconnect::rebuild(
-            None,
-            config,
-            dir.path().join("config.yaml"),
-            vec![(
-                id.to_string(),
-                app.active().live.incarnation,
-                reconnect::Mode::Session,
-            )],
-            approval_tx,
-            notify_tx,
-        )
-        .await
-        .map_err(|e| e.0)
-        .unwrap();
-        let backend = BackendManager::new(&None, replacement.built.secret_store.clone());
-        reconnect::apply(&mut app, &mut replacement);
+        let built = reconnect::rebuild(None, config, dir.path().join("config.yaml"))
+            .await
+            .map_err(|e| e.0)
+            .unwrap();
+        let backend = BackendManager::new(&None, built.secret_store.clone());
+        let (binding_tx, mut binding_rx) = mpsc::channel(8);
+        reconnect::connected(&mut app);
+        reconnect::request_tabs(
+            &mut app,
+            &built.server,
+            &backend,
+            &approval_tx,
+            &notify_tx,
+            &binding_tx,
+        );
+        let reconnect::ResultMessage::Tab { ticket, reopened } = binding_rx.recv().await.unwrap()
+        else {
+            panic!("expected active tab binding");
+        };
+        reconnect::apply_retry(&mut app, ticket, *reopened);
         assert!(
             load_active_turns(&app.active().session_db).await.is_ok(),
             "partial hydration failure retained the dead DB handle"
@@ -1677,18 +1680,12 @@ mod tests {
         })
         .await
         .unwrap();
-        // A different partial failure: inject a failed per-tab open into the
-        // rebuilt runtime result. Global health must not hide this tab's need
-        // to reopen. The next retry runs the REAL open/observation path.
+        // Global health must not hide a tab still waiting for a fresh handle.
+        // The next retry runs the real open/observation path.
         app.active_mut().session_db = dead_db;
         app.active_mut().live.unbound = true;
         app.active_mut().live.observation = None;
-        replacement.tabs.push(reconnect::Reopened {
-            id: id.to_string(),
-            incarnation: app.active().live.incarnation,
-            result: Err("controlled transient per-tab open failure".into()),
-        });
-        reconnect::apply(&mut app, &mut replacement);
+        app.active_mut().live.rebind_needed = true;
         assert!(app.backend_available && app.active().live.unbound);
         assert!(app.active().live.rebind_needed);
         app.input = "draft-during-loss-界".into();
@@ -1702,12 +1699,9 @@ mod tests {
             !app.operations.is_pending(),
             "unbound tab admitted a write against dead DB"
         );
-        let (binding_tx, mut binding_rx) = mpsc::channel(8);
-        let (approval_tx, _approval_rx) = mpsc::channel(8);
-        let (notify_tx, _notify_rx) = mpsc::channel(64);
         reconnect::request_tabs(
             &mut app,
-            &replacement.built.server,
+            &built.server,
             &backend,
             &approval_tx,
             &notify_tx,
@@ -1715,7 +1709,7 @@ mod tests {
         );
         reconnect::request_tabs(
             &mut app,
-            &replacement.built.server,
+            &built.server,
             &backend,
             &approval_tx,
             &notify_tx,
@@ -1771,7 +1765,7 @@ mod tests {
         println!(
             "REFRESH ERROR CONTRACT: PASS; last-good data retained and existing tab recovered"
         );
-        replacement.built.shutdown().await;
+        built.shutdown().await;
         drop(shutdown);
         task.await.unwrap().unwrap();
     }

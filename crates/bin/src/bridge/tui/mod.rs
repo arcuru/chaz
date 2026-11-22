@@ -677,6 +677,7 @@ pub(super) struct App {
     pub(super) agent_names: HashSet<String>,
     pub(super) should_quit: bool,
     pub(super) backend_available: bool,
+    pub(super) backend_notice: Option<String>,
     pub(super) debug_mode: bool,
     /// Mirror of `Server::is_startup_ready`, refreshed each frame in `ui`.
     /// Drives the "⟳ reconciling agents…" status indicator on the fast-start
@@ -888,6 +889,7 @@ impl App {
             agent_names,
             should_quit: false,
             backend_available: true,
+            backend_notice: None,
             debug_mode: false,
             startup_ready: true,
             session_list: Vec::new(),
@@ -1662,7 +1664,7 @@ fn start_catalog_load(
     models_tx: mpsc::Sender<ModelCatalog>,
     load: impl Future<Output = Result<Vec<ModelInfo>, String>> + Send + 'static,
 ) {
-    if app.model_picker_loading {
+    if !app.backend_available || app.model_picker_loading {
         return;
     }
     app.model_catalog_ticket += 1;
@@ -1878,7 +1880,7 @@ fn request_session_metadata(
     server: &Arc<Server>,
     session_rows_tx: &mpsc::Sender<SessionLoad>,
 ) {
-    if app.operations.is_creating_session() {
+    if !app.backend_available || app.operations.is_creating_session() {
         return;
     }
     let requested = app.requested_session_indices();

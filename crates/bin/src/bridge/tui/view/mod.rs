@@ -395,7 +395,11 @@ pub(super) fn ui(
     // The first quit must be visible above every mode and overlay. Leave the
     // composer, inline editor and picker drafts on screen; do not replace
     // their footers or introduce another confirmation state.
-    if let Some(warning) = app.operations.exit_warning() {
+    if let Some(warning) = app.operations.exit_warning().or_else(|| {
+        (app.mode != TuiMode::Chat)
+            .then(|| backend_status(app))
+            .flatten()
+    }) {
         let area = Rect {
             height: f.area().height.min(1),
             ..f.area()
@@ -403,6 +407,15 @@ pub(super) fn ui(
         f.render_widget(Clear, area);
         widgets::status_strip(f, area, &warning);
         app.click_regions.retain(|r| r.y >= area.bottom());
+    }
+}
+
+fn backend_status(app: &App) -> Option<String> {
+    let outcomes = app.operations.outcome_summary();
+    if let Some(notice) = &app.backend_notice {
+        Some(format!("{notice}{outcomes}"))
+    } else {
+        (!outcomes.is_empty()).then(|| outcomes.trim_start_matches(" · ").to_string())
     }
 }
 
@@ -584,6 +597,8 @@ pub(super) fn ui_chat(f: &mut ratatui::Frame, app: &mut App, ext_segments: &[Str
     // `agent | model | messages` line. Hidden (height 0) when no
     // extension has contributed a segment.
     let ext_status_h: u16 = if ext_segments.is_empty() { 0 } else { 1 };
+    let backend_status = backend_status(app);
+    let backend_status_h = u16::from(backend_status.is_some());
     // 1-line tab bar at the top. Always present even with one tab so the user
     // has a consistent affordance.
     let composer = composer::layout(&app.input, app.cursor, f.area().width.saturating_sub(2));
@@ -593,7 +608,7 @@ pub(super) fn ui_chat(f: &mut ratatui::Frame, app: &mut App, ext_segments: &[Str
         .min(
             f.area()
                 .height
-                .saturating_sub(3 + approval_h + ext_status_h)
+                .saturating_sub(3 + approval_h + ext_status_h + backend_status_h)
                 .max(3),
         );
     let chunks = Layout::vertical([
@@ -607,10 +622,14 @@ pub(super) fn ui_chat(f: &mut ratatui::Frame, app: &mut App, ext_segments: &[Str
         } else {
             composer_h
         }),
+        Constraint::Length(backend_status_h),
     ])
     .split(f.area());
 
     render_tab_bar(f, app, chunks[0]);
+    if let Some(status) = backend_status {
+        widgets::status_strip(f, chunks[6], &status);
+    }
 
     let messages_area = if app.active().live.worker_observer {
         let observer =
@@ -835,8 +854,10 @@ pub(super) fn ui_chat(f: &mut ratatui::Frame, app: &mut App, ext_segments: &[Str
         .collect();
     // A failed background read leaves the last good data on screen; say so
     // rather than letting it pass for fresh.
-    let refresh_indicator = if tab.live.error.is_some() {
-        " | ⚠ refresh failed"
+    let refresh_indicator = if tab.live.unbound && app.backend_available {
+        " | ⚠ cached tab · reopening"
+    } else if tab.live.error.is_some() {
+        " | ⚠ refresh failed (cached)"
     } else if tab.live.pending() {
         " | ⟳ refreshing (cached)"
     } else {

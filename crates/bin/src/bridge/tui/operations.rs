@@ -87,6 +87,8 @@ pub(super) struct Operations {
     current_input: Option<String>,
     uncertain_inputs: Vec<String>,
     uncertainty: Vec<String>,
+    unstarted_count: usize,
+    unstarted_inputs: Vec<String>,
     next_ticket: u64,
     current_ticket: Option<u64>,
     current_origin: Option<Origin>,
@@ -108,6 +110,8 @@ impl Default for Operations {
             current_input: None,
             uncertain_inputs: Vec::new(),
             uncertainty: Vec::new(),
+            unstarted_count: 0,
+            unstarted_inputs: Vec::new(),
             next_ticket: 0,
             current_ticket: None,
             current_origin: None,
@@ -123,6 +127,20 @@ impl Drop for Operations {
     }
 }
 impl Operations {
+    pub(super) fn outcome_summary(&self) -> String {
+        let mut status = String::new();
+        if !self.uncertainty.is_empty() {
+            status.push_str(" · Write outcome unknown");
+        }
+        if self.unstarted_count != 0 {
+            status.push_str(&format!(
+                " · {} queued action(s) not started",
+                self.unstarted_count
+            ));
+        }
+        status
+    }
+
     pub(super) fn indicator(&self) -> String {
         let mut status = String::new();
         if let Some(notice) = &self.notice {
@@ -251,17 +269,45 @@ impl Operations {
             .chain(self.uncertain_inputs.iter())
             .cloned()
             .collect();
-        (self.is_pending() || !inputs.is_empty() || !self.uncertainty.is_empty()).then(|| {
+        (self.is_pending() || self.unstarted_count != 0 || !inputs.is_empty() || !self.uncertainty.is_empty()).then(|| {
             format!(
                 concat!(
                     "Exited with unfinished/unconfirmed actions: queued actions were cancelled before ",
                     "starting; a started write may already have committed. Check the session before retrying.",
-                    "\nUnconfirmed accepted inputs:\n{}\nUnresolved outcomes:\n{}"
+                    "\nUnconfirmed accepted inputs:\n{}\nUnresolved outcomes:\n{}",
+                    "\nInputs from actions not started after connection loss:\n{}"
                 ),
                 inputs.join("\n---\n"),
-                self.uncertainty.join("\n---\n")
+                self.uncertainty.join("\n---\n"),
+                self.unstarted_inputs.join("\n---\n"),
             )
         })
+    }
+}
+
+/// Drop only futures the worker has never polled. The running action keeps
+/// ownership of its actual result, even if the socket has been retired.
+pub(super) fn cancel_unstarted(app: &mut App) {
+    while let Some(pending) = app.operations.queue.pop_front() {
+        app.operations.unstarted_count += 1;
+        app.operations.unstarted_inputs.extend(pending.input);
+        if app.operations.creation_ticket == Some(pending.ticket) {
+            app.operations.creation_ticket = None;
+            app.session_catalog_loading = false;
+            creation::failed(
+                app,
+                pending.ticket,
+                "Backend unavailable; queued action not started",
+            );
+        }
+        if let Some(sheet) = app
+            .field_sheet
+            .as_mut()
+            .filter(|s| s.pending == Some(pending.ticket))
+        {
+            sheet.pending = None;
+            sheet.notice = Some("Backend unavailable; queued action not started".into());
+        }
     }
 }
 
@@ -403,7 +449,8 @@ pub(super) fn apply(app: &mut App, completion: Completion) -> Invalidation {
     // Creation stays admitted only while its accepted action continues below
     // (a new destination still preparing); every other settlement releases it.
     let creating = creation::matches(app, pending.ticket);
-    let continues = matches!(&result, Ok(Effect::Open(open))
+    let continues = app.backend_available
+        && matches!(&result, Ok(Effect::Open(open))
         if creating || (nav_valid && app.tab_index_for(&open.switch.session_db_id).is_none()));
     if app.operations.creation_ticket == Some(pending.ticket) && !continues {
         app.operations.creation_ticket = None;
@@ -465,7 +512,15 @@ pub(super) fn apply(app: &mut App, completion: Completion) -> Invalidation {
             }
         }
         Ok(Effect::Open(open)) => {
-            if creating {
+            if !app.backend_available {
+                if creating {
+                    creation::failed(
+                        app,
+                        pending.ticket,
+                        "Session created; opening paused while backend is unavailable",
+                    );
+                }
+            } else if creating {
                 if let Some(view) = app.creation.as_mut() {
                     view.status = format!("Loading session… ({})", open.switch.session_db_id);
                 }
@@ -488,6 +543,9 @@ pub(super) fn apply(app: &mut App, completion: Completion) -> Invalidation {
             }
         }
         Ok(Effect::WorkerNavigation(mut tab)) => {
+            if !app.backend_available {
+                reconnect::suspend_tab(&mut tab);
+            }
             if nav_valid {
                 if let Some(i) = app.tab_index_for(&tab.session_db_id) {
                     if tab.scroll_offset == u16::MAX {
@@ -506,7 +564,10 @@ pub(super) fn apply(app: &mut App, completion: Completion) -> Invalidation {
                 app.mode = TuiMode::Chat;
             }
         }
-        Ok(Effect::Opened(tab)) => {
+        Ok(Effect::Opened(mut tab)) => {
+            if !app.backend_available {
+                reconnect::suspend_tab(&mut tab);
+            }
             app.session_list_fresh = false;
             if creating {
                 invalidation = Invalidation::Session(tab.session_db_id.clone());
@@ -584,7 +645,9 @@ pub(super) fn apply(app: &mut App, completion: Completion) -> Invalidation {
             _ => unreachable!("backend outcome must be prepared before application"),
         },
     }
-    app.operations.start();
+    if app.backend_available {
+        app.operations.start();
+    }
     invalidation
 }
 
@@ -868,6 +931,33 @@ mod tests {
     }
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    #[tokio::test]
+    async fn successful_open_waiting_at_disconnect_keeps_draft_but_fences_its_handle() {
+        let mut opened = app().await.tabs.pop().unwrap();
+        opened.session_db_id = "b".into();
+        let mut app = app().await;
+        assert!(begin_creation(&mut app));
+        app.creation.as_mut().unwrap().input = "creation draft".into();
+        submit(&mut app, true, Some("/new".into()), async move {
+            Ok(Effect::Opened(Box::new(opened)))
+        });
+        let completed = app.operations.recv().await.unwrap();
+        reconnect::disconnect(&mut app, "Backend unresponsive");
+        apply(&mut app, completed);
+        reconnect::connected(&mut app);
+        assert_eq!(app.input, "creation draft");
+        assert_eq!(app.active().session_db_id, "b");
+        assert!(app.active().live.rebind_needed);
+        assert!(
+            !app.backend_ready(),
+            "late completion admitted an old handle"
+        );
+        assert!(
+            app.operations.exit_report().is_none(),
+            "known success became uncertain"
+        );
     }
 
     #[tokio::test]

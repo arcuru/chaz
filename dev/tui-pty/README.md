@@ -50,12 +50,16 @@ The emulator repairs pyte 0.8.2's orphan continuation cells when a wide glyph is
 overwritten, matching a terminal's clearing behavior without changing valid
 wide-cell stubs. Its minimal overwrite case is checked alongside the negative controls.
 
-Additional regressions stop the test-owned IPC process beyond the read timeout
+Additional regressions pause the test-owned IPC process past two health deadlines
 while Enter, Session Settings and hub create/open actions are pending; local
 Unicode input and navigation must remain live. Two queued `/name` commands are
 checked against the owner's persisted metadata, not redraw-byte counts. An
 actual stop/restart must retain cached transcript/name/status, reconnect the
 owned client runtime without replaying submissions, and preserve the composer.
+The ready-state IPC gate also holds a single session read, then separately
+holds replies after a real write. The latter must retire the old connection,
+back off while the socket is unavailable, and rebind both cached tabs. The
+owner counts stored entries to tell a lost reply from a lost or replayed write.
 A test-only Rust entry point under a controlling PTY catches a background panic
 and read timeout, draws a live frame, and restores raw mode exactly once at exit.
 The screen assertions use pinned `pyte` via the script's `uv` metadata: ratatui

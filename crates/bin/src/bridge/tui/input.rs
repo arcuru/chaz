@@ -883,8 +883,10 @@ pub(super) fn handle_chat_key(app: &mut App, key: KeyEvent) -> Option<ChatAction
                     app.operations.notice = Some(
                         if creation_pending {
                             "Session creation already pending or failed — draft not submitted"
+                        } else if !app.backend_ready() {
+                            "Backend unavailable — draft not submitted"
                         } else {
-                            "Backend unavailable or action queue full — draft not submitted"
+                            "Action queue full — draft not submitted"
                         }
                         .into(),
                     );

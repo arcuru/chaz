@@ -154,7 +154,7 @@ async fn queued_old_catalog_cannot_clear_or_abort_replacement() {
     );
     // Completion A has already left its task, so aborting A cannot retract it.
     let old = rx.recv().await.unwrap();
-    reconnect::disconnect(&mut app);
+    reconnect::disconnect(&mut app, "Backend disconnected");
     app.backend_available = true;
     let (release, gate) = oneshot::channel::<()>();
     let (tx, mut new_rx) = mpsc::channel(4);

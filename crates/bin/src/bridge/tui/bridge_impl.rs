@@ -67,7 +67,7 @@ impl TuiBridge {
                     _ = &mut task.0 => break,
                     Some(message) = connection_rx.recv() => {
                         if let reconnect::ResultMessage::Rebuilt(Ok(replacement)) = message {
-                            replacement.built.shutdown().await;
+                            replacement.shutdown().await;
                         }
                     }
                 }
@@ -75,7 +75,7 @@ impl TuiBridge {
         }
         while let Ok(message) = connection_rx.try_recv() {
             if let reconnect::ResultMessage::Rebuilt(Ok(replacement)) = message {
-                replacement.built.shutdown().await;
+                replacement.shutdown().await;
             }
         }
         if let Some(built) = runtime {
@@ -106,6 +106,9 @@ impl TuiBridge {
         notify_rx: &mut mpsc::Receiver<String>,
     ) -> anyhow::Result<Option<String>> {
         let mut reconnect_allowed = true;
+        let mut reconnect_attempt = 0u32;
+        let mut retry_at = None;
+        let mut missed_probe = false;
         let mut app = app;
         let mut backend = BackendManager::new(&self.config.backends, self.secrets.clone());
         // One-shot-style delivery of background model catalog fetches.
@@ -142,7 +145,8 @@ impl TuiBridge {
             &refresh_tx,
         );
 
-        let mut activity_tick = tokio::time::interval(std::time::Duration::from_secs(5));
+        let mut activity_tick = tokio::time::interval(reconnect::PROBE_INTERVAL);
+        activity_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut first_ready_frame = true;
         let mut needs_draw = true;
         'run: loop {
@@ -153,6 +157,7 @@ impl TuiBridge {
             session_pages::update(&mut app, server, &backend, &session_pages_tx);
             if !app.backend_available
                 && reconnect_allowed
+                && retry_at.is_none()
                 && runtime_task.is_none()
                 && !app.operations.is_pending()
             {
@@ -160,9 +165,6 @@ impl TuiBridge {
                     runtime.take(),
                     self.config.clone(),
                     runtime_path.clone(),
-                    &app,
-                    approval_tx,
-                    notify_tx,
                     connection_tx,
                 ));
             }
@@ -230,7 +232,9 @@ impl TuiBridge {
                     Some(loaded) = jobs_rx.recv() => Action::JobsLoaded(loaded),
                     _ = activity_tick.tick() => {
                         needs_draw |= workers::age(&mut app);
-                        if app.backend_available {
+                        // Don't feed periodic read retries into an overdue
+                        // probe or a socket that has just missed a deadline.
+                        if app.backend_available && probe_task.is_none() && !missed_probe {
                             if app.mode == TuiMode::Jobs {
                                 jobs::refresh(&mut app, server, &jobs_tx);
                             }
@@ -252,6 +256,10 @@ impl TuiBridge {
                             needs_draw = true;
                         }
                         continue;
+                    },
+                    _ = tokio::time::sleep_until(retry_at.unwrap_or_else(tokio::time::Instant::now)), if retry_at.is_some() => {
+                        retry_at = None;
+                        break;
                     },
                     // Nothing else is ready: end the batch and draw.
                     _ = std::future::ready(()), if batch_slot > 0 => break,
@@ -564,70 +572,89 @@ impl TuiBridge {
                     Action::Connection(msg) => match msg {
                         reconnect::ResultMessage::Probe(result) => {
                             *probe_task = None;
-                            if let Err((error, transient)) = result {
-                                if transient {
+                            use reconnect::ProbeFailure;
+                            let reason = match result {
+                                Ok(()) => {
+                                    if std::mem::take(&mut missed_probe) {
+                                        needs_draw |= refresh::request_tick(&mut app, &refresh_tx);
+                                    }
+                                    None
+                                }
+                                Err(ProbeFailure::Deadline) if missed_probe => {
+                                    tracing::warn!(
+                                        "TUI service unresponsive after two health-probe deadlines"
+                                    );
+                                    Some("Backend unresponsive")
+                                }
+                                Err(ProbeFailure::Deadline) => {
+                                    missed_probe = true;
+                                    tracing::warn!(
+                                        "TUI service health probe timed out; confirming before reconnect"
+                                    );
+                                    None
+                                }
+                                Err(ProbeFailure::Disconnected(error)) => {
                                     tracing::warn!("TUI service disconnected: {error}");
-                                    reconnect::disconnect(&mut app);
-                                } else {
-                                    // A slow health read is not proof of a dead
-                                    // connection and must not kill healthy work.
+                                    Some("Backend disconnected")
+                                }
+                                Err(ProbeFailure::Other(error)) => {
+                                    missed_probe = false;
                                     tracing::warn!("Service health read failed: {error}");
+                                    None
+                                }
+                            };
+                            if let Some(reason) = reason {
+                                missed_probe = false;
+                                reconnect::disconnect(&mut app, reason);
+                                if let Some(connection) =
+                                    server.registry().instance().remote_connection()
+                                {
+                                    connection.retire();
                                 }
                             }
                         }
                         reconnect::ResultMessage::Rebuilt(result) => {
                             *runtime_task = None;
                             match result {
-                                Ok(mut replacement) => {
-                                    *server = replacement.built.server.clone();
+                                Ok(replacement) => {
+                                    reconnect_attempt = 0;
+                                    *server = replacement.server.clone();
                                     catalog_changes = server.registry().catalog_changes();
-                                    self.secrets = replacement.built.secret_store.clone();
+                                    self.secrets = replacement.secret_store.clone();
                                     backend = BackendManager::new(
                                         &self.config.backends,
                                         self.secrets.clone(),
                                     );
-                                    reconnect::apply(&mut app, &mut replacement);
+                                    reconnect::connected(&mut app);
+                                    reconnect::request_tabs(
+                                        &mut app,
+                                        server,
+                                        &backend,
+                                        approval_tx,
+                                        notify_tx,
+                                        connection_tx,
+                                    );
                                     if app.mode == TuiMode::Jobs {
                                         jobs::refresh(&mut app, server, &jobs_tx);
                                     }
-                                    let ids: Vec<_> =
-                                        app.tabs.iter().map(|t| t.session_db_id.clone()).collect();
-                                    for id in ids {
-                                        refresh::request(
-                                            &mut app,
-                                            &id,
-                                            refresh::RefreshKind::Session,
-                                            &refresh_tx,
-                                        );
-                                        refresh::request(
-                                            &mut app,
-                                            &id,
-                                            refresh::RefreshKind::Status,
-                                            &refresh_tx,
-                                        );
-                                    }
-                                    *runtime = Some(replacement.built);
+                                    *runtime = Some(*replacement);
                                     if app.mode == TuiMode::SessionPicker {
                                         open_session_picker(&mut app, server, &session_rows_tx);
                                     }
                                 }
                                 Err((error, transient)) => {
                                     reconnect_allowed = transient;
-                                    app.operations.notice = Some(format!(
-                                        "Reconnect failed: {error}; cached data retained"
-                                    ));
-                                    // Park a retry rather than spin if the socket is still absent.
+                                    tracing::warn!(%error, "TUI service reconnect failed");
                                     if transient {
-                                        let tx = connection_tx.clone();
-                                        *runtime_task =
-                                            Some(supervised::Task(tokio::spawn(async move {
-                                                tokio::time::sleep(std::time::Duration::from_secs(
-                                                    5,
-                                                ))
-                                                .await;
-                                                let _ =
-                                                    tx.send(reconnect::ResultMessage::Retry).await;
-                                            })));
+                                        retry_at = Some(
+                                            tokio::time::Instant::now()
+                                                + reconnect::retry_delay(reconnect_attempt),
+                                        );
+                                        reconnect_attempt = reconnect_attempt.saturating_add(1);
+                                    } else {
+                                        app.backend_notice = Some(format!(
+                                            "Reconnect stopped · cached data stale: {error}"
+                                        ));
                                     }
                                 }
                             }
@@ -647,9 +674,6 @@ impl TuiBridge {
                                     &refresh_tx,
                                 );
                             }
-                        }
-                        reconnect::ResultMessage::Retry => {
-                            *runtime_task = None;
                         }
                     },
                     Action::Operation(msg) => {
