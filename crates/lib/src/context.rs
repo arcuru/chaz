@@ -122,10 +122,10 @@ pub struct ContextBuilder<'a> {
     pub(crate) contributions: &'a [crate::extension::durable_context::CommittedContribution],
     pub(crate) agent_name: &'a str,
     system_prompt: &'a str,
-    /// Tool definitions for this turn. Also the set that `requires_tools`
-    /// on a skill is matched against, so a builder left without
-    /// [`Self::with_tools`] suppresses every skill that declares one.
+    /// Tool definitions used to budget the initial request.
     pub(crate) tool_defs: &'a [ToolDefinition],
+    /// With deferral, skill eligibility uses the pre-deferral visible names.
+    eligible_tools: Option<&'a [String]>,
     config: &'a ContextConfig,
     /// Per-agent override for max context tokens
     max_context_tokens_override: Option<usize>,
@@ -200,6 +200,7 @@ impl<'a> ContextBuilder<'a> {
             agent_name,
             system_prompt,
             tool_defs: &[],
+            eligible_tools: None,
             config,
             max_context_tokens_override: None,
             room_participants: &[],
@@ -278,6 +279,11 @@ impl<'a> ContextBuilder<'a> {
 
     pub fn with_tools(mut self, tool_defs: &'a [ToolDefinition]) -> Self {
         self.tool_defs = tool_defs;
+        self
+    }
+
+    pub(crate) fn with_tool_eligibility(mut self, names: Option<&'a [String]>) -> Self {
+        self.eligible_tools = names;
         self
     }
 
@@ -387,11 +393,17 @@ impl<'a> ContextBuilder<'a> {
             .map(|e| e.content.clone())
             .collect();
         if let Some(ref hub) = self.extension_hub {
-            let available_tool_names: Vec<String> = self
-                .tool_defs
-                .iter()
-                .map(|tool| tool.name.clone())
-                .collect();
+            let available_tool_names = self.eligible_tools.map_or_else(
+                || {
+                    Cow::Owned(
+                        self.tool_defs
+                            .iter()
+                            .map(|tool| tool.name.clone())
+                            .collect(),
+                    )
+                },
+                Cow::Borrowed,
+            );
             let augmentation = hub
                 .augment_system_prompt(
                     self.agent_name,

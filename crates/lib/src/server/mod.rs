@@ -1949,6 +1949,9 @@ impl Server {
             // A failed watch is not an adopted session. Allow a subsequent
             // registration to finish without losing to its own partial claim.
             self.runtime_lease.release(&session_db_id);
+            self.extensions
+                .close_tool_presentation(&session_db_id)
+                .await;
         }
         watched
     }
@@ -2325,6 +2328,7 @@ impl Server {
     /// state. Best-effort: process exit / abnormal termination skips this
     /// hook. Idempotent — calling on an unknown session is a no-op.
     pub async fn deregister_session(&self, session_db_id: &str) {
+        self.extensions.close_tool_presentation(session_db_id).await;
         // Cancellation must not depend on a successful database/key read.
         self.extensions
             .stop_session_turn_complete(session_db_id)
@@ -3927,6 +3931,7 @@ impl Server {
                 max_call_depth,
                 tools: scoped_tools,
                 profile,
+                bundle_presentation: None,
                 allow_no_reply: attachment.as_ref().is_some_and(|a| a.conversational_replies),
                 session: session.clone(),
                 grants: Default::default(),
@@ -3946,7 +3951,7 @@ impl Server {
                 warn!(session_db_id, attempt_id = %attempt.attempt_id, "job_wait is no longer in scope; holding checkpointed attempt");
                 return;
             }
-            let tool_defs = tool_ctx.definitions();
+            let eager = tool_ctx.profile.deferred_bundles.is_empty().then(|| tool_ctx.definitions());
             let prepared = {
                 let s = session.lock().await;
                 let snapshot = match &resume {
@@ -3977,22 +3982,22 @@ impl Server {
                     return;
                 }
             };
-            let (session_model, assembled) = {
+            let meta = session.lock().await.read_meta().await;
+            let session_model = meta.resolve_model_for_agent(&agent_name).map(str::to_string);
+            let effective_model = session_model.or(worker_model).or(default_model);
+            let assembled = async {
+                let tool_presentation = spawn_extensions.prepare_tool_presentation(
+                    &tool_ctx, || backend.supports_tools_for_model(effective_model.as_deref()),
+                ).await?;
+                let initial = tool_presentation.as_ref().map(|prepared| &prepared.initial);
+                let tool_defs = initial.map_or_else(|| eager.as_deref().unwrap_or_default(), |view| view.advertised.as_slice());
                 let s = session.lock().await;
-                let meta = s.read_meta().await;
                 let roster: Vec<String> =
                     meta.agents.iter().map(|a| a.display_name.clone()).collect();
                 // Per-agent override > session pin > backend default. The
                 // backend-default fallback mirrors the actual call, so an agent
                 // that pins no model still budgets against its real window.
-                let session_model = meta
-                    .resolve_model_for_agent(&agent_name)
-                    .map(str::to_string);
-                let budget_model = budget_model_id(
-                    &backend,
-                    session_model.as_deref(),
-                    worker_model.as_deref().or(default_model.as_deref()),
-                );
+                let budget_model = budget_model_id(&backend, effective_model.as_deref(), None);
                 // First use of a model we don't have a window for yet: learn it
                 // in the background so the next turn budgets window-aware.
                 if let Some(m) = budget_model.as_deref() {
@@ -4014,7 +4019,8 @@ impl Server {
                 if let Some(attachment) = &attachment {
                     builder = builder.with_attachment(attachment);
                 }
-                let assembled = builder.with_tools(&tool_defs)
+                let assembled = builder.with_tools(tool_defs)
+                        .with_tool_eligibility(initial.map(|view| view.eligible_names.as_slice()))
                         .with_max_tokens_override(max_tokens_override)
                         .with_room_participants(&roster)
                         .with_extension_hub(spawn_extensions.clone())
@@ -4022,10 +4028,10 @@ impl Server {
                         .with_session_signing_key(s.signing_key())
                         .with_invocation(&active_extensions, Some(attempt.request_id.as_str()))
                         .try_build()
-                        .await;
-                (session_model, assembled)
-            };
-            let assembled = match assembled {
+                        .await?;
+                Ok::<_, anyhow::Error>((assembled, tool_presentation))
+            }.await;
+            let (assembled, tool_presentation) = match assembled {
                 Ok(assembled) => assembled,
                 Err(error) => {
                     error!(%error, "Required context selection refused dispatch");
@@ -4040,11 +4046,6 @@ impl Server {
                     return;
                 }
             };
-            // Per-agent override > session pin > Worker spawn override >
-            // agent default. See `run_schedule_turn` for the matching path on
-            // scheduled fires.
-            let effective_model = session_model.or(worker_model).or(default_model);
-
             if assembled.truncated {
                 info!(
                     "Context truncated for {}: {} entries, ~{} tokens",
@@ -4077,6 +4078,7 @@ impl Server {
                 attempt_id: Some(attempt.attempt_id.clone()),
                 request_budget_tokens: Some(assembled.request_budget_tokens),
                 sources: assembled.sources,
+                tool_presentation,
             };
             let capacity = permit.map(|permit| runtime::ExecutionCapacity::new(
                 semaphore,

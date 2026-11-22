@@ -840,6 +840,8 @@ pub struct ModelCallScope {
     /// Provenance of `initial_messages`, index-aligned. A length mismatch
     /// is treated as no provenance.
     pub sources: Vec<ContextSource>,
+    /// First-round bundle presentation used by the context builder.
+    pub tool_presentation: Option<crate::tool_bundles::PreparedToolPresentation>,
 }
 
 impl Default for ModelCallScope {
@@ -850,6 +852,7 @@ impl Default for ModelCallScope {
             attempt_id: None,
             request_budget_tokens: None,
             sources: Vec::new(),
+            tool_presentation: None,
         }
     }
 }
@@ -1146,37 +1149,27 @@ impl<'a> RoundProjector<'a> {
         Ok(Some(accepted))
     }
 
-    /// Project logical model call `model_round` and send it. Transport
-    /// retries resend the same accepted request. The outer error is a
-    /// projection refusal (nothing was sent); the inner one is the
-    /// provider's.
-    #[allow(clippy::too_many_arguments)]
-    async fn call_model(
+    async fn prepare_request(
         &mut self,
-        backend: &BackendManager,
-        model: Option<&str>,
         messages: &[RuntimeMessage],
+        sources: &[ContextSource],
         tools: &[ToolDefinition],
         model_round: u64,
-        max_retries: u32,
-        recorder: &Option<Arc<dyn RuntimeRecorder>>,
-    ) -> Result<Result<LLMResponse, LlmError>, String> {
-        let baseline = messages;
-        let sources = self.sources_for(messages.len());
+    ) -> Result<Option<ProjectedRequest>, String> {
         if let Some(compactor) = &mut self.compactor {
-            compactor.refresh(messages, &sources, tools).await?;
+            compactor.refresh(messages, sources, tools).await?;
         }
         let projected = loop {
             // Always start from the original vector. Projector additions and
             // context tails are never fed back into the summarizer's source.
-            let compacted = self.compactor.as_ref().map(|c| c.view(messages, &sources));
+            let compacted = self.compactor.as_ref().map(|c| c.view(messages, sources));
             let (view_messages, view_sources, view_cache) = match &compacted {
                 Some(view) => (
                     view.messages.as_slice(),
                     view.sources.clone(),
                     view.remap_cache(&self.scope.cache),
                 ),
-                None => (messages, sources.clone(), self.scope.cache.clone()),
+                None => (messages, sources.to_vec(), self.scope.cache.clone()),
             };
             let mut projected = self
                 .project(view_messages, view_sources, &view_cache, tools, model_round)
@@ -1193,17 +1186,81 @@ impl<'a> RoundProjector<'a> {
             });
             let estimate = crate::context::estimate_request_tokens(sent, sent_tools);
             let wait = match &mut self.compactor {
-                Some(compactor) => {
-                    compactor
-                        .consider(messages, &sources, tools, estimate)
-                        .await
-                }
+                Some(compactor) => compactor.consider(messages, sources, tools, estimate).await,
                 None => Ok(false),
             };
             self.record_autocompact_status().await;
             if !wait? {
                 break projected;
             }
+        };
+        Ok(projected)
+    }
+
+    /// Project a logical call once and reuse its accepted envelope for
+    /// transport retries. If an opted-in view narrows during assembly, start
+    /// over with the subset; late additions wait until the next logical call.
+    #[allow(clippy::too_many_arguments)]
+    async fn call_model(
+        &mut self,
+        backend: &BackendManager,
+        model: Option<&str>,
+        messages: &[RuntimeMessage],
+        eager_tools: &[ToolDefinition],
+        model_round: u64,
+        max_retries: u32,
+        recorder: &Option<Arc<dyn RuntimeRecorder>>,
+        presentation: Option<(
+            &crate::tool_bundles::PresentationTurn,
+            Option<Vec<ToolDefinition>>,
+        )>,
+    ) -> Result<Result<LLMResponse, LlmError>, String> {
+        let baseline = messages;
+        let sources = self.sources_for(messages.len());
+        let ctx = self.tool_ctx;
+        let live_tools = async |turn: &crate::tool_bundles::PresentationTurn| {
+            turn.snapshot(ctx, true)
+                .await
+                .map(|view| view.advertised)
+                .map_err(|e| e.to_string())
+        };
+        let (turn, mut round_tools) = match presentation {
+            Some((turn, initial)) => {
+                let live = live_tools(turn).await?;
+                let tools = match initial {
+                    Some(mut tools) => {
+                        tools.retain(|def| live.contains(def));
+                        tools
+                    }
+                    None => live,
+                };
+                (Some(turn), tools)
+            }
+            None => (None, Vec::new()),
+        };
+        let projected = loop {
+            let tools = if turn.is_some() {
+                &round_tools
+            } else {
+                eager_tools
+            };
+            let prepared = self
+                .prepare_request(messages, &sources, tools, model_round)
+                .await;
+            if let Some(turn) = turn {
+                let live = live_tools(turn).await?;
+                let before = round_tools.len();
+                round_tools.retain(|def| live.contains(def));
+                if round_tools.len() != before {
+                    continue;
+                }
+            }
+            break prepared?;
+        };
+        let tools = if turn.is_some() {
+            &round_tools
+        } else {
+            eager_tools
         };
         // Final, complete-envelope gate is never waived for compaction.
         if let Some(request) = &projected {
@@ -1218,6 +1275,16 @@ impl<'a> RoundProjector<'a> {
             .validate_request_replay(model, self.resolved_model, messages)
             .map_err(|error| error.to_string())?;
         let cache = projected.as_ref().map_or(&self.scope.cache, |r| &r.cache);
+        let estimated = crate::context::estimate_request_tokens(messages, tools);
+        if turn.is_some()
+            && projected.is_none()
+            && let Some(budget) = self.scope.request_budget_tokens
+            && estimated > budget
+        {
+            return Err(
+                projection::ProjectionViolation::OverBudget { estimated, budget }.to_string(),
+            );
+        }
         let mut observation = crate::session::usage::CallObservation {
             model_sequence: model_round,
             timestamp: chrono::Utc::now(),
@@ -1226,7 +1293,7 @@ impl<'a> RoundProjector<'a> {
                 .or_else(|| backend.default_model())
                 .unwrap_or_default(),
             request_budget_tokens: self.scope.request_budget_tokens,
-            input_tokens: crate::context::estimate_request_tokens(messages, tools) as u64,
+            input_tokens: estimated as u64,
             output_tokens: None,
             prices: backend.model_info_for_call(model, None),
             metadata: None,
@@ -1245,6 +1312,14 @@ impl<'a> RoundProjector<'a> {
                     api: backend.model_api(model, self.resolved_model),
                 })
                 .await?;
+        }
+        if let Some(turn) = turn {
+            let live = live_tools(turn).await?;
+            if round_tools.iter().any(|def| !live.contains(def)) {
+                return Err(
+                    "tool presentation narrowed before dispatch; refusing stale request".into(),
+                );
+            }
         }
         let response = llm_call_with_retry(
             backend,
@@ -1266,7 +1341,13 @@ impl<'a> RoundProjector<'a> {
                 recorder.observe_call(observation).await?;
             }
         }
-        self.last_request = projected;
+        self.last_request = projected.or_else(|| {
+            turn.map(|_| ProjectedRequest {
+                messages: baseline.to_vec(),
+                tools: round_tools,
+                cache: self.scope.cache.clone(),
+            })
+        });
         Ok(response)
     }
 
@@ -1463,10 +1544,7 @@ async fn run_turn(
         .database()
         .root_id()
         .to_string();
-    let caller = match &tool_ctx.agent_identity {
-        Some(identity) => format!("agent-db:{}", identity.db_id),
-        None => format!("legacy-agent:{}", tool_ctx.agent_name),
-    };
+    let caller = tool_ctx.actor_key();
     let scoped_backend = backend.for_session(&session_id, &caller);
     let backend = &scoped_backend;
     let mut projector = RoundProjector::new(
@@ -1558,6 +1636,7 @@ async fn run_prepared_turn(
                     model_sequence,
                     max_retries,
                     &recorder,
+                    None,
                 )),
             )
             .await
@@ -1618,7 +1697,25 @@ async fn run_prepared_turn(
         }
     }
 
-    let tool_defs = tool_ctx.definitions();
+    let (presentation, mut initial_tools) = if tool_ctx.profile.deferred_bundles.is_empty() {
+        (None, None)
+    } else {
+        let prepared = match projector.scope.tool_presentation.take() {
+            Some(prepared) => prepared,
+            None => hub
+                .ok_or("tool bundle presentation requires a session host")?
+                .prepare_tool_presentation(tool_ctx, || true)
+                .await
+                .map_err(|e| e.to_string())?
+                .expect("opted-in profile has a presentation"),
+        };
+        (Some(prepared.turn), Some(prepared.initial.advertised))
+    };
+    let tool_defs = if presentation.is_none() {
+        tool_ctx.definitions()
+    } else {
+        Vec::new()
+    };
     let mut messages = initial_messages;
     // Pre-turn injections are not persisted. Boundary input is checkpointed
     // by the executor, but arbitrary recorders may not restore it: keep such
@@ -1745,6 +1842,9 @@ async fn run_prepared_turn(
         .await?;
         model_sequence += 1;
         iteration = model_sequence as usize;
+        // Resuming settles the pending batch before the next logical call.
+        // Don't preserve the view from before that observation completed.
+        initial_tools = None;
     }
     loop {
         let pending_input = input_boundary(&recorder, model_sequence, false).await?;
@@ -1754,15 +1854,20 @@ async fn run_prepared_turn(
         // call; transport retries reuse the accepted request.
         let Some(response) = until_cancelled(
             cancel,
-            Box::pin(projector.call_model(
-                backend,
-                model,
-                &messages,
-                &tool_defs,
-                model_sequence,
-                max_retries,
-                &recorder,
-            )),
+            Box::pin(
+                projector.call_model(
+                    backend,
+                    model,
+                    &messages,
+                    &tool_defs,
+                    model_sequence,
+                    max_retries,
+                    &recorder,
+                    presentation
+                        .as_ref()
+                        .map(|turn| (turn, initial_tools.take())),
+                ),
+            ),
         )
         .await
         else {
@@ -2195,6 +2300,15 @@ async fn run_prepared_turn(
                                 Some(format!("{model_sequence}:{call_index}:{}", call.id));
                             call_ctx.set_tool_call_site(model_sequence, call_index, &call.id);
                             call_ctx.grants = call_grants;
+                            if let (Some(turn), Some(owner)) =
+                                (&presentation, tools.owner_of(&call.name))
+                                && hub.is_some_and(|hub| hub.is_native_bundle_consumer(owner))
+                            {
+                                match turn.handle(owner).await {
+                                    Ok(handle) => call_ctx.bundle_presentation = handle,
+                                    Err(error) => warn!(%error, "Tool bundle handle unavailable"),
+                                }
+                            }
                             if call.name == JOB_WAIT_TOOL
                                 && let Ok((child, seconds)) =
                                     crate::tools::jobs::job_wait_arguments(&args)

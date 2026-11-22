@@ -714,6 +714,7 @@ impl Server {
             max_call_depth,
             tools: scoped_tools,
             profile,
+            bundle_presentation: None,
             allow_no_reply: attachment
                 .as_ref()
                 .is_some_and(|a| a.conversational_replies),
@@ -731,26 +732,41 @@ impl Server {
             call_cancel: None,
         };
 
-        let tool_defs = tool_ctx.definitions();
+        let eager = tool_ctx
+            .profile
+            .deferred_bundles
+            .is_empty()
+            .then(|| tool_ctx.definitions());
         let view = {
             let s = session.lock().await;
             self.extensions
                 .prepare_durable_context(&s, agent_name, None, &active_extensions)
                 .await?
         };
-        let (session_model, mut assembled) = {
-            let s = session.lock().await;
-            let meta = s.read_meta().await;
+        let meta = session.lock().await.read_meta().await;
+        let effective_model = meta
+            .resolve_model_for_agent(agent_name)
+            .map(str::to_string)
+            .or(default_model);
+        let tool_presentation = self
+            .extensions
+            .prepare_tool_presentation(&tool_ctx, || {
+                self.default_backend
+                    .supports_tools_for_model(effective_model.as_deref())
+            })
+            .await?;
+        let initial = tool_presentation.as_ref().map(|prepared| &prepared.initial);
+        let tool_defs = initial.map_or_else(
+            || eager.as_deref().unwrap_or_default(),
+            |view| view.advertised.as_slice(),
+        );
+        let mut assembled = {
             let roster: Vec<String> = meta.agents.iter().map(|a| a.display_name.clone()).collect();
             // Per-agent override > session pin > backend default. The backend-
             // default fallback mirrors the actual call, so an agent that pins no
             // model still budgets against its real window.
-            let session_model = meta.resolve_model_for_agent(agent_name).map(str::to_string);
-            let budget_model = budget_model_id(
-                &self.default_backend,
-                session_model.as_deref(),
-                default_model.as_deref(),
-            );
+            let budget_model =
+                budget_model_id(&self.default_backend, effective_model.as_deref(), None);
             // First use of a model we don't have a window for yet: learn it in
             // the background so the next turn budgets window-aware.
             if let Some(m) = budget_model.as_deref() {
@@ -770,8 +786,9 @@ impl Server {
             if let Some(attachment) = &attachment {
                 builder = builder.with_attachment(attachment);
             }
-            let assembled = builder
-                .with_tools(&tool_defs)
+            builder
+                .with_tools(tool_defs)
+                .with_tool_eligibility(initial.map(|view| view.eligible_names.as_slice()))
                 .with_max_tokens_override(max_tokens_override)
                 .with_room_participants(&roster)
                 .with_extension_hub(self.extensions.clone())
@@ -779,15 +796,8 @@ impl Server {
                 .with_session_signing_key(signing_key.clone())
                 .with_invocation(&active_extensions, None)
                 .try_build()
-                .await?;
-            (session_model, assembled)
+                .await?
         };
-        // Effective model resolution: per-agent override (new) > session pin
-        // (`/model X`, `SessionMeta.model`) > agent's configured default.
-        // `runtime::execute` then calls `BackendManager::resolve_model_name`
-        // to strip the backend prefix and fall back to the backend default
-        // when all three are None.
-        let effective_model = session_model.or(default_model);
 
         // Prepend the wake-prompt as a private System message. This is
         // invocation-scoped — it never appears as a session entry.
@@ -909,6 +919,7 @@ impl Server {
                 attempt_id: None,
                 request_budget_tokens: Some(assembled.request_budget_tokens),
                 sources: assembled.sources,
+                tool_presentation,
             },
         )
         .await;

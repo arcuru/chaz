@@ -639,6 +639,33 @@ An agent opts in from its settings, for example `/agent set skim tool_profile co
 
 The `compact` profile here shows full schemas for built-ins, brief schemas for the filesystem MCP namespace, name-only for github, and drops `shell` entirely.
 
+### Deferred tool bundles
+
+| Setting                              | Meaning                                                                                                                                  |
+| ------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------- |
+| `tool_bundles`                       | Top-level list of `{id, tools}` declarations. `id` is local to the config; `tools` lists exact registered names.                         |
+| `tool_profiles.<name>.defer_bundles` | Qualified bundle IDs to defer for this profile: `config/<id>` or `ext/<extension>/<id>` for an installed native extension's declaration. |
+
+Deferral changes which definitions are sent to the model, not which tools it can call. Declaring a bundle alone has no effect. An opted-in profile leaves its bundle members out of the request until a native consumer requests them for the current session and agent. The ordinary profile still shapes their schemas: a Hidden member stays hidden, and a deferred Full member can still satisfy a skill's `requires_tools`.
+
+The next model request reflects the union of active consumers' selections. Releasing one consumer's selection doesn't hide a tool another consumer still wants. Wants are local to the running peer and don't survive session teardown or restart. Revoking a tool's scope still wins. Bundles neither start MCP servers nor grant access to them.
+
+To try the runtime interface with a native consumer that can open a filesystem detail view:
+
+1. Declare a bundle and select it from an existing agent's profile. Use the exact name from the filesystem MCP server's registered tools:
+
+   ```yaml
+   tool_bundles:
+     - id: file-detail
+       tools: [filesystem__read_file]
+   tool_profiles:
+     compact-files:
+       defer_bundles: [config/file-detail]
+   ```
+
+2. The consumer opens its detail view by calling `set_wanted(&["config/file-detail"])` on its host-bound tool context handle. The next request can include `filesystem__read_file` if it is registered and in scope. A successful `set_wanted(&[])` clears that consumer's selection. Skill browsing and reading old tool results don't activate bundles.
+3. If the profile instead refers to `config/file-details`, startup refuses the candidate with `tool_profiles.compact-files.defer_bundles: unknown bundle 'config/file-details'`. Correct the reference or remove the opt-in. If the name is valid but the MCP tool has not registered yet, Chaz can start; that member is absent until it registers.
+
 ## Security Controls
 
 ### Capability boundary

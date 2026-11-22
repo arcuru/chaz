@@ -258,6 +258,7 @@ pub enum PresentationMode {
 pub struct ToolProfile {
     pub default_mode: PresentationMode,
     pub tool_modes: HashMap<String, PresentationMode>,
+    pub deferred_bundles: crate::tool_bundles::DeferredBundles,
 }
 
 impl Default for ToolProfile {
@@ -265,6 +266,7 @@ impl Default for ToolProfile {
         Self {
             default_mode: PresentationMode::Full,
             tool_modes: HashMap::new(),
+            deferred_bundles: Default::default(),
         }
     }
 }
@@ -373,6 +375,9 @@ pub struct ToolContext {
     pub tools: ScopedTools,
     /// Controls how tool definitions are presented to the LLM
     pub profile: ToolProfile,
+    /// Host-bound adapter handle, set only when dispatching an attributed
+    /// tool for an opted-in turn. Never constructed from tool arguments.
+    pub bundle_presentation: Option<crate::tool_bundles::BundlePresentation>,
     /// Stable for every turn in a session attached to Matrix.
     pub allow_no_reply: bool,
     /// Handle to the current session (for tools that need to write entries, e.g. compact)
@@ -422,6 +427,13 @@ pub struct ToolContext {
 }
 
 impl ToolContext {
+    pub(crate) fn actor_key(&self) -> String {
+        match &self.agent_identity {
+            Some(identity) => format!("agent-db:{}", identity.db_id),
+            None => format!("legacy-agent:{}", self.agent_name),
+        }
+    }
+
     pub(crate) fn set_tool_call_site(&mut self, sequence: u64, index: usize, call_id: &str) {
         self.tool_call_site = self
             .turn_request_id
@@ -452,6 +464,11 @@ impl ToolContext {
     /// Mirror the terminal action into context budgeting and the model request.
     pub fn definitions(&self) -> Vec<ToolDefinition> {
         let mut defs = self.tools.definitions(&self.profile);
+        self.append_no_reply(&mut defs);
+        defs
+    }
+
+    pub(crate) fn append_no_reply(&self, defs: &mut Vec<ToolDefinition>) {
         if self.allow_no_reply {
             defs.push(ToolDefinition {
                 name: NO_REPLY_TOOL.into(),
@@ -460,7 +477,6 @@ impl ToolContext {
                 strict: false,
             });
         }
-        defs
     }
 
     /// Read the resolved capability grants for the currently-executing tool.
@@ -1083,27 +1099,65 @@ impl ScopedTools {
     }
 
     pub fn definitions(&self, profile: &ToolProfile) -> Vec<ToolDefinition> {
-        self.registry
+        self.collect_definitions(profile, None).0
+    }
+
+    pub(crate) fn bundle_definitions(
+        &self,
+        profile: &ToolProfile,
+        deferred: &std::collections::HashSet<String>,
+    ) -> (Vec<ToolDefinition>, std::collections::HashSet<String>) {
+        self.collect_definitions(profile, Some(deferred))
+    }
+
+    fn collect_definitions(
+        &self,
+        profile: &ToolProfile,
+        deferred: Option<&std::collections::HashSet<String>>,
+    ) -> (Vec<ToolDefinition>, std::collections::HashSet<String>) {
+        let mut seen = std::collections::HashSet::new();
+        let mut ambiguous = std::collections::HashSet::new();
+        let mut defs = Vec::new();
+        for e in self
+            .registry
             .tools
             .read()
             .expect("ToolRegistry lock poisoned")
             .iter()
-            .filter(|e| match &self.allowed {
-                None => true,
-                Some(allowed) => is_allowed_by(allowed, &e.tool.descriptor().name),
-            })
-            .filter(|e| self.passes_extension_filter(e.owner))
-            .filter_map(|e| {
-                let desc = e.tool.descriptor();
+        {
+            let allowed_owner = self.passes_extension_filter(e.owner);
+            if !allowed_owner && deferred.is_none() {
+                continue;
+            }
+            let desc = e.tool.descriptor();
+            if deferred.is_some_and(|names| names.contains(&desc.name))
+                && !seen.insert(desc.name.clone())
+            {
+                ambiguous.insert(desc.name.clone());
+            }
+            if allowed_owner
+                && self
+                    .allowed
+                    .as_ref()
+                    .is_none_or(|allowed| is_allowed_by(allowed, &desc.name))
+            {
                 let def = ToolDefinition {
                     name: desc.name,
                     description: desc.description,
                     parameters: desc.parameters,
                     strict: e.tool.strict_schema(),
                 };
-                profile.apply(&def)
-            })
-            .collect()
+                if let Some(def) = profile.apply(&def) {
+                    defs.push(def);
+                }
+            }
+        }
+        for name in &ambiguous {
+            if defs.iter().any(|def| &def.name == name) {
+                tracing::warn!(tool = %name, "Ambiguous registered tool omitted from bundle presentation");
+            }
+        }
+        (defs, ambiguous)
     }
 
     pub fn get(&self, name: &str) -> Option<Arc<dyn Tool>> {
@@ -1142,6 +1196,7 @@ mod tests {
         let profile = ToolProfile {
             default_mode: PresentationMode::Full,
             tool_modes: HashMap::from([("shell".to_string(), PresentationMode::Hidden)]),
+            ..ToolProfile::default()
         };
         assert_eq!(profile.resolve_mode("shell"), &PresentationMode::Hidden);
         assert_eq!(profile.resolve_mode("recall"), &PresentationMode::Full);
@@ -1152,6 +1207,7 @@ mod tests {
         let profile = ToolProfile {
             default_mode: PresentationMode::Full,
             tool_modes: HashMap::from([("filesystem__*".to_string(), PresentationMode::Summary)]),
+            ..ToolProfile::default()
         };
         assert_eq!(
             profile.resolve_mode("filesystem__read_file"),
@@ -1184,6 +1240,7 @@ mod tests {
         let profile = ToolProfile {
             default_mode: PresentationMode::Brief,
             tool_modes: HashMap::new(),
+            ..ToolProfile::default()
         };
         let def = ToolDefinition {
             name: "shell".to_string(),
@@ -1209,6 +1266,7 @@ mod tests {
         let profile = ToolProfile {
             default_mode: PresentationMode::Summary,
             tool_modes: HashMap::new(),
+            ..ToolProfile::default()
         };
         let def = ToolDefinition {
             name: "shell".to_string(),
@@ -1232,6 +1290,7 @@ mod tests {
         let profile = ToolProfile {
             default_mode: PresentationMode::Hidden,
             tool_modes: HashMap::new(),
+            ..ToolProfile::default()
         };
         let def = ToolDefinition {
             name: "shell".to_string(),

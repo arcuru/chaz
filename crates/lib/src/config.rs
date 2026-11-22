@@ -58,6 +58,9 @@ pub struct Config {
     pub mcp_servers: Option<Vec<McpServerConfig>>,
     /// Named tool profiles controlling how tool definitions are presented to the LLM
     pub tool_profiles: Option<HashMap<String, ToolProfileConfig>>,
+    /// Named presentation groups of already-registered tools.
+    #[serde(default)]
+    pub tool_bundles: Vec<crate::tool_bundles::ToolBundleDeclaration>,
     /// Directory to scan for MCP server manifest files (.yaml/.json).
     /// Each file should contain a single McpServerConfig object.
     /// Merged with inline `mcp_servers` entries; name collisions are logged and skipped.
@@ -1056,6 +1059,9 @@ pub struct ToolProfileConfig {
     pub default: Option<PresentationMode>,
     /// Per-tool presentation mode overrides (supports "namespace__*" glob patterns)
     pub tools: Option<HashMap<String, PresentationMode>>,
+    /// Qualified bundle IDs whose tools are advertised only when wanted.
+    #[serde(default)]
+    pub defer_bundles: Vec<String>,
 }
 
 /// Configuration for an MCP server (subprocess or HTTP).
@@ -1234,6 +1240,9 @@ fn known_config_keys() -> HashSet<&'static str> {
         "schedules",
         "mcp_servers",
         "tool_profiles",
+        "tool_bundles",
+        "tool_bundles[].id",
+        "tool_bundles[].tools",
         "mcp_server_dir",
         "context",
         "web_search",

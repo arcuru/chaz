@@ -80,6 +80,7 @@ fn make_ctx(agent_name: &str, session: Arc<TokioMutex<Session>>) -> ToolContext 
         max_call_depth: 10,
         tools: ScopedTools::new(Arc::new(ToolRegistry::new()), None),
         profile: ToolProfile::default(),
+        bundle_presentation: None,
         allow_no_reply: false,
         session,
         grants: crate::grants::Grants::default(),

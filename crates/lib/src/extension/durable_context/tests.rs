@@ -151,6 +151,7 @@ impl Fixture {
                 attempt_id: Some("new-attempt".into()),
                 request_budget_tokens: Some(budget),
                 sources: assembled.sources,
+                ..Default::default()
             },
         )
         .await

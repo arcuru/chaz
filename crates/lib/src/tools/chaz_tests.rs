@@ -372,6 +372,7 @@ async fn tools_use_child_scope_hidden_presentation_and_effective_policy_grants()
     ctx.profile = ToolProfile {
         default_mode: PresentationMode::Brief,
         tool_modes: HashMap::from([("shell".into(), PresentationMode::Hidden)]),
+        ..ToolProfile::default()
     };
     ctx.session_capabilities = serde_json::from_value(
         json!({"shell": {"allow": ["git", "ls"]}, "fs": {"allow_read": ["/work/project"]}}),

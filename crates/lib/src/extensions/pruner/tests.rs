@@ -316,6 +316,7 @@ impl Fixture {
                 cache: built.cache,
                 attempt_id: Some(attempt.attempt_id.clone()),
                 request_budget_tokens: Some(built.request_budget_tokens),
+                ..Default::default()
             },
         )
         .await
@@ -1003,6 +1004,7 @@ async fn pruner_runtime_recovery_pages_remain_raw_in_current_and_historical_exch
             sources: built.sources,
             request_budget_tokens: Some(built.request_budget_tokens),
             attempt_id: Some(attempt.attempt_id.clone()),
+            ..Default::default()
         },
     )
     .await

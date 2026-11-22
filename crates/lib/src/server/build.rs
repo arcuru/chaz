@@ -725,6 +725,8 @@ pub async fn build(
         }
     }
 
+    let tool_profiles = crate::tool_bundles::build_profiles(config, &extensions)?;
+
     info!(
         elapsed_ms = t.elapsed().as_millis() as u64,
         "Startup: extension dependencies constructed"
@@ -761,24 +763,6 @@ pub async fn build(
         "Tool registry initialized"
     );
     let t = Instant::now();
-
-    // Build tool profiles from config
-    let tool_profiles: std::collections::HashMap<String, tool::ToolProfile> = config
-        .tool_profiles
-        .as_ref()
-        .map(|profiles| {
-            profiles
-                .iter()
-                .map(|(name, cfg)| {
-                    let profile = tool::ToolProfile {
-                        default_mode: cfg.default.clone().unwrap_or_default(),
-                        tool_modes: cfg.tools.clone().unwrap_or_default(),
-                    };
-                    (name.clone(), profile)
-                })
-                .collect()
-        })
-        .unwrap_or_default();
 
     // Create the callback-driven server
     let context_config = config.context.clone().unwrap_or_default();

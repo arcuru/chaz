@@ -46,6 +46,7 @@ pub mod server;
 pub mod session;
 pub mod skill_bank_db;
 pub mod tool;
+pub mod tool_bundles;
 pub mod tool_host;
 pub mod tools;
 pub mod types;

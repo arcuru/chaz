@@ -398,13 +398,8 @@ pub async fn list_events(session_db: &Database) -> anyhow::Result<Vec<ExtensionE
 /// Public for the upcoming `/extensions` reader and replay path; tests
 /// exercise it directly.
 pub async fn read_active(session_db: &Database) -> anyhow::Result<Vec<ExtensionRef>> {
-    let mut events = list_events(session_db).await?;
-    events.sort_by_key(|e| e.timestamp());
-    let mut latest: HashMap<String, ExtensionEvent> = HashMap::new();
-    for e in events {
-        latest.insert(e.name().to_string(), e);
-    }
-    let mut active: Vec<ExtensionRef> = latest
+    let mut active: Vec<ExtensionRef> = latest_events(session_db)
+        .await?
         .into_values()
         .filter_map(|e| match e {
             ExtensionEvent::Activated { extension_ref, .. } => Some(extension_ref),
@@ -429,16 +424,23 @@ pub async fn read_active(session_db: &Database) -> anyhow::Result<Vec<ExtensionR
 /// remove extensions from the session's active set, never add — so the
 /// dispatch path computes `session_active − read_disabled(agent_db)`.
 pub async fn read_disabled(db: &Database) -> anyhow::Result<HashSet<String>> {
+    Ok(latest_events(db)
+        .await?
+        .into_iter()
+        .filter_map(|(name, e)| matches!(e, ExtensionEvent::Deactivated { .. }).then_some(name))
+        .collect())
+}
+
+pub(crate) async fn latest_events(
+    db: &Database,
+) -> anyhow::Result<HashMap<String, ExtensionEvent>> {
     let mut events = list_events(db).await?;
     events.sort_by_key(|e| e.timestamp());
     let mut latest: HashMap<String, ExtensionEvent> = HashMap::new();
     for e in events {
         latest.insert(e.name().to_string(), e);
     }
-    Ok(latest
-        .into_iter()
-        .filter_map(|(name, e)| matches!(e, ExtensionEvent::Deactivated { .. }).then_some(name))
-        .collect())
+    Ok(latest)
 }
 
 /// Append a single event to an extension log (session or agent DB).
@@ -614,6 +616,12 @@ pub trait Extension: Send + Sync {
     /// Undeclared keys are not exposed through the generic field editor.
     fn setting_fields(&self) -> &'static [SettingField] {
         &[]
+    }
+
+    /// Local bundle declarations from installed native code. The host
+    /// qualifies each ID with the registered extension name.
+    fn tool_bundles(&self) -> Vec<crate::tool_bundles::ToolBundleDeclaration> {
+        Vec::new()
     }
 
     // ---- Cap-based install path -----------------------------------------
@@ -836,6 +844,7 @@ pub struct ExtensionHub {
     /// `None` until the host wires it via [`Self::set_peer_handles`].
     peer_handles: Option<Arc<instance::PeerHandles>>,
     turn_complete_tasks: Mutex<turn::TurnCompleteTasks>,
+    tool_presentations: crate::tool_bundles::PresentationSessions,
 }
 
 impl Default for ExtensionHub {
@@ -875,7 +884,64 @@ impl ExtensionHub {
             session_instances: tokio::sync::RwLock::new(HashMap::new()),
             peer_handles: None,
             turn_complete_tasks: Mutex::new(turn::TurnCompleteTasks::default()),
+            tool_presentations: Default::default(),
         }
+    }
+
+    pub(crate) async fn prepare_tool_presentation(
+        &self,
+        ctx: &crate::tool::ToolContext,
+        supports_tools: impl FnOnce() -> bool,
+    ) -> anyhow::Result<Option<crate::tool_bundles::PreparedToolPresentation>> {
+        if ctx.profile.deferred_bundles.is_empty() {
+            return Ok(None);
+        }
+        let session = ctx.session.lock().await.database().clone();
+        let agent = if let Some(identity) = &ctx.agent_identity {
+            let registry = self
+                .session_registry
+                .as_ref()
+                .context("no session registry for bundle presentation")?;
+            let db = registry
+                .open_agent_db(&identity.db_id, Some(&identity.pubkey))
+                .await?
+                .context("cannot open acting agent DB for bundle presentation")?;
+            Some(db.database().clone())
+        } else {
+            None
+        };
+        let ceiling = ctx
+            .active_extensions
+            .iter()
+            .filter(|name| !self.install_failures.contains_key(*name))
+            .cloned()
+            .collect();
+        let turn = self
+            .tool_presentations
+            .bind(ctx, session, agent, ceiling)
+            .await;
+        let initial = turn.snapshot(ctx, supports_tools()).await?;
+        Ok(Some(crate::tool_bundles::PreparedToolPresentation {
+            turn,
+            initial,
+        }))
+    }
+
+    pub(crate) fn is_native_bundle_consumer(&self, owner: &str) -> bool {
+        self.extensions.iter().any(|extension| {
+            extension.name() == owner
+                && matches!(extension.extension_ref(), ExtensionRef::Builtin { .. })
+        })
+    }
+
+    /// Clear this resident session's bundle wants and invalidate its handles.
+    /// This does not alter tool scope, extension activation, or history.
+    pub async fn reset_tool_presentation(&self, session_db_id: &str) {
+        self.tool_presentations.reset(session_db_id, false).await;
+    }
+
+    pub(crate) async fn close_tool_presentation(&self, session_db_id: &str) {
+        self.tool_presentations.reset(session_db_id, true).await;
     }
 
     /// Install the peer-handle bag used to construct

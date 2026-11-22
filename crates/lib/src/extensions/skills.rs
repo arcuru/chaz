@@ -538,11 +538,9 @@ async fn read_skill_rows(db: &eidetica::Database) -> Vec<crate::agent_db::Skill>
     }
 }
 
-/// The tools the model can actually call this turn — the same list the
-/// runtime hands the LLM, so `requires_tools` is matched against exactly
-/// what the model sees. Names are the presented names: MCP-backed tools
-/// appear as `{server}__{tool}`, and a tool the active `ToolProfile`
-/// hides is absent here because the model cannot call it either.
+/// Profile-visible tools in the caller's scope, before bundle deferral.
+/// A deferred definition can satisfy `requires_tools`; a Hidden one cannot.
+/// MCP names use `{server}__{tool}` just as they do in requests.
 fn available_tool_names(ctx: &crate::tool::ToolContext) -> Vec<String> {
     ctx.tools
         .definitions(&ctx.profile)

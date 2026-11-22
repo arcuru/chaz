@@ -916,6 +916,7 @@ async fn projector_receives_scoped_identity_and_sources() {
                 attempt_id: Some("attempt-1".into()),
                 request_budget_tokens: Some(10_000),
                 sources: sources.clone(),
+                ..Default::default()
             },
         )
         .await;
