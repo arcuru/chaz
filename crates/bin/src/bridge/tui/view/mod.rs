@@ -617,18 +617,18 @@ pub(super) fn ui_chat(f: &mut ratatui::Frame, app: &mut App, ext_segments: &[Str
         Constraint::Length(approval_h),
         Constraint::Length(ext_status_h),
         Constraint::Length(1),
+        Constraint::Length(backend_status_h),
         Constraint::Length(if app.active().live.worker_observer {
             1
         } else {
             composer_h
         }),
-        Constraint::Length(backend_status_h),
     ])
     .split(f.area());
 
     render_tab_bar(f, app, chunks[0]);
     if let Some(status) = backend_status {
-        widgets::status_strip(f, chunks[6], &status);
+        widgets::status_strip(f, chunks[5], &status);
     }
 
     let messages_area = if app.active().live.worker_observer {
@@ -1033,13 +1033,13 @@ pub(super) fn ui_chat(f: &mut ratatui::Frame, app: &mut App, ext_segments: &[Str
                 "Alt+P parent · Alt+W workers · Esc sessions · Ctrl+O expand · scroll / copy".into()
             })
             .style(theme::dim()),
-            chunks[5],
+            chunks[6],
         );
         return;
     }
     render_composer(
         f,
-        chunks[5],
+        chunks[6],
         &composer,
         if app.active().job.is_some() {
             super::jobs::composer_title(app.active())
@@ -1049,7 +1049,7 @@ pub(super) fn ui_chat(f: &mut ratatui::Frame, app: &mut App, ext_segments: &[Str
             " > "
         },
     );
-    render_completion_popup(f, app, chunks[1], chunks[5]);
+    render_completion_popup(f, app, chunks[1], chunks[6]);
 }
 
 fn render_composer(f: &mut ratatui::Frame, area: Rect, composer: &composer::Composer, title: &str) {

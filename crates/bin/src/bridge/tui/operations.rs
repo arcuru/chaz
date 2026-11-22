@@ -87,6 +87,7 @@ pub(super) struct Operations {
     current_input: Option<String>,
     uncertain_inputs: Vec<String>,
     uncertainty: Vec<String>,
+    outage_unknown: bool,
     unstarted_count: usize,
     unstarted_inputs: Vec<String>,
     next_ticket: u64,
@@ -110,6 +111,7 @@ impl Default for Operations {
             current_input: None,
             uncertain_inputs: Vec::new(),
             uncertainty: Vec::new(),
+            outage_unknown: false,
             unstarted_count: 0,
             unstarted_inputs: Vec::new(),
             next_ticket: 0,
@@ -129,7 +131,7 @@ impl Drop for Operations {
 impl Operations {
     pub(super) fn outcome_summary(&self) -> String {
         let mut status = String::new();
-        if !self.uncertainty.is_empty() {
+        if self.outage_unknown {
             status.push_str(" · Write outcome unknown");
         }
         if self.unstarted_count != 0 {
@@ -506,6 +508,7 @@ pub(super) fn apply(app: &mut App, completion: Completion) -> Invalidation {
                 }
             }
             if pending.write {
+                app.operations.outage_unknown |= !app.backend_available;
                 app.operations.uncertainty.push(notice);
             } else {
                 app.operations.notice = Some(notice);
