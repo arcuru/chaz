@@ -206,7 +206,9 @@ impl ConversationRead {
     }
 
     pub(super) fn display_rows(&self) -> Result<Vec<DisplayRow>> {
-        Ok(self.effective()?.display_rows())
+        Ok(self
+            .effective()?
+            .display_rows(&self.provenance.reply_targets))
     }
 
     pub(super) fn recorded_call(&self, call: &CallId, attempt: &str) -> Result<Option<&CallInput>> {

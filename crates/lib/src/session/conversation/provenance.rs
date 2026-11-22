@@ -146,6 +146,7 @@ pub(super) struct Evidence {
     pub calls: BTreeMap<(CallId, String), CallInput>,
     pub accounting: Vec<CallEvidence>,
     pub compactions: Vec<compaction::Intent>,
+    pub reply_targets: BTreeMap<String, RepresentationId>,
 }
 
 pub(super) async fn read(
@@ -398,21 +399,26 @@ pub(super) async fn read(
             else {
                 return Err(Error::Missing("completion response".into()));
             };
-            if !inputs.contains_key(&response.call.request)
-                || !responses.contains(&completion.response)
-            {
+            let (_, accepted) = inputs
+                .get(&response.call.request)
+                .ok_or_else(|| Error::Integrity("completion lacks its accepted input".into()))?;
+            if accepted.attempt != completion.attempt || !responses.contains(&completion.response) {
                 return Err(Error::Integrity(
                     "completion lacks its accepted input or response outcome".into(),
                 ));
             }
-            Ok(())
+            Ok(accepted.representation())
         }
         .await;
-        if let Err(error) = check {
-            originals.issues.push(error);
-        } else {
-            publications.insert(completion.publication.as_str());
-            completed.insert(completion.attempt.as_str(), *entry);
+        match check {
+            Err(error) => originals.issues.push(error),
+            Ok(trigger) => {
+                publications.insert(completion.publication.as_str());
+                completed.insert(completion.attempt.as_str(), *entry);
+                evidence
+                    .reply_targets
+                    .insert(completion.publication.clone(), trigger);
+            }
         }
     }
     match compaction::validate(

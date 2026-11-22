@@ -434,8 +434,22 @@ The TUI catalogs every built-in slash command in its inline completion popup —
 | `/compact`            | Ask the executor to compact the current immutable session snapshot                                |
 | `/context`            | Context-window usage for the current agent ([details](usage.md#context-window-snapshots-context)) |
 | `/autocompact [<n>]`  | Show or set automatic compaction ([details](extensions.md#automatic-compaction))                  |
-| `/print`              | Dump the transcript                                                                               |
+| `/print`              | Show the transcript, with reply previews where available                                          |
 | `/stop`               | Stop the active turn in this session; idle sessions are unchanged                                 |
+
+### Reply previews in `/print`
+
+The joined transcript is one list, not a branch picker. If a reply has a recorded
+trigger and another user message appears between that trigger and the reply,
+`/print` adds a short `re:` preview. A reply directly following its trigger does
+not need a cue. A missing cue does not prove what the model saw.
+
+For example, when reading a reopened fenced test conversation:
+
+1. `user: 2 + 2` is followed by `user: Correction: use 2 + 3 instead.`
+2. `assistant (re: 2 + 2): Four.` identifies the question that triggered the
+   reply. Don't read `Four.` as the answer to the correction just because the
+   correction is the row immediately above it.
 
 ### Living Agents
 
