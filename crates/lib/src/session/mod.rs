@@ -69,7 +69,10 @@ pub use transport::{
     session_attachment, transport_bindings, unbind_transport,
 };
 
-pub use context_compaction::{CompactToolScope, ContextCompaction, ContextReplacement};
+pub(crate) use context_compaction::fold_citation;
+pub use context_compaction::{
+    CompactToolScope, CompletedTurnActivity, ContextCompaction, ContextReplacement,
+};
 pub use conversation::{
     CallId, CallInput, CallMessageBinding, ConversationError, ConversationInspection,
     ConversationOriginals, FactId, Fidelity, ObservedBinding, RecordRef, RepresentationId,

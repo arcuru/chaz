@@ -179,6 +179,7 @@ pub(super) struct ConversationRead {
     descriptor_entries: BTreeSet<ID>,
     locations: BTreeMap<ID, BTreeSet<String>>,
     operations: BTreeMap<String, Operation>,
+    op_atoms: BTreeMap<String, String>,
     provenance: provenance::Evidence,
 }
 
@@ -357,17 +358,18 @@ pub(super) async fn open(
         descriptor_entries,
         locations: BTreeMap::new(),
         operations: BTreeMap::new(),
+        op_atoms: BTreeMap::new(),
         provenance: Default::default(),
     };
     let entries = entries(db, STORE, frontier).await?;
     let mut originals = Originals::default();
     let mut occurrences = Vec::new();
-    let mut op_atoms = BTreeMap::new();
     for entry in &entries {
         for (hash, text) in originals.delta(entry, STORE)? {
             match atom::decode_v1::<Operation>(&text) {
                 Ok(op) => {
-                    if op_atoms
+                    if read
+                        .op_atoms
                         .insert(op.op_id.clone(), hash.clone())
                         .is_some_and(|old| old != hash)
                     {

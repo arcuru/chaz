@@ -42,6 +42,9 @@ pub struct Settings {
     pub trigger_tokens: Option<u64>,
     pub keep_recent_tokens: u64,
     pub summary_max_tokens: u32,
+    /// Gate scoped preparations on cache lifetime and projected priced savings.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub cache_aware: bool,
 }
 
 impl Default for Settings {
@@ -51,6 +54,7 @@ impl Default for Settings {
             trigger_tokens: None,
             keep_recent_tokens: DEFAULT_KEEP_RECENT_TOKENS,
             summary_max_tokens: DEFAULT_SUMMARY_MAX_TOKENS,
+            cache_aware: false,
         }
     }
 }
@@ -95,6 +99,7 @@ pub(crate) async fn policy(db: &Database) -> anyhow::Result<Option<Policy>> {
         trigger_tokens: settings.trigger_tokens.map(size),
         keep_recent_tokens: size(settings.keep_recent_tokens),
         summary_max_tokens: settings.summary_max_tokens,
+        cache_aware: settings.cache_aware,
     }))
 }
 
@@ -255,6 +260,9 @@ async fn describe(settings: &Settings, db: &Database, ctx: &HookContext) -> Stri
         settings.keep_recent_tokens,
         settings.summary_max_tokens,
     )];
+    if settings.cache_aware {
+        lines.push("Cache-aware preparation: on (requires scoped history)".into());
+    }
     match read_status(db, &ctx.agent_name).await {
         Ok(Some(status)) => {
             let mut line = format!("Last: {} — {}", status.state, status.detail);
@@ -356,6 +364,7 @@ mod tests {
                 trigger_tokens: Some(27_000),
                 keep_recent_tokens: 20_000,
                 summary_max_tokens: 8_192,
+                cache_aware: false,
             })
         );
         assert!(invoke("27x", &session).await.is_err());

@@ -4,7 +4,8 @@ use super::*;
 use crate::{
     extension::caps::CapFuture,
     session::{
-        CompactToolScope, ContextCompaction, ContextReplacement, worker_links::WorkerCallSite,
+        CompactToolScope, CompletedTurnActivity, ContextCompaction, ContextReplacement,
+        worker_links::WorkerCallSite,
     },
 };
 use std::collections::BTreeSet;
@@ -84,7 +85,10 @@ impl ContextCompaction for TurnRecorder {
         self
     }
 
-    fn historical_members(&self) -> CapFuture<'_, Vec<RepresentationId>> {
+    fn scoped_history<'a>(
+        &'a self,
+        model_id: Option<&'a str>,
+    ) -> CapFuture<'a, (Vec<RepresentationId>, CompletedTurnActivity)> {
         Box::pin(async move {
             let session = self.write_session().await.map_err(anyhow::Error::msg)?;
             let state = self.compaction_state().await?;
@@ -96,11 +100,15 @@ impl ContextCompaction for TurnRecorder {
                 .as_deref()
                 .context("missing branch")?;
             let source = Staging::at(db, &state.source, &txn, branch).await?;
-            Ok(source
+            let members = source
                 .historical_members(&state.input)?
                 .into_iter()
                 .map(|(_, id)| id)
-                .collect())
+                .collect();
+            let activity = model_id.map_or_else(CompletedTurnActivity::default, |model| {
+                source.completed_turn_activity(&self.identity.agent, model)
+            });
+            Ok((members, activity))
         })
     }
 
@@ -193,6 +201,7 @@ impl ContextCompaction for TurnRecorder {
             );
             let intent = pending.take().expect("pending identity checked");
             let txn = state.transaction(db).await?;
+            let returned_summary = summary.is_some();
             let (replacement, status) = if let Some(summary) = summary {
                 ensure!(
                     state.terminal.is_none(),
@@ -208,7 +217,12 @@ impl ContextCompaction for TurnRecorder {
                     let source_txn = db.new_transaction_at(at).await?;
                     let source = Staging::at(db, at, &source_txn, branch).await?;
                     let replacement = source.replace_context(&txn, &intent, summary).await?;
-                    (Some(replacement), CompactionSettlement::Applied)
+                    let status = if replacement.is_some() {
+                        CompactionSettlement::Applied
+                    } else {
+                        CompactionSettlement::Unapplied
+                    };
+                    (replacement, status)
                 } else {
                     (None, CompactionSettlement::Stale)
                 }
@@ -228,6 +242,10 @@ impl ContextCompaction for TurnRecorder {
             ensure!(
                 status != CompactionSettlement::Stale,
                 "compaction targets are stale; summary not applied"
+            );
+            ensure!(
+                !returned_summary || status == CompactionSettlement::Applied,
+                "cited summary did not shrink the selected history"
             );
             Ok(())
         })
@@ -304,7 +322,7 @@ impl CompactToolScope for TurnRecorder {
             let (status, replacement) = if Box::pin(current_targets(db, &intent.targets)).await? {
                 (
                     CompactionSettlement::Applied,
-                    Some(source.replace_context(&txn, &intent, summary).await?),
+                    source.replace_context(&txn, &intent, summary).await?,
                 )
             } else {
                 (CompactionSettlement::Stale, None)

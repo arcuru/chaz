@@ -759,6 +759,8 @@ async fn scoped_api_limits_calls_and_settings_and_supports_no_tools_turns() {
         price_input: None,
         price_output: None,
         price_cache_read: None,
+        price_cache_write: None,
+        cache_lifetime_seconds: None,
         context_window: Some(10),
     }]);
     let backend = BackendManager::new(&Some(vec![config]), empty_secrets().await);

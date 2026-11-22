@@ -843,6 +843,10 @@ pub struct Model {
     /// "not applicable" rather than zero when absent.
     #[serde(default)]
     pub price_cache_read: Option<f64>,
+    /// Cache-write token price in USD per million tokens, when known.
+    pub price_cache_write: Option<f64>,
+    /// Lifetime of the effective prompt cache on this route, when known.
+    pub cache_lifetime_seconds: Option<u64>,
     /// Context window in tokens. Declare it for providers whose `/models`
     /// catalog doesn't report one (vanilla OpenAI, Ollama, …); when set it
     /// caps the per-turn context budget at this model's real limit instead
@@ -1283,6 +1287,8 @@ fn known_config_keys() -> HashSet<&'static str> {
         "backends[].models[].price_input",
         "backends[].models[].price_output",
         "backends[].models[].price_cache_read",
+        "backends[].models[].price_cache_write",
+        "backends[].models[].cache_lifetime_seconds",
         "backends[].models[].context_window",
     ] {
         keys.insert(k);

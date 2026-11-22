@@ -3,11 +3,25 @@
 use super::{RepresentationId, worker_links::WorkerCallSite};
 use crate::{extension::caps::CapFuture, runtime::RuntimeMessage};
 
+pub(crate) fn fold_citation(key: &str, last_index: usize) -> String {
+    format!(
+        "\n\nRetained message refs (tool_history_query, if available): cr1:{key}:<index>, indices 0 through {last_index}."
+    )
+}
+
 #[derive(Clone, Debug)]
 pub struct ContextReplacement {
     pub(crate) targets: Vec<RepresentationId>,
     pub(crate) summary: RepresentationId,
     pub(crate) text: String,
+}
+
+/// Validated foreground activity for the same agent and model in the source
+/// lineage. No timing or cost policy is interpreted by the store.
+#[derive(Debug, Default)]
+pub struct CompletedTurnActivity {
+    pub(crate) latest_completion: Option<chrono::DateTime<chrono::Utc>>,
+    pub(crate) call_counts: Vec<usize>,
 }
 
 /// Local tool authority for one invocation; selecting a range grants no model
@@ -25,7 +39,10 @@ pub trait CompactToolScope: Send + Sync {
 pub trait ContextCompaction: Send + Sync {
     fn tool_scope(&self) -> &dyn CompactToolScope;
 
-    fn historical_members(&self) -> CapFuture<'_, Vec<RepresentationId>>;
+    fn scoped_history<'a>(
+        &'a self,
+        model_id: Option<&'a str>,
+    ) -> CapFuture<'a, (Vec<RepresentationId>, CompletedTurnActivity)>;
     fn replacements(&self) -> CapFuture<'_, Vec<ContextReplacement>>;
 
     /// Pin selected immutable members before dispatching an auxiliary model

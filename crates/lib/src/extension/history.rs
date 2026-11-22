@@ -1,4 +1,4 @@
-//! Read-only retained tool evidence scoped to a caller's current session/tools.
+//! Read-only retained evidence scoped to a caller's current session/tools.
 //! A reference is an identity, not a capability. Every read revalidates current
 //! membership, source-tool visibility, and a completed coherent transcript.
 use crate::{
@@ -97,12 +97,7 @@ impl ScopedHistory {
         self
     }
 
-    async fn records(&self) -> anyhow::Result<Vec<(TurnTranscriptRecord, ToolCallRequest)>> {
-        let history = Session::history(&self.db)
-            .await?
-            .retained_tool_history()
-            .await?;
-        // Revalidate authority after the potentially slow retained-store read.
+    async fn authorized_tools(&self, require_recovery: bool) -> anyhow::Result<ScopedTools> {
         let current: HashSet<_> = super::read_active(&self.db)
             .await?
             .into_iter()
@@ -152,10 +147,24 @@ impl ScopedHistory {
             legacy.as_ref().is_none_or(|name| name == &self.agent)
         };
         anyhow::ensure!(authorized, "caller is no longer a session participant");
-        let visible = self
+        anyhow::ensure!(
+            !require_recovery
+                || (current.contains("context_prune") && self.active.contains("context_prune")),
+            "retained recovery is not currently granted"
+        );
+        Ok(self
             .tools
             .clone()
-            .narrow_active_extensions(self.active.intersection(&current).cloned().collect());
+            .narrow_active_extensions(self.active.intersection(&current).cloned().collect()))
+    }
+
+    async fn records(&self) -> anyhow::Result<Vec<(TurnTranscriptRecord, ToolCallRequest)>> {
+        let history = Session::history(&self.db)
+            .await?
+            .retained_tool_history()
+            .await?;
+        // Revalidate authority after the potentially slow retained-store read.
+        let visible = self.authorized_tools(false).await?;
         // Keep only complete, structurally valid exchanges. Compaction changes
         // the visible context but does not itself revoke retained-source access.
         Ok(history
@@ -279,6 +288,30 @@ impl ScopedHistory {
             max_bytes > 0 && max_bytes <= MAX_HISTORY_PAGE_BYTES,
             "page size must be 1..=16384 stored bytes"
         );
+        if reference.starts_with("cr1:") {
+            anyhow::ensure!(
+                self.selected.is_none(),
+                "fold recall requires tool invocation scope"
+            );
+            let message = Session::history(&self.db)
+                .await?
+                .folded_message(reference)
+                .await?;
+            let visible = self.authorized_tools(true).await?;
+            let message = message.filter(|message| {
+                visible
+                    .get(crate::extensions::pruner::RECOVERY_TOOL)
+                    .is_some()
+                    && message.tools.iter().all(|name| visible.get(name).is_some())
+            });
+            return match message {
+                Some(message) => {
+                    let sha256 = format!("{:x}", Sha256::digest(message.bytes.as_bytes()));
+                    page_bytes(reference, offset, max_bytes, &message.bytes, sha256, false)
+                }
+                None => Ok(missing(reference, offset)),
+            };
+        }
         anyhow::ensure!(
             reference.len() == 68
                 && reference.starts_with("tr1:")
@@ -290,41 +323,62 @@ impl ScopedHistory {
             if result.reference != reference {
                 continue;
             }
-            let output = &result.output;
-            anyhow::ensure!(
-                offset <= output.len() && output.is_char_boundary(offset),
-                "offset is not a stored UTF-8 byte boundary"
-            );
-            let mut end = offset.saturating_add(max_bytes).min(output.len());
-            while !output.is_char_boundary(end) {
-                end -= 1;
-            }
-            anyhow::ensure!(
-                end > offset || offset == output.len(),
-                "page size cannot fit the next UTF-8 character"
-            );
-            return Ok(HistoryPage {
-                reference: reference.into(),
-                status: "retained",
+            return page_bytes(
+                reference,
                 offset,
-                next_offset: (end < output.len()).then_some(end),
-                stored_bytes: output.len(),
-                sha256: Some(result.sha256),
-                stored_truncation_marker: result.stored_truncation_marker,
-                content: output[offset..end].into(),
-            });
+                max_bytes,
+                &result.output,
+                result.sha256,
+                result.stored_truncation_marker,
+            );
         }
-        Ok(HistoryPage {
-            reference: reference.into(),
-            status: "missing_or_not_authorized",
-            offset,
-            next_offset: None,
-            stored_bytes: 0,
-            sha256: None,
-            stored_truncation_marker: false,
-            content: String::new(),
-        })
+        Ok(missing(reference, offset))
     }
+}
+
+fn missing(reference: &str, offset: usize) -> HistoryPage {
+    HistoryPage {
+        reference: reference.into(),
+        status: "missing_or_not_authorized",
+        offset,
+        next_offset: None,
+        stored_bytes: 0,
+        sha256: None,
+        stored_truncation_marker: false,
+        content: String::new(),
+    }
+}
+
+fn page_bytes(
+    reference: &str,
+    offset: usize,
+    max_bytes: usize,
+    output: &str,
+    sha256: String,
+    stored_truncation_marker: bool,
+) -> anyhow::Result<HistoryPage> {
+    anyhow::ensure!(
+        offset <= output.len() && output.is_char_boundary(offset),
+        "offset is not a stored UTF-8 byte boundary"
+    );
+    let mut end = offset.saturating_add(max_bytes).min(output.len());
+    while !output.is_char_boundary(end) {
+        end -= 1;
+    }
+    anyhow::ensure!(
+        end > offset || offset == output.len(),
+        "page size cannot fit the next UTF-8 character"
+    );
+    Ok(HistoryPage {
+        reference: reference.into(),
+        status: "retained",
+        offset,
+        next_offset: (end < output.len()).then_some(end),
+        stored_bytes: output.len(),
+        sha256: Some(sha256),
+        stored_truncation_marker,
+        content: output[offset..end].into(),
+    })
 }
 
 fn matches_source(source: &ContextSource, record: &TurnTranscriptRecord) -> bool {

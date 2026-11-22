@@ -642,7 +642,7 @@ pruning is an optimization, not the required context strategy.
 | `context_prune.min_bytes`         | `16384`  | Minimum retained result size in UTF-8 bytes.                                                 |
 | `context_prune.min_savings_bytes` | `1024`   | Minimum reduction in the framed request payload; replacements must also be strictly shorter. |
 | `context_prune.exclude_tools`     | `[]`     | Tool names whose results stay unchanged.                                                     |
-| `tool_history_query.reference`    | Required | Stable `tr1:` reference from a pointer, not a visible message index.                         |
+| `tool_history_query.reference`    | Required | `tr1:` from a tool-result pointer, or `cr1:…:<index>` from a durable automatic fold.         |
 | `tool_history_query.offset`       | `0`      | Stored UTF-8 byte offset; must be a character boundary.                                      |
 | `tool_history_query.max_bytes`    | `16384`  | Page bound in stored bytes, from 1 through 16384.                                            |
 
@@ -877,8 +877,9 @@ It is off until you turn it on for a session.
 | `trigger_tokens`        | unset = 80% of window | Estimated size of the next model request that starts a summary. Never above the request budget.                                           |
 | `keep_recent_tokens`    | `20000`               | Recent messages kept word for word (Pi's default), capped at half the trigger.                                                            |
 | `summary_max_tokens`    | `8192`                | Output ceiling for one summary call, bounded by the backend ceiling and remaining model window. A ceiling, not a target.                  |
+| `cache_aware`           | `false`               | Require scoped history and known cache prices/lifetime before preparing. Fenced writer fixtures only.                                     |
 
-Change the last two with `/extensions set autocompact <key> <value>`.
+Change `keep_recent_tokens` and `summary_max_tokens` with `/extensions set autocompact <key> <value>`.
 Settings and activation changes take effect on the next turn, as with other extensions.
 
 ### What gets summarized, and what never is
@@ -895,7 +896,7 @@ A later compaction updates the previous summary with only the newly covered mess
 
 ### When it runs, and what it costs
 
-The summary is prepared in the background while the agent keeps calling tools; it takes effect at the next model call after it is ready.
+By default the summary is prepared in the background while the agent keeps calling tools; it takes effect at the next model call after it is ready.
 Nothing is restarted: tool results, approvals and call order stay as they were, and no tool runs twice.
 Only when the next request would be over the request budget does the call wait for the summary.
 
@@ -906,11 +907,38 @@ They use the backend's configured request timeout.
 Completed summary calls keep their reported usage even if a later segment is cancelled. Provider errors or cancellation of an in-flight call may leave that call's usage unknown; estimates are not substituted for it.
 There is one summary in flight at a time and no automatic retry.
 
-Summaries replace history only in what the model is sent.
+In ordinary sessions, automatic summaries replace history only in what the model is sent.
 The transcript, `/print` and tool-result records keep every original message.
 Summaries are local to the running turn; a later turn may summarize its selected history again.
 They do not change which summaries other agents or peers consume.
 The summary is labelled as a record of earlier messages, not instructions; that framing does not guarantee a summary is faithful.
+
+### Durable citations and cache timing in the fenced fixture
+
+The [fenced ConversationStore fixture](../architecture/sessions.md#conversationstore-v1-reads-and-fenced-writer-fixtures) reuses an applied fold on later turns.
+Its automatic summaries carry a host-assigned `cr1:` reference with a range of source indices.
+An index addresses one covered user or assistant message, including older messages covered by a superseded fold.
+The reader resolves it against the signed replacement at the accepted session history, then checks the current recovery tool grant, extension activation and session membership.
+An assistant message with tool calls also requires visibility of every source tool, since removing a field would no longer be exact recall.
+The returned bytes are the original stored JSON fact, not a reformatted transcript, a raw provider response or a second archive.
+Legacy summaries and manually written summaries don't gain citations.
+
+With `cache_aware: true` in the fixture, the normal size trigger still applies.
+At the first call of a turn, known expiry and projected savings may justify preparing and applying the fold before sending the request.
+During a turn, a recent provider-reported cache hit or write and enough projected future calls may justify background preparation despite a cache rewrite.
+Both estimates include the full summary prompt and the bounded output, not stand-in prices.
+An in-budget request can proceed unchanged if preparation is deferred or fails.
+At hard pressure, a fully priced eligible fold does not need to pay for itself, but an unknown price or lifetime still prevents preparation and an oversized request is never sent.
+The policy doesn't warm caches or prove provider savings.
+
+In a disposable fenced session, say the summary provides `cr1:…:<index>, indices 0 through 2`.
+
+1. With `context_prune` active and `tool_history_query` allowed, substitute the complete prefix from the summary and use index `0`: `{"reference":"cr1:…:0","offset":0}`.
+   The tool reports `"status":"retained"` and a page of the original JSON bytes. Append the decoded `content` strings and follow `next_offset` until it is `null`.
+2. Reopen the session; the same reference still works. If you remove the original source tool from the allowlist, a cited assistant message that called it returns `"status":"missing_or_not_authorized"` instead.
+   Restore the grant to read it again; a reference from a different session stays unavailable.
+3. If the test route is missing `cache_lifetime_seconds`, an above-trigger but in-budget turn sends its original context and `/autocompact` reports `Last: timing-deferred — cache-aware preparation needs scoped history, valid cache prices and a known lifetime`.
+   Supply verified [model cache metadata](configuration.md#per-model-cache-metadata) before testing the priced path; no production session can opt into the fenced writer here.
 
 ### Failure modes
 

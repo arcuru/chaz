@@ -533,6 +533,8 @@ async fn toolbar_context_reopen_honors_pins_and_refreshes_runtime_budget() {
         price_input: None,
         price_output: None,
         price_cache_read: None,
+        price_cache_write: None,
+        cache_lifetime_seconds: None,
         context_window: Some(64_000),
     }]);
     let mut secondary = Backend::new(BackendType::OpenAICompatible);

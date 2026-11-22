@@ -251,6 +251,10 @@ pub struct ModelInfo {
     pub price_output: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub price_cache_read: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub price_cache_write: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_lifetime_seconds: Option<u64>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub input_modalities: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -536,6 +540,9 @@ impl BackendManager {
                 info.price_input = info.price_input.or(cache.price_input);
                 info.price_output = info.price_output.or(cache.price_output);
                 info.price_cache_read = info.price_cache_read.or(cache.price_cache_read);
+                info.price_cache_write = info.price_cache_write.or(cache.price_cache_write);
+                info.cache_lifetime_seconds =
+                    info.cache_lifetime_seconds.or(cache.cache_lifetime_seconds);
                 Some(info)
             }
             (info, cache) => info.or(cache),
@@ -838,6 +845,8 @@ mod tests {
                     price_input: None,
                     price_output: None,
                     price_cache_read: None,
+                    price_cache_write: None,
+                    cache_lifetime_seconds: None,
                     context_window: None,
                 })
                 .collect(),
@@ -1229,6 +1238,8 @@ mod tests {
                 price_input: None,
                 price_output: None,
                 price_cache_read: None,
+                price_cache_write: None,
+                cache_lifetime_seconds: None,
                 context_window: None,
             }]);
             let manager = BackendManager::new(&Some(vec![config]), empty_secrets().await);
