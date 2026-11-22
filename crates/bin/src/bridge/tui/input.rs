@@ -1346,7 +1346,7 @@ pub(super) fn handle_settings_key(
             super::PeerSettingsCategory::ALL.get(cur),
             Some(super::PeerSettingsCategory::Extensions)
         )
-        && key.code == KeyCode::Char('e')
+        && matches!(key.code, KeyCode::Enter | KeyCode::Char('e'))
         && !key
             .modifiers
             .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)

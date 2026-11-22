@@ -259,6 +259,7 @@ pub(super) fn handle_key(sheet: &mut Option<Sheet>, key: KeyEvent) -> Option<Req
                 s.mode = Mode::Edit(draft);
             }
             KeyCode::Char('r') if s.selected().is_some_and(|r| r.present && r.editable) => {
+                s.notice = None;
                 s.mode = Mode::ConfirmReset;
             }
             KeyCode::Esc => {
