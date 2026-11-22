@@ -597,6 +597,16 @@ pub trait Tool: Send + Sync {
         ctx: &'a ToolContext,
     ) -> Pin<Box<dyn Future<Output = Result<String, ToolError>> + Send + 'a>>;
 
+    /// Execute with the host-selected context edit capability, if any.
+    fn execute_in_turn<'a>(
+        &'a self,
+        arguments: Value,
+        ctx: &'a ToolContext,
+        _compact: Option<&'a dyn crate::session::CompactToolScope>,
+    ) -> Pin<Box<dyn Future<Output = Result<String, ToolError>> + Send + 'a>> {
+        self.execute(arguments, ctx)
+    }
+
     /// Default policy for this tool. Config overrides merge into it field by field.
     /// Built-in tools override this with sensible defaults (e.g., shell → High/Always/no deadline).
     /// Config-level policy always takes precedence.

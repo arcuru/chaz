@@ -47,6 +47,10 @@ pub enum RuntimeEvent {
 
 /// Awaited persistence boundary for completed runtime messages.
 pub trait RuntimeRecorder: Send + Sync {
+    fn context_compaction(&self) -> Option<&dyn crate::session::ContextCompaction> {
+        None
+    }
+
     /// Check recorder admission before runtime hooks or effects.
     fn begin_turn(&self, _resuming: bool) -> Result<(), String> {
         Ok(())
@@ -919,6 +923,7 @@ impl<'a> RoundProjector<'a> {
         backend: &BackendManager,
         model: Option<&str>,
         initial: &[RuntimeMessage],
+        recorder: &Option<Arc<dyn RuntimeRecorder>>,
     ) -> Result<(), String> {
         if !self
             .tool_ctx
@@ -945,7 +950,27 @@ impl<'a> RoundProjector<'a> {
         )
         .map(Box::new);
         if let Some(compactor) = &mut self.compactor {
-            compactor.bind_session(db).await?;
+            if let Some(recorder) = recorder
+                .as_ref()
+                .filter(|r| r.context_compaction().is_some())
+            {
+                if let Some(hub) = self.hub
+                    && !hub
+                        .active_extensions_for_call(
+                            &self.tool_ctx.agent_name,
+                            Some(&db),
+                            &self.tool_ctx.active_extensions,
+                        )
+                        .await
+                        .contains(crate::extensions::autocompact::NAME)
+                {
+                    self.compactor = None;
+                    return Ok(());
+                }
+                compactor.bind_scope(recorder.clone(), db).await?;
+            } else {
+                compactor.bind_session(db).await?;
+            }
         }
         Ok(())
     }
@@ -1166,10 +1191,24 @@ impl<'a> RoundProjector<'a> {
         if let Some(compactor) = &mut self.compactor {
             compactor.refresh(messages, &sources, tools).await?;
         }
-        let projected = loop {
+        let compaction = recorder
+            .as_deref()
+            .and_then(RuntimeRecorder::context_compaction);
+        let (projected, prepared_sources) = loop {
             // Always start from the original vector. Projector additions and
             // context tails are never fed back into the summarizer's source.
-            let compacted = self.compactor.as_ref().map(|c| c.view(messages, &sources));
+            let compacted = if let Some(scope) = compaction {
+                let edits = scope
+                    .replacements()
+                    .await
+                    .map_err(|error| error.to_string())?;
+                if let Some(compactor) = &mut self.compactor {
+                    compactor.note_replacements(&edits);
+                }
+                autocompact::committed_view(messages, &sources, &edits)?
+            } else {
+                self.compactor.as_ref().map(|c| c.view(messages, &sources))
+            };
             let (view_messages, view_sources, view_cache) = match &compacted {
                 Some(view) => (
                     view.messages.as_slice(),
@@ -1179,8 +1218,21 @@ impl<'a> RoundProjector<'a> {
                 None => (messages, sources.clone(), self.scope.cache.clone()),
             };
             let mut projected = self
-                .project(view_messages, view_sources, &view_cache, tools, model_round)
+                .project(
+                    view_messages,
+                    view_sources.clone(),
+                    &view_cache,
+                    tools,
+                    model_round,
+                )
                 .await?;
+            let signed_sources = if projected.is_some()
+                || (compaction.is_none() && compacted.as_ref().is_some_and(|view| view.compacted))
+            {
+                None
+            } else {
+                Some(view_sources)
+            };
             if projected.is_none() && compacted.as_ref().is_some_and(|v| v.compacted) {
                 projected = Some(ProjectedRequest {
                     cache: view_cache,
@@ -1202,7 +1254,7 @@ impl<'a> RoundProjector<'a> {
             };
             self.record_autocompact_status().await;
             if !wait? {
-                break projected;
+                break (projected, signed_sources);
             }
         };
         // Final, complete-envelope gate is never waived for compaction.
@@ -1238,7 +1290,7 @@ impl<'a> RoundProjector<'a> {
                     observation: observation.clone(),
                     messages,
                     baseline,
-                    sources: projected.is_none().then_some(sources.as_slice()),
+                    sources: prepared_sources.as_deref(),
                     tools,
                     cache,
                     max_retries,
@@ -1478,7 +1530,7 @@ async fn run_turn(
     )
     .await;
     // Boxed: keeps the settings read off this already large future.
-    Box::pin(projector.enable_autocompact(backend, model, &initial_messages)).await?;
+    Box::pin(projector.enable_autocompact(backend, model, &initial_messages, &recorder)).await?;
 
     let result = Box::pin(run_prepared_turn(
         model,
@@ -1497,7 +1549,7 @@ async fn run_turn(
     ))
     .await;
     if let Some(compactor) = &mut projector.compactor {
-        compactor.finish_turn().await;
+        Box::pin(compactor.finish_turn()).await;
         projector.record_autocompact_status().await;
     }
     result
@@ -2424,11 +2476,15 @@ async fn invoke_tool(
                 deadline
             }
         });
+        let compaction = (name == "compact")
+            .then_some(checkpoint)
+            .flatten()
+            .and_then(|(recorder, _, _)| recorder.context_compaction())
+            .map(crate::session::ContextCompaction::tool_scope);
+        let execute = tool.execute_in_turn(args, &call_ctx, compaction);
         let result = match outer_deadline {
-            Some(deadline) => {
-                tokio::time::timeout_at(deadline, tool.execute(args, &call_ctx)).await
-            }
-            None => Ok(tool.execute(args, &call_ctx).await),
+            Some(deadline) => tokio::time::timeout_at(deadline, execute).await,
+            None => Ok(execute.await),
         };
         // Outside the tool timeout: success, error and timeout
         // all regain capacity before hooks, another tool in

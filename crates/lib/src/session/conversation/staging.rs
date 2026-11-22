@@ -6,7 +6,10 @@ use super::{
     ConversationError, ConversationRead, ConversationStore, ReadAtoms, Result, STORE, atom, open,
     provenance, view,
 };
-use crate::session::SessionContextView;
+use crate::{
+    runtime::RuntimeMessage,
+    session::{ContextReplacement, SessionContextView, history::HistoryBody},
+};
 use eidetica::{Database, Snapshot, Transaction};
 use serde::Serialize;
 
@@ -16,6 +19,7 @@ use super::record::{
 #[cfg(test)]
 pub(in crate::session) use super::turn::AcceptedInput;
 pub(in crate::session) use super::{
+    compaction::{Intent as CompactionIntent, Settlement as CompactionSettlement},
     provenance::{Accounting, CallStatus, Observation},
     record::{MessageRole, NativeResponse, Payload, ToolCallId, ToolExecutionId, View},
     turn::{AcceptedValue, Completion},
@@ -32,7 +36,16 @@ pub(in crate::session) async fn stage_descriptor(
     txn: &Transaction,
     db: &Database,
     at: &Snapshot,
+    compaction: bool,
 ) -> Result<()> {
+    let mut required_operations = std::collections::BTreeSet::from([
+        "append-v1".into(),
+        "replace-v1".into(),
+        contract::FENCED_TURN.into(),
+    ]);
+    if compaction {
+        required_operations.insert(contract::FENCED_COMPACTION.into());
+    }
     atom_in(
         &txn.get_store::<contract::ContractStore>(contract::STORE)
             .await?,
@@ -41,12 +54,7 @@ pub(in crate::session) async fn stage_descriptor(
             encoding: 1,
             context_semantics: 1,
             renderer: 1,
-            required_operations: [
-                "append-v1".into(),
-                "replace-v1".into(),
-                contract::FENCED_TURN.into(),
-            ]
-            .into(),
+            required_operations,
             legacy: contract::LegacyBoundary {
                 database: db.root_id().to_string(),
                 frontier: at.clone(),
@@ -167,6 +175,14 @@ impl<'a> Staging<'a> {
         Ok(&view::fact(id, &self.read.operations)?.payload)
     }
 
+    pub fn validate_preparation(&self, input: &super::CallInput) -> Result<()> {
+        provenance::validate_selection(
+            &self.read.effective()?,
+            &input.representations,
+            &input.messages,
+        )
+    }
+
     pub fn context(&self) -> Result<SessionContextView> {
         self.read.context()
     }
@@ -175,4 +191,110 @@ impl<'a> Staging<'a> {
         view::validate_at_observed(op, &self.read.operations, &self.read.legacy)?;
         atom_in(&self.txn.get_store::<ConversationStore>(STORE).await?, op).await
     }
+}
+
+impl Staging<'_> {
+    #[cfg(test)]
+    pub fn has_branch(&self, branch: &str) -> bool {
+        self.read
+            .operations
+            .values()
+            .any(|op| op.branch_id == branch)
+    }
+
+    #[cfg(test)]
+    pub fn supports_compaction(&self) -> bool {
+        self.read.fenced_compaction
+    }
+
+    pub fn compactions(&self) -> &[CompactionIntent] {
+        &self.read.provenance.compactions
+    }
+
+    pub fn historical_members(
+        &self,
+        input: &RepresentationId,
+    ) -> Result<Vec<(RuntimeMessage, RepresentationId)>> {
+        let mut members = Vec::new();
+        for group in self.context()?.groups {
+            if group.representation.as_ref() == Some(input) {
+                return Ok(members);
+            }
+            if let HistoryBody::Recorded { messages, .. } = group.body {
+                members.extend(messages);
+            }
+        }
+        Err(ConversationError::Missing(
+            "accepted input in context selection".into(),
+        ))
+    }
+
+    pub fn validate_compaction(&self, intent: &CompactionIntent) -> Result<()> {
+        if !self.read.fenced_compaction || intent.observed != self.observed {
+            return Err(ConversationError::InvalidScope(
+                "compaction source binding".into(),
+            ));
+        }
+        super::compaction::validate_selection(
+            &self.read.effective()?,
+            &intent.input,
+            &intent.targets,
+        )
+    }
+
+    pub fn compact_tool_summary(&self, tool: &ToolCallId) -> Option<String> {
+        super::compaction::tool_summary(&self.read.operations, tool)
+    }
+
+    pub async fn replace_context(
+        &self,
+        write: &Transaction,
+        intent: &CompactionIntent,
+        summary: String,
+    ) -> Result<ContextReplacement> {
+        self.validate_compaction(intent)?;
+        if summary.trim().is_empty() {
+            return Err(ConversationError::Malformed(
+                "empty compaction summary".into(),
+            ));
+        }
+        let mut op = self.operation(OperationKind::Replace, intent.targets.clone())?;
+        op.op_id.clone_from(&intent.id);
+        op.facts.push(Fact {
+            payload_version: 1,
+            payload: Payload::TransformationOutput {
+                text: summary.clone(),
+            },
+        });
+        op.outputs.push(Representation {
+            fact: op.fact_id(0),
+            view: View::Summary,
+            decoder_version: 1,
+        });
+        view::validate_at_observed(&op, &self.read.operations, &self.read.legacy)?;
+        atom_in(&write.get_store::<ConversationStore>(STORE).await?, &op).await?;
+        Ok(ContextReplacement {
+            targets: intent.targets.clone(),
+            summary: op.representation_id(0),
+            text: summary,
+        })
+    }
+}
+
+/// Conflict preflight, not a CAS. A replacement racing this read can still
+/// land on a sibling; signed joined readers refuse ambiguous effective context.
+pub(in crate::session) async fn current_targets(
+    db: &Database,
+    targets: &[RepresentationId],
+) -> Result<bool> {
+    let at = db.snapshot().await?;
+    let txn = db.new_transaction_at(&at).await?;
+    let read = Box::pin(open(db, &at, &txn)).await?;
+    if let Some(issue) = read.inspection.issues.first() {
+        return Err(issue.clone());
+    }
+    Ok(!read
+        .operations
+        .values()
+        .any(|op| op.targets.iter().any(|id| targets.contains(id))))
 }

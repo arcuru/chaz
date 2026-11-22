@@ -1,5 +1,7 @@
 //! Call preparation evidence, pinned to signed ancestry. No replay authority.
-use super::{Ancestry, ConversationError as Error, Result, atom, record::*, turn, view};
+use super::{
+    Ancestry, ConversationError as Error, Result, atom, compaction, record::*, turn, view,
+};
 use crate::session::usage::{CallEvidence, CallObservation};
 use eidetica::{Database, Snapshot, Transaction};
 use serde::{Deserialize, Serialize};
@@ -72,6 +74,13 @@ pub enum CallStatus {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", deny_unknown_fields)]
 pub(in crate::session) enum Observation {
+    CompactionIntent {
+        intent: compaction::Intent,
+    },
+    CompactionSettled {
+        id: String,
+        status: compaction::Settlement,
+    },
     InputAccepted {
         input: turn::AcceptedInput,
     },
@@ -121,7 +130,10 @@ pub(super) struct Record {
 impl Observation {
     fn call_key(&self) -> Option<(&CallId, &str, u8)> {
         Some(match self {
-            Self::InputAccepted { .. } | Self::TurnCompleted { .. } => return None,
+            Self::InputAccepted { .. }
+            | Self::TurnCompleted { .. }
+            | Self::CompactionIntent { .. }
+            | Self::CompactionSettled { .. } => return None,
             Self::Prepared { input } => (&input.call, &input.attempt, 0),
             Self::DispatchIntent { call, attempt } => (call, attempt, 1),
             Self::Outcome { call, attempt, .. } => (call, attempt, 2),
@@ -133,6 +145,7 @@ impl Observation {
 pub(super) struct Evidence {
     pub calls: BTreeMap<(CallId, String), CallInput>,
     pub accounting: Vec<CallEvidence>,
+    pub compactions: Vec<compaction::Intent>,
 }
 
 pub(super) async fn read(
@@ -147,6 +160,8 @@ pub(super) async fn read(
     let mut records = BTreeMap::new();
     let mut inputs = BTreeMap::new();
     let mut completions = BTreeMap::new();
+    let mut intents = BTreeMap::new();
+    let mut settlements = BTreeMap::new();
     for entry in &entries {
         for (hash, text) in originals.delta(entry, STORE)? {
             let record = match atom::decode_v1::<Record>(&text) {
@@ -158,6 +173,12 @@ pub(super) async fn read(
             };
             let Some((call, attempt, kind)) = record.observation.call_key() else {
                 let conflict = match record.observation {
+                    Observation::CompactionIntent { intent } => {
+                        intents.insert(intent.id.clone(), (entry, intent)).is_some()
+                    }
+                    Observation::CompactionSettled { id, status } => {
+                        settlements.insert(id, (entry, status)).is_some()
+                    }
                     Observation::InputAccepted { input } => {
                         inputs.insert(input.request(), (entry, input)).is_some()
                     }
@@ -197,7 +218,9 @@ pub(super) async fn read(
         return Ok((originals, evidence));
     }
     let fenced = conversation.fenced_turn;
-    if (fenced && inputs.len() != usize::from(!conversation.operations.is_empty()))
+    if (fenced
+        && (!conversation.fenced_compaction && inputs.len() > 1
+            || inputs.is_empty() != conversation.operations.is_empty()))
         || (!fenced && (!inputs.is_empty() || !completions.is_empty()))
     {
         originals.issues.push(Error::Integrity(
@@ -342,7 +365,10 @@ pub(super) async fn read(
                         })
                     }
                 }
-                Observation::InputAccepted { .. } | Observation::TurnCompleted { .. } => {
+                Observation::InputAccepted { .. }
+                | Observation::TurnCompleted { .. }
+                | Observation::CompactionIntent { .. }
+                | Observation::CompactionSettled { .. } => {
                     unreachable!()
                 }
             };
@@ -357,6 +383,7 @@ pub(super) async fn read(
         }
     }
     let mut publications = BTreeSet::new();
+    let mut completed = BTreeMap::new();
     for (entry, completion) in completions.values() {
         let check = async {
             Box::pin(turn::validate_completion(
@@ -385,11 +412,25 @@ pub(super) async fn read(
             originals.issues.push(error);
         } else {
             publications.insert(completion.publication.as_str());
+            completed.insert(completion.attempt.as_str(), *entry);
         }
     }
+    match compaction::validate(
+        conversation,
+        ancestry,
+        &inputs,
+        &completed,
+        &evidence.calls,
+        &intents,
+        &settlements,
+    ) {
+        Ok(applied) => publications.extend(applied),
+        Err(error) => originals.issues.push(error),
+    }
+    evidence.compactions = intents.values().map(|(_, intent)| intent.clone()).collect();
     if let Err(error) = turn::validate_operations(
         conversation,
-        inputs.values().next().map(|(_, input)| input),
+        inputs.values().map(|(_, input)| input),
         &responses,
         &publications,
         &accepted_values,
@@ -525,7 +566,7 @@ fn validate_input(
     Ok(())
 }
 
-fn validate_selection(
+pub(super) fn validate_selection(
     selected: &view::ConversationView,
     mut ids: &[RepresentationId],
     messages: &[CallMessageBinding],

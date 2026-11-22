@@ -44,7 +44,7 @@ The runtime owns source selection and application:
 
 ## Limits
 
-- Summaries are not persisted. A later turn that is still over the trigger summarizes its history again; persisting a precise-coverage summary across turns and agents needs a coverage and ownership contract for shared sessions.
+- In ordinary sessions automatic summaries remain per-turn. Only the [fenced ConversationStore fixture](../architecture/sessions.md#conversationstore-v1-reads-and-fenced-writer-fixtures) persists automatic replacements; there is no session setting that enables that writer.
 - Token counts are Chaz's local estimate (`cl100k_base` plus envelope overhead), not the provider's tokenizer. If discovery has no model window, the configured request budget also bounds auxiliary input plus output. Provider usage is shown only for the summary calls themselves.
 - Background summary calls share the active turn's authorized backend/model and configured access limits; they do not acquire a separate executor slot.
-- This adds no session entry or command wire variant. Existing and rollback readers ignore the opaque extension settings/status stores; native snapshot summaries remain the history-selection boundary.
+- Ordinary sessions still use native snapshot summaries as their persisted history-selection boundary. The fixture records one automatic history range at a time, protects the current attempt, and never retries an intent with the same targets; an intent without settlement is not evidence that no model call occurred.

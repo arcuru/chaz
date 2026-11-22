@@ -41,6 +41,15 @@ impl Tool for Compact {
         arguments: Value,
         ctx: &'a ToolContext,
     ) -> Pin<Box<dyn Future<Output = Result<String, crate::tool::ToolError>> + Send + 'a>> {
+        self.execute_in_turn(arguments, ctx, None)
+    }
+
+    fn execute_in_turn<'a>(
+        &'a self,
+        arguments: Value,
+        ctx: &'a ToolContext,
+        compact: Option<&'a dyn crate::session::CompactToolScope>,
+    ) -> Pin<Box<dyn Future<Output = Result<String, crate::tool::ToolError>> + Send + 'a>> {
         Box::pin(async move {
             let summary = arguments
                 .get("summary")
@@ -49,6 +58,24 @@ impl Tool for Compact {
 
             if summary.trim().is_empty() {
                 return Err("Summary cannot be empty".into());
+            }
+            if let Some(compact) = compact {
+                let site = ctx
+                    .tool_call_site
+                    .as_ref()
+                    .ok_or_else(|| "Missing compact invocation".to_string())?;
+                let targets = compact
+                    .targets(site)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                if targets.is_empty() {
+                    return Err("No completed history was selected for compaction".into());
+                }
+                compact
+                    .replace(site, targets, summary.into())
+                    .await
+                    .map_err(|error| error.to_string())?;
+                return Ok("Context compacted. Summary written to session; current input and tool exchanges retained.".into());
             }
 
             let entry = SessionEntry {

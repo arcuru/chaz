@@ -8,6 +8,7 @@ use super::{Ancestry, ConversationError, Originals, Result, atom};
 
 pub(super) const STORE: &str = "conversation_contract_v1";
 pub(super) const FENCED_TURN: &str = "fenced-turn-v1";
+pub(super) const FENCED_COMPACTION: &str = "fenced-compaction-v1";
 
 /// Context-owned legacy semantic stores covered by this reader increment.
 /// Job/input/auxiliary conversion and full write-door integration remain pending;
@@ -64,6 +65,9 @@ impl Descriptor {
         if self.fenced_turn() {
             supported.insert(FENCED_TURN.into());
         }
+        if self.fenced_turn() && self.fenced_compaction() {
+            supported.insert(FENCED_COMPACTION.into());
+        }
         if self.required_operations != supported {
             return Err(ConversationError::Unsupported(
                 "required conversation operation capabilities".into(),
@@ -73,6 +77,10 @@ impl Descriptor {
             return Err(ConversationError::InvalidScope("legacy boundary".into()));
         }
         Ok(())
+    }
+
+    pub(super) fn fenced_compaction(&self) -> bool {
+        self.required_operations.contains(FENCED_COMPACTION)
     }
 
     pub(super) fn fenced_turn(&self) -> bool {
