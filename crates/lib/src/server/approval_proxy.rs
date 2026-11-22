@@ -59,7 +59,7 @@ pub async fn spawn_session_db_approval_proxy(
 
     // Watch the session DB; every write pings the resolver to rescan decisions.
     let (ping_tx, mut ping_rx) = mpsc::channel::<()>(32);
-    match session_db
+    let subscription = match session_db
         .on_write(move |event, _db| {
             // Source-agnostic on purpose: the decision this proxy is waiting
             // for is written by the bridge, which on a split deployment is a
@@ -73,12 +73,12 @@ pub async fn spawn_session_db_approval_proxy(
         })
         .await
     {
-        Ok(sub) => sub.detach(),
-        Err(e) => warn!(
-            session = %sid,
-            "approval proxy could not watch session DB ({e}); approvals will time out to deny"
-        ),
-    }
+        Ok(sub) => Some(sub),
+        Err(e) => {
+            warn!(session = %sid, "approval proxy could not watch session DB ({e}); approvals will time out to deny");
+            None
+        }
+    };
 
     // Resolver: on each write, match landed decisions to blocked requests.
     {
@@ -86,6 +86,7 @@ pub async fn spawn_session_db_approval_proxy(
         let db = session_db.clone();
         let sid = sid.clone();
         tasks.push(tokio::spawn(async move {
+            let _subscription = subscription;
             while ping_rx.recv().await.is_some() {
                 while ping_rx.try_recv().is_ok() {} // debounce a burst
                 let session = Session::new(ConversationId(sid.clone()), db.clone()).await;

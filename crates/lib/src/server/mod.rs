@@ -48,6 +48,7 @@ mod agent_config;
 mod approval_proxy;
 pub use agent_config::AgentConfigOutcome;
 mod build;
+mod exposed_sessions;
 mod job_monitor;
 mod jobs;
 pub use job_monitor::{JobMonitor, JobMonitorNode};
@@ -850,8 +851,8 @@ impl Server {
     }
 
     /// Whether this server already watches the given session (its `on_write`
-    /// is installed and runtime state stored). Lets the agent-registry watcher
-    /// skip re-opening sessions it has already registered.
+    /// is installed and transport state stored). This does not imply a
+    /// runtime claim.
     pub async fn is_watching_session(&self, session_db_id: &str) -> bool {
         self.watched.lock().await.contains(session_db_id)
     }
@@ -1758,6 +1759,21 @@ impl Server {
         agent_override: Option<String>,
         approval_tx: Option<mpsc::Sender<ApprovalExchange>>,
     ) -> anyhow::Result<()> {
+        let registration = self
+            .registration_lock(&session_db.root_id().to_string())
+            .await;
+        let _registration = registration.lock().await;
+        self.watch_session_locked(session_db, backend, agent_override, approval_tx)
+            .await
+    }
+
+    async fn watch_session_locked(
+        &self,
+        session_db: &eidetica::Database,
+        backend: BackendManager,
+        agent_override: Option<String>,
+        approval_tx: Option<mpsc::Sender<ApprovalExchange>>,
+    ) -> anyhow::Result<()> {
         let session_db_id = session_db.root_id().to_string();
 
         {
@@ -1779,12 +1795,9 @@ impl Server {
             );
         }
 
-        let mut watched = self.watched.lock().await;
-        if watched.contains(&session_db_id) {
+        if self.is_watching_session(&session_db_id).await {
             return Ok(());
         }
-        watched.insert(session_db_id.clone());
-        drop(watched);
 
         let tx = self.notify_tx.clone();
         let sid = session_db_id.clone();
@@ -1793,7 +1806,7 @@ impl Server {
         // the catch-up read. The persisted request state decides what runs.
         let observed_tips = session_db.snapshot().await?;
         let catch_up_tips = observed_tips.clone();
-        session_db
+        let subscription = session_db
             .on_write_at_tips(observed_tips, move |event, _db| {
                 // Deliberately not gated on the source. A co-owner pushing
                 // into a shared session arrives as `Remote`, and that has to
@@ -1809,10 +1822,7 @@ impl Server {
                     Ok(())
                 })
             })
-            .await?
-            .detach();
-
-        info!(session_db_id = %session_db_id, "Server watching session (transport)");
+            .await?;
 
         // Reconcile once, now that the callback is installed. Entries written
         // while this session was unwatched are already in the database and no
@@ -1859,7 +1869,19 @@ impl Server {
             debug!(session_db_id = %session_db_id, "No processing loop; skipping catch-up");
         }
 
+        self.watched.lock().await.insert(session_db_id.clone());
+        subscription.detach();
+        info!(session_db_id = %session_db_id, "Server watching session (transport)");
         Ok(())
+    }
+
+    async fn registration_lock(&self, session_db_id: &str) -> Arc<Mutex<()>> {
+        self.registration_locks
+            .lock()
+            .await
+            .entry(session_db_id.to_owned())
+            .or_default()
+            .clone()
     }
 
     /// Register a session for callback-driven agent processing.
@@ -1874,34 +1896,61 @@ impl Server {
         agent_override: Option<String>,
         approval_tx: Option<mpsc::Sender<ApprovalExchange>>,
     ) -> anyhow::Result<()> {
+        let registration = self
+            .registration_lock(&session_db.root_id().to_string())
+            .await;
+        let _registration = registration.lock().await;
+        self.prepare_session_registration(session_db).await?;
+        self.claim_and_watch_session(session_db, backend, agent_override, approval_tx)
+            .await
+    }
+
+    async fn prepare_session_registration(
+        &self,
+        session_db: &eidetica::Database,
+    ) -> anyhow::Result<()> {
         if !self.executor_authorized {
             anyhow::bail!("server has no executor loop");
         }
         if crate::session::jobs::is_job_session(session_db).await {
             anyhow::bail!("job session requires executor admission");
         }
+        let session = Session::new(
+            ConversationId(session_db.root_id().to_string()),
+            session_db.clone(),
+        )
+        .await;
+        session.ensure_turn_schema_baseline().await
+    }
+
+    /// Called with the per-session registration lock, after preparation and
+    /// any caller-specific admission checks.
+    async fn claim_and_watch_session(
+        &self,
+        session_db: &eidetica::Database,
+        backend: BackendManager,
+        agent_override: Option<String>,
+        approval_tx: Option<mpsc::Sender<ApprovalExchange>>,
+    ) -> anyhow::Result<()> {
         let session_db_id = session_db.root_id().to_string();
-        let registration = self
-            .registration_locks
-            .lock()
-            .await
-            .entry(session_db_id.clone())
-            .or_default()
-            .clone();
-        let _registration = registration.lock().await;
-        let session = Session::new(ConversationId(session_db_id), session_db.clone()).await;
-        session.ensure_turn_schema_baseline().await?;
         let agent_name = agent_override
             .clone()
             .unwrap_or_else(|| "agent".to_string());
         // Initialize extension activation before installing callbacks or queuing
         // catch-up. A resumed wait consumes its checkpoint once per process,
         // even if required context selection refuses the uninitialized set.
-        self.claim_runtime(session_db, agent_name, 0, self.runtime_mode())
+        let claimed = self
+            .claim_runtime(session_db, agent_name, 0, self.runtime_mode())
             .await?;
-        self.watch_session(session_db, backend, agent_override, approval_tx)
-            .await?;
-        Ok(())
+        let watched = self
+            .watch_session_locked(session_db, backend, agent_override, approval_tx)
+            .await;
+        if watched.is_err() && claimed {
+            // A failed watch is not an adopted session. Allow a subsequent
+            // registration to finish without losing to its own partial claim.
+            self.runtime_lease.release(&session_db_id);
+        }
+        watched
     }
 
     /// List interrupted attempts that require an explicit retry decision.
@@ -4292,6 +4341,8 @@ impl Drop for ActivityHeartbeat {
     }
 }
 
+#[cfg(test)]
+mod exposed_sessions_tests;
 #[cfg(test)]
 mod hosted_restart_tests;
 #[cfg(test)]
