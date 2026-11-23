@@ -20,6 +20,55 @@ use tracing::{info, warn};
 
 use super::{AgentRef, SessionRegistry, parse_mentions, read_meta_from_db, update_meta_on_db};
 
+/// Recheck model-visible observation access with the current Agent key,
+/// not the potentially more privileged peer session handle.
+pub(crate) async fn require_session_participant(
+    db: &Database,
+    agent_name: &str,
+    agent_identity: Option<&DbEntry>,
+) -> anyhow::Result<()> {
+    let txn = db.new_transaction().await?;
+    let meta = txn.get_store::<eidetica::store::DocStore>("meta").await?;
+    let agents: Vec<AgentRef> = match meta.get_string("agents").await {
+        Ok(value) => serde_json::from_str(&value)?,
+        Err(error) if error.is_not_found() => vec![],
+        Err(error) => return Err(error.into()),
+    };
+    let legacy = match meta.get_string("agent_name").await {
+        Ok(value) => Some(value),
+        Err(error) if error.is_not_found() => None,
+        Err(error) => return Err(error.into()),
+    };
+    // Membership lives in AuthSettings, not the readable roster cache.
+    // Revoked agent keys remain present after last-member detach; that
+    // modern session must never fall through to legacy authorization.
+    let auth = db.get_settings().await?.auth_snapshot().await?;
+    let keys = auth.get_all_keys()?;
+    let caller_key = agent_identity.and_then(|agent| keys.get(&agent.pubkey.to_string()));
+    let modern = !agents.is_empty()
+        || caller_key.is_some()
+        || keys
+            .values()
+            .any(|key| key.name().is_some_and(|name| name.starts_with("agent:")));
+    let authorized = if modern {
+        agent_identity.is_some_and(|agent| agent.display_name == agent_name)
+            && caller_key.is_some_and(|key| {
+                matches!(key.status(), eidetica::auth::types::KeyStatus::Active)
+                    && matches!(
+                        key.permissions(),
+                        eidetica::auth::types::Permission::Write(_)
+                    )
+            })
+    } else {
+        // Explicit pre-Living-Agent compatibility: no roster or agent
+        // membership keys have ever been recorded, and the legacy name
+        // (when present) matches. Modern sessions never use this fallback.
+        legacy.as_deref().is_none_or(|name| name == agent_name)
+    };
+    anyhow::ensure!(authorized, "caller is no longer a session participant");
+    Ok(())
+}
+
 impl SessionRegistry {
     /// Ensure `agent` is attached to the session and is its host. Called by
     /// a bridge when a fresh room maps to this session: a login belongs to

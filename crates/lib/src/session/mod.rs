@@ -31,6 +31,7 @@ use tracing::{error, info, warn};
 #[cfg(test)]
 mod activity_tests;
 mod agents;
+pub(crate) use agents::require_session_participant;
 mod bridge_event;
 mod context_compaction;
 mod conversation;

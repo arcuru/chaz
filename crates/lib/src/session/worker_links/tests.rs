@@ -240,7 +240,35 @@ async fn worker_links_validate_exact_call_and_backlink_without_copying_payloads(
     )
     .await;
     assert!(conflict.is_err());
-    assert_eq!(worker_spawns(&parent).await.unwrap(), [spawn]);
+    assert_eq!(
+        worker_spawns(&parent).await.unwrap(),
+        std::slice::from_ref(&spawn)
+    );
+    assert_eq!(
+        joinable_worker_spawn(&parent, &spawn.child_session_id, &call())
+            .await
+            .unwrap(),
+        spawn
+    );
+    // Damaged or converged parent evidence can contain two references even
+    // though native submission refuses them. Do not pick the first match.
+    let duplicate = WorkerSpawn {
+        spawn_id: "duplicate".into(),
+        ..spawn.clone()
+    };
+    let txn = parent.new_transaction().await.unwrap();
+    txn.get_store::<Table<WorkerSpawn>>(SPAWNS)
+        .await
+        .unwrap()
+        .set(&duplicate.spawn_id, duplicate.clone())
+        .await
+        .unwrap();
+    txn.commit().await.unwrap();
+    assert!(
+        joinable_worker_spawn(&parent, &spawn.child_session_id, &call())
+            .await
+            .is_err()
+    );
 }
 
 #[tokio::test]
@@ -484,6 +512,11 @@ async fn worker_terminal_evidence_distinguishes_stop_failure_no_reply_and_broken
                 .unwrap()
                 .state,
             "completed attempt; result unavailable"
+        );
+        assert!(
+            latest_worker_outcome(&child, &spawn.directive_id)
+                .await
+                .is_err()
         );
     }
 }

@@ -19,7 +19,7 @@ use crate::mcp::McpServerStatus;
 use crate::security::SecurityContext;
 use crate::tool::ToolPolicyRegistry;
 use crate::tools::{
-    ChazTool, Compact, JobStatusTool, JobWaitTool, ShellExec, SpawnAgent, SpawnWorker,
+    ChazTool, Compact, JobStatusTool, JobWaitTool, ShellExec, SpawnAgent, SpawnWorker, WorkerWait,
 };
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -118,6 +118,9 @@ impl ExtensionInstance for CoreInstance {
                 server: self.server_slot.clone(),
                 backend: self.backend.clone(),
                 security: self.security.clone(),
+            }),
+            Arc::new(WorkerWait {
+                server: self.server_slot.clone(),
             }),
         ]
     }

@@ -23,6 +23,15 @@ pub struct WorkerCallSite {
     pub call_id: String,
 }
 
+impl WorkerCallSite {
+    fn same_invocation(&self, other: &Self) -> bool {
+        self.request_id == other.request_id
+            && self.attempt_id == other.attempt_id
+            && self.execution_id == other.execution_id
+            && self.agent == other.agent
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkerSpawn {
     pub version: u32,
@@ -69,6 +78,31 @@ fn require_version(version: u32) -> anyhow::Result<()> {
 
 pub async fn worker_spawns(db: &Database) -> anyhow::Result<Vec<WorkerSpawn>> {
     spawns_in_txn(&db.new_transaction().await?).await
+}
+
+/// Gate a model observation before opening the supplied child ID. Even a
+/// locally readable child is not available to a different invocation.
+pub(crate) async fn joinable_worker_spawn(
+    parent: &Database,
+    child_id: &str,
+    caller: &WorkerCallSite,
+) -> anyhow::Result<WorkerSpawn> {
+    let spawns = worker_spawns(parent).await?;
+    let mut by_child = spawns
+        .iter()
+        .filter(|spawn| spawn.child_session_id == child_id);
+    let spawn = by_child
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("Worker is not linked to this parent"))?;
+    anyhow::ensure!(
+        spawn.call.same_invocation(caller)
+            && by_child.next().is_none()
+            && !spawns
+                .iter()
+                .any(|other| other.spawn_id != spawn.spawn_id && other.call == spawn.call),
+        "Worker invocation does not match or the link is ambiguous"
+    );
+    Ok(spawn.clone())
 }
 
 /// Read display references from the same snapshot as the parent transcript.
@@ -485,7 +519,7 @@ pub async fn worker_outcome(
 }
 
 /// Select by native attempt generation, not row order, timestamps or latest text.
-/// Conflicting executions remain unavailable rather than inventing a winner.
+/// Conflicting executions or missing terminal evidence remain unavailable.
 pub async fn latest_worker_outcome(
     db: &Database,
     directive: &TurnRequestId,
@@ -494,7 +528,15 @@ pub async fn latest_worker_outcome(
     let Some(attempt) = latest_attempt_in_txn(&txn, directive).await? else {
         return Ok(None);
     };
-    completed_outcome_in_txn(&txn, &attempt).await
+    if attempt.status != super::TurnAttemptStatus::Completed {
+        return Ok(None);
+    }
+    let outcome = completed_outcome_in_txn(&txn, &attempt).await?;
+    anyhow::ensure!(
+        outcome.is_some(),
+        "completed Worker has no committed outcome"
+    );
+    Ok(outcome)
 }
 
 async fn latest_attempt_in_txn(

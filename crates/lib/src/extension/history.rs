@@ -103,50 +103,12 @@ impl ScopedHistory {
             .into_iter()
             .map(|r| r.name().to_string())
             .collect();
-        let txn = self.db.new_transaction().await?;
-        let meta = txn.get_store::<eidetica::store::DocStore>("meta").await?;
-        let agents: Vec<crate::session::AgentRef> = match meta.get_string("agents").await {
-            Ok(value) => serde_json::from_str(&value)?,
-            Err(error) if error.is_not_found() => vec![],
-            Err(error) => return Err(error.into()),
-        };
-        let legacy = match meta.get_string("agent_name").await {
-            Ok(value) => Some(value),
-            Err(error) if error.is_not_found() => None,
-            Err(error) => return Err(error.into()),
-        };
-        // Membership lives in AuthSettings, not the readable roster cache.
-        // Revoked agent keys remain present after last-member detach; that
-        // modern session must never fall through to legacy authorization.
-        let auth = self.db.get_settings().await?.auth_snapshot().await?;
-        let keys = auth.get_all_keys()?;
-        let caller_key = self
-            .agent_identity
-            .as_ref()
-            .and_then(|agent| keys.get(&agent.pubkey.to_string()));
-        let modern = !agents.is_empty()
-            || caller_key.is_some()
-            || keys
-                .values()
-                .any(|key| key.name().is_some_and(|name| name.starts_with("agent:")));
-        let authorized = if modern {
-            self.agent_identity
-                .as_ref()
-                .is_some_and(|agent| agent.display_name == self.agent)
-                && caller_key.is_some_and(|key| {
-                    matches!(key.status(), eidetica::auth::types::KeyStatus::Active)
-                        && matches!(
-                            key.permissions(),
-                            eidetica::auth::types::Permission::Write(_)
-                        )
-                })
-        } else {
-            // Explicit pre-Living-Agent compatibility: no roster or agent
-            // membership keys have ever been recorded, and the legacy name
-            // (when present) matches. Modern sessions never use this fallback.
-            legacy.as_ref().is_none_or(|name| name == &self.agent)
-        };
-        anyhow::ensure!(authorized, "caller is no longer a session participant");
+        crate::session::require_session_participant(
+            &self.db,
+            &self.agent,
+            self.agent_identity.as_ref(),
+        )
+        .await?;
         anyhow::ensure!(
             !require_recovery
                 || (current.contains("context_prune") && self.active.contains("context_prune")),

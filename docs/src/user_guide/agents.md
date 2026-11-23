@@ -846,7 +846,15 @@ For a declared `researcher` Worker:
 
 1. Call `spawn_worker` with `{"name":"researcher","task":"Find the canonical reference"}`. After submission the parent yields; the child can use its slot. A successful tool result might be `Canonical reference found`. The parent regains capacity before continuing.
 2. If the child exceeds the default tool timeout, the result is `Tool timed out after 300 seconds`, delivered after capacity is reacquired. The child may still be running. Inspect the spawned session and its transcript before another invocation; timeout does not automatically retry or create a replacement child.
-3. To submit without observing, use `{"name":"researcher","task":"Find the canonical reference","async":true}`. The result is `Worker 'researcher' spawned asynchronously in session <child DB ID>`. The parent retains its slot and continues; open that session to inspect the child's work.
+3. To submit without observing, use `{"name":"researcher","task":"Find the canonical reference","async":true}`. The result is `Worker 'researcher' spawned asynchronously in session <child DB ID>`. The parent retains its slot and continues.
+
+## Joining background Workers
+
+`worker_wait` observes the exact submitted Directive's outcome, not the latest message in the child transcript. The join belongs to the invocation that created the Worker: either one recorded interactive turn or one schedule fire. Knowing the ID does not let a later turn, another fire, or another Agent join it. Both tools must be available in the Agent's scope. A scheduled fire cannot obtain interactive tool approval and does not take over the routing of a pinned chat.
+
+1. Call `spawn_worker` with `{"name":"researcher","task":"Find the canonical reference","async":true}`. Save the child DB ID and submit any other independent Workers before waiting.
+2. Pass that ID to `worker_wait`, for example `{"session_db_id":"<child DB ID>","timeout_seconds":30}`. The parent yields its slot if it holds one. A successful response is `{"result":"Canonical reference found","state":"completed"}`.
+3. A short wait can return `{"state":"pending"}`. Wait again in the same turn; it did not cancel or resubmit anything. If a later turn tries the same handle, it gets `Tool error: Worker result unavailable for this invocation`. Inspect the Worker in the session UI if you have access rather than submitting it again on the basis of that error.
 
 ## Resuming a checkpointed wait after restart
 

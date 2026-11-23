@@ -17,6 +17,7 @@ Every built-in is owned by an [extension](extensions.md); disabling an extension
 | `job_status`        | `core`     | Low    | Never              | Reads the durable state and typed result of an Agent job               |
 | `job_wait`          | `core`     | Low    | Never              | Observes a job with a deadline, yielding the Agent's execution slot    |
 | `spawn_worker`      | `core`     | Medium | UnlessAutoApproved | Invokes a Worker template; yields its slot while waiting synchronously |
+| `worker_wait`       | `core`     | Low    | Never              | Observes a Worker spawned in the current turn                          |
 | `shell`             | `core`     | High   | Always             | Executes a shell command                                               |
 | `read_file`         | `fs`       | Low    | Never              | Reads a text file from disk, one bounded page of lines at a time       |
 | `write_file`        | `fs`       | Medium | UnlessAutoApproved | Writes content to a file                                               |
@@ -382,6 +383,10 @@ Worker templates are per-Agent (Chaz's `researcher` is distinct from Scout's `re
 `name` is required and selects the Worker template. `tools` narrows the resolved scope for this invocation (must be a subset of what the Worker template + parent Agent allow). `model` and `preset` are optional overrides. Unset fields on a Worker template fall back to the parent Agent's defaults. `max_spawn_depth` overrides the Worker's nested spawn-depth ceiling; it does not limit tool calls. A Worker, like an Agent, keeps calling tools until the model replies without one. See [Spawn Permissions](agents.md#spawn-permissions) and [How a turn ends](agents.md#how-a-turn-ends).
 
 By default, `spawn_worker` waits for the answer. It keeps the Agent's execution slot while registering the child and writing its Directive, then yields the slot during observation so the Worker can run even when all ten slots were occupied by parents. The runtime reacquires capacity and rechecks the parent job's execution branch before result hooks, another tool, or another model request. The default tool timeout remains 300 seconds; reacquiring capacity is outside that timeout. `async: true` returns after submission without yielding. A timeout or cancellation does not resubmit the Worker or guarantee that the child stopped; inspect its session before deciding whether another invocation is safe. See [Waiting without holding a slot](agents.md#waiting-without-holding-a-slot).
+
+### worker_wait
+
+Pass the child session DB ID from `spawn_worker` as `session_db_id`. `timeout_seconds` is an integer from 1 to 240, default 30. A committed outcome returns `completed`, `failed`, `cancelled`, or `no_reply` in `state`, with `result` when the Worker committed a reply or error. `pending` means the wait expired without a committed outcome; it is not proof that the Worker is still running. Missing, unrelated, ambiguous, or inaccessible evidence is unavailable, not a result. `worker_wait` is not `job_wait`, does not resume across restarts, and must itself be allowed by any explicit tool list. See [Joining background Workers](agents.md#joining-background-workers).
 
 ### skill_list / skill_search / skill_show
 
