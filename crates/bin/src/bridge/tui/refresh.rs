@@ -558,10 +558,7 @@ pub(super) async fn snapshot_from_session(
     let telemetry = chaz_core::session::usage::telemetry_at_snapshot(db, &tips, &entries).await?;
     let meta = chaz_core::session::try_read_meta_at(db, &tips).await?;
     let steering = Session::steering_view_at(db, &tips).await?;
-    let status = chaz_core::extension::try_read_extension_outputs_at(db, &tips)
-        .await
-        .map(status_segments)
-        .map_err(|e| e.to_string());
+    let status = load_status_at(db, &tips).await;
     let now = chrono::Utc::now();
     let attempts = steering.attempts_at(now);
     Ok::<_, anyhow::Error>(SessionSnapshot {
@@ -631,6 +628,16 @@ pub(super) async fn load_active_turns(db: &eidetica::Database) -> Result<TurnAct
 #[cfg(test)]
 pub(super) async fn load_status_segments(db: &eidetica::Database) -> Result<Vec<String>, String> {
     chaz_core::extension::try_read_extension_outputs(db)
+        .await
+        .map(status_segments)
+        .map_err(|e| e.to_string())
+}
+
+pub(super) async fn load_status_at(
+    db: &eidetica::Database,
+    tips: &eidetica::Snapshot,
+) -> Result<Vec<String>, String> {
+    chaz_core::extension::try_read_extension_outputs_at(db, tips)
         .await
         .map(status_segments)
         .map_err(|e| e.to_string())

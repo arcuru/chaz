@@ -480,10 +480,10 @@ fn spawn_model_window_fetch(
     let task = tokio::spawn(async move {
         match backend.fetch_models_with_info().await {
             Ok(models) => {
-                if let Some(info) = models.into_iter().find(|m| m.id == model) {
-                    if let Err(e) = store.put(&info).await {
-                        tracing::warn!(model = %model, "model info store write failed: {e}");
-                    }
+                if let Some(info) = models.into_iter().find(|m| m.id == model)
+                    && let Err(e) = store.put(&info).await
+                {
+                    tracing::warn!(model = %model, "model info store write failed: {e}");
                 }
             }
             Err(e) => {

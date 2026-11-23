@@ -130,6 +130,7 @@ pub(super) type TabSnapshot = (
 pub(super) struct Loaded {
     delivery: Delivery,
     result: Result<TabSnapshot, String>,
+    partial_status: Option<Result<Vec<String>, String>>,
 }
 
 fn tab_index(app: &App, delivery: &Delivery) -> Option<usize> {
@@ -183,17 +184,36 @@ impl Reads {
         let job = tab.job.is_some();
         let tips = delivery.tips.clone();
         self.0.spawn(async move {
-            let result = supervised::work(Box::pin(async {
-                if job {
-                    let loaded = jobs::snapshot_at(&db, tips).await?;
-                    Ok((loaded.session, Some(loaded.state)))
+            let loaded = supervised::work(Box::pin(async {
+                let result = if job {
+                    jobs::snapshot_at(&db, tips.clone())
+                        .await
+                        .map(|loaded| (loaded.session, Some(loaded.state)))
                 } else {
-                    let loaded = refresh::load_session_snapshot_at(&db, tips).await?;
-                    Ok((loaded, None))
-                }
+                    refresh::load_session_snapshot_at(&db, tips.clone())
+                        .await
+                        .map(|loaded| (loaded, None))
+                };
+                let status = if result.is_err() {
+                    // Invalid transcript/meta must not hide readable status at
+                    // that same frontier. Never bypass current native authority.
+                    let status = match chaz_core::session::jobs::require_observer_write(&db).await {
+                        Ok(_) => refresh::load_status_at(&db, &tips).await,
+                        Err(error) => Err(error.to_string()),
+                    };
+                    Some(status)
+                } else {
+                    None
+                };
+                Ok((result, status))
             }))
             .await;
-            Loaded { delivery, result }
+            let (result, partial_status) = loaded.unwrap_or_else(|error| (Err(error), None));
+            Loaded {
+                delivery,
+                result,
+                partial_status,
+            }
         });
     }
 }
@@ -229,6 +249,9 @@ pub(super) fn apply(
     app.tabs[idx].live.snapshot_started = None;
     app.tabs[idx].live.snapshot_overdue = false;
     refresh::apply_watched(app, idx, loaded.result, resolve);
+    if let Some(status) = loaded.partial_status {
+        refresh::replace_status(&mut app.tabs[idx], status);
+    }
     let _ = loaded.delivery.handled.send(());
     Some(loaded.delivery.session)
 }
