@@ -305,6 +305,7 @@ pub(super) fn ui(
         app.selection.clear();
     }
     app.settings_list_area = None;
+    app.visible_peer_agents = 0..0;
     app.settings_reader.viewport = None;
     if let Some(picker) = app.settings_picker.as_mut() {
         picker.viewport = Rect::default();
@@ -840,6 +841,8 @@ pub(super) fn ui_chat(f: &mut ratatui::Frame, app: &mut App, ext_segments: &[Str
         " | ⚠ refresh overdue (cached)"
     } else if app.model_metadata.error.is_some() {
         " | ⚠ model metadata stale"
+    } else if tab.live.agent_config_stale {
+        " | ⚠ agent config stale"
     } else if tab.live.pending() {
         " | ⟳ refreshing (cached)"
     } else {
@@ -2080,11 +2083,19 @@ pub(super) fn ui_picker(f: &mut ratatui::Frame, app: &mut App) {
         .values()
         .next()
         .map(|e| format!("Metadata refresh failed: {e}; cached rows retained"));
+    let catalog_error = (!app.session_list.is_empty())
+        .then(|| {
+            app.session_picker_error
+                .as_ref()
+                .map(|e| format!("Catalog refresh failed: {e}; cached rows retained"))
+        })
+        .flatten();
     let footer = if let Some(notice) = app
         .operations
         .notice
         .as_ref()
         .or(app.hub_notice.as_ref())
+        .or(catalog_error.as_ref())
         .or(metadata_error.as_ref())
     {
         Paragraph::new(format!(" {notice}")).style(bar.fg(COLOR_ERROR))

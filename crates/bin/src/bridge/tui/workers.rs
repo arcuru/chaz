@@ -239,11 +239,11 @@ pub(super) struct Groups {
 }
 /// Read only small reciprocal side records. No transcript hydration, recursive
 /// key acquisition, catalog mirroring, runtime registration or per-frame reads.
-pub(super) async fn catalog(
+pub(super) async fn group_catalog(
     registry: &SessionRegistry,
+    mut indices: Vec<SessionIndex>,
     filter: Option<&str>,
 ) -> Result<(Vec<SessionIndex>, Groups), String> {
-    let mut indices = registry.list_sessions().await.map_err(|e| e.to_string())?;
     let worker_indices: Vec<_> = indices
         .iter()
         .filter(|i| chaz_core::session::workers::is_worker_source(i.source.as_deref()))
@@ -399,10 +399,9 @@ pub(super) fn group(app: &mut App, mut groups: Groups) {
     app.worker_groups = groups;
 }
 
-pub(super) fn open_picker(app: &mut App, server: &Arc<Server>, tx: &mpsc::Sender<SessionLoad>) {
+pub(super) fn open_picker(app: &mut App) {
     let parent = app.current().map(|t| t.session_db_id.clone());
     enter_session_picker(app, parent);
-    refresh_session_catalog(app, server, tx);
 }
 
 pub(super) enum Destination {

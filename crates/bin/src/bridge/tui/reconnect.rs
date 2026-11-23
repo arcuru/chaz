@@ -226,7 +226,7 @@ pub(super) fn disconnect(app: &mut App, reason: &str) {
     app.jobs.error = Some("Retained snapshot is stale".into());
     peer_pages::suspend(app);
     session_pages::suspend(app);
-    app.cancel_session_fill();
+    app.retire_picker();
     app.model_catalog_ticket += 1;
     app.model_catalog_task = None;
     app.model_picker_loading = false;
@@ -279,7 +279,6 @@ pub(super) fn connected(app: &mut App) {
     app.backend_available = true;
     app.backend_notice = None;
     app.operations.notice = None;
-    app.session_list_fresh = false;
 }
 
 /// Stagger rebinding on the existing tick. Give the active tab the first

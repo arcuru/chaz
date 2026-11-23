@@ -31,7 +31,7 @@ use std::collections::HashSet;
 use std::future::Future;
 use std::io;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
 use tokio::sync::{Semaphore, mpsc};
 use tokio::task::JoinSet;
 use tokio_stream::StreamExt;
@@ -40,6 +40,7 @@ use tokio_stream::StreamExt;
 #[path = "../../../../lib/src/test_support/counting_backend.rs"]
 mod activity_backend;
 mod bridge_impl;
+mod components;
 mod creation;
 mod field_sheet;
 mod input;
@@ -76,13 +77,12 @@ enum Action {
     Key(KeyEvent),
     Mouse(MouseEvent),
     SessionChanged(presentation::Delivery),
-    CatalogChanged,
     ApprovalRequest(TaggedApproval),
     /// A background catalog fetch finished. `Ok` carries the live model
     /// list (already merged with cache); `Err` carries a display message.
     ModelsFetched(ModelCatalog),
     ModelMetadata(ModelMetadataUpdate),
-    SessionLoad(SessionLoad),
+    Component(components::Update),
     PeerPage(peer_pages::Loaded),
     SessionPage(session_pages::Loaded),
     JobsLoaded(jobs::Loaded),
@@ -91,38 +91,6 @@ enum Action {
     Refresh(Result<presentation::Loaded, tokio::task::JoinError>),
     Operation(operations::Completion),
     Connection(reconnect::ResultMessage),
-}
-
-enum SessionLoad {
-    Grouped {
-        generation: u64,
-        result: Result<(Vec<SessionIndex>, workers::Groups), String>,
-    },
-    #[cfg(test)]
-    Catalog {
-        generation: u64,
-        result: Result<Vec<SessionIndex>, String>,
-    },
-    Row {
-        generation: u64,
-        id: String,
-        result: Result<SessionInfo, String>,
-    },
-}
-
-enum CatalogLoadOutcome {
-    Ignored,
-    Loaded,
-    Failed,
-}
-
-/// Handle to in-flight picker work. Metadata reads are demand-driven and
-/// bounded to the visible window; cancellation plus generation checks keep
-/// obsolete results from mutating a later picker.
-pub(super) struct SessionFill {
-    generation: u64,
-    cancel: Arc<AtomicBool>,
-    tasks: Vec<supervised::Task<()>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -579,14 +547,18 @@ pub(super) struct RosterAgent {
 /// resolving each attached agent's effective model the same way the live
 /// turn does (`SessionMeta::resolve_model_for_agent` → agent `default_model`
 /// → `BackendManager::resolve_model_name`).
-fn build_roster(server: &Server, backend: &BackendManager, meta: &SessionMeta) -> Vec<RosterAgent> {
+fn build_roster(
+    server: &Server,
+    backend: &BackendManager,
+    meta: &SessionMeta,
+    defaults: &HashMap<eidetica::entry::ID, components::Defaults>,
+) -> Vec<RosterAgent> {
     meta.agents
         .iter()
         .map(|a| {
-            let agent_default = server
-                .agents()
-                .get(&a.display_name)
-                .and_then(|ag| ag.default_model.clone());
+            let id = eidetica::entry::ID::parse(&a.db_id).ok();
+            let (agent_default, _) =
+                refresh::agent_defaults(server, defaults, &a.display_name, id.as_ref());
             let session_model = meta
                 .resolve_model_for_agent(&a.display_name)
                 .map(str::to_string);
@@ -658,6 +630,9 @@ pub(super) struct ListScroll {
 
 pub(super) struct App {
     pub(super) model_metadata: ModelMetadata,
+    agent_defaults: HashMap<eidetica::entry::ID, components::Defaults>,
+    agent_config_errors: HashMap<eidetica::entry::ID, String>,
+    visible_peer_agents: std::ops::Range<usize>,
     jobs: jobs::JobsView,
     selection: selection::Selection,
     pub(super) mode: TuiMode,
@@ -688,15 +663,12 @@ pub(super) struct App {
     pub(super) session_list: Vec<SessionInfo>,
     worker_groups: workers::Groups,
     workers_filter: Option<String>,
-    /// Whether the current catalog snapshot has no pending invalidation.
-    pub(super) session_list_fresh: bool,
     /// Catalog rows retained by id so visible metadata requests never need to
     /// re-list the catalog.
     pub(super) session_indices: HashMap<String, SessionIndex>,
-    pub(super) session_fill: Option<SessionFill>,
+    row_fields: HashMap<String, components::RowFields>,
     pub(super) session_generation: u64,
     pub(super) session_catalog_loading: bool,
-    session_catalog_invalidated: bool,
     pub(super) session_picker_error: Option<String>,
     /// One-shot result shown in the hub footer (a failed open or create);
     /// cleared by the next hub key.
@@ -704,9 +676,7 @@ pub(super) struct App {
     /// Unsent composer text and cursor of each open conversation that is not
     /// focused. The focused one lives in `input`/`cursor`.
     pub(super) drafts: HashMap<String, (String, usize)>,
-    pub(super) session_rows_loading: HashSet<String>,
     session_row_errors: HashMap<String, String>,
-    pub(super) session_metadata_limit: Arc<Semaphore>,
     pub(super) picker_index: usize,
     /// Session rows actually visible in the last drawn picker frame. Requests
     /// run after drawing so input, catalog updates and resizes cannot use stale geometry.
@@ -875,6 +845,9 @@ impl App {
     fn hub(agent_names: HashSet<String>) -> Self {
         Self {
             model_metadata: ModelMetadata::default(),
+            agent_defaults: HashMap::new(),
+            agent_config_errors: HashMap::new(),
+            visible_peer_agents: 0..0,
             jobs: jobs::JobsView::default(),
             selection: selection::Selection::default(),
             mode: TuiMode::SessionPicker,
@@ -897,18 +870,14 @@ impl App {
             session_list: Vec::new(),
             worker_groups: Default::default(),
             workers_filter: None,
-            session_list_fresh: false,
             session_indices: HashMap::new(),
-            session_fill: None,
+            row_fields: HashMap::new(),
             session_generation: 0,
             session_catalog_loading: false,
-            session_catalog_invalidated: false,
             session_picker_error: None,
             hub_notice: None,
             drafts: HashMap::new(),
-            session_rows_loading: HashSet::new(),
             session_row_errors: HashMap::new(),
-            session_metadata_limit: Arc::new(Semaphore::new(4)),
             picker_index: 0,
             picker_visible_rows: 0..0,
             scroll: ListScroll::default(),
@@ -1171,13 +1140,10 @@ impl App {
             .clone();
         self.refresh_ticket += 1;
         tab.live.incarnation = self.refresh_ticket;
-        let handled = tab.live.initial_handled.take();
+        let observed = tab.live.initial_handled.is_some();
         self.tabs.push(tab);
-        if handled.is_some() {
+        if observed {
             project_open_row(self, self.tabs.len() - 1);
-        }
-        if let Some(handled) = handled {
-            let _ = handled.send(());
         }
     }
 
@@ -1217,7 +1183,7 @@ impl App {
         if self.tabs.is_empty() && needs_conversation {
             self.settings_return = None;
             self.session_settings_snapshot = None;
-            self.mode = TuiMode::SessionPicker;
+            open_session_picker(self);
             true
         } else {
             false
@@ -1237,33 +1203,10 @@ impl App {
         self.session_list.len() + 1
     }
 
-    /// Cancel picker work and invalidate any result already queued for the UI.
-    pub(super) fn cancel_session_fill(&mut self) {
-        if let Some(fill) = self.session_fill.take() {
-            fill.cancel.store(true, Ordering::Relaxed);
-        }
-        self.session_rows_loading.clear();
+    /// Retire the current hub route and any deliveries queued for it.
+    pub(super) fn retire_picker(&mut self) {
         self.session_catalog_loading = false;
         self.session_generation = self.session_generation.wrapping_add(1);
-    }
-
-    fn requested_session_indices(&mut self) -> Vec<SessionIndex> {
-        let mut visible: Vec<_> = self.picker_visible_rows.clone().collect();
-        visible.sort_by_key(|&i| usize::from(Some(i) != self.picker_index.checked_sub(1)));
-        let requested: Vec<_> = visible
-            .into_iter()
-            .filter_map(|i| self.session_list.get(i))
-            .filter(|row| {
-                !row.loaded
-                    && !self.session_rows_loading.contains(&row.session_db_id)
-                    && !self.session_row_errors.contains_key(&row.session_db_id)
-            })
-            .filter_map(|row| self.session_indices.get(&row.session_db_id).cloned())
-            .take(4usize.saturating_sub(self.session_rows_loading.len()))
-            .collect();
-        self.session_rows_loading
-            .extend(requested.iter().map(|index| index.session_db_id.clone()));
-        requested
     }
 
     /// Resolve the highlighted picker row to a dispatch token: the
@@ -1309,6 +1252,24 @@ impl App {
     /// floating-active sort.
     pub(super) fn active_scope_pin(&self) -> Option<&str> {
         self.model_picker_current_pin.as_deref()
+    }
+
+    fn model_pin_for(&self, server: &Server, scope: &ModelPickerScope) -> Option<String> {
+        match scope {
+            ModelPickerScope::Session => self.current()?.live.meta.model.clone(),
+            ModelPickerScope::Agent(name) => {
+                self.current()?.live.meta.agent_models.get(name).cloned()
+            }
+            ModelPickerScope::AgentGlobal(name) => {
+                components::default_model(self, server, name).flatten()
+            }
+        }
+    }
+
+    fn update_picker_pin(&mut self, server: &Server) {
+        if self.mode == TuiMode::ModelPicker {
+            self.model_picker_current_pin = self.model_pin_for(server, &self.model_picker_scope);
+        }
     }
 
     /// Merge favorites with a catalog list. Favorites pinned at top;
@@ -1690,128 +1651,37 @@ fn apply_model_catalog(app: &mut App, completion: ModelCatalog) {
     }
 }
 
-/// Enter the picker synchronously, then fetch catalog metadata in the
-/// background. The event loop remains free to render and cancel while the
-/// registry transaction is delayed.
-fn open_session_picker(
-    app: &mut App,
-    server: &Arc<Server>,
-    session_rows_tx: &mpsc::Sender<SessionLoad>,
-) {
+/// Enter the picker synchronously; the terminal reconciles its native watch
+/// registrations after drawing the viewport.
+fn open_session_picker(app: &mut App) {
     enter_session_picker(app, None);
-    refresh_session_catalog(app, server, session_rows_tx);
 }
 
 fn enter_session_picker(app: &mut App, filter: Option<String>) {
-    app.cancel_session_fill();
+    app.retire_picker();
     app.workers_filter = filter;
     app.picker_index = 0;
     app.mode = TuiMode::SessionPicker;
     app.session_picker_error = None;
     app.session_row_errors.clear();
     app.hub_notice = None;
-    // Explicit entry refreshes even if no write notification was observed.
-    app.session_list_fresh = false;
-}
-
-fn refresh_session_catalog(
-    app: &mut App,
-    server: &Arc<Server>,
-    session_rows_tx: &mpsc::Sender<SessionLoad>,
-) {
-    if app.session_catalog_loading || !app.backend_available {
-        return;
-    }
-    if app.operations.is_creating_session() {
-        app.session_catalog_loading = true;
-        return;
-    }
-
-    // Retire old visible-row reads too: dropping their tasks without clearing
-    // the loading IDs would leave those rows permanently in flight.
-    app.cancel_session_fill();
-    // Retain rows and selection while the coalesced read is pending.
-    app.session_catalog_invalidated = false;
-    app.session_catalog_loading = true;
-    let registry = server.registry_arc();
-    let generation = app.session_generation;
-    let filter = app.workers_filter.clone();
-    let tx = session_rows_tx.clone();
-    let cancel = Arc::new(AtomicBool::new(false));
-    let task = supervised::Task(tokio::spawn(async move {
-        let started = std::time::Instant::now();
-        let result = supervised::read(async move {
-            tokio::time::timeout(
-                std::time::Duration::from_secs(10),
-                workers::catalog(&registry, filter.as_deref()),
-            )
-            .await
-            .unwrap_or_else(|_| Err("Session ancestry read timed out; cached rows stale".into()))
-        })
-        .await;
-        tracing::info!(
-            generation,
-            elapsed_ms = started.elapsed().as_millis() as u64,
-            success = result.is_ok(),
-            "TUI session catalog completed"
-        );
-        let _ = tx.send(SessionLoad::Grouped { generation, result }).await;
-    }));
-    app.session_fill = Some(SessionFill {
-        generation,
-        cancel,
-        tasks: vec![task],
-    });
-}
-
-#[cfg(test)]
-fn spawn_session_catalog_load<F>(app: &mut App, tx: mpsc::Sender<SessionLoad>, load: F)
-where
-    F: Future<Output = Result<Vec<SessionIndex>, String>> + Send + 'static,
-{
-    let generation = app.session_generation;
-    let cancel = Arc::new(AtomicBool::new(false));
-    let worker_cancel = cancel.clone();
-    let task = supervised::Task(tokio::spawn(async move {
-        let started = std::time::Instant::now();
-        let result = supervised::read(load).await;
-        tracing::info!(
-            generation,
-            elapsed_ms = started.elapsed().as_millis() as u64,
-            success = result.is_ok(),
-            "TUI session catalog completed"
-        );
-        if !worker_cancel.load(Ordering::Relaxed) {
-            let _ = tx.send(SessionLoad::Catalog { generation, result }).await;
-        }
-    }));
-    app.session_fill = Some(SessionFill {
-        generation,
-        cancel,
-        tasks: vec![task],
-    });
+    app.session_catalog_loading = app.backend_available;
 }
 
 fn apply_session_catalog(app: &mut App, indices: Vec<SessionIndex>) {
     let selected = app.picker_selection();
-    let mut cached: HashMap<String, SessionInfo> = std::mem::take(&mut app.session_list)
-        .into_iter()
-        .filter(|row| row.loaded)
-        .map(|row| (row.session_db_id.clone(), row))
-        .collect();
     app.session_indices = indices
         .iter()
         .map(|index| (index.session_db_id.clone(), index.clone()))
         .collect();
+    app.row_fields
+        .retain(|id, _| app.session_indices.contains_key(id));
     app.session_list = indices
         .iter()
         .map(|index| {
             let mut row = SessionInfo::placeholder(index);
-            if let Some(old) = cached.remove(&index.session_db_id) {
-                row.name = old.name;
-                row.agent_name = old.agent_name;
-                row.description = old.description;
-                row.loaded = true;
+            if let Some(fields) = app.row_fields.get(&index.session_db_id) {
+                fields.project(&mut row, index.name.as_deref());
             }
             row
         })
@@ -1828,170 +1698,27 @@ fn apply_session_catalog(app: &mut App, indices: Vec<SessionIndex>) {
         .position(|row| row.session_db_id == selected)
         .map(|i| i + 1)
         .unwrap_or(0);
-    app.session_list_fresh = !app.session_catalog_invalidated;
     app.session_catalog_loading = false;
-}
-
-fn apply_session_catalog_result(
-    app: &mut App,
-    generation: u64,
-    result: Result<Vec<SessionIndex>, String>,
-) -> CatalogLoadOutcome {
-    if generation != app.session_generation || !matches!(app.mode, TuiMode::SessionPicker) {
-        return CatalogLoadOutcome::Ignored;
-    }
-    match result {
-        Ok(indices) => {
-            apply_session_catalog(app, indices);
-            CatalogLoadOutcome::Loaded
-        }
-        Err(error) => {
-            app.session_catalog_loading = false;
-            app.session_picker_error = Some(error);
-            CatalogLoadOutcome::Failed
-        }
-    }
+    app.session_picker_error = None;
 }
 
 /// The watched tab owns session metadata; catalog fields remain index-owned.
 fn project_open_row(app: &mut App, idx: usize) {
     let tab = &app.tabs[idx];
-    let id = &tab.session_db_id;
-    let meta = &tab.live.meta;
-    if let Some(row) = app.session_list.iter_mut().find(|r| &r.session_db_id == id) {
-        row.name = meta
-            .name
-            .clone()
-            .or_else(|| app.session_indices.get(id)?.name.clone());
-        row.agent_name = meta.agent_name.clone();
-        row.description = meta.description.clone();
-        row.loaded = true;
-    }
+    let id = tab.session_db_id.clone();
+    let fields = components::RowFields::from(&tab.live.meta);
+    project_row(app, &id, fields);
 }
 
-fn apply_session_row(
-    app: &mut App,
-    generation: u64,
-    id: String,
-    result: Result<SessionInfo, String>,
-) -> bool {
-    if generation != app.session_generation || !matches!(app.mode, TuiMode::SessionPicker) {
-        return false;
-    }
-    app.session_rows_loading.remove(&id);
-    if let Some(i) = app.tab_index_for(&id)
-        && app.tabs[i].live.observation.is_some()
-    {
-        // A row opened while this lazy read was in flight. The tab's watch
-        // now owns the projection, even if its latest read failed.
-        return false;
-    }
-    match result {
-        Ok(info) => {
-            if let Some(row) = app
-                .session_list
-                .iter_mut()
-                .find(|row| row.session_db_id == id)
-            {
-                *row = info;
-            }
-        }
-        Err(e) => {
-            app.session_row_errors.insert(id, e);
-        }
-    }
-    true
-}
-
-fn request_session_metadata(
-    app: &mut App,
-    server: &Arc<Server>,
-    session_rows_tx: &mpsc::Sender<SessionLoad>,
-) {
-    if !app.backend_available || app.operations.is_creating_session() {
-        return;
-    }
-    let requested = app.requested_session_indices();
-    if requested.is_empty() {
-        return;
-    }
-    let registry = server.registry_arc();
-    spawn_session_metadata_load(app, requested, session_rows_tx.clone(), move |index| {
-        let registry = registry.clone();
-        async move {
-            commands::try_load_session_metadata(&registry, index)
-                .await
-                .map_err(|e| e.to_string())
-        }
-    });
-}
-
-fn spawn_session_metadata_load<F, Fut>(
-    app: &mut App,
-    requested: Vec<SessionIndex>,
-    tx: mpsc::Sender<SessionLoad>,
-    load: F,
-) where
-    F: Fn(SessionIndex) -> Fut + Send + Sync + 'static,
-    Fut: Future<Output = Result<SessionInfo, String>> + Send + 'static,
-{
-    let generation = app.session_generation;
-    let limit = app.session_metadata_limit.clone();
-    let cancel = app
-        .session_fill
-        .as_ref()
-        .filter(|fill| fill.generation == generation)
-        .map(|fill| fill.cancel.clone())
-        .unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
-    let worker_cancel = cancel.clone();
-    let task = supervised::Task(tokio::spawn(async move {
-        let load = Arc::new(load);
-        let mut rows = JoinSet::new();
-        for index in requested {
-            let limit = limit.clone();
-            let load = load.clone();
-            let worker_cancel = worker_cancel.clone();
-            rows.spawn(async move {
-                let id = index.session_db_id.clone();
-                let result = supervised::read(async move {
-                    let _permit = limit.acquire_owned().await.map_err(|e| e.to_string())?;
-                    if worker_cancel.load(Ordering::Relaxed) {
-                        return Err("catalog read cancelled".into());
-                    }
-                    load(index).await
-                })
-                .await;
-                (id, result)
-            });
-        }
-        while let Some(result) = rows.join_next().await {
-            if let Ok((id, result)) = result
-                && tx
-                    .send(SessionLoad::Row {
-                        generation,
-                        id,
-                        result,
-                    })
-                    .await
-                    .is_err()
-            {
-                break;
-            }
-        }
-    }));
-    if let Some(fill) = app
-        .session_fill
-        .as_mut()
-        .filter(|f| f.generation == generation)
-    {
-        fill.tasks.retain(|t| !t.0.is_finished());
-        fill.tasks.push(task);
-    } else {
-        app.session_fill = Some(SessionFill {
-            generation,
-            cancel,
-            tasks: vec![task],
-        });
+fn project_row(app: &mut App, id: &str, fields: components::RowFields) {
+    if let Some(row) = app.session_list.iter_mut().find(|r| r.session_db_id == id) {
+        fields.project(
+            row,
+            app.session_indices
+                .get(id)
+                .and_then(|index| index.name.as_deref()),
+        );
+        app.row_fields.insert(id.to_owned(), fields);
     }
 }
 
@@ -2035,7 +1762,7 @@ async fn build_observed_tab(
         )
     };
     let id = db.root_id().to_string();
-    let mut tab = tab_from_snapshot(server, backend, db, id, snapshot).await?;
+    let mut tab = tab_from_snapshot(server, backend, db, id, snapshot)?;
     if let Some(state) = state {
         tab.job = Some(jobs::JobTab {
             state: None,
@@ -2056,40 +1783,42 @@ async fn build_tab(
     session_db_id: String,
 ) -> Result<Tab, String> {
     let snapshot = refresh::load_session_snapshot(&session_db_id, session_db.clone()).await?;
-    tab_from_snapshot(server, backend, session_db, session_db_id, snapshot).await
+    let mut tab = tab_from_snapshot(server, backend, session_db, session_db_id, snapshot)?;
+    // Unhosted in-memory agents are a binary test seam, not a second DB source.
+    tab.context_budget = server.effective_context_budget(
+        tab.model_pin.as_deref().unwrap_or(&tab.effective_model),
+        server
+            .agents()
+            .get(&tab.current_agent)
+            .and_then(|a| a.max_context_tokens),
+    );
+    Ok(tab)
 }
 
-async fn tab_from_snapshot(
+fn tab_from_snapshot(
     server: &Server,
     backend: &BackendManager,
     session_db: eidetica::Database,
     session_db_id: String,
     snapshot: refresh::SessionSnapshot,
 ) -> Result<Tab, String> {
-    let agent = server
-        .registry()
-        .resolve_agent(&session_db_id, None, server.agent_index())
-        .await;
     let meta = snapshot.meta;
-    let roster = build_roster(server, backend, &meta);
     let session_name = meta.name.clone();
     // Reopening a session must honor persisted pins just like a live refresh.
     // A peer hosting no agent yet still opens sessions for administration.
-    let agent_name = agent
-        .as_ref()
-        .map(|agent| agent.name.clone())
-        .unwrap_or_default();
-    let requested_model = meta.resolve_model_for_agent(&agent_name).or(agent
-        .as_ref()
-        .and_then(|agent| agent.default_model.as_deref()));
-    let effective_model = backend.resolve_model_name(requested_model);
-    let context_model = requested_model
-        .map(str::to_string)
-        .or_else(|| backend.default_model())
-        .unwrap_or_default();
-    let context_budget = server.effective_context_budget(
-        &context_model,
-        agent.as_ref().and_then(|agent| agent.max_context_tokens),
+    let (agent_name, _) = components::select_agent(server, &meta, &snapshot.writer_keys);
+    let refresh::Resolved {
+        effective_model,
+        context_budget,
+        roster,
+    } = refresh::resolve_from(
+        server,
+        backend,
+        &agent_name,
+        &meta,
+        &ModelMetadata::default(),
+        &HashMap::new(),
+        None,
     );
     let entries = snapshot.entries;
     let evidence = snapshot.active_turns?;
@@ -2114,6 +1843,7 @@ async fn tab_from_snapshot(
         expand_all: false,
         live: {
             let mut live = refresh::TabLive::with_meta(meta, snapshot.telemetry);
+            live.writer_keys = snapshot.writer_keys;
             live.tool_activity = snapshot.tool_activity;
             live.tool_activity.age(&evidence, chrono::Utc::now());
             live.entry_ids = snapshot.entry_ids.into_iter().map(Some).collect();
@@ -2138,22 +1868,6 @@ fn cycle_tab(app: &mut App, delta: i32) {
     let n = app.tabs.len() as i32;
     let i = (app.active_tab as i32 + delta).rem_euclid(n);
     app.set_active_tab(i as usize);
-}
-
-/// The hub is the base view: whenever no conversation is open, a
-/// conversation-scoped mode falls back to it.
-fn ensure_view(app: &mut App, server: &Arc<Server>, session_rows_tx: &mpsc::Sender<SessionLoad>) {
-    if app.ensure_view() {
-        open_session_picker(app, server, session_rows_tx);
-    } else if app.mode == TuiMode::SessionPicker
-        && !app.session_list_fresh
-        && !app.session_catalog_loading
-        && app.session_picker_error.is_none()
-    {
-        // Settings can interrupt the initial catalog load. Resume it when
-        // the hub becomes visible, without rendering an incomplete empty list.
-        refresh_session_catalog(app, server, session_rows_tx);
-    }
 }
 
 fn operation_context(
@@ -2182,7 +1896,6 @@ fn handle_chat_action(
     approval_tx: &mpsc::Sender<TaggedApproval>,
     notify_tx: &presentation::Sender,
     models_tx: &mpsc::Sender<ModelCatalog>,
-    session_rows_tx: &mpsc::Sender<SessionLoad>,
 ) {
     if app.current().is_some_and(|tab| tab.live.worker_observer)
         && !matches!(
@@ -2217,7 +1930,7 @@ fn handle_chat_action(
         return;
     }
     match action {
-        ChatAction::OpenWorkers => workers::open_picker(app, server, session_rows_tx),
+        ChatAction::OpenWorkers => workers::open_picker(app),
         ChatAction::OpenWorker(index) => {
             if let Some(spawn) = app
                 .current()
@@ -2288,16 +2001,7 @@ fn handle_chat_action(
             app.open_settings(scope, TuiMode::Chat);
         }
         ChatAction::OpenModelPicker { scope } => {
-            let current_pin = match &scope {
-                ModelPickerScope::Session => app.current().and_then(|t| t.live.meta.model.clone()),
-                ModelPickerScope::Agent(name) => app
-                    .current()
-                    .and_then(|t| t.live.meta.agent_models.get(name).cloned()),
-                ModelPickerScope::AgentGlobal(name) => server
-                    .agents()
-                    .get(name)
-                    .and_then(|a| a.default_model.clone()),
-            };
+            let current_pin = app.model_pin_for(server, &scope);
             app.seed_model_picker(backend, current_pin, scope);
             match app.session_catalog.clone() {
                 Some(catalog) => app.rebuild_model_list(catalog),
@@ -2317,7 +2021,7 @@ fn handle_chat_action(
             app.open_settings(SettingsScope::Session, TuiMode::Chat);
             app.settings_focus = SettingsFocus::List;
         }
-        ChatAction::OpenPicker => open_session_picker(app, server, session_rows_tx),
+        ChatAction::OpenPicker => open_session_picker(app),
     }
 }
 
@@ -2329,7 +2033,7 @@ fn apply_picker_rename(app: &mut App, server: &Arc<Server>, id: String, name: Op
             None => server.registry().clear_session_name(&id).await,
         }
         .map_err(|e| e.to_string())?;
-        Ok(operations::Effect::ReloadRow(id))
+        Ok(operations::Effect::Sent)
     });
 }
 
@@ -2358,9 +2062,7 @@ fn dispatch_picker_selection(
     // Lookup/hydration are cancellable reads; registration/create can have
     // effects and are never rolled back by a timeout.
     let write = !operations::command_is_read(&cmd);
-    if write {
-        app.session_list_fresh = false;
-    }
+
     let server = server.clone();
     let backend = backend.clone();
     let approval_tx = approval_tx.clone();
@@ -2433,7 +2135,6 @@ fn handle_settings_outcome(
     approval_tx: &mpsc::Sender<TaggedApproval>,
     notify_tx: &presentation::Sender,
     models_tx: &mpsc::Sender<ModelCatalog>,
-    session_rows_tx: &mpsc::Sender<SessionLoad>,
 ) {
     match outcome {
         input::SettingsKey::None => {}
@@ -2449,7 +2150,6 @@ fn handle_settings_outcome(
                 approval_tx,
                 notify_tx,
                 models_tx,
-                session_rows_tx,
             );
         }
         input::SettingsKey::DispatchCommand(cmd) => {
@@ -2880,10 +2580,12 @@ mod session_picker_tests {
             Err(tokio::sync::oneshot::error::TryRecvError::Empty)
         ));
         drop(rx); // Cancellation drops the runtime's pending decision receiver.
-        let (tx, mut rx) = mpsc::channel(1);
-        let id = app.active().session_db_id.clone();
-        refresh::request(&mut app, &id, refresh::RefreshKind::Activity, &tx);
-        refresh::apply(&mut app, rx.recv().await.unwrap(), |_, _| unreachable!());
+        refresh::fixture_reload(&mut app, |_, _| refresh::Resolved {
+            effective_model: String::new(),
+            context_budget: 0,
+            roster: vec![],
+        })
+        .await;
         assert!(app.active().pending_approval.is_none());
         input::handle_chat_key(
             &mut app,
@@ -2962,55 +2664,34 @@ mod session_picker_tests {
 
     #[tokio::test]
     async fn session_meta_name_refreshes_tab_picker_and_catalog_together() {
-        let mut app = App::new(HashSet::new(), test_tab().await);
+        let (_instance, mut user) = Instance::create_backend(
+            Box::new(InMemory::new()),
+            NewAccount::with_password("name-projection", "test-password"),
+        )
+        .await
+        .unwrap();
+        let mut tab = test_tab().await;
+        tab.session_db = user
+            .create_database(eidetica::crdt::Doc::new(), &user.get_default_key().unwrap())
+            .await
+            .unwrap();
+        let mut app = App::new(HashSet::new(), tab);
         let id = app.active().session_db_id.clone();
         let mut current = index(0);
         current.session_db_id = id.clone();
         apply_session_catalog(&mut app, vec![current, index(1)]);
         app.mode = TuiMode::SessionPicker;
-        let (tx, mut rx) = tokio::sync::mpsc::channel(2);
         for name in [Some("Migration diagnosis"), None] {
-            let loaded_id = id.clone();
-            refresh::request_with(
-                &mut app,
-                &id,
-                refresh::RefreshKind::Session,
-                &tx,
-                move |ticket| async move {
-                    refresh::Refresh::Session {
-                        session_db_id: loaded_id,
-                        ticket,
-                        snapshot: Ok(Box::new(refresh::SessionSnapshot {
-                            status: Ok(Vec::new()),
-                            entry_ids: Vec::new(),
-                            tool_activity: Default::default(),
-                            tips: eidetica::Snapshot::EMPTY,
-                            steering: None,
-                            input_attempt: None,
-                            inputs: vec![],
-                            entries: vec![],
-                            telemetry: Default::default(),
-                            meta: SessionMeta {
-                                name: name.map(str::to_owned),
-                                ..Default::default()
-                            },
-                            active_turns: Ok(chaz_core::session::TurnActivity::default()),
-                        })),
-                    }
-                },
-            );
-            let snapshot = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            let db = app.active().session_db.clone();
+            chaz_core::session::update_meta_on_db(&db, |meta| meta.name = name.map(str::to_owned))
                 .await
-                .unwrap()
                 .unwrap();
-            assert!(
-                refresh::apply(&mut app, snapshot, |_, _| refresh::Resolved {
-                    effective_model: "test-model".into(),
-                    context_budget: 0,
-                    roster: vec![],
-                })
-                .redraw
-            );
+            refresh::fixture_reload(&mut app, |_, _| refresh::Resolved {
+                effective_model: "test-model".into(),
+                context_budget: 0,
+                roster: vec![],
+            })
+            .await;
             assert_eq!(app.active().session_name.as_deref(), name);
             assert_eq!(
                 app.session_indices[&id].name, None,
@@ -3046,70 +2727,6 @@ mod session_picker_tests {
     }
 
     #[tokio::test]
-    async fn retained_picker_viewport_loads_visible_metadata_with_new_selected() {
-        let mut app = App::new(HashSet::new(), test_tab().await);
-        apply_session_catalog(&mut app, (0..100).map(index).collect());
-        app.mode = TuiMode::SessionPicker;
-        app.scroll.picker = 60;
-        // New session is selected, but the retained viewport is nowhere near row 0.
-        let before = draw_picker(&mut app, 100, 13);
-        assert_eq!(app.scroll.picker, 60);
-        assert!(before.iter().any(|r| r.contains("> + New session")));
-        let visible = visible_ids(&app);
-        assert_eq!(visible.len(), 3, "only rows actually built in the viewport");
-        let requested = app.requested_session_indices();
-        assert_eq!(
-            requested
-                .iter()
-                .map(|i| i.session_db_id.clone())
-                .collect::<HashSet<_>>(),
-            visible
-        );
-        assert!(
-            app.requested_session_indices().is_empty(),
-            "no duplicate in-flight requests"
-        );
-        let count = requested.len();
-        let (tx, mut rx) = mpsc::channel(8);
-        spawn_session_metadata_load(&mut app, requested, tx, |index| async move {
-            let mut info = SessionInfo::placeholder(&index);
-            info.agent_name = Some("visible-agent".into());
-            info.loaded = true;
-            Ok(info)
-        });
-        for _ in 0..count {
-            let SessionLoad::Row {
-                generation,
-                id,
-                result,
-            } = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
-                .await
-                .unwrap()
-                .unwrap()
-            else {
-                panic!("expected metadata row")
-            };
-            assert!(apply_session_row(&mut app, generation, id, result));
-        }
-        let after = draw_picker(&mut app, 100, 13);
-        for hit in &app.click_regions {
-            if let ClickTarget::PickerSelect(i) = hit.target {
-                assert!(after[hit.y as usize].contains("visible-agent"), "{after:?}");
-                assert!(app.session_list[i].loaded);
-            }
-        }
-        assert_eq!(
-            app.session_list.iter().filter(|row| row.loaded).count(),
-            count
-        );
-        assert!(app.session_list[..60].iter().all(|row| !row.loaded));
-        assert!(
-            app.requested_session_indices().is_empty(),
-            "loaded rows stay cached"
-        );
-    }
-
-    #[tokio::test]
     async fn picker_metadata_requests_follow_fresh_resize_and_input_frames() {
         use crossterm::event::{MouseButton, MouseEventKind};
         let mut app = App::new(HashSet::new(), test_tab().await);
@@ -3117,31 +2734,19 @@ mod session_picker_tests {
         app.mode = TuiMode::SessionPicker;
         app.scroll.picker = 50;
         assert!(
-            app.requested_session_indices().is_empty(),
+            components::visible_rows(&app).is_empty(),
             "no viewport before first draw"
         );
         draw_picker(&mut app, 100, 12);
         let small = visible_ids(&app);
-        let requested = app.requested_session_indices();
-        assert_eq!(
-            requested
-                .iter()
-                .map(|i| i.session_db_id.clone())
-                .collect::<HashSet<_>>(),
-            small
-        );
+        let requested = components::visible_rows(&app);
+        assert_eq!(requested.into_keys().collect::<HashSet<_>>(), small);
         draw_picker(&mut app, 100, 22);
         let large = visible_ids(&app);
         assert!(large.len() > small.len());
-        let extra = app.requested_session_indices();
-        assert_eq!(extra.len(), 1, "three previous reads still own slots");
-        assert!(
-            extra
-                .iter()
-                .all(|i| large.contains(&i.session_db_id) && !small.contains(&i.session_db_id))
-        );
+        let extra = components::visible_rows(&app);
+        assert_eq!(extra.into_keys().collect::<HashSet<_>>(), large);
         // Model completion of the previous reads before the next viewport move.
-        app.session_rows_loading.clear();
         // A click on the pinned row retains the viewport, while Down then wheel
         // changes the cursor; the next draw must update requests before dispatch.
         app.picker_index = 53;
@@ -3177,142 +2782,23 @@ mod session_picker_tests {
         let moved = visible_ids(&app);
         assert!(moved.is_disjoint(&large));
         assert_eq!(
-            app.requested_session_indices()
-                .iter()
-                .map(|i| i.session_db_id.clone())
+            components::visible_rows(&app)
+                .into_keys()
                 .collect::<HashSet<_>>(),
             moved
         );
-        app.session_rows_loading.clear();
         draw_picker(&mut app, 100, 7);
         assert_eq!(
             visible_ids(&app).len(),
             1,
             "a clipped row's header is still visible"
         );
-        assert_eq!(app.requested_session_indices().len(), 1);
+        assert_eq!(components::visible_rows(&app).len(), 1);
         draw_picker(&mut app, 100, 6);
         assert!(visible_ids(&app).is_empty());
         assert!(
-            app.requested_session_indices().is_empty(),
+            components::visible_rows(&app).is_empty(),
             "no rows fit below pinned header"
         );
-    }
-
-    #[tokio::test]
-    async fn visible_metadata_requests_are_bounded_and_cancel_invalidates_results() {
-        let mut app = App::new(HashSet::new(), test_tab().await);
-        let indices: Vec<_> = (0..100).map(index).collect();
-        apply_session_catalog(&mut app, indices);
-        app.mode = TuiMode::SessionPicker;
-
-        draw_picker(&mut app, 100, 12);
-        let first = app.requested_session_indices();
-        assert_eq!(first.len(), 3);
-        assert!(first.iter().all(|row| row.session_db_id != "session-99"));
-
-        app.picker_index = 100;
-        draw_picker(&mut app, 100, 12);
-        let scrolled = app.requested_session_indices();
-        assert_eq!(scrolled.len(), 1, "only one of four slots is available");
-        assert!(scrolled.iter().any(|row| row.session_db_id == "session-99"));
-
-        let generation = app.session_generation;
-        app.session_fill = Some(SessionFill {
-            generation,
-            cancel: Arc::new(AtomicBool::new(false)),
-            tasks: Vec::new(),
-        });
-        app.cancel_session_fill();
-        assert_ne!(app.session_generation, generation);
-        assert!(app.session_rows_loading.is_empty());
-
-        let mut stale = SessionInfo::placeholder(&index(0));
-        stale.agent_name = Some("stale".into());
-        stale.loaded = true;
-        assert!(!apply_session_row(
-            &mut app,
-            generation,
-            stale.session_db_id.clone(),
-            Ok(stale)
-        ));
-        assert!(app.session_list[0].agent_name.is_none());
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn delayed_catalog_keeps_picker_responsive_and_stale_results_are_ignored() {
-        let mut app = App::new(HashSet::new(), test_tab().await);
-        app.mode = TuiMode::SessionPicker;
-        app.session_catalog_loading = true;
-        let (tx, mut rx) = mpsc::channel(1);
-        spawn_session_catalog_load(&mut app, tx, async {
-            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-            Ok(vec![index(1)])
-        });
-
-        assert_eq!(app.picker_index, 0);
-        input::handle_picker_key(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-        assert!(matches!(app.mode, TuiMode::Chat));
-        app.cancel_session_fill();
-        assert!(rx.try_recv().is_err());
-
-        tokio::time::advance(std::time::Duration::from_secs(30)).await;
-        tokio::task::yield_now().await;
-        assert!(rx.try_recv().is_err(), "cancelled load emitted a result");
-
-        app.mode = TuiMode::SessionPicker;
-        let current = app.session_generation;
-        assert!(matches!(
-            apply_session_catalog_result(&mut app, current.wrapping_sub(1), Ok(vec![index(9)])),
-            CatalogLoadOutcome::Ignored
-        ));
-        assert!(app.session_list.is_empty());
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn delayed_row_load_is_bounded_and_cancel_stops_further_opens() {
-        let mut app = App::new(HashSet::new(), test_tab().await);
-        let indices: Vec<_> = (0..100).map(index).collect();
-        apply_session_catalog(&mut app, indices);
-        app.mode = TuiMode::SessionPicker;
-        draw_picker(&mut app, 100, 20);
-        let requested = app.requested_session_indices();
-        assert!(requested.len() < app.session_list.len());
-
-        let opens = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let max_active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let observed = opens.clone();
-        let observed_active = active.clone();
-        let observed_max = max_active.clone();
-        let (tx, mut rx) = mpsc::channel(32);
-        spawn_session_metadata_load(&mut app, requested, tx, move |index| {
-            let observed = observed.clone();
-            let active = observed_active.clone();
-            let max_active = observed_max.clone();
-            async move {
-                observed.fetch_add(1, Ordering::Relaxed);
-                let now_active = active.fetch_add(1, Ordering::Relaxed) + 1;
-                max_active.fetch_max(now_active, Ordering::Relaxed);
-                tokio::time::sleep(std::time::Duration::from_secs(10)).await;
-                active.fetch_sub(1, Ordering::Relaxed);
-                let mut row = SessionInfo::placeholder(&index);
-                row.loaded = true;
-                Ok(row)
-            }
-        });
-
-        for _ in 0..4 {
-            tokio::task::yield_now().await;
-        }
-        assert_eq!(opens.load(Ordering::Relaxed), 4);
-        assert_eq!(max_active.load(Ordering::Relaxed), 4);
-        app.cancel_session_fill();
-        tokio::time::advance(std::time::Duration::from_secs(10)).await;
-        for _ in 0..4 {
-            tokio::task::yield_now().await;
-        }
-        assert_eq!(opens.load(Ordering::Relaxed), 4);
-        assert!(rx.try_recv().is_err());
     }
 }

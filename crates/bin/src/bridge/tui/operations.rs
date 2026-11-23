@@ -46,8 +46,6 @@ pub(super) enum Effect {
     Open(Box<Open>),
     Sent,
     JobSent(String),
-    /// A closed session's lazy row may need a new read; carry no persisted value.
-    ReloadRow(String),
     Settings(String),
     Diff(AgentDiffView),
     Fields(Box<super::field_sheet::Update>),
@@ -349,8 +347,7 @@ pub(super) fn begin_creation(app: &mut App) -> bool {
             Some("Backend unavailable or action queue full — creation not accepted".into());
         return false;
     }
-    app.cancel_session_fill();
-    app.session_list_fresh = false;
+    app.retire_picker();
     // The catalog reload is deferred until the accepted action settles.
     app.session_catalog_loading = true;
     let ticket = app.operations.next_ticket + 1;
@@ -409,7 +406,6 @@ pub(super) fn apply(app: &mut App, completion: Completion) {
     if app.operations.creation_ticket == Some(pending.ticket) && !continues {
         app.operations.creation_ticket = None;
         app.session_catalog_loading = false;
-        app.session_list_fresh = false;
     }
     match result {
         Err(error) => {
@@ -509,7 +505,6 @@ pub(super) fn apply(app: &mut App, completion: Completion) {
             if !app.backend_available {
                 reconnect::suspend_tab(&mut tab);
             }
-            app.session_list_fresh = false;
             if creating {
                 creation::opened(app, pending.ticket, *tab);
             } else if nav_valid {
@@ -533,19 +528,6 @@ pub(super) fn apply(app: &mut App, completion: Completion) {
             if let Some(i) = target {
                 app.tabs[i].live.input_feedback = feedback;
                 app.tabs[i].touch_transcript();
-            }
-        }
-        Ok(Effect::ReloadRow(id)) => {
-            if app.tab_index_for(&id).is_none() {
-                app.cancel_session_fill();
-                app.session_list_fresh = false;
-                if let Some(row) = app
-                    .session_list
-                    .iter_mut()
-                    .find(|row| row.session_db_id == id)
-                {
-                    row.loaded = false;
-                }
             }
         }
         Ok(Effect::Settings(text)) => {

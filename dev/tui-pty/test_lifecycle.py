@@ -709,6 +709,8 @@ backends:
     api_key: fixture-only
     models:
       - name: catalog-model
+      - name: agent-alt
+        context_window: 96000
 ''')
             owner = subprocess.Popen(
                 [TARGET / "debug/examples/tui_service_fixture", home / "service.sock"],
@@ -738,6 +740,33 @@ backends:
                     fresh.expect_screen(expected, timeout=12)
                     fresh.capture(out / f"fresh-{update}")
                     fresh.close()
+                # The accepted AgentDB record changes both model and cap,
+                # with no session or peer metadata write to wake either UI.
+                owner.stdin.write("agent-cap\n"); owner.stdin.flush()
+                reply("AGENT agent-cap")
+                existing.expect_screen("model: agent-alt", timeout=12)
+                existing.expect_screen("ctx unknown/16k tok", timeout=12)
+                fresh = launch()
+                fresh.expect_screen("ctx unknown/16k tok", timeout=12)
+                fresh.expect_screen("model: agent-alt", timeout=12)
+                fresh.capture(out / "fresh-agent-cap")
+                fresh.close()
+                owner.stdin.write("agent-corrupt\n"); owner.stdin.flush()
+                reply("AGENT agent-corrupt")
+                existing.expect_screen("agent config stale", timeout=12)
+                existing.expect_screen("ctx unknown/16k tok", timeout=12)
+                existing.capture(out / "existing-agent-stale")
+                owner.stdin.write("agent-repair\n"); owner.stdin.flush()
+                reply("AGENT agent-repair")
+                existing.expect_screen("ctx unknown/128k tok", timeout=12)
+                existing.capture(out / "existing-agent-repaired")
+                # Direct --session startup has no operation completion to
+                # release the initial Session callback. Its idle feed must run.
+                owner.stdin.write("append\n"); owner.stdin.flush()
+                reply("APPENDED")
+                existing.expect_screen("RECOVERY-VISIBLE", timeout=12)
+                existing.expect_screen("RECOVERY-STATUS", timeout=12)
+                print("PRESENTATION WINDOWS: both clients converge on peer metadata and AgentDB config; malformed config keeps last good until repair")
             finally:
                 for process in processes:
                     process.close()

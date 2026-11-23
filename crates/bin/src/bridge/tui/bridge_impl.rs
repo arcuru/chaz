@@ -29,6 +29,7 @@ impl TuiBridge {
         let mut server = built.server.clone();
         let mut runtime = Some(built);
         let mut reads = presentation::Reads::default();
+        let mut components = components::Watches::new();
         let (connection_tx, mut connection_rx) = mpsc::channel(1);
         let mut probe_task: Option<supervised::Task<()>> = None;
         let mut runtime_task: Option<supervised::Task<()>> = None;
@@ -49,6 +50,7 @@ impl TuiBridge {
                 &notify_tx,
                 &mut notify_rx,
                 &mut reads,
+                &mut components,
             )
             .await;
         drop(terminal_owner);
@@ -58,6 +60,7 @@ impl TuiBridge {
         // The terminal state has retired its registrations. A native read
         // that began verification must still publish before it can be dropped.
         notify_rx.close();
+        components.shutdown().await;
         notify_tx.drain().await;
         while reads.join_next().await.is_some() {}
         if let Some(mut task) = probe_task.take() {
@@ -112,6 +115,7 @@ impl TuiBridge {
         notify_tx: &presentation::Sender,
         notify_rx: &mut mpsc::Receiver<presentation::Delivery>,
         reads: &mut presentation::Reads,
+        components: &mut components::Watches,
     ) -> anyhow::Result<Option<String>> {
         let mut reconnect_allowed = true;
         let mut reconnect_attempt = 0u32;
@@ -121,20 +125,20 @@ impl TuiBridge {
         let mut backend = server.backend().clone();
         let (initial_metadata, mut metadata_rx) = server.observe_model_metadata();
         refresh::apply_model_metadata(&mut app, server, initial_metadata);
+        // Startup can install a --session tab without an Operation completion.
+        refresh::apply_initial_models(&mut app, server);
         // One-shot-style delivery of background model catalog fetches.
         // Buffered so a force-refresh kicked off mid-render doesn't block.
         let (models_tx, mut models_rx) = mpsc::channel::<ModelCatalog>(4);
         let (workers_tx, mut workers_rx) = mpsc::channel(8);
-        let (session_rows_tx, mut session_rows_rx) = mpsc::channel::<SessionLoad>(128);
         let (peer_pages_tx, mut peer_pages_rx) = mpsc::channel(1);
         let (session_pages_tx, mut session_pages_rx) = mpsc::channel(1);
         let (jobs_tx, mut jobs_rx) = mpsc::channel::<jobs::Loaded>(1);
-        let mut catalog_changes = server.registry().catalog_changes();
 
         // An ordinary launch opens the hub — even on an empty install — and
         // creates nothing. The catalog loads in the background.
         if app.tabs.is_empty() {
-            open_session_picker(&mut app, server, &session_rows_tx);
+            open_session_picker(&mut app);
         }
 
         let mut activity_tick = tokio::time::interval(reconnect::PROBE_INTERVAL);
@@ -145,7 +149,7 @@ impl TuiBridge {
             reads.start_initial(&mut app);
             operations::cancel_closed_reads(&mut app);
             workers::update(&mut app, server, &workers_tx);
-            ensure_view(&mut app, server, &session_rows_tx);
+            app.ensure_view();
             peer_pages::update(&mut app, server, &peer_pages_tx);
             session_pages::update(&mut app, server, &backend, &session_pages_tx);
             if !app.backend_available
@@ -167,12 +171,10 @@ impl TuiBridge {
                     tracing::info!("TUI ready frame drawn");
                     first_ready_frame = false;
                 }
-                // Use this frame's viewport, not the previous frame's cursor or size.
-                if matches!(app.mode, TuiMode::SessionPicker) {
-                    request_session_metadata(&mut app, server, &session_rows_tx);
-                }
                 needs_draw = false;
             }
+            components.sync_picker(&mut app, server);
+            components.sync_agents(&mut app, server);
 
             if app.mode == TuiMode::Jobs
                 && app.jobs.data.observed_at.is_none()
@@ -217,11 +219,10 @@ impl TuiBridge {
                     Some(msg) = app.operations.recv() => Action::Operation(msg),
                     Some(msg) = reads.join_next(), if !reads.is_empty() => Action::Refresh(msg),
                     Some(update) = notify_rx.recv(), if reads.has_capacity() => Action::SessionChanged(update),
-                    Ok(()) = catalog_changes.changed() => Action::CatalogChanged,
                     Some(msg) = approval_rx.recv() => Action::ApprovalRequest(msg),
                     Some(res) = models_rx.recv() => Action::ModelsFetched(res),
                     Some(update) = metadata_rx.recv() => Action::ModelMetadata(update),
-                    Some(load) = session_rows_rx.recv() => Action::SessionLoad(load),
+                    Some(update) = components.rx.recv() => Action::Component(update),
                     Some(loaded) = peer_pages_rx.recv() => Action::PeerPage(loaded),
                     Some(loaded) = session_pages_rx.recv() => Action::SessionPage(loaded),
                     Some(loaded) = workers_rx.recv() => Action::WorkersLoaded(loaded),
@@ -247,12 +248,6 @@ impl TuiBridge {
                             *probe_task = Some(reconnect::spawn_probe(server, connection_tx));
                         }
                         needs_draw |= app.operations.warn_if_late();
-                        if !app.session_row_errors.is_empty()
-                            && app.mode == TuiMode::SessionPicker
-                        {
-                            app.session_row_errors.clear();
-                            needs_draw = true;
-                        }
                         continue;
                     },
                     _ = tokio::time::sleep_until(overdue.unwrap_or_else(tokio::time::Instant::now)), if overdue.is_some() => {
@@ -281,10 +276,6 @@ impl TuiBridge {
                     app.peer_agents_cursor,
                 );
                 match action {
-                    Action::CatalogChanged => {
-                        app.session_list_fresh = false;
-                        app.session_catalog_invalidated = true;
-                    }
                     Action::Key(key) => {
                         app.selection.clear();
                         if key.code == KeyCode::Char('c')
@@ -294,7 +285,7 @@ impl TuiBridge {
                         } else if app.mode == TuiMode::NewSession {
                             creation::handle_key(&mut app, key);
                             if app.mode == TuiMode::SessionPicker {
-                                open_session_picker(&mut app, server, &session_rows_tx);
+                                open_session_picker(&mut app);
                             }
                         } else if app.settings_too_small() && key.code != KeyCode::Esc {
                             // Only safe cancellation and the existing quit path remain live.
@@ -351,7 +342,6 @@ impl TuiBridge {
                                         approval_tx,
                                         notify_tx,
                                         &models_tx,
-                                        &session_rows_tx,
                                     );
                                 }
                                 TuiMode::SessionPicker => {
@@ -371,7 +361,7 @@ impl TuiBridge {
                             // whose catalog failed to load).
                             match app.mode {
                                 TuiMode::NewSession | TuiMode::Jobs => {
-                                    open_session_picker(&mut app, server, &session_rows_tx)
+                                    open_session_picker(&mut app)
                                 }
                                 TuiMode::Chat => {
                                     handle_chat_action(
@@ -383,13 +373,11 @@ impl TuiBridge {
                                         approval_tx,
                                         notify_tx,
                                         &models_tx,
-                                        &session_rows_tx,
                                     );
                                 }
                                 TuiMode::SessionPicker => {
                                     if app.tabs.is_empty() || app.session_picker_error.is_some() {
-                                        app.session_list_fresh = false;
-                                        open_session_picker(&mut app, server, &session_rows_tx);
+                                        open_session_picker(&mut app);
                                     } else {
                                         app.mode = TuiMode::Chat;
                                     }
@@ -439,7 +427,6 @@ impl TuiBridge {
                                             approval_tx,
                                             notify_tx,
                                             &models_tx,
-                                            &session_rows_tx,
                                         );
                                     }
                                 }
@@ -494,7 +481,6 @@ impl TuiBridge {
                                         approval_tx,
                                         notify_tx,
                                         &models_tx,
-                                        &session_rows_tx,
                                     );
                                 }
                             }
@@ -512,7 +498,6 @@ impl TuiBridge {
                                     approval_tx,
                                     notify_tx,
                                     &models_tx,
-                                    &session_rows_tx,
                                 ),
                                 input::MouseOutcome::Copy(text) => {
                                     if let Err(error) = selection::copy_to(&mut io::stdout(), &text)
@@ -561,6 +546,7 @@ impl TuiBridge {
                         }
                         let _ = update.handled.send(());
                     }
+                    Action::Component(update) => components.apply(&mut app, server, update),
                     Action::SessionChanged(update) => {
                         reads.start(&mut app, update);
                     }
@@ -599,6 +585,7 @@ impl TuiBridge {
                             if let Some(reason) = reason {
                                 missed_probe = false;
                                 reconnect::disconnect(&mut app, reason);
+                                components.disconnect();
                                 metadata_rx.close();
                                 if let Some(connection) =
                                     server.registry().instance().remote_connection()
@@ -613,7 +600,6 @@ impl TuiBridge {
                                 Ok(replacement) => {
                                     reconnect_attempt = 0;
                                     *server = replacement.server.clone();
-                                    catalog_changes = server.registry().catalog_changes();
                                     self.secrets = replacement.secret_store.clone();
                                     backend = server.backend().clone();
                                     let (initial, rx) = server.observe_model_metadata();
@@ -633,7 +619,7 @@ impl TuiBridge {
                                     }
                                     *runtime = Some(*replacement);
                                     if app.mode == TuiMode::SessionPicker {
-                                        open_session_picker(&mut app, server, &session_rows_tx);
+                                        open_session_picker(&mut app);
                                     }
                                 }
                                 Err((error, transient)) => {
@@ -660,18 +646,14 @@ impl TuiBridge {
                     },
                     Action::Operation(msg) => {
                         operations::apply(&mut app, msg);
-                        // An opening tab may predate the applied peer
-                        // component; use the GUI's component, not the live overlay.
-                        for tab in &mut app.tabs {
-                            refresh::apply_model_budget(tab, server, &app.model_metadata);
-                        }
+                        refresh::apply_initial_models(&mut app, server);
                     }
                     Action::Refresh(result) => match result {
                         Ok(loaded) => {
-                            let observed = app.model_metadata.clone();
                             if let Some(id) =
-                                presentation::apply(&mut app, loaded, |agent, meta| {
-                                    refresh::resolve_from(server, &backend, agent, meta, &observed)
+                                presentation::apply_then(&mut app, loaded, |app, idx| {
+                                    refresh::derive_tab(app, server, idx);
+                                    app.update_picker_pin(server);
                                 })
                             {
                                 session_pages::changed(&mut app, &id);
@@ -704,32 +686,6 @@ impl TuiBridge {
                     Action::ModelsFetched(res) => {
                         apply_model_catalog(&mut app, res);
                     }
-                    Action::SessionLoad(load) => match load {
-                        SessionLoad::Grouped { generation, result } => match result {
-                            Ok((indices, groups)) => {
-                                if matches!(
-                                    apply_session_catalog_result(&mut app, generation, Ok(indices)),
-                                    CatalogLoadOutcome::Loaded
-                                ) {
-                                    workers::group(&mut app, groups);
-                                }
-                            }
-                            Err(error) => {
-                                apply_session_catalog_result(&mut app, generation, Err(error));
-                            }
-                        },
-                        #[cfg(test)]
-                        SessionLoad::Catalog { generation, result } => {
-                            apply_session_catalog_result(&mut app, generation, result);
-                        }
-                        SessionLoad::Row {
-                            generation,
-                            id,
-                            result,
-                        } => {
-                            apply_session_row(&mut app, generation, id, result);
-                        }
-                    },
                 }
 
                 peer_pages::update(&mut app, server, &peer_pages_tx);
@@ -746,19 +702,14 @@ impl TuiBridge {
                     app.navigation_generation += 1;
                 }
 
-                // The picker owns the background fill; the moment we're not in it,
-                // stop opening session DBs the user isn't looking at. A re-open
-                // restarts the walk for whatever rows never finished.
-                if !matches!(app.mode, TuiMode::SessionPicker) {
-                    app.cancel_session_fill();
-                }
+                components.retire_picker_if_hidden(&app);
 
                 if app.should_quit {
                     break 'run;
                 }
             }
 
-            ensure_view(&mut app, server, &session_rows_tx);
+            app.ensure_view();
         }
 
         let exit_report = app.operations.exit_report();

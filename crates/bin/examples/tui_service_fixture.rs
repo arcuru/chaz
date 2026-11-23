@@ -229,6 +229,26 @@ async fn main() -> anyhow::Result<()> {
                     .await?;
                 println!("WINDOW {command}");
             }
+            "agent-cap" | "agent-repair" => {
+                let capped = command == "agent-cap";
+                agent_db
+                    .write_config(&AgentDbConfig {
+                        model: capped.then(|| "stub:agent-alt".into()),
+                        max_context_tokens: capped.then_some(16_000),
+                        ..Default::default()
+                    })
+                    .await?;
+                println!("AGENT {command}");
+            }
+            "agent-corrupt" => {
+                let txn = agent_db.database().new_transaction().await?;
+                txn.get_store::<eidetica::store::DocStore>(chaz_core::agent_db::CONFIG_STORE)
+                    .await?
+                    .set("value", true)
+                    .await?;
+                txn.commit().await?;
+                println!("AGENT {command}");
+            }
             "quit" => break,
             _ => anyhow::bail!("unknown fixture command"),
         }

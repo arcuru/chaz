@@ -1,5 +1,5 @@
-//! Native Snapshot delivery for session, Job, and Worker tabs. A registration
-//! owns its callback; the terminal runtime owns reads that callback requested.
+//! Native Snapshot delivery. A registration owns its callback; the terminal
+//! runtime owns the reads that callback requested.
 use super::*;
 use eidetica::{Database, Snapshot, WriteCallback};
 use std::sync::{Mutex, atomic::AtomicU64};
@@ -15,7 +15,7 @@ pub(super) fn next_id() -> u64 {
 /// Preparing a tab can outlive the navigation that requested it: dropping an
 /// in-progress native verification read can lose another watch's publication.
 /// Admission is before spawn, and shutdown drains only already admitted work.
-struct Preparations {
+pub(super) struct Preparations {
     permits: Arc<Semaphore>,
     tasks: Mutex<JoinSet<()>>,
 }
@@ -31,10 +31,7 @@ pub(super) fn channel() -> (Sender, mpsc::Receiver<Delivery>) {
     (
         Sender {
             updates,
-            preparations: Arc::new(Preparations {
-                permits: Arc::new(Semaphore::new(2)),
-                tasks: Mutex::new(JoinSet::new()),
-            }),
+            preparations: Arc::new(Preparations::new(2)),
         },
         rx,
     )
@@ -45,17 +42,31 @@ impl Sender {
         &self,
         work: impl Future<Output = Result<T, String>> + Send + 'static,
     ) -> Result<T, String> {
-        let pool = &self.preparations;
-        let permit = pool
-            .permits
-            .clone()
-            .acquire_owned()
-            .await
-            .map_err(|_| "TUI closed")?;
+        self.preparations.prepare(work).await
+    }
+
+    pub(super) async fn drain(&self) {
+        self.preparations.drain().await;
+    }
+}
+
+impl Preparations {
+    pub(super) fn new(limit: usize) -> Self {
+        Self {
+            permits: Arc::new(Semaphore::new(limit)),
+            tasks: Mutex::new(JoinSet::new()),
+        }
+    }
+
+    pub(super) async fn prepare<T: Send + 'static>(
+        &self,
+        work: impl Future<Output = Result<T, String>> + Send + 'static,
+    ) -> Result<T, String> {
+        let permit = self.acquire().await?;
         let (reply, result) = oneshot::channel();
         {
-            let mut tasks = pool.tasks.lock().expect("preparation lock poisoned");
-            if pool.permits.is_closed() {
+            let mut tasks = self.tasks.lock().expect("preparation lock poisoned");
+            if self.permits.is_closed() {
                 return Err("TUI closed".into());
             }
             while tasks.try_join_next().is_some() {}
@@ -64,13 +75,20 @@ impl Sender {
                 let _ = reply.send(supervised::work(work).await);
             });
         }
-        result.await.map_err(|_| "Tab preparation worker stopped")?
+        result.await.map_err(|_| "Presentation reader stopped")?
+    }
+
+    pub(super) async fn acquire(&self) -> Result<tokio::sync::OwnedSemaphorePermit, String> {
+        self.permits
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| "TUI closed".into())
     }
 
     pub(super) async fn drain(&self) {
-        let pool = &self.preparations;
-        pool.permits.close();
-        let mut tasks = std::mem::take(&mut *pool.tasks.lock().expect("preparation lock poisoned"));
+        self.permits.close();
+        let mut tasks = std::mem::take(&mut *self.tasks.lock().expect("preparation lock poisoned"));
         while tasks.join_next().await.is_some() {}
     }
 }
@@ -90,10 +108,17 @@ pub(super) async fn subscribe(
     observation: u64,
     tx: Sender,
 ) -> anyhow::Result<(WriteCallback, Delivery)> {
+    subscribe_to(db, observation, tx.updates).await
+}
+
+pub(super) async fn subscribe_to(
+    db: &Database,
+    observation: u64,
+    updates: mpsc::Sender<Delivery>,
+) -> anyhow::Result<(WriteCallback, Delivery)> {
     let session = db.root_id().to_string();
     let (first, initial) = oneshot::channel();
     let first = Mutex::new(Some(first));
-    let updates = tx.updates;
     let callback = db
         .on_write(move |tips, _| {
             let first = first.lock().expect("initial delivery lock poisoned").take();
@@ -130,7 +155,12 @@ pub(super) type TabSnapshot = (
 pub(super) struct Loaded {
     delivery: Delivery,
     result: Result<Box<TabSnapshot>, String>,
-    partial_status: Option<Result<Vec<String>, String>>,
+    partial: Option<Partial>,
+}
+
+struct Partial {
+    status: Result<Vec<String>, String>,
+    steering: Result<chaz_core::session::steering::SteeringView, String>,
 }
 
 fn tab_index(app: &App, delivery: &Delivery) -> Option<usize> {
@@ -194,25 +224,38 @@ impl Reads {
                         .await
                         .map(|loaded| (loaded, None))
                 };
-                let status = if result.is_err() {
+                let partial = if result.is_err() {
                     // Invalid transcript/meta must not hide readable status at
                     // that same frontier. Never bypass current native authority.
-                    let status = match chaz_core::session::jobs::require_observer_write(&db).await {
-                        Ok(_) => refresh::load_status_at(&db, &tips).await,
-                        Err(error) => Err(error.to_string()),
+                    let partial = match chaz_core::session::jobs::require_observer_write(&db).await
+                    {
+                        Ok(_) => {
+                            let (status, steering) = tokio::join!(
+                                refresh::load_status_at(&db, &tips),
+                                Session::steering_view_at(&db, &tips),
+                            );
+                            Partial {
+                                status,
+                                steering: steering.map_err(|e| e.to_string()),
+                            }
+                        }
+                        Err(error) => Partial {
+                            status: Err(error.to_string()),
+                            steering: Err(error.to_string()),
+                        },
                     };
-                    Some(status)
+                    Some(partial)
                 } else {
                     None
                 };
-                Ok((result, status))
+                Ok((result, partial))
             }))
             .await;
-            let (result, partial_status) = loaded.unwrap_or_else(|error| (Err(error), None));
+            let (result, partial) = loaded.unwrap_or_else(|error| (Err(error), None));
             Loaded {
                 delivery,
                 result: result.map(Box::new),
-                partial_status,
+                partial,
             }
         });
     }
@@ -240,18 +283,32 @@ pub(super) fn mark_overdue(app: &mut App, now: tokio::time::Instant) {
 
 /// Keep the delivery (including the ack) owned until GUI state is applied.
 /// On a closed/rebound route just retire it, even if native work succeeded.
+pub(super) fn apply_then(
+    app: &mut App,
+    loaded: Loaded,
+    derive: impl FnOnce(&mut App, usize),
+) -> Option<String> {
+    let idx = tab_index(app, &loaded.delivery)?;
+    app.tabs[idx].live.snapshot_started = None;
+    app.tabs[idx].live.snapshot_overdue = false;
+    if refresh::apply_watched(app, idx, loaded.result.map(|snapshot| *snapshot)) {
+        derive(app, idx);
+    }
+    if let Some(partial) = loaded.partial {
+        refresh::replace_status(&mut app.tabs[idx], partial.status);
+        refresh::replace_steering(app, idx, partial.steering);
+    }
+    let _ = loaded.delivery.handled.send(());
+    Some(loaded.delivery.session)
+}
+
+#[cfg(test)]
 pub(super) fn apply(
     app: &mut App,
     loaded: Loaded,
     resolve: impl FnOnce(&str, &SessionMeta) -> refresh::Resolved,
 ) -> Option<String> {
-    let idx = tab_index(app, &loaded.delivery)?;
-    app.tabs[idx].live.snapshot_started = None;
-    app.tabs[idx].live.snapshot_overdue = false;
-    refresh::apply_watched(app, idx, loaded.result.map(|snapshot| *snapshot), resolve);
-    if let Some(status) = loaded.partial_status {
-        refresh::replace_status(&mut app.tabs[idx], status);
-    }
-    let _ = loaded.delivery.handled.send(());
-    Some(loaded.delivery.session)
+    apply_then(app, loaded, |app, idx| {
+        refresh::derive_fixture(&mut app.tabs[idx], resolve)
+    })
 }

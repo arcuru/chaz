@@ -744,6 +744,7 @@ fn render_peer_agents(
         })
         .collect();
     let window = ListWindow::new(&heights, Some(cursor), budget, app.scroll.peer_agents);
+    app.visible_peer_agents = window.rows();
     if list_area.height > 0 {
         app.scroll.peer_agents = window.offset;
     }
@@ -756,14 +757,12 @@ fn render_peer_agents(
         for i in window.rows() {
             let name = &names[i];
             let agent = server.agents().get(name);
-            let resolved = agent
-                .as_ref()
-                .map(|a| backend.resolve_model_name(a.default_model.as_deref()))
-                .unwrap_or_default();
-            let model_label = if resolved.is_empty() {
-                "(no model)".to_string()
-            } else {
-                resolved
+            let model_label = match super::super::components::default_model(app, server, name) {
+                Some(default) => match backend.resolve_model_name(default.as_deref()) {
+                    model if model.is_empty() => "(no model)".to_string(),
+                    model => model,
+                },
+                None => "(config unavailable)".to_string(),
             };
             let is_selected = i == cursor;
             let marker = if is_selected { "> " } else { "  " };
@@ -838,8 +837,15 @@ fn render_peer_agents(
     // Detail pane — selected agent's fields, or a hint when no agents.
     let mut detail = names
         .get(cursor)
-        .and_then(|n| server.agents().get(n))
-        .map(|a| agent_detail_lines(&a))
+        .and_then(|name| server.agents().get(name).map(|agent| (name, agent)))
+        .map(|(name, agent)| {
+            let default = super::super::components::default_model(app, server, name);
+            let model = match default.as_ref() {
+                Some(model) => model.as_deref().unwrap_or("(backend default)"),
+                None => "(config unavailable)",
+            };
+            agent_detail_lines(&agent, model)
+        })
         .unwrap_or_else(|| {
             vec![Line::from(vec![Span::styled(
                 "  (select an agent)",
@@ -874,8 +880,7 @@ fn render_peer_agents(
 /// Worker template the Agent owns. Workers inherit the Agent's defaults
 /// where their own fields are unset; "(inherit)" is shown so the
 /// resolution path is visible.
-fn agent_detail_lines(a: &chaz_core::agent::Agent) -> Vec<Line<'static>> {
-    let default_model = a.default_model.as_deref().unwrap_or("(backend default)");
+fn agent_detail_lines(a: &chaz_core::agent::Agent, default_model: &str) -> Vec<Line<'static>> {
     let tools = match &a.allowed_tools {
         None => "all".to_string(),
         Some(v) if v.is_empty() => "(none)".to_string(),

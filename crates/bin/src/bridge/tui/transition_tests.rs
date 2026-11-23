@@ -67,7 +67,6 @@ async fn queued_defaults_add_then_delete_and_move_preserve_identity_and_order() 
     let (approval, _) = mpsc::channel(8);
     let (notify, _) = presentation::channel();
     let (models, _) = mpsc::channel(4);
-    let (rows, _) = mpsc::channel(128);
     let mut observations = Vec::new();
     for reorder in [false, true] {
         server.set_default_agents(vec!["a".into(), "b".into()]);
@@ -95,7 +94,6 @@ async fn queued_defaults_add_then_delete_and_move_preserve_identity_and_order() 
             &approval,
             &notify,
             &models,
-            &rows,
         );
         // Accept the next action before the earlier add can update worker state.
         app.peer_defaults_cursor = usize::from(reorder);
@@ -114,7 +112,6 @@ async fn queued_defaults_add_then_delete_and_move_preserve_identity_and_order() 
             &approval,
             &notify,
             &models,
-            &rows,
         );
         assert_eq!(
             server.default_agents(),
@@ -202,7 +199,6 @@ async fn close_then_next_event(event: Event) {
     let (approval, _) = mpsc::channel(8);
     let (notify, _) = presentation::channel();
     let (models, _) = mpsc::channel(4);
-    let (rows, _) = mpsc::channel(128);
     let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
     terminal
         .draw(|f| view::ui(f, &mut app, &built.server, &backend, &Config::default()))
@@ -221,7 +217,6 @@ async fn close_then_next_event(event: Event) {
                     &approval,
                     &notify,
                     &models,
-                    &rows,
                 ),
                 TuiMode::SessionPicker => {
                     app.open_settings(SettingsScope::Peer, TuiMode::SessionPicker)
@@ -770,7 +765,6 @@ async fn steering_promotion_refresh_and_reopen(is_job: bool) {
     let mut app = App::new(HashSet::from(["a".into()]), tab);
     let (approval, _) = mpsc::channel(8);
     let (models, _) = mpsc::channel(4);
-    let (rows, _) = mpsc::channel(4);
     app.input = "frame steering one".into();
     app.cursor = app.input.len();
     assert!(
@@ -791,7 +785,6 @@ async fn steering_promotion_refresh_and_reopen(is_job: bool) {
         &approval,
         &notify,
         &models,
-        &rows,
     );
     let result = tokio::time::timeout(Duration::from_secs(10), app.operations.recv())
         .await
@@ -828,18 +821,13 @@ async fn steering_promotion_refresh_and_reopen(is_job: bool) {
         .unwrap()
         .unwrap()
         .forget();
-    // Actual background refresh is exercised, then close/reopen through each real opener.
-    let (tx, mut rx) = mpsc::channel(8);
-    refresh::request(&mut app, &id, refresh::RefreshKind::Session, &tx);
-    let result = tokio::time::timeout(Duration::from_secs(10), rx.recv())
-        .await
-        .unwrap()
-        .unwrap();
-    refresh::apply(&mut app, result, |_, _| refresh::Resolved {
+    // The pinned read updates telemetry before close/reopen through each real opener.
+    refresh::fixture_reload(&mut app, |_, _| refresh::Resolved {
         effective_model: "stub".into(),
         context_budget: 32_000,
         roster: vec![],
-    });
+    })
+    .await;
     assert_eq!(app.tabs[0].live.telemetry.as_ref().unwrap().totals.calls, 2);
     assert!(app.tabs[0].live.telemetry.as_ref().unwrap().last_calls["a"].context_estimated);
     let screen = steering_frame(
@@ -1068,6 +1056,11 @@ async fn opened_tab_acks_initial_only_after_insertion() {
         app.active().session_name.as_deref(),
         Some("written while opening")
     );
+    assert!(
+        notifications.try_recv().is_err(),
+        "a partially applied install acknowledged the callback"
+    );
+    refresh::apply_initial_models(&mut app, &built.server);
     let delivery = tokio::time::timeout(std::time::Duration::from_secs(2), notifications.recv())
         .await
         .unwrap()

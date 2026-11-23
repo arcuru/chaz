@@ -284,8 +284,8 @@ async fn settle(app: &mut App) {
         operations::apply(app, completion);
     }
 }
-async fn receive(rx: &mut mpsc::Receiver<SessionLoad>) -> SessionLoad {
-    tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+async fn update(watches: &mut components::Watches) -> components::Update {
+    tokio::time::timeout(std::time::Duration::from_secs(2), watches.rx.recv())
         .await
         .unwrap()
         .unwrap()
@@ -315,6 +315,109 @@ fn new_session(app: &mut App, server: &Arc<Server>, backend: &BackendManager) {
 }
 
 #[tokio::test]
+async fn visible_rows_merge_group_and_session_deliveries_without_rereading_live_tips() {
+    use chaz_core::session::SessionStatus;
+    use eidetica::store::DocStore;
+    let dir = tempfile::tempdir().unwrap();
+    let built = runtime(dir.path(), Arc::new(Probe::default())).await;
+    let server = &built.server;
+    let registry = server.registry();
+    let (id, db) = registry.create_session(Some("tui")).await.unwrap();
+    let id = id.0;
+    let set_alias = async |from: Option<&str>, to: &str| {
+        // Group-only change: do not use rename, which also mirrors to Session.
+        let txn = registry.chaz_group().new_transaction().await.unwrap();
+        let names = txn.get_store::<DocStore>("session_names").await.unwrap();
+        if let Some(from) = from {
+            names.delete(from).await.unwrap();
+        }
+        names.set_string(to, &id).await.unwrap();
+        txn.commit().await.unwrap();
+    };
+    set_alias(None, "original alias").await;
+    let mut app = App::hub(HashSet::new());
+    let mut watches = components::Watches::new();
+    watches.sync_picker(&mut app, server);
+    let initial = update(&mut watches).await;
+    // Hold the delivered group result while committing a newer index. The GUI
+    // initially sees the pinned index, then follows the native notification.
+    registry.mark_session_closed(&id).await.unwrap();
+    watches.apply(&mut app, server, initial);
+    assert_eq!(app.session_list[0].status, SessionStatus::Active);
+    app.picker_index = 1;
+    let group = update(&mut watches).await;
+    watches.apply(&mut app, server, group);
+    assert_eq!(app.picker_selection(), id);
+    assert_eq!(app.session_list[0].status, SessionStatus::Closed);
+    assert!(
+        !app.session_list[0].loaded,
+        "index must not hydrate sessions"
+    );
+
+    app.picker_visible_rows = 0..1;
+    watches.sync_picker(&mut app, server);
+    let initial = update(&mut watches).await;
+    chaz_core::session::update_meta_on_db(&db, |meta| {
+        meta.name = Some("canonical session title".into());
+        meta.description = Some("new session data".into());
+    })
+    .await
+    .unwrap();
+    watches.apply(&mut app, server, initial);
+    assert_eq!(app.session_list[0].name.as_deref(), Some("original alias"));
+    let row = update(&mut watches).await;
+    watches.apply(&mut app, server, row);
+    assert_eq!(
+        app.session_list[0].description.as_deref(),
+        Some("new session data")
+    );
+    assert_eq!(
+        app.session_list[0].name.as_deref(),
+        Some("canonical session title")
+    );
+    assert_eq!(app.session_list[0].status, SessionStatus::Closed);
+
+    set_alias(Some("original alias"), "replacement alias").await;
+    let group = update(&mut watches).await;
+    watches.apply(&mut app, server, group);
+    assert_eq!(
+        app.session_list[0].name.as_deref(),
+        Some("canonical session title")
+    );
+    chaz_core::session::update_meta_on_db(&db, |meta| meta.name = None)
+        .await
+        .unwrap();
+    let row = update(&mut watches).await;
+    watches.apply(&mut app, server, row);
+    assert_eq!(
+        app.session_list[0].name.as_deref(),
+        Some("replacement alias")
+    );
+
+    chaz_core::session::update_meta_on_db(&db, |meta| meta.description = Some("older row".into()))
+        .await
+        .unwrap();
+    let retired = update(&mut watches).await;
+    chaz_core::session::update_meta_on_db(&db, |meta| meta.description = Some("open tab".into()))
+        .await
+        .unwrap();
+    let (notify, _) = presentation::channel();
+    let observation = jobs::observe(&db, notify.clone()).await.unwrap();
+    let tab = build_observed_tab(server, server.backend(), db, observation, false)
+        .await
+        .unwrap();
+    app.push_tab(tab);
+    refresh::apply_initial_models(&mut app, server);
+    watches.apply(&mut app, server, retired);
+    assert_eq!(app.session_list[0].description.as_deref(), Some("open tab"));
+    assert_eq!(app.session_list[0].status, SessionStatus::Closed);
+    watches.shutdown().await;
+    notify.drain().await;
+    drop(app);
+    built.shutdown().await;
+}
+
+#[tokio::test]
 async fn new_session_preempts_a_blocked_historical_open_without_history_growth() {
     for count in [1, 32, 128] {
         let dir = tempfile::tempdir().unwrap();
@@ -341,24 +444,17 @@ async fn new_session_preempts_a_blocked_historical_open_without_history_growth()
         let blocked = indices[0].session_db_id.clone();
         let mut app = App::hub(HashSet::new());
         apply_session_catalog(&mut app, indices.clone());
-        // The same production metadata loader enters the real open_session I/O,
-        // while holding the account-session mutex that create_session will need.
+        // A real historical binding holds the account mutex used by creation.
         *probe.blocked.lock().unwrap() = Some(ID::parse(&blocked).unwrap());
-        let (tx, mut rx) = mpsc::channel(128);
-        let registry = server.registry_arc();
-        spawn_session_metadata_load(
-            &mut app,
-            vec![indices[0].clone()],
-            tx.clone(),
-            move |index| {
-                let registry = registry.clone();
-                async move {
-                    commands::try_load_session_metadata(&registry, index)
-                        .await
-                        .map_err(|e| e.to_string())
-                }
-            },
-        );
+        let mut watches = components::Watches::new();
+        let row = app
+            .session_list
+            .iter()
+            .position(|r| r.session_db_id == blocked)
+            .unwrap();
+        app.picker_visible_rows = row..row + 1;
+        watches.sync_picker(&mut app, server);
+        let group = update(&mut watches).await;
         tokio::time::timeout(std::time::Duration::from_secs(2), probe.entered.notified())
             .await
             .unwrap();
@@ -372,7 +468,6 @@ async fn new_session_preempts_a_blocked_historical_open_without_history_growth()
         );
         probe.accessed.lock().unwrap().clear();
         assert!(frame(&mut app, server, &backend).contains("New session"));
-        let generation = app.session_generation;
         new_session(&mut app, server, &backend);
         new_session(&mut app, server, &backend);
         assert!(
@@ -382,9 +477,9 @@ async fn new_session_preempts_a_blocked_historical_open_without_history_growth()
                 .unwrap()
                 .contains("already pending")
         );
-        // Repeated frames must not restart historical reads during creation.
-        ensure_view(&mut app, server, &tx);
-        request_session_metadata(&mut app, server, &tx);
+        // The event loop retires picker routes as soon as creation owns navigation.
+        watches.retire_picker_if_hidden(&app);
+        watches.sync_picker(&mut app, server);
         settle(&mut app).await;
         assert_eq!(app.mode, TuiMode::Chat);
         assert_eq!(app.tabs.len(), 1);
@@ -411,35 +506,16 @@ async fn new_session_preempts_a_blocked_historical_open_without_history_growth()
             0,
             "test released the historical gate"
         );
-        assert!(rx.try_recv().is_err(), "blocked metadata completed");
-        // Pre-create successes and failures cannot change the new view.
-        assert!(matches!(
-            apply_session_catalog_result(&mut app, generation, Err("obsolete failure".into())),
-            CatalogLoadOutcome::Ignored
-        ));
+        assert!(watches.rx.try_recv().is_err(), "blocked metadata completed");
+        watches.apply(&mut app, server, group);
         assert!(app.session_picker_error.is_none());
-        assert!(matches!(
-            apply_session_catalog_result(&mut app, generation, Ok(indices)),
-            CatalogLoadOutcome::Ignored
-        ));
         let created = app.active().session_db_id.clone();
-        app.cancel_session_fill();
         *probe.blocked.lock().unwrap() = None;
-        open_session_picker(&mut app, server, &tx);
-        let SessionLoad::Grouped { generation, result } =
-            tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
-                .await
-                .unwrap()
-                .unwrap()
-        else {
-            panic!("expected reconciled catalog")
-        };
-        let (indices, groups) = result.unwrap();
-        assert!(matches!(
-            apply_session_catalog_result(&mut app, generation, Ok(indices)),
-            CatalogLoadOutcome::Loaded
-        ));
-        workers::group(&mut app, groups);
+        open_session_picker(&mut app);
+        app.picker_visible_rows = 0..0;
+        watches.sync_picker(&mut app, server);
+        let result = update(&mut watches).await;
+        watches.apply(&mut app, server, result);
         assert_eq!(app.session_list.len(), count + 1);
         assert_eq!(
             app.session_list
@@ -451,73 +527,28 @@ async fn new_session_preempts_a_blocked_historical_open_without_history_growth()
         println!(
             "history sessions={count}, unrelated DBs={count}: creation unrelated accesses=0; correct default, composer and reconciliation"
         );
+        watches.shutdown().await;
         drop(app);
         built.shutdown().await;
     }
 }
 
 #[tokio::test]
-async fn new_session_finishes_before_catalog_completion_and_failure() {
+async fn failed_catalog_does_not_block_creating_with_the_selected_agent() {
     let dir = tempfile::tempdir().unwrap();
     let built = runtime(dir.path(), Arc::new(Probe::default())).await;
     let server = &built.server;
     server.set_default_agents(vec!["selected".into()]);
     let backend = BackendManager::new(&None, built.secret_store.clone());
     let mut app = App::hub(HashSet::new());
-    let (tx, mut rx) = mpsc::channel(128);
-    let (mut release, gate) = oneshot::channel::<()>();
-    let (entered, started) = oneshot::channel();
-    app.session_catalog_loading = true;
-    spawn_session_catalog_load(&mut app, tx.clone(), async move {
-        entered.send(()).unwrap();
-        gate.await.map_err(|e| e.to_string())?;
-        Ok(Vec::new())
-    });
-    tokio::time::timeout(std::time::Duration::from_secs(2), started)
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(frame(&mut app, server, &backend).contains("Loading sessions"));
+    app.session_picker_error = Some("catalog unavailable".into());
+    assert!(frame(&mut app, server, &backend).contains("Failed to load sessions"));
     new_session(&mut app, server, &backend);
     settle(&mut app).await;
     assert_eq!(app.active().current_agent, "selected");
     assert_eq!(app.active().live.meta.agents[0].display_name, "selected");
     assert!(app.active().live.observation.is_some());
     assert_eq!(server.registry().list_sessions().await.unwrap().len(), 1);
-    tokio::time::timeout(std::time::Duration::from_secs(2), release.closed())
-        .await
-        .expect("creation did not cancel its obsolete catalog");
-    assert!(rx.try_recv().is_err());
-    open_session_picker(&mut app, server, &tx);
-    let generation = app.session_generation;
-    app.cancel_session_fill();
-    app.mode = TuiMode::SessionPicker;
-    spawn_session_catalog_load(&mut app, tx.clone(), async {
-        Err("historical catalog unavailable".into())
-    });
-    let SessionLoad::Catalog {
-        generation: current,
-        result,
-    } = receive(&mut rx).await
-    else {
-        panic!("expected failed catalog")
-    };
-    assert!(matches!(
-        apply_session_catalog_result(&mut app, current, result),
-        CatalogLoadOutcome::Failed
-    ));
-    assert!(frame(&mut app, server, &backend).contains("Failed to load sessions"));
-    assert!(matches!(
-        apply_session_catalog_result(&mut app, generation, Ok(Vec::new())),
-        CatalogLoadOutcome::Ignored
-    ));
-    new_session(&mut app, server, &backend);
-    settle(&mut app).await;
-    assert_eq!(
-        server.registry().list_sessions().await.unwrap().len(),
-        2,
-        "failed catalog or retry duplicated creation"
-    );
     drop(app);
     built.shutdown().await;
 }
@@ -529,7 +560,7 @@ async fn creation_survives_navigation_without_replay_or_focus_theft() {
     let server = &built.server;
     let backend = BackendManager::new(&None, built.secret_store.clone());
     let mut app = App::hub(HashSet::new());
-    let (tx, mut rx) = mpsc::channel(128);
+    let mut watches = components::Watches::new();
     let (release, gate) = oneshot::channel();
     operations::submit(&mut app, true, None, async move {
         gate.await.unwrap();
@@ -537,14 +568,9 @@ async fn creation_survives_navigation_without_replay_or_focus_theft() {
     });
     new_session(&mut app, server, &backend);
     assert!(app.operations.is_creating_session());
-    let generation = app.session_generation;
     app.open_settings(SettingsScope::Peer, TuiMode::SessionPicker);
-    app.navigation_generation += 1; // same ownership transition as the event loop
-    app.cancel_session_fill();
-    assert!(matches!(
-        apply_session_catalog_result(&mut app, generation, Ok(Vec::new())),
-        CatalogLoadOutcome::Ignored
-    ));
+    app.navigation_generation += 1;
+    watches.retire_picker_if_hidden(&app);
     // View cancellation does not undo or retry an accepted create write.
     release.send(()).unwrap();
     settle(&mut app).await;
@@ -559,13 +585,9 @@ async fn creation_survives_navigation_without_replay_or_focus_theft() {
     assert_eq!(sessions.len(), 1);
     let created = sessions[0].session_db_id.clone();
     app.close_settings();
-    ensure_view(&mut app, server, &tx);
-    let SessionLoad::Grouped { generation, result } = receive(&mut rx).await else {
-        panic!("expected grouped catalog")
-    };
-    let (indices, groups) = result.unwrap();
-    apply_session_catalog_result(&mut app, generation, Ok(indices));
-    workers::group(&mut app, groups);
+    watches.sync_picker(&mut app, server);
+    let result = update(&mut watches).await;
+    watches.apply(&mut app, server, result);
     assert_eq!(app.session_list.len(), 1);
     assert_eq!(app.session_list[0].session_db_id, created);
     let (approval, _) = mpsc::channel(8);
@@ -582,6 +604,7 @@ async fn creation_survives_navigation_without_replay_or_focus_theft() {
     assert_eq!(app.active().session_db_id, created);
     assert!(app.active().live.observation.is_some());
     assert_eq!(server.registry().list_sessions().await.unwrap().len(), 1);
+    watches.shutdown().await;
     drop(app);
     built.shutdown().await;
 }
@@ -593,12 +616,7 @@ async fn creation_admission_preserves_drafts_and_releases_only_its_own_ticket() 
     let server = &built.server;
     let backend = BackendManager::new(&None, built.secret_store.clone());
     let mut app = App::hub(HashSet::new());
-    let (rows, _) = mpsc::channel(128);
-    let (release, gate) = oneshot::channel::<()>();
-    spawn_session_catalog_load(&mut app, rows.clone(), async move {
-        gate.await.unwrap();
-        Ok(Vec::new())
-    });
+    open_session_picker(&mut app);
     let generation = app.session_generation;
     app.backend_available = false;
     new_session(&mut app, server, &backend);
@@ -619,8 +637,6 @@ async fn creation_admission_preserves_drafts_and_releases_only_its_own_ticket() 
     new_session(&mut app, server, &backend);
     settle(&mut app).await;
     assert_eq!(app.active().current_agent, "default");
-    tokio::task::yield_now().await;
-    assert!(release.send(()).is_err());
     let (approval, _) = mpsc::channel(8);
     let (notify, _) = presentation::channel();
     let (models, _) = mpsc::channel(4);
@@ -634,7 +650,6 @@ async fn creation_admission_preserves_drafts_and_releases_only_its_own_ticket() 
             &approval,
             &notify,
             &models,
-            &rows,
         );
         settle(&mut app).await;
         assert!(
@@ -684,7 +699,6 @@ async fn creation_admission_preserves_drafts_and_releases_only_its_own_ticket() 
         &approval,
         &notify,
         &models,
-        &rows,
     );
     assert!(app.operations.is_creating_session());
     app.input = "/new chosen".into();

@@ -1454,25 +1454,34 @@ A delayed open does not take focus after newer local navigation. Ordinary opens
 resolve their destination before installing observation: `/join` to an open
 tab reuses its live approval receiver. New destinations finish observation
 setup before reading their initial transcript and exposing their composer.
-A post-insertion check covers notifications delivered while the tab was opening.
+The initial database delivery is acknowledged only after the tab is installed.
 Jobs opened from either Jobs or the hub remain authorized observers, never ordinary execution sessions.
 
-Transcript, metadata, telemetry and steering evidence share one Verified database snapshot.
-A notification is only an invalidation hint: the TUI obtains a fresh native snapshot and checks current authority before reusing an already-covered view.
-Changed snapshots rebuild conservatively, even when only a heartbeat changed; duplicate or delayed notifications do not rehydrate the same transcript.
-Job-tab ticks check for changes without rereading unchanged transcripts or telemetry, and age retained activity and steering timestamps locally.
-Read-only local actions leave other tabs alone; session writes check their originating tab, while agent/global changes retain cross-tab refreshes.
+Transcript, metadata, telemetry and steering use the Verified Session snapshot
+delivered by the database, with current access checked separately. The callback
+waits until the terminal applies or discards the result; a burst can coalesce to
+its latest snapshot. A commit does not wait for the terminal.
 
-| Trigger / display                      | Behavior                                                                          |
-| -------------------------------------- | --------------------------------------------------------------------------------- |
-| Session write / Settings open          | Coalesced background transcript/meta/telemetry/status refresh                     |
-| Every five seconds                     | Age retained activity; check service health and retry failed reads                |
-| `⟳ refreshing (cached)`                | A read is pending; displayed data is the last successful read                     |
-| `⚠ refresh failed`                     | That read failed; last-good data remains, even if another read succeeds           |
-| `action(s) pending`                    | Accepted backend actions execute in order, one at a time                          |
-| Queue full or backend disconnected     | New backend actions are not accepted; composer/prompts stay editable              |
-| `Write still pending; outcome unknown` | A deadline warns, but does not cancel, retry or advance past the write            |
-| Quit with unfinished actions           | Esc (without popup), Ctrl+C and `/quit` warn first; repeat to abandon queued work |
+The hub joins its peer-local catalog (aliases, origin and closed state) with
+Session metadata. It observes only visible rows without an open tab, and those
+observations never load a transcript. The model and context limit use the last
+applied Session, Agent DB and peer model metadata components. These databases
+update independently, not as a global transaction. Configured windows and
+agent caps still apply; removing a learned window falls back to the configured
+limit or the safe default. Operation results report success or failure but do
+not overwrite these persisted display values.
+
+| Trigger / display                                 | Behavior                                                                          |
+| ------------------------------------------------- | --------------------------------------------------------------------------------- |
+| A database changes                                | Apply its latest delivered snapshot in the background, even while idle            |
+| Every five seconds                                | Age retained activity; check service health and retry failed reads                |
+| `⟳ refreshing (cached)`                           | A read is pending; displayed data is the last successful read                     |
+| `⚠ refresh failed`                                | That read failed; last-good data remains, even if another read succeeds           |
+| `⚠ model metadata stale` / `⚠ agent config stale` | A model source failed; its last accepted values remain visible                    |
+| `action(s) pending`                               | Accepted backend actions execute in order, one at a time                          |
+| Queue full or backend disconnected                | New backend actions are not accepted; composer/prompts stay editable              |
+| `Write still pending; outcome unknown`            | A deadline warns, but does not cancel, retry or advance past the write            |
+| Quit with unfinished actions                      | Esc (without popup), Ctrl+C and `/quit` warn first; repeat to abandon queued work |
 
 ### Cached is not confirmed
 
@@ -1481,12 +1490,13 @@ warning in every mode, including Settings editors, model selection and overlays.
 Drafts remain intact and visible; a second explicit quit confirms exit. An open
 completion popup still consumes the first Esc without arming quit.
 
-Reads have a bounded wait and supervised panic/cancellation handling. A failed
-read releases its slot for recovery without clearing cached data or restoring
-an otherwise live terminal. Errors are tracked separately for transcript/meta,
-status and activity; a successful activity read cannot hide a failed transcript
-read. Catalog failures likewise retain prior rows and mark their metadata stale.
-Errors are logged at `warn`; worker panics are logged at `error`.
+Reads run off the terminal thread. A slow snapshot can be marked overdue while
+its read finishes, without tearing down a working connection. Closing a view
+discards its observation; an already-started native verification read can finish
+without writing into a replacement view. A failed read leaves last-good data
+visible. Readable activity or status can advance at the same frontier without
+hiding a transcript error. A catalog failure retains prior rows and reports
+the stale catalog separately.
 
 Writes are different. A transport failure, timeout or cancellation cannot prove
 that a message or command did not commit. The TUI never automatically retries
