@@ -513,24 +513,26 @@ default_agents: [chaz]
                 # These are distinct readiness boundaries, not one startup-to-
                 # create duration that also includes time spent by the user.
                 logs = "\n".join(log.read_text() for log in sorted((home / "state").glob("chaz-tui*.log*")))
-                milestones = ["Session registry callback installed", "TUI first frame drawn",
-                              "TUI session catalog completed", "TUI new session requested",
-                              "TUI session composer ready", "TUI launch ready", "TUI ready frame drawn"]
-                for event in milestones:
+                launch_events = ["TUI first frame drawn", "Session registry callback installed",
+                                 "TUI launch ready", "TUI ready frame drawn"]
+                requested, composer_ready = "TUI new session requested", "TUI session composer ready"
+                # The displayed empty and populated catalog frames above
+                # witness observation; there is no one-shot catalog load log.
+                for event in (*launch_events, requested, composer_ready):
                     self.assertIn(event, logs)
                 # Each launch paints before registry work, then hands off to
                 # the ready loop. Neither frame implies executor readiness.
                 positions = [[i for i, line in enumerate(logs.splitlines()) if event in line]
-                             for event in [milestones[1], milestones[0], milestones[5], milestones[6]]]
+                             for event in launch_events]
                 for events in positions:
                     self.assertEqual(len(events), 2, positions)
                 for first, registry, launch_ready, ready_frame in zip(*positions):
                     self.assertLess(first, registry)
                     self.assertLess(registry, launch_ready)
                     self.assertLess(launch_ready, ready_frame)
-                self.assertLess(logs.index(milestones[3]), logs.index(milestones[4]))
-                requests_logged = [line for line in logs.splitlines() if milestones[3] in line]
-                composers_logged = [line for line in logs.splitlines() if milestones[4] in line]
+                self.assertLess(logs.index(requested), logs.index(composer_ready))
+                requests_logged = [line for line in logs.splitlines() if requested in line]
+                composers_logged = [line for line in logs.splitlines() if composer_ready in line]
                 self.assertEqual(len(requests_logged), 2)
                 self.assertEqual(len(composers_logged), 2)
                 for request, composer in zip(requests_logged, composers_logged):
