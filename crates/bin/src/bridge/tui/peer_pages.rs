@@ -97,6 +97,9 @@ fn selected(app: &App) -> Option<Category> {
 /// Called by the event loop, never by rendering. Same-page events
 /// reuse the snapshot; leaving/re-entering or replacing Server invalidates it.
 pub(super) fn update(app: &mut App, server: &Arc<Server>, tx: &mpsc::Sender<Loaded>) {
+    if !app.backend_available {
+        return;
+    }
     let category = selected(app);
     let pages = &mut app.peer_pages;
     if pages.category == category
@@ -198,6 +201,11 @@ pub(super) fn update(app: &mut App, server: &Arc<Server>, tx: &mpsc::Sender<Load
         _ => unreachable!(),
     };
     pages.snapshot = Some(Snapshot { category, data });
+}
+
+pub(super) fn suspend(app: &mut App) {
+    app.peer_pages.task = None;
+    app.peer_pages.generation = app.peer_pages.generation.wrapping_add(1);
 }
 
 pub(super) fn apply(app: &mut App, loaded: Loaded) {

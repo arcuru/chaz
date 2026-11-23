@@ -760,18 +760,28 @@ eidetica:
                 offset = len(process.raw); process.send("\x10")
                 process.expect_screen("SERVICE-CACHED-TRANSCRIPT", timeout=1)
                 visible_input("界NAV-LIVE")
-                # Leave the backend stopped beyond the read timeout; pending
-                # work must fail/release, not restore the terminal or hang UI.
-                deadline = time.monotonic() + 12
-                while time.monotonic() < deadline:
+                # Leave the real service paused long enough that even a
+                # replacement connection's handshake times out.
+                process.expect_screen("Backend unresponsive", timeout=32)
+                deadline = time.monotonic() + 15
+                while True:
                     process.drain(0.05)
+                    logs = "".join(path.read_text() for path in (home / "state").glob("chaz-tui*.log*"))
+                    if "Service reconnect timed out" in logs:
+                        break
+                    self.assertLess(time.monotonic(), deadline, "wedged reconnect did not time out")
                 self.assertNotIn(b"\x1b[?1049l", process.raw)
                 visible_input("éAFTER-TIMEOUT")
                 os.kill(owner.pid, signal.SIGCONT)
-                # Accepted actions settle once; no automatic write retry.
-                deadline = time.monotonic() + 8
-                while time.monotonic() < deadline:
+                # Wait for the existing tab (not just the global runtime) to
+                # be available before testing ordinary ordered writes.
+                deadline = time.monotonic() + 20
+                while any(word in "\n".join(process.screen.display)
+                          for word in ("Backend unresponsive", "cached tab · reopening")):
                     process.drain(0.05)
+                    self.assertLess(time.monotonic(), deadline, "unpaused service did not rebind")
+                process.expect_screen("éAFTER-TIMEOUT", timeout=2)
+                print("PAUSED SERVICE: reconnect handshake timed out, then the same TUI recovered with its draft")
                 process.send("\x7f" * 100)
                 os.kill(owner.pid, signal.SIGSTOP)
                 process.send("/name ordered-one\r/name ordered-two\r")

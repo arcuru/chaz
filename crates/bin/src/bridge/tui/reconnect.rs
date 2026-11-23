@@ -5,7 +5,15 @@ use chaz_core::{
     instance,
     server::{self, BuiltServer},
 };
-use std::path::PathBuf;
+use std::{collections::hash_map::RandomState, hash::BuildHasher, path::PathBuf, time::Duration};
+
+pub(super) const PROBE_INTERVAL: Duration = Duration::from_secs(5);
+
+pub(super) enum ProbeFailure {
+    Deadline,
+    Disconnected(String),
+    Other(String),
+}
 
 pub(super) struct Reopened {
     pub id: String,
@@ -16,14 +24,9 @@ pub(super) struct ReopenedState {
     db: eidetica::Database,
     observation: Result<Observation, String>,
 }
-pub(super) struct Replacement {
-    pub built: BuiltServer,
-    pub tabs: Vec<Reopened>,
-}
 pub(super) enum ResultMessage {
-    Retry,
-    Probe(Result<(), (String, bool)>),
-    Rebuilt(Result<Box<Replacement>, (String, bool)>),
+    Probe(Result<(), ProbeFailure>),
+    Rebuilt(Result<Box<BuiltServer>, (String, bool)>),
     Tab {
         ticket: u64,
         reopened: Box<Reopened>,
@@ -105,36 +108,33 @@ async fn reopen(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(super) fn spawn_rebuild(
     old: Option<BuiltServer>,
     config: Config,
     path: PathBuf,
-    app: &App,
-    approval_tx: &mpsc::Sender<TaggedApproval>,
-    notify_tx: &mpsc::Sender<String>,
     tx: &mpsc::Sender<ResultMessage>,
 ) -> supervised::Task<()> {
-    let tabs = app
-        .tabs
-        .iter()
-        .map(|t| (t.session_db_id.clone(), t.live.incarnation, Mode::of(t)))
-        .collect();
     let tx = tx.clone();
-    let approval_tx = approval_tx.clone();
-    let notify_tx = notify_tx.clone();
     supervised::Task(tokio::spawn(async move {
-        let result = supervised::work(async move {
-            Ok(rebuild(old, config, path, tabs, approval_tx, notify_tx).await)
-        })
-        .await
-        .unwrap_or_else(|e| Err((e, false)));
+        let result =
+            supervised::work(async move { Ok(rebuild(old, config, path).await.map(Box::new)) })
+                .await
+                .unwrap_or_else(|e| Err((e, false)));
         if let Err(e) = tx.send(ResultMessage::Rebuilt(result)).await
             && let ResultMessage::Rebuilt(Ok(replacement)) = e.0
         {
-            replacement.built.shutdown().await;
+            replacement.shutdown().await;
         }
     }))
+}
+
+async fn probe(instance: &eidetica::Instance) -> Result<(), ProbeFailure> {
+    match tokio::time::timeout(supervised::READ_TIMEOUT, instance::probe_service(instance)).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) if e.is_transient_service() => Err(ProbeFailure::Disconnected(e.to_string())),
+        Ok(Err(e)) => Err(ProbeFailure::Other(e.to_string())),
+        Err(_) => Err(ProbeFailure::Deadline),
+    }
 }
 
 pub(super) fn spawn_probe(
@@ -144,29 +144,25 @@ pub(super) fn spawn_probe(
     let instance = server.registry().instance().clone();
     let tx = tx.clone();
     supervised::Task(tokio::spawn(async move {
-        let result = supervised::read(async move {
-            match instance::probe_service(&instance).await {
-                Ok(()) => Ok(Ok(())),
-                Err(e) => {
-                    let transient = e.is_transient_service();
-                    Ok(Err((e.to_string(), transient)))
-                }
-            }
-        })
-        .await
-        .unwrap_or_else(|e| Err((e, false)));
+        let result = supervised::work(async { Ok(probe(&instance).await) })
+            .await
+            .unwrap_or_else(|e| Err(ProbeFailure::Other(e)));
         let _ = tx.send(ResultMessage::Probe(result)).await;
     }))
+}
+
+pub(super) fn retry_delay(attempt: u32) -> Duration {
+    // Use the existing service backoff, jittered below its cap so clients
+    // that lost the same daemon don't all retry on the same beat.
+    let percent = 75 + (RandomState::new().hash_one(attempt) % 26) as u32;
+    instance::service_reconnect_delay(attempt) * percent / 100
 }
 
 pub(super) async fn rebuild(
     old: Option<BuiltServer>,
     mut config: Config,
     path: PathBuf,
-    tabs: Vec<(String, u64, Mode)>,
-    approval_tx: mpsc::Sender<TaggedApproval>,
-    notify_tx: mpsc::Sender<String>,
-) -> Result<Box<Replacement>, (String, bool)> {
+) -> Result<BuiltServer, (String, bool)> {
     if let Some(old) = old {
         old.shutdown().await;
     }
@@ -174,66 +170,79 @@ pub(super) async fn rebuild(
     let connected = tokio::time::timeout(supervised::READ_TIMEOUT, instance::connect(&config))
         .await
         .map_err(|_| ("Service reconnect timed out".into(), true))?
-        .map_err(|e| (e.to_string(), e.is_transient_service()))?;
+        .map_err(|e| {
+            let transient = e.is_transient_service()
+                || matches!(&e, instance::ConnectError::Login { source, .. } if source.is_io_error());
+            (e.to_string(), transient)
+        })?;
     let options = server::BuildOptions::local(
         path,
         connected.capabilities,
         Vec::new(),
         server::McpReadiness::Deferred,
     );
-    let built = server::build(&mut config, connected.instance, connected.user, options)
-        .await
-        .map_err(|e| {
+    // Construction may have side effects. If IPC stops answering during
+    // construction, retire the candidate socket and join, not abort or
+    // overlap construction. A slow build on a responsive socket is fine.
+    let instance = connected.instance.clone();
+    let build = server::build(&mut config, connected.instance, connected.user, options);
+    tokio::pin!(build);
+    let lost_service = async {
+        loop {
+            tokio::time::sleep(PROBE_INTERVAL).await;
+            if matches!(
+                probe(&instance).await,
+                Err(ProbeFailure::Deadline | ProbeFailure::Disconnected(_))
+            ) {
+                break;
+            }
+        }
+    };
+    tokio::select! {
+        result = &mut build => result.map_err(|e| {
             let transient = e.chain().any(|e| {
                 e.downcast_ref::<eidetica::Error>()
                     .is_some_and(|e| e.is_io_error())
             });
             (e.to_string(), transient)
-        })?;
-    let backend = BackendManager::new(&config.backends, built.secret_store.clone());
-    let mut reopened = Vec::new();
-    for (id, incarnation, mode) in tabs {
-        reopened.push(
-            reopen(
-                built.server.clone(),
-                backend.clone(),
-                id,
-                incarnation,
-                mode,
-                approval_tx.clone(),
-                notify_tx.clone(),
-            )
-            .await,
-        );
+        }),
+        _ = lost_service => {
+            if let Some(connection) = instance.remote_connection() {
+                connection.retire();
+            }
+            if let Ok(built) = build.await {
+                built.shutdown().await;
+            }
+            Err(("Service stopped answering during reconnect".into(), true))
+        }
     }
-    Ok(Box::new(Replacement {
-        built,
-        tabs: reopened,
-    }))
 }
 
-pub(super) fn disconnect(app: &mut App) {
+pub(super) fn disconnect(app: &mut App, reason: &str) {
     app.backend_available = false;
-    app.field_sheet = None;
+    app.backend_notice = Some(format!("{reason} · cached data stale"));
+    operations::cancel_unstarted(app);
     jobs::cancel(app);
-    app.jobs.error = Some("Backend disconnected; retained snapshot is stale".into());
+    app.jobs.error = Some("Retained snapshot is stale".into());
+    peer_pages::suspend(app);
+    session_pages::suspend(app);
     app.cancel_session_fill();
     app.model_catalog_ticket += 1;
     app.model_catalog_task = None;
     app.model_picker_loading = false;
     for tab in &mut app.tabs {
-        tab.live.cancel_reads();
-        tab.live.observation = None;
-        tab.live.rebind_needed = true;
-        tab.live.unbound = true;
+        suspend_tab(tab);
     }
-    app.operations.notice = Some(
-        concat!(
-            "Backend disconnected — cached data is stale; ",
-            "reconnecting after accepted actions settle. No writes replayed"
-        )
-        .into(),
-    );
+}
+
+/// A successful open can already be waiting in the operation channel when
+/// the generation is retired. Keep the view, never admit work on its old DB.
+pub(super) fn suspend_tab(tab: &mut Tab) {
+    tab.live.cancel_reads();
+    tab.live.observation = None;
+    tab.live.rebind_needed = true;
+    tab.live.unbound = true;
+    tab.pending_approval = None;
 }
 
 fn apply_tab(app: &mut App, reopened: Reopened) -> Option<String> {
@@ -263,20 +272,15 @@ fn apply_tab(app: &mut App, reopened: Reopened) -> Option<String> {
     (!tab.live.unbound).then_some(reopened.id)
 }
 
-pub(super) fn apply(app: &mut App, replacement: &mut Replacement) {
-    for reopened in replacement.tabs.drain(..) {
-        apply_tab(app, reopened);
-    }
+pub(super) fn connected(app: &mut App) {
     app.backend_available = true;
-    // Recovery is a lifecycle transition, not an indefinite status override.
-    // Unresolved write uncertainty belongs to Operations, independently.
+    app.backend_notice = None;
     app.operations.notice = None;
     app.session_list_fresh = false;
 }
 
-/// Retry only missing per-tab handles/observations on the healthy generation.
-/// One owned read per tab, driven by the existing five-second tick; no runtime
-/// rebuild and no accepted write is replayed.
+/// Stagger rebinding on the existing tick. Give the active tab the first
+/// slot, but let never-tried/older tabs proceed even if it repeatedly fails.
 pub(super) fn request_tabs(
     app: &mut App,
     server: &Arc<Server>,
@@ -285,51 +289,65 @@ pub(super) fn request_tabs(
     notify_tx: &mpsc::Sender<String>,
     tx: &mpsc::Sender<ResultMessage>,
 ) {
-    if !app.backend_available {
+    if !app.backend_available
+        || app
+            .tabs
+            .iter()
+            .filter(|t| t.live.rebind_task.is_some())
+            .count()
+            >= 2
+    {
         return;
     }
-    for tab in &mut app.tabs {
-        if !tab.live.rebind_needed || tab.live.rebind_task.is_some() {
-            continue;
-        }
-        app.refresh_ticket += 1;
-        let ticket = app.refresh_ticket;
-        tab.live.rebind_ticket = Some(ticket);
-        let id = tab.session_db_id.clone();
-        let incarnation = tab.live.incarnation;
-        let mode = Mode::of(tab);
-        let server = server.clone();
-        let backend = backend.clone();
-        let approval_tx = approval_tx.clone();
-        let notify_tx = notify_tx.clone();
-        let tx = tx.clone();
-        tab.live.rebind_task = Some(supervised::Task(tokio::spawn(async move {
-            let reopened = reopen(
-                server,
-                backend,
-                id,
-                incarnation,
-                mode,
-                approval_tx,
-                notify_tx,
-            )
+    let Some((_, tab)) = app
+        .tabs
+        .iter_mut()
+        .enumerate()
+        .filter(|(_, tab)| tab.live.rebind_needed && tab.live.rebind_task.is_none())
+        .min_by_key(|(i, tab)| (tab.live.rebind_ticket, *i != app.active_tab))
+    else {
+        return;
+    };
+    app.refresh_ticket += 1;
+    let ticket = app.refresh_ticket;
+    tab.live.rebind_ticket = Some(ticket);
+    let id = tab.session_db_id.clone();
+    let incarnation = tab.live.incarnation;
+    let mode = Mode::of(tab);
+    let server = server.clone();
+    let backend = backend.clone();
+    let approval_tx = approval_tx.clone();
+    let notify_tx = notify_tx.clone();
+    let tx = tx.clone();
+    tab.live.rebind_task = Some(supervised::Task(tokio::spawn(async move {
+        let reopened = reopen(
+            server,
+            backend,
+            id,
+            incarnation,
+            mode,
+            approval_tx,
+            notify_tx,
+        )
+        .await;
+        let _ = tx
+            .send(ResultMessage::Tab {
+                ticket,
+                reopened: Box::new(reopened),
+            })
             .await;
-            let _ = tx
-                .send(ResultMessage::Tab {
-                    ticket,
-                    reopened: Box::new(reopened),
-                })
-                .await;
-        })));
-    }
+    })));
 }
 
 pub(super) fn apply_retry(app: &mut App, ticket: u64, reopened: Reopened) -> Option<String> {
     let i = app.tab_index_for(&reopened.id).filter(|&i| {
         app.tabs[i].live.incarnation == reopened.incarnation
             && app.tabs[i].live.rebind_ticket == Some(ticket)
+            && app.tabs[i].live.rebind_task.is_some()
     })?;
-    app.tabs[i].live.rebind_task = None;
-    app.tabs[i].live.rebind_ticket = None;
-    apply_tab(app, reopened)
+    let bound = apply_tab(app, reopened);
+    if app.tabs[i].live.rebind_needed {
+        app.tabs[i].live.rebind_ticket = Some(ticket);
+    }
+    bound
 }

@@ -428,7 +428,7 @@ async fn queued_old_jobs_completion_cannot_drop_replacement_after_disconnect() {
     let data = app.jobs.data.clone();
     request_with(&mut app, &tx, async move { Ok(data) });
     let old = rx.recv().await.unwrap();
-    reconnect::disconnect(&mut app);
+    reconnect::disconnect(&mut app, "Backend disconnected");
     app.backend_available = true;
     let (release, gate) = tokio::sync::oneshot::channel::<()>();
     let data = app.jobs.data.clone();

@@ -116,6 +116,36 @@ The usual pending-write warning and double-quit confirmation still apply.
    Copy it before using `Ctrl+W` to discard the failed view, then explicitly open
    the existing session or request another new one after resolving the error.
 
+## When the backend stops answering
+
+| Status                                     | What it means                                                                                                       |
+| ------------------------------------------ | ------------------------------------------------------------------------------------------------------------------- |
+| `refresh failed (cached)`                  | This part of the tab didn't refresh. The last result stays on screen.                                               |
+| `Backend unresponsive · cached data stale` | Two consecutive connection-health checks timed out. Chaz stops using that connection and tries to reconnect.        |
+| `Backend disconnected · cached data stale` | The connection closed. Chaz tries to reconnect without restarting the service.                                      |
+| `draft not submitted`                      | Enter was rejected. The text is still in the composer.                                                              |
+| `action(s) pending`                        | The TUI accepted the action, but it has not reported an outcome yet.                                                |
+| `Write outcome unknown`                    | A started action lost its result. It may already have committed. Check before trying again.                         |
+| `queued action(s) not started`             | These actions were accepted into the local queue but never ran. Chaz prints their retained inputs, if any, on exit. |
+
+A slow session read is not by itself a disconnect. Chaz checks the service
+connection separately. While reconnecting, you can switch tabs, read cached
+transcripts and edit drafts. The client makes one reconnect attempt at a time,
+waiting longer between failures up to a short cap. Once the service responds,
+Chaz reopens the active tab first and refreshes the others in the background.
+It never sends a queued or uncertain write again for you.
+
+### Walkthrough: keep working in cached tabs
+
+1. If you see `Backend unresponsive · cached data stale`, use `Ctrl+H` or
+   `Ctrl+L` to switch to another open conversation. You can keep typing there.
+2. If you press Enter while offline, `Backend unavailable — draft not submitted`
+   means your draft was not sent. `Write outcome unknown` instead describes an
+   earlier action that started before the connection was lost.
+3. Wait for the tab to reopen. Check the refreshed conversation for any
+   uncertain action before resubmitting it. Send the retained draft only when
+   you're ready; reconnecting will not send it.
+
 ## Interface Layout
 
 ```text

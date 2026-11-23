@@ -147,6 +147,9 @@ pub(super) fn update(
         });
         return;
     }
+    if !app.backend_available || tab.live.unbound {
+        return;
+    }
     // Memory-only configuration capture. No backend catalog/model requests.
     let agents = server.agents_arc();
     let index = server.agent_index().clone();
@@ -194,6 +197,12 @@ pub(super) fn update(
             })
             .await;
     })));
+}
+
+pub(super) fn suspend(app: &mut App) {
+    app.session_pages.task = None;
+    app.session_pages.generation = app.session_pages.generation.wrapping_add(1);
+    app.session_pages.dirty = true;
 }
 pub(super) fn apply(app: &mut App, loaded: Loaded) {
     if selected(app) != Some((loaded.category, loaded.id.clone(), loaded.incarnation))
