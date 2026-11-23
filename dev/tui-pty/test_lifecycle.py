@@ -687,6 +687,65 @@ default_agents: [chaz]
             finally:
                 process.close()
 
+    def test_existing_and_fresh_clients_converge_on_model_windows_while_idle(self):
+        from test_interactions import environment, evidence
+        out = evidence("model-windows")
+        processes = []
+        with tempfile.TemporaryDirectory(prefix="chaz-window-pty-") as directory:
+            home = Path(directory)
+            env = environment(home)
+            config = home / "config.yaml"
+            config.write_text(f'''execution: client
+state_dir: "{home}/state"
+eidetica:
+  connection: "unix://{home}/service.sock"
+  login:
+    username: pty-service
+    password: test-password
+backends:
+  - name: stub
+    type: openaicompatible
+    api_base: "http://127.0.0.1:1/v1"
+    api_key: fixture-only
+    models:
+      - name: catalog-model
+''')
+            owner = subprocess.Popen(
+                [TARGET / "debug/examples/tui_service_fixture", home / "service.sock"],
+                env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, text=True,
+            )
+            def reply(expected):
+                self.assertTrue(select.select([owner.stdout], [], [], 15)[0], "fixture deadline")
+                self.assertTrue(owner.stdout.readline().startswith(expected))
+            def launch():
+                process = PtyProcess([BINARY, "--config", config, "--session", "service-fixture"], env, home)
+                processes.append(process)
+                process.resize(140, 35)
+                return process
+            try:
+                reply("READY")
+                existing = launch()
+                existing.expect_screen("ctx unknown/128k tok")
+                for update, budget in [("large", "1.1M"), ("small", "32k"), ("unknown", "128k")]:
+                    owner.stdin.write(f"window-{update}\n"); owner.stdin.flush()
+                    reply("WINDOW")
+                    # No key, resize or session write wakes the existing view.
+                    expected = f"ctx unknown/{budget} tok"
+                    existing.expect_screen(expected, timeout=12)
+                    existing.capture(out / f"existing-{update}")
+                    fresh = launch()
+                    fresh.expect_screen(expected, timeout=12)
+                    fresh.capture(out / f"fresh-{update}")
+                    fresh.close()
+            finally:
+                for process in processes:
+                    process.close()
+                if owner.poll() is None:
+                    owner.stdin.write("quit\n"); owner.stdin.flush()
+                    owner.wait(timeout=10)
+                owner.stdin.close(); owner.stdout.close(); owner.stderr.close()
+
     def test_stalled_ipc_actions_and_service_loss_recovery(self):
         fixture = TARGET / "debug/examples/tui_service_fixture"
         process = owner = None

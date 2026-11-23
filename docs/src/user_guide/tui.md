@@ -413,8 +413,11 @@ The denominator is the runtime's effective **input** context budget, not the
 output-token cap. Configured model windows take precedence over discovered
 windows; an explicit agent cap can lower the budget. When the model window is
 unknown, the configured input-budget fallback still applies. A zero budget is
-shown as `unknown`. The bar refreshes model defaults, learned windows and caps
-on redraw. Long session names are clipped to keep the pair visible.
+shown as `unknown`. When another client on the same peer saves learned model
+metadata, an open terminal updates without input or a session write. Clearing a
+learned window restores the applicable configured budget or agent cap. If the
+peer metadata cannot be read, the last budget remains visible with
+`⚠ model metadata stale`. Long session names are clipped to keep the pair visible.
 
 For example:
 

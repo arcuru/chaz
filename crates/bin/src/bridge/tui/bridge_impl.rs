@@ -118,7 +118,9 @@ impl TuiBridge {
         let mut retry_at = None;
         let mut missed_probe = false;
         let mut app = app;
-        let mut backend = BackendManager::new(&self.config.backends, self.secrets.clone());
+        let mut backend = server.backend().clone();
+        let (initial_metadata, mut metadata_rx) = server.observe_model_metadata();
+        refresh::apply_model_metadata(&mut app, server, initial_metadata);
         // One-shot-style delivery of background model catalog fetches.
         // Buffered so a force-refresh kicked off mid-render doesn't block.
         let (models_tx, mut models_rx) = mpsc::channel::<ModelCatalog>(4);
@@ -183,6 +185,7 @@ impl TuiBridge {
             // wheel notches or session writes costs one frame, not one each.
             // Every event is still handled, in arrival order.
             for batch_slot in 0..MAX_ACTIONS_PER_FRAME {
+                let overdue = presentation::next_overdue(&app);
                 let action = tokio::select! {
                     event = events.next() => {
                         let Some(event) = event else { break 'run };
@@ -217,6 +220,7 @@ impl TuiBridge {
                     Ok(()) = catalog_changes.changed() => Action::CatalogChanged,
                     Some(msg) = approval_rx.recv() => Action::ApprovalRequest(msg),
                     Some(res) = models_rx.recv() => Action::ModelsFetched(res),
+                    Some(update) = metadata_rx.recv() => Action::ModelMetadata(update),
                     Some(load) = session_rows_rx.recv() => Action::SessionLoad(load),
                     Some(loaded) = peer_pages_rx.recv() => Action::PeerPage(loaded),
                     Some(loaded) = session_pages_rx.recv() => Action::SessionPage(loaded),
@@ -250,6 +254,11 @@ impl TuiBridge {
                             needs_draw = true;
                         }
                         continue;
+                    },
+                    _ = tokio::time::sleep_until(overdue.unwrap_or_else(tokio::time::Instant::now)), if overdue.is_some() => {
+                        presentation::mark_overdue(&mut app, tokio::time::Instant::now());
+                        needs_draw = true;
+                        break;
                     },
                     _ = tokio::time::sleep_until(retry_at.unwrap_or_else(tokio::time::Instant::now)), if retry_at.is_some() => {
                         retry_at = None;
@@ -546,6 +555,12 @@ impl TuiBridge {
                             }
                         }
                     }
+                    Action::ModelMetadata(update) => {
+                        if app.backend_available {
+                            refresh::apply_model_metadata(&mut app, server, update.state);
+                        }
+                        let _ = update.handled.send(());
+                    }
                     Action::SessionChanged(update) => {
                         reads.start(&mut app, update);
                     }
@@ -584,6 +599,7 @@ impl TuiBridge {
                             if let Some(reason) = reason {
                                 missed_probe = false;
                                 reconnect::disconnect(&mut app, reason);
+                                metadata_rx.close();
                                 if let Some(connection) =
                                     server.registry().instance().remote_connection()
                                 {
@@ -599,10 +615,10 @@ impl TuiBridge {
                                     *server = replacement.server.clone();
                                     catalog_changes = server.registry().catalog_changes();
                                     self.secrets = replacement.secret_store.clone();
-                                    backend = BackendManager::new(
-                                        &self.config.backends,
-                                        self.secrets.clone(),
-                                    );
+                                    backend = server.backend().clone();
+                                    let (initial, rx) = server.observe_model_metadata();
+                                    metadata_rx = rx;
+                                    refresh::apply_model_metadata(&mut app, server, initial);
                                     reconnect::connected(&mut app);
                                     reconnect::request_tabs(
                                         &mut app,
@@ -644,12 +660,18 @@ impl TuiBridge {
                     },
                     Action::Operation(msg) => {
                         operations::apply(&mut app, msg);
+                        // An opening tab may predate the applied peer
+                        // component; use the GUI's component, not the live overlay.
+                        for tab in &mut app.tabs {
+                            refresh::apply_model_budget(tab, server, &app.model_metadata);
+                        }
                     }
                     Action::Refresh(result) => match result {
                         Ok(loaded) => {
+                            let observed = app.model_metadata.clone();
                             if let Some(id) =
                                 presentation::apply(&mut app, loaded, |agent, meta| {
-                                    refresh::resolve(server, &backend, agent, meta)
+                                    refresh::resolve_from(server, &backend, agent, meta, &observed)
                                 })
                             {
                                 session_pages::changed(&mut app, &id);

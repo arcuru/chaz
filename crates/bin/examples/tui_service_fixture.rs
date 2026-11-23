@@ -214,6 +214,21 @@ async fn main() -> anyhow::Result<()> {
                 .await?;
                 println!("APPENDED");
             }
+            "window-large" | "window-small" | "window-unknown" => {
+                let context_window = match command.as_str() {
+                    "window-large" => Some(1_050_000),
+                    "window-small" => Some(32_000),
+                    _ => None,
+                };
+                chaz_core::model_info_store::ModelInfoStore::new(registry.chaz_peer().clone())
+                    .put(&chaz_core::backends::ModelInfo {
+                        id: "catalog-model".into(),
+                        context_window,
+                        ..Default::default()
+                    })
+                    .await?;
+                println!("WINDOW {command}");
+            }
             "quit" => break,
             _ => anyhow::bail!("unknown fixture command"),
         }

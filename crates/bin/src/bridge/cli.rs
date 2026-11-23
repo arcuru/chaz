@@ -11,10 +11,7 @@
 //! No interactive approval — tools requiring approval are auto-denied
 //! (see [`SecurityContext::request_approval`] when `approval_callback` is None).
 
-use chaz_core::backends::BackendManager;
 use chaz_core::bridge::Bridge;
-use chaz_core::config::Config;
-use chaz_core::security::SecretStore;
 use chaz_core::server::Server;
 use chaz_core::session::{EntryType, Session, SessionEntry};
 
@@ -24,8 +21,6 @@ use tokio::sync::mpsc;
 use tracing::warn;
 
 pub struct CliBridge {
-    config: Config,
-    secrets: SecretStore,
     prompt: String,
     /// Optional named session to reuse. When `None`, a fresh ephemeral
     /// session is created per invocation.
@@ -33,15 +28,8 @@ pub struct CliBridge {
 }
 
 impl CliBridge {
-    pub fn new(
-        config: Config,
-        secrets: SecretStore,
-        prompt: String,
-        session_name: Option<String>,
-    ) -> Self {
+    pub fn new(prompt: String, session_name: Option<String>) -> Self {
         Self {
-            config,
-            secrets,
             prompt,
             session_name,
         }
@@ -90,7 +78,7 @@ impl Bridge for CliBridge {
             resolve_cli_session(&server, self.session_name.as_deref()).await?;
         server.load_session_entities(&session_db).await?;
 
-        let backend = BackendManager::new(&self.config.backends, self.secrets.clone());
+        let backend = server.backend().clone();
 
         if server.is_executor_authorized() {
             // Approval channel = None → auto-deny any tool needing approval.

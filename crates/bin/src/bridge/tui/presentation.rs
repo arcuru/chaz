@@ -178,7 +178,7 @@ impl Reads {
         };
         debug_assert!(self.has_capacity());
         let tab = &mut app.tabs[idx];
-        tab.live.snapshot_pending = true;
+        tab.live.snapshot_started = Some(tokio::time::Instant::now());
         let db = tab.session_db.clone();
         let job = tab.job.is_some();
         let tips = delivery.tips.clone();
@@ -198,6 +198,26 @@ impl Reads {
     }
 }
 
+fn overdue_at(tab: &Tab) -> Option<tokio::time::Instant> {
+    tab.live
+        .snapshot_started
+        .filter(|_| !tab.live.snapshot_overdue)
+        .map(|started| started + supervised::READ_TIMEOUT)
+}
+
+pub(super) fn next_overdue(app: &App) -> Option<tokio::time::Instant> {
+    app.tabs.iter().filter_map(overdue_at).min()
+}
+
+pub(super) fn mark_overdue(app: &mut App, now: tokio::time::Instant) {
+    for tab in &mut app.tabs {
+        if overdue_at(tab).is_some_and(|deadline| deadline <= now) {
+            tab.live.snapshot_overdue = true;
+            tracing::warn!(session = %tab.session_db_id, "Snapshot read overdue; retaining last-good state while it finishes");
+        }
+    }
+}
+
 /// Keep the delivery (including the ack) owned until GUI state is applied.
 /// On a closed/rebound route just retire it, even if native work succeeded.
 pub(super) fn apply(
@@ -206,7 +226,8 @@ pub(super) fn apply(
     resolve: impl FnOnce(&str, &SessionMeta) -> refresh::Resolved,
 ) -> Option<String> {
     let idx = tab_index(app, &loaded.delivery)?;
-    app.tabs[idx].live.snapshot_pending = false;
+    app.tabs[idx].live.snapshot_started = None;
+    app.tabs[idx].live.snapshot_overdue = false;
     refresh::apply_watched(app, idx, loaded.result, resolve);
     let _ = loaded.delivery.handled.send(());
     Some(loaded.delivery.session)

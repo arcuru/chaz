@@ -102,7 +102,8 @@ pub(super) struct TabLive {
     pub(super) incarnation: u64,
     pub(super) observation: Option<Observation>,
     pub(super) initial_handled: Option<tokio::sync::oneshot::Sender<()>>,
-    pub(super) snapshot_pending: bool,
+    pub(super) snapshot_started: Option<tokio::time::Instant>,
+    pub(super) snapshot_overdue: bool,
     pub(super) rebind_needed: bool,
     pub(super) unbound: bool,
     pub(super) rebind_ticket: Option<u64>,
@@ -136,7 +137,8 @@ impl TabLive {
             self.job = RefreshSlot::default();
         }
         self.covered = None;
-        self.snapshot_pending = false;
+        self.snapshot_started = None;
+        self.snapshot_overdue = false;
         self.initial_handled = None;
         self.rebind_task = None;
         self.rebind_ticket = None;
@@ -164,7 +166,7 @@ impl TabLive {
         {
             return true;
         }
-        self.snapshot_pending || self.rebind_task.is_some()
+        self.snapshot_started.is_some() || self.rebind_task.is_some()
     }
 }
 
@@ -831,26 +833,70 @@ pub(super) struct Resolved {
 /// the effective model moves; the per-agent override beats the session pin
 /// for the tab's current agent. The budget follows the model, and the full
 /// roster follows attach/detach, host changes and per-agent pins.
+#[cfg(test)]
 pub(super) fn resolve(
     server: &Server,
     backend: &BackendManager,
     current_agent: &str,
     meta: &SessionMeta,
 ) -> Resolved {
+    resolve_from(
+        server,
+        backend,
+        current_agent,
+        meta,
+        &ModelMetadata::default(),
+    )
+}
+
+pub(super) fn resolve_from(
+    server: &Server,
+    backend: &BackendManager,
+    current_agent: &str,
+    meta: &SessionMeta,
+    observed: &ModelMetadata,
+) -> Resolved {
     let agent = server.agents().get(current_agent);
-    let agent_default = agent.as_ref().and_then(|a| a.default_model.clone());
-    let session_model = meta
-        .resolve_model_for_agent(current_agent)
-        .map(str::to_string);
-    let effective_model =
-        backend.resolve_model_name(session_model.as_deref().or(agent_default.as_deref()));
+    let default_model = agent.as_ref().and_then(|a| a.default_model.as_deref());
+    let session_model = meta.resolve_model_for_agent(current_agent);
     let agent_cap = agent.as_ref().and_then(|a| a.max_context_tokens);
-    let context_budget = server.effective_context_budget(&effective_model, agent_cap);
     Resolved {
-        effective_model,
-        context_budget,
+        effective_model: backend.resolve_model_name(session_model.or(default_model)),
+        context_budget: server
+            .observed_context_budget(session_model, default_model, agent_cap, observed)
+            .tokens,
         roster: build_roster(server, backend, meta),
     }
+}
+
+pub(super) fn apply_model_metadata(app: &mut App, server: &Server, state: ModelMetadata) {
+    // The replacement generation may still be starting. Keep last-good
+    // numbers until there is a real observed (possibly empty) component.
+    if state.ready {
+        app.model_metadata = state;
+    } else {
+        app.model_metadata.error = state.error;
+    }
+    for tab in &mut app.tabs {
+        apply_model_budget(tab, server, &app.model_metadata);
+    }
+}
+
+pub(super) fn apply_model_budget(tab: &mut Tab, server: &Server, observed: &ModelMetadata) {
+    let Resolved {
+        effective_model,
+        context_budget,
+        roster,
+    } = resolve_from(
+        server,
+        server.backend(),
+        &tab.current_agent,
+        &tab.live.meta,
+        observed,
+    );
+    tab.effective_model = effective_model;
+    tab.context_budget = context_budget;
+    tab.roster = roster;
 }
 
 pub(super) fn replace_status(tab: &mut Tab, status: Result<Vec<String>, String>) {

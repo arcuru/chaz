@@ -456,7 +456,7 @@ async fn main() -> anyhow::Result<()> {
     } else if args.print {
         // One-shot: no background bridges; MCP cleanup still runs below.
         let prompt = args.prompt.clone().expect("--print requires PROMPT");
-        let bridge = bridge::cli::CliBridge::new(config, secret_store, prompt, args.session);
+        let bridge = bridge::cli::CliBridge::new(prompt, args.session);
         bridge.run(server).await
     } else {
         unreachable!("interactive startup is owned by the TUI")

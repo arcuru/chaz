@@ -245,6 +245,15 @@ async fn exercise_context_command(
             ..Default::default()
         })
         .await;
+    let (observation, initial) = crate::server::model_metadata::Observation::start(
+        command_server.registry().chaz_peer().clone(),
+        command_server.default_backend.clone(),
+        command_server.model_metadata.clone(),
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(2), initial)
+        .await
+        .unwrap()
+        .unwrap();
     let (_, command_db) = command_server.registry().open_session(&sid).await.unwrap();
     command_server.refresh_active_extensions(&sid).await;
     let client_mock = Arc::new(MockBackend::new());
@@ -382,6 +391,7 @@ async fn exercise_context_command(
             .any(|m| m.contains("/context diagnostic snapshot")),
         "snapshot must be delivered to one turn only"
     );
+    observation.stop().await;
     server.shutdown().await;
     command_server.shutdown().await;
 }
@@ -391,4 +401,104 @@ fn parsed_command(text: &str) -> crate::commands::Command {
         panic!("expected a command: {text}");
     };
     command
+}
+
+#[tokio::test]
+async fn observed_model_windows_change_what_a_registered_worker_packs() {
+    use crate::model_info_store::ModelInfoStore;
+    use crate::test_support::MockBackend;
+    use std::time::Duration;
+    let (_instance, server, registry) = context_extension_fixture().await;
+    register_alpha_agent_runtime(&server);
+    let (conv, db) = registry
+        .create_session(Some("packing-fixture"))
+        .await
+        .unwrap();
+    let sid = db.root_id().to_string();
+    let mut session = Session::try_new(conv, db.clone()).await.unwrap();
+    for content in [
+        "EARLY-HISTORY-WITNESS".into(),
+        " harmless text".repeat(5_000),
+    ] {
+        session
+            .add_entry(SessionEntry {
+                sender: "alpha".into(),
+                content,
+                timestamp: Utc::now(),
+                entry_type: EntryType::Message,
+                metadata: None,
+                routing: None,
+            })
+            .await
+            .unwrap();
+    }
+    let mock = Arc::new(MockBackend::new());
+    for text in ["large reply", "small reply", "unknown reply"] {
+        mock.push_text(text);
+    }
+    let secrets = crate::security::SecretStore::new(registry.chaz_peer().clone()).await;
+    let backend = BackendManager::with_mock(mock.clone(), secrets);
+    let (observation, initial) = crate::server::model_metadata::Observation::start(
+        registry.chaz_peer().clone(),
+        backend.clone(),
+        server.model_metadata.clone(),
+    );
+    tokio::time::timeout(Duration::from_secs(3), initial)
+        .await
+        .unwrap()
+        .unwrap();
+    let (base, mut display) = server.observe_model_metadata();
+    assert!(base.ready && base.infos.is_empty());
+    // Register once, before any learned model values. Nothing re-registers the worker.
+    server
+        .register_session(&db, backend.clone(), Some("alpha".into()), None)
+        .await
+        .unwrap();
+    let store = ModelInfoStore::new(registry.chaz_peer().clone());
+    for (i, window) in [Some(1_050_000), Some(8_192), None].into_iter().enumerate() {
+        store
+            .put(&ModelInfo {
+                id: "test-model".into(),
+                context_window: window,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let update = tokio::time::timeout(Duration::from_secs(3), display.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(update.state.infos["test-model"].context_window, window);
+        assert_eq!(
+            backend.context_window("test-model"),
+            window.map(|n| n as usize)
+        );
+        assert_eq!(
+            server
+                .observed_context_budget(Some("test-model"), None, Some(100_000), &update.state)
+                .tokens,
+            window.map_or(100_000, |n| (n as usize).min(100_000))
+        );
+        update.handled.send(()).unwrap();
+        write_user_message_with_content(&db, &sid, &format!("packing turn {i}")).await;
+        await_call_count(&mock, i + 1).await;
+        await_no_processing(&server, &sid).await;
+        let calls = mock.recorded_calls();
+        assert!(user_messages(&calls[i]).contains(&format!("packing turn {i}").as_str()));
+        // The large and default windows keep the old history, while the
+        // small window leaves less than the deliberately long suffix.
+        let early = calls[i].messages.iter().any(|msg| match msg {
+            crate::runtime::RuntimeMessage::Assistant(text)
+            | crate::runtime::RuntimeMessage::User(text) => text.contains("EARLY-HISTORY-WITNESS"),
+            _ => false,
+        });
+        assert_eq!(
+            early,
+            i != 1,
+            "real packed request {i} did not reflect its persisted window"
+        );
+    }
+    drop(display);
+    observation.stop().await;
+    server.shutdown().await;
 }

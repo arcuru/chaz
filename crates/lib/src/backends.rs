@@ -1,7 +1,7 @@
 /// Manage all the backends for chaz.
 ///
 /// This module is responsible for handling dispatch, validation, and general management for all the different backends
-use std::collections::HashMap;
+use crate::model_info_store::ModelInfos;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, RwLock};
@@ -278,17 +278,9 @@ pub struct BackendManager {
     /// the backend config. Production code never sets this; constructed only
     /// via `BackendManager::with_mock`.
     mock: Option<Arc<dyn BackendDispatch>>,
-    /// Context windows for in-use models, sourced from the persisted
-    /// `model_info_store`, keyed by the same model id space as
-    /// `list_known_models_with_info`. Consulted by `context_window` as a
-    /// fallback when the YAML-declared model carries no window — this is what
-    /// makes window-aware budgeting work with zero config. Shared via `Arc`
-    /// so per-session worker backends (cloned from the server's default
-    /// backend) observe the same overlay; `RwLock` so the startup warm — or a
-    /// background fetch when a not-yet-seen model is first used — can refresh
-    /// it in place.
-    model_windows: Arc<RwLock<HashMap<String, u32>>>,
-    model_info: Arc<RwLock<HashMap<String, ModelInfo>>>,
+    /// Learned metadata from the local peer's in-use model store. Runtime
+    /// clones share the overlay; presentation can retain an applied version.
+    model_info: Arc<RwLock<Arc<ModelInfos>>>,
 }
 
 /// A generic Message
@@ -348,8 +340,7 @@ impl BackendManager {
             secrets,
             session_scope: None,
             mock: None,
-            model_windows: Arc::new(RwLock::new(HashMap::new())),
-            model_info: Arc::new(RwLock::new(HashMap::new())),
+            model_info: Arc::new(RwLock::new(Arc::default())),
         }
     }
 
@@ -370,8 +361,7 @@ impl BackendManager {
             secrets,
             session_scope: None,
             mock: Some(mock),
-            model_windows: Arc::new(RwLock::new(HashMap::new())),
-            model_info: Arc::new(RwLock::new(HashMap::new())),
+            model_info: Arc::new(RwLock::new(Arc::default())),
         }
     }
 
@@ -457,16 +447,18 @@ impl BackendManager {
     /// Resolution order:
     /// 1. The YAML-declared catalog (`list_known_models_with_info`) — an
     ///    explicit `context_window:` in config is operator intent and wins.
-    /// 2. The in-use-model overlay loaded from `model_info_store` via
-    ///    [`set_model_windows`] / [`insert_model_window`] — the zero-config
-    ///    path, so a model whose window chaz learned from a `/models` fetch
-    ///    budgets correctly without anyone hand-editing config.
+    /// 2. The observed in-use model info from the peer DB, which the catalog
+    ///    fetch or a picker choice can populate without editing config.
     ///
     /// Both use the same id space, so multi-backend prefixed ids
     /// (`backend:model`) match in either tier. `None` when neither source
     /// knows the model's window — callers fall back to the configured
     /// `max_context_tokens`.
     pub fn context_window(&self, model: &str) -> Option<usize> {
+        self.context_window_in(model, &self.model_info.read().unwrap())
+    }
+
+    pub(crate) fn context_window_in(&self, model: &str, observed: &ModelInfos) -> Option<usize> {
         if let Some(w) = self
             .list_known_models_with_info()
             .into_iter()
@@ -475,39 +467,29 @@ impl BackendManager {
         {
             return Some(w as usize);
         }
-        self.model_windows
-            .read()
-            .unwrap()
+        observed
             .get(model)
-            .map(|&w| w as usize)
+            .and_then(|info| info.context_window)
+            .map(|w| w as usize)
     }
 
-    /// Replace the whole in-use-model window overlay consulted by
-    /// [`context_window`]. Called once at startup (server warm) from the
-    /// persisted `model_info_store`. Because the overlay lives behind a shared
-    /// `Arc`, updates are visible to every clone of this manager — including
-    /// the per-session worker backends cloned at `register_session`.
-    pub fn set_model_windows(&self, windows: HashMap<String, u32>) {
-        *self.model_windows.write().unwrap() = windows;
+    pub(crate) fn replace_model_info(&self, infos: Arc<ModelInfos>) {
+        *self.model_info.write().unwrap() = infos;
     }
 
-    /// Insert (or update) a single model's window into the overlay, leaving
-    /// the rest intact. Used by the background "first use of a not-yet-seen
-    /// model" path so the very next turn budgets window-aware without waiting
-    /// for a restart. Shares the same `Arc`, so all clones see it.
-    pub fn insert_model_window(&self, model: String, window: u32) {
-        self.model_windows.write().unwrap().insert(model, window);
+    #[cfg(test)]
+    pub(crate) fn insert_model_window(&self, model: String, window: u32) {
+        let mut overlay = self.model_info.write().unwrap();
+        let info = Arc::make_mut(&mut overlay)
+            .entry(model.clone())
+            .or_default();
+        info.id = model;
+        info.context_window = Some(window);
     }
 
-    /// Refresh cached in-use prices and windows without a network request.
-    pub fn insert_model_info(&self, info: ModelInfo) {
-        if let Some(window) = info.context_window {
-            self.insert_model_window(info.id.clone(), window);
-        }
-        self.model_info
-            .write()
-            .unwrap()
-            .insert(info.id.clone(), info);
+    #[cfg(test)]
+    pub(crate) fn insert_model_info(&self, info: ModelInfo) {
+        Arc::make_mut(&mut self.model_info.write().unwrap()).insert(info.id.clone(), info);
     }
 
     /// Configured fields win over cached fields. Lookup remains backend-scoped;
@@ -1037,10 +1019,8 @@ mod tests {
 
         // Overlay supplies windows the catalog learned at runtime, including
         // one that also has a YAML value.
-        let mut overlay = HashMap::new();
-        overlay.insert("gpt-4".to_string(), 999_000);
-        overlay.insert("gpt-3.5".to_string(), 128_000);
-        mgr.set_model_windows(overlay);
+        mgr.insert_model_window("gpt-4".into(), 999_999);
+        mgr.insert_model_window("gpt-3.5".into(), 128_000);
 
         // YAML wins over the overlay (explicit operator intent).
         assert_eq!(mgr.context_window("gpt-4"), Some(64_000));

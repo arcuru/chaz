@@ -15,7 +15,7 @@ use chaz_core::bridge::ApprovalExchange;
 use chaz_core::commands::{self, Command, CommandContext, CommandOutcome, SessionInfo};
 use chaz_core::config::Config;
 use chaz_core::security::SecretStore;
-use chaz_core::server::Server;
+use chaz_core::server::{ModelMetadata, ModelMetadataUpdate, Server};
 use chaz_core::session::SessionIndex;
 use chaz_core::session::{AgentRef, EntryType, Session, SessionEntry, SessionMeta};
 
@@ -81,6 +81,7 @@ enum Action {
     /// A background catalog fetch finished. `Ok` carries the live model
     /// list (already merged with cache); `Err` carries a display message.
     ModelsFetched(ModelCatalog),
+    ModelMetadata(ModelMetadataUpdate),
     SessionLoad(SessionLoad),
     PeerPage(peer_pages::Loaded),
     SessionPage(session_pages::Loaded),
@@ -656,6 +657,7 @@ pub(super) struct ListScroll {
 }
 
 pub(super) struct App {
+    pub(super) model_metadata: ModelMetadata,
     jobs: jobs::JobsView,
     selection: selection::Selection,
     pub(super) mode: TuiMode,
@@ -872,6 +874,7 @@ impl App {
     /// The launch state: the session hub with no conversation open.
     fn hub(agent_names: HashSet<String>) -> Self {
         Self {
+            model_metadata: ModelMetadata::default(),
             jobs: jobs::JobsView::default(),
             selection: selection::Selection::default(),
             mode: TuiMode::SessionPicker,

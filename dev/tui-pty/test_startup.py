@@ -243,7 +243,7 @@ class Outage(ServicePty):
         self.process.send("\x08")  # Ctrl+H: return to the original tab
         self.process.expect_screen("SERVICE-CACHED-TRANSCRIPT", timeout=2)
 
-    def test_session_read_timeout_does_not_disconnect_healthy_service(self):
+    def test_overdue_session_read_does_not_disconnect_healthy_service(self):
         armed = threading.Event()
         self.launch(lambda r: armed.is_set() and '"entries"' in json.dumps(r)
                     and isinstance(r.get("AuthenticatedDb", {}).get("op"), dict)
@@ -256,8 +256,8 @@ class Outage(ServicePty):
         self.process.send("\x0c")  # Ctrl+L: cached second tab is still usable
         self.process.expect_screen("SECONDARY-CACHED", timeout=2)
         deadline = time.monotonic() + 15
-        while "Refresh failed: backend read timed out" not in self.logs():
-            self.assertLess(time.monotonic(), deadline, "the gated session read did not time out")
+        while "Snapshot read overdue" not in self.logs():
+            self.assertLess(time.monotonic(), deadline, "the gated session read did not report it was overdue")
             self.process.drain(0.05)
         self.assertEqual(self.control("sessions", "SESSIONS"), "SESSIONS 2")
         self.gate.release.set()
@@ -267,7 +267,7 @@ class Outage(ServicePty):
         self.assertNotIn("TUI service disconnected", self.logs())
         self.assertNotIn("Backend unresponsive", "\n".join(self.process.screen.display))
         self.quit()
-        print("SLOW TAB: one real session read timed out; live owner and both cached tabs recovered without reconnecting")
+        print("SLOW TAB: the held snapshot read reported overdue and finished without reconnecting")
 
     def test_outage_recovery_does_not_replay_a_committed_write_with_no_reply(self):
         armed = threading.Event()
