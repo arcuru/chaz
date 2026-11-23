@@ -888,6 +888,8 @@ async fn budget_model_falls_back_to_backend_default() {
         price_input: None,
         price_output: None,
         price_cache_read: None,
+        price_cache_write: None,
+        cache_lifetime_seconds: None,
         context_window: None,
     }]);
     let backend = crate::backends::BackendManager::new(&Some(vec![b]), secrets.clone());

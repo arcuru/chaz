@@ -41,6 +41,9 @@ use crate::extension::projection::ContextSource;
 use crate::tool::ToolDefinition;
 use tracing::{debug, info, warn};
 
+#[path = "autocompact/timing.rs"]
+mod timing;
+
 /// Pi summarizes a split request in at most two calls (history + request
 /// prefix). Steering input can create more segments; the cut is pulled back
 /// so a single preparation never makes more than this many calls.
@@ -121,6 +124,7 @@ pub struct Policy {
     pub keep_recent_tokens: usize,
     /// Output ceiling for one summary request (not a target length).
     pub summary_max_tokens: u32,
+    pub cache_aware: bool,
 }
 
 /// Default trigger, as a percentage of the model context window.
@@ -208,6 +212,7 @@ pub(crate) struct Compactor {
     reported: Option<(String, String)>,
     session: Option<(eidetica::Database, Vec<String>)>,
     scoped: Option<Scoped>,
+    timing: Option<timing::Timing>,
     invalidated: bool,
     boundary_failure: Option<String>,
     /// Each finished call reports immediately, even if a later segment is
@@ -343,6 +348,7 @@ impl Compactor {
             reported: None,
             session: None,
             scoped: None,
+            timing: None,
             invalidated: false,
             boundary_failure: None,
             usage: Default::default(),
@@ -354,12 +360,26 @@ impl Compactor {
         recorder: std::sync::Arc<dyn super::RuntimeRecorder>,
         db: eidetica::Database,
     ) -> Result<(), String> {
-        let eligible = recorder
+        let scope = recorder
             .context_compaction()
-            .expect("selected compaction capability")
-            .historical_members()
+            .expect("selected compaction capability");
+        let priced = if self.policy.cache_aware {
+            self.backend
+                .model_info_for_call(self.model.as_deref(), None)
+                .and_then(|info| Some((timing::Prices::from_model(&info)?, info.id)))
+        } else {
+            None
+        };
+        let (eligible, activity) = scope
+            .scoped_history(priced.as_ref().map(|(_, id)| id.as_str()))
             .await
             .map_err(|err| err.to_string())?;
+        self.timing = priced.map(|(prices, _)| timing::Timing {
+            prices,
+            activity,
+            calls: 0,
+            last_warm_response: None,
+        });
         self.scoped = Some(Scoped {
             db,
             recorder,
@@ -368,6 +388,24 @@ impl Compactor {
             intent: None,
         });
         Ok(())
+    }
+
+    pub(crate) fn note_model_response(
+        &mut self,
+        metadata: Option<&ResponseMetadata>,
+        resolved_model: &str,
+        started: std::time::Instant,
+    ) {
+        if let Some(timing) = &mut self.timing {
+            timing.calls = timing.calls.saturating_add(1);
+            timing.last_warm_response = metadata
+                .filter(|m| {
+                    m.model == resolved_model
+                        && (m.usage.cached_tokens.unwrap_or(0) > 0
+                            || m.usage.cache_creation_tokens.unwrap_or(0) > 0)
+                })
+                .map(|_| started);
+        }
     }
 
     pub(crate) fn note_replacements(&mut self, edits: &[crate::session::ContextReplacement]) {
@@ -610,19 +648,21 @@ impl Compactor {
         (cut > floor && !jobs.is_empty()).then_some(jobs)
     }
 
+    /// Return true only when an expired-cache preparation must finish before dispatch.
     async fn start(
         &mut self,
         messages: &[RuntimeMessage],
         sources: &[ContextSource],
         estimate: usize,
-    ) {
+        over_budget: bool,
+    ) -> bool {
         if !matches!(self.scoped_policy_is_current().await, Ok(true)) {
             self.invalidated = true;
             self.set_status(
                 "unapplied",
                 "automatic compaction authorization changed".into(),
             );
-            return;
+            return false;
         }
         let Some(mut jobs) = self.plan(messages, sources) else {
             // Keep the last rejection visible instead of replacing it with
@@ -636,12 +676,57 @@ impl Compactor {
                     ),
                 );
             }
-            return;
+            return false;
         };
-        if let Some(scope) = &mut self.scoped {
+        if self.scoped.is_some() {
             // Reserve one immutable range per preparation. Later safe
             // boundaries can choose another; no partial multi-call adoption.
             jobs.truncate(1);
+        }
+        // Price/TTL refusal is before the durable reservation, even at hard
+        // pressure. A priced hard fold need not predict future savings.
+        let mut wait_before_first_call = false;
+        if self.policy.cache_aware {
+            let Some(timing) = &self.timing else {
+                self.set_status("timing-deferred", "cache-aware preparation needs scoped history, valid cache prices and a known lifetime".into());
+                return false;
+            };
+            if !over_budget {
+                let job = &jobs[0];
+                let input = estimate_request_tokens(&summary_request(job), &[]);
+                let output = summary_limit(self.window, self.policy.summary_max_tokens, input);
+                let covered = estimate_request_tokens(&job.covered, &[]);
+                // Include framing and the host's compact citation in the projected target.
+                let overhead = message_tokens(&RuntimeMessage::User(format!(
+                    "{SUMMARY_PREFIX}{SUMMARY_SUFFIX}"
+                ))) + crate::session::fold_citation(&"x".repeat(64), usize::MAX)
+                    .len();
+                let target = estimate
+                    .saturating_sub(covered)
+                    .saturating_add(output)
+                    .saturating_add(overhead);
+                let Some(phase) = timing.phase().filter(|&phase| {
+                    output > 0
+                        && timing::pays(
+                            phase,
+                            timing.prices,
+                            timing.expected_calls(),
+                            estimate,
+                            target,
+                            input,
+                            output,
+                        )
+                }) else {
+                    self.set_status(
+                        "timing-deferred",
+                        "cache state or projected savings do not justify preparation".into(),
+                    );
+                    return false;
+                };
+                wait_before_first_call = phase == timing::Phase::ExpiredBeforeTurn;
+            }
+        }
+        if let Some(scope) = &mut self.scoped {
             let job = &jobs[0];
             let members = job
                 .covered
@@ -667,7 +752,7 @@ impl Compactor {
                     self.exhausted = self.exhausted.max(job.end);
                     warn!(%error, "Could not reserve automatic context replacement");
                     self.set_status("unapplied", "compaction source reservation refused".into());
-                    return;
+                    return false;
                 }
             }
         }
@@ -680,7 +765,7 @@ impl Compactor {
                 "unapplied",
                 "automatic compaction authorization changed".into(),
             );
-            return;
+            return false;
         }
         let cut = jobs.last().map_or(0, |j| j.end);
         let backend = self.backend.clone();
@@ -722,6 +807,7 @@ impl Compactor {
             "preparing",
             format!("summarizing history before message {cut}"),
         );
+        wait_before_first_call
     }
 
     /// Validate and apply a finished preparation against the current vector.
@@ -926,7 +1012,18 @@ impl Compactor {
             && self.pending.is_none()
             && (over.is_none() || self.boundary_failure.is_none())
         {
-            self.start(messages, sources, estimate).await;
+            let idle = self
+                .start(messages, sources, estimate, over.is_some())
+                .await;
+            if idle {
+                // An expired-cache fold only saves the first rewrite if its
+                // result is ready before the foreground request. Failure
+                // still permits the original, already in-budget envelope.
+                return Ok(self
+                    .finish_pending(true, messages, sources, tools)
+                    .await
+                    .is_ok());
+            }
         }
         let Some(hard) = over else {
             return Ok(false);
@@ -944,6 +1041,12 @@ impl Compactor {
             self.boundary_failure
                 .as_ref()
                 .map(|e| format!("the last summary was rejected: {e}"))
+                .or_else(|| {
+                    self.status
+                        .as_ref()
+                        .filter(|s| s.state == "timing-deferred")
+                        .map(|s| s.detail.clone())
+                })
                 .unwrap_or_else(|| "autocompaction found nothing more to summarize".into())
         };
         let detail =
@@ -1019,31 +1122,9 @@ async fn summarize(
     max_tokens: u32,
     job: &Job,
 ) -> SummaryResult {
-    let (source, previous) = match &job.previous {
-        Some((summary, end)) => (&job.covered[end - job.start..], Some(summary.as_str())),
-        None => (job.covered.as_slice(), None),
-    };
-    let mut prompt = format!("<conversation>\n{}\n</conversation>\n\n", serialize(source));
-    if let Some(previous) = previous {
-        prompt.push_str(&format!(
-            "<previous-summary>\n{previous}\n</previous-summary>\n\n"
-        ));
-    }
-    prompt.push_str(match (job.kind, previous) {
-        (_, Some(_)) => UPDATE_SUMMARIZATION_PROMPT,
-        (Kind::History, None) => SUMMARIZATION_PROMPT,
-        (Kind::RequestPrefix, None) => TURN_PREFIX_SUMMARIZATION_PROMPT,
-    });
-    let request = vec![
-        RuntimeMessage::System(SUMMARIZATION_SYSTEM_PROMPT.into()),
-        RuntimeMessage::User(prompt),
-    ];
-    // Pi: the output ceiling shrinks so input and output fit the window.
-    let mut limit = max_tokens as usize;
-    if let Some(window) = window {
-        let input = estimate_request_tokens(&request, &[]);
-        limit = limit.min(window.saturating_sub(input));
-    }
+    let request = summary_request(job);
+    let input = estimate_request_tokens(&request, &[]);
+    let limit = summary_limit(window, max_tokens, input);
     if limit == 0 {
         return Err((
             "summary source does not fit the model context window".into(),
@@ -1074,6 +1155,33 @@ async fn summarize(
         )),
         Err(error) => Err((format!("summary request failed: {error}"), Vec::new())),
     }
+}
+
+fn summary_request(job: &Job) -> [RuntimeMessage; 2] {
+    let (source, previous) = match &job.previous {
+        Some((summary, end)) => (&job.covered[end - job.start..], Some(summary.as_str())),
+        None => (job.covered.as_slice(), None),
+    };
+    let mut prompt = format!("<conversation>\n{}\n</conversation>\n\n", serialize(source));
+    if let Some(previous) = previous {
+        prompt.push_str(&format!(
+            "<previous-summary>\n{previous}\n</previous-summary>\n\n"
+        ));
+    }
+    prompt.push_str(match (job.kind, previous) {
+        (_, Some(_)) => UPDATE_SUMMARIZATION_PROMPT,
+        (Kind::History, None) => SUMMARIZATION_PROMPT,
+        (Kind::RequestPrefix, None) => TURN_PREFIX_SUMMARIZATION_PROMPT,
+    });
+    [
+        RuntimeMessage::System(SUMMARIZATION_SYSTEM_PROMPT.into()),
+        RuntimeMessage::User(prompt),
+    ]
+}
+
+fn summary_limit(window: Option<usize>, max_tokens: u32, input: usize) -> usize {
+    // Pi: the output ceiling shrinks so input and output fit the window.
+    (max_tokens as usize).min(window.map_or(usize::MAX, |window| window.saturating_sub(input)))
 }
 
 /// Remap the already assembled request using committed replacements only.
@@ -1260,6 +1368,7 @@ mod tests {
                 trigger_tokens: Some(500),
                 keep_recent_tokens: 200,
                 summary_max_tokens: 8_192,
+                cache_aware: false,
             },
             backend,
             None,
@@ -1628,6 +1737,7 @@ mod tests {
             trigger_tokens: None,
             keep_recent_tokens: 20_000,
             summary_max_tokens: 8_192,
+            cache_aware: false,
         };
         let make = |window: Option<u32>, hard: Option<usize>| {
             let policy = policy.clone();
@@ -1666,6 +1776,8 @@ mod tests {
                     price_input: None,
                     price_output: None,
                     price_cache_read: None,
+                    price_cache_write: None,
+                    cache_lifetime_seconds: None,
                     context_window: Some(window),
                 }]);
                 backend
@@ -1679,6 +1791,7 @@ mod tests {
                     trigger_tokens: None,
                     keep_recent_tokens: 20_000,
                     summary_max_tokens: 8_192,
+                    cache_aware: false,
                 },
                 backend.clone(),
                 model,

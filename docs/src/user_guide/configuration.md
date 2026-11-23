@@ -441,6 +441,18 @@ All LLM HTTP requests are wrapped in a configurable timeout and retried on trans
 
 Retries use exponential backoff (1s, 2s, 4s, … capped at 30s). Rate-limit responses (HTTP 429) with a `Retry-After` header are honored as the minimum delay. Non-retryable errors (401, 403, 400) fail immediately.
 
+### Per-model cache metadata
+
+| `backends[].models[]` field | Default | Meaning                                                             |
+| --------------------------- | ------- | ------------------------------------------------------------------- |
+| `price_cache_read`          | Unknown | USD per million cached input tokens.                                |
+| `price_cache_write`         | Unknown | USD per million input tokens written to the cache.                  |
+| `cache_lifetime_seconds`    | Unknown | Positive lifetime of the effective cache on this route, in seconds. |
+
+These fields describe the route; they do not enable caching, request a provider TTL, or keep a cache warm.
+Explicit values take precedence over discovered values for the same model. OpenRouter-style catalogs may report prices but do not supply the lifetime here.
+The [fenced cache-aware preparation experiment](extensions.md#durable-citations-and-cache-timing-in-the-fenced-fixture) also needs `price_input` and `price_output`; do not enter placeholder prices to make the gate run.
+
 ### Per-model reasoning
 
 Some models think before they answer, spending extra tokens working through the question. That helps on hard problems but slows down simple ones. You can set how much effort each model puts in:

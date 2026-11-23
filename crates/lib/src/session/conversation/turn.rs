@@ -232,7 +232,7 @@ pub(super) async fn validate_completion(
     read: &ConversationRead,
     entry: &Entry,
     completion: &Completion,
-) -> Result<()> {
+) -> Result<chrono::DateTime<chrono::Utc>> {
     let op = operation_in(read, entry, &completion.publication)?;
     let Payload::NativeModelResponse { response } =
         &super::view::fact(&completion.response, &read.operations)?.payload
@@ -264,5 +264,7 @@ pub(super) async fn validate_completion(
     {
         return Err(Error::Integrity("invalid atomic attempt transition".into()));
     }
-    Ok(())
+    after
+        .completed_at
+        .ok_or_else(|| Error::Missing("completion timestamp".into()))
 }

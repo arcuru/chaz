@@ -11,6 +11,19 @@ const FOLLOWUP: &str = "New question after reopen.";
 const CORRECTION: &str = "Unrelated sibling survives.";
 const FOLD: &str = "Durably summarized old evidence.";
 
+async fn enable_recovery(db: &Database) {
+    crate::extension::append_event(
+        db,
+        crate::extension::ExtensionEvent::Activated {
+            name: "context_prune".into(),
+            extension_ref: crate::extension::ExtensionRef::builtin("context_prune"),
+            timestamp: Utc::now(),
+        },
+    )
+    .await
+    .unwrap();
+}
+
 fn completions(message: Value, finish: &str) -> ResponseTemplate {
     ResponseTemplate::new(200).set_body_json(json!({
         "id":"compact-fixture-response", "model":MODEL,
@@ -199,11 +212,19 @@ async fn fenced_v1_real_compact_tool_default_stack_reuses_signed_replacement() {
 
 #[tokio::test]
 async fn fenced_v1_background_summary_default_stack_survives_untargeted_sibling() {
-    let old = "Historical detail unique to original source. ".repeat(170);
-    let mut fx = Box::pin(Fixture::build(false, None, Some(&old), |req: &Request| {
+    let old = "  Historical detail unique to original source 🦀. \n".repeat(500);
+    let native = "  Assistant evidence 🦀 before a tool call. \n".repeat(500);
+    let mock_user = old.clone();
+    let mock_native = native.clone();
+    let mut fx = Box::pin(Fixture::build(true, None, Some(&old), move |req: &Request| {
         let body: Value = req.body_json().unwrap();
         if asks_summary(&body) {
             text_response(FOLD)
+        } else if contents(&body, &mock_user)
+            && !body["messages"].as_array().unwrap().iter().any(|m| m["role"] == "tool")
+        {
+            completions(json!({"role":"assistant", "content":mock_native, "reasoning_content":"retained opaque fixture",
+                "tool_calls":[{"id":"wire-1","type":"function","function":{"name":TOOL,"arguments":"{ \"a\": 2, \"b\": 2 }"}}]}), "tool_calls")
         } else {
             text_response(BODY)
         }
@@ -211,7 +232,17 @@ async fn fenced_v1_background_summary_default_stack_survives_untargeted_sibling(
     .await;
     let seed = Box::pin(fx.run()).await.unwrap();
     Box::pin(fx.complete(&seed.body)).await.unwrap();
+    let registry = Arc::new(ToolRegistry::new());
+    registry.register(Add(fx.tool.clone()));
+    registry.register_arc_owned(
+        Arc::new(crate::extensions::pruner::ToolHistoryQuery),
+        Some("context_prune"),
+    );
+    fx.context.tools = crate::tool::ScopedTools::new(registry.clone(), None);
+    fx.context.active_extensions.insert("context_prune".into());
+    Box::pin(enable_recovery(&fx.db)).await;
     Box::pin(fx.enable_automatic()).await;
+    fx.backend.insert_model_window(MODEL.into(), 65_536);
     let before = fx.db.snapshot().await.unwrap();
     Box::pin(fx.advance("background-turn", QUESTION, false)).await;
     fx.budget = Some(500);
@@ -227,16 +258,35 @@ async fn fenced_v1_background_summary_default_stack_survives_untargeted_sibling(
     .unwrap();
     let output = Box::pin(fx.run()).await.unwrap();
     Box::pin(fx.complete(&output.body)).await.unwrap();
-    let wire = Box::pin(fx.assert_effects(3, 0, 0)).await;
-    assert!(asks_summary(&wire[1]));
-    assert!(contents(&wire[1], &old));
-    assert!(!contents(&wire[1], QUESTION) && !contents(&wire[1], CORRECTION));
-    assert!(contents(&wire[2], FOLD) && contents(&wire[2], QUESTION));
-    assert!(!contents(&wire[2], CORRECTION));
-    let reopened = fx.reopened().await;
+    let wire = Box::pin(fx.assert_effects(4, 1, 2)).await;
+    assert!(asks_summary(&wire[2]));
+    assert!(contents(&wire[2], old.trim()));
+    assert!(!contents(&wire[2], QUESTION) && !contents(&wire[2], CORRECTION));
+    assert!(contents(&wire[3], FOLD) && contents(&wire[3], QUESTION));
+    assert!(!contents(&wire[3], CORRECTION));
+    let summary = wire[3]["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["content"].as_str().is_some_and(|c| c.contains(FOLD)))
+        .unwrap()
+        .clone();
+    let disk = fx._disk.take().unwrap();
+    let root = fx.db.root_id().clone();
+    let call = fx.call(0);
+    let attempt = fx.recorder.attempt.attempt_id.clone();
+    // Release every handle before reopening the same SQLite namespace.
+    drop(fx);
+    let url = format!(
+        "sqlite://{}?mode=rwc",
+        disk.path().join("fenced.db").display()
+    );
+    let fresh = Instance::connect(&url).await.unwrap();
+    let account = fresh.login_account("test", "test-password").await.unwrap();
+    let reopened = account.open_database(&root).await.unwrap();
     let joined = Session::history(&reopened).await.unwrap();
     let prepared = joined
-        .recorded_call(&fx.call(0), &fx.recorder.attempt.attempt_id)
+        .recorded_call(&call, &attempt)
         .await
         .unwrap()
         .unwrap();
@@ -246,7 +296,7 @@ async fn fenced_v1_background_summary_default_stack_survives_untargeted_sibling(
         .display_rows()
         .await
         .unwrap();
-    assert!(seen.iter().any(|r| r.content == FOLD));
+    assert!(seen.iter().any(|r| r.content.starts_with(FOLD)));
     assert!(!seen.iter().any(|r| r.content == CORRECTION));
     let isolated_append = Session::history_at(&reopened, &sibling)
         .await
@@ -255,7 +305,7 @@ async fn fenced_v1_background_summary_default_stack_survives_untargeted_sibling(
         .await
         .unwrap();
     assert!(isolated_append.iter().any(|r| r.content == CORRECTION));
-    assert!(!isolated_append.iter().any(|r| r.content == FOLD));
+    assert!(!isolated_append.iter().any(|r| r.content.starts_with(FOLD)));
     let history = joined.context().await.unwrap();
     let context = ContextBuilder::from_history(&history, AGENT, "", &ContextConfig::default())
         .build()
@@ -271,13 +321,20 @@ async fn fenced_v1_background_summary_default_stack_survives_untargeted_sibling(
         displayed.iter().filter(|r| r.content == CORRECTION).count(),
         1
     );
-    assert_eq!(displayed.iter().filter(|r| r.content == FOLD).count(), 1);
+    assert_eq!(
+        displayed
+            .iter()
+            .filter(|r| r.content.starts_with(FOLD))
+            .count(),
+        1
+    );
     assert_eq!(
         displayed.iter().filter(|r| r.content == QUESTION).count(),
         1
     );
     assert!(!displayed.iter().any(|r| r.content == old));
-    let inspect = Box::pin(fx.operation_log()).await;
+    let inspect = joined.inspect_conversation().await.unwrap().unwrap();
+    assert!(inspect.issues.is_empty(), "{:?}", inspect.issues);
     assert!(
         inspect
             .operations
@@ -292,6 +349,212 @@ async fn fenced_v1_background_summary_default_stack_survives_untargeted_sibling(
             .values()
             .any(|a| a.contains("CompactionSettled") && a.contains("Applied"))
     );
+
+    // The model uses the host's citation, not an ID chosen by the summarizer.
+    let rendered = summary["content"].as_str().unwrap();
+    let (reference, _) = rendered
+        .split_once("cr1:")
+        .unwrap()
+        .1
+        .split_once(":<index>")
+        .unwrap();
+    let user_ref = format!("cr1:{reference}:0");
+    let assistant_ref = format!("cr1:{reference}:1");
+    let session = Arc::new(Mutex::new(
+        Session::new(
+            crate::types::ConversationId("fenced".into()),
+            reopened.clone(),
+        )
+        .await,
+    ));
+    let mut reopened_context = tool_context_with_host(session, registry, Arc::new(MockHost::new()));
+    reopened_context
+        .active_extensions
+        .insert("context_prune".into());
+    let originals = &inspect.operations.atoms;
+    for (reference, kind, text) in [
+        (&user_ref, "Input", &old),
+        (&assistant_ref, "NativeModelResponse", &native),
+    ] {
+        let actual = Box::pin(reassemble(&reopened_context, reference)).await;
+        let expected = raw_fact(originals.values(), kind, text);
+        assert_eq!(actual, expected);
+    }
+    let hidden = reopened_context
+        .tools
+        .narrow(Some(&["tool_history_query".into()]));
+    let mut restricted = reopened_context.clone();
+    restricted.tools = hidden;
+    assert_eq!(
+        Box::pin(query(&restricted, &assistant_ref, 0)).await["status"],
+        "missing_or_not_authorized"
+    );
+    assert_eq!(
+        Box::pin(query(&restricted, &user_ref, 0)).await["status"],
+        "retained"
+    );
+    for forged in [
+        format!("cr1:{}:0", "0".repeat(64)),
+        format!("cr1:{reference}:999"),
+    ] {
+        assert_eq!(
+            Box::pin(query(&reopened_context, &forged, 0)).await["status"],
+            "missing_or_not_authorized"
+        );
+    }
+    let (_peer, _account, foreign_db) = crate::session::test_helpers::test_session_db().await;
+    Box::pin(enable_recovery(&foreign_db)).await;
+    let mut foreign = reopened_context.clone();
+    foreign.session = Arc::new(Mutex::new(
+        Session::new(crate::types::ConversationId("foreign".into()), foreign_db).await,
+    ));
+    assert_eq!(
+        Box::pin(query(&foreign, &user_ref, 0)).await["status"],
+        "missing_or_not_authorized"
+    );
+}
+
+async fn query(ctx: &ToolContext, reference: &str, offset: usize) -> Value {
+    let result = crate::extensions::pruner::ToolHistoryQuery
+        .execute(json!({"reference":reference,"offset":offset}), ctx)
+        .await
+        .unwrap();
+    serde_json::from_str(&result).unwrap()
+}
+
+async fn reassemble(ctx: &ToolContext, reference: &str) -> String {
+    let mut full = String::new();
+    for i in 0..8 {
+        let page = Box::pin(query(ctx, reference, full.len())).await;
+        assert_eq!(page["status"], "retained");
+        let text = page["content"].as_str().unwrap();
+        assert!(!text.is_empty() && text.len() <= 16 * 1024);
+        full.push_str(text);
+        if page["next_offset"].is_null() {
+            assert!(i > 0, "fixture must exercise multiple pages");
+            assert_eq!(page["stored_bytes"], full.len());
+            use sha2::{Digest, Sha256};
+            assert_eq!(
+                page["sha256"],
+                format!("{:x}", Sha256::digest(full.as_bytes()))
+            );
+            return full;
+        }
+        assert_eq!(page["next_offset"], full.len());
+    }
+    panic!("fixture exceeded its paging bound");
+}
+
+fn raw_fact<'a>(atoms: impl Iterator<Item = &'a String>, kind: &str, text: &str) -> &'a str {
+    #[derive(serde::Deserialize)]
+    struct Facts<'a> {
+        #[serde(borrow)]
+        facts: Vec<&'a serde_json::value::RawValue>,
+    }
+    atoms
+        .flat_map(|atom| serde_json::from_str::<Facts<'_>>(atom).unwrap().facts)
+        .map(serde_json::value::RawValue::get)
+        .find(|raw| {
+            let fact: Value = serde_json::from_str(raw).unwrap();
+            fact["payload"]["kind"] == kind
+                && (fact["payload"]["text"] == text
+                    || fact["payload"]["response"]["content"] == text)
+        })
+        .unwrap()
+}
+
+#[tokio::test]
+async fn fenced_v1_priced_idle_preparation_waits_and_missing_ttl_defers() {
+    let old = "Prior source with useful material. ".repeat(300);
+    let mut fx = Box::pin(Fixture::build(false, None, Some(&old), |req: &Request| {
+        if asks_summary(&req.body_json().unwrap()) {
+            text_response(FOLD)
+        } else {
+            text_response(BODY)
+        }
+    }))
+    .await;
+    let mut info = crate::backends::ModelInfo {
+        id: MODEL.into(),
+        price_input: Some(0.1),
+        price_output: Some(0.1),
+        price_cache_read: Some(0.1),
+        price_cache_write: Some(3.0),
+        ..Default::default()
+    };
+    fx.backend.insert_model_info(info.clone());
+    Box::pin(fx.enable_automatic()).await;
+    Box::pin(crate::extension::update_settings(
+        &fx.db,
+        "autocompact",
+        false,
+        |settings| {
+            settings["cache_aware"] = json!(true);
+            Ok(())
+        },
+    ))
+    .await
+    .unwrap();
+    for (branch, input) in [(None, old.as_str()), (Some("unknown-ttl"), QUESTION)] {
+        if let Some(branch) = branch {
+            Box::pin(fx.advance(branch, input, false)).await;
+        }
+        let run = Box::pin(fx.run()).await.unwrap();
+        // Use a deterministic completion time in the disposable signed Store
+        // so the next boundary is expired without sleeps or model traffic.
+        let mut entry = message(AGENT, &run.body);
+        entry.timestamp = Utc::now() - chrono::Duration::minutes(10);
+        Box::pin(
+            fx.recorder
+                .complete(&mut *fx.session.lock().await, Some(entry), None),
+        )
+        .await
+        .unwrap();
+    }
+    let wire = Box::pin(fx.assert_effects(2, 0, 0)).await;
+    assert!(
+        wire.iter()
+            .all(|req| !asks_summary(req) && contents(req, &old))
+    );
+    let originals = Box::pin(fx.operation_log()).await;
+    assert!(
+        !originals
+            .provenance
+            .atoms
+            .values()
+            .any(|a| a.contains("CompactionIntent"))
+    );
+
+    info.cache_lifetime_seconds = Some(300);
+    fx.backend.insert_model_info(info);
+    Box::pin(fx.advance("expired-priced", FOLLOWUP, true)).await;
+    let run = Box::pin(fx.run()).await.unwrap();
+    Box::pin(fx.complete(&run.body)).await.unwrap();
+    let wire = Box::pin(fx.assert_effects(4, 0, 0)).await;
+    assert!(asks_summary(&wire[2]));
+    assert!(contents(&wire[3], FOLD) && !contents(&wire[3], &old));
+
+    let slots = wire[3]["messages"].as_array().unwrap();
+    let fold = slots
+        .iter()
+        .position(|m| m["content"].as_str().is_some_and(|s| s.contains(FOLD)))
+        .unwrap();
+    let stable_prefix = &slots[..=fold];
+    for i in 0..3 {
+        Box::pin(fx.advance(&format!("replay-{i}"), FOLLOWUP, i == 0)).await;
+        let next = Box::pin(fx.run()).await.unwrap();
+        Box::pin(fx.complete(&next.body)).await.unwrap();
+    }
+    let replay = Box::pin(fx.assert_effects(7, 0, 0)).await;
+    assert_eq!(replay.iter().filter(|wire| asks_summary(wire)).count(), 1);
+    for req in &replay[4..] {
+        assert!(
+            req["messages"]
+                .as_array()
+                .unwrap()
+                .starts_with(stable_prefix)
+        );
+    }
 }
 
 #[tokio::test]
@@ -363,7 +626,7 @@ async fn fenced_v1_overlapping_result_does_not_replace_current_coverage() {
         let mut fx = Box::pin(Fixture::build(
             false,
             None,
-            Some("Original historical input"),
+            Some(&"Original historical input. ".repeat(100)),
             |_: &Request| text_response(BODY),
         ))
         .await;
@@ -414,6 +677,7 @@ async fn fenced_v1_overlapping_result_does_not_replace_current_coverage() {
         source
             .replace_context(&sibling_txn, &sibling, FOLD.into())
             .await
+            .unwrap()
             .unwrap();
         stage_observation(
             &sibling_txn,

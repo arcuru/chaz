@@ -213,6 +213,37 @@ impl Staging<'_> {
         &self.read.provenance.compactions
     }
 
+    pub fn completed_turn_activity(
+        &self,
+        agent: &str,
+        model: &str,
+    ) -> crate::session::CompletedTurnActivity {
+        use std::collections::BTreeMap;
+        let evidence = &self.read.provenance;
+        let mut latest_completion = None;
+        let mut counts = BTreeMap::new();
+        for call in &evidence.accounting {
+            if call.agent == agent
+                && let Some(at) = evidence.completed_at.get(&call.invocation)
+            {
+                // A newer return with unknown pricing cannot prove inactivity.
+                latest_completion = latest_completion.max(Some(*at));
+                if call
+                    .call
+                    .prices
+                    .as_ref()
+                    .is_some_and(|prices| prices.id == model)
+                {
+                    *counts.entry(&call.invocation).or_insert(0) += 1;
+                }
+            }
+        }
+        crate::session::CompletedTurnActivity {
+            latest_completion,
+            call_counts: counts.into_values().collect(),
+        }
+    }
+
     pub fn historical_members(
         &self,
         input: &RepresentationId,
@@ -253,13 +284,30 @@ impl Staging<'_> {
         write: &Transaction,
         intent: &CompactionIntent,
         summary: String,
-    ) -> Result<ContextReplacement> {
+    ) -> Result<Option<ContextReplacement>> {
         self.validate_compaction(intent)?;
         if summary.trim().is_empty() {
             return Err(ConversationError::Malformed(
                 "empty compaction summary".into(),
             ));
         }
+        let summary = if intent.tool.is_none() {
+            let cited = self.read.cite_automatic_summary(intent, summary)?;
+            let members: Vec<_> = self
+                .historical_members(&intent.input)?
+                .into_iter()
+                .filter(|(_, id)| intent.targets.contains(id))
+                .map(|(message, _)| message)
+                .collect();
+            let rendered = RuntimeMessage::User(view::historical_transformation(&cited));
+            use crate::context::estimate_request_tokens;
+            if estimate_request_tokens(&[rendered], &[]) >= estimate_request_tokens(&members, &[]) {
+                return Ok(None);
+            }
+            cited
+        } else {
+            summary
+        };
         let mut op = self.operation(OperationKind::Replace, intent.targets.clone())?;
         op.op_id.clone_from(&intent.id);
         op.facts.push(Fact {
@@ -275,11 +323,11 @@ impl Staging<'_> {
         });
         view::validate_at_observed(&op, &self.read.operations, &self.read.legacy)?;
         atom_in(&write.get_store::<ConversationStore>(STORE).await?, &op).await?;
-        Ok(ContextReplacement {
+        Ok(Some(ContextReplacement {
             targets: intent.targets.clone(),
             summary: op.representation_id(0),
             text: summary,
-        })
+        }))
     }
 }
 

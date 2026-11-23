@@ -26,6 +26,11 @@ pub struct HistoryRead<'a> {
     format: Format,
 }
 
+pub(crate) struct FoldedMessage {
+    pub bytes: String,
+    pub tools: Vec<String>,
+}
+
 enum Format {
     Legacy,
     ConversationV1(Box<OnceCell<conversation::ConversationRead>>),
@@ -390,6 +395,16 @@ impl HistoryRead<'_> {
             Some(read) => Ok(read.context()?),
             None => self.context_for(None, &|_| true).await,
         }
+    }
+
+    pub(crate) async fn folded_message(
+        &self,
+        reference: &str,
+    ) -> anyhow::Result<Option<FoldedMessage>> {
+        Ok(match self.conversation().await? {
+            Some(read) => read.folded_message(&self.database.root_id().to_string(), reference)?,
+            None => None,
+        })
     }
 
     pub async fn turn_context(

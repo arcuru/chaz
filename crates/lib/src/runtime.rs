@@ -1298,6 +1298,7 @@ impl<'a> RoundProjector<'a> {
                 })
                 .await?;
         }
+        let started = std::time::Instant::now();
         let response = llm_call_with_retry(
             backend,
             model,
@@ -1310,6 +1311,13 @@ impl<'a> RoundProjector<'a> {
         .await;
         if let Ok(response) = &response {
             observation.response(response);
+            if let Some(compactor) = &mut self.compactor {
+                compactor.note_model_response(
+                    observation.metadata.as_ref(),
+                    self.resolved_model,
+                    started,
+                );
+            }
             observation.prices = backend.model_info_for_call(
                 model,
                 observation.metadata.as_ref().map(|m| m.model.as_str()),

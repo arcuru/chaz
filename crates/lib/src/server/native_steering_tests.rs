@@ -112,6 +112,8 @@ impl Wire {
             price_input: None,
             price_output: None,
             price_cache_read: None,
+            price_cache_write: None,
+            cache_lifetime_seconds: None,
             context_window: None,
         }]);
         BackendManager::new(&Some(vec![b]), secrets)

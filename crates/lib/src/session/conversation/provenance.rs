@@ -146,6 +146,8 @@ pub(super) struct Evidence {
     pub calls: BTreeMap<(CallId, String), CallInput>,
     pub accounting: Vec<CallEvidence>,
     pub compactions: Vec<compaction::Intent>,
+    pub applied_compactions: BTreeSet<String>,
+    pub completed_at: BTreeMap<String, chrono::DateTime<chrono::Utc>>,
 }
 
 pub(super) async fn read(
@@ -386,7 +388,7 @@ pub(super) async fn read(
     let mut completed = BTreeMap::new();
     for (entry, completion) in completions.values() {
         let check = async {
-            Box::pin(turn::validate_completion(
+            let completed_at = Box::pin(turn::validate_completion(
                 db,
                 conversation,
                 entry,
@@ -405,14 +407,16 @@ pub(super) async fn read(
                     "completion lacks its accepted input or response outcome".into(),
                 ));
             }
-            Ok(())
+            Ok(completed_at)
         }
         .await;
-        if let Err(error) = check {
-            originals.issues.push(error);
-        } else {
-            publications.insert(completion.publication.as_str());
-            completed.insert(completion.attempt.as_str(), *entry);
+        match check {
+            Err(error) => originals.issues.push(error),
+            Ok(at) => {
+                publications.insert(completion.publication.as_str());
+                completed.insert(completion.attempt.as_str(), *entry);
+                evidence.completed_at.insert(completion.attempt.clone(), at);
+            }
         }
     }
     match compaction::validate(
@@ -424,7 +428,10 @@ pub(super) async fn read(
         &intents,
         &settlements,
     ) {
-        Ok(applied) => publications.extend(applied),
+        Ok(applied) => {
+            publications.extend(applied.iter().copied());
+            evidence.applied_compactions = applied.into_iter().map(str::to_owned).collect();
+        }
         Err(error) => originals.issues.push(error),
     }
     evidence.compactions = intents.values().map(|(_, intent)| intent.clone()).collect();

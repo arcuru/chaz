@@ -18,6 +18,8 @@ pub(super) fn backend(base: &str) -> Backend {
         price_input: None,
         price_output: None,
         price_cache_read: None,
+        price_cache_write: None,
+        cache_lifetime_seconds: None,
         context_window: None,
     }]);
     backend

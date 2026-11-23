@@ -3,10 +3,130 @@
 use super::{
     Ancestry, ConversationError as Error, ConversationRead, Result, record::*, turn, view,
 };
-use crate::session::history::HistoryBody;
+use crate::session::history::{FoldedMessage, HistoryBody};
 use eidetica::{Snapshot, entry::Entry};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
+
+const REFERENCE_KIND: &str = "cr1:";
+
+fn fold_key(database: &str, fold: &str) -> String {
+    // The fold ID binds the ordered signed targets; the database prevents a
+    // same-ID fold in another session from accepting this citation.
+    blake3::hash(format!("{database}:{fold}").as_bytes())
+        .to_hex()
+        .to_string()
+}
+
+impl ConversationRead {
+    fn covered_messages<'a>(&'a self, targets: &'a [RepresentationId]) -> Result<Vec<&'a FactId>> {
+        let mut pending: Vec<_> = targets.iter().rev().collect();
+        let mut seen = BTreeSet::new();
+        let mut messages = Vec::new();
+        while let Some(id) = pending.pop() {
+            if !seen.insert(id) {
+                continue;
+            }
+            let Some(op) = self.operations.get(&id.operation) else {
+                continue; // Imported legacy anchors are not native message facts.
+            };
+            let out = op
+                .outputs
+                .get(id.index as usize)
+                .ok_or_else(|| Error::Missing("covered representation".into()))?;
+            match out.view {
+                View::Message(_) | View::NativeExchange => messages.push(&out.fact),
+                View::Summary if self.provenance.applied_compactions.contains(&op.op_id) => {
+                    pending.extend(op.targets.iter().rev());
+                }
+                _ => {}
+            }
+        }
+        Ok(messages)
+    }
+
+    pub(super) fn cite_automatic_summary(
+        &self,
+        intent: &Intent,
+        mut text: String,
+    ) -> Result<String> {
+        let count = self.covered_messages(&intent.targets)?.len();
+        if count > 0 {
+            let key = fold_key(&intent.input.database, &intent.id);
+            text.push_str(&crate::session::fold_citation(&key, count - 1));
+        }
+        Ok(text)
+    }
+
+    pub(in crate::session) fn folded_message(
+        &self,
+        database: &str,
+        reference: &str,
+    ) -> Result<Option<FoldedMessage>> {
+        if let Some(error) = self.inspection.issues.first() {
+            return Err(error.clone());
+        }
+        let Some((key, slot)) = reference
+            .strip_prefix(REFERENCE_KIND)
+            .and_then(|r| r.split_once(':'))
+        else {
+            return Ok(None);
+        };
+        if key.len() != 64
+            || !key
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
+            return Ok(None);
+        }
+        let Some(index) = slot.parse::<usize>().ok().filter(|n| n.to_string() == slot) else {
+            return Ok(None);
+        };
+        // Only an applied and validated fold in this verified frontier can
+        // name its targets. An arbitrary operation ID is not a history grant.
+        let Some(fold) = self
+            .provenance
+            .applied_compactions
+            .iter()
+            .find(|id| fold_key(database, id) == key)
+        else {
+            return Ok(None);
+        };
+        let Some(id) = self
+            .covered_messages(&self.operations[fold].targets)?
+            .get(index)
+            .copied()
+        else {
+            return Ok(None);
+        };
+        let tools = match &view::fact(id, &self.operations)?.payload {
+            Payload::NativeModelResponse { response } => response
+                .tool_calls
+                .iter()
+                .map(|call| call.name.clone())
+                .collect(),
+            _ => Vec::new(),
+        };
+        // Select the original JSON span, not a re-serialization: whitespace,
+        // escaping, native tool arguments and opaque fields stay byte exact.
+        #[derive(Deserialize)]
+        struct RawFacts<'a> {
+            #[serde(borrow)]
+            facts: Vec<&'a serde_json::value::RawValue>,
+        }
+        let atom = &self.inspection.operations.atoms[&self.op_atoms[&id.operation]];
+        let raw: RawFacts<'_> = serde_json::from_str(atom)?;
+        Ok(Some(FoldedMessage {
+            bytes: raw
+                .facts
+                .get(id.index as usize)
+                .ok_or_else(|| Error::Integrity("original fact span missing".into()))?
+                .get()
+                .to_owned(),
+            tools,
+        }))
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

@@ -210,7 +210,7 @@ fn page_bytes() -> usize {
 impl Tool for ToolHistoryQuery {
     fn descriptor(&self) -> ToolDescriptor {
         ToolDescriptor { name: RECOVERY_TOOL.into(),
-            description: "Read a bounded exact UTF-8 byte page from an authorized retained historical tool result. Reference is tr1:..., offsets are stored bytes. Follow next_offset until null. Reports missing/invisible sources and stored truncation markers; never re-executes a tool.".into(),
+            description: "Read an exact byte page from authorized retained history: tr1:... for a tool result or cr1:...:<index> for a message cited by a durable automatic summary. Offsets are stored UTF-8 bytes. Follow next_offset until null. Missing/invisible sources are not disclosed; never re-executes a tool.".into(),
             parameters: json!({"type":"object", "properties": {
                 "reference":{"type":"string"}, "offset":{"type":"integer", "minimum":0},
                 "max_bytes":{"type":"integer", "minimum":1, "maximum":16384}

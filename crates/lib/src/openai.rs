@@ -653,6 +653,8 @@ impl OpenAI {
                         price_input: m.price_input,
                         price_output: m.price_output,
                         price_cache_read: m.price_cache_read,
+                        price_cache_write: m.price_cache_write,
+                        cache_lifetime_seconds: m.cache_lifetime_seconds,
                         input_modalities: Vec::new(),
                         output_modalities: Vec::new(),
                         context_window: m.context_window,
@@ -725,7 +727,7 @@ impl OpenAI {
 
         // OpenRouter quotes prices as $/token (decimal string). ModelInfo
         // carries $/Mtok so the picker can display "$2.50".
-        fn parse_per_mtok(s: Option<String>) -> Option<f64> {
+        fn parse_per_mtok(s: Option<&str>) -> Option<f64> {
             s.and_then(|s| s.parse::<f64>().ok())
                 .map(|per_token| per_token * 1_000_000.0)
         }
@@ -744,9 +746,16 @@ impl OpenAI {
                     .or(m.context_length);
                 crate::backends::ModelInfo {
                     id: m.id,
-                    price_input: parse_per_mtok(pricing.prompt),
-                    price_output: parse_per_mtok(pricing.completion),
-                    price_cache_read: parse_per_mtok(pricing.input_cache_read),
+                    price_input: parse_per_mtok(pricing.prompt.as_deref()),
+                    price_output: parse_per_mtok(pricing.completion.as_deref()),
+                    price_cache_read: parse_per_mtok(pricing.input_cache_read.as_deref()),
+                    price_cache_write: parse_per_mtok(
+                        pricing
+                            .input_cache_write
+                            .as_ref()
+                            .and_then(serde_json::Value::as_str),
+                    ),
+                    cache_lifetime_seconds: None,
                     input_modalities: arch.input_modalities,
                     output_modalities: arch.output_modalities,
                     context_window,
@@ -791,6 +800,9 @@ struct ModelPricing {
     completion: Option<String>,
     #[serde(default)]
     input_cache_read: Option<String>,
+    // Compatible gateways previously treated this as an unknown field.
+    // A nonstandard shape must not invalidate the entire model listing.
+    input_cache_write: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1302,6 +1314,8 @@ mod tests {
             price_input: None,
             price_output: None,
             price_cache_read: None,
+            price_cache_write: None,
+            cache_lifetime_seconds: None,
             context_window: None,
         }]);
         OpenAI::new(&backend, &secrets)

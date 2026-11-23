@@ -1332,6 +1332,10 @@ impl App {
                     price_input: fav.price_input.or(cat.price_input),
                     price_output: fav.price_output.or(cat.price_output),
                     price_cache_read: fav.price_cache_read.or(cat.price_cache_read),
+                    price_cache_write: fav.price_cache_write.or(cat.price_cache_write),
+                    cache_lifetime_seconds: fav
+                        .cache_lifetime_seconds
+                        .or(cat.cache_lifetime_seconds),
                     input_modalities: if fav.input_modalities.is_empty() {
                         cat.input_modalities.clone()
                     } else {
