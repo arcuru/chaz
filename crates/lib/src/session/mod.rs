@@ -1248,9 +1248,6 @@ impl Session {
     }
 
     /// Reconcile requests against one immutable database snapshot.
-    ///
-    /// This snapshot covers the state present before `on_write_at_tips` was
-    /// registered. The callback handles later commits.
     pub async fn turn_requests_at(
         &self,
         snapshot: eidetica::Snapshot,

@@ -2066,10 +2066,8 @@ impl ApprovalWatcher {
     }
 }
 
-/// The write callback only invalidates. Revalidation needs registry locks
-/// which a committing writer can already hold; awaiting it inside the callback
-/// would deadlock that writer (including sync). One owned task serializes posts
-/// and drops the subscription on detach or generation teardown.
+/// The write callback only invalidates. One owned task serializes posts and
+/// drops the subscription on detach or generation teardown.
 async fn attach_approval_watcher(
     session_db: &eidetica::Database,
     room: Room,
@@ -2079,9 +2077,13 @@ async fn attach_approval_watcher(
     use futures::FutureExt;
     let changed = Arc::new(Notify::new());
     let wake = changed.clone();
+    // Attaching alone should not replay approval announcements.
+    let baseline = session_db.snapshot().await?;
     let subscription = session_db
-        .on_write(move |_, _| {
-            wake.notify_one();
+        .on_write(move |latest, _| {
+            if latest != &baseline {
+                wake.notify_one();
+            }
             async { Ok(()) }
         })
         .await?;

@@ -101,6 +101,11 @@ impl BackendImpl for Storage {
         self.probe.wait(tree).await;
         self.inner.snapshot(tree).await
     }
+    async fn non_failed_snapshot(&self, tree: &ID) -> eidetica::Result<Snapshot> {
+        self.probe.record(tree);
+        self.probe.wait(tree).await;
+        self.inner.non_failed_snapshot(tree).await
+    }
     async fn store_snapshot(&self, tree: &ID, store: &str) -> eidetica::Result<Snapshot> {
         self.probe.record(tree);
         self.inner.store_snapshot(tree, store).await

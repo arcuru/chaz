@@ -250,6 +250,11 @@ impl<B: BackendImpl> BackendImpl for CountingBackend<B> {
         self.inner.snapshot(tree).await
     }
 
+    async fn non_failed_snapshot(&self, tree: &ID) -> Result<Snapshot> {
+        self.probe.tree("non_failed_snapshot", tree);
+        self.inner.non_failed_snapshot(tree).await
+    }
+
     async fn store_snapshot(&self, tree: &ID, store: &str) -> Result<Snapshot> {
         self.probe.tree("store_snapshot", tree);
         self.inner.store_snapshot(tree, store).await

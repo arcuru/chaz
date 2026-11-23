@@ -1618,20 +1618,19 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let writes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let writes_for_callback = writes.clone();
-        let subscription = agent_db
-            .database()
-            .on_write(move |_, _| {
-                let writes = writes_for_callback.clone();
-                Box::pin(async move {
-                    writes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    Ok(())
-                })
+        let db = agent_db.database();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let _subscription = db
+            .on_write(move |latest, _| {
+                let _ = tx.send(latest.clone());
+                std::future::ready(Ok(()))
             })
             .await
             .unwrap();
-        subscription.detach();
+        let before = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
 
         let (_cv, resolved) = reg
             .get_or_create_channel_session(&agent, login, "matrix", login, "!room:s")
@@ -1640,6 +1639,7 @@ mod tests {
 
         assert_eq!(resolved.root_id(), &sid);
         assert!(reg.is_sync_enabled_for(&sid).await.unwrap());
-        assert_eq!(writes.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let after = db.snapshot().await.unwrap();
+        assert_eq!(db.ids_added(&before, &after).await.unwrap().len(), 1);
     }
 }

@@ -1801,26 +1801,21 @@ impl Server {
 
         let tx = self.notify_tx.clone();
         let sid = session_db_id.clone();
-        // Capture the initial read cursor before subscribing. A write between
-        // subscription setup and catch-up then reaches either the callback or
-        // the catch-up read. The persisted request state decides what runs.
-        let observed_tips = session_db.snapshot().await?;
-        let catch_up_tips = observed_tips.clone();
+        let catch_up_tips = session_db.snapshot().await?;
+        let baseline = catch_up_tips.clone();
         let subscription = session_db
-            .on_write_at_tips(observed_tips, move |event, _db| {
-                // Deliberately not gated on the source. A co-owner pushing
-                // into a shared session arrives as `Remote`, and that has to
-                // wake the agent here exactly as a local commit does — that
-                // is what makes a shared session two-directional. Naming the
-                // source in the log is what separates "a peer's write woke
-                // us" from "our own write did" when reading a trace.
-                debug!(session_db_id = %sid, source = ?event.source(), "Session write; waking the processing loop");
+            .on_write(move |latest, _| {
+                // The explicit catch-up handles the baseline. A different
+                // initial Snapshot can include writes that raced subscription.
+                let changed = latest != &baseline;
                 let tx = tx.clone();
                 let sid = sid.clone();
-                Box::pin(async move {
-                    let _ = tx.send(ProcessingCommand::Wake(sid)).await;
+                async move {
+                    if changed {
+                        let _ = tx.send(ProcessingCommand::Wake(sid)).await;
+                    }
                     Ok(())
-                })
+                }
             })
             .await?;
 
@@ -1975,8 +1970,7 @@ impl Server {
             .collect())
     }
 
-    /// Start observing a persisted command from the current session cursor.
-    /// The cursor is captured before the write so completion cannot race the
+    /// Subscribe before writing a persisted command so completion cannot race
     /// waiter setup.
     pub async fn observe_session_command(
         &self,
@@ -1984,11 +1978,10 @@ impl Server {
     ) -> anyhow::Result<SessionCommandObserver> {
         let (conversation_id, session_db) = self.registry.open_session(session_db_id).await?;
         let session = Session::new(conversation_id, session_db.clone()).await;
-        let cursor = session_db.snapshot().await?;
         let notify = Arc::new(tokio::sync::Notify::new());
         let notify_callback = notify.clone();
         let callback = session_db
-            .on_write_at_tips(cursor, move |_, _| {
+            .on_write(move |_, _| {
                 let notify = notify_callback.clone();
                 async move {
                     notify.notify_one();
@@ -2226,8 +2219,8 @@ impl Server {
                 conversation, child.clone(), agent_name, backend, approval_tx,
                 call_depth, max_call_depth, parent_tools, Some(worker_prompt), worker_model, worker_role_suffix,
             ).await?;
-            // The Directive predates the callback; wake explicitly rather than
-            // rewriting it. Generic resident adoption always excludes spawn:.
+            // Keep the explicit wake after setup. Generic resident adoption
+            // always excludes spawn: sessions.
             self.notify_tx.send(ProcessingCommand::Wake(id.clone())).await?;
             Ok::<_, anyhow::Error>((result.0, result.1, result.2, directive_id))
         }.await;
@@ -2275,41 +2268,8 @@ impl Server {
             );
         }
 
-        let mut watched = self.watched.lock().await;
-        if !watched.contains(&session_db_id) {
-            watched.insert(session_db_id.clone());
-            drop(watched);
-
-            let tx = self.notify_tx.clone();
-            let sid = session_db_id.clone();
-            session_db
-                .on_write(move |event, _db| {
-                    // Source-agnostic for the same reason as `watch_session`:
-                    // a spawned child can be co-owned too, and a peer's write
-                    // into it has to advance the run.
-                    debug!(session_db_id = %sid, source = ?event.source(), "Child session write; waking the processing loop");
-                    let tx = tx.clone();
-                    let sid = sid.clone();
-                    Box::pin(async move {
-                        let _ = tx.send(ProcessingCommand::Wake(sid)).await;
-                        Ok(())
-                    })
-                })
-                .await?
-                .detach();
-
-            info!(
-                session_db_id = %session_db_id,
-                agent = %agent_name,
-                "Server watching child session"
-            );
-        } else {
-            drop(watched);
-        }
-
-        // The spawning peer owns the child session's runtime — claim it
-        // (a fresh session id never contends, so `Always` always succeeds)
-        // so the `session_start` hook fires on the gated path.
+        // Initialize the runtime before the subscription's initial Snapshot
+        // can wake the child. A fresh child id does not contend for ownership.
         self.claim_runtime(
             &session_db,
             agent_name.to_string(),
@@ -2317,6 +2277,35 @@ impl Server {
             RuntimeMode::Always,
         )
         .await?;
+
+        if !self.is_watching_session(&session_db_id).await {
+            let tx = self.notify_tx.clone();
+            let sid = session_db_id.clone();
+            let subscription = session_db
+                .on_write(move |_, _| {
+                    let tx = tx.clone();
+                    let sid = sid.clone();
+                    Box::pin(async move {
+                        let _ = tx.send(ProcessingCommand::Wake(sid)).await;
+                        Ok(())
+                    })
+                })
+                .await;
+            match subscription {
+                Ok(subscription) => subscription.detach(),
+                Err(error) => {
+                    self.deregister_session(&session_db_id).await;
+                    return Err(error.into());
+                }
+            }
+            self.watched.lock().await.insert(session_db_id.clone());
+
+            info!(
+                session_db_id = %session_db_id,
+                agent = %agent_name,
+                "Server watching child session"
+            );
+        }
 
         Ok((conversation_id, session_db, completion_rx))
     }

@@ -71,6 +71,10 @@ pub(crate) async fn counting_eidetica() -> (Instance, AccountSession, EntryReads
 
 #[async_trait::async_trait]
 impl BackendImpl for Counting {
+    fn supports_private_cache_admission(&self) -> bool {
+        self.inner.supports_private_cache_admission()
+    }
+
     async fn local_account_record(&self, name: &str) -> eidetica::Result<Option<Vec<u8>>> {
         self.inner.local_account_record(name).await
     }
@@ -115,6 +119,9 @@ impl BackendImpl for Counting {
     }
     async fn snapshot(&self, tree: &ID) -> eidetica::Result<Snapshot> {
         self.inner.snapshot(tree).await
+    }
+    async fn non_failed_snapshot(&self, tree: &ID) -> eidetica::Result<Snapshot> {
+        self.inner.non_failed_snapshot(tree).await
     }
     async fn store_snapshot(&self, tree: &ID, store: &str) -> eidetica::Result<Snapshot> {
         self.inner.store_snapshot(tree, store).await

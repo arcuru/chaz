@@ -296,28 +296,19 @@ impl DeliveryReconciler {
             shutdown: watch::channel(false).0,
         });
 
-        // Subscribe at the cursor the first pass reads from, so a write
-        // landing between the pass and the subscription reaches one of them.
-        let cursor = session_db.snapshot().await?;
+        // The explicit first pass handles existing state. Don't schedule it
+        // twice on a quiet tree, but keep a wake if setup raced a write.
+        let baseline = session_db.snapshot().await?;
         let weak: Weak<Self> = Arc::downgrade(&this);
         session_db
-            .on_write_at_tips(cursor, move |event, _| {
-                let weak = weak.clone();
-                let source = format!("{:?}", event.source());
-                Box::pin(async move {
-                    if let Some(reconciler) = weak.upgrade() {
-                        debug!(
-                            session_db_id = %reconciler.binding.session_db_id,
-                            source,
-                            "Session write; reconciling the transport"
-                        );
-                        // A Matrix confirmation is itself a session write. Run
-                        // reconciliation after callback dispatch, never while
-                        // the confirming commit waits for callbacks to settle.
-                        tokio::spawn(async move { reconciler.run_pass().await });
-                    }
-                    Ok(())
-                })
+            .on_write(move |latest, _| {
+                if latest != &baseline
+                    && let Some(reconciler) = weak.upgrade()
+                {
+                    // Reconciliation can itself write a Matrix confirmation.
+                    tokio::spawn(async move { reconciler.run_pass().await });
+                }
+                std::future::ready(Ok(()))
             })
             .await?
             .detach();

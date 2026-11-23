@@ -38,15 +38,7 @@ pub(super) async fn attach(
     stopped: watch::Receiver<bool>,
 ) -> anyhow::Result<Watcher> {
     let changed = Arc::new(Notify::new());
-    let wake = changed.clone();
-    // Subscribe BEFORE the initial read. Cursor registration is not an eager
-    // replay in embedded mode; no state read before registration is trusted.
-    let subscription = db
-        .on_write(move |_, _| {
-            wake.notify_one();
-            async { Ok(()) }
-        })
-        .await?;
+    let subscription = subscribe_changes(db, changed.clone()).await?;
     let db = db.clone();
     Ok(Watcher(tokio::spawn(async move {
         let _subscription = subscription;
@@ -64,6 +56,24 @@ pub(super) async fn attach(
             error!("Matrix activity watcher panicked");
         }
     })))
+}
+
+async fn subscribe_changes(
+    db: &eidetica::Database,
+    changed: Arc<Notify>,
+) -> eidetica::Result<eidetica::WriteCallback> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    // `run` takes a fresh read after registration. The ordered initial
+    // Snapshot is already covered; only subsequent changes invalidate it.
+    let initial = AtomicBool::new(true);
+    db.on_write(move |_, _| {
+        if !initial.swap(false, Ordering::Relaxed) {
+            changed.notify_one();
+        }
+        std::future::ready(Ok(()))
+    })
+    .await
 }
 
 async fn run<R, RF, N, J, S, SF, E>(
@@ -171,14 +181,7 @@ mod tests {
     impl Driver {
         async fn start(db: eidetica::Database, gate: Arc<Semaphore>) -> Self {
             let changed = Arc::new(Notify::new());
-            let wake = changed.clone();
-            let subscription = db
-                .on_write(move |_, _| {
-                    wake.notify_one();
-                    async { Ok(()) }
-                })
-                .await
-                .unwrap();
+            let subscription = subscribe_changes(&db, changed.clone()).await.unwrap();
             let (stop, stopped) = watch::channel(false);
             let reads = Arc::new(AtomicUsize::new(0));
             let fail_send = Arc::new(AtomicBool::new(false));

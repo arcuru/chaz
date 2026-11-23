@@ -166,11 +166,13 @@ async fn hydration_service_rpc_counts_and_unchanged_views() {
         let remote = user.open_database(db.root_id()).await.unwrap();
         app.push_tab(tab(&db.root_id().to_string(), remote));
     }
-    // Warm both paths; this is a deterministic call-count comparison, not a latency claim.
+    // Warm the transcripts under test before auxiliary views can fill the
+    // per-login cache budget. This counts warm reads, not cache capacity.
     for tab in &app.tabs {
-        load_session_snapshot("warm", tab.session_db.clone())
-            .await
-            .unwrap();
+        let db = &tab.session_db;
+        let snapshot = db.snapshot().await.unwrap();
+        let entries = Session::entries_at_snapshot(db, &snapshot).await.unwrap();
+        assert_eq!(entries.len(), 1024);
     }
     let (tx, mut rx) = mpsc::channel(64);
     let ids: Vec<_> = app.tabs.iter().map(|t| t.session_db_id.clone()).collect();
@@ -235,7 +237,6 @@ async fn hydration_callbacks_during_load_remote_hints_and_teardown() {
         )
         .await
         .unwrap();
-        let cursor = db.snapshot().await.unwrap();
         session
             .update_meta(|m| m.name = Some("before-subscribe".into()))
             .await
@@ -270,16 +271,19 @@ async fn hydration_callbacks_during_load_remote_hints_and_teardown() {
         let id = db.root_id().to_string();
         let (notify, mut events) = mpsc::unbounded_channel();
         let subscription = observed
-            .on_write_at_tips(cursor, move |event, _| {
-                let tx = notify.clone();
-                let source = event.source();
-                async move {
-                    let _ = tx.send(source);
-                    Ok(())
-                }
+            .on_write(move |latest, _| {
+                let _ = notify.send(latest.clone());
+                std::future::ready(Ok(()))
             })
             .await
             .unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), events.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+            db.snapshot().await.unwrap()
+        );
         let mut app = App::new(HashSet::new(), tab(&id, observed.clone()));
         let (tx, mut rx) = mpsc::channel(64);
         assert!(!round(&mut app, &id, &tx, &mut rx).await);
@@ -327,10 +331,13 @@ async fn hydration_callbacks_during_load_remote_hints_and_teardown() {
             })
             .await
             .unwrap();
-            tokio::time::timeout(Duration::from_secs(2), events.recv())
-                .await
-                .unwrap()
-                .unwrap();
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(2), events.recv())
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                db.snapshot().await.unwrap()
+            );
             request(&mut app, &id, RefreshKind::Session, &tx);
         }
         release.send(()).unwrap();
@@ -344,20 +351,6 @@ async fn hydration_callbacks_during_load_remote_hints_and_teardown() {
         assert!(rx.try_recv().is_err(), "burst spawned an unbounded read");
         assert!(!round(&mut app, &id, &tx, &mut rx).await);
         assert_eq!(app.active().session_name.as_deref(), Some("during-7"));
-        // Native Remote verification delivery (not a fabricated source label), same view.
-        for tip in db.snapshot().await.unwrap().tips() {
-            owner.demote_to_unverified(db.root_id(), tip).await.unwrap();
-        }
-        db.verify().await.unwrap();
-        tokio::time::timeout(Duration::from_secs(2), async {
-            loop {
-                if events.recv().await.unwrap() == eidetica::instance::WriteSource::Remote {
-                    break;
-                }
-            }
-        })
-        .await
-        .unwrap();
         let before = reads.tables();
         for _ in 0..10 {
             assert!(round(&mut app, &id, &tx, &mut rx).await);
@@ -365,7 +358,7 @@ async fn hydration_callbacks_during_load_remote_hints_and_teardown() {
         assert_eq!(
             reads.tables()["entries"],
             before["entries"],
-            "duplicate/out-of-order hints cannot rehydrate or roll backwards"
+            "duplicate hints cannot rehydrate an unchanged transcript"
         );
         assert_eq!(app.active().session_name.as_deref(), Some("during-7"));
         while events.try_recv().is_ok() {}
@@ -532,6 +525,11 @@ async fn hydration_scoped_operations_share_callback_read_and_leave_other_tabs_al
             }
         })
         .await
+        .unwrap();
+    // The callback we use below must correspond to the operation, not setup.
+    tokio::time::timeout(Duration::from_secs(2), events.recv())
+        .await
+        .unwrap()
         .unwrap();
     let before = reads.tables();
     operations::submit(&mut app, true, None, async move {

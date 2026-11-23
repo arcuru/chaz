@@ -400,10 +400,9 @@ fn assert_permission_denied(error: eidetica::Error, tree: &ID, required: &str) {
     );
 }
 
-/// Exercise the native service's actual Write gate, not historical signed-entry
-/// submission (which is verification-gated). Abort the empty private cache build;
-/// no records are published and no Provider effects are executed.
-async fn service_write_probe(
+/// Exercise Read authorization for private derived-cache staging. The service
+/// scopes this request to the login. Abort without publishing any cache state.
+async fn stage_private_cache(
     remote: &Instance,
     db: &Database,
     identity: &SigKey,
@@ -428,7 +427,7 @@ async fn service_write_probe(
     connection
         .abort_store_state(db.root_id().clone(), identity.clone(), token)
         .await
-        .expect("authorized staging must be cleaned up; abort is not the Write probe");
+        .expect("authorized staging must be cleaned up");
     Ok(())
 }
 
@@ -540,26 +539,25 @@ async fn peer_reconciliation() -> anyhow::Result<()> {
     let service =
         ServiceFixture::start(&replica, &account, &[&reader, &direct, &delegated]).await?;
     let remote = &service.client;
-    // The pinned subscription API uses the attached key rather than the read handle's identity.
-    let service_session = open_as(remote, &local, &reader)
-        .await?
-        .with_key(reader.clone());
-    let cursor = local.snapshot().await?;
+    let service_session = open_as(remote, &local, &reader).await?;
+    let initial = local.snapshot().await?;
     let (local_tx, mut local_rx) = mpsc::unbounded_channel();
     let _local_watch = local
-        .on_write_at_tips(cursor.clone(), move |event, _| {
-            let _ = local_tx.send((event.previous_tips().clone(), event.post_tips().clone()));
+        .on_write(move |latest, _| {
+            let _ = local_tx.send(latest.clone());
             async { Ok(()) }
         })
         .await?;
     let (remote_tx, mut remote_rx) = mpsc::unbounded_channel();
     let _remote_watch = service_session
-        .on_write_at_tips(cursor, move |event, _| {
-            let _ = remote_tx.send((event.previous_tips().clone(), event.post_tips().clone()));
+        .on_write(move |latest, _| {
+            let _ = remote_tx.send(latest.clone());
             async { Ok(()) }
         })
         .await
         .context("subscribe service with explicit reader")?;
+    assert_eq!(local_rx.recv().await.unwrap(), initial);
+    assert_eq!(remote_rx.recv().await.unwrap(), initial);
 
     let direct_id = publish(
         &session,
@@ -606,19 +604,20 @@ async fn peer_reconciliation() -> anyhow::Result<()> {
     let before_remote = remote_rx.recv().await.unwrap();
     assert_eq!(before_local, before_remote);
     for db in [&local, &service_session] {
-        let raw_ids = db.ids_added(&before_local.0, &before_local.1).await?;
+        let added = db.ids_added(&initial, &before_local).await?;
+        assert!(added.contains(&direct_id));
         assert!(
-            raw_ids.contains(&invalid_id),
-            "watch brackets include Failed entries"
+            !added.contains(&invalid_id),
+            "watch excludes Failed entries"
         );
         assert!(
-            raw_ids.contains(&delegated_id),
-            "watch brackets include Unverified entries"
+            !added.contains(&delegated_id),
+            "watch excludes Unverified entries"
         );
         assert_eq!(
             record_ids(&records(db).await?),
             vec![direct_id.clone()],
-            "verified records exclude the Failed and Unverified entries reported by the watch"
+            "verified records exclude the Failed and Unverified entries"
         );
         assert_eq!(
             issued_records(db, &operators).await?,
@@ -646,8 +645,6 @@ async fn peer_reconciliation() -> anyhow::Result<()> {
     let after_local = local_rx.recv().await.unwrap();
     let after_remote = remote_rx.recv().await.unwrap();
     assert_eq!(after_local, after_remote);
-    assert_eq!(after_local.0, before_local.1);
-    assert_eq!(after_local.0, after_local.1, "promotion adds no DAG IDs");
     let mut expected = vec![direct_id.clone(), delegated_id.clone()];
     expected.sort();
     let local_provider = Database::open(&replica, provider.root_id()).await?;
@@ -660,11 +657,12 @@ async fn peer_reconciliation() -> anyhow::Result<()> {
             provider_operators(authority, operator_keys).await?,
             operators
         );
+        let added = db.ids_added(&before_local, &after_local).await?;
         assert!(
-            db.ids_added(&after_local.0, &after_local.1)
-                .await?
-                .is_empty()
+            added.contains(&delegated_id),
+            "promotion changes the Verified view"
         );
+        assert!(!added.contains(&invalid_id));
         assert_eq!(record_ids(&records(db).await?), expected);
         assert_eq!(issued_records(db, &operators).await?, expected);
         assert!(!db.verify_entry_signature(&invalid_id).await?);
@@ -686,12 +684,11 @@ async fn peer_reconciliation() -> anyhow::Result<()> {
     .await?;
     assert_eq!(acting.current_permission().await?, Permission::Write(10));
     assert!(!service_actor.snapshot().await?.is_empty());
-    service_write_probe(remote, &local, &identity).await?;
+    stage_private_cache(remote, &local, &identity).await?;
     let direct_identity = SigKey::from_pubkey(&direct.public_key());
 
-    // A server-native Write gate detects a reduction even though Read and
-    // historical authentication still work. No client-side permission RPC or
-    // production observer bypass is introduced by this disposable cache probe.
+    // Check the downgrade on the local replica. Private cache staging is not
+    // a Write probe: both the service read and staging must still work.
     let tx = provider.new_transaction().await?;
     tx.get_settings()?
         .set_auth_key(
@@ -705,22 +702,15 @@ async fn peer_reconciliation() -> anyhow::Result<()> {
         Permission::Write(10),
         "the unsynchronized replica is honestly stale"
     );
-    service_write_probe(remote, &local, &identity).await?;
     receiving
         .sync_with_peer_as(&address, Some(provider.root_id()), Some(&reader))
         .await?;
-    assert_permission_denied(
-        service_write_probe(remote, &local, &identity)
-            .await
-            .unwrap_err(),
-        session.root_id(),
-        "Write(0)",
-    );
     assert_eq!(acting.current_permission().await?, Permission::Read);
     assert!(
         !service_actor.snapshot().await?.is_empty(),
         "Read survives downgrade"
     );
+    stage_private_cache(remote, &local, &identity).await?;
 
     // The reader may still verify old issuance after an operator loses all
     // current Provider/session authority.
@@ -767,7 +757,7 @@ async fn peer_reconciliation() -> anyhow::Result<()> {
             .await?,
         Permission::Write(10)
     );
-    service_write_probe(remote, &local, &direct_identity).await?;
+    stage_private_cache(remote, &local, &direct_identity).await?;
     let tx = session.new_transaction().await?;
     tx.get_settings()?
         .revoke_auth_key(&direct.public_key())
@@ -790,15 +780,15 @@ async fn peer_reconciliation() -> anyhow::Result<()> {
         );
     }
     assert_permission_denied(
-        service_write_probe(remote, &local, &direct_identity)
+        stage_private_cache(remote, &local, &direct_identity)
             .await
             .unwrap_err(),
         session.root_id(),
-        "Write(0)",
+        "Read",
     );
     // Client-side delegated current_permission remains unsupported (covered
-    // above), so the production observer guard stays. The service gate instead
-    // checks current accepted authority natively on each actual request.
+    // above), so the production observer guard stays. The staging request
+    // exercises the service's current Read gate independently.
 
     service.stop().await?;
     serving.stop_server().await?;

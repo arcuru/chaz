@@ -46,9 +46,7 @@ uuid.workspace = true
 wasmtime.workspace = true
 
 [dev-dependencies]
-# `testing` exposes `Instance::demote_to_unverified`, which lets a test drive
-# the same ingest-then-verify path sync uses and observe a `WriteSource::Remote`
-# callback without standing up a second peer.
+# `testing` lets the history test exercise an unverified entry.
 eidetica = { workspace = true, features = ["testing"] }
 tempfile.workspace = true
 tracing-subscriber.workspace = true

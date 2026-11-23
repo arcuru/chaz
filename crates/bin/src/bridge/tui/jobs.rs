@@ -113,10 +113,9 @@ pub(super) async fn observe(
     tx: mpsc::Sender<String>,
 ) -> anyhow::Result<Observation> {
     chaz_core::session::jobs::require_observer_write(db).await?;
-    let tips = db.snapshot().await?;
     let sid = db.root_id().to_string();
     let callback = db
-        .on_write_at_tips(tips, move |_, _| {
+        .on_write(move |_, _| {
             let tx = tx.clone();
             let sid = sid.clone();
             async move {

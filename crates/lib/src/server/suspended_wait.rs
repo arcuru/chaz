@@ -79,7 +79,7 @@ impl Server {
             Ok((_, db)) if hints => {
                 let on_write = notify.clone();
                 match db
-                    .on_write_at_tips(db.snapshot().await?, move |_, _| {
+                    .on_write(move |_, _| {
                         let notify = on_write.clone();
                         async move {
                             notify.notify_one();

@@ -3195,98 +3195,7 @@ async fn deregister_session_releases_runtime_claim() {
     );
 }
 
-// ---- Write source: local vs remote -----------------------------------
-//
-// Every `on_write` subscription in chaz is deliberately source-agnostic: a
-// session write wakes the agent whether it was committed here or arrived from
-// a co-owner over sync. These tests pin both halves of that, because nothing
-// else in the suite distinguishes them — a callback registration that quietly
-// stopped seeing remote fires would look identical to a healthy one.
-
-/// Both write sources reach a per-database callback, and `WriteEvent::source`
-/// tells them apart. This is the eidetica contract the whole sharing story
-/// rests on; it is pinned here so a dependency bump that regressed it fails
-/// in chaz rather than silently going one-directional in production.
-#[tokio::test]
-async fn write_events_carry_the_source_that_produced_them() {
-    use crate::test_support::replay_tips_as_remote;
-    use eidetica::instance::WriteSource;
-
-    let (_instance, _server, registry) = server_fixture().await;
-    let (_conv, session_db) = registry.create_session(Some("t")).await.unwrap();
-    let sid = session_db.root_id().to_string();
-
-    let seen: Arc<std::sync::Mutex<Vec<WriteSource>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let sink = seen.clone();
-    session_db
-        .on_write(move |event, _db| {
-            sink.lock().unwrap().push(event.source());
-            Box::pin(async { Ok(()) })
-        })
-        .await
-        .unwrap()
-        .detach();
-
-    write_user_message(&session_db, &sid).await;
-    assert_eq!(
-        seen.lock().unwrap().as_slice(),
-        &[WriteSource::Local],
-        "a locally committed entry fires exactly one Local event"
-    );
-
-    replay_tips_as_remote(registry.instance(), &session_db).await;
-    assert_eq!(
-        seen.lock().unwrap().as_slice(),
-        &[WriteSource::Local, WriteSource::Remote],
-        "sync-ingested entries fire on the same callback, tagged Remote"
-    );
-}
-
-/// A remote-sourced write on a watched session runs the agent — the host half
-/// of a co-owned session.
-///
-/// The user message is committed *before* `register_session`, so the local
-/// commit fires into a session nobody is watching yet. The only event the
-/// server ever sees is the remote-sourced replay, which makes the agent's
-/// reply attributable to it and nothing else.
-#[tokio::test]
-async fn a_remote_write_wakes_the_agent_on_the_host() {
-    use crate::test_support::{MockBackend, replay_tips_as_remote};
-
-    let (_instance, server, registry) = server_fixture().await;
-    let (entry, _adb) = seed_agent(&server, &registry, "alpha").await;
-    register_alpha_agent_runtime(&server);
-
-    let (_conv, session_db) = registry.create_session(Some("t")).await.unwrap();
-    let sid = session_db.root_id().to_string();
-    registry
-        .attach_agent_to_session(&sid, &entry)
-        .await
-        .unwrap();
-
-    write_user_message(&session_db, &sid).await;
-
-    let mock = Arc::new(MockBackend::new());
-    mock.push_text("ack from the host");
-    let backend = crate::backends::BackendManager::with_mock(
-        mock.clone(),
-        crate::security::SecretStore::new(registry.chaz_peer().clone()).await,
-    );
-    server
-        .register_session(&session_db, backend, Some("alpha".to_string()), None)
-        .await
-        .unwrap();
-
-    replay_tips_as_remote(registry.instance(), &session_db).await;
-
-    assert!(
-        await_agent_reply(&session_db, &sid, "alpha").await,
-        "a remote-sourced write must drive the agent loop on the host"
-    );
-}
-
-/// The local counterpart, so a regression that gated the wake path on
-/// `WriteSource::Remote` is caught as readily as one that gated it on `Local`.
+/// A local commit must wake the agent without a synced update.
 #[tokio::test]
 async fn a_local_write_wakes_the_agent() {
     use crate::test_support::MockBackend;
@@ -3790,14 +3699,15 @@ async fn successive_compactions_use_the_prior_native_snapshot_boundary() {
         crate::security::SecretStore::new(registry.chaz_peer().clone()).await,
     );
     executor
-        .register_session(&db, backend, Some("agent".into()), None)
+        .register_session(&db, backend, Some("default".into()), None)
         .await
         .unwrap();
+    // Use the fixture's registered agent; an unknown sender queues a normal turn.
     for content in ["old one", "old two", "old three"] {
         let mut session = Session::new(ConversationId(sid.clone()), db.clone()).await;
         session
             .add_entry(SessionEntry {
-                sender: "agent".into(),
+                sender: "default".into(),
                 content: content.into(),
                 timestamp: Utc::now(),
                 entry_type: EntryType::Message,
@@ -3815,15 +3725,23 @@ async fn successive_compactions_use_the_prior_native_snapshot_boundary() {
             source_snapshot: snapshot,
         },
     };
-    executor
+    let first = executor
         .submit_session_command(&sid, submit("compact-first", db.snapshot().await.unwrap()))
         .await
         .unwrap();
+    assert!(
+        matches!(
+            first.outcome,
+            crate::session::SessionCommandOutcome::Compact { ref summary } if summary == "first summary"
+        ),
+        "unexpected first outcome: {:?}",
+        first.outcome
+    );
     for content in ["new one", "new two"] {
         let mut session = Session::new(ConversationId(sid.clone()), db.clone()).await;
         session
             .add_entry(SessionEntry {
-                sender: "agent".into(),
+                sender: "default".into(),
                 content: content.into(),
                 timestamp: Utc::now(),
                 entry_type: EntryType::Message,
@@ -3833,18 +3751,27 @@ async fn successive_compactions_use_the_prior_native_snapshot_boundary() {
             .await
             .unwrap();
     }
-    executor
+    let second = executor
         .submit_session_command(&sid, submit("compact-second", db.snapshot().await.unwrap()))
         .await
         .unwrap();
+    assert!(
+        matches!(
+            second.outcome,
+            crate::session::SessionCommandOutcome::Compact { ref summary } if summary == "second summary"
+        ),
+        "unexpected second outcome: {:?}",
+        second.outcome
+    );
     let context = Session::new(ConversationId(sid), db)
         .await
         .context_entries()
         .await
         .unwrap();
-    assert_eq!(context.len(), 1);
+    assert_eq!(context.len(), 1, "{context:?}");
     assert_eq!(context[0].content, "second summary");
     assert_eq!(mock.simple_call_count(), 2);
+    assert!(mock.recorded_calls().is_empty());
 }
 
 #[tokio::test]
@@ -4906,9 +4833,8 @@ async fn shared_service_clients_observe_durable_attempt_completion() {
     let executor_db = executor.user.open_database(&root).await.unwrap();
     let client_db = client.user.open_database(&root).await.unwrap();
     let (wake_tx, mut wake_rx) = tokio::sync::mpsc::unbounded_channel();
-    let cursor = client_db.snapshot().await.unwrap();
     let _callback = client_db
-        .on_write_at_tips(cursor, move |_, _| {
+        .on_write(move |_, _| {
             let wake_tx = wake_tx.clone();
             async move {
                 wake_tx.send(()).unwrap();
@@ -5288,6 +5214,10 @@ async fn resident_executor_adopts_and_processes_local_client_session() {
         })
         .await
         .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(2), agent_wake_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
 
     let client_registry = Arc::new(
         crate::session::SessionRegistry::new(client.instance, client.user, agents.clone())
@@ -5373,10 +5303,10 @@ async fn resident_executor_adopts_and_processes_local_client_session() {
         !logs.contains("Failed to open database for callbacks"),
         "local service turn must not reopen callback trees with the login key: {logs}"
     );
-    assert!(
-        agent_wake_rx.try_recv().is_ok(),
-        "local session publication must notify the bound Agent DB subscriber"
-    );
+    tokio::time::timeout(std::time::Duration::from_secs(2), agent_wake_rx.recv())
+        .await
+        .expect("local session publication must notify the bound Agent DB subscriber")
+        .unwrap();
 }
 
 #[tokio::test]
@@ -6015,9 +5945,8 @@ async fn shared_login_transport_and_observer_frontends_keep_independent_progress
     assert!(observer.capabilities.executor().is_err());
     let observer_db = observer.user.open_database(&root).await.unwrap();
     let (wake_tx, mut wake_rx) = tokio::sync::mpsc::unbounded_channel();
-    let cursor = observer_db.snapshot().await.unwrap();
     let _observer_callback = observer_db
-        .on_write_at_tips(cursor, move |_, _| {
+        .on_write(move |_, _| {
             let wake_tx = wake_tx.clone();
             async move {
                 let _ = wake_tx.send(());

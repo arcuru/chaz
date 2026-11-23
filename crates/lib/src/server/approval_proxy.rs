@@ -57,14 +57,11 @@ pub async fn spawn_session_db_approval_proxy(
     let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
     let sid = session_db.root_id().to_string();
 
-    // Watch the session DB; every write pings the resolver to rescan decisions.
+    // Both bridged and local decisions wake the same resolver.
     let (ping_tx, mut ping_rx) = mpsc::channel::<()>(32);
     let subscription = match session_db
-        .on_write(move |event, _db| {
-            // Source-agnostic on purpose: the decision this proxy is waiting
-            // for is written by the bridge, which on a split deployment is a
-            // separate peer — so it reaches this DB as a `Remote` write.
-            debug!(source = ?event.source(), "Session write; rescanning approval decisions");
+        .on_write(move |_, _| {
+            debug!("Session write; rescanning approval decisions");
             let ping_tx = ping_tx.clone();
             Box::pin(async move {
                 let _ = ping_tx.send(()).await;

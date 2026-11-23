@@ -2113,7 +2113,7 @@ dependencies = [
 [[package]]
 name = "eidetica"
 version = "0.2.0"
-source = "git+https://github.com/arcuru/eidetica?rev=f5779645b54ff28b5602bd4ea37c59023d0d1e6a#f5779645b54ff28b5602bd4ea37c59023d0d1e6a"
+source = "git+https://github.com/arcuru/eidetica?rev=391908f5548fedef1e9e039256eeac3d739f2935#391908f5548fedef1e9e039256eeac3d739f2935"
 dependencies = [
  "aes-gcm",
  "argon2",
@@ -2128,6 +2128,7 @@ dependencies = [
  "handle_trait",
  "hex",
  "instability",
+ "ipld-core",
  "iroh",
  "iroh-mdns-address-lookup",
  "iroh-tickets",
@@ -2137,6 +2138,7 @@ dependencies = [
  "postcard-derive",
  "rand 0.8.8",
  "reqwest 0.12.28",
+ "rustix",
  "serde",
  "serde_bytes",
  "serde_ipld_dagcbor",
