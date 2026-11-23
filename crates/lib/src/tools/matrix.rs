@@ -1,6 +1,6 @@
 use crate::session::{
-    BridgeEventRole, EntryRouting, EntryType, SessionEntry, TransportRef, is_bound,
-    session_attachment,
+    BridgeEventRole, EntryRouting, EntryType, SessionEntry, TransportAttachment, TransportRef,
+    TurnRequestId, is_bound, session_attachment,
 };
 use crate::session::{Session, SessionRegistry};
 use crate::tool::{Tool, ToolContext, ToolDescriptor, ToolError};
@@ -143,6 +143,116 @@ impl Tool for MatrixSend {
     }
 }
 
+/// Routing for the exact input of this turn, not earlier Matrix messages in
+/// context. This is a scoping hint, never proof of the Matrix sender.
+fn current_matrix_origin<'a>(
+    session: &'a Session,
+    request: Option<&TurnRequestId>,
+    attachment: &TransportAttachment,
+) -> Option<(&'a EntryRouting, chrono::DateTime<chrono::Utc>)> {
+    let request = request?;
+    session.entries_with_ids().find_map(|(id, entry)| {
+        if id != request || entry.entry_type != EntryType::Message {
+            return None;
+        }
+        let routing = entry.routing.as_ref()?;
+        let source = routing.source.as_ref()?;
+        (source.transport == attachment.transport
+            && source.login_id == attachment.login_id
+            && source.channel == attachment.channel)
+            .then_some((routing, entry.timestamp))
+    })
+}
+
+/// Propose a literal title. This tool has no Matrix credentials or authority
+/// to confirm the proposal, even when runtime tool approval is bypassed.
+pub struct MatrixRename {
+    pub registry: Arc<SessionRegistry>,
+}
+
+impl Tool for MatrixRename {
+    fn descriptor(&self) -> ToolDescriptor {
+        ToolDescriptor {
+            name: "matrix__rename".into(),
+            description: "Propose a literal new title for the current Matrix workspace chat, only in response to a user's rename request there. Nothing is renamed by this tool. Show the returned confirmation command verbatim for the workspace manager to send in the same chat; never send it yourself or claim the rename happened.".into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {"title": {"type": "string", "description": "Literal proposed title"}},
+                "required": ["title"],
+                "additionalProperties": false
+            }),
+        }
+    }
+
+    fn execute<'a>(
+        &'a self,
+        arguments: Value,
+        ctx: &'a ToolContext,
+    ) -> Pin<Box<dyn Future<Output = Result<String, ToolError>> + Send + 'a>> {
+        Box::pin(async move {
+            let title = arguments
+                .as_object()
+                .filter(|object| object.len() == 1)
+                .and_then(|object| object.get("title"))
+                .and_then(Value::as_str)
+                .ok_or_else(|| ToolError::InvalidArgument("expected only a title string".into()))?;
+            let title = crate::session::validate_session_description(title)
+                .map_err(ToolError::InvalidArgument)?;
+            let deny = || {
+                ToolError::Execution(
+                    "rename requires a turn from this Matrix workspace chat".into(),
+                )
+            };
+            let request_id = ctx.turn_request_id.as_ref().ok_or_else(deny)?;
+            let mut session = ctx.session.lock().await;
+            let db = session.database();
+            let attachment = session_attachment(db)
+                .await
+                .map_err(|error| ToolError::Execution(error.to_string()))?
+                .filter(|attachment| {
+                    attachment.transport == "matrix" && attachment.conversational_replies
+                })
+                .ok_or_else(deny)?;
+            if !current_matrix_origin(&session, Some(request_id), &attachment)
+                .and_then(|(routing, _)| routing.matrix_room.as_ref())
+                .is_some_and(|room| room.workspace_chat)
+            {
+                return Err(deny());
+            }
+            ensure_agent_owns_login(
+                &self.registry,
+                &session,
+                &ctx.agent_name,
+                "matrix",
+                &attachment.login_id,
+            )
+            .await?;
+            if !matches!(session_attachment(db).await, Ok(Some(current)) if current == attachment) {
+                return Err(deny());
+            }
+            let proposal = crate::bridge::MatrixRenameProposal {
+                request_id: request_id.to_string(),
+                title,
+            };
+            let body = serde_json::to_string(&proposal)
+                .map_err(|error| ToolError::Execution(error.to_string()))?;
+            let token = session
+                .add_entry(SessionEntry::new_bridge_event(
+                    &ctx.agent_name,
+                    BridgeEventRole::MatrixRenameProposal,
+                    body,
+                    None,
+                ))
+                .await
+                .map_err(|error| ToolError::Execution(error.to_string()))?;
+            Ok(format!(
+                "No title has changed. The workspace manager must send this exact message in the same chat to confirm:\n!chaz chat confirm-rename {token} {}",
+                proposal.title
+            ))
+        })
+    }
+}
+
 /// Read only the current request's cached bridge facts, not room state from a
 /// previous turn or a remote provider. A local turn can report actions, but
 /// cannot ask the bridge for an observation.
@@ -194,19 +304,8 @@ impl Tool for MatrixRoomInfo {
             {
                 return unknown();
             }
-            let routing = session.entries_with_ids().find_map(|(id, entry)| {
-                if Some(id) != ctx.turn_request_id.as_ref()
-                    || entry.entry_type != EntryType::Message
-                {
-                    return None;
-                }
-                let routing = entry.routing.as_ref()?;
-                let source = routing.source.as_ref()?;
-                (source.transport == attachment.transport
-                    && source.login_id == attachment.login_id
-                    && source.channel == attachment.channel)
-                    .then_some((routing, entry.timestamp))
-            });
+            let routing =
+                current_matrix_origin(&session, ctx.turn_request_id.as_ref(), &attachment);
             let observed = routing.and_then(|(routing, received_at)| {
                 let room = routing.matrix_room.as_ref()?;
                 Some(serde_json::json!({
@@ -337,7 +436,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn room_info_requires_current_owned_binding_and_exact_request() {
+    async fn workspace_tools_require_current_owned_binding_and_exact_request() {
         const LOGIN: &str = "@alpha:s";
         const OTHER_LOGIN: &str = "@other:s";
         const ROOM: &str = "!room:s";
@@ -414,6 +513,9 @@ mod tests {
         ctx.agent_name = "alpha".into();
         ctx.turn_request_id = Some(question.clone());
         ctx.allow_no_reply = true;
+        let rename = MatrixRename {
+            registry: registry.clone(),
+        };
         let tool = MatrixRoomInfo { registry };
         let info = async |ctx: &ToolContext| {
             serde_json::from_str::<Value>(&tool.execute(json!({}), ctx).await.unwrap()).unwrap()
@@ -436,6 +538,25 @@ mod tests {
             })
         );
         assert!(tool.execute(json!({"room_id": ROOM}), &ctx).await.is_err());
+        assert!(
+            rename
+                .execute(json!({"title": "Winter bike", "room_id": ROOM}), &ctx)
+                .await
+                .is_err()
+        );
+        let proposed = rename
+            .execute(json!({"title": "Winter bike"}), &ctx)
+            .await
+            .unwrap();
+        {
+            let session = ctx.session.lock().await;
+            let (id, row) = session.entries_with_ids().last().unwrap();
+            let payload = crate::bridge::MatrixRenameProposal::from_entry(row).unwrap();
+            assert_eq!(payload.request_id, question.as_str());
+            assert_eq!(payload.title, "Winter bike");
+            assert!(proposed.ends_with(&format!("!chaz chat confirm-rename {id} Winter bike")));
+            assert!(row.routing.is_none(), "a proposal is not an outbound post");
+        }
 
         ctx.turn_request_id = Some(legacy);
         ctx.tools = ScopedTools::new(tools, Some(Vec::new()));
@@ -447,10 +568,22 @@ mod tests {
         );
         assert_eq!(got["actions"]["default_final_queues_room_reply"], true);
         assert_eq!(got["actions"]["matrix__send_can_queue_room_post"], false);
+        assert!(
+            rename
+                .execute(json!({"title": "Winter bike"}), &ctx)
+                .await
+                .is_err()
+        );
         ctx.turn_request_id = None;
         let got = info(&ctx).await;
         assert_eq!(got["observed_room"], Value::Null);
         assert_eq!(got["actions"]["default_final_queues_room_reply"], false);
+        assert!(
+            rename
+                .execute(json!({"title": "Winter bike"}), &ctx)
+                .await
+                .is_err()
+        );
 
         ctx.turn_request_id = Some(question);
         ctx.agent_name = "beta".into();
@@ -459,6 +592,12 @@ mod tests {
             info(&ctx).await,
             unknown,
             "another agent cannot use alpha's login"
+        );
+        assert!(
+            rename
+                .execute(json!({"title": "Winter bike"}), &ctx)
+                .await
+                .is_err()
         );
         ctx.agent_name = "alpha".into();
         crate::session::unbind_transport(&db, "matrix", LOGIN, ROOM)
