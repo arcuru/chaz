@@ -18,6 +18,7 @@ pub enum BridgeEventRole {
     Observation,
     Outbound,
     Receipt,
+    MatrixNewChatProposal,
 }
 
 impl BridgeEventRole {
@@ -26,6 +27,7 @@ impl BridgeEventRole {
             Self::Observation => "observation",
             Self::Outbound => "outbound",
             Self::Receipt => "receipt",
+            Self::MatrixNewChatProposal => "matrix_new_chat_proposal",
         }
     }
 }
@@ -61,6 +63,7 @@ impl BridgeEvent {
             "observation" => Some(BridgeEventRole::Observation),
             "outbound" => Some(BridgeEventRole::Outbound),
             "receipt" => Some(BridgeEventRole::Receipt),
+            "matrix_new_chat_proposal" => Some(BridgeEventRole::MatrixNewChatProposal),
             _ => None,
         }
     }

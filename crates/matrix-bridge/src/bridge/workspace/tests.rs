@@ -135,6 +135,7 @@ struct Registry {
     bindings: HashMap<String, String>,
     labels: HashMap<String, String>,
     delivery: HashSet<(String, String)>,
+    proposals: HashMap<(String, String), MatrixNewChatProposal>,
     creates: usize,
     fail_once: HashSet<&'static str>,
 }
@@ -212,6 +213,21 @@ impl SessionOps for FakeSessions {
             .labels
             .insert(session.into(), label.into());
         Ok(())
+    }
+    async fn new_chat_proposal(
+        &self,
+        room: &str,
+        session: &str,
+        token: &str,
+    ) -> anyhow::Result<MatrixNewChatProposal> {
+        self.check_binding(room, session).await?;
+        self.0
+            .lock()
+            .unwrap()
+            .proposals
+            .get(&(session.into(), token.into()))
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("no matching new chat proposal in this chat"))
     }
 }
 
@@ -601,6 +617,157 @@ async fn repeated_and_concurrent_delivery_of_one_request_creates_one_chat() {
         .unwrap();
     assert_eq!(receipt, a);
     assert_eq!(h.posts(), 3);
+}
+
+#[tokio::test]
+async fn exact_manager_confirmation_admits_one_recoverable_new_chat() {
+    let h = harness("12").await;
+    h.setup().await;
+    h.lobby("chat new First").await;
+    let before = h.state().await;
+    let first = &before.chats[0];
+    let session = first.session_db_id.as_deref().unwrap();
+    let origin = Origin::Managed(h.ws.index().get(&first.room_id).unwrap());
+    let visitor = "@visitor:example.org";
+    let send = |sender, event_id, origin, command| {
+        h.ws.handle(Request {
+            sender,
+            event_id,
+            room_id: &first.room_id,
+            origin,
+            command,
+        })
+    };
+    let command = "chat confirm-new token New  chat";
+    // Even a decodable proposal is inert without live manager ingress.
+    for token in ["token", "second-token"] {
+        h.reg.0.lock().unwrap().proposals.insert(
+            (session.into(), token.into()),
+            MatrixNewChatProposal {
+                request_id: "original-turn".into(),
+                title: "New  chat".into(),
+            },
+        );
+    }
+    h.ws.remember_new_chat_request(
+        visitor,
+        &first.room_id,
+        session,
+        TurnRequestId::parse("original-turn"),
+    );
+    let reply = send(MANAGER, "$no-grant", origin.clone(), command)
+        .await
+        .unwrap();
+    assert!(
+        reply.contains("no current unconfirmed manager request"),
+        "{reply}"
+    );
+    h.ws.remember_new_chat_request(
+        MANAGER,
+        &first.room_id,
+        session,
+        TurnRequestId::parse("original-turn"),
+    );
+    for (sender, event_id, origin, cmd, expected) in [
+        (
+            visitor,
+            "$visitor",
+            origin.clone(),
+            command,
+            "limited to the configured manager",
+        ),
+        (
+            MANAGER,
+            "$dm",
+            Origin::Direct,
+            command,
+            "where it was proposed",
+        ),
+        (
+            MANAGER,
+            "$wrong-title",
+            origin.clone(),
+            "chat confirm-new token New chat",
+            "title does not match",
+        ),
+        (
+            MANAGER,
+            "$no-token",
+            origin.clone(),
+            "chat confirm-new absent New  chat",
+            "no matching new chat proposal",
+        ),
+    ] {
+        let reply = send(sender, event_id, origin, cmd).await.unwrap();
+        assert!(reply.contains(expected), "{reply}");
+    }
+    assert_eq!(h.state().await, before);
+    assert_eq!(h.posts(), 3);
+    assert_eq!(h.reg.0.lock().unwrap().creates, 1);
+
+    h.hs.0
+        .lock()
+        .unwrap()
+        .script
+        .push_back(Create::LostResponse);
+    let reply = send(MANAGER, "$confirmed", origin.clone(), command)
+        .await
+        .unwrap();
+    assert!(
+        reply.contains("uncertain") && !reply.contains("Open chat:"),
+        "{reply}"
+    );
+    assert_eq!(
+        send(MANAGER, "$confirmed", origin.clone(), command)
+            .await
+            .unwrap(),
+        reply
+    );
+    h.reg.0.lock().unwrap().fail_once.insert("provision");
+    let reply = h.lobby("workspace retry op-3").await;
+    assert!(
+        reply.contains("incomplete") && !reply.contains("Open chat:"),
+        "{reply}"
+    );
+    let ready = h.lobby("workspace retry op-3").await;
+    let state = h.state().await;
+    assert_eq!(state.chats.len(), 2);
+    assert_eq!(&state.chats[0], first);
+    let new = &state.chats[1];
+    assert_ne!(new.session_db_id, first.session_db_id);
+    assert!(
+        new.ready && ready.contains(&format!("Open chat: {}", link(&new.room_id))),
+        "{ready}"
+    );
+    assert_eq!(
+        send(MANAGER, "$confirmed", origin.clone(), command)
+            .await
+            .unwrap(),
+        ready
+    );
+    let after = send(
+        MANAGER,
+        "$second",
+        origin,
+        "chat confirm-new second-token New  chat",
+    )
+    .await
+    .unwrap();
+    assert!(
+        after.contains("no current unconfirmed manager request"),
+        "{after}"
+    );
+    assert_eq!(h.state().await, state);
+    assert_eq!(h.posts(), 4, "only one POST for the confirmed chat");
+    assert_eq!(h.reg.0.lock().unwrap().creates, 2);
+    let hs = h.hs.0.lock().unwrap();
+    assert_eq!(
+        hs.invites
+            .iter()
+            .filter(|(id, _)| id == &new.room_id)
+            .collect::<Vec<_>>(),
+        vec![&(new.room_id.clone(), MANAGER.into())]
+    );
 }
 
 #[tokio::test]

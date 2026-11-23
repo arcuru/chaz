@@ -3,7 +3,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use chaz_core::bridge::MatrixNewChatProposal;
 use chaz_core::server::Server;
+use chaz_core::session::Session;
 use matrix_sdk::config::RequestConfig;
 use matrix_sdk::deserialized_responses::RawAnySyncOrStrippedState;
 use matrix_sdk::ruma::api::client::discovery::get_capabilities;
@@ -332,5 +334,29 @@ impl SessionOps for LiveSessions {
         let (_conv, db) = self.server.registry().open_session(session).await?;
         chaz_core::session::set_session_description(&db, Some(label)).await?;
         Ok(())
+    }
+
+    async fn new_chat_proposal(
+        &self,
+        room: &str,
+        session: &str,
+        token: &str,
+    ) -> anyhow::Result<MatrixNewChatProposal> {
+        let agent = owning_agent_entry(&self.server, &self.owning_agent)
+            .ok_or_else(|| anyhow::anyhow!("owning agent is not hosted"))?;
+        let (conv, db) = crate::bridge::resolve_workspace_session(
+            &self.server,
+            &agent,
+            &self.login_id,
+            room,
+            session,
+        )
+        .await?;
+        let session = Session::try_new(conv, db).await?;
+        session
+            .entries_with_ids()
+            .find(|(id, entry)| id.as_str() == token && entry.sender == self.owning_agent)
+            .and_then(|(_, entry)| MatrixNewChatProposal::from_entry(entry))
+            .ok_or_else(|| anyhow::anyhow!("no matching new chat proposal in this chat"))
     }
 }

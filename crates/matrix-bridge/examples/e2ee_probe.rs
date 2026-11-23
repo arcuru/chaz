@@ -85,6 +85,9 @@ enum Command {
         contains: String,
         #[arg(long)]
         withheld: bool,
+        /// Print the decrypted body instead of the event ID on match.
+        #[arg(long, conflicts_with = "withheld")]
+        print_body: bool,
         #[arg(long, default_value_t = 120)]
         timeout: u64,
     },
@@ -251,6 +254,7 @@ async fn main() -> anyhow::Result<()> {
             sender,
             contains,
             withheld,
+            print_body,
             timeout,
         } => {
             let (client, mut saved) = restore(&args.dir).await?;
@@ -279,7 +283,7 @@ async fn main() -> anyhow::Result<()> {
                             ensure!(!withheld, "{id} decrypted, but its key should be withheld");
                             let body = raw["content"]["body"].as_str().unwrap_or_default();
                             if body.contains(&contains) {
-                                println!("{id}");
+                                println!("{}", if print_body { body } else { &id });
                                 return Ok(());
                             }
                         }

@@ -11,7 +11,9 @@ what is deliberately deferred.
 
 - One private, bot-created Space and one real Lobby room. The Lobby carries
   management commands only: it has no session and never wakes a model.
-- Chats are created only by an explicit, authenticated `!chaz chat new <name>`.
+- Chats are created only by an explicit, authenticated `!chaz chat new <name>`
+  in the Lobby or `!chaz chat confirm-new <proposal> <exact title>` in the
+  workspace chat that proposed it.
   Each gets a new session; nothing existing is enrolled, imported or moved.
 - A small message-command vocabulary (`!chaz workspace …`, `!chaz chat …`).
   Messages, not slash commands, because Matrix clients may intercept unknown
@@ -21,7 +23,7 @@ what is deliberately deferred.
 
 Deferred, and not implied by anything in v1: archive, a threaded Inbox,
 adopting an existing room, promoting a thread to a room, nested project
-Spaces, and model-callable or proactive management.
+Spaces, and autonomous management.
 
 ## Contracts
 
@@ -35,6 +37,15 @@ bridge configured differently refuses to act on it.
 login's `workspace_manager` MXID, after the ordinary allow-list and decrypted
 event path. Room membership never substitutes, and a manager change refuses
 the existing record rather than inheriting it.
+
+**A conversational proposal is not a command.** `matrix__new_chat` writes
+an inert proposal to the originating session. That row cannot grant authority
+to make a Matrix write. The bridge remembers the latest live turn request it
+accepted from the manager per ready chat, not an actor supplied by the tool or
+inferred from session history. A confirmation must name the proposal in that
+still-bound session and repeat its exact title. It consumes that turn's grant
+and starts the same journaled operation as the Lobby command. Restarts do not
+restore unconfirmed grants; retries of confirmed operations use the journal.
 
 **Workspace rooms stay out of generic session paths.** The message handler
 routes every event through `workspace::route` before history bootstrap or any
@@ -120,12 +131,8 @@ Future direction, not current scope:
 - **Archive** means moving a chat under an Archive sub-Space of the workspace,
   keeping its room, session and history. It does not mean hiding a chat by
   removing it from the workspace, pausing it, or leaving or deleting the room.
-- **Model-callable management**, at least from a future model-backed Lobby
-  session, would call the same authenticated, journaled operations. The bridge
-  may then keep the Matrix name and topic in step with the session's existing
-  title and description and selected operational metadata such as the model,
-  rather than a second naming model. Disclosing such metadata into room state
-  needs its own decision.
+- Keeping the Matrix name and topic in step with session metadata (such as the
+  model) would disclose that metadata into room state and needs its own decision.
 - The command-only Lobby is a v1 constraint, not a permanent rule.
 
 ## Code map

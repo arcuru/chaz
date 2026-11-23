@@ -655,6 +655,9 @@ pub async fn build(
         tool_registry.register(crate::tools::MatrixRoomInfo {
             registry: registry.clone(),
         });
+        tool_registry.register(crate::tools::MatrixNewChat {
+            registry: registry.clone(),
+        });
     }
 
     // Set up extension hub infrastructure before install_all.

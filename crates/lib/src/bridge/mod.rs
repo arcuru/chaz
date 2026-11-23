@@ -23,6 +23,33 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::oneshot;
 
+/// Inert proposal shared by the executor and Matrix peer. Its row ID is the
+/// confirmation token, not a credential. Only the bridge can approve it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MatrixNewChatProposal {
+    pub request_id: String,
+    pub title: String,
+}
+
+impl MatrixNewChatProposal {
+    pub fn into_entry(self, agent: &str) -> serde_json::Result<SessionEntry> {
+        Ok(SessionEntry::new_bridge_event(
+            agent,
+            crate::session::BridgeEventRole::MatrixNewChatProposal,
+            serde_json::to_string(&self)?,
+            None,
+        ))
+    }
+
+    pub fn from_entry(entry: &SessionEntry) -> Option<Self> {
+        let event = entry.bridge_event()?;
+        (event.role() == Some(crate::session::BridgeEventRole::MatrixNewChatProposal))
+            .then(|| serde_json::from_str(&event.body).ok())
+            .flatten()
+    }
+}
+
 /// Durable per-binding outbound delivery for transport bridges.
 pub mod delivery;
 /// Shared outbound helpers for transport bridge implementations and user interaction.

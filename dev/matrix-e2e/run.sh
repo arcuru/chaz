@@ -1656,11 +1656,30 @@ CHAT_BINDINGS="$(grep -F "Channel bound to session" "$BRIDGE_LOG" | grep -cF "$C
 printf '\033[1;32mPASS\033[0m — new chat: private, linked from the Space, room facts verified by the stub, replied only here\n' >&2
 
 log "workspace: second chat has independent history and addressed replies"
-ws_say "$LOBBY_ID" "!chaz chat new Trip plans"
-ws_expect "$LOBBY_ID" "(c2) — done"
-OTHER_CHAT_ID="$(ws_invited "Trip plans")" || fail "no second chat invitation"
+ws_say "$CHAT_ID" "workspace new-chat probe: please open another chat called Trip plans"
+PROPOSAL="$(probe --dir "$SIGNED_DIR" expect --room "$CHAT_ID" --sender "$AGENT_MXID" \
+	--contains '!chaz chat confirm-new' --print-body --timeout "$REPLY_TIMEOUT")" || fail "no agent proposal"
+CONFIRM_NEW="$(grep -E '^!chaz chat confirm-new [^[:space:]]+ Trip plans$' <<<"$PROPOSAL")" ||
+	fail "proposal does not contain an exact confirmation command"
+ws_say "$LOBBY_ID" "$CONFIRM_NEW"
+ws_expect "$LOBBY_ID" "where it was proposed"
+ws_say "$CHAT_ID" "${CONFIRM_NEW%Trip plans}Changed title"
+ws_expect "$CHAT_ID" "the title does not match"
+[[ -z "$(ws_invited 'Trip plans' || true)" && -z "$(ws_invited 'Changed title' || true)" ]] ||
+	fail "the proposal or invalid confirmation invited the manager"
+ws_say "$CHAT_ID" "$CONFIRM_NEW"
+READY="$(probe --dir "$SIGNED_DIR" expect --room "$CHAT_ID" --sender "$AGENT_MXID" \
+	--contains 'Open chat: https://matrix.to/#/' --print-body --timeout "$REPLY_TIMEOUT")" || fail "no new chat link"
+OTHER_CHAT_ID="$(sed -n 's|^Open chat: https://matrix.to/#/||p' <<<"$READY")"
+[[ "$OTHER_CHAT_ID" == '!'* && "$OTHER_CHAT_ID" != "$CHAT_ID" && "$(ws_invited 'Trip plans')" == "$OTHER_CHAT_ID" ]] ||
+	fail "the returned link did not identify the fresh invitation"
+ws_say "$CHAT_ID" "$CONFIRM_NEW"
+ws_expect "$CHAT_ID" "no current unconfirmed manager request"
 ws_join "$OTHER_CHAT_ID"
 ws_assert_private "$OTHER_CHAT_ID" true
+[[ -z "$(ws_invited 'Trip plans' || true)" ]] || fail "a repeated confirmation created a duplicate invite"
+[[ "$(grep -F 'Channel bound to session' "$BRIDGE_LOG" | grep -cF "$OTHER_CHAT_ID")" -eq 1 ]] ||
+	fail "the tool-created chat does not have exactly one session binding"
 CHAT_REPLIES="$(probe --dir "$SIGNED_DIR" wire --room "$CHAT_ID" --sender "$AGENT_MXID")"
 ws_say "$OTHER_CHAT_ID" "workspace sibling ping"
 ws_expect "$OTHER_CHAT_ID" "$MARKER"
@@ -1668,6 +1687,10 @@ ws_expect "$OTHER_CHAT_ID" "$MARKER"
     fail "sibling reply reached the first chat"
 ! grep -F 'stub_llm: request:' "$WORKSPACE/stub-llm.log" | grep -F 'workspace sibling ping' | grep -qF 'workspace chat ping' ||
     fail "independent chats shared their transcripts"
+ws_say "$CHAT_ID" 'original chat after new-chat confirmation'
+ws_expect "$CHAT_ID" "$MARKER"
+! grep -F 'stub_llm: request:' "$WORKSPACE/stub-llm.log" | grep -F 'original chat after new-chat confirmation' | grep -qF 'workspace sibling ping' ||
+	fail "new chat history reached the original chat"
 TURNS_BEFORE="$(stub_requests)"
 ws_say "$LOBBY_ID" "!chaz chat rename c1 Winter bike"
 ws_expect "$LOBBY_ID" "rename c1 to “Winter bike” — done"
@@ -1676,7 +1699,7 @@ ws_state "$CHAT_ID" | jq -e 'map(select(.type == "m.room.name"))[0].content.name
 ws_say "$LOBBY_ID" "!chaz chat list"
 ws_expect "$LOBBY_ID" "c1 “Winter bike”"
 [[ "$(stub_requests)" -eq "$TURNS_BEFORE" ]] || fail "literal rename invoked a model"
-printf '\033[1;32mPASS\033[0m — workspace siblings: separate transcripts and addressed replies; literal rename/list without a model\n' >&2
+printf '\033[1;32mPASS\033[0m — workspace new-chat tool: exact confirmation only in the origin; one private link and fresh session, independent replies; literal rename/list without a model\n' >&2
 
 log "Case W4: bridge and daemon restarts keep the chat"
 kill -TERM "$BRIDGE_PID"

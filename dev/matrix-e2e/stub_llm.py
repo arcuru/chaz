@@ -351,6 +351,18 @@ class Handler(BaseHTTPRequestHandler):
                     return
             self._send({"error": "workspace room-info result missing or incorrect"}, status=400)
             return
+        if "workspace new-chat probe" in latest_user:
+            if not has_tool_result and "matrix__new_chat" in tools:
+                self._fixture_reply(name="matrix__new_chat", call_id="workspace-new-chat",
+                                    arguments={"title": "Trip plans"})
+                return
+            result = messages[-1]
+            match = re.search(r"(?m)^!chaz chat confirm-new [^\s]+ Trip plans$", result.get("content", ""))
+            if (result.get("role") == "tool" and result.get("tool_call_id") == "workspace-new-chat" and match):
+                self._fixture_reply(content="No room has been created. Send this here:\n" + match[0])
+                return
+            self._send({"error": "workspace new-chat proposal missing or incorrect"}, status=400)
+            return
         if "workspace approval probe" in latest_user:
             if has_tool_result:
                 result = messages[-1]

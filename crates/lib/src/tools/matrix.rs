@@ -143,6 +143,99 @@ impl Tool for MatrixSend {
     }
 }
 
+/// Propose a title without creating or inviting anyone to a room.
+pub struct MatrixNewChat {
+    pub registry: Arc<SessionRegistry>,
+}
+
+impl Tool for MatrixNewChat {
+    fn descriptor(&self) -> ToolDescriptor {
+        ToolDescriptor {
+            name: "matrix__new_chat".into(),
+            description: "Propose one new private workspace chat with a fresh session, in response to a request in a Matrix workspace chat. Does not create anything. Show the returned confirmation command verbatim for the workspace manager to send in this room. Never send it yourself or claim creation has happened.".into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {"title": {"type": "string", "description": "Literal proposed title"}},
+                "required": ["title"],
+                "additionalProperties": false
+            }),
+        }
+    }
+
+    fn execute<'a>(
+        &'a self,
+        arguments: Value,
+        ctx: &'a ToolContext,
+    ) -> Pin<Box<dyn Future<Output = Result<String, ToolError>> + Send + 'a>> {
+        Box::pin(async move {
+            let raw = arguments
+                .as_object()
+                .filter(|object| object.len() == 1)
+                .and_then(|object| object.get("title"))
+                .and_then(Value::as_str)
+                .ok_or_else(|| ToolError::InvalidArgument("expected only a title string".into()))?;
+            let title = crate::session::validate_session_description(raw)
+                .map_err(ToolError::InvalidArgument)?;
+            let deny = || {
+                ToolError::Execution(
+                    "new chat proposals require a turn from this Matrix workspace chat".into(),
+                )
+            };
+            let request = ctx.turn_request_id.as_ref().ok_or_else(deny)?;
+            let mut session = ctx.session.lock().await;
+            let db = session.database();
+            let attachment = session_attachment(db)
+                .await
+                .map_err(|e| ToolError::Execution(e.to_string()))?
+                .filter(|a| a.transport == "matrix" && a.conversational_replies)
+                .ok_or_else(deny)?;
+            // Routing data limits where the tool can propose; it is not proof
+            // of who spoke. The bridge checks its own ingress at confirmation.
+            if !session.entries_with_ids().any(|(id, entry)| {
+                id == request
+                    && entry.entry_type == EntryType::Message
+                    && entry.routing.as_ref().is_some_and(|routing| {
+                        routing
+                            .matrix_room
+                            .as_ref()
+                            .is_some_and(|r| r.workspace_chat)
+                            && routing.source.as_ref().is_some_and(|source| {
+                                source.transport == "matrix"
+                                    && source.login_id == attachment.login_id
+                                    && source.channel == attachment.channel
+                            })
+                    })
+            }) {
+                return Err(deny());
+            }
+            ensure_agent_owns_login(
+                &self.registry,
+                &session,
+                &ctx.agent_name,
+                "matrix",
+                &attachment.login_id,
+            )
+            .await?;
+            if !matches!(session_attachment(db).await, Ok(Some(current)) if current == attachment) {
+                return Err(deny());
+            }
+            let entry = crate::bridge::MatrixNewChatProposal {
+                request_id: request.to_string(),
+                title: title.clone(),
+            }
+            .into_entry(&ctx.agent_name)
+            .map_err(|e| ToolError::Execution(e.to_string()))?;
+            let token = session
+                .add_entry(entry)
+                .await
+                .map_err(|e| ToolError::Execution(e.to_string()))?;
+            Ok(format!(
+                "No room has been created. The workspace manager must send this exact message in the same chat to confirm:\n!chaz chat confirm-new {token} {title}"
+            ))
+        })
+    }
+}
+
 /// Read only the current request's cached bridge facts, not room state from a
 /// previous turn or a remote provider. A local turn can report actions, but
 /// cannot ask the bridge for an observation.

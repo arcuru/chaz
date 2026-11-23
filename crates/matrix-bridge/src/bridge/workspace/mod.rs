@@ -3,7 +3,7 @@
 //!
 //! Everything here is management metadata. The Space and Lobby never get a
 //! session or a model turn; each chat's session is created by the explicit
-//! `!chaz chat new` operation, never by generic join bootstrap. Room names and
+//! new-chat operation, never by generic join bootstrap. Room names and
 //! Space edges are labels, not identity: a chat is identified by its recorded
 //! room ID and session ID, and authorization is the exact configured manager
 //! MXID plus the existing allow list.
@@ -24,8 +24,10 @@ mod storage;
 
 use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex as StdMutex, RwLock};
 
+use chaz_core::bridge::MatrixNewChatProposal;
+use chaz_core::session::TurnRequestId;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
@@ -170,6 +172,13 @@ pub(crate) trait SessionOps: Send + Sync + 'static {
         session: &str,
         label: &str,
     ) -> impl Future<Output = anyhow::Result<()>> + Send;
+    /// Read an inert proposal from the exact, still-bound workspace session.
+    fn new_chat_proposal(
+        &self,
+        room: &str,
+        session: &str,
+        token: &str,
+    ) -> impl Future<Output = anyhow::Result<MatrixNewChatProposal>> + Send;
 }
 
 // ---------------------------------------------------------------------------
@@ -418,6 +427,9 @@ pub(crate) struct Workspace<M, S> {
     owning_agent: String,
     manager: Option<String>,
     index: RoomIndex,
+    /// Latest live waking manager request per chat. Session data alone cannot
+    /// assert the Matrix sender; do not restore this authority from history.
+    new_chat_requests: StdMutex<HashMap<String, TurnRequestId>>,
     /// Serializes every operation and holds the authoritative cached copy:
     /// the peer-local record is written only through this lock.
     state: Mutex<Option<WorkspaceState>>,
@@ -451,7 +463,7 @@ const HELP: &str = "**workspace commands** (prefix with `!chaz `):\n\
 \n\
 In a direct chat with the bot: `workspace setup` · `workspace confirm <op>`\n\
 In the Lobby: `chat new <name>` · `chat list` · `chat rename <chat> <name>`\n\
-In a workspace chat: `chat rename <name>`\n\
+In a workspace chat: `chat rename <name>` · `chat confirm-new <proposal> <exact title>`\n\
 Anywhere above: `workspace status [<op>]` · `workspace retry <op>` · `workspace cancel <op>`\n\
 \n\
 The Lobby is command-only; talk to the agent in a chat room.";
@@ -486,12 +498,30 @@ impl<M: MatrixOps, S: SessionOps> Workspace<M, S> {
             owning_agent,
             manager,
             index,
+            new_chat_requests: Default::default(),
             state: Mutex::new(state),
         })
     }
 
     pub(crate) fn index(&self) -> RoomIndex {
         self.index.clone()
+    }
+
+    pub(crate) fn remember_new_chat_request(
+        &self,
+        sender: &str,
+        room: &str,
+        session: &str,
+        request: TurnRequestId,
+    ) {
+        if self.manager.as_deref() == Some(sender)
+            && matches!(self.index.get(room), Some(Place::Chat { ready: true, session_db_id: Some(id), .. }) if id == session)
+        {
+            self.new_chat_requests
+                .lock()
+                .unwrap()
+                .insert(room.into(), request);
+        }
     }
 
     async fn save(&self, state: &WorkspaceState) -> anyhow::Result<()> {
@@ -624,25 +654,51 @@ impl<M: MatrixOps, S: SessionOps> Workspace<M, S> {
                     .as_mut()
                     .ok_or_else(|| anyhow::anyhow!("no workspace has been set up"))?;
                 self.ensure_idle(state)?;
-                state.next_chat += 1;
-                let handle = format!("c{}", state.next_chat);
-                let id = state.alloc_op();
-                let mut steps = BTreeMap::new();
-                for step in CHAT_STEPS {
-                    steps.insert(step.to_string(), Step::Pending);
+                self.new_chat(state, req, label).await
+            }
+            (Some("chat"), Some("confirm-new")) => {
+                let Origin::Managed(Place::Chat {
+                    handle,
+                    ready: true,
+                    ..
+                }) = origin
+                else {
+                    anyhow::bail!("confirm a new chat in the workspace chat where it was proposed");
+                };
+                let token = words.get(2).ok_or_else(|| {
+                    anyhow::anyhow!("usage: !chaz chat confirm-new <proposal> <exact title>")
+                })?;
+                let label = valid_label(&rest(3))?;
+                let state = guard
+                    .as_mut()
+                    .ok_or_else(|| anyhow::anyhow!("no workspace has been set up"))?;
+                let session = state
+                    .chat(handle)
+                    .filter(|chat| chat.ready && chat.room_id == req.room_id)
+                    .and_then(|chat| chat.session_db_id.as_deref())
+                    .ok_or_else(|| anyhow::anyhow!("workspace chat binding is unavailable"))?;
+                self.ensure_idle(state)?;
+                let proposal = self
+                    .sessions
+                    .new_chat_proposal(req.room_id, session, token)
+                    .await?;
+                anyhow::ensure!(
+                    label == proposal.title,
+                    "the title does not match the proposal; no chat was created"
+                );
+                {
+                    let mut requests = self.new_chat_requests.lock().unwrap();
+                    anyhow::ensure!(
+                        requests
+                            .get(req.room_id)
+                            .is_some_and(|id| id.as_str() == proposal.request_id),
+                        "no current unconfirmed manager request in this chat; ask again here"
+                    );
+                    // A second proposal from this turn cannot create another
+                    // room. After admission all retries use the journal.
+                    requests.remove(req.room_id);
                 }
-                state.operations.push(Operation {
-                    id: id.clone(),
-                    kind: OpKind::NewChat { handle, label },
-                    requester: req.sender.to_string(),
-                    event_id: req.event_id.to_string(),
-                    origin_room: req.room_id.to_string(),
-                    status: OpStatus::Incomplete,
-                    steps,
-                    last_error: None,
-                });
-                self.save(state).await?;
-                self.drive(state, &id).await
+                self.new_chat(state, req, label).await
             }
             (Some("chat"), Some("list")) => {
                 anyhow::ensure!(
@@ -708,6 +764,32 @@ impl<M: MatrixOps, S: SessionOps> Workspace<M, S> {
             );
         }
         Ok(())
+    }
+
+    async fn new_chat(
+        &self,
+        state: &mut WorkspaceState,
+        req: &Request<'_>,
+        label: String,
+    ) -> anyhow::Result<String> {
+        state.next_chat += 1;
+        let handle = format!("c{}", state.next_chat);
+        let id = state.alloc_op();
+        state.operations.push(Operation {
+            id: id.clone(),
+            kind: OpKind::NewChat { handle, label },
+            requester: req.sender.to_string(),
+            event_id: req.event_id.to_string(),
+            origin_room: req.room_id.to_string(),
+            status: OpStatus::Incomplete,
+            steps: CHAT_STEPS
+                .into_iter()
+                .map(|s| (s.to_string(), Step::Pending))
+                .collect(),
+            last_error: None,
+        });
+        self.save(state).await?;
+        self.drive(state, &id).await
     }
 
     async fn setup_preview(
