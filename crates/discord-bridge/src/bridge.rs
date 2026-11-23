@@ -709,13 +709,12 @@ async fn attach_approval_watcher(
     let seen: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
     let announced: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
     let db = session_db.clone();
+    // This watcher handles new requests and timeouts, not a replay of old
+    // announcements when joining a channel again.
+    let baseline = session_db.snapshot().await?;
     session_db
-        .on_write(move |event, _db| {
-            // Must not be gated on `Local`: the request this renders is
-            // written by the daemon running the agent, which on a split
-            // deployment is a different peer and arrives via sync. The same
-            // goes for the timeout decision that closes it.
-            tracing::trace!(session = %sid, source = ?event.source(), "Session write; rescanning approval requests");
+        .on_write(move |latest, _| {
+            let changed = latest != &baseline;
             let http = http.clone();
             let pending = pending.clone();
             let seen = seen.clone();
@@ -723,6 +722,9 @@ async fn attach_approval_watcher(
             let sid = sid.clone();
             let db = db.clone();
             Box::pin(async move {
+                if !changed {
+                    return Ok(());
+                }
                 let session = Session::new(ConversationId(sid.clone()), db.clone()).await;
                 let mut seen = seen.lock().await;
                 let requests =

@@ -231,7 +231,6 @@ async fn activity_subscription_initial_read_and_remote_completion_use_native_vis
             .await
             .unwrap();
         let mut session = Session::new(ConversationId(db.root_id().to_string()), db.clone()).await;
-        let cursor = db.snapshot().await.unwrap();
         let old = session
             .start_turn_attempt(TurnRequestId::parse("before-subscribe"))
             .await
@@ -267,18 +266,20 @@ async fn activity_subscription_initial_read_and_remote_completion_use_native_vis
         };
         let (events, mut received) = mpsc::unbounded_channel();
         let subscription = observed
-            .on_write_at_tips(cursor, move |event, _| {
-                let events = events.clone();
-                let source = event.source();
-                async move {
-                    let _ = events.send(source);
-                    Ok(())
-                }
+            .on_write(move |latest, _| {
+                let _ = events.send(latest.clone());
+                std::future::ready(Ok(()))
             })
             .await
             .unwrap();
-        // Native registration isn't eager catch-up. Reading AFTER it sees the
-        // completed turn even with no subsequent write to trigger a callback.
+        let next = async |received: &mut mpsc::UnboundedReceiver<eidetica::Snapshot>| {
+            tokio::time::timeout(std::time::Duration::from_secs(2), received.recv()).await
+        };
+        assert_eq!(
+            next(&mut received).await.unwrap().unwrap(),
+            db.snapshot().await.unwrap()
+        );
+        // The initial view includes the completed turn without a later write.
         assert_eq!(
             Session::turn_activity(&observed)
                 .await
@@ -291,39 +292,27 @@ async fn activity_subscription_initial_read_and_remote_completion_use_native_vis
             .start_turn_attempt(TurnRequestId::parse("during-read"))
             .await
             .unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(2), received.recv())
-            .await
-            .unwrap()
-            .unwrap();
+        assert_eq!(
+            next(&mut received).await.unwrap().unwrap(),
+            db.snapshot().await.unwrap()
+        );
         let captured = Session::turn_activity(&observed).await.unwrap();
         assert_eq!(captured.active_at(Utc::now()).count(), 1);
-        // Start and heartbeat are also delivered through the native Remote
-        // verification path, not just local commits or a supplied source flag.
-        for heartbeat in [false, true] {
-            if heartbeat {
-                Session::renew_turn_activity(&db, &attempt.attempt_id)
-                    .await
-                    .unwrap();
-            }
-            crate::test_support::replay_tips_as_remote(&owner, &db).await;
-            tokio::time::timeout(std::time::Duration::from_secs(2), async {
-                loop {
-                    if received.recv().await.unwrap() == eidetica::instance::WriteSource::Remote {
-                        break;
-                    }
-                }
-            })
+        Session::renew_turn_activity(&observed, &attempt.attempt_id)
             .await
             .unwrap();
-            assert_eq!(
-                Session::turn_activity(&observed)
-                    .await
-                    .unwrap()
-                    .active_at(Utc::now())
-                    .count(),
-                1
-            );
-        }
+        assert_eq!(
+            next(&mut received).await.unwrap().unwrap(),
+            db.snapshot().await.unwrap()
+        );
+        assert_eq!(
+            Session::turn_activity(&observed)
+                .await
+                .unwrap()
+                .active_at(Utc::now())
+                .count(),
+            1
+        );
         // Both transactions branch from the same native view. Commit the
         // completion first, then the competing heartbeat, as late sync can.
         let completion = db.new_transaction().await.unwrap();
@@ -351,10 +340,10 @@ async fn activity_subscription_initial_read_and_remote_completion_use_native_vis
             .unwrap();
         completion.commit().await.unwrap();
         heartbeat.commit().await.unwrap();
-        crate::test_support::replay_tips_as_remote(&owner, &db).await;
+        let latest = db.snapshot().await.unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(2), async {
             loop {
-                if received.recv().await.unwrap() == eidetica::instance::WriteSource::Remote {
+                if received.recv().await.unwrap() == latest {
                     break;
                 }
             }

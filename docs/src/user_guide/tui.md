@@ -860,8 +860,8 @@ Independent peers still need the existing explicit sharing/sync procedure.
 A synced parent carries references, not permission or automatic child acquisition.
 `/workers` retains an unavailable target; listing or opening never fetches an
 arbitrary remote database or approves a share.
-Inspection requires existing Write authority (Admin also works), because native
-record reads can materialize caches. It is not a Read-only permission feature.
+Chaz requires existing Write authority for inspection (Admin also works).
+This applies even when Eidetica can read the underlying records with Read.
 An already-bound narrower or delegated identity is never replaced with a broader
 key to make inspection succeed. Unsupported delegated-service permission checks
 report unavailable instead.
@@ -1676,10 +1676,9 @@ result evidence. A projection row is discovery, not execution authority.
 
 Local v1 requires **existing Write authority** on the observed databases;
 Admin is also supported, but not required. This includes the Agent/executor
-sources and job sessions. The observer UI is non-executing, **not a Read-only
-credential boundary**. The current Eidetica service needs Write to materialize
-native record caches when reading. True Read-only observation is deferred
-until that upstream path is repaired and verified; it is not supported yet.
+sources and job sessions. The observer UI does not execute jobs, but it does
+not accept Read-only credentials even when Eidetica can read the underlying
+records with Read.
 Chaz never upgrades a key, grants access, or substitutes a privileged credential.
 A delegated service session whose native Write query is unsupported also stays
 explicitly unavailable; the monitor does not guess its authority.

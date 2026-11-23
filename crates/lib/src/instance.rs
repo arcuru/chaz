@@ -884,14 +884,15 @@ eidetica:
         let observer_db = second.user.open_database(&callback_root).await.unwrap();
         let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
         let _callback = observer_db
-            .on_write(move |_, _| {
-                let event_tx = event_tx.clone();
-                async move {
-                    event_tx.send(()).unwrap();
-                    Ok(())
-                }
+            .on_write(move |latest, _| {
+                let _ = event_tx.send(latest.clone());
+                std::future::ready(Ok(()))
             })
             .await
+            .unwrap();
+        let initial = tokio::time::timeout(std::time::Duration::from_secs(2), event_rx.recv())
+            .await
+            .unwrap()
             .unwrap();
         let writer_db = first.user.open_database(&callback_root).await.unwrap();
         writer_db
@@ -903,10 +904,12 @@ eidetica:
             })
             .await
             .unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(2), event_rx.recv())
+        let changed = tokio::time::timeout(std::time::Duration::from_secs(2), event_rx.recv())
             .await
             .expect("the daemon must push another client's write")
             .expect("the observer callback channel must remain open");
+        assert_ne!(initial, changed);
+        assert_eq!(observer_db.snapshot().await.unwrap(), changed);
 
         drop(first);
         drop(second);

@@ -239,9 +239,8 @@ pub(crate) async fn status_from_db(
     let snapshot = db.snapshot().await?;
     status_at(db, &snapshot, None, live_attempts, executor_observer, None).await
 }
-/// Local-v1 observation needs write-capable credentials because the current
-/// service materializes native record caches while reading. This checks existing
-/// authority only; it neither grants permission nor acquires execution.
+/// Local-v1 observation requires existing Write authority even when native reads
+/// succeed with Read. This check neither grants permission nor acquires execution.
 pub async fn require_observer_write(
     db: &eidetica::Database,
 ) -> anyhow::Result<eidetica::auth::types::Permission> {

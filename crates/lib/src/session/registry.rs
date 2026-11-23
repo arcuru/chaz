@@ -273,12 +273,9 @@ impl SessionRegistry {
         let sync_tx = new_session_tx.clone();
         let stage = Instant::now();
         chaz_group
-            .on_write(move |event, db| {
+            .on_write(move |_, db| {
                 catalog_notify.send_replace(());
-                tracing::debug!(
-                    source = ?event.source(),
-                    "chaz_group write; rescanning the sessions index"
-                );
+                tracing::debug!("chaz_group write; rescanning the sessions index");
                 let sync_tx = sync_tx.clone();
                 let db = db.clone();
                 Box::pin(async move {

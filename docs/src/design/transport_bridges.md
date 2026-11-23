@@ -159,13 +159,11 @@ The daemon closes the loop in `watch_agent_session_registries`
 at deferred startup. Discovery and acquisition are separate:
 
 1. **One watcher per hosted Agent DB.** It reads exposures at a verified
-   snapshot and subscribes with `on_write_at_tips` from that frontier. A second
-   frontier read after subscribing catches writes from the setup gap: neither
-   an embedded callback nor a service subscription promises to replay a write
-   that landed before it was installed. The event's previous and post tips
-   bracket DAG history, not registry rows. After a local or synced write the
-   watcher reads the latest verified state of that agent's registry. Bursts
-   can coalesce; the watcher reports only IDs that became exposed or unexposed.
+   snapshot, subscribes with `on_write`, and rechecks the frontier after
+   subscribing. The callback provides an initial snapshot and subsequent
+   verified frontier changes. The watcher uses them as wake hints and reads
+   the latest verified state of that agent's registry. Bursts can coalesce;
+   the watcher reports only IDs that became exposed or unexposed.
 2. **One acquisition coordinator for the daemon.** It keeps one pending slot
    per session DB ID, even when several agents expose that session. An unrelated
    write doesn't start work or move a retry deadline.
@@ -360,16 +358,12 @@ ask in the first place (see [Security → Tool Approval](../user_guide/security.
 
 ## Invariants and gotchas
 
-- **`on_write` fires on synced writes.** This is the linchpin — the daemon's
-  registry-watch and the proxy's decision-resolver both depend on a _remote_
-  peer's write triggering a local callback. `WriteEvent::source` distinguishes
-  `Local` from `Remote` when a callback cares.
-- **Never commit to a tree inside its own `on_write`.** eidetica serializes
-  writes per-tree under a lock held across callbacks; a reentrant commit on the
-  same tree deadlocks. Every DB write in this design happens _outside_ the
-  callback: the proxy's requester is driven by the runtime mpsc, not the watch;
-  the bridge writes the decision from the reaction handler, not from the request
-  watcher.
+- **`on_write` also sees synced changes.** A verified frontier change from
+  another peer wakes the registry watcher and the approval resolver just as a
+  local commit does. Pending callbacks can coalesce; they aren't a write log.
+- **Watchers don't write decisions.** The proxy's requester is driven by the
+  runtime channel, not the watch. The bridge writes a decision from the
+  reaction handler, not from the request watcher.
 - **`request_id` is the only correlation.** The proxy's pending map and the
   bridge's pending map are independent; they agree only via the `request_id`
   carried in both entries. The session-DB entry id is _not_ used.

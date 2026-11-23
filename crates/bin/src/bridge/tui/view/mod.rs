@@ -2485,10 +2485,7 @@ mod chat_frame_tests {
             .unwrap();
         app.active_mut().session_db_id = db.root_id().to_string();
         app.active_mut().session_db = db.clone();
-        let _callback = db
-            .on_write_at_tips(db.snapshot().await.unwrap(), |_, _| async { Ok(()) })
-            .await
-            .unwrap();
+        let _callback = db.on_write(|_, _| async { Ok(()) }).await.unwrap();
         app.active_mut().job = Some(JobTab {
             state: Some(JobState::StartedUnknown {
                 attempt_id: "diagnostic-attempt".into(),

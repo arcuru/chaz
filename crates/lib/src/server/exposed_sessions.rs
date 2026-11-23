@@ -331,9 +331,7 @@ async fn attempt<A: Acquire>(
     }
 }
 
-/// Keep this agent's own authoritative list at a verified snapshot. Write
-/// events bracket the DAG, not the rows; neither embedded registration nor
-/// service subscription necessarily replays a write before it became live.
+/// Keep this agent's own authoritative list at a verified snapshot.
 async fn watch_agent<A: Acquire>(
     acquirer: Arc<A>,
     agent: Arc<Exposer>,
@@ -344,7 +342,7 @@ async fn watch_agent<A: Acquire>(
     let initial = db.snapshot().await?;
     let first = acquirer.exposed(&agent, &initial).await;
     let _subscription = db
-        .on_write_at_tips(initial.clone(), {
+        .on_write({
             let wake = wake.clone();
             move |_, _| {
                 wake.notify_one();
@@ -357,8 +355,8 @@ async fn watch_agent<A: Acquire>(
     let mut previous = BTreeSet::new();
     let mut observed = None;
     loop {
-        // Always recheck once after subscribing. Subsequent wakes can be
-        // coalesced and their post_tips are raw, so read the verified head.
+        // Keep the post-subscribe recheck. Use callback snapshots only as wake
+        // hints; reconcile exposures from the current verified head.
         let read = async {
             let tips = db.snapshot().await?;
             if observed.as_ref() == Some(&tips) {

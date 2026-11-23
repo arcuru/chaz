@@ -346,7 +346,7 @@ This was a real bug fixed in 2026-04 — `/share`/`/agent share`/`/memory share`
 - The source peer's sync server log shows incoming connections from the receiver's address.
 
 **A co-owner's edits to a synced session don't trigger an agent run on the host.**
-Sync-ingested entries reach every `on_write` subscriber tagged `WriteSource::Remote`, and chaz gates none of its callbacks on the source — a co-owner's message wakes the host's agent exactly as a local one does. If it doesn't, the write is not reaching the host at all: check the two sync items above, and confirm the host has the session registered (`!chaz attach <name-or-id>` in the target room, or a TUI tab open on it). A session that synced into the peer but was never attached has no callback installed on it.
+A synced message that changes the verified snapshot wakes the host's agent just like a local message. If it doesn't, check the two sync items above and confirm the host has the session registered (`!chaz attach <name-or-id>` in the target room, or a TUI tab open on it). A session that synced into the peer but was never attached has no callback installed on it.
 
 Note that only `Verified` writes fire callbacks. Entries arrive from sync as `Unverified` and fire on promotion — so if the host holds no key that can validate the co-owner's entries, they land in the database without ever waking anything.
 

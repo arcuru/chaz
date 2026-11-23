@@ -362,8 +362,7 @@ async fn service_steering(
         crate::instance::connect_with(&reader_settings, crate::config::ExecutionRole::Client)
             .await
             .unwrap();
-    // Same service, independent Read-only and unentitled keys remain refused.
-    // The deferred raw Read cache reproducer below retains the upstream bug.
+    // Same service, separate Read-only and unentitled identities.
     let read_db = {
         let user = &mut reader_connection.user;
         let read_key = user
@@ -415,22 +414,18 @@ async fn service_steering(
         read_db.current_permission().await.unwrap(),
         eidetica::auth::types::Permission::Read
     );
-    // DEFERRED READ-ONLY CACHE REPRODUCER: bypass only Chaz's new observation
-    // preflight, not Eidetica auth. Retain the original native query failure;
-    // success here requires revisiting this assertion and true Read support.
-    let raw_read = async {
-        read_db
-            .new_transaction()
-            .await?
-            .get_store::<eidetica::store::Table<JobInputRequest>>("job_inputs")
-            .await?
-            .search(|_: &JobInputRequest| true)
-            .await
-    }
-    .await;
-    let deferred_error = raw_read.unwrap_err().to_string();
-    eprintln!("DEFERRED Read-only cache materialization (not repaired): {deferred_error}");
-    assert!(deferred_error.contains("PermissionDenied") && deferred_error.contains("Write(0)"));
+    // The native cold read succeeds, but Chaz still requires Write to observe a job.
+    let rows = read_db
+        .new_transaction()
+        .await
+        .unwrap()
+        .get_store::<eidetica::store::Table<JobInputRequest>>("job_inputs")
+        .await
+        .unwrap()
+        .search(|_: &JobInputRequest| true)
+        .await
+        .unwrap();
+    assert_eq!(rows, vec![(input.id.clone(), input.clone())]);
     let refusal = crate::session::jobs::observer_status(&read_db)
         .await
         .unwrap_err()

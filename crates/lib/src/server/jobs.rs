@@ -459,17 +459,10 @@ impl Server {
             self.sessions.lock().await.remove(&session_db_id);
             return Err(error);
         }
-        let observed_tips = match child_db.snapshot().await {
-            Ok(tips) => tips,
-            Err(error) => {
-                self.deregister_session(&session_db_id).await;
-                return Err(error.into());
-            }
-        };
         let tx = self.notify_tx.clone();
         let sid = session_db_id.clone();
         let callback = child_db
-            .on_write_at_tips(observed_tips, move |_, _| {
+            .on_write(move |_, _| {
                 let tx = tx.clone();
                 let sid = sid.clone();
                 Box::pin(async move {
@@ -688,11 +681,10 @@ impl Server {
             Ok(opened) => opened,
             Err(_) => self.registry.open_job_session(session_db_id).await?,
         };
-        let tips = db.snapshot().await?;
         let notify = std::sync::Arc::new(tokio::sync::Notify::new());
         let notify_on_write = notify.clone();
         let _callback = db
-            .on_write_at_tips(tips, move |_, _| {
+            .on_write(move |_, _| {
                 let notify = notify_on_write.clone();
                 async move {
                     notify.notify_one();

@@ -423,7 +423,7 @@ pub(crate) async fn wait_for_yield(db: &Database, id: &str) -> anyhow::Result<Ex
     let notify = std::sync::Arc::new(tokio::sync::Notify::new());
     let signal = notify.clone();
     let _callback = db
-        .on_write_at_tips(db.snapshot().await?, move |_, _| {
+        .on_write(move |_, _| {
             let signal = signal.clone();
             async move {
                 signal.notify_one();

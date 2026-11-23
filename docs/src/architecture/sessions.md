@@ -508,7 +508,7 @@ compacted saw only the summary.
 
 Because each session is a standalone eidetica database, sessions can be synced between chaz instances. The `/share` command generates a `DatabaseTicket` URL, and `/sync` pulls a remote session. Eidetica handles the Merkle-CRDT synchronization protocol.
 
-Synced sessions receive remote writes via eidetica's `on_write` callbacks with `WriteSource::Remote`, triggering the same bridge notification path as local writes.
+When a synced entry changes the verified snapshot, Eidetica's `on_write` callback takes the same bridge notification path as a local write.
 
 ## Home Peer (Per-Session, with Agent-Level Fresh-Timer Default)
 
