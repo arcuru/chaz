@@ -93,7 +93,9 @@ fixture, the reply still descends from its dispatch intent, not the latest tips.
 The writer checks current permission, its attempt, and cancellation separately
 from that history. A joined read includes both appends once. It does not imply
 that the earlier request saw the correction, or that stable display order
-identifies a reply target.
+identifies a reply target. The [merged history comparison](../design/merged_context.md)
+shows why the next model request keeps the flat rendering, and when a cue
+about prior visibility would add information at the cost of history.
 
 Dated row APIs used by queues and transport delivery do not present v1
 projections as legacy rows. The single-turn fixture's descriptor requires

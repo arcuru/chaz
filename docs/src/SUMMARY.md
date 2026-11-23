@@ -33,6 +33,7 @@
 
 - [Capability Tiers](design/capability_tiers.md)
 - [Session Messaging Primitive](design/session_messaging.md)
+- [Merged History in the Next Model Call](design/merged_context.md)
 - [Dumb Transport Bridges](design/transport_bridges.md)
 - [Matrix Workspace](design/matrix_workspace.md)
 - [Autonomous Agents in Shared Sessions](design/autonomous_agents.md)
