@@ -129,7 +129,7 @@ pub(super) type TabSnapshot = (
 
 pub(super) struct Loaded {
     delivery: Delivery,
-    result: Result<TabSnapshot, String>,
+    result: Result<Box<TabSnapshot>, String>,
     partial_status: Option<Result<Vec<String>, String>>,
 }
 
@@ -211,7 +211,7 @@ impl Reads {
             let (result, partial_status) = loaded.unwrap_or_else(|error| (Err(error), None));
             Loaded {
                 delivery,
-                result,
+                result: result.map(Box::new),
                 partial_status,
             }
         });
@@ -248,7 +248,7 @@ pub(super) fn apply(
     let idx = tab_index(app, &loaded.delivery)?;
     app.tabs[idx].live.snapshot_started = None;
     app.tabs[idx].live.snapshot_overdue = false;
-    refresh::apply_watched(app, idx, loaded.result, resolve);
+    refresh::apply_watched(app, idx, loaded.result.map(|snapshot| *snapshot), resolve);
     if let Some(status) = loaded.partial_status {
         refresh::replace_status(&mut app.tabs[idx], status);
     }

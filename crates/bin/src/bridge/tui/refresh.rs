@@ -1236,10 +1236,6 @@ mod tests {
             .collect()
     }
 
-    fn key(code: KeyCode) -> KeyEvent {
-        KeyEvent::new(code, KeyModifiers::NONE)
-    }
-
     /// A burst of session writes while a reload runs spawns no extra reads:
     /// it collapses into exactly one follow-up.
     #[tokio::test]
