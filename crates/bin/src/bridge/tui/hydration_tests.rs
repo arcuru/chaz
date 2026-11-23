@@ -793,3 +793,231 @@ async fn hydration_equal_frontier_is_not_cached_authority() {
         }
     }
 }
+
+// The GUI owns the read and acknowledges only after applying or retiring it.
+// Dropping a registration can cancel its wait but cannot interrupt native
+// access-time verification inside a read that the GUI has already started.
+struct Delivery {
+    tips: eidetica::Snapshot,
+    handled: oneshot::Sender<()>,
+}
+
+async fn feed(db: &eidetica::Database) -> (eidetica::WriteCallback, mpsc::Receiver<Delivery>) {
+    let (tx, rx) = mpsc::channel(1);
+    let cb = db
+        .on_write(move |tips, _| {
+            let tips = tips.clone();
+            let tx = tx.clone();
+            async move {
+                let (handled, done) = oneshot::channel();
+                if tx.send(Delivery { tips, handled }).await.is_ok() {
+                    let _ = done.await;
+                }
+                Ok(())
+            }
+        })
+        .await
+        .unwrap();
+    (cb, rx)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hydration_acknowledged_snapshot_feed() {
+    for connected in [false, true] {
+        tokio::time::timeout(Duration::from_secs(15), acknowledged_round(connected))
+            .await
+            .expect("snapshot/commit/GUI wait cycle");
+    }
+}
+
+async fn acknowledged_round(connected: bool) {
+    let (owner, mut user, _) = counting_eidetica().await;
+    let db = seed(&mut user, 3).await;
+    let other = seed(&mut user, 1).await;
+    let initial = db.snapshot().await.unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("watch.sock");
+    let (shutdown, receiver) = watch::channel(());
+    let service = if connected {
+        let service = eidetica::service::ServiceServer::bind(owner.clone(), &socket)
+            .await
+            .unwrap();
+        Some(tokio::spawn(service.run(receiver)))
+    } else {
+        None
+    };
+    let client = if connected {
+        Some(
+            eidetica::Instance::connect(format!("unix://{}", socket.display()))
+                .await
+                .unwrap(),
+        )
+    } else {
+        None
+    };
+    let (observed, independent) = if let Some(client) = &client {
+        let login = client.login_account("test", "test-password").await.unwrap();
+        (
+            login.open_database(db.root_id()).await.unwrap(),
+            login.open_database(other.root_id()).await.unwrap(),
+        )
+    } else {
+        (db.clone(), other.clone())
+    };
+    let id = db.root_id().to_string();
+    let mut app = App::new(HashSet::new(), tab(&id, observed.clone()));
+    let (watcher, mut inbox) = feed(&observed).await;
+    let (_other_watcher, mut other_inbox) = feed(&independent).await;
+    other_inbox.recv().await.unwrap().handled.send(()).unwrap();
+    let first = inbox.recv().await.unwrap();
+    assert_eq!(first.tips, initial);
+
+    // Hold even the initial hydration until *after* the burst. Neither
+    // same-tree commits nor a different tree on the same transport wait for it.
+    for name in ["one", "two", "three"] {
+        chaz_core::session::update_meta_on_db(&db, |m| m.name = Some(name.into()))
+            .await
+            .unwrap();
+    }
+    chaz_core::session::update_meta_on_db(&other, |m| m.name = Some("independent".into()))
+        .await
+        .unwrap();
+    let elsewhere = other_inbox.recv().await.unwrap();
+    let loaded = load_session_snapshot_at(&independent, elsewhere.tips)
+        .await
+        .unwrap();
+    assert_eq!(loaded.meta.name.as_deref(), Some("independent"));
+    elsewhere.handled.send(()).unwrap();
+
+    let loaded = load_session_snapshot_at(&observed, first.tips)
+        .await
+        .unwrap();
+    apply_session_snapshot(&mut app, 0, 1, loaded, resolved);
+    assert_eq!(app.active().live.covered.as_ref(), Some(&initial));
+    assert_eq!(app.active().entries.len(), 3);
+    assert_eq!(app.active().session_name, None);
+    assert!(matches!(
+        inbox.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    ));
+    first.handled.send(()).unwrap();
+
+    // Service frames need not have traversed the wire by commit completion.
+    // Require eventual coverage of the final frontier without a catch-up read
+    // or another write; never assume the first post-ack frame is already it.
+    let latest = db.snapshot().await.unwrap();
+    let pending = loop {
+        let update = inbox.recv().await.unwrap();
+        let loaded = load_session_snapshot_at(&observed, update.tips)
+            .await
+            .unwrap();
+        apply_session_snapshot(&mut app, 0, 2, loaded, resolved);
+        if app.active().live.covered.as_ref() == Some(&latest) {
+            break update.handled;
+        }
+        assert!(
+            connected,
+            "local mailbox should retain only the latest pending snapshot"
+        );
+        update.handled.send(()).unwrap();
+    };
+    assert_eq!(app.active().session_name.as_deref(), Some("three"));
+    // Close while the registration is waiting for its GUI acknowledgment.
+    app.close_tab_at(0);
+    drop(watcher);
+    let mut pending = pending;
+    pending.closed().await;
+    assert!(inbox.recv().await.is_none());
+    app.push_tab(tab(&id, observed.clone()));
+    let (replacement, mut reopened) = feed(&observed).await;
+    let initial = reopened.recv().await.unwrap();
+    let loaded = load_session_snapshot_at(&observed, initial.tips)
+        .await
+        .unwrap();
+    apply_session_snapshot(&mut app, 0, 3, loaded, resolved);
+    assert_eq!(app.active().session_name.as_deref(), Some("three"));
+    initial.handled.send(()).unwrap();
+    drop(replacement);
+    drop(_other_watcher);
+    drop(client);
+    drop(shutdown);
+    if let Some(service) = service {
+        service.await.unwrap().unwrap();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hydration_retirement_finishes_started_verification() {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        use eidetica::{
+            Database, auth::crypto::PrivateKey, backend::VerificationStatus, store::DocStore,
+        };
+        let (source, _, _) = counting_eidetica().await;
+        let signer = PrivateKey::generate();
+        let writer = Database::create(&source, signer.clone(), Default::default())
+            .await
+            .unwrap();
+        let (owner, _, reads) = counting_eidetica().await;
+        owner
+            .put_entry(
+                writer.root_id(),
+                VerificationStatus::Unverified,
+                writer.get_entry(writer.root_id()).await.unwrap(),
+                eidetica::WriteSource::Remote,
+            )
+            .await
+            .unwrap();
+        let db = Database::open(&owner, writer.root_id())
+            .await
+            .unwrap()
+            .with_key(signer);
+        let (closing, mut old_rx) = feed(&db).await;
+        let (_survivor, mut live_rx) = feed(&db).await;
+        let old = old_rx.recv().await.unwrap();
+        let live = live_rx.recv().await.unwrap();
+        assert_eq!(live.tips, old.tips);
+        live.handled.send(()).unwrap();
+
+        let txn = writer.new_transaction().await.unwrap();
+        txn.get_store::<DocStore>("meta")
+            .await
+            .unwrap()
+            .set_string("name", "promoted")
+            .await
+            .unwrap();
+        let entry = txn.commit().await.unwrap();
+        db.insert_raw(writer.get_entry(&entry).await.unwrap())
+            .await
+            .unwrap();
+        let (promoted, release) = reads.pause_after_promotion(entry.clone());
+        // Reading the initial historical view rechecks *live* native Write
+        // authority. That check verifies the newer signed entry. Its lifetime
+        // is the owned load, not the registration waiting for GUI handling.
+        let mut owned = JoinSet::new();
+        owned.spawn({
+            let db = db.clone();
+            async move { load_session_snapshot_at(&db, old.tips).await }
+        });
+        promoted.await.unwrap();
+        drop(closing);
+        let mut abandoned = old.handled;
+        abandoned.closed().await;
+        release.send(()).unwrap();
+        let old = owned.join_next().await.unwrap().unwrap().unwrap();
+        assert_eq!(
+            old.meta.name, None,
+            "the retired load still read its historical frontier"
+        );
+        // No retry, new read or later write can heal a missed publication.
+        // The surviving registration must receive the promotion itself.
+        let live = live_rx.recv().await.unwrap();
+        assert_eq!(live.tips.tips(), &[entry]);
+        let loaded = load_session_snapshot_at(&db, live.tips).await.unwrap();
+        let mut app = App::new(HashSet::new(), tab(&db.root_id().to_string(), db.clone()));
+        apply_session_snapshot(&mut app, 0, 1, loaded, resolved);
+        assert_eq!(app.active().session_name.as_deref(), Some("promoted"));
+        live.handled.send(()).unwrap();
+    })
+    .await
+    .expect("retiring one observer lost another observer's promotion");
+}
