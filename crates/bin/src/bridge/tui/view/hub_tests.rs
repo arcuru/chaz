@@ -41,10 +41,14 @@ fn frame(app: &mut App, server: &Arc<Server>, backend: &BackendManager, w: u16, 
 
 fn channels() -> (
     mpsc::Sender<super::super::TaggedApproval>,
-    mpsc::Sender<String>,
+    super::super::presentation::Sender,
     mpsc::Sender<SessionLoad>,
 ) {
-    (mpsc::channel(8).0, mpsc::channel(8).0, mpsc::channel(8).0)
+    (
+        mpsc::channel(8).0,
+        super::super::presentation::channel().0,
+        mpsc::channel(8).0,
+    )
 }
 
 async fn settle(app: &mut App) {
@@ -617,12 +621,16 @@ async fn hub_return_from_settings_restarts_cancelled_catalog_discovery() {
 }
 
 #[tokio::test]
-async fn description_edit_patches_the_cached_picker_row_without_renaming() {
-    use super::super::{ChatAction, apply_session_catalog, handle_chat_action};
+async fn description_edit_updates_picker_through_the_watched_session() {
+    use super::super::{
+        ChatAction, apply_session_catalog, handle_chat_action, presentation, refresh,
+    };
     use chaz_core::commands::Command;
 
     let (_instance, server, backend, _) = fixture().await;
-    let (approval_tx, notify_tx, rows_tx) = channels();
+    let (approval_tx, _, rows_tx) = channels();
+    let (notify_tx, mut deliveries) = presentation::channel();
+    let mut reads = presentation::Reads::default();
     let models_tx = mpsc::channel(8).0;
     let secrets = SecretStore::new(server.registry().chaz_peer().clone()).await;
     let mut app = App::hub(HashSet::new());
@@ -643,7 +651,7 @@ async fn description_edit_patches_the_cached_picker_row_without_renaming() {
         .await
         .unwrap();
 
-    // Seed the picker cache with this session's loaded (description-free) row.
+    // Seed the picker index. Only the watched session owns the loaded metadata.
     let index = server
         .registry()
         .list_sessions()
@@ -652,10 +660,7 @@ async fn description_edit_patches_the_cached_picker_row_without_renaming() {
         .into_iter()
         .find(|index| index.session_db_id == id)
         .unwrap();
-    apply_session_catalog(&mut app, vec![index.clone()]);
-    app.session_list[0] = chaz_core::commands::try_load_session_metadata(server.registry(), index)
-        .await
-        .unwrap();
+    apply_session_catalog(&mut app, vec![index]);
     assert_eq!(app.session_list[0].description, None);
     app.mode = TuiMode::Chat;
 
@@ -673,6 +678,25 @@ async fn description_edit_patches_the_cached_picker_row_without_renaming() {
         );
         settle(app).await;
     };
+    let observe = async |reads: &mut presentation::Reads,
+                         deliveries: &mut mpsc::Receiver<presentation::Delivery>,
+                         app: &mut App,
+                         expected: Option<&str>| {
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                reads.start(app, deliveries.recv().await.unwrap());
+                let loaded = reads.join_next().await.unwrap().unwrap();
+                presentation::apply(app, loaded, |agent, meta| {
+                    refresh::resolve(&server, &backend, agent, meta)
+                });
+                if app.session_list[0].description.as_deref() == expected {
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+    };
     let canonical = async || {
         let (_, db) = server.registry().open_session(&id).await.unwrap();
         chaz_core::session::try_read_meta_from_db(&db)
@@ -685,7 +709,18 @@ async fn description_edit_patches_the_cached_picker_row_without_renaming() {
         Command::DescribeSession("Q3 budget with finance".into()),
     )
     .await;
-    // The cached row is patched in place (no catalog reload) and keeps its name.
+    assert_eq!(
+        app.session_list[0].description, None,
+        "completion is not persisted display authority"
+    );
+    observe(
+        &mut reads,
+        &mut deliveries,
+        &mut app,
+        Some("Q3 budget with finance"),
+    )
+    .await;
+    // The GUI applies the watched projection in place, with no catalog reload.
     assert!(app.session_list_fresh);
     assert_eq!(
         app.session_list[0].description.as_deref(),
@@ -723,6 +758,11 @@ async fn description_edit_patches_the_cached_picker_row_without_renaming() {
     );
 
     run(&mut app, Command::ClearSessionDescription).await;
+    assert_eq!(
+        app.session_list[0].description.as_deref(),
+        Some("Q3 budget with finance")
+    );
+    observe(&mut reads, &mut deliveries, &mut app, None).await;
     assert_eq!(app.session_list[0].description, None);
     assert_eq!(app.session_list[0].name.as_deref(), Some("planning"));
     let meta = canonical().await;
@@ -734,7 +774,9 @@ async fn description_edit_patches_the_cached_picker_row_without_renaming() {
     app.mode = TuiMode::Chat;
 
     // Double-width text is clipped by terminal cells and still shows the ellipsis.
-    run(&mut app, Command::DescribeSession("界".repeat(12))).await;
+    let description = "界".repeat(12);
+    run(&mut app, Command::DescribeSession(description.clone())).await;
+    observe(&mut reads, &mut deliveries, &mut app, Some(&description)).await;
     open_session_picker(&mut app, &server, &rows_tx);
     let narrow = frame(&mut app, &server, &backend, 20, 8);
     let line = narrow.lines().find(|l| l.contains('界')).expect(&narrow);

@@ -60,11 +60,11 @@ async fn reopen(
     incarnation: u64,
     mode: Mode,
     approval_tx: mpsc::Sender<TaggedApproval>,
-    notify_tx: mpsc::Sender<String>,
+    notify_tx: presentation::Sender,
 ) -> Reopened {
     let opener = server.clone();
     let target = id.clone();
-    let result = supervised::read(async move {
+    let result = supervised::work(async move {
         let opened = if mode == Mode::Job {
             opener.registry().open_job_session(&target).await
         } else {
@@ -261,7 +261,10 @@ fn apply_tab(app: &mut App, reopened: Reopened) -> Option<String> {
                     tab.live.rebind_needed = false;
                     None
                 }
-                Err(error) => Some(error),
+                Err(error) => {
+                    tab.live.observation = None;
+                    Some(error)
+                }
             }
         }
         Err(error) => Some(error),
@@ -286,7 +289,7 @@ pub(super) fn request_tabs(
     server: &Arc<Server>,
     backend: &BackendManager,
     approval_tx: &mpsc::Sender<TaggedApproval>,
-    notify_tx: &mpsc::Sender<String>,
+    notify_tx: &presentation::Sender,
     tx: &mpsc::Sender<ResultMessage>,
 ) {
     if !app.backend_available
@@ -303,7 +306,9 @@ pub(super) fn request_tabs(
         .tabs
         .iter_mut()
         .enumerate()
-        .filter(|(_, tab)| tab.live.rebind_needed && tab.live.rebind_task.is_none())
+        .filter(|(_, tab)| {
+            (tab.live.rebind_needed || tab.live.error.is_some()) && !tab.live.pending()
+        })
         .min_by_key(|(i, tab)| (tab.live.rebind_ticket, *i != app.active_tab))
     else {
         return;
@@ -320,16 +325,27 @@ pub(super) fn request_tabs(
     let notify_tx = notify_tx.clone();
     let tx = tx.clone();
     tab.live.rebind_task = Some(supervised::Task(tokio::spawn(async move {
-        let reopened = reopen(
-            server,
-            backend,
-            id,
-            incarnation,
-            mode,
-            approval_tx,
-            notify_tx,
-        )
-        .await;
+        let fallback_id = id.clone();
+        let reopened = notify_tx
+            .clone()
+            .prepare(Box::pin(async move {
+                Ok(reopen(
+                    server,
+                    backend,
+                    id,
+                    incarnation,
+                    mode,
+                    approval_tx,
+                    notify_tx,
+                )
+                .await)
+            }))
+            .await
+            .unwrap_or_else(|error| Reopened {
+                id: fallback_id,
+                incarnation,
+                result: Err(error),
+            });
         let _ = tx
             .send(ResultMessage::Tab {
                 ticket,

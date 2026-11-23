@@ -307,7 +307,7 @@ fn frame(app: &mut App, server: &Arc<Server>, backend: &BackendManager) -> Strin
 }
 fn new_session(app: &mut App, server: &Arc<Server>, backend: &BackendManager) {
     let (approval, _) = mpsc::channel(8);
-    let (notify, _) = mpsc::channel(64);
+    let (notify, _) = presentation::channel();
     let selected =
         input::handle_picker_key(app, KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE))
             .unwrap();
@@ -569,7 +569,7 @@ async fn creation_survives_navigation_without_replay_or_focus_theft() {
     assert_eq!(app.session_list.len(), 1);
     assert_eq!(app.session_list[0].session_db_id, created);
     let (approval, _) = mpsc::channel(8);
-    let (notify, _) = mpsc::channel(64);
+    let (notify, _) = presentation::channel();
     dispatch_picker_selection(
         created.clone(),
         &mut app,
@@ -622,7 +622,7 @@ async fn creation_admission_preserves_drafts_and_releases_only_its_own_ticket() 
     tokio::task::yield_now().await;
     assert!(release.send(()).is_err());
     let (approval, _) = mpsc::channel(8);
-    let (notify, _) = mpsc::channel(64);
+    let (notify, _) = presentation::channel();
     let (models, _) = mpsc::channel(4);
     for group in ["unknown", "chosen"] {
         handle_chat_action(

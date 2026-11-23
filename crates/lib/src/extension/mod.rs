@@ -189,7 +189,10 @@ impl ExtensionOutput {
 }
 
 async fn load_extension_outputs(session_db: &Database) -> anyhow::Result<Doc> {
-    let txn = session_db.new_transaction().await?;
+    extension_outputs_in(&session_db.new_transaction().await?).await
+}
+
+async fn extension_outputs_in(txn: &eidetica::Transaction) -> anyhow::Result<Doc> {
     Ok(txn
         .get_store::<DocStore>(EXTENSION_OUTPUTS_STORE)
         .await?
@@ -213,9 +216,20 @@ pub async fn read_extension_outputs(session_db: &Database) -> BTreeMap<String, E
 pub async fn try_read_extension_outputs(
     session_db: &Database,
 ) -> anyhow::Result<BTreeMap<String, ExtensionOutput>> {
-    load_extension_outputs(session_db)
-        .await?
-        .iter()
+    decode_extension_outputs(load_extension_outputs(session_db).await?)
+}
+
+/// Read published status from the same frontier as the session view.
+pub async fn try_read_extension_outputs_at(
+    session_db: &Database,
+    snapshot: &eidetica::Snapshot,
+) -> anyhow::Result<BTreeMap<String, ExtensionOutput>> {
+    let txn = session_db.new_transaction_at(snapshot).await?;
+    decode_extension_outputs(extension_outputs_in(&txn).await?)
+}
+
+fn decode_extension_outputs(doc: Doc) -> anyhow::Result<BTreeMap<String, ExtensionOutput>> {
+    doc.iter()
         .map(|(ext, value)| {
             let output = ExtensionOutput::from_stored(value)
                 .with_context(|| format!("invalid published output for extension '{ext}'"))?;

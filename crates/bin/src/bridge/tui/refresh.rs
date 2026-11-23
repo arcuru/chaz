@@ -1,28 +1,11 @@
-//! Background refresh of backend-owned tab state.
-//!
-//! Reading a session (entries, meta, live turn claims, extension outputs) is
-//! storage I/O that can be slow — over IPC it routinely takes hundreds of
-//! milliseconds. None of it may run on the input/render task: the run loop
-//! only *requests* a refresh here and keeps drawing the state it already has.
-//! The read runs on a spawned task and comes back as a [`Refresh`] message.
-//!
-//! Each tab owns one [`RefreshSlot`] per kind of read. A slot allows at most
-//! one read in flight; a request that arrives while one is running marks the
-//! slot dirty, and the completion asks for exactly one follow-up read. A burst
-//! of session writes therefore costs at most two reads per tab, and background
-//! work stays bounded by `tabs × kinds`.
-//!
-//! Every read carries a ticket from a single monotonic counter. A completion
-//! is applied only when its tab still exists (looked up by session id, never
-//! by index) and its ticket is the one the slot is waiting for, so a result
-//! for a closed, replaced or superseded request is discarded instead of
-//! overwriting newer state or landing on another session.
+//! Pinned session hydration and in-memory application of the session projection.
 
 use super::*;
 use chaz_core::session::TurnActivity;
 
 /// One kind of background read for one tab: at most one in flight, plus a
 /// dirty bit that coalesces every request made while it runs.
+#[cfg(test)]
 #[derive(Debug, Default)]
 pub(super) struct RefreshSlot {
     in_flight: Option<u64>,
@@ -30,6 +13,7 @@ pub(super) struct RefreshSlot {
     task: Option<tokio::task::JoinHandle<()>>,
 }
 
+#[cfg(test)]
 impl Drop for RefreshSlot {
     fn drop(&mut self) {
         if let Some(task) = self.task.take() {
@@ -38,6 +22,7 @@ impl Drop for RefreshSlot {
     }
 }
 
+#[cfg(test)]
 impl RefreshSlot {
     /// Claim the slot for `ticket`. Returns `false` (and marks the slot
     /// dirty) when a read is already running; that read's completion then
@@ -89,11 +74,15 @@ pub(super) struct TabLive {
     pub(super) input_retry:
         Arc<tokio::sync::Mutex<Option<chaz_core::session::steering::JobInputRequest>>>,
     /// Full session reload (entries + meta + activity) after a write.
+    #[cfg(test)]
     pub(super) reload: RefreshSlot,
     /// Extension status strip read.
+    #[cfg(test)]
     pub(super) status: RefreshSlot,
     /// Activity evidence read only on invalidation, initial load or retry.
+    #[cfg(test)]
     pub(super) activity: RefreshSlot,
+    #[cfg(test)]
     pub(super) job: RefreshSlot,
     /// Ticket of the newest read whose `active_turns` has been applied, so a
     /// slow tick can't overwrite a newer reload's count (or vice versa).
@@ -112,6 +101,8 @@ pub(super) struct TabLive {
     local_entries: Vec<SessionEntry>,
     pub(super) incarnation: u64,
     pub(super) observation: Option<Observation>,
+    pub(super) initial_handled: Option<tokio::sync::oneshot::Sender<()>>,
+    pub(super) snapshot_pending: bool,
     pub(super) rebind_needed: bool,
     pub(super) unbound: bool,
     pub(super) rebind_ticket: Option<u64>,
@@ -128,11 +119,25 @@ pub(super) struct TabLive {
 impl TabLive {
     pub(super) fn cancel_reads(&mut self) {
         self.workers.cancel();
-        self.reload = RefreshSlot::default();
-        self.status = RefreshSlot::default();
-        self.activity = RefreshSlot::default();
-        self.job = RefreshSlot::default();
+        #[cfg(test)]
+        {
+            self.reload = RefreshSlot::default();
+        }
+        #[cfg(test)]
+        {
+            self.status = RefreshSlot::default();
+        }
+        #[cfg(test)]
+        {
+            self.activity = RefreshSlot::default();
+        }
+        #[cfg(test)]
+        {
+            self.job = RefreshSlot::default();
+        }
         self.covered = None;
+        self.snapshot_pending = false;
+        self.initial_handled = None;
         self.rebind_task = None;
         self.rebind_ticket = None;
     }
@@ -146,15 +151,20 @@ impl TabLive {
             ..Default::default()
         }
     }
-    pub(super) fn failed(&self, kind: RefreshKind) -> bool {
+    #[cfg(test)]
+    pub(in crate::bridge::tui) fn failed(&self, kind: RefreshKind) -> bool {
         self.errors[kind as usize].is_some()
     }
     pub(super) fn pending(&self) -> bool {
-        self.reload.in_flight.is_some()
+        #[cfg(test)]
+        if self.reload.in_flight.is_some()
             || self.status.in_flight.is_some()
             || self.activity.in_flight.is_some()
             || self.job.in_flight.is_some()
-            || self.rebind_task.is_some()
+        {
+            return true;
+        }
+        self.snapshot_pending || self.rebind_task.is_some()
     }
 }
 
@@ -170,9 +180,11 @@ pub(super) struct SessionSnapshot {
     pub(super) telemetry: chaz_core::session::usage::SessionTelemetry,
     pub(super) meta: SessionMeta,
     pub(super) active_turns: Result<TurnActivity, String>,
+    pub(super) status: Result<Vec<String>, String>,
 }
 
 /// A completed background read, routed back to the run loop.
+#[cfg(test)]
 pub(super) enum Refresh {
     Unchanged {
         session_db_id: String,
@@ -212,6 +224,7 @@ pub(super) enum RefreshKind {
 }
 
 /// Result of applying one [`Refresh`].
+#[cfg(test)]
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(super) struct Applied {
     /// Visible state changed; the next frame must be drawn.
@@ -221,6 +234,7 @@ pub(super) struct Applied {
 }
 
 /// Retry failed reads and age retained activity and steering evidence.
+#[cfg(test)]
 pub(super) fn request_tick(app: &mut App, tx: &mpsc::Sender<Refresh>) -> bool {
     let now = chrono::Utc::now();
     let mut redraw = age_activity(app, now);
@@ -290,6 +304,7 @@ pub(super) fn age_activity(app: &mut App, now: chrono::DateTime<chrono::Utc>) ->
     redraw
 }
 
+#[cfg(test)]
 impl App {
     fn next_ticket(&mut self) -> u64 {
         self.refresh_ticket += 1;
@@ -344,6 +359,7 @@ impl Tab {
 /// Spawn `load` for tab `session_db_id`'s `kind` slot unless one is already
 /// running (then the request is coalesced into a single follow-up). Never
 /// awaits: the caller returns to input/render immediately.
+#[cfg(test)]
 pub(super) fn request_with<Fut>(
     app: &mut App,
     session_db_id: &str,
@@ -400,6 +416,7 @@ pub(super) fn request_with<Fut>(
 
 /// Request a background read of `kind` for the tab hosting `session_db_id`
 /// using the real session store.
+#[cfg(test)]
 pub(super) fn request(
     app: &mut App,
     session_db_id: &str,
@@ -492,6 +509,7 @@ pub(super) fn request(
     });
 }
 
+#[cfg(test)]
 pub(super) async fn load_session_snapshot(
     _session_db_id: &str,
     db: eidetica::Database,
@@ -500,7 +518,7 @@ pub(super) async fn load_session_snapshot(
     load_session_snapshot_at(&db, tips).await
 }
 
-async fn load_session_snapshot_at(
+pub(super) async fn load_session_snapshot_at(
     db: &eidetica::Database,
     tips: eidetica::Snapshot,
 ) -> Result<SessionSnapshot, String> {
@@ -538,6 +556,10 @@ pub(super) async fn snapshot_from_session(
     let telemetry = chaz_core::session::usage::telemetry_at_snapshot(db, &tips, &entries).await?;
     let meta = chaz_core::session::try_read_meta_at(db, &tips).await?;
     let steering = Session::steering_view_at(db, &tips).await?;
+    let status = chaz_core::extension::try_read_extension_outputs_at(db, &tips)
+        .await
+        .map(status_segments)
+        .map_err(|e| e.to_string());
     let now = chrono::Utc::now();
     let attempts = steering.attempts_at(now);
     Ok::<_, anyhow::Error>(SessionSnapshot {
@@ -547,6 +569,7 @@ pub(super) async fn snapshot_from_session(
         },
         inputs: steering.inputs_at(now),
         active_turns: Ok(steering.activity().clone()),
+        status,
         steering: Some(steering),
         tips,
         entries,
@@ -595,6 +618,7 @@ pub(super) fn age_steering(app: &mut App, now: chrono::DateTime<chrono::Utc>) ->
     redraw
 }
 
+#[cfg(test)]
 pub(super) async fn load_active_turns(db: &eidetica::Database) -> Result<TurnActivity, String> {
     Session::turn_activity(db).await.map_err(|e| e.to_string())
 }
@@ -602,16 +626,46 @@ pub(super) async fn load_active_turns(db: &eidetica::Database) -> Result<TurnAct
 /// Flatten every extension's status map from the session's
 /// `extension_outputs` store (written by the daemon at the turn boundary)
 /// into render-ready segments, ordered by extension name then key.
+#[cfg(test)]
 pub(super) async fn load_status_segments(db: &eidetica::Database) -> Result<Vec<String>, String> {
     chaz_core::extension::try_read_extension_outputs(db)
         .await
-        .map(|outputs| {
-            outputs
-                .into_values()
-                .flat_map(|o| o.status.into_values())
-                .collect()
-        })
+        .map(status_segments)
         .map_err(|e| e.to_string())
+}
+
+fn status_segments(
+    outputs: std::collections::BTreeMap<String, chaz_core::extension::ExtensionOutput>,
+) -> Vec<String> {
+    outputs
+        .into_values()
+        .flat_map(|output| output.status.into_values())
+        .collect()
+}
+
+pub(super) fn apply_watched(
+    app: &mut App,
+    idx: usize,
+    snapshot: Result<presentation::TabSnapshot, String>,
+    resolve: impl FnOnce(&str, &SessionMeta) -> Resolved,
+) {
+    let is_job = app.tabs[idx].job.is_some();
+    let kind = if is_job {
+        RefreshKind::Job
+    } else {
+        RefreshKind::Session
+    };
+    record_error(&mut app.tabs[idx], kind, snapshot.as_ref().err().cloned());
+    match snapshot {
+        Ok((snapshot, state)) => {
+            apply_session_snapshot(app, idx, app.refresh_ticket, snapshot, resolve);
+            if let Some(state) = state {
+                jobs::apply_state(&mut app.tabs[idx], state);
+            }
+        }
+        Err(error) if is_job => jobs::apply_error(&mut app.tabs[idx], error),
+        Err(_) => app.tabs[idx].live.covered = None,
+    }
 }
 
 fn record_error(tab: &mut Tab, kind: RefreshKind, error: Option<String>) {
@@ -671,6 +725,7 @@ fn apply_active_turns(
 
 /// Apply a completed read to its tab. Stale or orphaned results are dropped.
 /// Synchronous: everything here is in-memory.
+#[cfg(test)]
 pub(super) fn apply(
     app: &mut App,
     msg: Refresh,
@@ -826,6 +881,7 @@ fn apply_session_snapshot(
         telemetry,
         meta,
         active_turns,
+        status,
     } = snapshot;
     let Resolved {
         effective_model,
@@ -834,7 +890,8 @@ fn apply_session_snapshot(
     } = resolve(&app.tabs[idx].current_agent, &meta);
 
     let tab = &mut app.tabs[idx];
-    tab.live.covered = active_turns.is_ok().then_some(tips);
+    tab.live.covered = (active_turns.is_ok() && status.is_ok()).then_some(tips);
+    replace_status(tab, status);
     tab.live.steering = steering;
     tab.live.input_attempt = input_attempt;
     tab.live.inputs = inputs;
@@ -873,21 +930,7 @@ fn apply_session_snapshot(
         s.entry_count = entry_count;
     }
 
-    if let Some(index) = app.session_indices.get_mut(&db_id) {
-        index.name = meta.name.clone();
-    }
-
-    // Keep mutable row metadata in lock-step without deriving transcript
-    // summaries for the picker.
-    if let Some(row) = app
-        .session_list
-        .iter_mut()
-        .find(|s| s.session_db_id == db_id)
-    {
-        row.name = meta.name.clone();
-        row.agent_name = meta.agent_name.clone();
-        row.loaded = true;
-    }
+    project_open_row(app, idx);
 }
 
 #[cfg(test)]
@@ -979,6 +1022,7 @@ mod tests {
             session_db_id: id.into(),
             ticket,
             snapshot: Ok(Box::new(SessionSnapshot {
+                status: Ok(Vec::new()),
                 entry_ids: Vec::new(),
                 tool_activity: Default::default(),
                 tips: eidetica::Snapshot::EMPTY,
@@ -1141,76 +1185,6 @@ mod tests {
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
-    }
-
-    /// The regression this module exists for: with a status read and a
-    /// session reload both stalled on the backend, typing, scrolling and
-    /// drawing still complete and show the cached state. Paused time makes
-    /// any accidental await on the stalled reads trip the timeout instead of
-    /// hanging.
-    #[tokio::test(start_paused = true)]
-    async fn stalled_reads_leave_typing_scrolling_and_drawing_live() {
-        let (_instance, mut app) = app_with_tabs(&["a"]).await;
-        app.active_mut().live.status_segments = vec!["cached-status".into()];
-        app.active_mut()
-            .set_entries((0..200).map(|i| message(&format!("line {i}"))).collect());
-        let (tx, mut rx) = mpsc::channel(8);
-        let release_status = request_gated(&mut app, "a", RefreshKind::Status, &tx, |t| {
-            status("a", t, "fresh-status")
-        });
-        let session = Session::new(
-            chaz_core::types::ConversationId("a".into()),
-            app.active().session_db.clone(),
-        )
-        .await;
-        session
-            .start_turn_attempt(chaz_core::session::TurnRequestId::parse("live"))
-            .await
-            .unwrap();
-        let activity = load_active_turns(session.database()).await.unwrap();
-        let release_reload = request_gated(&mut app, "a", RefreshKind::Session, &tx, move |t| {
-            snapshot("a", t, vec![message("reloaded")], activity)
-        });
-        assert!(app.active().live.status.is_pending());
-        assert!(app.active().live.reload.is_pending());
-
-        let frame = tokio::time::timeout(Duration::from_secs(1), async {
-            for c in "hello".chars() {
-                input::handle_chat_key(&mut app, key(KeyCode::Char(c)));
-            }
-            input::handle_chat_key(&mut app, key(KeyCode::PageUp));
-            draw_chat(&mut app, 60, 20)
-        })
-        .await
-        .expect("input/render waited on a stalled backend read");
-
-        assert_eq!(app.input, "hello");
-        assert_eq!(app.active().scroll_offset, 20);
-        let text = frame.join("\n");
-        assert!(text.contains("hello"), "{text}");
-        assert!(text.contains("cached-status"), "{text}");
-        // Each message is four rows, so 20 rows up hides the last five.
-        assert!(text.contains("line 194"), "scrolled view: {text}");
-        assert!(!text.contains("line 195"), "scrolled view: {text}");
-        assert!(rx.try_recv().is_err(), "reads are still stalled");
-
-        release_status.send(()).unwrap();
-        release_reload.send(()).unwrap();
-        for _ in 0..2 {
-            let msg = rx.recv().await.unwrap();
-            let applied = apply(&mut app, msg, resolved);
-            assert!(applied.redraw);
-            assert_eq!(applied.follow_up, None);
-        }
-        let tab = app.active();
-        assert_eq!(tab.live.status_segments, vec!["fresh-status".to_string()]);
-        assert_eq!(tab.entries.len(), 1);
-        assert_eq!(tab.session_name.as_deref(), Some("renamed"));
-        assert_eq!(tab.effective_model, "test-model");
-        assert_eq!(tab.active_turns, 1);
-        assert!(!tab.live.reload.is_pending() && !tab.live.status.is_pending());
-        // The composer survived the reload untouched.
-        assert_eq!(app.input, "hello");
     }
 
     /// A burst of session writes while a reload runs spawns no extra reads:
@@ -1631,7 +1605,7 @@ mod tests {
             ..Default::default()
         };
         let (approval_tx, _approval_rx) = mpsc::channel(8);
-        let (notify_tx, _notify_rx) = mpsc::channel(64);
+        let (notify_tx, _notify_rx) = presentation::channel();
         // The runtime can reopen the DB even while presentation meta is
         // malformed. A hydration failure must not strand its old IPC handle.
         db.with_transaction(|txn| async move {

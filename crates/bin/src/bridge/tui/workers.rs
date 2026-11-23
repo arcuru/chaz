@@ -34,28 +34,39 @@ pub(super) async fn switch_session(identifier: &str, server: &Server) -> Command
 }
 
 pub(super) async fn open_tab(
-    server: &Server,
+    server: &Arc<Server>,
     backend: &BackendManager,
     id: &str,
-    tx: mpsc::Sender<String>,
+    tx: presentation::Sender,
 ) -> Result<Tab, String> {
-    let (_, db) = server
-        .registry()
-        .open_session_for_inspection(id)
+    let (server, backend, id) = (server.clone(), backend.clone(), id.to_owned());
+    tx.clone()
+        .prepare(Box::pin(async move {
+            let (_, db) = server
+                .registry()
+                .open_session_for_inspection(&id)
+                .await
+                .map_err(|e| e.to_string())?;
+            if !chaz_core::session::workers::is_worker_session(&db)
+                .await
+                .map_err(|e| e.to_string())?
+            {
+                return Err("referenced transcript is not a Worker".into());
+            }
+            inspect(&server, &backend, db, tx).await
+        }))
         .await
-        .map_err(|e| e.to_string())?;
-    if !chaz_core::session::workers::is_worker_session(&db)
-        .await
-        .map_err(|e| e.to_string())?
-    {
-        return Err("referenced transcript is not a Worker".into());
-    }
-    // Install before reading, closing the read/subscribe gap. The existing job
-    // callback is nonexecuting and requires the same native materialization floor.
+}
+
+async fn inspect(
+    server: &Server,
+    backend: &BackendManager,
+    db: eidetica::Database,
+    tx: presentation::Sender,
+) -> Result<Tab, String> {
     let observation = jobs::observe(&db, tx).await.map_err(|e| e.to_string())?;
-    let mut tab = build_tab(server, backend, db, id.to_owned()).await?;
+    let mut tab = build_observed_tab(server, backend, db, observation, false).await?;
     tab.live.worker_observer = true;
-    tab.live.observation = Some(observation);
     Ok(tab)
 }
 
@@ -402,7 +413,7 @@ pub(super) fn navigate(
     app: &mut App,
     server: &Arc<Server>,
     backend: &BackendManager,
-    tx: &mpsc::Sender<String>,
+    tx: &presentation::Sender,
     destination: Destination,
 ) {
     let Some(source) = app.current().map(|t| t.session_db.clone()) else {
@@ -412,7 +423,7 @@ pub(super) fn navigate(
     let backend = backend.clone();
     let tx = tx.clone();
     operations::submit(app, false, None, async move {
-        let (id, target, call, child) = match destination {
+        let (target, call, child) = match destination {
             Destination::Child(spawn) => {
                 let (_, child) = server
                     .registry()
@@ -428,7 +439,7 @@ pub(super) fn navigate(
                 {
                     return Err("referenced transcript is not a Worker".into());
                 }
-                (spawn.child_session_id, child, None, true)
+                (child, None, true)
             }
             Destination::Parent(spawn) => {
                 let origin = worker_links::worker_origin(&source)
@@ -451,17 +462,16 @@ pub(super) fn navigate(
                 worker_links::verify_worker_spawn(&parent, &source, &spawn)
                     .await
                     .map_err(|e| e.to_string())?;
-                (origin.parent_session_id, parent, Some(spawn.call), false)
+                (parent, Some(spawn.call), false)
             }
         };
-        let observation = jobs::observe(&target, tx)
-            .await
-            .map_err(|e| e.to_string())?;
-        let mut tab = build_tab(&server, &backend, target, id).await?;
-        tab.live.observation = Some(observation);
-        // Both destinations are observers, including newly opened ordinary
-        // parents on executor-capable TUIs. Existing parent tabs keep drafts.
-        tab.live.worker_observer = true;
+        // Both destinations are observers, including ordinary parents.
+        let mut tab = tx
+            .clone()
+            .prepare(Box::pin(async move {
+                inspect(&server, &backend, target, tx).await
+            }))
+            .await?;
         if child {
             tab.scroll_offset = u16::MAX; // The staged Directive is the initial child row.
         } else if let Some(call) = call {

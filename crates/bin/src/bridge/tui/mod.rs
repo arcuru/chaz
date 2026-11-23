@@ -46,6 +46,7 @@ mod input;
 mod jobs;
 mod operations;
 mod peer_pages;
+mod presentation;
 #[cfg(test)]
 mod readiness_tests;
 mod reconnect;
@@ -74,9 +75,7 @@ pub(super) type TaggedApproval = (String, u64, ApprovalExchange);
 enum Action {
     Key(KeyEvent),
     Mouse(MouseEvent),
-    /// A session DB fired an on_write callback — payload is the
-    /// session_db_id so we can refresh the right tab.
-    SessionChanged(String),
+    SessionChanged(presentation::Delivery),
     CatalogChanged,
     ApprovalRequest(TaggedApproval),
     /// A background catalog fetch finished. `Ok` carries the live model
@@ -88,7 +87,7 @@ enum Action {
     JobsLoaded(jobs::Loaded),
     WorkersLoaded(workers::Loaded),
     /// A background tab read finished (see [`refresh`]).
-    Refresh(refresh::Refresh),
+    Refresh(Result<presentation::Loaded, tokio::task::JoinError>),
     Operation(operations::Completion),
     Connection(reconnect::ResultMessage),
 }
@@ -1169,7 +1168,14 @@ impl App {
             .clone();
         self.refresh_ticket += 1;
         tab.live.incarnation = self.refresh_ticket;
+        let handled = tab.live.initial_handled.take();
         self.tabs.push(tab);
+        if handled.is_some() {
+            project_open_row(self, self.tabs.len() - 1);
+        }
+        if let Some(handled) = handled {
+            let _ = handled.send(());
+        }
     }
 
     /// Close one conversation view. The stored session, its attachments and
@@ -1456,15 +1462,9 @@ fn restore_terminal() {
 #[derive(Default)]
 pub(super) struct Observation {
     pub id: u64,
-    callback: Option<eidetica::instance::WriteCallback>,
-    forwarder: Option<tokio::task::JoinHandle<()>>,
-}
-impl Drop for Observation {
-    fn drop(&mut self) {
-        if let Some(task) = self.forwarder.take() {
-            task.abort();
-        }
-    }
+    _callback: Option<eidetica::WriteCallback>,
+    initial: Option<presentation::Delivery>,
+    forwarder: Option<supervised::Task<()>>,
 }
 
 /// Register a session DB with the server and wire up per-tab notify and
@@ -1476,7 +1476,7 @@ async fn setup_session(
     session_db: &eidetica::Database,
     backend: BackendManager,
     approval_tx: mpsc::Sender<TaggedApproval>,
-    notify_tx: mpsc::Sender<String>,
+    notify_tx: presentation::Sender,
 ) -> anyhow::Result<Observation> {
     let session_db_id = session_db.root_id().to_string();
 
@@ -1493,12 +1493,10 @@ async fn setup_session(
         "Worker sessions must be opened as observers"
     );
     server.load_session_entities(session_db).await?;
-    static NEXT_OBSERVATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-    let observation_id = NEXT_OBSERVATION.fetch_add(1, Ordering::Relaxed);
+    let observation_id = presentation::next_id();
     let mut observation = Observation {
         id: observation_id,
-        callback: None,
-        forwarder: None,
+        ..Default::default()
     };
 
     if server.is_executor_authorized() {
@@ -1517,7 +1515,7 @@ async fn setup_session(
                 }
             }
         });
-        observation.forwarder = Some(forwarder);
+        observation.forwarder = Some(supervised::Task(forwarder));
         server
             .register_session(session_db, backend, None, Some(raw_tx))
             .await?;
@@ -1527,22 +1525,10 @@ async fn setup_session(
             .await?;
     }
 
-    let notify_id = session_db_id;
-    observation.callback = Some(
-        session_db
-            .on_write(move |_, _db| {
-                // Source-agnostic: a co-owner's message landing over sync should
-                // redraw the tab as readily as one typed here.
-                tracing::trace!(session = %notify_id, "Session write; redrawing the tab");
-                let tx = notify_tx.clone();
-                let id = notify_id.clone();
-                Box::pin(async move {
-                    let _ = tx.send(id).await;
-                    Ok(())
-                })
-            })
-            .await?,
-    );
+    let (callback, initial) =
+        presentation::subscribe(session_db, observation_id, notify_tx).await?;
+    observation._callback = Some(callback);
+    observation.initial = Some(initial);
 
     Ok(observation)
 }
@@ -1817,11 +1803,21 @@ fn apply_session_catalog(app: &mut App, indices: Vec<SessionIndex>) {
     app.session_list = indices
         .iter()
         .map(|index| {
-            cached
-                .remove(&index.session_db_id)
-                .unwrap_or_else(|| SessionInfo::placeholder(index))
+            let mut row = SessionInfo::placeholder(index);
+            if let Some(old) = cached.remove(&index.session_db_id) {
+                row.name = old.name;
+                row.agent_name = old.agent_name;
+                row.description = old.description;
+                row.loaded = true;
+            }
+            row
         })
         .collect();
+    for idx in 0..app.tabs.len() {
+        if app.tabs[idx].live.observation.is_some() && app.tabs[idx].live.covered.is_some() {
+            project_open_row(app, idx);
+        }
+    }
     commands::sort_session_infos(&mut app.session_list);
     app.picker_index = app
         .session_list
@@ -1854,6 +1850,22 @@ fn apply_session_catalog_result(
     }
 }
 
+/// The watched tab owns session metadata; catalog fields remain index-owned.
+fn project_open_row(app: &mut App, idx: usize) {
+    let tab = &app.tabs[idx];
+    let id = &tab.session_db_id;
+    let meta = &tab.live.meta;
+    if let Some(row) = app.session_list.iter_mut().find(|r| &r.session_db_id == id) {
+        row.name = meta
+            .name
+            .clone()
+            .or_else(|| app.session_indices.get(id)?.name.clone());
+        row.agent_name = meta.agent_name.clone();
+        row.description = meta.description.clone();
+        row.loaded = true;
+    }
+}
+
 fn apply_session_row(
     app: &mut App,
     generation: u64,
@@ -1864,6 +1876,13 @@ fn apply_session_row(
         return false;
     }
     app.session_rows_loading.remove(&id);
+    if let Some(i) = app.tab_index_for(&id)
+        && app.tabs[i].live.observation.is_some()
+    {
+        // A row opened while this lazy read was in flight. The tab's watch
+        // now owns the projection, even if its latest read failed.
+        return false;
+    }
     match result {
         Ok(info) => {
             if let Some(row) = app
@@ -1973,7 +1992,60 @@ fn spawn_session_metadata_load<F, Fut>(
     }
 }
 
-/// Build a `Tab` for an already-registered session DB.
+/// Open an ordinary tab with its execution wiring and its own initial view.
+async fn open_live_tab(
+    server: Arc<Server>,
+    backend: BackendManager,
+    db: eidetica::Database,
+    approval_tx: mpsc::Sender<TaggedApproval>,
+    notify_tx: presentation::Sender,
+) -> Result<Tab, String> {
+    notify_tx
+        .clone()
+        .prepare(Box::pin(async move {
+            let observation = setup_session(&server, &db, backend.clone(), approval_tx, notify_tx)
+                .await
+                .map_err(|e| format!("{e:#}"))?;
+            build_observed_tab(&server, &backend, db, observation, false).await
+        }))
+        .await
+}
+
+async fn build_observed_tab(
+    server: &Server,
+    backend: &BackendManager,
+    db: eidetica::Database,
+    mut observation: Observation,
+    job: bool,
+) -> Result<Tab, String> {
+    let initial = observation
+        .initial
+        .take()
+        .expect("new observation has an initial delivery");
+    let (snapshot, state) = if job {
+        let loaded = jobs::snapshot_at(&db, initial.tips).await?;
+        (loaded.session, Some(loaded.state))
+    } else {
+        (
+            refresh::load_session_snapshot_at(&db, initial.tips).await?,
+            None,
+        )
+    };
+    let id = db.root_id().to_string();
+    let mut tab = tab_from_snapshot(server, backend, db, id, snapshot).await?;
+    if let Some(state) = state {
+        tab.job = Some(jobs::JobTab {
+            state: None,
+            details: false,
+        });
+        jobs::apply_state(&mut tab, state);
+    }
+    tab.live.observation = Some(observation);
+    tab.live.initial_handled = Some(initial.handled);
+    Ok(tab)
+}
+
+#[cfg(test)]
 async fn build_tab(
     server: &Server,
     backend: &BackendManager,
@@ -2019,7 +2091,7 @@ async fn tab_from_snapshot(
     let entries = snapshot.entries;
     let evidence = snapshot.active_turns?;
     let active_turns = evidence.active_at(chrono::Utc::now()).count();
-    Ok(Tab {
+    let mut tab = Tab {
         job: None,
         session_db_id,
         session_db,
@@ -2043,13 +2115,15 @@ async fn tab_from_snapshot(
             live.tool_activity.age(&evidence, chrono::Utc::now());
             live.entry_ids = snapshot.entry_ids.into_iter().map(Some).collect();
             live.activity_evidence = Some(evidence);
-            live.covered = Some(snapshot.tips);
+            live.covered = snapshot.status.is_ok().then_some(snapshot.tips);
             live.steering = snapshot.steering;
             live.inputs = snapshot.inputs;
             live.input_attempt = snapshot.input_attempt;
             live
         },
-    })
+    };
+    refresh::replace_status(&mut tab, snapshot.status);
+    Ok(tab)
 }
 
 /// Shift the active tab by `delta` (wraps around), only in the conversation
@@ -2084,7 +2158,7 @@ fn operation_context(
     backend: &BackendManager,
     secrets: &SecretStore,
     approval_tx: &mpsc::Sender<TaggedApproval>,
-    notify_tx: &mpsc::Sender<String>,
+    notify_tx: &presentation::Sender,
 ) -> operations::Context {
     operations::Context {
         server: server.clone(),
@@ -2103,7 +2177,7 @@ fn handle_chat_action(
     backend: &BackendManager,
     secrets: &SecretStore,
     approval_tx: &mpsc::Sender<TaggedApproval>,
-    notify_tx: &mpsc::Sender<String>,
+    notify_tx: &presentation::Sender,
     models_tx: &mpsc::Sender<ModelCatalog>,
     session_rows_tx: &mpsc::Sender<SessionLoad>,
 ) {
@@ -2252,7 +2326,7 @@ fn apply_picker_rename(app: &mut App, server: &Arc<Server>, id: String, name: Op
             None => server.registry().clear_session_name(&id).await,
         }
         .map_err(|e| e.to_string())?;
-        Ok(operations::Effect::Renamed { id, name })
+        Ok(operations::Effect::ReloadRow(id))
     });
 }
 
@@ -2262,7 +2336,7 @@ fn dispatch_picker_selection(
     server: &Arc<Server>,
     backend: &BackendManager,
     approval_tx: &mpsc::Sender<TaggedApproval>,
-    notify_tx: &mpsc::Sender<String>,
+    notify_tx: &presentation::Sender,
 ) {
     app.hub_notice = None;
     if let Some(i) = app.tab_index_for(&selected) {
@@ -2320,7 +2394,7 @@ fn dispatch_model_selection(
     backend: &BackendManager,
     secrets: &SecretStore,
     approval_tx: &mpsc::Sender<TaggedApproval>,
-    notify_tx: &mpsc::Sender<String>,
+    notify_tx: &presentation::Sender,
 ) {
     if !app.backend_ready() || !app.operations.has_capacity() {
         app.operations.notice =
@@ -2354,7 +2428,7 @@ fn handle_settings_outcome(
     backend: &BackendManager,
     secrets: &SecretStore,
     approval_tx: &mpsc::Sender<TaggedApproval>,
-    notify_tx: &mpsc::Sender<String>,
+    notify_tx: &presentation::Sender,
     models_tx: &mpsc::Sender<ModelCatalog>,
     session_rows_tx: &mpsc::Sender<SessionLoad>,
 ) {
@@ -2904,6 +2978,7 @@ mod session_picker_tests {
                         session_db_id: loaded_id,
                         ticket,
                         snapshot: Ok(Box::new(refresh::SessionSnapshot {
+                            status: Ok(Vec::new()),
                             entry_ids: Vec::new(),
                             tool_activity: Default::default(),
                             tips: eidetica::Snapshot::EMPTY,
@@ -2934,7 +3009,10 @@ mod session_picker_tests {
                 .redraw
             );
             assert_eq!(app.active().session_name.as_deref(), name);
-            assert_eq!(app.session_indices[&id].name.as_deref(), name);
+            assert_eq!(
+                app.session_indices[&id].name, None,
+                "the session projection cannot mutate the index"
+            );
             assert_eq!(
                 app.session_list
                     .iter()

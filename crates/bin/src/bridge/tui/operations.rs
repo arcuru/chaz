@@ -40,24 +40,14 @@ impl Origin {
 }
 
 pub(super) enum Effect {
-    /// A non-session mutation can affect every tab's model/agent display.
-    Global(Box<Effect>),
     Outcome(CommandOutcome),
     Opened(Box<Tab>),
     WorkerNavigation(Box<Tab>),
     Open(Box<Open>),
     Sent,
     JobSent(String),
-    Renamed {
-        id: String,
-        name: Option<String>,
-    },
-    /// A description command committed; patch the cached picker row.
-    Described {
-        id: String,
-        description: Option<String>,
-        text: String,
-    },
+    /// A closed session's lazy row may need a new read; carry no persisted value.
+    ReloadRow(String),
     Settings(String),
     Diff(AgentDiffView),
     Fields(Box<super::field_sheet::Update>),
@@ -386,45 +376,11 @@ pub(super) fn submit(
         .then_some(app.operations.next_ticket)
 }
 
-#[derive(Debug, Default, PartialEq, Eq)]
-pub(super) enum Invalidation {
-    #[default]
-    None,
-    Session(String),
-    All,
-}
-
-pub(super) fn refresh_after(
-    app: &mut App,
-    invalidation: Invalidation,
-    tx: &mpsc::Sender<refresh::Refresh>,
-) {
-    let all = invalidation == Invalidation::All;
-    let ids: Vec<_> = match invalidation {
-        Invalidation::None => Vec::new(),
-        Invalidation::Session(id) => vec![id],
-        Invalidation::All => app.tabs.iter().map(|t| t.session_db_id.clone()).collect(),
-    };
-    for id in ids {
-        if all && let Some(i) = app.tab_index_for(&id) {
-            app.tabs[i].live.covered = None;
-        }
-        refresh::request(app, &id, refresh::RefreshKind::Session, tx);
-        if app
-            .tabs
-            .get(app.active_tab)
-            .is_some_and(|t| t.session_db_id == id && t.job.is_none())
-        {
-            refresh::request(app, &id, refresh::RefreshKind::Status, tx);
-        }
-    }
-}
-
 /// In-memory apply only. Writes survive a closed view, but results never
 /// mutate a new incarnation or switch focus after newer local navigation.
-pub(super) fn apply(app: &mut App, completion: Completion) -> Invalidation {
+pub(super) fn apply(app: &mut App, completion: Completion) {
     if app.operations.current_ticket != Some(completion.pending.ticket) {
-        return Invalidation::None;
+        return;
     }
     app.operations.current_ticket = None;
     app.operations.current_origin = None;
@@ -435,10 +391,6 @@ pub(super) fn apply(app: &mut App, completion: Completion) -> Invalidation {
     app.operations.exit_confirm = false;
     app.operations.notice = None;
     let Completion { pending, result } = completion;
-    let (result, global) = match result {
-        Ok(Effect::Global(effect)) => (Ok(*effect), true),
-        result => (result, false),
-    };
     let nav_valid = pending.origin.navigation_valid(app);
     let field_current = app
         .field_sheet
@@ -459,20 +411,6 @@ pub(super) fn apply(app: &mut App, completion: Completion) -> Invalidation {
         app.session_catalog_loading = false;
         app.session_list_fresh = false;
     }
-    // Session writes already invalidate through on_write. A scoped check also
-    // covers uncertain completions; equality suppression absorbs callback overlap.
-    // Never cancel a healthy callback read just because its write completed.
-    let mut invalidation = if pending.write {
-        if global || result.is_err() || matches!(&result, Ok(Effect::Settings(_))) {
-            Invalidation::All
-        } else {
-            target
-                .map(|i| Invalidation::Session(app.tabs[i].session_db_id.clone()))
-                .unwrap_or_default()
-        }
-    } else {
-        Invalidation::None
-    };
     match result {
         Err(error) => {
             if field_current && let Some(sheet) = app.field_sheet.as_mut() {
@@ -573,12 +511,8 @@ pub(super) fn apply(app: &mut App, completion: Completion) -> Invalidation {
             }
             app.session_list_fresh = false;
             if creating {
-                invalidation = Invalidation::Session(tab.session_db_id.clone());
                 creation::opened(app, pending.ticket, *tab);
             } else if nav_valid {
-                // Notifications delivered before insertion could not find a tab.
-                // Check again after insertion, even when its first read succeeded.
-                invalidation = Invalidation::Session(tab.session_db_id.clone());
                 tracing::info!(ticket = pending.ticket, session_db_id = %tab.session_db_id,
                     agent = %tab.current_agent, "TUI session composer ready");
                 if let Some(i) = app.tab_index_for(&tab.session_db_id) {
@@ -601,24 +535,18 @@ pub(super) fn apply(app: &mut App, completion: Completion) -> Invalidation {
                 app.tabs[i].touch_transcript();
             }
         }
-        Ok(Effect::Renamed { id, name }) => {
-            // A closed/reopened view receives fresh meta through its own read.
-            if let Some(i) = target.filter(|&i| app.tabs[i].session_db_id == id) {
-                app.tabs[i].session_name = name.clone();
+        Ok(Effect::ReloadRow(id)) => {
+            if app.tab_index_for(&id).is_none() {
+                app.cancel_session_fill();
+                app.session_list_fresh = false;
+                if let Some(row) = app
+                    .session_list
+                    .iter_mut()
+                    .find(|row| row.session_db_id == id)
+                {
+                    row.loaded = false;
+                }
             }
-            if let Some(row) = app.session_list.iter_mut().find(|s| s.session_db_id == id) {
-                row.name = name;
-            }
-        }
-        Ok(Effect::Described {
-            id,
-            description,
-            text,
-        }) => {
-            if let Some(row) = app.session_list.iter_mut().find(|s| s.session_db_id == id) {
-                row.description = description;
-            }
-            show_text(app, target, text);
         }
         Ok(Effect::Settings(text)) => {
             if nav_valid {
@@ -637,7 +565,6 @@ pub(super) fn apply(app: &mut App, completion: Completion) -> Invalidation {
                 sheet.complete(*loaded);
             }
         }
-        Ok(Effect::Global(_)) => unreachable!("unwrapped above"),
         Ok(Effect::Outcome(outcome)) => match outcome {
             CommandOutcome::Quit => {
                 app.should_quit = app.operations.request_exit();
@@ -651,7 +578,6 @@ pub(super) fn apply(app: &mut App, completion: Completion) -> Invalidation {
     if app.backend_available {
         app.operations.start();
     }
-    invalidation
 }
 
 /// Show a command result in its originating view, or as a notice without one.
@@ -694,7 +620,7 @@ pub(super) struct Context {
     pub backend: BackendManager,
     pub secrets: SecretStore,
     pub approval_tx: mpsc::Sender<TaggedApproval>,
-    pub notify_tx: mpsc::Sender<String>,
+    pub notify_tx: presentation::Sender,
 }
 impl Context {
     pub(super) async fn command(
@@ -703,35 +629,6 @@ impl Context {
         target: Option<Target>,
         selected_info: Option<ModelInfo>,
     ) -> Result<Effect, String> {
-        // The value a successful description command stored, so the cached
-        // picker row can be patched like a rename instead of going stale.
-        let described = match &cmd {
-            Command::DescribeSession(text) => {
-                Some(chaz_core::session::validate_session_description(text).ok())
-            }
-            Command::ClearSessionDescription => Some(None),
-            _ => None,
-        };
-        let global = !command_is_read(&cmd)
-            && !matches!(
-                &cmd,
-                Command::NameSession(_)
-                    | Command::ClearSessionName
-                    | Command::DescribeSession(_)
-                    | Command::ClearSessionDescription
-                    | Command::Model(_)
-                    | Command::AgentModel { .. }
-                    | Command::AgentAdd(_)
-                    | Command::AgentRemove(_)
-                    | Command::AgentSetHost(_)
-                    | Command::AgentSetBurst(_)
-                    | Command::Stop
-                    | Command::RetryInterrupted(_)
-                    | Command::Compact
-                    | Command::NewSession(_)
-                    | Command::SwitchSession(_)
-            );
-        let target_id = target.as_ref().map(|t| t.id.clone());
         let outcome = if let Command::SwitchSession(identifier) = cmd {
             let server = self.server.clone();
             supervised::read(async move { Ok(workers::switch_session(&identifier, &server).await) })
@@ -765,21 +662,7 @@ impl Context {
         if let Some(info) = selected_info {
             self.server.cache_model_info(&info).await;
         }
-        if let (Some(description), Some(id), CommandOutcome::Text(text)) =
-            (described, target_id, &outcome)
-        {
-            return Ok(Effect::Described {
-                id,
-                description,
-                text: text.clone(),
-            });
-        }
-        let effect = self.prepare(outcome).await?;
-        Ok(if global {
-            Effect::Global(Box::new(effect))
-        } else {
-            effect
-        })
+        self.prepare(outcome).await
     }
     async fn prepare(&self, outcome: CommandOutcome) -> Result<Effect, String> {
         match outcome {
@@ -809,14 +692,14 @@ pub(super) struct Open {
     server: Arc<Server>,
     backend: BackendManager,
     approval_tx: mpsc::Sender<TaggedApproval>,
-    notify_tx: mpsc::Sender<String>,
+    notify_tx: presentation::Sender,
     switch: Box<chaz_core::commands::SessionSwitch>,
 }
 pub(super) fn resolved_open(
     server: &Arc<Server>,
     backend: &BackendManager,
     approval_tx: mpsc::Sender<TaggedApproval>,
-    notify_tx: mpsc::Sender<String>,
+    notify_tx: presentation::Sender,
     switch: Box<chaz_core::commands::SessionSwitch>,
 ) -> Effect {
     Effect::Open(Box::new(Open {
@@ -852,23 +735,15 @@ impl Open {
             .await
             .map(|tab| Effect::Opened(Box::new(tab)));
         }
-        let observation = setup_session(
-            &self.server,
-            &self.switch.db,
-            self.backend.clone(),
+        open_live_tab(
+            self.server,
+            self.backend,
+            self.switch.db,
             self.approval_tx,
             self.notify_tx,
         )
         .await
-        .map_err(|e| e.to_string())?;
-        let server = self.server.clone();
-        let backend = self.backend.clone();
-        let db = self.switch.db.clone();
-        let id = self.switch.session_db_id.clone();
-        let mut tab =
-            supervised::read(async move { build_tab(&server, &backend, db, id).await }).await?;
-        tab.live.observation = Some(observation);
-        Ok(Effect::Opened(Box::new(tab)))
+        .map(|tab| Effect::Opened(Box::new(tab)))
     }
 }
 

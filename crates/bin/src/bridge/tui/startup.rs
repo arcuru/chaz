@@ -41,7 +41,7 @@ impl TuiBridge {
         );
 
         let (approval_tx, approval_rx) = mpsc::channel::<TaggedApproval>(8);
-        let (notify_tx, notify_rx) = mpsc::channel::<String>(64);
+        let (notify_tx, notify_rx) = presentation::channel();
         let (stage_tx, mut stage_rx) = watch::channel("Connecting…");
         let (cancel_tx, cancel_rx) = watch::channel(false);
         let worker_path = path.clone();
@@ -161,6 +161,8 @@ impl TuiBridge {
                 _ => {}
             }
         }
+        drop(notify_rx);
+        notify_tx.drain().await;
         result.map(|_| ())
     }
 }
@@ -195,7 +197,7 @@ async fn initialize(
     mut cancel: watch::Receiver<bool>,
     stage: watch::Sender<&'static str>,
     approval_tx: mpsc::Sender<TaggedApproval>,
-    notify_tx: mpsc::Sender<String>,
+    notify_tx: presentation::Sender,
     started: Instant,
 ) -> Result<Option<Initialized>, String> {
     let t = Instant::now();
@@ -266,16 +268,9 @@ async fn initialize(
             .await
             .map(Some);
         }
-        let observation =
-            setup_session(&built.server, &db, backend.clone(), approval_tx, notify_tx)
-                .await
-                .map_err(|e| format!("{e:#}"))?;
-        let id = db.root_id().to_string();
-        let server = built.server.clone();
-        let mut tab =
-            supervised::read(async move { build_tab(&server, &backend, db, id).await }).await?;
-        tab.live.observation = Some(observation);
-        Ok(Some(tab))
+        open_live_tab(built.server.clone(), backend, db, approval_tx, notify_tx)
+            .await
+            .map(Some)
     }))
     .await;
     match tab {

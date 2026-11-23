@@ -23,11 +23,12 @@ impl TuiBridge {
         terminal_owner: supervised::TerminalGuard,
         approval_tx: mpsc::Sender<TaggedApproval>,
         mut approval_rx: mpsc::Receiver<TaggedApproval>,
-        notify_tx: mpsc::Sender<String>,
-        mut notify_rx: mpsc::Receiver<String>,
+        notify_tx: presentation::Sender,
+        mut notify_rx: mpsc::Receiver<presentation::Delivery>,
     ) -> anyhow::Result<()> {
         let mut server = built.server.clone();
         let mut runtime = Some(built);
+        let mut reads = presentation::Reads::default();
         let (connection_tx, mut connection_rx) = mpsc::channel(1);
         let mut probe_task: Option<supervised::Task<()>> = None;
         let mut runtime_task: Option<supervised::Task<()>> = None;
@@ -47,12 +48,18 @@ impl TuiBridge {
                 &mut approval_rx,
                 &notify_tx,
                 &mut notify_rx,
+                &mut reads,
             )
             .await;
         drop(terminal_owner);
         if let Ok(Some(report)) = &result {
             eprintln!("{report}");
         }
+        // The terminal state has retired its registrations. A native read
+        // that began verification must still publish before it can be dropped.
+        notify_rx.close();
+        notify_tx.drain().await;
+        while reads.join_next().await.is_some() {}
         if let Some(mut task) = probe_task.take() {
             task.0.abort();
             let _ = (&mut task.0).await;
@@ -102,8 +109,9 @@ impl TuiBridge {
         app: App,
         approval_tx: &mpsc::Sender<TaggedApproval>,
         approval_rx: &mut mpsc::Receiver<TaggedApproval>,
-        notify_tx: &mpsc::Sender<String>,
-        notify_rx: &mut mpsc::Receiver<String>,
+        notify_tx: &presentation::Sender,
+        notify_rx: &mut mpsc::Receiver<presentation::Delivery>,
+        reads: &mut presentation::Reads,
     ) -> anyhow::Result<Option<String>> {
         let mut reconnect_allowed = true;
         let mut reconnect_attempt = 0u32;
@@ -119,10 +127,6 @@ impl TuiBridge {
         let (peer_pages_tx, mut peer_pages_rx) = mpsc::channel(1);
         let (session_pages_tx, mut session_pages_rx) = mpsc::channel(1);
         let (jobs_tx, mut jobs_rx) = mpsc::channel::<jobs::Loaded>(1);
-        // Background tab reads (session reloads, status strip, live-turn
-        // counts). Tasks are owned by their tab's slots; the channel adds
-        // bounded backpressure when many open tabs finish together.
-        let (refresh_tx, mut refresh_rx) = mpsc::channel::<refresh::Refresh>(64);
         let mut catalog_changes = server.registry().catalog_changes();
 
         // An ordinary launch opens the hub — even on an empty install — and
@@ -131,25 +135,12 @@ impl TuiBridge {
             open_session_picker(&mut app, server, &session_rows_tx);
         }
 
-        // The run loop never awaits a storage read: backend-dependent state
-        // is requested from `refresh` and arrives later as `Action::Refresh`,
-        // while the frame shows what is already cached.
-        let initial = app
-            .current()
-            .map(|t| t.session_db_id.clone())
-            .unwrap_or_default();
-        refresh::request(
-            &mut app,
-            &initial,
-            refresh::RefreshKind::Status,
-            &refresh_tx,
-        );
-
         let mut activity_tick = tokio::time::interval(reconnect::PROBE_INTERVAL);
         activity_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut first_ready_frame = true;
         let mut needs_draw = true;
         'run: loop {
+            reads.start_initial(&mut app);
             operations::cancel_closed_reads(&mut app);
             workers::update(&mut app, server, &workers_tx);
             ensure_view(&mut app, server, &session_rows_tx);
@@ -193,8 +184,9 @@ impl TuiBridge {
             // Every event is still handled, in arrival order.
             for batch_slot in 0..MAX_ACTIONS_PER_FRAME {
                 let action = tokio::select! {
-                    Some(Ok(event)) = events.next() => {
-                        match event {
+                    event = events.next() => {
+                        let Some(event) = event else { break 'run };
+                        match event? {
                             Event::Key(key) => Action::Key(key),
                             Event::Mouse(m) if input::mouse_is_actionable(&m) => {
                                 // A click maps through the last frame's regions;
@@ -220,8 +212,8 @@ impl TuiBridge {
                     }
                     Some(msg) = connection_rx.recv() => Action::Connection(msg),
                     Some(msg) = app.operations.recv() => Action::Operation(msg),
-                    Some(msg) = refresh_rx.recv() => Action::Refresh(msg),
-                    Some(id) = notify_rx.recv() => Action::SessionChanged(id),
+                    Some(msg) = reads.join_next(), if !reads.is_empty() => Action::Refresh(msg),
+                    Some(update) = notify_rx.recv(), if reads.has_capacity() => Action::SessionChanged(update),
                     Ok(()) = catalog_changes.changed() => Action::CatalogChanged,
                     Some(msg) = approval_rx.recv() => Action::ApprovalRequest(msg),
                     Some(res) = models_rx.recv() => Action::ModelsFetched(res),
@@ -241,7 +233,9 @@ impl TuiBridge {
                             reconnect::request_tabs(
                                 &mut app, server, &backend, approval_tx, notify_tx, connection_tx,
                             );
-                            needs_draw |= refresh::request_tick(&mut app, &refresh_tx);
+                            let now = chrono::Utc::now();
+                            needs_draw |= refresh::age_activity(&mut app, now);
+                            needs_draw |= refresh::age_steering(&mut app, now);
                         }
                         if app.backend_available && probe_task.is_none()
                             && server.registry().instance().remote_connection().is_some()
@@ -552,22 +546,8 @@ impl TuiBridge {
                             }
                         }
                     }
-                    Action::SessionChanged(id) => {
-                        session_pages::changed(&mut app, &id);
-                        if !app.backend_available {
-                            continue;
-                        }
-                        // Coalesced: a burst of writes while a reload is running
-                        // costs one follow-up reload, not one per write.
-                        refresh::request(&mut app, &id, refresh::RefreshKind::Session, &refresh_tx);
-                        if app.current().is_some_and(|t| t.session_db_id == id) {
-                            refresh::request(
-                                &mut app,
-                                &id,
-                                refresh::RefreshKind::Status,
-                                &refresh_tx,
-                            );
-                        }
+                    Action::SessionChanged(update) => {
+                        reads.start(&mut app, update);
                     }
                     Action::Connection(msg) => match msg {
                         reconnect::ResultMessage::Probe(result) => {
@@ -575,9 +555,7 @@ impl TuiBridge {
                             use reconnect::ProbeFailure;
                             let reason = match result {
                                 Ok(()) => {
-                                    if std::mem::take(&mut missed_probe) {
-                                        needs_draw |= refresh::request_tick(&mut app, &refresh_tx);
-                                    }
+                                    missed_probe = false;
                                     None
                                 }
                                 Err(ProbeFailure::Deadline) if missed_probe => {
@@ -660,37 +638,26 @@ impl TuiBridge {
                             }
                         }
                         reconnect::ResultMessage::Tab { ticket, reopened } => {
-                            if let Some(id) = reconnect::apply_retry(&mut app, ticket, *reopened) {
-                                refresh::request(
-                                    &mut app,
-                                    &id,
-                                    refresh::RefreshKind::Session,
-                                    &refresh_tx,
-                                );
-                                refresh::request(
-                                    &mut app,
-                                    &id,
-                                    refresh::RefreshKind::Status,
-                                    &refresh_tx,
-                                );
-                            }
+                            reconnect::apply_retry(&mut app, ticket, *reopened);
+                            reads.start_initial(&mut app);
                         }
                     },
                     Action::Operation(msg) => {
-                        let invalidation = operations::apply(&mut app, msg);
-                        if app.backend_available {
-                            operations::refresh_after(&mut app, invalidation, &refresh_tx);
-                        }
+                        operations::apply(&mut app, msg);
                     }
-                    Action::Refresh(msg) => {
-                        let applied = refresh::apply(&mut app, msg, |agent, meta| {
-                            refresh::resolve(server, &backend, agent, meta)
-                        });
-                        needs_draw |= applied.redraw;
-                        if let Some((id, kind)) = applied.follow_up {
-                            refresh::request(&mut app, &id, kind, &refresh_tx);
+                    Action::Refresh(result) => match result {
+                        Ok(loaded) => {
+                            if let Some(id) =
+                                presentation::apply(&mut app, loaded, |agent, meta| {
+                                    refresh::resolve(server, &backend, agent, meta)
+                                })
+                            {
+                                session_pages::changed(&mut app, &id);
+                                needs_draw = true;
+                            }
                         }
-                    }
+                        Err(error) => tracing::warn!(%error, "Snapshot read worker stopped"),
+                    },
                     Action::ApprovalRequest((id, observation_id, exchange)) => {
                         if let Some(idx) = app.tab_index_for(&id).filter(|&i| {
                             app.tabs[i]
@@ -755,23 +722,6 @@ impl TuiBridge {
                 );
                 if navigation_before != navigation_after {
                     app.navigation_generation += 1;
-                    if app.backend_available
-                        && matches!(
-                            app.mode,
-                            TuiMode::Chat | TuiMode::Settings(SettingsScope::Session)
-                        )
-                        && let Some(id) = app.current().map(|t| t.session_db_id.clone())
-                    {
-                        if matches!(app.mode, TuiMode::Settings(SettingsScope::Session)) {
-                            refresh::request(
-                                &mut app,
-                                &id,
-                                refresh::RefreshKind::Session,
-                                &refresh_tx,
-                            );
-                        }
-                        refresh::request(&mut app, &id, refresh::RefreshKind::Status, &refresh_tx);
-                    }
                 }
 
                 // The picker owns the background fill; the moment we're not in it,
