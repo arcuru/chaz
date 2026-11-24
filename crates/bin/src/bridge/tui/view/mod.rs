@@ -1401,7 +1401,10 @@ fn build_transcript(
                 let Some(role) = entry.bridge_role() else {
                     continue;
                 }; // future role is inert
-                if role == BridgeEventRole::Receipt {
+                if matches!(
+                    role,
+                    BridgeEventRole::Receipt | BridgeEventRole::MatrixRenameProposal
+                ) {
                     continue;
                 }
                 let (label, address) = if role == BridgeEventRole::Observation {

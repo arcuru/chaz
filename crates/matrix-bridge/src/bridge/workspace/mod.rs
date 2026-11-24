@@ -25,7 +25,9 @@ mod storage;
 use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 use std::sync::{Arc, RwLock};
+use std::time::{Duration, Instant};
 
+use chaz_core::bridge::MatrixRenameProposal;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
@@ -59,6 +61,7 @@ const CHAT_STEPS: [&str; 7] = [
     "invite",
 ];
 const RENAME_STEPS: [&str; 2] = ["matrix.name", "session.label"];
+const RENAME_CONFIRM_WINDOW: Duration = Duration::from_secs(300);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -136,6 +139,13 @@ pub(crate) trait MatrixOps: Send + Sync + 'static {
         child: &str,
         space: &str,
     ) -> impl Future<Output = anyhow::Result<()>> + Send;
+    /// Require joined bot power to send m.room.name and observe the current
+    /// name at the server, not a possibly stale sync echo.
+    fn name_matches(
+        &self,
+        room: &str,
+        name: &str,
+    ) -> impl Future<Output = anyhow::Result<bool>> + Send;
     fn set_name(&self, room: &str, name: &str) -> impl Future<Output = anyhow::Result<()>> + Send;
 }
 
@@ -169,7 +179,13 @@ pub(crate) trait SessionOps: Send + Sync + 'static {
         &self,
         session: &str,
         label: &str,
-    ) -> impl Future<Output = anyhow::Result<()>> + Send;
+    ) -> impl Future<Output = anyhow::Result<bool>> + Send;
+    fn rename_proposal(
+        &self,
+        room: &str,
+        session: &str,
+        proposal: &str,
+    ) -> impl Future<Output = anyhow::Result<MatrixRenameProposal>> + Send;
 }
 
 // ---------------------------------------------------------------------------
@@ -418,9 +434,18 @@ pub(crate) struct Workspace<M, S> {
     owning_agent: String,
     manager: Option<String>,
     index: RoomIndex,
+    // One recent, unconsumed manager-origin turn per chat, in this bridge
+    // generation only. A synchronized row's claimed sender is not authority.
+    rename_requests: std::sync::Mutex<HashMap<String, RenameRequest>>,
     /// Serializes every operation and holds the authoritative cached copy:
     /// the peer-local record is written only through this lock.
     state: Mutex<Option<WorkspaceState>>,
+}
+
+struct RenameRequest {
+    session: String,
+    request: String,
+    expires: Instant,
 }
 
 fn new_workspace_id() -> anyhow::Result<String> {
@@ -451,7 +476,7 @@ const HELP: &str = "**workspace commands** (prefix with `!chaz `):\n\
 \n\
 In a direct chat with the bot: `workspace setup` · `workspace confirm <op>`\n\
 In the Lobby: `chat new <name>` · `chat list` · `chat rename <chat> <name>`\n\
-In a workspace chat: `chat rename <name>`\n\
+In a workspace chat: `chat rename <name>` · `chat confirm-rename <proposal> <exact title>`\n\
 Anywhere above: `workspace status [<op>]` · `workspace retry <op>` · `workspace cancel <op>`\n\
 \n\
 The Lobby is command-only; talk to the agent in a chat room.";
@@ -486,12 +511,56 @@ impl<M: MatrixOps, S: SessionOps> Workspace<M, S> {
             owning_agent,
             manager,
             index,
+            rename_requests: Default::default(),
             state: Mutex::new(state),
         })
     }
 
     pub(crate) fn index(&self) -> RoomIndex {
         self.index.clone()
+    }
+
+    /// Called only after committing a live, waking Matrix message. Do not
+    /// reconstruct these authorizations from history, including after restart.
+    pub(crate) fn remember_rename_request(
+        &self,
+        sender: &str,
+        room: &str,
+        session: &str,
+        request: &str,
+    ) {
+        if self.manager.as_deref() != Some(sender)
+            || !matches!(self.index.get(room), Some(Place::Chat { ready: true, session_db_id: Some(id), .. }) if id == session)
+        {
+            return;
+        }
+        self.rename_requests.lock().unwrap().insert(
+            room.to_owned(),
+            RenameRequest {
+                session: session.to_owned(),
+                request: request.to_owned(),
+                expires: Instant::now() + RENAME_CONFIRM_WINDOW,
+            },
+        );
+    }
+
+    fn consume_rename_request(
+        &self,
+        room: &str,
+        session: &str,
+        request: &str,
+    ) -> anyhow::Result<()> {
+        let mut requests = self.rename_requests.lock().unwrap();
+        anyhow::ensure!(
+            requests
+                .get(room)
+                .is_some_and(|current| current.session == session
+                    && current.request == request
+                    && Instant::now() < current.expires),
+            "no current unconfirmed manager request in this chat; ask again here"
+        );
+        requests.remove(room);
+        Ok(())
     }
 
     async fn save(&self, state: &WorkspaceState) -> anyhow::Result<()> {
@@ -667,34 +736,79 @@ impl<M: MatrixOps, S: SessionOps> Workspace<M, S> {
                 let state = guard
                     .as_mut()
                     .ok_or_else(|| anyhow::anyhow!("no workspace has been set up"))?;
-                let chat = state.chat(&handle).ok_or_else(|| {
-                    anyhow::anyhow!("no workspace chat {handle:?}; see !chaz chat list")
+                self.rename(state, req, handle, label).await
+            }
+            (Some("chat"), Some("confirm-rename")) => {
+                let Origin::Managed(Place::Chat {
+                    handle,
+                    ready: true,
+                    ..
+                }) = origin
+                else {
+                    anyhow::bail!("confirm a proposed title inside its workspace chat");
+                };
+                let token = words.get(2).ok_or_else(|| {
+                    anyhow::anyhow!("usage: !chaz chat confirm-rename <proposal> <exact title>")
                 })?;
-                anyhow::ensure!(
-                    chat.ready,
-                    "chat {handle} is not ready; finish its creation first"
-                );
+                let title = valid_label(&rest(3))?;
+                let state = guard
+                    .as_mut()
+                    .ok_or_else(|| anyhow::anyhow!("no workspace has been set up"))?;
+                let chat = state
+                    .chat(handle)
+                    .filter(|chat| chat.ready && chat.room_id == req.room_id)
+                    .ok_or_else(|| anyhow::anyhow!("workspace chat identity changed; refusing"))?;
+                let session = chat
+                    .session_db_id
+                    .as_deref()
+                    .ok_or_else(|| anyhow::anyhow!("workspace chat has no session"))?;
                 self.ensure_idle(state)?;
-                let id = state.alloc_op();
-                let steps = RENAME_STEPS
-                    .into_iter()
-                    .map(|s| (s.to_string(), Step::Pending))
-                    .collect();
-                state.operations.push(Operation {
-                    id: id.clone(),
-                    kind: OpKind::Rename { handle, label },
-                    requester: req.sender.to_string(),
-                    event_id: req.event_id.to_string(),
-                    origin_room: req.room_id.to_string(),
-                    status: OpStatus::Incomplete,
-                    steps,
-                    last_error: None,
-                });
-                self.save(state).await?;
-                self.drive(state, &id).await
+                let proposal = self
+                    .sessions
+                    .rename_proposal(req.room_id, session, token)
+                    .await?;
+                anyhow::ensure!(
+                    proposal.title == title,
+                    "the title does not match the proposal; nothing was renamed"
+                );
+                self.consume_rename_request(req.room_id, session, &proposal.request_id)?;
+                self.rename(state, req, handle.clone(), title).await
             }
             _ => anyhow::bail!("unknown workspace command; see !chaz workspace help"),
         }
+    }
+
+    async fn rename(
+        &self,
+        state: &mut WorkspaceState,
+        req: &Request<'_>,
+        handle: String,
+        label: String,
+    ) -> anyhow::Result<String> {
+        let chat = state
+            .chat(&handle)
+            .ok_or_else(|| anyhow::anyhow!("no workspace chat {handle:?}; see !chaz chat list"))?;
+        anyhow::ensure!(
+            chat.ready,
+            "chat {handle} is not ready; finish its creation first"
+        );
+        self.ensure_idle(state)?;
+        let id = state.alloc_op();
+        state.operations.push(Operation {
+            id: id.clone(),
+            kind: OpKind::Rename { handle, label },
+            requester: req.sender.to_string(),
+            event_id: req.event_id.to_string(),
+            origin_room: req.room_id.to_string(),
+            status: OpStatus::Incomplete,
+            steps: RENAME_STEPS
+                .into_iter()
+                .map(|s| (s.to_owned(), Step::Pending))
+                .collect(),
+            last_error: None,
+        });
+        self.save(state).await?;
+        self.drive(state, &id).await
     }
 
     fn ensure_idle(&self, state: &WorkspaceState) -> anyhow::Result<()> {
@@ -953,11 +1067,11 @@ impl<M: MatrixOps, S: SessionOps> Workspace<M, S> {
                         state.chat_mut(handle).unwrap().session_db_id = Some(sid.clone());
                         return Ok(Some(sid));
                     }
-                    "session.label" => {
-                        self.sessions
-                            .set_label(chat.session_db_id.as_deref().unwrap(), label)
-                            .await
-                    }
+                    "session.label" => self
+                        .sessions
+                        .set_label(chat.session_db_id.as_deref().unwrap(), label)
+                        .await
+                        .map(|_| ()),
                     "delivery" => {
                         self.sessions
                             .install_delivery(&chat.room_id, chat.session_db_id.as_deref().unwrap())
@@ -979,22 +1093,47 @@ impl<M: MatrixOps, S: SessionOps> Workspace<M, S> {
                     .map_err(failed)?;
                 match step {
                     "matrix.name" => {
+                        if self
+                            .matrix
+                            .name_matches(&chat.room_id, label)
+                            .await
+                            .map_err(failed)?
+                        {
+                            let outcome = if state.op(id).unwrap().steps[name] == Step::Attempted {
+                                "matched_after_attempt"
+                            } else {
+                                "already_matched"
+                            };
+                            return Ok(Some(outcome.into()));
+                        }
                         // A lost response or cancellation may follow a successful
                         // state write. Retain that uncertainty and require retry
                         // of the same literal name, not abandonment of half a rename.
                         set_step(state, id, name, Step::Attempted);
                         self.save(state).await.map_err(StepFailure::failed)?;
-                        self.matrix.set_name(&chat.room_id, label).await
+                        self.matrix
+                            .set_name(&chat.room_id, label)
+                            .await
+                            .map_err(failed)?;
+                        Ok(Some("changed".into()))
                     }
                     "session.label" => {
-                        self.sessions
+                        let changed = self
+                            .sessions
                             .set_label(chat.session_db_id.as_deref().unwrap(), label)
                             .await
+                            .map_err(failed)?;
+                        Ok(Some(
+                            if changed {
+                                "changed"
+                            } else {
+                                "already_matched"
+                            }
+                            .into(),
+                        ))
                     }
                     _ => unreachable!("unknown rename step {step}"),
                 }
-                .map_err(failed)?;
-                Ok(None)
             }
         }
     }
@@ -1128,7 +1267,24 @@ fn describe(state: &WorkspaceState, op: &Operation) -> String {
     let done: Vec<&str> = ordered
         .iter()
         .filter(|(_, s)| matches!(s, Step::Done(_)))
-        .map(|(n, _)| step_label(n))
+        .map(|(name, step)| match (name.as_str(), step) {
+            ("matrix.name", Step::Done(Some(outcome))) => match outcome.as_str() {
+                "changed" => "room name changed",
+                "already_matched" => "room name already matched",
+                "matched_after_attempt" => "room name verified after an unconfirmed write",
+                _ => step_label(name),
+            },
+            ("session.label", Step::Done(Some(outcome)))
+                if matches!(op.kind, OpKind::Rename { .. }) =>
+            {
+                match outcome.as_str() {
+                    "changed" => "session label changed",
+                    "already_matched" => "session label already matched",
+                    _ => step_label(name),
+                }
+            }
+            _ => step_label(name),
+        })
         .collect();
     let pending: Vec<&str> = ordered
         .iter()
@@ -1187,7 +1343,7 @@ fn describe(state: &WorkspaceState, op: &Operation) -> String {
             }
         }
         (OpKind::Rename { .. }, OpStatus::Done) => {
-            text.push_str("\nRoom and session unchanged; only the label changed.")
+            text.push_str("\nSame room, session and history.")
         }
         _ => {}
     }

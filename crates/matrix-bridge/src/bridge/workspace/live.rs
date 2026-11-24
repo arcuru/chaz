@@ -3,16 +3,20 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use chaz_core::bridge::MatrixRenameProposal;
 use chaz_core::server::Server;
+use chaz_core::session::Session;
 use matrix_sdk::config::RequestConfig;
 use matrix_sdk::deserialized_responses::RawAnySyncOrStrippedState;
 use matrix_sdk::ruma::api::client::discovery::get_capabilities;
 use matrix_sdk::ruma::api::client::room::Visibility;
 use matrix_sdk::ruma::api::client::room::create_room::v3::{Request as CreateRoom, RoomPreset};
+use matrix_sdk::ruma::api::client::state::get_state_event_for_key;
 use matrix_sdk::ruma::events::StateEventType;
+use matrix_sdk::ruma::events::room::member::MembershipState;
 use matrix_sdk::ruma::serde::Raw;
 use matrix_sdk::ruma::{OwnedRoomId, RoomVersionId, UserId};
-use matrix_sdk::{Client, Room, RoomMemberships};
+use matrix_sdk::{Client, Room, RoomMemberships, RoomState};
 use serde_json::json;
 
 use super::{CreateError, MARKER_TYPE, Marker, MatrixOps, Role, RoomSpec, SessionOps};
@@ -236,6 +240,38 @@ impl MatrixOps for LiveMatrix {
         Ok(())
     }
 
+    async fn name_matches(&self, room: &str, name: &str) -> anyhow::Result<bool> {
+        let room = self.room(room).await?;
+        anyhow::ensure!(
+            room.state() == RoomState::Joined
+                && room.get_member(self.bot()?).await?.is_some_and(|member| {
+                    member.membership() == &MembershipState::Join
+                        && member.can_send_state(StateEventType::RoomName)
+                }),
+            "the bot is not joined or lacks power to set m.room.name"
+        );
+        let request = get_state_event_for_key::v3::Request::new(
+            room.room_id().to_owned(),
+            StateEventType::RoomName,
+            String::new(),
+        );
+        match self.client.send(request).await {
+            Ok(response) => Ok(response
+                .into_content()
+                .get_field::<String>("name")?
+                .as_deref()
+                == Some(name)),
+            Err(error)
+                if error
+                    .as_client_api_error()
+                    .is_some_and(|error| error.status_code.as_u16() == 404) =>
+            {
+                Ok(false)
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
     async fn set_name(&self, room: &str, name: &str) -> anyhow::Result<()> {
         self.room(room).await?.set_name(name.to_string()).await?;
         Ok(())
@@ -328,9 +364,48 @@ impl SessionOps for LiveSessions {
         Ok(())
     }
 
-    async fn set_label(&self, session: &str, label: &str) -> anyhow::Result<()> {
+    async fn set_label(&self, session: &str, label: &str) -> anyhow::Result<bool> {
         let (_conv, db) = self.server.registry().open_session(session).await?;
+        if chaz_core::session::try_read_meta_from_db(&db)
+            .await?
+            .description
+            .as_deref()
+            == Some(label)
+        {
+            return Ok(false);
+        }
         chaz_core::session::set_session_description(&db, Some(label)).await?;
-        Ok(())
+        Ok(true)
+    }
+
+    async fn rename_proposal(
+        &self,
+        room: &str,
+        session: &str,
+        proposal: &str,
+    ) -> anyhow::Result<MatrixRenameProposal> {
+        let agent = owning_agent_entry(&self.server, &self.owning_agent)
+            .ok_or_else(|| anyhow::anyhow!("owning agent is not hosted"))?;
+        let (_, db) = crate::bridge::resolve_workspace_session(
+            &self.server,
+            &agent,
+            &self.login_id,
+            room,
+            session,
+        )
+        .await?;
+        let session = Session::try_new(
+            chaz_core::types::ConversationId(db.root_id().to_string()),
+            db,
+        )
+        .await?;
+        session
+            .entries_with_ids()
+            .find_map(|(id, entry)| {
+                (id.as_str() == proposal && entry.sender == self.owning_agent)
+                    .then(|| MatrixRenameProposal::from_entry(entry))
+                    .flatten()
+            })
+            .ok_or_else(|| anyhow::anyhow!("no matching rename proposal in this chat"))
     }
 }
