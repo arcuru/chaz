@@ -1740,3 +1740,39 @@ ws_say "$CHAT_ID" "!chaz deny"
 ws_expect "$CHAT_ID" "$MARKER workspace-approval-denied"
 grep -qF 'stub_llm: workspace approval denied' "$WORKSPACE/stub-llm.log" || fail "denial did not reach the requesting turn"
 printf '\033[1;32mPASS\033[0m — workspace approvals: prompt and denied final only in intended chat; sibling decision cannot resolve it\n' >&2
+
+log "Case W5: only same-room exact confirmation changes both titles"
+ws_name_event() { ws_state "$1" | jq -ce '.[] | select(.type == "m.room.name") | {event_id, name: .content.name}'; }
+NAME_BEFORE="$(ws_name_event "$CHAT_ID")"
+SIBLING_NAME_BEFORE="$(ws_name_event "$OTHER_CHAT_ID")"
+[[ $(jq -r .name <<<"$NAME_BEFORE") == "Winter bike" ]] || fail "missing original Matrix name"
+WORKSPACE_SESSION_ID="$(sed -E $'s/\x1B\\[[0-9;]*[[:alpha:]]//g' "$BRIDGE_LOG" |
+    awk -v room="$CHAT_ID" '/Matrix outbound delivery installed/ && $NF == "room_id=" room {
+        for (i=1; i<NF; i++) if ($i ~ /^session_db_id=/) print substr($i, 15)
+    }')"
+[[ $WORKSPACE_SESSION_ID =~ ^[a-z0-9]+$ ]] || fail "could not identify the workspace session before rename"
+ws_say "$CHAT_ID" "Rename this chat to Storm commute"
+ws_expect "$CHAT_ID" "!chaz chat confirm-rename"
+CONFIRMATION="$(sed -n 's/^stub_llm: workspace rename confirmation: //p' "$WORKSPACE/stub-llm.log")"
+[[ $CONFIRMATION == '!chaz chat confirm-rename '*" Storm commute" ]] || fail "missing exact rename proposal"
+[[ $(ws_name_event "$CHAT_ID") == "$NAME_BEFORE" ]] || fail "tool changed the room name before confirmation"
+
+ws_say "$OTHER_CHAT_ID" "$CONFIRMATION"
+ws_expect "$OTHER_CHAT_ID" "no matching rename proposal in this chat"
+ws_say "$CHAT_ID" "${CONFIRMATION%Storm commute}Wrong title"
+ws_expect "$CHAT_ID" "the title does not match the proposal"
+[[ $(ws_name_event "$CHAT_ID") == "$NAME_BEFORE" ]] || fail "denied confirmation changed the room name"
+ws_say "$CHAT_ID" '!chaz info'
+ws_expect "$CHAT_ID" "Description: Winter bike"
+
+ws_say "$CHAT_ID" "$CONFIRMATION"
+ws_expect "$CHAT_ID" "Done: room name changed, session label changed."
+[[ $(ws_name_event "$CHAT_ID" | jq -r .name) == "Storm commute" ]] || fail "confirmed Matrix name not visible"
+[[ $(ws_name_event "$OTHER_CHAT_ID") == "$SIBLING_NAME_BEFORE" ]] || fail "rename touched the sibling room"
+ws_say "$CHAT_ID" '!chaz info'
+ws_expect "$CHAT_ID" "Session: $WORKSPACE_SESSION_ID"$'\n'"Description: Storm commute"
+ws_say "$CHAT_ID" "$CONFIRMATION"
+ws_expect "$CHAT_ID" "no current unconfirmed manager request"
+ws_say "$CHAT_ID" "workspace rename continuity ping"
+ws_expect "$CHAT_ID" "$MARKER rename-continuity"
+printf '\033[1;32mPASS\033[0m — workspace rename: proposal alone and denied confirmation changed neither title; exact confirmation renamed the same room and session; follow-up kept its history\n' >&2

@@ -207,6 +207,11 @@ are encrypted:
 - **Restarts (W4):** after both the bridge and daemon restart, the same chat
   answers, `chat list` still shows it, no replacement session is created and no
   second room appears.
+- **Confirmed rename (W5):** the stub calls `matrix__rename`. The proposal,
+  a confirmation in the sibling chat, and a confirmation with a different
+  title leave the labels alone. The exact confirmation changes the Matrix
+  name and the original session's description. A fresh message in the same
+  room still reaches the preceding conversation.
 
 Room-creation uncertainty and partial-step recovery are covered by the bridge's
 hermetic unit tests. This harness does not inject network faults or verify a

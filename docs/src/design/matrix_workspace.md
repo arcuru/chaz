@@ -17,13 +17,14 @@ what is deliberately deferred.
   Each gets a new session; nothing existing is enrolled, imported or moved.
 - A small message-command vocabulary (`!chaz workspace …`, `!chaz chat …`).
   Messages, not slash commands, because Matrix clients may intercept unknown
-  slash commands. No model interprets a management command or writes a title.
+  slash commands. Management commands do not run a model. The agent can
+  propose a name for the current chat; it cannot confirm or write it.
 - Personal audience: the configured manager and the bot. Invitations are
   explicit, never derived from Space membership.
 
 Deferred, and not implied by anything in v1: archive, a threaded Inbox,
 adopting an existing room, promoting a thread to a room, nested project
-Spaces, and autonomous management.
+Spaces, and proactive management.
 
 ## Contracts
 
@@ -37,6 +38,17 @@ bridge configured differently refuses to act on it.
 login's `workspace_manager` MXID, after the ordinary allow-list and decrypted
 event path. Room membership never substitutes, and a manager change refuses
 the existing record rather than inheriting it.
+
+**A rename proposal is not authorization.** The tool writes a typed, inert
+proposal to the current session; it carries the exact input row ID and literal
+title, not a room or actor supplied by the model. The Matrix bridge keeps one
+short-lived, unconsumed manager input row per ready chat after live ingress. A
+matching session row alone is not proof of a Matrix sender. The bridge looks up
+the proposal in that chat and requires a separate command from the manager
+there, with the exact title, before admitting a regular journaled rename. This
+does not use generic tool approval. Restart loses pending confirmations, not
+confirmed operations. Older peers ignore the proposal role; it is neither a
+user message nor an outbound post on the session wire.
 
 **A conversational proposal is not a command.** `matrix__new_chat` writes
 an inert proposal to the originating session. That row cannot grant authority
@@ -100,8 +112,8 @@ operation is unfinished at a time. Partial results are reported step by step
 and continue only on an explicit `retry`; `cancel` never deletes, leaves or
 re-permissions a room. A Matrix rename is also marked attempted before its
 state write. Once attempted, it cannot be cancelled: a lost response may have
-left only the Matrix name changed. Retry sets the same literal name and finishes
-the session label.
+left only the Matrix name changed. Retry checks the name at the homeserver,
+sets the same literal name if still needed, and finishes the session label.
 
 **Privacy is set explicitly.** Each room is created invite-only, with joined
 history visibility, guest access forbidden, no directory entry and no
@@ -131,8 +143,9 @@ Future direction, not current scope:
 - **Archive** means moving a chat under an Archive sub-Space of the workspace,
   keeping its room, session and history. It does not mean hiding a chat by
   removing it from the workspace, pausing it, or leaving or deleting the room.
-- Keeping the Matrix name and topic in step with session metadata (such as the
-  model) would disclose that metadata into room state and needs its own decision.
+- **Other model-callable management** would need its own authorization contract
+  before calling the journaled operations. Mirroring operational metadata such
+  as model names into Matrix room state also needs its own decision.
 - The command-only Lobby is a v1 constraint, not a permanent rule.
 
 ## Code map

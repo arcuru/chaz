@@ -118,6 +118,16 @@ impl MatrixOps for FakeMatrix {
         hs.parents.push((child.into(), space.into()));
         Ok(())
     }
+    async fn name_matches(&self, room: &str, name: &str) -> anyhow::Result<bool> {
+        self.fail("name_power")?;
+        let hs = self.0.lock().unwrap();
+        Ok(hs.names.get(room).map(String::as_str).or_else(|| {
+            hs.rooms
+                .iter()
+                .find(|(id, _)| id == room)
+                .map(|(_, spec)| spec.name.as_str())
+        }) == Some(name))
+    }
     async fn set_name(&self, room: &str, name: &str) -> anyhow::Result<()> {
         self.fail("set_name")?;
         let mut hs = self.0.lock().unwrap();
@@ -134,8 +144,9 @@ struct Registry {
     by_source: HashMap<String, String>,
     bindings: HashMap<String, String>,
     labels: HashMap<String, String>,
+    proposals: HashMap<(String, String), (String, String)>,
     delivery: HashSet<(String, String)>,
-    proposals: HashMap<(String, String), MatrixNewChatProposal>,
+    new_chat_proposals: HashMap<(String, String), MatrixNewChatProposal>,
     creates: usize,
     fail_once: HashSet<&'static str>,
 }
@@ -205,14 +216,32 @@ impl SessionOps for FakeSessions {
         );
         Ok(())
     }
-    async fn set_label(&self, session: &str, label: &str) -> anyhow::Result<()> {
+    async fn set_label(&self, session: &str, label: &str) -> anyhow::Result<bool> {
         self.fail("label")?;
-        self.0
+        let previous = self
+            .0
             .lock()
             .unwrap()
             .labels
             .insert(session.into(), label.into());
-        Ok(())
+        Ok(previous.as_deref() != Some(label))
+    }
+    async fn rename_proposal(
+        &self,
+        room: &str,
+        session: &str,
+        proposal: &str,
+    ) -> anyhow::Result<MatrixRenameProposal> {
+        self.check_binding(room, session).await?;
+        let registry = self.0.lock().unwrap();
+        let (request_id, title) = registry
+            .proposals
+            .get(&(session.into(), proposal.into()))
+            .ok_or_else(|| anyhow::anyhow!("no matching rename proposal in this chat"))?;
+        Ok(MatrixRenameProposal {
+            request_id: request_id.clone(),
+            title: title.clone(),
+        })
     }
     async fn new_chat_proposal(
         &self,
@@ -224,7 +253,7 @@ impl SessionOps for FakeSessions {
         self.0
             .lock()
             .unwrap()
-            .proposals
+            .new_chat_proposals
             .get(&(session.into(), token.into()))
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("no matching new chat proposal in this chat"))
@@ -641,7 +670,7 @@ async fn exact_manager_confirmation_admits_one_recoverable_new_chat() {
     let command = "chat confirm-new token New  chat";
     // Even a decodable proposal is inert without live manager ingress.
     for token in ["token", "second-token"] {
-        h.reg.0.lock().unwrap().proposals.insert(
+        h.reg.0.lock().unwrap().new_chat_proposals.insert(
             (session.into(), token.into()),
             MatrixNewChatProposal {
                 request_id: "original-turn".into(),
@@ -1032,7 +1061,7 @@ async fn rename_is_literal_and_reports_partial_success() {
         session_db_id: None,
     });
     let reply = h.send(chat.clone(), "chat rename Winter bike").await;
-    assert!(reply.contains("Done: room name set."), "{reply}");
+    assert!(reply.contains("Done: room name changed."), "{reply}");
     assert!(reply.contains("Pending: session label set."), "{reply}");
     let state = h.state().await;
     let room = state.chats[0].room_id.clone();
@@ -1045,12 +1074,20 @@ async fn rename_is_literal_and_reports_partial_success() {
     let cancel = h.lobby("workspace cancel op-3").await;
     assert!(cancel.contains("finish the session label"), "{cancel}");
     let reply = h.lobby("workspace retry op-3").await;
-    assert!(reply.contains("only the label changed"), "{reply}");
+    assert!(
+        reply.contains("Done: room name changed, session label changed."),
+        "{reply}"
+    );
     let state = h.state().await;
     assert_eq!(state.chats[0].label, "Winter bike");
     assert_eq!(state.chats[0].room_id, room);
     let sid = state.chats[0].session_db_id.clone().unwrap();
     assert_eq!(h.reg.0.lock().unwrap().labels[&sid], "Winter bike");
+    let already = h.lobby("chat rename c1 Winter bike").await;
+    assert!(
+        already.contains("Done: room name already matched, session label already matched."),
+        "{already}"
+    );
 
     // Lobby form names the chat by handle.
     let reply = h.lobby("chat rename c1 Spring bike").await;
@@ -1135,6 +1172,10 @@ async fn lost_rename_response_cannot_abandon_inconsistent_labels() {
         .unwrap();
     assert!(reply.contains("done"), "{reply}");
     let after = h.state().await;
+    assert!(
+        reply.contains("room name verified after an unconfirmed write"),
+        "{reply}"
+    );
     assert_eq!(after.chats[0].label, "Winter bike");
     assert_eq!(
         h.reg.0.lock().unwrap().labels[chat.session_db_id.as_ref().unwrap()],
@@ -1142,6 +1183,94 @@ async fn lost_rename_response_cannot_abandon_inconsistent_labels() {
     );
     assert_eq!(after.chats[0].room_id, chat.room_id);
     assert_eq!(after.chats[0].session_db_id, chat.session_db_id);
+}
+
+#[tokio::test]
+async fn confirmed_rename_requires_the_manager_exact_title_and_live_request_once() {
+    let h = harness("12").await;
+    h.setup().await;
+    h.lobby("chat new Bike repair").await;
+    h.lobby("chat new Sibling").await;
+    let before = h.state().await;
+    let chat = &before.chats[0];
+    let sibling = &before.chats[1];
+    let sid = chat.session_db_id.as_deref().unwrap();
+    h.reg.0.lock().unwrap().proposals.insert(
+        (sid.into(), "proposal".into()),
+        ("turn".into(), "Winter bike".into()),
+    );
+    let confirm = async |sender, room, command| {
+        h.ws.handle(Request {
+            sender,
+            event_id: &h.next_event(),
+            room_id: room,
+            origin: Origin::Managed(h.ws.index().get(room).unwrap()),
+            command,
+        })
+        .await
+        .unwrap()
+    };
+    let command = "chat confirm-rename proposal Winter bike";
+    let outsider = "@guest:example.org";
+    h.ws.remember_rename_request(outsider, &chat.room_id, sid, "turn");
+    assert!(
+        confirm(MANAGER, &chat.room_id, command)
+            .await
+            .contains("no current unconfirmed manager request")
+    );
+    h.ws.remember_rename_request(MANAGER, &chat.room_id, sid, "different-turn");
+    assert!(
+        confirm(MANAGER, &chat.room_id, command)
+            .await
+            .contains("no current unconfirmed manager request")
+    );
+    h.ws.remember_rename_request(MANAGER, &chat.room_id, sid, "turn");
+    assert!(
+        confirm(outsider, &chat.room_id, command)
+            .await
+            .contains("limited to the configured manager")
+    );
+    assert!(
+        confirm(MANAGER, &sibling.room_id, command)
+            .await
+            .contains("no matching rename proposal")
+    );
+    assert!(
+        confirm(
+            MANAGER,
+            &chat.room_id,
+            "chat confirm-rename proposal Different title"
+        )
+        .await
+        .contains("does not match")
+    );
+    assert_eq!(h.state().await, before);
+
+    h.hs.0.lock().unwrap().fail_once.insert("name_power");
+    let denied = confirm(MANAGER, &chat.room_id, command).await;
+    assert!(denied.contains("injected name_power failure"), "{denied}");
+    assert!(!h.hs.0.lock().unwrap().names.contains_key(&chat.room_id));
+    assert_eq!(h.reg.0.lock().unwrap().labels[sid], "Bike repair");
+    assert_eq!(h.state().await.chats, before.chats);
+
+    // Retry a confirmed operation, not the proposal. Only its literal title
+    // can be applied; replay must not create another operation.
+    let reply = h.lobby("workspace retry op-4").await;
+    assert!(
+        reply.contains("room name changed, session label changed"),
+        "{reply}"
+    );
+    let after = h.state().await;
+    assert_eq!(after.chats[0].room_id, chat.room_id);
+    assert_eq!(after.chats[0].session_db_id.as_deref(), Some(sid));
+    assert_eq!(h.hs.0.lock().unwrap().names[&chat.room_id], "Winter bike");
+    assert_eq!(h.reg.0.lock().unwrap().labels[sid], "Winter bike");
+    assert!(
+        confirm(MANAGER, &chat.room_id, command)
+            .await
+            .contains("no current unconfirmed manager request")
+    );
+    assert_eq!(h.state().await, after);
 }
 
 #[test]

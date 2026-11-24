@@ -1529,6 +1529,7 @@ impl Bridge for MatrixBridge {
                         }
                         match session.add_bridge_input(entry, wake).await {
                             Ok(request) if managed_chat && session.entries().last().is_some_and(|entry| entry.entry_type == chaz_core::session::EntryType::Message) => {
+                                workspace.remember_rename_request(event.sender.as_str(), &room_id, &session_db_id, request.as_str());
                                 workspace.remember_new_chat_request(event.sender.as_str(), &room_id, &session_db_id, request);
                             }
                             Ok(_) => {}

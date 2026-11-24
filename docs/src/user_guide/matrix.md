@@ -344,19 +344,20 @@ Commands are sent as Matrix messages. Session ops go through the same transport-
 Only the login's configured `workspace_manager` may run these; see
 [Personal workspace](#personal-workspace-space-lobby-and-named-chats).
 
-| Command                                           | Where                                | Description                                                              |
-| ------------------------------------------------- | ------------------------------------ | ------------------------------------------------------------------------ |
-| `!chaz workspace help`                            | anywhere                             | Show the workspace vocabulary                                            |
-| `!chaz workspace setup`                           | direct chat with the bot             | Preview the Space and Lobby, with room version and creator powers        |
-| `!chaz workspace confirm <op>`                    | direct chat with the bot             | Create the previewed Space and Lobby                                     |
-| `!chaz workspace status [<op>]`                   | workspace chat, Lobby or direct chat | Workspace summary, or the exact progress of one operation                |
-| `!chaz workspace retry <op>`                      | workspace chat, Lobby or direct chat | Continue an incomplete operation, or re-check an uncertain room creation |
-| `!chaz workspace cancel <op>`                     | Lobby or direct chat                 | Stop an unfinished operation; deletes nothing                            |
-| `!chaz chat new <name>`                           | Lobby                                | Create a fresh named chat room with its own new session                  |
-| `!chaz chat confirm-new <proposal> <exact title>` | original workspace chat              | Confirm the agent's proposal and get the new chat's link                 |
-| `!chaz chat list`                                 | Lobby                                | List this workspace's chats with their handles (`c1`, `c2`, …) and links |
-| `!chaz chat rename <chat> <name>`                 | Lobby                                | Rename a chat by handle; the room and session stay the same              |
-| `!chaz chat rename <name>`                        | inside a workspace chat              | Rename this chat                                                         |
+| Command                                              | Where                            | Description                                                              |
+| ---------------------------------------------------- | -------------------------------- | ------------------------------------------------------------------------ |
+| `!chaz workspace help`                               | anywhere                         | Show the workspace vocabulary                                            |
+| `!chaz workspace setup`                              | direct chat with the bot         | Preview the Space and Lobby, with room version and creator powers        |
+| `!chaz workspace confirm <op>`                       | direct chat with the bot         | Create the previewed Space and Lobby                                     |
+| `!chaz workspace status [<op>]`                      | Lobby or direct chat             | Workspace summary, or the exact progress of one operation                |
+| `!chaz workspace retry <op>`                         | Lobby or direct chat             | Continue an incomplete operation, or re-check an uncertain room creation |
+| `!chaz workspace cancel <op>`                        | Lobby or direct chat             | Stop an unfinished operation; deletes nothing                            |
+| `!chaz chat new <name>`                              | Lobby                            | Create a fresh named chat room with its own new session                  |
+| `!chaz chat list`                                    | Lobby                            | List this workspace's chats with their handles (`c1`, `c2`, …) and links |
+| `!chaz chat rename <chat> <name>`                    | Lobby                            | Rename a chat by handle; the room and session stay the same              |
+| `!chaz chat rename <name>`                           | inside a workspace chat          | Rename this chat                                                         |
+| `!chaz chat confirm-rename <proposal> <exact title>` | inside the chat that proposed it | Confirm the agent's exact title once                                     |
+| `!chaz chat confirm-new <proposal> <exact title>`    | original workspace chat          | Confirm the agent's proposal and get the new chat's link                 |
 
 ## Attached rooms and reply routing
 
@@ -701,8 +702,9 @@ What is automatic and what you do:
   be revoked, so the bot keeps it. An unrecognised room version refuses setup.
 - **Names are literal labels.** `chat rename` sets the room name and the
   session's [description](tui.md#session-descriptions) to exactly what you
-  typed; no model writes titles. The model-based `!chaz rename` is refused in
-  workspace chats. Rooms and sessions are identified by ID, never by name.
+  typed. You can also ask the agent to propose a title and confirm it yourself.
+  The older model-based `!chaz rename` is refused in workspace chats. Rooms
+  and sessions are identified by ID, never by name.
 - **Bindings are fixed.** `attach`, `detach` and `participation` are refused
   in workspace chats, and the bot never creates a replacement session for a
   chat whose session it cannot open. Literal rename and approval reactions also
@@ -737,7 +739,7 @@ is an operation (`op-N`) with saved step progress:
   the operation and investigate storage/sync rather than creating another DB.
 - One operation runs at a time; a new request waits until the unfinished one
   is retried or cancelled. Repeated delivery of the same command returns the
-  same report. Bridge restarts keep the journal; nothing resumes on its own.
+  same report. Bridge restarts keep admitted operations; nothing resumes on its own.
 - Cancel never deletes or leaves a room. A room an operation already created
   stays as it is, marked "not ready" in `chat list`, and setup cannot be
   cancelled once it created a room — retry it instead. The same holds for a
@@ -745,8 +747,50 @@ is an operation (`op-N`) with saved step progress:
   a lost response may hide a successful write. Retry the same literal rename
   to finish both labels rather than cancelling it.
 
-There is no archive, threaded Inbox, existing-room adoption, nested Space or
-automatic management.
+V1 has no archive, threaded Inbox, existing-room adoption or nested Spaces.
+
+### Ask the agent to rename this chat
+
+Ask from inside the workspace chat, using the manager's Matrix account. The
+agent's `matrix__rename` tool proposes a title, but it doesn't write either
+label. Only the configured manager can confirm, by sending the bot's command
+with the exact title in that same room. Joining the room, allowing a tool call
+or sending a reaction does not count as confirmation.
+
+The proposal must match your most recent message to the agent in that chat.
+Confirm within five minutes of that message. If the bridge restarts or the
+proposal expires, ask again. The bot also needs permission to set the Matrix
+room name; it reports separate results for the room name and the Chaz session
+description. The room topic, room ID and session ID stay the same.
+If the agent uses a tool allowlist, it needs `matrix__rename` on that list.
+
+1. In **Bike repair**, ask “Rename this chat to Winter bike.” The agent gives
+   you a command. Nothing is renamed yet.
+
+   ```text
+   !chaz chat confirm-rename 37fcf843-b94a-4eca-a248-12ef552cdb90 Winter bike
+   ```
+
+2. If you change the end of that command to `Spring bike`, the bot refuses
+   and leaves both labels alone:
+
+   ```text
+   !chaz Error: the title does not match the proposal; nothing was renamed
+   ```
+
+3. Send the exact command from step 1 in **Bike repair**. Keep talking in the
+   same room after your Matrix client shows the new name.
+
+   ```text
+   op-4: rename c1 to “Winter bike” — done.
+   Done: room name changed, session label changed.
+   Same room, session and history.
+   ```
+
+   If only one label was updated, use `!chaz workspace retry op-4` to finish
+   the confirmed operation. To skip the agent and confirmation entirely, type
+   `!chaz chat rename Winter bike` in the chat. In the Lobby, use the handle:
+   `!chaz chat rename c1 Winter bike`.
 
 ### Start another chat without leaving this one
 
@@ -885,8 +929,8 @@ unreadable binding.
 
    > !chaz chat rename c1 Winter bike
    op-4: rename c1 to “Winter bike” — done.
-   Done: room name set, session label set.
-   Room and session unchanged; only the label changed.
+   Done: room name changed, session label changed.
+   Same room, session and history.
    ```
 
    Typing an ordinary message in the Lobby gets a reminder that it is

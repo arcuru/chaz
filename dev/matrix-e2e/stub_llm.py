@@ -363,6 +363,30 @@ class Handler(BaseHTTPRequestHandler):
                 return
             self._send({"error": "workspace new-chat proposal missing or incorrect"}, status=400)
             return
+        if "Rename this chat to Storm commute" in latest_user:
+            if not has_tool_result and "matrix__rename" in tools:
+                self._fixture_reply(name="matrix__rename", call_id="workspace-rename",
+                                    arguments={"title": "Storm commute"})
+                return
+            result = messages[-1]
+            content = result.get("content", "")
+            prefix = '<tool_output tool="matrix__rename">\n'
+            if (result.get("role") == "tool" and result.get("tool_call_id") == "workspace-rename"
+                    and content.startswith(prefix) and content.endswith("\n</tool_output>")):
+                lines = content.removeprefix(prefix).removesuffix("\n</tool_output>").splitlines()
+                if (len(lines) == 2 and lines[0].startswith("No title has changed.")
+                        and re.fullmatch(r"!chaz chat confirm-rename [\w-]+ Storm commute", lines[1])):
+                    sys.stderr.write("stub_llm: workspace rename confirmation: " + lines[1] + "\n")
+                    self._fixture_reply(content=lines[1])
+                    return
+            self._send({"error": "workspace rename proposal result missing or incorrect"}, status=400)
+            return
+        if "workspace rename continuity ping" in latest_user:
+            if "Rename this chat to Storm commute" not in user_text:
+                self._send({"error": "rename lost the conversation history"}, status=400)
+                return
+            self._fixture_reply(content=self.server.reply + " rename-continuity")
+            return
         if "workspace approval probe" in latest_user:
             if has_tool_result:
                 result = messages[-1]
