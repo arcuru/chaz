@@ -71,6 +71,8 @@ enum Command {
         room: OwnedRoomId,
         #[arg(long)]
         body: String,
+        #[arg(long)]
+        mention: Option<OwnedUserId>,
     },
     /// Wait for a new message from `sender` in `room`. By default it must be
     /// encrypted on the wire, decrypt, and contain `contains`. With
@@ -238,7 +240,11 @@ async fn main() -> anyhow::Result<()> {
                 );
             }
         }
-        Command::Send { room, body } => {
+        Command::Send {
+            room,
+            body,
+            mention,
+        } => {
             let (client, mut saved) = restore(&args.dir).await?;
             sync(&client, &mut saved, &args.dir).await?;
             let room = client.get_room(&room).context("unknown room")?;
@@ -246,7 +252,11 @@ async fn main() -> anyhow::Result<()> {
                 room.latest_encryption_state().await?.is_encrypted(),
                 "room is not encrypted"
             );
-            let response = room.send(RoomMessageEventContent::text_plain(body)).await?;
+            let mut content = RoomMessageEventContent::text_plain(body);
+            if let Some(user) = mention {
+                content.mentions = Some(matrix_sdk::ruma::events::Mentions::with_user_ids([user]));
+            }
+            let response = room.send(content).await?;
             println!("{}", response.response.event_id);
         }
         Command::Expect {

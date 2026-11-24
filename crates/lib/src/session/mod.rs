@@ -1847,6 +1847,57 @@ impl Session {
             .collect())
     }
 
+    /// An external effect may be tied to the first execution of a waking
+    /// message, never to a /retry or a completed/interrupted attempt. Check
+    /// activity and the exact attempt in the same verified view.
+    pub async fn is_live_initial_turn(
+        &self,
+        snapshot: &Snapshot,
+        request: &TurnRequestId,
+        attempt_id: &str,
+    ) -> anyhow::Result<bool> {
+        let mut attempts = self
+            .read_turn_attempts_at(snapshot)
+            .await?
+            .into_iter()
+            .map(|(_, attempt)| attempt)
+            .filter(|attempt| &attempt.request_id == request);
+        let Some(attempt) = attempts.next() else {
+            return Ok(false);
+        };
+        if attempts.next().is_some()
+            || attempt.attempt_id != attempt_id
+            || attempt.generation != 1
+            || attempt.status != TurnAttemptStatus::Started
+            || stop_request_for_turn(self.entries(), &attempt, |_| false).is_some()
+        {
+            return Ok(false);
+        }
+        let txn = self.database.new_transaction_at(snapshot).await?;
+        let store = txn
+            .get_store::<Table<DateTime<Utc>>>(TURN_ACTIVITY_STORE)
+            .await?;
+        let heartbeat = match store.get(attempt_id).await {
+            Ok(time) => time,
+            Err(e) if e.is_not_found() => attempt.started_at,
+            Err(e) => return Err(e.into()),
+        };
+        if !fresh_activity(heartbeat, Utc::now()) {
+            return Ok(false);
+        }
+        // Local steering may add new instructions to this same attempt. It
+        // must not inherit the identity of the Matrix message that woke it.
+        let steered = txn
+            .get_store::<Table<TurnTranscriptRecord>>(TURN_TRANSCRIPT_STORE)
+            .await?
+            .search(|record| {
+                record.attempt_id == attempt_id
+                    && matches!(record.message, TurnTranscriptMessage::Steering { .. })
+            })
+            .await?;
+        Ok(steered.is_empty())
+    }
+
     /// Read activity using this handle's identity and the native Verified view.
     pub async fn turn_activity(database: &Database) -> anyhow::Result<TurnActivity> {
         let txn = database.new_transaction().await?;
@@ -2572,6 +2623,56 @@ pub fn trailing_agent_message_burst(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn only_the_original_unsteered_attempt_can_carry_bridge_actions() {
+        let (_instance, _user, db) = test_helpers::test_session_db().await;
+        let sid = ConversationId(db.root_id().to_string());
+        let mut session = Session::new(sid.clone(), db.clone()).await;
+        let wake = session
+            .add_entry(SessionEntry {
+                sender: "manager".into(),
+                content: "rename this chat".into(),
+                timestamp: Utc::now(),
+                entry_type: EntryType::Message,
+                metadata: None,
+                routing: None,
+            })
+            .await
+            .unwrap();
+        let original = session.start_turn_attempt(wake.clone()).await.unwrap();
+        let check = async |attempt: &TurnAttempt, request: &TurnRequestId| {
+            let snapshot = db.snapshot().await.unwrap();
+            let view = Session::try_new_at(sid.clone(), db.clone(), &snapshot)
+                .await
+                .unwrap();
+            view.is_live_initial_turn(&snapshot, request, &attempt.attempt_id)
+                .await
+                .unwrap()
+        };
+        assert!(check(&original, &wake).await);
+        assert!(!check(&original, &TurnRequestId::parse("another wake")).await);
+        session
+            .append_turn_transcript(
+                TurnTranscriptRecord {
+                    request_id: wake.clone(),
+                    attempt_id: original.attempt_id.clone(),
+                    sequence: 1,
+                    timestamp: Utc::now(),
+                    identity: None,
+                    message: TurnTranscriptMessage::Steering {
+                        model_sequence: 1,
+                        inputs: Vec::new(),
+                    },
+                },
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        assert!(!check(&original, &wake).await);
+        let retry = session.start_turn_attempt(wake.clone()).await.unwrap();
+        assert!(!check(&retry, &wake).await);
+    }
+
     #[tokio::test]
     async fn stop_requires_session_write_authority() {
         let (instance, _user, db) = test_session_db().await;

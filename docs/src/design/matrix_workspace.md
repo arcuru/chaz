@@ -12,13 +12,13 @@ what is deliberately deferred.
 - One private, bot-created Space and one real Lobby room. The Lobby carries
   management commands only: it has no session and never wakes a model.
 - Chats are created only by an explicit, authenticated `!chaz chat new <name>`
-  in the Lobby or `!chaz chat confirm-new <proposal> <exact title>` in the
-  workspace chat that proposed it.
+  in the Lobby or by asking the agent on an addressed, live manager turn
+  in a ready workspace chat.
   Each gets a new session; nothing existing is enrolled, imported or moved.
 - A small message-command vocabulary (`!chaz workspace …`, `!chaz chat …`).
   Messages, not slash commands, because Matrix clients may intercept unknown
-  slash commands. Management commands do not run a model. The agent can
-  propose a name for the current chat; it cannot confirm or write it.
+  slash commands. Management commands do not run a model. The agent may
+  request a typed action, not post management commands on behalf of the manager.
 - Personal audience: the configured manager and the bot. Invitations are
   explicit, never derived from Space membership.
 
@@ -39,25 +39,24 @@ login's `workspace_manager` MXID, after the ordinary allow-list and decrypted
 event path. Room membership never substitutes, and a manager change refuses
 the existing record rather than inheriting it.
 
-**A rename proposal is not authorization.** The tool writes a typed, inert
-proposal to the current session; it carries the exact input row ID and literal
-title, not a room or actor supplied by the model. The Matrix bridge keeps one
-short-lived, unconsumed manager input row per ready chat after live ingress. A
-matching session row alone is not proof of a Matrix sender. The bridge looks up
-the proposal in that chat and requires a separate command from the manager
-there, with the exact title, before admitting a regular journaled rename. This
-does not use generic tool approval. Restart loses pending confirmations, not
-confirmed operations. Older peers ignore the proposal role; it is neither a
-user message nor an outbound post on the session wire.
+**An action request is not authorization.** The daemon copies the waking row
+and attempt IDs and Matrix source coordinates from the active tool context,
+not from model arguments. A typed request row is inert without a watcher
+started from the actual Matrix ingress. Under the operation lock the bridge
+matches the sender and event from live, decrypted Matrix sync, resolves the
+same login, room and session, and checks that the original turn is still
+active and has not incorporated steering from a separate input.
+Neither backfill, a later retry of the turn, ambient wake nor an attached
+local frontend grants authority. The tool receives the bridge's result for
+that request row, not an approval prompt or a queued-success claim. Old
+proposal rows remain readable but never start actions.
 
-**A conversational proposal is not a command.** `matrix__new_chat` writes
-an inert proposal to the originating session. That row cannot grant authority
-to make a Matrix write. The bridge remembers the latest live turn request it
-accepted from the manager per ready chat, not an actor supplied by the tool or
-inferred from session history. A confirmation must name the proposal in that
-still-bound session and repeat its exact title. It consumes that turn's grant
-and starts the same journaled operation as the Lobby command. Restarts do not
-restore unconfirmed grants; retries of confirmed operations use the journal.
+**One action per waking event.** The operation journal records the trusted
+Matrix event ID. Duplicate tool calls with the same action and title return
+the recorded outcome; a different action on that event is refused. Bridge
+restart loses the live watcher, not admitted operations. Read-only status and
+explicit human retry are the recovery path when a tool result or Matrix
+response is missing; no transport replay is authorized.
 
 **Workspace rooms stay out of generic session paths.** The message handler
 routes every event through `workspace::route` before history bootstrap or any

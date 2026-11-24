@@ -207,15 +207,19 @@ are encrypted:
 - **Restarts (W4):** after both the bridge and daemon restart, the same chat
   answers, `chat list` still shows it, no replacement session is created and no
   second room appears.
-- **Confirmed rename (W5):** the stub calls `matrix__rename`. The proposal,
-  a confirmation in the sibling chat, and a confirmation with a different
-  title leave the labels alone. The exact confirmation changes the Matrix
-  name and the original session's description. A fresh message in the same
-  room still reaches the preceding conversation.
+- **Conversational new chat (W3):** one manager message returns a private
+  link to a fresh session. The stub requests the same action twice in one
+  turn; the relay counts exactly one create. Each room sees its own history.
+- **Conversational rename (W5):** one manager message changes both labels.
+  The original session, room, and transcript remain in place.
+- **Uncertain create (W6):** the bridge's loopback relay hides Synapse's
+  successful create response with a 502. The tool reports uncertainty;
+  `workspace retry` finds the original marked room and provisions it
+  without another create request.
+- **Guest denial (W7):** a joined, allowlisted third user explicitly addresses
+  the bot and reaches the rename tool, but the bridge refuses both writes.
 
-Room-creation uncertainty and partial-step recovery are covered by the bridge's
-hermetic unit tests. This harness does not inject network faults or verify a
-particular desktop or mobile client's navigation UI.
+This harness does not verify a desktop or mobile client's navigation UI.
 
 ## Transport
 

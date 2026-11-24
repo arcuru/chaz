@@ -20,6 +20,8 @@ pub enum BridgeEventRole {
     Receipt,
     MatrixRenameProposal,
     MatrixNewChatProposal,
+    MatrixWorkspaceRequest,
+    MatrixWorkspaceResult,
 }
 
 impl BridgeEventRole {
@@ -30,6 +32,8 @@ impl BridgeEventRole {
             Self::Receipt => "receipt",
             Self::MatrixRenameProposal => "matrix_rename_proposal",
             Self::MatrixNewChatProposal => "matrix_new_chat_proposal",
+            Self::MatrixWorkspaceRequest => "matrix_workspace_request",
+            Self::MatrixWorkspaceResult => "matrix_workspace_result",
         }
     }
 }
@@ -67,6 +71,8 @@ impl BridgeEvent {
             "receipt" => Some(BridgeEventRole::Receipt),
             "matrix_rename_proposal" => Some(BridgeEventRole::MatrixRenameProposal),
             "matrix_new_chat_proposal" => Some(BridgeEventRole::MatrixNewChatProposal),
+            "matrix_workspace_request" => Some(BridgeEventRole::MatrixWorkspaceRequest),
+            "matrix_workspace_result" => Some(BridgeEventRole::MatrixWorkspaceResult),
             _ => None,
         }
     }
@@ -176,11 +182,23 @@ mod tests {
             .add_entry(make(EntryType::BridgeEvent, unknown))
             .await
             .unwrap();
+        // The pre-direct-action wire row remains readable but is never an
+        // outbound event or a model input in either reader generation.
+        let proposal = r#"{"version":1,"role":"matrix_rename_proposal","body":"{\"request_id\":\"old-wake\",\"title\":\"Old title\"}"}"#;
+        session
+            .add_entry(make(EntryType::BridgeEvent, proposal))
+            .await
+            .unwrap();
         let reloaded = Session::new(ConversationId(db.root_id().to_string()), db.clone()).await;
-        assert_eq!(reloaded.entries().len(), 4);
+        assert_eq!(reloaded.entries().len(), 5);
         assert_eq!(reloaded.entries()[1].entry_type, future);
         assert_eq!(reloaded.entries()[2].entry_type, future_with_payload);
         assert_eq!(reloaded.entries()[3].bridge_role(), None);
+        assert_eq!(
+            reloaded.entries()[4].bridge_role(),
+            Some(BridgeEventRole::MatrixRenameProposal)
+        );
+        assert_eq!(reloaded.entries()[4].content, proposal);
         let request = reloaded
             .next_turn_request(|_| false, &Default::default())
             .await
@@ -201,7 +219,7 @@ mod tests {
             !context
                 .messages
                 .iter()
-                .any(|m| matches!(m, RuntimeMessage::User(text) if text.contains("future")))
+                .any(|m| matches!(m, RuntimeMessage::User(text) if text.contains("future") || text.contains("Old title")))
         );
         // Legacy Matrix rows still decode into core roles, without rewriting.
         let legacy = make(EntryType::MatrixObserved, "legacy observation");

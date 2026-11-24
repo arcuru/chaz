@@ -3,9 +3,13 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use chaz_core::bridge::{MatrixNewChatProposal, MatrixRenameProposal};
+use chaz_core::bridge::matrix_workspace::{
+    ACTION_REQUEST_LIFETIME, ACTION_RESULT_TIMEOUT, ActionRequest, ActionResult,
+};
 use chaz_core::server::Server;
-use chaz_core::session::Session;
+use chaz_core::session::{EntryType, Session, TurnRequestState, session_attachment};
+use chrono::Utc;
+use futures::FutureExt;
 use matrix_sdk::config::RequestConfig;
 use matrix_sdk::deserialized_responses::RawAnySyncOrStrippedState;
 use matrix_sdk::ruma::api::client::discovery::get_capabilities;
@@ -19,7 +23,9 @@ use matrix_sdk::ruma::{OwnedRoomId, RoomVersionId, UserId};
 use matrix_sdk::{Client, Room, RoomMemberships, RoomState};
 use serde_json::json;
 
-use super::{CreateError, MARKER_TYPE, Marker, MatrixOps, Role, RoomSpec, SessionOps};
+use super::{
+    ChatWake, CreateError, MARKER_TYPE, Marker, MatrixOps, Role, RoomSpec, SessionOps, Workspace,
+};
 use crate::bridge::{AttachedChannels, PendingApprovals, attach_once, owning_agent_entry};
 
 /// How long to wait for a just-created room to arrive through sync before a
@@ -377,59 +383,183 @@ impl SessionOps for LiveSessions {
         chaz_core::session::set_session_description(&db, Some(label)).await?;
         Ok(true)
     }
+}
 
-    async fn rename_proposal(
-        &self,
-        room: &str,
-        session: &str,
-        proposal: &str,
-    ) -> anyhow::Result<MatrixRenameProposal> {
-        let agent = owning_agent_entry(&self.server, &self.owning_agent)
-            .ok_or_else(|| anyhow::anyhow!("owning agent is not hosted"))?;
-        let (_, db) = crate::bridge::resolve_workspace_session(
-            &self.server,
-            &agent,
-            &self.login_id,
-            room,
-            session,
-        )
-        .await?;
-        let session = Session::try_new(
-            chaz_core::types::ConversationId(db.root_id().to_string()),
-            db,
-        )
-        .await?;
-        session
-            .entries_with_ids()
-            .find_map(|(id, entry)| {
-                (id.as_str() == proposal && entry.sender == self.owning_agent)
-                    .then(|| MatrixRenameProposal::from_entry(entry))
-                    .flatten()
-            })
-            .ok_or_else(|| anyhow::anyhow!("no matching rename proposal in this chat"))
+pub(in crate::bridge) const ACTION_TURN_LIFETIME: Duration = Duration::from_secs(5 * 60);
+
+pub(in crate::bridge) fn fresh_action_event(event_at: u64, since: i64, now: i64) -> bool {
+    // Matrix origin time is a fail-closed freshness filter, not proof of
+    // identity. Identity comes from the authenticated /sync event itself.
+    i64::try_from(event_at)
+        .is_ok_and(|ts| ts >= since && (0..=60_000).contains(&now.saturating_sub(ts)))
+}
+
+impl Workspace<LiveMatrix, LiveSessions> {
+    /// A watcher belongs to a freshly committed Matrix wake, not a session
+    /// attach or replay. Run off the sync handler: creation waits for sync echoes.
+    pub(in crate::bridge) fn watch_actions(
+        self: &Arc<Self>,
+        room: Room,
+        db: eidetica::Database,
+        wake: ChatWake,
+    ) {
+        let attached = &self.sessions.attached;
+        let mut tasks = attached.observer_tasks.lock().unwrap();
+        if *attached.stopped.borrow() {
+            return;
+        }
+        tasks.retain(|task| !task.is_finished());
+        let mut stopped = attached.stopped.clone();
+        let workspace = self.clone();
+        tasks.push(tokio::spawn(async move {
+            let result = std::panic::AssertUnwindSafe(async {
+                tokio::select! {
+                    biased;
+                    _ = stopped.changed() => Ok(()),
+                    result = tokio::time::timeout(ACTION_TURN_LIFETIME + ACTION_RESULT_TIMEOUT, workspace.serve_actions(&room, &db, &wake)) => result.unwrap_or(Ok(())),
+                }
+            }).catch_unwind().await;
+            match result {
+                Ok(Ok(())) => {},
+                Ok(Err(error)) => tracing::warn!(room = %wake.room, %error, "Matrix workspace action watcher stopped"),
+                Err(_) => tracing::error!(room = %wake.room, "Matrix workspace action watcher panicked; check workspace status"),
+            }
+        }).abort_handle());
     }
 
-    async fn new_chat_proposal(
+    async fn serve_actions(
         &self,
-        room: &str,
-        session: &str,
-        token: &str,
-    ) -> anyhow::Result<MatrixNewChatProposal> {
-        let agent = owning_agent_entry(&self.server, &self.owning_agent)
+        room: &Room,
+        db: &eidetica::Database,
+        wake: &ChatWake,
+    ) -> anyhow::Result<()> {
+        let changed = Arc::new(tokio::sync::Notify::new());
+        let ping = changed.clone();
+        let _subscription = db
+            .on_write(move |_, _| {
+                ping.notify_one();
+                async { Ok(()) }
+            })
+            .await?;
+        let id = chaz_core::types::ConversationId(wake.session.clone());
+        let mut answered = std::collections::HashSet::new();
+        loop {
+            if std::time::Instant::now() >= wake.expires {
+                return Ok(());
+            }
+            let mut view = Session::try_new(id.clone(), db.clone()).await?;
+            if matches!(
+                view.turn_state_for_entry(&wake.turn, &Default::default())
+                    .await?,
+                TurnRequestState::Completed { .. }
+            ) {
+                return Ok(());
+            }
+            let requests = view
+                .entries_with_ids()
+                .filter_map(|(invocation, row)| {
+                    if row.sender != self.owning_agent || answered.contains(invocation) {
+                        return None;
+                    }
+                    let request = ActionRequest::from_entry(row)?;
+                    (request.turn == wake.turn)
+                        .then(|| (invocation.clone(), request, row.timestamp))
+                })
+                .collect::<Vec<_>>();
+            for (invocation, request, requested_at) in requests {
+                let outcome = tokio::time::timeout(ACTION_RESULT_TIMEOUT, self.act(wake, &request, async {
+                    self.check_waking_turn(room, wake, &request).await?;
+                    let age = (Utc::now() - requested_at).num_milliseconds();
+                    anyhow::ensure!((-5_000..ACTION_REQUEST_LIFETIME.as_millis() as i64).contains(&age), "Matrix workspace request expired");
+                    Ok(())
+                })).await
+                    .map_err(|_| "The Matrix operation did not return in time. Check workspace status before trying again.".to_owned())
+                    .and_then(|result| result.map_err(|error| error.to_string()));
+                let entry = ActionResult {
+                    invocation: invocation.clone(),
+                    outcome,
+                }
+                .into_entry(&self.login_id)?;
+                view.add_entry(entry).await?;
+                answered.insert(invocation);
+            }
+            changed.notified().await;
+        }
+    }
+
+    async fn check_waking_turn(
+        &self,
+        room: &Room,
+        wake: &ChatWake,
+        request: &ActionRequest,
+    ) -> anyhow::Result<()> {
+        let bot = self.matrix.bot()?;
+        anyhow::ensure!(
+            room.room_id().as_str() == wake.room
+                && room.state() == RoomState::Joined
+                && room.client().user_id() == Some(bot),
+            "workspace login or room is no longer joined"
+        );
+        // No workspace history is imported on join. Still reject old events
+        // that arrive after a leave/rejoin, even if not in the session yet.
+        let join = room
+            .get_state_event(StateEventType::RoomMember, bot.as_str())
+            .await?;
+        let joined_at = match join {
+            Some(RawAnySyncOrStrippedState::Sync(join))
+                if join
+                    .get_field::<serde_json::Value>("content")?
+                    .is_some_and(|content| content["membership"] == "join") =>
+            {
+                join.get_field::<u64>("origin_server_ts")?
+            }
+            _ => None,
+        };
+        anyhow::ensure!(
+            joined_at.is_some_and(|since| since < wake.event_at),
+            "the waking Matrix event is not from the current join"
+        );
+        let agent = owning_agent_entry(&self.sessions.server, &self.owning_agent)
             .ok_or_else(|| anyhow::anyhow!("owning agent is not hosted"))?;
-        let (conv, db) = crate::bridge::resolve_workspace_session(
-            &self.server,
+        let (id, db) = crate::bridge::resolve_workspace_session(
+            &self.sessions.server,
             &agent,
             &self.login_id,
-            room,
-            session,
+            &wake.room,
+            &wake.session,
         )
         .await?;
-        let session = Session::try_new(conv, db).await?;
-        session
-            .entries_with_ids()
-            .find(|(id, entry)| id.as_str() == token && entry.sender == self.owning_agent)
-            .and_then(|(_, entry)| MatrixNewChatProposal::from_entry(entry))
-            .ok_or_else(|| anyhow::anyhow!("no matching new chat proposal in this chat"))
+        anyhow::ensure!(
+            session_attachment(&db)
+                .await?
+                .is_some_and(|attachment| attachment.transport == "matrix"
+                    && attachment.login_id == self.login_id
+                    && attachment.channel == wake.room
+                    && attachment.conversational_replies),
+            "the session is not attached to this Matrix chat"
+        );
+        let snapshot = db.snapshot().await?;
+        let session = Session::try_new_at(id, db, &snapshot).await?;
+        anyhow::ensure!(
+            session.entries_with_ids().any(|(id, entry)| {
+                id == &wake.turn
+                    && entry.entry_type == EntryType::Message
+                    && entry
+                        .routing
+                        .as_ref()
+                        .and_then(|r| r.source.as_ref())
+                        .is_some_and(|source| {
+                            source.transport == "matrix"
+                                && source.login_id == self.login_id
+                                && source.channel == wake.room
+                                && source.message_id.as_deref() == Some(&wake.event)
+                                && source.sender.as_deref() == Some(&wake.sender)
+                        })
+            }) && session
+                .is_live_initial_turn(&snapshot, &wake.turn, &request.attempt)
+                .await?,
+            "workspace action no longer belongs to the original live turn"
+        );
+        Ok(())
     }
 }

@@ -23,7 +23,7 @@ pub use describe::DescribeTool;
 pub use edit::EditFile;
 pub use file::{ReadFile, WriteFile};
 pub use jobs::{JobStatusTool, JobWaitTool};
-pub use matrix::{MatrixNewChat, MatrixRename, MatrixRoomInfo, MatrixSend};
+pub use matrix::{MatrixChatAction, MatrixRoomInfo, MatrixSend};
 pub(crate) use matrix::{addressed_send_entry, ensure_agent_owns_login};
 pub use memory::{ListMemoryBanks, Recall, Remember};
 pub(crate) use memory::{search_memory, search_memory_structured, write_memory_entry};

@@ -402,6 +402,16 @@ AGENT_MXID="@agent:$SERVER_NAME"
 PUPPET_MXID="@puppet:$SERVER_NAME"
 STRANGER_MXID="@stranger:$SERVER_NAME"
 
+# Only the bridge uses this loopback fault relay. The normal Synapse response
+# is forwarded except for one named workspace create whose success is hidden.
+BRIDGE_HOMESERVER="$HOMESERVER"
+if [[ $REAL_MODEL -eq 0 ]]; then
+	MATRIX_PROXY_PORT="$(free_port)"
+	BRIDGE_HOMESERVER="http://127.0.0.1:$MATRIX_PROXY_PORT"
+	spawn matrix-faults python3 "$HERE/matrix_faults.py" "$MATRIX_PROXY_PORT" "$SYNAPSE_PORT"
+	wait_for "Matrix fault relay" 20 curl -sf --max-time "$CURL_MAX_TIME" "$BRIDGE_HOMESERVER/_matrix/client/versions"
+fi
+
 # ------------------------------------------------------------ chaz configs ---
 DAEMON_CONFIG="$WORKSPACE/daemon.yaml"
 BRIDGE_CONFIG="$WORKSPACE/bridge.yaml"
@@ -524,7 +534,7 @@ logins:
   - agent: chaz
     ticket: "$TICKET"
     type: matrix
-    homeserver_url: "$HOMESERVER"
+    homeserver_url: "$BRIDGE_HOMESERVER"
     username: "$AGENT_MXID"
     password: "$AGENT_PASSWORD"
     allow_list: "$PUPPET_MXID"
@@ -563,7 +573,7 @@ LEGACY_LOGIN="$(curl -sS --max-time "$CURL_MAX_TIME" -X POST -H 'Content-Type: a
 LEGACY_DEVICE="$(jq -r '.device_id // empty' <<<"$LEGACY_LOGIN")"
 [[ -n $LEGACY_DEVICE ]] || fail "could not log the agent in to seed a legacy session"
 mkdir -p "$LOGIN_STATE_DIR"
-jq -c --arg hs "$HOMESERVER" '{
+jq -c --arg hs "$BRIDGE_HOMESERVER" '{
 	client_session: {homeserver: $hs, db_path: "", passphrase: ""},
 	user_session: {user_id: .user_id, device_id: .device_id, access_token: .access_token}
 }' <<<"$LEGACY_LOGIN" >"$LOGIN_STATE_DIR/session"
@@ -1655,29 +1665,17 @@ CHAT_BINDINGS="$(grep -F "Channel bound to session" "$BRIDGE_LOG" | grep -cF "$C
 [[ $CHAT_BINDINGS -eq 1 ]] || fail "expected one session binding for the chat, found $CHAT_BINDINGS"
 printf '\033[1;32mPASS\033[0m — new chat: private, linked from the Space, room facts verified by the stub, replied only here\n' >&2
 
-log "workspace: second chat has independent history and addressed replies"
+log "workspace: one message opens a new chat with independent history"
 ws_say "$CHAT_ID" "workspace new-chat probe: please open another chat called Trip plans"
-PROPOSAL="$(probe --dir "$SIGNED_DIR" expect --room "$CHAT_ID" --sender "$AGENT_MXID" \
-	--contains '!chaz chat confirm-new' --print-body --timeout "$REPLY_TIMEOUT")" || fail "no agent proposal"
-CONFIRM_NEW="$(grep -E '^!chaz chat confirm-new [^[:space:]]+ Trip plans$' <<<"$PROPOSAL")" ||
-	fail "proposal does not contain an exact confirmation command"
-ws_say "$LOBBY_ID" "$CONFIRM_NEW"
-ws_expect "$LOBBY_ID" "where it was proposed"
-ws_say "$CHAT_ID" "${CONFIRM_NEW%Trip plans}Changed title"
-ws_expect "$CHAT_ID" "the title does not match"
-[[ -z "$(ws_invited 'Trip plans' || true)" && -z "$(ws_invited 'Changed title' || true)" ]] ||
-	fail "the proposal or invalid confirmation invited the manager"
-ws_say "$CHAT_ID" "$CONFIRM_NEW"
 READY="$(probe --dir "$SIGNED_DIR" expect --room "$CHAT_ID" --sender "$AGENT_MXID" \
 	--contains 'Open chat: https://matrix.to/#/' --print-body --timeout "$REPLY_TIMEOUT")" || fail "no new chat link"
 OTHER_CHAT_ID="$(sed -n 's|^Open chat: https://matrix.to/#/||p' <<<"$READY")"
 [[ "$OTHER_CHAT_ID" == '!'* && "$OTHER_CHAT_ID" != "$CHAT_ID" && "$(ws_invited 'Trip plans')" == "$OTHER_CHAT_ID" ]] ||
 	fail "the returned link did not identify the fresh invitation"
-ws_say "$CHAT_ID" "$CONFIRM_NEW"
-ws_expect "$CHAT_ID" "no current unconfirmed manager request"
+[[ $(grep -c '^create Trip plans ' "$WORKSPACE/matrix-faults.log") -eq 1 ]] || fail "duplicate tool call sent another createRoom"
 ws_join "$OTHER_CHAT_ID"
 ws_assert_private "$OTHER_CHAT_ID" true
-[[ -z "$(ws_invited 'Trip plans' || true)" ]] || fail "a repeated confirmation created a duplicate invite"
+[[ -z "$(ws_invited 'Trip plans' || true)" ]] || fail "a duplicate tool call created another invite"
 [[ "$(grep -F 'Channel bound to session' "$BRIDGE_LOG" | grep -cF "$OTHER_CHAT_ID")" -eq 1 ]] ||
 	fail "the tool-created chat does not have exactly one session binding"
 CHAT_REPLIES="$(probe --dir "$SIGNED_DIR" wire --room "$CHAT_ID" --sender "$AGENT_MXID")"
@@ -1687,9 +1685,9 @@ ws_expect "$OTHER_CHAT_ID" "$MARKER"
     fail "sibling reply reached the first chat"
 ! grep -F 'stub_llm: request:' "$WORKSPACE/stub-llm.log" | grep -F 'workspace sibling ping' | grep -qF 'workspace chat ping' ||
     fail "independent chats shared their transcripts"
-ws_say "$CHAT_ID" 'original chat after new-chat confirmation'
+ws_say "$CHAT_ID" 'original chat after opening another'
 ws_expect "$CHAT_ID" "$MARKER"
-! grep -F 'stub_llm: request:' "$WORKSPACE/stub-llm.log" | grep -F 'original chat after new-chat confirmation' | grep -qF 'workspace sibling ping' ||
+! grep -F 'stub_llm: request:' "$WORKSPACE/stub-llm.log" | grep -F 'original chat after opening another' | grep -qF 'workspace sibling ping' ||
 	fail "new chat history reached the original chat"
 TURNS_BEFORE="$(stub_requests)"
 ws_say "$LOBBY_ID" "!chaz chat rename c1 Winter bike"
@@ -1699,7 +1697,7 @@ ws_state "$CHAT_ID" | jq -e 'map(select(.type == "m.room.name"))[0].content.name
 ws_say "$LOBBY_ID" "!chaz chat list"
 ws_expect "$LOBBY_ID" "c1 “Winter bike”"
 [[ "$(stub_requests)" -eq "$TURNS_BEFORE" ]] || fail "literal rename invoked a model"
-printf '\033[1;32mPASS\033[0m — workspace new-chat tool: exact confirmation only in the origin; one private link and fresh session, independent replies; literal rename/list without a model\n' >&2
+printf '\033[1;32mPASS\033[0m — workspace new-chat tool: one message, one POST despite a duplicate tool call, private link and fresh session, independent replies; literal rename/list without a model\n' >&2
 
 log "Case W4: bridge and daemon restarts keep the chat"
 kill -TERM "$BRIDGE_PID"
@@ -1741,38 +1739,65 @@ ws_expect "$CHAT_ID" "$MARKER workspace-approval-denied"
 grep -qF 'stub_llm: workspace approval denied' "$WORKSPACE/stub-llm.log" || fail "denial did not reach the requesting turn"
 printf '\033[1;32mPASS\033[0m — workspace approvals: prompt and denied final only in intended chat; sibling decision cannot resolve it\n' >&2
 
-log "Case W5: only same-room exact confirmation changes both titles"
+log "Case W5: one manager message changes both labels in place"
 ws_name_event() { ws_state "$1" | jq -ce '.[] | select(.type == "m.room.name") | {event_id, name: .content.name}'; }
-NAME_BEFORE="$(ws_name_event "$CHAT_ID")"
-SIBLING_NAME_BEFORE="$(ws_name_event "$OTHER_CHAT_ID")"
-[[ $(jq -r .name <<<"$NAME_BEFORE") == "Winter bike" ]] || fail "missing original Matrix name"
-WORKSPACE_SESSION_ID="$(sed -E $'s/\x1B\\[[0-9;]*[[:alpha:]]//g' "$BRIDGE_LOG" |
+BEFORE_SIBLING="$(ws_name_event "$OTHER_CHAT_ID")"
+WORKSPACE_SESSION_ID="$(sed -E $'s/\x1B\[[0-9;]*[[:alpha:]]//g' "$BRIDGE_LOG" |
     awk -v room="$CHAT_ID" '/Matrix outbound delivery installed/ && $NF == "room_id=" room {
         for (i=1; i<NF; i++) if ($i ~ /^session_db_id=/) print substr($i, 15)
     }')"
 [[ $WORKSPACE_SESSION_ID =~ ^[a-z0-9]+$ ]] || fail "could not identify the workspace session before rename"
 ws_say "$CHAT_ID" "Rename this chat to Storm commute"
-ws_expect "$CHAT_ID" "!chaz chat confirm-rename"
-CONFIRMATION="$(sed -n 's/^stub_llm: workspace rename confirmation: //p' "$WORKSPACE/stub-llm.log")"
-[[ $CONFIRMATION == '!chaz chat confirm-rename '*" Storm commute" ]] || fail "missing exact rename proposal"
-[[ $(ws_name_event "$CHAT_ID") == "$NAME_BEFORE" ]] || fail "tool changed the room name before confirmation"
-
-ws_say "$OTHER_CHAT_ID" "$CONFIRMATION"
-ws_expect "$OTHER_CHAT_ID" "no matching rename proposal in this chat"
-ws_say "$CHAT_ID" "${CONFIRMATION%Storm commute}Wrong title"
-ws_expect "$CHAT_ID" "the title does not match the proposal"
-[[ $(ws_name_event "$CHAT_ID") == "$NAME_BEFORE" ]] || fail "denied confirmation changed the room name"
-ws_say "$CHAT_ID" '!chaz info'
-ws_expect "$CHAT_ID" "Description: Winter bike"
-
-ws_say "$CHAT_ID" "$CONFIRMATION"
 ws_expect "$CHAT_ID" "Done: room name changed, session label changed."
-[[ $(ws_name_event "$CHAT_ID" | jq -r .name) == "Storm commute" ]] || fail "confirmed Matrix name not visible"
-[[ $(ws_name_event "$OTHER_CHAT_ID") == "$SIBLING_NAME_BEFORE" ]] || fail "rename touched the sibling room"
+[[ $(ws_name_event "$CHAT_ID" | jq -r .name) == "Storm commute" ]] || fail "new Matrix name not visible"
+[[ $(ws_name_event "$OTHER_CHAT_ID") == "$BEFORE_SIBLING" ]] || fail "rename touched the sibling room"
 ws_say "$CHAT_ID" '!chaz info'
 ws_expect "$CHAT_ID" "Session: $WORKSPACE_SESSION_ID"$'\n'"Description: Storm commute"
-ws_say "$CHAT_ID" "$CONFIRMATION"
-ws_expect "$CHAT_ID" "no current unconfirmed manager request"
 ws_say "$CHAT_ID" "workspace rename continuity ping"
 ws_expect "$CHAT_ID" "$MARKER rename-continuity"
-printf '\033[1;32mPASS\033[0m — workspace rename: proposal alone and denied confirmation changed neither title; exact confirmation renamed the same room and session; follow-up kept its history\n' >&2
+printf '\033[1;32mPASS\033[0m — workspace rename: one message changed both titles; same room, session and history\n' >&2
+
+log "Case W6: recover a homeserver-committed create with an uncertain response"
+ws_say "$CHAT_ID" "workspace uncertain probe: open another chat called Recovery plans"
+UNCERTAIN="$(probe --dir "$SIGNED_DIR" expect --room "$CHAT_ID" --sender "$AGENT_MXID" \
+	--contains 'Workspace create uncertain:' --print-body --timeout "$REPLY_TIMEOUT")" || fail "uncertain operation was not reported"
+OP="${UNCERTAIN##*: }"
+[[ $OP =~ ^op-[0-9]+$ ]] || fail "no journal operation ID: $UNCERTAIN"
+[[ -z "$(ws_invited 'Recovery plans' || true)" ]] || fail "uncertain room was invited before recovery"
+RECOVER_ID="$(awk '/^create Recovery plans / && $NF == 502 { print $(NF-1) }' "$WORKSPACE/matrix-faults.log")"
+[[ "$RECOVER_ID" == '!'* && "$RECOVER_ID" != "$CHAT_ID" && "$RECOVER_ID" != "$OTHER_CHAT_ID" ]] ||
+	fail "fault relay did not observe a committed room before losing the response"
+ws_say "$LOBBY_ID" "!chaz workspace retry $OP"
+ws_expect "$LOBBY_ID" "Open chat: https://matrix.to/#/$RECOVER_ID"
+[[ $(ws_invited 'Recovery plans') == "$RECOVER_ID" ]] || fail "retry did not recover the original room"
+[[ $(grep -c '^create Recovery plans ' "$WORKSPACE/matrix-faults.log") -eq 1 ]] || fail "retry reissued createRoom"
+ws_join "$RECOVER_ID"
+ws_assert_private "$RECOVER_ID" true
+[[ $(grep -F 'Channel bound to session' "$BRIDGE_LOG" | grep -cF "$RECOVER_ID") -eq 1 ]] ||
+	fail "recovered chat does not have exactly one session"
+printf '\033[1;32mPASS\033[0m — workspace recovery: a committed create returned 502, status was uncertain, explicit retry recovered the original room and one session without another POST\n' >&2
+
+log "Case W7: an allowed room participant cannot rename as manager"
+# Admit the guest through the normal tool path, not a rejection at the allow
+# list or a non-waking message. The manager identity is unchanged.
+kill -TERM "$BRIDGE_PID"
+wait_for "bridge to exit" 30 sh -c "! kill -0 $BRIDGE_PID 2>/dev/null"
+retire_pid "$BRIDGE_PID"
+sed -i "s/allow_list: .*/allow_list: '$PUPPET_MXID|$STRANGER_MXID'/" "$BRIDGE_CONFIG"
+spawn bridge-workspace-guest env RUST_LOG="$BRIDGE_RUST_LOG" "$CHAZ_MATRIX_BIN" --config "$BRIDGE_CONFIG"
+BRIDGE_PID="$SPAWNED_PID"
+BRIDGE_LOG="$WORKSPACE/bridge-workspace-guest.log"
+wait_for "bridge with guest allowed" 120 grep -q "The client is ready" "$BRIDGE_LOG"
+GUEST_DIR="$WORKSPACE/probe-guest"
+probe --dir "$GUEST_DIR" login --homeserver "$HOMESERVER" --user stranger --password "$STRANGER_PASSWORD" >/dev/null
+CHAT_URI="$(jq -rn --arg r "$CHAT_ID" '$r|@uri')"
+mx POST "/_matrix/client/v3/rooms/$CHAT_URI/invite" "$PUPPET_TOKEN" \
+	"$(jq -nc --arg u "$STRANGER_MXID" '{user_id:$u}')" | jq -e '.errcode == null' >/dev/null
+mx POST "/_matrix/client/v3/join/$CHAT_URI" "$STRANGER_TOKEN" '{}' | jq -e '.room_id' >/dev/null
+NAME_BEFORE="$(ws_name_event "$CHAT_ID")"
+probe --dir "$GUEST_DIR" send --room "$CHAT_ID" --mention "$AGENT_MXID" --body "workspace guest rename probe: rename to Guest title" >/dev/null
+ws_expect "$CHAT_ID" "$MARKER workspace-guest-denied"
+[[ $(ws_name_event "$CHAT_ID") == "$NAME_BEFORE" ]] || fail "guest changed the room name"
+probe --dir "$SIGNED_DIR" send --room "$CHAT_ID" --mention "$AGENT_MXID" --body '!chaz info' >/dev/null
+ws_expect "$CHAT_ID" "Session: $WORKSPACE_SESSION_ID"$'\n'"Description: Storm commute"
+printf '\033[1;32mPASS\033[0m — workspace guest denial: an allowlisted joined guest reached the tool, bridge denied the write, both labels stayed unchanged\n' >&2

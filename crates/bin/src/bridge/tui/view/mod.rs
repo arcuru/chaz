@@ -1421,6 +1421,8 @@ fn build_transcript(
                     BridgeEventRole::Receipt
                         | BridgeEventRole::MatrixRenameProposal
                         | BridgeEventRole::MatrixNewChatProposal
+                        | BridgeEventRole::MatrixWorkspaceRequest
+                        | BridgeEventRole::MatrixWorkspaceResult
                 ) {
                     continue;
                 }

@@ -351,35 +351,52 @@ class Handler(BaseHTTPRequestHandler):
                     return
             self._send({"error": "workspace room-info result missing or incorrect"}, status=400)
             return
-        if "workspace new-chat probe" in latest_user:
-            if not has_tool_result and "matrix__new_chat" in tools:
+        if "workspace new-chat probe" in latest_user or "workspace uncertain probe" in latest_user:
+            uncertain = "workspace uncertain probe" in latest_user
+            title = "Recovery plans" if uncertain else "Trip plans"
+            if not has_tool_result:
                 self._fixture_reply(name="matrix__new_chat", call_id="workspace-new-chat",
-                                    arguments={"title": "Trip plans"})
-                return
-            result = messages[-1]
-            match = re.search(r"(?m)^!chaz chat confirm-new [^\s]+ Trip plans$", result.get("content", ""))
-            if (result.get("role") == "tool" and result.get("tool_call_id") == "workspace-new-chat" and match):
-                self._fixture_reply(content="No room has been created. Send this here:\n" + match[0])
-                return
-            self._send({"error": "workspace new-chat proposal missing or incorrect"}, status=400)
-            return
-        if "Rename this chat to Storm commute" in latest_user:
-            if not has_tool_result and "matrix__rename" in tools:
-                self._fixture_reply(name="matrix__rename", call_id="workspace-rename",
-                                    arguments={"title": "Storm commute"})
+                                    arguments={"title": title})
                 return
             result = messages[-1]
             content = result.get("content", "")
-            prefix = '<tool_output tool="matrix__rename">\n'
-            if (result.get("role") == "tool" and result.get("tool_call_id") == "workspace-rename"
-                    and content.startswith(prefix) and content.endswith("\n</tool_output>")):
-                lines = content.removeprefix(prefix).removesuffix("\n</tool_output>").splitlines()
-                if (len(lines) == 2 and lines[0].startswith("No title has changed.")
-                        and re.fullmatch(r"!chaz chat confirm-rename [\w-]+ Storm commute", lines[1])):
-                    sys.stderr.write("stub_llm: workspace rename confirmation: " + lines[1] + "\n")
-                    self._fixture_reply(content=lines[1])
+            link = re.search(r"(?m)^Open chat: https://matrix.to/#/!\S+$", content)
+            if uncertain:
+                if "— uncertain." in content and not link:
+                    op = re.search(r"(?m)^(op-\d+): new chat", content)
+                    if op:
+                        self._fixture_reply(content="Workspace create uncertain: " + op[1])
+                        return
+            elif link and "— done." in content:
+                if result.get("tool_call_id") == "workspace-new-chat":
+                    self._fixture_reply(name="matrix__new_chat", call_id="workspace-duplicate",
+                                        arguments={"title": title})
                     return
-            self._send({"error": "workspace rename proposal result missing or incorrect"}, status=400)
+                if result.get("tool_call_id") == "workspace-duplicate":
+                    previous = next((m for m in reversed(messages[:-1]) if m.get("role") == "tool"), {})
+                    if previous.get("tool_call_id") == "workspace-new-chat" and previous.get("content") == content:
+                        self._fixture_reply(content=link[0])
+                        return
+            sys.stderr.write("stub_llm: invalid workspace create result: " + content + "\n")
+            self._send({"error": "workspace create or duplicate result missing or incorrect"}, status=400)
+            return
+        if "Rename this chat to Storm commute" in latest_user or "workspace guest rename probe" in latest_user:
+            guest = "workspace guest rename probe" in latest_user
+            if not has_tool_result:
+                self._fixture_reply(name="matrix__rename", call_id="workspace-rename",
+                                    arguments={"title": "Guest title" if guest else "Storm commute"})
+                return
+            result = messages[-1]
+            content = result.get("content", "")
+            if result.get("role") == "tool" and result.get("tool_call_id") == "workspace-rename":
+                if guest and "require the configured Matrix manager" in content:
+                    self._fixture_reply(content=self.server.reply + " workspace-guest-denied")
+                    return
+                if not guest and "Done: room name changed, session label changed." in content:
+                    self._fixture_reply(content="Done: room name changed, session label changed.")
+                    return
+            sys.stderr.write("stub_llm: invalid workspace rename result: " + content + "\n")
+            self._send({"error": "workspace rename result missing or incorrect"}, status=400)
             return
         if "workspace rename continuity ping" in latest_user:
             if "Rename this chat to Storm commute" not in user_text:
