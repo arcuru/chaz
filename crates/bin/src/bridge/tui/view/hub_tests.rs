@@ -575,23 +575,21 @@ async fn hub_return_from_settings_rebinds_the_picker_and_rejects_retired_deliver
     let mut watches = Watches::new();
     open_session_picker(&mut app);
     watches.sync_picker(&mut app, &server);
-    let retired = tokio::time::timeout(std::time::Duration::from_secs(3), watches.rx.recv())
+    let retired = tokio::time::timeout(std::time::Duration::from_secs(3), watches.next())
         .await
-        .unwrap()
         .unwrap();
     app.open_settings(SettingsScope::Peer, TuiMode::SessionPicker);
     watches.retire_picker_if_hidden(&app);
     app.close_settings();
     watches.sync_picker(&mut app, &server);
-    watches.apply(&mut app, &server, retired);
+    watches.apply(&mut app, &server, &backend, retired);
     assert!(app.session_list.is_empty());
     let loading = frame(&mut app, &server, &backend, 80, 24);
     assert!(loading.contains("Loading sessions…"), "{loading}");
-    let load = tokio::time::timeout(std::time::Duration::from_secs(3), watches.rx.recv())
+    let load = tokio::time::timeout(std::time::Duration::from_secs(3), watches.next())
         .await
-        .unwrap()
         .unwrap();
-    watches.apply(&mut app, &server, load);
+    watches.apply(&mut app, &server, &backend, load);
     assert_eq!(app.session_list.len(), session_ids(&server).await.len());
     assert!(!app.session_list.is_empty());
     watches.shutdown().await;
@@ -606,8 +604,7 @@ async fn description_edit_updates_picker_through_the_watched_session() {
 
     let (_instance, server, backend, _) = fixture().await;
     let (approval_tx, _) = channels();
-    let (notify_tx, mut deliveries) = presentation::channel();
-    let mut reads = presentation::Reads::default();
+    let (notify_tx, wake) = presentation::channel();
     let models_tx = mpsc::channel(8).0;
     let secrets = SecretStore::new(server.registry().chaz_peer().clone()).await;
     let mut app = App::hub(HashSet::new());
@@ -622,7 +619,6 @@ async fn description_edit_updates_picker_through_the_watched_session() {
     );
     settle(&mut app).await;
     let id = app.active().session_db_id.clone();
-    refresh::apply_initial_models(&mut app, &server);
     server
         .registry()
         .set_session_name(&id, "planning".into())
@@ -655,20 +651,16 @@ async fn description_edit_updates_picker_through_the_watched_session() {
         );
         settle(app).await;
     };
-    let observe = async |reads: &mut presentation::Reads,
-                         deliveries: &mut mpsc::Receiver<presentation::Delivery>,
-                         app: &mut App,
-                         expected: Option<&str>| {
+    let observe = async |app: &mut App, expected: Option<&str>| {
         tokio::time::timeout(std::time::Duration::from_secs(3), async {
             loop {
-                reads.start(app, deliveries.recv().await.unwrap());
-                let loaded = reads.join_next().await.unwrap().unwrap();
-                presentation::apply(app, loaded, |agent, meta| {
-                    refresh::resolve(&server, &backend, agent, meta)
+                presentation::apply_latest(app, |app, idx| {
+                    refresh::derive_tab(app, &server, &backend, idx);
                 });
                 if app.session_list[0].description.as_deref() == expected {
                     break;
                 }
+                wake.notified().await;
             }
         })
         .await
@@ -690,13 +682,7 @@ async fn description_edit_updates_picker_through_the_watched_session() {
         app.session_list[0].description, None,
         "completion is not persisted display authority"
     );
-    observe(
-        &mut reads,
-        &mut deliveries,
-        &mut app,
-        Some("Q3 budget with finance"),
-    )
-    .await;
+    observe(&mut app, Some("Q3 budget with finance")).await;
     // The GUI applies the watched projection in place, with no catalog reload.
     assert!(!app.session_catalog_loading);
     assert_eq!(
@@ -739,7 +725,7 @@ async fn description_edit_updates_picker_through_the_watched_session() {
         app.session_list[0].description.as_deref(),
         Some("Q3 budget with finance")
     );
-    observe(&mut reads, &mut deliveries, &mut app, None).await;
+    observe(&mut app, None).await;
     assert_eq!(app.session_list[0].description, None);
     assert_eq!(app.session_list[0].name.as_deref(), Some("planning"));
     let meta = canonical().await;
@@ -753,7 +739,7 @@ async fn description_edit_updates_picker_through_the_watched_session() {
     // Double-width text is clipped by terminal cells and still shows the ellipsis.
     let description = "界".repeat(12);
     run(&mut app, Command::DescribeSession(description.clone())).await;
-    observe(&mut reads, &mut deliveries, &mut app, Some(&description)).await;
+    observe(&mut app, Some(&description)).await;
     open_session_picker(&mut app);
     let narrow = frame(&mut app, &server, &backend, 20, 8);
     let line = narrow.lines().find(|l| l.contains('界')).expect(&narrow);

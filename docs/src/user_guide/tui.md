@@ -413,11 +413,8 @@ The denominator is the runtime's effective **input** context budget, not the
 output-token cap. Configured model windows take precedence over discovered
 windows; an explicit agent cap can lower the budget. When the model window is
 unknown, the configured input-budget fallback still applies. A zero budget is
-shown as `unknown`. When another client on the same peer saves learned model
-metadata, an open terminal updates without input or a session write. Clearing a
-learned window restores the applicable configured budget or agent cap. If the
-peer metadata cannot be read, the last budget remains visible with
-`⚠ model metadata stale`. Long session names are clipped to keep the pair visible.
+shown as `unknown`. The bar uses learned windows already available to this
+runtime on redraw. Long session names are clipped to keep the pair visible.
 
 For example:
 
@@ -1454,34 +1451,32 @@ A delayed open does not take focus after newer local navigation. Ordinary opens
 resolve their destination before installing observation: `/join` to an open
 tab reuses its live approval receiver. New destinations finish observation
 setup before reading their initial transcript and exposing their composer.
-The initial database delivery is acknowledged only after the tab is installed.
+A newly opened tab starts from a database snapshot and keeps observing later changes.
 Jobs opened from either Jobs or the hub remain authorized observers, never ordinary execution sessions.
 
 Transcript, metadata, telemetry and steering use the Verified Session snapshot
 delivered by the database, with current access checked separately. The callback
-waits until the terminal applies or discards the result; a burst can coalesce to
-its latest snapshot. A commit does not wait for the terminal.
+reads that snapshot without waiting for a frame. If writes arrive faster than
+the terminal can draw, it can skip intermediate views and show the latest one.
 
 The hub joins its peer-local catalog (aliases, origin and closed state) with
 Session metadata. It observes only visible rows without an open tab, and those
 observations never load a transcript. The model and context limit use the last
-applied Session, Agent DB and peer model metadata components. These databases
-update independently, not as a global transaction. Configured windows and
-agent caps still apply; removing a learned window falls back to the configured
-limit or the safe default. Operation results report success or failure but do
-not overwrite these persisted display values.
+applied Session and Agent DB views. These databases update independently.
+Configured windows and agent caps still apply. Operation results report success
+or failure without overwriting persisted display values.
 
-| Trigger / display                                 | Behavior                                                                          |
-| ------------------------------------------------- | --------------------------------------------------------------------------------- |
-| A database changes                                | Apply its latest delivered snapshot in the background, even while idle            |
-| Every five seconds                                | Age retained activity; check service health and retry failed reads                |
-| `⟳ refreshing (cached)`                           | A read is pending; displayed data is the last successful read                     |
-| `⚠ refresh failed`                                | That read failed; last-good data remains, even if another read succeeds           |
-| `⚠ model metadata stale` / `⚠ agent config stale` | A model source failed; its last accepted values remain visible                    |
-| `action(s) pending`                               | Accepted backend actions execute in order, one at a time                          |
-| Queue full or backend disconnected                | New backend actions are not accepted; composer/prompts stay editable              |
-| `Write still pending; outcome unknown`            | A deadline warns, but does not cancel, retry or advance past the write            |
-| Quit with unfinished actions                      | Esc (without popup), Ctrl+C and `/quit` warn first; repeat to abandon queued work |
+| Trigger / display                      | Behavior                                                                          |
+| -------------------------------------- | --------------------------------------------------------------------------------- |
+| A database changes                     | Apply its latest delivered snapshot in the background, even while idle            |
+| Every five seconds                     | Age retained activity; check service health and retry failed reads                |
+| `⟳ refreshing (cached)`                | A read is pending; displayed data is the last successful read                     |
+| `⚠ refresh failed`                     | That read failed; last-good data remains, even if another read succeeds           |
+| `⚠ agent config stale`                 | Reading agent settings failed; the last accepted values remain visible            |
+| `action(s) pending`                    | Accepted backend actions execute in order, one at a time                          |
+| Queue full or backend disconnected     | New backend actions are not accepted; composer/prompts stay editable              |
+| `Write still pending; outcome unknown` | A deadline warns, but does not cancel, retry or advance past the write            |
+| Quit with unfinished actions           | Esc (without popup), Ctrl+C and `/quit` warn first; repeat to abandon queued work |
 
 ### Cached is not confirmed
 

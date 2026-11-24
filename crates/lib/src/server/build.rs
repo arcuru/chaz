@@ -357,7 +357,6 @@ pub struct BuiltServer {
     pub secret_store: security::SecretStore,
     tasks: Vec<tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
     server_slot: crate::instance::ServerSlot,
-    model_metadata: super::model_metadata::Observation,
 }
 
 impl BuiltServer {
@@ -370,7 +369,6 @@ impl BuiltServer {
         for session in sessions {
             self.server.deregister_session(&session).await;
         }
-        self.model_metadata.stop().await;
         self.server.shutdown().await;
         for slot in &self.tasks {
             let mut slot = slot.lock().await;
@@ -921,11 +919,6 @@ pub async fn build(
         critical_path_ms = build_start.elapsed().as_millis() as u64,
         "Critical-path build complete; deferring at-startup work to background"
     );
-    let (model_metadata, initial_metadata) = super::model_metadata::Observation::start(
-        registry.chaz_peer().clone(),
-        default_backend.clone(),
-        server.model_metadata.clone(),
-    );
     {
         let server = server.clone();
         let registry = registry.clone();
@@ -936,9 +929,6 @@ pub async fn build(
         let mcp_readiness = opts.mcp_readiness;
         let mcp_registry = mcp_registry.clone();
         tasks.push(tokio::spawn(async move {
-            // The read owner applies the overlay and releases readiness even
-            // before a GUI has attached or acknowledged an update.
-            let _ = initial_metadata.await;
             run_deferred_startup(
                 server,
                 registry,
@@ -971,16 +961,16 @@ pub async fn build(
             .map(|task| tokio::sync::Mutex::new(Some(task)))
             .collect(),
         server_slot,
-        model_metadata,
     })
 }
 
 /// The deferred at-startup work, run in a background task off the
 /// critical path so the gateway draws/serves immediately (see the
-/// fast-start block at the end of [`build`]). Clients only initialize folders;
+/// fast-start block at the end of [`build`]). Clients stop after step 1;
 /// the remaining steps belong to executors. Order matters:
 ///
-/// 1. Initialize trusted agent folders without importing pending edits.
+/// 1. `warm_model_windows` — best-effort; the per-turn budget falls back
+///    to the static default until this lands, so a miss is tolerated.
 /// 2. `mark_startup_ready` — after MCP readiness when a one-shot needs it,
 ///    so held turns release before the (slower) schedule + routine work
 ///    below. Hosted agents were already registered from their Agent DBs.
@@ -1002,11 +992,21 @@ async fn run_deferred_startup(
 ) {
     let deferred_start = Instant::now();
 
+    // 1. Seed the context-window overlay from the persisted in-use model
+    //    store. No-op on a fresh machine until a model is used or picked.
+    let t = Instant::now();
+    server.warm_model_windows().await;
+    info!(
+        elapsed_ms = t.elapsed().as_millis() as u64,
+        "Deferred: warmed model windows"
+    );
+
     // Folder synchronization also belongs to trusted clients. It neither
     // starts agent turns nor imports pending file edits.
     Box::pin(server.initialize_agent_folders()).await;
 
-    // Clients never reconcile agents, materialize schedules or open an
+    // Model-window metadata is also presentation data. Clients warm it in the
+    // background, but never reconcile agents, materialize schedules or open an
     // executor readiness gate. Their command/observation surface is ready now.
     if config.execution == Some(crate::config::ExecutionRole::Client) {
         return;

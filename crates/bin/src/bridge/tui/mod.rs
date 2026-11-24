@@ -15,7 +15,7 @@ use chaz_core::bridge::ApprovalExchange;
 use chaz_core::commands::{self, Command, CommandContext, CommandOutcome, SessionInfo};
 use chaz_core::config::Config;
 use chaz_core::security::SecretStore;
-use chaz_core::server::{ModelMetadata, ModelMetadataUpdate, Server};
+use chaz_core::server::Server;
 use chaz_core::session::SessionIndex;
 use chaz_core::session::{AgentRef, EntryType, Session, SessionEntry, SessionMeta};
 
@@ -76,19 +76,14 @@ pub(super) type TaggedApproval = (String, u64, ApprovalExchange);
 enum Action {
     Key(KeyEvent),
     Mouse(MouseEvent),
-    SessionChanged(presentation::Delivery),
     ApprovalRequest(TaggedApproval),
     /// A background catalog fetch finished. `Ok` carries the live model
     /// list (already merged with cache); `Err` carries a display message.
     ModelsFetched(ModelCatalog),
-    ModelMetadata(ModelMetadataUpdate),
-    Component(components::Update),
     PeerPage(peer_pages::Loaded),
     SessionPage(session_pages::Loaded),
     JobsLoaded(jobs::Loaded),
     WorkersLoaded(workers::Loaded),
-    /// A background tab read finished (see [`refresh`]).
-    Refresh(Result<presentation::Loaded, tokio::task::JoinError>),
     Operation(operations::Completion),
     Connection(reconnect::ResultMessage),
 }
@@ -629,7 +624,6 @@ pub(super) struct ListScroll {
 }
 
 pub(super) struct App {
-    pub(super) model_metadata: ModelMetadata,
     agent_defaults: HashMap<eidetica::entry::ID, components::Defaults>,
     agent_config_errors: HashMap<eidetica::entry::ID, String>,
     visible_peer_agents: std::ops::Range<usize>,
@@ -844,7 +838,6 @@ impl App {
     /// The launch state: the session hub with no conversation open.
     fn hub(agent_names: HashSet<String>) -> Self {
         Self {
-            model_metadata: ModelMetadata::default(),
             agent_defaults: HashMap::new(),
             agent_config_errors: HashMap::new(),
             visible_peer_agents: 0..0,
@@ -1140,7 +1133,7 @@ impl App {
             .clone();
         self.refresh_ticket += 1;
         tab.live.incarnation = self.refresh_ticket;
-        let observed = tab.live.initial_handled.is_some();
+        let observed = tab.live.observation.is_some();
         self.tabs.push(tab);
         if observed {
             project_open_row(self, self.tabs.len() - 1);
@@ -1423,12 +1416,10 @@ fn restore_terminal() {
     let _ = crossterm::execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen);
 }
 
-#[derive(Default)]
 pub(super) struct Observation {
     pub id: u64,
-    _callback: Option<eidetica::WriteCallback>,
-    initial: Option<presentation::Delivery>,
-    forwarder: Option<supervised::Task<()>>,
+    watch: presentation::SessionWatch,
+    _forwarder: Option<supervised::Task<()>>,
 }
 
 /// Register a session DB with the server and wire up per-tab notify and
@@ -1458,12 +1449,7 @@ async fn setup_session(
     );
     server.load_session_entities(session_db).await?;
     let observation_id = presentation::next_id();
-    let mut observation = Observation {
-        id: observation_id,
-        ..Default::default()
-    };
-
-    if server.is_executor_authorized() {
+    let forwarder = if server.is_executor_authorized() {
         // Per-session raw approval channel → tagged forward to shared channel.
         let (raw_tx, mut raw_rx) = mpsc::channel::<ApprovalExchange>(8);
         let forwarder_id = session_db_id.clone();
@@ -1479,22 +1465,23 @@ async fn setup_session(
                 }
             }
         });
-        observation.forwarder = Some(supervised::Task(forwarder));
+        let forwarder = supervised::Task(forwarder);
         server
             .register_session(session_db, backend, None, Some(raw_tx))
             .await?;
+        Some(forwarder)
     } else {
         server
             .watch_session(session_db, backend, None, None)
             .await?;
-    }
-
-    let (callback, initial) =
-        presentation::subscribe(session_db, observation_id, notify_tx).await?;
-    observation._callback = Some(callback);
-    observation.initial = Some(initial);
-
-    Ok(observation)
+        None
+    };
+    let watch = presentation::SessionWatch::open(session_db, notify_tx, false).await?;
+    Ok(Observation {
+        id: observation_id,
+        watch,
+        _forwarder: forwarder,
+    })
 }
 
 /// `--session NAME`: reopen the session with that name, or create and name
@@ -1736,7 +1723,7 @@ async fn open_live_tab(
             let observation = setup_session(&server, &db, backend.clone(), approval_tx, notify_tx)
                 .await
                 .map_err(|e| format!("{e:#}"))?;
-            build_observed_tab(&server, &backend, db, observation, false).await
+            build_observed_tab(&server, &backend, db, observation).await
         }))
         .await
 }
@@ -1746,21 +1733,8 @@ async fn build_observed_tab(
     backend: &BackendManager,
     db: eidetica::Database,
     mut observation: Observation,
-    job: bool,
 ) -> Result<Tab, String> {
-    let initial = observation
-        .initial
-        .take()
-        .expect("new observation has an initial delivery");
-    let (snapshot, state) = if job {
-        let loaded = jobs::snapshot_at(&db, initial.tips).await?;
-        (loaded.session, Some(loaded.state))
-    } else {
-        (
-            refresh::load_session_snapshot_at(&db, initial.tips).await?,
-            None,
-        )
-    };
+    let (snapshot, state) = *observation.watch.initial().await?.result?;
     let id = db.root_id().to_string();
     let mut tab = tab_from_snapshot(server, backend, db, id, snapshot)?;
     if let Some(state) = state {
@@ -1771,7 +1745,6 @@ async fn build_observed_tab(
         jobs::apply_state(&mut tab, state);
     }
     tab.live.observation = Some(observation);
-    tab.live.initial_handled = Some(initial.handled);
     Ok(tab)
 }
 
@@ -1811,15 +1784,7 @@ fn tab_from_snapshot(
         effective_model,
         context_budget,
         roster,
-    } = refresh::resolve_from(
-        server,
-        backend,
-        &agent_name,
-        &meta,
-        &ModelMetadata::default(),
-        &HashMap::new(),
-        None,
-    );
+    } = refresh::resolve_from(server, backend, &agent_name, &meta, &HashMap::new(), None);
     let entries = snapshot.entries;
     let evidence = snapshot.active_turns?;
     let active_turns = evidence.active_at(chrono::Utc::now()).count();

@@ -87,7 +87,7 @@ async fn reopen(
                         .await
                         .map_err(|e| e.to_string())?
                 {
-                    jobs::observe(&observed, notify_tx)
+                    jobs::observe(&observed, notify_tx, mode == Mode::Job)
                         .await
                         .map_err(|e| e.to_string())
                 } else {

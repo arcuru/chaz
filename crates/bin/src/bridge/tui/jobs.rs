@@ -111,15 +111,13 @@ pub(super) fn apply(app: &mut App, result: Result<JobMonitor, String>) {
 pub(super) async fn observe(
     db: &eidetica::Database,
     tx: presentation::Sender,
+    job: bool,
 ) -> anyhow::Result<Observation> {
     chaz_core::session::jobs::require_observer_write(db).await?;
-    let id = presentation::next_id();
-    let (callback, initial) = presentation::subscribe(db, id, tx).await?;
     Ok(Observation {
-        id,
-        _callback: Some(callback),
-        initial: Some(initial),
-        ..Default::default()
+        id: presentation::next_id(),
+        watch: presentation::SessionWatch::open(db, tx, job).await?,
+        _forwarder: None,
     })
 }
 
@@ -137,8 +135,8 @@ pub(super) async fn open_tab(
                 .open_job_session(&id)
                 .await
                 .map_err(|e| e.to_string())?;
-            let observation = observe(&db, tx).await.map_err(|e| e.to_string())?;
-            build_observed_tab(&server, &backend, db, observation, true).await
+            let observation = observe(&db, tx, true).await.map_err(|e| e.to_string())?;
+            build_observed_tab(&server, &backend, db, observation).await
         }))
         .await
 }

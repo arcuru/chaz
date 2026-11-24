@@ -1018,7 +1018,7 @@ async fn busy_steering_publication_after_close_or_retry_is_not_an_idle_turn() {
 }
 
 #[tokio::test]
-async fn opened_tab_acks_initial_only_after_insertion() {
+async fn opened_tab_applies_latest_projection_after_insertion() {
     let dir = tempfile::tempdir().unwrap();
     let built = runtime(dir.path()).await;
     let server = built.server.clone();
@@ -1026,7 +1026,7 @@ async fn opened_tab_acks_initial_only_after_insertion() {
     let (_, db) = server.registry().create_session(Some("tui")).await.unwrap();
     let id = db.root_id().to_string();
     let (approval, _approvals) = mpsc::channel(8);
-    let (notify, mut notifications) = presentation::channel();
+    let (notify, wake) = presentation::channel();
     let (ready, prepared) = oneshot::channel();
     let (release, gate) = oneshot::channel();
     let mut app = App::hub(HashSet::new());
@@ -1045,36 +1045,19 @@ async fn opened_tab_acks_initial_only_after_insertion() {
     chaz_core::session::update_meta_on_db(&db, |m| m.name = Some("written while opening".into()))
         .await
         .unwrap();
-    assert!(matches!(
-        notifications.try_recv(),
-        Err(mpsc::error::TryRecvError::Empty)
-    ));
     release.send(()).unwrap();
     let completion = app.operations.recv().await.unwrap();
     operations::apply(&mut app, completion);
-    assert_ne!(
-        app.active().session_name.as_deref(),
-        Some("written while opening")
-    );
-    assert!(
-        notifications.try_recv().is_err(),
-        "a partially applied install acknowledged the callback"
-    );
-    refresh::apply_initial_models(&mut app, &built.server);
-    let delivery = tokio::time::timeout(std::time::Duration::from_secs(2), notifications.recv())
-        .await
-        .unwrap()
-        .unwrap();
-    let mut reads = presentation::Reads::default();
-    reads.start(&mut app, delivery);
-    let message = reads.join_next().await.unwrap().unwrap();
-    assert_eq!(
-        presentation::apply(&mut app, message, |agent, meta| {
-            refresh::resolve(&built.server, &render_backend, agent, meta)
-        })
-        .as_deref(),
-        Some(id.as_str())
-    );
+    assert_eq!(app.active().session_db_id, id);
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while !presentation::apply_latest(&mut app, |app, idx| {
+            refresh::derive_tab(app, &built.server, &render_backend, idx);
+        }) {
+            wake.notified().await;
+        }
+    })
+    .await
+    .unwrap();
     assert_eq!(
         app.active().session_name.as_deref(),
         Some("written while opening")

@@ -16,14 +16,12 @@
 //! entries). See `docs/src/design/model_info_store.md`.
 
 use crate::backends::ModelInfo;
-use eidetica::store::{DocStore, StoreError};
-use eidetica::{Database, Snapshot, Transaction};
-use std::collections::BTreeMap;
+use eidetica::Database;
+use eidetica::store::DocStore;
+use std::collections::{BTreeMap, HashMap};
 
 const STORE: &str = "model_info";
 const KEY: &str = "in_use";
-
-pub type ModelInfos = BTreeMap<String, ModelInfo>;
 
 #[derive(Clone)]
 pub struct ModelInfoStore {
@@ -37,44 +35,45 @@ impl ModelInfoStore {
         Self { db: chaz_peer }
     }
 
-    /// Read the exact delivered frontier. An absent key is empty; a broken
-    /// store, transport failure or invalid value must not erase last-good info.
-    pub async fn read_at(&self, snapshot: &Snapshot) -> anyhow::Result<ModelInfos> {
-        Self::read_in(&self.db.new_transaction_at(snapshot).await?).await
+    /// All persisted in-use models, keyed by id. `BTreeMap` so serialization
+    /// is order-stable (an unchanged set always re-serializes identically,
+    /// which makes [`put`](Self::put)'s no-write-on-unchanged check exact).
+    /// Empty when nothing has been stored yet or the entry is unreadable.
+    pub async fn all(&self) -> BTreeMap<String, ModelInfo> {
+        let Ok(txn) = self.db.new_transaction().await else {
+            return BTreeMap::new();
+        };
+        let Ok(store) = txn.get_store::<DocStore>(STORE).await else {
+            return BTreeMap::new();
+        };
+        let Ok(raw) = store.get_string(KEY).await else {
+            return BTreeMap::new();
+        };
+        serde_json::from_str(&raw).unwrap_or_default()
     }
 
-    async fn read_in(txn: &Transaction) -> anyhow::Result<ModelInfos> {
-        let store = txn.get_store::<DocStore>(STORE).await?;
-        match store.get_string(KEY).await {
-            Ok(raw) => Ok(serde_json::from_str(&raw)?),
-            Err(eidetica::Error::Store(error))
-                if matches!(error.as_ref(), StoreError::KeyNotFound { store, key }
-                    if store == STORE && key == KEY) =>
-            {
-                Ok(ModelInfos::new())
-            }
-            Err(error) => Err(error.into()),
-        }
-    }
-
-    #[cfg(test)]
-    async fn all(&self) -> ModelInfos {
-        self.read_at(&self.db.snapshot().await.unwrap())
+    /// `{ id -> context_window }` for every in-use model that declares a
+    /// window. Feeds the runtime's window overlay at startup
+    /// ([`crate::server::Server::warm_model_windows`]).
+    pub async fn context_windows(&self) -> HashMap<String, u32> {
+        self.all()
             .await
-            .unwrap()
+            .into_iter()
+            .filter_map(|(id, info)| info.context_window.map(|w| (id, w)))
+            .collect()
     }
 
     /// Upsert one model's info into the in-use set. Writes nothing — and so
     /// appends nothing to the append-only DB — when the stored entry already
     /// equals `info`, so re-using an already-cached model never causes churn.
     pub async fn put(&self, info: &ModelInfo) -> anyhow::Result<()> {
-        let txn = self.db.new_transaction().await?;
-        let mut map = Self::read_in(&txn).await?;
+        let mut map = self.all().await;
         if map.get(&info.id) == Some(info) {
             return Ok(());
         }
         map.insert(info.id.clone(), info.clone());
         let json = serde_json::to_string(&map)?;
+        let txn = self.db.new_transaction().await?;
         let store = txn.get_store::<DocStore>(STORE).await?;
         store.set_string(KEY, &json).await?;
         txn.commit().await?;
@@ -118,6 +117,7 @@ mod tests {
         let (_inst, _user, db) = fresh_db().await;
         let store = ModelInfoStore::new(db);
         assert!(store.all().await.is_empty());
+        assert!(store.context_windows().await.is_empty());
     }
 
     #[tokio::test]
@@ -141,7 +141,10 @@ mod tests {
             Some(128_000)
         );
 
-        assert_eq!(all["inclusionai/ring-2.6-1t:free"].context_window, None);
+        // Only the model declaring a window appears in the overlay feed.
+        let windows = store.context_windows().await;
+        assert_eq!(windows.len(), 1);
+        assert_eq!(windows.get("deepseek/deepseek-v4-pro"), Some(&128_000));
     }
 
     #[tokio::test]

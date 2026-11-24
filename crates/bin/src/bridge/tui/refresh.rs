@@ -38,8 +38,6 @@ pub(super) struct TabLive {
     local_entries: Vec<SessionEntry>,
     pub(super) incarnation: u64,
     pub(super) observation: Option<Observation>,
-    pub(super) initial_handled: Option<tokio::sync::oneshot::Sender<()>>,
-    pub(super) snapshot_started: Option<tokio::time::Instant>,
     pub(super) snapshot_overdue: bool,
     pub(super) rebind_needed: bool,
     pub(super) unbound: bool,
@@ -58,9 +56,7 @@ impl TabLive {
     pub(super) fn cancel_reads(&mut self) {
         self.workers.cancel();
         self.covered = None;
-        self.snapshot_started = None;
         self.snapshot_overdue = false;
-        self.initial_handled = None;
         self.rebind_task = None;
         self.rebind_ticket = None;
     }
@@ -74,8 +70,11 @@ impl TabLive {
             ..Default::default()
         }
     }
+    pub(super) fn snapshot_started(&self) -> Option<tokio::time::Instant> {
+        self.observation.as_ref().and_then(|o| o.watch.started())
+    }
     pub(super) fn pending(&self) -> bool {
-        self.snapshot_started.is_some() || self.rebind_task.is_some()
+        self.snapshot_started().is_some() || self.rebind_task.is_some()
     }
 }
 
@@ -386,39 +385,11 @@ pub(super) struct Resolved {
     pub(super) roster: Vec<RosterAgent>,
 }
 
-/// Resolve the tab's display values from fresh meta. If `/model X` or
-/// `/model <agent> Y` ran on this session (or a remote peer pinned a model),
-/// the effective model moves; the per-agent override beats the session pin
-/// for the tab's current agent. The budget follows the model, and the full
-/// roster follows attach/detach, host changes and per-agent pins.
-#[cfg(test)]
-pub(super) fn resolve(
-    server: &Server,
-    backend: &BackendManager,
-    current_agent: &str,
-    meta: &SessionMeta,
-) -> Resolved {
-    resolve_from(
-        server,
-        backend,
-        current_agent,
-        meta,
-        &ModelMetadata::default(),
-        &HashMap::new(),
-        server
-            .agent_index()
-            .find_by_name(current_agent)
-            .as_ref()
-            .map(|entry| &entry.db_id),
-    )
-}
-
 pub(super) fn resolve_from(
     server: &Server,
     backend: &BackendManager,
     current_agent: &str,
     meta: &SessionMeta,
-    observed: &ModelMetadata,
     defaults: &HashMap<eidetica::entry::ID, components::Defaults>,
     agent_id: Option<&eidetica::entry::ID>,
 ) -> Resolved {
@@ -427,7 +398,7 @@ pub(super) fn resolve_from(
     Resolved {
         effective_model: backend.resolve_model_name(session_model.or(default_model.as_deref())),
         context_budget: server
-            .observed_context_budget(session_model, default_model.as_deref(), agent_cap, observed)
+            .context_budget(session_model, default_model.as_deref(), agent_cap)
             .tokens,
         roster: build_roster(server, backend, meta, defaults),
     }
@@ -453,33 +424,13 @@ pub(super) fn agent_defaults(
     (None, None)
 }
 
-pub(super) fn apply_model_metadata(app: &mut App, server: &Server, state: ModelMetadata) {
-    // The replacement generation may still be starting. Keep last-good
-    // numbers until there is a real observed (possibly empty) component.
-    if state.ready {
-        app.model_metadata = state;
-    } else {
-        app.model_metadata.error = state.error;
-    }
-    derive_models(app, server);
-}
-
-pub(super) fn derive_models(app: &mut App, server: &Server) {
+pub(super) fn derive_models(app: &mut App, server: &Server, backend: &BackendManager) {
     for idx in 0..app.tabs.len() {
-        derive_tab(app, server, idx);
+        derive_tab(app, server, backend, idx);
     }
 }
 
-pub(super) fn apply_initial_models(app: &mut App, server: &Server) {
-    for idx in 0..app.tabs.len() {
-        if let Some(handled) = app.tabs[idx].live.initial_handled.take() {
-            derive_tab(app, server, idx);
-            let _ = handled.send(());
-        }
-    }
-}
-
-pub(super) fn derive_tab(app: &mut App, server: &Server, idx: usize) {
+pub(super) fn derive_tab(app: &mut App, server: &Server, backend: &BackendManager, idx: usize) {
     let tab = &mut app.tabs[idx];
     if tab.live.unbound {
         return;
@@ -494,10 +445,9 @@ pub(super) fn derive_tab(app: &mut App, server: &Server, idx: usize) {
         roster,
     } = resolve_from(
         server,
-        server.backend(),
+        backend,
         &name,
         &tab.live.meta,
-        &app.model_metadata,
         &app.agent_defaults,
         agent_id,
     );
@@ -510,6 +460,29 @@ pub(super) fn derive_tab(app: &mut App, server: &Server, idx: usize) {
     tab.effective_model = effective_model;
     tab.context_budget = context_budget;
     tab.roster = roster;
+}
+
+/// Preserve the existing redraw behavior for model windows learned by this
+/// runtime. The redraw uses the accepted Agent DB defaults, not an optimistic
+/// Config/operation result or a new peer metadata subscription.
+pub(super) fn update_context_budget(app: &mut App, server: &Server) {
+    let Some(tab) = app
+        .tabs
+        .get_mut(app.active_tab)
+        .filter(|tab| !tab.live.unbound)
+    else {
+        return;
+    };
+    let (_, entry) = components::select_agent(server, &tab.live.meta, &tab.live.writer_keys);
+    let (model, cap) = agent_defaults(
+        server,
+        &app.agent_defaults,
+        &tab.current_agent,
+        entry.as_ref().map(|entry| &entry.db_id),
+    );
+    tab.context_budget = server
+        .context_budget(tab.model_pin.as_deref(), model.as_deref(), cap)
+        .tokens;
 }
 
 pub(super) fn replace_status(tab: &mut Tab, status: Result<Vec<String>, String>) {
@@ -946,7 +919,7 @@ mod tests {
             ..Default::default()
         };
         let (approval_tx, _approval_rx) = mpsc::channel(8);
-        let (notify_tx, _notify_rx) = presentation::channel();
+        let (notify_tx, wake) = presentation::channel();
         // The runtime can reopen the DB even while presentation meta is
         // malformed. A hydration failure must not strand its old IPC handle.
         db.with_transaction(|txn| async move {
@@ -983,13 +956,18 @@ mod tests {
         );
         assert_eq!(app.active().entries[0].content, "last-good-transcript");
         assert_eq!(app.active().live.status_segments, ["last-good-status"]);
-        let mut reads = presentation::Reads::default();
-        reads.start_initial(&mut app);
-        presentation::apply(
-            &mut app,
-            reads.join_next().await.unwrap().unwrap(),
-            resolved,
-        );
+        let project = async |app: &mut App| {
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while !presentation::apply_latest(app, |app, idx| {
+                    derive_fixture(&mut app.tabs[idx], resolved);
+                }) {
+                    wake.notified().await;
+                }
+            })
+            .await
+            .expect("reconnected projection");
+        };
+        project(&mut app).await;
         assert_eq!(app.active().entries[0].content, "last-good-transcript");
         assert!(app.active().live.error.is_some());
         db.with_transaction(|txn| async move {
@@ -1060,12 +1038,7 @@ mod tests {
             "PARTIAL RECONNECT CONTRACT: PASS; independent handle install, last-good hydration, ",
             "per-tab retry on same runtime, stale-ticket rejection, no dead-handle write admission"
         ));
-        reads.start_initial(&mut app);
-        presentation::apply(
-            &mut app,
-            reads.join_next().await.unwrap().unwrap(),
-            resolved,
-        );
+        project(&mut app).await;
         assert_eq!(app.input, "draft-during-loss-界");
         assert_eq!(app.active().scroll_offset, 20);
         assert_eq!(

@@ -24,11 +24,10 @@ impl TuiBridge {
         approval_tx: mpsc::Sender<TaggedApproval>,
         mut approval_rx: mpsc::Receiver<TaggedApproval>,
         notify_tx: presentation::Sender,
-        mut notify_rx: mpsc::Receiver<presentation::Delivery>,
+        notify_rx: Arc<tokio::sync::Notify>,
     ) -> anyhow::Result<()> {
         let mut server = built.server.clone();
         let mut runtime = Some(built);
-        let mut reads = presentation::Reads::default();
         let mut components = components::Watches::new();
         let (connection_tx, mut connection_rx) = mpsc::channel(1);
         let mut probe_task: Option<supervised::Task<()>> = None;
@@ -48,8 +47,7 @@ impl TuiBridge {
                 &approval_tx,
                 &mut approval_rx,
                 &notify_tx,
-                &mut notify_rx,
-                &mut reads,
+                &notify_rx,
                 &mut components,
             )
             .await;
@@ -59,10 +57,8 @@ impl TuiBridge {
         }
         // The terminal state has retired its registrations. A native read
         // that began verification must still publish before it can be dropped.
-        notify_rx.close();
         components.shutdown().await;
         notify_tx.drain().await;
-        while reads.join_next().await.is_some() {}
         if let Some(mut task) = probe_task.take() {
             task.0.abort();
             let _ = (&mut task.0).await;
@@ -113,8 +109,7 @@ impl TuiBridge {
         approval_tx: &mpsc::Sender<TaggedApproval>,
         approval_rx: &mut mpsc::Receiver<TaggedApproval>,
         notify_tx: &presentation::Sender,
-        notify_rx: &mut mpsc::Receiver<presentation::Delivery>,
-        reads: &mut presentation::Reads,
+        notify_rx: &tokio::sync::Notify,
         components: &mut components::Watches,
     ) -> anyhow::Result<Option<String>> {
         let mut reconnect_allowed = true;
@@ -122,11 +117,8 @@ impl TuiBridge {
         let mut retry_at = None;
         let mut missed_probe = false;
         let mut app = app;
-        let mut backend = server.backend().clone();
-        let (initial_metadata, mut metadata_rx) = server.observe_model_metadata();
-        refresh::apply_model_metadata(&mut app, server, initial_metadata);
-        // Startup can install a --session tab without an Operation completion.
-        refresh::apply_initial_models(&mut app, server);
+        let mut backend = BackendManager::new(&self.config.backends, self.secrets.clone());
+        refresh::derive_models(&mut app, server, &backend);
         // One-shot-style delivery of background model catalog fetches.
         // Buffered so a force-refresh kicked off mid-render doesn't block.
         let (models_tx, mut models_rx) = mpsc::channel::<ModelCatalog>(4);
@@ -146,7 +138,11 @@ impl TuiBridge {
         let mut first_ready_frame = true;
         let mut needs_draw = true;
         'run: loop {
-            reads.start_initial(&mut app);
+            needs_draw |= components.apply_latest(&mut app, server, &backend);
+            needs_draw |= presentation::apply_latest(&mut app, |app, idx| {
+                refresh::derive_tab(app, server, &backend, idx);
+                app.update_picker_pin(server);
+            });
             operations::cancel_closed_reads(&mut app);
             workers::update(&mut app, server, &workers_tx);
             app.ensure_view();
@@ -185,7 +181,7 @@ impl TuiBridge {
             // Block for one action, then drain whatever else is already
             // queued (bounded) before drawing again, so a burst of keys,
             // wheel notches or session writes costs one frame, not one each.
-            // Every event is still handled, in arrival order.
+            // Inputs and operation results remain separate from projections.
             for batch_slot in 0..MAX_ACTIONS_PER_FRAME {
                 let overdue = presentation::next_overdue(&app);
                 let action = tokio::select! {
@@ -201,7 +197,6 @@ impl TuiBridge {
                                     terminal.draw(|f| {
                                         view::ui(f, &mut app, server, &backend, &self.config)
                                     })?;
-                                    needs_draw = false;
                                 }
                                 Action::Mouse(m)
                             }
@@ -217,12 +212,13 @@ impl TuiBridge {
                     }
                     Some(msg) = connection_rx.recv() => Action::Connection(msg),
                     Some(msg) = app.operations.recv() => Action::Operation(msg),
-                    Some(msg) = reads.join_next(), if !reads.is_empty() => Action::Refresh(msg),
-                    Some(update) = notify_rx.recv(), if reads.has_capacity() => Action::SessionChanged(update),
+                    _ = notify_rx.notified() => {
+                        needs_draw = true;
+                        break;
+                    },
+                    _ = components.changed() => break,
                     Some(msg) = approval_rx.recv() => Action::ApprovalRequest(msg),
                     Some(res) = models_rx.recv() => Action::ModelsFetched(res),
-                    Some(update) = metadata_rx.recv() => Action::ModelMetadata(update),
-                    Some(update) = components.rx.recv() => Action::Component(update),
                     Some(loaded) = peer_pages_rx.recv() => Action::PeerPage(loaded),
                     Some(loaded) = session_pages_rx.recv() => Action::SessionPage(loaded),
                     Some(loaded) = workers_rx.recv() => Action::WorkersLoaded(loaded),
@@ -262,11 +258,7 @@ impl TuiBridge {
                     // Nothing else is ready: end the batch and draw.
                     _ = std::future::ready(()), if batch_slot > 0 => break,
                 };
-                // Background results decide for themselves whether they changed
-                // anything visible; every other action can.
-                if !matches!(action, Action::Refresh(_) | Action::SessionChanged(_)) {
-                    needs_draw = true;
-                }
+                needs_draw = true;
 
                 let navigation_before = (
                     app.mode,
@@ -540,16 +532,6 @@ impl TuiBridge {
                             }
                         }
                     }
-                    Action::ModelMetadata(update) => {
-                        if app.backend_available {
-                            refresh::apply_model_metadata(&mut app, server, update.state);
-                        }
-                        let _ = update.handled.send(());
-                    }
-                    Action::Component(update) => components.apply(&mut app, server, update),
-                    Action::SessionChanged(update) => {
-                        reads.start(&mut app, update);
-                    }
                     Action::Connection(msg) => match msg {
                         reconnect::ResultMessage::Probe(result) => {
                             *probe_task = None;
@@ -586,7 +568,6 @@ impl TuiBridge {
                                 missed_probe = false;
                                 reconnect::disconnect(&mut app, reason);
                                 components.disconnect();
-                                metadata_rx.close();
                                 if let Some(connection) =
                                     server.registry().instance().remote_connection()
                                 {
@@ -601,10 +582,10 @@ impl TuiBridge {
                                     reconnect_attempt = 0;
                                     *server = replacement.server.clone();
                                     self.secrets = replacement.secret_store.clone();
-                                    backend = server.backend().clone();
-                                    let (initial, rx) = server.observe_model_metadata();
-                                    metadata_rx = rx;
-                                    refresh::apply_model_metadata(&mut app, server, initial);
+                                    backend = BackendManager::new(
+                                        &self.config.backends,
+                                        self.secrets.clone(),
+                                    );
                                     reconnect::connected(&mut app);
                                     reconnect::request_tabs(
                                         &mut app,
@@ -641,27 +622,18 @@ impl TuiBridge {
                         }
                         reconnect::ResultMessage::Tab { ticket, reopened } => {
                             reconnect::apply_retry(&mut app, ticket, *reopened);
-                            reads.start_initial(&mut app);
                         }
                     },
                     Action::Operation(msg) => {
+                        let first_new = app.tabs.len();
                         operations::apply(&mut app, msg);
-                        refresh::apply_initial_models(&mut app, server);
-                    }
-                    Action::Refresh(result) => match result {
-                        Ok(loaded) => {
-                            if let Some(id) =
-                                presentation::apply_then(&mut app, loaded, |app, idx| {
-                                    refresh::derive_tab(app, server, idx);
-                                    app.update_picker_pin(server);
-                                })
-                            {
-                                session_pages::changed(&mut app, &id);
-                                needs_draw = true;
-                            }
+                        // A new tab can share an Agent DB that was already
+                        // observed. Use that accepted config without waiting
+                        // for a new write to either database.
+                        for idx in first_new..app.tabs.len() {
+                            refresh::derive_tab(&mut app, server, &backend, idx);
                         }
-                        Err(error) => tracing::warn!(%error, "Snapshot read worker stopped"),
-                    },
+                    }
                     Action::ApprovalRequest((id, observation_id, exchange)) => {
                         if let Some(idx) = app.tab_index_for(&id).filter(|&i| {
                             app.tabs[i]

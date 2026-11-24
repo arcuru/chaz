@@ -689,11 +689,11 @@ default_agents: [chaz]
             finally:
                 process.close()
 
-    def test_existing_and_fresh_clients_converge_on_model_windows_while_idle(self):
+    def test_existing_and_fresh_clients_observe_agent_edits_while_idle(self):
         from test_interactions import environment, evidence
-        out = evidence("model-windows")
+        out = evidence("agent-observation")
         processes = []
-        with tempfile.TemporaryDirectory(prefix="chaz-window-pty-") as directory:
+        with tempfile.TemporaryDirectory(prefix="chaz-agent-observation-pty-") as directory:
             home = Path(directory)
             env = environment(home)
             config = home / "config.yaml"
@@ -715,7 +715,7 @@ backends:
         context_window: 96000
 ''')
             owner = subprocess.Popen(
-                [TARGET / "debug/examples/tui_service_fixture", home / "service.sock"],
+                [TARGET / "debug/examples/tui_service_fixture", home / "service.sock", "outage"],
                 env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE, text=True,
             )
@@ -731,23 +731,18 @@ backends:
                 reply("READY")
                 existing = launch()
                 existing.expect_screen("ctx unknown/128k tok")
-                for update, budget in [("large", "1.1M"), ("small", "32k"), ("unknown", "128k")]:
-                    owner.stdin.write(f"window-{update}\n"); owner.stdin.flush()
-                    reply("WINDOW")
-                    # No key, resize or session write wakes the existing view.
-                    expected = f"ctx unknown/{budget} tok"
-                    existing.expect_screen(expected, timeout=12)
-                    existing.capture(out / f"existing-{update}")
-                    fresh = launch()
-                    fresh.expect_screen(expected, timeout=12)
-                    fresh.capture(out / f"fresh-{update}")
-                    fresh.close()
-                # The accepted AgentDB record changes both model and cap,
-                # with no session or peer metadata write to wake either UI.
+                # No session write or input wakes the existing view.
                 owner.stdin.write("agent-cap\n"); owner.stdin.flush()
                 reply("AGENT agent-cap")
                 existing.expect_screen("model: agent-alt", timeout=12)
                 existing.expect_screen("ctx unknown/16k tok", timeout=12)
+                # Opening another tab must use the Agent DB view this client
+                # has already accepted, even if neither database writes again.
+                existing.send("/join secondary\r")
+                existing.expect_screen("SECONDARY-CACHED")
+                existing.expect_screen("model: agent-alt")
+                existing.send("\x17")  # Ctrl+W: return to the original tab.
+                existing.expect_screen("SERVICE-CACHED-TRANSCRIPT")
                 fresh = launch()
                 fresh.expect_screen("ctx unknown/16k tok", timeout=12)
                 fresh.expect_screen("model: agent-alt", timeout=12)
@@ -762,13 +757,12 @@ backends:
                 reply("AGENT agent-repair")
                 existing.expect_screen("ctx unknown/128k tok", timeout=12)
                 existing.capture(out / "existing-agent-repaired")
-                # Direct --session startup has no operation completion to
-                # release the initial Session callback. Its idle feed must run.
+                # The existing session also observes the next write while idle.
                 owner.stdin.write("append\n"); owner.stdin.flush()
                 reply("APPENDED")
                 existing.expect_screen("RECOVERY-VISIBLE", timeout=12)
                 existing.expect_screen("RECOVERY-STATUS", timeout=12)
-                print("PRESENTATION WINDOWS: both clients converge on peer metadata and AgentDB config; malformed config keeps last good until repair")
+                print("AGENT OBSERVATION: both clients see the stored default and cap; malformed config keeps last good until repair")
             finally:
                 for process in processes:
                     process.close()

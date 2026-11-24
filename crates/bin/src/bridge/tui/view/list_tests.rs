@@ -520,7 +520,7 @@ async fn wheel_ownership_stays_with_modal_or_visible_list() {
 }
 
 #[tokio::test]
-async fn toolbar_context_uses_applied_model_metadata_and_preserves_precedence() {
+async fn toolbar_context_reopen_honors_pins_and_refreshes_runtime_budget() {
     use chaz_core::backends::ModelInfo;
     use chaz_core::config::{Backend, BackendType, Model};
     use chaz_core::session::Session;
@@ -541,21 +541,6 @@ async fn toolbar_context_uses_applied_model_metadata_and_preserves_precedence() 
     secondary.name = Some("secondary".into());
     let (_instance, server, backend, mut app) =
         fixture_with_backends(Some(vec![configured, secondary])).await;
-    let peer = server.registry().chaz_peer();
-    let store = chaz_core::model_info_store::ModelInfoStore::new(peer.clone());
-    let apply_peer = async |app: &mut App| {
-        let snapshot = peer.snapshot().await.unwrap();
-        let infos = store.read_at(&snapshot).await.unwrap();
-        super::super::refresh::apply_model_metadata(
-            app,
-            &server,
-            chaz_core::server::ModelMetadata {
-                ready: true,
-                infos: Arc::new(infos),
-                error: None,
-            },
-        );
-    };
     let db = app.active().session_db.clone();
     let id = app.active().session_db_id.clone();
     let session = Session::new(chaz_core::types::ConversationId(id.clone()), db.clone()).await;
@@ -577,11 +562,10 @@ async fn toolbar_context_uses_applied_model_metadata_and_preserves_precedence() 
         .await
         .unwrap();
     assert_eq!(tab.effective_model, "large-model");
+    assert_eq!(tab.context_budget, 1_050_000);
     assert_eq!(tab.model_pin.as_deref(), Some("secondary:large-model"));
     app.tabs[0] = tab;
-    apply_peer(&mut app).await;
-    assert_eq!(app.active().context_budget, 1_050_000);
-    // Persisted peer state is not applied by drawing a frame.
+    // No session write: a learned-window update must reach the very next frame.
     server
         .cache_model_info(&ModelInfo {
             id: "secondary:large-model".into(),
@@ -591,9 +575,6 @@ async fn toolbar_context_uses_applied_model_metadata_and_preserves_precedence() 
         .await;
     let mut terminal = Terminal::new(TestBackend::new(100, 16)).unwrap();
     let screen = draw(&mut terminal, &mut app, &server, &backend).join("\n");
-    assert!(screen.contains("ctx unknown/1.1M tok"), "{screen}");
-    apply_peer(&mut app).await;
-    let screen = draw(&mut terminal, &mut app, &server, &backend).join("\n");
     assert!(screen.contains("ctx unknown/2M tok"), "{screen}");
     server.agents().upsert(Agent::from_db_config(
         "agent-00",
@@ -602,7 +583,6 @@ async fn toolbar_context_uses_applied_model_metadata_and_preserves_precedence() 
             ..Default::default()
         },
     ));
-    apply_peer(&mut app).await;
     let screen = draw(&mut terminal, &mut app, &server, &backend).join("\n");
     assert!(screen.contains("ctx unknown/16k tok"), "{screen}");
     // A per-agent pin wins over the session pin; explicit YAML windows win
@@ -639,32 +619,6 @@ async fn toolbar_context_uses_applied_model_metadata_and_preserves_precedence() 
     ));
     let screen = draw(&mut terminal, &mut app, &server, &backend).join("\n");
     assert!(screen.contains("ctx unknown/64k tok"), "{screen}");
-    // A session without pins uses the current agent default with the last
-    // applied learned information.
-    session
-        .update_meta(|meta| {
-            meta.model = None;
-            meta.agent_models.clear();
-        })
-        .await
-        .unwrap();
-    app.tabs[0] = super::super::build_tab(&server, &backend, db, id)
-        .await
-        .unwrap();
-    apply_peer(&mut app).await;
-    let screen = draw(&mut terminal, &mut app, &server, &backend).join("\n");
-    assert!(screen.contains("ctx unknown/2M tok"), "{screen}");
-    server.agents().upsert(Agent::from_db_config(
-        "agent-00",
-        &AgentDbConfig {
-            model: Some("primary:small-model".into()),
-            ..Default::default()
-        },
-    ));
-    apply_peer(&mut app).await;
-    let screen = draw(&mut terminal, &mut app, &server, &backend).join("\n");
-    assert!(screen.contains("ctx unknown/64k tok"), "{screen}");
-    assert_eq!(app.active().effective_model, "small-model");
     server.shutdown().await;
 }
 

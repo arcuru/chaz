@@ -64,8 +64,10 @@ async fn inspect(
     db: eidetica::Database,
     tx: presentation::Sender,
 ) -> Result<Tab, String> {
-    let observation = jobs::observe(&db, tx).await.map_err(|e| e.to_string())?;
-    let mut tab = build_observed_tab(server, backend, db, observation, false).await?;
+    let observation = jobs::observe(&db, tx, false)
+        .await
+        .map_err(|e| e.to_string())?;
+    let mut tab = build_observed_tab(server, backend, db, observation).await?;
     tab.live.worker_observer = true;
     Ok(tab)
 }

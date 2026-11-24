@@ -37,8 +37,8 @@ enters use does not.
 
 `ModelInfoStore` (`crates/lib/src/model_info_store.rs`) exposes:
 
-- `read_at(&Snapshot)` reads the whole in-use set at the supplied frontier. A
-  missing key gives an empty map; an unreadable value gives an error.
+- `all() -> BTreeMap<id, ModelInfo>` — read the whole in-use set.
+- `context_windows() -> {id -> window}` — the windows the runtime warms from.
 - `put(&ModelInfo)` — upsert one model. **No-ops when the stored entry already
   equals the input**, so re-using an already-recorded model appends nothing to
   the append-only DB. This is the core churn guard.
@@ -58,12 +58,14 @@ A model lands in the store via **two** triggers (both, by design):
 
 1. **On switch** — when you pick a model in the TUI picker,
    `dispatch_model_selection` hands the merged `ModelInfo` to
-   `Server::cache_model_info`, which saves it to the store.
+   `Server::cache_model_info`, which slots its window into the live overlay and
+   `put`s it into the store.
 2. **On first runtime use** — when the runtime is about to budget a turn for a
    model whose window it doesn't yet know, `spawn_model_window_fetch` (via
    `Server::ensure_model_window_cached`) fetches that model's info from the
-   live catalog in the background and saves it. The current turn can proceed
-   with its current budget. Deduped per model id via an in-flight set, so a burst
+   live catalog **in the background**, slots the window into the overlay so the
+   _next_ turn is window-aware, and `put`s it. Non-blocking — the current turn
+   proceeds model-blind. Deduped per model id via an in-flight set, so a burst
    of turns on a new model triggers exactly one fetch.
 
 Trigger 1 covers models you explicitly select; trigger 2 covers models you use
@@ -73,10 +75,10 @@ ever required in config.
 
 ## How the runtime uses it
 
-- Each runtime watches its peer DB. The initial and subsequent deliveries read
-  the supplied snapshot and replace the learned map shared by the runtime's
-  backend clones. A replacement without a window clears the previous one.
-  A failed read retains the last good map and retries with a fresh subscription.
+- At startup, `Server::warm_model_windows` reads `context_windows()` into the
+  default backend's overlay (`BackendManager::set_model_windows`). The overlay
+  lives behind a shared `Arc`, so it also reaches every per-session worker
+  backend cloned from the default.
 - `BackendManager::context_window` resolves in two tiers: a YAML-declared
   `context_window:` (explicit operator intent — wins), then the overlay (the
   zero-config path). `None` only when neither knows the model, in which case the
@@ -86,9 +88,10 @@ ever required in config.
   per-agent cap may still lower it.
 - The same budget surfaces in the TUI status bar as the denominator of
   `ctx ~<used>/<max> tok`.
-  The terminal applies the same immutable map before acknowledging the watch.
-  It recomputes the displayed budget using that map, not another database read
-  or a newer runtime overlay. Executor readiness does not wait for the terminal.
+  `Server::effective_context_budget` returns the concrete denominator and
+  resolves windows through the server's **own** `default_backend` (the one that
+  gets warmed and updated) — not a caller's freshly-built manager, whose overlay
+  would be empty.
 
 ### The numeric context pair
 
@@ -114,7 +117,7 @@ honest:
 
 A fresh machine that has never used or picked a model is a clean no-op: the
 overlay stays empty and the runtime uses the static budget until the first use
-or selection populates the store.
+or selection populates the store; the next startup warms from it.
 
 ## The in-memory picker catalog
 
@@ -145,5 +148,7 @@ deliberately:
   point even a re-fetched-but-unchanged value dedupes to its existing hash and
   stops accreting. When that lands, this rides it for free.
 
-Moving this data to a file would also require replacing the database watch
-that propagates changes to executors and open clients.
+If that upstream story stalls and the store grows faster than expected, the
+fallback is a `$XDG_CACHE_HOME/chaz/` file — `ModelInfoStore`'s surface
+(`all`/`put`/`context_windows`) is the same either way, so only the backend
+swaps.

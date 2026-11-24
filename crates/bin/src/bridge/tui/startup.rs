@@ -237,7 +237,7 @@ async fn initialize(
     }
     stage.send_replace("Loading session…");
     // Retain the BuiltServer outside the panic boundary so launch failures shut it down.
-    let backend = built.server.backend().clone();
+    let backend = BackendManager::new(&config.backends, built.secret_store.clone());
     let tab = supervised::work(Box::pin(async {
         let Some(db) = launch_session(&built.server, session.as_deref(), prompt)
             .await

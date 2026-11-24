@@ -154,18 +154,16 @@ async fn hydration_service_rpc_counts_and_unchanged_views() {
         let entries = Session::entries_at_snapshot(db, &snapshot).await.unwrap();
         assert_eq!(entries.len(), 1024);
     }
-    let (tx, mut inbox) = presentation::channel();
-    let mut loads = presentation::Reads::default();
+    let (tx, inbox) = presentation::channel();
     let before = rpcs.load(Ordering::SeqCst);
     let tables = reads.tables();
     for i in 0..app.tabs.len() {
         app.tabs[i].live.observation = Some(
-            jobs::observe(&app.tabs[i].session_db, tx.clone())
+            jobs::observe(&app.tabs[i].session_db, tx.clone(), false)
                 .await
                 .unwrap(),
         );
-        loads.start_initial(&mut app);
-        apply_watch(&mut loads, &mut app).await;
+        apply_next(&mut app, &inbox).await;
     }
     let entries = reads.tables()["entries"] - tables["entries"];
     eprintln!(
@@ -179,11 +177,8 @@ async fn hydration_service_rpc_counts_and_unchanged_views() {
         age_activity(&mut app, chrono::Utc::now());
         age_steering(&mut app, chrono::Utc::now());
     }
-    assert!(
-        tokio::time::timeout(Duration::from_millis(50), inbox.recv())
-            .await
-            .is_err()
-    );
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(!apply_pending(&mut app));
     let after = reads.tables();
     assert_eq!(
         rpcs.load(Ordering::SeqCst),
@@ -253,11 +248,9 @@ async fn hydration_job_ticks_skip_transcript_and_telemetry_but_age_and_observe_c
         details: false,
     });
     let mut app = App::new(HashSet::new(), job_tab);
-    let (tx, mut inbox) = presentation::channel();
-    let mut loads = presentation::Reads::default();
+    let (tx, inbox) = presentation::channel();
     install_watch(&mut app, &tx).await;
-    loads.start_initial(&mut app);
-    apply_watch(&mut loads, &mut app).await;
+    apply_next(&mut app, &inbox).await;
     assert!(matches!(
         app.active().job.as_ref().unwrap().state,
         Some(JobState::StartedUnknown {
@@ -271,11 +264,8 @@ async fn hydration_job_ticks_skip_transcript_and_telemetry_but_age_and_observe_c
         age_activity(&mut app, chrono::Utc::now());
         age_steering(&mut app, chrono::Utc::now());
     }
-    assert!(
-        tokio::time::timeout(Duration::from_millis(50), inbox.recv())
-            .await
-            .is_err()
-    );
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(!apply_pending(&mut app));
     let after = reads.tables();
     for store in [
         "entries",
@@ -308,16 +298,16 @@ async fn hydration_job_ticks_skip_transcript_and_telemetry_but_age_and_observe_c
     ));
     assert_eq!(reads.tables(), after, "expiry performs no storage I/O");
     // A real change still performs exactly one transcript hydration.
+    let before = reads.tables();
     session
         .update_meta(|m| m.name = Some("renamed job".into()))
         .await
         .unwrap();
-    let before = reads.tables();
-    apply_next(&mut loads, &mut app, &mut inbox).await;
+    apply_next(&mut app, &inbox).await;
     assert_eq!(reads.tables()["entries"] - before["entries"], 1);
     assert_eq!(app.active().session_name.as_deref(), Some("renamed job"));
     session.complete_turn_attempt(&attempt, None).await.unwrap();
-    apply_next(&mut loads, &mut app, &mut inbox).await;
+    apply_next(&mut app, &inbox).await;
     assert!(matches!(
         app.active().job.as_ref().unwrap().state,
         Some(JobState::Succeeded { .. })
@@ -339,11 +329,9 @@ async fn hydration_failure_keeps_last_good_but_applies_readable_activity_then_re
         .await
         .unwrap();
     let mut app = App::new(HashSet::new(), tab(&id, db.clone()));
-    let (tx, mut inbox) = presentation::channel();
-    let mut reads = presentation::Reads::default();
+    let (tx, inbox) = presentation::channel();
     install_watch(&mut app, &tx).await;
-    reads.start_initial(&mut app);
-    apply_watch(&mut reads, &mut app).await;
+    apply_next(&mut app, &inbox).await;
     assert!(app.active().live.covered.is_some());
     assert_eq!(app.active().active_turns, 1);
     let write_meta = async |payload: &str| {
@@ -357,13 +345,13 @@ async fn hydration_failure_keeps_last_good_but_applies_readable_activity_then_re
         txn.commit().await.unwrap();
     };
     write_meta("malformed-json").await;
-    apply_next(&mut reads, &mut app, &mut inbox).await;
+    apply_next(&mut app, &inbox).await;
     assert!(app.active().live.covered.is_none());
     assert!(app.active().live.error.is_some());
     assert_eq!(app.active().entries.len(), 8);
     assert_eq!(app.active().active_turns, 1);
     session.complete_turn_attempt(&attempt, None).await.unwrap();
-    apply_next(&mut reads, &mut app, &mut inbox).await;
+    apply_next(&mut app, &inbox).await;
     assert_eq!(
         app.active().active_turns,
         0,
@@ -371,7 +359,7 @@ async fn hydration_failure_keeps_last_good_but_applies_readable_activity_then_re
     );
     assert!(app.active().live.error.is_some());
     write_meta("[]").await;
-    apply_next(&mut reads, &mut app, &mut inbox).await;
+    apply_next(&mut app, &inbox).await;
     assert!(app.active().live.error.is_none());
     assert_eq!(
         app.active().live.covered.as_ref(),
@@ -453,32 +441,27 @@ async fn hydration_equal_frontier_is_not_cached_authority() {
         );
         let id = db.root_id().to_string();
         let mut app = App::new(HashSet::new(), tab(&id, db.clone()));
-        let (tx, _inbox) = presentation::channel();
-        let mut reads = presentation::Reads::default();
+        let (tx, inbox) = presentation::channel();
         install_watch(&mut app, &tx).await;
-        reads.start_initial(&mut app);
-        apply_watch(&mut reads, &mut app).await;
+        apply_next(&mut app, &inbox).await;
         assert_eq!(
             app.active().live.covered.as_ref(),
             Some(&observed.snapshot().await.unwrap())
         );
         // A previously displayed view, same root and same frontier, grants nothing.
-        assert!(jobs::observe(&observed, tx.clone()).await.is_err());
+        assert!(jobs::observe(&observed, tx.clone(), true).await.is_err());
         // A native read-only subscription can still deliver; it is not proof
         // that the already-open write-capable view may reuse its old values.
-        let observation = presentation::next_id();
-        let (callback, initial) = presentation::subscribe(&observed, observation, tx.clone())
+        let watch = presentation::SessionWatch::open(&observed, tx.clone(), true)
             .await
             .unwrap();
         app.active_mut().session_db = observed;
         app.active_mut().live.observation = Some(Observation {
-            id: observation,
-            _callback: Some(callback),
-            initial: Some(initial),
-            ..Default::default()
+            id: presentation::next_id(),
+            watch,
+            _forwarder: None,
         });
-        reads.start_initial(&mut app);
-        apply_watch(&mut reads, &mut app).await;
+        apply_next(&mut app, &inbox).await;
         assert!(app.active().live.covered.is_none());
         assert_eq!(
             app.active().entries.len(),
@@ -495,8 +478,7 @@ async fn hydration_equal_frontier_is_not_cached_authority() {
         );
         app.active_mut().session_db = db;
         install_watch(&mut app, &tx).await;
-        reads.start_initial(&mut app);
-        apply_watch(&mut reads, &mut app).await;
+        apply_next(&mut app, &inbox).await;
         assert!(app.active().live.error.is_none());
         drop(app);
         drop(client);
@@ -508,45 +490,48 @@ async fn hydration_equal_frontier_is_not_cached_authority() {
 }
 
 async fn install_watch(app: &mut App, tx: &presentation::Sender) {
-    app.active_mut().live.observation = Some(
-        jobs::observe(&app.active().session_db, tx.clone())
+    let tab = app.active_mut();
+    tab.live.observation = Some(
+        jobs::observe(&tab.session_db, tx.clone(), tab.job.is_some())
             .await
             .unwrap(),
     );
 }
 
-async fn apply_watch(reads: &mut presentation::Reads, app: &mut App) {
-    let loaded = reads.join_next().await.unwrap().unwrap();
-    assert!(presentation::apply(app, loaded, resolved).is_some());
+fn apply_pending(app: &mut App) -> bool {
+    presentation::apply_latest(app, |app, idx| derive_fixture(&mut app.tabs[idx], resolved))
 }
 
-async fn apply_next(
-    reads: &mut presentation::Reads,
-    app: &mut App,
-    inbox: &mut mpsc::Receiver<presentation::Delivery>,
-) {
-    let delivery = tokio::time::timeout(Duration::from_secs(5), inbox.recv())
-        .await
-        .unwrap()
-        .unwrap();
-    reads.start(app, delivery);
-    apply_watch(reads, app).await;
+async fn apply_next(app: &mut App, inbox: &tokio::sync::Notify) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !apply_pending(app) {
+            inbox.notified().await;
+        }
+    })
+    .await
+    .expect("new database projection");
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn hydration_acknowledged_snapshot_feed() {
-    for connected in [false, true] {
-        tokio::time::timeout(Duration::from_secs(15), acknowledged_round(connected))
-            .await
-            .expect("snapshot/commit/GUI wait cycle");
+async fn wait_for_snapshot(app: &App, inbox: &tokio::sync::Notify, tips: &eidetica::Snapshot) {
+    let watch = &app.active().live.observation.as_ref().unwrap().watch;
+    while !watch.has_snapshot(tips) {
+        inbox.notified().await;
     }
 }
 
-async fn acknowledged_round(connected: bool) {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hydration_latest_projection_does_not_wait_for_gui() {
+    for connected in [false, true] {
+        tokio::time::timeout(Duration::from_secs(15), latest_round(connected))
+            .await
+            .expect("latest projection did not arrive with the GUI stalled");
+    }
+}
+
+async fn latest_round(connected: bool) {
     let (owner, mut user, _) = counting_eidetica().await;
     let db = seed(&mut user, 3).await;
     let other = seed(&mut user, 1).await;
-    let initial = db.snapshot().await.unwrap();
     let dir = tempfile::tempdir().unwrap();
     let socket = dir.path().join("watch.sock");
     let (shutdown, receiver) = watch::channel(());
@@ -582,16 +567,17 @@ async fn acknowledged_round(connected: bool) {
         HashSet::new(),
         tab(&other.root_id().to_string(), independent),
     );
-    let (tx, mut inbox) = presentation::channel();
-    let (other_tx, mut other_inbox) = presentation::channel();
-    let mut reads = presentation::Reads::default();
+    let (tx, inbox) = presentation::channel();
+    let (other_tx, other_inbox) = presentation::channel();
     install_watch(&mut app, &tx).await;
     install_watch(&mut elsewhere, &other_tx).await;
-    reads.start_initial(&mut elsewhere);
-    apply_watch(&mut reads, &mut elsewhere).await;
+    apply_next(&mut app, &inbox).await;
+    apply_next(&mut elsewhere, &other_inbox).await;
+    assert_eq!(app.active().entries.len(), 3);
+    assert_eq!(app.active().session_name, None);
 
-    // Hold initial hydration until *after* a write burst. Neither same-tree
-    // commits nor a different tree on the same transport wait for the GUI.
+    // Don't apply or remove any GUI result while these writes commit and the
+    // callback hydrates them. The other database shares the same transport.
     let second_writer = app.active().session_db.clone();
     for (name, writer) in [("one", &db), ("two", &second_writer), ("three", &db)] {
         chaz_core::session::update_meta_on_db(writer, |m| m.name = Some(name.into()))
@@ -610,44 +596,33 @@ async fn acknowledged_round(connected: bool) {
     chaz_core::session::update_meta_on_db(&other, |m| m.name = Some("independent".into()))
         .await
         .unwrap();
-    reads.start(&mut elsewhere, other_inbox.recv().await.unwrap());
-    apply_watch(&mut reads, &mut elsewhere).await;
+    let other_latest = other.snapshot().await.unwrap();
+    wait_for_snapshot(&elsewhere, &other_inbox, &other_latest).await;
+    assert!(apply_pending(&mut elsewhere));
     assert_eq!(
         elsewhere.active().session_name.as_deref(),
         Some("independent")
     );
 
-    reads.start_initial(&mut app);
-    let loaded = reads.join_next().await.unwrap().unwrap();
-    assert!(matches!(
-        inbox.try_recv(),
-        Err(mpsc::error::TryRecvError::Empty)
-    ));
-    assert!(presentation::apply(&mut app, loaded, resolved).is_some());
-    assert_eq!(app.active().live.covered.as_ref(), Some(&initial));
-    assert_eq!(app.active().entries.len(), 3);
-    assert_eq!(app.active().session_name, None);
-    assert!(app.active().live.status_segments.is_empty());
-
     let latest = db.snapshot().await.unwrap();
-    loop {
-        reads.start(&mut app, inbox.recv().await.unwrap());
-        apply_watch(&mut reads, &mut app).await;
-        if app.active().live.covered.as_ref() == Some(&latest) {
-            break;
-        }
-        assert!(
-            connected,
-            "local mailbox must retain only the latest pending snapshot"
-        );
-    }
+    wait_for_snapshot(&app, &inbox, &latest).await;
+    assert_eq!(
+        app.active().session_name,
+        None,
+        "the GUI has not applied any update"
+    );
+    assert!(apply_pending(&mut app));
+    assert_eq!(app.active().live.covered.as_ref(), Some(&latest));
+    assert!(
+        !apply_pending(&mut app),
+        "a burst must leave no queued intermediate view"
+    );
     assert_eq!(app.active().session_name.as_deref(), Some("three"));
     assert_eq!(app.active().live.status_segments, ["new status"]);
     app.close_tab_at(0);
     app.push_tab(tab(&id, observed.clone()));
     install_watch(&mut app, &tx).await;
-    reads.start_initial(&mut app);
-    apply_watch(&mut reads, &mut app).await;
+    apply_next(&mut app, &inbox).await;
     assert_eq!(app.active().session_name.as_deref(), Some("three"));
     drop(app);
     drop(elsewhere);
@@ -684,15 +659,14 @@ async fn hydration_retirement_finishes_started_verification() {
             .unwrap()
             .with_key(signer);
         let id = db.root_id().to_string();
-        let (tx, _old_rx) = presentation::channel();
-        let (surviving, mut live_rx) = presentation::channel();
+        let (tx, old_inbox) = presentation::channel();
+        let (surviving, live_inbox) = presentation::channel();
         let mut app = App::new(HashSet::new(), tab(&id, db.clone()));
         let mut other = App::new(HashSet::new(), tab(&id, db.clone()));
-        let mut owned = presentation::Reads::default();
-        install_watch(&mut app, &tx).await;
         install_watch(&mut other, &surviving).await;
-        owned.start_initial(&mut other);
-        apply_watch(&mut owned, &mut other).await;
+        apply_next(&mut other, &live_inbox).await;
+        let held = tx.hold_reads().await;
+        install_watch(&mut app, &tx).await;
 
         let txn = writer.new_transaction().await.unwrap();
         txn.get_store::<DocStore>("meta")
@@ -708,8 +682,8 @@ async fn hydration_retirement_finishes_started_verification() {
         let (promoted, release) = reads.pause_after_promotion(entry.clone());
         // Reading the initial historical view rechecks *live* native Write
         // authority. That check verifies the newer signed entry. Its lifetime
-        // is the owned load, not the registration waiting for GUI handling.
-        owned.start_initial(&mut app);
+        // is the owned load, not the callback waiting for it.
+        drop(held);
         promoted.await.unwrap();
         for c in "still typing".chars() {
             input::handle_chat_key(
@@ -720,19 +694,22 @@ async fn hydration_retirement_finishes_started_verification() {
         assert_eq!(app.input, "still typing");
         app.close_tab_at(0);
         release.send(()).unwrap();
-        let loaded = owned.join_next().await.unwrap().unwrap();
-        // Reopen the same DB before the retired result can touch the GUI.
-        app.push_tab(tab(&id, db.clone()));
-        install_watch(&mut app, &tx).await;
-        assert!(presentation::apply(&mut app, loaded, resolved).is_none());
-        assert_eq!(app.active().session_name, None);
         // No retry, new read or later write can heal a missed publication.
-        // The surviving registration must receive the promotion itself.
-        let live = live_rx.recv().await.unwrap();
-        assert_eq!(live.tips.tips(), &[entry]);
-        owned.start(&mut other, live);
-        apply_watch(&mut owned, &mut other).await;
+        apply_next(&mut other, &live_inbox).await;
+        assert_eq!(
+            other.active().live.covered.as_ref().unwrap().tips(),
+            &[entry]
+        );
         assert_eq!(other.active().session_name.as_deref(), Some("promoted"));
+        app.push_tab(tab(&id, db));
+        assert!(
+            !apply_pending(&mut app),
+            "retired route must not publish into a replacement"
+        );
+        assert_eq!(app.active().session_name, None);
+        install_watch(&mut app, &tx).await;
+        apply_next(&mut app, &old_inbox).await;
+        assert_eq!(app.active().session_name.as_deref(), Some("promoted"));
     })
     .await
     .expect("retiring one observer lost another observer's promotion");

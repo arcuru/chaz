@@ -5,20 +5,18 @@ use chaz_core::hosted_index::DbEntry;
 use eidetica::auth::crypto::PublicKey;
 use eidetica::entry::ID;
 use eidetica::{Database, Snapshot};
-use tokio::sync::oneshot;
+use presentation::Latest;
+use tokio::sync::Notify;
 
-/// A native subscription serializes deliveries until the terminal accepts or
-/// discards them. Dropping a route stops it, but not a native read that has
-/// already begun verification; the separately owned pool drains those reads.
 struct Watch {
     id: u64,
+    latest: Arc<Latest<Result<Value, String>>>,
     _task: supervised::Task<()>,
 }
 
 pub(super) struct Update {
     id: u64,
     result: Result<Value, String>,
-    handled: Option<oneshot::Sender<()>>,
 }
 
 #[derive(Clone)]
@@ -135,11 +133,12 @@ impl Watch {
         source: Source,
         server: Arc<Server>,
         pool: Arc<presentation::Preparations>,
-        tx: mpsc::Sender<Update>,
+        wake: Arc<Notify>,
     ) -> Self {
         let id = presentation::next_id();
+        let latest = Arc::new(Latest::new(wake));
+        let output = latest.clone();
         let task = tokio::spawn(async move {
-            let (delivery_tx, mut deliveries) = mpsc::channel(1);
             let registered = async {
                 // Ordinary historical binding can hold the account mutex and
                 // must be preemptible by New Session. Once subscribed, reads
@@ -156,64 +155,45 @@ impl Watch {
                     pool.prepare(async move { source.open(&server).await.map_err(stringify) })
                         .await?
                 };
+                let read_pool = pool.clone();
+                let latest = output.clone();
+                let read_db = db.clone();
                 pool.prepare(async move {
-                    let (callback, initial) = presentation::subscribe_to(&db, id, delivery_tx)
-                        .await
-                        .map_err(stringify)?;
-                    Ok((db, callback, initial))
+                    let (callback, _) = presentation::subscribe(&db, latest, move |tips| {
+                        let (source, db, server) =
+                            (source.clone(), read_db.clone(), server.clone());
+                        let pool = read_pool.clone();
+                        async move {
+                            pool.prepare(async move {
+                                source.read(&server, db, tips).await.map_err(stringify)
+                            })
+                            .await
+                        }
+                    })
+                    .await
+                    .map_err(stringify)?;
+                    Ok(callback)
                 })
                 .await
             }
             .await;
-            let (db, _callback, mut delivery) = match registered {
-                Ok(parts) => parts,
-                Err(error) => {
-                    let _ = tx
-                        .send(Update {
-                            id,
-                            result: Err(error),
-                            handled: None,
-                        })
-                        .await;
-                    return;
-                }
-            };
-            loop {
-                let read_source = source.clone();
-                let read_db = db.clone();
-                let read_server = server.clone();
-                let tips = delivery.tips;
-                let result = pool
-                    .prepare(async move {
-                        read_source
-                            .read(&read_server, read_db, tips)
-                            .await
-                            .map_err(stringify)
-                    })
-                    .await;
-                if tx
-                    .send(Update {
-                        id,
-                        result,
-                        handled: Some(delivery.handled),
-                    })
-                    .await
-                    .is_err()
-                {
-                    break;
-                }
-                // The callback cannot send another delivery until the GUI
-                // drops or acknowledges the preceding update's sender.
-                let Some(next) = deliveries.recv().await else {
-                    break;
-                };
-                delivery = next;
+            match registered {
+                Ok(_callback) => std::future::pending::<()>().await,
+                Err(error) => output.publish(Err(error)),
             }
         });
         Self {
             id,
+            latest,
             _task: supervised::Task(task),
         }
+    }
+
+    fn take(&self) -> Option<Update> {
+        self.latest.take().map(|result| Update {
+            id: self.id,
+            result,
+        })
     }
 }
 
@@ -227,21 +207,18 @@ pub(super) struct Watches {
     group: Option<(u64, GroupView, Watch)>,
     rows: HashMap<String, (bool, Watch)>,
     agents: HashMap<ID, (DbEntry, Watch)>,
-    tx: mpsc::Sender<Update>,
-    pub(super) rx: mpsc::Receiver<Update>,
+    wake: Arc<Notify>,
 }
 
 impl Watches {
     pub(super) fn new() -> Self {
-        let (tx, rx) = mpsc::channel(32);
         Self {
             pool: Arc::new(presentation::Preparations::new(4)),
             row_pool: Arc::new(presentation::Preparations::new(4)),
             group: None,
             rows: HashMap::new(),
             agents: HashMap::new(),
-            tx,
-            rx,
+            wake: Arc::new(Notify::new()),
         }
     }
 
@@ -253,7 +230,6 @@ impl Watches {
 
     pub(super) async fn shutdown(&mut self) {
         self.disconnect();
-        self.rx.close();
         tokio::join!(self.pool.drain(), self.row_pool.drain());
     }
 
@@ -268,7 +244,7 @@ impl Watches {
                 Source::Group(view.clone()),
                 server.clone(),
                 self.pool.clone(),
-                self.tx.clone(),
+                self.wake.clone(),
             );
             self.group = Some((app.session_generation, view, watch));
             app.session_catalog_loading = app.mode == TuiMode::SessionPicker;
@@ -287,7 +263,7 @@ impl Watches {
                     Source::Row { id, worker },
                     server.clone(),
                     self.row_pool.clone(),
-                    self.tx.clone(),
+                    self.wake.clone(),
                 );
                 (worker, watch)
             });
@@ -364,14 +340,61 @@ impl Watches {
                     Source::Agent(Box::new(entry.clone())),
                     server.clone(),
                     self.pool.clone(),
-                    self.tx.clone(),
+                    self.wake.clone(),
                 );
                 (entry, watch)
             });
         }
     }
 
-    pub(super) fn apply(&self, app: &mut App, server: &Server, update: Update) {
+    fn active_watches(&self) -> impl Iterator<Item = &Watch> {
+        self.group
+            .iter()
+            .map(|(_, _, watch)| watch)
+            .chain(self.rows.values().map(|(_, watch)| watch))
+            .chain(self.agents.values().map(|(_, watch)| watch))
+    }
+
+    pub(super) async fn changed(&self) {
+        self.wake.notified().await;
+    }
+
+    pub(super) fn apply_latest(
+        &self,
+        app: &mut App,
+        server: &Server,
+        backend: &BackendManager,
+    ) -> bool {
+        let mut changed = false;
+        for update in self.active_watches().filter_map(Watch::take) {
+            self.apply(app, server, backend, update);
+            changed = true;
+        }
+        changed
+    }
+
+    #[cfg(test)]
+    pub(super) fn try_next(&self) -> Option<Update> {
+        self.active_watches().find_map(Watch::take)
+    }
+
+    #[cfg(test)]
+    pub(super) async fn next(&self) -> Update {
+        loop {
+            if let Some(update) = self.try_next() {
+                return update;
+            }
+            self.changed().await;
+        }
+    }
+
+    pub(super) fn apply(
+        &self,
+        app: &mut App,
+        server: &Server,
+        backend: &BackendManager,
+        update: Update,
+    ) {
         if !app.backend_available {
             return;
         }
@@ -429,19 +452,16 @@ impl Watches {
                 Ok(Value::Agent(value)) => {
                     app.agent_defaults.insert(id.clone(), value);
                     app.agent_config_errors.remove(id);
-                    refresh::derive_models(app, server);
+                    refresh::derive_models(app, server, backend);
                     app.update_picker_pin(server);
                 }
                 Err(error) => {
                     tracing::warn!(agent_db = %id, %error, "Agent configuration observation failed");
                     app.agent_config_errors.insert(id.clone(), error);
-                    refresh::derive_models(app, server);
+                    refresh::derive_models(app, server, backend);
                 }
                 _ => unreachable!(),
             }
-        }
-        if let Some(handled) = update.handled {
-            let _ = handled.send(());
         }
     }
 }

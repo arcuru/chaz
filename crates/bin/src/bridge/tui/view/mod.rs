@@ -321,6 +321,7 @@ pub(super) fn ui(
     // can show the "reconciling agents…" indicator until the deferred
     // at-startup work releases it.
     app.startup_ready = server.is_startup_ready();
+    super::refresh::update_context_budget(app, server);
     // Refresh peer-side caches whenever any Settings page is up. The Peer
     // Settings views index into these directly for action keys ([r]
     // reload, [d] remove, Ctrl+↑↓ reorder); the Session→Agents picker
@@ -839,8 +840,6 @@ pub(super) fn ui_chat(f: &mut ratatui::Frame, app: &mut App, ext_segments: &[Str
         " | ⚠ refresh failed (cached)"
     } else if tab.live.snapshot_overdue {
         " | ⚠ refresh overdue (cached)"
-    } else if app.model_metadata.error.is_some() {
-        " | ⚠ model metadata stale"
     } else if tab.live.agent_config_stale {
         " | ⚠ agent config stale"
     } else if tab.live.pending() {

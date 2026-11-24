@@ -285,9 +285,8 @@ async fn settle(app: &mut App) {
     }
 }
 async fn update(watches: &mut components::Watches) -> components::Update {
-    tokio::time::timeout(std::time::Duration::from_secs(2), watches.rx.recv())
+    tokio::time::timeout(std::time::Duration::from_secs(2), watches.next())
         .await
-        .unwrap()
         .unwrap()
 }
 fn frame(app: &mut App, server: &Arc<Server>, backend: &BackendManager) -> String {
@@ -321,6 +320,7 @@ async fn visible_rows_merge_group_and_session_deliveries_without_rereading_live_
     let dir = tempfile::tempdir().unwrap();
     let built = runtime(dir.path(), Arc::new(Probe::default())).await;
     let server = &built.server;
+    let backend = BackendManager::new(&None, built.secret_store.clone());
     let registry = server.registry();
     let (id, db) = registry.create_session(Some("tui")).await.unwrap();
     let id = id.0;
@@ -342,11 +342,11 @@ async fn visible_rows_merge_group_and_session_deliveries_without_rereading_live_
     // Hold the delivered group result while committing a newer index. The GUI
     // initially sees the pinned index, then follows the native notification.
     registry.mark_session_closed(&id).await.unwrap();
-    watches.apply(&mut app, server, initial);
+    watches.apply(&mut app, server, &backend, initial);
     assert_eq!(app.session_list[0].status, SessionStatus::Active);
     app.picker_index = 1;
     let group = update(&mut watches).await;
-    watches.apply(&mut app, server, group);
+    watches.apply(&mut app, server, &backend, group);
     assert_eq!(app.picker_selection(), id);
     assert_eq!(app.session_list[0].status, SessionStatus::Closed);
     assert!(
@@ -363,10 +363,10 @@ async fn visible_rows_merge_group_and_session_deliveries_without_rereading_live_
     })
     .await
     .unwrap();
-    watches.apply(&mut app, server, initial);
+    watches.apply(&mut app, server, &backend, initial);
     assert_eq!(app.session_list[0].name.as_deref(), Some("original alias"));
     let row = update(&mut watches).await;
-    watches.apply(&mut app, server, row);
+    watches.apply(&mut app, server, &backend, row);
     assert_eq!(
         app.session_list[0].description.as_deref(),
         Some("new session data")
@@ -379,7 +379,7 @@ async fn visible_rows_merge_group_and_session_deliveries_without_rereading_live_
 
     set_alias(Some("original alias"), "replacement alias").await;
     let group = update(&mut watches).await;
-    watches.apply(&mut app, server, group);
+    watches.apply(&mut app, server, &backend, group);
     assert_eq!(
         app.session_list[0].name.as_deref(),
         Some("canonical session title")
@@ -388,7 +388,7 @@ async fn visible_rows_merge_group_and_session_deliveries_without_rereading_live_
         .await
         .unwrap();
     let row = update(&mut watches).await;
-    watches.apply(&mut app, server, row);
+    watches.apply(&mut app, server, &backend, row);
     assert_eq!(
         app.session_list[0].name.as_deref(),
         Some("replacement alias")
@@ -402,13 +402,12 @@ async fn visible_rows_merge_group_and_session_deliveries_without_rereading_live_
         .await
         .unwrap();
     let (notify, _) = presentation::channel();
-    let observation = jobs::observe(&db, notify.clone()).await.unwrap();
-    let tab = build_observed_tab(server, server.backend(), db, observation, false)
+    let observation = jobs::observe(&db, notify.clone(), false).await.unwrap();
+    let tab = build_observed_tab(server, &backend, db, observation)
         .await
         .unwrap();
     app.push_tab(tab);
-    refresh::apply_initial_models(&mut app, server);
-    watches.apply(&mut app, server, retired);
+    watches.apply(&mut app, server, &backend, retired);
     assert_eq!(app.session_list[0].description.as_deref(), Some("open tab"));
     assert_eq!(app.session_list[0].status, SessionStatus::Closed);
     watches.shutdown().await;
@@ -506,8 +505,8 @@ async fn new_session_preempts_a_blocked_historical_open_without_history_growth()
             0,
             "test released the historical gate"
         );
-        assert!(watches.rx.try_recv().is_err(), "blocked metadata completed");
-        watches.apply(&mut app, server, group);
+        assert!(watches.try_next().is_none(), "blocked metadata completed");
+        watches.apply(&mut app, server, &backend, group);
         assert!(app.session_picker_error.is_none());
         let created = app.active().session_db_id.clone();
         *probe.blocked.lock().unwrap() = None;
@@ -515,7 +514,7 @@ async fn new_session_preempts_a_blocked_historical_open_without_history_growth()
         app.picker_visible_rows = 0..0;
         watches.sync_picker(&mut app, server);
         let result = update(&mut watches).await;
-        watches.apply(&mut app, server, result);
+        watches.apply(&mut app, server, &backend, result);
         assert_eq!(app.session_list.len(), count + 1);
         assert_eq!(
             app.session_list
@@ -587,7 +586,7 @@ async fn creation_survives_navigation_without_replay_or_focus_theft() {
     app.close_settings();
     watches.sync_picker(&mut app, server);
     let result = update(&mut watches).await;
-    watches.apply(&mut app, server, result);
+    watches.apply(&mut app, server, &backend, result);
     assert_eq!(app.session_list.len(), 1);
     assert_eq!(app.session_list[0].session_db_id, created);
     let (approval, _) = mpsc::channel(8);
