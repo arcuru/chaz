@@ -1496,7 +1496,7 @@ impl Bridge for MatrixBridge {
                         // exposed session, runs the agent and writes the reply,
                         // which the response callback above delivers back here.
                         let mut session = Session::new(
-                            chaz_core::types::ConversationId(session_db_id),
+                            chaz_core::types::ConversationId(session_db_id.clone()),
                             session_db,
                         )
                         .await;
@@ -1527,8 +1527,12 @@ impl Bridge for MatrixBridge {
                             entry.routing.as_mut().unwrap().matrix_room =
                                 room_info::observe(&room, managed_chat).await;
                         }
-                        if let Err(e) = session.add_bridge_input(entry, wake).await {
-                            error!("Failed to record inbound message: {e}");
+                        match session.add_bridge_input(entry, wake).await {
+                            Ok(request) if managed_chat && session.entries().last().is_some_and(|entry| entry.entry_type == chaz_core::session::EntryType::Message) => {
+                                workspace.remember_rename_request(event.sender.as_str(), &room_id, &session_db_id, request.as_str());
+                            }
+                            Ok(_) => {}
+                            Err(e) => error!("Failed to record inbound message: {e}"),
                         }
                     }
                 },
