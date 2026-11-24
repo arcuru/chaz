@@ -775,6 +775,7 @@ impl SessionRegistry {
     ) -> anyhow::Result<(ConversationId, Database)> {
         let root_id = eidetica::entry::ID::parse(session_db_id)
             .map_err(|e| anyhow::anyhow!("Invalid session DB ID '{session_db_id}': {e}"))?;
+        let id = ConversationId(session_db_id.to_owned());
         if let Some(db) = self
             .local_client_sessions
             .lock()
@@ -782,23 +783,20 @@ impl SessionRegistry {
             .get(session_db_id)
             .cloned()
         {
-            return Ok((ConversationId(session_db_id.to_string()), db));
+            return Ok((id, db));
         }
         let user = self.user.lock().await;
-        let key_id = user
-            .find_key(&root_id)?
-            .ok_or_else(|| anyhow::anyhow!("no session signing key"))?;
-        let mut db = user.open_database_with_key(&root_id, &key_id).await?;
+        let (mut db, key_id) = Self::bind_tracked_session(&user, &root_id).await?;
         // Single-hop delegated sessions share an inherited snapshot floor across
         // interactive turns, tools and pinned schedules. Refresh every keyed
         // embedded open, including read-only opens, without changing the selected key.
         // Service discovery cannot resolve delegation: preserve its bound identity
         // and explicit authority gaps rather than selecting a different path.
-        // Direct and nested handles retain their existing native semantics.
+        // Direct, nested, and already-bound client handles retain their existing semantics.
         if self.instance.backend().local_engine().is_some()
             && matches!(db.auth_identity(), Some(eidetica::auth::types::SigKey::Delegation { path, .. }) if path.len() == 1)
         {
-            let (identity, _) = Database::find_sigkeys(&self.instance, &root_id, &key_id)
+            let (identity, _) = Database::find_sigkeys(&self.instance, db.root_id(), &key_id)
                 .await?
                 .into_iter()
                 .next()
@@ -808,7 +806,31 @@ impl SessionRegistry {
                 identity,
             ));
         }
-        Ok((ConversationId(session_db_id.to_string()), db))
+        Ok((id, db))
+    }
+
+    /// Bind the account's existing identity without refreshing delegation or
+    /// starting access-time verification while holding the account lock. A
+    /// presentation reader must still check native current authority before
+    /// projecting data. This is not an execution or key-acquisition path.
+    pub async fn bind_session_for_observation(&self, id: &str) -> anyhow::Result<Database> {
+        let root = eidetica::entry::ID::parse(id)?;
+        if let Some(db) = self.local_client_sessions.lock().await.get(id).cloned() {
+            return Ok(db);
+        }
+        let user = self.user.lock().await;
+        Ok(Self::bind_tracked_session(&user, &root).await?.0)
+    }
+
+    async fn bind_tracked_session(
+        user: &eidetica::AccountSession,
+        root_id: &eidetica::entry::ID,
+    ) -> anyhow::Result<(Database, eidetica::auth::crypto::PublicKey)> {
+        let key_id = user
+            .find_key(root_id)?
+            .ok_or_else(|| anyhow::anyhow!("no session signing key"))?;
+        let db = user.open_database_with_key(root_id, &key_id).await?;
+        Ok((db, key_id))
     }
 
     /// Capture the actual selected signer while opening an embedded session.
@@ -902,6 +924,18 @@ impl SessionRegistry {
     /// routing-index source string.
     pub async fn list_sessions(&self) -> anyhow::Result<Vec<SessionIndex>> {
         let txn = self.chaz_group.new_transaction().await?;
+        Self::list_sessions_in(&txn).await
+    }
+
+    /// Read routing, catalog and aliases from one delivered group frontier.
+    pub async fn list_sessions_at(
+        &self,
+        at: &eidetica::Snapshot,
+    ) -> anyhow::Result<Vec<SessionIndex>> {
+        Self::list_sessions_in(&self.chaz_group.new_transaction_at(at).await?).await
+    }
+
+    async fn list_sessions_in(txn: &eidetica::Transaction) -> anyhow::Result<Vec<SessionIndex>> {
         let sessions = txn.get_store::<DocStore>(STORE_SESSIONS).await?;
         let catalog = txn.get_store::<DocStore>(STORE_SESSION_CATALOG).await?;
         let names = txn.get_store::<DocStore>(STORE_SESSION_NAMES).await?;

@@ -413,8 +413,8 @@ The denominator is the runtime's effective **input** context budget, not the
 output-token cap. Configured model windows take precedence over discovered
 windows; an explicit agent cap can lower the budget. When the model window is
 unknown, the configured input-budget fallback still applies. A zero budget is
-shown as `unknown`. The bar refreshes model defaults, learned windows and caps
-on redraw. Long session names are clipped to keep the pair visible.
+shown as `unknown`. The bar uses learned windows already available to this
+runtime on redraw. Long session names are clipped to keep the pair visible.
 
 For example:
 
@@ -1451,21 +1451,28 @@ A delayed open does not take focus after newer local navigation. Ordinary opens
 resolve their destination before installing observation: `/join` to an open
 tab reuses its live approval receiver. New destinations finish observation
 setup before reading their initial transcript and exposing their composer.
-A post-insertion check covers notifications delivered while the tab was opening.
+A newly opened tab starts from a database snapshot and keeps observing later changes.
 Jobs opened from either Jobs or the hub remain authorized observers, never ordinary execution sessions.
 
-Transcript, metadata, telemetry and steering evidence share one Verified database snapshot.
-A notification is only an invalidation hint: the TUI obtains a fresh native snapshot and checks current authority before reusing an already-covered view.
-Changed snapshots rebuild conservatively, even when only a heartbeat changed; duplicate or delayed notifications do not rehydrate the same transcript.
-Job-tab ticks check for changes without rereading unchanged transcripts or telemetry, and age retained activity and steering timestamps locally.
-Read-only local actions leave other tabs alone; session writes check their originating tab, while agent/global changes retain cross-tab refreshes.
+Transcript, metadata, telemetry and steering use the Verified Session snapshot
+delivered by the database, with current access checked separately. The callback
+reads that snapshot without waiting for a frame. If writes arrive faster than
+the terminal can draw, it can skip intermediate views and show the latest one.
+
+The hub joins its peer-local catalog (aliases, origin and closed state) with
+Session metadata. It observes only visible rows without an open tab, and those
+observations never load a transcript. The model and context limit use the last
+applied Session and Agent DB views. These databases update independently.
+Configured windows and agent caps still apply. Operation results report success
+or failure without overwriting persisted display values.
 
 | Trigger / display                      | Behavior                                                                          |
 | -------------------------------------- | --------------------------------------------------------------------------------- |
-| Session write / Settings open          | Coalesced background transcript/meta/telemetry/status refresh                     |
+| A database changes                     | Apply its latest delivered snapshot in the background, even while idle            |
 | Every five seconds                     | Age retained activity; check service health and retry failed reads                |
 | `⟳ refreshing (cached)`                | A read is pending; displayed data is the last successful read                     |
 | `⚠ refresh failed`                     | That read failed; last-good data remains, even if another read succeeds           |
+| `⚠ agent config stale`                 | Reading agent settings failed; the last accepted values remain visible            |
 | `action(s) pending`                    | Accepted backend actions execute in order, one at a time                          |
 | Queue full or backend disconnected     | New backend actions are not accepted; composer/prompts stay editable              |
 | `Write still pending; outcome unknown` | A deadline warns, but does not cancel, retry or advance past the write            |
@@ -1478,12 +1485,13 @@ warning in every mode, including Settings editors, model selection and overlays.
 Drafts remain intact and visible; a second explicit quit confirms exit. An open
 completion popup still consumes the first Esc without arming quit.
 
-Reads have a bounded wait and supervised panic/cancellation handling. A failed
-read releases its slot for recovery without clearing cached data or restoring
-an otherwise live terminal. Errors are tracked separately for transcript/meta,
-status and activity; a successful activity read cannot hide a failed transcript
-read. Catalog failures likewise retain prior rows and mark their metadata stale.
-Errors are logged at `warn`; worker panics are logged at `error`.
+Reads run off the terminal thread. A slow snapshot can be marked overdue while
+its read finishes, without tearing down a working connection. Closing a view
+discards its observation; an already-started native verification read can finish
+without writing into a replacement view. A failed read leaves last-good data
+visible. Readable activity or status can advance at the same frontier without
+hiding a transcript error. A catalog failure retains prior rows and reports
+the stale catalog separately.
 
 Writes are different. A transport failure, timeout or cancellation cannot prove
 that a message or command did not commit. The TUI never automatically retries

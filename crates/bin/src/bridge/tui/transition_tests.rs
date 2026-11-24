@@ -65,9 +65,8 @@ async fn queued_defaults_add_then_delete_and_move_preserve_identity_and_order() 
     let server = &built.server;
     let backend = BackendManager::new(&None, built.secret_store.clone());
     let (approval, _) = mpsc::channel(8);
-    let (notify, _) = mpsc::channel(64);
+    let (notify, _) = presentation::channel();
     let (models, _) = mpsc::channel(4);
-    let (rows, _) = mpsc::channel(128);
     let mut observations = Vec::new();
     for reorder in [false, true] {
         server.set_default_agents(vec!["a".into(), "b".into()]);
@@ -95,7 +94,6 @@ async fn queued_defaults_add_then_delete_and_move_preserve_identity_and_order() 
             &approval,
             &notify,
             &models,
-            &rows,
         );
         // Accept the next action before the earlier add can update worker state.
         app.peer_defaults_cursor = usize::from(reorder);
@@ -114,7 +112,6 @@ async fn queued_defaults_add_then_delete_and_move_preserve_identity_and_order() 
             &approval,
             &notify,
             &models,
-            &rows,
         );
         assert_eq!(
             server.default_agents(),
@@ -200,9 +197,8 @@ async fn close_then_next_event(event: Event) {
     let backend = BackendManager::new(&None, built.secret_store.clone());
     let mut app = session_app(&built, &backend).await;
     let (approval, _) = mpsc::channel(8);
-    let (notify, _) = mpsc::channel(64);
+    let (notify, _) = presentation::channel();
     let (models, _) = mpsc::channel(4);
-    let (rows, _) = mpsc::channel(128);
     let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
     terminal
         .draw(|f| view::ui(f, &mut app, &built.server, &backend, &Config::default()))
@@ -221,7 +217,6 @@ async fn close_then_next_event(event: Event) {
                     &approval,
                     &notify,
                     &models,
-                    &rows,
                 ),
                 TuiMode::SessionPicker => {
                     app.open_settings(SettingsScope::Peer, TuiMode::SessionPicker)
@@ -284,7 +279,7 @@ async fn sessionless_jobs_escape_and_pending_exit_preserve_batch_view_contract()
     let dir = tempfile::tempdir().unwrap();
     let built = runtime(dir.path()).await;
     let backend = BackendManager::new(&None, built.secret_store.clone());
-    let (notify, _) = mpsc::channel(64);
+    let (notify, _) = presentation::channel();
     let (jobs_tx, _) = mpsc::channel(1);
     let mut app = App::hub(HashSet::new());
     app.mode = TuiMode::Jobs;
@@ -451,7 +446,7 @@ async fn ordinary_open_candidates_do_not_register_before_view_ownership() {
     let (_, db) = built.registry.create_session(Some("tui")).await.unwrap();
     let id = db.root_id().to_string();
     let (approval, _) = mpsc::channel(8);
-    let (notify, _) = mpsc::channel(64);
+    let (notify, _) = presentation::channel();
     let mut app = App::hub(HashSet::new());
     let ctx = operation_context(
         &built.server,
@@ -757,7 +752,7 @@ async fn steering_promotion_refresh_and_reopen(is_job: bool) {
         .unwrap()
         .unwrap()
         .forget();
-    let (notify, _) = mpsc::channel(64);
+    let (notify, _) = presentation::channel();
     let tab = if is_job {
         jobs::open_tab(server, &backend, &id, notify.clone())
             .await
@@ -770,7 +765,6 @@ async fn steering_promotion_refresh_and_reopen(is_job: bool) {
     let mut app = App::new(HashSet::from(["a".into()]), tab);
     let (approval, _) = mpsc::channel(8);
     let (models, _) = mpsc::channel(4);
-    let (rows, _) = mpsc::channel(4);
     app.input = "frame steering one".into();
     app.cursor = app.input.len();
     assert!(
@@ -791,7 +785,6 @@ async fn steering_promotion_refresh_and_reopen(is_job: bool) {
         &approval,
         &notify,
         &models,
-        &rows,
     );
     let result = tokio::time::timeout(Duration::from_secs(10), app.operations.recv())
         .await
@@ -828,18 +821,13 @@ async fn steering_promotion_refresh_and_reopen(is_job: bool) {
         .unwrap()
         .unwrap()
         .forget();
-    // Actual background refresh is exercised, then close/reopen through each real opener.
-    let (tx, mut rx) = mpsc::channel(8);
-    refresh::request(&mut app, &id, refresh::RefreshKind::Session, &tx);
-    let result = tokio::time::timeout(Duration::from_secs(10), rx.recv())
-        .await
-        .unwrap()
-        .unwrap();
-    refresh::apply(&mut app, result, |_, _| refresh::Resolved {
+    // The pinned read updates telemetry before close/reopen through each real opener.
+    refresh::fixture_reload(&mut app, |_, _| refresh::Resolved {
         effective_model: "stub".into(),
         context_budget: 32_000,
         roster: vec![],
-    });
+    })
+    .await;
     assert_eq!(app.tabs[0].live.telemetry.as_ref().unwrap().totals.calls, 2);
     assert!(app.tabs[0].live.telemetry.as_ref().unwrap().last_calls["a"].context_estimated);
     let screen = steering_frame(
@@ -1030,7 +1018,7 @@ async fn busy_steering_publication_after_close_or_retry_is_not_an_idle_turn() {
 }
 
 #[tokio::test]
-async fn opened_tab_checks_writes_whose_notifications_arrived_before_insertion() {
+async fn opened_tab_applies_latest_projection_after_insertion() {
     let dir = tempfile::tempdir().unwrap();
     let built = runtime(dir.path()).await;
     let server = built.server.clone();
@@ -1038,53 +1026,38 @@ async fn opened_tab_checks_writes_whose_notifications_arrived_before_insertion()
     let (_, db) = server.registry().create_session(Some("tui")).await.unwrap();
     let id = db.root_id().to_string();
     let (approval, _approvals) = mpsc::channel(8);
-    let (notify, mut notifications) = mpsc::channel(64);
+    let (notify, wake) = presentation::channel();
     let (ready, prepared) = oneshot::channel();
     let (release, gate) = oneshot::channel();
     let mut app = App::hub(HashSet::new());
     let opening = db.clone();
-    let sid = id.clone();
+    let render_backend = backend.clone();
     operations::submit(&mut app, false, None, async move {
-        let observation = setup_session(&server, &opening, backend.clone(), approval, notify)
-            .await
-            .map_err(|e| e.to_string())?;
-        let mut tab = build_tab(&server, &backend, opening, sid).await?;
-        tab.live.observation = Some(observation);
+        let tab = open_live_tab(server, backend, opening, approval, notify).await?;
         ready.send(()).unwrap();
         gate.await.unwrap();
         Ok(operations::Effect::Opened(Box::new(tab)))
     });
-    prepared.await.unwrap();
-    chaz_core::session::update_meta_on_db(&db, |m| m.name = Some("written while opening".into()))
-        .await
-        .unwrap();
-    // The UI can consume the callback before the prepared tab is inserted.
-    let (tx, mut rx) = mpsc::channel(8);
-    let event = tokio::time::timeout(std::time::Duration::from_secs(2), notifications.recv())
+    tokio::time::timeout(std::time::Duration::from_secs(2), prepared)
         .await
         .unwrap()
         .unwrap();
-    refresh::request(&mut app, &event, refresh::RefreshKind::Session, &tx);
-    assert!(rx.try_recv().is_err());
+    chaz_core::session::update_meta_on_db(&db, |m| m.name = Some("written while opening".into()))
+        .await
+        .unwrap();
     release.send(()).unwrap();
     let completion = app.operations.recv().await.unwrap();
-    let invalidation = operations::apply(&mut app, completion);
-    assert_eq!(invalidation, operations::Invalidation::Session(id));
-    operations::refresh_after(&mut app, invalidation, &tx);
-    for _ in 0..2 {
-        let msg = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        refresh::apply(&mut app, msg, |agent, meta| {
-            refresh::resolve(
-                &built.server,
-                &BackendManager::new(&None, built.secret_store.clone()),
-                agent,
-                meta,
-            )
-        });
-    }
+    operations::apply(&mut app, completion);
+    assert_eq!(app.active().session_db_id, id);
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while !presentation::apply_latest(&mut app, |app, idx| {
+            refresh::derive_tab(app, &built.server, &render_backend, idx);
+        }) {
+            wake.notified().await;
+        }
+    })
+    .await
+    .unwrap();
     assert_eq!(
         app.active().session_name.as_deref(),
         Some("written while opening")

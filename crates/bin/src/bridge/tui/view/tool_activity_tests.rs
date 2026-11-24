@@ -154,18 +154,12 @@ fn result(
 }
 
 async fn reload(app: &mut App) {
-    let id = app.active().session_db_id.clone();
-    let (tx, mut rx) = tokio::sync::mpsc::channel(8);
-    refresh::request(app, &id, refresh::RefreshKind::Session, &tx);
-    let msg = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
-        .await
-        .unwrap()
-        .unwrap();
-    refresh::apply(app, msg, |_, _| refresh::Resolved {
+    refresh::fixture_reload(app, |_, _| refresh::Resolved {
         effective_model: "fixture".into(),
         context_budget: 0,
         roster: Vec::new(),
-    });
+    })
+    .await;
 }
 
 fn draw(app: &mut App, width: u16, height: u16) -> Terminal<TestBackend> {
@@ -889,19 +883,7 @@ async fn nested_tool_evidence_failure_retains_view_and_retry_recovers() {
         .await
         .unwrap();
     txn.commit().await.unwrap();
-    let (tx, mut rx) = tokio::sync::mpsc::channel(8);
-    refresh::request_tick(&mut app, &tx);
-    while app.active().live.failed(refresh::RefreshKind::Session) {
-        let msg = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        refresh::apply(&mut app, msg, |_, _| refresh::Resolved {
-            effective_model: String::new(),
-            context_budget: 0,
-            roster: Vec::new(),
-        });
-    }
+    reload(&mut app).await;
     assert!(app.active().live.error.is_none());
     assert!(app.active().live.covered.is_some());
     assert!(app.active().live.tool_activity.runs[0].cancelled);

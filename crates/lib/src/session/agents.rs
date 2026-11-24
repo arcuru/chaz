@@ -391,11 +391,30 @@ impl SessionRegistry {
         session_db: &Database,
         agent_index: &crate::hosted_index::HostedIndex,
     ) -> anyhow::Result<Vec<crate::hosted_index::DbEntry>> {
+        let settings = session_db.get_settings().await?;
+        let auth = settings.auth_snapshot().await?;
+        Ok(Self::direct_writer_keys(auth)?
+            .iter()
+            .filter_map(|key| agent_index.find_by_pubkey(key))
+            .collect())
+    }
+
+    /// Direct membership at the same frontier as session metadata. For
+    /// presentation only; this does not authorize operations on the session.
+    pub async fn direct_writer_keys_at(
+        db: &Database,
+        at: &eidetica::Snapshot,
+    ) -> anyhow::Result<Vec<eidetica::auth::crypto::PublicKey>> {
+        let txn = db.new_transaction_at(at).await?;
+        Self::direct_writer_keys(txn.get_settings()?.auth_snapshot().await?)
+    }
+
+    fn direct_writer_keys(
+        auth: eidetica::auth::settings::AuthSettings,
+    ) -> anyhow::Result<Vec<eidetica::auth::crypto::PublicKey>> {
         use eidetica::auth::crypto::PublicKey;
         use eidetica::auth::types::KeyStatus;
 
-        let settings = session_db.get_settings().await?;
-        let auth = settings.auth_snapshot().await?;
         let keys = auth.get_all_keys()?;
 
         let mut out = Vec::new();
@@ -409,9 +428,7 @@ impl SessionRegistry {
             let Ok(pubkey) = PublicKey::from_prefixed_string(&pubkey_str) else {
                 continue;
             };
-            if let Some(entry) = agent_index.find_by_pubkey(&pubkey) {
-                out.push(entry);
-            }
+            out.push(pubkey);
         }
         Ok(out)
     }

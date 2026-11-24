@@ -619,30 +619,6 @@ async fn toolbar_context_reopen_honors_pins_and_refreshes_runtime_budget() {
     ));
     let screen = draw(&mut terminal, &mut app, &server, &backend).join("\n");
     assert!(screen.contains("ctx unknown/64k tok"), "{screen}");
-    // Without session pins, a live agent-default edit must also reach the next
-    // frame. AgentSet updates the registry, not the session DB's on_write hook.
-    session
-        .update_meta(|meta| {
-            meta.model = None;
-            meta.agent_models.clear();
-        })
-        .await
-        .unwrap();
-    app.tabs[0] = super::super::build_tab(&server, &backend, db, id)
-        .await
-        .unwrap();
-    let screen = draw(&mut terminal, &mut app, &server, &backend).join("\n");
-    assert!(screen.contains("ctx unknown/2M tok"), "{screen}");
-    server.agents().upsert(Agent::from_db_config(
-        "agent-00",
-        &AgentDbConfig {
-            model: Some("primary:small-model".into()),
-            ..Default::default()
-        },
-    ));
-    let screen = draw(&mut terminal, &mut app, &server, &backend).join("\n");
-    assert!(screen.contains("ctx unknown/64k tok"), "{screen}");
-    assert_eq!(app.active().effective_model, "small-model");
     server.shutdown().await;
 }
 

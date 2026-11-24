@@ -656,7 +656,16 @@ impl AgentDb {
     }
 
     pub async fn read_config(&self) -> anyhow::Result<AgentDbConfig> {
-        let cfg = crate::agent_record::read(&self.database, CONFIG_STORE).await?;
+        Self::config_in(&self.database.new_transaction().await?).await
+    }
+
+    /// Read the accepted record at a delivered frontier, not the current tips.
+    pub async fn read_config_at(&self, at: &eidetica::Snapshot) -> anyhow::Result<AgentDbConfig> {
+        Self::config_in(&self.database.new_transaction_at(at).await?).await
+    }
+
+    async fn config_in(txn: &eidetica::Transaction) -> anyhow::Result<AgentDbConfig> {
+        let cfg = crate::agent_record::read_in(txn, CONFIG_STORE).await?;
         crate::agent_bundle::validate(&cfg)?;
         Ok(cfg)
     }

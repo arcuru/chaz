@@ -110,48 +110,35 @@ pub(super) fn apply(app: &mut App, result: Result<JobMonitor, String>) {
 
 pub(super) async fn observe(
     db: &eidetica::Database,
-    tx: mpsc::Sender<String>,
+    tx: presentation::Sender,
+    job: bool,
 ) -> anyhow::Result<Observation> {
     chaz_core::session::jobs::require_observer_write(db).await?;
-    let sid = db.root_id().to_string();
-    let callback = db
-        .on_write(move |_, _| {
-            let tx = tx.clone();
-            let sid = sid.clone();
-            async move {
-                let _ = tx.send(sid).await;
-                Ok(())
-            }
-        })
-        .await?;
     Ok(Observation {
-        id: 0,
-        callback: Some(callback),
-        forwarder: None,
+        id: presentation::next_id(),
+        watch: presentation::SessionWatch::open(db, tx, job).await?,
+        _forwarder: None,
     })
 }
 
 pub(super) async fn open_tab(
-    server: &Server,
+    server: &Arc<Server>,
     backend: &BackendManager,
     id: &str,
-    tx: mpsc::Sender<String>,
+    tx: presentation::Sender,
 ) -> Result<Tab, String> {
-    let (_, db) = server
-        .registry()
-        .open_job_session(id)
+    let (server, backend, id) = (server.clone(), backend.clone(), id.to_owned());
+    tx.clone()
+        .prepare(Box::pin(async move {
+            let (_, db) = server
+                .registry()
+                .open_job_session(&id)
+                .await
+                .map_err(|e| e.to_string())?;
+            let observation = observe(&db, tx, true).await.map_err(|e| e.to_string())?;
+            build_observed_tab(&server, &backend, db, observation).await
+        }))
         .await
-        .map_err(|e| e.to_string())?;
-    let observation = observe(&db, tx).await.map_err(|e| e.to_string())?;
-    let snapshot = snapshot(&db).await?;
-    let mut tab = tab_from_snapshot(server, backend, db, id.into(), snapshot.session).await?;
-    tab.job = Some(JobTab {
-        state: None,
-        details: false,
-    });
-    tab.live.observation = Some(observation);
-    apply_state(&mut tab, snapshot.state);
-    Ok(tab)
 }
 
 pub(super) fn open(
@@ -159,7 +146,7 @@ pub(super) fn open(
     server: &Arc<Server>,
     backend: &BackendManager,
     id: String,
-    tx: &mpsc::Sender<String>,
+    tx: &presentation::Sender,
 ) {
     if let Some(index) = app.tab_index_for(&id) {
         app.set_active_tab(index);
@@ -179,11 +166,6 @@ pub(super) fn open(
 pub(super) struct Snapshot {
     pub(super) session: refresh::SessionSnapshot,
     pub(super) state: JobState,
-}
-
-pub(super) async fn snapshot(db: &eidetica::Database) -> Result<Snapshot, String> {
-    let tips = db.snapshot().await.map_err(|e| e.to_string())?;
-    snapshot_at(db, tips).await
 }
 
 pub(super) async fn snapshot_at(
@@ -367,7 +349,7 @@ pub(super) fn handle_key(
     key: KeyEvent,
     server: &Arc<Server>,
     backend: &BackendManager,
-    notify_tx: &mpsc::Sender<String>,
+    notify_tx: &presentation::Sender,
     jobs_tx: &mpsc::Sender<Loaded>,
 ) {
     match key.code {

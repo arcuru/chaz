@@ -21,15 +21,41 @@ use eidetica::{
     snapshot::Snapshot,
 };
 
+struct PauseAfterPromotion {
+    entry: ID,
+    reached: tokio::sync::oneshot::Sender<()>,
+    resume: tokio::sync::oneshot::Receiver<()>,
+}
+
 #[derive(Clone, Default)]
 pub(crate) struct EntryReads(
     Arc<AtomicUsize>,
     Arc<AtomicUsize>,
     Arc<std::sync::Mutex<std::collections::BTreeMap<String, usize>>>,
     Arc<std::sync::Mutex<Option<String>>>,
+    Arc<std::sync::Mutex<Option<PauseAfterPromotion>>>,
 );
 
 impl EntryReads {
+    /// Pause after storing a real promotion but before the verifier can publish it.
+    #[allow(dead_code)] // Used by the TUI tests that include this fixture.
+    pub(crate) fn pause_after_promotion(
+        &self,
+        entry: ID,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (reached, at_promotion) = tokio::sync::oneshot::channel();
+        let (release, resume) = tokio::sync::oneshot::channel();
+        *self.4.lock().unwrap() = Some(PauseAfterPromotion {
+            entry,
+            reached,
+            resume,
+        });
+        (at_promotion, release)
+    }
+
     /// Inject a missing backend resource only at one store's state resolution.
     #[allow(dead_code)] // This fixture is also included by the binary's tests.
     pub(crate) fn fail_store_reads(&self, store: Option<&str>) {
@@ -109,7 +135,18 @@ impl BackendImpl for Counting {
         id: &ID,
         status: VerificationStatus,
     ) -> eidetica::Result<()> {
-        self.inner.update_verification_status(id, status).await
+        self.inner.update_verification_status(id, status).await?;
+        let pause = self
+            .reads
+            .4
+            .lock()
+            .unwrap()
+            .take_if(|p| status == VerificationStatus::Verified && p.entry == *id);
+        if let Some(pause) = pause {
+            let _ = pause.reached.send(());
+            let _ = pause.resume.await;
+        }
+        Ok(())
     }
     async fn get_entries_by_verification_status(
         &self,

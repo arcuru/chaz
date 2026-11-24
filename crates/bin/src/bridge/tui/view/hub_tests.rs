@@ -2,8 +2,8 @@
 //! view-close never create or delete stored sessions, and drafts, scroll and
 //! Settings callers survive navigation. Frames are drawn, not snapshotted.
 use super::super::{
-    App, ModelPickerScope, SessionLoad, TuiMode, dispatch_model_selection,
-    dispatch_picker_selection, ensure_view, input, launch_session, open_session_picker,
+    App, ModelPickerScope, TuiMode, dispatch_model_selection, dispatch_picker_selection, input,
+    launch_session, open_session_picker,
 };
 use super::list_tests::{draw, fixture, send_mouse};
 use super::*;
@@ -41,10 +41,9 @@ fn frame(app: &mut App, server: &Arc<Server>, backend: &BackendManager, w: u16, 
 
 fn channels() -> (
     mpsc::Sender<super::super::TaggedApproval>,
-    mpsc::Sender<String>,
-    mpsc::Sender<SessionLoad>,
+    super::super::presentation::Sender,
 ) {
-    (mpsc::channel(8).0, mpsc::channel(8).0, mpsc::channel(8).0)
+    (mpsc::channel(8).0, super::super::presentation::channel().0)
 }
 
 async fn settle(app: &mut App) {
@@ -74,8 +73,7 @@ async fn hub_launch_creates_nothing_and_is_a_safe_base_view() {
     );
 
     let mut app = App::hub(HashSet::new());
-    let (_, _, rows_tx) = channels();
-    open_session_picker(&mut app, &server, &rows_tx);
+    open_session_picker(&mut app);
     assert!(app.tabs.is_empty());
     assert_eq!(app.mode, TuiMode::SessionPicker);
 
@@ -89,7 +87,7 @@ async fn hub_launch_creates_nothing_and_is_a_safe_base_view() {
         !loading.contains("Esc back"),
         "no conversation to go back to: {loading}"
     );
-    app.cancel_session_fill();
+    app.retire_picker();
     app.session_picker_error = Some("store offline".into());
     let failed = frame(&mut app, &server, &backend, 80, 24);
     assert!(
@@ -123,7 +121,7 @@ async fn hub_launch_creates_nothing_and_is_a_safe_base_view() {
         assert!(input::handle_picker_key(&mut app, key(code)).is_none());
         assert_eq!(app.mode, TuiMode::SessionPicker);
     }
-    ensure_view(&mut app, &server, &rows_tx);
+    app.ensure_view();
     assert_eq!(app.mode, TuiMode::SessionPicker);
 
     // Wheel and clicks over an empty hub never reach a missing transcript.
@@ -311,9 +309,9 @@ async fn launch_creates_or_reopens_exactly_the_requested_session() {
 async fn new_open_switch_and_close_preserve_sessions_drafts_and_scroll() {
     let (_instance, server, backend, _) = fixture().await;
     let existing = session_ids(&server).await;
-    let (approval_tx, notify_tx, rows_tx) = channels();
+    let (approval_tx, notify_tx) = channels();
     let mut app = App::hub(HashSet::new());
-    open_session_picker(&mut app, &server, &rows_tx);
+    open_session_picker(&mut app);
 
     // New creates and opens exactly one stored session.
     dispatch_picker_selection(
@@ -348,12 +346,12 @@ async fn new_open_switch_and_close_preserve_sessions_drafts_and_scroll() {
     app.active_mut().scroll_offset = 5;
 
     // Hub → another stored session: a fresh composer there.
-    open_session_picker(&mut app, &server, &rows_tx);
+    open_session_picker(&mut app);
     assert!(!frame(&mut app, &server, &backend, 80, 24).contains("Ctrl+C quit · Esc"));
     assert!(input::handle_picker_key(&mut app, key(KeyCode::Esc)).is_none());
     assert_eq!(app.mode, TuiMode::Chat, "Esc returns to the live caller");
     assert_eq!((app.input.as_str(), app.cursor), (draft.as_str(), cursor));
-    open_session_picker(&mut app, &server, &rows_tx);
+    open_session_picker(&mut app);
     dispatch_picker_selection(
         existing[0].clone(),
         &mut app,
@@ -385,7 +383,7 @@ async fn new_open_switch_and_close_preserve_sessions_drafts_and_scroll() {
     assert!(screen.contains("Ctrl+S settings"), "{screen}");
     assert!(screen.contains("Ctrl+H/L tabs"), "{screen}");
     // Picking an already-open session focuses its view, not a duplicate.
-    open_session_picker(&mut app, &server, &rows_tx);
+    open_session_picker(&mut app);
     dispatch_picker_selection(
         existing[0].clone(),
         &mut app,
@@ -415,7 +413,7 @@ async fn new_open_switch_and_close_preserve_sessions_drafts_and_scroll() {
     assert_eq!((app.input.as_str(), app.cursor), ("second", 3));
     app.close_tab_at(app.active_tab);
     assert!(app.tabs.is_empty() && app.input.is_empty());
-    ensure_view(&mut app, &server, &rows_tx);
+    app.ensure_view();
     assert_eq!(app.mode, TuiMode::SessionPicker);
     assert_eq!(session_ids(&server).await, after_new);
     let screen = frame(&mut app, &server, &backend, 80, 24);
@@ -440,9 +438,9 @@ async fn new_open_switch_and_close_preserve_sessions_drafts_and_scroll() {
 async fn hub_failures_stay_in_the_hub_and_peer_actions_need_no_conversation() {
     let (_instance, server, backend, _) = fixture().await;
     let before = session_ids(&server).await;
-    let (approval_tx, notify_tx, rows_tx) = channels();
+    let (approval_tx, notify_tx) = channels();
     let mut app = App::hub(HashSet::new());
-    open_session_picker(&mut app, &server, &rows_tx);
+    open_session_picker(&mut app);
     dispatch_picker_selection(
         "missing-session".into(),
         &mut app,
@@ -469,7 +467,7 @@ async fn hub_failures_stay_in_the_hub_and_peer_actions_need_no_conversation() {
     app.model_picker_caller = app.mode;
     app.mode = TuiMode::ModelPicker;
     let _ = frame(&mut app, &server, &backend, 80, 24);
-    ensure_view(&mut app, &server, &rows_tx);
+    app.ensure_view();
     assert_eq!(app.mode, TuiMode::ModelPicker);
     dispatch_model_selection(
         "stub".into(),
@@ -570,63 +568,47 @@ async fn hub_tab_cycle_cannot_change_settings_or_switcher_caller() {
 }
 
 #[tokio::test]
-async fn hub_return_from_settings_restarts_cancelled_catalog_discovery() {
+async fn hub_return_from_settings_rebinds_the_picker_and_rejects_retired_delivery() {
+    use super::super::components::Watches;
     let (_instance, server, backend, _) = fixture().await;
     let mut app = App::hub(HashSet::new());
-    let (rows_tx, mut rows_rx) = mpsc::channel(8);
-    open_session_picker(&mut app, &server, &rows_tx);
-    let cancelled_generation = app.session_generation;
+    let mut watches = Watches::new();
+    open_session_picker(&mut app);
+    watches.sync_picker(&mut app, &server);
+    let retired = tokio::time::timeout(std::time::Duration::from_secs(3), watches.next())
+        .await
+        .unwrap();
     app.open_settings(SettingsScope::Peer, TuiMode::SessionPicker);
-    // The event loop cancels discovery when the hub is not visible.
-    app.cancel_session_fill();
+    watches.retire_picker_if_hidden(&app);
     app.close_settings();
-    ensure_view(&mut app, &server, &rows_tx);
-    assert!(
-        app.session_catalog_loading,
-        "return left the catalog unloaded"
-    );
+    watches.sync_picker(&mut app, &server);
+    watches.apply(&mut app, &server, &backend, retired);
+    assert!(app.session_list.is_empty());
     let loading = frame(&mut app, &server, &backend, 80, 24);
     assert!(loading.contains("Loading sessions…"), "{loading}");
-    assert!(!loading.contains("No saved sessions"), "{loading}");
-    assert!(matches!(
-        super::super::apply_session_catalog_result(&mut app, cancelled_generation, Ok(Vec::new())),
-        super::super::CatalogLoadOutcome::Ignored
-    ));
-    let load = tokio::time::timeout(std::time::Duration::from_secs(5), rows_rx.recv())
+    let load = tokio::time::timeout(std::time::Duration::from_secs(3), watches.next())
         .await
-        .unwrap()
         .unwrap();
-    let SessionLoad::Grouped { generation, result } = load else {
-        panic!("expected grouped catalog")
-    };
-    let (indices, groups) = result.unwrap();
-    super::super::apply_session_catalog_result(&mut app, generation, Ok(indices));
-    super::super::workers::group(&mut app, groups);
-    assert!(app.session_list_fresh);
+    watches.apply(&mut app, &server, &backend, load);
     assert_eq!(app.session_list.len(), session_ids(&server).await.len());
-    assert!(!app.session_list.is_empty(), "fixture has a stored session");
-
-    // A completed empty catalog stays authoritative on a Settings round trip.
-    super::super::apply_session_catalog(&mut app, Vec::new());
-    app.open_settings(SettingsScope::Peer, TuiMode::SessionPicker);
-    app.cancel_session_fill();
-    app.close_settings();
-    ensure_view(&mut app, &server, &rows_tx);
-    assert!(!app.session_catalog_loading);
-    assert!(app.session_list_fresh);
+    assert!(!app.session_list.is_empty());
+    watches.shutdown().await;
 }
 
 #[tokio::test]
-async fn description_edit_patches_the_cached_picker_row_without_renaming() {
-    use super::super::{ChatAction, apply_session_catalog, handle_chat_action};
+async fn description_edit_updates_picker_through_the_watched_session() {
+    use super::super::{
+        ChatAction, apply_session_catalog, handle_chat_action, presentation, refresh,
+    };
     use chaz_core::commands::Command;
 
     let (_instance, server, backend, _) = fixture().await;
-    let (approval_tx, notify_tx, rows_tx) = channels();
+    let (approval_tx, _) = channels();
+    let (notify_tx, wake) = presentation::channel();
     let models_tx = mpsc::channel(8).0;
     let secrets = SecretStore::new(server.registry().chaz_peer().clone()).await;
     let mut app = App::hub(HashSet::new());
-    open_session_picker(&mut app, &server, &rows_tx);
+    open_session_picker(&mut app);
     dispatch_picker_selection(
         "__new__".into(),
         &mut app,
@@ -643,7 +625,7 @@ async fn description_edit_patches_the_cached_picker_row_without_renaming() {
         .await
         .unwrap();
 
-    // Seed the picker cache with this session's loaded (description-free) row.
+    // Seed the picker index. Only the watched session owns the loaded metadata.
     let index = server
         .registry()
         .list_sessions()
@@ -652,10 +634,7 @@ async fn description_edit_patches_the_cached_picker_row_without_renaming() {
         .into_iter()
         .find(|index| index.session_db_id == id)
         .unwrap();
-    apply_session_catalog(&mut app, vec![index.clone()]);
-    app.session_list[0] = chaz_core::commands::try_load_session_metadata(server.registry(), index)
-        .await
-        .unwrap();
+    apply_session_catalog(&mut app, vec![index]);
     assert_eq!(app.session_list[0].description, None);
     app.mode = TuiMode::Chat;
 
@@ -669,9 +648,23 @@ async fn description_edit_patches_the_cached_picker_row_without_renaming() {
             &approval_tx,
             &notify_tx,
             &models_tx,
-            &rows_tx,
         );
         settle(app).await;
+    };
+    let observe = async |app: &mut App, expected: Option<&str>| {
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                presentation::apply_latest(app, |app, idx| {
+                    refresh::derive_tab(app, &server, &backend, idx);
+                });
+                if app.session_list[0].description.as_deref() == expected {
+                    break;
+                }
+                wake.notified().await;
+            }
+        })
+        .await
+        .unwrap();
     };
     let canonical = async || {
         let (_, db) = server.registry().open_session(&id).await.unwrap();
@@ -685,8 +678,13 @@ async fn description_edit_patches_the_cached_picker_row_without_renaming() {
         Command::DescribeSession("Q3 budget with finance".into()),
     )
     .await;
-    // The cached row is patched in place (no catalog reload) and keeps its name.
-    assert!(app.session_list_fresh);
+    assert_eq!(
+        app.session_list[0].description, None,
+        "completion is not persisted display authority"
+    );
+    observe(&mut app, Some("Q3 budget with finance")).await;
+    // The GUI applies the watched projection in place, with no catalog reload.
+    assert!(!app.session_catalog_loading);
     assert_eq!(
         app.session_list[0].description.as_deref(),
         Some("Q3 budget with finance")
@@ -702,7 +700,7 @@ async fn description_edit_patches_the_cached_picker_row_without_renaming() {
             .any(|e| e.content == "Session description set: Q3 budget with finance")
     );
 
-    open_session_picker(&mut app, &server, &rows_tx);
+    open_session_picker(&mut app);
     let screen = frame(&mut app, &server, &backend, 80, 24);
     assert!(screen.contains("\"planning\""), "{screen}");
     assert!(screen.contains("    Q3 budget with finance"), "{screen}");
@@ -723,19 +721,26 @@ async fn description_edit_patches_the_cached_picker_row_without_renaming() {
     );
 
     run(&mut app, Command::ClearSessionDescription).await;
+    assert_eq!(
+        app.session_list[0].description.as_deref(),
+        Some("Q3 budget with finance")
+    );
+    observe(&mut app, None).await;
     assert_eq!(app.session_list[0].description, None);
     assert_eq!(app.session_list[0].name.as_deref(), Some("planning"));
     let meta = canonical().await;
     assert_eq!(meta.description, None);
     assert_eq!(meta.name.as_deref(), Some("planning"));
-    open_session_picker(&mut app, &server, &rows_tx);
+    open_session_picker(&mut app);
     let screen = frame(&mut app, &server, &backend, 80, 24);
     assert!(!screen.contains("Q3 budget"), "{screen}");
     app.mode = TuiMode::Chat;
 
     // Double-width text is clipped by terminal cells and still shows the ellipsis.
-    run(&mut app, Command::DescribeSession("界".repeat(12))).await;
-    open_session_picker(&mut app, &server, &rows_tx);
+    let description = "界".repeat(12);
+    run(&mut app, Command::DescribeSession(description.clone())).await;
+    observe(&mut app, Some(&description)).await;
+    open_session_picker(&mut app);
     let narrow = frame(&mut app, &server, &backend, 20, 8);
     let line = narrow.lines().find(|l| l.contains('界')).expect(&narrow);
     assert!(line.contains('…') && line.ends_with('│'), "{narrow}");
@@ -746,9 +751,8 @@ async fn session_shortcuts_create_focus_and_retain_the_previous_conversation() {
     use super::super::{ChatAction, Command, handle_chat_action, show_system_msg};
 
     let (_instance, server, backend, mut app) = fixture().await;
-    let (approval, notify, _) = channels();
+    let (approval, notify) = channels();
     let (models, _) = mpsc::channel(4);
-    let (rows, _) = mpsc::channel(128);
     let secrets = SecretStore::new(server.registry().chaz_peer().clone()).await;
     let original_id = app.active().session_db_id.clone();
     show_system_msg(&mut app, "retained transcript".into());
@@ -764,7 +768,7 @@ async fn session_shortcuts_create_focus_and_retain_the_previous_conversation() {
     ));
     assert!(!app.active().expand_all, "Ctrl+T still toggles expansion");
     handle_chat_action(
-        action, &mut app, &server, &backend, &secrets, &approval, &notify, &models, &rows,
+        action, &mut app, &server, &backend, &secrets, &approval, &notify, &models,
     );
     settle(&mut app).await;
     assert_eq!(app.mode, TuiMode::Chat);
@@ -818,16 +822,15 @@ async fn expand_toggle_is_session_local() {
     use super::super::handle_chat_action;
 
     let (_instance, server, backend, mut app) = fixture().await;
-    let (approval, notify, _) = channels();
+    let (approval, notify) = channels();
     let (models, _) = mpsc::channel(4);
-    let (rows, _) = mpsc::channel(128);
     let secrets = SecretStore::new(server.registry().chaz_peer().clone()).await;
 
     // A second session in its own tab.
     let new_key = KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL);
     let action = input::handle_chat_key(&mut app, new_key).unwrap();
     handle_chat_action(
-        action, &mut app, &server, &backend, &secrets, &approval, &notify, &models, &rows,
+        action, &mut app, &server, &backend, &secrets, &approval, &notify, &models,
     );
     settle(&mut app).await;
     assert_eq!(app.tabs.len(), 2);
@@ -986,10 +989,10 @@ async fn worker_hub_open_is_inspection_only_and_preserves_parent_draft() {
         .await
         .unwrap();
     let before = child.snapshot().await.unwrap();
-    let (approval, notify, rows) = channels();
+    let (approval, notify) = channels();
     let models = mpsc::channel(8).0;
     let secrets = SecretStore::new(server.registry().chaz_peer().clone()).await;
-    open_session_picker(&mut app, &server, &rows);
+    open_session_picker(&mut app);
     dispatch_picker_selection(
         id.0.clone(),
         &mut app,
@@ -1030,7 +1033,7 @@ async fn worker_hub_open_is_inspection_only_and_preserves_parent_draft() {
         ChatAction::OpenSettings(SettingsScope::Session),
     ] {
         handle_chat_action(
-            action, &mut app, &server, &backend, &secrets, &approval, &notify, &models, &rows,
+            action, &mut app, &server, &backend, &secrets, &approval, &notify, &models,
         );
         assert!(!app.operations.is_pending());
     }
@@ -1044,49 +1047,6 @@ async fn worker_hub_open_is_inspection_only_and_preserves_parent_draft() {
 }
 
 #[tokio::test]
-async fn catalog_refresh_keeps_cursor_identity_and_retains_invalidations_during_read() {
-    use super::super::{CatalogLoadOutcome, apply_session_catalog, apply_session_catalog_result};
-    let (_instance, server, _backend, _) = fixture().await;
-    let mut app = App::hub(HashSet::new());
-    app.mode = TuiMode::SessionPicker;
-    apply_session_catalog(&mut app, server.registry().list_sessions().await.unwrap());
-    app.picker_index = 1;
-    let selected = app.picker_selection();
-    server.registry().create_session(Some("tui")).await.unwrap();
-    app.session_catalog_invalidated = true;
-    let generation = app.session_generation;
-    assert!(matches!(
-        apply_session_catalog_result(
-            &mut app,
-            generation,
-            Ok(server.registry().list_sessions().await.unwrap())
-        ),
-        CatalogLoadOutcome::Loaded
-    ));
-    assert_eq!(app.picker_selection(), selected);
-    assert!(
-        !app.session_list_fresh,
-        "in-flight invalidation must schedule one follow-up"
-    );
-    let retained = app.session_list.len();
-    assert!(matches!(
-        apply_session_catalog_result(&mut app, generation, Err("offline".into())),
-        CatalogLoadOutcome::Failed
-    ));
-    assert_eq!(app.session_list.len(), retained);
-    assert_eq!(app.picker_selection(), selected);
-    app.session_rows_loading.insert(selected.clone());
-    let (tx, _rx) = mpsc::channel(8);
-    super::super::refresh_session_catalog(&mut app, &server, &tx);
-    assert!(
-        app.session_rows_loading.is_empty(),
-        "retired row tasks must not monopolize the metadata limit"
-    );
-    assert_ne!(app.session_generation, generation);
-    assert_eq!(app.picker_selection(), selected);
-}
-
-#[tokio::test]
 async fn worker_parent_observer_rebind_never_installs_an_ordinary_session_watcher() {
     let (_instance, server, backend, mut app) = fixture().await;
     let id = app.active().session_db_id.clone();
@@ -1097,7 +1057,7 @@ async fn worker_parent_observer_rebind_never_installs_an_ordinary_session_watche
         !server.is_watching_session(&id).await,
         "positive unregistered control"
     );
-    let (approval, notify, _) = channels();
+    let (approval, notify) = channels();
     let (tx, mut rx) = mpsc::channel(8);
     super::super::reconnect::request_tabs(&mut app, &server, &backend, &approval, &notify, &tx);
     let super::super::reconnect::ResultMessage::Tab { ticket, reopened } = rx.recv().await.unwrap()

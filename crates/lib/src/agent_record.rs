@@ -77,6 +77,13 @@ pub(crate) async fn read<T: DeserializeOwned + Default>(
     store_name: &str,
 ) -> anyhow::Result<T> {
     let txn = database.new_transaction().await?;
+    read_in(&txn, store_name).await
+}
+
+pub(crate) async fn read_in<T: DeserializeOwned + Default>(
+    txn: &Transaction,
+    store_name: &str,
+) -> anyhow::Result<T> {
     let store = txn.get_store::<DocStore>(store_name).await?;
     match store.get(KEY).await {
         Ok(Value::Text(json)) => Ok(serde_json::from_str(&json)?),

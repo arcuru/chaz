@@ -470,7 +470,11 @@ context:
                 process.send("\x1bOQ")
                 process.expect("Observer details", timeout=1)
                 process.send("\x1bOQ\x1b[5~\x1b[6~")
-                process.expect("Unavailable", timeout=10)  # Tab reads are bounded too.
+                # Rendering or changing tabs does not initiate another storage
+                # read. Retain the completed view until a delivery or proven
+                # service outage, without admitting another execution.
+                process.expect("Completed", timeout=1)
+                process.expect("Finished job", timeout=1)
                 self.assertEqual(len(job_calls), 2)
                 process.send("\x07")
                 service.send_signal(signal.SIGCONT)
