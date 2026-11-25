@@ -177,6 +177,11 @@ pub(crate) struct DisplayRow {
     pub sender: String,
     pub content: String,
     pub kind: EntryType,
+    /// Short preview of the user input this assistant reply actually answered,
+    /// bound to the validated turn receipt. Present only when positional reading alone
+    /// could mislead: another visible user input sits between that input and
+    /// the reply. Legacy rows and unambiguous replies carry `None`.
+    pub reply_to: Option<String>,
 }
 
 impl From<SessionEntry> for DisplayRow {
@@ -185,6 +190,7 @@ impl From<SessionEntry> for DisplayRow {
             sender: entry.sender,
             content: entry.content,
             kind: entry.entry_type,
+            reply_to: None,
         }
     }
 }

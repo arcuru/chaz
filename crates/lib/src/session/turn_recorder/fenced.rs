@@ -86,16 +86,7 @@ impl Session {
         let db = session_guard.database();
         let boundary = Snapshot::from([db.root_id().clone()]);
         let read = Session::history(db).await?;
-        ensure!(
-            !branch.is_empty()
-                && !agent.is_empty()
-                && entry.entry_type == EntryType::Message
-                && !entry.sender.is_empty()
-                && !entry.content.is_empty()
-                && entry.metadata.is_none()
-                && entry.routing.is_none(),
-            "fixture requires an unaddressed local message"
-        );
+        ensure_fixture_message(&branch, &agent, &entry)?;
         let active = if read.snapshot() == &boundary && read.entries().await?.is_empty() {
             let txn = db.new_transaction_at(&boundary).await?;
             stage_descriptor(&txn, db, &boundary, compaction).await?;
@@ -124,12 +115,84 @@ impl Session {
             anyhow::bail!("fixture requires a fresh session");
         };
         let (frontier, input, attempt) = accept_fixture_input(db, &active, &branch, entry).await?;
+        drop(session_guard);
+        Ok(Self::fenced_recorder(
+            session,
+            (frontier, input, attempt),
+            branch,
+            agent,
+            compaction,
+            cancel,
+            fail,
+        ))
+    }
+
+    /// Start a fenced turn at an explicit accepted frontier of a compaction-
+    /// capable fixture session, so a second lineage can diverge from the first
+    /// and produce independent replies on one reopened store.
+    pub(in crate::session) async fn start_fenced_turn_at(
+        session: Arc<Mutex<Self>>,
+        branch: String,
+        agent: String,
+        entry: SessionEntry,
+        at: Snapshot,
+    ) -> anyhow::Result<(TurnRecorder, Snapshot)> {
+        let mut session_guard = session.lock().await;
+        session_guard.refresh_writer().await?;
+        let db = session_guard.database();
+        ensure_fixture_message(&branch, &agent, &entry)?;
+        let txn = db.new_transaction_at(&at).await?;
+        let staged = Staging::at(db, &at, &txn, &branch).await?;
+        ensure!(
+            staged.supports_compaction(),
+            "another accepted attempt requires the compaction descriptor"
+        );
+        let attempts = txn
+            .get_store::<Table<TurnAttempt>>(TURN_ATTEMPTS_STORE)
+            .await?;
+        ensure!(
+            attempts
+                .search(|attempt| attempt.status != TurnAttemptStatus::Completed)
+                .await?
+                .is_empty(),
+            "fixture cannot replay an interrupted attempt"
+        );
+        ensure!(
+            !staged.has_branch(&branch),
+            "fixture branch already accepted"
+        );
+        drop(txn);
+        let (frontier, input, attempt) = accept_fixture_input(db, &at, &branch, entry).await?;
+        drop(session_guard);
+        Ok((
+            Self::fenced_recorder(
+                session,
+                (frontier.clone(), input, attempt),
+                branch,
+                agent,
+                true,
+                None,
+                None,
+            ),
+            frontier,
+        ))
+    }
+
+    fn fenced_recorder(
+        session: Arc<Mutex<Self>>,
+        accepted: (Snapshot, RepresentationId, TurnAttempt),
+        branch: String,
+        agent: String,
+        compaction: bool,
+        cancel: Option<TurnCancel>,
+        fail: Option<FailCommit>,
+    ) -> TurnRecorder {
+        let (frontier, input, attempt) = accepted;
         let identity = TurnCallIdentity {
             agent,
             requested_model: String::new(),
             execution_id: Some(branch),
         };
-        drop(session_guard);
         let mut recorder = Self::turn_recorder(session, &attempt, identity, Default::default());
         recorder.fenced_compaction = compaction;
         recorder.fenced = Some(Mutex::new(FencedTurn {
@@ -147,8 +210,23 @@ impl Session {
             terminal: None,
             fail,
         }));
-        Ok(recorder)
+        recorder
     }
+}
+
+#[cfg(test)]
+fn ensure_fixture_message(branch: &str, agent: &str, entry: &SessionEntry) -> anyhow::Result<()> {
+    ensure!(
+        !branch.is_empty()
+            && !agent.is_empty()
+            && entry.entry_type == EntryType::Message
+            && !entry.sender.is_empty()
+            && !entry.content.is_empty()
+            && entry.metadata.is_none()
+            && entry.routing.is_none(),
+        "fixture requires an unaddressed local message"
+    );
+    Ok(())
 }
 
 #[cfg(test)]

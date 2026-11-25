@@ -37,6 +37,9 @@ const BRANCH: &str = "fixture-execution";
 const TOOL: &str = "fake_add";
 const BODY: &str = "Four.";
 const CORRECTION: &str = "Correction: use 2 + 3 instead.";
+const Q_CAPITAL: &str = "What is the capital of France?";
+const A_CAPITAL: &str = "Paris.";
+const Q_CAPITAL_PREVIEW: &str = "What is the capital of F…";
 
 struct Add(Arc<AtomicUsize>);
 impl Tool for Add {
@@ -82,6 +85,31 @@ fn stub_response(tools: bool, request: &Request) -> ResponseTemplate {
     }))
 }
 
+/// Content-routed responder for scenarios with two distinct questions: the
+/// loopback answers whichever user question the serialized request ends with.
+fn two_answer_response(request: &Request) -> ResponseTemplate {
+    let body: Value = request.body_json().unwrap();
+    let answer = body["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .rev()
+        .find(|msg| msg["role"] == "user")
+        .and_then(|msg| msg["content"].as_str())
+        .map(|text| {
+            if text.contains("capital") {
+                A_CAPITAL
+            } else {
+                BODY
+            }
+        });
+    ResponseTemplate::new(200).set_body_json(json!({
+        "id":"fake-response", "model":MODEL,
+        "choices":[{"index":0,"message":{"role":"assistant","content":answer},"finish_reason":"stop"}],
+        "usage":{"prompt_tokens":12,"completion_tokens":3,"total_tokens":15}
+    }))
+}
+
 struct Fixture {
     instance: Instance,
     session: Arc<Mutex<Session>>,
@@ -90,6 +118,7 @@ struct Fixture {
     backend: BackendManager,
     mock: MockServer,
     host: Arc<MockHost>,
+    tools: Arc<ToolRegistry>,
     tool: Arc<AtomicUsize>,
     hook: Arc<AtomicUsize>,
     hub: ExtensionHub,
@@ -177,7 +206,7 @@ impl Fixture {
                 .await
                 .unwrap();
         }
-        let mut context = tool_context_with_host(session.clone(), tools, host.clone());
+        let mut context = tool_context_with_host(session.clone(), tools.clone(), host.clone());
         context.turn_request_id = Some(recorder.attempt.request_id.clone());
         context.turn_attempt = Some(crate::tool::ToolAttemptIdentity {
             attempt_id: recorder.attempt.attempt_id.clone(),
@@ -207,6 +236,7 @@ impl Fixture {
             backend,
             mock,
             host,
+            tools: tools.clone(),
             tool,
             hook,
             hub,
@@ -228,7 +258,37 @@ impl Fixture {
     }
 
     async fn run(&self) -> Result<RuntimeOutcome, String> {
-        let view = Session::history_at(&self.db, &self.input)
+        let cancel = (!self.recorder.fenced_compaction).then_some(&self.cancel);
+        self.run_ctx(&self.recorder, &self.input, cancel, &self.context)
+            .await
+    }
+    /// Run one fenced turn against its own pinned input snapshot. The tool
+    /// context carries that turn's request/attempt identity only.
+    async fn run_with(
+        &self,
+        recorder: &Arc<TurnRecorder>,
+        at: &Snapshot,
+        cancel: Option<&TurnCancel>,
+    ) -> Result<RuntimeOutcome, String> {
+        let mut context =
+            tool_context_with_host(self.session.clone(), self.tools.clone(), self.host.clone());
+        context.turn_request_id = Some(recorder.attempt.request_id.clone());
+        context.turn_attempt = Some(crate::tool::ToolAttemptIdentity {
+            attempt_id: recorder.attempt.attempt_id.clone(),
+            execution_id: recorder.identity.execution_id.clone(),
+        });
+        context.active_extensions.insert("fenced-hook".into());
+        self.run_ctx(recorder, at, cancel, &context).await
+    }
+
+    async fn run_ctx(
+        &self,
+        recorder: &Arc<TurnRecorder>,
+        at: &Snapshot,
+        cancel: Option<&TurnCancel>,
+        tool_context: &ToolContext,
+    ) -> Result<RuntimeOutcome, String> {
+        let view = Session::history_at(&self.db, at)
             .await
             .unwrap()
             .context()
@@ -243,16 +303,16 @@ impl Fixture {
             context.messages,
             &self.backend,
             &permissive_security(),
-            &self.context,
+            tool_context,
             &self.policies,
-            Some(self.recorder.clone()),
+            Some(recorder.clone()),
             Some(&self.hub),
-            (!self.recorder.fenced_compaction).then_some(&self.cancel),
+            cancel,
             None,
             ModelCallScope {
                 sources: context.sources,
                 request_budget_tokens: self.budget.or(Some(context.request_budget_tokens)),
-                attempt_id: Some(self.recorder.attempt.attempt_id.clone()),
+                attempt_id: Some(recorder.attempt.attempt_id.clone()),
                 ..Default::default()
             },
         )
@@ -261,8 +321,12 @@ impl Fixture {
     }
 
     async fn complete(&self, text: &str) -> anyhow::Result<()> {
+        self.settle(&self.recorder, text).await
+    }
+
+    async fn settle(&self, recorder: &Arc<TurnRecorder>, text: &str) -> anyhow::Result<()> {
         let mut session = self.session.lock().await;
-        self.recorder
+        recorder
             .complete(&mut session, Some(message(AGENT, text)), None)
             .await
     }
@@ -374,6 +438,155 @@ async fn fenced_v1_reply_keeps_its_intent_when_the_same_store_moves() {
     Box::pin(concurrent_reply()).await;
 }
 
+#[tokio::test]
+async fn fenced_v1_two_independent_answers_cue_their_actual_triggers() {
+    Box::pin(two_independent_answers()).await;
+}
+
+#[tokio::test]
+async fn fenced_v1_sequential_control_needs_no_cue() {
+    Box::pin(sequential_control()).await;
+}
+
+/// Two questions staged as lineage siblings: neither reply's writer observed
+/// the other question or answer, so only the lineage-derived cue can pair
+/// them once both land in one merged chat.
+async fn two_independent_answers() {
+    let fx = Box::pin(Fixture::build(false, None, Some("2 + 2"), two_answer_response).await);
+    let first = Box::pin(fx.run()).await.unwrap();
+    assert_eq!(first.body, BODY);
+    Box::pin(fx.complete(&first.body)).await.unwrap();
+
+    // Diverge from the shared frontier before the first input, so the second
+    // turn's lineage contains neither the first question nor its answer.
+    let input_entry = fx.input.tips()[0].clone();
+    let shared = Snapshot::from(
+        fx.db
+            .get_entry(&input_entry)
+            .await
+            .unwrap()
+            .parents()
+            .unwrap(),
+    );
+    let (second, second_input) = Session::start_fenced_turn_at(
+        fx.session.clone(),
+        format!("{BRANCH}-b"),
+        AGENT.into(),
+        message("user", Q_CAPITAL),
+        shared,
+    )
+    .await
+    .unwrap();
+    let second = Arc::new(second);
+    let output = Box::pin(fx.run_with(&second, &second_input, None))
+        .await
+        .unwrap();
+    assert_eq!(output.body, A_CAPITAL);
+    Box::pin(fx.settle(&second, &output.body)).await.unwrap();
+
+    let reopened = fx.reopened().await;
+    let rows = Session::history(&reopened)
+        .await
+        .unwrap()
+        .display_rows()
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 4);
+    for text in ["2 + 2", Q_CAPITAL, BODY, A_CAPITAL] {
+        assert_eq!(
+            rows.iter().filter(|row| row.content == text).count(),
+            1,
+            "duplicated row: {text}"
+        );
+    }
+    let replies = &rows[2..];
+    let cued: Vec<_> = replies
+        .iter()
+        .filter(|row| row.reply_to.is_some())
+        .collect();
+    assert_eq!(
+        cued.len(),
+        1,
+        "exactly the reply with another question between it and its trigger cues"
+    );
+    for row in replies {
+        let own = if row.content == BODY {
+            "2 + 2"
+        } else {
+            Q_CAPITAL_PREVIEW
+        };
+        if let Some(preview) = &row.reply_to {
+            assert_eq!(preview, own, "a cue quotes its own reply's trigger");
+        }
+    }
+    let rendered = Box::pin(print(&reopened)).await;
+    assert_eq!(rendered.lines().count(), 4);
+    assert_eq!(rendered.matches("(re: ").count(), 1);
+    Box::pin(fx.assert_effects(2, 0, 0)).await;
+
+    let (plain, grouped) = variant_renders(&rows, Some((2, 4)));
+    println!("Two independent answers /print (preview cue, retained):\n{rendered}");
+    println!("Two independent answers plain stable order:\n{plain}");
+    println!("Two independent answers group cue:\n{grouped}");
+}
+
+/// Control: a second turn started at the joined frontier after the first
+/// settles. Positional reading already pairs each answer with its question,
+/// so the display stays quiet.
+async fn sequential_control() {
+    let fx = Box::pin(Fixture::build(false, None, Some("2 + 2"), two_answer_response).await);
+    let first = Box::pin(fx.run()).await.unwrap();
+    assert_eq!(first.body, BODY);
+    Box::pin(fx.complete(&first.body)).await.unwrap();
+    let after_first = fx.db.snapshot().await.unwrap();
+
+    let (second, second_input) = Session::start_fenced_turn_at(
+        fx.session.clone(),
+        format!("{BRANCH}-b"),
+        AGENT.into(),
+        message("user", Q_CAPITAL),
+        after_first,
+    )
+    .await
+    .unwrap();
+    let second = Arc::new(second);
+    let output = Box::pin(fx.run_with(&second, &second_input, None))
+        .await
+        .unwrap();
+    assert_eq!(output.body, A_CAPITAL);
+    Box::pin(fx.settle(&second, &output.body)).await.unwrap();
+
+    let reopened = fx.reopened().await;
+    let rendered = Box::pin(print(&reopened)).await;
+    assert_eq!(
+        rendered,
+        format!("user: 2 + 2\nassistant: {BODY}\nuser: {Q_CAPITAL}\nassistant: {A_CAPITAL}\n")
+    );
+    Box::pin(fx.assert_effects(2, 0, 0)).await;
+    println!("Sequential control /print (no cue needed):\n{rendered}");
+}
+
+/// Compared display variants for the captured read-through, rendered from the
+/// same display rows the retained preview variant prints: plain stable order,
+/// and one group cue above reply rows the scenario knows are parallel.
+fn variant_renders(
+    rows: &[crate::session::history::DisplayRow],
+    parallel: Option<(usize, usize)>,
+) -> (String, String) {
+    let plain: String = rows
+        .iter()
+        .map(|row| format!("{}: {}\n", row.sender, row.content))
+        .collect();
+    let mut grouped = String::new();
+    for (index, row) in rows.iter().enumerate() {
+        if let Some((start, end)) = parallel.filter(|&(start, _)| index == start) {
+            grouped.push_str(&format!("‖ {} parallel replies\n", end - start));
+        }
+        grouped.push_str(&format!("{}: {}\n", row.sender, row.content));
+    }
+    (plain, grouped)
+}
+
 async fn concurrent_reply() {
     let fx = Box::pin(Fixture::new(true, None)).await;
     let (request, release) = pause_first_call(&fx, true).await;
@@ -480,7 +693,7 @@ async fn concurrent_reply() {
     let rendered = Box::pin(print(&reopened)).await;
     assert_eq!(
         rendered,
-        format!("user: 2 + 2\nuser: {CORRECTION}\nassistant: {BODY}\n")
+        format!("user: 2 + 2\nuser: {CORRECTION}\nassistant (re: 2 + 2): {BODY}\n")
     );
 
     // Keep the same signed bytes; the second peer receives the full reply
@@ -527,7 +740,20 @@ async fn concurrent_reply() {
     assert_eq!(reopened.snapshot().await.unwrap(), joined);
     assert_eq!(reversed.snapshot().await.unwrap(), joined);
 
-    println!("Joined /print:\n{rendered}Prepared C (not dispatched):\n{on_both}");
+    let rows = Session::history(&reopened)
+        .await
+        .unwrap()
+        .display_rows()
+        .await
+        .unwrap();
+    let (plain, grouped) = variant_renders(&rows, None);
+    println!(
+        "Joined /print (preview cue, retained):\n{rendered}Prepared C (not dispatched):\n{on_both}"
+    );
+    println!("Correction-in-flight plain stable order:\n{plain}");
+    println!(
+        "Correction-in-flight group cue (single reply; a parallelism cue does not apply):\n{grouped}"
+    );
 }
 
 async fn linear_entries(db: &Database, tip: &ID) -> Vec<Entry> {

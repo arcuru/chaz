@@ -148,6 +148,7 @@ pub(super) struct Evidence {
     pub compactions: Vec<compaction::Intent>,
     pub applied_compactions: BTreeSet<String>,
     pub completed_at: BTreeMap<String, chrono::DateTime<chrono::Utc>>,
+    pub reply_targets: BTreeMap<String, RepresentationId>,
 }
 
 pub(super) async fn read(
@@ -400,22 +401,26 @@ pub(super) async fn read(
             else {
                 return Err(Error::Missing("completion response".into()));
             };
-            if !inputs.contains_key(&response.call.request)
-                || !responses.contains(&completion.response)
-            {
+            let (_, accepted) = inputs
+                .get(&response.call.request)
+                .ok_or_else(|| Error::Integrity("completion lacks its accepted input".into()))?;
+            if accepted.attempt != completion.attempt || !responses.contains(&completion.response) {
                 return Err(Error::Integrity(
                     "completion lacks its accepted input or response outcome".into(),
                 ));
             }
-            Ok(completed_at)
+            Ok((completed_at, accepted.representation()))
         }
         .await;
         match check {
             Err(error) => originals.issues.push(error),
-            Ok(at) => {
+            Ok((at, trigger)) => {
                 publications.insert(completion.publication.as_str());
                 completed.insert(completion.attempt.as_str(), *entry);
                 evidence.completed_at.insert(completion.attempt.clone(), at);
+                evidence
+                    .reply_targets
+                    .insert(completion.publication.clone(), trigger);
             }
         }
     }
