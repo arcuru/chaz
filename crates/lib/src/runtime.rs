@@ -29,8 +29,7 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
-/// Compatibility event stream for standalone runtime callers such as
-/// scheduled turns, which do not have a durable turn attempt.
+/// Compatibility event stream for standalone runtime callers.
 pub enum RuntimeEvent {
     ToolCall {
         id: String,
@@ -54,6 +53,12 @@ pub trait RuntimeRecorder: Send + Sync {
     /// Check recorder admission before runtime hooks or effects.
     fn begin_turn(&self, _resuming: bool) -> Result<(), String> {
         Ok(())
+    }
+
+    /// Recorded Worker provenance when this invocation has no queued turn
+    /// request. This is not a request, checkpoint or Agent-job identity.
+    fn standalone_worker_invocation(&self) -> Option<&str> {
+        None
     }
 
     /// Called only at a complete model/tool boundary. A closing boundary may
@@ -1744,7 +1749,7 @@ async fn run_prepared_turn(
                     "{model_sequence}:{}:{}",
                     resume.call_index, call.id
                 ));
-                call_ctx.set_tool_call_site(model_sequence, resume.call_index, &call.id);
+                call_ctx.set_tool_call_site(model_sequence, resume.call_index, &call.id, None);
                 call_ctx.grants = tool_ctx.resolve_call_grants(&policy.grants, &call.name);
                 call_ctx.observation_deadline = Some(resume.deadline);
                 // The remaining policy budget, not a fresh one: an expired
@@ -2253,7 +2258,14 @@ async fn run_prepared_turn(
                                 tool_ctx.resolve_call_grants(&policy.grants, &call.name);
                             call_ctx.tool_call_key =
                                 Some(format!("{model_sequence}:{call_index}:{}", call.id));
-                            call_ctx.set_tool_call_site(model_sequence, call_index, &call.id);
+                            call_ctx.set_tool_call_site(
+                                model_sequence,
+                                call_index,
+                                &call.id,
+                                recorder
+                                    .as_ref()
+                                    .and_then(|r| r.standalone_worker_invocation()),
+                            );
                             call_ctx.grants = call_grants;
                             if call.name == JOB_WAIT_TOOL
                                 && let Ok((child, seconds)) =

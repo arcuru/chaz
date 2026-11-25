@@ -59,7 +59,9 @@ observation is separate evidence; a dispatch error is not remote delivery.
 Accepted input at a text or silence closing boundary requires another call of
 the same attempt before terminal publication. See [shared steering](sessions.md#shared-active-turn-steering).
 
-Scheduled turns currently retain the compatibility `RuntimeEvent` adapter because they do not have a durable turn-attempt record. That adapter projects tool-call and tool-result events to ordinary session entries.
+Scheduled fires use the same loop and tool audit projection, with an awaited recorder bound to the fire's own invocation ID. That ID scopes Worker call sites without creating a queued request or durable interactive attempt. The recorder retains only the structured spawning-call proof in addition to the schedule's tool audit and usage. It does not record the private wake prompt or make the fire replayable. Schedule admission, approvals, and local-only settlement remain separate from interactive routing.
+
+`worker_wait` checks the current invocation and Agent against the reciprocal Worker link and the recorded native spawning call, then observes only the child's committed Directive outcome. It releases an owned executor permit only for observation and does not checkpoint, cancel, or replay a child. Scheduled turns do not hold an interactive executor permit; their Workers still use the normal child permit pool.
 
 ## Cancellation
 

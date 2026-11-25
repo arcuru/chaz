@@ -33,4 +33,4 @@ pub use search::{SearchBackend, WebSearch};
 pub use shell::ShellExec;
 pub use time::GetTime;
 pub use web::WebFetch;
-pub use worker::SpawnWorker;
+pub use worker::{SpawnWorker, WorkerWait};

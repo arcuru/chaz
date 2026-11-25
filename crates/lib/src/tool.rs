@@ -422,22 +422,35 @@ pub struct ToolContext {
 }
 
 impl ToolContext {
-    pub(crate) fn set_tool_call_site(&mut self, sequence: u64, index: usize, call_id: &str) {
-        self.tool_call_site = self
-            .turn_request_id
-            .as_ref()
-            .zip(self.turn_attempt.as_ref())
-            .map(
-                |(request, attempt)| crate::session::worker_links::WorkerCallSite {
-                    request_id: request.clone(),
-                    attempt_id: attempt.attempt_id.clone(),
-                    execution_id: attempt.execution_id.clone(),
-                    agent: self.agent_name.clone(),
-                    model_sequence: sequence,
-                    call_index: index,
-                    call_id: call_id.to_string(),
-                },
-            );
+    pub(crate) fn set_tool_call_site(
+        &mut self,
+        sequence: u64,
+        index: usize,
+        call_id: &str,
+        standalone_invocation: Option<&str>,
+    ) {
+        let invocation = match (&self.turn_request_id, &self.turn_attempt) {
+            (Some(request), Some(attempt)) => Some((
+                request.clone(),
+                attempt.attempt_id.as_str(),
+                attempt.execution_id.clone(),
+            )),
+            (None, None) => {
+                standalone_invocation.map(|id| (crate::session::TurnRequestId::parse(id), id, None))
+            }
+            _ => None,
+        };
+        self.tool_call_site = invocation.map(|(request_id, attempt_id, execution_id)| {
+            crate::session::worker_links::WorkerCallSite {
+                request_id,
+                attempt_id: attempt_id.into(),
+                execution_id,
+                agent: self.agent_name.clone(),
+                model_sequence: sequence,
+                call_index: index,
+                call_id: call_id.into(),
+            }
+        });
     }
 
     /// Yield capacity only after submission/effects are complete. From here

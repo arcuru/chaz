@@ -8,29 +8,98 @@
 use super::*;
 
 struct ScheduleRecorder {
-    events: crate::runtime::EventRecorder,
-    db: eidetica::Database,
-    signing_key: Option<eidetica::auth::crypto::PrivateKey>,
+    session: Arc<Mutex<Session>>,
     invocation: String,
-    agent: String,
+    identity: TurnCallIdentity,
+    sequence: std::sync::atomic::AtomicU64,
 }
 impl crate::runtime::RuntimeRecorder for ScheduleRecorder {
+    fn standalone_worker_invocation(&self) -> Option<&str> {
+        Some(&self.invocation)
+    }
+
     fn record<'a>(
         &'a self,
         record: crate::runtime::RuntimeRecord,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>> {
-        self.events.record(record)
+        use crate::session::TurnTranscriptMessage;
+        use crate::session::turn_recorder::{display_entries_for_record, transcript_record};
+        Box::pin(async move {
+            let mut record = transcript_record(
+                TurnRequestId::parse(self.invocation.clone()),
+                self.invocation.clone(),
+                self.identity.clone(),
+                self.sequence.fetch_add(1, Ordering::Relaxed),
+                record,
+            );
+            let mut entries = display_entries_for_record(&self.identity.agent, &record);
+            entries.retain(|entry| match entry.entry_type {
+                EntryType::ToolCall => !entry
+                    .content
+                    .strip_prefix(crate::tool::NO_REPLY_TOOL)
+                    .is_some_and(|suffix| suffix.starts_with('(')),
+                EntryType::ToolResult => true,
+                _ => false,
+            });
+            if entries.is_empty() {
+                return Ok(());
+            }
+            let mut session = self.session.lock().await;
+            // Keep only the call positions and IDs needed for Worker ancestry,
+            // not private provider data or a replayable exchange. No queued
+            // request or attempt exists for the synthetic schedule ID.
+            if let TurnTranscriptMessage::ModelResponse {
+                content,
+                tool_calls,
+                provider_extra,
+                metadata,
+                ..
+            } = &mut record.message
+                && tool_calls.iter().any(|call| call.name == "spawn_worker")
+            {
+                *content = None;
+                provider_extra.clear();
+                *metadata = None;
+                for call in tool_calls {
+                    call.arguments.clear(); // already present in the tool audit
+                }
+                session.refresh_writer().await.map_err(|e| e.to_string())?;
+                session
+                    .append_turn_transcript(record, entries)
+                    .await
+                    .map_err(|e| e.to_string())?;
+            } else {
+                // No Worker creation depends on these display-only rows.
+                for mut entry in entries {
+                    let written = async {
+                        session.refresh_writer().await?;
+                        entry.timestamp = Utc::now();
+                        session.add_entry(entry).await
+                    }
+                    .await;
+                    if let Err(error) = written {
+                        tracing::error!(%error, "Failed to write scheduled tool audit entry");
+                    }
+                }
+            }
+            Ok(())
+        })
     }
     fn observe_call<'a>(
         &'a self,
         call: crate::session::usage::CallObservation,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>> {
         Box::pin(async move {
-            let db = crate::session::current_session_writer(&self.db, self.signing_key.as_ref())
-                .await
-                .map_err(|e| e.to_string())?;
-            crate::session::usage::persist_call(&db, &self.invocation, None, &self.agent, call)
-                .await
+            let mut session = self.session.lock().await;
+            session.refresh_writer().await.map_err(|e| e.to_string())?;
+            crate::session::usage::persist_call(
+                session.database(),
+                &self.invocation,
+                None,
+                &self.identity.agent,
+                call,
+            )
+            .await
         })
     }
 }
@@ -814,84 +883,24 @@ impl Server {
             );
         }
 
-        // Event writer: capture ToolCall/ToolResult as session entries.
-        let (event_tx, mut event_rx) =
-            tokio::sync::mpsc::channel::<crate::runtime::RuntimeEvent>(64);
-        let event_session = session.clone();
-        let event_agent = agent_name.to_string();
-        let event_writer = tokio::spawn(async move {
-            while let Some(event) = event_rx.recv().await {
-                let mut s = event_session.lock().await;
-                if let Err(error) = s.refresh_writer().await {
-                    tracing::error!(%error, "Cannot refresh scheduled event writer");
-                    continue;
-                }
-                match event {
-                    crate::runtime::RuntimeEvent::ToolCall {
-                        name, arguments, ..
-                    } => {
-                        if let Err(e) = s
-                            .add_entry(SessionEntry {
-                                sender: event_agent.clone(),
-                                content: format!("{name}({arguments})"),
-                                timestamp: Utc::now(),
-                                entry_type: EntryType::ToolCall,
-                                metadata: None,
-                                routing: None,
-                            })
-                            .await
-                        {
-                            tracing::error!("Failed to record scheduled tool call: {e}");
-                        }
-                    }
-                    crate::runtime::RuntimeEvent::ToolResult {
-                        name,
-                        output,
-                        is_error,
-                        ..
-                    } => {
-                        let content = if is_error {
-                            format!("{name}: ERROR: {output}")
-                        } else {
-                            let t = crate::util::truncate_chars(&output, 500);
-                            let truncated = if t.len() < output.len() {
-                                format!("{t}…")
-                            } else {
-                                output
-                            };
-                            format!("{name}: {truncated}")
-                        };
-                        if let Err(e) = s
-                            .add_entry(SessionEntry {
-                                sender: event_agent.clone(),
-                                content,
-                                timestamp: Utc::now(),
-                                entry_type: EntryType::ToolResult,
-                                metadata: None,
-                                routing: None,
-                            })
-                            .await
-                        {
-                            tracing::error!("Failed to record scheduled tool result: {e}");
-                        }
-                    }
-                }
-            }
-        });
-
         let request_security = SecurityContext {
             leak_detector: self.security.leak_detector.clone(),
             auto_approved_tools: self.security.auto_approved_tools.clone(),
             approval_callback: None, // no interactive approval for schedule fires
         };
 
-        let invocation = uuid::Uuid::new_v4().to_string();
+        let invocation = format!("schedule:{}", uuid::Uuid::new_v4());
         let recorder = Arc::new(ScheduleRecorder {
-            events: crate::runtime::EventRecorder(event_tx),
-            db: session_db.clone(),
-            signing_key,
+            session: session.clone(),
             invocation: invocation.clone(),
-            agent: agent_name.into(),
+            identity: TurnCallIdentity {
+                agent: agent_name.into(),
+                requested_model: self
+                    .default_backend
+                    .resolve_model_name(effective_model.as_deref()),
+                execution_id: None,
+            },
+            sequence: Default::default(),
         });
         let result = crate::runtime::execute_with_recorder(
             effective_model.as_deref(),
@@ -922,7 +931,6 @@ impl Server {
             }
             outcome
         });
-        let _ = event_writer.await;
 
         // Write the terminal Message unless the Matrix-bound turn ended with no_reply.
         let mut s = session.lock().await;

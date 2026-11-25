@@ -1,10 +1,14 @@
 use crate::backends::BackendManager;
 use crate::security::SecurityContext;
+use crate::session::worker_links::{self, WorkerTerminal};
 use crate::session::{EntryType, Session, SessionEntry};
-use crate::tool::{ApprovalRequirement, RiskLevel, Tool, ToolContext, ToolDescriptor, ToolPolicy};
+use crate::tool::{
+    ApprovalRequirement, RiskLevel, Tool, ToolContext, ToolDescriptor, ToolError, ToolPolicy,
+};
 use serde_json::Value;
 use std::future::Future;
 use std::pin::Pin;
+use std::time::Duration;
 use tracing::info;
 
 /// Spawn a Worker — a configured one-shot LLM call declared per-Agent.
@@ -65,7 +69,7 @@ impl Tool for SpawnWorker {
                     },
                     "async": {
                         "type": "boolean",
-                        "description": "If true, spawn and return immediately without waiting for the result."
+                        "description": "If true, return the child session DB handle immediately; use worker_wait in this same invocation if available. If omitted or false, wait inline."
                     }
                 },
                 "required": ["name", "task"]
@@ -295,6 +299,149 @@ impl Tool for SpawnWorker {
                 _ => Err("No response from worker".into()),
             }
         })
+    }
+}
+
+pub struct WorkerWait {
+    pub server: crate::instance::ServerSlot,
+}
+
+impl Tool for WorkerWait {
+    fn descriptor(&self) -> ToolDescriptor {
+        ToolDescriptor {
+            name: "worker_wait".into(),
+            description: "Observe the exact outcome of a Worker spawned by this invocation. A bounded wait can return pending without cancelling the Worker. Not for spawn_agent jobs.".into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "session_db_id": {"type": "string", "description": "Exact child session DB handle from spawn_worker."},
+                    "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 240, "description": "Observation deadline (default 30 seconds)."}
+                },
+                "required": ["session_db_id"],
+                "additionalProperties": false
+            }),
+        }
+    }
+
+    fn default_policy(&self) -> ToolPolicy {
+        ToolPolicy {
+            timeout: Some(300),
+            ..ToolPolicy::default()
+        }
+    }
+
+    fn execute<'a>(
+        &'a self,
+        arguments: Value,
+        ctx: &'a ToolContext,
+    ) -> Pin<Box<dyn Future<Output = Result<String, ToolError>> + Send + 'a>> {
+        Box::pin(async move {
+            let id = arguments
+                .get("session_db_id")
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty())
+                .ok_or("Missing 'session_db_id' Worker handle")?;
+            let seconds = arguments
+                .get("timeout_seconds")
+                .map(Value::as_u64)
+                .unwrap_or(Some(30))
+                .filter(|secs| (1..=240).contains(secs))
+                .ok_or("timeout_seconds must be 1..240")?;
+            let server = self.server.get().ok_or("Server not initialized")?;
+            let outcome = observe_worker(&server, ctx, id, Duration::from_secs(seconds))
+                .await
+                .map_err(|error| {
+                    tracing::debug!(%error, "Exact Worker observation unavailable");
+                    "Worker result unavailable for this invocation"
+                })?;
+            let Some((outcome, entry)) = outcome else {
+                return Ok(serde_json::json!({"state": "pending"}).to_string());
+            };
+            let state = match outcome.terminal {
+                WorkerTerminal::Reply => "completed",
+                WorkerTerminal::Failed => "failed",
+                WorkerTerminal::Cancelled => "cancelled",
+                WorkerTerminal::NoReply => "no_reply",
+            };
+            Ok(match entry {
+                Some(entry) => serde_json::json!({"state": state, "result": entry.content}),
+                None => serde_json::json!({"state": state}),
+            }
+            .to_string())
+        })
+    }
+}
+
+async fn observe_worker(
+    server: &crate::server::Server,
+    ctx: &ToolContext,
+    id: &str,
+    bound: Duration,
+) -> anyhow::Result<Option<(worker_links::WorkerOutcome, Option<SessionEntry>)>> {
+    let caller = ctx
+        .tool_call_site
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("no recorded Worker invocation"))?;
+    let (parent, signing_key) = {
+        let session = ctx.session.lock().await;
+        (session.database().clone(), session.signing_key())
+    };
+    let authorized_spawn = || async {
+        let parent = crate::session::current_session_writer(&parent, signing_key.as_ref()).await?;
+        crate::session::jobs::require_observer_write(&parent).await?;
+        crate::session::require_session_participant(
+            &parent,
+            &ctx.agent_name,
+            ctx.agent_identity.as_ref(),
+        )
+        .await?;
+        let spawn = worker_links::joinable_worker_spawn(&parent, id, caller).await?;
+        Ok::<_, anyhow::Error>((parent, spawn))
+    };
+    let (parent, spawn) = authorized_spawn().await?;
+    let (_, child) = server.registry().open_worker_session(id).await?;
+    worker_links::verify_worker_spawn(&parent, &child, &spawn).await?;
+
+    ctx.yield_for_observation();
+    let notify = std::sync::Arc::new(tokio::sync::Notify::new());
+    let wake = notify.clone();
+    let observation = async {
+        let _subscription = child
+            .on_write(move |_, _| {
+                let wake = wake.clone();
+                async move {
+                    wake.notify_one();
+                    Ok(())
+                }
+            })
+            .await?;
+        loop {
+            if let Some((outcome, _)) =
+                worker_links::latest_worker_outcome(&child, &spawn.directive_id).await?
+            {
+                return Ok::<_, anyhow::Error>(outcome);
+            }
+            notify.notified().await;
+        }
+    };
+    match tokio::time::timeout(bound, observation).await {
+        Err(_) => Ok(None),
+        Ok(result) => {
+            let result = result?;
+            // The wait didn't acquire a lease on membership or on the link.
+            let (parent, current_spawn) = authorized_spawn().await?;
+            anyhow::ensure!(current_spawn == spawn, "Worker link changed while waiting");
+            crate::session::jobs::require_observer_write(&child).await?;
+            worker_links::verify_worker_spawn(&parent, &child, &current_spawn).await?;
+            let current = worker_links::latest_worker_outcome(&child, &spawn.directive_id).await?;
+            anyhow::ensure!(
+                current
+                    .as_ref()
+                    .is_some_and(|(outcome, _)| outcome == &result),
+                "Worker outcome changed while waiting"
+            );
+            Ok(current)
+        }
     }
 }
 

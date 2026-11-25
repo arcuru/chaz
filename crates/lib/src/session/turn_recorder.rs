@@ -2,8 +2,8 @@
 //! schedules calls, tool effects and publication; this recorder writes the
 //! selected history format without choosing when to run them.
 use super::{
-    EntryType, Session, SessionEntry, TurnAttempt, TurnCallIdentity, TurnTranscriptMessage,
-    TurnTranscriptRecord, execution, jobs, steering, usage, wait_resume,
+    EntryType, Session, SessionEntry, TurnAttempt, TurnCallIdentity, TurnRequestId,
+    TurnTranscriptMessage, TurnTranscriptRecord, execution, jobs, steering, usage, wait_resume,
 };
 use crate::runtime;
 use chrono::Utc;
@@ -292,54 +292,13 @@ impl runtime::RuntimeRecorder for TurnRecorder {
                 } if name == "matrix__send"
             );
             let sequence = self.sequence.fetch_add(1, Ordering::SeqCst) as u64;
-            let message = match message {
-                runtime::RuntimeRecord::Steering {
-                    model_sequence,
-                    inputs,
-                } => TurnTranscriptMessage::Steering {
-                    model_sequence,
-                    inputs,
-                },
-                runtime::RuntimeRecord::Cancelled => TurnTranscriptMessage::Cancelled,
-                runtime::RuntimeRecord::ModelResponse {
-                    model_sequence,
-                    content,
-                    tool_calls,
-                    provider_extra,
-                    metadata,
-                    terminal,
-                } => TurnTranscriptMessage::ModelResponse {
-                    model_sequence,
-                    content,
-                    tool_calls,
-                    provider_extra,
-                    metadata,
-                    terminal,
-                },
-                runtime::RuntimeRecord::ToolResult {
-                    model_sequence,
-                    call_index,
-                    call_id,
-                    name,
-                    output,
-                    outcome,
-                } => TurnTranscriptMessage::ToolResult {
-                    model_sequence,
-                    call_index,
-                    call_id,
-                    name,
-                    output,
-                    outcome,
-                },
-            };
-            let record = TurnTranscriptRecord {
-                request_id: self.attempt.request_id.clone(),
-                attempt_id: self.attempt.attempt_id.clone(),
+            let record = transcript_record(
+                self.attempt.request_id.clone(),
+                self.attempt.attempt_id.clone(),
+                self.identity.clone(),
                 sequence,
-                timestamp: Utc::now(),
-                identity: Some(self.identity.clone()),
                 message,
-            };
+            );
             if matches!(
                 record.message,
                 TurnTranscriptMessage::ModelResponse { terminal: true, .. }
@@ -466,7 +425,66 @@ fn execution_yield_error(yielded: &execution::ExecutionYield) -> String {
     )
 }
 
-fn display_entries_for_record(
+pub(crate) fn transcript_record(
+    request_id: TurnRequestId,
+    attempt_id: String,
+    identity: TurnCallIdentity,
+    sequence: u64,
+    message: runtime::RuntimeRecord,
+) -> TurnTranscriptRecord {
+    use TurnTranscriptMessage as T;
+    use runtime::RuntimeRecord as R;
+    let message = match message {
+        R::Steering {
+            model_sequence,
+            inputs,
+        } => T::Steering {
+            model_sequence,
+            inputs,
+        },
+        R::Cancelled => T::Cancelled,
+        R::ModelResponse {
+            model_sequence,
+            content,
+            tool_calls,
+            provider_extra,
+            metadata,
+            terminal,
+        } => T::ModelResponse {
+            model_sequence,
+            content,
+            tool_calls,
+            provider_extra,
+            metadata,
+            terminal,
+        },
+        R::ToolResult {
+            model_sequence,
+            call_index,
+            call_id,
+            name,
+            output,
+            outcome,
+        } => T::ToolResult {
+            model_sequence,
+            call_index,
+            call_id,
+            name,
+            output,
+            outcome,
+        },
+    };
+    TurnTranscriptRecord {
+        request_id,
+        attempt_id,
+        sequence,
+        timestamp: Utc::now(),
+        identity: Some(identity),
+        message,
+    }
+}
+
+pub(crate) fn display_entries_for_record(
     agent_name: &str,
     record: &TurnTranscriptRecord,
 ) -> Vec<SessionEntry> {

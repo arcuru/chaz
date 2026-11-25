@@ -945,6 +945,15 @@ pub(super) async fn server_fixture_backend(
     hub: Arc<crate::extension::ExtensionHub>,
     backend_override: Option<BackendManager>,
 ) -> (Instance, Arc<Server>, Arc<crate::session::SessionRegistry>) {
+    server_fixture_backend_with_approvals(host, hub, backend_override, &[]).await
+}
+
+pub(super) async fn server_fixture_backend_with_approvals(
+    host: Arc<dyn ToolHost>,
+    hub: Arc<crate::extension::ExtensionHub>,
+    backend_override: Option<BackendManager>,
+    auto_approved: &[&str],
+) -> (Instance, Arc<Server>, Arc<crate::session::SessionRegistry>) {
     let backend = InMemory::new();
     let (instance, user) = Instance::create_backend(
         Box::new(backend),
@@ -964,7 +973,7 @@ pub(super) async fn server_fixture_backend(
     let policies = Arc::new(crate::tool::ToolPolicyRegistry::empty());
     let security = SecurityContext {
         leak_detector: crate::security::LeakDetector::new(crate::security::LeakPolicy::default()),
-        auto_approved_tools: std::collections::HashSet::new(),
+        auto_approved_tools: auto_approved.iter().map(|name| (*name).into()).collect(),
         approval_callback: None,
     };
     let secrets = crate::security::SecretStore::new(registry.chaz_peer().clone()).await;
@@ -1917,14 +1926,26 @@ async fn schedule_admission_caps_overlapping_turns_at_max_fires() {
 
 #[tokio::test]
 async fn schedule_overlapping_fires_respect_max_fires_end_to_end() {
-    // Full-path hard-cap proof: 12 concurrent overlapping
-    // `fire_agent_schedule` turns against max_fires=3 must run exactly
-    // 3 turns. The pre-fire admission (not post-hoc counting) is the
-    // enforcement point, so this holds no matter how the turns
-    // interleave. (The test backend fails every turn, so the 3 admitted
-    // turns refund their slots afterwards — the audit row count is the
-    // stable witness: denied fires record nothing.)
-    let (_instance, server, registry) = server_fixture().await;
+    // Failed turns refund their reservations. Keep the three admitted
+    // turns in flight until all competing admissions have been checked;
+    // spawning all tasks at once doesn't guarantee that overlap.
+    let model = Arc::new(crate::test_support::MockBackend::new());
+    let backend =
+        BackendManager::with_mock(model.clone(), crate::test_support::empty_secrets().await);
+    let (_instance, server, registry) = server_fixture_backend(
+        Arc::new(crate::tool_host::NativeToolHost::new()),
+        Arc::new(crate::test_support::context_hub().await),
+        Some(backend),
+    )
+    .await;
+    let gates: Vec<_> = (0..3)
+        .map(|_| {
+            model.push_err(crate::error::LlmError::Configuration {
+                message: "held schedule failure".into(),
+            });
+            model.block_next_call()
+        })
+        .collect();
     let (entry, adb) = seed_agent(&server, &registry, "accounting-e2e").await;
     let owner_id = entry.db_id.to_string();
     let mut schedule = Schedule::new(
@@ -1956,10 +1977,31 @@ async fn schedule_overlapping_fires_respect_max_fires_end_to_end() {
         payload.one_shot = false;
         tasks.spawn(async move { server.fire_agent_schedule(payload).await });
     }
-    while let Some(result) = tasks.join_next().await {
-        // Admitted turns err (empty test backend); denied ones return Ok.
-        let _ = result.unwrap();
-    }
+    tokio::time::timeout(ASYNC_TEST_TIMEOUT, async {
+        for gate in &gates {
+            gate.wait_started().await;
+        }
+        for _ in 0..ATTEMPTS - gates.len() {
+            tasks
+                .join_next()
+                .await
+                .unwrap()
+                .unwrap()
+                .expect("excess fire should skip");
+        }
+        for gate in gates {
+            gate.release();
+        }
+        while let Some(result) = tasks.join_next().await {
+            let error = result.unwrap().unwrap_err();
+            assert!(
+                error.to_string().contains("held schedule failure"),
+                "{error}"
+            );
+        }
+    })
+    .await
+    .expect("prove overlap before any failed turn refunds");
 
     // Exactly max_fires turns ran: one audit row + one Fresh session each.
     // (Post-hoc counting would have run all 12.)
