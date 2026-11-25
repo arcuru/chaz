@@ -160,6 +160,8 @@ Choose the direction deliberately:
 
 There is no file watcher. Restarting at the same successfully projected revision leaves even an invalid local draft alone. A changed DB configuration arriving while this peer was offline projects outward on startup. Memory, session-index and other unrelated DB writes do not overwrite drafts, and a no-op setting update does not export again.
 
+In TUI client mode, you can open or create a session while another process is using its agent's managed folder. The session reads the accepted DB configuration; the local export waits in the background and resumes when the lock is released. This does not import local edits or change who runs the session.
+
 Reload validates the entire scoped document and every referenced parent/worker source before committing. A malformed/duplicate/unknown field, wrong version/identity, missing source, traversal, symlink or special file fails without changing accepted settings or runtime prompts. With no ref, it visits already hosted agents and reports each result; batch reload is not cross-agent atomic.
 
 Projection uses individual atomic file replacements and a persistent interruption journal. It is **not atomic with the DB commit**. If the DB commits but write-back fails, the result says so. Fix the filesystem problem and run `/agent project <ref>` to retry outward from the DB, not reload stale files. An incomplete projection blocks reload. Restart or a later DB event also retries pending outward work.

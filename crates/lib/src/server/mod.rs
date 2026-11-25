@@ -623,7 +623,7 @@ pub struct Server {
     agent_folders: std::sync::RwLock<Option<Arc<crate::agent_folder::AgentFolders>>>,
     agent_folder_statuses: std::sync::RwLock<HashMap<eidetica::entry::ID, (String, String)>>,
     agent_config_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
-    watched_agent_configs: Mutex<std::collections::HashSet<String>>,
+    watched_agent_configs: Mutex<HashMap<eidetica::entry::ID, mpsc::Sender<()>>>,
     /// Fail-closed ceiling on a pending tool approval, set once at startup
     /// from `Config.approvals` via [`Server::set_approval_timeout`]. Read by
     /// the per-session approval proxy each time an exposed session registers,
@@ -750,7 +750,7 @@ impl Server {
             agent_folders: std::sync::RwLock::new(None),
             agent_folder_statuses: std::sync::RwLock::new(HashMap::new()),
             agent_config_locks: Mutex::new(HashMap::new()),
-            watched_agent_configs: Mutex::new(std::collections::HashSet::new()),
+            watched_agent_configs: Mutex::new(HashMap::new()),
             approval_timeout: std::sync::RwLock::new(
                 crate::bridge::ApprovalsConfig::default().timeout(),
             ),
@@ -1059,6 +1059,36 @@ impl Server {
         &self,
         session_db: &eidetica::Database,
     ) -> anyhow::Result<crate::hosted_index::TargetedBuildStats> {
+        let (stats, _) = self.hydrate_session_entities(session_db).await?;
+        Box::pin(self.initialize_agent_folders()).await;
+        Ok(stats)
+    }
+
+    /// A client tab needs accepted DB configuration, not a completed local
+    /// export. Queue initial projection on the same generation-owned watcher
+    /// that handles DB changes, including when no further writes arrive.
+    pub async fn load_session_entities_for_observation(
+        &self,
+        session_db: &eidetica::Database,
+    ) -> anyhow::Result<crate::hosted_index::TargetedBuildStats> {
+        let (stats, explicit_agents) = self.hydrate_session_entities(session_db).await?;
+        for (id, _) in explicit_agents {
+            if self.agent_index.find_by_id(&id).is_some()
+                && let Err(error) = self.request_agent_folder_projection(&id).await
+            {
+                tracing::warn!(db_id = %id, %error, "cannot queue agent folder projection");
+            }
+        }
+        Ok(stats)
+    }
+
+    async fn hydrate_session_entities(
+        &self,
+        session_db: &eidetica::Database,
+    ) -> anyhow::Result<(
+        crate::hosted_index::TargetedBuildStats,
+        Vec<(eidetica::entry::ID, String)>,
+    )> {
         let meta = crate::session::read_meta_from_db(session_db).await;
         let explicit_agents = meta
             .agents
@@ -1092,8 +1122,7 @@ impl Server {
             }
         }
         Box::pin(self.load_hosted_agents(unregistered, &[])).await;
-        Box::pin(self.initialize_agent_folders()).await;
-        Ok(stats)
+        Ok((stats, explicit_agents))
     }
 
     /// Best-effort attach of the configured default agents to a

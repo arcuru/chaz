@@ -171,6 +171,8 @@ The DB commit and filesystem writes are not one atomic transaction. After accept
 
 Startup subscribes to Agent DB notifications before reading/projecting the latest config. When the completed config/source identity is unchanged and no projection is pending, it leaves local drafts untouched, including invalid YAML. Changed accepted data or a pending journal triggers outward projection. There is no file watcher and no import on restart.
 
+Opening a TUI client tab hydrates from the accepted DB and queues projection for its attached agents on the existing per-agent config watchers. The tab does not wait for the local folder lock. The watcher still takes the same locks and reads the latest DB revision after acquiring them.
+
 Legacy migration is the one-time DB-format transition, not routine projection: it preserves the saved effective parent prompt exactly, retaining original fragments only when they reproduce it. Otherwise it stores the saved text as a verbatim source. Missing saved content or unrecoverable worker sources blocks migration without replacing legacy data. Execution on a folder-configured peer refuses an unmigrated agent instead of guessing a prompt. All configuration-writing peers must be upgraded before using bundles; rolling back binaries does not revert synchronized data.
 
 The model-facing host separately denies direct file-tool writes to the managed root and aliases. This does not isolate native same-user shell or trusted extensions; see the [security boundary](../user_guide/security.md#agent-configuration-is-operator-owned).
