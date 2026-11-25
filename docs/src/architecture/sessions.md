@@ -97,6 +97,13 @@ identifies a reply target. The [merged history comparison](../design/merged_cont
 shows why the next model request keeps the flat rendering, and when a cue
 about prior visibility would add information at the cost of history.
 
+`/print` keeps the joined transcript in stable order. For a fenced reply, the
+completion links its final response to the request's accepted input. If that
+input is still visible and another user message intervenes, `/print` quotes a
+short preview of the accepted input. The cue names the trigger, not every
+message the model saw. It does not change the stored conversation or model
+context.
+
 Dated row APIs used by queues and transport delivery do not present v1
 projections as legacy rows. The single-turn fixture's descriptor requires
 `fenced-turn-v1` and `fenced-input-appends-v1`; readers that do not understand

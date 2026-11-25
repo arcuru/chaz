@@ -578,7 +578,13 @@ async fn render_history(
             entry.kind,
             EntryType::Message | EntryType::Directive | EntryType::Summary | EntryType::Error
         ) {
-            buf.push_str(&format!("{label}{type_label}: {}\n", entry.content));
+            // Reply cues quote the user input a lineage-recorded assistant
+            // reply actually answered, from signed scope rather than position.
+            let cue = match &entry.reply_to {
+                Some(preview) => format!(" (re: {preview})"),
+                None => String::new(),
+            };
+            buf.push_str(&format!("{label}{type_label}{cue}: {}\n", entry.content));
         }
     }
     Ok(if buf.is_empty() {

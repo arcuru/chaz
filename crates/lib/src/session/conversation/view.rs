@@ -366,8 +366,13 @@ impl ConversationView {
         Ok(groups)
     }
 
-    pub(super) fn display_rows(&self) -> Vec<crate::session::history::DisplayRow> {
+    pub(super) fn display_rows(
+        &self,
+        reply_targets: &BTreeMap<String, RepresentationId>,
+    ) -> Vec<crate::session::history::DisplayRow> {
         use crate::session::{EntryType, history::DisplayRow};
+        let mut user_inputs = BTreeMap::new();
+        let mut last_user = None;
         self.representations
             .iter()
             .filter_map(|row| {
@@ -409,10 +414,23 @@ impl ConversationView {
                         _ => return None, // Native observations are not publications.
                     },
                 };
+                let RepresentationSource::Conversation { representation, .. } = &row.source else {
+                    unreachable!("legacy rows return above");
+                };
+                if representation.view == View::Message(MessageRole::User) {
+                    user_inputs.insert(&row.id, content.as_str());
+                    last_user = Some(&row.id);
+                }
+                let reply_to = reply_targets
+                    .get(&row.id.operation)
+                    .filter(|target| Some(*target) != last_user)
+                    .and_then(|target| user_inputs.get(target))
+                    .and_then(|text| preview(text));
                 Some(DisplayRow {
                     sender: sender.into(),
                     content: content.clone(),
                     kind,
+                    reply_to,
                 })
             })
             .collect()
@@ -585,4 +603,14 @@ fn render_unit(unit: &[&VisibleRepresentation]) -> Result<Vec<(RuntimeMessage, R
             Ok((message, visible.id.clone()))
         })
         .collect()
+}
+
+fn preview(text: &str) -> Option<String> {
+    let line = text.lines().map(str::trim).find(|line| !line.is_empty())?;
+    let mut chars = line.chars().filter(|c| !c.is_control());
+    let mut quote: String = chars.by_ref().take(24).collect();
+    if chars.next().is_some() || text.contains('\n') {
+        quote.push('…');
+    }
+    (!quote.is_empty()).then_some(quote)
 }
