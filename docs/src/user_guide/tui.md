@@ -759,7 +759,7 @@ A **session** is stored data: its transcript, roster and name live in the peer's
 - **The list is local.** Rows come from this peer's session catalog: TUI sessions, Matrix-attached ones, `spawn_agent` / `spawn_worker` children, and anything synced so far. It is not an inventory of every remote peer. Agent names load only for visible rows; a row shows `…` until then. `*` marks the focused conversation.
 - **A session named `tui` is ordinary.** Earlier versions opened a session named `tui` on every launch. Existing ones stay as they are and appear in the list like any other session.
 
-The list reads registry metadata only: root ID, name, bridge, agent, age and status. It never scans transcripts for counts, previews or costs, and `/costs` scans usage explicitly. The catalog loads in the background, so navigation, New and Peer Settings work while it loads. _Loading sessions…_, _No saved sessions yet_ and _Failed to load sessions: … — Ctrl+P retries._ are distinct states; a failure is never shown as an empty list. A failed open or create stays in the hub with the error in the footer until the next key.
+The list reads registry metadata only: root ID, name, bridge, agent, age and status. It never scans transcripts for counts, previews or costs, and `/costs` scans usage explicitly. The catalog loads in the background, so navigation, New and Peer Settings work while it loads. Its rows are selectable as soon as it is read; [Worker grouping](#a-transcript-is-not-an-execution) settles afterwards. _Loading sessions…_, _No saved sessions yet_ and _Failed to load sessions: … — Ctrl+P retries._ are distinct states; a failure is never shown as an empty list. A failed open or create stays in the hub with the error in the footer until the next key.
 
 Creating a session cancels the hub's historical catalog and row reads before
 starting the write. Those reads stay paused until creation settles, so a slow
@@ -812,6 +812,7 @@ Cancelling these presentation reads does not resolve backend-wide storage stalls
 | ------------------------------------------------------- | ---------------------------------------------------------------------------------------------- |
 | `[spawn]` in the session hub                            | A Worker transcript; not proof of completion                                                   |
 | Indented `↳` session row                                | Reciprocal stored parent/child references; independent roots and unknown ancestry stay visible |
+| `ancestry check pending` under a `[spawn]` row          | Its stored parent reference is still being checked; every row is already usable                |
 | Select a row, `/join <name-or-ID>`, or `--session NAME` | Open or focus an inspection-only Worker tab                                                    |
 | **Open workers**, `/workers`, or `Alt+W`                | Parent-filtered list of linked children, including unavailable references                      |
 | **Open child** in an expanded tool run                  | Inspect the exact child's initial Directive and full transcript                                |
@@ -851,6 +852,12 @@ Separate TUI and daemon processes using the same Eidetica service and login shar
 a local catalog. The visible hub refreshes on catalog changes and explicit entry.
 Grouping reads small reciprocal references, not every transcript. It preserves
 root ordering and the selected session ID; lazy descriptions cannot reshuffle it.
+Rows do not wait for it: until a Worker's reference is checked, its row stays an
+unindented root marked `ancestry check pending`. All checks for a catalog apply
+together, moving verified Workers under their parents. While the hub stays open,
+a later catalog change keeps the settled grouping until its own check finishes.
+Leaving the hub or reconnecting discards an unfinished check, and the next hub
+starts ungrouped. The parent-filtered `/workers` list appears once fully checked.
 Missing parents, conflicting ancestry and legacy Workers without links remain
 navigable roots with an explanation. No historical ancestry is guessed or backfilled.
 The visible transcript refreshes linked child evidence at most once every five
@@ -900,6 +907,9 @@ report unavailable instead.
    reopen. Do not invoke another Worker merely because inspection failed.
    A legacy `[spawn]` row without references remains inspectable and says
    `legacy ancestry unknown` rather than inventing a parent.
+   If checks are slow, `[spawn]` rows say `ancestry check pending`; select and
+   open sessions meanwhile. A failed check says `ancestry unavailable: …` and
+   leaves its row an ordinary root.
 
 ## Settings
 

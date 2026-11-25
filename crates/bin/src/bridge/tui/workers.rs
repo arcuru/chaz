@@ -239,39 +239,55 @@ pub(super) struct Groups {
     pub notes: HashMap<String, String>,
     pub depths: HashMap<String, usize>,
 }
-/// Read only small reciprocal side records. No transcript hydration, recursive
-/// key acquisition, catalog mirroring, runtime registration or per-frame reads.
-pub(super) async fn group_catalog(
-    registry: &SessionRegistry,
-    mut indices: Vec<SessionIndex>,
-    filter: Option<&str>,
-) -> Result<(Vec<SessionIndex>, Groups), String> {
-    let worker_indices: Vec<_> = indices
+
+pub(super) fn worker_ids(indices: &[SessionIndex]) -> Vec<String> {
+    indices
         .iter()
         .filter(|i| chaz_core::session::workers::is_worker_source(i.source.as_deref()))
-        .cloned()
-        .collect();
-    let rows: Vec<_> = stream::iter(worker_indices)
-        .map(|index| async move {
-            let result = async {
-                let (_, child) = registry.open_worker_session(&index.session_db_id).await?;
-                let Some(origin) = worker_links::worker_origin(&child).await? else {
-                    return Ok(None);
-                };
-                let (_, parent) = registry
-                    .open_session_for_inspection(&origin.parent_session_id)
-                    .await?;
-                anyhow::ensure!(
-                    worker_links::worker_parent(&child, &parent)
-                        .await?
-                        .is_some(),
-                    "Worker relation missing"
-                );
-                Ok(Some(origin.parent_session_id))
+        .map(|i| i.session_db_id.clone())
+        .collect()
+}
+
+async fn verified_parent(registry: &SessionRegistry, id: &str) -> anyhow::Result<Option<String>> {
+    let (_, child) = registry.open_worker_session(id).await?;
+    let Some(origin) = worker_links::worker_origin(&child).await? else {
+        return Ok(None);
+    };
+    let (_, parent) = registry
+        .open_session_for_inspection(&origin.parent_session_id)
+        .await?;
+    anyhow::ensure!(
+        worker_links::worker_parent(&child, &parent)
+            .await?
+            .is_some(),
+        "Worker relation missing"
+    );
+    Ok(Some(origin.parent_session_id))
+}
+
+/// Read only small reciprocal side records. No transcript hydration, recursive
+/// key acquisition, catalog mirroring, runtime registration or per-frame reads.
+/// Dropping this stops at the checks already admitted to `pool`, which owns and
+/// bounds them across superseded catalogs.
+pub(super) async fn ancestry(
+    server: Arc<Server>,
+    workers: Vec<String>,
+    pool: Arc<presentation::Preparations>,
+) -> Groups {
+    let rows: Vec<_> = stream::iter(workers)
+        .map(|id| {
+            let (server, pool) = (server.clone(), pool.clone());
+            async move {
+                let worker = id.clone();
+                let result = pool
+                    .prepare(async move {
+                        verified_parent(server.registry(), &worker)
+                            .await
+                            .map_err(|e| e.to_string())
+                    })
+                    .await;
+                (id, result)
             }
-            .await
-            .map_err(|e: anyhow::Error| e.to_string());
-            (index.session_db_id.clone(), result)
         })
         .buffer_unordered(4)
         .collect()
@@ -292,37 +308,60 @@ pub(super) async fn group_catalog(
             }
         }
     }
-    if let Some(parent_id) = filter {
-        let (_, parent) = registry
-            .open_session_for_inspection(parent_id)
-            .await
-            .map_err(|e| e.to_string())?;
-        let refs = worker_links::worker_spawns(&parent)
-            .await
-            .map_err(|e| e.to_string())?;
-        let children: HashSet<_> = refs.iter().map(|s| s.child_session_id.clone()).collect();
-        indices.retain(|i| children.contains(&i.session_db_id));
-        for id in children {
-            if !indices.iter().any(|i| i.session_db_id == id) {
-                indices.push(SessionIndex {
-                    session_db_id: id.clone(),
-                    source: Some("spawn:reference".into()),
-                    bridge: chaz_core::session::BridgeKind::Spawn,
-                    created_at: None,
-                    status: chaz_core::session::SessionStatus::Active,
-                    name: None,
-                });
-                groups
-                    .notes
-                    .insert(id, "referenced transcript unavailable locally".into());
-            }
+    groups
+}
+
+/// The parent-filtered picker has no ordinary rows to show first, so it still
+/// waits for its linked children and their ancestry together.
+pub(super) async fn linked_workers(
+    server: &Arc<Server>,
+    mut indices: Vec<SessionIndex>,
+    parent_id: &str,
+    pool: Arc<presentation::Preparations>,
+) -> Result<(Vec<SessionIndex>, Groups), String> {
+    let mut groups = ancestry(server.clone(), worker_ids(&indices), pool).await;
+    let registry = server.registry();
+    let (_, parent) = registry
+        .open_session_for_inspection(parent_id)
+        .await
+        .map_err(|e| e.to_string())?;
+    let refs = worker_links::worker_spawns(&parent)
+        .await
+        .map_err(|e| e.to_string())?;
+    let children: HashSet<_> = refs.iter().map(|s| s.child_session_id.clone()).collect();
+    indices.retain(|i| children.contains(&i.session_db_id));
+    for id in children {
+        if !indices.iter().any(|i| i.session_db_id == id) {
+            indices.push(SessionIndex {
+                session_db_id: id.clone(),
+                source: Some("spawn:reference".into()),
+                bridge: chaz_core::session::BridgeKind::Spawn,
+                created_at: None,
+                status: chaz_core::session::SessionStatus::Active,
+                name: None,
+            });
+            groups
+                .notes
+                .insert(id, "referenced transcript unavailable locally".into());
         }
     }
     Ok((indices, groups))
 }
 
-/// Order once at a catalog refresh boundary; lazy row metadata cannot reshuffle
-/// the forest. Invalid cycles/missing parents remain ordinary navigable roots.
+/// Worker rows without a settled answer stay navigable roots and say so.
+pub(super) fn mark_pending(groups: &mut Groups, workers: &[String]) {
+    for id in workers {
+        if !groups.parents.contains_key(id) && !groups.notes.contains_key(id) {
+            groups
+                .notes
+                .insert(id.clone(), "ancestry check pending".into());
+        }
+    }
+}
+
+/// Order once when a catalog arrives and once when its ancestry settles; lazy
+/// row metadata cannot reshuffle the forest. Invalid cycles/missing parents
+/// remain ordinary navigable roots.
 pub(super) fn group(app: &mut App, mut groups: Groups) {
     let selected = app.picker_selection();
     let ids: HashSet<_> = app
@@ -355,7 +394,9 @@ pub(super) fn group(app: &mut App, mut groups: Groups) {
             .notes
             .insert(id, "ancestry conflicted or parent unavailable".into());
     }
-    let rows = std::mem::take(&mut app.session_list);
+    let mut rows = std::mem::take(&mut app.session_list);
+    // The rows may be in an earlier forest order, not root order.
+    commands::sort_session_infos(&mut rows);
     let mut children: HashMap<String, Vec<String>> = HashMap::new();
     let mut roots = Vec::new();
     for row in &rows {

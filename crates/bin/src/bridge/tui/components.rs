@@ -19,10 +19,21 @@ pub(super) struct Update {
     result: Result<Value, String>,
 }
 
+#[cfg(test)]
+impl Update {
+    pub(super) fn is_ancestry(&self) -> bool {
+        matches!(self.result, Ok(Value::Ancestry(_)))
+    }
+
+    pub(super) fn is_catalog(&self) -> bool {
+        matches!(self.result, Ok(Value::Group(..)))
+    }
+}
+
 #[derive(Clone)]
 enum Source {
     Agent(Box<DbEntry>),
-    Group(GroupView),
+    Group(GroupView, Arc<presentation::Preparations>),
     Row { id: String, worker: bool },
 }
 
@@ -34,7 +45,9 @@ enum GroupView {
 
 enum Value {
     Agent(Defaults),
-    Group(Vec<SessionIndex>, workers::Groups),
+    /// No groups means the rows do not depend on ancestry, or must not wait for it.
+    Group(Vec<SessionIndex>, Option<workers::Groups>),
+    Ancestry(workers::Groups),
     Row(RowFields),
 }
 
@@ -79,7 +92,7 @@ impl Source {
                 .ok_or_else(|| anyhow::anyhow!("Agent DB key unavailable"))?
                 .database()
                 .clone()),
-            Source::Group(_) => Ok(server.registry().chaz_group().clone()),
+            Source::Group(..) => Ok(server.registry().chaz_group().clone()),
             Source::Row { id, worker: true } => {
                 Ok(server.registry().open_worker_session(id).await?.1)
             }
@@ -89,7 +102,12 @@ impl Source {
         }
     }
 
-    async fn read(&self, server: &Server, db: Database, tips: Snapshot) -> anyhow::Result<Value> {
+    async fn read(
+        &self,
+        server: &Arc<Server>,
+        db: Database,
+        tips: Snapshot,
+    ) -> anyhow::Result<Value> {
         // Embedded store reads do not enforce per-handle access the way service
         // reads do. A retained frontier or previously valid key grants nothing.
         if db.instance()?.remote_connection().is_none() {
@@ -103,16 +121,17 @@ impl Source {
                     cap: config.max_context_tokens,
                 }))
             }
-            Source::Group(view) => {
-                let registry = server.registry();
-                let indices = registry.list_sessions_at(&tips).await?;
+            Source::Group(view, pool) => {
+                let indices = server.registry().list_sessions_at(&tips).await?;
                 let (rows, groups) = match view {
-                    GroupView::Picker(filter) => {
-                        workers::group_catalog(registry, indices, filter.as_deref())
-                            .await
-                            .map_err(anyhow::Error::msg)?
+                    GroupView::Picker(Some(parent)) => {
+                        let (rows, groups) =
+                            workers::linked_workers(server, indices, parent, pool.clone())
+                                .await
+                                .map_err(anyhow::Error::msg)?;
+                        (rows, Some(groups))
                     }
-                    GroupView::SessionSettings => (indices, workers::Groups::default()),
+                    GroupView::Picker(None) | GroupView::SessionSettings => (indices, None),
                 };
                 Ok(Value::Group(rows, groups))
             }
@@ -189,6 +208,27 @@ impl Watch {
         }
     }
 
+    /// One check of the Workers in an accepted catalog. A newer catalog replaces
+    /// this watch, so its result can never be applied to rows it did not check.
+    fn ancestry(
+        workers: Vec<String>,
+        server: Arc<Server>,
+        pool: Arc<presentation::Preparations>,
+        wake: Arc<Notify>,
+    ) -> Self {
+        let latest = Arc::new(Latest::new(wake));
+        let output = latest.clone();
+        let task = tokio::spawn(async move {
+            let groups = workers::ancestry(server, workers, pool).await;
+            output.publish(Ok(Value::Ancestry(groups)));
+        });
+        Self {
+            id: presentation::next_id(),
+            latest,
+            _task: supervised::Task(task),
+        }
+    }
+
     fn take(&self) -> Option<Update> {
         self.latest.take().map(|result| Update {
             id: self.id,
@@ -201,10 +241,26 @@ fn stringify(error: anyhow::Error) -> String {
     format!("{error:#}")
 }
 
+struct GroupWatch {
+    generation: u64,
+    view: GroupView,
+    watch: Watch,
+    /// Retired with the view or connection, and replaced by each catalog.
+    ancestry: Option<Watch>,
+}
+
+impl GroupWatch {
+    fn is_current(&self, app: &App) -> bool {
+        self.generation == app.session_generation && group_view(app).as_ref() == Some(&self.view)
+    }
+}
+
 pub(super) struct Watches {
     pool: Arc<presentation::Preparations>,
     row_pool: Arc<presentation::Preparations>,
-    group: Option<(u64, GroupView, Watch)>,
+    /// Separate so a stuck check cannot hold up catalog or agent reads.
+    ancestry_pool: Arc<presentation::Preparations>,
+    group: Option<GroupWatch>,
     rows: HashMap<String, (bool, Watch)>,
     agents: HashMap<ID, (DbEntry, Watch)>,
     wake: Arc<Notify>,
@@ -215,6 +271,7 @@ impl Watches {
         Self {
             pool: Arc::new(presentation::Preparations::new(4)),
             row_pool: Arc::new(presentation::Preparations::new(4)),
+            ancestry_pool: Arc::new(presentation::Preparations::new(4)),
             group: None,
             rows: HashMap::new(),
             agents: HashMap::new(),
@@ -230,23 +287,31 @@ impl Watches {
 
     pub(super) async fn shutdown(&mut self) {
         self.disconnect();
-        tokio::join!(self.pool.drain(), self.row_pool.drain());
+        tokio::join!(
+            self.pool.drain(),
+            self.row_pool.drain(),
+            self.ancestry_pool.drain()
+        );
     }
 
     pub(super) fn sync_picker(&mut self, app: &mut App, server: &Arc<Server>) {
         self.retire_picker_if_hidden(app);
         let Some(view) = group_view(app) else { return };
-        if self.group.as_ref().is_none_or(|(generation, current, _)| {
-            *generation != app.session_generation || *current != view
-        }) {
+        // Anything still current survived the retirement above.
+        if self.group.is_none() {
             self.rows.clear();
             let watch = Watch::start(
-                Source::Group(view.clone()),
+                Source::Group(view.clone(), self.ancestry_pool.clone()),
                 server.clone(),
                 self.pool.clone(),
                 self.wake.clone(),
             );
-            self.group = Some((app.session_generation, view, watch));
+            self.group = Some(GroupWatch {
+                generation: app.session_generation,
+                view,
+                watch,
+                ancestry: None,
+            });
             app.session_catalog_loading = app.mode == TuiMode::SessionPicker;
         }
         if app.mode != TuiMode::SessionPicker {
@@ -271,10 +336,11 @@ impl Watches {
     }
 
     pub(super) fn retire_picker_if_hidden(&mut self, app: &App) {
-        let view = group_view(app);
-        if self.group.as_ref().is_some_and(|(generation, current, _)| {
-            *generation != app.session_generation || Some(current) != view.as_ref()
-        }) {
+        if self
+            .group
+            .as_ref()
+            .is_some_and(|group| !group.is_current(app))
+        {
             self.group = None;
             self.rows.clear();
         }
@@ -350,7 +416,8 @@ impl Watches {
     fn active_watches(&self) -> impl Iterator<Item = &Watch> {
         self.group
             .iter()
-            .map(|(_, _, watch)| watch)
+            .flat_map(|group| [Some(&group.watch), group.ancestry.as_ref()])
+            .flatten()
             .chain(self.rows.values().map(|(_, watch)| watch))
             .chain(self.agents.values().map(|(_, watch)| watch))
     }
@@ -360,15 +427,15 @@ impl Watches {
     }
 
     pub(super) fn apply_latest(
-        &self,
+        &mut self,
         app: &mut App,
-        server: &Server,
+        server: &Arc<Server>,
         backend: &BackendManager,
     ) -> bool {
-        let mut changed = false;
-        for update in self.active_watches().filter_map(Watch::take) {
+        let updates: Vec<_> = self.active_watches().filter_map(Watch::take).collect();
+        let changed = !updates.is_empty();
+        for update in updates {
             self.apply(app, server, backend, update);
-            changed = true;
         }
         changed
     }
@@ -389,24 +456,44 @@ impl Watches {
     }
 
     pub(super) fn apply(
-        &self,
+        &mut self,
         app: &mut App,
-        server: &Server,
+        server: &Arc<Server>,
         backend: &BackendManager,
         update: Update,
     ) {
         if !app.backend_available {
             return;
         }
-        if let Some((generation, view, _)) =
-            self.group.as_ref().filter(|(_, _, w)| w.id == update.id)
-            && *generation == app.session_generation
-            && group_view(app).as_ref() == Some(view)
+        if let Some(group) = self
+            .group
+            .as_mut()
+            .filter(|group| group.watch.id == update.id && group.is_current(app))
         {
-            match (view, update.result) {
-                (GroupView::Picker(_), Ok(Value::Group(indices, groups))) => {
+            match (&group.view, update.result) {
+                (GroupView::Picker(_), Ok(Value::Group(indices, Some(groups)))) => {
                     apply_session_catalog(app, indices);
                     workers::group(app, groups);
+                }
+                (GroupView::Picker(_), Ok(Value::Group(indices, None))) => {
+                    let ids = workers::worker_ids(&indices);
+                    // Grouping this view already accepted stays until its
+                    // replacement settles; another view's is never inherited.
+                    let mut groups = match group.ancestry.take() {
+                        Some(_) => std::mem::take(&mut app.worker_groups),
+                        None => workers::Groups::default(),
+                    };
+                    workers::mark_pending(&mut groups, &ids);
+                    apply_session_catalog(app, indices);
+                    workers::group(app, groups);
+                    group.ancestry = (!ids.is_empty()).then(|| {
+                        Watch::ancestry(
+                            ids,
+                            server.clone(),
+                            self.ancestry_pool.clone(),
+                            self.wake.clone(),
+                        )
+                    });
                 }
                 (GroupView::SessionSettings, Ok(Value::Group(indices, _))) => {
                     if let Some(snapshot) = &mut app.session_settings_snapshot {
@@ -423,6 +510,13 @@ impl Watches {
                 (GroupView::SessionSettings, Err(error)) => {
                     tracing::warn!(%error, "Session index observation failed")
                 }
+                _ => unreachable!(),
+            }
+        } else if self.group.as_ref().is_some_and(|group| {
+            group.ancestry.as_ref().is_some_and(|w| w.id == update.id) && group.is_current(app)
+        }) {
+            match update.result {
+                Ok(Value::Ancestry(groups)) => workers::group(app, groups),
                 _ => unreachable!(),
             }
         } else if let Some((id, (worker, _))) = self

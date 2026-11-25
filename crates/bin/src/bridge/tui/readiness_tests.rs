@@ -11,14 +11,14 @@ use eidetica::{
     snapshot::Snapshot,
 };
 use std::sync::Mutex;
-use tokio::sync::{Notify, Semaphore, oneshot};
+use tokio::sync::{Notify, oneshot};
 
 struct Probe {
     roots: Mutex<HashSet<ID>>,
     accessed: Mutex<HashSet<ID>>,
     blocked: Mutex<Option<ID>>,
     entered: Notify,
-    release: Semaphore,
+    release: Notify,
 }
 impl Default for Probe {
     fn default() -> Self {
@@ -27,16 +27,19 @@ impl Default for Probe {
             accessed: Mutex::new(HashSet::new()),
             blocked: Mutex::new(None),
             entered: Notify::new(),
-            release: Semaphore::new(0),
+            release: Notify::new(),
         }
     }
 }
 impl Probe {
     async fn wait(&self, id: &ID) {
-        let blocked = self.blocked.lock().unwrap().as_ref() == Some(id);
-        if blocked {
+        loop {
+            let released = self.release.notified();
+            if self.blocked.lock().unwrap().as_ref() != Some(id) {
+                return;
+            }
             self.entered.notify_one();
-            let _permit = self.release.acquire().await.unwrap();
+            released.await;
         }
     }
     fn record(&self, id: &ID) {
@@ -500,9 +503,8 @@ async fn new_session_preempts_a_blocked_historical_open_without_history_growth()
             probe.accessed.lock().unwrap().is_empty(),
             "creation accessed unrelated databases"
         );
-        assert_eq!(
-            probe.release.available_permits(),
-            0,
+        assert!(
+            probe.blocked.lock().unwrap().is_some(),
             "test released the historical gate"
         );
         assert!(watches.try_next().is_none(), "blocked metadata completed");
@@ -794,7 +796,7 @@ async fn new_session_composer_precedes_creation_and_hydration_and_keeps_drafts_s
             );
         }
         *probe.blocked.lock().unwrap() = None;
-        probe.release.add_permits(1);
+        probe.release.notify_waiters();
         settle(&mut app).await;
         assert!(app.creation.is_none());
         assert!(!app.operations.is_creating_session());
@@ -818,4 +820,218 @@ async fn new_session_composer_precedes_creation_and_hydration_and_keeps_drafts_s
         drop(app);
         built.shutdown().await;
     }
+}
+
+#[tokio::test]
+async fn ordinary_rows_are_usable_while_worker_ancestry_is_pending() {
+    use chaz_core::session::{TurnRequestId, worker_links::*};
+    use eidetica::store::{DocStore, Table};
+    let dir = tempfile::tempdir().unwrap();
+    let probe = Arc::new(Probe::default());
+    let built = runtime(dir.path(), probe.clone()).await;
+    let server = &built.server;
+    let backend = BackendManager::new(&None, built.secret_store.clone());
+    let registry = server.registry();
+    let (parent, parent_db) = registry.create_session(Some("tui")).await.unwrap();
+    let (ordinary, _) = registry.create_session(Some("tui")).await.unwrap();
+    let (child, child_db) = registry
+        .create_child_session(&parent.0, Some("spawn:one"))
+        .await
+        .unwrap();
+    let (parent, ordinary, child) = (parent.0, ordinary.0, child.0);
+    let txn = child_db.new_transaction().await.unwrap();
+    txn.get_store::<Table<WorkerOrigin>>("worker_origin_v1")
+        .await
+        .unwrap()
+        .set(
+            "origin",
+            WorkerOrigin {
+                version: 1,
+                parent_session_id: parent.clone(),
+                spawn_id: "one".into(),
+            },
+        )
+        .await
+        .unwrap();
+    txn.commit().await.unwrap();
+    let txn = parent_db.new_transaction().await.unwrap();
+    txn.get_store::<Table<WorkerSpawn>>("worker_spawns_v1")
+        .await
+        .unwrap()
+        .set(
+            "one",
+            WorkerSpawn {
+                version: 1,
+                spawn_id: "one".into(),
+                call: WorkerCallSite {
+                    request_id: TurnRequestId::parse("request"),
+                    attempt_id: "attempt".into(),
+                    execution_id: None,
+                    agent: "default".into(),
+                    model_sequence: 0,
+                    call_index: 0,
+                    call_id: "call".into(),
+                },
+                child_session_id: child.clone(),
+                directive_id: TurnRequestId::parse("directive"),
+            },
+        )
+        .await
+        .unwrap();
+    txn.commit().await.unwrap();
+    // Bound handles keep the gate on the ancestry read, not on the account lock.
+    registry.open_worker_session(&child).await.unwrap();
+    // A catalog commit that only touches an alias, so each is one group delivery.
+    let rename = async |name: &str| {
+        let txn = registry.chaz_group().new_transaction().await.unwrap();
+        let names = txn.get_store::<DocStore>("session_names").await.unwrap();
+        names.set_string(name, &ordinary).await.unwrap();
+        txn.commit().await.unwrap();
+    };
+    let order = |app: &App| -> Vec<String> {
+        app.session_list
+            .iter()
+            .map(|row| row.session_db_id.clone())
+            .collect()
+    };
+    let flat = [child.clone(), ordinary.clone(), parent.clone()];
+    let grouped = [ordinary.clone(), parent.clone(), child.clone()];
+    let hold = || *probe.blocked.lock().unwrap() = Some(ID::parse(&child).unwrap());
+    let release = || {
+        *probe.blocked.lock().unwrap() = None;
+        probe.release.notify_waiters();
+    };
+
+    hold();
+    let mut app = App::hub(HashSet::new());
+    let mut watches = components::Watches::new();
+    open_session_picker(&mut app);
+    watches.sync_picker(&mut app, server);
+    let catalog = update(&mut watches).await;
+    assert!(catalog.is_catalog());
+    watches.apply(&mut app, server, &backend, catalog);
+    tokio::time::timeout(std::time::Duration::from_secs(2), probe.entered.notified())
+        .await
+        .expect("the ancestry check must really be pending");
+    assert!(!app.session_catalog_loading);
+    assert_eq!(order(&app), flat);
+    let pending = frame(&mut app, server, &backend);
+    for id in &flat {
+        assert!(pending.contains(&short_session_id(id)), "{pending}");
+    }
+    assert!(!pending.contains('↳'), "unverified relation: {pending}");
+    assert!(pending.contains("ancestry check pending"), "{pending}");
+    for _ in 0..2 {
+        input::handle_picker_key(&mut app, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+    }
+    assert_eq!(app.picker_selection(), ordinary);
+
+    // A newer catalog is also usable at once and supersedes the pending check.
+    rename("renamed-while-pending").await;
+    let catalog = update(&mut watches).await;
+    assert!(catalog.is_catalog());
+    watches.apply(&mut app, server, &backend, catalog);
+    assert!(frame(&mut app, server, &backend).contains("renamed-while-pending"));
+    assert_eq!(order(&app), flat);
+    assert_eq!(app.picker_selection(), ordinary);
+
+    // Completed, but the catalog it checked is replaced before delivery.
+    release();
+    let stale = update(&mut watches).await;
+    assert!(stale.is_ancestry());
+    rename("renamed-after-check").await;
+    hold();
+    let catalog = update(&mut watches).await;
+    assert!(catalog.is_catalog());
+    watches.apply(&mut app, server, &backend, catalog);
+    watches.apply(&mut app, server, &backend, stale);
+    assert_eq!(order(&app), flat, "superseded ancestry was accepted");
+    release();
+    let settled = update(&mut watches).await;
+    assert!(settled.is_ancestry());
+    watches.apply(&mut app, server, &backend, settled);
+    assert_eq!(order(&app), grouped);
+    assert_eq!(app.worker_groups.depths[&child], 1);
+    assert!(app.worker_groups.notes.is_empty());
+    assert_eq!(app.picker_selection(), ordinary);
+    assert!(frame(&mut app, server, &backend).contains('↳'));
+
+    // A refresh of the same view keeps its settled grouping while rechecking.
+    hold();
+    rename("renamed-after-settling").await;
+    let catalog = update(&mut watches).await;
+    assert!(catalog.is_catalog());
+    watches.apply(&mut app, server, &backend, catalog);
+    assert_eq!(order(&app), grouped);
+    assert_eq!(app.picker_selection(), ordinary);
+
+    // Neither a new hub view nor a new connection inherits or accepts it.
+    for reconnect in [false, true] {
+        release();
+        let retired = update(&mut watches).await;
+        assert!(retired.is_ancestry());
+        hold();
+        if reconnect {
+            watches.disconnect();
+        } else {
+            open_session_picker(&mut app);
+        }
+        app.picker_visible_rows = 0..0; // no row metadata deliveries
+        watches.sync_picker(&mut app, server);
+        let catalog = update(&mut watches).await;
+        assert!(catalog.is_catalog());
+        watches.apply(&mut app, server, &backend, catalog);
+        assert_eq!(order(&app), flat);
+        watches.apply(&mut app, server, &backend, retired);
+        assert_eq!(order(&app), flat, "retired ancestry was accepted");
+    }
+
+    release();
+    let settled = update(&mut watches).await;
+    assert!(settled.is_ancestry());
+    watches.apply(&mut app, server, &backend, settled);
+    assert_eq!(order(&app), grouped);
+
+    // A relation that no longer verifies returns its Worker to root order.
+    let txn = parent_db.new_transaction().await.unwrap();
+    let spawns = txn
+        .get_store::<Table<WorkerSpawn>>("worker_spawns_v1")
+        .await
+        .unwrap();
+    assert!(spawns.delete("one").await.unwrap());
+    txn.commit().await.unwrap();
+    rename("renamed-after-removal").await;
+    let catalog = update(&mut watches).await;
+    assert!(catalog.is_catalog());
+    watches.apply(&mut app, server, &backend, catalog);
+    let settled = update(&mut watches).await;
+    assert!(settled.is_ancestry());
+    watches.apply(&mut app, server, &backend, settled);
+    assert_eq!(order(&app), flat);
+    assert!(app.worker_groups.notes[&child].contains("ancestry unavailable"));
+
+    // Opening an ordinary row does not wait either.
+    hold();
+    rename("renamed-before-opening").await;
+    let catalog = update(&mut watches).await;
+    assert!(catalog.is_catalog());
+    watches.apply(&mut app, server, &backend, catalog);
+    let (approval, _) = mpsc::channel(8);
+    let (notify, _) = presentation::channel();
+    dispatch_picker_selection(
+        ordinary.clone(),
+        &mut app,
+        server,
+        &backend,
+        &approval,
+        &notify,
+    );
+    settle(&mut app).await;
+    assert_eq!(app.active().session_db_id, ordinary);
+    release();
+    watches.retire_picker_if_hidden(&app);
+    watches.shutdown().await;
+    notify.drain().await;
+    drop(app);
+    built.shutdown().await;
 }
