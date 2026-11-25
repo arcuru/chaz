@@ -1447,9 +1447,16 @@ async fn setup_session(
                 .await?,
         "Worker sessions must be opened as observers"
     );
-    server.load_session_entities(session_db).await?;
+    let executor = server.is_executor_authorized();
+    if executor {
+        server.load_session_entities(session_db).await?;
+    } else {
+        server
+            .load_session_entities_for_observation(session_db)
+            .await?;
+    }
     let observation_id = presentation::next_id();
-    let forwarder = if server.is_executor_authorized() {
+    let forwarder = if executor {
         // Per-session raw approval channel → tagged forward to shared channel.
         let (raw_tx, mut raw_rx) = mpsc::channel::<ApprovalExchange>(8);
         let forwarder_id = session_db_id.clone();

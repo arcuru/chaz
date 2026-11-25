@@ -115,6 +115,7 @@ class Gate:
 
 class ServicePty(unittest.TestCase):
     fixture_args = ()
+    extra_config = ""
 
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="chaz-startup-pty-")
@@ -150,7 +151,7 @@ eidetica:
   login:
     username: {username}
     password: test-password
-''')
+{self.extra_config}''')
         self.started = time.monotonic()
         self.process = PtyProcess([BINARY, "--config", config, *args], self.env, self.home)
         self.process.resize(120, 40)
@@ -231,6 +232,67 @@ eidetica:
 
     def logs(self):
         return "\n".join(log.read_text() for log in sorted((self.home / "state").glob("chaz-tui*.log*")))
+
+
+class FolderLock(ServicePty):
+    fixture_args = ("folder-lock",)
+
+    def test_existing_and_new_session_open_while_projection_waits(self):
+        self.extra_config = f'''agent_config_dir: "{self.home}/agent-folders"
+default_agents: [fixture-default]
+agent_groups:
+  locked: [chaz]
+'''
+        # The fixture owner holds Chaz's actual flock across process boundaries.
+        # The existing session's agent isn't among the startup defaults, so
+        # startup's background projection can't satisfy its initial export.
+        folder = Path(self.control("lock-folder", "LOCKED ").removeprefix("LOCKED "))
+        tips = self.control("agent-tips", "TIPS ")
+        self.launch(lambda r: False)
+        self.process.expect_screen("service-fixture", timeout=15)
+        self.process.send("\x1b[B\r")
+        self.process.expect_screen("SERVICE-CACHED-TRANSCRIPT", timeout=10)
+        self.process.expect_screen("Ctrl+S settings", timeout=2)
+        self.assertFalse(folder.exists(), "folder was projected without acquiring the flock")
+        self.assertEqual(self.control("agent-tips", "TIPS "), tips)
+        self.assertEqual(self.control("sessions", "SESSIONS"), "SESSIONS 1")
+        self.assertEqual(self.control("entries", "ENTRIES"), "ENTRIES 1")
+
+        self.control("unlock-folder", "UNLOCKED")
+        deadline = time.monotonic() + 10
+        while True:
+            journal = folder / ".projection.json"
+            if journal.exists():
+                state = json.loads(journal.read_text())
+                if state["completed"] and state["pending"] is None:
+                    break
+            self.assertLess(time.monotonic(), deadline, "projection did not resume after unlock")
+            self.process.drain(0.05)
+        self.assertIn("accepted locked-folder prompt", (folder / "agent.yaml").read_text())
+        self.assertEqual(self.control("agent-tips", "TIPS "), tips)
+
+        # Take the same lock again for the ordered create path, which also
+        # commits one new session and attaches the same agent before opening.
+        self.control("lock-folder", "LOCKED ")
+        self.process.send("/new locked\r")
+        deadline = time.monotonic() + 10
+        while True:
+            opened = [line for line in self.logs().splitlines() if "TUI session composer ready" in line]
+            if len(opened) >= 2:
+                self.assertTrue(opened[-1].endswith(" agent=chaz"), opened)
+                break
+            self.assertLess(time.monotonic(), deadline, "new session did not open while flock was held")
+            self.process.drain(0.05)
+        self.process.expect_screen("Ctrl+S settings", timeout=2)
+        self.assertNotIn("SERVICE-CACHED-TRANSCRIPT", "\n".join(self.process.screen.display))
+        self.process.send("held-lock-draft")
+        self.process.expect_screen("held-lock-draft", timeout=2)
+        # Closing the client must not need the other process to release its lock.
+        self.quit()
+        self.control("unlock-folder", "UNLOCKED")
+        self.assertEqual(self.control("sessions", "SESSIONS"), "SESSIONS 2")
+        self.assertEqual(self.control("entries", "ENTRIES"), "ENTRIES 1")
+        print("FOLDER LOCK: existing and new composers opened under flock; unlock projected accepted config without a DB write")
 
 
 class Outage(ServicePty):

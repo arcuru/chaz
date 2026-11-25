@@ -2,12 +2,13 @@
 use chaz_core::{
     agent::AgentRegistry,
     agent_db::{AgentDbConfig, AgentMeta, create_agent_db},
+    agent_folder::AgentFolders,
     extension::{ExtensionOutput, write_extension_outputs},
     hosted_index::DbEntry,
     session::{EntryType, Session, SessionEntry, SessionRegistry},
 };
 use eidetica::{Instance, NewAccount, backend::database::InMemory, service::ServiceServer};
-use std::{collections::BTreeMap, sync::Arc};
+use std::{collections::BTreeMap, path::Path, sync::Arc};
 use tokio::{
     io::{AsyncBufReadExt, BufReader},
     sync::watch,
@@ -16,15 +17,22 @@ use tokio::{
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let socket = std::env::args().nth(1).expect("socket path required");
+    let mode = std::env::args().nth(2);
     let (owner, mut user) = Instance::create_backend(
         Box::new(InMemory::new()),
         NewAccount::with_password("pty-service", "test-password"),
     )
     .await?;
+    let mut config = AgentDbConfig::default();
+    if mode.as_deref() == Some("folder-lock") {
+        chaz_core::agent_bundle::import_sources(&mut config)?;
+        create_agent_db(&mut user, "fixture-default", &config, &AgentMeta::default()).await?;
+        config.system_prompt = "accepted locked-folder prompt".into();
+    }
     let (agent_db, pubkey) = create_agent_db(
         &mut user,
         "chaz",
-        &AgentDbConfig::default(),
+        &config,
         &AgentMeta {
             display_name: Some("chaz".into()),
             ..Default::default()
@@ -62,7 +70,6 @@ async fn main() -> anyhow::Result<()> {
         )]),
     )
     .await?;
-    let mode = std::env::args().nth(2);
     let mut secondary = if mode.as_deref() == Some("outage") {
         let (conv, db) = registry.create_session(Some("tui")).await?;
         let id = db.root_id().to_string();
@@ -147,6 +154,7 @@ async fn main() -> anyhow::Result<()> {
             .await?;
     }
     let agents_json = serde_json::to_string(&session.try_read_meta().await?.agents)?;
+    let mut folder_lock = None;
     let service = ServiceServer::bind(owner.clone(), &socket).await?;
     let (shutdown, receiver) = watch::channel(());
     let mut running = Some((shutdown, tokio::spawn(service.run(receiver))));
@@ -185,6 +193,20 @@ async fn main() -> anyhow::Result<()> {
             }
             "sessions" => {
                 println!("SESSIONS {}", registry.list_sessions().await?.len());
+            }
+            "lock-folder" => {
+                let root = Path::new(&socket).parent().unwrap().join("agent-folders");
+                let folders = AgentFolders::new(root);
+                let agent_id = agent_db.id().to_string();
+                folder_lock = Some(folders.lock(&agent_id)?);
+                println!("LOCKED {}", folders.folder("chaz", &agent_id).display());
+            }
+            "unlock-folder" => {
+                anyhow::ensure!(folder_lock.take().is_some(), "no folder lock held");
+                println!("UNLOCKED");
+            }
+            "agent-tips" => {
+                println!("TIPS {:?}", agent_db.database().snapshot().await?.tips());
             }
             "entries" => {
                 let (conv, db) = registry.open_session(&id).await?;

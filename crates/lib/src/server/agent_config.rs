@@ -8,7 +8,7 @@ use anyhow::{Context, ensure};
 use eidetica::entry::ID;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, mpsc};
 
 #[derive(Debug, Default)]
 pub struct AgentConfigOutcome {
@@ -359,33 +359,59 @@ impl Server {
     /// Source-agnostic local/synced DB notifications, coalesced per agent. The
     /// deterministic exported identity ignores unrelated Agent DB writes.
     pub async fn watch_agent_config(&self, db_id: &ID) -> anyhow::Result<()> {
+        self.ensure_agent_config_watch(db_id, false).await
+    }
+
+    pub(super) async fn request_agent_folder_projection(&self, db_id: &ID) -> anyhow::Result<()> {
+        self.ensure_agent_config_watch(db_id, true).await
+    }
+
+    async fn ensure_agent_config_watch(
+        &self,
+        db_id: &ID,
+        queue_projection: bool,
+    ) -> anyhow::Result<()> {
         if self.agent_folders().is_none() {
             return Ok(());
         }
-        let db = self.config_db(&self.config_entry(db_id)?).await?;
-        let id = db_id.to_string();
         let mut watched = self.watched_agent_configs.lock().await;
-        if watched.contains(&id) {
-            return Ok(());
+        let tx = match watched.entry(db_id.clone()) {
+            std::collections::hash_map::Entry::Occupied(watch) => watch.into_mut(),
+            std::collections::hash_map::Entry::Vacant(watch) => {
+                watch.insert(self.subscribe_agent_config(db_id).await?)
+            }
+        };
+        if queue_projection {
+            // Like DB notifications, repeated opens coalesce. The watcher
+            // reads current DB state under the existing projection locks.
+            let _ = tx.try_send(());
         }
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<()>(1);
+        Ok(())
+    }
+
+    async fn subscribe_agent_config(&self, db_id: &ID) -> anyhow::Result<mpsc::Sender<()>> {
+        let db = self.config_db(&self.config_entry(db_id)?).await?;
+        let (tx, mut rx) = mpsc::channel::<()>(1);
+        let notify = tx.clone();
         let subscription = db
             .database()
             .on_write(move |_, _| {
-                let _ = tx.try_send(());
+                let _ = notify.try_send(());
                 Box::pin(async { Ok(()) })
             })
             .await?;
         subscription.detach();
-        watched.insert(id);
-        drop(watched);
         let weak = self.self_ref.clone();
         let db_id = db_id.clone();
         self.track_task(tokio::spawn(async move {
             while rx.recv().await.is_some() {
                 let Some(server) = weak.upgrade() else { break; };
                 match server.project_agent_config(&db_id, false).await {
-                    Ok(outcome) if outcome.projection_error.is_none() => {},
+                    Ok(outcome) if outcome.projection_error.is_none() => {
+                        if outcome.flattened {
+                            tracing::warn!(%db_id, "preserved saved prompt as one source; original decomposition unavailable");
+                        }
+                    },
                     Ok(outcome) => tracing::warn!(%db_id, error = ?outcome.projection_error, "agent DB authoritative; folder projection pending"),
                     Err(error) => {
                         if let Some(entry) = server.agent_index.find_by_id(&db_id) {
@@ -396,7 +422,7 @@ impl Server {
                 }
             }
         }));
-        Ok(())
+        Ok(tx)
     }
 
     pub async fn initialize_agent_folders(&self) {
