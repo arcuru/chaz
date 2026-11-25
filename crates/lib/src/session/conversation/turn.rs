@@ -2,7 +2,11 @@
 //! receipt nor a readable branch grants an executor another attempt.
 use super::{ConversationError as Error, ConversationRead, Result, record::*};
 use crate::session::{TURN_ATTEMPTS_STORE, TurnAttempt, TurnAttemptStatus};
-use eidetica::{Database, Snapshot, entry::Entry, store::Table};
+use eidetica::{
+    Database, Snapshot,
+    entry::{Entry, ID},
+    store::Table,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -12,6 +16,8 @@ pub(in crate::session) struct AcceptedInput {
     pub fact: FactId,
     pub branch: String,
     pub attempt: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pin: Option<ID>,
 }
 
 impl AcceptedInput {
@@ -153,7 +159,7 @@ pub(super) fn validate_operations<'a>(
     Ok(())
 }
 
-async fn attempt_at(db: &Database, at: &Snapshot, id: &str) -> Result<TurnAttempt> {
+pub(super) async fn attempt_at(db: &Database, at: &Snapshot, id: &str) -> Result<TurnAttempt> {
     Ok(db
         .new_transaction_at(at)
         .await?
@@ -161,6 +167,21 @@ async fn attempt_at(db: &Database, at: &Snapshot, id: &str) -> Result<TurnAttemp
         .await?
         .get(id)
         .await?)
+}
+
+#[cfg(test)]
+pub(super) fn require_local_input(entry: &crate::session::SessionEntry) -> Result<()> {
+    if entry.entry_type != crate::session::EntryType::Message
+        || entry.sender.is_empty()
+        || entry.content.is_empty()
+        || entry.metadata.is_some()
+        || entry.routing.is_some()
+    {
+        return Err(Error::InvalidScope(
+            "expected an unaddressed local message".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn is_user_append(op: &Operation) -> bool {
@@ -174,6 +195,7 @@ pub(super) async fn validate_input(
     read: &ConversationRead,
     entry: &Entry,
     input: &AcceptedInput,
+    parents: &BTreeSet<ID>,
 ) -> Result<()> {
     let op = operation_in(read, entry, &input.fact.operation)?;
     let valid_op =
@@ -183,8 +205,28 @@ pub(super) async fn validate_input(
             "input lacks its atomic fact or attempt".into(),
         ));
     }
+    match &input.pin {
+        Some(pin) if read.pinned_executions => {
+            if op.observed.frontier != Snapshot::from(entry.parents()?)
+                || input.branch != input.request()
+            {
+                return Err(Error::Integrity(
+                    "pinned input differs from signed parents or request identity".into(),
+                ));
+            }
+            read.pins.bound(pin, parents)?;
+        }
+        None if !read.pinned_executions => {}
+        _ => {
+            return Err(Error::Integrity(
+                "input pin does not match descriptor".into(),
+            ));
+        }
+    }
+    let written = row_delta(entry, &input.attempt)?;
     let attempt = attempt_at(db, &Snapshot::from([entry.id()]), &input.attempt).await?;
-    if attempt.attempt_id != input.attempt
+    if written != attempt
+        || attempt.attempt_id != input.attempt
         || attempt.request_id.as_str() != input.request()
         || attempt.status != TurnAttemptStatus::Started
         || attempt.completed_at.is_some()
@@ -194,7 +236,36 @@ pub(super) async fn validate_input(
             "input attempt differs from its receipt".into(),
         ));
     }
+    if read.pinned_executions {
+        let before = db
+            .new_transaction_at(&Snapshot::from(entry.parents()?))
+            .await?;
+        let store = before
+            .get_store::<Table<TurnAttempt>>(TURN_ATTEMPTS_STORE)
+            .await?;
+        match store.get(&input.attempt).await {
+            Err(error) if error.is_not_found() => {}
+            Ok(_) => {
+                return Err(Error::IdentityConflict(
+                    "input attempt already exists".into(),
+                ));
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
     Ok(())
+}
+
+fn row_delta(entry: &Entry, attempt: &str) -> Result<TurnAttempt> {
+    let delta = super::atom::decode_doc(entry.data(TURN_ATTEMPTS_STORE)?)?;
+    let row = (!delta.is_atomic())
+        .then(|| delta.get(attempt))
+        .flatten()
+        .and_then(|row| row.as_text())
+        .ok_or_else(|| {
+            Error::Integrity("receipt Entry did not write its exact attempt row".into())
+        })?;
+    super::atom::decode(row)
 }
 
 pub(super) fn validate_publication(
@@ -247,10 +318,12 @@ pub(super) async fn validate_completion(
             "publication lacks its atomic completion".into(),
         ));
     }
+    let written = row_delta(entry, &completion.attempt)?;
     let parents = Snapshot::from(entry.parents()?);
     let before = attempt_at(db, &parents, &completion.attempt).await?;
     let after = attempt_at(db, &Snapshot::from([entry.id()]), &completion.attempt).await?;
-    if before.attempt_id != completion.attempt
+    if written != after
+        || before.attempt_id != completion.attempt
         || before.request_id.as_str() != response.call.request
         || before.status != TurnAttemptStatus::Started
         || before.completed_at.is_some()

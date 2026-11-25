@@ -3,6 +3,7 @@
 //! can grant one. All commits are owned here, outside the Store.
 use super::*;
 mod compaction;
+mod pinned;
 #[cfg(test)]
 use crate::session::{
     TurnRequestId,
@@ -30,10 +31,14 @@ pub(in crate::session) enum FailCommit {
     Completion,
 }
 
-pub(super) struct FencedTurn {
-    // Only this recorder's commits advance the selected lineage.
+struct LegacyLineage {
     frontier: Snapshot,
     source: Snapshot,
+}
+
+pub(super) struct FencedTurn {
+    legacy: Option<LegacyLineage>,
+    pinned: Option<pinned::PinnedTurn>,
     compaction: Option<Box<compaction::State>>,
     cancel: Option<TurnCancel>,
     input: RepresentationId,
@@ -196,8 +201,11 @@ impl Session {
         let mut recorder = Self::turn_recorder(session, &attempt, identity, Default::default());
         recorder.fenced_compaction = compaction;
         recorder.fenced = Some(Mutex::new(FencedTurn {
-            source: frontier.clone(),
-            frontier,
+            legacy: Some(LegacyLineage {
+                source: frontier.clone(),
+                frontier,
+            }),
+            pinned: None,
             compaction: compaction.then(Box::default),
             cancel,
             input,
@@ -251,6 +259,7 @@ pub(super) async fn accept_fixture_input(
         fact: input.fact_id(0),
         branch: branch.into(),
         attempt: uuid::Uuid::new_v4().to_string(),
+        pin: None,
     };
     let attempt = TurnAttempt {
         attempt_id: accepted.attempt.clone(),
@@ -316,8 +325,19 @@ impl TurnRecorder {
             "missing model input sources"
         );
         let id = self.call_id(sequence);
-        let txn = state.transaction(db).await?;
-        let staged = Staging::at(db, &state.frontier, &txn, &id.branch).await?;
+        let exec = if let Some(pinned) = &mut state.pinned {
+            pinned
+                .model
+                .take()
+                .context("model request has no fresh accepted context")?
+        } else {
+            pinned::Execution {
+                at: state.frontier().clone(),
+                txn: state.transaction(db).await?,
+            }
+        };
+        let txn = &exec.txn;
+        let staged = Staging::at(db, &exec.at, txn, &id.branch).await?;
         let groups = staged.context()?.groups;
         let rendered: BTreeMap<_, _> = groups
             .into_iter()
@@ -349,6 +369,14 @@ impl TurnRecorder {
                     id
                 }
                 ContextSource::Instructions | ContextSource::TurnInjection => {
+                    if state.pinned.is_some() && *source == ContextSource::Instructions {
+                        ensure!(
+                            index == 0 && matches!(message, RuntimeMessage::System(_)),
+                            "invalid pinned instruction slot"
+                        );
+                        messages.push(Some(CallMessageBinding::PinnedInstructions));
+                        continue;
+                    }
                     let value = serde_json::to_value(match (source, message) {
                         (ContextSource::Instructions, RuntimeMessage::System(text)) => {
                             AcceptedValue::Instruction(text.clone())
@@ -449,24 +477,31 @@ impl TurnRecorder {
         if let Some(compaction) = &mut state.compaction {
             compaction.prepared = Some(input.clone());
         }
-        stage_observation(
-            &txn,
-            Observation::Prepared {
-                input: Box::new(input),
-            },
-        )
-        .await?;
-        Box::pin(state.commit(&session, &self.attempt, txn)).await?;
-        let intent = state.transaction(db).await?;
-        stage_observation(
-            &intent,
-            Observation::DispatchIntent {
-                call: id,
-                attempt: self.attempt.attempt_id.clone(),
-            },
-        )
-        .await?;
-        Box::pin(state.commit(&session, &self.attempt, intent)).await?;
+        if state.pinned.is_some() {
+            state.require_active(&session, &self.attempt).await?;
+            let pinned = state.pinned.as_mut().expect("pinned turn");
+            pinned.model = Some(exec);
+            pinned.selection = Some(input);
+        } else {
+            stage_observation(
+                txn,
+                Observation::Prepared {
+                    input: Box::new(input),
+                },
+            )
+            .await?;
+            Box::pin(state.commit(&session, &self.attempt, exec.txn)).await?;
+            let intent = state.transaction(db).await?;
+            stage_observation(
+                &intent,
+                Observation::DispatchIntent {
+                    call: id,
+                    attempt: self.attempt.attempt_id.clone(),
+                },
+            )
+            .await?;
+            Box::pin(state.commit(&session, &self.attempt, intent)).await?;
+        }
         state.next_model += 1;
         state.pending = Some(call.observation);
         Ok(())
@@ -508,13 +543,46 @@ impl TurnRecorder {
         let session = self.write_session().await.map_err(anyhow::Error::msg)?;
         let db = session.database();
         let mut state = fenced.lock().await;
-        let txn = state.transaction(db).await?;
+        let exec = if let Some(pinned) = &mut state.pinned {
+            match &message {
+                RuntimeRecord::ModelResponse { .. } => pinned
+                    .model
+                    .take()
+                    .context("model response has no execution transaction")?,
+                RuntimeRecord::ToolResult {
+                    model_sequence,
+                    call_index,
+                    ..
+                } => {
+                    match pinned.tool.take() {
+                        Some((sequence, index, exec))
+                            if sequence == *model_sequence && index == *call_index =>
+                        {
+                            exec
+                        }
+                        Some(_) => {
+                            anyhow::bail!("tool outcome does not match its execution transaction")
+                        }
+                        // Approval refusal, unknown tool, and other no-invoke
+                        // outcomes have no effect whose cut needs retaining.
+                        None => pinned::Execution::current(db).await?,
+                    }
+                }
+                _ => anyhow::bail!("unsupported pinned runtime observation"),
+            }
+        } else {
+            pinned::Execution {
+                at: state.frontier().clone(),
+                txn: state.transaction(db).await?,
+            }
+        };
+        let txn = exec.txn;
         let branch = self
             .identity
             .execution_id
             .as_deref()
             .context("missing fenced branch")?;
-        let staged = Staging::at(db, &state.frontier, &txn, branch).await?;
+        let staged = Staging::at(db, &exec.at, &txn, branch).await?;
         match message {
             RuntimeRecord::ModelResponse {
                 model_sequence,
@@ -549,38 +617,59 @@ impl TurnRecorder {
                     )])
                     .await?;
                 let response = op.fact_id(0);
-                stage_observation(
-                    &txn,
+                let accounting = Box::new(Accounting {
+                    agent: self.identity.agent.clone(),
+                    timestamp: observed.timestamp,
+                    request_budget_tokens: observed.request_budget_tokens,
+                    input_tokens: observed.input_tokens,
+                    output_tokens: observed
+                        .output_tokens
+                        .context("missing output accounting")?,
+                    prices: observed.prices,
+                });
+                let observation = if let Some(pinned) = &mut state.pinned {
+                    let mut input = pinned
+                        .selection
+                        .take()
+                        .context("missing model input selection")?;
+                    Observation::ModelExecuted {
+                        result: Box::new(ModelExecution {
+                            response: response.clone(),
+                            requested_model: input.requested_model,
+                            cache: input
+                                .effective_nonsecret_settings
+                                .remove("cache")
+                                .context("missing model cache options")?,
+                            messages: input.messages,
+                            tools: input.tools,
+                            accounting,
+                        }),
+                    }
+                } else {
                     Observation::Outcome {
                         call,
                         attempt: self.attempt.attempt_id.clone(),
                         status: CallStatus::Responded,
                         response: Some(response.clone()),
-                        accounting: Some(Box::new(Accounting {
-                            agent: self.identity.agent.clone(),
-                            timestamp: observed.timestamp,
-                            request_budget_tokens: observed.request_budget_tokens,
-                            input_tokens: observed.input_tokens,
-                            output_tokens: observed
-                                .output_tokens
-                                .context("missing output accounting")?,
-                            prices: observed.prices,
-                        })),
-                    },
-                )
-                .await?;
+                        accounting: Some(accounting),
+                    }
+                };
+                stage_observation(&txn, observation).await?;
                 #[cfg(test)]
                 ensure!(
                     state.fail != Some(FailCommit::Response),
                     "injected refusal after staging response and accounting"
                 );
-                Box::pin(state.commit(&session, &self.attempt, txn)).await?;
+                let entry = Box::pin(state.commit(&session, &self.attempt, txn)).await?;
                 state.responses.insert(model_sequence, response.clone());
                 state
                     .exchanges
                     .insert(model_sequence, vec![op.representation_id(0)]);
                 if terminal {
                     state.terminal = Some(response);
+                    if let Some(pinned) = &mut state.pinned {
+                        pinned.terminal = Some(entry);
+                    }
                 }
             }
             RuntimeRecord::ToolResult {
@@ -657,10 +746,19 @@ impl TurnRecorder {
             .terminal
             .take()
             .context("no unsettled terminal response")?;
-        let txn = state.transaction(db).await?;
+        let (at, txn) = if let Some(pinned) = &mut state.pinned {
+            let at = Snapshot::from([pinned
+                .terminal
+                .take()
+                .context("missing terminal model Entry")?]);
+            let txn = db.new_transaction_at(&at).await?;
+            (at, txn)
+        } else {
+            (state.frontier().clone(), state.transaction(db).await?)
+        };
         let staged = Staging::at(
             db,
-            &state.frontier,
+            &at,
             &txn,
             self.identity
                 .execution_id
@@ -700,11 +798,15 @@ impl TurnRecorder {
 }
 
 impl FencedTurn {
+    fn frontier(&self) -> &Snapshot {
+        &self.legacy.as_ref().expect("legacy fixture").frontier
+    }
+
     async fn transaction(&self, db: &Database) -> anyhow::Result<Transaction> {
         if self.compaction.is_none() {
-            Session::require_accepted_history_frontier(db, &self.frontier).await?;
+            Session::require_accepted_history_frontier(db, self.frontier()).await?;
         }
-        Ok(db.new_transaction_at(&self.frontier).await?)
+        Ok(db.new_transaction_at(self.frontier()).await?)
     }
 
     async fn commit(
@@ -712,7 +814,19 @@ impl FencedTurn {
         session: &Session,
         attempt: &TurnAttempt,
         txn: Transaction,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<eidetica::entry::ID> {
+        self.require_active(session, attempt).await?;
+        let entry = txn.commit().await?;
+        if let Some(legacy) = &mut self.legacy {
+            legacy.frontier = Snapshot::from([entry.clone()]);
+        }
+        Ok(entry)
+    }
+
+    async fn require_active(&self, session: &Session, attempt: &TurnAttempt) -> anyhow::Result<()> {
+        if let Some(pinned) = &self.pinned {
+            pinned.require_config_access().await?;
+        }
         if let Some(cancel) = &self.cancel {
             // Eidetica signs against the transaction's historical parents. Check
             // live authority separately; the synthetic writer does not provide a
@@ -736,7 +850,6 @@ impl FencedTurn {
             );
             ensure!(!cancel.is_cancelled(), "fenced turn cancelled");
         }
-        self.frontier = Snapshot::from([txn.commit().await?]);
         Ok(())
     }
 }

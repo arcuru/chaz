@@ -20,12 +20,12 @@ use super::record::{
 pub(in crate::session) use super::turn::AcceptedInput;
 pub(in crate::session) use super::{
     compaction::{Intent as CompactionIntent, Settlement as CompactionSettlement},
-    provenance::{Accounting, CallStatus, Observation},
+    provenance::{Accounting, CallStatus, ModelExecution, Observation},
     record::{MessageRole, NativeResponse, Payload, ToolCallId, ToolExecutionId, View},
     turn::{AcceptedValue, Completion},
 };
 
-async fn atom_in(store: &impl ReadAtoms, value: &impl Serialize) -> Result<()> {
+pub(super) async fn atom_in(store: &impl ReadAtoms, value: &impl Serialize) -> Result<()> {
     let text = atom::encode(value)?;
     store.doc().set(atom::key(&text), text).await?;
     Ok(())
@@ -38,16 +38,41 @@ pub(in crate::session) async fn stage_descriptor(
     at: &Snapshot,
     compaction: bool,
 ) -> Result<()> {
+    stage_contract(
+        txn,
+        db,
+        at,
+        if compaction {
+            contract::FENCED_COMPACTION
+        } else {
+            contract::FENCED_INPUT_APPENDS
+        },
+    )
+    .await
+}
+
+#[cfg(test)]
+pub(in crate::session) async fn stage_pinned_descriptor(
+    txn: &Transaction,
+    db: &Database,
+    at: &Snapshot,
+) -> Result<()> {
+    stage_contract(txn, db, at, contract::PINNED_EXECUTIONS).await
+}
+
+#[cfg(test)]
+async fn stage_contract(
+    txn: &Transaction,
+    db: &Database,
+    at: &Snapshot,
+    capability: &str,
+) -> Result<()> {
     let mut required_operations = std::collections::BTreeSet::from([
         "append-v1".into(),
         "replace-v1".into(),
         contract::FENCED_TURN.into(),
     ]);
-    required_operations.insert(if compaction {
-        contract::FENCED_COMPACTION.into()
-    } else {
-        contract::FENCED_INPUT_APPENDS.into()
-    });
+    required_operations.insert(capability.into());
     atom_in(
         &txn.get_store::<contract::ContractStore>(contract::STORE)
             .await?,
@@ -96,7 +121,10 @@ impl<'a> Staging<'a> {
         txn: &'a Transaction,
         branch: &'a str,
     ) -> Result<Self> {
-        let read = Box::pin(open(db, at, txn)).await?;
+        // The write side can already contain staged atoms from this model
+        // call. Validate the original accepted cut, not those pending writes.
+        let input = db.new_transaction_at(at).await?;
+        let read = Box::pin(open(db, at, &input)).await?;
         read.effective()?;
         Ok(Self {
             read,
@@ -124,6 +152,12 @@ impl<'a> Staging<'a> {
     }
 
     pub async fn append(&self, facts: Vec<(Payload, View)>) -> Result<Operation> {
+        let op = self.new_append(facts)?;
+        self.stage(&op).await?;
+        Ok(op)
+    }
+
+    fn new_append(&self, facts: Vec<(Payload, View)>) -> Result<Operation> {
         let mut op = self.operation(OperationKind::Append, Vec::new())?;
         for (index, (payload, view)) in facts.into_iter().enumerate() {
             let index = u32::try_from(index)
@@ -138,7 +172,6 @@ impl<'a> Staging<'a> {
                 decoder_version: 1,
             });
         }
-        self.stage(&op).await?;
         Ok(op)
     }
 
@@ -196,6 +229,56 @@ impl<'a> Staging<'a> {
 }
 
 impl Staging<'_> {
+    #[cfg(test)]
+    pub async fn stage_fixture_op(&self, op: &Operation) -> Result<()> {
+        self.stage(op).await
+    }
+
+    #[cfg(test)]
+    pub fn prepare_pinned_input(
+        &self,
+        entry: crate::session::SessionEntry,
+        agent: &eidetica::entry::ID,
+    ) -> Result<PreparedPinnedInput> {
+        let pin = self
+            .read
+            .agent_pin(&agent.to_string())?
+            .ok_or_else(|| {
+                ConversationError::Missing("Agent is not pinned in this Session".into())
+            })?
+            .0;
+        super::turn::require_local_input(&entry)?;
+        let mut op = self.new_append(vec![(
+            Payload::Input {
+                sender: entry.sender,
+                text: entry.content,
+            },
+            View::Message(MessageRole::User),
+        )])?;
+        // A v1 grouping key is still required by the legacy view machinery;
+        // it is derived, never a selectable execution lineage.
+        op.branch_id = format!("conversation:{}", op.op_id);
+        let accepted = AcceptedInput {
+            fact: op.fact_id(0),
+            branch: op.branch_id.clone(),
+            attempt: op.op_id.clone(),
+            pin: Some(pin.clone()),
+        };
+        Ok(PreparedPinnedInput {
+            attempted: Default::default(),
+            attempt: crate::session::TurnAttempt {
+                attempt_id: accepted.attempt.clone(),
+                request_id: crate::session::TurnRequestId::parse(accepted.request()),
+                started_at: entry.timestamp,
+                generation: 1,
+                status: crate::session::TurnAttemptStatus::Started,
+                completed_at: None,
+            },
+            op,
+            accepted,
+        })
+    }
+
     #[cfg(test)]
     pub fn has_branch(&self, branch: &str) -> bool {
         self.read
@@ -328,6 +411,76 @@ impl Staging<'_> {
             summary: op.representation_id(0),
             text: summary,
         }))
+    }
+}
+
+#[cfg(test)]
+pub(in crate::session) struct PreparedPinnedInput {
+    attempted: std::sync::atomic::AtomicBool,
+    pub op: Operation,
+    pub accepted: AcceptedInput,
+    pub attempt: crate::session::TurnAttempt,
+}
+
+#[cfg(test)]
+impl PreparedPinnedInput {
+    pub fn reserve_once(&self) -> bool {
+        !self
+            .attempted
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+    }
+
+    pub async fn stage(&self, staged: &Staging<'_>) -> Result<()> {
+        staged.stage(&self.op).await?;
+        stage_observation(
+            staged.txn,
+            Observation::InputAccepted {
+                input: self.accepted.clone(),
+            },
+        )
+        .await?;
+        staged
+            .txn
+            .get_store::<eidetica::store::Table<crate::session::TurnAttempt>>(
+                crate::session::TURN_ATTEMPTS_STORE,
+            )
+            .await?
+            .set(&self.attempt.attempt_id, self.attempt.clone())
+            .await?;
+        Ok(())
+    }
+
+    /// Query accepted history without executing or granting another attempt.
+    pub async fn readback(
+        &self,
+        db: &Database,
+        at: &Snapshot,
+    ) -> Result<Option<eidetica::entry::ID>> {
+        let txn = db.new_transaction_at(at).await?;
+        let read = Box::pin(open(db, at, &txn)).await?;
+        if let Some(error) = read.inspection.issues.first() {
+            return Err(error.clone());
+        }
+        let conflict = || ConversationError::IdentityConflict("prepared input".into());
+        let Some((entry, receipt)) = read.provenance.inputs.get(&self.accepted.request()) else {
+            if read.operations.contains_key(&self.op.op_id) {
+                return Err(conflict());
+            }
+            return Ok(None);
+        };
+        if receipt != &self.accepted
+            || read.op_atoms.get(&self.op.op_id) != Some(&atom::key(&atom::encode(&self.op)?))
+            || super::turn::attempt_at(
+                db,
+                &Snapshot::from([entry.clone()]),
+                &self.attempt.attempt_id,
+            )
+            .await?
+                != self.attempt
+        {
+            return Err(conflict());
+        }
+        Ok(Some(entry.clone()))
     }
 }
 

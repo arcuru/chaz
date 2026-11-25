@@ -9,7 +9,7 @@ use super::{
 use crate::extension::durable_context::{self, CommittedContribution};
 use eidetica::backend::Reachability;
 use eidetica::store::{DocStore, Table};
-use eidetica::{Database, Snapshot, Transaction};
+use eidetica::{Database, Snapshot, Transaction, entry::ID};
 use std::{
     collections::{HashMap, HashSet},
     hash::Hash,
@@ -228,7 +228,7 @@ impl Session {
         HistoryRead::open(database, snapshot.clone()).await
     }
 
-    pub(super) async fn require_accepted_history_frontier(
+    pub(crate) async fn require_accepted_history_frontier(
         database: &Database,
         snapshot: &Snapshot,
     ) -> anyhow::Result<()> {
@@ -337,6 +337,26 @@ impl HistoryRead<'_> {
         Ok(self.conversation().await?.map(|read| read.inspection()))
     }
 
+    /// This Agent's unique Session binding at this read's accepted tips.
+    /// The reference identifies config data, not the authority to act as the Agent.
+    pub async fn agent_pin(&self, agent: &ID) -> anyhow::Result<Option<(&ID, &super::RecordRef)>> {
+        Ok(match self.conversation().await? {
+            Some(read) => read.agent_pin(&agent.to_string())?,
+            None => None,
+        })
+    }
+
+    /// The original pin selected by a signed input Entry, even after an update.
+    pub async fn accepted_agent_pin(
+        &self,
+        input: &ID,
+    ) -> anyhow::Result<Option<(&ID, &super::RecordRef)>> {
+        Ok(match self.conversation().await? {
+            Some(read) => read.accepted_agent_pin(input)?,
+            None => None,
+        })
+    }
+
     /// Obtain an immutable preparation at this frontier. The Store validates
     /// its selection against the original observed snapshot, not this head.
     pub async fn recorded_call(
@@ -346,6 +366,14 @@ impl HistoryRead<'_> {
     ) -> anyhow::Result<Option<&CallInput>> {
         Ok(match self.conversation().await? {
             Some(read) => read.recorded_call(call, attempt)?,
+            None => None,
+        })
+    }
+
+    /// Read a completed pinned execution by its native result Entry ID.
+    pub async fn recorded_call_entry(&self, entry: &ID) -> anyhow::Result<Option<&CallInput>> {
+        Ok(match self.conversation().await? {
+            Some(read) => read.recorded_call_entry(entry)?,
             None => None,
         })
     }

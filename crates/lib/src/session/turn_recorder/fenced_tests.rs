@@ -4,6 +4,7 @@
 use super::*;
 
 mod compaction;
+mod pinned;
 use crate::{
     backends::BackendManager,
     commands::{Command, CommandContext, CommandOutcome, command_fixture, dispatch},
@@ -41,7 +42,16 @@ const Q_CAPITAL: &str = "What is the capital of France?";
 const A_CAPITAL: &str = "Paris.";
 const Q_CAPITAL_PREVIEW: &str = "What is the capital of F…";
 
-struct Add(Arc<AtomicUsize>);
+type ToolPause = Arc<
+    std::sync::Mutex<
+        Option<(
+            tokio::sync::oneshot::Sender<()>,
+            tokio::sync::oneshot::Receiver<()>,
+        )>,
+    >,
+>;
+
+struct Add(Arc<AtomicUsize>, ToolPause);
 impl Tool for Add {
     fn descriptor(&self) -> ToolDescriptor {
         ToolDescriptor {
@@ -58,7 +68,17 @@ impl Tool for Add {
     ) -> Pin<Box<dyn Future<Output = Result<String, ToolError>> + Send + 'a>> {
         assert_eq!(args, json!({"a": 2, "b": 2}));
         self.0.fetch_add(1, Ordering::SeqCst);
-        Box::pin(async { Ok("4".into()) })
+        let pause = self.1.lock().unwrap().take();
+        Box::pin(async move {
+            if let Some((seen, release)) = pause {
+                seen.send(()).unwrap();
+                tokio::time::timeout(Duration::from_secs(30), release)
+                    .await
+                    .unwrap()
+                    .unwrap();
+            }
+            Ok("4".into())
+        })
     }
 }
 
@@ -120,6 +140,7 @@ struct Fixture {
     host: Arc<MockHost>,
     tools: Arc<ToolRegistry>,
     tool: Arc<AtomicUsize>,
+    tool_pause: ToolPause,
     hook: Arc<AtomicUsize>,
     hub: ExtensionHub,
     context: ToolContext,
@@ -179,6 +200,22 @@ impl Fixture {
             .await
             .unwrap(),
         });
+        Self::with_recorder(
+            instance, session, recorder, with_tool, disk, cancel, responder,
+        )
+        .await
+    }
+
+    async fn with_recorder(
+        instance: Instance,
+        session: Arc<Mutex<Session>>,
+        recorder: Arc<TurnRecorder>,
+        with_tool: bool,
+        disk: Option<tempfile::TempDir>,
+        cancel: TurnCancel,
+        responder: impl wiremock::Respond + 'static,
+    ) -> Self {
+        let db = session.lock().await.database().clone();
         let input = db.snapshot().await.unwrap();
         let mock = MockServer::start().await;
         assert!(mock.address().ip().is_loopback());
@@ -193,15 +230,16 @@ impl Fixture {
         config.max_retries = Some(0);
         let backend = BackendManager::new(&Some(vec![config]), SecretStore::new(db.clone()).await);
         let tools = Arc::new(ToolRegistry::new());
-        if historical_input.is_some() {
+        if recorder.fenced_compaction {
             tools.register(crate::tools::Compact);
         }
         let tool = Arc::new(AtomicUsize::new(0));
+        let tool_pause = ToolPause::default();
         let hook = Arc::new(AtomicUsize::new(0));
         let mut hub = context_hub().await;
         let host = Arc::new(MockHost::new());
         if with_tool {
-            tools.register(Add(tool.clone()));
+            tools.register(Add(tool.clone(), tool_pause.clone()));
             hub.install_all(vec![counting_ext("fenced-hook", hook.clone())])
                 .await
                 .unwrap();
@@ -210,7 +248,7 @@ impl Fixture {
         context.turn_request_id = Some(recorder.attempt.request_id.clone());
         context.turn_attempt = Some(crate::tool::ToolAttemptIdentity {
             attempt_id: recorder.attempt.attempt_id.clone(),
-            execution_id: Some(BRANCH.into()),
+            execution_id: recorder.identity.execution_id.clone(),
         });
         context.active_extensions.insert("fenced-hook".into());
         let policies = ToolPolicyRegistry::new(
@@ -238,6 +276,7 @@ impl Fixture {
             host,
             tools: tools.clone(),
             tool,
+            tool_pause,
             hook,
             hub,
             context,
@@ -415,6 +454,10 @@ async fn pause_first_call(
 }
 
 async fn append_correction(db: &Database, at: &Snapshot) -> ID {
+    append_steering(db, at, CORRECTION).await
+}
+
+async fn append_steering(db: &Database, at: &Snapshot, content: &str) -> ID {
     use crate::session::conversation::staging::{MessageRole, Payload, Staging, View};
 
     let txn = db.new_transaction_at(at).await.unwrap();
@@ -424,7 +467,7 @@ async fn append_correction(db: &Database, at: &Snapshot) -> ID {
         .append(vec![(
             Payload::Input {
                 sender: "user".into(),
-                text: CORRECTION.into(),
+                text: content.into(),
             },
             View::Message(MessageRole::User),
         )])

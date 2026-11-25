@@ -137,6 +137,62 @@ replacements both commit on siblings, inspection retains the originals and
 effective context refuses the conflict. The current request and live tool
 batch are never replacement targets. This is not production writer admission.
 
+#### Per-Agent pins and observed execution tips
+
+The `pinned-executions-v1` fixture starts a fresh Session with an Agent's
+config reference. Another Agent joins under its own AgentDB root ID, not a
+display name. The reference names an accepted AgentDB frontier and the digest
+of the stored config at that frontier. Editing AgentDB does not update a Session
+pin. An explicit Session update writes a new pin Entry, and the reader selects
+the unique pin visible to the input's signed parents. Concurrent updates to the
+same Agent from a common pin have no implicit winner. Unrelated Agents still
+resolve independently.
+
+An accepted message names its pin by Entry ID. Acceptance readback and calls in
+its tool loop keep that reference, even as the calls see new Session context. For
+example: join at config A, edit AgentDB to B, and reopen the Session. A new input
+still binds A. After an explicit pin update, new inputs that see the update
+bind B; the earlier input and its in-flight calls still bind A. Use
+`HistoryRead::accepted_agent_pin` to inspect the original binding and
+`AgentDb::read_config_ref` to read it exactly. If the referenced revision is
+not held or cannot be read, the fixture refuses to start; it does not substitute
+the current config. A pin is not a permission grant.
+
+The recorder refreshes accepted history for every logical model request. The
+response and accounting commit together at the tips used by that request;
+each tool result commits at the cut taken before invoking that tool. Neither
+commit picks up a new parent while the operation runs. If a correction comes
+in during a request, it and the response are siblings. The next request reads
+both. Render order is not causality: a model/tool exchange stays contiguous
+in the request even when a correction landed between its members.
+`HistoryRead::recorded_call_entry` starts from the native result Entry and
+derives the request cut from its signed parents. The v1 representation member
+IDs identify context selections within Entries, not separate execution branches.
+
+| Write                                         | What survives, and why                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| --------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Session creation, Agent join, explicit update | One exact config reference in the pin Entry. No copy of the Agent config in the transcript.                                                                                                                                                                                                                                                                                                                                                              |
+| Local input acceptance                        | Message, pin link and exact Started attempt row in one Entry. The attempt row is a live execution guard, not model context. Identical acceptance readback does not grant another executor.                                                                                                                                                                                                                                                               |
+| Model execution                               | One result Entry with native response, compact accounting, and ordered request slots. History selection cannot be recovered from parents alone; budget and projection can omit content. The reader derives the history ID list and addition list from the slots. Inline instructions refer to the pin; injected values and tool schemas are captured once in the attempt and later calls reference them. There is no separate prepare or dispatch Entry. |
+| Tool execution                                | One result at the tool's observed tips, linked to the native model call occurrence by response member and call index. Provider IDs alone are not enough. Denied/unavailable tools record observations, not executions.                                                                                                                                                                                                                                   |
+| Final publication                             | Separate from the provider's return because result hooks can change the visible reply. The existing attempt settlement stays atomic with publication. Unchanged text reuses the native result, retaining its original accounting.                                                                                                                                                                                                                        |
+
+A refused commit, cancellation or uncertain transport does not authorize
+re-execution. The fixture can read the accepted input after an acknowledgement
+is lost, but it cannot recover the right to dispatch; its in-memory reservation
+is not a cross-process execution claim. The writer checks currently observed
+Session permission, the Started attempt, cancellation, and access to the exact
+Agent config separately from the historical transaction. A permission preflight
+is not a distributed fence against an unseen change.
+
+This capability only has a test writer, with an inline prompt, a loopback
+model transport, and in-process stub tools. It is not combined with the
+compaction writer fixture or enabled for deployed sessions. Legacy compaction,
+durable job claims/waits, steering incorporation receipts, approval and
+cancellation rows, and bridge outbox/delivery retain their existing safeguards.
+In particular the absence of a dispatch record here must not be used to justify
+removing effect intents from an executor that can recover or resume external work.
+
 ### Assistant `ResponseMetadata`
 
 Every assistant `Message` entry carries an optional `ResponseMetadata`: the model name, an optional provider and response ID, a `TokenUsage` (prompt/completion/cached/cache_creation/reasoning tokens plus an optional `cost_usd`), and any extra wire-format fields the backend retained. This is populated from the `LLMResponse` returned by the configured `LLMBackend` at the moment the assistant turn is committed to the session DB — there is no separate billing log.

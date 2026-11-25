@@ -157,8 +157,7 @@ impl runtime::RuntimeRecorder for TurnRecorder {
     ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
         Box::pin(async move {
             if let Some(fenced) = &self.fenced {
-                return self
-                    .fenced_prepare(fenced, call)
+                return Box::pin(self.fenced_prepare(fenced, call))
                     .await
                     .map_err(|err| err.to_string());
             }
@@ -169,6 +168,39 @@ impl runtime::RuntimeRecorder for TurnRecorder {
             )
             .await?;
             self.observe_call(call.observation).await
+        })
+    }
+
+    fn fresh_call_context<'a>(
+        &'a self,
+        messages: &'a [runtime::RuntimeMessage],
+        sources: &'a [crate::extension::projection::ContextSource],
+    ) -> Pin<Box<dyn Future<Output = Result<Option<runtime::CallContext>, String>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            match &self.fenced {
+                Some(fenced) => Box::pin(self.fresh_pinned_context(fenced, messages, sources))
+                    .await
+                    .map_err(|err| err.to_string()),
+                None => Ok(None),
+            }
+        })
+    }
+
+    fn begin_tool_execution<'a>(
+        &'a self,
+        model_sequence: u64,
+        call_index: usize,
+        name: &'a str,
+        args: &'a serde_json::Value,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(async move {
+            if let Some(fenced) = &self.fenced {
+                Box::pin(self.begin_pinned_tool(fenced, model_sequence, call_index, name, args))
+                    .await
+                    .map_err(|err| err.to_string())?;
+            }
+            Ok(())
         })
     }
 
@@ -258,8 +290,7 @@ impl runtime::RuntimeRecorder for TurnRecorder {
     ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
         Box::pin(async move {
             if let Some(fenced) = &self.fenced {
-                return self
-                    .fenced_record(fenced, message)
+                return Box::pin(self.fenced_record(fenced, message))
                     .await
                     .map_err(|err| err.to_string());
             }

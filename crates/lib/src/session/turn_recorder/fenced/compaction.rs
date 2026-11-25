@@ -93,13 +93,21 @@ impl ContextCompaction for TurnRecorder {
             let session = self.write_session().await.map_err(anyhow::Error::msg)?;
             let state = self.compaction_state().await?;
             let db = session.database();
-            let txn = db.new_transaction_at(&state.source).await?;
+            let txn = db
+                .new_transaction_at(&state.legacy.as_ref().expect("compaction lineage").source)
+                .await?;
             let branch = self
                 .identity
                 .execution_id
                 .as_deref()
                 .context("missing branch")?;
-            let source = Staging::at(db, &state.source, &txn, branch).await?;
+            let source = Staging::at(
+                db,
+                &state.legacy.as_ref().expect("compaction lineage").source,
+                &txn,
+                branch,
+            )
+            .await?;
             let members = source
                 .historical_members(&state.input)?
                 .into_iter()
@@ -147,7 +155,7 @@ impl ContextCompaction for TurnRecorder {
                 .execution_id
                 .as_deref()
                 .context("missing branch")?;
-            let source = Staging::at(db, &state.frontier, &txn, branch).await?;
+            let source = Staging::at(db, state.frontier(), &txn, branch).await?;
             let historical = source.historical_members(&state.input)?;
             let intent = CompactionIntent {
                 id: uuid::Uuid::new_v4().to_string(),
@@ -179,7 +187,8 @@ impl ContextCompaction for TurnRecorder {
                 },
             )
             .await?;
-            state.frontier = Snapshot::from([txn.commit().await?]);
+            state.legacy.as_mut().expect("compaction lineage").frontier =
+                Snapshot::from([txn.commit().await?]);
             let id = intent.id.clone();
             state.compaction.as_mut().context("missing scope")?.pending = Some(intent);
             Ok(id)
@@ -230,7 +239,8 @@ impl ContextCompaction for TurnRecorder {
                 (None, CompactionSettlement::Unapplied)
             };
             stage_observation(&txn, Observation::CompactionSettled { id, status }).await?;
-            state.frontier = Snapshot::from([txn.commit().await?]);
+            state.legacy.as_mut().expect("compaction lineage").frontier =
+                Snapshot::from([txn.commit().await?]);
             if let Some(replacement) = replacement {
                 state
                     .compaction
@@ -290,7 +300,7 @@ impl CompactToolScope for TurnRecorder {
             let (prepared, tool) = self.compact_tool(&state, site)?;
             let branch = &prepared.call.branch;
             let txn = state.transaction(db).await?;
-            let current = Staging::at(db, &state.frontier, &txn, branch).await?;
+            let current = Staging::at(db, state.frontier(), &txn, branch).await?;
             ensure!(
                 current.compact_tool_summary(&tool).as_deref() == Some(summary.as_str()),
                 "compact summary differs from the recorded tool arguments"
@@ -336,7 +346,8 @@ impl CompactToolScope for TurnRecorder {
             )
             .await?;
             stage_observation(&txn, Observation::CompactionIntent { intent }).await?;
-            state.frontier = Snapshot::from([txn.commit().await?]);
+            state.legacy.as_mut().expect("compaction lineage").frontier =
+                Snapshot::from([txn.commit().await?]);
             state
                 .compaction
                 .as_mut()

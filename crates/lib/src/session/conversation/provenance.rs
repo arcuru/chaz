@@ -20,6 +20,29 @@ pub struct RecordRef {
     pub format: u32,
 }
 
+impl RecordRef {
+    fn well_formed(&self) -> bool {
+        !self.database.is_empty()
+            && !self.frontier.is_empty()
+            && !self.store.is_empty()
+            && !self.logical_id.is_empty()
+            && self.format == 1
+            && self.record_digest.len() == 64
+            && self
+                .record_digest
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    }
+
+    /// Shape only; this does not inspect the Agent database or confer access.
+    pub(crate) fn is_agent_config(&self) -> bool {
+        self.well_formed()
+            && self.store == crate::agent_db::CONFIG_STORE
+            && self.logical_id == crate::agent_record::KEY
+            && self.member.is_none()
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Fidelity {
     Approximate,
@@ -59,6 +82,8 @@ pub struct CallInput {
 pub enum CallMessageBinding {
     Representation(RepresentationId),
     AcceptedAddition(FactId),
+    /// Resolve the inline instructions through the accepted input's Agent pin.
+    PinnedInstructions,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -87,6 +112,9 @@ pub(in crate::session) enum Observation {
     TurnCompleted {
         completion: turn::Completion,
     },
+    ModelExecuted {
+        result: Box<ModelExecution>,
+    },
     #[serde(rename = "CallPrepared")]
     Prepared {
         input: Box<CallInput>,
@@ -105,6 +133,85 @@ pub(in crate::session) enum Observation {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         accounting: Option<Box<Accounting>>,
     },
+}
+
+/// The completed result Entry supplies the observed tips and the native
+/// response supplies logical attribution. Keep only irreducible selection and
+/// accounting data; no second lists of history IDs or accepted additions.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(in crate::session) struct ModelExecution {
+    pub response: FactId,
+    pub requested_model: String,
+    pub cache: serde_json::Value,
+    pub messages: Vec<CallMessageBinding>,
+    pub tools: Vec<FactId>,
+    pub accounting: Box<Accounting>,
+}
+
+impl ModelExecution {
+    fn read(
+        self,
+        entry: &eidetica::entry::Entry,
+        read: &super::ConversationRead,
+    ) -> Result<[Observation; 2]> {
+        let op = turn::operation_in(read, entry, &self.response.operation)?;
+        let Some(Fact {
+            payload: Payload::NativeModelResponse { response },
+            ..
+        }) = op.facts.get(self.response.index as usize)
+        else {
+            return Err(Error::Integrity(
+                "executed model Entry lacks its native result".into(),
+            ));
+        };
+        let accepted_additions = self
+            .messages
+            .iter()
+            .filter_map(|slot| match slot {
+                CallMessageBinding::AcceptedAddition(id) => Some(id.clone()),
+                _ => None,
+            })
+            .chain(self.tools.iter().cloned())
+            .collect();
+        let input = CallInput {
+            call: response.call.clone(),
+            attempt: response.attempt.clone(),
+            observed: ObservedBinding {
+                database: self.response.database.clone(),
+                frontier: Snapshot::from(entry.parents()?),
+            },
+            representations: self
+                .messages
+                .iter()
+                .filter_map(representation_slot)
+                .cloned()
+                .collect(),
+            renderer_version: 1,
+            context_version: 1,
+            requested_model: self.requested_model,
+            api: "chat-completions".into(),
+            effective_nonsecret_settings: BTreeMap::from([("cache".into(), self.cache)]),
+            sources: Vec::new(),
+            accepted_additions,
+            messages: self.messages,
+            tools: self.tools,
+            fidelity: Fidelity::Approximate,
+            reasons: vec!["Accepted inputs and declarations, not serializer byte evidence".into()],
+        };
+        Ok([
+            Observation::Prepared {
+                input: Box::new(input),
+            },
+            Observation::Outcome {
+                call: response.call.clone(),
+                attempt: response.attempt.clone(),
+                status: CallStatus::Responded,
+                response: Some(self.response),
+                accounting: Some(self.accounting),
+            },
+        ])
+    }
 }
 
 /// Only local estimates/rates live here. Reported usage and opaque provider
@@ -132,6 +239,7 @@ impl Observation {
         Some(match self {
             Self::InputAccepted { .. }
             | Self::TurnCompleted { .. }
+            | Self::ModelExecuted { .. }
             | Self::CompactionIntent { .. }
             | Self::CompactionSettled { .. } => return None,
             Self::Prepared { input } => (&input.call, &input.attempt, 0),
@@ -143,7 +251,9 @@ impl Observation {
 
 #[derive(Default)]
 pub(super) struct Evidence {
+    pub inputs: BTreeMap<String, (eidetica::entry::ID, turn::AcceptedInput)>,
     pub calls: BTreeMap<(CallId, String), CallInput>,
+    pub model_entries: BTreeMap<eidetica::entry::ID, (CallId, String)>,
     pub accounting: Vec<CallEvidence>,
     pub compactions: Vec<compaction::Intent>,
     pub applied_compactions: BTreeSet<String>,
@@ -174,39 +284,70 @@ pub(super) async fn read(
                     continue;
                 }
             };
-            let Some((call, attempt, kind)) = record.observation.call_key() else {
-                let conflict = match record.observation {
-                    Observation::CompactionIntent { intent } => {
-                        intents.insert(intent.id.clone(), (entry, intent)).is_some()
+            let observations = match record.observation {
+                Observation::ModelExecuted { result } if conversation.pinned_executions => {
+                    match result.read(entry, conversation) {
+                        Ok(pair) => pair.into_iter().collect(),
+                        Err(error) => {
+                            originals.issues.push(error);
+                            continue;
+                        }
                     }
-                    Observation::CompactionSettled { id, status } => {
-                        settlements.insert(id, (entry, status)).is_some()
+                }
+                Observation::ModelExecuted { .. } => {
+                    originals.issues.push(Error::Unsupported(
+                        "atomic model result without pinned executions".into(),
+                    ));
+                    continue;
+                }
+                ref prior if conversation.pinned_executions && prior.call_key().is_some() => {
+                    originals.issues.push(Error::Integrity(
+                        "split provenance on pinned execution".into(),
+                    ));
+                    continue;
+                }
+                other => vec![other],
+            };
+            for observation in observations {
+                let Some((call, attempt, kind)) = observation.call_key() else {
+                    let conflict = match observation {
+                        Observation::CompactionIntent { intent } => {
+                            intents.insert(intent.id.clone(), (entry, intent)).is_some()
+                        }
+                        Observation::CompactionSettled { id, status } => {
+                            settlements.insert(id, (entry, status)).is_some()
+                        }
+                        Observation::InputAccepted { input } => {
+                            inputs.insert(input.request(), (entry, input)).is_some()
+                        }
+                        Observation::TurnCompleted { completion } => completions
+                            .insert(completion.attempt.clone(), (entry, completion))
+                            .is_some(),
+                        _ => unreachable!(),
+                    };
+                    if conflict {
+                        originals
+                            .issues
+                            .push(Error::IdentityConflict("turn receipt".into()));
                     }
-                    Observation::InputAccepted { input } => {
-                        inputs.insert(input.request(), (entry, input)).is_some()
-                    }
-                    Observation::TurnCompleted { completion } => completions
-                        .insert(completion.attempt.clone(), (entry, completion))
-                        .is_some(),
-                    _ => unreachable!(),
+                    continue;
                 };
-                if conflict {
+                let key = (call.clone(), attempt.to_owned(), kind);
+                let record = Record {
+                    version: 1,
+                    observation,
+                };
+                let (prior_hash, locations, _) = records
+                    .entry(key)
+                    .or_insert_with(|| (hash.clone(), Vec::new(), record.clone()));
+                if prior_hash != &hash || (conversation.pinned_executions && !locations.is_empty())
+                {
                     originals
                         .issues
-                        .push(Error::IdentityConflict("turn receipt".into()));
+                        .push(Error::IdentityConflict("call provenance".into()));
+                } else {
+                    locations.push(entry);
                 }
-                continue;
-            };
-            let key = (call.clone(), attempt.to_owned(), kind);
-            let (prior_hash, locations, _) = records
-                .entry(key)
-                .or_insert_with(|| (hash.clone(), Vec::new(), record.clone()));
-            if prior_hash != &hash {
-                originals
-                    .issues
-                    .push(Error::IdentityConflict("call provenance".into()));
-            } else {
-                locations.push(entry);
             }
         }
     }
@@ -222,8 +363,9 @@ pub(super) async fn read(
     }
     let fenced = conversation.fenced_turn;
     if (fenced
-        && (!conversation.fenced_compaction && inputs.len() > 1
-            || inputs.is_empty() != conversation.operations.is_empty()))
+        && (!conversation.fenced_compaction && !conversation.pinned_executions && inputs.len() > 1
+            || !conversation.pinned_executions
+                && inputs.is_empty() != conversation.operations.is_empty()))
         || (!fenced && (!inputs.is_empty() || !completions.is_empty()))
     {
         originals.issues.push(Error::Integrity(
@@ -234,9 +376,22 @@ pub(super) async fn read(
     let mut responses = BTreeSet::new();
     let mut accounted = BTreeSet::new();
     let mut accepted_values = BTreeSet::new();
-    for (entry, input) in inputs.values() {
-        if let Err(error) = Box::pin(turn::validate_input(db, conversation, entry, input)).await {
+    for (request, (entry, input)) in &inputs {
+        let parents = ancestry.prefix(&Snapshot::from(entry.parents()?))?;
+        if let Err(error) = Box::pin(turn::validate_input(
+            db,
+            conversation,
+            entry,
+            input,
+            &parents,
+        ))
+        .await
+        {
             originals.issues.push(error);
+        } else {
+            evidence
+                .inputs
+                .insert(request.clone(), (entry.id(), input.clone()));
         }
     }
     for ((call, attempt, kind), (_, locations, record)) in &records {
@@ -306,10 +461,15 @@ pub(super) async fn read(
                     accounting,
                     ..
                 } => {
-                    if !earlier(0)
-                        || ((response.is_some()
-                            || matches!(status, CallStatus::Failed | CallStatus::Uncertain))
-                            && !earlier(1))
+                    let atomic = conversation.pinned_executions
+                        && records
+                            .get(&(call.clone(), attempt.clone(), 0))
+                            .is_some_and(|(_, sites, _)| sites.as_slice() == [*entry]);
+                    if !atomic
+                        && (!earlier(0)
+                            || ((response.is_some()
+                                || matches!(status, CallStatus::Failed | CallStatus::Uncertain))
+                                && !earlier(1)))
                     {
                         Err(Error::Integrity(
                             "outcome lacks original call evidence".into(),
@@ -370,6 +530,7 @@ pub(super) async fn read(
                 }
                 Observation::InputAccepted { .. }
                 | Observation::TurnCompleted { .. }
+                | Observation::ModelExecuted { .. }
                 | Observation::CompactionIntent { .. }
                 | Observation::CompactionSettled { .. } => {
                     unreachable!()
@@ -380,6 +541,16 @@ pub(super) async fn read(
             }
         }
         if let Observation::Prepared { input } = &record.observation {
+            if conversation.pinned_executions
+                && evidence
+                    .model_entries
+                    .insert(locations[0].id(), (call.clone(), attempt.clone()))
+                    .is_some()
+            {
+                originals.issues.push(Error::IdentityConflict(
+                    "multiple model results in one Entry".into(),
+                ));
+            }
             evidence
                 .calls
                 .insert((call.clone(), attempt.clone()), input.as_ref().clone());
@@ -486,19 +657,20 @@ fn validate_input(
     {
         return Err(Error::Integrity("incomplete call input binding".into()));
     }
-    if input.sources.iter().any(|source| {
-        source.database.is_empty()
-            || source.frontier.is_empty()
-            || source.store.is_empty()
-            || source.logical_id.is_empty()
-            || source.format != 1
-            || source.record_digest.len() != 64
-            || !source
-                .record_digest
-                .bytes()
-                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-    }) {
+    if input.sources.iter().any(|source| !source.well_formed()) {
         return Err(Error::Integrity("invalid selected source reference".into()));
+    }
+    let pinned_instructions = input
+        .messages
+        .iter()
+        .filter(|slot| **slot == CallMessageBinding::PinnedInstructions)
+        .count();
+    if pinned_instructions > 0
+        && (!conversation.pinned_executions
+            || pinned_instructions != 1
+            || input.messages.first() != Some(&CallMessageBinding::PinnedInstructions))
+    {
+        return Err(Error::Integrity("invalid pinned instructions slot".into()));
     }
     let observed = ancestry.prefix(&input.observed.frontier)?;
     conversation.require_descriptor(&observed)?;
@@ -637,7 +809,7 @@ pub(super) fn validate_selection(
 fn representation_slot(slot: &CallMessageBinding) -> Option<&RepresentationId> {
     match slot {
         CallMessageBinding::Representation(id) => Some(id),
-        CallMessageBinding::AcceptedAddition(_) => None,
+        CallMessageBinding::AcceptedAddition(_) | CallMessageBinding::PinnedInstructions => None,
     }
 }
 

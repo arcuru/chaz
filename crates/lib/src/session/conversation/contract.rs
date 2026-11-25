@@ -10,6 +10,7 @@ pub(super) const STORE: &str = "conversation_contract_v1";
 pub(super) const FENCED_TURN: &str = "fenced-turn-v1";
 pub(super) const FENCED_COMPACTION: &str = "fenced-compaction-v1";
 pub(super) const FENCED_INPUT_APPENDS: &str = "fenced-input-appends-v1";
+pub(super) const PINNED_EXECUTIONS: &str = "pinned-executions-v1";
 
 /// Context-owned legacy semantic stores covered by this reader increment.
 /// Job/input/auxiliary conversion and full write-door integration remain pending;
@@ -67,6 +68,8 @@ impl Descriptor {
             supported.insert(FENCED_TURN.into());
             if self.fenced_compaction() {
                 supported.insert(FENCED_COMPACTION.into());
+            } else if self.pinned_executions() {
+                supported.insert(PINNED_EXECUTIONS.into());
             } else if self.fenced_input_appends() {
                 supported.insert(FENCED_INPUT_APPENDS.into());
             }
@@ -91,7 +94,11 @@ impl Descriptor {
     }
 
     pub(super) fn fenced_input_appends(&self) -> bool {
-        self.required_operations.contains(FENCED_INPUT_APPENDS)
+        self.pinned_executions() || self.required_operations.contains(FENCED_INPUT_APPENDS)
+    }
+
+    pub(super) fn pinned_executions(&self) -> bool {
+        self.required_operations.contains(PINNED_EXECUTIONS)
     }
 }
 
@@ -163,6 +170,7 @@ const FORMAT_STORES: &[&str] = &[
     STORE,
     super::STORE,
     super::provenance::STORE,
+    super::pins::STORE,
     "conversation_call_telemetry_v1",
 ];
 

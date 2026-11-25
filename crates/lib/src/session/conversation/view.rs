@@ -37,6 +37,7 @@ impl VisibleRepresentation {
 #[derive(Clone, Debug, Default)]
 pub(super) struct ConversationView {
     pub representations: Vec<VisibleRepresentation>,
+    group_concurrent_tool_results: bool,
 }
 
 pub(super) fn validate_shape(op: &Operation) -> Result<()> {
@@ -298,6 +299,30 @@ pub(super) fn effective(
                     key.4.push((i as u32, op.op_id.clone()));
                     key
                 }
+                None if legacy.group_concurrent_tool_results
+                    && op.outputs[i].view == View::ToolResult =>
+                {
+                    let Payload::ToolOutcome { execution, .. } =
+                        &fact(&op.outputs[i].fact, ops)?.payload
+                    else {
+                        return Err(ConversationError::Integrity(
+                            "tool result has no occurrence".into(),
+                        ));
+                    };
+                    // Keep a wire exchange indivisible even if steering was
+                    // accepted before its tools returned. This is rendering
+                    // order only; each tool still has its own native parents.
+                    let response = RepresentationId {
+                        database: execution.call.response.database.clone(),
+                        operation: execution.call.response.operation.clone(),
+                        index: execution.call.response.index,
+                    };
+                    let mut key = keys.get(&response).cloned().ok_or_else(|| {
+                        ConversationError::InvalidScope("tool result precedes its response".into())
+                    })?;
+                    key.4.push((execution.call.index, op.op_id.clone()));
+                    key
+                }
                 None => (1, op.causal_seq, op.op_id.clone(), i as u32, Vec::new()),
             };
             keys.insert(op.representation_id(i as u32), key);
@@ -317,6 +342,7 @@ pub(super) fn effective(
     visible.sort_by(|a, b| a.0.cmp(&b.0));
     let view = ConversationView {
         representations: visible.into_iter().map(|(_, r)| r).collect(),
+        group_concurrent_tool_results: legacy.group_concurrent_tool_results,
     };
     view.validate_exchanges(false)?;
     Ok(view)
@@ -493,7 +519,7 @@ impl ConversationView {
                     }
                 }
                 (View::AuditOnly, _) => {}
-                _ if !pending.is_empty() => {
+                _ if !pending.is_empty() && (completed || !self.group_concurrent_tool_results) => {
                     return Err(ConversationError::ExchangeConflict(
                         "split tool exchange".into(),
                     ));

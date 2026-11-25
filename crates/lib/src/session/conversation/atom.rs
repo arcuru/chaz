@@ -49,9 +49,12 @@ pub(super) fn atoms(doc: &Doc) -> Result<BTreeMap<String, String>> {
 }
 
 pub(super) fn encode<T: Serialize>(record: &T) -> Result<String> {
-    let value = serde_json::to_value(record)?;
-    // serde_json's map feature selection is workspace-wide. Explicitly sort
-    // recursively rather than relying on whether preserve_order is enabled.
+    Ok(canonical_json(serde_json::to_value(record)?)?)
+}
+
+/// serde_json's map feature selection is workspace-wide. Explicitly sort
+/// recursively rather than relying on whether preserve_order is enabled.
+pub(crate) fn canonical_json(value: Value) -> serde_json::Result<String> {
     fn ordered(value: Value) -> Value {
         match value {
             Value::Object(values) => {
@@ -62,7 +65,7 @@ pub(super) fn encode<T: Serialize>(record: &T) -> Result<String> {
             other => other,
         }
     }
-    Ok(serde_json::to_string(&ordered(value))?)
+    serde_json::to_string(&ordered(value))
 }
 
 pub(super) fn decode_v1<T: serde::de::DeserializeOwned>(text: &str) -> Result<T> {
