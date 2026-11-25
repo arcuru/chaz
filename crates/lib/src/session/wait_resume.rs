@@ -229,13 +229,50 @@ pub(crate) fn plan_job_wait_resume(
         Ok((child, _)) if child == checkpoint.child_session_db_id => {}
         _ => return Err("checkpoint arguments do not name its child"),
     }
+    plan_exact_wait(
+        ExactWait {
+            request_id: &checkpoint.request_id,
+            attempt_id: &checkpoint.attempt_id,
+            model_sequence: checkpoint.model_sequence,
+            call_index: checkpoint.call_index,
+            call_id: &checkpoint.call_id,
+            tool: crate::runtime::JOB_WAIT_TOOL,
+            arguments: &checkpoint.arguments,
+            checkpointed_at: checkpoint.checkpointed_at,
+            deadline: checkpoint.deadline,
+            policy_deadline,
+            policy_timeout_seconds: checkpoint.policy_timeout_seconds,
+        },
+        records,
+    )
+}
 
+/// The shared, observation-only transcript pairing; each carrier validates
+/// its own authority, operation, deadline and checkpoint before calling it.
+pub(super) struct ExactWait<'a> {
+    pub request_id: &'a TurnRequestId,
+    pub attempt_id: &'a str,
+    pub model_sequence: u64,
+    pub call_index: usize,
+    pub call_id: &'a str,
+    pub tool: &'a str,
+    pub arguments: &'a str,
+    pub checkpointed_at: DateTime<Utc>,
+    pub deadline: DateTime<Utc>,
+    pub policy_deadline: DateTime<Utc>,
+    pub policy_timeout_seconds: u64,
+}
+
+pub(super) fn plan_exact_wait(
+    checkpoint: ExactWait<'_>,
+    records: &[TurnTranscriptRecord],
+) -> Result<(RuntimeResume, u64), &'static str> {
     let mut sorted = records.to_vec();
     sorted.sort_by_key(|record| record.sequence);
     for (expected, record) in sorted.iter().enumerate() {
         if record.sequence != expected as u64
             || record.attempt_id != checkpoint.attempt_id
-            || record.request_id != checkpoint.request_id
+            || &record.request_id != checkpoint.request_id
         {
             return Err("transcript is not one contiguous attempt");
         }
@@ -263,7 +300,7 @@ pub(crate) fn plan_job_wait_resume(
                 || *sequence != model_sequence
                 || !super::steering::validate_boundary(
                     inputs,
-                    &checkpoint.attempt_id,
+                    checkpoint.attempt_id,
                     &mut input_ids,
                 )
             {
@@ -311,9 +348,9 @@ pub(crate) fn plan_job_wait_resume(
         if pending
             && (checkpoint.call_index.checked_add(1) != Some(tool_calls.len())
                 || tool_calls[checkpoint.call_index].id != checkpoint.call_id
-                || tool_calls[checkpoint.call_index].name != crate::runtime::JOB_WAIT_TOOL)
+                || tool_calls[checkpoint.call_index].name != checkpoint.tool)
         {
-            return Err("checkpointed call is not the final job_wait of its batch");
+            return Err("checkpointed call is not the final wait of its batch");
         }
         metadata.extend(response_metadata.clone());
         message_sequences.push(*sequence);
@@ -386,11 +423,11 @@ pub(crate) fn plan_job_wait_resume(
             model_sequence: checkpoint.model_sequence,
             call_index: checkpoint.call_index,
             call: crate::runtime::ToolCallRequest {
-                arguments: checkpoint.arguments.clone(),
+                arguments: checkpoint.arguments.to_owned(),
                 ..pending_call
             },
             deadline: checkpoint.deadline,
-            policy_deadline,
+            policy_deadline: checkpoint.policy_deadline,
             policy_timeout_seconds: checkpoint.policy_timeout_seconds,
             metadata,
             matrix_send_queued,
