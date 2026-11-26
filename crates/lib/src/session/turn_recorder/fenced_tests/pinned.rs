@@ -684,6 +684,45 @@ async fn pinned_fixture_repeated_wake_and_lost_ack_do_not_dispatch_again() {
 }
 
 #[tokio::test]
+async fn pinned_fixture_unsettled_attempt_only_holds_its_own_agent() {
+    let (instance, _, db) = crate::session::test_helpers::test_session_db().await;
+    let first = agent(&instance, "first", A).await;
+    let other = agent(&instance, "other", OTHER).await;
+    let session = session(&db).await;
+    for agent in [&first, &other] {
+        Session::fixture_pin_agent(&session, agent, false)
+            .await
+            .unwrap();
+    }
+    let start = |agent: &AgentDb, display: &str| {
+        Box::pin(Session::start_pinned_fixture(
+            session.clone(),
+            agent.clone(),
+            message("user", "both of you"),
+            display.into(),
+            TurnCancel::new(),
+        ))
+    };
+    // The first Agent's attempt stays Started; the other Agent still owes
+    // its own response, and the first still owes nothing new.
+    let (held, ..) = start(&first, AGENT).await.unwrap();
+    let (answered, ..) = start(&other, "Other").await.unwrap();
+    let refused = start(&first, AGENT).await.err().unwrap();
+    assert!(
+        refused.to_string().contains("unsettled attempt"),
+        "{refused}"
+    );
+    let history = Session::history(&db).await.unwrap();
+    for (input, agent) in [(&held, &first), (&answered, &other)] {
+        let (pin, _) = history.agent_pin(&agent.id()).await.unwrap().unwrap();
+        assert_eq!(
+            history.accepted_agent_pin(input).await.unwrap().unwrap().0,
+            pin
+        );
+    }
+}
+
+#[tokio::test]
 async fn pinned_fixture_unavailable_revision_never_accepts_input() {
     let (instance, _, db) = crate::session::test_helpers::test_session_db().await;
     let first = agent(&instance, "first", A).await;
