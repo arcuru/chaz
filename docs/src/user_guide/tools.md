@@ -6,35 +6,37 @@ Chaz agents interact with the world through tools. The ReAct loop calls tools ba
 
 Every built-in is owned by an [extension](extensions.md); disabling an extension hides its tools from the LLM. The owning extension is shown so you can find a tool's lifecycle (and disable it per-session/per-agent) at a glance.
 
-| Tool                | Owner      | Risk   | Approval           | Description                                                            |
-| ------------------- | ---------- | ------ | ------------------ | ---------------------------------------------------------------------- |
-| `get_time`          | `system`   | Low    | Never              | Returns the current UTC time                                           |
-| `calculate`         | `system`   | Low    | Never              | Evaluates math expressions (via meval)                                 |
-| `describe_tool`     | `system`   | Low    | Never              | Returns a tool's description and parameter summary                     |
-| `chaz`              | `core`     | Low    | Never              | Query this runtime's session, identity, callable tools, or usage       |
-| `compact`           | `core`     | Low    | Never              | Summarize and compact conversation context                             |
-| `spawn_agent`       | `core`     | Medium | UnlessAutoApproved | Submits a durable Agent job and returns its DB handle immediately      |
-| `job_status`        | `core`     | Low    | Never              | Reads the durable state and typed result of an Agent job               |
-| `job_wait`          | `core`     | Low    | Never              | Observes a job with a deadline, yielding the Agent's execution slot    |
-| `spawn_worker`      | `core`     | Medium | UnlessAutoApproved | Invokes a Worker template; yields its slot while waiting synchronously |
-| `worker_wait`       | `core`     | Low    | Never              | Observes a Worker spawned in the current turn                          |
-| `shell`             | `core`     | High   | Always             | Executes a shell command                                               |
-| `read_file`         | `fs`       | Low    | Never              | Reads a text file from disk, one bounded page of lines at a time       |
-| `write_file`        | `fs`       | Medium | UnlessAutoApproved | Writes content to a file                                               |
-| `edit_file`         | `fs`       | Medium | UnlessAutoApproved | Replace exact text in a file (single or atomic-multi-edit)             |
-| `web_fetch`         | `web`      | Medium | UnlessAutoApproved | HTTP GET or POST requests                                              |
-| `web_search`        | `web`      | Low    | Never              | Search the web; returns title/url/snippet per result                   |
-| `remember`          | `memory`   | Low    | Never              | Stores a key-value fact in the agent's own memory (or a granted bank)  |
-| `recall`            | `memory`   | Low    | Never              | Searches the agent's own memory (or a granted bank) by keyword         |
-| `list_memory_banks` | `memory`   | Low    | Never              | Lists the memory banks this agent has been granted access to           |
-| `skill_list`        | `skills`   | Low    | Never              | List the skills available to this agent (progressive disclosure)       |
-| `skill_search`      | `skills`   | Low    | Never              | Search the skill catalog by keyword                                    |
-| `skill_show`        | `skills`   | Low    | Never              | Fetch a skill's body — the "activation" half of progressive disclosure |
-| `schedule_add`      | `schedule` | Low    | Never              | Add a recurring agent-owned cron or interval schedule                  |
-| `schedule_modify`   | `schedule` | Low    | Never              | Partial update of an existing schedule                                 |
-| `schedule_remove`   | `schedule` | Low    | Never              | Delete a schedule by id                                                |
-| `schedule_list`     | `schedule` | Low    | Never              | List an agent's schedules                                              |
-| `schedule_once`     | `schedule` | Low    | Never              | Add a one-shot schedule firing after N seconds                         |
+| Tool                      | Owner      | Risk   | Approval           | Description                                                            |
+| ------------------------- | ---------- | ------ | ------------------ | ---------------------------------------------------------------------- |
+| `get_time`                | `system`   | Low    | Never              | Returns the current UTC time                                           |
+| `calculate`               | `system`   | Low    | Never              | Evaluates math expressions (via meval)                                 |
+| `describe_tool`           | `system`   | Low    | Never              | Returns a tool's description and parameter summary                     |
+| `chaz`                    | `core`     | Low    | Never              | Query this runtime's session, identity, callable tools, or usage       |
+| `compact`                 | `core`     | Low    | Never              | Summarize and compact conversation context                             |
+| `spawn_agent`             | `core`     | Medium | UnlessAutoApproved | Submits a durable Agent job and returns its DB handle immediately      |
+| `job_status`              | `core`     | Low    | Never              | Reads the durable state and typed result of an Agent job               |
+| `job_wait`                | `core`     | Low    | Never              | Observes a job with a deadline, yielding the Agent's execution slot    |
+| `spawn_worker`            | `core`     | Medium | UnlessAutoApproved | Invokes a Worker template; yields its slot while waiting synchronously |
+| `worker_wait`             | `core`     | Low    | Never              | Observes a Worker spawned in the current turn                          |
+| `shell`                   | `core`     | High   | Always             | Executes a shell command                                               |
+| `read_file`               | `fs`       | Low    | Never              | Reads a text file from disk, one bounded page of lines at a time       |
+| `write_file`              | `fs`       | Medium | UnlessAutoApproved | Writes content to a file                                               |
+| `edit_file`               | `fs`       | Medium | UnlessAutoApproved | Replace exact text in a file (single or atomic-multi-edit)             |
+| `web_fetch`               | `web`      | Medium | UnlessAutoApproved | HTTP GET or POST requests                                              |
+| `web_search`              | `web`      | Low    | Never              | Search the web; returns title/url/snippet per result                   |
+| `remember`                | `memory`   | Low    | Never              | Stores a key-value fact in the agent's own memory (or a granted bank)  |
+| `recall`                  | `memory`   | Low    | Never              | Searches the agent's own memory (or a granted bank) by keyword         |
+| `list_memory_banks`       | `memory`   | Low    | Never              | Lists the memory banks this agent has been granted access to           |
+| `browse_sessions`         | `memory`   | Low    | Never              | Lists this Agent’s readable session references or pages chat excerpts  |
+| `import_session_messages` | `memory`   | Medium | UnlessAutoApproved | Copies [selected excerpts to a bank](memory.md#session-excerpt-tools)  |
+| `skill_list`              | `skills`   | Low    | Never              | List the skills available to this agent (progressive disclosure)       |
+| `skill_search`            | `skills`   | Low    | Never              | Search the skill catalog by keyword                                    |
+| `skill_show`              | `skills`   | Low    | Never              | Fetch a skill's body — the "activation" half of progressive disclosure |
+| `schedule_add`            | `schedule` | Low    | Never              | Add a recurring agent-owned cron or interval schedule                  |
+| `schedule_modify`         | `schedule` | Low    | Never              | Partial update of an existing schedule                                 |
+| `schedule_remove`         | `schedule` | Low    | Never              | Delete a schedule by id                                                |
+| `schedule_list`           | `schedule` | Low    | Never              | List an agent's schedules                                              |
+| `schedule_once`           | `schedule` | Low    | Never              | Add a one-shot schedule firing after N seconds                         |
 
 Built-in tools are grouped by extension. External tools from [MCP servers](mcp.md) plug in under the same policy layer and show up here too, namespaced as `<server>__<tool>` (matches the Anthropic Agent SDK / Claude Code `mcp__server__tool` convention so OpenAI-compatible providers, which reject dots in function names, accept them).
 

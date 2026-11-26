@@ -10,6 +10,7 @@ mod matrix;
 mod memory;
 mod schedule;
 mod search;
+pub(crate) mod session_memory;
 mod shell;
 mod time;
 mod web;

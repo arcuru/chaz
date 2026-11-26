@@ -14,11 +14,12 @@
 
 use crate::agent_db::MemoryEntry;
 use crate::embedding::{Embedder, EmbeddingEntry, cosine_similarity, embeddings_store_name};
-use crate::hosted_index::HostedIndex;
+use crate::hosted_index::{DbEntry, HostedIndex};
 use crate::session::SessionRegistry;
 use crate::tool::{Tool, ToolContext, ToolDescriptor, ToolPolicy};
 use chrono::Utc;
 use eidetica::Database;
+use eidetica::auth::types::Permission;
 use eidetica::store::Table;
 use serde_json::Value;
 use std::future::Future;
@@ -272,32 +273,43 @@ impl Tool for Recall {
         ctx: &'a ToolContext,
     ) -> Pin<Box<dyn Future<Output = Result<String, crate::tool::ToolError>> + Send + 'a>> {
         Box::pin(async move {
-            let agent_db = open_own_agent_db(ctx, &self.registry, &self.agent_index).await?;
             let embedder = self.embedder.as_deref();
             match arguments.get("bank").and_then(|v| v.as_str()) {
-                None => do_recall(
-                    ctx,
-                    &arguments,
-                    agent_db.database(),
-                    crate::agent_db::MEMORY_STORE,
-                    "own",
-                    embedder,
-                )
-                .await
-                .map_err(Into::into),
-                Some(bank_name) => {
-                    let bank =
-                        resolve_bank_for_read(ctx, &agent_db, &self.registry, bank_name).await?;
+                None => {
+                    let agent_db =
+                        open_own_agent_db(ctx, &self.registry, &self.agent_index).await?;
                     do_recall(
                         ctx,
                         &arguments,
-                        bank.database(),
-                        crate::memory_bank_db::MEMORY_STORE,
-                        "bank",
+                        agent_db.database(),
+                        crate::agent_db::MEMORY_STORE,
+                        "own",
                         embedder,
                     )
                     .await
                     .map_err(Into::into)
+                }
+                Some(bank_name) => {
+                    let caller = ctx
+                        .agent_identity
+                        .as_ref()
+                        .filter(|entry| entry.display_name == ctx.agent_name)
+                        .ok_or("A Living Agent identity is required for bank recall")?;
+                    let bank =
+                        resolve_bank_for_read(ctx, caller, &self.registry, bank_name).await?;
+                    let result = do_recall(
+                        ctx,
+                        &arguments,
+                        &bank,
+                        crate::memory_bank_db::MEMORY_STORE,
+                        "bank",
+                        embedder,
+                    )
+                    .await?;
+                    SessionRegistry::check_index_grant(&bank, &caller.pubkey, Permission::Read)
+                        .await
+                        .map_err(|_| bank_recall_unavailable(bank_name))?;
+                    Ok(result)
                 }
             }
         })
@@ -333,24 +345,35 @@ async fn resolve_bank_for_write(
     open_bank_by_ref(registry, &bank_ref).await
 }
 
-/// Look up `bank_name` and open the bank DB for a read. Read and Write
-/// permissions both satisfy; only missing-ref and missing-key cases
-/// fail.
+/// Keep the caller's own bank reference as the locator for explicit recall.
 async fn resolve_bank_for_read(
     ctx: &ToolContext,
-    agent_db: &crate::agent_db::AgentDb,
+    caller: &DbEntry,
     registry: &SessionRegistry,
     bank_name: &str,
-) -> Result<crate::memory_bank_db::MemoryBankDb, String> {
+) -> Result<Database, String> {
+    let agent_db = registry
+        .open_index_agent(caller)
+        .await
+        .map_err(|_| bank_recall_unavailable(bank_name))?;
     let bank_ref = match agent_db
         .find_memory_bank(bank_name)
         .await
         .map_err(|e| format!("Failed to look up memory bank: {e}"))?
     {
         Some(r) => r,
-        None => return Err(unknown_bank_error(ctx, agent_db, bank_name).await),
+        None => return Err(unknown_bank_error(ctx, &agent_db, bank_name).await),
     };
-    open_bank_by_ref(registry, &bank_ref).await
+    let root = eidetica::entry::ID::parse(&bank_ref.db_id)
+        .map_err(|_| bank_recall_unavailable(bank_name))?;
+    registry
+        .open_bank_for_recall(caller, &root)
+        .await
+        .map_err(|_| bank_recall_unavailable(bank_name))
+}
+
+fn bank_recall_unavailable(bank_name: &str) -> String {
+    format!("Memory bank '{bank_name}' unavailable for recall; check the current Read grant")
 }
 
 async fn open_bank_by_ref(

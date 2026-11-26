@@ -37,6 +37,7 @@ mod context_compaction;
 mod conversation;
 pub mod execution;
 pub(crate) mod history;
+mod index_access;
 pub mod jobs;
 mod keys;
 mod registry;

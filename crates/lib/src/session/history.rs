@@ -212,6 +212,14 @@ impl Session {
         Ok(read.txn)
     }
 
+    /// Frontier for tools that address dated `entries` by native row ID. Bind
+    /// format selection and subsequent key reads to the same verified history.
+    pub(crate) async fn legacy_entry_snapshot(database: &Database) -> anyhow::Result<Snapshot> {
+        let history = Self::history(database).await?;
+        history.require_legacy()?;
+        Ok(history.snapshot)
+    }
+
     /// Open the current accepted history on the caller's database handle.
     pub async fn history(database: &Database) -> anyhow::Result<HistoryRead<'_>> {
         let snapshot = accepted_frontier(database).await?;

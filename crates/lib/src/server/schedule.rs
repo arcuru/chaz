@@ -845,6 +845,7 @@ impl Server {
                 .with_room_participants(&roster)
                 .with_extension_hub(self.extensions.clone())
                 .with_session_db(session_db)
+                .with_agent_identity(tool_ctx.agent_identity.as_ref())
                 .with_session_signing_key(signing_key.clone())
                 .with_invocation(&active_extensions, None)
                 .try_build()
