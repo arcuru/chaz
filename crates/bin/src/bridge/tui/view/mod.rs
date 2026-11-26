@@ -33,6 +33,7 @@ use super::TuiMode;
 use super::short_session_id;
 use super::theme;
 use super::widgets;
+use super::{HelpAction, HelpPage, SettingsFocus};
 
 // Palette lives in `theme.rs`. Local aliases here keep the existing render
 // code terse (`COLOR_USER` → `theme::USER`) without churn at every call site.
@@ -419,11 +420,123 @@ pub(super) fn ui_overlay(f: &mut ratatui::Frame, app: &mut App) {
     match &app.overlay {
         Some(Overlay::Help { scroll }) => {
             let scroll = *scroll;
-            ui_help_overlay(f, app, scroll);
+            ui_help_overlay(f, app, scroll, true);
         }
+        Some(Overlay::ContextHelp(HelpPage::Commands { scroll })) => {
+            let scroll = *scroll;
+            app.click_regions.clear();
+            ui_help_overlay(f, app, scroll, false);
+        }
+        Some(Overlay::ContextHelp(page)) => render_context_help(f, app, page),
         Some(Overlay::RenamePrompt { .. }) => ui_rename_overlay(f, app),
         None => {}
     }
+}
+
+fn render_context_help(f: &mut ratatui::Frame, app: &App, page: &HelpPage) {
+    let area = f.area();
+    let popup = if area.width >= 64 && area.height >= 14 {
+        centered_rect(area, 80, 65)
+    } else {
+        area
+    };
+    f.render_widget(Clear, popup);
+    let inner = if popup == area {
+        popup
+    } else {
+        let block = Block::bordered().border_style(theme::accent());
+        let inner = block.inner(popup);
+        f.render_widget(block, popup);
+        inner
+    };
+    let parts = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).split(inner);
+    let mut lines = Vec::new();
+    let footer;
+    if let TuiMode::Settings(scope) = app.mode {
+        let index = app.settings_index(scope);
+        let (title, category) = match scope {
+            SettingsScope::Peer => ("Peer Settings", PeerSettingsCategory::ALL[index].label()),
+            SettingsScope::Session => (
+                "Session Settings",
+                SessionSettingsCategory::ALL[index].label(),
+            ),
+        };
+        let (focus, keys) = match app.settings_focus {
+            SettingsFocus::Category => (
+                "Category",
+                "↑↓ / Tab  Change category\n→         Move to detail",
+            ),
+            SettingsFocus::List if scope == SettingsScope::Session && category == "Models" => (
+                "List",
+                "↑↓        Select model scope\nEnter     Open model picker\n←         Focus category",
+            ),
+            SettingsFocus::List => ("List", "↑↓        Select a row\n←         Focus category"),
+            SettingsFocus::Content => {
+                ("Read", "↑↓ / Pg   Scroll detail\n←         Move focus left")
+            }
+        };
+        let title = if scope == SettingsScope::Session {
+            app.current().map_or_else(
+                || format!("Help / {title}"),
+                |tab| format!("Help / {title}: {}", tab.title()),
+            )
+        } else {
+            format!("Help / {title}")
+        };
+        lines.push(Line::styled(title, theme::accent_bold()));
+        lines.push(Line::from(format!("{category} / {focus} · Keys here")));
+        lines.extend(keys.lines().map(Line::from));
+        footer = "Esc close Help";
+    } else {
+        let title = app.current().map(|t| t.title()).unwrap_or_default();
+        lines.push(Line::styled(
+            format!("Help / Conversation: {title}"),
+            theme::accent_bold(),
+        ));
+        if app.has_pending_approval() {
+            lines.push(Line::from("Approval waiting. Close Help to review."));
+            footer = "Esc close Help";
+        } else if let HelpPage::Actions(row) = page {
+            lines.push(Line::from("Keys here   [Actions]"));
+            let window = ListWindow::uniform(
+                HelpAction::ALL.len(),
+                1,
+                Some(*row),
+                parts[0].height.saturating_sub(2) as usize,
+                0,
+            );
+            for i in window.rows() {
+                lines.push(Line::from(vec![
+                    Span::raw(if *row == i { "> " } else { "  " }),
+                    Span::styled(
+                        HelpAction::ALL[i].label(),
+                        if *row == i {
+                            theme::accent_bold()
+                        } else {
+                            Style::default()
+                        },
+                    ),
+                ]));
+            }
+            footer = "↑↓ choose · Enter open · Tab · Esc close";
+        } else {
+            lines.push(Line::from("[Keys here]   Actions"));
+            lines.push(Line::from("Enter     Submit composer"));
+            lines.push(Line::from("Ctrl+S    Open Session Settings"));
+            lines.push(Line::from("Ctrl+P    Open session hub"));
+            lines.push(Line::from(if app.completion.is_some() {
+                "Esc       Dismiss completion"
+            } else if app.current().is_some_and(|tab| tab.active_turns > 0) {
+                "Esc       Stop active turn"
+            } else {
+                "Esc       Quit idle conversation"
+            }));
+            lines.push(Line::from("Shortcut not reaching Chaz? Tab."));
+            footer = "Tab Actions · Esc close Help";
+        }
+    }
+    f.render_widget(Paragraph::new(lines), parts[0]);
+    widgets::status_strip(f, parts[1], footer);
 }
 
 /// Grouped help catalog — the shared command catalog (see
@@ -433,25 +546,31 @@ fn help_entries() -> Vec<(&'static str, &'static str)> {
     super::input::command_catalog()
 }
 
-fn ui_help_overlay(f: &mut ratatui::Frame, app: &mut App, scroll: u16) {
+fn ui_help_overlay(f: &mut ratatui::Frame, app: &mut App, scroll: u16, insert: bool) {
     let area = f.area();
     let popup = centered_rect(area, 80, 80);
 
     // Dim/disable-click backdrop: clicks here dismiss the overlay.
-    app.click_regions.push(ClickRegion {
-        x: area.x,
-        y: area.y,
-        w: area.width,
-        h: area.height,
-        target: ClickTarget::OverlayDismiss,
-    });
+    if insert {
+        app.click_regions.push(ClickRegion {
+            x: area.x,
+            y: area.y,
+            w: area.width,
+            h: area.height,
+            target: ClickTarget::OverlayDismiss,
+        });
+    }
 
     f.render_widget(Clear, popup);
 
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(COLOR_ACCENT))
-        .title(" Help — Esc to close · ↑↓/PgUp/PgDn/wheel scroll · click a row to insert ")
+        .title(if insert {
+            " Help — Esc to close · ↑↓/PgUp/PgDn/wheel scroll · click a row to insert "
+        } else {
+            " Commands · Esc close · ↑↓ scroll "
+        })
         .title_style(
             Style::default()
                 .fg(COLOR_SYSTEM)
@@ -476,7 +595,10 @@ fn ui_help_overlay(f: &mut ratatui::Frame, app: &mut App, scroll: u16) {
         } else {
             // Only register hit-tests for rows that are visible inside the
             // popup after scrolling — off-screen rows shouldn't capture clicks.
-            if abs_y_i >= inner.y as i32 && abs_y_i < (inner.y as i32 + inner.height as i32) {
+            if insert
+                && abs_y_i >= inner.y as i32
+                && abs_y_i < (inner.y as i32 + inner.height as i32)
+            {
                 app.click_regions.push(ClickRegion {
                     x: inner.x,
                     y: abs_y_i as u16,
@@ -1032,23 +1154,34 @@ pub(super) fn ui_chat(f: &mut ratatui::Frame, app: &mut App, ext_segments: &[Str
         } else {
             " > "
         },
+        app.overlay.is_none(),
+        app.overlay.is_none() && !has_approval,
     );
     render_completion_popup(f, app, chunks[1], chunks[6]);
 }
 
-fn render_composer(f: &mut ratatui::Frame, area: Rect, composer: &composer::Composer, title: &str) {
+fn render_composer(
+    f: &mut ratatui::Frame,
+    area: Rect,
+    composer: &composer::Composer,
+    title: &str,
+    focused: bool,
+    show_help: bool,
+) {
     let visible_h = area.height.saturating_sub(2) as usize;
     let start = composer
         .cursor_row
         .saturating_sub(visible_h.saturating_sub(1));
-    let input = Paragraph::new(composer.lines[start..].join("\n")).block(
-        Block::bordered()
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(COLOR_DIM))
-            .title(Span::styled(title, Style::default().fg(COLOR_ACCENT))),
-    );
+    let mut block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(COLOR_DIM))
+        .title(Span::styled(title, Style::default().fg(COLOR_ACCENT)));
+    if show_help && area.width as usize >= title.width() + 12 {
+        block = block.title_top(Line::styled(" F1 Help ", theme::dim()).right_aligned());
+    }
+    let input = Paragraph::new(composer.lines[start..].join("\n")).block(block);
     f.render_widget(input, area);
-    if visible_h > 0 {
+    if visible_h > 0 && focused {
         f.set_cursor_position((
             area.x + composer.cursor_col + 1,
             area.y + (composer.cursor_row - start) as u16 + 1,
@@ -1100,7 +1233,7 @@ pub(super) fn ui_loading_draft(
         chunks[1],
     );
     widgets::status_strip(f, chunks[2], footer);
-    render_composer(f, chunks[3], &composer, " > ");
+    render_composer(f, chunks[3], &composer, " > ", true, false);
 }
 
 /// Slash-command completion dropdown. Anchored to the bottom-left of the input
