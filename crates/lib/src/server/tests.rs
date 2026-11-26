@@ -5179,16 +5179,7 @@ async fn targeted_service_client_expands_peer_discovery_only_on_demand() {
 
 #[tokio::test]
 async fn resident_executor_picks_up_new_input_during_catalog_backfill() {
-    // Spawned service/callback tasks share this current-thread runtime, so a
-    // thread-local subscriber captures discovery order without affecting other tests.
-    let logs = tempfile::NamedTempFile::new().unwrap();
-    let subscriber = tracing_subscriber::fmt()
-        .with_ansi(false)
-        .with_max_level(tracing::Level::INFO)
-        .with_writer(logs.reopen().unwrap())
-        .finish();
-    let _subscriber = tracing::subscriber::set_default(subscriber);
-
+    use crate::agent_db::AgentDb;
     use eidetica::NewAccount;
     use eidetica::backend::database::InMemory;
     use eidetica::service::ServiceServer;
@@ -5251,8 +5242,8 @@ async fn resident_executor_picks_up_new_input_during_catalog_backfill() {
     let client_agent = client.user.open_database(&agent_db.id()).await.unwrap();
     let (agent_wake_tx, mut agent_wake_rx) = tokio::sync::mpsc::unbounded_channel();
     let _agent_callback = client_agent
-        .on_write(move |_, _| {
-            agent_wake_tx.send(()).unwrap();
+        .on_write(move |snapshot, _| {
+            let _ = agent_wake_tx.send(snapshot.clone());
             std::future::ready(Ok(()))
         })
         .await
@@ -5328,16 +5319,16 @@ async fn resident_executor_picks_up_new_input_during_catalog_backfill() {
         Some(crate::instance::ExecutorCapability::for_test()),
     );
 
-    tokio::time::timeout(ASYNC_TEST_TIMEOUT, async {
-        while !std::fs::read_to_string(logs.path())
-            .unwrap()
-            .contains("New session detected")
-        {
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("startup snapshot did not begin adoption");
+    // Install the observer before yielding to the spawned watcher on this
+    // current-thread runtime. It signals before trying to take startup_hold.
+    let (adoption_tx, mut adoption_rx) = mpsc::unbounded_channel();
+    executor.local_adoption_events.set(adoption_tx).unwrap();
+    assert!(matches!(
+        tokio::time::timeout(ASYNC_TEST_TIMEOUT, adoption_rx.recv())
+            .await
+            .expect("startup snapshot did not begin adoption"),
+        Some(LocalAdoptionEvent::Started(_))
+    ));
     let (fresh_id, fresh_db) = client_registry.create_session(Some("fresh")).await.unwrap();
     client_registry
         .attach_agent_to_session(&fresh_id.0, &agent)
@@ -5345,6 +5336,27 @@ async fn resident_executor_picks_up_new_input_during_catalog_backfill() {
         .unwrap();
     write_user_message_with_content(&fresh_db, &fresh_id.0, "hello during adoption").await;
     drop(startup_hold);
+
+    let old_registered = tokio::time::timeout(ASYNC_TEST_TIMEOUT, async {
+        let mut registered = 0;
+        loop {
+            match adoption_rx
+                .recv()
+                .await
+                .expect("resident adoption observer")
+            {
+                LocalAdoptionEvent::Started(id) if id == fresh_id.0 => return registered,
+                LocalAdoptionEvent::Registered => registered += 1,
+                LocalAdoptionEvent::Started(_) => {}
+            }
+        }
+    })
+    .await
+    .expect("the resident must discover the newly published session");
+    assert!(
+        (1..old_count).contains(&old_registered),
+        "fresh pickup must happen during backfill, not after it (old rows registered: {old_registered}/{old_count})"
+    );
 
     await_call_count(&mock, 2).await;
     assert!(await_agent_reply(&fresh_db, &fresh_id.0, "default").await);
@@ -5360,6 +5372,26 @@ async fn resident_executor_picks_up_new_input_during_catalog_backfill() {
         "local execution must not fabricate transport exposure metadata"
     );
 
+    // Observe the actual publication via the bound subscription, not the
+    // absence of an SDK error log (which may be filtered).
+    let client_agent = AgentDb::from_database(client_agent);
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let published = agent_wake_rx.recv().await.expect("bound Agent DB observer");
+            if client_agent
+                .list_session_refs_at(&published)
+                .await
+                .unwrap()
+                .iter()
+                .any(|row| row.session_db_id == sid)
+            {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("local session publication must notify the bound Agent DB subscriber");
+
     drop(client_server);
     drop(executor);
     drop(client_registry);
@@ -5367,30 +5399,11 @@ async fn resident_executor_picks_up_new_input_during_catalog_backfill() {
     drop(shutdown);
     task.await.unwrap().unwrap();
 
-    let logs = std::fs::read_to_string(logs.path()).unwrap();
-    let (before_pickup, _) = logs
-        .split_once(&format!("New session detected session_db_id={fresh_id}"))
-        .expect("the resident must discover the newly published session");
-    let old_registered = before_pickup
-        .matches("Resident executor registered")
-        .count();
-    assert!(
-        (1..old_count).contains(&old_registered),
-        "fresh pickup must happen during backfill, not after it (old rows registered: {old_registered}/{old_count})"
-    );
     assert_eq!(
         mock.recorded_calls().len(),
         2,
         "one call per distinct prompt"
     );
-    assert!(
-        !logs.contains("Failed to open database for callbacks"),
-        "local service turn must not reopen callback trees with the login key: {logs}"
-    );
-    tokio::time::timeout(std::time::Duration::from_secs(2), agent_wake_rx.recv())
-        .await
-        .expect("local session publication must notify the bound Agent DB subscriber")
-        .unwrap();
 }
 
 #[tokio::test]

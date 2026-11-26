@@ -509,6 +509,13 @@ fn track_owned_task(
     }
 }
 
+#[cfg(test)]
+#[derive(Debug)]
+enum LocalAdoptionEvent {
+    Started(String),
+    Registered,
+}
+
 /// Callback-driven agent server.
 pub struct Server {
     self_ref: std::sync::Weak<Self>,
@@ -562,6 +569,8 @@ pub struct Server {
     suspended_wait_reconciliations: AtomicUsize,
     #[cfg(test)]
     transcript_fail_after: Arc<std::sync::Mutex<Option<usize>>>,
+    #[cfg(test)]
+    local_adoption_events: OnceLock<mpsc::UnboundedSender<LocalAdoptionEvent>>,
     /// Attempts started by this process and not yet durably completed.
     /// This distinguishes a genuinely active task from a persisted start left
     /// behind by a previous process. It is process-local coordination, not
@@ -728,6 +737,8 @@ impl Server {
             turns: Arc::new(Mutex::new(HashMap::new())),
             #[cfg(test)]
             transcript_fail_after: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(test)]
+            local_adoption_events: OnceLock::new(),
             live_attempts: Arc::new(Mutex::new(std::collections::HashSet::new())),
             job_incarnation: uuid::Uuid::new_v4().to_string(),
             pending_retry_attempts: Arc::new(Mutex::new(std::collections::HashSet::new())),
@@ -2579,6 +2590,10 @@ impl Server {
             source = ?session.source,
             "New session detected"
         );
+        #[cfg(test)]
+        if let Some(events) = self.local_adoption_events.get() {
+            let _ = events.send(LocalAdoptionEvent::Started(session.session_db_id.clone()));
+        }
         let mut opened = self
             .registry
             .open_local_client_session(&session.session_db_id)
@@ -2628,6 +2643,10 @@ impl Server {
                 session_db_id = %session.session_db_id,
                 "Resident executor registered local client session"
             );
+            #[cfg(test)]
+            if let Some(events) = self.local_adoption_events.get() {
+                let _ = events.send(LocalAdoptionEvent::Registered);
+            }
             true
         }
     }
