@@ -48,6 +48,117 @@ def evidence(name):
 
 
 class Interactions(unittest.TestCase):
+    def test_context_help_round_trip_keeps_draft_cursor_and_model_scope(self):
+        calls = []
+
+        class Handler(stub.Handler):
+            def do_POST(self):
+                request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                calls.append([m.get("content") for m in request["messages"] if m["role"] == "user"])
+                self._fixture_reply(content="TRANSPORT-PROBE-OK")
+
+        http = HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=http.serve_forever, daemon=True)
+        thread.start()
+        process = None
+        out = evidence("context-help")
+        try:
+            with tempfile.TemporaryDirectory(prefix="chaz-help-pty-") as directory:
+                home = Path(directory)
+                env = environment(home)
+                config = home / "config.yaml"
+                config.write_text(f'''execution: executor
+state_dir: "{home}/state"
+unlock_password: fixture-only
+eidetica:
+  connection: "sqlite://{home}/fixture.db"
+  login:
+    username: pty-test
+    password: test-password
+backends:
+  - name: stub
+    type: openaicompatible
+    api_base: "http://127.0.0.1:{http.server_port}/v1"
+    api_key: not-a-real-key
+    models:
+      - name: base
+      - name: fast
+default_agents: [writer, reviewer]
+''')
+                def run(*args):
+                    result = subprocess.run(args, env=env, cwd=home, timeout=30,
+                                            capture_output=True, text=True)
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    return result.stdout
+
+                run(FIXTURE, home / "fixture.db")
+                command = [BINARY, "--config", config]
+                for agent in ["writer", "reviewer"]:
+                    run(*command, "cmd", f"/agent new {agent} model=stub/base tools= system_prompt=fixture")
+                session_cmd = [*command, "cmd", "--session", "planning"]
+                run(*session_cmd, "/model stub/base")
+                self.assertNotIn("not currently attached", run(*session_cmd, "/model reviewer stub/fast"))
+
+                process = PtyProcess([*command, "--session", "planning"], env, home)
+                process.resize(80, 24)
+                process.expect_screen("F1 Help", timeout=10)
+                process.send("Ship Friday" + "\x1b[D" * 6)
+                process.expect_screen("Ship Friday", timeout=8)
+                process.send("\x1bOP")  # F1 (xterm)
+                process.expect_screen("[Keys here]", timeout=5)
+                process.send("\t\x07\x1b[B")  # Ctrl+G cannot open Jobs behind Help
+                process.expect_screen("> Open Session Settings", timeout=5)
+                def capture(name):
+                    out.mkdir(parents=True, exist_ok=True)
+                    (out / f"{name}.txt").write_text("\n".join(line.rstrip() for line in process.screen.display) + "\n")
+
+                capture("chat-actions-80x24")
+                process.send("\r")
+                process.expect_screen("Session Settings", timeout=5)
+                process.send("3\x1b[C\x1b[B")  # Models, focus List, select writer
+                process.expect_screen("> writer", timeout=5)
+                rows = process.screen.display
+                pin = next(line for line in rows if "Session pin" in line and "stub/base" in line)
+                inherited = next(line for line in rows if "> writer" in line)
+                override = next(line for line in rows if "reviewer" in line)
+                self.assertEqual(pin.index("stub/base"), inherited.index("Uses session pin"))
+                self.assertEqual(pin.index("stub/base"), override.index("stub/fast"))
+                capture("models-80x24")
+
+                process.resize(40, 8)
+                process.expect_screen("LIST", timeout=5)
+                process.send("\x1bOP")
+                process.expect_screen("Models / List · Keys here", timeout=5)
+                capture("settings-help-40x8")
+                process.send("\x1b")
+                process.expect_screen("> writer", timeout=5)
+                process.expect_screen("LIST", timeout=5)
+                capture("models-restored-40x8")
+                process.send("\x1b")
+                process.expect_screen("Ship Friday", timeout=5)
+                process.send("X")
+                process.expect_screen("Ship XFriday", timeout=5)
+                self.assertEqual(calls, [])
+                capture("draft-restored-40x8")
+
+                # Positive control: replace the draft without submitting it,
+                # then send only a separate probe to prove the stub observes turns.
+                process.resize(80, 24)
+                process.send("\x1b[F" + "\x7f" * len("Ship XFriday") + "transport probe\r")
+                process.expect_screen("TRANSPORT-PROBE-OK", timeout=10)
+                self.assertEqual(len(calls), 1)
+                self.assertIn("transport probe", calls[0])
+                self.assertFalse(any(text and "Ship" in text for text in calls[0]))
+                process.send("\x03")
+                self.assertEqual(process.child.wait(timeout=5), 0)
+        finally:
+            if process:
+                process.capture(out)
+                process.close()
+            http.shutdown()
+            http.server_close()
+            thread.join(timeout=5)
+
     def test_conversation_selection_copies_source_text(self):
         self.selection_case(False)
 

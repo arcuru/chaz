@@ -947,10 +947,13 @@ async fn settings_geometry_boundaries_show_every_category_and_selected_row() {
                     } else {
                         "agent-29"
                     };
-                    assert!(
-                        rows[hit.y as usize].contains(name) && rows[hit.y as usize].contains('>'),
-                        "{rows:?}"
-                    );
+                    let row = &rows[hit.y as usize];
+                    if scope == SettingsScope::Session && category == 2 {
+                        // Selected scope, but the category owns focus.
+                        assert!(row.contains(&format!("= {name}")), "{rows:?}");
+                    } else {
+                        assert!(row.contains(name) && row.contains('>'), "{rows:?}");
+                    }
                     key(&mut app, KeyCode::Right);
                     assert_eq!(app.settings_focus, SettingsFocus::List);
                     key(&mut app, KeyCode::Right);
@@ -1011,7 +1014,7 @@ async fn settings_compact_empty_missing_and_static_pages_use_full_content_slot()
                             .unwrap();
                         assert!(
                             draw(&mut terminal, &mut app, &server, &backend)[hit.y as usize]
-                                .contains("> Session")
+                                .contains("= Session pin")
                         );
                         continue;
                     }

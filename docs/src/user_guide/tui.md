@@ -438,13 +438,13 @@ For example:
 
 ## Commands
 
-The TUI catalogs every built-in slash command in its inline completion popup — type `/` to open it, `Tab` / arrow keys to navigate, `Enter` to insert. `F1` or `/help` shows the same catalog as a scrollable overlay. The list below is the same one rendered there, grouped the same way.
+The TUI catalogs every built-in slash command in its inline completion popup — type `/` to open it, `Tab` / arrow keys to navigate, `Enter` to insert. Submit `/help` to open the scrollable catalog, where clicking a row inserts a template. From an open conversation with a draft, use `F1` → `Tab` → **Read slash command reference** to browse the same catalog without replacing the draft. The list below is grouped the same way.
 
 ### Session
 
 | Command               | Description                                                                                       |
 | --------------------- | ------------------------------------------------------------------------------------------------- |
-| `/help`, `/?`         | Open the help overlay (also `F1`)                                                                 |
+| `/help`, `/?`         | Open the slash command catalog                                                                    |
 | `/sessions`, `/s`     | Open the session hub (also `Ctrl+P`)                                                              |
 | `/new`                | Create a new session and switch to it (also `Ctrl+T`)                                             |
 | `/new <group>`        | Create a new session with a named agent group attached                                            |
@@ -604,7 +604,7 @@ Unknown `/<name>` commands route to extension dispatch — see the error you get
 | `Home` / `End`        | Move cursor to start / end of input                                   |
 | `Alt+Enter`           | Insert a line break in the draft instead of sending                   |
 | `Esc`                 | Dismiss overlay/completion first; otherwise stop busy turn, quit idle |
-| `F1`                  | Open the help overlay                                                 |
+| `F1`                  | Show contextual Help in a conversation or on the main Settings page   |
 | `Ctrl+P`              | Open the session hub (in the hub: back to the open conversation)      |
 | `Ctrl+T`              | Open and focus a new session tab (chat or session hub)                |
 | `Ctrl+O`              | Toggle expanded tool calls/results and directives (chat only)         |
@@ -616,9 +616,19 @@ Unknown `/<name>` commands route to extension dispatch — see the error you get
 
 Approval prompts accept `y` to approve, `n` to deny, and `a` to approve all remaining tool calls for this turn. `Esc` and slash commands remain available to stop the turn; `Ctrl+C` still quits.
 
+### Open Settings without replacing a draft
+
+In a conversation, `F1 Help` on the composer opens **Keys here**. Press `Tab` to switch to **Actions**, use `↑`/`↓` to highlight a destination, and `Enter` to open it. Use this when a terminal intercepts `Ctrl+S` or when you don't know the shortcut. Actions navigate directly rather than typing or submitting a slash command. `Esc` closes just Help; it does not reach the covered page. Settings Help describes the current pane without moving its focus or selection.
+
+1. In a conversation, type `Ship Friday` and move the cursor just before `Friday`. Press `F1`, `Tab`, then `Down`. The highlight reads `> Open Session Settings`. Press `Enter` to open it.
+2. Press `3` for Models, `Right` to focus the scope list, then `Down` if an agent is attached. Press `F1`. With an agent row focused, Help reads `Models / List · Keys here`.
+3. Press `Esc` once. The same Models row still owns the list keys. Press `Esc` again to return to the composer and type `X`: it reads `Ship XFriday`, still unsent.
+
+If you highlight the wrong action, press `Esc` instead of `Enter`. Help closes and you can keep editing at the same cursor.
+
 ### Mouse
 
-Mouse capture is enabled. Click on completion rows, help-overlay command rows, approval buttons, hub and picker rows, tab titles, or tab close `×` widgets to act on them. The scroll wheel scrolls the help overlay when it is open; in the session hub and model picker it moves the selection three rows. In Settings, it selects over the visible list rows and reads over the visible content body (see [Reading Settings details](#reading-settings-details)); headers, the category rail, and the status strip swallow it. Other overlays swallow it; otherwise it scrolls history.
+Mouse capture is enabled. Click on completion rows, `/help` command rows, approval buttons, hub and picker rows, tab titles, or tab close `×` widgets to act on them. The scroll wheel scrolls the command catalog when it is open; in the session hub and model picker it moves the selection three rows. In Settings, it selects over the visible list rows and reads over the visible content body (see [Reading Settings details](#reading-settings-details)); headers, the category rail, and the status strip swallow it. Other overlays swallow it; otherwise it scrolls history.
 
 ### Copy conversation text
 
@@ -929,15 +939,17 @@ report unavailable instead.
 
 Settings has two separate scopes: **Peer** covers this process's hosted agents and configuration; **Session** covers the active conversation's roster and model overrides. A per-agent Session model override does not change that agent's DB default. Peer → Agents can change the DB default, which applies wherever a session override does not win.
 
-| Entry path                         | Opens                                                  |
-| ---------------------------------- | ------------------------------------------------------ |
-| `Ctrl+S` in chat or `/settings`    | Session Settings                                       |
-| `/models` in chat                  | Session Settings → Models, with the scope list focused |
-| `Ctrl+S` or `s` in the session hub | Peer Settings (no open conversation needed)            |
+| Entry path                         | Opens                                                                   |
+| ---------------------------------- | ----------------------------------------------------------------------- |
+| `Ctrl+S` in chat or `/settings`    | Session Settings (also **Open Session Settings** in `F1` → **Actions**) |
+| `/models` in chat                  | Session Settings → Models, with the scope list focused                  |
+| `Ctrl+S` or `s` in the session hub | Peer Settings (no open conversation needed)                             |
 
 `Ctrl+S` does nothing while Settings or the model picker is already open. `Ctrl+H` and `Ctrl+L` cycle tabs only in chat, so Settings and pickers retain their conversation caller. Plain `PageUp`/`PageDown` still scroll. Settings remembers its caller: `Esc` returns to chat or the session hub, rather than quitting. At normal terminal sizes the category rail stays on the left and the current page on the right. Navigation starts at **Category**, then enters **List → Content** (static/empty pages skip List); see [Reading Settings details](#reading-settings-details) for all keys and pointer controls. Number keys follow the sidebar order below (`1`–`9` for Peer, `1`–`7` for Session).
 
 A model picker returns to its Settings page on selection or `Esc`; canceling writes no model. Add prompts, add-agent pickers and YAML diffs handle `Esc` first, so cancel them before leaving Settings. Exiting Settings does not undo edits already applied.
+
+In Models, the session pin and the agent values line up in one column. `Uses session pin` means no per-agent override. With no pin, an unoverridden agent uses its agent/backend default. A model ID on an agent's row is an explicit override, even if it matches the pin. `>` marks the row that owns the list keys.
 
 ### Shipped pages and controls
 

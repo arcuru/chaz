@@ -4,7 +4,7 @@
 //! plus per-category Peer/Session detail renderers. Child module of `view`
 //! so it can use the parent's render helpers via `use super::*`.
 
-use super::super::{SettingsFocus, SettingsLayout};
+use super::super::SettingsLayout;
 use super::*;
 
 /// No hidden page or modal publishes actions below the supported floor.
@@ -183,7 +183,17 @@ pub(super) fn ui_settings(
         SettingsScope::Session => ("Session Settings", app.current().map(|tab| tab.title())),
     };
 
-    widgets::header(f, chunks[0], title, subtitle.as_deref(), Some("[Esc back]"));
+    let hint = if app.overlay.is_none()
+        && app.agent_diff.is_none()
+        && app.settings_prompt.is_none()
+        && app.settings_picker.is_none()
+        && !app.has_pending_approval()
+    {
+        "[F1 Help · Esc back]"
+    } else {
+        "[Esc back]"
+    };
+    widgets::header(f, chunks[0], title, subtitle.as_deref(), Some(hint));
 
     let compact = app.settings_layout == SettingsLayout::Compact;
     let selected = app.settings_index(scope);
@@ -1719,10 +1729,36 @@ fn render_session_overview(f: &mut ratatui::Frame, area: Rect, app: &mut App) {
     render_content(f, area, app, "Overview", lines, 4);
 }
 
-/// Session pin + per-agent overrides. Press Enter (handled upstream) to
-/// open the model picker for the active scope. v1 picker doesn't pre-
-/// select the scope based on this row; user picks via the picker's own
-/// scope strip.
+const MODEL_LABEL_WIDTH: u16 = 16;
+
+/// Keep the value edge fixed even for long or wide agent names.
+fn model_register_row(
+    name: &str,
+    value: String,
+    selected: bool,
+    list_focused: bool,
+    value_style: Style,
+) -> Line<'static> {
+    let name = content::clipped(name, MODEL_LABEL_WIDTH - 2);
+    let padding = " ".repeat(MODEL_LABEL_WIDTH as usize - name.width());
+    let marker = match (selected, list_focused) {
+        (true, true) => "> ",
+        (true, false) => "= ",
+        _ => "  ",
+    };
+    let label_style = if selected && list_focused {
+        Style::default().add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+    };
+    Line::from(vec![
+        Span::styled(marker, theme::accent()),
+        Span::styled(name, label_style),
+        Span::raw(padding),
+        Span::styled(value, value_style),
+    ])
+}
+
 /// Session → Models — cursor list of scopes (row 0 = Session pin,
 /// rows 1..n = each attached agent). The selected row's scope is what
 /// Enter opens the picker for.
@@ -1756,18 +1792,12 @@ pub(super) fn render_session_models(
         }
     };
 
-    let mut lines: Vec<Line> = vec![
-        Line::from(""),
-        Line::from(vec![Span::styled("  Models", theme::accent_bold())]),
-        Line::from(vec![Span::styled(
-            "  ─────",
-            Style::default().fg(theme::DIM),
-        )]),
-        Line::from(""),
-    ];
-
     let compact = app.settings_layout == SettingsLayout::Compact;
-    let header = list_header(&mut lines, compact);
+    let mut lines = vec![Line::styled("  Models", theme::accent_bold())];
+    if !compact {
+        lines.push(Line::from(""));
+    }
+    let header = lines.len();
     let heights: Vec<usize> = (0..total_rows)
         .map(|i| {
             if compact {
@@ -1796,30 +1826,22 @@ pub(super) fn render_session_models(
     app.settings_list_area =
         list_viewport(area, header as u16, window.rows().map(|i| heights[i]).sum());
     let mut row_offsets = Vec::new();
-    // Row 0 — Session pin. Selection marker + resolved-to suffix so the
-    // user sees what the pin maps to without flipping to /agents.
-
+    let list_focused = app.settings_focus == SettingsFocus::List;
     if window.first == 0 {
         row_offsets.push((0, lines.len() as u16));
-        let session_marker = if cursor == 0 { "> " } else { "  " };
-        let session_style = if cursor == 0 {
-            theme::selected()
-        } else {
-            Style::default().fg(Color::White)
-        };
-        lines.push(Line::from(vec![Span::styled(
-            format!(
-                "{session_marker}{name:<14}  {pin}",
-                name = "Session",
-                pin = session_pin_label
-            ),
-            session_style,
-        )]));
+        lines.push(model_register_row(
+            "Session pin",
+            session_pin_label,
+            cursor == 0,
+            list_focused,
+            Style::default(),
+        ));
         if !compact {
-            lines.push(Line::from(vec![Span::styled(
-                format!("      resolves to {session_resolved}"),
-                Style::default().fg(theme::DIM),
-            )]));
+            let indent = MODEL_LABEL_WIDTH as usize + 2;
+            lines.push(Line::styled(
+                format!("{:indent$}Resolves to {session_resolved}", ""),
+                theme::dim(),
+            ));
             lines.push(Line::from(""));
         }
     }
@@ -1840,22 +1862,20 @@ pub(super) fn render_session_models(
         for row in window.rows().filter(|&i| i > 0) {
             let agent = &snapshot.agents[row - 1];
             row_offsets.push((row, lines.len() as u16));
-            let is_selected = row == cursor;
-            let marker = if is_selected { "> " } else { "  " };
-            let style = if is_selected {
-                theme::selected()
-            } else {
-                Style::default().fg(Color::White)
+            let (value, style) = match snapshot.agent_models.get(&agent.display_name) {
+                Some(model) => (model.clone(), Style::default()),
+                None if snapshot.model_pin.is_some() => {
+                    ("Uses session pin".to_string(), theme::dim())
+                }
+                None => ("Agent/backend default".to_string(), theme::dim()),
             };
-            let pin_label = snapshot
-                .agent_models
-                .get(&agent.display_name)
-                .cloned()
-                .unwrap_or_else(|| "(uses session pin)".to_string());
-            lines.push(Line::from(vec![Span::styled(
-                format!("{marker}{name:<14}  {pin_label}", name = agent.display_name),
+            lines.push(model_register_row(
+                &agent.display_name,
+                value,
+                row == cursor,
+                list_focused,
                 style,
-            )]));
+            ));
         }
     }
 
