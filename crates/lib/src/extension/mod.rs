@@ -2179,6 +2179,7 @@ impl ExtensionHub {
         self.context_tails_for_call(
             &caps::ContextTailCall {
                 agent_name,
+                agent_identity: None,
                 recent_message_text,
                 session_db_id: session_db.map(|db| db.root_id().to_string()),
                 request_id: None,

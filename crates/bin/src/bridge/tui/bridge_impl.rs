@@ -282,6 +282,31 @@ impl TuiBridge {
                         } else if app.settings_too_small() && key.code != KeyCode::Esc {
                             // Only safe cancellation and the existing quit path remain live.
                             continue;
+                        } else if app.overlay.is_some() {
+                            match input::handle_overlay_key(&mut app, key) {
+                                input::OverlayKey::Chat(action) => {
+                                    handle_chat_action(
+                                        action,
+                                        &mut app,
+                                        server,
+                                        &backend,
+                                        &self.secrets,
+                                        approval_tx,
+                                        notify_tx,
+                                        &models_tx,
+                                    );
+                                    if app.mode == TuiMode::Jobs {
+                                        jobs::refresh(&mut app, server, &jobs_tx);
+                                    }
+                                }
+                                input::OverlayKey::RenameSubmit {
+                                    session_db_id,
+                                    name,
+                                } => {
+                                    apply_picker_rename(&mut app, server, session_db_id, name);
+                                }
+                                _ => continue,
+                            }
                         } else if app.field_sheet.is_some()
                             && key.modifiers.contains(KeyModifiers::CONTROL)
                         {
@@ -391,17 +416,6 @@ impl TuiBridge {
                         {
                             cycle_tab(&mut app, 1);
                         } else {
-                            match input::handle_overlay_key(&mut app, key) {
-                                input::OverlayKey::Consumed => continue,
-                                input::OverlayKey::RenameSubmit {
-                                    session_db_id,
-                                    name,
-                                } => {
-                                    apply_picker_rename(&mut app, server, session_db_id, name);
-                                    continue;
-                                }
-                                input::OverlayKey::NotConsumed => {}
-                            }
                             match app.mode {
                                 TuiMode::NewSession => creation::handle_key(&mut app, key),
                                 TuiMode::Jobs => jobs::handle_key(
@@ -672,6 +686,11 @@ impl TuiBridge {
                 );
                 if navigation_before != navigation_after {
                     app.navigation_generation += 1;
+                    // An asynchronous navigation can replace the caller while
+                    // Help is open. Never carry a highlighted action onto it.
+                    if matches!(app.overlay, Some(Overlay::ContextHelp(_))) {
+                        app.overlay = None;
+                    }
                 }
 
                 components.retire_picker_if_hidden(&app);

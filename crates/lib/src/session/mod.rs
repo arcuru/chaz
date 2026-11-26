@@ -36,7 +36,10 @@ mod bridge_event;
 mod context_compaction;
 mod conversation;
 pub mod execution;
+#[cfg(unix)]
+pub mod fixed_call;
 pub(crate) mod history;
+mod index_access;
 pub mod jobs;
 mod keys;
 mod registry;

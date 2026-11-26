@@ -406,6 +406,8 @@ pub trait PromptAugmentation: Send + Sync {
 /// Identity and recent-text inputs for one ephemeral context-tail invocation.
 pub struct ContextTailCall<'a> {
     pub agent_name: &'a str,
+    /// Host-resolved receiving Agent; absent on legacy/ad hoc calls.
+    pub agent_identity: Option<&'a DbEntry>,
     /// Preserve the existing newest-first input and native query extraction.
     pub recent_message_text: &'a [String],
     pub session_db_id: Option<String>,

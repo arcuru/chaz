@@ -14,11 +14,12 @@
 
 use crate::agent_db::MemoryEntry;
 use crate::embedding::{Embedder, EmbeddingEntry, cosine_similarity, embeddings_store_name};
-use crate::hosted_index::HostedIndex;
+use crate::hosted_index::{DbEntry, HostedIndex};
 use crate::session::SessionRegistry;
 use crate::tool::{Tool, ToolContext, ToolDescriptor, ToolPolicy};
 use chrono::Utc;
 use eidetica::Database;
+use eidetica::auth::types::Permission;
 use eidetica::store::Table;
 use serde_json::Value;
 use std::future::Future;
@@ -94,31 +95,6 @@ fn read_schema_banks() -> Value {
 
 /// Default cap on returned entries when the caller doesn't specify `limit`.
 const DEFAULT_RECALL_LIMIT: usize = 10;
-
-/// Parse `{key, value, tags?}`, write the entry to `(db, store)`, return the
-/// success string. Shared by `Remember`'s self-memory and bank paths.
-async fn do_remember(
-    ctx: &ToolContext,
-    arguments: &Value,
-    db: &Database,
-    store: &str,
-    success_prefix: &str,
-    log_scope: &'static str,
-    embedder: Option<&dyn Embedder>,
-) -> Result<String, String> {
-    let key = str_arg(arguments, "key")?;
-    let value = str_arg(arguments, "value")?;
-    let tags = string_array_arg(arguments, "tags");
-    let entry = MemoryEntry {
-        key: key.to_string(),
-        value: value.to_string(),
-        timestamp: Utc::now(),
-        tags,
-    };
-    write_memory_entry(db, store, entry, embedder).await?;
-    debug!(agent = %ctx.agent_name, %key, scope = log_scope, "Stored memory");
-    Ok(format!("{success_prefix}: {key} = {value}"))
-}
 
 /// Parse `{query, tags?, limit?}`, search `(db, store)`, return the formatted result.
 /// Shared by `Recall`'s self-memory and bank paths.
@@ -197,36 +173,40 @@ impl Tool for Remember {
         ctx: &'a ToolContext,
     ) -> Pin<Box<dyn Future<Output = Result<String, crate::tool::ToolError>> + Send + 'a>> {
         Box::pin(async move {
-            let agent_db = open_own_agent_db(ctx, &self.registry, &self.agent_index).await?;
-            let embedder = self.embedder.as_deref();
-            match arguments.get("bank").and_then(|v| v.as_str()) {
-                None => do_remember(
+            let bank = arguments.get("bank").and_then(Value::as_str);
+            let (db, actor, prefix) = if let Some(name) = bank {
+                let caller = bank_actor(ctx)?;
+                let db = resolve_agent_bank(
                     ctx,
-                    &arguments,
-                    agent_db.database(),
-                    crate::agent_db::MEMORY_STORE,
-                    "Remembered",
-                    "own",
-                    embedder,
+                    caller,
+                    &self.registry,
+                    name,
+                    Permission::Write(u32::MAX),
                 )
-                .await
-                .map_err(Into::into),
-                Some(bank_name) => {
-                    let bank =
-                        resolve_bank_for_write(ctx, &agent_db, &self.registry, bank_name).await?;
-                    do_remember(
-                        ctx,
-                        &arguments,
-                        bank.database(),
-                        crate::memory_bank_db::MEMORY_STORE,
-                        &format!("Remembered in bank '{bank_name}'"),
-                        "bank",
-                        embedder,
-                    )
-                    .await
-                    .map_err(Into::into)
-                }
-            }
+                .await?;
+                (db, Some(caller), format!("Remembered in bank '{name}'"))
+            } else {
+                let db = open_own_agent_db(ctx, &self.registry, &self.agent_index).await?;
+                (db.database().clone(), None, "Remembered".into())
+            };
+            let key = str_arg(&arguments, "key")?;
+            let value = str_arg(&arguments, "value")?;
+            let entry = MemoryEntry {
+                key: key.into(),
+                value: value.into(),
+                timestamp: Utc::now(),
+                tags: string_array_arg(&arguments, "tags"),
+            };
+            write_memory_entry(
+                &db,
+                crate::agent_db::MEMORY_STORE,
+                entry,
+                self.embedder.as_deref(),
+                actor,
+            )
+            .await?;
+            debug!(agent = %ctx.agent_name, %key, ?bank, "Stored memory");
+            Ok(format!("{prefix}: {key} = {value}"))
         })
     }
 }
@@ -272,103 +252,95 @@ impl Tool for Recall {
         ctx: &'a ToolContext,
     ) -> Pin<Box<dyn Future<Output = Result<String, crate::tool::ToolError>> + Send + 'a>> {
         Box::pin(async move {
-            let agent_db = open_own_agent_db(ctx, &self.registry, &self.agent_index).await?;
             let embedder = self.embedder.as_deref();
             match arguments.get("bank").and_then(|v| v.as_str()) {
-                None => do_recall(
-                    ctx,
-                    &arguments,
-                    agent_db.database(),
-                    crate::agent_db::MEMORY_STORE,
-                    "own",
-                    embedder,
-                )
-                .await
-                .map_err(Into::into),
-                Some(bank_name) => {
-                    let bank =
-                        resolve_bank_for_read(ctx, &agent_db, &self.registry, bank_name).await?;
+                None => {
+                    let agent_db =
+                        open_own_agent_db(ctx, &self.registry, &self.agent_index).await?;
                     do_recall(
                         ctx,
                         &arguments,
-                        bank.database(),
-                        crate::memory_bank_db::MEMORY_STORE,
-                        "bank",
+                        agent_db.database(),
+                        crate::agent_db::MEMORY_STORE,
+                        "own",
                         embedder,
                     )
                     .await
                     .map_err(Into::into)
+                }
+                Some(bank_name) => {
+                    let caller = bank_actor(ctx)?;
+                    let bank = resolve_agent_bank(
+                        ctx,
+                        caller,
+                        &self.registry,
+                        bank_name,
+                        Permission::Read,
+                    )
+                    .await?;
+                    let result = do_recall(
+                        ctx,
+                        &arguments,
+                        &bank,
+                        crate::memory_bank_db::MEMORY_STORE,
+                        "bank",
+                        embedder,
+                    )
+                    .await?;
+                    SessionRegistry::check_index_grant(&bank, &caller.pubkey, Permission::Read)
+                        .await
+                        .map_err(|_| bank_unavailable(bank_name))?;
+                    Ok(result)
                 }
             }
         })
     }
 }
 
-/// Look up `bank_name` in the running agent's `memory_banks` subtree
-/// and open the bank DB. Confirms the ref exists and the recorded
-/// permission is Write — for read-only refs, writes error out even if
-/// eidetica would accept them (a defensive check; ultimate authority
-/// still comes from the bank's AuthSettings).
-async fn resolve_bank_for_write(
+fn bank_actor(ctx: &ToolContext) -> Result<&DbEntry, String> {
+    ctx.agent_identity
+        .as_ref()
+        .filter(|e| e.display_name == ctx.agent_name)
+        .ok_or_else(|| "A Living Agent identity is required for bank access".into())
+}
+
+/// A reference selects a memory table; it cannot lend another signer to the caller.
+async fn resolve_agent_bank(
     ctx: &ToolContext,
-    agent_db: &crate::agent_db::AgentDb,
+    caller: &DbEntry,
     registry: &SessionRegistry,
     bank_name: &str,
-) -> Result<crate::memory_bank_db::MemoryBankDb, String> {
+    minimum: Permission,
+) -> Result<Database, String> {
+    let agent_db = registry
+        .open_index_agent(caller)
+        .await
+        .map_err(|_| bank_unavailable(bank_name))?;
     let bank_ref = match agent_db
         .find_memory_bank(bank_name)
         .await
         .map_err(|e| format!("Failed to look up memory bank: {e}"))?
     {
         Some(r) => r,
-        None => return Err(unknown_bank_error(ctx, agent_db, bank_name).await),
+        None => return Err(unknown_bank_error(ctx, &agent_db, bank_name).await),
     };
-
-    if !matches!(bank_ref.permission, crate::agent_db::BankPermission::Write) {
+    if matches!(minimum, Permission::Write(_))
+        && bank_ref.permission != crate::agent_db::BankPermission::Write
+    {
         return Err(format!(
-            "Memory bank '{bank_name}' is Read-only for this agent; cannot remember. \
-             Ask the bank owner for Write access."
+            "Memory bank '{bank_name}' is Read-only for this agent; cannot remember"
         ));
     }
-    open_bank_by_ref(registry, &bank_ref).await
-}
-
-/// Look up `bank_name` and open the bank DB for a read. Read and Write
-/// permissions both satisfy; only missing-ref and missing-key cases
-/// fail.
-async fn resolve_bank_for_read(
-    ctx: &ToolContext,
-    agent_db: &crate::agent_db::AgentDb,
-    registry: &SessionRegistry,
-    bank_name: &str,
-) -> Result<crate::memory_bank_db::MemoryBankDb, String> {
-    let bank_ref = match agent_db
-        .find_memory_bank(bank_name)
-        .await
-        .map_err(|e| format!("Failed to look up memory bank: {e}"))?
-    {
-        Some(r) => r,
-        None => return Err(unknown_bank_error(ctx, agent_db, bank_name).await),
-    };
-    open_bank_by_ref(registry, &bank_ref).await
-}
-
-async fn open_bank_by_ref(
-    registry: &SessionRegistry,
-    bank_ref: &crate::agent_db::MemoryBankRef,
-) -> Result<crate::memory_bank_db::MemoryBankDb, String> {
-    let db_id = eidetica::entry::ID::parse(&bank_ref.db_id)
-        .map_err(|e| format!("Bank ref '{}' has invalid db_id: {e}", bank_ref.name))?;
+    let root =
+        eidetica::entry::ID::parse(&bank_ref.db_id).map_err(|_| bank_unavailable(bank_name))?;
     registry
-        .open_memory_bank(&db_id, None)
+        .open_agent_bank(caller, &root, minimum)
         .await
-        .map_err(|e| format!("Failed to open bank '{}': {e}", bank_ref.name))?
-        .ok_or_else(|| {
-            format!(
-                "Memory bank '{}' is referenced but this peer holds no key for it (DB {}).",
-                bank_ref.name, bank_ref.db_id
-            )
-        })
+        .map_err(|_| bank_unavailable(bank_name))
+}
+
+fn bank_unavailable(bank_name: &str) -> String {
+    format!("Memory bank '{bank_name}' unavailable; check the current bank grant")
 }
 
 /// Build a helpful "bank not found" error listing what the agent *can*
@@ -471,6 +443,7 @@ pub(crate) async fn write_memory_entry(
     store_name: &str,
     entry: MemoryEntry,
     embedder: Option<&dyn Embedder>,
+    bank_actor: Option<&DbEntry>,
 ) -> Result<(), String> {
     // Embed before opening the txn — the embedding call is async I/O
     // and we don't want a long-held write lock.
@@ -514,6 +487,11 @@ pub(crate) async fn write_memory_entry(
             .map_err(|e| format!("Failed to store embedding: {e}"))?;
     }
 
+    if let Some(actor) = bank_actor {
+        SessionRegistry::check_index_grant(database, &actor.pubkey, Permission::Write(u32::MAX))
+            .await
+            .map_err(|_| "Bank Write grant is no longer available".to_string())?;
+    }
     txn.commit()
         .await
         .map_err(|e| format!("Failed to commit memory: {e}"))?;

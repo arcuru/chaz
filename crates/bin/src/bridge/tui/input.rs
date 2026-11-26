@@ -256,6 +256,7 @@ pub(super) enum OverlayKey {
     NotConsumed,
     /// Overlay handled the key; nothing further to do.
     Consumed,
+    Chat(ChatAction),
     /// The rename overlay was submitted. The main loop persists the change
     /// (passing `None` clears the alias) and refreshes the picker list.
     RenameSubmit {
@@ -264,14 +265,28 @@ pub(super) enum OverlayKey {
     },
 }
 
-/// Routes a key through the active overlay. Called from the top of
-/// `handle_chat_key` / picker handling so overlays intercept input before the
-/// underlying mode sees it.
+fn scroll_help(scroll: &mut u16, code: KeyCode) {
+    match code {
+        KeyCode::Up => *scroll = scroll.saturating_sub(1),
+        KeyCode::Down => *scroll = scroll.saturating_add(1),
+        KeyCode::PageUp => *scroll = scroll.saturating_sub(10),
+        KeyCode::PageDown => *scroll = scroll.saturating_add(10),
+        KeyCode::Home => *scroll = 0,
+        _ => {}
+    }
+}
+
+/// Give the active overlay the whole key before the mode or global shortcuts.
 pub(super) fn handle_overlay_key(app: &mut App, key: KeyEvent) -> OverlayKey {
     if app.settings_too_small() && key.code != KeyCode::Esc {
         return OverlayKey::Consumed;
     }
     let backend_ready = app.backend_ready();
+    let chat_actions = app.mode == TuiMode::Chat
+        && !app.has_pending_approval()
+        && app
+            .current()
+            .is_some_and(|tab| !tab.live.worker_observer && tab.job.is_none());
     let Some(overlay) = app.overlay.as_mut() else {
         return OverlayKey::NotConsumed;
     };
@@ -281,16 +296,52 @@ pub(super) fn handle_overlay_key(app: &mut App, key: KeyEvent) -> OverlayKey {
         return OverlayKey::Consumed;
     }
     match overlay {
+        Overlay::ContextHelp(page) => {
+            use super::{HelpAction, HelpPage};
+
+            if matches!(key.code, KeyCode::Esc | KeyCode::F(1))
+                || matches!(page, HelpPage::Keys) && key.code == KeyCode::Enter
+            {
+                app.overlay = None;
+            } else {
+                match (page, key.code) {
+                    (HelpPage::Keys, KeyCode::Tab) if chat_actions => {
+                        app.overlay = Some(Overlay::ContextHelp(HelpPage::Actions(0)));
+                    }
+                    (HelpPage::Actions(_), KeyCode::Tab | KeyCode::BackTab)
+                    | (HelpPage::Commands { .. }, KeyCode::Tab) => {
+                        app.overlay = Some(Overlay::ContextHelp(HelpPage::Keys));
+                    }
+                    (HelpPage::Actions(row), KeyCode::Up) => *row = row.saturating_sub(1),
+                    (HelpPage::Actions(row), KeyCode::Down) => {
+                        *row = (*row + 1).min(HelpAction::ALL.len() - 1);
+                    }
+                    (HelpPage::Actions(row), KeyCode::Enter) if chat_actions => {
+                        let action = match HelpAction::ALL[*row] {
+                            HelpAction::Sessions => ChatAction::OpenPicker,
+                            HelpAction::SessionSettings => {
+                                ChatAction::OpenSettings(SettingsScope::Session)
+                            }
+                            HelpAction::Jobs => ChatAction::OpenJobs,
+                            HelpAction::Commands => {
+                                app.overlay =
+                                    Some(Overlay::ContextHelp(HelpPage::Commands { scroll: 0 }));
+                                return OverlayKey::Consumed;
+                            }
+                        };
+                        app.overlay = None;
+                        return OverlayKey::Chat(action);
+                    }
+                    (HelpPage::Commands { scroll }, code) => scroll_help(scroll, code),
+                    _ => {}
+                }
+            }
+        }
         Overlay::Help { scroll } => match key.code {
             KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => {
                 app.overlay = None;
             }
-            KeyCode::Up => *scroll = scroll.saturating_sub(1),
-            KeyCode::Down => *scroll = scroll.saturating_add(1),
-            KeyCode::PageUp => *scroll = scroll.saturating_sub(10),
-            KeyCode::PageDown => *scroll = scroll.saturating_add(10),
-            KeyCode::Home => *scroll = 0,
-            _ => {}
+            code => scroll_help(scroll, code),
         },
         Overlay::RenamePrompt {
             session_db_id,
@@ -429,7 +480,11 @@ pub(super) fn handle_mouse(app: &mut App, m: MouseEvent) -> Option<MouseOutcome>
     match m.kind {
         MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
             let down = m.kind == MouseEventKind::ScrollDown;
-            if let Some(Overlay::Help { scroll }) = app.overlay.as_mut() {
+            if let Some(
+                Overlay::Help { scroll }
+                | Overlay::ContextHelp(super::HelpPage::Commands { scroll }),
+            ) = app.overlay.as_mut()
+            {
                 *scroll = if down {
                     scroll.saturating_add(3)
                 } else {
@@ -493,6 +548,10 @@ pub(super) fn handle_mouse(app: &mut App, m: MouseEvent) -> Option<MouseOutcome>
         }
         MouseEventKind::Down(MouseButton::Left) => {}
         _ => return None,
+    }
+
+    if matches!(app.overlay, Some(Overlay::ContextHelp(_))) {
+        return None;
     }
 
     // The filter picker has keyboard actions, not background list/category hits.
@@ -948,8 +1007,13 @@ pub(super) fn handle_chat_key(app: &mut App, key: KeyEvent) -> Option<ChatAction
             let off = &mut app.active_mut().scroll_offset;
             *off = off.saturating_sub(20);
         }
-        KeyCode::F(1) => {
-            app.overlay = Some(Overlay::Help { scroll: 0 });
+        KeyCode::F(1) if !app.has_pending_approval() => {
+            app.overlay = Some(if app.active().job.is_some() {
+                Overlay::Help { scroll: 0 }
+            } else {
+                Overlay::ContextHelp(super::HelpPage::Keys)
+            });
+            app.click_regions.clear();
         }
         _ => {}
     }
@@ -1278,6 +1342,12 @@ pub(super) fn handle_settings_key(
     // Same gate for the picker — mutually exclusive with the prompt.
     if app.settings_picker.is_some() {
         return handle_settings_picker_key(app, key);
+    }
+
+    if key.code == KeyCode::F(1) {
+        app.overlay = Some(Overlay::ContextHelp(super::HelpPage::Keys));
+        app.click_regions.clear();
+        return SettingsKey::None;
     }
 
     let n = app.settings_category_count(scope);

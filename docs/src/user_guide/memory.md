@@ -34,7 +34,7 @@ Two consequences worth noticing:
 
 ## The Tools
 
-Agents interact with memory through three tools. All three need to be in `allowed_tools`.
+The `memory` extension supplies the following tools. An Agent with an `allowed_tools` list needs an entry for each tool it uses.
 
 ### `remember`
 
@@ -72,6 +72,34 @@ See [Searching memory](#searching-memory) below for how ranking works.
 
 Lists every bank the agent can see, with the permission level. Always includes `self`. Designed to be called on-demand when the agent needs to discover what's available — same pattern as `describe_tool`.
 
+### Session excerpt tools
+
+| Tool                      | Arguments                                                  | Result                                                                                                                               |
+| ------------------------- | ---------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
+| `browse_sessions`         | `{}`; optional `cursor`                                    | One page of session DB IDs from this Agent's registry that its key can currently read.                                               |
+| `browse_sessions`         | `session_db_id`; optional `cursor`                         | At most eight rows in native key order, filtered to chat messages. Returns their IDs, senders, timestamps and untrusted excerpts.    |
+| `import_session_messages` | `session_db_id`, `bank`, `bank_db_id`, `message_ids` (1–8) | Copy those messages to the named standalone bank. The receipt identifies both databases, the selected IDs and how many rows changed. |
+
+### A copy has its own audience
+
+The responding Living Agent must have an active direct key in its invoking session with Write, and at least Read in the source. A session can be read by ID without appearing in the Agent's registry. A registry entry, an Account key on the host, a wildcard grant or an old cursor is not the Agent's grant. Import also needs an unambiguous writable bank reference on the Agent and current Write on that bank. Neither tool creates grants.
+
+Browsing another session records the returned excerpts in **this** conversation. Importing makes a copy readable in the destination bank; it can turn up in recall, including auto-recall. Source revocation stops future reads and refreshes; it cannot withdraw an earlier tool result or bank copy. Enable these tools only for Agents you intend to make those choices. No private session is imported just because an Agent is attached to it.
+
+Only plain `Message` rows from the supported dated session layout are eligible. Tool calls, results, directives, summaries, routing data and provider metadata aren't returned. Text is limited to 768 UTF-8 bytes, the sender to 128 bytes. The bank stores a labelled, quoted excerpt, not a generated summary or an instruction. Import calls no embedding provider. Its entries participate in lexical `recall` under the `session-excerpt` tag. A session using another history format is not interpreted as an empty dated session.
+
+### Walkthrough: keep one message from another session
+
+1. In a session where the Agent participates, call `browse_sessions {}`. Take one of the returned IDs. The following examples abbreviate database IDs as `S` and `B` and a message ID as `M`.
+2. Call `browse_sessions {"session_db_id":"S"}`. Select a `message_id` from `untrusted_message_excerpts`. For another page, send the same arguments plus the returned `cursor` (the value of `next_cursor`). An empty page with a cursor means _keep going_: the eight source rows might all be audit records. `null` means end. Pages use a fixed snapshot, not chronological order or a watermark for new messages.
+3. Call `list_memory_banks` and take the DB ID (`B`) for `notes`. To keep the excerpt there, call `import_session_messages {"session_db_id":"S","bank":"notes","bank_db_id":"B","message_ids":["M"]}`. If the Agent has only Read there, the tool reports `import unavailable; check the selected chat IDs and current session/bank grants`. Choose a bank already writable by this Agent; the tool doesn't upgrade the grant.
+4. With a writable `notes`, the result is `{"bank_db_id":"B","changed":1,"message_ids":["M"],"session_db_id":"S"}`. Call `recall {"bank":"notes","query":"lighthouse","tags":["session-excerpt"]}` for a message mentioning a lighthouse. Its key is `session:S/message:M` and its value identifies the original sender and timestamp.
+5. Save the source, destination and selected IDs if you need to retry. Reuse the same bank ID: if `notes` now points elsewhere, the request fails without copying. The same call to the same bank returns `"changed":0` for an unchanged excerpt. If the text was edited, repeat the import to refresh that row. Concurrent imports are independent snapshot copies, not an ordered sync: refresh once after edits and overlapping calls finish. Removal from the source does **not** delete the copy. Cursors expire on restart or eviction (128 retained); restart browsing without a cursor. Refreshing known message IDs needs no cursor. This is a selected copy, not a continuous history sync.
+
+A page or batch limit bounds rows and returned text, not the cost of reading the underlying database. A cold Eidetica service may build derived state from signed history; a large stored row must be read before its excerpt can be cut. Use a service version supporting Read-only cache builds. Bank aliases aren't native table keys: import examines at most 128 references and refuses larger or ambiguous directories rather than guessing a destination. Native recall's bank-wide ranking cost is separate from import.
+
+For a sense of scale, the opt-in `session_excerpt_growth` test grows one SQLite-backed session from 64 to 512 to 2,048 rows. Each eight-row commit contains four 1 KiB chat messages and four non-message rows, including a 16 KiB tool result. In five local runs over a Unix socket, the first page on each new frontier took 46–62, 117–157 and 434–548 ms respectively. At 2,048 rows the same page took 29–40 ms when repeated and still returned only 3,703 bytes. At that size the SQLite database and sidecars together occupied about 24 MB before the reads and 36 MB after browsing, copying and recalling. Those sizes include indexes, derived state and journal files, not just the new bank row. These are fixture observations, not a latency target or a measurement of a production session.
+
 ## The `/memory` Commands
 
 Bank management is shared across transports. TUI uses `/memory <sub>`; Matrix uses `!chaz memory <sub>`.
@@ -86,7 +114,7 @@ Bank management is shared across transports. TUI uses `/memory <sub>`; Matrix us
 | `/memory share <bank>`                                     | Generate a DatabaseTicket URL for the bank (like `/agent share`).                                                                                                                 |
 | `/memory unshare <bank>`                                   | Disable the logged-in user's sync preference for the bank (also from a service client). Does not revoke existing keys.                                                            |
 | `/memory import <ticket> [admin\|write\|read]`             | Sync a shared bank from another peer's ticket. Optional permission (default `write`) is the level requested when bootstrapping. Requires the ticket to carry a key for this peer. |
-| `/memory attach <bank>`                                    | Attach a bank to the current session. Its memories are surfaced in context (see [Autonomous Auto-recall](#autonomous-memory-auto-recall)).                                        |
+| `/memory attach <bank>`                                    | Select a bank for [auto-recall](#autonomous-memory-auto-recall) in this session. Does not grant Read.                                                                             |
 | `/memory detach <bank>`                                    | Detach a previously-attached bank from this session.                                                                                                                              |
 | `/memory config [show\|set\|reset] [--agent <name-or-id>]` | View or change an agent's auto-recall settings. See [Auto-recall config](#auto-recall-configuration).                                                                             |
 
@@ -94,7 +122,7 @@ Refs accept either a display name or an eidetica DB ID.
 
 ## Autonomous Memory Auto-recall
 
-When the `memory` extension is active, chaz automatically searches the agent's own memory and all attached banks for facts relevant to the current conversation. The top results are injected at the end of context as a `## Relevant Memories` block — the agent sees them alongside the conversation history, not in its system prompt.
+When the `memory` extension is active, chaz automatically searches the agent's own memory and the attached banks its key can currently read for facts relevant to the current conversation. The top results are injected at the end of context as a `## Relevant Memories` block — the agent sees them alongside the conversation history, not in its system prompt.
 
 **No manual `recall` needed.** It fires every turn, before the LLM call. If no relevant memories are found, nothing is injected.
 
@@ -102,7 +130,7 @@ When the `memory` extension is active, chaz automatically searches the agent's o
 
 1. Up to 5 recent conversation messages are joined newest-first, tokenized, and stopwords removed. The first 10 remaining tokens form the query, giving the current prompt priority.
 2. The agent's own `memory` store is searched with BM25 + cosine hybrid ranking.
-3. Every attached bank (via `/memory attach` or a persistent `/memory grant`) is searched the same way.
+3. Each selected bank the responding Agent can read is searched the same way.
 4. Up to 3 results per store (configurable) are formatted and appended.
 
 ```text
@@ -116,7 +144,7 @@ _(from bank: project-conventions)_
 
 ### Attaching banks to a session
 
-Banks must be explicitly attached to participate in auto-recall (even if the agent has a grant). Two ways:
+Attachment selects a bank to search; it does not lend the host's bank key to the responding Agent. In a session shared by two Agents, only an Agent with its own active bank Read (or stronger) can receive the bank's results. Revoking that grant stops future recall even if the attachment remains. It does not erase text already disclosed.
 
 **Per-session** — attach for the current conversation only:
 
@@ -125,14 +153,14 @@ Banks must be explicitly attached to participate in auto-recall (even if the age
 /memory detach project-conventions
 ```
 
-**Per-agent (persistent)** — grant the agent the bank once:
+**Access** — if the Agent needs a grant, the bank owner can grant Read without granting Write:
 
 ```text
 /memory new project-conventions      # only if the bank doesn't exist yet
-/memory grant project-conventions chaz write
+/memory grant project-conventions chaz read
 ```
 
-The grant writes the bank's AuthSettings and a `MemoryBankRef` into the agent DB, so the attachment survives restarts and travels with the agent. Root config does not attach banks: the old per-agent `default_memory_banks` YAML list is gone with root agent definitions, and a config still carrying it refuses to start with these steps (see [legacy root `agents:` blocks](configuration.md#legacy-root-agents-blocks)). The same bank can be granted to several agents to share it between them.
+The grant writes the bank's AuthSettings and a persistent `MemoryBankRef` into the Agent DB. Explicit `recall` uses this reference. On this version, attach the bank to the session for auto-recall; the legacy selector does not read new Table grants. An attachment alone creates no grant or reference. Root config does not attach banks: the old per-agent `default_memory_banks` YAML list is gone with root agent definitions, and a config still carrying it refuses to start with these steps (see [legacy root `agents:` blocks](configuration.md#legacy-root-agents-blocks)). The same bank can be granted to several agents to share it between them.
 
 ### Auto-recall configuration
 
@@ -284,13 +312,7 @@ Writes from either peer replicate bidirectionally.
 
 ## Agent-DB-as-Bank
 
-Because an Agent DB has the same `memory` Table a bank does, you can grant one agent access to another's _own_ notes:
-
-```text
-/memory grant alpha beta read   # here the "bank" is alpha's own Agent DB
-```
-
-This only works if alpha is a hosted agent on this peer (its DB ID is in the `agents` index). The command resolves the bank ref against both `memory_banks` and `agents` indices, and treats the agent DB as a bank for the purposes of the grant.
+An existing bank reference can point to another Agent DB's `memory` table. Explicit `recall` requires the receiving Agent's current Read on that DB, just as for a standalone bank. `/memory grant` resolves the bank argument against hosted memory banks, not hosted Agents. Use a standalone bank for new shared notes and session excerpts.
 
 ## Searching memory
 
