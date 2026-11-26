@@ -149,6 +149,13 @@ impl Session {
         attempt_id: &str,
     ) -> anyhow::Result<Option<JobWaitCheckpoint>> {
         let txn = database.new_transaction().await?;
+        Self::latest_job_wait_checkpoint_in_txn(&txn, attempt_id).await
+    }
+
+    pub(super) async fn latest_job_wait_checkpoint_in_txn(
+        txn: &eidetica::Transaction,
+        attempt_id: &str,
+    ) -> anyhow::Result<Option<JobWaitCheckpoint>> {
         Ok(txn
             .get_store::<Table<JobWaitCheckpoint>>(JOB_WAIT_CHECKPOINTS_STORE)
             .await?
@@ -207,6 +214,16 @@ pub(crate) fn plan_job_wait_resume(
     checkpoint: &JobWaitCheckpoint,
     records: &[TurnTranscriptRecord],
 ) -> Result<(RuntimeResume, u64), &'static str> {
+    plan_job_wait_resume_with_schedules(checkpoint, records, &[])
+}
+
+/// The caller supplies exact-Agent-authorized material for this same attempt
+/// only. The ordinary planner has no resolver and refuses private references.
+pub(crate) fn plan_job_wait_resume_with_schedules(
+    checkpoint: &JobWaitCheckpoint,
+    records: &[TurnTranscriptRecord],
+    private: &[(crate::agent_db::ScheduleReference, String)],
+) -> Result<(RuntimeResume, u64), &'static str> {
     if checkpoint.version != JOB_WAIT_CHECKPOINT_VERSION {
         return Err("unknown checkpoint version");
     }
@@ -245,6 +262,8 @@ pub(crate) fn plan_job_wait_resume(
     let mut message_sequences = Vec::new();
     let mut input_ids = std::collections::HashSet::new();
     let mut steering_pending = false;
+    let mut scheduled_pending = false;
+    let mut schedule_ids = std::collections::HashSet::new();
     let mut metadata = Vec::new();
     let mut matrix_send_queued = false;
     let mut rate_limited_calls = Vec::new();
@@ -274,6 +293,28 @@ pub(crate) fn plan_job_wait_resume(
             message_sequences.extend(std::iter::repeat_n(*sequence, inputs.len()));
             continue;
         }
+        if let TurnTranscriptMessage::ScheduledInput {
+            model_sequence: sequence,
+            references,
+        } = &record.message
+        {
+            if scheduled_pending
+                || *sequence != model_sequence
+                || !super::scheduled::validate_references(references, &mut schedule_ids)
+            {
+                return Err("scheduled boundary does not match the attempt/call");
+            }
+            scheduled_pending = true;
+            for reference in references {
+                let (_, text) = private
+                    .iter()
+                    .find(|(candidate, _)| candidate == reference)
+                    .ok_or("scheduled reference needs exact-Agent reconstruction")?;
+                messages.push(RuntimeMessage::System(text.clone()));
+                message_sequences.push(*sequence);
+            }
+            continue;
+        }
         let TurnTranscriptMessage::ModelResponse {
             model_sequence: sequence,
             content,
@@ -292,6 +333,7 @@ pub(crate) fn plan_job_wait_resume(
             return Err("transcript advanced past the checkpoint");
         }
         steering_pending = false;
+        scheduled_pending = false;
         if tool_calls.is_empty() {
             if *sequence >= checkpoint.model_sequence {
                 return Err("checkpointed response has no calls");

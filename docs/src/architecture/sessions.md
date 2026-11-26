@@ -112,6 +112,7 @@ plain user appends, not new attempts. No production path creates this
 descriptor, enables v1 writes, or converts existing histories. The fixture
 does not provide a distributed authority barrier or exercise durable projection
 hooks, bridge publication, or waits.
+Scheduled wakes require legacy history at admission and at the runtime write frontier.
 Before enabling production writes, all authorized peers and rollback binaries
 need compatible readers. Never delete a descriptor to make legacy code accept
 that history.
@@ -152,11 +153,13 @@ context replay or completion/admission logic.
 
 Identified `turn_transcript` calls remain the fallback for older attempts.
 New observations supersede matching transcript calls; `turn_attempt_id` on final
-metadata prevents counting an attempt summary again. Scheduled executions use
-an observation-only invocation UUID and `extra.chaz_telemetry_id` on summaries,
-not a fabricated request/attempt or restart checkpoint. Old unmarked summaries
-remain readable. Branch identity preserves competing calls, and snapshots keep
-racing finalization from exposing both forms.
+metadata prevents counting an attempt summary again. A scheduled invocation uses
+its real request and attempt for recording, or the containing attempt when a
+Pinned wake joins a running turn. This identity does not authorize restart or
+replay. The reader still recognizes old standalone schedule summaries marked
+with `extra.chaz_telemetry_id`, and old unmarked summaries remain readable.
+Branch identity preserves competing calls, and snapshots keep racing
+finalization from exposing both forms.
 
 Reports and estimates have separate totals and per-field call coverage. Provider
 zero replaces an estimate; omitted new wire fields remain distinguishable from
@@ -551,13 +554,13 @@ When an agent is co-owned (multiple peers hold an authorized key on the agent DB
 State lives in two places:
 
 - **Per-session**: `AgentRef.home_pubkey` inside `SessionMeta.agents`. Set automatically on attach to the attaching peer's pubkey on the agent DB. Rewritten by `/agent rehost`. `None` (legacy) means "any keyholder runs" — back-compat for sessions that predate this feature.
-- **Agent-level**: `meta.home_pubkey` on the agent DB itself. Used only by `fire_agent_schedule`'s `Fresh` target, where no session exists yet to carry the per-session field. Set automatically by `create_agent_db` to the creator's pubkey. Rewritten by `/agent rehost --agent`.
+- **Agent-level**: `meta.home_pubkey` on the agent DB itself. Checked at schedule admission; a `Fresh` target has no session yet to carry a per-session value. Set automatically by `create_agent_db` to the creator's pubkey. Rewritten by `/agent rehost --agent`.
 
 The gate fires at three sites:
 
 - `process_session` (interactive turns) — uses the per-session home.
-- `fire_agent_schedule(Fresh)` — uses the agent-level home (no session yet).
-- `fire_agent_schedule(Pinned)` — uses the per-session home of the pinned session.
+- Fresh clock admission — checks the Agent-level home before provisioning.
+- Pinned clock admission and delivery — also check the pinned Session’s per-Agent home and current membership.
 
 When a non-home peer's gate fires, an in-memory skip counter increments. At a threshold of 3 consecutive skips per (session, agent), a WARN logs the exact `/agent rehost` command to take over from a surviving peer. The counter resets on a successful run or on rehost.
 

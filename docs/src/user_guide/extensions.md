@@ -27,7 +27,7 @@ declares — `Tool` and `Command` are registrations; the other hook kinds run at
 | `memory`            | Command, Tool                | `/memory` + `remember` / `recall` / `list_memory_banks`. See [Memory](memory.md).                                                                    |
 | `skills`            | Command, Tool                | `/skills` + `skill_list` / `skill_search` / `skill_show`, plus the per-session catalog prompt injection.                                             |
 | `schedule`          | Command, Tool                | `/schedule` + `schedule_add` / `schedule_modify` / `schedule_remove` / `schedule_list` / `schedule_once`.                                            |
-| `agent_schedule`    | _(routine handler)_          | Standalone fire path for agent-owned schedules. Not directly toggled by users; no tools or commands.                                                 |
+| `agent_schedule`    | _(routine handler)_          | Hands agent-owned schedule occurrences to the shared turn runner. Not directly toggled by users; no tools or commands.                               |
 | `mcp-<server>`      | Tool                         | One extension per configured [MCP server](mcp.md), named `mcp-<server_name>`. Wraps the server and registers its tools under the server's namespace. |
 | `path_normalizer`   | ToolCall                     | Strips trailing slashes from `path` arguments on filesystem tools before they execute.                                                               |
 | `session_naming`    | TurnComplete                 | Opt-in, one-shot model-assisted naming of an unnamed session. See [Model-assisted session names](#model-assisted-session-names).                     |

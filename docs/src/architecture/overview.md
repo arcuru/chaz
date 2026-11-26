@@ -270,7 +270,7 @@ crates/lib/src/
     memory.rs          remember, recall, list_memory_banks, /memory, recall context tail
     skills.rs          skill tools, /skills, prompt augmentation
     schedule.rs        schedule_add|modify|remove|list|once, /schedule (agent-owned)
-    agent_schedule.rs  routine handler running the standalone agent-owned schedule fire path
+    agent_schedule.rs  routine handler publishing exact scheduled inputs into the common turn runner
     mcp.rs             McpExtension — one per configured MCP server
     path_normalizer.rs tool_call hook stripping trailing `/` from path args
     security_warnings.rs tool_result hook scanning for prompt-injection patterns

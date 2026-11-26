@@ -12,6 +12,9 @@ use eidetica::service::ServiceServer;
 use std::time::Duration;
 use tokio::sync::watch;
 
+#[path = "wait_resume_tests/private_schedule.rs"]
+mod private_schedule;
+
 /// A countable stand-in for an effectful tool run before the wait.
 struct Effect {
     calls: Arc<AtomicUsize>,

@@ -11,7 +11,7 @@ mod view;
 
 pub(super) mod staging;
 #[cfg(test)]
-mod tests;
+pub(super) mod tests;
 
 pub use provenance::{CallInput, CallMessageBinding, Fidelity, RecordRef};
 pub use record::{CallId, FactId, ObservedBinding, RepresentationId};

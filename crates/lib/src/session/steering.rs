@@ -435,6 +435,22 @@ async fn ordered_inputs_at(
     Ok(ordered)
 }
 
+pub(crate) async fn input_is_closed(
+    txn: &eidetica::Transaction,
+    attempt_id: &str,
+) -> anyhow::Result<bool> {
+    match txn
+        .get_store::<Table<bool>>(CLOSED)
+        .await?
+        .get(attempt_id)
+        .await
+    {
+        Ok(closed) => Ok(closed),
+        Err(error) if error.is_not_found() => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
 /// Executor-only call boundary, after the entire native tool exchange. The
 /// close marker distinguishes concurrent late publication from acceptance;
 /// it is best-effort local serialization, not distributed fencing.

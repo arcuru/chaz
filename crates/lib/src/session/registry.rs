@@ -371,6 +371,40 @@ impl SessionRegistry {
         crate::executor_db::ensure(&mut user, &agent, agent_key).await
     }
 
+    /// First authorized schedule admission selects storage once. Reads never
+    /// create or replace it, and a later executing peer must use this reference.
+    pub(crate) async fn ensure_scheduling_agent_db(
+        &self,
+        entry: &crate::hosted_index::DbEntry,
+    ) -> anyhow::Result<crate::agent_db::AgentDb> {
+        let mut user = self.user.lock().await;
+        let agent = crate::agent_db::AgentDb::from_database(
+            user.open_database_with_key(&entry.db_id, &entry.pubkey)
+                .await?,
+        );
+        if agent.scheduling_reference().await?.is_none() {
+            let (db, peer) = crate::executor_db::ensure(&mut user, &agent, &entry.pubkey).await?;
+            agent
+                .pin_scheduling_reference(crate::agent_db::ExecutorRef {
+                    db_id: db.root_id().to_string(),
+                    peer_pubkey: peer.to_string(),
+                })
+                .await?;
+        }
+        let reference = agent
+            .scheduling_reference()
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("scheduling Executor reference missing"))?;
+        let db = crate::executor_db::open_scheduling_writer(
+            &mut user,
+            &agent,
+            &reference,
+            &entry.pubkey,
+        )
+        .await?;
+        Ok(agent.with_scheduling_database(db))
+    }
+
     /// Read through the Agent's reference using that Agent's key; no creation.
     pub async fn agent_executor_queues(
         &self,
@@ -657,11 +691,67 @@ impl SessionRegistry {
         let mut found = Vec::new();
         for tracked in user.databases().await? {
             let db = user.open_database(&tracked.database_id).await?;
-            if db.get_name().await? == name {
+            let creation = db
+                .new_transaction_at(&eidetica::Snapshot::from([db.root_id().clone()]))
+                .await?;
+            if creation.get_settings()?.get_name().await? == name {
                 found.push(db.root_id().to_string());
             }
         }
         Ok(found)
+    }
+
+    /// Reconcile one inert Fresh root from the exact delivery's creation marker.
+    /// Only the acknowledged new intent may create; a retry with no marked root
+    /// holds rather than guessing whether a previous create took effect.
+    pub(crate) async fn prepare_fresh_schedule_root(
+        &self,
+        agent: &crate::agent_db::AgentDb,
+        entry: &crate::hosted_index::DbEntry,
+        reference: &crate::agent_db::ScheduleReference,
+    ) -> anyhow::Result<(ConversationId, Database)> {
+        use crate::schedule_state::lifecycle::{FreshRoot, fresh};
+        anyhow::ensure!(agent.id() == entry.db_id, "Fresh owner differs");
+        let source = fresh::source(reference)?;
+        let lock = self.channel_create_lock(&source).await;
+        let _guard = lock.lock().await;
+        let (row, may_create) = fresh::request(agent, reference, Utc::now()).await?;
+        let mut marked = self.find_sessions_by_source(&source).await?;
+        anyhow::ensure!(
+            marked.len() <= 1,
+            "multiple Fresh roots carry this delivery; outcome held"
+        );
+        let bound = match &row.fresh_root {
+            Some(FreshRoot::Bound { session_db_id }) => Some(session_db_id.as_str()),
+            _ => None,
+        };
+        let (conv, db) = match (marked.pop(), bound) {
+            (Some(id), Some(bound)) if id != bound => {
+                anyhow::bail!("Fresh root marker and binding differ")
+            }
+            (Some(id), _) => self.open_session(&id).await?,
+            (None, None) if may_create => self.create_session(Some(&source)).await?,
+            _ => anyhow::bail!("Fresh creation outcome unknown; refusing a replacement root"),
+        };
+        if bound.is_some() {
+            // Binding closed provisioning. A later detach, home change or
+            // unreadable membership cannot authorize recreating the grant.
+            super::agents::require_schedule_member(&db, agent.database(), entry).await?;
+            return Ok((conv, db));
+        }
+        // A crash may precede any post-creation initialization. Repair only
+        // this identified root; preserve its existing baseline and history.
+        super::Session::try_new(conv.clone(), db.clone())
+            .await?
+            .ensure_turn_schema_baseline()
+            .await?;
+        crate::db_kind::write_marker(&db, crate::db_kind::KIND_SESSION, &source).await?;
+        self.upsert_session_catalog(&db.root_id().to_string(), Some(&source), None)
+            .await?;
+        self.attach_agent_to_session(&db.root_id().to_string(), entry)
+            .await?;
+        fresh::bind(agent, reference, &db.root_id().to_string(), Utc::now()).await?;
+        Ok((conv, db))
     }
 
     /// Whether this registry itself created the session during this process.

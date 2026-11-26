@@ -444,10 +444,16 @@ After E1–E6 (whose exact counts remain unchanged), the agent calls `schedule_a
 to create two real pinned intervals capped at one fire each. One scheduled
 turn explicitly calls `matrix__send`; the other returns only a normal final.
 The signed probe decrypts the explicit post and requires ciphertext on the
-wire. The harness waits for each retired pinned row and persisted terminal
-Message, then observes a distinguishable encrypted command-reply barrier.
-Exact wire counts prove one explicit scheduled post, no duplicate final, and
-zero posts from the no-send scheduled final. Plaintext DM counts are unchanged.
+wire. The harness checks each completed fire through `schedule_probe`, built
+by `just e2e` (override with `SCHEDULE_PROBE_BIN`). It opens a consistent SQLite
+backup, never a second connection to the running embedded backend. Native reads
+require exactly one handoff in the Agent's selected ledger, its linked successful
+Session outcome, one matching local-only final and exhausted effective capacity.
+The Agent definition must remain unchanged. Raw `store_state_*` tables are
+materialization caches and cannot prove these facts.
+A distinguishable encrypted command-reply barrier follows each check. Exact
+wire counts prove one explicit scheduled post, no duplicate final, and zero
+posts from the no-send scheduled final. Plaintext DM counts are unchanged.
 
 The stub matches the scheduler's private first System message, not old user
 text. Current ReAct results are recognized by their call ID at the request's

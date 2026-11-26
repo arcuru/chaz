@@ -947,16 +947,19 @@ async fn recorded_and_scheduled_turns_join_only_their_exact_background_workers()
             .unwrap_or_else(|| panic!("missing model-visible result for {id}"))
     }
 
-    let interactive = Arc::new(MockBackend::new());
-    let scheduled = Arc::new(MockBackend::new());
+    let model = Arc::new(MockBackend::new());
     let secrets = crate::test_support::empty_secrets().await;
+    let timer_slot = crate::instance::ServerSlot::default();
+    let mut hub = crate::test_support::context_hub().await;
+    hub.install_all(vec![Arc::new(
+        crate::extensions::agent_schedule::AgentScheduleExtension::new(timer_slot.clone()),
+    )])
+    .await
+    .unwrap();
     let (_owner, server, registry) = server_fixture_backend_with_approvals(
-        Arc::new(crate::tool_host::NativeToolHost::new()),
-        Arc::new(crate::test_support::context_hub().await),
-        Some(BackendManager::with_mock(
-            scheduled.clone(),
-            secrets.clone(),
-        )),
+        Arc::new(crate::test_support::MockHost::new()),
+        Arc::new(hub),
+        None,
         &["spawn_worker"],
     )
     .await;
@@ -971,27 +974,22 @@ async fn recorded_and_scheduled_turns_join_only_their_exact_background_workers()
     server
         .register_session(
             &db,
-            BackendManager::with_mock(interactive.clone(), secrets),
+            BackendManager::with_mock(model.clone(), secrets),
             Some("default".into()),
             None,
         )
         .await
         .unwrap();
+    timer_slot.set(server.clone());
     let wake = "private wake prompt; not a queued user turn";
-    let target = crate::agent_db::ScheduleTarget::Pinned {
-        session_db_id: sid.0.clone(),
-    };
-    adb.upsert_schedule(Schedule::new(
-        "worker-fire",
-        Trigger::OneShot {
-            fire_at: Utc::now(),
-        },
-        wake,
-        target,
-    ))
+    let legacy_wake = "ambiguous pre-upgrade wake must not replay";
+    let engine = crate::routine::RoutineEngine::new(
+        registry.chaz_peer().clone(),
+        Some(server.extensions().clone()),
+    )
     .await
     .unwrap();
-    let payload = pinned_schedule_payload(&owner.db_id.to_string(), "worker-fire", wake, &sid.0);
+    server.set_routine_engine(engine.clone());
     let reserved = server
         .semaphore
         .clone()
@@ -1000,7 +998,9 @@ async fn recorded_and_scheduled_turns_join_only_their_exact_background_workers()
         .unwrap();
     let mut joined = Vec::new();
 
-    for (is_schedule, model) in [(false, &interactive), (true, &scheduled)] {
+    for is_schedule in [false, true] {
+        let before = model.recorded_calls().len();
+        let children_before = children_mock.recorded_calls().len();
         let start = model.block_next_call();
         let after_one = model.block_next_call();
         let after_two = model.block_next_call();
@@ -1019,39 +1019,107 @@ async fn recorded_and_scheduled_turns_join_only_their_exact_background_workers()
         } else {
             "interactive parent final"
         };
-        children_mock.push_text(first_reply);
+        if is_schedule {
+            // Return this error unless the gate overrides it for the first Directive.
+            children_mock.push_err(crate::error::LlmError::Configuration {
+                message: "exact second failure".into(),
+            });
+        } else {
+            children_mock.push_text(first_reply);
+        }
         children_mock.push_err(crate::error::LlmError::Configuration {
             message: "exact second failure".into(),
         });
         model.push_tool_calls([spawn("first instruction")]);
         model.push_tool_calls([spawn("second instruction")]);
-        let mut fire = None;
+        let _scheduled_slot =
+            is_schedule.then(|| server.semaphore.clone().try_acquire_owned().unwrap());
         if is_schedule {
-            let server = server.clone();
-            let payload = payload.clone();
-            fire = Some(tokio::spawn(async move {
-                server.fire_agent_schedule(payload).await
-            }));
+            // Only one free slot for the entire scheduled leg. Both async
+            // Workers must be linked before either can take the parent's slot.
+            let new = Schedule::new(
+                "worker-fire",
+                Trigger::OneShot {
+                    fire_at: Utc::now(),
+                },
+                wake,
+                crate::agent_db::ScheduleTarget::Pinned {
+                    session_db_id: sid.0.clone(),
+                },
+            );
+            let mut old = new.clone();
+            old.id = "legacy-past".into();
+            old.trigger = Trigger::OneShot {
+                fire_at: Utc::now() - chrono::Duration::hours(1),
+            };
+            old.prompt = legacy_wake.into();
+            old.lifetime = None;
+            old.policy_origin = None;
+            old.fire_count = 1;
+            adb.upsert_schedule(old.clone()).await.unwrap();
+            adb.upsert_schedule(new).await.unwrap();
+            let scheduling = registry.ensure_scheduling_agent_db(&owner).await.unwrap();
+            let schedule = scheduling
+                .find_schedule("worker-fire")
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                async {
+                    for _ in 0..100 {
+                        if scheduling
+                            .reconcile_schedule_accounting(&schedule, 32)
+                            .await
+                            .unwrap()
+                            .complete
+                        {
+                            return true;
+                        }
+                    }
+                    false
+                }
+                .await,
+                "bounded accounting reconciliation did not finish"
+            );
+            super::super::build::register_startup_agent_schedules(
+                &engine,
+                &registry,
+                server.agent_index(),
+            )
+            .await;
+            assert_eq!(
+                engine.list_routines().await.len(),
+                1,
+                "only the new one-shot may arm"
+            );
+            old.policy_origin = Some(crate::agent_db::SchedulePolicyOrigin::LegacyOneShotHeld);
+            assert_eq!(scheduling.find_schedule(&old.id).await.unwrap(), Some(old));
+            let timer =
+                crate::routine::RoutineId::new(format!("agent:{}:worker-fire", owner.db_id));
+            assert!(engine.get(&timer).await.is_some());
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while engine.get(&timer).await.is_some() {
+                    engine.tick().await;
+                }
+            })
+            .await
+            .expect("registered timer acknowledged without waiting for model or Workers");
+            assert_eq!(scheduling.list_schedule_fires().await.unwrap().len(), 1);
         } else {
             write_user_message_with_content(&db, &sid.0, "interactive parent request").await;
         }
         entered(&start, "start").await;
-        if !is_schedule {
-            // A real competing fire must skip while the interactive runtime owns the target.
-            tokio::time::timeout(
-                Duration::from_secs(5),
-                server.fire_agent_schedule(payload.clone()),
-            )
-            .await
-            .unwrap()
-            .unwrap();
-            assert!(scheduled.recorded_calls().is_empty());
-            assert!(adb.list_schedule_fires().await.unwrap().is_empty());
-            assert!(adb.find_schedule("worker-fire").await.unwrap().is_some());
-        }
+        let initial_call = &model.recorded_calls()[before];
+        assert_eq!(
+            format!("{:?}", initial_call.messages).contains(wake),
+            is_schedule
+        );
+        assert!(!format!("{:?}", initial_call.messages).contains(legacy_wake));
         start.release();
         entered(&after_one, "after_one").await;
-        entered(&first_child, "first_child").await;
+        if !is_schedule {
+            entered(&first_child, "first_child").await;
+        }
         after_one.release();
         entered(&after_two, "after_two").await;
 
@@ -1062,10 +1130,15 @@ async fn recorded_and_scheduled_turns_join_only_their_exact_background_workers()
             panic!("both Workers must be published before either completes: {links:?}")
         };
         assert_eq!(first.call.attempt_id, second.call.attempt_id);
-        assert_eq!(
-            first.call.request_id.as_str().starts_with("schedule:"),
-            is_schedule
-        );
+        let parent = Session::new(sid.clone(), db.clone()).await;
+        let attempts = parent.attempts_for_test().await;
+        assert_eq!(attempts.len(), if is_schedule { 2 } else { 1 });
+        let attempt = attempts
+            .iter()
+            .find(|attempt| attempt.attempt_id == first.call.attempt_id)
+            .expect("Worker belongs to an actual parent attempt, not a stand-in identity");
+        assert_eq!(first.call.request_id, attempt.request_id);
+        assert_eq!(second.call.request_id, attempt.request_id);
         assert_eq!(first.call.agent, "default");
         assert_eq!(first.call.call_id, second.call.call_id);
         let (_, first_db) = registry
@@ -1079,15 +1152,28 @@ async fn recorded_and_scheduled_turns_join_only_their_exact_background_workers()
                 .is_none()
         );
         assert!(
-            model.recorded_calls()[0]
+            model.recorded_calls()[before]
                 .tools
                 .iter()
                 .any(|tool| tool.name == "worker_wait")
         );
-        assert!(tool_result(model, "reused-spawn-id").contains(&second.child_session_id));
+        assert!(tool_result(&model, "reused-spawn-id").contains(&second.child_session_id));
+        assert_eq!(server.semaphore.available_permits(), 0);
+        assert_eq!(
+            children_mock.recorded_calls().len(),
+            children_before + usize::from(!is_schedule)
+        );
 
-        let (id, name, arguments) = wait("second", &second.child_session_id, 30);
-        model.push_tool_calls([wait("short", &first.child_session_id, 1)]);
+        let (id, name, arguments) = if is_schedule {
+            wait("early", &first.child_session_id, 30)
+        } else {
+            wait("early", &second.child_session_id, 30)
+        };
+        if is_schedule {
+            model.push_tool_calls([wait("followup", &second.child_session_id, 30)]);
+        } else {
+            model.push_tool_calls([wait("followup", &first.child_session_id, 1)]);
+        }
         after_two.release_with(runtime::LLMResponse::ToolCalls {
             content: None,
             tool_calls: vec![runtime::ToolCallRequest {
@@ -1098,35 +1184,95 @@ async fn recorded_and_scheduled_turns_join_only_their_exact_background_workers()
             provider_extra: Default::default(),
             metadata: None,
         });
-        // In the interactive case both slots were held by parent and first
-        // Worker. The second cannot start without the native wait yielding.
-        tokio::select! {
-            result = tokio::time::timeout(Duration::from_secs(10), second_child.wait_started()) => result.expect("second Worker requires a yielded slot"),
-            _ = after_second_join.wait_started() => panic!("join did not observe the second Worker: {}", tool_result(model, "second")),
-        }
-        second_child.release();
-        entered(&after_second_join, "after_second_join").await;
-        let second_result = tool_result(model, "second");
-        assert!(
-            second_result.contains("\"state\":\"failed\"")
-                && second_result.contains("exact second failure"),
-            "{second_result}"
-        );
-        assert!(!second_result.contains(first_reply));
-        model.push_tool_calls([
-            wait("first", &first.child_session_id, 30),
-            wait("again", &first.child_session_id, 30),
-        ]);
-        after_second_join.release();
-        entered(&after_pending, "after_pending").await;
-        assert!(tool_result(model, "short").contains("\"state\":\"pending\""));
-        assert!(
-            latest_worker_outcome(&first_db, &first.directive_id)
+        let continue_joins = async {
+            tokio::time::timeout(Duration::from_secs(20), after_second_join.wait_started())
                 .await
-                .unwrap()
-                .is_none()
-        );
-        first_child.release();
+                .expect("parent did not resume after the first join");
+            let early_result = tool_result(&model, "early");
+            if is_schedule {
+                assert!(
+                    early_result.contains("\"state\":\"completed\"")
+                        && early_result.contains(first_reply),
+                    "{early_result}"
+                );
+            } else {
+                assert!(
+                    early_result.contains("\"state\":\"failed\"")
+                        && early_result.contains("exact second failure"),
+                    "{early_result}"
+                );
+                assert!(!early_result.contains(first_reply));
+            }
+            model.push_tool_calls([
+                wait("first", &first.child_session_id, 30),
+                wait("again", &first.child_session_id, 30),
+            ]);
+            after_second_join.release();
+            entered(&after_pending, "after_pending").await;
+        };
+        if is_schedule {
+            // One slot: neither Worker can call the model before the parent
+            // yields, but the two waiters need not queue in submission order.
+            let answer_workers =
+                async {
+                    for gate in [&first_child, &second_child] {
+                        entered(gate, "scheduled Worker requires the parent's yielded slot").await;
+                        let calls = children_mock.recorded_calls();
+                        let instruction = calls.last().unwrap().messages.iter().find_map(
+                            |message| match message {
+                                runtime::RuntimeMessage::Assistant(text)
+                                | runtime::RuntimeMessage::User(text)
+                                    if matches!(
+                                        text.as_str(),
+                                        "first instruction" | "second instruction"
+                                    ) =>
+                                {
+                                    Some(text.as_str())
+                                }
+                                _ => None,
+                            },
+                        );
+                        match instruction {
+                            Some("first instruction") => {
+                                gate.release_with(runtime::LLMResponse::Text {
+                                    content: first_reply.into(),
+                                    provider_extra: Default::default(),
+                                    metadata: None,
+                                })
+                            }
+                            Some("second instruction") => gate.release(),
+                            other => panic!("unexpected Worker Directive: {other:?}"),
+                        }
+                    }
+                };
+            tokio::join!(answer_workers, continue_joins);
+        } else {
+            // The interactive parent and first Worker hold both slots.
+            tokio::select! {
+                result = tokio::time::timeout(Duration::from_secs(10), second_child.wait_started()) => result.expect("second Worker requires the parent's yielded slot"),
+                _ = after_second_join.wait_started() => panic!("join did not observe the exact Worker: {}", tool_result(&model, "early")),
+            }
+            second_child.release();
+            continue_joins.await;
+        }
+        let followup = tool_result(&model, "followup");
+        if is_schedule {
+            assert!(
+                followup.contains("\"state\":\"failed\"")
+                    && followup.contains("exact second failure"),
+                "{followup}"
+            );
+            assert!(!followup.contains(first_reply));
+        } else {
+            assert!(followup.contains("\"state\":\"pending\""));
+            assert!(
+                latest_worker_outcome(&first_db, &first.directive_id)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            first_child.release();
+        }
         await_no_processing(&server, &first.child_session_id).await;
         let mut worker =
             Session::new(ConversationId(first.child_session_id.clone()), first_db).await;
@@ -1148,51 +1294,56 @@ async fn recorded_and_scheduled_turns_join_only_their_exact_background_workers()
         model.push_text(final_reply);
         after_pending.release();
         entered(&after_first_join, "after_first_join").await;
-        let first_result = tool_result(model, "first");
+        let first_result = tool_result(&model, "first");
         assert!(
             first_result.contains("\"state\":\"completed\"") && first_result.contains(first_reply),
             "{first_result}"
         );
         assert!(!first_result.contains("unrelated newer child message"));
-        assert_eq!(tool_result(model, "again"), first_result);
+        assert_eq!(tool_result(&model, "again"), first_result);
         after_first_join.release();
-        if let Some(fire) = fire {
-            tokio::time::timeout(Duration::from_secs(10), fire)
+        await_no_processing(&server, &sid.0).await;
+        if is_schedule {
+            let scheduling = registry
+                .open_scheduling_agent_db(&owner.db_id, None)
                 .await
                 .unwrap()
-                .unwrap()
                 .unwrap();
-            assert_eq!(adb.list_schedule_fires().await.unwrap().len(), 1);
+            engine
+                .register_agent(&owner.db_id.to_string(), &scheduling)
+                .await
+                .unwrap();
+            assert!(
+                engine.list_routines().await.is_empty(),
+                "consumed wake cannot rearm"
+            );
+            assert_eq!(scheduling.list_schedule_fires().await.unwrap().len(), 1);
         }
-        await_no_processing(&server, &sid.0).await;
         joined.extend(links.into_iter().map(|link| link.child_session_id));
     }
 
     // Same Agent and same session, but a different actual invocation. Both
     // previously successful handles remain accessible to the operator API.
-    interactive.push_tool_calls([
+    model.push_tool_calls([
         wait("old-interactive", &joined[0], 1),
         wait("old-schedule", &joined[2], 1),
     ]);
-    interactive.push_text("interactive still routed to its original backend");
-    let denied = interactive.block_next_call();
-    let checked = interactive.block_next_call();
+    model.push_text("later interactive reply");
+    let denied = model.block_next_call();
+    let checked = model.block_next_call();
     write_user_message_with_content(&db, &sid.0, "later interactive request").await;
     entered(&denied, "denied").await;
     denied.release();
     entered(&checked, "checked").await;
     for id in ["old-interactive", "old-schedule"] {
-        let refusal = tool_result(&interactive, id);
+        let refusal = tool_result(&model, id);
         assert!(
             refusal.contains("Worker result unavailable for this invocation"),
             "{refusal}"
         );
         assert!(!refusal.contains("first result"));
     }
-    let replayed = format!(
-        "{:?}",
-        interactive.recorded_calls().last().unwrap().messages
-    );
+    let replayed = format!("{:?}", model.recorded_calls().last().unwrap().messages);
     assert!(!replayed.contains(wake));
     assert!(
         !replayed.contains("scheduled first result"),
@@ -1203,13 +1354,13 @@ async fn recorded_and_scheduled_turns_join_only_their_exact_background_workers()
     let parent = Session::new(sid, db).await;
     assert_eq!(
         parent.attempts_for_test().await.len(),
-        2,
-        "no scheduled request was queued"
+        3,
+        "one recorded scheduled attempt and two human turns"
     );
     assert_eq!(
-        scheduled.recorded_calls().len(),
-        6,
-        "never route the interactive request to the schedule backend"
+        model.recorded_calls().len(),
+        14,
+        "no extra turn or model replay"
     );
     assert!(
         parent
@@ -1225,5 +1376,6 @@ async fn recorded_and_scheduled_turns_join_only_their_exact_background_workers()
         MAX_CONCURRENT_LLM_CALLS
     );
     server.shutdown().await;
+    timer_slot.clear();
     slot.clear();
 }

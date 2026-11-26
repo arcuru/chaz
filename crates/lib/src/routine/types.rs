@@ -191,10 +191,21 @@ pub enum RoutineScope {
 /// The handler loads the owning agent and invokes it intrinsically.
 pub const AGENT_SCHEDULE_EXTENSION: &str = "agent_schedule";
 
-/// In-engine payload for an agent-owned schedule fire. Carries everything
-/// the `agent_schedule` routine handler needs to resolve the target,
-/// audit the fire, and invoke the owning agent — without re-reading
-/// the agent DB.
+/// Exact source and due-slot identity carried from the clock to admission.
+/// Current private source, home and target authority are revalidated on the Agent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScheduleClock {
+    pub lifetime: String,
+    pub revision: String,
+    pub slot: crate::agent_db::DueSlot,
+    /// The durable slot was already due before this engine started: a missed
+    /// window from downtime, not ordinary timer lateness. Admission applies
+    /// the schedule's catch-up policy; it is never retry authority.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub missed: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AgentSchedulePayload {
     pub owner_agent_db_id: String,
@@ -204,13 +215,17 @@ pub struct AgentSchedulePayload {
     /// dispatch time so a detached turn can verify the entry is still live.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub generation: Option<String>,
+    /// Exact disarmed timer slot. Missing on legacy direct callers, never
+    /// interpreted as durable timer authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clock: Option<ScheduleClock>,
+    /// Legacy-readable projection only; admission resolves immutable Agent text.
     pub prompt: String,
     /// `crate::agent_db::ScheduleTarget`, carried as JSON so this type
     /// doesn't depend on the agent_db module.
     pub target: serde_json::Value,
-    /// One-shots are removed from the owning agent's `schedules` store
-    /// after a successful fire (the engine drops the in-memory entry;
-    /// the handler must clear the persisted row).
+    /// Legacy-readable trigger projection. Committed handoff consumes the
+    /// original timing slot; definitions and history are not deleted.
     pub one_shot: bool,
 }
 

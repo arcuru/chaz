@@ -4,6 +4,8 @@
 >
 > **Status update (2026-05-27):** the two "Future:" sections at the bottom have both shipped. Scheduled runs took a different shape than the one sketched here — agent-owned schedules run through `Server::fire_agent_schedule` on a standalone path that does **not** write a `Directive` entry into the session (the wake-prompt is invocation-scoped input, not a broadcast entry). See [Agent-Owned Schedules](./agent_schedules.md). Inter-agent communication shipped as mention-gated chat-room turns; see [Autonomous Agents in Shared Sessions](./autonomous_agents.md). Request selection is durable reconciliation rather than a latest-entry check; see [Durable turn recovery](../architecture/sessions.md#durable-turn-recovery). The `spawn_agent` sequence and completion signal below are historical.
 
+> The original standalone schedule runner described above has been replaced by [private scheduled input in the shared turn runner](./agent_schedules.md#private-input-in-the-common-recorder). Scheduled wakes still do not write shared `Directive` entries.
+
 ## Summary
 
 All agent invocation in chaz goes through a single mechanism: write an entry to a session database, and the server's callback-driven processing handles execution. Users, agents, schedulers, and system processes all invoke agents the same way.
@@ -120,16 +122,7 @@ Spawn-specific metadata is bundled in `SpawnContext`:
 
 Executor-backed turns use an awaited recorder rather than a concurrent best-effort event writer. A model response carrying tool calls commits before execution, and its full correlated result commits before the next model call. Display entries are projections of those successful commits and may truncate results; the structured transcript does not.
 
-Standalone scheduled turns keep a compatibility `mpsc::Sender<RuntimeEvent>` adapter because that path has no durable request attempt:
-
-```text
-enum RuntimeEvent {
-    ToolCall { id, name, arguments }
-    ToolResult { id, name, output, is_error }
-}
-```
-
-These scheduled audit writes remain outside the turn-attempt recovery protocol.
+Scheduled inputs also use the shared recorder. It stores a reference to the private input, tied to the actual Session attempt. A scheduled-only attempt does not get a generic restart checkpoint. See [private input in the common recorder](./agent_schedules.md#private-input-in-the-common-recorder).
 
 ## Future: Scheduled Runs
 

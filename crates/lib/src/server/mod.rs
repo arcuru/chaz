@@ -54,7 +54,11 @@ mod jobs;
 pub use job_monitor::{JobMonitor, JobMonitorNode};
 mod runtime_lease;
 mod schedule;
+mod scheduled_delivery;
+mod scheduled_input;
+mod scheduled_projection;
 mod suspended_wait;
+mod timer_admission;
 
 pub use build::{BuildOptions, BuiltServer, McpReadiness, build};
 pub use runtime_lease::{LeaseError, LocalRuntimeLease, OwnerId, RuntimeLease};
@@ -295,6 +299,7 @@ struct SpawnContext {
 struct RunningTurn {
     attempt: TurnAttempt,
     cancel: runtime::TurnCancel,
+    agent_db_id: Option<String>,
 }
 
 type RunningTurns = Arc<Mutex<HashMap<String, RunningTurn>>>;
@@ -562,6 +567,14 @@ pub struct Server {
     suspended_wait_reconciliations: AtomicUsize,
     #[cfg(test)]
     transcript_fail_after: Arc<std::sync::Mutex<Option<usize>>>,
+    #[cfg(test)]
+    schedule_fail_at: std::sync::Mutex<Option<&'static str>>,
+    #[cfg(test)]
+    timed_prepared_barrier:
+        std::sync::Mutex<Option<Arc<crate::extensions::agent_schedule::ScheduleDispatchBarrier>>>,
+    #[cfg(test)]
+    schedule_closing_barrier:
+        std::sync::Mutex<Option<Arc<crate::extensions::agent_schedule::ScheduleDispatchBarrier>>>,
     /// Attempts started by this process and not yet durably completed.
     /// This distinguishes a genuinely active task from a persisted start left
     /// behind by a previous process. It is process-local coordination, not
@@ -575,15 +588,6 @@ pub struct Server {
     /// Wait checkpoints this process already resumed or found ineligible.
     /// Each is considered for automatic resume at most once per process.
     considered_wait_checkpoints: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
-    /// Per-schedule accounting locks. Schedule turns deliberately overlap, but
-    /// their lifecycle read-modify-write operations must not lose increments:
-    /// `max_fires` admission reserves its slot under these locks, so
-    /// overlapping turns in this process cannot overshoot the cap. The
-    /// mutexes are process-local — two chaz processes hosting the same
-    /// agent could double-admit against the shared agent DB. Cross-process
-    /// overlap is out of scope: the home-peer gate means a single peer
-    /// admits a schedule's fires in practice.
-    schedule_accounting: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
     /// Home-peer gate skip counter keyed by `(session_db_id, agent_name)`.
     /// In-memory, peer-local. Incremented on every wake that the gate
     /// suppresses; cleared when a turn actually runs (home == self) or on
@@ -728,6 +732,12 @@ impl Server {
             turns: Arc::new(Mutex::new(HashMap::new())),
             #[cfg(test)]
             transcript_fail_after: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(test)]
+            schedule_fail_at: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            timed_prepared_barrier: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            schedule_closing_barrier: std::sync::Mutex::new(None),
             live_attempts: Arc::new(Mutex::new(std::collections::HashSet::new())),
             job_incarnation: uuid::Uuid::new_v4().to_string(),
             pending_retry_attempts: Arc::new(Mutex::new(std::collections::HashSet::new())),
@@ -737,7 +747,6 @@ impl Server {
             suspended_wait_hints: AtomicBool::new(true),
             #[cfg(test)]
             suspended_wait_reconciliations: AtomicUsize::new(0),
-            schedule_accounting: Arc::new(Mutex::new(HashMap::new())),
             skip_counters: Arc::new(Mutex::new(HashMap::new())),
             active_extensions: Arc::new(Mutex::new(HashMap::new())),
             notify_tx,
@@ -2397,6 +2406,10 @@ impl Server {
         server: std::sync::Weak<Self>,
         mut notify_rx: mpsc::Receiver<ProcessingCommand>,
     ) {
+        let mut accounting = schedule::AccountingPump::default();
+        let mut deliveries = scheduled_delivery::DeliveryPump::default();
+        let mut accounting_tick = tokio::time::interval(std::time::Duration::from_secs(1));
+        accounting_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             let Some(server) = server.upgrade() else {
                 break;
@@ -2406,6 +2419,13 @@ impl Server {
             }
             let command = tokio::select! {
                 command = notify_rx.recv() => command,
+                _ = accounting_tick.tick() => {
+                    accounting.step(&server).await;
+                    if server.routine_engine().is_some() {
+                        deliveries.step(&server).await;
+                    }
+                    continue;
+                }
                 _ = server.shutdown_notify.notified() => None,
             };
             let Some(command) = command else { break };
@@ -2725,7 +2745,7 @@ impl Server {
         }
         // An exact checkpointed wait from a previous process resumes before
         // newer work, just as its live turn would have kept the session busy.
-        if let Some((request, plan)) = self.find_resumable_wait(&session, &live_attempts).await
+        if let Some((request, plan)) = self.find_resumable_wait(&session, &live_attempts).await?
             && let Some(outcome) = self
                 .resume_checkpointed_wait(
                     session_db_id,
@@ -3062,6 +3082,7 @@ impl Server {
             spawn_ctx,
             None,
             None,
+            false,
         )
         .await;
 
@@ -3075,20 +3096,15 @@ impl Server {
         &self,
         session: &Session,
         live_attempts: &std::collections::HashSet<String>,
-    ) -> Option<(
-        crate::session::TurnRequest,
-        crate::session::wait_resume::ResumableWait,
-    )> {
-        let requests = match session
+    ) -> anyhow::Result<
+        Option<(
+            crate::session::TurnRequest,
+            crate::session::wait_resume::ResumableWait,
+        )>,
+    > {
+        let requests = session
             .turn_requests(|name| self.agents.get(name).is_some(), live_attempts)
-            .await
-        {
-            Ok(requests) => requests,
-            Err(error) => {
-                warn!(%error, "Could not read turn requests for wait resumption");
-                return None;
-            }
-        };
+            .await?;
         for request in requests {
             let TurnRequestState::Interrupted { attempt_id } = &request.state else {
                 continue;
@@ -3110,8 +3126,11 @@ impl Server {
             {
                 continue;
             }
-            match session.resumable_job_wait(&request.id, checkpoint).await {
-                Ok(Ok(plan)) => return Some((request, plan)),
+            match self
+                .resumable_scheduled_wait(session, &request.id, checkpoint)
+                .await
+            {
+                Ok(Ok(plan)) => return Ok(Some((request, plan))),
                 Ok(Err(reason)) => {
                     info!(
                         attempt_id,
@@ -3119,13 +3138,25 @@ impl Server {
                     );
                     self.considered_wait_checkpoints.lock().unwrap().insert(key);
                 }
+                Err(error)
+                    if error.is::<crate::schedule_state::lifecycle::ReconciliationRequired>() =>
+                {
+                    // A cold disposable accounting observation is not an
+                    // invalid checkpoint. The bounded projection pump wakes
+                    // this exact Session after reconciliation, without replay.
+                    debug!(
+                        attempt_id,
+                        "Scheduled wait awaiting accounting reconciliation"
+                    );
+                    return Err(error);
+                }
                 Err(error) => {
                     warn!(%error, attempt_id, "Could not validate job wait checkpoint; holding attempt");
                     self.considered_wait_checkpoints.lock().unwrap().insert(key);
                 }
             }
         }
-        None
+        Ok(None)
     }
 
     /// Resume one validated checkpointed wait under the same attempt.
@@ -3296,7 +3327,10 @@ impl Server {
             _ => None,
         };
         let plan = match current {
-            Some(checkpoint) => fresh.resumable_job_wait(&request.id, checkpoint).await,
+            Some(checkpoint) => {
+                self.resumable_scheduled_wait(&fresh, &request.id, checkpoint)
+                    .await
+            }
             None => Ok(Err("attempt changed before resumption")),
         };
         let (plan, attempt) = match plan {
@@ -3352,6 +3386,7 @@ impl Server {
             spawn_ctx,
             reserved_permit,
             Some(plan),
+            false,
         )
         .await;
         Ok(Some(Some(attempt_id)))
@@ -3405,6 +3440,7 @@ impl Server {
             spawn,
             Some(permit),
             None,
+            false,
         )
         .await;
         Ok(true)
@@ -3676,6 +3712,7 @@ impl Server {
         spawn: SpawnContext,
         reserved_permit: Option<OwnedSemaphorePermit>,
         resume: Option<crate::session::wait_resume::ResumableWait>,
+        private_schedule: bool,
     ) {
         let agent_name = agent.name.clone();
         let agent_identity = self.agent_index.find_by_name(&agent_name);
@@ -3761,6 +3798,7 @@ impl Server {
             RunningTurn {
                 attempt: attempt.clone(),
                 cancel: cancel.clone(),
+                agent_db_id: agent_identity.as_ref().map(|agent| agent.db_id.to_string()),
             },
         );
         // Re-read after registration so an event between the durable start
@@ -3788,7 +3826,10 @@ impl Server {
                 .map(|_| uuid::Uuid::new_v4().to_string());
             let (branch_started, branch_recorded) = tokio::sync::oneshot::channel::<()>();
             let mut suspended = None;
-            let work = async {
+            // This large turn future also sits inside the execution/yield
+            // selector. Keep it on the heap so nested scheduled-input storage
+            // checks fit the default Tokio stack in unoptimized builds.
+            let work = Box::pin(async {
             if let (Some((queue, agent_db_id, peer)), Some(job)) = (&projection, &projection_job) {
                 let _guard = projection_lock.lock().await;
                 let live = live_attempts.lock().await.clone();
@@ -3899,6 +3940,7 @@ impl Server {
                     .await
                 {
                     error!("Failed to write turn ack for {session_db_id}: {e}");
+                    if private_schedule { return; }
                 }
             }
 
@@ -3933,7 +3975,7 @@ impl Server {
             };
             let tool_ctx = ToolContext {
                 agent_name: agent_name.clone(),
-                agent_identity,
+                agent_identity: agent_identity.clone(),
                 turn_request_id: Some(attempt.request_id.clone()),
                 tool_call_key: None,
                 turn_attempt: Some(crate::tool::ToolAttemptIdentity {
@@ -3988,6 +4030,10 @@ impl Server {
                         return;
                     }
                     let mut s = session.lock().await;
+                    if let Err(error) = s.finish_scheduled_inputs(&attempt.attempt_id).await {
+                        error!(%error, "Scheduled context-refusal cleanup failed; attempt held");
+                        return;
+                    }
                     if let Err(error) = s.complete_turn_attempt(&attempt, Some(SessionEntry {
                         sender: agent_name.clone(), content: format!("Error: {error}"), timestamp: Utc::now(),
                         entry_type: EntryType::Error, metadata: None, routing: None,
@@ -4051,6 +4097,10 @@ impl Server {
                         return;
                     }
                     let mut s = session.lock().await;
+                    if let Err(error) = s.finish_scheduled_inputs(&attempt.attempt_id).await {
+                        error!(%error, "Scheduled context-refusal cleanup failed; attempt held");
+                        return;
+                    }
                     if let Err(error) = s.complete_turn_attempt(&attempt, Some(SessionEntry {
                         sender: agent_name.clone(), content: format!("Error: {error}"), timestamp: Utc::now(),
                         entry_type: EntryType::Error, metadata: None, routing: None,
@@ -4059,8 +4109,7 @@ impl Server {
                 }
             };
             // Per-agent override > session pin > Worker spawn override >
-            // agent default. See `run_schedule_turn` for the matching path on
-            // scheduled fires.
+            // agent default. Targeted schedules use this same runner.
             let effective_model = session_model.or(worker_model).or(default_model);
 
             if assembled.truncated {
@@ -4082,8 +4131,12 @@ impl Server {
                     // A resumed attempt appends after its own persisted records.
                     next_sequence: resume.as_ref().map_or(0, |plan| plan.next_sequence),
                     explicit_bridge_send: resume.as_ref().is_some_and(|plan| plan.runtime.matrix_send_queued),
-                    context_snapshot,
-                    can_suspend: spawn.completion_tx.is_none(),
+                    // A private standalone request has no generic restart
+                    // or snapshot authority. Active Pinned input uses the
+                    // ordinary turn's paired exact-wait reconstruction.
+                    context_snapshot: if private_schedule { None } else { context_snapshot },
+                    can_suspend: !private_schedule && spawn.completion_tx.is_none(),
+                    scheduled: agent_identity.clone().map(|agent| Box::new(scheduled_input::ScheduledInputs::new(server.clone(), agent)) as _),
                     #[cfg(test)]
                     fail_after: Some(transcript_fail_after),
                 },
@@ -4150,6 +4203,10 @@ impl Server {
                     // still uses the unchanged original observation deadline.
                     deadline: wait.deadline.min(wait.checkpointed_at + chrono::Duration::seconds(wait.policy_timeout_seconds as i64)),
                 });
+                return;
+            }
+            if let Err(error) = recorder.finish_scheduled_inputs().await {
+                error!(%error, session_db_id, "Scheduled cleanup failed before settlement; attempt remains interrupted");
                 return;
             }
             let mut s = session.lock().await;
@@ -4274,6 +4331,10 @@ impl Server {
                     }
                 }
             }
+            if let Some(server) = server.upgrade()
+                && let Err(error) = server.project_scheduled_attempt(&s, &attempt.attempt_id).await {
+                error!(%error, session_db_id, "Session result committed but schedule projection held; reconciliation required");
+            }
             drop(s);
             if let (Some((queue, agent_db_id, peer)), Some(job)) = (&projection, &projection_job) {
                 let _guard = projection_lock.lock().await;
@@ -4282,7 +4343,8 @@ impl Server {
                     error!(%error, session_db_id, "Session result committed but job projection failed; reconciliation required");
                 }
             }
-            };
+            });
+            let execution = async {
             if let Some(id) = &branch_id {
                 let projection_watch = async {
                     let (Some((queue, agent_db_id, peer)), Some(job)) = (&projection, &projection_job) else {
@@ -4319,6 +4381,10 @@ impl Server {
                     () = work => {},
                 }
             } else { work.await; }
+            };
+            if futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(execution)).await.is_err() {
+                error!(session_db_id, attempt_id = %attempt.attempt_id, "Turn panicked; retaining uncertain attempt and releasing local capacity");
+            }
 
             // The work future (and its Session, context and recorder) is
             // gone. A wait descriptor, not this turn task, keeps ordering.
@@ -4363,6 +4429,8 @@ impl Drop for ActivityHeartbeat {
 mod exposed_sessions_tests;
 #[cfg(test)]
 mod hosted_restart_tests;
+#[cfg(test)]
+mod schedule_tests;
 #[cfg(test)]
 mod telemetry_tests;
 #[cfg(test)]

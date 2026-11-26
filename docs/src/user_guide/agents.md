@@ -340,18 +340,19 @@ Older configs used a top-level `roles:` block and an `agent.role:` reference. Th
 
 Each Agent DB contains the following well-known stores:
 
-| Store            | Kind                         | Contents                                                                                         |
-| ---------------- | ---------------------------- | ------------------------------------------------------------------------------------------------ |
-| `config`         | DocStore                     | One atomic `AgentDbConfig` record: settings and individual prompt sources                        |
-| `memory`         | `Table<MemoryEntry>`         | The agent's own persistent key-value facts (written by `remember`, read by `recall`)             |
-| `meta`           | DocStore                     | Atomic display metadata record; separate `kind`, `display_name` and `home_pubkey` markers        |
-| `history`        | `Table<SessionHistoryEntry>` | Sessions this agent has participated in (appended on attach)                                     |
-| `memory_banks`   | `Table<MemoryBankRef>`       | Refs to shared memory banks this agent has been granted access to (name, db_id, permission)      |
-| `schedules`      | `Table<Schedule>`            | Agent-owned cron, interval, and one-shot wakes — see [Schedules](#schedules) below               |
-| `schedule_fires` | `Table<...>`                 | Per-fire records (cost, errors) for schedules — used by the standalone fire path for attribution |
-| `skills`         | `Table<Skill>`               | Agent-local skills (prompt fragments) attached as private context                                |
-| `skill_banks`    | `Table<SkillBankRef>`        | Refs to shared skill banks this agent has been granted access to                                 |
-| `providers`      | `Table<ProviderRef>`         | Known Provider roots and routing hints; metadata only, no grants or session attachments          |
+| Store                 | Kind                         | Contents                                                                                    |
+| --------------------- | ---------------------------- | ------------------------------------------------------------------------------------------- |
+| `config`              | DocStore                     | One atomic `AgentDbConfig` record: settings and individual prompt sources                   |
+| `memory`              | `Table<MemoryEntry>`         | The agent's own persistent key-value facts (written by `remember`, read by `recall`)        |
+| `meta`                | DocStore                     | Atomic display metadata record; separate `kind`, `display_name` and `home_pubkey` markers   |
+| `history`             | `Table<SessionHistoryEntry>` | Sessions this agent has participated in (appended on attach)                                |
+| `memory_banks`        | `Table<MemoryBankRef>`       | Refs to shared memory banks this agent has been granted access to (name, db_id, permission) |
+| `schedules`           | `Table<Schedule>`            | Agent-owned cron, interval, and one-shot wakes — see [Schedules](#schedules) below          |
+| `scheduling_executor` | `Table<ExecutorRef>`         | Stable reference to the owned Executor DB holding operational scheduling state              |
+| `schedule_fires`      | `Table<ScheduleFire>`        | Legacy fire records only; new handoffs go to the selected Executor DB                       |
+| `skills`              | `Table<Skill>`               | Agent-local skills (prompt fragments) attached as private context                           |
+| `skill_banks`         | `Table<SkillBankRef>`        | Refs to shared skill banks this agent has been granted access to                            |
+| `providers`           | `Table<ProviderRef>`         | Known Provider roots and routing hints; metadata only, no grants or session attachments     |
 
 The peer maintains two **in-memory** indices (`hosted_index::HostedIndex`) — one for Living Agents and one for standalone Memory Bank DBs — built once at startup by walking eidetica's `user.databases()` and reading each DB's `meta.kind` marker (`agent` / `bank` / `session`, written at creation time). Both indices map `db_id ↔ display_name ↔ pubkey`. They exist because eidetica has no inverse "list DBs this key can access" query, and routing reads them on every session entry. Mutations from `/agent new`, `/memory new`, `/agent delete`, etc. update the cache directly. There is no persistent mirror — eidetica's key store is the single source of truth for "which DBs does this peer host."
 
@@ -492,7 +493,7 @@ Resolution order on every turn:
 3. Agent's own `default_model` from its DB config
 4. Backend default
 
-The same chain runs whether the agent turn was kicked off by a human message, an `@mention` chain, or a scheduled fire — `run_schedule_turn` and `spawn_agent_task` both resolve through `SessionMeta::resolve_model_for_agent(name)`. The Matrix bridge's legacy `!chaz` direct-chat path doesn't run through the agent runtime and so isn't agent-scoped; live Matrix agent turns are.
+The same chain runs whether the agent turn was kicked off by a human message, an `@mention` chain, or a scheduled fire — the common runner resolves through `SessionMeta::resolve_model_for_agent(name)`. The Matrix bridge's legacy `!chaz` direct-chat path doesn't run through the agent runtime and so isn't agent-scoped; live Matrix agent turns are.
 
 ### `/agent` commands
 
@@ -683,7 +684,7 @@ pointer that silently re-routes turns.
 
 A schedule belongs to an Agent and lives in that Agent's DB, not in a session. It syncs with the Agent's other state. Only the Agent's home daemon executes it: Fresh schedules use the Agent-level home, while Pinned schedules use that Agent's home for the target session. Other daemons may load the same synced row, but the home-peer check makes them skip it. There is no distributed lock or automatic failover; use `/agent rehost --agent` for Fresh schedules or `/agent rehost` in the pinned session when the home daemon changes.
 
-The home daemon's `RoutineEngine` sleeps until a schedule is due, then runs the owning Agent directly. The schedule prompt is private input for that turn. It is not written as a broadcast `Directive`, and the normal "which Agent responds?" routing step does not run because the schedule already names its owner.
+The home daemon's `RoutineEngine` sleeps until a schedule is due, then hands private input to the owning Agent through the ordinary turn runner. The schedule prompt is private input for that turn. It is not written as a broadcast `Directive`, and the normal "which Agent responds?" routing step does not run because the schedule already names its owner.
 
 Each schedule has a **target**: `Pinned` (fire into a specific existing session) or `Fresh` (create a new session per fire — an autonomous recurring task). Three trigger shapes:
 
@@ -696,7 +697,7 @@ Each schedule has a **target**: `Pinned` (fire into a specific existing session)
 - `max_fires` — retire after N fires. `cron` hourly + `max_fires: 8` = "wake hourly for 8 hours".
 - `expires_at` — an RFC 3339 instant after which it stops.
 
-Whichever is hit first retires the schedule. The fire path writes `enabled = false` and `fire_count` to the Agent DB, so the count survives restarts and reloads do not revive a retired row. It reserves a `max_fires` slot before the turn starts; overlapping turns therefore cannot exceed the cap. A failed turn refunds its slot, so the count records successful fires rather than attempts. Retired schedules stay in the DB as disabled rows, and `schedule_list` shows their bounds and `[fired N×]` count.
+Whichever is hit first retires the schedule. The selected owned Executor DB holds counts, reservations and retirement; the Agent DB holds definitions and the storage reference, with no per-fire updates. A slot is reserved before Fresh session creation. `max_fires` bounds the preserved legacy baseline plus successful logical fires and outstanding reservations. Fresh success requires a durable successful terminal turn; Pinned success requires Included, even if the containing turn later fails. Known-unused input or a known failed Fresh turn releases its reservation once, without erasing handoff history or rearming a consumed one-shot. Uncertain outcomes keep capacity reserved. A busy target or full runtime capacity leaves committed input pending; it is not a failed fire. `schedule_list` shows effective enablement, bounds and `[capacity used: N]` (legacy count, successful occurrences, and outstanding reservations). It does not show private wake text. Raising a bound can make a schedule eligible again without rewriting its operational count.
 
 A schedule whose `Pinned` session is gone, or whose owning agent is no longer a member, self-skips at fire time (logged, not errored) — there is no detach/delete sweep.
 
@@ -707,6 +708,109 @@ To publish, use a Pinned schedule targeting an attached session and instruct
 its owner to call `matrix__send`; its normal final remains local. Fresh
 schedules have no room binding. See the [migration walkthrough](matrix.md#migration-schedules-no-longer-auto-post-finals).
 
+### Dispatch is not completion
+
+The timer finishes when its input is durably handed off, before Started or any model call. Its handoff record links to an inert Session request through a small `Ack` entry; delivery later binds the real attempt. That entry contains timer identity only: it is not a queued instruction, model context or a retryable private prompt. Tool calls/results, final status and usage are recorded in the Session, not on the Agent or in the timer log.
+
+| Boundary                                    | On a required recording failure                                                            |
+| ------------------------------------------- | ------------------------------------------------------------------------------------------ |
+| Reserve a slot or start the Session attempt | Stop before model/tool work; do not report a successful timer firing                       |
+| Commit the Executor handoff                 | Stop before execution; an unacknowledged commit is uncertain, not safe to refund or replay |
+| Record a model response or tool result      | Stop before the next tool/model step; an effect may already have happened                  |
+| Commit the final result                     | Keep the accepted fire and existing Session evidence; do not replay or claim completion    |
+
+One-shots are reserved too. A pending reservation survives restart and appears as **held: dispatch outcome uncertain; no automatic replay**. Accepted one-shots disappear from ordinary inventory, but their physical definitions remain so config bootstrap cannot recreate them. Re-adding a consumed ID, or removing and recreating a definition, creates a new lifetime and is new work, not continuation of the old attempt. `schedule_modify` and `/schedule modify` reject consumed one-shots; use the corresponding add operation to create new work.
+
+The owning executor pins one owned Executor DB. Rehosting or adding another peer's Executor does not select a fresh counter ledger. An unreadable selected DB holds work instead of starting with empty state. Legacy counts and fire rows remain readable without rewriting history.
+
+Before enabling the new executor, back up the Agent, Session and selected Executor data and upgrade all peers that read or write schedules. On startup the Agent's home executor versions legacy definitions in place, preserving triggers, enablement, expiry, `max_fires` and accounting. A legacy one-shot already due at migration is held: its old records cannot prove whether it ran. `/schedule list` reports that hold without showing wake text. The original definition is still present; don't delete and recreate it as a way to resolve the old outcome. An old executor ignores the new handoff and input receipts, so rolling back the binary alone is not a safe data rollback. Quiesce scheduling and keep a compatible reader for the existing records.
+
+Do not run old and new scheduler writers concurrently or assume a writer rollback preserves the new bounds: old writers do not consult this ledger. Rollout/version coordination is separate from schedule configuration. Private wake prompts remain invocation input; Chaz does not copy them into the Ack, transcript inputs, telemetry or handoff records. Model/tool outputs are still ordinary execution history.
+
+If Pinned input arrives after the active turn has closed input, it waits for an
+idle invocation instead; the containing human turn is not restarted. Once input
+is bound, an uncertain receipt is held rather than silently moved to another turn.
+Included private input can survive an executor restart only through the containing
+turn's [checkpointed `job_wait`](#resuming-a-checkpointed-wait-after-restart), with the same attempt,
+paired history and current Agent authority. Rebuilding accounting observations
+may delay that continuation. It does not authorize replay of earlier tools or
+recovery of a model request whose response was never recorded.
+
+### Missed windows and catch-up
+
+A **missed window** is time the schedule was due while its home daemon was not running. It is not the same as a slow turn, a busy session, or the few milliseconds a running timer may be late: a slot that falls due while the engine is running is delivered once, however late. Chaz decides "missed" from the durable clock in the Executor DB plus the engine's own start time, not from a lateness threshold. If the next slot the clock recorded was already due before this daemon started, the whole gap up to now is one missed window.
+
+| `catch_up`                          | On restart after a missed window                                                                                                                                                                                      |
+| ----------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `false` (default for new schedules) | Record the window and move the clock to the next live slot. No occurrence, reservation, Session input or model call. An interval restarts its fixed delay from the restart.                                           |
+| `true`                              | Run **one** catch-up fire for the whole window, then continue from the first slot after it. The other missed slots are coalesced into that fire, never replayed as a burst. `expires_at` and `max_fires` still apply. |
+| absent on a migrated legacy row     | Legacy intervals keep their old one overdue fire (`true`); legacy cron stays `false`. Setting `catch_up` explicitly overrides this.                                                                                   |
+
+Set it with `catch_up` on `schedule_add` or `schedule_modify`. Changing it is a definition edit, like changing the trigger. `schedule_list` and `/schedule list` show `[catch-up on]` and a prompt-free summary such as `[missed: 10 slot(s) in 1 window(s); latest 2026-11-06 12:10:00Z skipped]`. If the Executor DB cannot be read the listing says `[missed windows unknown]` rather than implying nothing was missed. Very large cron windows are counted up to 1024 slots and shown as `at least N`.
+
+What catch-up does **not** do:
+
+- It never retries or replays an occurrence that was already prepared or handed off. A slot with an existing occurrence is not a missed trigger; its outcome follows [Dispatch is not completion](#dispatch-is-not-completion).
+- It does not change failed or interrupted turns. They have separate recovery rules.
+- It needs the clock to have recorded a slot. A schedule that has never handed off a fire has no durable slot yet. A never-fired cron schedule simply waits for its next tick after restart, and a never-fired one-shot whose `fire_at` passed while down still fires once on the next start.
+- A non-home daemon never records or skips another peer's window.
+
+#### Walkthrough: downtime with and without catch-up
+
+1. The agent adds a five-minute Fresh check with the default policy:
+
+   ```json
+   {
+     "id": "check",
+     "interval_seconds": 300,
+     "target": "fresh",
+     "task": "Check the queue."
+   }
+   ```
+
+   It fires at 12:05 and the clock records its next slot, 12:10.
+
+2. **Failure path: chaz is down from 12:07 to 12:31.** On restart the 12:10 slot is already due, so it is a missed window. With `catch_up` off, nothing runs and the listing shows:
+
+   ```text
+   - **check** [every 300s] [missed: 5 slot(s) in 1 window(s); latest 2026-11-06 12:30:00Z skipped] → fresh
+   ```
+
+   The next fire is 12:36, five minutes after the restart. No Fresh session or model call was made for the gap.
+
+3. **Opt in and repeat.** `schedule_modify` with `{"id": "check", "catch_up": true}` turns catch-up on. After its first fire, another outage that covers several slots selects one catch-up delivery. The listing says `catch-up selected`; check the Session to see whether the turn completed. If `expires_at` passed during the outage, nothing runs; the bound wins.
+
+### Interruption recovery
+
+`interruption_retries` on `schedule_add` or `schedule_modify` defaults to `0`:
+inspect an interrupted attempt rather than replay it. A positive value is a
+retry limit per occurrence. The executor records each retry before it can run;
+restarting or issuing an explicit failure retry does not replenish the limit.
+Enable this only for work that can safely run again. A prior model request,
+tool call, or external effect may have happened even when no result was saved.
+
+Recovery needs an exact Started attempt from an earlier executor generation on
+the same home peer. A missing record or changed home is not enough. Recorded
+failures still require `/schedule retry`, and a recorded stop prevents automatic
+retry. Chaz does not use this path for an attempt with a `job_wait` checkpoint;
+only the ordinary exact-wait logic can resume that attempt. Fresh retries use
+the same session. Pinned retries send just the private schedule input, never
+the containing human turn. Keep one executor for the session; the home key
+doesn't elect an executor or fence competing runtimes.
+
+#### Walkthrough: allow one restart retry
+
+1. Add a Fresh interval with `"interruption_retries": 1` and a task whose
+   effects are safe to repeat. `schedule_list` includes `[restart retry limit: 1]`.
+2. Stop the executor abruptly after it records Started but before the turn
+   records completion. Restart the same home executor. It can record one
+   new delivery in the existing session. The log says
+   `Allocated opted-in schedule recovery; prior effects may repeat`.
+3. If that retry is interrupted too, restarting again leaves it held. The
+   recorded ordinal is already at the limit. A recorded stop or terminal
+   failure also prevents another automatic retry; inspect the original and
+   retry attempt records before doing any more work.
+
 ### Entry points
 
 Routines are created two ways, both compiling to the same `Routine` rows fired by the one engine:
@@ -716,9 +820,9 @@ Routines are created two ways, both compiling to the same `Routine` rows fired b
 
 ### When rules fire
 
-Firing is **server-side and independent of any UI**. A rule fires whenever chaz is running and the session is registered — you do _not_ need the session open or focused in the TUI, and for Matrix no one needs to be in the room. The agent turn runs on the server regardless; a bridge only affects when you _see_ the result. (Agent-owned schedules use the standalone fire path described above — no `Directive` entry is written, the schedule's `prompt` is passed as invocation-scoped input. Static-config session routines still write a `Directive` into their target session.)
+Firing is **server-side and independent of any UI**. A rule fires whenever chaz is running and the session is registered — you do _not_ need the session open or focused in the TUI, and for Matrix no one needs to be in the room. The agent turn runs on the server regardless; a bridge only affects when you _see_ the result. (Agent-owned schedules use the common runner with private reference-only input — no broadcast `Directive` is written.)
 
-- **chaz must be running.** The engine is one per-process task, not a system cron. While chaz is down nothing fires. A missed cron tick is skipped; an interval resumes from its last successful-dispatch anchor, so if its period elapsed during downtime it fires immediately on restart. A one-shot whose `fire_at` passed while down fires once on the next start.
+- **chaz must be running.** The engine is one per-process task, not a system cron. While chaz is down nothing fires. What happens to slots that fell due during downtime is the schedule's `catch_up` policy; see [Missed windows and catch-up](#missed-windows-and-catch-up).
 - **The session must still be registered.** Closing/deregistering a session prunes its routines from the engine, so a closed session stops firing.
 - **The home daemon must be running and host the Agent.** A non-home daemon skips the fire. Rehost the Agent or pinned session explicitly if ownership moves.
 - **Changes are live.** `/schedule add|remove`, `schedule_modify`, and `schedule_once` take effect on the running engine immediately — no restart needed.
@@ -735,6 +839,7 @@ Cron uses 6 fields: `sec min hour day_of_month month day_of_week`. Intervals use
 | `/schedule modify <id> cron <6 fields> [agent_ref]`                           | Replace a rule's trigger with a cron expression.                                                                                   |
 | `/schedule modify <id> interval <seconds> [agent_ref]`                        | Replace a rule's trigger with a fixed-delay interval.                                                                              |
 | `/schedule remove <id>`                                                       | Remove a rule by id.                                                                                                               |
+| `/schedule retry <occurrence> <delivery> <attempt> [agent]`                   | In the affected session on the executor, retry an exact failed or unused delivery. This may repeat effects.                        |
 
 To create a one-shot rule from the TUI, agents call the `schedule_once` tool. There's no slash-command form yet.
 
@@ -753,7 +858,7 @@ Example — make `researcher` check the current session five minutes after each 
 ### Walkthrough: interval wake, failure, and recovery
 
 This example uses a 60-second Fresh interval owned by `watcher`, capped at
-three successful fires. It starts with the `schedule_add` tool.
+three successful logical fires. It starts with the `schedule_add` tool.
 
 1. **Happy path — create and first fire.** The agent calls `schedule_add`:
 
@@ -779,33 +884,52 @@ three successful fires. It starts with the `schedule_add` tool.
 
    ```text
    Schedules on 'watcher':
-   - **watcher** [every 60s] (max 3 fires) [fired 1×] → fresh — Check the deploy queue and report only actionable changes
+   - **watcher** [every 60s] (max 3 fires) [capacity used: 1] → fresh
    ```
 
-2. **Failure and retry.** If the backend is unavailable, the failed turn is
-   recorded without usage metadata. Its `max_fires` slot is refunded, so the
-   count stays at one and the interval tries again after the next period:
+2. **Execution failure.** If the second accepted fire reaches an unavailable
+   backend, the Session records the error. The timer already handed off the
+   work. A known failed Fresh turn releases its success-capacity reservation;
+   handoff history stays intact. The next interval is a new occurrence, not a
+   replay of the failed turn. After settlement the listing remains at one used slot:
 
    ```text
    Schedules on 'watcher':
-   - **watcher** [every 60s] (max 3 fires) [fired 1×] → fresh — Check the deploy queue and report only actionable changes
+   - **watcher** [every 60s] (max 3 fires) [capacity used: 1] → fresh
    ```
 
    A prompt or target edit can also invalidate a detached fire before its
-   turn starts. In that case chaz closes the newly created Fresh session and
-   runs the edited schedule on its next due fire.
+   turn starts. Its old private reference cannot run under the new revision;
+   retained inert preparation is not permission to create a replacement root.
 
-3. **Retirement and recovery — the cap is reached.** Fires 2 and 3
-   succeed. The third admission spends the last slot, so the row retires
-   on the spot (`Schedule retired after fire (reached max_fires (3))` in
-   the server log):
+3. **Retry deliberately.** The executor's `Scheduled delivery did not succeed`
+   log has the `occurrence_id`, `delivery_id`, and `attempt_id`, without the
+   wake text. Open that Fresh session, inspect the failed attempt for partial
+   effects, then run `/schedule retry <occurrence_id> <delivery_id> <attempt_id> watcher`.
+   A successful command records a new delivery for the same occurrence and
+   session, not a new timer fire. The reply reads:
+
+   ```text
+   Retry delivery <delivery ID> recorded. This does not confirm execution; the prior attempt may already have had effects.
+   ```
+
+   If the reply is lost, repeat the same command. It returns the same delivery
+   instead of creating a second retry. If another fire took the last slot, the
+   reply is `Schedule retry refused: schedule is retired or has no retry capacity`.
+   For Pinned schedules, the retry sends only the schedule input. An Included
+   input does not qualify even if the containing turn failed. `/retry` is for
+   ordinary interrupted requests, not schedule Acks.
+
+4. **Retirement — the cap is reached.** After two further
+   successful Fresh occurrences, the third successful logical fire uses the last slot, so the effective listing is disabled even while
+   that execution is still running:
 
    ```text
    Schedules on 'watcher':
-   - **watcher** [every 60s] (disabled) (max 3 fires) [fired 3×] → fresh — Check the deploy queue and report only actionable changes
+   - **watcher** [every 60s] (disabled) (max 3 fires) [capacity used: 3] → fresh
    ```
 
-   The retired row is kept for audit, not deleted. To put the watcher
+   The definition and operational evidence are kept, not deleted. To put the watcher
    back on duty with a fresh budget, raise the bound and re-enable it —
    changes take effect on the running engine immediately:
 
@@ -817,7 +941,7 @@ three successful fires. It starts with the `schedule_add` tool.
    Modified schedule 'watcher' on 'watcher': enabled=true max_fires=6
    ```
 
-4. **Disable or remove it.** Disable a schedule without deleting its row,
+5. **Disable or remove it.** Disable a schedule without deleting its row,
    or remove it completely:
 
    ```json
@@ -944,7 +1068,7 @@ For a declared `researcher` Worker:
 
 ## Joining background Workers
 
-`worker_wait` observes the exact submitted Directive's outcome, not the latest message in the child transcript. The join belongs to the invocation that created the Worker: either one recorded interactive turn or one schedule fire. Knowing the ID does not let a later turn, another fire, or another Agent join it. Both tools must be available in the Agent's scope. A scheduled fire cannot obtain interactive tool approval and does not take over the routing of a pinned chat.
+`worker_wait` observes the exact submitted Directive's outcome, not the latest message in the child transcript. The join belongs to the recorded attempt that created the Worker. A Pinned input delivered to a running turn uses that turn's attempt. Knowing the ID does not let a different attempt or Agent join it. Both tools must be available in the Agent's scope. A wake that starts its own scheduled turn cannot obtain interactive tool approval and does not take over the routing of a pinned chat.
 
 1. Call `spawn_worker` with `{"name":"researcher","task":"Find the canonical reference","async":true}`. Save the child DB ID and submit any other independent Workers before waiting.
 2. Pass that ID to `worker_wait`, for example `{"session_db_id":"<child DB ID>","timeout_seconds":30}`. The parent yields its slot if it holds one. A successful response is `{"result":"Canonical reference found","state":"completed"}`.
@@ -960,14 +1084,14 @@ A parent that is only waiting on a child job has nothing ambiguous in flight: ob
 
 Everything else stays held. A start with no checkpoint, a wait whose observation finished or result was already recorded, a transcript with any gap or mismatch, or an unknown checkpoint version is left `Interrupted` for an explicit `/retry`, as before. The checkpoint is written only when the turn's state can be restored exactly, so these waits are never checkpointed and never resume:
 
-| Condition at the wait                                       | Checkpointed |
-| ----------------------------------------------------------- | ------------ |
-| `job_wait` is the last call in its model response           | yes          |
-| `job_wait` is followed by another call in the same response | no           |
-| the turn chose **Approve all** earlier                      | no           |
-| an extension injected messages before the turn started      | no           |
-| invalid `job_wait` arguments                                | no           |
-| a frontend-only or scheduled turn with no durable attempt   | no           |
+| Condition at the wait                                                                | Checkpointed |
+| ------------------------------------------------------------------------------------ | ------------ |
+| `job_wait` is the last call in its model response                                    | yes          |
+| `job_wait` is followed by another call in the same response                          | no           |
+| the turn chose **Approve all** earlier                                               | no           |
+| an extension injected messages before the turn started                               | no           |
+| invalid `job_wait` arguments                                                         | no           |
+| a frontend-only turn or a scheduled-only attempt without a recorded context snapshot | no           |
 
 After observation, the checkpoint is retired before result hooks run. If the process stops during a hook or result commit, the attempt stays held even without a recorded result; a hook may already have had effects.
 
@@ -995,7 +1119,7 @@ A checkpointed `job_wait` can suspend inside the running executor too. The paren
 
 | Wait state                                                                                                                       | In-process behavior                                                           |
 | -------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------- |
-| Restorable final `job_wait`, child pending                                                                                       | Unload; keep a small wait descriptor and session reservation                  |
+| Restorable final `job_wait`, including paired ordinary/private scheduled input, child pending                                    | Unload; keep a small wait descriptor and session reservation                  |
 | Child already finished, or finishes during registration                                                                          | Recheck persisted state and readmit the same wait                             |
 | Missing or duplicate child notifications                                                                                         | Periodic reconciliation; no second advancement                                |
 | Observation or policy deadline expires                                                                                           | Readmit under the original deadlines, not a fresh timeout                     |
@@ -1012,6 +1136,16 @@ For example:
 4. If you use `/stop` while the parent is unloaded, the session records `Stopped: the turn was cancelled at the user's request.` No model, tool or hook resumes to produce that stop. A late child result does not revive the parent.
 
 Restart behavior is unchanged: only an unretired exact checkpoint may continue; all uncertain effects stay held for explicit handling. Suspension creates no new persisted schema, cross-peer pickup permission or fencing guarantee.
+
+A private scheduled input does not require a loaded parent if its input and
+model response are durably paired. The input stays private to the original Agent
+and attempt, including while waiting for accounting reconstruction. That wait
+holds no execution slot and does not restart the containing human turn.
+For example, if a scheduled input joins a turn that has already written a report:
+
+1. The turn calls `job_wait` with `{"session_db_id":"<child DB ID>","timeout_seconds":30}` and unloads.
+2. If the accounting observation is lost before the child finishes, Chaz rebuilds it from the selected ledger. The session stays reserved; a newer message waits, and the earlier report is not written again.
+3. Once the ledger is ready, the same wait returns the child's current state, for example `{"session_db_id":"<child DB ID>","state":{"Rejected":{"message":"child withdrawn"}}}`, under the original deadline. Missing private revisions, revoked membership or an unpaired model request remain held instead of replaying effects.
 
 ## Parallel executions of one job
 
@@ -1137,7 +1271,7 @@ The immediate response contains `session_db_id`, not the answer. Observe it with
 /schedule add brief 0 0 9 * * Mon-Fri researcher Summarise overnight activity
 ```
 
-The schedule is stored in `researcher`'s DB. Every peer hosting `researcher` runs its own copy (sleep-until-next, no polling). When it fires, the standalone path runs `researcher`'s turn directly with the prompt as invocation input — no `Directive` is written — whether or not anyone is watching the session.
+The schedule is stored in `researcher`'s DB. Every peer hosting `researcher` runs its own copy (sleep-until-next, no polling). When it fires, the home daemon hands private input to the exact `researcher` through the common runner — no `Directive` is written. An ordinary Pinned target must still be registered; an active turn for another Agent is not a substitute target.
 
 ### 7. Share the agent with another peer (co-ownership)
 
@@ -1199,7 +1333,7 @@ History is append-only; detach does not erase it.
 
 A single agent DB can be hosted by several peers simultaneously. Each peer holds its _own_ keypair — `/pubkey` + `/agent invite` is the handshake that pre-authorises a second peer's pubkey on the DB before the ticket ever moves. The keys never sync; only DB entries do.
 
-Each peer keeps its own row in its local `agents` index; eidetica sync replicates every store on the agent DB (`config`, `memory`, `meta`, `history`, `memory_banks`, `schedules`, `schedule_fires`, `skills`, `skill_banks`) between peers. Session `AuthSettings` lists each peer's pubkey separately, so routing treats them as distinct authorised writers — but only the **home peer** (see [Execution ownership](#execution-ownership-home-peer)) actually runs the turn, preventing the multi-peer race.
+Each peer keeps its own row in its local `agents` index; eidetica sync replicates every store on the agent DB (`config`, `memory`, `meta`, `history`, `memory_banks`, schedule definitions/storage references, legacy `schedule_fires`, `skills`, `skill_banks`) between peers. Session `AuthSettings` lists each peer's pubkey separately, so routing treats them as distinct authorised writers — but only the **home peer** (see [Execution ownership](#execution-ownership-home-peer)) actually runs the turn, preventing the multi-peer race.
 
 ```mermaid
 graph LR

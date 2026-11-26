@@ -69,6 +69,76 @@ pub(crate) async fn require_session_participant(
     Ok(())
 }
 
+/// Check the schedule's exact Agent membership and home from one Session
+/// snapshot. A retained delegation alone is not membership: detach revokes
+/// the direct attachment key, not the delegated tree.
+pub(crate) async fn require_schedule_member(
+    session: &Database,
+    agent: &Database,
+    entry: &DbEntry,
+) -> anyhow::Result<()> {
+    use eidetica::auth::{crypto::PublicKey, types::KeyStatus};
+    anyhow::ensure!(
+        agent.root_id() == &entry.db_id,
+        "schedule membership Agent differs"
+    );
+    let snapshot = session.snapshot().await?;
+    let meta = super::try_read_meta_at(session, &snapshot).await?;
+    let id = entry.db_id.to_string();
+    let mut matching = meta.agents.iter().filter(|member| member.db_id == id);
+    let member = matching
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("scheduled target membership changed"))?;
+    anyhow::ensure!(matching.next().is_none(), "conflicting schedule membership");
+    if let Some(home) = &member.home_pubkey {
+        anyhow::ensure!(
+            PublicKey::from_prefixed_string(home)? == entry.pubkey,
+            "scheduled target home changed"
+        );
+    }
+    let txn = session.new_transaction_at(&snapshot).await?;
+    let auth = txn.get_settings()?.auth_snapshot().await?;
+    let keys = auth.get_all_keys()?;
+    let active_writer = |key: &AuthKey| {
+        matches!(key.status(), KeyStatus::Active)
+            && matches!(key.permissions(), Permission::Write(_))
+    };
+    match auth.get_key_by_pubkey(&entry.pubkey) {
+        Ok(key) => {
+            anyhow::ensure!(
+                active_writer(&key),
+                "scheduled Agent membership key revoked or narrowed"
+            );
+            return Ok(());
+        }
+        Err(eidetica::Error::Auth(error))
+            if matches!(
+                error.as_ref(),
+                eidetica::auth::errors::AuthError::KeyNotFound { .. }
+            ) => {}
+        Err(error) => return Err(error.into()),
+    }
+    // A bridge may have attached this Agent with a different member key.
+    // Require a direct active Session attachment from that exact Agent's
+    // current keys as well as the link to its delegated root.
+    let delegation = auth.get_delegated_tree(&entry.db_id)?;
+    let agent_auth = agent.get_settings().await?.auth_snapshot().await?;
+    let agent_keys = agent_auth.get_all_keys()?;
+    anyhow::ensure!(
+        delegation.permission_bounds.max.can_write()
+            && keys.iter().any(|(id, key)| {
+                active_writer(key)
+                    && key.name().is_some_and(|name| name.starts_with("agent:"))
+                    && agent_keys.get(id).is_some_and(|source| {
+                        matches!(source.status(), KeyStatus::Active)
+                            && source.permissions().can_write()
+                    })
+            }),
+        "scheduled target has no active attachment from this Agent"
+    );
+    Ok(())
+}
+
 impl SessionRegistry {
     /// Ensure `agent` is attached to the session and is its host. Called by
     /// a bridge when a fresh room maps to this session: a login belongs to

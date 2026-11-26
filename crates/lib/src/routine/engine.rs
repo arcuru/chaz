@@ -19,9 +19,9 @@
 
 use super::types::{
     AGENT_SCHEDULE_EXTENSION, AgentSchedulePayload, Routine, RoutineId, RoutineScope,
-    RoutineTarget, Trigger, next_interval_fire,
+    RoutineTarget, ScheduleClock, Trigger, next_interval_fire,
 };
-use crate::agent_db::AgentDb;
+use crate::agent_db::{AgentDb, DueSlot};
 use crate::extension::ExtensionHub;
 use chrono::{DateTime, Utc};
 use cron::Schedule as CronSchedule;
@@ -68,6 +68,13 @@ struct RoutineEntry {
     /// complete only against the same incarnation, never a later routine
     /// which reused its id.
     incarnation: u64,
+    /// Agent definition lifetime/revision, not operational projections. A
+    /// remove/recreate with identical text is still a new authorizing source.
+    schedule_identity: Option<(String, String)>,
+    clock: Option<ScheduleClock>,
+    // Set only after the handler reads the exact committed durable handoff.
+    clock_successor: Option<Option<DueSlot>>,
+    clock_persisted: bool,
 }
 
 /// Mutable engine state guarded by a single mutex. Heap and routine
@@ -132,6 +139,12 @@ pub struct RoutineEngine {
     /// builds always pass a real hub.
     hub: Option<Arc<ExtensionHub>>,
     stopped: AtomicBool,
+    /// Engine lifecycle boundary: a persisted slot due before this instant
+    /// was missed during downtime; one due later is ordinary lateness.
+    started_at: DateTime<Utc>,
+    /// Test-only simulated process restart boundary.
+    #[cfg(test)]
+    restarted_at: std::sync::Mutex<Option<DateTime<Utc>>>,
 }
 
 impl RoutineEngine {
@@ -155,9 +168,26 @@ impl RoutineEngine {
             chaz_peer,
             hub,
             stopped: AtomicBool::new(false),
+            started_at: Utc::now(),
+            #[cfg(test)]
+            restarted_at: Default::default(),
         });
         engine.load_globals().await?;
         Ok(engine)
+    }
+
+    fn lifecycle_start(&self) -> DateTime<Utc> {
+        #[cfg(test)]
+        if let Some(at) = *self.restarted_at.lock().unwrap() {
+            return at;
+        }
+        self.started_at
+    }
+
+    /// Simulate a process restart boundary for the next agent load/reload.
+    #[cfg(test)]
+    pub(crate) fn simulate_restart_for_test(&self, at: DateTime<Utc>) {
+        *self.restarted_at.lock().unwrap() = Some(at);
     }
 
     async fn load_globals(self: &Arc<Self>) -> anyhow::Result<()> {
@@ -175,6 +205,10 @@ impl RoutineEngine {
                     scope: RoutineScope::Global,
                     next_fire: DateTime::<Utc>::MAX_UTC,
                     incarnation: 0,
+                    schedule_identity: None,
+                    clock: None,
+                    clock_successor: None,
+                    clock_persisted: false,
                 });
                 continue;
             }
@@ -186,6 +220,10 @@ impl RoutineEngine {
                         scope: RoutineScope::Global,
                         next_fire: when,
                         incarnation: 0,
+                        schedule_identity: None,
+                        clock: None,
+                        clock_successor: None,
+                        clock_persisted: false,
                     };
                     state.push(entry);
                 }
@@ -203,6 +241,10 @@ impl RoutineEngine {
                         scope: RoutineScope::Global,
                         next_fire: DateTime::<Utc>::MAX_UTC,
                         incarnation: 0,
+                        schedule_identity: None,
+                        clock: None,
+                        clock_successor: None,
+                        clock_persisted: false,
                     });
                 }
             }
@@ -236,6 +278,10 @@ impl RoutineEngine {
                     scope: RoutineScope::Session(session_db_id.to_string()),
                     next_fire: when,
                     incarnation: 0,
+                    schedule_identity: None,
+                    clock: None,
+                    clock_successor: None,
+                    clock_persisted: false,
                 });
             }
         }
@@ -285,7 +331,8 @@ impl RoutineEngine {
     /// engine's in-memory [`Routine`] form (dispatched to the
     /// `agent_schedule` extension), and seeds the heap with
     /// [`RoutineScope::Agent`]. Mirrors [`Self::register_session`] —
-    /// persistence stays in the Agent DB; the engine only schedules.
+    /// definitions stay in the Agent DB, operational state in its selected
+    /// Executor; the engine only schedules.
     ///
     /// [`Schedule`]: crate::agent_db::Schedule
     pub async fn register_agent(
@@ -293,54 +340,123 @@ impl RoutineEngine {
         agent_db_id: &str,
         agent_db: &AgentDb,
     ) -> anyhow::Result<()> {
-        let schedules = agent_db.list_schedules().await?;
-        let routines: Vec<_> = schedules
-            .into_iter()
-            .filter(|schedule| schedule.enabled)
-            .filter_map(|schedule| match schedule_to_routine(agent_db_id, &schedule) {
-                Ok(routine) => Some((schedule, routine)),
-                Err(e) => {
-                    warn!(agent = agent_db_id, schedule = %schedule.id, "skipping unconvertible schedule: {e}");
-                    None
-                }
-            })
-            .collect();
-        let last_fired = load_last_fired(
-            &self.chaz_peer,
-            routines
-                .iter()
-                .map(|(_, routine)| routine.id.clone())
-                .collect(),
-        )
-        .await;
+        let entries = self.load_agent_entries(agent_db_id, agent_db, None).await?;
         let mut state = self.state.lock().await;
-        let now = Utc::now();
-        for (schedule, routine) in routines {
-            // A schedule past its expiry / fire-count bound is never
-            // seeded — a restart must not resurrect a retired schedule.
-            // The authoritative enable=false write happens in the fire
-            // path; this is the load-time guard.
-            if let Some(reason) = schedule.retirement_reason(now) {
-                tracing::debug!(
-                    agent = agent_db_id,
-                    schedule = %schedule.id,
-                    "skipping retired schedule at load: {reason}"
-                );
-                continue;
-            }
-            let last = last_fired.get(routine.id.as_str()).copied();
-            if let Some(when) = next_fire_time(&routine.trigger, last) {
-                state.push(RoutineEntry {
-                    routine,
-                    scope: RoutineScope::Agent(agent_db_id.to_string()),
-                    next_fire: when,
-                    incarnation: 0,
-                });
-            }
+        for entry in entries {
+            state.push(entry);
         }
         drop(state);
         self.notify.notify_one();
         Ok(())
+    }
+
+    async fn load_agent_entries(
+        &self,
+        agent_db_id: &str,
+        agent_db: &AgentDb,
+        only_schedule: Option<&str>,
+    ) -> anyhow::Result<Vec<RoutineEntry>> {
+        let schedules = agent_db.list_schedules().await?;
+        let mut routines = Vec::new();
+        for schedule in schedules {
+            if only_schedule.is_some_and(|id| schedule.id != id) {
+                continue;
+            }
+            if schedule.legacy_migration_held() {
+                // Stored legacy definitions are inspectable, not clock authority.
+                continue;
+            }
+            let effective = match agent_db.scheduling_database().await? {
+                Some(db) => crate::schedule_state::effective(db, schedule.clone()).await?,
+                None => Some(schedule.clone()),
+            };
+            let Some(effective) = effective else {
+                continue;
+            };
+            let pending =
+                crate::schedule_state::lifecycle::clock::pending(agent_db, &schedule).await?;
+            // Capacity includes this prepared slot's OWN reservation. Keep its
+            // immutable definition/token, never the effective projection, so a
+            // no-op reload can finish that handoff without allocating again.
+            let own_slot = pending
+                && schedule.enabled
+                && schedule.expires_at.is_none_or(|expiry| Utc::now() < expiry)
+                && schedule
+                    .max_fires
+                    .is_none_or(|max| effective.fire_count <= max)
+                && match agent_db.scheduling_database().await? {
+                    Some(db) => !crate::schedule_state::state(db, &schedule).await?.retired,
+                    None => false,
+                };
+            if !own_slot
+                && (!effective.enabled || effective.retirement_reason(Utc::now()).is_some())
+            {
+                continue;
+            }
+            match schedule_to_routine(agent_db_id, &schedule) {
+                Ok(routine) => routines.push((schedule, routine, pending)),
+                Err(error) => {
+                    warn!(agent = agent_db_id, schedule = %schedule.id, %error, "skipping unconvertible schedule")
+                }
+            }
+        }
+        let last_fired = load_last_fired(
+            &self.chaz_peer,
+            routines
+                .iter()
+                .map(|(_, routine, _)| routine.id.clone())
+                .collect(),
+        )
+        .await;
+        let mut entries = Vec::new();
+        for (schedule, routine, pending) in routines {
+            let last = last_fired.get(routine.id.as_str()).copied();
+            let cursor = agent_db.schedule_clock_cursor(&schedule).await?;
+            let persisted = cursor.is_some();
+            let slot = match cursor {
+                Some(cursor) => cursor.next,
+                None => next_fire_time(&routine.trigger, last).map(|when| match &routine.trigger {
+                    Trigger::Interval { period } => DueSlot::Interval {
+                        anchor: when
+                            - chrono::Duration::from_std(*period).expect("validated interval"),
+                        ordinal: 0,
+                    },
+                    _ => DueSlot::Calendar { due_at: when },
+                }),
+            };
+            if let Some(slot) = slot {
+                let when = slot_due(&routine.trigger, &slot)?;
+                // The durable cursor wins over a missing/stale peer-local
+                // projection. Neither reload nor lost acknowledgement chooses
+                // another interval anchor or occurrence identity.
+                if let DueSlot::Interval { anchor, .. } = &slot
+                    && persisted
+                    && last != Some(*anchor)
+                {
+                    save_last_fired(&self.chaz_peer, &routine.id, *anchor).await?;
+                }
+                entries.push(RoutineEntry {
+                    routine,
+                    scope: RoutineScope::Agent(agent_db_id.to_string()),
+                    next_fire: when,
+                    incarnation: 0,
+                    schedule_identity: Some((schedule.lifetime_key(), schedule.revision_key()?)),
+                    clock: Some(ScheduleClock {
+                        lifetime: schedule.lifetime_key(),
+                        revision: schedule.revision_key()?,
+                        slot,
+                        // Only a durably owned slot can be missed. An unseeded
+                        // first slot keeps its existing computed due time, and
+                        // an already-prepared slot is ordinary preparation, so
+                        // a no-op reload keeps its exact token.
+                        missed: persisted && !pending && when < self.lifecycle_start(),
+                    }),
+                    clock_successor: None,
+                    clock_persisted: persisted,
+                });
+            }
+        }
+        Ok(entries)
     }
 
     /// Drop every in-memory routine owned by `agent_db_id`. The
@@ -372,44 +488,68 @@ impl RoutineEngine {
         agent_db_id: &str,
         agent_db: &AgentDb,
     ) -> anyhow::Result<()> {
+        // Load fallible storage before touching live entries. Apply the whole
+        // replacement under one lock: no-op reload must not expose a missing
+        // generation to a concurrently revalidating admission callback.
+        let entries = self.load_agent_entries(agent_db_id, agent_db, None).await?;
         let scope = RoutineScope::Agent(agent_db_id.to_string());
-        let prior_intervals: HashMap<_, _> = {
-            let state = self.state.lock().await;
+        let mut state = self.state.lock().await;
+        let prior_entries: HashMap<_, _> = {
             state
                 .routines
                 .iter()
                 .filter(|(_, entry)| entry.scope == scope)
-                .filter_map(|(id, entry)| match entry.routine.trigger {
-                    Trigger::Interval { .. } => Some((id.clone(), entry.clone())),
-                    _ => None,
+                .map(|(id, entry)| {
+                    let armed = state.heap.iter().any(|Reverse((when, queued_id))| {
+                        queued_id == id && *when == entry.next_fire
+                    });
+                    (id.clone(), (entry.clone(), armed))
                 })
                 .collect()
         };
-        self.deregister_agent(agent_db_id).await;
-        self.register_agent(agent_db_id, agent_db).await?;
+        for id in prior_entries.keys() {
+            state.remove(id);
+        }
+        for entry in entries {
+            state.push(entry);
+        }
 
-        // A metadata-only interval edit must not move an already scheduled
-        // first fire, but it must invalidate already-detached payloads: the
-        // generation names the executable content (trigger + prompt/target),
-        // not just the slot. Keep the existing slot when the trigger is
-        // unchanged; preserve the incarnation only when the dispatch payload
-        // is also identical (a true no-op reload). A prompt/target edit keeps
-        // its slot yet bumps the generation, so a detached old payload no
-        // longer validates. Creation, enablement, and trigger changes have no
-        // prior live interval and seed from now with a fresh incarnation.
-        let mut state = self.state.lock().await;
-        for (id, prior) in prior_intervals {
-            if let Some(entry) = state.routines.get_mut(&id)
-                && entry.routine.trigger == prior.routine.trigger
-            {
-                entry.next_fire = prior.next_fire;
-                if entry.routine.target.payload == prior.routine.target.payload {
-                    entry.incarnation = prior.incarnation;
+        // A true no-op preserves the live token AND its armed/disarmed state
+        // for every trigger. Re-arming an in-flight slot would let reload race
+        // bounded admission and dispatch the same clock opportunity twice.
+        // Metadata-only interval edits keep their slot but invalidate the old
+        // executable token; creation, enablement and trigger edits seed anew.
+        for (id, (prior, armed)) in prior_entries {
+            if let Some(entry) = state.routines.get_mut(&id) {
+                let unchanged = entry.schedule_identity == prior.schedule_identity
+                    && (!entry.clock_persisted || entry.clock == prior.clock);
+                let same_lifetime = entry.schedule_identity.as_ref().map(|id| &id.0)
+                    == prior.schedule_identity.as_ref().map(|id| &id.0);
+                if unchanged
+                    || (same_lifetime
+                        && !entry.clock_persisted
+                        && matches!(prior.routine.trigger, Trigger::Interval { .. })
+                        && entry.routine.trigger == prior.routine.trigger)
+                {
+                    entry.next_fire = prior.next_fire;
+                    if let (Some(clock), Some(prior_clock)) = (&mut entry.clock, &prior.clock) {
+                        clock.slot = prior_clock.slot.clone();
+                    }
+                    if unchanged {
+                        entry.incarnation = prior.incarnation;
+                        entry.clock_successor = prior.clock_successor;
+                        entry.clock_persisted = prior.clock_persisted;
+                        entry.routine.consecutive_failures = prior.routine.consecutive_failures;
+                        entry.routine.last_error = prior.routine.last_error;
+                        entry.routine.enabled &= prior.routine.enabled;
+                    }
+                    state
+                        .heap
+                        .retain(|Reverse((_, queued_id))| queued_id != &id);
+                    if !unchanged || armed {
+                        state.heap.push(Reverse((prior.next_fire, id)));
+                    }
                 }
-                state
-                    .heap
-                    .retain(|Reverse((_, queued_id))| queued_id != &id);
-                state.heap.push(Reverse((prior.next_fire, id)));
             }
         }
         drop(state);
@@ -485,6 +625,10 @@ impl RoutineEngine {
             scope,
             next_fire: when,
             incarnation: 0,
+            schedule_identity: None,
+            clock: None,
+            clock_successor: None,
+            clock_persisted: false,
         });
         drop(state);
         self.notify.notify_one();
@@ -633,11 +777,59 @@ impl RoutineEngine {
         }
     }
 
+    /// Test driver runs the real due-fire loop without running a wall-clock timer.
+    /// Only recurring controls need their already-loaded heap slot made due.
+    #[cfg(test)]
+    pub(crate) async fn fire_due_for_test(self: &Arc<Self>, id: &RoutineId) {
+        {
+            let mut state = self.state.lock().await;
+            let entry = state.routines.get_mut(id).expect("schedule loaded");
+            if entry.routine.trigger.is_recurring() {
+                entry.next_fire = Utc::now() - chrono::Duration::seconds(1);
+                if let Some(clock) = &mut entry.clock {
+                    clock.missed = false;
+                    clock.slot = match entry.routine.trigger {
+                        Trigger::Interval { period } => DueSlot::Interval {
+                            anchor: entry.next_fire - chrono::Duration::from_std(period).unwrap(),
+                            ordinal: 0,
+                        },
+                        Trigger::Cron { ref expr } => {
+                            let cron = CronSchedule::from_str(expr).unwrap();
+                            let due_at = cron
+                                .after(&(Utc::now() - chrono::Duration::days(1)))
+                                .next()
+                                .unwrap();
+                            entry.next_fire = due_at;
+                            DueSlot::Calendar { due_at }
+                        }
+                        _ => DueSlot::Calendar {
+                            due_at: entry.next_fire,
+                        },
+                    };
+                }
+            }
+            let when = entry.next_fire;
+            state.heap.retain(|Reverse((_, queued_id))| queued_id != id);
+            state.heap.push(Reverse((when, id.clone())));
+        }
+        self.fire_due().await;
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn fire_due_without_rearming_for_test(self: &Arc<Self>) {
+        self.fire_due().await;
+    }
+
     async fn fire_one(self: &Arc<Self>, id: &RoutineId) {
         // Snapshot under lock; release before "dispatching".
         let snapshot = {
-            let state = self.state.lock().await;
-            state.routines.get(id).cloned()
+            let mut state = self.state.lock().await;
+            state.routines.get_mut(id).map(|entry| {
+                if entry.clock.is_some() {
+                    entry.routine.last_error = None;
+                }
+                entry.clone()
+            })
         };
         let Some(entry) = snapshot else {
             return;
@@ -651,6 +843,7 @@ impl RoutineEngine {
                             serde_json::from_value(entry.routine.target.payload.clone())?;
                         payload.generation =
                             Some(format!("{}:{}", self.generation_seed, entry.incarnation));
+                        payload.clock = entry.clock.clone();
                         serde_json::to_value(payload).map_err(Into::into)
                     })()
                 } else {
@@ -667,9 +860,161 @@ impl RoutineEngine {
             None => Ok(()),
         };
 
+        if entry.clock.is_some() && self.hub.is_some() {
+            self.finish_agent_clock(id, &entry, dispatch_result).await;
+            return;
+        }
         match dispatch_result {
             Ok(()) => self.on_fire_success(id, &entry).await,
             Err(e) => self.on_fire_failure(id, &entry, e).await,
+        }
+    }
+
+    /// Transfer only the exact disarmed token after durable handoff readback.
+    pub(crate) async fn acknowledge_agent_clock(
+        &self,
+        payload: &AgentSchedulePayload,
+        next: Option<DueSlot>,
+    ) -> anyhow::Result<()> {
+        let id = RoutineId::new(format!(
+            "agent:{}:{}",
+            payload.owner_agent_db_id, payload.schedule_id
+        ));
+        let mut state = self.state.lock().await;
+        let entry = state
+            .routines
+            .get_mut(&id)
+            .ok_or_else(|| anyhow::anyhow!("clock token removed"))?;
+        anyhow::ensure!(
+            payload.generation.as_deref()
+                == Some(format!("{}:{}", self.generation_seed, entry.incarnation).as_str())
+                && payload.clock.is_some()
+                && payload.clock == entry.clock,
+            "stale clock handoff token"
+        );
+        if let Some(prior) = &entry.clock_successor {
+            anyhow::ensure!(*prior == next, "clock successor changed");
+        }
+        entry.clock_successor = Some(next);
+        Ok(())
+    }
+
+    /// Bounded accounting maintenance may retry the SAME inert preparation.
+    /// It cannot rearm a consumed slot or retry a model/containing human turn.
+    pub(crate) async fn resume_agent_preparation(
+        &self,
+        agent: &AgentDb,
+        schedule: &crate::agent_db::Schedule,
+    ) -> anyhow::Result<()> {
+        let owner = agent.id().to_string();
+        let id = RoutineId::new(format!("agent:{owner}:{}", schedule.id));
+        let mut state = self.state.lock().await;
+        if let Some(entry) = state.routines.get(&id)
+            && entry.clock.is_some()
+            && entry.clock_successor.is_none()
+            && entry.routine.enabled
+            && entry.routine.last_error.is_some()
+            && !state.heap.iter().any(|Reverse((_, queued))| queued == &id)
+        {
+            let when = entry.next_fire;
+            state.heap.push(Reverse((when, id)));
+            self.notify.notify_one();
+            return Ok(());
+        }
+        if state.routines.contains_key(&id) {
+            return Ok(());
+        }
+        drop(state);
+        // A cold load may have omitted an interval whose last slot was held.
+        // After a known-unused/failed projection releases it, restore only the
+        // cursor-owned next slot. Never seed a new clock from settlement.
+        if !schedule.enabled
+            || !agent
+                .schedule_clock_cursor(schedule)
+                .await?
+                .is_some_and(|cursor| cursor.next.is_some())
+            || !agent
+                .effective_schedule(&schedule.id)
+                .await?
+                .is_some_and(|s| s.enabled && s.retirement_reason(Utc::now()).is_none())
+        {
+            return Ok(());
+        }
+        if let Some(entry) = self
+            .load_agent_entries(&owner, agent, Some(&schedule.id))
+            .await?
+            .into_iter()
+            .find(|entry| entry.routine.id == id && entry.clock_persisted)
+        {
+            let mut state = self.state.lock().await;
+            if !state.routines.contains_key(&id) {
+                state.push(entry);
+                self.notify.notify_one();
+            }
+        }
+        Ok(())
+    }
+
+    async fn finish_agent_clock(
+        &self,
+        id: &RoutineId,
+        snapshot: &RoutineEntry,
+        result: anyhow::Result<()>,
+    ) {
+        let mut state = self.state.lock().await;
+        let Some(entry) = state
+            .routines
+            .get_mut(id)
+            .filter(|entry| entry.incarnation == snapshot.incarnation)
+        else {
+            return;
+        };
+        match entry.clock_successor.take() {
+            Some(Some(slot)) => {
+                let when = match slot_due(&entry.routine.trigger, &slot) {
+                    Ok(when) => when,
+                    Err(error) => {
+                        entry.routine.last_error = Some(error.to_string());
+                        return;
+                    }
+                };
+                if let DueSlot::Interval { anchor, .. } = &slot
+                    && let Err(error) = save_last_fired(&self.chaz_peer, id, *anchor).await
+                {
+                    // The selected ledger already owns the successor. Restart
+                    // repairs this disposable projection; never roll back handoff.
+                    error!(routine = %id, %error, "clock projection write failed");
+                }
+                let clock = entry.clock.as_mut().expect("timed entry");
+                clock.slot = slot;
+                clock.missed = false;
+                entry.clock_persisted = true;
+                entry.next_fire = when;
+                entry.routine.consecutive_failures = 0;
+                entry.routine.last_error = None;
+                state.heap.push(Reverse((when, id.clone())));
+            }
+            Some(None) => {
+                state.routines.remove(id);
+            }
+            None => {
+                // No acknowledged successor: keep the exact slot disarmed.
+                // Reconciliation, not wall time or a generic failure retry,
+                // may readmit its unchanged inert preparation.
+                entry.routine.last_error = Some(truncate_error(
+                    result
+                        .err()
+                        .map(|e| e.to_string())
+                        .unwrap_or_else(|| "clock handoff not committed".into()),
+                ));
+                entry.routine.consecutive_failures =
+                    entry.routine.consecutive_failures.saturating_add(1);
+                if entry.routine.max_failures > 0
+                    && entry.routine.consecutive_failures >= entry.routine.max_failures
+                {
+                    entry.routine.enabled = false;
+                }
+            }
         }
     }
 
@@ -788,6 +1133,7 @@ fn schedule_to_routine(
         owner_agent_db_id: owner_agent_db_id.to_string(),
         schedule_id: t.id.clone(),
         generation: None,
+        clock: None,
         prompt: t.prompt.clone(),
         target: serde_json::to_value(&t.target)?,
         one_shot: !t.trigger.is_recurring(),
@@ -834,6 +1180,19 @@ fn next_fire_time(
             next_interval_fire(*period, interval_anchor.unwrap_or_else(Utc::now))
         }
         Trigger::OneShot { fire_at } => Some(*fire_at),
+    }
+}
+
+fn slot_due(trigger: &Trigger, slot: &DueSlot) -> anyhow::Result<DateTime<Utc>> {
+    match (trigger, slot) {
+        (Trigger::Interval { period }, DueSlot::Interval { anchor, .. }) => {
+            next_interval_fire(*period, *anchor)
+                .ok_or_else(|| anyhow::anyhow!("invalid interval slot"))
+        }
+        (Trigger::Cron { .. } | Trigger::OneShot { .. }, DueSlot::Calendar { due_at }) => {
+            Ok(*due_at)
+        }
+        _ => anyhow::bail!("clock slot and trigger differ"),
     }
 }
 

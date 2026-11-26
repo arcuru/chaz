@@ -1,6 +1,7 @@
 //! In-process exact-wait suspension. Only the descriptor and the session's
 //! processing reservation survive; persisted records decide readiness/resume.
 use super::*;
+use crate::schedule_state::lifecycle::ReconciliationRequired;
 use futures::FutureExt;
 use std::panic::AssertUnwindSafe;
 
@@ -28,20 +29,33 @@ impl Server {
                 let Some(owner) = server.upgrade() else {
                     return;
                 };
-                let result = AssertUnwindSafe(owner.observe_suspended_wait(&sid, &wait, &cancel))
-                    .catch_unwind().await;
-                match result {
-                    Ok(Ok(true)) => {} // the readmitted turn now owns the reservation
-                    Ok(Ok(false)) => owner.release_suspended_wait(&sid, &wait).await,
-                    Ok(Err(error)) => {
-                        warn!(%error, session_db_id = %sid, attempt_id = %wait.attempt_id,
-                        "Suspended wait could not advance; holding for explicit retry/restart");
-                        owner.release_suspended_wait(&sid, &wait).await;
+                loop {
+                    let result = AssertUnwindSafe(owner.observe_suspended_wait(&sid, &wait, &cancel))
+                        .catch_unwind().await;
+                    match result {
+                        Ok(Err(error)) if error.is::<ReconciliationRequired>() => {
+                            // Drop the loaded views and permit before waiting for
+                            // the ordinary accounting pump. Keep only this exact
+                            // descriptor/reservation so newer turns cannot overtake.
+                            debug!(session_db_id = %sid, "Suspended private wait awaiting accounting reconciliation");
+                            #[cfg(test)]
+                            owner.suspended_wait_reconciliations.fetch_add(1, Ordering::SeqCst);
+                            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                            continue;
+                        }
+                        Ok(Ok(true)) => {} // the readmitted turn now owns the reservation
+                        Ok(Ok(false)) => owner.release_suspended_wait(&sid, &wait).await,
+                        Ok(Err(error)) => {
+                            warn!(%error, session_db_id = %sid, attempt_id = %wait.attempt_id,
+                            "Suspended wait could not advance; holding for explicit retry/restart");
+                            owner.release_suspended_wait(&sid, &wait).await;
+                        }
+                        Err(_) => {
+                            error!(session_db_id = %sid, "Suspended wait observer panicked; holding attempt");
+                            owner.release_suspended_wait(&sid, &wait).await;
+                        }
                     }
-                    Err(_) => {
-                        error!(session_db_id = %sid, "Suspended wait observer panicked; holding attempt");
-                        owner.release_suspended_wait(&sid, &wait).await;
-                    }
+                    break;
                 }
             }));
         })
@@ -205,8 +219,8 @@ impl Server {
             ) == wait.deadline,
             "suspended deadline changed"
         );
-        let plan = session
-            .resumable_job_wait(&request.id, checkpoint)
+        let plan = self
+            .resumable_scheduled_wait(&session, &request.id, checkpoint)
             .await?
             .map_err(|reason| anyhow::anyhow!(reason))?;
         if cancel.is_cancelled() {
@@ -275,6 +289,10 @@ impl Server {
             },
         ));
         let metadata = runtime::cancel_suspended_wait(recorder.clone(), plan.runtime)
+            .await
+            .map_err(|error| anyhow::anyhow!(error))?;
+        recorder
+            .finish_scheduled_inputs()
             .await
             .map_err(|error| anyhow::anyhow!(error))?;
         let mut s = session.lock().await;

@@ -55,12 +55,6 @@ pub trait RuntimeRecorder: Send + Sync {
         Ok(())
     }
 
-    /// Recorded Worker provenance when this invocation has no queued turn
-    /// request. This is not a request, checkpoint or Agent-job identity.
-    fn standalone_worker_invocation(&self) -> Option<&str> {
-        None
-    }
-
     /// Called only at a complete model/tool boundary. A closing boundary may
     /// return input that requires continuing before any terminal publication.
     fn input_boundary<'a>(
@@ -125,6 +119,12 @@ pub trait RuntimeRecorder: Send + Sync {
     /// Only the resident executor can keep a suspended turn's reservation.
     /// Standalone recorders continue observing in their live runtime.
     fn can_suspend_job_wait(&self) -> bool {
+        false
+    }
+
+    /// The caller can reconstruct persisted ordinary/private boundary input
+    /// under its original attempt. Arbitrary recorders stay resident by default.
+    fn can_suspend_with_boundary_input(&self) -> bool {
         false
     }
 
@@ -1749,7 +1749,7 @@ async fn run_prepared_turn(
                     "{model_sequence}:{}:{}",
                     resume.call_index, call.id
                 ));
-                call_ctx.set_tool_call_site(model_sequence, resume.call_index, &call.id, None);
+                call_ctx.set_tool_call_site(model_sequence, resume.call_index, &call.id);
                 call_ctx.grants = tool_ctx.resolve_call_grants(&policy.grants, &call.name);
                 call_ctx.observation_deadline = Some(resume.deadline);
                 // The remaining policy budget, not a fresh one: an expired
@@ -2258,14 +2258,7 @@ async fn run_prepared_turn(
                                 tool_ctx.resolve_call_grants(&policy.grants, &call.name);
                             call_ctx.tool_call_key =
                                 Some(format!("{model_sequence}:{call_index}:{}", call.id));
-                            call_ctx.set_tool_call_site(
-                                model_sequence,
-                                call_index,
-                                &call.id,
-                                recorder
-                                    .as_ref()
-                                    .and_then(|r| r.standalone_worker_invocation()),
-                            );
+                            call_ctx.set_tool_call_site(model_sequence, call_index, &call.id);
                             call_ctx.grants = call_grants;
                             if call.name == JOB_WAIT_TOOL
                                 && let Ok((child, seconds)) =
@@ -2300,7 +2293,9 @@ async fn run_prepared_turn(
                                         }
                                         Ok(())
                                             if recorder.can_suspend_job_wait()
-                                                && !boundary_input_seen =>
+                                                && (!boundary_input_seen
+                                                    || recorder
+                                                        .can_suspend_with_boundary_input()) =>
                                         {
                                             // Hook closures can hold arbitrary turn-local
                                             // state. No carryover contract exists for them.

@@ -96,9 +96,10 @@ HERE="$REPO_ROOT/dev/matrix-e2e"
 CHAZ_BIN="${CHAZ_BIN:-$REPO_ROOT/target/debug/chaz}"
 CHAZ_MATRIX_BIN="${CHAZ_MATRIX_BIN:-$REPO_ROOT/target/debug/chaz-matrix}"
 E2EE_PROBE_BIN="${E2EE_PROBE_BIN:-$REPO_ROOT/target/debug/examples/e2ee_probe}"
+SCHEDULE_PROBE_BIN="${SCHEDULE_PROBE_BIN:-$REPO_ROOT/target/debug/examples/schedule_probe}"
 
 BINS=("$CHAZ_BIN" "$CHAZ_MATRIX_BIN")
-[[ $REAL_MODEL -eq 1 ]] || BINS+=("$E2EE_PROBE_BIN")
+[[ $REAL_MODEL -eq 1 ]] || BINS+=("$E2EE_PROBE_BIN" "$SCHEDULE_PROBE_BIN")
 for bin in "${BINS[@]}"; do
 	if [[ ! -x $bin ]]; then
 		echo "missing binary: $bin (run 'just e2e', or set CHAZ_BIN / CHAZ_MATRIX_BIN / E2EE_PROBE_BIN)" >&2
@@ -1247,26 +1248,24 @@ printf '\033[1;32mPASS\033[0m — encrypted cases passed (plain message, command
 # --------------------------------------------- pinned scheduled E2EE turns ---
 # Keep E1–E6 and the plaintext DM counts unchanged. The agent creates real
 # bounded schedules in this already-attached encrypted session via schedule_add.
-# The retired pinned row plus the persisted terminal Message proves execution
-# reached its final write; a later distinguishable encrypted reply is a barrier.
+# Check native selected-ledger/Session evidence on a consistent SQLite backup.
+# Raw store_state_* tables are disposable caches, not authoritative history, and
+# fire accounting no longer rewrites the Agent definition. The running embedded
+# backend is never opened by a second process. A later encrypted reply is a barrier.
 scheduled_completed() {
-    local mode="$1"
-    sqlite3 "$WORKSPACE/state-daemon/eidetica.db.cache" \
-    "select count(distinct e.record_key)
-     from store_state_namespaces fn join store_state_records f on fn.namespace_id=f.namespace_id
-     join store_state_namespaces en on en.database_id=json_extract(cast(f.record_value as text),'\$.target.session_db_id')
-     join store_state_records e on en.namespace_id=e.namespace_id
-     where fn.store_name='schedules' and en.store_name='entries'
-     and json_extract(cast(f.record_value as text),'\$.id')='e2ee-$mode'
-     and json_extract(cast(f.record_value as text),'\$.target.kind')='pinned'
-     and json_extract(cast(f.record_value as text),'\$.prompt')='$MARKER-scheduled-$mode'
-     and json_extract(cast(f.record_value as text),'\$.enabled')=0
-     and json_extract(cast(f.record_value as text),'\$.fire_count')=1
-     and json_extract(cast(e.record_value as text),'\$.entry_type')='Message'
-     and json_extract(cast(e.record_value as text),'\$.sender')='chaz'
-     and json_extract(cast(e.record_value as text),'\$.routing') is null
-     and json_extract(cast(e.record_value as text),'\$.content')='$MARKER-scheduled-$mode-final';" |
-        grep -qx 1
+    local mode="$1" snapshot rc
+    snapshot="$(mktemp -d "$WORKSPACE/schedule-$mode-XXXXXX")"
+    if timeout 15s sqlite3 "$WORKSPACE/state-daemon/eidetica.db" ".backup '$snapshot/eidetica.db'" &&
+        timeout 15s "$SCHEDULE_PROBE_BIN" --connection "sqlite://$snapshot/eidetica.db" \
+            --schedule "e2ee-$mode" --prompt "$MARKER-scheduled-$mode" \
+            --final-text "$MARKER-scheduled-$mode-final" \
+            >"$WORKSPACE/schedule-$mode-evidence.json" 2>>"$WORKSPACE/schedule-probe.log"; then
+        rc=0
+    else
+        rc=1
+    fi
+    rm -rf "$snapshot"
+    return "$rc"
 }
 for mode in send silent; do
     log "scheduled E2EE: pinned $mode turn"

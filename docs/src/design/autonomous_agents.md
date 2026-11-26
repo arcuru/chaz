@@ -205,11 +205,10 @@ context-build time_, not baked into the agent's stored system prompt:
    `AgentRef`), or is "attached" sufficient? v1 proposal: attached is
    sufficient; no new field.
 4. **Resolved.** A fired schedule is **not** a burst entry at all.
-   Agent-owned schedules run the standalone fire path and feed their
-   prompt as invocation-scoped input — no shared `Directive` entry is
-   written, so a scheduled wake neither resets nor extends a burst. The
-   legacy session-`Directive` scheduler that raised this question is
-   deleted. See [Agent-Owned Schedules](./agent_schedules.md).
+   Agent-owned schedules feed private input into the ordinary turn runner.
+   No shared `Directive` entry is written, so a scheduled wake neither
+   resets nor extends a burst. The old scheduler that wrote shared
+   `Directive` entries was removed. See [Agent-Owned Schedules](./agent_schedules.md).
 
 ## Implementation Touch Points
 

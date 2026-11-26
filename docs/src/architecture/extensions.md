@@ -371,9 +371,11 @@ scopes exist on the engine side (`RoutineScope::Global` from
 `Agent(id)` from an agent DB) — they control where the routine is stored
 and rescheduled, not what the handler receives.
 
-The engine owns recurring rescheduling, one-shot row deletion, and
-auto-disable after `max_failures` consecutive errors; the handler just
-does the per-fire work. Routine fires are **not** gated by the
+The engine owns recurring rescheduling, dropping one-shots from its heap,
+and auto-disable after `max_failures` consecutive dispatch errors. Agent
+schedule definitions remain on the Agent; their selected Executor records
+one-shot consumption and dispatch linkage before the handler acknowledges.
+Detached execution failures are not dispatch failures. Routine fires are **not** gated by the
 per-session active set.
 
 ## Per-session active set

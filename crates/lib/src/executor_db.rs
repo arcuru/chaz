@@ -223,6 +223,43 @@ pub async fn open_for_agent(
     Ok(db)
 }
 
+/// Scheduling mutations use the selected Executor's existing direct owner key.
+/// Delegated reads still prove the Agent/ref/kind link, and both source authority
+/// and current delegation bounds must permit the write. In particular, owning
+/// the Executor cannot upgrade a read-only Agent. This also avoids asking a
+/// remote client to perform local-only delegation validation when committing.
+pub(crate) async fn open_scheduling_writer(
+    user: &mut AccountSession,
+    agent: &AgentDb,
+    reference: &ExecutorRef,
+    agent_key: &PublicKey,
+) -> anyhow::Result<Database> {
+    let delegated = open_for_agent(user, agent, reference, agent_key).await?;
+    let permission = crate::session::jobs::require_observer_write(agent.database()).await?;
+    let grant = delegated
+        .get_settings()
+        .await?
+        .auth_snapshot()
+        .await?
+        .get_delegated_tree(agent.database().root_id())?;
+    anyhow::ensure!(
+        permission
+            .clamp_to_bounds(&grant.permission_bounds)
+            .can_write(),
+        "scheduling Executor delegation does not permit writes"
+    );
+    let peer = user.get_default_key()?;
+    anyhow::ensure!(
+        reference.peer_pubkey == peer.to_string(),
+        "selected scheduling Executor is not owned by this peer"
+    );
+    let db = user
+        .open_database_with_key(delegated.root_id(), &peer)
+        .await?;
+    crate::session::jobs::require_observer_write(&db).await?;
+    Ok(db)
+}
+
 pub(crate) async fn reconcile_job(
     db: &Database,
     session: &Database,
@@ -250,6 +287,88 @@ mod tests {
     use super::*;
     use eidetica::backend::database::InMemory;
     use eidetica::{Instance, NewAccount};
+
+    #[tokio::test]
+    async fn scheduling_owner_key_never_upgrades_agent_or_delegation_permissions() {
+        use eidetica::auth::types::AuthKey;
+        for restriction in ["source", "delegation", "owner"] {
+            let (_instance, mut user) = Instance::create_backend(
+                Box::new(InMemory::new()),
+                NewAccount::passwordless(restriction),
+            )
+            .await
+            .unwrap();
+            let (agent, key) = crate::agent_db::create_agent_db(
+                &mut user,
+                "owner",
+                &Default::default(),
+                &Default::default(),
+            )
+            .await
+            .unwrap();
+            let (owned, _) = ensure(&mut user, &agent, &key).await.unwrap();
+            let mut reference = agent.list_executors().await.unwrap().pop().unwrap();
+            let writer = open_scheduling_writer(&mut user, &agent, &reference, &key)
+                .await
+                .unwrap();
+            let txn = writer.new_transaction().await.unwrap();
+            txn.get_store::<Table<bool>>("writer_probe")
+                .await
+                .unwrap()
+                .set("positive", true)
+                .await
+                .unwrap();
+            txn.commit().await.unwrap();
+            if restriction == "source" {
+                let txn = agent.database().new_transaction().await.unwrap();
+                txn.get_settings()
+                    .unwrap()
+                    .set_auth_key(&key, AuthKey::active(None, Permission::Read))
+                    .await
+                    .unwrap();
+                txn.commit().await.unwrap();
+            } else if restriction == "delegation" {
+                let txn = owned.new_transaction().await.unwrap();
+                txn.get_settings()
+                    .unwrap()
+                    .add_delegated_tree(DelegatedTreeRef {
+                        permission_bounds: PermissionBounds {
+                            max: Permission::Read,
+                            min: None,
+                        },
+                        tree: TreeReference {
+                            root: agent.id(),
+                            tips: agent.database().snapshot().await.unwrap().into_tips(),
+                        },
+                    })
+                    .await
+                    .unwrap();
+                txn.commit().await.unwrap();
+            } else {
+                reference.peer_pubkey = key.to_string();
+                crate::db_kind::write_marker(
+                    &owned,
+                    crate::db_kind::KIND_EXECUTOR,
+                    &format!("executor:{}:{key}", agent.id()),
+                )
+                .await
+                .unwrap();
+            }
+            // Read access and the direct owner key remain. Neither is Write
+            // authority for a scheduling operation on this addressed Agent.
+            open_for_agent(&mut user, &agent, &reference, &key)
+                .await
+                .unwrap();
+            let before = owned.snapshot().await.unwrap();
+            assert!(
+                open_scheduling_writer(&mut user, &agent, &reference, &key)
+                    .await
+                    .is_err(),
+                "{restriction}"
+            );
+            assert_eq!(owned.snapshot().await.unwrap(), before);
+        }
+    }
 
     #[tokio::test]
     async fn stable_queue_adopts_orphan_and_agent_key_can_read() {

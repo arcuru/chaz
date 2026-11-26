@@ -422,22 +422,13 @@ pub struct ToolContext {
 }
 
 impl ToolContext {
-    pub(crate) fn set_tool_call_site(
-        &mut self,
-        sequence: u64,
-        index: usize,
-        call_id: &str,
-        standalone_invocation: Option<&str>,
-    ) {
+    pub(crate) fn set_tool_call_site(&mut self, sequence: u64, index: usize, call_id: &str) {
         let invocation = match (&self.turn_request_id, &self.turn_attempt) {
             (Some(request), Some(attempt)) => Some((
                 request.clone(),
                 attempt.attempt_id.as_str(),
                 attempt.execution_id.clone(),
             )),
-            (None, None) => {
-                standalone_invocation.map(|id| (crate::session::TurnRequestId::parse(id), id, None))
-            }
             _ => None,
         };
         self.tool_call_site = invocation.map(|(request_id, attempt_id, execution_id)| {
