@@ -23,8 +23,7 @@ use std::sync::Arc;
 
 /// Schedule extension. Stateless — each instance builds a scoped
 /// `AgentStateAdmin` from the peer handles at instantiate time.
-/// Agent-owned schedule fires run through the separate `agent_schedule`
-/// extension's standalone path.
+/// The `agent_schedule` timer extension hands off into the common runner.
 pub struct ScheduleExtension;
 
 impl ScheduleExtension {
@@ -62,6 +61,7 @@ impl Extension for ScheduleExtension {
     fn instantiate<'a>(&'a self, scope_ctx: ScopeCtx<'a>) -> InstantiateFuture<'a> {
         let manifest = self.manifest();
         let peer = scope_ctx.peer();
+        let server_slot = peer.server_slot.clone();
         let allowlist = peer.agent_state_allowlist.get("schedule").cloned();
         // An empty list otherwise makes every requested agent look missing.
         if let Some(warning) = deny_all_warning("schedule", allowlist.as_deref()) {
@@ -76,6 +76,7 @@ impl Extension for ScheduleExtension {
             Ok(Arc::new(ScheduleInstance {
                 manifest,
                 agent_state,
+                server_slot,
             }) as Arc<dyn ExtensionInstance>)
         })
     }
@@ -84,6 +85,7 @@ impl Extension for ScheduleExtension {
 struct ScheduleInstance {
     manifest: ExtensionManifest,
     agent_state: Arc<dyn AgentStateAdmin>,
+    server_slot: crate::instance::ServerSlot,
 }
 
 impl ExtensionInstance for ScheduleInstance {
@@ -106,6 +108,7 @@ impl ExtensionInstance for ScheduleInstance {
             "schedule".into(),
             Arc::new(ScheduleCommand {
                 agent_state: self.agent_state.clone(),
+                server_slot: self.server_slot.clone(),
             }),
         )]
     }
@@ -113,11 +116,12 @@ impl ExtensionInstance for ScheduleInstance {
 
 struct ScheduleCommand {
     agent_state: Arc<dyn AgentStateAdmin>,
+    server_slot: crate::instance::ServerSlot,
 }
 
 impl ExtensionCommand for ScheduleCommand {
     fn description(&self) -> &'static str {
-        "Manage schedules on agents — add | modify | remove | list"
+        "Manage schedules on agents — add | modify | remove | list | retry"
     }
 
     fn invoke<'a>(
@@ -144,11 +148,54 @@ impl ExtensionCommand for ScheduleCommand {
                 }
                 "add" => add_cmd(rest, &*self.agent_state, ctx).await,
                 "modify" => modify_cmd(rest, &*self.agent_state, ctx).await,
+                "retry" => self.retry(rest, ctx).await,
                 other => ExtensionCommandOutcome::Error(format!(
-                    "Unknown subcommand '/schedule {other}'. Use: add | modify | remove | list"
+                    "Unknown subcommand '/schedule {other}'. Use: add | modify | remove | list | retry"
                 )),
             }
         })
+    }
+}
+
+impl ScheduleCommand {
+    async fn retry(&self, args: &str, ctx: &HookContext) -> ExtensionCommandOutcome {
+        let mut args = args.split_whitespace();
+        let (Some(occurrence), Some(delivery), Some(attempt), agent, None) = (
+            args.next(),
+            args.next(),
+            args.next(),
+            args.next(),
+            args.next(),
+        ) else {
+            return ExtensionCommandOutcome::Error(
+                "Usage: /schedule retry <occurrence> <delivery> <attempt> [agent]".into(),
+            );
+        };
+        let entry = match self
+            .agent_state
+            .resolve_agent(agent.unwrap_or(&ctx.agent_name))
+        {
+            Ok(entry) => entry,
+            Err(error) => return ExtensionCommandOutcome::Error(error),
+        };
+        let Some(server) = self.server_slot.get() else {
+            return ExtensionCommandOutcome::Error(
+                "Schedule retry needs the running executor".into(),
+            );
+        };
+        let session = ctx.session.lock().await.database().root_id().to_string();
+        match server
+            .retry_schedule_delivery(&session, &entry, occurrence, delivery, attempt)
+            .await
+        {
+            Ok(reference) => ExtensionCommandOutcome::Text(format!(
+                "Retry delivery {} recorded. This does not confirm execution; the prior attempt may already have had effects.",
+                reference.delivery_id
+            )),
+            Err(error) => {
+                ExtensionCommandOutcome::Error(format!("Schedule retry refused: {error}"))
+            }
+        }
     }
 }
 
@@ -172,8 +219,8 @@ async fn open_agent_db_for_cmd(
 }
 
 /// Format one schedule row.
-fn fmt_schedule_line(t: &Schedule) -> String {
-    let state = if t.enabled { "" } else { " (disabled)" };
+fn fmt_schedule_line(t: &Schedule, policy: &str) -> String {
+    let state = crate::schedule_state::effective_status(t);
     let when = match &t.trigger {
         Trigger::Cron { expr } => expr.clone(),
         Trigger::Interval { period } => format!("every {period:?}"),
@@ -195,14 +242,14 @@ fn fmt_schedule_line(t: &Schedule) -> String {
     } else {
         format!(" ({})", bounds.join(", "))
     };
-    let fired = if t.fire_count > 0 {
-        format!(" [fired {}×]", t.fire_count)
+    let capacity = if t.fire_count > 0 {
+        format!(" [capacity used: {}]", t.fire_count)
     } else {
         String::new()
     };
     format!(
-        "  {} [{when}]{state}{bounds}{fired} → {target_label} — {}",
-        t.id, t.prompt
+        "  {} [{when}]{state}{bounds}{capacity}{policy} → {target_label}",
+        t.id
     )
 }
 
@@ -220,10 +267,14 @@ async fn agent_block(cap: &dyn AgentStateAdmin, name: &str, host: bool) -> Strin
         Ok(a) => a,
         Err(e) => return format!("{name}{marker}: failed to open agent DB — {e:#}"),
     };
-    match adb.list_schedules().await {
+    match adb.effective_schedules().await {
         Ok(s) if s.is_empty() => format!("{name}{marker}: (no schedules)"),
         Ok(s) => {
-            let lines: Vec<String> = s.iter().map(fmt_schedule_line).collect();
+            let mut lines = Vec::with_capacity(s.len());
+            for t in &s {
+                let policy = crate::schedule_state::policy_status(&adb, t).await;
+                lines.push(fmt_schedule_line(t, &policy));
+            }
             format!("{name}{marker}:\n{}", lines.join("\n"))
         }
         Err(e) => format!("{name}{marker}: failed to list — {e}"),
@@ -366,6 +417,17 @@ async fn modify_cmd(
     }) else {
         return ExtensionCommandOutcome::Error(format!("No schedule with id '{id}'"));
     };
+    match adb.effective_schedule(id).await {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return ExtensionCommandOutcome::Error(format!(
+                "Schedule '{id}' was consumed; use /schedule add to create a new lifetime"
+            ));
+        }
+        Err(e) => {
+            return ExtensionCommandOutcome::Error(format!("Failed to read schedule state: {e}"));
+        }
+    }
     schedule.trigger = trigger;
     match adb.upsert_schedule(schedule).await {
         Ok(()) => {
@@ -434,7 +496,7 @@ async fn add_cmd(
             Ok(adb) => adb,
             Err(e) => return ExtensionCommandOutcome::Error(format!("{e:#}")),
         };
-        match adb.find_schedule(id).await {
+        match adb.effective_schedule(id).await {
             Ok(Some(_)) => {
                 return ExtensionCommandOutcome::Error(format!(
                     "Schedule '{id}' already exists on agent '{}'; use /schedule modify or remove first",
@@ -516,7 +578,7 @@ async fn add_cmd(
         Ok(adb) => adb,
         Err(e) => return ExtensionCommandOutcome::Error(format!("{e:#}")),
     };
-    match adb.find_schedule(id).await {
+    match adb.effective_schedule(id).await {
         Ok(Some(_)) => {
             return ExtensionCommandOutcome::Error(format!(
                 "Schedule '{id}' already exists on agent '{}'; use /schedule modify or remove first",
@@ -633,6 +695,7 @@ mod tests {
             crate::extension::agent_state::ScopedAgentStateAdmin::new(registry, index, None);
         ScheduleCommand {
             agent_state: Arc::new(scoped),
+            server_slot: Default::default(),
         }
     }
 
@@ -722,6 +785,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn consumed_one_shot_requires_add_instead_of_modify() {
+        use chrono::Utc;
+        let (_i, index, registry, ctx) = fixture().await;
+        let entry = index.find_by_name("alpha").unwrap();
+        let adb = registry
+            .open_agent_db(&entry.db_id, Some(&entry.pubkey))
+            .await
+            .unwrap()
+            .unwrap();
+        let schedule = Schedule::new(
+            "wake",
+            Trigger::OneShot {
+                fire_at: Utc::now(),
+            },
+            "private wake",
+            ScheduleTarget::Fresh,
+        );
+        adb.upsert_schedule(schedule.clone()).await.unwrap();
+        let selected = registry.ensure_scheduling_agent_db(&entry).await.unwrap();
+        let operations = selected.scheduling_database().await.unwrap().unwrap();
+        let reservation = crate::schedule_state::reserve(operations, &schedule, Utc::now())
+            .await
+            .unwrap()
+            .unwrap();
+        let mut session = ctx.session.lock().await;
+        let attempt = session
+            .start_scheduled_attempt(reservation.firing_id.clone(), "timer".into())
+            .await
+            .unwrap();
+        crate::schedule_state::handoff(
+            operations,
+            &reservation,
+            crate::agent_db::ScheduleFire {
+                schedule_id: schedule.id.clone(),
+                firing_id: Some(reservation.firing_id.clone()),
+                lifetime: Some(reservation.lifetime.clone()),
+                request_id: Some(attempt.request_id),
+                attempt_id: Some(attempt.attempt_id),
+                fired_at: Utc::now(),
+                session_db_id: session.database().root_id().to_string(),
+                fresh: true,
+                usage: None,
+            },
+        )
+        .await
+        .unwrap();
+        drop(session);
+        let c = cmd(registry.clone(), index);
+        assert!(
+            matches!(c.invoke("modify wake interval 60 alpha", &ctx).await,
+            ExtensionCommandOutcome::Error(e) if e.contains("consumed"))
+        );
+        assert_eq!(
+            adb.find_schedule("wake").await.unwrap(),
+            Some(schedule.clone())
+        );
+        assert!(matches!(
+            c.invoke("add interval wake 60 alpha new work", &ctx).await,
+            ExtensionCommandOutcome::Text(_)
+        ));
+        let view = registry
+            .open_scheduling_agent_db(&entry.db_id, Some(&entry.pubkey))
+            .await
+            .unwrap()
+            .unwrap();
+        let recreated = view.effective_schedule("wake").await.unwrap().unwrap();
+        assert_ne!(recreated.lifetime, schedule.lifetime);
+        assert_eq!(recreated.fire_count, 0);
+    }
+
+    #[tokio::test]
     async fn list_with_agent_arg_narrows_to_that_agent() {
         let (_i, index, registry, ctx) = fixture().await;
         let c = cmd(registry, index);
@@ -734,6 +868,7 @@ mod tests {
             ExtensionCommandOutcome::Text(s) => {
                 assert!(s.starts_with("alpha"), "header missing: {s}");
                 assert!(s.contains("nine-am"), "schedule missing: {s}");
+                assert!(!s.contains("morning brief"), "private wake leaked: {s}");
             }
             ExtensionCommandOutcome::Error(e) => panic!("list errored: {e}"),
         }

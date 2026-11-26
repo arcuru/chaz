@@ -1,520 +1,220 @@
 //! Agent-owned schedule fire path for [`Server`].
 //!
-//! Extracted from `server/mod.rs`: `fire_agent_schedule`, the agent-db
-//! openers it uses, the schedule-turn runner, and the session-start hook.
-//! Compiled as a child module so these `impl Server` methods keep access
-//! to the server's private state.
+//! Bounded clock admission and accounting maintenance feed the common runner.
+//! The Session-start hook is shared by ordinary and scheduled registration.
 
 use super::*;
 
-struct ScheduleRecorder {
-    session: Arc<Mutex<Session>>,
-    invocation: String,
-    identity: TurnCallIdentity,
-    sequence: std::sync::atomic::AtomicU64,
+/// Read-only accounting maintenance on the ordinary processing loop, never on
+/// the clock's admission path. This is not a delivery queue: it neither creates
+/// storage nor starts/retries work. Retained handles keep disposable observations
+/// alive across pages; every cycle rediscovers current definitions and keys.
+#[derive(Default)]
+pub(super) struct AccountingPump {
+    work: Vec<(crate::agent_db::AgentDb, String)>,
+    next: usize,
+    projections: super::scheduled_projection::ProjectionPump,
 }
-impl crate::runtime::RuntimeRecorder for ScheduleRecorder {
-    fn standalone_worker_invocation(&self) -> Option<&str> {
-        Some(&self.invocation)
-    }
 
-    fn record<'a>(
-        &'a self,
-        record: crate::runtime::RuntimeRecord,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>> {
-        use crate::session::TurnTranscriptMessage;
-        use crate::session::turn_recorder::{display_entries_for_record, transcript_record};
-        Box::pin(async move {
-            let mut record = transcript_record(
-                TurnRequestId::parse(self.invocation.clone()),
-                self.invocation.clone(),
-                self.identity.clone(),
-                self.sequence.fetch_add(1, Ordering::Relaxed),
-                record,
-            );
-            let mut entries = display_entries_for_record(&self.identity.agent, &record);
-            entries.retain(|entry| match entry.entry_type {
-                EntryType::ToolCall => !entry
-                    .content
-                    .strip_prefix(crate::tool::NO_REPLY_TOOL)
-                    .is_some_and(|suffix| suffix.starts_with('(')),
-                EntryType::ToolResult => true,
-                _ => false,
-            });
-            if entries.is_empty() {
-                return Ok(());
+impl AccountingPump {
+    pub(super) async fn step(&mut self, server: &Server) {
+        if !server.executor_authorized
+            || !server.is_startup_ready()
+            || server.routine_engine().is_none()
+        {
+            return;
+        }
+        self.projections.step(server).await;
+        if self.next == self.work.len() {
+            let mut work = Vec::new();
+            for entry in server.agent_index.list() {
+                let result = async {
+                    let Some(agent) = server
+                        .registry
+                        .open_scheduling_agent_db(&entry.db_id, Some(&entry.pubkey))
+                        .await?
+                    else {
+                        return Ok::<_, anyhow::Error>(());
+                    };
+                    let schedules = agent.list_schedules().await?;
+                    if !schedules.is_empty() {
+                        let agent = if agent.scheduling_reference().await?.is_none() {
+                            let mut eligible = false;
+                            for schedule in &schedules {
+                                if schedule.enabled
+                                    && server
+                                        .timer_target_authority(&agent, schedule, &entry)
+                                        .await
+                                        .is_ok()
+                                {
+                                    eligible = true;
+                                    break;
+                                }
+                            }
+                            if !eligible {
+                                return Ok(());
+                            }
+                            server.registry.ensure_scheduling_agent_db(&entry).await?
+                        } else {
+                            agent
+                        };
+                        // A present unavailable ledger is never replaced.
+                        agent.scheduling_database().await?.ok_or_else(|| {
+                            anyhow::anyhow!("selected scheduling Executor unavailable")
+                        })?;
+                        for schedule in schedules {
+                            work.push((agent.clone(), schedule.id));
+                        }
+                    }
+                    Ok(())
+                }
+                .await;
+                if let Err(error) = result {
+                    debug!(agent_db_id = %entry.db_id, %error, "Scheduling accounting discovery held");
+                }
             }
-            let mut session = self.session.lock().await;
-            // Keep only the call positions and IDs needed for Worker ancestry,
-            // not private provider data or a replayable exchange. No queued
-            // request or attempt exists for the synthetic schedule ID.
-            if let TurnTranscriptMessage::ModelResponse {
-                content,
-                tool_calls,
-                provider_extra,
-                metadata,
-                ..
-            } = &mut record.message
-                && tool_calls.iter().any(|call| call.name == "spawn_worker")
+            // Open successors before dropping old handles: the shared cache is
+            // weakly indexed and would otherwise disappear at every cycle.
+            self.work = work;
+            self.next = 0;
+        }
+        let Some((agent, id)) = self.work.get(self.next) else {
+            return;
+        };
+        self.next += 1;
+        if server.agent_index.find_by_id(&agent.id()).is_none() {
+            return;
+        }
+        let result = async {
+            // Do not finish an audit with a stale definition baseline.
+            if let Some(schedule) = agent.find_schedule(id).await?
+                && agent
+                    .reconcile_schedule_accounting(&schedule, 32)
+                    .await?
+                    .complete
+                && let Some(engine) = server.routine_engine()
             {
-                *content = None;
-                provider_extra.clear();
-                *metadata = None;
-                for call in tool_calls {
-                    call.arguments.clear(); // already present in the tool audit
-                }
-                session.refresh_writer().await.map_err(|e| e.to_string())?;
-                session
-                    .append_turn_transcript(record, entries)
-                    .await
-                    .map_err(|e| e.to_string())?;
-            } else {
-                // No Worker creation depends on these display-only rows.
-                for mut entry in entries {
-                    let written = async {
-                        session.refresh_writer().await?;
-                        entry.timestamp = Utc::now();
-                        session.add_entry(entry).await
-                    }
-                    .await;
-                    if let Err(error) = written {
-                        tracing::error!(%error, "Failed to write scheduled tool audit entry");
-                    }
-                }
+                engine.resume_agent_preparation(agent, &schedule).await?;
             }
-            Ok(())
-        })
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        if let Err(error) = result {
+            debug!(agent_db_id = %agent.id(), schedule_id = %id, %error, "Scheduling accounting reconciliation held");
+        }
     }
-    fn observe_call<'a>(
-        &'a self,
-        call: crate::session::usage::CallObservation,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>> {
-        Box::pin(async move {
-            let mut session = self.session.lock().await;
-            session.refresh_writer().await.map_err(|e| e.to_string())?;
-            crate::session::usage::persist_call(
-                session.database(),
-                &self.invocation,
-                None,
-                &self.identity.agent,
-                call,
-            )
-            .await
-        })
-    }
-}
-
-/// Outcome of [`Server::try_admit_schedule_fire`].
-pub(super) enum ScheduleAdmission {
-    /// The schedule may fire. `retired_now` carries the bound message
-    /// when this admission spent the last `max_fires` slot (the row is
-    /// already persisted disabled). Admissions that reserve nothing
-    /// (one-shots, missing rows) carry `None` and refund nothing.
-    Admitted { retired_now: Option<String> },
-    /// The schedule already hit a lifecycle bound; the row is persisted
-    /// disabled (no-op if it already was). The caller skips the fire.
-    Retired(String),
 }
 
 impl Server {
-    /// Standalone execution path for agent-owned schedule fires.
-    ///
-    /// This is deliberately separate from [`Self::process_session`] — it
-    /// calls [`crate::runtime::execute`] directly without touching the
-    /// session's `SessionRuntime` (agent_override, backend, completion
-    /// channel). A Pinned schedule firing into a live session the user is
-    /// chatting in does not hijack the interactive routing.
-    ///
-    /// Steps:
-    /// 1. Host check — skip if the agent isn't on this peer.
-    /// 2. Resolve target — Fresh creates a session + attaches the owner;
-    ///    Pinned opens the existing session + idempotently attaches.
-    /// 3. Acquire the session's `processing` lock; skip if busy.
-    /// 4. Load the agent, build context with the wake-prompt as a private
-    ///    System message, run the ReAct loop.
-    /// 5. Write ToolCall/ToolResult entries + a terminal Message.
-    /// 6. Record a [`crate::agent_db::ScheduleFire`] with usage on the
-    ///    agent's DB.
-    /// 7. One-shot cleanup: delete the Schedule row from the agent DB.
+    /// Request one retry of the named terminal delivery in this exact Session.
+    /// This publishes work for the existing coordinator; it never starts a turn.
+    pub(crate) async fn retry_schedule_delivery(
+        &self,
+        session_db_id: &str,
+        entry: &crate::hosted_index::DbEntry,
+        occurrence: &str,
+        delivery: &str,
+        expected_attempt: &str,
+    ) -> anyhow::Result<crate::agent_db::ScheduleReference> {
+        use crate::schedule_state::lifecycle::{self, Preparation, retry};
+        anyhow::ensure!(
+            self.executor_authorized
+                && self.is_startup_ready()
+                && !self.shutting_down.load(Ordering::Acquire),
+            "schedule retry needs the running executor"
+        );
+        let agent = self.registry.open_scheduling_writer(entry).await?;
+        let prior = retry::delivery(&agent, occurrence, delivery).await?;
+        let Preparation::HandedOff { input, .. } = &prior.preparation else {
+            anyhow::bail!("schedule delivery was not handed off");
+        };
+        anyhow::ensure!(
+            input.session_db_id == session_db_id && self.is_session_open(session_db_id).await,
+            "use schedule retry from the delivery's open Session"
+        );
+        let (conv, db, key) = self
+            .registry
+            .open_session_with_signer(session_db_id)
+            .await?;
+        let mut session = Session::try_new(conv, db).await?.with_signing_key(key);
+        self.schedule_target_owner(&session, &prior.reference, entry)
+            .await?;
+        agent
+            .resolve_schedule_reference(&prior.reference, Utc::now())
+            .await?;
+        lifecycle::settle(&agent, &prior.reference, &session).await?;
+        retry::explicit(
+            &agent,
+            &prior.reference,
+            expected_attempt,
+            &mut session,
+            Utc::now(),
+        )
+        .await
+    }
+
+    /// Prepare/reconcile one Fresh Session for an already reserved occurrence.
+    /// This does not register a runtime, publish runnable input or start a turn.
+    /// The common admission path must still commit handoff and revalidate both
+    /// authority guards. Never use a creation retry as execution recovery.
+    pub async fn prepare_fresh_schedule_root(
+        &self,
+        reference: &crate::agent_db::ScheduleReference,
+    ) -> anyhow::Result<(ConversationId, eidetica::Database)> {
+        anyhow::ensure!(
+            self.executor_authorized,
+            "client cannot provision scheduled work"
+        );
+        let owner = eidetica::entry::ID::parse(&reference.owner_agent_db_id)?;
+        let entry = self
+            .agent_index
+            .find_by_id(&owner)
+            .ok_or_else(|| anyhow::anyhow!("Fresh owner not hosted"))?;
+        let agent = self.registry.open_scheduling_writer(&entry).await?;
+        let schedule = agent
+            .resolve_schedule_reference(reference, Utc::now())
+            .await?;
+        anyhow::ensure!(
+            matches!(schedule.target, crate::agent_db::ScheduleTarget::Fresh),
+            "not a Fresh schedule"
+        );
+        anyhow::ensure!(
+            crate::db_kind::try_read_agent_home_pubkey(agent.database())
+                .await?
+                .is_none_or(|home| home == entry.pubkey),
+            "not home peer for Fresh schedule"
+        );
+        self.registry
+            .prepare_fresh_schedule_root(&agent, &entry, reference)
+            .await
+    }
+
+    #[cfg(test)]
+    pub(super) fn check_schedule_write(&self, boundary: &str) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            *self.schedule_fail_at.lock().unwrap() != Some(boundary),
+            "injected schedule {boundary} write failure"
+        );
+        Ok(())
+    }
+
+    /// Acknowledge only committed clock handoff, never Started or completion.
+    /// Legacy payloads without a live clock/generation are inert, not execution
+    /// authority. Ordered discovery uses the ordinary turn runner and capacity.
+    pub async fn dispatch_agent_schedule(
+        self: &Arc<Self>,
+        payload: crate::routine::AgentSchedulePayload,
+    ) -> anyhow::Result<()> {
+        self.dispatch_timed_schedule(&payload).await
+    }
+
+    /// Compatibility entry point with the same handoff-only contract as the
+    /// timer. This cannot execute a legacy prompt/target payload directly.
     pub async fn fire_agent_schedule(
         &self,
         payload: crate::routine::AgentSchedulePayload,
     ) -> anyhow::Result<()> {
-        if !self.executor_authorized {
-            anyhow::bail!("client server cannot execute agent schedules");
-        }
-        use crate::agent_db::{ScheduleFire, ScheduleTarget};
-
-        // 1. Host check — unparseable IDs are silently skipped (they
-        //    can't possibly be hosted on this peer).
-        let owner_id = match eidetica::entry::ID::parse(&payload.owner_agent_db_id) {
-            Ok(id) => id,
-            Err(e) => {
-                tracing::debug!(
-                    agent_db_id = %payload.owner_agent_db_id,
-                    schedule = %payload.schedule_id,
-                    "Unparseable owner_agent_db_id; skipping schedule fire: {e}"
-                );
-                return Ok(());
-            }
-        };
-        let Some(agent_entry) = self.agent_index.find_by_id(&owner_id) else {
-            tracing::debug!(
-                agent_db_id = %payload.owner_agent_db_id,
-                schedule = %payload.schedule_id,
-                "Agent not hosted on this peer; skipping schedule fire"
-            );
-            return Ok(());
-        };
-
-        // A routine handler detaches agent turns from the engine's fire loop.
-        // Require a generation-bearing payload to still name the live entry
-        // before it can create a session or begin any turn work. Legacy
-        // persisted payloads omit this field and retain the prior behavior.
-        if !self.schedule_generation_is_live(&payload).await {
-            tracing::debug!(
-                agent = %agent_entry.display_name,
-                schedule = %payload.schedule_id,
-                "Stale agent schedule fire; skipping"
-            );
-            return Ok(());
-        }
-
-        let adb = self
-            .open_agent_db_for_schedule(&agent_entry)
-            .await
-            .ok_or_else(|| anyhow::anyhow!("cannot open owning agent DB for schedule fire"))?;
-
-        // 2. Resolve and check the target before lifecycle admission. A
-        // non-home daemon must not consume a max_fires slot for work it will
-        // never run.
-        let target: ScheduleTarget = serde_json::from_value(payload.target.clone())
-            .map_err(|e| anyhow::anyhow!("invalid schedule target in payload: {e}"))?;
-
-        let agent_name = agent_entry.display_name.clone();
-
-        match &target {
-            ScheduleTarget::Fresh => {
-                if let Some(home) = crate::db_kind::read_agent_home_pubkey(adb.database()).await
-                    && home != agent_entry.pubkey
-                {
-                    tracing::debug!(
-                        agent = %agent_name,
-                        schedule = %payload.schedule_id,
-                        "Not home peer for agent's Fresh schedule fire; skipping"
-                    );
-                    return Ok(());
-                }
-            }
-            ScheduleTarget::Pinned { session_db_id } => {
-                if !self.is_session_open(session_db_id).await {
-                    if let Err(e) = self.disable_schedule(&adb, &payload.schedule_id).await {
-                        tracing::error!(
-                            agent = %agent_name,
-                            schedule = %payload.schedule_id,
-                            "Failed to persist Pinned-target retirement: {e}"
-                        );
-                    }
-                    tracing::info!(
-                        session = %session_db_id,
-                        agent = %agent_name,
-                        schedule = %payload.schedule_id,
-                        "Pinned target session closed; retiring schedule"
-                    );
-                    return Ok(());
-                }
-                if !self.peer_is_home_for(session_db_id, &agent_name).await {
-                    tracing::debug!(
-                        session = %session_db_id,
-                        agent = %agent_name,
-                        schedule = %payload.schedule_id,
-                        "Not home peer for pinned schedule's session; skipping"
-                    );
-                    self.record_home_skip(session_db_id, &agent_name).await;
-                    return Ok(());
-                }
-            }
-        }
-
-        // Reserve the max_fires slot before creating a Fresh session. The
-        // home checks above ensure a non-home daemon cannot consume it.
-        let admission_note = match self
-            .try_admit_schedule_fire(&adb, &payload.schedule_id, Utc::now(), !payload.one_shot)
-            .await?
-        {
-            ScheduleAdmission::Admitted { retired_now } => retired_now,
-            ScheduleAdmission::Retired(reason) => {
-                tracing::info!(
-                    agent = %agent_name,
-                    schedule = %payload.schedule_id,
-                    "Schedule retired ({reason}); skipping fire"
-                );
-                return Ok(());
-            }
-        };
-
-        let (session_db, is_fresh, session_db_id) = match &target {
-            ScheduleTarget::Fresh => {
-                let source = format!(
-                    "schedule:{}:{}",
-                    payload.owner_agent_db_id, payload.schedule_id
-                );
-                let (_conv, db) = match self.registry.create_session(Some(&source)).await {
-                    Ok(session) => session,
-                    Err(error) => {
-                        if !payload.one_shot {
-                            self.refund_schedule_fire_admission(
-                                &adb,
-                                &payload.schedule_id,
-                                Utc::now(),
-                            )
-                            .await?;
-                        }
-                        return Err(error);
-                    }
-                };
-                let sid = db.root_id().to_string();
-
-                // Attach the owner agent to the session so it has Write
-                // permission and the session meta records membership.
-                if let Err(error) = self
-                    .registry
-                    .attach_agent_to_session(&sid, &agent_entry)
-                    .await
-                {
-                    self.deregister_session(&sid).await;
-                    let _ = self.registry.mark_session_closed(&sid).await;
-                    if !payload.one_shot {
-                        self.refund_schedule_fire_admission(&adb, &payload.schedule_id, Utc::now())
-                            .await?;
-                    }
-                    return Err(error);
-                }
-
-                // Register with the server so the session has a
-                // SessionRuntime (backend + on_write callback) for any
-                // tools that need it (spawn_agent writes to the on_write
-                // path). The agent_override is set to the schedule owner so
-                // future interactive writes route to this agent.
-                if let Err(error) = self
-                    .register_session(
-                        &db,
-                        self.default_backend.clone(),
-                        Some(agent_name.clone()),
-                        None,
-                    )
-                    .await
-                {
-                    self.deregister_session(&sid).await;
-                    let _ = self.registry.mark_session_closed(&sid).await;
-                    if !payload.one_shot {
-                        self.refund_schedule_fire_admission(&adb, &payload.schedule_id, Utc::now())
-                            .await?;
-                    }
-                    return Err(error);
-                }
-
-                tracing::info!(
-                    session = %sid,
-                    agent = %agent_name,
-                    schedule = %payload.schedule_id,
-                    "Created Fresh session for agent schedule fire"
-                );
-
-                (db, true, sid)
-            }
-            ScheduleTarget::Pinned { session_db_id } => {
-                let (_conv, db) = match self.registry.open_session(session_db_id).await {
-                    Ok(session) => session,
-                    Err(error) => {
-                        if !payload.one_shot {
-                            self.refund_schedule_fire_admission(
-                                &adb,
-                                &payload.schedule_id,
-                                Utc::now(),
-                            )
-                            .await?;
-                        }
-                        return Err(error);
-                    }
-                };
-                let sid = session_db_id.clone();
-
-                // Idempotent attach: if the agent was detached after the
-                // schedule was created, the fire-time membership check
-                // catches it and re-attaches. If attach fails (session
-                // gone, auth broken), skip this fire.
-                let session = Session::new(ConversationId(sid.clone()), db.clone()).await;
-                let meta = session.read_meta().await;
-                let already_member = meta
-                    .agents
-                    .iter()
-                    .any(|a| a.db_id == agent_entry.db_id.to_string());
-                if !already_member {
-                    if let Err(e) = self
-                        .registry
-                        .attach_agent_to_session(&sid, &agent_entry)
-                        .await
-                    {
-                        tracing::warn!(
-                            session = %sid,
-                            agent = %agent_name,
-                            schedule = %payload.schedule_id,
-                            "Pinned schedule: failed to re-attach agent to session: {e}"
-                        );
-                        if !payload.one_shot {
-                            self.refund_schedule_fire_admission(
-                                &adb,
-                                &payload.schedule_id,
-                                Utc::now(),
-                            )
-                            .await?;
-                        }
-                        return Ok(()); // self-skip
-                    }
-                    tracing::info!(
-                        session = %sid,
-                        agent = %agent_name,
-                        schedule = %payload.schedule_id,
-                        "Pinned schedule: re-attached agent to session"
-                    );
-                }
-
-                (db, false, sid)
-            }
-        };
-
-        // 3. Acquire the processing lock (skip if session is busy).
-        //    Release at the end of this scope via the deferred block.
-        {
-            let mut processing = self.processing.lock().await;
-            if !processing.insert(session_db_id.clone()) {
-                tracing::debug!(
-                    session = %session_db_id,
-                    schedule = %payload.schedule_id,
-                    "Session busy; skipping schedule fire"
-                );
-                if !payload.one_shot {
-                    self.refund_schedule_fire_admission(&adb, &payload.schedule_id, Utc::now())
-                        .await?;
-                }
-                return Ok(());
-            }
-        }
-
-        // Re-validate after target resolution + lock acquisition: a remove
-        // or same-ID replacement (including a metadata-only prompt/target
-        // edit, which now bumps the generation) may have landed between the
-        // pre-check above and turn start. Fail closed — release the lock
-        // and skip before any LLM work or cost attribution.
-        if !self.schedule_generation_is_live(&payload).await {
-            tracing::debug!(
-                agent = %agent_name,
-                schedule = %payload.schedule_id,
-                "Stale agent schedule fire at turn start; skipping"
-            );
-            {
-                let mut processing = self.processing.lock().await;
-                processing.remove(&session_db_id);
-            }
-            if is_fresh {
-                // The session above was created for a turn that will never
-                // run. Tear it down (runtime state + catalog status) so no
-                // permanent user-visible empty session remains. Pinned
-                // targets reuse a pre-existing session and are left alone.
-                self.deregister_session(&session_db_id).await;
-                if let Err(e) = self.registry.mark_session_closed(&session_db_id).await {
-                    tracing::warn!(
-                        session = %session_db_id,
-                        agent = %agent_name,
-                        schedule = %payload.schedule_id,
-                        "Failed to mark stale Fresh session closed: {e}"
-                    );
-                }
-            }
-            if !payload.one_shot {
-                self.refund_schedule_fire_admission(&adb, &payload.schedule_id, Utc::now())
-                    .await?;
-            }
-            return Ok(());
-        }
-
-        // 4. Load the agent + build context + run the turn.
-        let outcome = self
-            .run_schedule_turn(
-                &agent_name,
-                &session_db,
-                &session_db_id,
-                &payload.prompt,
-                &payload.schedule_id,
-            )
-            .await;
-
-        // Release the processing lock.
-        {
-            let mut processing = self.processing.lock().await;
-            processing.remove(&session_db_id);
-        }
-
-        // 5. Record ScheduleFire on the agent's DB (best-effort audit).
-        let fired_at = Utc::now();
-        let fire = ScheduleFire {
-            schedule_id: payload.schedule_id.clone(),
-            fired_at,
-            session_db_id: session_db_id.clone(),
-            fresh: is_fresh,
-            usage: outcome.as_ref().ok().and_then(|o| o.metadata.clone()),
-        };
-        if let Err(e) = adb.record_schedule_fire(fire).await {
-            tracing::error!(
-                agent = %agent_name,
-                schedule = %payload.schedule_id,
-                "Failed to record ScheduleFire: {e}"
-            );
-        }
-
-        // A failed turn refunds its reservation, so max_fires counts
-        // successful fires rather than attempts. One-shots reserve nothing.
-        if !payload.one_shot {
-            if outcome.is_ok() {
-                if let Some(reason) = admission_note {
-                    tracing::info!(
-                        agent = %agent_name,
-                        schedule = %payload.schedule_id,
-                        "Schedule retired after fire ({reason})"
-                    );
-                }
-            } else if let Err(e) = self
-                .refund_schedule_fire_admission(&adb, &payload.schedule_id, Utc::now())
-                .await
-            {
-                tracing::error!(
-                    agent = %agent_name,
-                    schedule = %payload.schedule_id,
-                    "Failed to refund schedule fire_count: {e}"
-                );
-            }
-        }
-
-        // 6. One-shot cleanup: delete the Schedule row after a successful fire.
-        if payload.one_shot {
-            if let Err(e) = adb.remove_schedule(&payload.schedule_id).await {
-                tracing::error!(
-                    agent = %agent_name,
-                    schedule = %payload.schedule_id,
-                    "Failed to remove one-shot schedule: {e}"
-                );
-            } else {
-                tracing::info!(
-                    agent = %agent_name,
-                    schedule = %payload.schedule_id,
-                    "Removed one-shot schedule after successful fire"
-                );
-            }
-        }
-
-        // Surface any runtime error
-        outcome.map(|_| ())
+        self.dispatch_timed_schedule(&payload).await
     }
 
     /// Open a hosted agent's Living Agent DB by display name. `None` if
@@ -547,16 +247,14 @@ impl Server {
     }
 
     /// True when a generation-bearing payload still names the live engine
-    /// entry. Legacy payloads without a generation always pass. Called both
-    /// before session creation and again after target resolution + lock
-    /// acquisition so a remove/replace landing in between can't slip a
-    /// detached turn through.
-    async fn schedule_generation_is_live(
+    /// entry. A missing generation never grants authority. Rechecked before
+    /// durable handoff; current immutable source/target guards own delivery.
+    pub(super) async fn schedule_generation_is_live(
         &self,
         payload: &crate::routine::AgentSchedulePayload,
     ) -> bool {
         let Some(generation) = &payload.generation else {
-            return true;
+            return false;
         };
         let routine_id = crate::routine::RoutineId::new(format!(
             "agent:{}:{}",
@@ -581,7 +279,7 @@ impl Server {
         {
             Ok(Some(adb)) => Some(adb),
             Ok(None) => {
-                tracing::warn!(agent = %entry.display_name, "No key for agent DB; can't write fire audit");
+                tracing::warn!(agent = %entry.display_name, "No key for schedule owner DB");
                 None
             }
             Err(e) => {
@@ -589,387 +287,6 @@ impl Server {
                 None
             }
         }
-    }
-
-    /// Return the in-process mutex for an agent-owned schedule. The key uses
-    /// the agent DB id as well as the schedule id, which is the schedule's
-    /// durable ownership boundary.
-    async fn schedule_accounting_lock(
-        &self,
-        adb: &crate::agent_db::AgentDb,
-        schedule_id: &str,
-    ) -> Arc<Mutex<()>> {
-        let key = format!("{}:{schedule_id}", adb.id());
-        let mut locks = self.schedule_accounting.lock().await;
-        locks
-            .entry(key)
-            .or_insert_with(|| Arc::new(Mutex::new(())))
-            .clone()
-    }
-
-    /// Pre-fire admission check that reserves a `max_fires` slot up front
-    /// under the per-schedule accounting lock. This is the hard-cap
-    /// enforcement point: the bound check and the `fire_count` increment
-    /// happen atomically, so N concurrent overlapping turns cannot all
-    /// pass admission at count 0. A turn that hits `max_fires` with its
-    /// reservation persists `enabled = false` immediately, so the next
-    /// tick's admission — and any engine reload — drops it.
-    ///
-    /// `reserve = false` (one-shots) still enforces the bounds but counts
-    /// nothing. Missing or disabled rows are not executable, even for legacy
-    /// generation-free payloads.
-    ///
-    /// The lock is process-local: two chaz processes hosting the same
-    /// agent could still double-admit against the shared agent DB.
-    /// Cross-process overlap is out of scope — in practice the home-peer
-    /// gate means a single peer admits a schedule's fires.
-    pub(super) async fn try_admit_schedule_fire(
-        &self,
-        adb: &crate::agent_db::AgentDb,
-        schedule_id: &str,
-        now: chrono::DateTime<Utc>,
-        reserve: bool,
-    ) -> anyhow::Result<ScheduleAdmission> {
-        let lock = self.schedule_accounting_lock(adb, schedule_id).await;
-        let _guard = lock.lock().await;
-        let Some(mut schedule) = adb.find_schedule(schedule_id).await? else {
-            return Ok(ScheduleAdmission::Retired("schedule was removed".into()));
-        };
-        if !schedule.enabled {
-            return Ok(ScheduleAdmission::Retired("schedule is disabled".into()));
-        };
-        if let Some(reason) = schedule.retirement_reason(now) {
-            if schedule.enabled {
-                schedule.enabled = false;
-                adb.upsert_schedule(schedule).await?;
-            }
-            return Ok(ScheduleAdmission::Retired(reason));
-        }
-        if !reserve {
-            return Ok(ScheduleAdmission::Admitted { retired_now: None });
-        }
-        schedule.fire_count = schedule.fire_count.saturating_add(1);
-        let retired_now = schedule.retirement_reason(now);
-        if retired_now.is_some() {
-            schedule.enabled = false;
-        }
-        adb.upsert_schedule(schedule).await?;
-        Ok(ScheduleAdmission::Admitted { retired_now })
-    }
-
-    /// Refund one reserved admission after a failed turn, under the same
-    /// lock. Keeps `max_fires` counting successful fires rather than
-    /// attempts: without this, N failed turns would burn the budget and
-    /// retire a schedule that never ran once. If the refund drops the row
-    /// back under its bound it is re-enabled (an expiry still retires, so
-    /// only a bound-free row flips back); the engine picks the revived
-    /// row up on its next reload.
-    pub(super) async fn refund_schedule_fire_admission(
-        &self,
-        adb: &crate::agent_db::AgentDb,
-        schedule_id: &str,
-        now: chrono::DateTime<Utc>,
-    ) -> anyhow::Result<()> {
-        let lock = self.schedule_accounting_lock(adb, schedule_id).await;
-        let _guard = lock.lock().await;
-        let Some(mut schedule) = adb.find_schedule(schedule_id).await? else {
-            return Ok(());
-        };
-        schedule.fire_count = schedule.fire_count.saturating_sub(1);
-        if !schedule.enabled && schedule.retirement_reason(now).is_none() {
-            schedule.enabled = true;
-        }
-        adb.upsert_schedule(schedule).await?;
-        Ok(())
-    }
-
-    /// Disable a schedule for a terminal non-turn condition while sharing the
-    /// completion-accounting lock. Missing or already-disabled rows are no-ops.
-    async fn disable_schedule(
-        &self,
-        adb: &crate::agent_db::AgentDb,
-        schedule_id: &str,
-    ) -> anyhow::Result<()> {
-        let lock = self.schedule_accounting_lock(adb, schedule_id).await;
-        let _guard = lock.lock().await;
-        let Some(mut schedule) = adb.find_schedule(schedule_id).await? else {
-            return Ok(());
-        };
-        if schedule.enabled {
-            schedule.enabled = false;
-            adb.upsert_schedule(schedule).await?;
-        }
-        Ok(())
-    }
-
-    /// Load the agent, hydrate from DB, build context with the wake-prompt
-    /// as a private System message, run the ReAct loop, and write entries.
-    ///
-    /// Returns the [`crate::runtime::RuntimeOutcome`] so the caller can
-    /// extract usage metadata for cost attribution.
-    async fn run_schedule_turn(
-        &self,
-        agent_name: &str,
-        session_db: &eidetica::Database,
-        session_db_id: &str,
-        wake_prompt: &str,
-        schedule_id: &str,
-    ) -> anyhow::Result<crate::runtime::RuntimeOutcome> {
-        if !self.executor_authorized {
-            anyhow::bail!("client server cannot execute scheduled model or tool turns");
-        }
-        // Load the agent: check the in-memory registry first; build from
-        // DB config if not present (agent was never attached to a session
-        // this boot).
-        let mut agent = match self.agents.get(agent_name) {
-            Some(a) => a,
-            None => {
-                // Build a minimal agent from the DB config.
-                // hydrate_agent_from_db below will fill in the rest.
-                self.agents
-                    .build_from_db_config(agent_name, &crate::agent_db::AgentDbConfig::default())
-            }
-        };
-        // Hydrate from the Living Agent DB (live refresh).
-        agent = self.agent_for_execution(agent).await?;
-
-        let default_model = agent.default_model.clone();
-        let allowed_tools = agent.allowed_tools.clone();
-        let agent_capabilities = agent.capabilities.clone();
-        let agent_grants = agent.grants.clone();
-        let max_call_depth = agent.max_spawn_depth as usize;
-        let max_context_tokens = agent.max_context_tokens;
-        let profile = agent
-            .tool_profile
-            .as_ref()
-            .and_then(|name| self.tool_profiles.get(name))
-            .cloned()
-            .unwrap_or_default();
-
-        let active_extensions = self
-            .active_extensions_for_agent(session_db_id, agent_name)
-            .await;
-        let scoped_tools = ScopedTools::new(self.tools.clone(), allowed_tools)
-            .with_active_extensions(Some(active_extensions.clone()));
-
-        // The pinned target can already contain a newer delegated floor from
-        // an interactive turn. Anchor its actual signer before this invocation.
-        let (conversation_id, current_db, signing_key) = self
-            .registry
-            .open_session_with_signer(session_db_id)
-            .await?;
-        anyhow::ensure!(
-            current_db.root_id() == session_db.root_id(),
-            "schedule target changed"
-        );
-        Session::require_legacy_history(&current_db).await?;
-        let session_db = &current_db;
-        let session = Session::new(conversation_id, current_db.clone())
-            .await
-            .with_signing_key(signing_key.clone());
-        let session_capabilities = session.read_meta().await.capabilities;
-        let session = Arc::new(tokio::sync::Mutex::new(session));
-        let attachment = crate::session::session_attachment(session_db).await?;
-
-        let tool_ctx = ToolContext {
-            agent_name: agent_name.to_string(),
-            agent_identity: self.agent_index.find_by_name(agent_name),
-            turn_request_id: None,
-            tool_call_key: None,
-            turn_attempt: None,
-            tool_call_site: None,
-            observation_yield: None,
-            call_depth: 0,
-            max_call_depth,
-            tools: scoped_tools,
-            profile,
-            allow_no_reply: attachment
-                .as_ref()
-                .is_some_and(|a| a.conversational_replies),
-            session: session.clone(),
-            grants: Default::default(),
-            session_capabilities,
-            agent_capabilities,
-            agent_grants,
-            host: self.host.clone(),
-            active_extensions: active_extensions.clone(),
-            routine_engine: self.routine_engine().cloned(),
-            observation_deadline: None,
-            call_deadline: None,
-            call_timeout: None,
-            call_cancel: None,
-        };
-
-        let tool_defs = tool_ctx.definitions();
-        let view = {
-            let s = session.lock().await;
-            self.extensions
-                .prepare_durable_context(&s, agent_name, None, &active_extensions)
-                .await?
-        };
-        let (session_model, mut assembled) = {
-            let s = session.lock().await;
-            let meta = s.read_meta().await;
-            let roster: Vec<String> = meta.agents.iter().map(|a| a.display_name.clone()).collect();
-            // Per-agent override > session pin > backend default. The backend-
-            // default fallback mirrors the actual call, so an agent that pins no
-            // model still budgets against its real window.
-            let session_model = meta.resolve_model_for_agent(agent_name).map(str::to_string);
-            let budget_model = budget_model_id(
-                &self.default_backend,
-                session_model.as_deref(),
-                default_model.as_deref(),
-            );
-            // First use of a model we don't have a window for yet: learn it in
-            // the background so the next turn budgets window-aware.
-            if let Some(m) = budget_model.as_deref() {
-                self.ensure_model_window_cached(&self.default_backend, m);
-            }
-            let max_tokens_override = resolve_context_max_tokens(
-                &self.default_backend,
-                budget_model.as_deref(),
-                max_context_tokens,
-            );
-            let mut builder = ContextBuilder::from_history(
-                &view,
-                agent_name,
-                &agent.system_prompt,
-                &self.context_config,
-            );
-            if let Some(attachment) = &attachment {
-                builder = builder.with_attachment(attachment);
-            }
-            let assembled = builder
-                .with_tools(&tool_defs)
-                .with_max_tokens_override(max_tokens_override)
-                .with_room_participants(&roster)
-                .with_extension_hub(self.extensions.clone())
-                .with_session_db(session_db)
-                .with_session_signing_key(signing_key.clone())
-                .with_invocation(&active_extensions, None)
-                .try_build()
-                .await?;
-            (session_model, assembled)
-        };
-        // Effective model resolution: per-agent override (new) > session pin
-        // (`/model X`, `SessionMeta.model`) > agent's configured default.
-        // `runtime::execute` then calls `BackendManager::resolve_model_name`
-        // to strip the backend prefix and fall back to the backend default
-        // when all three are None.
-        let effective_model = session_model.or(default_model);
-
-        // Prepend the wake-prompt as a private System message. This is
-        // invocation-scoped — it never appears as a session entry.
-        for anchor in &mut assembled.cache.anchors {
-            if let crate::cache::CacheAnchor::Message(index) = anchor {
-                *index += 1;
-            }
-        }
-        assembled.messages.insert(
-            0,
-            crate::runtime::RuntimeMessage::System(wake_prompt.to_string()),
-        );
-        assembled
-            .sources
-            .insert(0, crate::extension::projection::ContextSource::Instructions);
-
-        if assembled.truncated {
-            tracing::info!(
-                agent = %agent_name,
-                schedule = %schedule_id,
-                "Context truncated: {} entries, ~{} tokens",
-                assembled.entries_included,
-                assembled.estimated_tokens
-            );
-        }
-
-        let request_security = SecurityContext {
-            leak_detector: self.security.leak_detector.clone(),
-            auto_approved_tools: self.security.auto_approved_tools.clone(),
-            approval_callback: None, // no interactive approval for schedule fires
-        };
-
-        let invocation = format!("schedule:{}", uuid::Uuid::new_v4());
-        let recorder = Arc::new(ScheduleRecorder {
-            session: session.clone(),
-            invocation: invocation.clone(),
-            identity: TurnCallIdentity {
-                agent: agent_name.into(),
-                requested_model: self
-                    .default_backend
-                    .resolve_model_name(effective_model.as_deref()),
-                execution_id: None,
-            },
-            sequence: Default::default(),
-        });
-        let result = crate::runtime::execute_with_recorder(
-            effective_model.as_deref(),
-            assembled.messages,
-            &self.default_backend,
-            &request_security,
-            &tool_ctx,
-            &self.policies,
-            Some(recorder),
-            Some(self.extensions.as_ref()),
-            None,
-            crate::runtime::ModelCallScope {
-                cache: assembled.cache,
-                context_strategy: assembled.strategy,
-                attempt_id: None,
-                request_budget_tokens: Some(assembled.request_budget_tokens),
-                sources: assembled.sources,
-            },
-        )
-        .await;
-
-        let result = result.map(|mut outcome| {
-            if let Some(metadata) = &mut outcome.metadata {
-                metadata.extra.insert(
-                    crate::session::usage::SUMMARY_ID.into(),
-                    serde_json::Value::String(invocation),
-                );
-            }
-            outcome
-        });
-
-        // Write the terminal Message unless the Matrix-bound turn ended with no_reply.
-        let mut s = session.lock().await;
-        s.refresh_writer().await?;
-        match &result {
-            Ok(outcome) if tool_ctx.allow_no_reply && outcome.body.trim().is_empty() => {}
-            Ok(outcome) => {
-                if let Err(e) = s
-                    .add_entry(SessionEntry {
-                        sender: agent_name.to_string(),
-                        content: outcome.body.clone(),
-                        timestamp: Utc::now(),
-                        entry_type: EntryType::Message,
-                        metadata: outcome.metadata.clone(),
-                        routing: None,
-                    })
-                    .await
-                {
-                    tracing::error!("Failed to write scheduled turn result: {e}");
-                }
-            }
-            Err(err) => {
-                if let Err(e) = s
-                    .add_entry(SessionEntry {
-                        sender: agent_name.to_string(),
-                        content: format!("Error: {err}"),
-                        timestamp: Utc::now(),
-                        entry_type: EntryType::Error,
-                        metadata: None,
-                        routing: None,
-                    })
-                    .await
-                {
-                    tracing::error!("Failed to write scheduled turn error: {e}");
-                }
-            }
-        }
-
-        result.map_err(|e| anyhow::anyhow!("{e}"))
     }
 
     /// Build a `HookContext` for the given session and fire `session_start`.
@@ -1017,152 +334,5 @@ impl Server {
         self.extensions
             .refresh_status_outputs(&status_agent, &status_db)
             .await;
-    }
-}
-
-#[cfg(test)]
-mod telemetry_tests {
-    use super::*;
-    use crate::runtime::{LLMResponse, ResponseMetadata, TokenUsage};
-    use crate::test_support::MockBackend;
-
-    #[tokio::test]
-    async fn scheduled_telemetry_is_live_and_retained_after_no_reply_failure_and_reopen() {
-        for fail in [false, true] {
-            let model = Arc::new(MockBackend::new());
-            let backend = BackendManager::with_mock(
-                model.clone(),
-                crate::test_support::empty_secrets().await,
-            );
-            let (_instance, server, registry) = super::super::tests::server_fixture_backend(
-                Arc::new(crate::tool_host::NativeToolHost::new()),
-                Arc::new(crate::test_support::context_hub().await),
-                Some(backend),
-            )
-            .await;
-            server.tools.register(crate::tools::Calculate);
-            let (_agent, _adb) = super::super::tests::seed_agent(&server, &registry, "host").await;
-            let (_id, db) = registry.create_session(Some("matrix")).await.unwrap();
-            let sid = db.root_id().to_string();
-            server.extensions.record_active(&db).await.unwrap();
-            crate::session::bind_transport(&db, "matrix", "@host:example", "!room:example")
-                .await
-                .unwrap();
-            let metadata = || {
-                Some(ResponseMetadata {
-                    model: "wire".into(),
-                    usage: TokenUsage {
-                        prompt_tokens: 100,
-                        completion_tokens: 10,
-                        cost_usd: Some(0.01),
-                        ..Default::default()
-                    },
-                    ..Default::default()
-                })
-            };
-            model.push_response(Ok(LLMResponse::ToolCalls {
-                content: None,
-                tool_calls: vec![runtime::ToolCallRequest {
-                    id: "one".into(),
-                    name: "calculate".into(),
-                    arguments: "{\"expression\":\"1+1\"}".into(),
-                }],
-                provider_extra: Default::default(),
-                metadata: metadata(),
-            }));
-            if fail {
-                model.push_err(crate::error::LlmError::Configuration {
-                    message: "later failure".into(),
-                });
-            } else {
-                model.push_response(Ok(LLMResponse::ToolCalls {
-                    content: None,
-                    tool_calls: vec![runtime::ToolCallRequest {
-                        id: "quiet".into(),
-                        name: "no_reply".into(),
-                        arguments: "{}".into(),
-                    }],
-                    provider_extra: Default::default(),
-                    metadata: metadata(),
-                }));
-            }
-            let first = model.block_next_call();
-            let second = model.block_next_call();
-            let run_server = server.clone();
-            let run_db = db.clone();
-            let run_sid = sid.clone();
-            let mut task = tokio::spawn(async move {
-                run_server
-                    .run_schedule_turn(
-                        "host",
-                        &run_db,
-                        &run_sid,
-                        "PRIVATE SCHEDULE PROMPT",
-                        "fixture",
-                    )
-                    .await
-            });
-            tokio::select! {
-                result = &mut task => panic!("scheduled turn exited before first call: {result:?}"),
-                result = tokio::time::timeout(std::time::Duration::from_secs(5), first.wait_started()) => result.unwrap(),
-            }
-            first.release();
-            tokio::time::timeout(std::time::Duration::from_secs(5), second.wait_started())
-                .await
-                .unwrap();
-            let snapshot = db.snapshot().await.unwrap();
-            let entries = Session::entries_at_snapshot(&db, &snapshot).await.unwrap();
-            let live = crate::session::usage::telemetry_at_snapshot(&db, &snapshot, &entries)
-                .await
-                .unwrap();
-            assert_eq!(
-                live.totals.prompt_tokens, 100,
-                "first reported call visible while next blocks"
-            );
-            assert!(
-                live.totals.estimated.prompt_tokens > 0,
-                "held second request estimated"
-            );
-            assert!(!entries.iter().any(|e| e.entry_type == EntryType::Message));
-            assert!(
-                Session::active_turn_attempts(&db).await.unwrap().is_empty(),
-                "schedule has no fabricated attempt"
-            );
-            second.release();
-            let result = tokio::time::timeout(std::time::Duration::from_secs(5), task)
-                .await
-                .unwrap()
-                .unwrap();
-            assert_eq!(result.is_err(), fail);
-            let snapshot = db.snapshot().await.unwrap();
-            let entries = Session::entries_at_snapshot(&db, &snapshot).await.unwrap();
-            let reopened = crate::session::usage::telemetry_at_snapshot(&db, &snapshot, &entries)
-                .await
-                .unwrap();
-            assert_eq!(reopened.totals.prompt_tokens, if fail { 100 } else { 200 });
-            assert_eq!(reopened.totals.calls, 2);
-            assert!(
-                !entries.iter().any(|e| e.entry_type == EntryType::Message),
-                "no_reply stays silent"
-            );
-            assert!(
-                !entries
-                    .iter()
-                    .any(|e| e.content.contains("PRIVATE SCHEDULE PROMPT"))
-            );
-            let txn = db.new_transaction().await.unwrap();
-            let rows = txn
-                .get_store::<eidetica::store::Table<serde_json::Value>>("call_telemetry")
-                .await
-                .unwrap()
-                .search(|_| true)
-                .await
-                .unwrap();
-            assert!(
-                !serde_json::to_string(&rows)
-                    .unwrap()
-                    .contains("PRIVATE SCHEDULE PROMPT")
-            );
-        }
     }
 }

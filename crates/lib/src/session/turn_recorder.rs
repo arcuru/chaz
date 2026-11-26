@@ -1,10 +1,12 @@
 //! Persistence for the runtime's awaited recording seam. The executor still
 //! schedules calls, tool effects and publication; this recorder writes the
 //! selected history format without choosing when to run them.
+use super::steering::JobInputState;
 use super::{
     EntryType, Session, SessionEntry, TurnAttempt, TurnCallIdentity, TurnRequestId,
     TurnTranscriptMessage, TurnTranscriptRecord, execution, jobs, steering, usage, wait_resume,
 };
+use crate::agent_db::ScheduleReference;
 use crate::runtime;
 use chrono::Utc;
 use eidetica::{Database, Snapshot};
@@ -30,11 +32,32 @@ pub(crate) struct TurnRecorder {
     /// it a wait cannot be reconstructed, so none is checkpointed.
     context_snapshot: Option<Snapshot>,
     can_suspend: bool,
+    scheduled: Option<Box<dyn ScheduleInputAuthority>>,
+    selected_schedules: Mutex<Vec<ScheduleReference>>,
     #[cfg(test)]
     fail_after: Option<Arc<std::sync::Mutex<Option<usize>>>>,
     fenced: Option<Mutex<fenced::FencedTurn>>,
     fenced_admitted: AtomicBool,
     fenced_compaction: bool,
+}
+
+/// Resolve private wake material through the live executor's authority.
+/// Session owns the input and transcript writes and their ordering.
+pub(crate) trait ScheduleInputAuthority: Send + Sync {
+    fn lock_binding(&self) -> futures::future::BoxFuture<'_, Result<Box<dyn Send>, String>>;
+    fn resolve<'a>(
+        &'a self,
+        session: &'a Session,
+        reference: &'a ScheduleReference,
+        included_attempt: Option<&'a str>,
+    ) -> futures::future::BoxFuture<'a, anyhow::Result<String>>;
+    fn project<'a>(
+        &'a self,
+        session: &'a Session,
+        attempt: &'a str,
+    ) -> futures::future::BoxFuture<'a, anyhow::Result<()>>;
+    #[cfg(test)]
+    fn on_closing(&self) -> futures::future::BoxFuture<'_, ()>;
 }
 
 #[derive(Default)]
@@ -43,6 +66,7 @@ pub(crate) struct TurnRecorderOptions {
     pub explicit_bridge_send: bool,
     pub context_snapshot: Option<Snapshot>,
     pub can_suspend: bool,
+    pub scheduled: Option<Box<dyn ScheduleInputAuthority>>,
     #[cfg(test)]
     pub fail_after: Option<Arc<std::sync::Mutex<Option<usize>>>>,
 }
@@ -63,6 +87,8 @@ impl Session {
             explicit_bridge_send: AtomicBool::new(options.explicit_bridge_send),
             context_snapshot: options.context_snapshot,
             can_suspend: options.can_suspend,
+            scheduled: options.scheduled,
+            selected_schedules: Mutex::default(),
             #[cfg(test)]
             fail_after: options.fail_after,
             fenced: None,
@@ -176,6 +202,11 @@ impl runtime::RuntimeRecorder for TurnRecorder {
         self.can_suspend
     }
 
+    fn can_suspend_with_boundary_input(&self) -> bool {
+        // Exact-wait admission reconstructs paired inputs for this attempt.
+        self.can_suspend
+    }
+
     fn input_boundary<'a>(
         &'a self,
         model_sequence: u64,
@@ -186,12 +217,24 @@ impl runtime::RuntimeRecorder for TurnRecorder {
             if self.fenced.is_some() {
                 return Ok(Vec::new()); // no steering or job activity on this fixture
             }
+            // A late bind must either join this boundary or see it closed.
+            let binding = match &self.scheduled {
+                Some(authority) => Some(authority.lock_binding().await?),
+                None => None,
+            };
             let session = self.write_session().await?;
+            let private = self.scheduled_boundary(&session).await.map_err(|error| {
+                format!("runtime persistence failed: scheduled input boundary: {error}")
+            })?;
+            #[cfg(test)]
+            if closing && let Some(authority) = &self.scheduled {
+                authority.on_closing().await;
+            }
             let mut messages: Vec<runtime::RuntimeMessage> = steering::input_boundary(
                 session.database(),
                 &self.attempt.attempt_id,
                 model_sequence,
-                closing,
+                closing && private.is_empty(),
             )
             .await
             .map(|texts| {
@@ -201,6 +244,8 @@ impl runtime::RuntimeRecorder for TurnRecorder {
                     .collect()
             })
             .map_err(|error| format!("runtime persistence failed: job input boundary: {error}"))?;
+            messages.extend(private);
+            drop(binding);
             // Parallel-execution notices join at the same safe boundary;
             // a closing boundary never demands another model call for them.
             if let Some(branch) = &self.identity.execution_id {
@@ -248,6 +293,12 @@ impl runtime::RuntimeRecorder for TurnRecorder {
                 })
                 .await?;
             }
+            // Keep the User-then-private order for exact-wait reconstruction.
+            self.dispatch_scheduled(model_sequence, messages, baseline)
+                .await
+                .map_err(|error| {
+                    format!("runtime persistence failed: scheduled dispatch: {error}")
+                })?;
             Ok(())
         })
     }
@@ -274,6 +325,11 @@ impl runtime::RuntimeRecorder for TurnRecorder {
                 }
             }
             if let runtime::RuntimeRecord::ModelResponse { model_sequence, .. } = &message {
+                self.observe_scheduled_call(*model_sequence)
+                    .await
+                    .map_err(|error| {
+                        format!("runtime persistence failed: scheduled receipt: {error}")
+                    })?;
                 let session = self.write_session().await?;
                 steering::input_call_observed(
                     session.database(),
@@ -425,7 +481,7 @@ fn execution_yield_error(yielded: &execution::ExecutionYield) -> String {
     )
 }
 
-pub(crate) fn transcript_record(
+fn transcript_record(
     request_id: TurnRequestId,
     attempt_id: String,
     identity: TurnCallIdentity,
@@ -484,12 +540,13 @@ pub(crate) fn transcript_record(
     }
 }
 
-pub(crate) fn display_entries_for_record(
+fn display_entries_for_record(
     agent_name: &str,
     record: &TurnTranscriptRecord,
 ) -> Vec<SessionEntry> {
     match &record.message {
         TurnTranscriptMessage::Cancelled
+        | TurnTranscriptMessage::ScheduledInput { .. }
         | TurnTranscriptMessage::Unknown { .. }
         | TurnTranscriptMessage::ToolResult {
             outcome: runtime::ToolResultOutcome::Unknown { .. },
@@ -556,5 +613,159 @@ pub(crate) fn display_entries_for_record(
                 routing: None,
             }]
         }
+    }
+}
+impl TurnRecorder {
+    async fn scheduled_boundary(
+        &self,
+        session: &Session,
+    ) -> Result<Vec<runtime::RuntimeMessage>, String> {
+        let Some(adapter) = &self.scheduled else {
+            return Ok(Vec::new());
+        };
+        let mut selected = self.selected_schedules.lock().await;
+        let mut messages = Vec::new();
+        for input in session
+            .scheduled_inputs_for_attempt(&self.attempt.attempt_id)
+            .await
+            .map_err(|e| e.to_string())?
+        {
+            match input.state {
+                JobInputState::Queued => {
+                    let text = adapter
+                        .resolve(session, &input.anchor.reference, None)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    session
+                        .record_schedule_input(
+                            &input.anchor.reference,
+                            &self.attempt.attempt_id,
+                            JobInputState::Accepted,
+                        )
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    selected.push(input.anchor.reference);
+                    messages.push(runtime::RuntimeMessage::System(text));
+                }
+                JobInputState::Accepted if !selected.contains(&input.anchor.reference) => {
+                    return Err("scheduled selection interrupted before dispatch; held".into());
+                }
+                _ => {}
+            }
+        }
+        Ok(messages)
+    }
+
+    async fn dispatch_scheduled(
+        &self,
+        model_sequence: u64,
+        messages: &[runtime::RuntimeMessage],
+        baseline: &[runtime::RuntimeMessage],
+    ) -> Result<(), String> {
+        let session = self.write_session().await?;
+        let inputs = session
+            .scheduled_inputs_for_attempt(&self.attempt.attempt_id)
+            .await
+            .map_err(|e| e.to_string())?;
+        let selected = self.selected_schedules.lock().await;
+        let mut references = Vec::new();
+        for input in inputs {
+            if matches!(
+                input.state,
+                JobInputState::Queued
+                    | JobInputState::NotApplied { .. }
+                    | JobInputState::Uncertain { .. }
+            ) {
+                continue;
+            }
+            let adapter = self
+                .scheduled
+                .as_ref()
+                .ok_or("scheduled input has no exact executor")?;
+            // Included instructions belong to this attempt, not a later edited
+            // definition. Current keys/home/membership still gate every round.
+            let text = adapter
+                .resolve(
+                    &session,
+                    &input.anchor.reference,
+                    matches!(input.state, JobInputState::Included { .. })
+                        .then_some(self.attempt.attempt_id.as_str()),
+                )
+                .await
+                .map_err(|e| e.to_string())?;
+            let count = |vector: &[runtime::RuntimeMessage]| {
+                vector.iter().filter(|message| matches!(message, runtime::RuntimeMessage::System(body) if body == &text)).count()
+            };
+            let expected = count(baseline);
+            if expected == 0 || count(messages) < expected {
+                return Err("projection removed private scheduled input".into());
+            }
+            if input.state == JobInputState::Accepted {
+                if !selected.contains(&input.anchor.reference) {
+                    return Err("scheduled input was not selected by this runtime".into());
+                }
+                references.push(input.anchor.reference);
+            }
+        }
+        drop(selected);
+        if !references.is_empty() {
+            let record = TurnTranscriptRecord {
+                request_id: self.attempt.request_id.clone(),
+                attempt_id: self.attempt.attempt_id.clone(),
+                sequence: self.sequence.fetch_add(1, Ordering::SeqCst) as u64,
+                timestamp: Utc::now(),
+                identity: Some(self.identity.clone()),
+                message: TurnTranscriptMessage::ScheduledInput {
+                    model_sequence,
+                    references,
+                },
+            };
+            // Receipt + prompt-free transcript are one native commit. A failed
+            // reply stops dispatch and is never called Included or safe to retry.
+            session
+                .append_turn_transcript_for_branch(
+                    record,
+                    Vec::new(),
+                    self.identity.execution_id.as_deref(),
+                )
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    }
+
+    async fn observe_scheduled_call(&self, model_sequence: u64) -> Result<(), String> {
+        let session = self.write_session().await?;
+        for input in session
+            .scheduled_inputs_for_attempt(&self.attempt.attempt_id)
+            .await
+            .map_err(|e| e.to_string())?
+        {
+            if input.state == (JobInputState::Dispatching { model_sequence }) {
+                session
+                    .record_schedule_input(
+                        &input.anchor.reference,
+                        &self.attempt.attempt_id,
+                        JobInputState::Included { model_sequence },
+                    )
+                    .await
+                    .map_err(|e| e.to_string())?;
+            }
+        }
+        if let Some(adapter) = &self.scheduled {
+            adapter
+                .project(&session, &self.attempt.attempt_id)
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn finish_scheduled_inputs(&self) -> Result<(), String> {
+        let session = self.write_session().await?;
+        session
+            .finish_scheduled_inputs(&self.attempt.attempt_id)
+            .await
+            .map_err(|e| e.to_string())
     }
 }

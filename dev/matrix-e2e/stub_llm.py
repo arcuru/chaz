@@ -189,12 +189,13 @@ class Handler(BaseHTTPRequestHandler):
         })
 
     def _schedule_fixture(self, messages, tools):
-        # The scheduler prepends private System input. Historical user prompts
-        # and tool results are not a new schedule invocation or ReAct result.
-        task = messages[0].get("content") if messages and isinstance(messages[0], dict) \
-            and messages[0].get("role") == "system" else None
+        # The common runner appends private System input at a safe boundary.
+        # Match its exact fixture body by role, never a historical user quote
+        # or an assumed position ahead of the ordinary agent instructions.
         for mode in ("send", "silent"):
-            if task != f"{self.server.reply}-scheduled-{mode}":
+            if not any(isinstance(msg, dict) and msg.get("role") == "system"
+                       and msg.get("content") == f"{self.server.reply}-scheduled-{mode}"
+                       for msg in messages):
                 continue
             call_id = f"scheduled-{mode}-send"
             current_result = messages[-1].get("role") == "tool" \

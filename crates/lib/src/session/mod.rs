@@ -31,6 +31,7 @@ use tracing::{error, info, warn};
 #[cfg(test)]
 mod activity_tests;
 mod agents;
+pub(crate) use agents::require_schedule_member;
 pub(crate) use agents::require_session_participant;
 mod bridge_event;
 mod context_compaction;
@@ -41,10 +42,12 @@ pub mod fixed_call;
 pub(crate) mod history;
 pub mod jobs;
 mod keys;
+pub mod outcome;
 mod registry;
 pub mod roots;
 #[cfg(test)]
 mod roots_tests;
+pub mod scheduled;
 pub mod steering;
 pub(crate) use registry::JobRequest;
 #[cfg(test)]
@@ -76,6 +79,9 @@ pub(crate) use context_compaction::fold_citation;
 pub use context_compaction::{
     CompactToolScope, CompletedTurnActivity, ContextCompaction, ContextReplacement,
 };
+#[cfg(test)]
+pub(crate) use conversation::tests::activate as activate_conversation_for_test;
+
 pub use conversation::{
     CallId, CallInput, CallMessageBinding, ConversationError, ConversationInspection,
     ConversationOriginals, FactId, Fidelity, ObservedBinding, RecordRef, RepresentationId,
@@ -792,6 +798,12 @@ session_wire_enum! {
         Steering {
             model_sequence: u64,
             inputs: Vec<steering::JobInputRequest>,
+        },
+        /// Private input boundary. Only immutable references are retained;
+        /// generic historical context must never resolve these instructions.
+        ScheduledInput {
+            model_sequence: u64,
+            references: Vec<crate::agent_db::ScheduleReference>,
         },
         /// The executor settled this attempt at the user's request.
         Cancelled,
@@ -1556,6 +1568,47 @@ impl Session {
             .unwrap_or(TurnRequestState::Queued))
     }
 
+    /// Construct historical standalone records for reader fixtures only.
+    /// Production uses the reference-bound atomic start in `scheduled`.
+    #[cfg(test)]
+    pub(crate) async fn start_scheduled_attempt(
+        &mut self,
+        attempt_id: String,
+        origin: String,
+    ) -> anyhow::Result<TurnAttempt> {
+        let entry = SessionEntry {
+            sender: "system".into(),
+            content: origin,
+            timestamp: Utc::now(),
+            entry_type: EntryType::Ack,
+            metadata: None,
+            routing: None,
+        };
+        let txn = self.database.new_transaction().await?;
+        let row = txn
+            .get_store::<Table<SessionEntry>>(&self.store_name)
+            .await?
+            .insert(entry.clone())
+            .await?;
+        let request_id = TurnRequestId::parse(row);
+        let attempt = TurnAttempt {
+            attempt_id,
+            request_id: request_id.clone(),
+            started_at: Utc::now(),
+            generation: 1,
+            status: TurnAttemptStatus::Started,
+            completed_at: None,
+        };
+        txn.get_store::<Table<TurnAttempt>>(TURN_ATTEMPTS_STORE)
+            .await?
+            .set(&attempt.attempt_id, attempt.clone())
+            .await?;
+        txn.commit().await?;
+        self.entries.push(entry);
+        self.entry_ids.push(request_id);
+        Ok(attempt)
+    }
+
     /// Persist attempt start before model or tool execution.
     pub async fn start_turn_attempt(
         &self,
@@ -1723,6 +1776,7 @@ impl Session {
             }
             crate::session::jobs::write_job_result_in_txn(&txn, &result).await?;
         }
+        outcome::write_in_txn(&txn, &completed, final_entry.as_ref(), transcript.as_ref()).await?;
         let mut committed_entries = Vec::new();
         let has_final = final_entry.is_some();
         if final_entry.is_some() || outbound.is_some() {
@@ -1792,6 +1846,19 @@ impl Session {
         } = &record.message
         {
             steering::dispatch_in_txn(&txn, *model_sequence, inputs).await?;
+        }
+        if let TurnTranscriptMessage::ScheduledInput {
+            model_sequence,
+            references,
+        } = &record.message
+        {
+            self.dispatch_scheduled_inputs_in_txn(
+                &txn,
+                &record.attempt_id,
+                *model_sequence,
+                references,
+            )
+            .await?;
         }
         let record_sequence = record.sequence;
         let display_attempt = record.attempt_id.clone();

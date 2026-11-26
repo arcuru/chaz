@@ -423,7 +423,7 @@ For a five-minute fixed-delay check instead:
 }
 ```
 
-`schedule_modify` accepts the same mutually exclusive `cron` and `interval_seconds` fields, plus `task`, `target`, `enabled`, `max_fires`, and `expires_at`. For example, this changes the period and pauses the schedule:
+`schedule_modify` accepts the same mutually exclusive `cron` and `interval_seconds` fields, plus `task`, `target`, `enabled`, `max_fires`, `expires_at`, `catch_up` and `interruption_retries`. Both `schedule_add` and `schedule_modify` take an optional boolean `catch_up` (default off): whether one catch-up fire covers a window missed while chaz was down. See [Missed windows and catch-up](agents.md#missed-windows-and-catch-up). For example, this changes the period and pauses the schedule:
 
 ```json
 {
@@ -433,7 +433,7 @@ For a five-minute fixed-delay check instead:
 }
 ```
 
-Intervals first fire after one period. A task-only or target-only edit keeps the current due time; changing the trigger or re-enabling the schedule starts a full new period. The dispatch anchor is saved across reloads and restarts. If chaz was down longer than the period, the interval fires as soon as it starts again. Missed cron ticks are skipped. Zero, chrono-unrepresentable, and overflowed-first-fire periods are rejected.
+Intervals first fire after one period. A task-only or target-only edit keeps the current due time; changing the trigger or re-enabling the schedule starts a full new period. The dispatch anchor is saved across reloads and restarts. An overdue saved slot follows `catch_up`. Zero, chrono-unrepresentable, and overflowed-first-fire periods are rejected.
 
 The `agent` field is optional — omit it to target yourself, or pass a display name / DB id to target another agent on this peer.
 
@@ -442,7 +442,7 @@ The `agent` field is optional — omit it to target yourself, or pass a display 
 - `max_fires` — retire after this many fires. `cron` hourly + `max_fires: 8` expresses "wake hourly for 8 hours".
 - `expires_at` — RFC 3339 timestamp after which it stops firing.
 
-Whichever bound is hit first wins; both are optional (omit = unbounded). `fire_count` is tracked authoritatively in the agent DB so `max_fires` survives restarts. When a bound is reached the schedule is persisted as disabled (it shows in `schedule_list` as `(disabled)` with its `[fired N×]` count rather than being deleted, so the history stays auditable). `schedule_modify` can set/replace `max_fires`/`expires_at`; re-enabling a schedule that already passed a bound will simply retire again on its next fire.
+Whichever bound is hit first wins; both are optional (omit = unbounded). The selected Executor DB tracks capacity used: the historical count, successful logical fires and outstanding reservations. A reached bound shows as `(disabled)` with `[capacity used: N]`; it does not overwrite operator enablement on the definition. Raising `max_fires` or extending `expires_at` can make an enabled definition eligible again.
 
 ```json
 {
@@ -452,13 +452,13 @@ Whichever bound is hit first wins; both are optional (omit = unbounded). `fire_c
 }
 ```
 
-Use `schedule_list` to inspect a schedule. There is no separate show tool. A failed turn does not consume a `max_fires` slot; chaz refunds the reservation and tries the interval again after its next period. To recover a schedule that reached a bound, raise or replace the bound and set `enabled` to `true` in the same `schedule_modify` call.
+Use `schedule_list` to inspect the trigger, target and bounds without exposing the private wake text. There is no separate show tool. A handoff reserves capacity; for Fresh it takes a successful terminal turn to count as success, and for Pinned it takes an Included input. Known-unused input or a known failed Fresh turn releases its reservation. Uncertain outcomes retain capacity. `interruption_retries` defaults to `0` (hold for inspection); a positive limit opts into bounded restart retries and can repeat effects. See [Interruption recovery](agents.md#interruption-recovery).
 
 Schedules belong to one Agent. Only that Agent's home daemon executes them: Fresh schedules use the Agent-level home, and Pinned schedules use the Agent's home for that session. Other daemons skip the fire. Ownership changes are explicit through `/agent rehost`; this is not a distributed-locking or automatic-failover scheme.
 
 ### schedule_once
 
-One-shot wakeup that fires a directive into this session after a delay, then deletes itself. The directive is routed back to the calling agent — cross-agent scheduling stays in `schedule_add`. Use it for "come back to this in N seconds" cases; for recurring work, use `schedule_add` instead.
+One-shot private wakeup in this session after a delay. Acceptance consumes it and hides it from inventory without deleting its definition. The wake is handed directly to the calling agent — cross-agent scheduling stays in `schedule_add`. Use it for "come back to this in N seconds" cases; for recurring work, use `schedule_add` instead.
 
 ```json
 {

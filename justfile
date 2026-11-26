@@ -54,7 +54,7 @@ tui-pty:
 
 # Matrix bridge end-to-end test against a throwaway homeserver
 e2e *args='':
-    cargo build --quiet --bin chaz --bin chaz-matrix --example e2ee_probe
+    cargo build --quiet --bin chaz --bin chaz-matrix --example e2ee_probe --example schedule_probe
     nix develop .#e2e --command dev/matrix-e2e/run.sh {{ args }}
 
 # Matrix key-maintenance CLI acceptance against disposable Synapse (no models)

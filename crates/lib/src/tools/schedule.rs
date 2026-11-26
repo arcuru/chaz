@@ -95,6 +95,20 @@ fn opt_max_fires(arguments: &Value) -> Result<Option<u32>, String> {
     }
 }
 
+fn interruption_retries(arguments: &Value) -> Result<Option<u32>, String> {
+    arguments
+        .get("interruption_retries")
+        .map(|value| {
+            value
+                .as_u64()
+                .and_then(|value| u32::try_from(value).ok())
+                .ok_or_else(|| {
+                    "interruption_retries must be an integer from 0 to 4294967295".into()
+                })
+        })
+        .transpose()
+}
+
 /// Render the lifecycle bounds as a short ` (…)` suffix, or empty when
 /// unbounded. Shared by the add/modify replies and the list output.
 fn fmt_bounds(
@@ -183,7 +197,9 @@ impl Tool for ScheduleAdd {
                     "agent":  { "type": "string", "description": "Optional: agent that owns the schedule, by display name or DB id. Omit to target yourself." },
                     "target": { "type": "string", "enum": ["pinned", "fresh"], "description": "Optional: 'pinned' (fire into this session, default) or 'fresh' (create a new session each fire)." },
                     "max_fires":  { "type": "integer", "description": "Optional: retire the schedule after this many fires. E.g. cron hourly + max_fires 8 = 'wake hourly for 8 hours'." },
-                    "expires_at": { "type": "string", "description": "Optional: RFC 3339 timestamp after which the schedule stops firing (e.g. '2026-06-01T09:00:00Z'). Whichever of max_fires/expires_at is hit first retires it." }
+                    "expires_at": { "type": "string", "description": "Optional: RFC 3339 timestamp after which the schedule stops firing (e.g. '2026-06-01T09:00:00Z'). Whichever of max_fires/expires_at is hit first retires it." },
+                    "catch_up": { "type": "boolean", "description": "Optional: If the schedule was due while chaz was not running, true runs ONE catch-up fire for the whole missed window (remaining missed slots are coalesced, expiry/max_fires still apply); false (default) records the missed window and waits for the next slot." },
+                    "interruption_retries": { "type": "integer", "minimum": 0, "maximum": u32::MAX, "description": "Optional: 0 (default) holds interrupted attempts. A positive ceiling permits bounded restart retries per occurrence and can duplicate model, tool or external effects. Ordinary failure and explicit stop are never auto-retried." }
                 },
                 "required": ["id", "task"],
                 "oneOf": [
@@ -230,7 +246,7 @@ impl Tool for ScheduleAdd {
 
             // Check for duplicate id.
             if adb
-                .find_schedule(user_id)
+                .effective_schedule(user_id)
                 .await
                 .map_err(|e| e.to_string())?
                 .is_some()
@@ -256,6 +272,9 @@ impl Tool for ScheduleAdd {
             );
             schedule.expires_at = expires_at;
             schedule.max_fires = max_fires;
+            schedule.catch_up = opt_bool(&arguments, "catch_up");
+            let retry_limit = interruption_retries(&arguments)?.and_then(std::num::NonZeroU32::new);
+            schedule.interruption_retries = retry_limit;
             adb.upsert_schedule(schedule)
                 .await
                 .map_err(|e| format!("Failed to save schedule: {e}"))?;
@@ -278,8 +297,11 @@ impl Tool for ScheduleAdd {
                 Some(cron) => format!("cron='{cron}'"),
                 None => format!("every {}s", arguments["interval_seconds"]),
             };
+            let recovery = retry_limit
+                .map(|limit| format!("; restart retry limit {limit} (prior effects may repeat)"))
+                .unwrap_or_default();
             Ok(format!(
-                "Added schedule '{user_id}' on agent '{}': {trigger} → {target_label}{bounds} — {task}",
+                "Added schedule '{user_id}' on agent '{}': {trigger} → {target_label}{bounds}{recovery} — {task}",
                 entry.display_name
             ))
         })
@@ -319,7 +341,9 @@ impl Tool for ScheduleModify {
                     "target":  { "type": "string", "enum": ["pinned", "fresh"], "description": "Optional: 'pinned' or 'fresh'." },
                     "enabled": { "type": "boolean", "description": "Optional: toggle the schedule on/off without deleting it. Re-enabling a schedule that already hit its max_fires/expires_at bound will retire again on the next fire." },
                     "max_fires":  { "type": "integer", "description": "Optional: set/replace the max-fires bound (counts existing fires)." },
-                    "expires_at": { "type": "string", "description": "Optional: set/replace the RFC 3339 expiry timestamp." }
+                    "expires_at": { "type": "string", "description": "Optional: set/replace the RFC 3339 expiry timestamp." },
+                    "catch_up": { "type": "boolean", "description": "Optional: set the missed-window policy explicitly. If the schedule was due while chaz was not running, true runs ONE catch-up fire for the whole missed window (remaining missed slots are coalesced, expiry/max_fires still apply); false (default) records the missed window and waits for the next slot." },
+                    "interruption_retries": { "type": "integer", "minimum": 0, "maximum": u32::MAX, "description": "Optional: 0 holds interrupted attempts. A positive ceiling permits bounded restart retries per occurrence and can duplicate model, tool or external effects. Editing the policy invalidates pending old-revision delivery." }
                 },
                 "required": ["id"]
                 ,"allOf": [
@@ -347,6 +371,8 @@ impl Tool for ScheduleModify {
             let new_enabled = opt_bool(&arguments, "enabled");
             let new_expires_at = opt_expires_at(&arguments)?;
             let new_max_fires = opt_max_fires(&arguments)?;
+            let new_catch_up = opt_bool(&arguments, "catch_up");
+            let new_interruption_retries = interruption_retries(&arguments)?;
 
             if new_cron.is_none()
                 && new_interval.is_none()
@@ -355,9 +381,11 @@ impl Tool for ScheduleModify {
                 && new_enabled.is_none()
                 && new_expires_at.is_none()
                 && new_max_fires.is_none()
+                && new_catch_up.is_none()
+                && new_interruption_retries.is_none()
             {
                 return Err(
-                    "No fields to modify — pass at least one of: cron, interval_seconds, task, target, enabled, max_fires, expires_at"
+                    "No fields to modify — pass at least one of: cron, interval_seconds, task, target, enabled, max_fires, expires_at, catch_up, interruption_retries"
                         .into(),
                 );
             }
@@ -382,6 +410,18 @@ impl Tool for ScheduleModify {
                         entry.display_name
                     )
                 })?;
+
+            if adb
+                .effective_schedule(id)
+                .await
+                .map_err(|e| format!("Failed to read schedule state: {e}"))?
+                .is_none()
+            {
+                return Err(format!(
+                    "Schedule '{id}' was consumed; use schedule_add to create a new lifetime"
+                )
+                .into());
+            }
 
             let trigger_changed = new_cron.is_some() || new_interval.is_some();
             let enabling = new_enabled == Some(true) && !schedule.enabled;
@@ -413,7 +453,18 @@ impl Tool for ScheduleModify {
             if new_max_fires.is_some() {
                 schedule.max_fires = new_max_fires;
             }
+            if new_catch_up.is_some() {
+                schedule.catch_up = new_catch_up;
+            }
+            if let Some(limit) = new_interruption_retries {
+                schedule.interruption_retries = std::num::NonZeroU32::new(limit);
+            }
 
+            if new_enabled == Some(true) {
+                adb.reset_schedule_retirement(&schedule)
+                    .await
+                    .map_err(|e| format!("Failed to reset schedule retirement: {e}"))?;
+            }
             adb.upsert_schedule(schedule)
                 .await
                 .map_err(|e| format!("Failed to save schedule: {e}"))?;
@@ -456,6 +507,16 @@ impl Tool for ScheduleModify {
             }
             if let Some(exp) = new_expires_at {
                 parts.push(format!("expires_at={}", exp.to_rfc3339()));
+            }
+            if let Some(c) = new_catch_up {
+                parts.push(format!("catch_up={c}"));
+            }
+            if let Some(limit) = new_interruption_retries {
+                parts.push(if limit > 0 {
+                    format!("interruption_retries={limit} (prior effects may repeat)")
+                } else {
+                    "interruption_retries=0".into()
+                });
             }
             Ok(parts.join(" "))
         })
@@ -557,7 +618,7 @@ impl Tool for ScheduleList {
         ToolDescriptor {
             name: "schedule_list".to_string(),
             description:
-                "List schedules owned by an agent — id, schedule, target (pinned/fresh), task, whether enabled, any lifecycle bounds (max_fires/expires_at) and the fire count. Pass agent name to list another agent's schedules."
+                "List schedules owned by an agent — id, trigger, target (pinned/fresh), effective enablement, lifecycle bounds (max_fires/expires_at) and capacity used. Wake text is private. Pass agent name to list another agent's schedules."
                     .to_string(),
             parameters: serde_json::json!({
                 "type": "object",
@@ -583,7 +644,7 @@ impl Tool for ScheduleList {
             let adb = open_agent_db(&*self.agent_state, &entry).await?;
 
             let schedules = adb
-                .list_schedules()
+                .effective_schedules()
                 .await
                 .map_err(|e| format!("Failed to list schedules: {e}"))?;
             if schedules.is_empty() {
@@ -592,7 +653,7 @@ impl Tool for ScheduleList {
             let mut lines = Vec::with_capacity(schedules.len() + 1);
             lines.push(format!("Schedules on '{}':", entry.display_name));
             for t in &schedules {
-                let state = if t.enabled { "" } else { " (disabled)" };
+                let state = crate::schedule_state::effective_status(t);
                 let schedule = match &t.trigger {
                     Trigger::Cron { expr } => expr.clone(),
                     Trigger::Interval { period } => format!("every {period:?}"),
@@ -605,14 +666,15 @@ impl Tool for ScheduleList {
                     ScheduleTarget::Fresh => "fresh".to_string(),
                 };
                 let bounds = fmt_bounds(&t.expires_at, &t.max_fires);
-                let fired = if t.fire_count > 0 {
-                    format!(" [fired {}×]", t.fire_count)
+                let capacity = if t.fire_count > 0 {
+                    format!(" [capacity used: {}]", t.fire_count)
                 } else {
                     String::new()
                 };
+                let missed = crate::schedule_state::policy_status(&adb, t).await;
                 lines.push(format!(
-                    "- **{}** [{schedule}]{state}{bounds}{fired} → {target_label} — {}",
-                    t.id, t.prompt
+                    "- **{}** [{schedule}]{state}{bounds}{capacity}{missed} → {target_label}",
+                    t.id
                 ));
             }
             Ok(lines.join("\n"))
@@ -760,6 +822,11 @@ mod tests {
         ))
     }
 
+    async fn alpha_schedule_db(list: &ScheduleList) -> AgentDb {
+        let entry = list.agent_state.resolve_agent("alpha").unwrap();
+        open_agent_db(&*list.agent_state, &entry).await.unwrap()
+    }
+
     async fn fixture(
         agent_name: &str,
     ) -> (
@@ -878,7 +945,12 @@ mod tests {
         let out = list.execute(serde_json::json!({}), &ctx).await.unwrap();
         assert!(out.contains("five-min"), "id missing: {out}");
         assert!(out.contains("0 */5 * * * *"), "cron missing: {out}");
-        assert!(out.contains("check in"), "task missing: {out}");
+        assert!(!out.contains("check in"), "private wake leaked: {out}");
+        let db = alpha_schedule_db(&list).await;
+        assert_eq!(
+            db.find_schedule("five-min").await.unwrap().unwrap().prompt,
+            "check in"
+        );
     }
 
     #[tokio::test]
@@ -962,7 +1034,12 @@ mod tests {
             .unwrap();
 
         let out = list.execute(serde_json::json!({}), &ctx).await.unwrap();
-        assert!(out.contains("new-task"), "task not updated: {out}");
+        assert!(!out.contains("new-task"), "private wake leaked: {out}");
+        let db = alpha_schedule_db(&list).await;
+        assert_eq!(
+            db.find_schedule("r1").await.unwrap().unwrap().prompt,
+            "new-task"
+        );
         assert!(
             out.contains("0 * * * * *"),
             "cron should be preserved: {out}"
@@ -1101,8 +1178,15 @@ mod tests {
 
         let listed = list.execute(serde_json::json!({}), &ctx).await.unwrap();
         assert!(listed.contains("wakeup-"), "schedule id missing: {listed}");
-        assert!(listed.contains("check on build"), "task missing: {listed}");
+        assert!(
+            !listed.contains("check on build"),
+            "private wake leaked: {listed}"
+        );
         assert!(listed.contains("[@"), "fire_at marker missing: {listed}");
+        let db = alpha_schedule_db(&list).await;
+        let schedules = db.list_schedules().await.unwrap();
+        assert_eq!(schedules.len(), 1);
+        assert_eq!(schedules[0].prompt, "check on build");
     }
 
     #[tokio::test]

@@ -1,0 +1,37 @@
+[
+  {
+    "id": "scheduled-wake",
+    "store": "entries",
+    "value": {
+      "sender": "scheduler",
+      "content": "{\"version\":1,\"owner_agent_db_id\":\"agent-root\",\"schedule_id\":\"wake\",\"definition_epoch\":\"epoch\",\"occurrence_id\":\"occurrence\",\"delivery_id\":\"delivery\"}",
+      "timestamp": "2026-10-23T09:00:00Z",
+      "entry_type": "ScheduledWake"
+    }
+  },
+  {
+    "id": "scheduled-reference",
+    "store": "turn_transcript",
+    "value": {
+      "request_id": "scheduled-wake",
+      "attempt_id": "attempt",
+      "sequence": 0,
+      "timestamp": "2026-10-23T09:00:00Z",
+      "message": {
+        "ScheduledSteering": {
+          "version": 1,
+          "model_sequence": 0,
+          "inputs": [
+            {
+              "owner_agent_db_id": "agent-root",
+              "schedule_id": "wake",
+              "definition_epoch": "epoch",
+              "occurrence_id": "occurrence",
+              "delivery_id": "delivery"
+            }
+          ]
+        }
+      }
+    }
+  }
+]

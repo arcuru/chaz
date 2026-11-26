@@ -37,6 +37,14 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use tracing::info;
 
+pub use crate::schedule_state::lifecycle::clock::ClockCursor;
+pub use crate::schedule_state::lifecycle::{
+    AccountingProgress, Occurrence, OccurrenceScan, Preparation,
+};
+pub use crate::schedule_state::readers::{
+    AccountingView, DueSlot, SchedulePreview, ScheduleReference,
+};
+
 pub const CONFIG_STORE: &str = "config";
 pub const MEMORY_STORE: &str = "memory";
 pub const META_STORE: &str = "meta";
@@ -64,6 +72,7 @@ pub const SESSIONS_STORE: &str = "sessions";
 pub const EXECUTORS_STORE: &str = "executors";
 /// Metadata-only catalog of known Provider DB roots. Membership grants no access.
 pub const PROVIDERS_STORE: &str = "providers";
+const SCHEDULING_STORE: &str = "scheduling_executor";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ExecutorRef {
@@ -520,6 +529,10 @@ pub struct SkillBankRef {
 fn default_true() -> bool {
     true
 }
+fn zero_schedule_count(value: &u32) -> bool {
+    *value == 0
+}
+
 fn default_schedule_max_failures() -> u32 {
     3
 }
@@ -544,18 +557,22 @@ pub enum ScheduleTarget {
 ///
 /// The `prompt` is invocation-scoped input handed to the agent when the
 /// schedule fires; it is *not* written as a broadcast session entry.
-/// Failure-tracking fields mirror [`crate::routine::Routine`] so the
-/// engine's auto-disable pass can operate on schedules uniformly
-/// (`max_failures == 0` opts out).
+/// Operational fields below are frozen legacy baselines on Agent definitions.
+/// New admissions/counters/retirement live in the selected Executor DB.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Schedule {
     pub id: String,
+    /// Definition lifetime: edits retain it; remove/recreate starts a new one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lifetime: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_origin: Option<SchedulePolicyOrigin>,
     pub trigger: crate::routine::Trigger,
     pub prompt: String,
     pub target: ScheduleTarget,
     #[serde(default = "default_true")]
     pub enabled: bool,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "zero_schedule_count")]
     pub consecutive_failures: u32,
     #[serde(default = "default_schedule_max_failures")]
     pub max_failures: u32,
@@ -567,16 +584,35 @@ pub struct Schedule {
     /// hit first retires the schedule.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<DateTime<Utc>>,
-    /// Maximum number of successful fires before the schedule retires.
+    /// Ceiling on the historical baseline, successful fires and reservations.
     /// `None` = unbounded. Makes "wake hourly for 8 hours" expressible
     /// (`cron` hourly + `max_fires: 8`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_fires: Option<u32>,
-    /// Count of fires that have run the agent turn. Authoritative in the
-    /// agent DB (the engine's in-memory routine is rebuilt from here),
-    /// so `max_fires` survives restarts.
-    #[serde(default)]
+    /// Legacy baseline on definitions; effective projections include the
+    /// Executor ledger's successes and outstanding reservations. Never write a
+    /// projected value back into a definition.
+    #[serde(default, skip_serializing_if = "zero_schedule_count")]
     pub fire_count: u32,
+    /// Explicit missed-window policy. Absent means the default: off for new
+    /// schedules, and the migrated legacy behavior (interval on, cron off)
+    /// for `legacy_migrated` definitions. Omitted so old revisions keep
+    /// their identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub catch_up: Option<bool>,
+    /// Opt-in interruption-only retry ceiling per occurrence. An omitted
+    /// value leaves ambiguous outcomes held and preserves legacy revisions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interruption_retries: Option<std::num::NonZeroU32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SchedulePolicyOrigin {
+    /// Keeps the old accounting namespace and interval restart behavior.
+    LegacyMigrated,
+    /// No trustworthy observation of a legacy due one-shot's outcome.
+    LegacyOneShotHeld,
 }
 
 impl Schedule {
@@ -589,6 +625,8 @@ impl Schedule {
     ) -> Self {
         Self {
             id: id.into(),
+            lifetime: Some(uuid::Uuid::new_v4().to_string()),
+            policy_origin: None,
             trigger,
             prompt: prompt.into(),
             target,
@@ -599,6 +637,44 @@ impl Schedule {
             expires_at: None,
             max_fires: None,
             fire_count: 0,
+            catch_up: None,
+            interruption_retries: None,
+        }
+    }
+
+    /// Whether one bounded catch-up occurrence may cover a missed window.
+    /// An explicit setting wins; only migrated legacy intervals default on.
+    pub fn effective_catch_up(&self) -> bool {
+        self.catch_up.unwrap_or(
+            self.policy_origin == Some(SchedulePolicyOrigin::LegacyMigrated)
+                && matches!(self.trigger, crate::routine::Trigger::Interval { .. }),
+        )
+    }
+
+    pub fn lifetime_key(&self) -> String {
+        match (&self.lifetime, self.policy_origin) {
+            (Some(id), None) => format!("v1:{id}"),
+            _ => format!("legacy:{}", self.id),
+        }
+    }
+
+    pub(crate) fn legacy_migration_held(&self) -> bool {
+        self.lifetime.is_none()
+            || self.policy_origin == Some(SchedulePolicyOrigin::LegacyOneShotHeld)
+    }
+
+    pub(crate) fn hold_unmigrated(&mut self, now: DateTime<Utc>) {
+        if self.legacy_migration_held() && self.enabled {
+            self.enabled = false;
+            self.last_error = Some(
+                if self.policy_origin == Some(SchedulePolicyOrigin::LegacyOneShotHeld)
+                    || matches!(self.trigger, Trigger::OneShot { fire_at } if fire_at <= now)
+                {
+                    crate::schedule_state::LEGACY_ONE_SHOT_HELD.into()
+                } else {
+                    crate::schedule_state::LEGACY_MIGRATION_HELD.into()
+                },
+            );
         }
     }
 
@@ -622,38 +698,117 @@ impl Schedule {
     }
 }
 
-/// Audit record of one schedule fire, written to the owning agent's
-/// `schedule_fires` store. For `Fresh` targets this is how the
+/// A dispatch handoff in the Agent-selected Executor's `schedule_fires` store.
+/// Legacy completion-time rows on the Agent remain readable. For `Fresh` targets this is how the
 /// freshly-created session's address is recoverable ("this schedule
 /// fired and the session it created is at X"); for `Pinned` it
 /// records the run against the existing session.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScheduleFire {
     pub schedule_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub firing_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lifetime: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<crate::session::TurnRequestId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempt_id: Option<String>,
     pub fired_at: DateTime<Utc>,
-    /// The session the fire ran in — created (Fresh) or reused (Pinned).
+    /// The execution's target session — created (Fresh) or reused (Pinned).
     pub session_db_id: String,
     /// True when this fire created a new session (Fresh target).
     pub fresh: bool,
-    /// Token/cost provenance for the turn this fire drove. Attributing
-    /// it here keeps autonomous-wake cost on the *agent's* ledger
-    /// rather than the session's (session usage stays Message-only by
-    /// design). `None` if the turn produced no usable metadata.
+    /// Legacy completion-time usage only. New handoffs leave this absent;
+    /// execution outcome and telemetry belong to the linked Session attempt.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<crate::runtime::ResponseMetadata>,
+}
+
+/// Private definition custody stays on the Agent, never on a Session or Executor.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScheduleRevision {
+    pub version: u32,
+    pub revision: String,
+    pub definition: Schedule,
+}
+
+impl Schedule {
+    /// Content identity for executable/policy material, independent of legacy
+    /// counters. The version pins canonical JSON field names/default omissions:
+    /// new default policy fields must remain omitted for old revisions. The
+    /// encoding golden must not be updated merely to accept changed identities.
+    pub fn revision_key(&self) -> anyhow::Result<String> {
+        let mut material = serde_json::to_value(self)?;
+        let fields = material.as_object_mut().expect("Schedule is an object");
+        for operational in ["fire_count", "consecutive_failures", "last_error"] {
+            fields.remove(operational);
+        }
+        Ok(format!(
+            "v1:{}",
+            blake3::hash(&serde_json::to_vec(&material)?)
+        ))
+    }
+
+    pub fn occurrence_key(
+        &self,
+        owner_agent_db_id: &str,
+        slot: &DueSlot,
+    ) -> anyhow::Result<String> {
+        crate::schedule_state::readers::occurrence_id(owner_agent_db_id, self, slot)
+    }
+}
+
+const SCHEDULE_REVISIONS_STORE: &str = "schedule_revisions";
+
+async fn archive_schedule(txn: &eidetica::Transaction, schedule: &Schedule) -> anyhow::Result<()> {
+    let revision = schedule.revision_key()?;
+    let revisions = txn
+        .get_store::<Table<ScheduleRevision>>(SCHEDULE_REVISIONS_STORE)
+        .await?;
+    match revisions.get(&revision).await {
+        Ok(prior) => anyhow::ensure!(
+            prior.version == 1
+                && prior.revision == revision
+                && prior.definition.revision_key()? == revision,
+            "conflicting schedule revision"
+        ),
+        Err(error) if error.is_not_found() => {
+            revisions
+                .set(
+                    &revision,
+                    ScheduleRevision {
+                        version: 1,
+                        revision: revision.clone(),
+                        definition: schedule.clone(),
+                    },
+                )
+                .await?;
+        }
+        Err(error) => return Err(error.into()),
+    }
+    Ok(())
 }
 
 /// Handle over the eidetica `Database` that holds an agent's state.
 #[derive(Clone, Debug)]
 pub struct AgentDb {
     database: Database,
+    schedule_db: Option<Database>,
+    schedule_lock: crate::schedule_state::serialization::ScheduleLock,
 }
 
 impl AgentDb {
     /// Wrap an existing database as an `AgentDb`. Use when the caller already
     /// opened the DB (e.g. via `AccountSession::open_database`).
     pub fn from_database(database: Database) -> Self {
-        Self { database }
+        let schedule_lock = crate::schedule_state::serialization::for_agent(database.root_id());
+        Self {
+            database,
+            schedule_db: None,
+            schedule_lock,
+        }
     }
 
     /// Eidetica root ID of this agent's DB. Stable — this is the agent's
@@ -664,6 +819,15 @@ impl AgentDb {
 
     pub fn database(&self) -> &Database {
         &self.database
+    }
+
+    /// Acquire before reading definitions/accounting for a local mutation.
+    /// Never hold this across execution/capacity waits or registry user locks.
+    /// This is not a cross-process fence against synchronized remote edits.
+    pub(crate) async fn lock_scheduling(
+        &self,
+    ) -> tokio::sync::OwnedMutexGuard<crate::schedule_state::lifecycle::AccountingCache> {
+        self.schedule_lock.clone().lock_owned().await
     }
 
     pub async fn read_config(&self) -> anyhow::Result<AgentDbConfig> {
@@ -947,6 +1111,235 @@ impl AgentDb {
         Ok(true)
     }
 
+    /// One pinned owned Executor reference, not a per-executing-peer ledger.
+    pub async fn scheduling_reference(&self) -> anyhow::Result<Option<ExecutorRef>> {
+        let txn = self.database.new_transaction().await?;
+        let rows = txn
+            .get_store::<Table<ExecutorRef>>(SCHEDULING_STORE)
+            .await?
+            .search(|_: &ExecutorRef| true)
+            .await?;
+        let selected = rows.first().map(|(_, r)| r.clone());
+        anyhow::ensure!(
+            rows.iter().all(|(_, r)| Some(r) == selected.as_ref()),
+            "conflicting scheduling Executor references"
+        );
+        Ok(selected)
+    }
+
+    pub(crate) async fn pin_scheduling_reference(
+        &self,
+        reference: ExecutorRef,
+    ) -> anyhow::Result<()> {
+        let _guard = self.lock_scheduling().await;
+        if let Some(existing) = self.scheduling_reference().await? {
+            anyhow::ensure!(
+                existing == reference,
+                "scheduling Executor already selected"
+            );
+            return Ok(());
+        }
+        let txn = self.database.new_transaction().await?;
+        txn.get_store::<Table<ExecutorRef>>(SCHEDULING_STORE)
+            .await?
+            .insert(reference)
+            .await?;
+        txn.commit().await?;
+        Ok(())
+    }
+
+    pub(crate) fn with_scheduling_database(mut self, db: Database) -> Self {
+        self.schedule_db = Some(db);
+        self
+    }
+
+    pub(crate) async fn scheduling_database(&self) -> anyhow::Result<Option<&Database>> {
+        match (
+            self.scheduling_reference().await?,
+            self.schedule_db.as_ref(),
+        ) {
+            (None, _) => Ok(None),
+            (Some(reference), Some(db)) if reference.db_id == db.root_id().to_string() => {
+                Ok(Some(db))
+            }
+            _ => anyhow::bail!(
+                "selected scheduling Executor unavailable; reopen through the Agent identity"
+            ),
+        }
+    }
+
+    /// Read-only runtime projection. Never pass these values to definition CRUD.
+    pub async fn effective_schedules(&self) -> anyhow::Result<Vec<Schedule>> {
+        let mut schedules = Vec::new();
+        let db = self.scheduling_database().await?;
+        for schedule in self.list_schedules().await? {
+            match db {
+                Some(db) => {
+                    if let Some(schedule) = crate::schedule_state::effective(db, schedule).await? {
+                        schedules.push(schedule);
+                    }
+                }
+                None => {
+                    let mut schedule = schedule;
+                    schedule.enabled &= schedule.retirement_reason(Utc::now()).is_none();
+                    schedule.hold_unmigrated(Utc::now());
+                    schedules.push(schedule);
+                }
+            }
+        }
+        Ok(schedules)
+    }
+
+    /// Effective lookup for ordinary schedule inventory/admission surfaces.
+    /// Bootstrap and edits use `find_schedule` for the physical definition.
+    pub async fn effective_schedule(&self, id: &str) -> anyhow::Result<Option<Schedule>> {
+        let Some(schedule) = self.find_schedule(id).await? else {
+            return Ok(None);
+        };
+        match self.scheduling_database().await? {
+            Some(db) => crate::schedule_state::effective(db, schedule).await,
+            None => {
+                let mut schedule = schedule;
+                schedule.enabled &= schedule.retirement_reason(Utc::now()).is_none();
+                schedule.hold_unmigrated(Utc::now());
+                Ok(Some(schedule))
+            }
+        }
+    }
+
+    pub async fn reset_schedule_retirement(&self, schedule: &Schedule) -> anyhow::Result<()> {
+        let _guard = self.lock_scheduling().await;
+        if let Some(db) = self.scheduling_database().await? {
+            crate::schedule_state::retire(db, schedule, false).await?;
+        }
+        Ok(())
+    }
+
+    /// Conservative read-only inspection; this never initializes or migrates
+    /// the selected operational database.
+    pub async fn preview_scheduling(&self) -> anyhow::Result<Vec<SchedulePreview>> {
+        crate::schedule_state::readers::preview(self).await
+    }
+
+    /// Read prompt-free prepared/handoff identities from the selected ledger.
+    pub async fn schedule_occurrences(&self) -> anyhow::Result<Vec<Occurrence>> {
+        crate::schedule_state::lifecycle::occurrences(self).await
+    }
+
+    /// Read one bounded reconciliation page before lifecycle mutations. A partial
+    /// audit is not capacity/authority; unexpected accounting/metadata writes
+    /// invalidate it. Unrelated Executor writes require a bounded ancestry proof.
+    /// The caller drives pages outside timer admission, never while awaiting work.
+    pub async fn reconcile_schedule_accounting(
+        &self,
+        schedule: &Schedule,
+        limit: usize,
+    ) -> anyhow::Result<AccountingProgress> {
+        crate::schedule_state::lifecycle::reconcile(self, schedule, limit).await
+    }
+
+    /// Prepare a clock-authorized occurrence, not a Started attempt. The caller
+    /// validates home/keys/membership and persisted clock lineage. Local edits
+    /// and lifecycle writes share serialization; legacy migration is explicit.
+    /// Requires completed accounting reconciliation of the current ledger head.
+    pub async fn prepare_schedule_occurrence(
+        &self,
+        schedule_id: &str,
+        expected_revision: &str,
+        slot: DueSlot,
+        now: DateTime<Utc>,
+    ) -> anyhow::Result<Occurrence> {
+        crate::schedule_state::lifecycle::prepare(self, schedule_id, expected_revision, slot, now)
+            .await
+    }
+
+    /// Pin a timer-authorized due slot before Session preparation. Handoff
+    /// commits its next clock cursor atomically with ordered publication; a
+    /// missing/changed cursor cannot reset previously timed work. The caller
+    /// still proves and retains both engine/authority guards through handoff.
+    pub async fn prepare_schedule_clock(
+        &self,
+        schedule_id: &str,
+        expected_revision: &str,
+        slot: DueSlot,
+        now: DateTime<Utc>,
+    ) -> anyhow::Result<Occurrence> {
+        crate::schedule_state::lifecycle::prepare_clock(
+            self,
+            schedule_id,
+            expected_revision,
+            slot,
+            now,
+        )
+        .await
+    }
+
+    /// Apply catch-up policy to a slot missed during downtime. Never retries
+    /// or replays an existing occurrence; see [`crate::schedule_state::lifecycle::miss_clock`].
+    pub async fn miss_schedule_clock(
+        &self,
+        schedule_id: &str,
+        expected_revision: &str,
+        slot: DueSlot,
+        now: DateTime<Utc>,
+    ) -> anyhow::Result<crate::schedule_state::lifecycle::clock::MissedClock> {
+        crate::schedule_state::lifecycle::miss_clock(
+            self,
+            schedule_id,
+            expected_revision,
+            slot,
+            now,
+        )
+        .await
+    }
+
+    /// Prompt-free missed-window history for one schedule lifetime.
+    pub async fn schedule_missed_windows(
+        &self,
+        schedule: &Schedule,
+    ) -> anyhow::Result<Vec<crate::schedule_state::lifecycle::clock::MissedWindow>> {
+        crate::schedule_state::lifecycle::clock::missed_windows(self, schedule).await
+    }
+
+    /// Read an exact revision's durable clock successor without initialization
+    /// or replay. Absence is not proof of an empty history or migration safety.
+    pub async fn schedule_clock_cursor(
+        &self,
+        schedule: &Schedule,
+    ) -> anyhow::Result<Option<ClockCursor>> {
+        crate::schedule_state::lifecycle::clock::cursor(self, schedule).await
+    }
+
+    /// Commit handoff only after an exact inert Session anchor is durable.
+    /// Callers still revalidate target authority before starting/including it;
+    /// this acknowledgement is neither Started nor successful delivery.
+    pub async fn handoff_schedule_occurrence(
+        &self,
+        reference: &ScheduleReference,
+        session: &crate::session::Session,
+        now: DateTime<Utc>,
+    ) -> anyhow::Result<Occurrence> {
+        crate::schedule_state::lifecycle::handoff(self, reference, session, now).await
+    }
+
+    /// Project exact Session delivery/terminal evidence. Missing evidence keeps
+    /// the reservation; late settlement never changes the schedule definition.
+    pub async fn settle_schedule_occurrence(
+        &self,
+        reference: &ScheduleReference,
+        session: &crate::session::Session,
+    ) -> anyhow::Result<Option<crate::session::scheduled::ScheduleDeliveryEvidence>> {
+        crate::schedule_state::lifecycle::settle(self, reference, session).await
+    }
+
+    /// Release known-unused preparation only, never an uncertain handoff.
+    pub async fn release_schedule_preparation(
+        &self,
+        reference: &ScheduleReference,
+    ) -> anyhow::Result<()> {
+        crate::schedule_state::lifecycle::release_prepared(self, reference).await
+    }
+
     // -----------------------------------------------------------------
     // Agent-owned schedules
     // -----------------------------------------------------------------
@@ -955,34 +1348,100 @@ impl AgentDb {
     pub async fn list_schedules(&self) -> anyhow::Result<Vec<Schedule>> {
         let txn = self.database.new_transaction().await?;
         let store = txn.get_store::<Table<Schedule>>(SCHEDULES_STORE).await?;
-        let rows = store.search(|_: &Schedule| true).await?;
-        Ok(rows.into_iter().map(|(_, t)| t).collect())
+        let mut schedules: Vec<_> = store
+            .search(|_: &Schedule| true)
+            .await?
+            .into_iter()
+            .map(|(_, schedule)| schedule)
+            .collect();
+        schedules.sort_by(|a, b| a.id.cmp(&b.id));
+        anyhow::ensure!(
+            schedules
+                .windows(2)
+                .all(|pair| pair[0].id != pair[1].id || pair[0] == pair[1]),
+            "conflicting schedule definitions"
+        );
+        schedules.dedup();
+        Ok(schedules)
     }
 
     /// Insert a schedule, or replace the existing one with the same `id`.
-    /// Dedup-by-id keeps edits and failure-state updates idempotent
-    /// (same pattern as `attach_memory_bank`'s dedup-by-name).
+    /// Pass raw definitions, not effective runtime projections. Edits retain
+    /// their lifetime; `Schedule::new` starts a new one.
     pub async fn upsert_schedule(&self, schedule: Schedule) -> anyhow::Result<()> {
+        let _guard = self.lock_scheduling().await;
         validate_schedule_trigger(&schedule.trigger)?;
         let txn = self.database.new_transaction().await?;
         let store = txn.get_store::<Table<Schedule>>(SCHEDULES_STORE).await?;
         let existing = store.search(|t: &Schedule| t.id == schedule.id).await?;
-        for (row_id, _) in existing {
+        for (row_id, prior) in existing {
+            archive_schedule(&txn, &prior).await?;
             store.delete(&row_id).await?;
         }
+        archive_schedule(&txn, &schedule).await?;
         store.insert(schedule).await?;
         txn.commit().await?;
         Ok(())
     }
 
+    /// Version existing definitions on the owning executor, without moving any
+    /// accounting or reinterpreting history. Due legacy one-shots carry no
+    /// trustworthy evidence that they have not already run; leave them inert.
+    pub(crate) async fn migrate_legacy_schedules(
+        &self,
+        now: DateTime<Utc>,
+    ) -> anyhow::Result<usize> {
+        let _guard = self.lock_scheduling().await;
+        // A missing pointer is a pre-ledger installation. A present, unusable
+        // pointer is a hold; never replace it or make old accounting invisible.
+        self.scheduling_database().await?;
+        let txn = self.database.new_transaction().await?;
+        let store = txn.get_store::<Table<Schedule>>(SCHEDULES_STORE).await?;
+        let rows = store.search(|_: &Schedule| true).await?;
+        let mut definitions = HashMap::new();
+        let mut migrated = 0;
+        for (key, prior) in &rows {
+            anyhow::ensure!(
+                definitions
+                    .insert(prior.id.as_str(), prior)
+                    .is_none_or(|existing| existing == prior),
+                "conflicting schedule definitions"
+            );
+            if prior.lifetime.is_some() || prior.policy_origin.is_some() {
+                continue;
+            }
+            let mut next = prior.clone();
+            if matches!(prior.trigger, Trigger::OneShot { fire_at } if fire_at <= now) {
+                // Later edits must not reinterpret missing evidence as
+                // permission to arm a clock for this historical lifetime.
+                next.policy_origin = Some(SchedulePolicyOrigin::LegacyOneShotHeld);
+            } else {
+                // Keep the old Agent-local bucket, including any reservations.
+                // A fresh definition gets a UUID namespace.
+                next.lifetime = Some(prior.id.clone());
+                next.policy_origin = Some(SchedulePolicyOrigin::LegacyMigrated);
+            }
+            archive_schedule(&txn, prior).await?;
+            archive_schedule(&txn, &next).await?;
+            store.set(key, next).await?;
+            migrated += 1;
+        }
+        if migrated != 0 {
+            txn.commit().await?;
+        }
+        Ok(migrated)
+    }
+
     /// Remove the schedule with the given `id`. Returns true if a row was
     /// removed; no-op (false) on an unknown id.
     pub async fn remove_schedule(&self, id: &str) -> anyhow::Result<bool> {
+        let _guard = self.lock_scheduling().await;
         let txn = self.database.new_transaction().await?;
         let store = txn.get_store::<Table<Schedule>>(SCHEDULES_STORE).await?;
         let existing = store.search(|t: &Schedule| t.id == id).await?;
         let removed = !existing.is_empty();
-        for (row_id, _) in existing {
+        for (row_id, prior) in existing {
+            archive_schedule(&txn, &prior).await?;
             store.delete(&row_id).await?;
         }
         txn.commit().await?;
@@ -994,10 +1453,60 @@ impl AgentDb {
         let txn = self.database.new_transaction().await?;
         let store = txn.get_store::<Table<Schedule>>(SCHEDULES_STORE).await?;
         let mut rows = store.search(|t: &Schedule| t.id == id).await?;
+        anyhow::ensure!(
+            rows.iter()
+                .all(|(_, row)| Some(row) == rows.first().map(|(_, row)| row)),
+            "conflicting schedule definitions"
+        );
         Ok(rows.pop().map(|(_, t)| t))
     }
 
+    /// Resolve only an immutable reference addressed to this exact Agent.
+    /// This supplies private material, not permission to dispatch: the caller
+    /// must still validate the selected ledger, target, occurrence and keys.
+    pub async fn resolve_schedule_reference(
+        &self,
+        reference: &ScheduleReference,
+        now: DateTime<Utc>,
+    ) -> anyhow::Result<Schedule> {
+        reference.validate()?;
+        anyhow::ensure!(
+            reference.owner_agent_db_id == self.id().to_string(),
+            "scheduled input belongs to another Agent"
+        );
+        let txn = self.database.new_transaction().await?;
+        let archived = txn
+            .get_store::<Table<ScheduleRevision>>(SCHEDULE_REVISIONS_STORE)
+            .await?
+            .get(&reference.revision)
+            .await?;
+        anyhow::ensure!(
+            archived.version == 1
+                && archived.revision == reference.revision
+                && archived.definition.revision_key()? == reference.revision
+                && archived.definition.id == reference.schedule_id
+                && archived.definition.lifetime_key() == reference.lifetime,
+            "scheduled definition reference differs"
+        );
+        // Retained material is not retained authority: removal, disablement or
+        // any executable/policy edit invalidates admission and continuation.
+        let current = self
+            .find_schedule(&reference.schedule_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("scheduled definition was removed"))?;
+        anyhow::ensure!(
+            current.enabled
+                && !current.legacy_migration_held()
+                && current.lifetime_key() == reference.lifetime
+                && current.revision_key()? == reference.revision
+                && current.expires_at.is_none_or(|expiry| now < expiry),
+            "scheduled definition is stale, disabled or expired"
+        );
+        Ok(archived.definition)
+    }
+
     /// Append a fire-audit record. Append-only — one row per fire.
+    #[cfg(test)]
     pub async fn record_schedule_fire(&self, fire: ScheduleFire) -> anyhow::Result<()> {
         let txn = self.database.new_transaction().await?;
         let store = txn
@@ -1014,9 +1523,17 @@ impl AgentDb {
         let store = txn
             .get_store::<Table<ScheduleFire>>(SCHEDULE_FIRES_STORE)
             .await?;
-        let mut rows = store.search(|_: &ScheduleFire| true).await?;
-        rows.sort_by_key(|a| a.1.fired_at);
-        Ok(rows.into_iter().map(|(_, f)| f).collect())
+        let mut rows: Vec<_> = store
+            .search(|_: &ScheduleFire| true)
+            .await?
+            .into_iter()
+            .map(|(_, f)| f)
+            .collect();
+        if let Some(db) = self.scheduling_database().await? {
+            rows.extend(crate::schedule_state::fires(db).await?);
+        }
+        rows.sort_by_key(|fire| fire.fired_at);
+        Ok(rows)
     }
 
     // -----------------------------------------------------------------
@@ -2390,6 +2907,10 @@ mod tests {
         assert!(db.list_schedule_fires().await.unwrap().is_empty());
 
         let f1 = ScheduleFire {
+            firing_id: None,
+            lifetime: None,
+            request_id: None,
+            attempt_id: None,
             schedule_id: "nightly".into(),
             fired_at: Utc::now(),
             session_db_id: "sha256:fresh1".into(),
@@ -2397,6 +2918,10 @@ mod tests {
             usage: None,
         };
         let f2 = ScheduleFire {
+            firing_id: None,
+            lifetime: None,
+            request_id: None,
+            attempt_id: None,
             schedule_id: "daily".into(),
             fired_at: Utc::now() + chrono::Duration::seconds(5),
             session_db_id: "sha256:pinned".into(),

@@ -89,6 +89,57 @@ impl SessionRegistry {
         Ok(Some(crate::agent_db::AgentDb::from_database(db)))
     }
 
+    /// Scoped scheduling read: open only the selected owned ledger. No create,
+    /// replacement or fallback-to-zero on an unavailable reference.
+    pub async fn open_scheduling_agent_db(
+        &self,
+        agent_db_id: &eidetica::entry::ID,
+        pubkey: Option<&eidetica::auth::crypto::PublicKey>,
+    ) -> anyhow::Result<Option<crate::agent_db::AgentDb>> {
+        let mut user = self.user.lock().await;
+        let key = match pubkey {
+            Some(pk) => pk.clone(),
+            None => match user.find_key(agent_db_id)? {
+                Some(k) => k,
+                None => return Ok(None),
+            },
+        };
+        let mut agent = crate::agent_db::AgentDb::from_database(
+            user.open_database_with_key(agent_db_id, &key).await?,
+        );
+        if let Some(reference) = agent.scheduling_reference().await? {
+            let db =
+                crate::executor_db::open_for_agent(&mut user, &agent, &reference, &key).await?;
+            agent = agent.with_scheduling_database(db);
+        }
+        Ok(Some(agent))
+    }
+
+    /// No initialization or fallback: open the exact selected operational writer
+    /// after validating the current Agent, delegation bounds and peer ownership.
+    pub(crate) async fn open_scheduling_writer(
+        &self,
+        entry: &crate::hosted_index::DbEntry,
+    ) -> anyhow::Result<crate::agent_db::AgentDb> {
+        let mut user = self.user.lock().await;
+        let agent = crate::agent_db::AgentDb::from_database(
+            user.open_database_with_key(&entry.db_id, &entry.pubkey)
+                .await?,
+        );
+        let reference = agent
+            .scheduling_reference()
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("scheduling Executor reference missing"))?;
+        let db = crate::executor_db::open_scheduling_writer(
+            &mut user,
+            &agent,
+            &reference,
+            &entry.pubkey,
+        )
+        .await?;
+        Ok(agent.with_scheduling_database(db))
+    }
+
     /// Open a Memory Bank DB via this peer's user (Memory Banks Stage
     /// 9.C). Returns `None` if this peer holds no key for the DB —
     /// expected for bank references an agent's key was revoked from, or

@@ -80,6 +80,24 @@ class MultiRoundTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             stub_llm.multi_round_response(request, "reply")
 
+    def test_schedule_private_input_is_matched_by_role_not_system_position(self):
+        handler = object.__new__(stub_llm.Handler)
+        handler.server = SimpleNamespace(reply="reply")
+        responses = []
+        handler._send = lambda payload, status=200: responses.append((payload, status))
+        private = {"role": "system", "content": "reply-scheduled-send"}
+        history = [{"role": "system", "content": "ordinary agent instructions"},
+                   {"role": "user", "content": "create pinned schedule send"}]
+        self.assertTrue(handler._schedule_fixture(history + [private], {"matrix__send"}))
+        response, status = responses.pop()
+        self.assertEqual(status, 200)
+        self.assertEqual(response["choices"][0]["message"]["tool_calls"][0]["id"], "scheduled-send-send")
+        # A user quoting the sentinel is not authenticated private input.
+        self.assertFalse(handler._schedule_fixture([
+            history[0], {"role": "user", "content": private["content"]}
+        ], {"matrix__send"}))
+        self.assertEqual(responses, [])
+
     def test_compact_barrier_rejects_history_and_denied_current_result(self):
         def handle(messages, tools=None):
             if tools is None:

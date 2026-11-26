@@ -325,6 +325,86 @@ eidetica:
                 execution == ExecutionRole::Executor
             );
         }
+        // A consumed one-shot with the configured ID is still a physical
+        // definition. Bootstrap must not recreate it as a fresh cron lifetime.
+        let sid = db.root_id().to_string();
+        let one_shot = agent_db::Schedule::new(
+            "executor-schedule",
+            routine::Trigger::OneShot {
+                fire_at: chrono::Utc::now(),
+            },
+            "private fixture",
+            agent_db::ScheduleTarget::Pinned {
+                session_db_id: sid.clone(),
+            },
+        );
+        agent_db.upsert_schedule(one_shot.clone()).await.unwrap();
+        let entry = built
+            .server
+            .agent_index()
+            .find_by_id(&agent_db.id())
+            .unwrap();
+        let selected = built
+            .registry
+            .ensure_scheduling_agent_db(&entry)
+            .await
+            .unwrap();
+        let operations = selected.scheduling_database().await.unwrap().unwrap();
+        let reservation = crate::schedule_state::reserve(operations, &one_shot, chrono::Utc::now())
+            .await
+            .unwrap()
+            .unwrap();
+        let mut session =
+            crate::session::Session::new(crate::types::ConversationId(sid.clone()), db.clone())
+                .await;
+        let attempt = session
+            .start_scheduled_attempt(reservation.firing_id.clone(), "timer fixture".into())
+            .await
+            .unwrap();
+        crate::schedule_state::handoff(
+            operations,
+            &reservation,
+            agent_db::ScheduleFire {
+                schedule_id: one_shot.id.clone(),
+                fired_at: chrono::Utc::now(),
+                session_db_id: sid,
+                fresh: false,
+                usage: None,
+                firing_id: Some(reservation.firing_id.clone()),
+                lifetime: Some(reservation.lifetime.clone()),
+                request_id: Some(attempt.request_id),
+                attempt_id: Some(attempt.attempt_id),
+            },
+        )
+        .await
+        .unwrap();
+        Box::pin(run_deferred_startup(
+            built.server.clone(),
+            built.registry.clone(),
+            config.clone(),
+            backends::BackendManager::new(&None, built.secret_store.clone()),
+            false,
+            false,
+            McpReadiness::Deferred,
+            built.server.mcp_registry().clone(),
+        ))
+        .await;
+        assert_eq!(
+            agent_db.find_schedule("executor-schedule").await.unwrap(),
+            Some(one_shot)
+        );
+        assert!(
+            built
+                .registry
+                .open_scheduling_agent_db(&agent_db.id(), None)
+                .await
+                .unwrap()
+                .unwrap()
+                .effective_schedule("executor-schedule")
+                .await
+                .unwrap()
+                .is_none()
+        );
         built.shutdown().await;
     }
 }
@@ -1188,28 +1268,7 @@ async fn run_deferred_startup(
                 error!(session = %s.session_db_id, "server.register_session failed: {e}");
             }
         }
-        // Register every hosted agent's own schedules (Agent-Owned
-        // Schedules). The agent is the unit of ownership; chaz is the
-        // runtime that loads it and fires the callback. Schedules persist
-        // in the agent's DB, so this picks up whatever synced/created
-        // since last boot.
-        for entry in server.agent_index().list() {
-            let opened = {
-                let user = registry.user_lock().await;
-                user.open_database(&entry.db_id).await
-            };
-            let db = match opened {
-                Ok(db) => db,
-                Err(e) => {
-                    error!(agent = %entry.display_name, "open agent DB for schedules failed: {e}");
-                    continue;
-                }
-            };
-            let adb = agent_db::AgentDb::from_database(db);
-            if let Err(e) = engine.register_agent(&entry.db_id.to_string(), &adb).await {
-                error!(agent = %entry.display_name, "engine.register_agent failed: {e}");
-            }
-        }
+        register_startup_agent_schedules(&engine, &registry, server.agent_index()).await;
 
         let engine_clone = engine.clone();
         server.track_task(tokio::spawn(async move {
@@ -1229,6 +1288,49 @@ async fn run_deferred_startup(
         total_ms = deferred_start.elapsed().as_millis() as u64,
         "Deferred at-startup work complete"
     );
+}
+
+/// Seed Agent clocks after migrating eligible legacy definitions on the home executor.
+pub(super) async fn register_startup_agent_schedules(
+    engine: &Arc<routine::RoutineEngine>,
+    registry: &session::SessionRegistry,
+    agent_index: &crate::hosted_index::HostedIndex,
+) {
+    // Register every hosted agent's own schedules (Agent-Owned
+    // Schedules). The agent is the unit of ownership; chaz is the
+    // runtime that loads it and fires the callback. Schedules persist
+    // in the agent's DB, so this picks up whatever synced/created
+    // since last boot.
+    for entry in agent_index.list() {
+        let adb = match registry
+            .open_scheduling_agent_db(&entry.db_id, Some(&entry.pubkey))
+            .await
+        {
+            Ok(Some(adb)) => adb,
+            Ok(None) => continue,
+            Err(e) => {
+                error!(agent = %entry.display_name, "open scheduling state failed: {e}");
+                continue;
+            }
+        };
+        let home = match crate::db_kind::try_read_agent_home_pubkey(adb.database()).await {
+            Ok(home) => home,
+            Err(error) => {
+                warn!(agent_db_id = %entry.db_id, %error, "Schedule home authority unreadable; held");
+                continue;
+            }
+        };
+        if home.is_none_or(|home| home == entry.pubkey)
+            && let Err(error) = adb.migrate_legacy_schedules(chrono::Utc::now()).await
+        {
+            warn!(agent_db_id = %entry.db_id, %error, "Legacy schedule migration held");
+            // Current healthy definitions are still safe to load. The
+            // engine cannot arm any legacy row with no migrated epoch.
+        }
+        if let Err(e) = engine.register_agent(&entry.db_id.to_string(), &adb).await {
+            error!(agent = %entry.display_name, "engine.register_agent failed: {e}");
+        }
+    }
 }
 
 /// Production [`Acquire`](super::exposed_sessions::Acquire): reads Agent DB

@@ -59,9 +59,9 @@ observation is separate evidence; a dispatch error is not remote delivery.
 Accepted input at a text or silence closing boundary requires another call of
 the same attempt before terminal publication. See [shared steering](sessions.md#shared-active-turn-steering).
 
-Scheduled fires use the same loop and tool audit projection, with an awaited recorder bound to the fire's own invocation ID. That ID scopes Worker call sites without creating a queued request or durable interactive attempt. The recorder retains only the structured spawning-call proof in addition to the schedule's tool audit and usage. It does not record the private wake prompt or make the fire replayable. Schedule admission, approvals, and local-only settlement remain separate from interactive routing.
+An idle scheduled wake uses the same loop, recorder and capacity as other turns. Its inert request reference becomes the identity of a real attempt only when the shared runner starts it. A Pinned wake joined to a running turn instead uses that turn's existing attempt. Worker call sites are scoped to the actual attempt in either case. The recorder retains private input by reference, not as a queued user message or a replayable prompt. Schedule admission, approvals and local-only settlement remain separate from interactive routing.
 
-`worker_wait` checks the current invocation and Agent against the reciprocal Worker link and the recorded native spawning call, then observes only the child's committed Directive outcome. It releases an owned executor permit only for observation and does not checkpoint, cancel, or replay a child. Scheduled turns do not hold an interactive executor permit; their Workers still use the normal child permit pool.
+`worker_wait` checks the current invocation and Agent against the reciprocal Worker link and the recorded native spawning call, then observes only the child's committed Directive outcome. In either interactive or scheduled turns it releases the executor permit only while observing and reacquires it before continuing the turn. It does not checkpoint, cancel, or replay a child.
 
 ## Cancellation
 
@@ -233,3 +233,71 @@ without quoting it.
 A body that is not valid JSON at all reaches the bounded-excerpt path in
 `LlmError` whether it came with an error status or a broken success status,
 because the SDK reports both as the same deserialize error.
+
+## Durable scheduled turns
+
+Scheduled turns reuse `SessionRuntimeRecorder`: a required model-response
+commit precedes tool effects, and a tool-result commit precedes the next model
+call. The terminal record/final entry/attempt settlement uses the ordinary
+Session transaction. Required write failures stop progression, leaving any
+already-recorded evidence intact.
+
+The replacement's targeted adapter can start committed idle/Fresh inputs through
+this same runner after acquiring capacity, or bind exact-Agent active Pinned input.
+It uses an atomic Ack-request Started/input-receipt transaction, reference-only
+transcripts and monotonic Session-to-ledger projection. An Included reference may
+remain in its exact containing attempt after definition removal, never in a later
+turn; current Agent keys/home/membership still gate every request. See
+[Targeted idle and Fresh admission](../design/agent_schedules.md#targeted-idle-and-fresh-admission).
+RoutineEngine now carries an exact lifetime/revision/slot snapshot through bounded
+preparation and committed handoff into ordered discovery. It does not execute a
+second ReAct loop. Its acknowledgement advances the clock, not execution status.
+
+The Agent DB stores definitions, immutable private revisions and one pinned
+`ExecutorRef` in `scheduling_executor`. That owned Executor stores occurrences,
+clock successors, handoff order/history, successful logical fires and reservations.
+The Session stores an inert reference-only Ack, later input/attempt receipts and
+execution evidence. Those commits are not cross-DB atomic. A missing or conflicting
+selected reference holds work, never selects an empty replacement.
+
+Operational writes use that Executor's existing direct owner key, including
+when connected through the local Eidetica service. Opening the writer first
+checks the Agent's current Write authority, the exact delegation and its bounds,
+the Executor marker and this peer's ownership. The owner key cannot upgrade a
+read-only Agent or a read-only delegation. Read-only views still use the Agent's
+delegated identity and do not select or initialize storage.
+
+Admission reserves capacity before Fresh creation, binds one known root and
+prepares its inert Ack before publication. An Ack alone is not runnable. The
+ordinary runner acquires capacity before Started; active Pinned input instead
+joins the exact Agent's containing attempt at a safe model boundary. The delivery,
+request, attempt and engine generation are distinct identities. Pinned success
+means Included; Fresh success also requires durable terminal success. Neither
+means real-world fulfillment. Known-unused/failed capacity releases once;
+uncertainty holds the reservation without replaying a containing human turn.
+
+A lost timer acknowledgement or peer-local timestamp does not choose a new
+interval anchor: reload reads the selected ledger's exact successor. Generic retry
+still cannot reconstruct a standalone private turn. Same-attempt Pinned wait
+reconstruction resolves authenticated immutable references in memory; later turns
+never import private wake bodies. Required-write failures stop progression.
+
+A restarted executor rebuilds its accounting observations before readmitting
+a private checkpointed wait. Missing observation state defers the wait; it is
+not a permanently invalid checkpoint. The existing bounded projection scan
+reconciles the ledger and wakes that Session for ordinary exact-wait validation.
+The common recorder also permits in-process unloading with paired boundary
+input. If its accounting observation becomes cold during the unloaded wait, the
+observer drops loaded views and capacity, retains the exact descriptor/session
+reservation and waits for the same bounded pump. Newer turns cannot overtake it.
+Other readmission errors stay held; arbitrary recorders do not acquire this
+boundary-input restore capability. Missing records, invalid authority and
+unpaired model dispatch still hold work.
+
+Direct schedule callers use the same handoff-only clock admission. Missing clock
+or generation data refuses before execution; there is no standalone schedule
+runner. Legacy Agent counts/history remain preserved, and compatible readers
+must precede activation.
+Binary rollback does not remove written sidecars, migrate history or grant replay.
+No live migration, catch-up policy, automatic interruption retry or distributed
+fencing is supplied by this timer integration.

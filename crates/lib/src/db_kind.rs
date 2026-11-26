@@ -92,10 +92,21 @@ pub async fn clear_agent_home_pubkey(database: &Database) -> anyhow::Result<()> 
 /// latter case the gate falls back to legacy "any keyholder runs" behavior
 /// (safer than going silent on corruption).
 pub async fn read_agent_home_pubkey(database: &Database) -> Option<PublicKey> {
-    let txn = database.new_transaction().await.ok()?;
-    let store = txn.get_store::<DocStore>(META_STORE).await.ok()?;
-    let raw = store.get_string(HOME_PUBKEY_KEY).await.ok()?;
-    PublicKey::from_prefixed_string(&raw).ok()
+    try_read_agent_home_pubkey(database).await.ok().flatten()
+}
+
+/// Scheduling must distinguish an unset legacy key from unreadable or invalid
+/// authority. Only a missing key in a successfully read store is unset.
+pub(crate) async fn try_read_agent_home_pubkey(
+    database: &Database,
+) -> anyhow::Result<Option<PublicKey>> {
+    let txn = database.new_transaction().await?;
+    let store = txn.get_store::<DocStore>(META_STORE).await?;
+    match store.get_string(HOME_PUBKEY_KEY).await {
+        Ok(raw) => Ok(Some(PublicKey::from_prefixed_string(&raw)?)),
+        Err(eidetica::Error::Store(error)) if error.is_not_found() => Ok(None),
+        Err(error) => Err(error.into()),
+    }
 }
 
 #[cfg(test)]
@@ -155,5 +166,20 @@ mod tests {
     async fn read_home_pubkey_on_unset_db_returns_none() {
         let (_inst, _user, db) = fresh_db().await;
         assert!(read_agent_home_pubkey(&db).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn schedule_home_authority_does_not_treat_invalid_key_as_unset() {
+        let (_inst, _user, db) = fresh_db().await;
+        assert_eq!(try_read_agent_home_pubkey(&db).await.unwrap(), None);
+        let txn = db.new_transaction().await.unwrap();
+        txn.get_store::<DocStore>(META_STORE)
+            .await
+            .unwrap()
+            .set_string(HOME_PUBKEY_KEY, "corrupt home key")
+            .await
+            .unwrap();
+        txn.commit().await.unwrap();
+        assert!(try_read_agent_home_pubkey(&db).await.is_err());
     }
 }

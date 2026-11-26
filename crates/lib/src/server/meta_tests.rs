@@ -166,6 +166,7 @@ async fn heartbeat_pass_reads_meta_once_and_next_callback_observes_late_stop() {
                 RunningTurn {
                     attempt: attempt.clone(),
                     cancel: cancel.clone(),
+                    agent_db_id: None,
                 },
             );
             server
@@ -197,6 +198,7 @@ async fn heartbeat_pass_reads_meta_once_and_next_callback_observes_late_stop() {
                 RunningTurn {
                     attempt: attempt.clone(),
                     cancel: cancel.clone(),
+                    agent_db_id: None,
                 },
             );
             executor

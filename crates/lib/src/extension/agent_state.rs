@@ -116,7 +116,7 @@ impl AgentStateAdmin for ScopedAgentStateAdmin {
 
             let agent_db = self
                 .registry
-                .open_agent_db(&entry.db_id, Some(&entry.pubkey))
+                .open_scheduling_agent_db(&entry.db_id, Some(&entry.pubkey))
                 .await
                 .map_err(|e| anyhow::anyhow!("Failed to open agent DB: {e}"))?
                 .ok_or_else(|| anyhow::anyhow!("No key for agent '{}' DB", entry.display_name))?;

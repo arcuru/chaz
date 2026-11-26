@@ -786,6 +786,8 @@ fn replay_turn_tagged<'a>(
     let mut model_sequence = None;
     let mut terminal = false;
     let mut steering_pending = None;
+    let mut scheduled_pending = false;
+    let mut schedule_ids = std::collections::HashSet::new();
     let mut i = 0;
     while i < sorted.len() {
         let record = &sorted[i];
@@ -832,6 +834,23 @@ fn replay_turn_tagged<'a>(
             i += 1;
             continue;
         }
+        if let TurnTranscriptMessage::ScheduledInput {
+            model_sequence: seq,
+            references,
+        } = &record.message
+        {
+            if scheduled_pending
+                || *seq != model_sequence.map_or(0, |p| p + 1)
+                || !crate::session::scheduled::validate_references(references, &mut schedule_ids)
+            {
+                return None;
+            }
+            // The later-turn history keeps model/tool evidence, never the
+            // invocation-private instruction that led to it.
+            scheduled_pending = true;
+            i += 1;
+            continue;
+        }
         let TurnTranscriptMessage::ModelResponse {
             model_sequence: seq,
             content,
@@ -848,6 +867,7 @@ fn replay_turn_tagged<'a>(
         }
         model_sequence = Some(*seq);
         steering_pending = None;
+        scheduled_pending = false;
         i += 1;
         if *end {
             // Ordinary terminal text is restored from its final entry.
@@ -1789,6 +1809,7 @@ mod tests {
                 TurnTranscriptMessage::Cancelled | TurnTranscriptMessage::Unknown { .. } => {}
                 TurnTranscriptMessage::ModelResponse { model_sequence, .. }
                 | TurnTranscriptMessage::Steering { model_sequence, .. }
+                | TurnTranscriptMessage::ScheduledInput { model_sequence, .. }
                 | TurnTranscriptMessage::ToolResult { model_sequence, .. } => *model_sequence += 1,
             }
         }
@@ -1808,6 +1829,7 @@ mod tests {
                     TurnTranscriptMessage::Cancelled | TurnTranscriptMessage::Unknown { .. } => {}
                     TurnTranscriptMessage::ModelResponse { model_sequence, .. }
                     | TurnTranscriptMessage::Steering { model_sequence, .. }
+                    | TurnTranscriptMessage::ScheduledInput { model_sequence, .. }
                     | TurnTranscriptMessage::ToolResult { model_sequence, .. } => {
                         *model_sequence += model_offset;
                     }

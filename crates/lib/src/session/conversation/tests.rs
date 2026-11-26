@@ -19,7 +19,7 @@ async fn stage(store: &DocStore, value: &impl Serialize) -> String {
     key
 }
 
-async fn activate(db: &Database, boundary: &Snapshot) -> Snapshot {
+pub(crate) async fn activate(db: &Database, boundary: &Snapshot) -> Snapshot {
     let descriptor = contract::Descriptor {
         version: 1,
         encoding: 1,
