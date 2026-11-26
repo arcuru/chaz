@@ -133,7 +133,11 @@ pub(crate) async fn write<T: Serialize>(
     Ok(())
 }
 
-async fn stage<T: Serialize>(txn: &Transaction, store_name: &str, value: &T) -> anyhow::Result<()> {
+pub(crate) async fn stage<T: Serialize>(
+    txn: &Transaction,
+    store_name: &str,
+    value: &T,
+) -> anyhow::Result<()> {
     let fields = serde_json::to_value(value)?;
     ensure!(fields.is_object(), "expected record fields");
     // Nothing inside this boundary is merged independently: no stale grant,
