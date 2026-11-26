@@ -210,6 +210,18 @@ impl ConversationRead {
         self.pins.current(agent)
     }
 
+    /// Attempt IDs of every input accepted under one of this Agent's pins.
+    #[cfg(test)]
+    pub(super) fn agent_attempts<'a>(&'a self, agent: &'a str) -> impl Iterator<Item = &'a str> {
+        self.provenance
+            .inputs
+            .values()
+            .filter_map(move |(_, input)| {
+                let config = self.pins.config(input.pin.as_ref()?)?;
+                (config.database == agent).then_some(input.attempt.as_str())
+            })
+    }
+
     pub(super) fn accepted_agent_pin(
         &self,
         accepted_entry: &ID,

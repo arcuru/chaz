@@ -1,23 +1,17 @@
 //! The pinned fixture has one live transaction per execution. It has no
 //! reopen-to-execute path, durable dispatch lease, or external effect grant.
 use super::*;
-use crate::{agent_db::AgentDb, session::RecordRef};
+use crate::agent_db::AgentDb;
 use eidetica::entry::ID;
 
 pub(super) struct PinnedTurn {
     pub(super) agent: AgentDb,
-    config: RecordRef,
+    /// Read once, at acceptance, from the exact pinned revision.
+    instructions: String,
     pub(super) model: Option<Execution>,
     pub(super) selection: Option<crate::session::CallInput>,
     pub(super) tool: Option<(u64, usize, Execution)>,
     pub(super) terminal: Option<ID>,
-}
-
-impl PinnedTurn {
-    pub(super) async fn require_config_access(&self) -> anyhow::Result<()> {
-        self.agent.read_config_ref(&self.config).await?;
-        Ok(())
-    }
 }
 
 pub(super) struct Execution {
@@ -53,13 +47,6 @@ impl TurnRecorder {
             pin.model.is_none() && pin.tool.is_none(),
             "execution already in progress"
         );
-        let config = pin.agent.read_config_ref(&pin.config).await?;
-        ensure!(
-            config.prompt_sources.is_none()
-                && config.system_prompt_ref.is_none()
-                && config.system_prompt_files.is_empty(),
-            "fixture only reads inline pinned instructions"
-        );
         let db = session.database();
         let exec = Box::pin(Execution::current(db)).await?;
         let call = self.call_id(0);
@@ -68,10 +55,10 @@ impl TurnRecorder {
             messages: Vec::new(),
             sources: Vec::new(),
         };
-        if !config.system_prompt.is_empty() {
+        if !pin.instructions.is_empty() {
             fresh
                 .messages
-                .push(RuntimeMessage::System(config.system_prompt));
+                .push(RuntimeMessage::System(pin.instructions.clone()));
             fresh.sources.push(ContextSource::Instructions);
         }
         // The one inline prompt comes from the pinned Agent revision, not
@@ -116,7 +103,6 @@ impl TurnRecorder {
             pin.tool.is_none() && pin.model.is_none(),
             "execution already in progress"
         );
-        pin.agent.read_config_ref(&pin.config).await?;
         let db = session.database();
         let exec = Box::pin(Execution::current(db)).await?;
         let response = state
@@ -187,27 +173,21 @@ impl Session {
         Ok(txn.commit().await?)
     }
 
-    pub(in crate::session) async fn prepare_pinned_fixture(
-        session: &Arc<Mutex<Self>>,
-        agent: &AgentDb,
-        entry: SessionEntry,
-    ) -> anyhow::Result<PreparedPinnedInput> {
-        let session = session.lock().await;
-        let db = session.database();
-        let exec = Execution::current(db).await?;
-        let staged = Staging::at(db, &exec.at, &exec.txn, "fixture").await?;
-        Ok(staged.prepare_pinned_input(entry, &agent.id())?)
-    }
-
-    /// Only a first successful local acceptance returns an executor. Lost
-    /// acknowledgement is readback evidence, never permission to dispatch.
+    /// A Session write wakes this check; it never responds by itself. One
+    /// history read resolves the Agent's unique pin, the exact config is read
+    /// once, and the input commits with its Started attempt only if the Agent
+    /// owes a response. Unavailable or ambiguous pins accept nothing.
     pub(in crate::session) async fn start_pinned_fixture(
         session: Arc<Mutex<Self>>,
-        prepared: &PreparedPinnedInput,
         agent: AgentDb,
+        entry: SessionEntry,
         display: String,
         cancel: TurnCancel,
-    ) -> anyhow::Result<(ID, TurnRecorder)> {
+    ) -> anyhow::Result<(ID, TurnAttempt, TurnRecorder)> {
+        ensure!(
+            entry.sender != display,
+            "an Agent's own reply is not input it owes a response to"
+        );
         let mut guard = session.lock().await;
         guard.refresh_writer().await?;
         let db = guard.database();
@@ -215,45 +195,27 @@ impl Session {
             db.current_permission().await?.can_write() && !cancel.is_cancelled(),
             "cannot accept input without live writer"
         );
-        let current = Self::history(db).await?;
+        let exec = Execution::current(db).await?;
+        let staged = Staging::at(db, &exec.at, &exec.txn, "fixture").await?;
+        let (pin, reference) = staged.agent_pin(&agent.id())?;
+        let config = agent.read_config_ref(&reference).await?;
         ensure!(
-            prepared.readback(db, current.snapshot()).await?.is_none(),
-            "input already accepted; cannot dispatch again"
+            config.prompt_sources.is_none()
+                && config.system_prompt_ref.is_none()
+                && config.system_prompt_files.is_empty(),
+            "fixture only reads inline pinned instructions"
         );
-        let at = &prepared.op.observed.frontier;
-        let original = Self::history_at(db, at).await?;
-        let (pin, config) = original
-            .agent_pin(&agent.id())
-            .await?
-            .context("no pinned Agent")?;
-        ensure!(
-            Some(pin) == prepared.accepted.pin.as_ref(),
-            "input refers to a different Agent pin"
-        );
-        // A new input must also refuse an ambiguous live pin. A unique new
-        // update is allowed to be a sibling of an already prepared input.
-        current
-            .agent_pin(&agent.id())
-            .await?
-            .context("no current Agent membership")?;
-        agent.read_config_ref(config).await?;
-        let config = config.clone();
-        ensure!(
-            prepared.reserve_once(),
-            "input acceptance already attempted; inspect readback, do not dispatch again"
-        );
-        let txn = db.new_transaction_at(at).await?;
-        let staged = Staging::at(db, at, &txn, &prepared.accepted.branch).await?;
-        prepared.stage(&staged).await?;
-        let accepted = txn.commit().await?;
+        let (_, accepted, attempt) = staged.accept_pinned_input(entry, &agent.id(), pin).await?;
+        drop(staged);
+        let entry = exec.txn.commit().await?;
         drop(guard);
         let mut recorder = Self::turn_recorder(
             session,
-            &prepared.attempt,
+            &attempt,
             TurnCallIdentity {
                 agent: display,
                 requested_model: String::new(),
-                execution_id: Some(prepared.accepted.branch.clone()),
+                execution_id: Some(accepted.branch.clone()),
             },
             Default::default(),
         );
@@ -261,7 +223,7 @@ impl Session {
             legacy: None,
             pinned: Some(PinnedTurn {
                 agent,
-                config,
+                instructions: config.system_prompt,
                 model: None,
                 selection: None,
                 tool: None,
@@ -269,7 +231,7 @@ impl Session {
             }),
             compaction: None,
             cancel: Some(cancel),
-            input: prepared.accepted.representation(),
+            input: accepted.representation(),
             next_model: 0,
             pending: None,
             responses: Default::default(),
@@ -279,6 +241,6 @@ impl Session {
             terminal: None,
             fail: None,
         }));
-        Ok((accepted, recorder))
+        Ok((entry, attempt, recorder))
     }
 }

@@ -158,6 +158,14 @@ bind B; the earlier input and its in-flight calls still bind A. Use
 not held or cannot be read, the fixture refuses to start; it does not substitute
 the current config. A pin is not a permission grant.
 
+A Session write is a reason for the executor to inspect, not to respond. One
+history read resolves the Agent's unique pin and the exact config is read once.
+The Agent owes a response to a new local input only while none of the inputs
+accepted under its pins has an unsettled attempt, and never to its own reply.
+A repeated wake or a resubmission after a lost acknowledgement finds that
+Started attempt and accepts nothing. The turn reuses the config it read; each model request
+reads only the latest accepted Session context.
+
 The recorder refreshes accepted history for every logical model request. The
 response and accounting commit together at the tips used by that request;
 each tool result commits at the cut taken before invoking that tool. Neither
@@ -187,18 +195,19 @@ so this fixture adds no parallel turns.
 | Write                                         | What survives, and why                                                                                                                                                                                                                                                                                                                                                                                                                                   |
 | --------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Session creation, Agent join, explicit update | One exact config reference in the pin Entry. No copy of the Agent config in the transcript.                                                                                                                                                                                                                                                                                                                                                              |
-| Local input acceptance                        | Message, pin link and exact Started attempt row in one Entry. The attempt row is a live execution guard, not model context. Identical acceptance readback does not grant another executor.                                                                                                                                                                                                                                                               |
+| Local input acceptance                        | Message, pin link and exact Started attempt row in one Entry. The attempt row is the existing execution guard, not model context: while it is unsettled the Agent owes nothing new.                                                                                                                                                                                                                                                                      |
 | Model execution                               | One result Entry with native response, compact accounting, and ordered request slots. History selection cannot be recovered from parents alone; budget and projection can omit content. The reader derives the history ID list and addition list from the slots. Inline instructions refer to the pin; injected values and tool schemas are captured once in the attempt and later calls reference them. There is no separate prepare or dispatch Entry. |
 | Tool execution                                | One result at the tool's observed tips, linked to the native model call occurrence by response member and call index. Provider IDs alone are not enough. Denied/unavailable tools record observations, not executions.                                                                                                                                                                                                                                   |
 | Final publication                             | Separate from the provider's return because result hooks can change the visible reply. The existing attempt settlement stays atomic with publication. Unchanged text reuses the native result, retaining its original accounting.                                                                                                                                                                                                                        |
 
 A refused commit, cancellation or uncertain transport does not authorize
-re-execution. The fixture can read the accepted input after an acknowledgement
-is lost, but it cannot recover the right to dispatch; its in-memory reservation
-is not a cross-process execution claim. The writer checks currently observed
-Session permission, the Started attempt, cancellation, and access to the exact
-Agent config separately from the historical transaction. A permission preflight
-is not a distributed fence against an unseen change.
+re-execution. After a lost acknowledgement the accepted input is readable, and
+its Started attempt refuses another acceptance for that Agent. The check is
+serialized per Session handle, like the resident server's one turn per Session;
+it is not a cross-peer execution claim. The writer checks currently observed
+Session permission, the Started attempt and cancellation separately from the
+historical transaction. A permission preflight is not a distributed fence
+against an unseen change.
 
 This capability only has a test writer, with an inline prompt, a loopback
 model transport, and in-process stub tools. It is not combined with the

@@ -85,20 +85,27 @@ async fn sqlite_pins_and_steering() {
     let first = AgentDb::from_database(account.open_database(&first_id).await.unwrap());
     let other = AgentDb::from_database(account.open_database(&other_id).await.unwrap());
     let session = session(&db).await;
-    let prepared = Session::prepare_pinned_fixture(&session, &first, message("user", "2 + 2"))
-        .await
-        .unwrap();
-    assert_eq!(prepared.accepted.pin.as_ref(), Some(&a));
     let cancel = TurnCancel::new();
-    let (input, recorder) = Box::pin(Session::start_pinned_fixture(
+    let (input, _, recorder) = Box::pin(Session::start_pinned_fixture(
         session.clone(),
-        &prepared,
         first.clone(),
+        message("user", "2 + 2"),
         AGENT.into(),
         cancel.clone(),
     ))
     .await
     .unwrap();
+    let accepted = Session::history(&db).await.unwrap();
+    assert_eq!(
+        accepted
+            .accepted_agent_pin(&input)
+            .await
+            .unwrap()
+            .unwrap()
+            .0,
+        &a
+    );
+    drop(accepted);
     let fx = Arc::new(
         Box::pin(Fixture::with_recorder(
             instance.clone(),
@@ -256,26 +263,6 @@ async fn sqlite_pins_and_steering() {
         &other_pin
     );
 
-    // Lost acknowledgement is not a second start; exact durable receipt
-    // remains readable even when current pins and execution history change.
-    assert_eq!(
-        prepared.readback(&db, current.snapshot()).await.unwrap(),
-        Some(input.clone())
-    );
-    assert!(
-        Box::pin(Session::start_pinned_fixture(
-            session.clone(),
-            &prepared,
-            first.clone(),
-            AGENT.into(),
-            TurnCancel::new()
-        ))
-        .await
-        .err()
-        .unwrap()
-        .to_string()
-        .contains("already accepted")
-    );
     assert!(
         Box::pin(fx.run())
             .await
@@ -325,21 +312,27 @@ async fn sqlite_pins_and_steering() {
         OTHER
     );
     let current_session = super::pinned::session(&db).await;
-    let next =
-        Session::prepare_pinned_fixture(&current_session, &first, message("user", "Next request"))
-            .await
-            .unwrap();
-    assert_eq!(next.accepted.pin.as_ref(), Some(&b));
     let cancel = TurnCancel::new();
-    let (_, recorder) = Box::pin(Session::start_pinned_fixture(
+    let (next_input, next, recorder) = Box::pin(Session::start_pinned_fixture(
         current_session.clone(),
-        &next,
         first,
+        message("user", "Next request"),
         AGENT.into(),
         cancel.clone(),
     ))
     .await
     .unwrap();
+    assert_eq!(
+        Session::history(&db)
+            .await
+            .unwrap()
+            .accepted_agent_pin(&next_input)
+            .await
+            .unwrap()
+            .unwrap()
+            .0,
+        &b
+    );
     let fx = Box::pin(Fixture::with_recorder(
         reopened,
         current_session,
@@ -355,11 +348,11 @@ async fn sqlite_pins_and_steering() {
     assert_eq!(wire[0]["messages"][0]["content"], B);
     let history = Session::history(&db).await.unwrap();
     let call = history
-        .recorded_call(&fx.call(0), &next.attempt.attempt_id)
+        .recorded_call(&fx.call(0), &next.attempt_id)
         .await
         .unwrap()
         .unwrap();
-    Box::pin(check_readback_bindings(&db, call, &foreign, &next.attempt)).await;
+    Box::pin(check_readback_bindings(&db, call, &foreign, &next)).await;
 }
 
 async fn check_readback_bindings(
@@ -532,9 +525,15 @@ async fn pinned_fixture_conflicting_updates_do_not_choose_a_winner() {
         &other_pin
     );
     assert!(
-        Session::prepare_pinned_fixture(&session, &first, message("user", "No winner"))
-            .await
-            .is_err()
+        Box::pin(Session::start_pinned_fixture(
+            session,
+            first,
+            message("user", "No winner"),
+            AGENT.into(),
+            TurnCancel::new()
+        ))
+        .await
+        .is_err()
     );
     assert_eq!(db.snapshot().await.unwrap(), *joined.snapshot());
 }
@@ -550,46 +549,53 @@ async fn pinned_fixture_refuses_inherited_attempt_row_and_nonlocal_input() {
     let mut invalid = message("user", "not local");
     invalid.entry_type = EntryType::Cancel;
     assert!(
-        Session::prepare_pinned_fixture(&session, &first, invalid)
-            .await
-            .is_err()
+        Box::pin(Session::start_pinned_fixture(
+            session.clone(),
+            first.clone(),
+            invalid,
+            AGENT.into(),
+            TurnCancel::new()
+        ))
+        .await
+        .is_err()
     );
 
     // A started row is inherited at acceptance, and the receipt Entry writes
     // a different attempt. Checking subtree membership and merged rows alone
     // would accept it. Build a valid fact at these very parents.
-    let plan = Session::prepare_pinned_fixture(&session, &first, message("user", "must be atomic"))
+    // Build a valid fact in a transaction that is never committed.
+    let tip = db.snapshot().await.unwrap();
+    let draft = db.new_transaction_at(&tip).await.unwrap();
+    let staged = Staging::at(&db, &tip, &draft, "fixture").await.unwrap();
+    let (pin, _) = staged.agent_pin(&first.id()).unwrap();
+    let (op, accepted, attempt) = staged
+        .accept_pinned_input(message("user", "must be atomic"), &first.id(), pin)
         .await
         .unwrap();
+    drop(staged);
+    drop(draft);
     let txn = db.new_transaction().await.unwrap();
     let store = txn
         .get_store::<Table<TurnAttempt>>(crate::session::TURN_ATTEMPTS_STORE)
         .await
         .unwrap();
     store
-        .set(&plan.attempt.attempt_id, plan.attempt.clone())
+        .set(&attempt.attempt_id, attempt.clone())
         .await
         .unwrap();
     let at = Snapshot::from([txn.commit().await.unwrap()]);
     let txn = db.new_transaction_at(&at).await.unwrap();
-    let staged = Staging::at(&db, &at, &txn, &plan.accepted.branch)
-        .await
-        .unwrap();
-    let mut fact = plan.op.clone();
+    let staged = Staging::at(&db, &at, &txn, &accepted.branch).await.unwrap();
+    let mut fact = op;
     fact.observed.frontier = at.clone();
     staged.stage_fixture_op(&fact).await.unwrap();
-    stage_observation(
-        &txn,
-        Observation::InputAccepted {
-            input: plan.accepted.clone(),
-        },
-    )
-    .await
-    .unwrap();
+    stage_observation(&txn, Observation::InputAccepted { input: accepted })
+        .await
+        .unwrap();
     txn.get_store::<Table<TurnAttempt>>(crate::session::TURN_ATTEMPTS_STORE)
         .await
         .unwrap()
-        .insert(plan.attempt.clone())
+        .insert(attempt)
         .await
         .unwrap();
     txn.commit().await.unwrap();
@@ -611,45 +617,70 @@ async fn pinned_fixture_refuses_inherited_attempt_row_and_nonlocal_input() {
 }
 
 #[tokio::test]
-async fn pinned_fixture_only_one_concurrent_admission_across_session_handles() {
+async fn pinned_fixture_repeated_wake_and_lost_ack_do_not_dispatch_again() {
     let (instance, _, db) = crate::session::test_helpers::test_session_db().await;
     let first = agent(&instance, "first", A).await;
-    let one = session(&db).await;
-    let two = session(&db).await;
-    Session::fixture_pin_agent(&one, &first, false)
+    let session = session(&db).await;
+    Session::fixture_pin_agent(&session, &first, false)
         .await
         .unwrap();
-    let plan = Session::prepare_pinned_fixture(&one, &first, message("user", "accept once"))
-        .await
-        .unwrap();
-    let (a, b) = tokio::join!(
+    // With nothing unsettled, the Agent's own reply still owes nothing.
+    let pinned = db.snapshot().await.unwrap();
+    let own = Box::pin(Session::start_pinned_fixture(
+        session.clone(),
+        first.clone(),
+        message(AGENT, "my own reply"),
+        AGENT.into(),
+        TurnCancel::new(),
+    ))
+    .await
+    .err()
+    .unwrap();
+    assert!(own.to_string().contains("own reply"), "{own}");
+    assert_eq!(db.snapshot().await.unwrap(), pinned);
+    // Two concurrent wakes for the same Session: the executor accepts once.
+    let (one, two) = tokio::join!(
         Box::pin(Session::start_pinned_fixture(
-            one,
-            &plan,
+            session.clone(),
             first.clone(),
+            message("user", "accept once"),
             AGENT.into(),
             TurnCancel::new()
         )),
         Box::pin(Session::start_pinned_fixture(
-            two,
-            &plan,
-            first,
+            session.clone(),
+            first.clone(),
+            message("user", "accept once"),
             AGENT.into(),
             TurnCancel::new()
         )),
     );
-    assert_ne!(a.is_ok(), b.is_ok());
-    let entry = a.ok().or_else(|| b.ok()).unwrap().0;
-    assert_eq!(
-        db.snapshot().await.unwrap(),
-        Snapshot::from([entry.clone()])
+    assert_ne!(one.is_ok(), two.is_ok());
+    let refused = one.as_ref().err().or(two.as_ref().err()).unwrap();
+    assert!(
+        refused.to_string().contains("unsettled attempt"),
+        "{refused}"
     );
-    assert_eq!(
-        plan.readback(&db, &db.snapshot().await.unwrap())
-            .await
-            .unwrap(),
-        Some(entry)
-    );
+    let (entry, ..) = one.ok().or(two.ok()).unwrap();
+    let accepted = Snapshot::from([entry.clone()]);
+    assert_eq!(db.snapshot().await.unwrap(), accepted);
+
+    // The caller lost the acknowledgement and resubmits: the durable Started
+    // attempt says the Agent already owes this response, so nothing new runs.
+    let retry = Box::pin(Session::start_pinned_fixture(
+        session,
+        first,
+        message("user", "accept once"),
+        AGENT.into(),
+        TurnCancel::new(),
+    ))
+    .await
+    .err()
+    .unwrap();
+    assert!(retry.to_string().contains("unsettled attempt"), "{retry}");
+    let history = Session::history(&db).await.unwrap();
+    assert!(history.accepted_agent_pin(&entry).await.unwrap().is_some());
+    assert_eq!(history.snapshot(), &accepted);
 }
 
 #[tokio::test]
@@ -673,14 +704,10 @@ async fn pinned_fixture_unavailable_revision_never_accepts_input() {
         .await
         .unwrap();
     let at = Snapshot::from([txn.commit().await.unwrap()]);
-    let prepared =
-        Session::prepare_pinned_fixture(&session, &first, message("user", "no fallback"))
-            .await
-            .unwrap();
     let error = Box::pin(Session::start_pinned_fixture(
         session,
-        &prepared,
         first,
+        message("user", "no fallback"),
         AGENT.into(),
         TurnCancel::new(),
     ))
@@ -691,7 +718,6 @@ async fn pinned_fixture_unavailable_revision_never_accepts_input() {
         error.downcast_ref(),
         Some(crate::agent_db::BoundConfigError::Unavailable(_))
     ));
-    assert_eq!(prepared.readback(&db, &at).await.unwrap(), None);
     assert_eq!(db.snapshot().await.unwrap(), at);
 }
 
@@ -704,14 +730,11 @@ async fn pinned_fixture_refuses_result_and_tools_after_live_revocation() {
         Session::fixture_pin_agent(&session, &first, false)
             .await
             .unwrap();
-        let prepared = Session::prepare_pinned_fixture(&session, &first, message("user", "2 + 2"))
-            .await
-            .unwrap();
         let cancel = TurnCancel::new();
-        let (input, recorder) = Box::pin(Session::start_pinned_fixture(
+        let (input, _, recorder) = Box::pin(Session::start_pinned_fixture(
             session.clone(),
-            &prepared,
             first,
+            message("user", "2 + 2"),
             AGENT.into(),
             cancel.clone(),
         ))
@@ -770,14 +793,11 @@ async fn run_pinned(
     with_tool: bool,
     responder: impl wiremock::Respond + 'static,
 ) -> Fixture {
-    let prepared = Session::prepare_pinned_fixture(session, agent, message("user", question))
-        .await
-        .unwrap();
     let cancel = TurnCancel::new();
-    let (_, recorder) = Box::pin(Session::start_pinned_fixture(
+    let (.., recorder) = Box::pin(Session::start_pinned_fixture(
         session.clone(),
-        &prepared,
         agent.clone(),
+        message("user", question),
         display.into(),
         cancel.clone(),
     ))

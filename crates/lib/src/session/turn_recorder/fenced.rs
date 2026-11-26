@@ -839,9 +839,6 @@ impl FencedTurn {
     }
 
     async fn require_active(&self, session: &Session, attempt: &TurnAttempt) -> anyhow::Result<()> {
-        if let Some(pinned) = &self.pinned {
-            pinned.require_config_access().await?;
-        }
         if let Some(cancel) = &self.cancel {
             // Eidetica signs against the transaction's historical parents. Check
             // live authority separately; the synthetic writer does not provide a

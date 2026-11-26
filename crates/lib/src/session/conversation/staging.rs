@@ -238,20 +238,47 @@ impl Staging<'_> {
         self.stage(op).await
     }
 
+    /// This Agent's unique pin at the observed tips.
     #[cfg(test)]
-    pub fn prepare_pinned_input(
+    pub fn agent_pin(
+        &self,
+        agent: &eidetica::entry::ID,
+    ) -> Result<(eidetica::entry::ID, super::RecordRef)> {
+        self.read
+            .agent_pin(&agent.to_string())?
+            .map(|(id, config)| (id.clone(), config.clone()))
+            .ok_or_else(|| ConversationError::Missing("Agent is not pinned in this Session".into()))
+    }
+
+    /// Stage a local input, its acceptance and the Started attempt in this
+    /// transaction. A Session write is a reason to inspect, not to respond:
+    /// while any input accepted under this Agent's pins has an unsettled
+    /// attempt, the Agent owes nothing new. Its own reply, a repeated wake or
+    /// a retry after a lost acknowledgement finds that attempt and stops.
+    #[cfg(test)]
+    pub async fn accept_pinned_input(
         &self,
         entry: crate::session::SessionEntry,
         agent: &eidetica::entry::ID,
-    ) -> Result<PreparedPinnedInput> {
-        let pin = self
-            .read
-            .agent_pin(&agent.to_string())?
-            .ok_or_else(|| {
-                ConversationError::Missing("Agent is not pinned in this Session".into())
-            })?
-            .0;
+        pin: eidetica::entry::ID,
+    ) -> Result<(Operation, AcceptedInput, crate::session::TurnAttempt)> {
+        use crate::session::{TURN_ATTEMPTS_STORE, TurnAttempt, TurnAttemptStatus};
         super::turn::require_local_input(&entry)?;
+        let attempts = self
+            .txn
+            .get_store::<eidetica::store::Table<TurnAttempt>>(TURN_ATTEMPTS_STORE)
+            .await?;
+        for attempt in self.read.agent_attempts(&agent.to_string()) {
+            let settled = attempts
+                .get(attempt)
+                .await
+                .is_ok_and(|row| row.status == TurnAttemptStatus::Completed);
+            if !settled {
+                return Err(ConversationError::IdentityConflict(
+                    "Agent has an unsettled attempt; inspect it, do not dispatch again".into(),
+                ));
+            }
+        }
         let mut op = self.new_append(vec![(
             Payload::Input {
                 sender: entry.sender,
@@ -266,21 +293,26 @@ impl Staging<'_> {
             fact: op.fact_id(0),
             branch: op.branch_id.clone(),
             attempt: op.op_id.clone(),
-            pin: Some(pin.clone()),
+            pin: Some(pin),
         };
-        Ok(PreparedPinnedInput {
-            attempted: Default::default(),
-            attempt: crate::session::TurnAttempt {
-                attempt_id: accepted.attempt.clone(),
-                request_id: crate::session::TurnRequestId::parse(accepted.request()),
-                started_at: entry.timestamp,
-                generation: 1,
-                status: crate::session::TurnAttemptStatus::Started,
-                completed_at: None,
+        let attempt = TurnAttempt {
+            attempt_id: accepted.attempt.clone(),
+            request_id: crate::session::TurnRequestId::parse(accepted.request()),
+            started_at: entry.timestamp,
+            generation: 1,
+            status: TurnAttemptStatus::Started,
+            completed_at: None,
+        };
+        self.stage(&op).await?;
+        stage_observation(
+            self.txn,
+            Observation::InputAccepted {
+                input: accepted.clone(),
             },
-            op,
-            accepted,
-        })
+        )
+        .await?;
+        attempts.set(&attempt.attempt_id, attempt.clone()).await?;
+        Ok((op, accepted, attempt))
     }
 
     #[cfg(test)]
@@ -415,76 +447,6 @@ impl Staging<'_> {
             summary: op.representation_id(0),
             text: summary,
         }))
-    }
-}
-
-#[cfg(test)]
-pub(in crate::session) struct PreparedPinnedInput {
-    attempted: std::sync::atomic::AtomicBool,
-    pub op: Operation,
-    pub accepted: AcceptedInput,
-    pub attempt: crate::session::TurnAttempt,
-}
-
-#[cfg(test)]
-impl PreparedPinnedInput {
-    pub fn reserve_once(&self) -> bool {
-        !self
-            .attempted
-            .swap(true, std::sync::atomic::Ordering::AcqRel)
-    }
-
-    pub async fn stage(&self, staged: &Staging<'_>) -> Result<()> {
-        staged.stage(&self.op).await?;
-        stage_observation(
-            staged.txn,
-            Observation::InputAccepted {
-                input: self.accepted.clone(),
-            },
-        )
-        .await?;
-        staged
-            .txn
-            .get_store::<eidetica::store::Table<crate::session::TurnAttempt>>(
-                crate::session::TURN_ATTEMPTS_STORE,
-            )
-            .await?
-            .set(&self.attempt.attempt_id, self.attempt.clone())
-            .await?;
-        Ok(())
-    }
-
-    /// Query accepted history without executing or granting another attempt.
-    pub async fn readback(
-        &self,
-        db: &Database,
-        at: &Snapshot,
-    ) -> Result<Option<eidetica::entry::ID>> {
-        let txn = db.new_transaction_at(at).await?;
-        let read = Box::pin(open(db, at, &txn)).await?;
-        if let Some(error) = read.inspection.issues.first() {
-            return Err(error.clone());
-        }
-        let conflict = || ConversationError::IdentityConflict("prepared input".into());
-        let Some((entry, receipt)) = read.provenance.inputs.get(&self.accepted.request()) else {
-            if read.operations.contains_key(&self.op.op_id) {
-                return Err(conflict());
-            }
-            return Ok(None);
-        };
-        if receipt != &self.accepted
-            || read.op_atoms.get(&self.op.op_id) != Some(&atom::key(&atom::encode(&self.op)?))
-            || super::turn::attempt_at(
-                db,
-                &Snapshot::from([entry.clone()]),
-                &self.attempt.attempt_id,
-            )
-            .await?
-                != self.attempt
-        {
-            return Err(conflict());
-        }
-        Ok(Some(entry.clone()))
     }
 }
 
