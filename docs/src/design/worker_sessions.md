@@ -211,17 +211,18 @@ unbounded collapsed transcript region.
 Use sanitized, terminal-width-aware previews and existing full-content copy paths.
 The visible transcript polls small child evidence at most once every five seconds,
 with four concurrent reads and one bounded read task; cached activity ages without
-claiming remote liveness. Hub grouping runs only at catalog refresh boundaries.
+claiming remote liveness. Hub grouping runs once per accepted catalog, after its
+rows are already usable. A newer catalog, view or connection discards the check.
 A display label or preview is never a session identifier or an instruction.
 
 The hub derives a forest from verified origins, retaining independent roots and
 unknown/legacy ancestry as ordinary navigable rows.
 Read only small origin/relation metadata to establish grouping; never hydrate
 all transcripts or compute recency/usage to sort the tree.
-Bound metadata concurrency and coalesce refreshes. Apply a settled ordering at a
-refresh boundary, retaining cursor identity, rather than moving rows on every
-lazy description fill. Retain current root ordering; use stable IDs to break
-ties. Cycles, conflicting parents and missing parents cannot hide a session or
+Bound metadata concurrency and coalesce refreshes. Apply one settled ordering per
+catalog check, retaining cursor identity, rather than moving rows as individual
+checks finish or on every lazy description fill. Retain current root ordering;
+use stable IDs to break ties. Cycles, conflicting parents and missing parents cannot hide a session or
 cause an infinite walk: show an explicit unknown/conflicted root/reference.
 Existing Agent-job ancestry may be projected from its existing validated records;
 this does not alter job admission, scheduling or the separate Tasks view.
