@@ -5178,13 +5178,13 @@ async fn targeted_service_client_expands_peer_discovery_only_on_demand() {
 }
 
 #[tokio::test]
-async fn resident_executor_adopts_and_processes_local_client_session() {
+async fn resident_executor_picks_up_new_input_during_catalog_backfill() {
     // Spawned service/callback tasks share this current-thread runtime, so a
-    // thread-local subscriber captures this turn without affecting other tests.
+    // thread-local subscriber captures discovery order without affecting other tests.
     let logs = tempfile::NamedTempFile::new().unwrap();
     let subscriber = tracing_subscriber::fmt()
         .with_ansi(false)
-        .with_max_level(tracing::Level::ERROR)
+        .with_max_level(tracing::Level::INFO)
         .with_writer(logs.reopen().unwrap())
         .finish();
     let _subscriber = tracing::subscriber::set_default(subscriber);
@@ -5234,6 +5234,7 @@ async fn resident_executor_adopts_and_processes_local_client_session() {
     let agents = Arc::new(AgentRegistry::with_default_agent());
     let mock = Arc::new(crate::test_support::MockBackend::new());
     mock.push_text("resident reply");
+    mock.push_text("resident reply");
     let agent_index = HostedIndex::empty("agent");
     agent_index.register(agent.clone());
 
@@ -5280,6 +5281,10 @@ async fn resident_executor_adopts_and_processes_local_client_session() {
     assert!(!client_server.is_watching_session(&sid).await);
     assert!(client_server.runtime_owner_of(&sid).is_none());
     write_user_message_with_content(&client_db, &sid, "hello resident executor").await;
+    let old_count = 20;
+    for _ in 1..old_count {
+        client_registry.create_session(Some("old")).await.unwrap();
+    }
 
     // Connect and construct the resident after the client has queued its turn.
     // This is the daemon-restart shape: the new registry has no in-memory
@@ -5296,6 +5301,9 @@ async fn resident_executor_adopts_and_processes_local_client_session() {
         mock.clone(),
         crate::security::SecretStore::new(executor_registry.chaz_peer().clone()).await,
     );
+    // Keep the first adoption wave in flight until the client publishes the
+    // new row. It must not be present in the executor's first snapshot.
+    let startup_hold = executor_registry.user_lock().await;
     let executor = Server::new(
         executor_registry.clone(),
         agents.clone(),
@@ -5320,10 +5328,29 @@ async fn resident_executor_adopts_and_processes_local_client_session() {
         Some(crate::instance::ExecutorCapability::for_test()),
     );
 
-    await_call_count(&mock, 1).await;
+    tokio::time::timeout(ASYNC_TEST_TIMEOUT, async {
+        while !std::fs::read_to_string(logs.path())
+            .unwrap()
+            .contains("New session detected")
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("startup snapshot did not begin adoption");
+    let (fresh_id, fresh_db) = client_registry.create_session(Some("fresh")).await.unwrap();
+    client_registry
+        .attach_agent_to_session(&fresh_id.0, &agent)
+        .await
+        .unwrap();
+    write_user_message_with_content(&fresh_db, &fresh_id.0, "hello during adoption").await;
+    drop(startup_hold);
+
+    await_call_count(&mock, 2).await;
+    assert!(await_agent_reply(&fresh_db, &fresh_id.0, "default").await);
     assert!(
         await_agent_reply(&client_db, &sid, "default").await,
-        "the resident executor must write the reply into the client-created session"
+        "the resident executor must still recover the prompt queued before restart"
     );
     assert!(executor.is_watching_session(&sid).await);
     assert!(executor.runtime_owner_of(&sid).is_some());
@@ -5341,6 +5368,21 @@ async fn resident_executor_adopts_and_processes_local_client_session() {
     task.await.unwrap().unwrap();
 
     let logs = std::fs::read_to_string(logs.path()).unwrap();
+    let (before_pickup, _) = logs
+        .split_once(&format!("New session detected session_db_id={fresh_id}"))
+        .expect("the resident must discover the newly published session");
+    let old_registered = before_pickup
+        .matches("Resident executor registered")
+        .count();
+    assert!(
+        (1..old_count).contains(&old_registered),
+        "fresh pickup must happen during backfill, not after it (old rows registered: {old_registered}/{old_count})"
+    );
+    assert_eq!(
+        mock.recorded_calls().len(),
+        2,
+        "one call per distinct prompt"
+    );
     assert!(
         !logs.contains("Failed to open database for callbacks"),
         "local service turn must not reopen callback trees with the login key: {logs}"

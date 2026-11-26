@@ -2441,62 +2441,100 @@ impl Server {
         let Some(mut rx) = self.registry.subscribe_new_sessions().await else {
             return;
         };
-        let mut seen = std::collections::HashSet::new();
-        self.adopt_indexed_local_client_sessions(&mut seen).await;
-        let mut reconcile = tokio::time::interval(std::time::Duration::from_secs(60));
+        use futures::StreamExt as _;
+        use std::collections::VecDeque;
+        use std::time::Duration;
+        use tokio::time::Instant;
+
+        enum Adoption {
+            Fresh,
+            Backfill,
+            Retry,
+            Settled,
+        }
+
+        let mut known = HashMap::new();
+        let mut initial_scan = true;
+        let mut refresh = true;
+        let mut fresh: VecDeque<crate::session::SessionIndex> = VecDeque::new();
+        let mut backfill = VecDeque::new();
+        let period = Duration::from_secs(60);
+        let mut reconcile = tokio::time::interval_at(Instant::now() + period, period);
         reconcile.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        loop {
-            if self.shutting_down.load(Ordering::Acquire) {
-                break;
+        while !self.shutting_down.load(Ordering::Acquire) {
+            if refresh {
+                // A bounded notification can omit IDs. It invalidates the
+                // snapshot, but the durable catalog still selects candidates.
+                for _ in 0..rx.len() {
+                    let _ = rx.try_recv();
+                }
+                match self.registry.list_sessions().await {
+                    Ok(sessions) => {
+                        fresh.clear();
+                        backfill.clear();
+                        let mut retries = Vec::new();
+                        for session in sessions {
+                            let state = known.entry(session.session_db_id.clone()).or_insert(
+                                if initial_scan {
+                                    Adoption::Backfill
+                                } else {
+                                    Adoption::Fresh
+                                },
+                            );
+                            match state {
+                                Adoption::Fresh => fresh.push_back(session),
+                                Adoption::Backfill => backfill.push_back(session),
+                                Adoption::Retry => retries.push(session),
+                                Adoption::Settled => {}
+                            }
+                        }
+                        backfill.extend(retries);
+                        initial_scan = false;
+                    }
+                    Err(error) => {
+                        error!(%error, "Failed to scan indexed sessions for resident execution");
+                    }
+                }
             }
-            let should_rescan = tokio::select! {
-                event = rx.recv() => event.is_some(),
+
+            // Check for additions between small waves rather than waiting for
+            // the entire backlog. One slot favors a new row, one favors old
+            // work; cap pressure on the shared service even when both fill.
+            let first = fresh.pop_front().or_else(|| backfill.pop_front());
+            let second = backfill.pop_front().or_else(|| fresh.pop_front());
+            let mut batch = futures::stream::iter([first, second].into_iter().flatten())
+                .map(|session| async move {
+                    let id = session.session_db_id.clone();
+                    let settled = self.adopt_local_client_session(session).await;
+                    (id, settled)
+                })
+                .buffer_unordered(2);
+            while let Some((id, settled)) = batch.next().await {
+                known.insert(
+                    id,
+                    if settled {
+                        Adoption::Settled
+                    } else {
+                        Adoption::Retry
+                    },
+                );
+            }
+
+            refresh = tokio::select! {
+                biased;
+                _ = self.shutdown_notify.notified() => break,
+                event = rx.recv() => {
+                    if event.is_none() { break; }
+                    true
+                }
                 _ = reconcile.tick() => true,
-                _ = self.shutdown_notify.notified() => false,
+                _ = std::future::ready(()), if !fresh.is_empty() || !backfill.is_empty() => false,
             };
-            if !should_rescan {
-                break;
-            }
-            while rx.try_recv().is_ok() {}
-            self.adopt_indexed_local_client_sessions(&mut seen).await;
         }
     }
 
-    /// Re-scan rather than trusting the bounded notification channel to name
-    /// every row. Each callback is only a change signal; the durable registry
-    /// is the source of truth, including after an executor restart.
-    async fn adopt_indexed_local_client_sessions(
-        &self,
-        seen: &mut std::collections::HashSet<String>,
-    ) {
-        let sessions = match self.registry.list_sessions().await {
-            Ok(sessions) => sessions,
-            Err(error) => {
-                error!(%error, "Failed to scan indexed sessions for resident execution");
-                return;
-            }
-        };
-        let candidates = sessions
-            .into_iter()
-            .filter(|session| !seen.contains(&session.session_db_id))
-            .collect::<Vec<_>>();
-
-        use futures::StreamExt as _;
-        let settled = futures::stream::iter(candidates.into_iter().map(|session| async move {
-            let session_db_id = session.session_db_id.clone();
-            self.adopt_local_client_session(session)
-                .await
-                .then_some(session_db_id)
-        }))
-        .buffer_unordered(16)
-        .filter_map(futures::future::ready)
-        .collect::<Vec<_>>()
-        .await;
-        seen.extend(settled);
-    }
-
     /// Return true when the row is settled for this process. A transient open
-    /// or registration failure stays unseen so the next index write retries it.
+    /// or registration failure remains eligible on the next catalog scan.
     async fn adopt_local_client_session(&self, session: crate::session::SessionIndex) -> bool {
         if session
             .source
