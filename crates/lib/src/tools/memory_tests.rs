@@ -22,13 +22,22 @@ async fn fixture(
     HostedIndex,
     Arc<TokioMutex<Session>>,
 ) {
-    let backend = InMemory::new();
-    let (instance, user) = Instance::create_backend(
-        Box::new(backend),
-        NewAccount::with_password("test", "test-password"),
-    )
-    .await
-    .unwrap();
+    fixture_on(agent_name, Box::new(InMemory::new())).await
+}
+
+async fn fixture_on(
+    agent_name: &str,
+    backend: Box<dyn eidetica::backend::BackendImpl>,
+) -> (
+    Instance,
+    Arc<SessionRegistry>,
+    HostedIndex,
+    Arc<TokioMutex<Session>>,
+) {
+    let (instance, user) =
+        Instance::create_backend(backend, NewAccount::with_password("test", "test-password"))
+            .await
+            .unwrap();
     let agents_reg = Arc::new(AgentRegistry::with_default_agent());
     let registry = Arc::new(
         SessionRegistry::new(instance.clone(), user, agents_reg)
@@ -216,18 +225,62 @@ async fn provision_bank(
 }
 
 #[tokio::test]
-async fn remember_with_bank_writes_to_bank_and_recall_reads_back() {
+async fn recall_with_bank_requires_current_direct_read_despite_reference() {
+    use crate::agent_db::BankPermission;
+    use crate::embedding::EmbedError;
+    use eidetica::auth::crypto::PublicKey;
+    use eidetica::auth::types::{AuthKey, Permission};
+    use eidetica::entry::ID;
+
+    struct RevokeDuringSearch(Arc<SessionRegistry>, ID, PublicKey);
+
+    impl Embedder for RevokeDuringSearch {
+        fn model_id(&self) -> &str {
+            "test/revoke"
+        }
+
+        fn embed<'a>(
+            &'a self,
+            _text: &'a str,
+        ) -> Pin<Box<dyn Future<Output = Result<Vec<f32>, EmbedError>> + Send + 'a>> {
+            Box::pin(async move {
+                self.0
+                    .revoke_on_memory_bank(&self.1, &self.2)
+                    .await
+                    .unwrap();
+                Ok(vec![1.0])
+            })
+        }
+    }
+
     let (_instance, registry, index, session) = fixture("alpha").await;
-    let _ = provision_bank(
-        &registry,
-        "alpha",
-        "patrick",
-        crate::agent_db::BankPermission::Write,
-    )
-    .await;
+    let bank_root =
+        ID::parse(&provision_bank(&registry, "alpha", "patrick", BankPermission::Write).await)
+            .unwrap();
+    let bank = registry
+        .open_memory_bank(&bank_root, None)
+        .await
+        .unwrap()
+        .unwrap();
+    let txn = bank.database().new_transaction().await.unwrap();
+    txn.get_settings()
+        .unwrap()
+        .set_global_auth_key(AuthKey::active(None, Permission::Read))
+        .await
+        .unwrap();
+    txn.commit().await.unwrap();
 
     let remember = Remember::new(registry.clone(), index.clone(), None);
-    let ctx = make_ctx("alpha", session.clone());
+    let recall = Recall::new(registry.clone(), index.clone(), None);
+    let caller = index.find_by_name("alpha").unwrap();
+    let mut ctx = make_ctx("alpha", session);
+    ctx.agent_identity = Some(caller.clone());
+    let args = serde_json::json!({ "query": "boss", "bank": "patrick" });
+    assert!(recall.execute(args.clone(), &ctx).await.is_err());
+    registry
+        .grant_on_memory_bank(&bank_root, &caller.pubkey, "alpha", BankPermission::Write)
+        .await
+        .unwrap();
     let out = remember
         .execute(
             serde_json::json!({
@@ -244,19 +297,47 @@ async fn remember_with_bank_writes_to_bank_and_recall_reads_back() {
         "response should mention bank: {out}"
     );
 
-    // Recall via the same bank finds it.
-    let recall = Recall::new(registry.clone(), index, None);
-    let found = recall
-        .execute(
-            serde_json::json!({ "query": "boss", "bank": "patrick" }),
-            &ctx,
-        )
+    // Read alone suffices even though the reference still advertises Write.
+    registry
+        .grant_on_memory_bank(&bank_root, &caller.pubkey, "alpha", BankPermission::Read)
         .await
         .unwrap();
+    // A stale Write reference cannot lend the host's bank key to the caller.
+    assert!(
+        remember
+            .execute(
+                serde_json::json!({"key":"k", "value":"v", "bank":"patrick"}),
+                &ctx
+            )
+            .await
+            .is_err()
+    );
+    let found = recall.execute(args.clone(), &ctx).await.unwrap();
     assert!(
         found.contains("boss"),
         "recall should return entry: {found}"
     );
+    let missing_identity = make_ctx("alpha", ctx.session.clone());
+    assert!(
+        recall
+            .execute(args.clone(), &missing_identity)
+            .await
+            .is_err()
+    );
+    // The native handle can still read under wildcard Auth. A grant checked
+    // only at open would disclose the result after the direct slot is revoked.
+    let racing_recall = Recall::new(
+        registry.clone(),
+        index,
+        Some(Arc::new(RevokeDuringSearch(
+            registry,
+            bank_root,
+            caller.pubkey,
+        ))),
+    );
+    let error = racing_recall.execute(args.clone(), &ctx).await.unwrap_err();
+    assert!(error.to_string().contains("current bank grant"), "{error}");
+    assert!(recall.execute(args, &ctx).await.is_err());
 
     // And own memory is untouched (self-remember was never called).
     let found_self = recall
@@ -280,8 +361,9 @@ async fn remember_with_read_only_bank_errors() {
     )
     .await;
 
-    let remember = Remember::new(registry.clone(), index, None);
-    let ctx = make_ctx("alpha", session);
+    let mut ctx = make_ctx("alpha", session);
+    ctx.agent_identity = index.find_by_name("alpha");
+    let remember = Remember::new(registry, index, None);
     let err = remember
         .execute(
             serde_json::json!({ "key": "k", "value": "v", "bank": "readonly" }),
@@ -304,8 +386,9 @@ async fn recall_with_unknown_bank_lists_available() {
     )
     .await;
 
+    let mut ctx = make_ctx("alpha", session);
+    ctx.agent_identity = index.find_by_name("alpha");
     let recall = Recall::new(registry.clone(), index, None);
-    let ctx = make_ctx("alpha", session);
     let err = recall
         .execute(
             serde_json::json!({ "query": "x", "bank": "nonexistent" }),
@@ -780,7 +863,7 @@ async fn recall_with_failing_query_embedder_falls_back_to_bm25() {
 
 #[tokio::test]
 async fn bank_remember_with_embedder_populates_embedding_subtree() {
-    // The bank path uses `do_remember(..., embedder=Some(...))`
+    // The bank writer receives the configured embedder
     // exactly like self memory; verify by writing into a bank and
     // reading the bank's `embeddings:<model_id>` subtree directly.
     let (_instance, registry, index, session) = fixture("alpha").await;
@@ -795,7 +878,18 @@ async fn bank_remember_with_embedder_populates_embedding_subtree() {
     let embedder: Arc<dyn Embedder> =
         Arc::new(MockEmbedder::new("test/mock", vec!["deploy", "friday"]));
     let remember = Remember::new(registry.clone(), index.clone(), Some(embedder.clone()));
-    let ctx = make_ctx("alpha", session);
+    let mut ctx = make_ctx("alpha", session);
+    ctx.agent_identity = index.find_by_name("alpha");
+    let id = eidetica::entry::ID::parse(&bank_db_id).unwrap();
+    registry
+        .grant_on_memory_bank(
+            &id,
+            &ctx.agent_identity.as_ref().unwrap().pubkey,
+            "alpha",
+            crate::agent_db::BankPermission::Write,
+        )
+        .await
+        .unwrap();
     remember
         .execute(
             serde_json::json!({
@@ -812,7 +906,6 @@ async fn bank_remember_with_embedder_populates_embedding_subtree() {
     // the user lock drops before we consume `registry` into Recall.
     {
         let user = registry.user_for_tests().await;
-        let id = eidetica::entry::ID::parse(&bank_db_id).unwrap();
         let database = user.open_database(&id).await.unwrap();
         let txn = database.new_transaction().await.unwrap();
         let store = txn
@@ -825,11 +918,10 @@ async fn bank_remember_with_embedder_populates_embedding_subtree() {
 
     // And recall via the bank still works (hybrid path).
     let recall = Recall::new(registry, index, Some(embedder));
-    let ctx2 = make_ctx("alpha", ctx.session.clone());
     let out = recall
         .execute(
             serde_json::json!({ "query": "friday", "bank": "shared" }),
-            &ctx2,
+            &ctx,
         )
         .await
         .unwrap();
@@ -1011,4 +1103,398 @@ async fn search_memory_honors_entry_char_cap() {
         "expected 20-char value with elision, got: {out}"
     );
     assert!(!out.contains(&"y".repeat(21)), "value not truncated: {out}");
+}
+
+/// No model or embedding provider. Both reads and the copy enter through the
+/// tool boundary; the fixture owner only provisions grants and edits source rows.
+#[tokio::test]
+async fn copy_session_messages_rechecks_grants_and_refreshes_native_bank() {
+    exercise_session_copy(false).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn copy_session_messages_service_read_only_source() {
+    exercise_session_copy(true).await;
+}
+
+async fn exercise_session_copy(service: bool) {
+    use crate::agent_db::BankPermission;
+    use crate::session::{EntryType, SessionEntry};
+    use crate::tools::session_memory::{BrowseSessions, ImportSessionMessages};
+    use eidetica::auth::types::{AuthKey, Permission};
+    use serde_json::json;
+
+    let (_instance, owner, index, here) = fixture("alpha").await;
+    let bank_id = provision_bank(&owner, "alpha", "notes", BankPermission::Write).await;
+    // Only fixture setup uses the owner. In both modes the tool has Read alone.
+    #[cfg(unix)]
+    let (registry, server) = if service {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("copy.sock");
+        let (shutdown, rx) = tokio::sync::watch::channel(());
+        let server = eidetica::service::ServiceServer::bind(_instance, &socket)
+            .await
+            .unwrap();
+        let task = tokio::spawn(server.run(rx));
+        let client = Instance::connect(format!("unix://{}", socket.display()))
+            .await
+            .unwrap();
+        let user = client.login_account("test", "test-password").await.unwrap();
+        let registry = Arc::new(
+            SessionRegistry::new(client, user, Arc::new(AgentRegistry::with_default_agent()))
+                .await
+                .unwrap(),
+        );
+        (registry, Some((dir, shutdown, task)))
+    } else {
+        (owner.clone(), None)
+    };
+    #[cfg(not(unix))]
+    let registry = owner.clone();
+    let mut ctx = make_ctx("alpha", here.clone());
+    let actor = index.find_by_name("alpha").unwrap();
+    let browse = BrowseSessions::new(registry.clone());
+    let import = ImportSessionMessages(registry.clone());
+    assert!(browse.execute(json!({}), &ctx).await.is_err());
+    ctx.agent_identity = Some(actor.clone());
+    let here_id = here.lock().await.database().root_id().to_string();
+    owner
+        .attach_agent_to_session(&here_id, &actor)
+        .await
+        .unwrap();
+    let (source_id, db) = owner.create_session(Some("other")).await.unwrap();
+    let page_arg = json!({"session_db_id":source_id.0});
+    assert!(browse.execute(page_arg.clone(), &ctx).await.is_err());
+    owner
+        .attach_agent_to_session(&source_id.0, &actor)
+        .await
+        .unwrap();
+    let source = db.new_transaction().await.unwrap();
+    source
+        .get_settings()
+        .unwrap()
+        .set_auth_key(&actor.pubkey, AuthKey::active(None, Permission::Read))
+        .await
+        .unwrap();
+    source.commit().await.unwrap();
+    let mut msg = SessionEntry {
+        sender: "Alice".into(),
+        content: "lighthouse".into(),
+        timestamp: Utc::now(),
+        entry_type: EntryType::Message,
+        metadata: None,
+        routing: None,
+    };
+    let here_msg = here.lock().await.add_entry(msg.clone()).await.unwrap();
+    let here_arg = json!({"session_db_id":here_id});
+    assert!(
+        browse
+            .execute(here_arg.clone(), &ctx)
+            .await
+            .unwrap()
+            .contains(here_msg.as_str())
+    );
+    let mut source_session = Session::new(source_id.clone(), db.clone()).await;
+    let mut ids = Vec::new();
+    for _ in 0..9 {
+        ids.push(
+            source_session
+                .add_entry(msg.clone())
+                .await
+                .unwrap()
+                .to_string(),
+        );
+    }
+    ids.sort();
+    let selected = &ids[8];
+    let listing = browse.execute(json!({}), &ctx).await.unwrap();
+    assert!(listing.contains(&here_id) && listing.contains(&source_id.0));
+    let page: Value =
+        serde_json::from_str(&browse.execute(page_arg.clone(), &ctx).await.unwrap()).unwrap();
+    assert_eq!(
+        page["untrusted_message_excerpts"].as_array().unwrap().len(),
+        8
+    );
+    let next = json!({"session_db_id":source_id.0, "cursor":page["next_cursor"].as_str().unwrap()});
+    let last: Value =
+        serde_json::from_str(&browse.execute(next.clone(), &ctx).await.unwrap()).unwrap();
+    assert_eq!(
+        last["untrusted_message_excerpts"][0]["message_id"],
+        selected.as_str()
+    );
+    assert!(last["next_cursor"].is_null());
+    // After restart cursors expire, but a selected native row ID is durable.
+    assert!(
+        BrowseSessions::new(registry.clone())
+            .execute(next.clone(), &ctx)
+            .await
+            .is_err()
+    );
+    let bank_root = eidetica::entry::ID::parse(&bank_id).unwrap();
+    let args = json!({"session_db_id":source_id.0,"bank":"notes","bank_db_id":bank_id,"message_ids":[selected]});
+    owner
+        .grant_on_memory_bank(&bank_root, &actor.pubkey, "alpha", BankPermission::Read)
+        .await
+        .unwrap();
+    assert!(import.execute(args.clone(), &ctx).await.is_err());
+    owner
+        .grant_on_memory_bank(&bank_root, &actor.pubkey, "alpha", BankPermission::Write)
+        .await
+        .unwrap();
+    // The name still resolves to a writable bank, but not the bank the caller selected.
+    let mut rebound = args.clone();
+    rebound["bank_db_id"] = json!(here_id);
+    assert!(import.execute(rebound, &ctx).await.is_err());
+    let bad_batch = json!({"session_db_id": source_id.0, "bank": "notes", "bank_db_id":bank_id, "message_ids": [selected, "absent"]});
+    assert!(import.execute(bad_batch, &ctx).await.is_err());
+    // No prefix of the failed batch was committed.
+    for expect in [1, 0] {
+        let receipt: Value =
+            serde_json::from_str(&import.execute(args.clone(), &ctx).await.unwrap()).unwrap();
+        assert_eq!(receipt["changed"], expect);
+    }
+    msg.content = "observatory".into();
+    let edit = db.new_transaction().await.unwrap();
+    edit.get_store::<Table<SessionEntry>>("entries")
+        .await
+        .unwrap()
+        .set(selected, msg)
+        .await
+        .unwrap();
+    edit.commit().await.unwrap();
+    let receipt: Value =
+        serde_json::from_str(&import.execute(args.clone(), &ctx).await.unwrap()).unwrap();
+    assert_eq!(receipt["changed"], 1);
+    let recall = Recall::new(registry, index, None);
+    let recalled = recall
+        .execute(json!({"query":"observatory", "bank":"notes"}), &ctx)
+        .await
+        .unwrap();
+    assert!(
+        recalled.contains("observatory")
+            && recalled.contains("Alice")
+            && recalled.contains(&format!("session:{}/message:{selected}", source_id.0)),
+        "{recalled}"
+    );
+    assert!(!recalled.contains("lighthouse"));
+    // A format trace forbids falling back to old entries, even when a known
+    // message ID and all native grants still exist.
+    let mixed = here
+        .lock()
+        .await
+        .database()
+        .new_transaction()
+        .await
+        .unwrap();
+    mixed
+        .get_store::<eidetica::store::DocStore>("conversation_v1")
+        .await
+        .unwrap()
+        .set_string("unknown", "unsupported")
+        .await
+        .unwrap();
+    mixed.commit().await.unwrap();
+    assert!(browse.execute(here_arg, &ctx).await.is_err());
+    assert!(
+        import
+            .execute(
+                json!({"session_db_id":here_id, "bank":"notes", "bank_db_id":bank_id, "message_ids":[here_msg.as_str()]}),
+                &ctx
+            )
+            .await
+            .is_err()
+    );
+    let revoke = db.new_transaction().await.unwrap();
+    revoke
+        .get_settings()
+        .unwrap()
+        .revoke_auth_key(&actor.pubkey)
+        .await
+        .unwrap();
+    revoke.commit().await.unwrap();
+    assert!(browse.execute(next, &ctx).await.is_err());
+    assert!(import.execute(args, &ctx).await.is_err());
+    assert!(
+        !browse
+            .execute(json!({}), &ctx)
+            .await
+            .unwrap()
+            .contains(&source_id.0)
+    );
+    #[cfg(unix)]
+    if let Some((_dir, shutdown, task)) = server {
+        shutdown.send(()).unwrap();
+        task.await.unwrap().unwrap();
+    }
+}
+
+/// Opt-in characterization, not a CI timing threshold. The source frontier
+/// advances between sizes; this does not simulate an OS cache flush.
+#[cfg(unix)]
+#[tokio::test]
+#[ignore = "SQLite session excerpt workload"]
+async fn session_excerpt_growth() {
+    use crate::{
+        agent_db::BankPermission,
+        session::{EntryType, SessionEntry},
+        tools::session_memory::{BrowseSessions, ImportSessionMessages},
+    };
+    use eidetica::{
+        auth::types::{AuthKey, Permission},
+        backend::database::Sqlite,
+    };
+    use serde_json::json;
+    use std::time::Instant;
+
+    let dir = tempfile::tempdir().unwrap();
+    let url = format!(
+        "sqlite://{}?mode=rwc",
+        dir.path().join("corpus.db").display()
+    );
+    let disk_bytes = || {
+        dir.path()
+            .read_dir()
+            .unwrap()
+            .flatten()
+            .filter_map(|p| p.metadata().ok())
+            .filter(|m| m.is_file())
+            .map(|m| m.len())
+            .sum::<u64>()
+    };
+    let (instance, owner, index, here) =
+        fixture_on("reader", Box::new(Sqlite::connect(&url).await.unwrap())).await;
+    let actor = index.find_by_name("reader").unwrap();
+    let bank = provision_bank(&owner, "reader", "notes", BankPermission::Write).await;
+    owner
+        .grant_on_memory_bank(
+            &eidetica::entry::ID::parse(&bank).unwrap(),
+            &actor.pubkey,
+            "reader",
+            BankPermission::Write,
+        )
+        .await
+        .unwrap();
+    let here_id = here.lock().await.database().root_id().to_string();
+    owner
+        .attach_agent_to_session(&here_id, &actor)
+        .await
+        .unwrap();
+    let (source, db) = owner.create_session(Some("corpus")).await.unwrap();
+    owner
+        .attach_agent_to_session(&source.0, &actor)
+        .await
+        .unwrap();
+    let txn = db.new_transaction().await.unwrap();
+    txn.get_settings()
+        .unwrap()
+        .set_auth_key(&actor.pubkey, AuthKey::active(None, Permission::Read))
+        .await
+        .unwrap();
+    txn.commit().await.unwrap();
+    let socket = dir.path().join("service.sock");
+    let (shutdown, rx) = tokio::sync::watch::channel(());
+    let service = eidetica::service::ServiceServer::bind(instance, &socket)
+        .await
+        .unwrap();
+    let task = tokio::spawn(service.run(rx));
+    let client = Instance::connect(format!("unix://{}", socket.display()))
+        .await
+        .unwrap();
+    let user = client.login_account("test", "test-password").await.unwrap();
+    let reg = Arc::new(
+        SessionRegistry::new(client, user, Arc::new(AgentRegistry::with_default_agent()))
+            .await
+            .unwrap(),
+    );
+    let browse = BrowseSessions::new(reg.clone());
+    let import = ImportSessionMessages(reg.clone());
+    let recall = Recall::new(reg, index, None);
+    let mut ctx = make_ctx("reader", here);
+    ctx.agent_identity = Some(actor);
+    let mut previous = 0;
+    for rows in [64, 512, 2048] {
+        // A batch of eight records includes four ordinary chat messages plus
+        // directive, summary, tool-call and larger tool-result audit records.
+        for start in (previous..rows).step_by(8) {
+            let txn = db.new_transaction().await.unwrap();
+            let entries = txn
+                .get_store::<Table<SessionEntry>>("entries")
+                .await
+                .unwrap();
+            for i in start..start + 8 {
+                let (kind, bytes) = match i % 8 {
+                    4 => (EntryType::Directive, 256),
+                    5 => (EntryType::Summary, 512),
+                    6 => (EntryType::ToolCall, 256),
+                    7 => (EntryType::ToolResult, 16 * 1024),
+                    _ => (EntryType::Message, 1024),
+                };
+                entries
+                    .set(
+                        format!("row-{i:06}"),
+                        SessionEntry {
+                            sender: "Alice".into(),
+                            content: format!("lighthouse {i} {}", "x".repeat(bytes)),
+                            timestamp: Utc::now(),
+                            entry_type: kind,
+                            metadata: None,
+                            routing: None,
+                        },
+                    )
+                    .await
+                    .unwrap();
+            }
+            txn.commit().await.unwrap();
+        }
+        previous = rows;
+        let start_bytes = disk_bytes();
+        let args = json!({"session_db_id":source.0});
+        let mut pages = vec![];
+        let mut page_len = 0;
+        let mut next_cursor = Value::Null;
+        for _ in 0..4 {
+            let t = Instant::now();
+            let result = browse.execute(args.clone(), &ctx).await.unwrap();
+            pages.push(t.elapsed().as_micros());
+            page_len = result.len();
+            let page: Value = serde_json::from_str(&result).unwrap();
+            assert_eq!(
+                page["untrusted_message_excerpts"].as_array().unwrap().len(),
+                4
+            );
+            next_cursor = page["next_cursor"].clone();
+        }
+        let t = Instant::now();
+        let next = browse
+            .execute(json!({"session_db_id":source.0,"cursor":next_cursor}), &ctx)
+            .await
+            .unwrap();
+        let next_us = t.elapsed().as_micros();
+        assert!(next.contains("row-000008"));
+        let id = format!("row-{:06}", rows - 8);
+        let copy =
+            json!({"bank":"notes","bank_db_id":bank,"session_db_id":source.0,"message_ids":[id]});
+        let mut imports = vec![];
+        for expected in [1, 0] {
+            let t = Instant::now();
+            let result = import.execute(copy.clone(), &ctx).await.unwrap();
+            imports.push(t.elapsed().as_micros());
+            let receipt: Value = serde_json::from_str(&result).unwrap();
+            assert_eq!(receipt["changed"], expected);
+        }
+        let t = Instant::now();
+        let result = recall
+            .execute(json!({"bank":"notes","query":"lighthouse"}), &ctx)
+            .await
+            .unwrap();
+        let recall_us = t.elapsed().as_micros();
+        assert!(result.contains(&id));
+        eprintln!(
+            "rows={rows} page_us={pages:?} next_us={next_us} copy_retry_us={imports:?} recall_us={recall_us} page_bytes={page_len} sqlite_plus_sidecars_before={start_bytes} after={}",
+            disk_bytes()
+        );
+    }
+    shutdown.send(()).unwrap();
+    task.await.unwrap().unwrap();
 }
