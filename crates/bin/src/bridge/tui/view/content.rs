@@ -6,6 +6,8 @@ use ratatui::text::{Line, Span};
 use serde_json::Value;
 use tui_markdown::{Options, StyleSheet};
 use unicode_normalization::UnicodeNormalization;
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 use super::theme;
 
@@ -20,6 +22,28 @@ pub(super) fn safe_line(text: &str) -> String {
         usize::MAX,
     )
     .text
+}
+
+/// Fit single-line labels in a fixed cell budget without splitting a grapheme.
+pub(super) fn clipped(text: &str, width: u16) -> String {
+    let safe = safe_line(&text.replace(['\n', '\r'], " "));
+    if safe.width() <= width as usize {
+        return safe;
+    }
+    let mut out = String::new();
+    let budget = width.saturating_sub(1) as usize;
+    let mut used = 0;
+    for glyph in safe.graphemes(true) {
+        if used + glyph.width() > budget {
+            break;
+        }
+        used += glyph.width();
+        out.push_str(glyph);
+    }
+    if width > 0 {
+        out.push('…');
+    }
+    out
 }
 
 /// Preserve source spelling for normalization/tab-only display changes. Other

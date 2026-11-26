@@ -687,6 +687,52 @@ The test uses a known Provider, explicit reader keys and explicit sync; it does
 not define how to discover Providers, fetch dependencies automatically or settle
 concurrent authority changes. It makes no promise of global or timed revocation.
 
+#### One fixed resource call
+
+The `session::fixed_call` pilot is an opt-in carrier for a disposable root,
+not a registered tool or an automatic resume path in the daemon. It does not
+change existing session writers, bridge messages, or Worker and Agent job
+admission. A root created for the pilot has a marker in its signed genesis;
+changing a child's current settings cannot make it one of these roots.
+
+A current direct session Admin installs one binding and both direct Write
+grants in one `_settings` transaction. Both peers pin the same session root,
+generation, resource (transport, login, channel and operation), and two
+distinct keys. No delegation from a metadata database is installed, so a
+metadata Reader does not become a session reader. An existing direct grant is
+not overwritten. The pilot does not replace bindings or restore revoked
+grants. If a key is no longer authorized at the locally accepted frontier,
+or its current authority cannot be checked, neither edge proceeds.
+
+1. Provision the serving peer's private journal before installing the
+   binding. The requester admits a final pending tool call and publishes one
+   signed record holding both the request and its wait checkpoint. It pins the
+   effective arguments, context, attempt, branch, call and absolute deadline.
+   The pilot accepts up to 2 KiB of arguments and waits at most 60 seconds.
+2. The serving peer treats notifications as hints and reads fresh verified
+   entries. It checks the actual requester key, the binding at issuance and
+   current authority. The serving adapter still must check its local resource
+   and permissions and screen its reply before sync. The carrier caps the
+   reply body at 16 KiB. A durable local start
+   precedes the effect, even if the requester is offline. A saved completion
+   can be republished; an ambiguous start is `Unknown`, never a second call.
+   A missing or unreadable journal holds rather than opening a new one.
+3. Reopen with the same binding, select the original interrupted attempt and
+   recover its call from the persisted checkpoint. Restart only observes; it
+   never issues again. The requester accepts only the bound
+   fulfiller's signed reply to that entry ID. Under the executor's normal
+   session serialization, the pilot checks the same pending transcript and
+   pairs the result and retirement in one transaction. It does not run result
+   hooks, request a model response, or add a Message or bridge send. Expiry and
+   cancellation stop waiting without proving no work ran.
+
+The journal lock prevents overlap on that one serving peer's journal; it is
+not a distributed lock or a guarantee of immediate revocation across peers.
+Do not copy or restore the journal independently of the operator and binding.
+The disposable proof uses two native peers and a local marker instead of
+Matrix credentials or a model. A Matrix adapter must still enforce its room
+membership, history boundaries and page limits.
+
 ### Shared active-turn steering
 
 Chat and Job observers publish the same `JobInputRequest` through Session's

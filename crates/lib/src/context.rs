@@ -121,6 +121,7 @@ pub struct ContextBuilder<'a> {
     receipts: &'a [String],
     pub(crate) contributions: &'a [crate::extension::durable_context::CommittedContribution],
     pub(crate) agent_name: &'a str,
+    agent_identity: Option<&'a crate::hosted_index::DbEntry>,
     system_prompt: &'a str,
     /// Tool definitions for this turn. Also the set that `requires_tools`
     /// on a skill is matched against, so a builder left without
@@ -198,6 +199,7 @@ impl<'a> ContextBuilder<'a> {
             read_only: false,
             receipts: &[],
             agent_name,
+            agent_identity: None,
             system_prompt,
             tool_defs: &[],
             config,
@@ -215,6 +217,14 @@ impl<'a> ContextBuilder<'a> {
     /// Supply the session DB for per-session extension provider resolution.
     pub fn with_session_db(mut self, db: &'a Database) -> Self {
         self.session_db = Some(db);
+        self
+    }
+
+    pub(crate) fn with_agent_identity(
+        mut self,
+        identity: Option<&'a crate::hosted_index::DbEntry>,
+    ) -> Self {
+        self.agent_identity = identity;
         self
     }
 
@@ -437,6 +447,7 @@ impl<'a> ContextBuilder<'a> {
                 .context_tails_for_call(
                     &crate::extension::caps::ContextTailCall {
                         agent_name: self.agent_name,
+                        agent_identity: self.agent_identity,
                         recent_message_text: &recent_text,
                         session_db_id: self.session_db.map(|db| db.root_id().to_string()),
                         request_id: self.request_id,

@@ -10,28 +10,7 @@ type ToolLines = (
     Vec<(usize, usize, String)>,
 );
 
-/// Clip by terminal cells before Paragraph wrapping. Even a one-column
-/// viewport cannot turn a compact run into one row per character.
-fn clipped(text: &str, width: u16) -> String {
-    let safe = content::safe_line(&text.replace(['\n', '\r'], " "));
-    if safe.width() <= width as usize {
-        return safe;
-    }
-    let mut out = String::new();
-    let budget = width.saturating_sub(1) as usize;
-    let mut used = 0;
-    for glyph in safe.graphemes(true) {
-        if used + glyph.width() > budget {
-            break;
-        }
-        used += glyph.width();
-        out.push_str(glyph);
-    }
-    if width > 0 {
-        out.push('…');
-    }
-    out
-}
+use content::clipped;
 
 fn preview(text: &str, arguments: bool) -> String {
     let decoded = serde_json::from_str::<Value>(text);

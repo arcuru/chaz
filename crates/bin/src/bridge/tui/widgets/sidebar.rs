@@ -27,8 +27,8 @@ pub(in super::super) fn sidebar_detail_layout(area: Rect, sidebar_w: u16) -> (Re
 
 /// Render a sidebar of category labels.
 ///
-/// Selection marker `>` is rendered on the active row; inactive rows are
-/// dim. When `focused` is true the active row uses the inverted "selected"
+/// The active row has a `>` when focused and an `=` otherwise. When
+/// `focused` is true the active row uses the inverted "selected"
 /// style (black-on-accent) so it's obvious which pane owns arrow keys;
 /// when false the active row stays accent-bold (still visible, no bg) so
 /// the user can tell which category is current without it stealing focus.
@@ -45,7 +45,11 @@ pub(in super::super) fn sidebar(
     let mut lines: Vec<Line> = Vec::with_capacity(items.len());
     for (i, label) in items.iter().enumerate() {
         let is_active = i == selected;
-        let marker = if is_active { "> " } else { "  " };
+        let marker = match (is_active, focused) {
+            (true, true) => "> ",
+            (true, false) => "= ",
+            _ => "  ",
+        };
         let style = if is_active && focused {
             theme::selected()
         } else if is_active {

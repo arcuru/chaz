@@ -364,6 +364,7 @@ async fn tail_reopens_authorized_session_after_delegation_advances() {
     let delivered = tail
         .context_tail(&ContextTailCall {
             agent_name: "alpha",
+            agent_identity: None,
             recent_message_text: &[],
             session_db_id: Some(sid),
             request_id: None,

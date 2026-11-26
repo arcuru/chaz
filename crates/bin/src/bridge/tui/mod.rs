@@ -404,6 +404,7 @@ pub(super) enum Overlay {
     Help {
         scroll: u16,
     },
+    ContextHelp(HelpPage),
     /// Modal input for renaming a session. Submitting an empty string clears
     /// the alias (matches `/name` with no arg).
     RenamePrompt {
@@ -412,6 +413,38 @@ pub(super) enum Overlay {
         input: String,
         cursor: usize,
     },
+}
+
+pub(super) enum HelpPage {
+    Keys,
+    Actions(usize),
+    Commands { scroll: u16 },
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum HelpAction {
+    Sessions,
+    SessionSettings,
+    Jobs,
+    Commands,
+}
+
+impl HelpAction {
+    const ALL: [Self; 4] = [
+        Self::Sessions,
+        Self::SessionSettings,
+        Self::Jobs,
+        Self::Commands,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Sessions => "Open session hub",
+            Self::SessionSettings => "Open Session Settings",
+            Self::Jobs => "Open jobs",
+            Self::Commands => "Read slash command reference",
+        }
+    }
 }
 
 /// Inline slash-command completion popup state. Present only while the input

@@ -4075,6 +4075,7 @@ impl Server {
                         .with_room_participants(&roster)
                         .with_extension_hub(spawn_extensions.clone())
                         .with_session_db(s.database())
+                        .with_agent_identity(tool_ctx.agent_identity.as_ref())
                         .with_session_signing_key(s.signing_key())
                         .with_invocation(&active_extensions, Some(attempt.request_id.as_str()))
                         .try_build()
