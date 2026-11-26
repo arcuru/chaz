@@ -34,7 +34,9 @@ Consider a recorded parent turn that calls `spawn_worker` with
    and returns the referenced reply text, not the latest message in the child.
    A failed outcome is not a reply. The parent reacquires capacity before
    result hooks or further execution, records its own correlated tool result,
-   and can continue its model conversation in the same attempt.
+   and can continue its model conversation in the same attempt. The child entry
+   holds the Worker's reply; the parent transcript holds what the parent loop
+   received after output processing and size limits.
 
 With `"async":true`, step 4 does not happen: the caller keeps its slot and
 gets the child DB ID in the spawn result, not the Worker's answer. If
@@ -98,6 +100,6 @@ remains visible; it does not fetch the child or grant access.
 After an executor restart the committed transcripts, links and outcomes remain.
 The narrowed Worker runtime and completion channel do not. Resident adoption
 skips `spawn:` children, and neither an inline spawn wait nor `worker_wait`
-creates an Agent-job checkpoint. A parent interrupted at either call cannot
+writes a `job_wait` checkpoint. A parent interrupted at either call cannot
 automatically pick up the result and continue. Compare [Checkpointed Job
 Waits](checkpointed_waits.md) for the distinct `job_wait` protocol.

@@ -28,11 +28,18 @@ persisted session state, not just the latest entry. Shared-session Agent
 messages follow [mention-gated turns](autonomous_agents.md), not a rule that
 all Agent messages invoke every participant.
 
-For an executor-backed turn the model response containing tool calls commits
-before the tools execute. Each full tool result commits before the next model
-request. The `ToolCall` and `ToolResult` entries are for display; native paired
-transcript records carry the full exchange. Neither a display entry nor a
+For a session turn with a durable attempt, the model response containing tool
+calls commits before the tools execute. The parent records each settled tool
+result before its next model request. The `ToolCall` and `ToolResult` entries
+are for display; the native transcript pairs calls with the results passed to
+the loop, after filtering and size limits. Neither a display entry nor a
 write callback is evidence that an interrupted call can safely run again.
+
+A standalone schedule fire has no parent turn attempt. It can write tool audit
+entries and a reply to its target session. For `spawn_worker` it also records
+the call positions and IDs needed to link the child, without storing a
+replayable parent exchange. A later interactive turn does not inherit the
+schedule's Worker results as paired tool calls.
 
 See [Durable turn recovery](../architecture/sessions.md#durable-turn-recovery),
 [Agent jobs](../architecture/sessions.md#agent-jobs-and-worker-children),
